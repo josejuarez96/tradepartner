@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import itertools
 import math
+import random
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import duckdb
@@ -19,6 +21,7 @@ import pytest
 from tradepartner.calendar import session_close
 from tradepartner.execution.ids import client_order_id
 from tradepartner.execution.ledger import Ledger, from_journal
+from tradepartner.execution.risk import round_down
 from tradepartner.store import schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import insert_row
@@ -674,3 +677,64 @@ def test_an_implied_residual_price_needs_only_to_be_finite() -> None:
     # 9 + 1 shares; cash moves only by the feed fill's 450.
     assert ledger.positions == {A: 10.0}
     assert ledger.cash == pytest.approx(550.0)
+
+
+# #1296: fills are summed exactly, so a full exit on a 9-decimal grid leaves
+# no nano-share behind. Summed as floats, 0.057436865 + 1 - 0.5 is
+# 0.5574368649999999, and `round_down(·, 9)` sold one step less than held.
+NINE = 9  # the quantity grid set explicitly, not the config default (#1294)
+
+
+def _exact_ledger(fills: list[OrderedFill], orders: list[OrderRow]) -> Ledger:
+    """A ledger with no dust tolerance at all, so any residue stays visible."""
+    return from_journal(
+        fills, orders, (), NO_ACTIONS, None, 1000.0, D9, window_id=WINDOW, quantity_tolerance=0.0
+    )
+
+
+def test_the_recorded_ko_fills_exit_fully_on_the_nine_decimal_grid() -> None:
+    buy_1, buy_2 = _order(A, "buy", D1), _order(A, "buy", D5)
+    sell = _order(A, "sell", D7)
+    fills = [
+        _fill(buy_1, 0.057436865, 60.0, fill_id=1),
+        _fill(buy_2, 1, 60.0, fill_id=2),
+        _fill(sell, 0.5, 60.0, fill_id=3),
+    ]
+    assert round_down(0.057436865 + 1 - 0.5, NINE) == 0.557436864  # the float bug
+    held = _exact_ledger(fills, [buy_1, buy_2, sell]).positions[A]
+    assert held == 0.557436865
+    exit_quantity = round_down(held, NINE)
+    assert exit_quantity == 0.557436865
+    exit_order = _order(A, "sell", D8)
+    after = _exact_ledger(
+        [*fills, _fill(exit_order, exit_quantity, 60.0, fill_id=4)],
+        [buy_1, buy_2, sell, exit_order],
+    )
+    assert after.positions == {}
+
+
+def test_random_nine_decimal_fills_exit_exactly_and_never_oversell() -> None:
+    rng = random.Random(1296)
+    step = Decimal(1).scaleb(-NINE)
+    for _ in range(500):
+        count = rng.randint(2, 5)
+        quantities = [Decimal(rng.randint(1, 10**13)) * step for _ in range(count)]
+        orders = [_order(A, "buy", D1, attempt=i + 1) for i in range(count)]
+        fills = [
+            _fill(order, float(q), 10.0, fill_id=i + 1)
+            for i, (order, q) in enumerate(zip(orders, quantities, strict=True))
+        ]
+        sell = _order(A, "sell", D5)
+        sold = Decimal(rng.randint(0, int(sum(quantities) / step) - 1)) * step
+        if sold:
+            fills.append(_fill(sell, float(sold), 10.0, fill_id=count + 1))
+            orders.append(sell)
+        truth = sum(quantities) - sold
+        exit_quantity = round_down(_exact_ledger(fills, orders).positions[A], NINE)
+        assert Decimal(repr(exit_quantity)) == truth  # the whole holding, on the grid
+        exit_order = _order(A, "sell", D7)
+        after = _exact_ledger(
+            [*fills, _fill(exit_order, exit_quantity, 10.0, fill_id=count + 2)],
+            [*orders, exit_order],
+        )
+        assert after.positions == {}

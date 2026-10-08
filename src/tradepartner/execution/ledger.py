@@ -48,6 +48,9 @@ A row's own date for the split test is its `session` (an adjustment) or the
 New York date of `filled_at` (a fill): a fill on the ex-date is already in
 post-split shares. Quantities within `quantity_tolerance` of zero
 (`risk.reconcile_quantity_tolerance` from the frozen window) are dropped.
+Positions are summed in `Decimal` from each quantity's shortest form, so
+fills on the broker's quantity grid add up exactly and a full exit's
+`risk.round_down` sells the whole holding, not one grid step less (#1296).
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -141,6 +145,11 @@ def _split_factor(splits: Iterable[tuple[date, float]], stated_on: date) -> floa
         if stated_on < ex_date:
             factor *= ratio
     return factor
+
+
+def _dec(value: float) -> Decimal:
+    """`value` as the `Decimal` of its shortest decimal form."""
+    return Decimal(repr(value))
 
 
 def _check_window(kind: str, row_window: int, window_id: int) -> None:
@@ -242,7 +251,9 @@ def from_journal(
 
     by_id = {order.client_order_id: order for order in orders}
     splits = _splits_by_security(actions_as_of, through)
-    positions: dict[str, float] = defaultdict(float)
+    # Summed in `Decimal` from each number's shortest form, never `float`, so
+    # a full exit on a fine quantity grid leaves no float residue (#1296).
+    positions: dict[str, Decimal] = defaultdict(Decimal)
 
     seen_fills: set[int] = set()
     for fill in fills:
@@ -254,7 +265,7 @@ def from_journal(
             continue
         sign = 1 if fill.side == _BUY else -1
         factor = _split_factor(splits.get(fill.security_id, ()), stated_on)
-        positions[fill.security_id] += sign * row.quantity * factor
+        positions[fill.security_id] += sign * _dec(row.quantity) * _dec(factor)
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
 
@@ -266,9 +277,9 @@ def from_journal(
             continue
         if adjustment.quantity is not None and adjustment.security_id is not None:
             factor = _split_factor(splits.get(adjustment.security_id, ()), adjustment.session)
-            positions[adjustment.security_id] += adjustment.quantity * factor
+            positions[adjustment.security_id] += _dec(adjustment.quantity) * _dec(factor)
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
 
-    held = {name: q for name, q in positions.items() if abs(q) > quantity_tolerance}
+    held = {name: float(q) for name, q in positions.items() if abs(q) > _dec(quantity_tolerance)}
     return Ledger(positions=held, cash=cash, through=through)
