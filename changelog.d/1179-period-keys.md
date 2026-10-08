@@ -1,3 +1,0 @@
-- T97 (#1179): metrics keyed per period with periods_per_year, V and SR* in annual units (sharpe_unit), one N function (results.family_n), vintage columns; schema version 15 copies Phase 3 rows to the period keys.
-### Changed
-- Backtest metrics are stored under period keys (`sharpe_period`, `turnover_period`, `n_periods`, ...) with `periods_per_year`, `turnover_annual` and `sharpe_annual_excess_spy`; the deflated Sharpe takes V over annualised Sharpes and SR* per trial period; schema version 15 adds `trials.detail_level`, `data_vintage`, `code_tree_sha256` and `trial_results.sharpe_unit` and copies every existing trial's monthly rows to the new keys (#1179).

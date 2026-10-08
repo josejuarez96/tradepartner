@@ -1,3 +1,0 @@
-- T110 (#1204): on a lab store, backtest refuses a sweep variant (refused_variant), only pre-lab or promoted hypotheses spend the holdout, under the family's spend cap; store_path runs need the fixture marker; V window key at cadence.
-### Added
-- Strategy-lab holdout rules on the backtest path: `refused_variant`, the pre-lab/promotion spend gate and the family holdout-spend cap (lab-initialised stores only; a store without the lab tables decides as Phase 3); `run_hypothesis(store_path=...)` refuses a store without the fixture marker unless it is `settings.store.path`, and runs every trial on a marked store as synthetic; the V pair's window key reads the hypothesis's cadence (T110).
