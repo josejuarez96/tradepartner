@@ -9,15 +9,17 @@ window's first rebalance for every T_i (quadratic in the rebalance count) and CI
 once per worker that draws a truncation or prefix test. A later axis
 (the strategy family, T85e) extends `Case` and `CASES`, not the tests.
 
-**Families** (T85e). The three cadence cases run `family="momentum"`; the
-`profitability` case runs that family at `month_end` from 2018 (the fixture universe is
-empty before), so the truncated set includes `statement_facts` and `classifications`,
-whose fixture rows carry point-in-time cases on universe members (fixture README,
-"Statement facts"). Its own teeth: the FY2018 10-K of SEC_TRANSFER (CIK0001000007),
-accepted at 16:30 New York after close(2019-02-28), is not read by the plan at that
-close, so it leaves `run(end=2019-03-29)` (whose last plan is at 2019-02-28) unchanged,
-and changes `run(end=2019-04-30)`. A plan read at the fill session's close (2019-03-01)
-would see it.
+**Families** (T85e, extended by T130). The three cadence cases run `family="momentum"`; the
+`profitability` and `combined` cases run their family at `month_end` from 2018 (the fixture
+universe is empty before), so the truncated set includes `statement_facts` and
+`classifications`, whose fixture rows carry point-in-time cases on universe members
+(fixture README, "Statement facts"). The cases are a literal list (not `ENGINE_FAMILIES`),
+so T130 added `combined` here. The profitability case's teeth: the FY2018 10-K of
+SEC_TRANSFER (CIK0001000007), accepted at 16:30 New York after close(2019-02-28), is not
+read by the plan at that close, so it leaves `run(end=2019-03-29)` (whose last plan is at
+2019-02-28) unchanged, and changes `run(end=2019-04-30)`. A plan read at the fill session's
+close (2019-03-01) would see it. `combined` composes momentum's price read with the facts
+read, so both the seeded bar revisions and the 10-K reach its plans.
 
 `engine.run` over a `StoreProvider` on the fixture universe, at every rebalance
 session T_i of the case's window:
@@ -185,6 +187,18 @@ CASES: dict[str, Case] = {
             seed_to=date(2019, 11, 30),
             family="profitability",
         ),
+        # B4 `combined` (T130) reads prices and facts, so its walk must cross both. It
+        # starts where the facts do, as the profitability case does; the whole fixture
+        # range is empty before 2018.
+        Case(
+            "month_end",
+            date(2018, 1, 2),
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            seed_from=date(2018, 6, 1),
+            seed_to=date(2019, 11, 30),
+            family="combined",
+        ),
     )
 }
 assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
@@ -208,8 +222,13 @@ def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
     # (2018-01-02). Benchmarks are read by symbol (#840) and the engine refuses one with
     # no bar at F_0, so these runs name none, as they effectively did before (master
     # rows unknown); the other cadences follow suit, so only the cadence differs. A
-    # profitability case takes the same top fraction from its own section.
-    extra = {"profitability": {"top_fraction": 0.5}} if family == "profitability" else {}
+    # profitability or combined case takes the same top fraction from its own section;
+    # combined also takes one from `combined`.
+    extra: dict[str, dict[str, float]] = {}
+    if family in ("profitability", "combined"):
+        extra["profitability"] = {"top_fraction": 0.5}
+    if family == "combined":
+        extra["combined"] = {"top_fraction": 0.5}
     return Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},
@@ -564,8 +583,8 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) 
 def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
     fixture: Fixture,
 ) -> None:
-    if fixture.case.family != "profitability":
-        pytest.skip("only the profitability family reads statement facts")
+    if fixture.case.family not in ("profitability", "combined"):
+        pytest.skip("only the profitability and combined families read statement facts")
     cik, accepted, t_i = LATE_10K
     i = fixture.sessions.index(t_i)
     t_next, t_after = fixture.sessions[i + 1], fixture.sessions[i + 2]

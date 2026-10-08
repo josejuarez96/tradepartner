@@ -18,6 +18,7 @@ from tradepartner.config import Settings
 SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner"
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-momentum.md"
 PROF_FIXTURE = FIXTURE.with_name("fixture-profitability.md")
+COMBINED_FIXTURE = FIXTURE.with_name("fixture-combined.md")
 H1_FILE = SRC.parents[1] / "docs" / "hypotheses" / "h1-momentum-12-1.md"
 SCHEDULE_KEYS = ("schedule.rebalance_cadence", "schedule.signal_anchor")
 IN_SAMPLE_START = date(2019, 11, 29)
@@ -216,16 +217,16 @@ def test_fingerprint_raises_for_an_unlisted_family() -> None:
         frozen.fingerprint("nosuch", {}, IN_SAMPLE_START)
 
 
-def test_two_section_family_hashes_both_and_has_no_inert_section(
+def test_three_section_family_hashes_all_and_has_no_inert_section(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A test-only spec that lists two sections freezes and hashes both and has no
+    """A test-only spec that lists three sections freezes and hashes all three and has no
     inert section (ADR 0014 point 2: `combined` is the real caller, T130)."""
     from tradepartner import config as config_module
 
     original = config_module.FAMILIES["momentum"]
-    two_sections = type(original)(
-        sections=("strategy", "profitability"),
+    composed = type(original)(
+        sections=("strategy", "profitability", "combined"),
         params_model=original.params_model,
         parent=None,
         engine_ready=True,
@@ -235,11 +236,15 @@ def test_two_section_family_hashes_both_and_has_no_inert_section(
         benchmark=None,
         sweepable_keys=(),
     )
-    monkeypatch.setitem(config_module.FAMILIES, "momentum", two_sections)
+    monkeypatch.setitem(config_module.FAMILIES, "momentum", composed)
     assert frozen.inert_sections("momentum") == frozenset()
-    params = {"strategy.top_fraction": 0.3, "profitability.top_fraction": 0.4}
+    params = {
+        "strategy.top_fraction": 0.3,
+        "profitability.top_fraction": 0.4,
+        "combined.top_fraction": 0.5,
+    }
     base = frozen.fingerprint("momentum", params, IN_SAMPLE_START)
-    for key in ("strategy.top_fraction", "profitability.top_fraction"):
+    for key in ("strategy.top_fraction", "profitability.top_fraction", "combined.top_fraction"):
         moved = {**params, key: params[key] + 0.1}
         assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != base
 
@@ -307,6 +312,15 @@ PROFITABILITY_DEFAULTS = (
     ("profitability.include_derived", True, 12),
     ("profitability.top_fraction", 0.10, 12),
     ("profitability.weighting", "equal", 12),
+)
+
+#: The `combined` fixture twin's frozen values (T130), computed on this branch over
+#: `Settings(_env_file=None)`.
+COMBINED_FINGERPRINT = "810686f134111c9bddfc9194050de71ed65a497ba0acf7c4fd43052e26a3b9d2"
+COMBINED_PARAMS_SHA256 = "239dd0b6cfbc1fc1ef21e48831dfdae80b6d67a3688ab3d172a9bcb290163094"
+COMBINED_DEFAULTS = (
+    ("combined.top_fraction", 0.10, 16),
+    ("combined.weighting", "equal", 16),
 )
 
 
@@ -395,6 +409,79 @@ def test_profitability_hash_and_fingerprint_ignore_live_strategy(settings: Setti
     stray = {**base, "strategy.top_fraction": 0.5}
     assert frozen.fingerprint("profitability", stray, IN_SAMPLE_START) == frozen.fingerprint(
         "profitability", base, IN_SAMPLE_START
+    )
+
+
+# --- the `combined` family (hypothesis backlog B4; ADR 0014 point 6, T130) ------
+
+
+def _combined_params(settings: Settings) -> dict[str, Any]:
+    return hypothesis.frozen_params(hypothesis.parse_file(COMBINED_FIXTURE), settings)
+
+
+def _combined_defaults_settings() -> Settings:
+    return Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_combined_table_entries_are_pinned_by_value() -> None:
+    """Append-only: the `combined.*` defaults land after the stale-listing entry."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[10:12], COMBINED_DEFAULTS)
+    assert frozen.FAMILY_SIGNAL_SECTIONS["combined"] == "combined"
+
+
+def test_combined_twin_frozen_set_and_fingerprint_pinned() -> None:
+    from tradepartner.store import registry
+
+    settings = _combined_defaults_settings()
+    params = _combined_params(settings)
+    assert registry.params_sha256(params) == COMBINED_PARAMS_SHA256
+    assert frozen.fingerprint("combined", params, date(2017, 1, 31)) == COMBINED_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(params, "combined")
+    # Its listed sections are kept whole: both sub-signals' keys, default-valued ones too.
+    assert {k for k in canonical if k.startswith("combined.")} == {
+        key for key, _default, _version in COMBINED_DEFAULTS
+    }
+    assert any(k.startswith("strategy.") for k in canonical)
+    assert any(k.startswith("profitability.") for k in canonical)
+
+
+def test_combined_twin_ignores_live_sub_signal_keys() -> None:
+    """The fixture names both sub-signals' keys, so a live `strategy.*` or
+    `profitability.*` change moves neither the stored frozen set nor its hash (T130)."""
+    from tradepartner.store import registry
+
+    settings = _combined_defaults_settings()
+    base = _combined_params(settings)
+    live = settings.model_copy(
+        update={
+            "strategy": settings.strategy.model_copy(
+                update={"formation_months": 6, "skip_months": 0, "top_fraction": 0.5}
+            ),
+            "profitability": settings.profitability.model_copy(
+                update={"top_fraction": 0.9, "max_fact_age_days": 100}
+            ),
+        }
+    )
+    moved = _combined_params(live)
+    assert moved == base
+    assert registry.params_sha256(moved) == COMBINED_PARAMS_SHA256
+    assert frozen.fingerprint("combined", moved, date(2017, 1, 31)) == COMBINED_FINGERPRINT
+    assert frozen.canonical_frozen_set(moved, "combined") == frozen.canonical_frozen_set(
+        base, "combined"
+    )
+
+
+def test_momentum_and_combined_fingerprints_still_ignore_each_other_s_sections(
+    settings: Settings,
+) -> None:
+    """A `strategy.*` key in a profitability set is ignored, and `combined`'s sections are
+    frozen in full, so the pinned momentum twin is untouched by T130."""
+    momentum = _new_params(settings)
+    assert frozen.fingerprint("momentum", momentum, IN_SAMPLE_START) == frozen.fingerprint(
+        "momentum", {**momentum, "combined.top_fraction": 0.9}, IN_SAMPLE_START
+    )
+    assert not any(
+        k.startswith("combined.") for k in frozen.canonical_frozen_set(momentum, "momentum")
     )
 
 

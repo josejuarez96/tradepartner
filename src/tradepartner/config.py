@@ -710,7 +710,7 @@ class GapConfig(_ClosedConfig):
 # for the deflated Sharpe, so a family cannot be invented by config: adding one is a
 # reviewed code change here. `oracle` is refused on the real store (registry, T31b). A
 # test pins `get_args(HypothesisFamily) == tuple(FAMILIES)` (ADR 0014 point 2).
-HypothesisFamily = Literal["momentum", "oracle", "profitability"]
+HypothesisFamily = Literal["momentum", "oracle", "profitability", "combined"]
 
 # Cadence and signal anchor (strategy-lab spec, "Config keys"; ADR 0012, superseding
 # ADR 0006's Cadence section): frozen per hypothesis like the universe, beside
@@ -806,6 +806,21 @@ class ProfitabilityConfig(BaseModel):
         return self
 
 
+class CombinedConfig(BaseModel):
+    """The `combined` family's construction keys (hypothesis backlog B4; ADR 0014 point
+    6, T130). The signal is a fixed equal-rank combination of momentum and profitability
+    (never fitted on returns), so the family carries only the portfolio rules the engine
+    reads for every family: `top_fraction`, a share of the combined scored names in
+    (0, 1], and `weighting`. Nothing else; the sub-signals' own keys stay in `strategy`
+    and `profitability`.
+    """
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    top_fraction: float = Field(default=0.10, gt=0, le=1)
+    weighting: Literal["equal"] = "equal"
+
+
 # --- The family registry (ADR 0014; T128) ------------------------------------
 #
 # One table from which every per-family table derives. Each entry pins:
@@ -889,6 +904,43 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "n_excluded_sector",
             "n_excluded_malformed",
             "n_derived",
+        ),
+        benchmark="MTUM",
+        sweepable_keys=(),
+    ),
+    "combined": FamilySpec(
+        # Its own construction section first, then both sub-signals' sections, so a B4
+        # registration freezes, requires and hashes `strategy.*` and `profitability.*`
+        # and reads neither live (ADR 0014 points 2 and 6).
+        sections=("combined", "strategy", "profitability"),
+        params_model=CombinedConfig,
+        # Owner decision 2026-10-06 on #1074: `combined` is a child of `momentum` in
+        # `FAMILY_PARENTS` (ADR 0014 open question 2).
+        parent="momentum",
+        engine_ready=True,
+        # Not paper-ready: `combined` lands through the engine registry only (ADR 0014
+        # point 5), so the paper planner never sees it.
+        paper_ready=False,
+        # Momentum's reason, profitability's four, then the combination's own reason,
+        # in the precedence `combined_rank` reports and pairwise disjoint (T130).
+        exclusion_reasons=(
+            "no_history",
+            "sector",
+            "no_facts",
+            "stale_facts",
+            "malformed",
+            "one_signal_only",
+        ),
+        # Both sub-signals' counts plus `n_combined` (T130).
+        count_names=(
+            "n_excluded_no_history",
+            "n_ranked",
+            "n_excluded_no_facts",
+            "n_excluded_stale_facts",
+            "n_excluded_sector",
+            "n_excluded_malformed",
+            "n_derived",
+            "n_combined",
         ),
         benchmark="MTUM",
         sweepable_keys=(),
@@ -1488,6 +1540,7 @@ class Settings(BaseSettings):
     hypotheses: HypothesesConfig = Field(default_factory=HypothesesConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     profitability: ProfitabilityConfig = Field(default_factory=ProfitabilityConfig)
+    combined: CombinedConfig = Field(default_factory=CombinedConfig)
     costs: CostsConfig = Field(default_factory=CostsConfig)
     holdout: HoldoutConfig = Field(default_factory=HoldoutConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)

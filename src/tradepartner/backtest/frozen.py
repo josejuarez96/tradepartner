@@ -48,6 +48,11 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # store, not the strategy, enters at its real default, so H1 reads 63 too (owner,
     # 2026-10-07; strategy-lab spec Definitions, "Frozen-key defaults").
     ("gap.stale_listing_sessions", 63, 16),
+    # The `combined` family's construction keys (hypothesis backlog B4; ADR 0014 point 6,
+    # T130). `strategy.*` and `profitability.*` are its listed sections too, but their
+    # table entries already exist above.
+    ("combined.top_fraction", 0.10, 16),
+    ("combined.weighting", "equal", 16),
 )
 
 #: The frozen key set before the lab (`frozen_keys()` on 2026-10-05, schema version 12).

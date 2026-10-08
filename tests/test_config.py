@@ -28,6 +28,7 @@ from tradepartner.config import (
     FROZEN_PAPER_KEYS,
     PAPER_FAMILIES,
     AlpacaConfig,
+    CombinedConfig,
     CostsConfig,
     EdgarConfig,
     ExecutionConfig,
@@ -717,7 +718,7 @@ def test_env_file_override_via_tradepartner_env_file(
 
 
 def test_hypotheses_families_default() -> None:
-    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability"]
+    assert _settings().hypotheses.families == ["momentum", "oracle", "profitability", "combined"]
 
 
 def test_hypotheses_family_outside_the_list_rejected() -> None:
@@ -1075,15 +1076,19 @@ def test_hypothesis_family_literal_equals_the_registry_keys() -> None:
 
 
 def test_family_parents_derives_without_oracle_at_today_s_values() -> None:
-    assert FAMILY_PARENTS == {"momentum": None, "profitability": None}
+    assert FAMILY_PARENTS == {"momentum": None, "profitability": None, "combined": "momentum"}
 
 
 def test_family_signal_sections_derives_without_oracle_at_today_s_values() -> None:
-    assert FAMILY_SIGNAL_SECTIONS == {"momentum": "strategy", "profitability": "profitability"}
+    assert FAMILY_SIGNAL_SECTIONS == {
+        "momentum": "strategy",
+        "profitability": "profitability",
+        "combined": "combined",
+    }
 
 
 def test_engine_families_derives_at_today_s_value() -> None:
-    assert ENGINE_FAMILIES == ("momentum", "oracle", "profitability")
+    assert ENGINE_FAMILIES == ("momentum", "oracle", "profitability", "combined")
 
 
 def test_paper_families_derives_at_today_s_value() -> None:
@@ -1150,6 +1155,77 @@ def test_profitability_family_spec() -> None:
         "n_excluded_sector",
         "n_excluded_malformed",
         "n_derived",
+    )
+    assert spec.benchmark == "MTUM"
+    assert spec.sweepable_keys == ()
+
+
+# --- The `combined` family (hypothesis backlog B4; ADR 0014 point 6, T130) -----
+
+
+def test_combined_is_a_child_of_momentum() -> None:
+    """Owner decision 2026-10-06 on #1074 (ADR 0014 open question 2)."""
+    assert "combined" in get_args(HypothesisFamily)
+    assert FAMILY_PARENTS["combined"] == "momentum"
+
+
+def test_combined_defaults() -> None:
+    c = _settings().combined
+    assert c.top_fraction == pytest.approx(0.10)
+    assert c.weighting == "equal"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"unknown_key": 1},
+        {"top_fraction": float("nan")},
+        {"top_fraction": float("inf")},
+        {"top_fraction": 0.0},
+        {"top_fraction": 1.5},
+        {"weighting": "cap"},
+    ],
+)
+def test_combined_rejects_invalid_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, combined=override)
+
+
+def test_combined_keys_are_not_sweepable_by_default() -> None:
+    assert not any(k.startswith("combined.") for k in _settings().lab.sweepable_keys)
+
+
+def test_env_example_names_combined_keys() -> None:
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    text = env_example.read_text(encoding="utf-8")
+    for name in Settings.model_fields["combined"].annotation.model_fields:  # type: ignore[union-attr]
+        assert f"COMBINED__{name.upper()}=" in text, name
+
+
+def test_combined_family_spec() -> None:
+    spec = FAMILIES["combined"]
+    assert spec.sections == ("combined", "strategy", "profitability")
+    assert spec.params_model is CombinedConfig
+    assert spec.parent == "momentum"
+    assert spec.engine_ready is True
+    assert spec.paper_ready is False
+    assert spec.exclusion_reasons == (
+        "no_history",
+        "sector",
+        "no_facts",
+        "stale_facts",
+        "malformed",
+        "one_signal_only",
+    )
+    assert spec.count_names == (
+        "n_excluded_no_history",
+        "n_ranked",
+        "n_excluded_no_facts",
+        "n_excluded_stale_facts",
+        "n_excluded_sector",
+        "n_excluded_malformed",
+        "n_derived",
+        "n_combined",
     )
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == ()

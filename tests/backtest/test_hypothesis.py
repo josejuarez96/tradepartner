@@ -29,9 +29,12 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fix
 SLUG = "fixture-momentum"
 PROF_FIXTURE = FIXTURE.with_name("fixture-profitability.md")
 PROF_SLUG = "fixture-profitability"
+COMBINED_FIXTURE = FIXTURE.with_name("fixture-combined.md")
+COMBINED_SLUG = "fixture-combined"
 
 # Spec req 10: the frozen sections (every key) and the single frozen keys.
 FROZEN_SECTIONS = (
+    "combined",
     "strategy",
     "profitability",
     "schedule",
@@ -201,8 +204,11 @@ def test_out_of_range_value_is_refused(
 
 def test_frozen_set_is_exactly_the_spec_key_list(settings: Settings) -> None:
     frozen = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
-    # A momentum registration stores no `profitability.*` key (amendment #720, T85).
-    assert set(frozen) == {k for k in _spec_frozen_keys() if not k.startswith("profitability.")}
+    # A momentum registration stores no `profitability.*` key (amendment #720, T85) and
+    # no `combined.*` key (an unlisted section is inert, ADR 0014 point 2).
+    assert set(frozen) == {
+        k for k in _spec_frozen_keys() if not k.startswith(("profitability.", "combined."))
+    }
     assert set(hypothesis.frozen_keys()) == _spec_frozen_keys()
     for key in (
         "metrics.risk_free_rate",
@@ -502,7 +508,9 @@ def test_profitability_file_registers_without_strategy_keys(
         "SELECT params_json FROM hypotheses WHERE hypothesis_id = ?", [record.hypothesis_id]
     ).fetchone()
     assert stored is not None and '"strategy.' not in stored[0]
-    assert set(record.params) == {k for k in _spec_frozen_keys() if not k.startswith("strategy.")}
+    assert set(record.params) == {
+        k for k in _spec_frozen_keys() if not k.startswith(("strategy.", "combined."))
+    }
 
 
 @pytest.mark.parametrize("line", ["top_fraction = 0.2", "max_fact_age_days = 548"])
@@ -543,6 +551,49 @@ def test_profitability_registration_ignores_live_strategy_settings(
     assert loaded.strategy.top_fraction == 0.5
     assert hypothesis.frozen_hash_matches(loaded, first.params_sha256, family="profitability")
     assert hypothesis.frozen_params_of(loaded, family="profitability") == first.params
+
+
+# --- the `combined` family (hypothesis backlog B4; ADR 0014 point 6, T130) ------
+
+
+def _combined_copy(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "hypotheses" / f"{COMBINED_SLUG}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_combined_file_names_and_freezes_both_sub_signal_keys(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A `combined` file names every `combined.*`, `strategy.*` and `profitability.*` key
+    and its registration freezes all three sections, with no inert section."""
+    parsed = hypothesis.parse_file(COMBINED_FIXTURE)
+    required = hypothesis.required_keys("combined")
+    assert {"holdout.start", "holdout.end"} <= required
+    assert {
+        k
+        for k in _spec_frozen_keys()
+        if k.startswith(("combined.", "strategy.", "profitability.", "costs."))
+    } <= required
+    assert required <= set(parsed.file_params)
+    assert frozen.inert_sections("combined") == frozenset()
+    record = _register(conn, COMBINED_FIXTURE, settings)
+    assert record.family == "combined"
+    assert record.params["combined.top_fraction"] == 0.2
+    assert record.params["strategy.formation_months"] == 12
+    assert record.params["profitability.max_fact_age_days"] == 548
+    assert set(record.params) == set(hypothesis.family_frozen_keys("combined"))
+
+
+def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path: Path) -> None:
+    """`strategy` is one of `combined`'s listed sections, so its keys are required, not
+    another family's': the refusal is `required keys missing`, not an inert-section one."""
+    text = COMBINED_FIXTURE.read_text().replace("\nformation_months = 12\n", "\n", 1)
+    with pytest.raises(HypothesisFileError, match="missing") as excinfo:
+        hypothesis.parse_file(_combined_copy(tmp_path, text))
+    assert "strategy.formation_months" in str(excinfo.value)
+    assert "another family" not in str(excinfo.value)
 
 
 @pytest.mark.parametrize(

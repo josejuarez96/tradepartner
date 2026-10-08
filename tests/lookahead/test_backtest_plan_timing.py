@@ -7,16 +7,18 @@ the whole fixture range as T40b did; `week_end` and `daily` walk the same window
 about thirty rebalances as `test_backtest_invariance.py`. A later axis (the strategy
 family, T85e) extends `Case` and `CASES`, not the tests.
 
-**Families** (T85e). The cadence cases run `family="momentum"`; the `profitability` case
-runs that family at `month_end` from 2018, so the plans read `statement_facts` and
-`classifications` and the compared fields include the family's six counts. Teeth (b)
-revises a momentum anchor bar, so it runs on the momentum cases; the profitability
-case's teeth are the fixture's acceptance cases (`Accepted`, fixture README "Statement
-facts"): on a store without that case's rows, the plan at the close before acceptance
-is unchanged and the plan at the first close after it is not. A plan read at the fill
-session's close, or strictly before `session_close(T)`, fails at least one of them. A
-provider read past `t` alone is masked by the signal's rule 0 (`known_at <= t`); with
-that filter gone too, the 10-K case fails.
+**Families** (T85e, extended by T130). The cadence cases run `family="momentum"`; the
+`profitability` and `combined` cases run their family at `month_end` from 2018, so the
+plans read `statement_facts` and `classifications` and the compared fields include the
+family's counts. `combined` composes momentum's price read with the facts read, so it
+carries both sub-signals' counts. The cases are a literal list (not `ENGINE_FAMILIES`), so
+T130 added `combined` here. Teeth (b) revises a momentum anchor bar, so it runs on the
+momentum cases; the profitability and combined cases' teeth are the fixture's acceptance
+cases (`Accepted`, fixture README "Statement facts"): on a store without that case's rows,
+the plan at the close before acceptance is unchanged and the plan at the first close after
+it is not. A plan read at the fill session's close, or strictly before `session_close(T)`,
+fails at least one of them. A provider read past `t` alone is masked by the signal's rule 0
+(`known_at <= t`); with that filter gone too, the 10-K case fails.
 
 T40's truncation and prefix invariance cannot see an engine that fills at F_k from
 targets planned with a read at close(T_{k+1}): every read stays inside both cuts. This
@@ -208,6 +210,19 @@ CASES: dict[str, Case] = {
             family="profitability",
             accepted=ACCEPTED,
         ),
+        # B4 `combined` (T130): its plans read prices and facts, so it carries the
+        # acceptance teeth too. Added here because `CASES` is a literal list, not
+        # `ENGINE_FAMILIES`. The two 2019-01-31 boundary stamps are dropped: the name they
+        # concern is outside the combined common set (momentum excludes it), so deleting
+        # its fact row cannot move a combined plan, while it does move a profitability one.
+        Case(
+            "month_end",
+            date(2018, 1, 2),
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            family="combined",
+            accepted=(*ACCEPTED[:1], *ACCEPTED[3:]),
+        ),
     )
 }
 assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
@@ -228,7 +243,11 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
-    extra = {"profitability": {"top_fraction": 0.5}} if family == "profitability" else {}
+    extra: dict[str, dict[str, float]] = {}
+    if family in ("profitability", "combined"):
+        extra["profitability"] = {"top_fraction": 0.5}
+    if family == "combined":
+        extra["combined"] = {"top_fraction": 0.5}
     return Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},
