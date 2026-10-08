@@ -600,6 +600,19 @@ LAB_MIGRATION_HINT = (
 #: Errors a lab command reports as a refusal (exit 2): raised before anything is
 #: written, or inside a write chunk that rolls back. `LabNotInitialised` is separate.
 _LAB_REFUSALS = (registry.RegistryError, ValueError)
+#: `run_sweep`'s refusals, each raised before it writes a row (its docstring); the
+#: unknown slug and the budget are checked by `sweep run` itself first. Any other
+#: error comes after the run opened, so it exits 1, not as a refusal.
+_SWEEP_RUN_REFUSALS = (
+    lab.RegistryTooLarge,
+    lab.NoCodeVintage,
+    lab_queries.SweepNotCompleteError,
+    registry.UnmarkedStoreRefused,
+)
+
+
+def _describe(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _echo_scrubbed(text: str, settings: Settings) -> None:
@@ -674,8 +687,6 @@ def _sweep_run_text(outcome: lab.SweepRunOutcome, conn: duckdb.DuckDBPyConnectio
             f"  trial {t.trial_id}: {_hypothesis_slug(conn, t.hypothesis_id)} "
             f"(group {t.read_group_index}) {t.status}" + (f": {t.message}" if t.message else "")
         )
-    for trial_id, error in sorted(outcome.errors.items()):
-        lines.append(f"  trial {trial_id} error: {error.strip()}")
     return "\n".join(lines)
 
 
@@ -1312,7 +1323,10 @@ def make_app(
             f"in-sample from {record.in_sample_start}, holdout {record.holdout_start} "
             f"to {record.holdout_end}"
         )
-        typer.echo(f"frozen parameters sha256 {record.params_sha256}:")
+        typer.echo(
+            f"frozen parameters (stored set sha256 {record.params_sha256}; a key the "
+            "stored set lacks shows its table default):"
+        )
         values = frozen_values(record)
         for key in sorted(values):
             typer.echo(f"  {key} = {json.dumps(values[key], default=str)}")
@@ -1403,12 +1417,16 @@ def make_app(
         s = settings()
         if not file.is_file():
             raise _fail(f"no sweep file at {file}", USAGE_ERROR)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
                 registration = lab_sweep.register(conn, file, s, registered_by=_REGISTERED_BY)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         record = registration.sweep
@@ -1421,7 +1439,8 @@ def make_app(
             f"{record.promote_at_least}, retire below {record.retire_below}",
         ]
         lines += [
-            f"  {v.variant_index}: {h.slug} {json.dumps(v.variant_params, sort_keys=True)}"
+            f"  {v.variant_index}: {h.slug} "
+            + json.dumps(v.variant_params, sort_keys=True, default=str)
             for v, h in zip(registration.variants, registration.hypotheses, strict=True)
         ]
         _echo_scrubbed("\n".join(lines), s)
@@ -1445,6 +1464,20 @@ def make_app(
         if s.store.path != get_settings().store.path:
             # run_sweep loads its own settings; the result is read back through `s`.
             raise _fail("sweep run runs only on the loaded settings' store", USAGE_ERROR)
+        if time_budget_minutes is not None and not time_budget_minutes > 0:
+            raise _fail("--time-budget-minutes must be positive", USAGE_ERROR)
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                lab_schema.require_lab(conn)
+                if lab_registry.sweep_by_slug(conn, slug) is None:
+                    raise ValueError(f"no sweep is registered as {slug!r}")
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
         try:
             outcome = lab.run_sweep(
                 slug,
@@ -1455,12 +1488,17 @@ def make_app(
             )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
-        except (LabNotInitialised, *_LAB_REFUSALS) as exc:
+        except (LabNotInitialised, *_SWEEP_RUN_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         except Exception as exc:
-            raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), 1) from None
+            # Raised after the run opened: its rows so far stay recorded (the run's
+            # row is closed incomplete), so this is a failure, not a refusal.
+            message = f"sweep run failed (rows written so far stay recorded): {_describe(exc)}"
+            raise _fail(_scrubbed(message, s), 1) from None
         with open_read_only(s) as conn:
             _echo_scrubbed(_sweep_run_text(outcome, conn), s)
+        for error in dict.fromkeys(e.strip() for e in outcome.errors.values()):
+            typer.echo(_scrubbed(error, s), err=True)
         raise typer.Exit(0 if outcome.n_failed == 0 else 1)
 
     @sweep_app.command("status")
@@ -1527,6 +1565,8 @@ def make_app(
                 )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         promoted = outcome.promoted
@@ -1555,6 +1595,8 @@ def make_app(
                 decision_id = promotion.retire(conn, slug, reason)
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
         except (LabNotInitialised, *_LAB_REFUSALS) as exc:
             raise _lab_fail(exc, s) from None
         _echo_scrubbed(f"decision {decision_id}: sweep_retired for {slug}", s)

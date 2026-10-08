@@ -36,7 +36,7 @@ from conftest import load_universe_fixtures, mark_pre_lab
 from typer.testing import CliRunner
 
 from tradepartner import cli
-from tradepartner.backtest import frozen, hypothesis, sweep, sweep_report
+from tradepartner.backtest import frozen, hypothesis, lab, sweep, sweep_report
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.cli_record import scrub_text
@@ -321,6 +321,23 @@ def test_sweep_run_refuses_rerun_on_an_incomplete_sweep_and_an_unknown_slug(
     assert _counts(store) == before
 
 
+def test_an_error_after_the_run_opened_exits_1_not_as_a_refusal(
+    store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _cli("sweep", "register", str(_sweep_file(tmp_path / "files"))).exit_code == 0
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("a mid-run defect")
+
+    monkeypatch.setattr(lab, "_run_group", broken)
+    out = _cli("sweep", "run", SLUG)
+    assert out.exit_code == 1, out.output
+    assert "refused" not in out.output
+    assert "rows written so far stay recorded" in out.output
+    with _read(store) as conn:
+        assert conn.execute("SELECT completed FROM sweep_runs").fetchall() == [(False,)]
+
+
 def test_sweep_run_refuses_above_the_registry_size_limit(
     store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -416,8 +433,8 @@ def test_sweep_promote_registers_the_argmax_file_with_its_decision(
     assert ("promotion",) in kinds
 
 
-def test_sweep_promote_refuses_an_incomplete_sweep_and_a_blank_reason(
-    store: Path, done: Path, tmp_path: Path
+def test_sweep_promote_refuses_a_blank_reason_and_a_missing_file(
+    done: Path, tmp_path: Path
 ) -> None:
     file = _promotion_file(done, tmp_path / "promote")
     before = _counts(done)
@@ -465,9 +482,23 @@ def test_lab_status_prints_the_registry(done: Path) -> None:
 def test_backtest_of_a_variant_slug_exits_2_refused_variant(done: Path) -> None:
     assert cli.STATUS_EXIT["refused_variant"] == 2
     variant = _variant_slugs(done)[0]
+    with _read(done) as conn:
+        record = registry.get_hypothesis(conn, variant)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM trials WHERE hypothesis_id = ?", [record.hypothesis_id]
+        ).fetchone()
     out = _cli("backtest", variant)
     assert out.exit_code == 2, out.output
     assert "refused_variant" in out.stdout
+    with _read(done) as conn:
+        rows = conn.execute(
+            "SELECT r.status FROM trials t JOIN trial_results r USING (trial_id) "
+            "WHERE t.hypothesis_id = ? ORDER BY t.trial_id",
+            [record.hypothesis_id],
+        ).fetchall()
+    assert before is not None
+    assert len(rows) == before[0] + 1
+    assert rows[-1] == ("refused_variant",)
 
 
 # --- the un-migrated store -------------------------------------------------------------
