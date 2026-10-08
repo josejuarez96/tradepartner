@@ -97,6 +97,34 @@ def _frozen_json(frozen: RiskConfig) -> str:
     return json.dumps(values, sort_keys=True)
 
 
+def registered_hypothesis(settings: Settings, slug: str = "h-run-core-mark") -> int:
+    """The id of a momentum hypothesis registered on `settings`'s store (registered on
+    first use): the run reads its window's cadence from it (ADR 0015 seam 4)."""
+    with open_for_write(settings) as conn:
+        try:
+            return registry.get_hypothesis(conn, slug).hypothesis_id
+        except registry.UnknownHypothesis:
+            pass
+        params = Settings(
+            _env_file=None,
+            holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
+        )
+        return registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title="tracking run core test",
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256="0" * 64,
+            params=frozen_params_of(params, family="momentum"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT_START,
+            holdout_end=HOLDOUT_END,
+            registered_by="test",
+            settings=params,
+        ).hypothesis_id
+
+
 @dataclass
 class Env:
     settings: Settings
@@ -140,10 +168,12 @@ class Env:
         first: date = MARK_FIRST_REBALANCE,
         started: datetime = MARK_START,
         frozen: RiskConfig | None = None,
-        hypothesis_id: int = 1,
+        hypothesis_id: int | None = None,
         starting_equity: float = FAKE_CASH,
         book_id: str = "main",
     ) -> PaperWindowRow:
+        if hypothesis_id is None:
+            hypothesis_id = registered_hypothesis(self.settings)
         row = PaperWindowRow(
             hypothesis_id=hypothesis_id,
             first_rebalance_session=first,

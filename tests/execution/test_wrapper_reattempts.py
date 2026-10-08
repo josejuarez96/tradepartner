@@ -318,6 +318,7 @@ def test_sells_fill_half_percent_below_reference_and_last_phase_writes_off_buys(
                 for decision in (sell, buy, deferred)
             ],
             session=S,
+            cadence="month_end",
         )
         is RebalanceState.EXECUTED
     )

@@ -191,21 +191,22 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
-from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
 from tradepartner.backtest.frozen import frozen_values
-from tradepartner.calendar import last_session_of_month, previous_session, session_close
+from tradepartner.backtest.schedule import rebalance_sessions
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import (
     FROZEN_COSTS_KEYS,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
     PAPER_FAMILIES,
+    Cadence,
     RiskConfig,
     Settings,
 )
@@ -275,7 +276,7 @@ _COSTS_PREFIX = "costs."
 _EXECUTION_PREFIX = "execution."
 #: The one cadence a paper window accepts (strategy-lab spec req 11; ADR 0005).
 _CADENCE_KEY = "schedule.rebalance_cadence"
-_PAPER_CADENCE = "month_end"
+_PAPER_CADENCE: Cadence = "month_end"
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -322,21 +323,35 @@ def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
 
 
-def _first_rebalance_session(holdout_end: date, today: date) -> date:
-    """T_0 (spec Definitions "Paper window"): the first rebalance session
-    (last XNYS session of a calendar month) strictly after both
-    `holdout_end` and `today`."""
-    lower = max(holdout_end, today)
-    month = lower.replace(day=1)
-    while True:
-        candidate = last_session_of_month(month.year, month.month)
-        if candidate > lower:
-            return candidate
-        month += relativedelta(months=1)
+#: How far `_first_rebalance_session` looks ahead: the slowest cadence, `month_end`,
+#: has a rebalance session within two calendar months of any day.
+_REBALANCE_SEARCH = timedelta(days=62)
 
 
-def _holdout_end_completed(holdout_end: date, now: datetime) -> bool:
-    if holdout_end != last_session_of_month(holdout_end.year, holdout_end.month):
+def window_cadence(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> Cadence:
+    """The window's hypothesis's frozen `schedule.rebalance_cadence`, read through
+    `frozen_values` (ADR 0015 seam 4): the cadence every paper-path call is passed.
+    `ValueError` for a value outside `Cadence`."""
+    hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
+    cadence = frozen_values(hypothesis)[_CADENCE_KEY]
+    if cadence not in get_args(Cadence):
+        raise ValueError(f"window {window.window_id}'s hypothesis has cadence {cadence!r}")
+    return cast(Cadence, cadence)
+
+
+def _is_rebalance_session(day: date, cadence: Cadence) -> bool:
+    return not isinstance(day, datetime) and rebalance_sessions(day, day, cadence) == [day]
+
+
+def _first_rebalance_session(holdout_end: date, today: date, cadence: Cadence) -> date:
+    """T_0 (spec Definitions "Paper window"): the first rebalance session at
+    `cadence` strictly after both `holdout_end` and `today`."""
+    lower = max(holdout_end, today) + timedelta(days=1)
+    return rebalance_sessions(lower, lower + _REBALANCE_SEARCH, cadence)[0]
+
+
+def _holdout_end_completed(holdout_end: date, now: datetime, cadence: Cadence) -> bool:
+    if not _is_rebalance_session(holdout_end, cadence):
         return False
     return session_close(holdout_end) <= now
 
@@ -621,7 +636,7 @@ def start(
                     "in_sample trial of this hypothesis",
                 )
             now = _read_clock(clock)
-            if not _holdout_end_completed(hyp.holdout_end, now):
+            if not _holdout_end_completed(hyp.holdout_end, now, _PAPER_CADENCE):
                 raise StartRefusedError(
                     "holdout_not_complete",
                     f"{slug!r}'s frozen holdout.end ({hyp.holdout_end}) is not a "
@@ -662,7 +677,7 @@ def start(
             now=today,
         )
 
-        t_0 = _first_rebalance_session(hyp.holdout_end, today)
+        t_0 = _first_rebalance_session(hyp.holdout_end, today, _PAPER_CADENCE)
         commit, _dirty = registry.code_version()
         params = _frozen_params(settings, registered)
         frozen_json = registry.canonical_params_json(params)
@@ -1318,7 +1333,11 @@ def _min_override_reason_chars(window: PaperWindowRow) -> int:
 
 
 def _override_fields(
-    window: PaperWindowRow, kind: str, rebalance_session: date | None, security_id: str | None
+    window: PaperWindowRow,
+    kind: str,
+    rebalance_session: date | None,
+    security_id: str | None,
+    cadence: Cadence,
 ) -> None:
     """Refuse `override` for a kind outside the schema's set or fields it does
     not take (module docstring)."""
@@ -1331,11 +1350,9 @@ def _override_fields(
         return
     if rebalance_session is None or not security_id:
         raise WindowCommandRefused(OVERRIDE, f"{kind} needs a rebalance session and a name")
-    if isinstance(rebalance_session, datetime) or rebalance_session != last_session_of_month(
-        rebalance_session.year, rebalance_session.month
-    ):
+    if not _is_rebalance_session(rebalance_session, cadence):
         raise WindowCommandRefused(
-            OVERRIDE, f"{rebalance_session} is not a rebalance session (a month's last session)"
+            OVERRIDE, f"{rebalance_session} is not a rebalance session at cadence {cadence}"
         )
     if rebalance_session < window.first_rebalance_session:
         raise WindowCommandRefused(
@@ -1368,7 +1385,7 @@ def override(
     note = reason.strip()
     with open_for_write(settings) as conn:
         window, window_id = _window_of(conn)
-        _override_fields(window, kind, rebalance_session, security_id)
+        _override_fields(window, kind, rebalance_session, security_id, window_cadence(conn, window))
         minimum = _min_override_reason_chars(window)
         if len(note) < minimum:
             raise WindowCommandRefused(

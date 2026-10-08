@@ -14,6 +14,7 @@ from typing import Any, Protocol
 import polars as pl
 import pytest
 
+from execution.test_run_core import registered_hypothesis
 from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker
 from tradepartner.config import RiskConfig, Settings
@@ -108,7 +109,7 @@ def _new_window(
     settings: Settings, started: datetime, *, starting_cash: float = 100_000.0
 ) -> PaperWindowRow:
     row = PaperWindowRow(
-        hypothesis_id=1,
+        hypothesis_id=registered_hypothesis(settings),
         first_rebalance_session=date(2026, 9, 30),
         account_id="PA1",
         starting_cash=starting_cash,

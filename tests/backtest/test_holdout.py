@@ -425,11 +425,46 @@ def _track(window: Window, flags: Flags = NO_FLAGS, reasons: Reasons = NO_REASON
 
 
 def test_first_tracking_session_is_the_rebalance_after_holdout_end() -> None:
-    assert first_tracking_session(FROZEN) == FIRST_TRACKING
+    assert first_tracking_session(FROZEN, "month_end") == FIRST_TRACKING
     mid_month = Frozen(**{**FROZEN.__dict__, "holdout_end": date(2026, 8, 14)})
-    assert first_tracking_session(mid_month) == date(2026, 8, 31)
+    assert first_tracking_session(mid_month, "month_end") == date(2026, 8, 31)
     year_end = Frozen(**{**FROZEN.__dict__, "holdout_end": date(2026, 12, 31)})
-    assert first_tracking_session(year_end) == date(2027, 1, 29)
+    assert first_tracking_session(year_end, "month_end") == date(2027, 1, 29)
+
+
+@pytest.mark.parametrize(
+    ("holdout_end", "cadence", "expected"),
+    [
+        # 2026-08-31 is a Monday: the week's last session is Friday 2026-09-04.
+        (date(2026, 8, 31), "week_end", date(2026, 9, 4)),
+        (date(2026, 8, 31), "daily", date(2026, 9, 1)),
+        # 2026-08-14 is a Friday, itself a week end: the next one is 2026-08-21.
+        (date(2026, 8, 14), "week_end", date(2026, 8, 21)),
+        (date(2026, 8, 14), "daily", date(2026, 8, 17)),
+        # 2026-09-04 is the Friday before Labor Day: the next session is Tuesday.
+        (date(2026, 9, 4), "daily", date(2026, 9, 8)),
+        # 2026-04-02 is the Thursday before Good Friday, the week's last session.
+        (date(2026, 3, 31), "week_end", date(2026, 4, 2)),
+    ],
+)
+def test_first_tracking_session_follows_the_cadence(
+    holdout_end: date, cadence: Cadence, expected: date
+) -> None:
+    """ADR 0015 seam 4: the first rebalance session of the hypothesis's cadence
+    strictly after `holdout.end`, not always a month end."""
+    frozen = Frozen(**{**FROZEN.__dict__, "holdout_end": holdout_end})
+    assert first_tracking_session(frozen, cadence) == expected
+
+
+def test_a_tracking_window_reads_decides_cadence() -> None:
+    """`_tracking` takes `decide`'s `cadence`: a week-end tracking window may start at
+    the first week end after `holdout.end`, which a month-end hypothesis refuses."""
+    window = Window(date(2026, 9, 4), date(2026, 12, 31))
+    week = decide(window, FROZEN, NO_FLAGS, NO_REASONS, None, (), tracking=True, cadence="week_end")
+    assert (week.outcome, week.kind) == ("run", "tracking")
+    month = decide(window, FROZEN, NO_FLAGS, NO_REASONS, None, (), tracking=True)
+    assert month.outcome == "refused_window"
+    assert str(FIRST_TRACKING) in month.message
 
 
 @pytest.mark.parametrize(

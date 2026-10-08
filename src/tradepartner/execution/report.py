@@ -60,7 +60,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -72,15 +72,15 @@ from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import (
-    last_session_of_month,
     previous_session,
     session_close,
 )
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
+from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
@@ -104,6 +104,9 @@ PriceOf = Callable[[str, date], float | None]
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _NEW_YORK = ZoneInfo("America/New_York")
+#: How far back the rebalance-session searches look: the slowest cadence, `month_end`,
+#: has a rebalance session within two calendar months of any day.
+_REBALANCE_SEARCH = timedelta(days=62)
 _DIVIDEND = "dividend"
 _SPLIT = "split"
 _DIVIDEND_CASH = "dividend_cash"
@@ -703,19 +706,12 @@ def _local_date(at: datetime) -> date:
     return at.astimezone(_NEW_YORK).date()
 
 
-def _last_completed_rebalance_session(now: datetime) -> date:
-    """The latest rebalance session (last XNYS session of a month) whose close is
-    at or before `now`: `paper report`'s "last completed T" (spec req 10)."""
+def _last_completed_rebalance_session(now: datetime, cadence: Cadence) -> date:
+    """The latest rebalance session at `cadence` whose close is at or before `now`:
+    `paper report`'s "last completed T" (spec req 10)."""
     today = _local_date(now)
-    year, month = today.year, today.month
-    while True:
-        candidate = last_session_of_month(year, month)
-        if candidate <= today and session_close(candidate) <= now:
-            return candidate
-        if month == 1:
-            year, month = year - 1, 12
-        else:
-            month -= 1
+    sessions = rebalance_sessions(today - _REBALANCE_SEARCH, today, cadence)
+    return next(t for t in reversed(sessions) if session_close(t) <= now)
 
 
 def _stop_session_of(stops: Sequence[PaperWindowStopRow]) -> date | None:
@@ -823,16 +819,12 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
     )
 
 
-def _before(session: date) -> date:
-    """The last rebalance session strictly before `session` (spec req 15: "a
-    closed window is checked through its last completed rebalance session
-    before the stop session")."""
-    year, month = session.year, session.month
-    while True:
-        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
-        candidate = last_session_of_month(year, month)
-        if candidate < session:
-            return candidate
+def _before(session: date, cadence: Cadence) -> date:
+    """The last rebalance session at `cadence` strictly before `session` (spec req 15:
+    "a closed window is checked through its last completed rebalance session before
+    the stop session")."""
+    last = session - timedelta(days=1)
+    return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
 def report(settings: Settings, connect: Connect) -> Report:
@@ -869,11 +861,12 @@ def report(settings: Settings, connect: Connect) -> Report:
         window_id = window.window_id
         fill_price_key = _frozen_fill_price(window)
         hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
+        cadence = window_cadence(conn, window)
         t0 = window.first_rebalance_session
-        last_t = _last_completed_rebalance_session(utc_now())
+        last_t = _last_completed_rebalance_session(utc_now(), cadence)
         stop_session = _stop_session_of(store_journal.window_stops_for(conn, window_id))
         while stop_session is not None and last_t >= stop_session:
-            last_t = _before(last_t)
+            last_t = _before(last_t, cadence)
 
     outcome = run_hypothesis(
         hypothesis.slug,

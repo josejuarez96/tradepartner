@@ -429,7 +429,7 @@ def test_chain_becomes_due_once_a_run_exists_after_its_threshold(settings: Setti
     run after T_{i+1} = T2: now its missing terminal event and outcome are due,
     and the check must flag it (pins the `session > threshold` boundary from
     both sides, not just the "not yet due" one)."""
-    t3 = outcomes_module._rebalance_after(T2)
+    t3 = outcomes_module._rebalance_after(T2, "month_end")
     with open_for_write(settings) as conn:
         _build_passing_fixture(conn)
         _insert_decision(conn, 2, 2, T1)
@@ -518,7 +518,7 @@ def _chain(settings: Settings) -> check_module.CheckLine:
     """The chain line alone: these fixtures' extra fills have no bars for the
     tracking line to price."""
     with open_read_only(settings) as conn:
-        return check_module._chain_line(conn, WINDOW_ID)
+        return check_module._chain_line(conn, WINDOW_ID, "month_end")
 
 
 def test_chain_counts_an_owner_settled_order_complete_once_not_executed_is_written(
@@ -680,7 +680,7 @@ def test_order_due_threshold_is_the_orders_own_session_for_a_forced_exit() -> No
     `outcomes.outcome_horizon` (#597): a forced exit is due at its own
     session, whatever decision it carries."""
     order = _order(T1, phase="exit")
-    assert check_module._order_due_threshold(order, None) == T1
+    assert check_module._order_due_threshold(order, None, "month_end") == T1
 
 
 def test_order_due_threshold_uses_the_decisions_rebalance_session() -> None:
@@ -695,12 +695,12 @@ def test_order_due_threshold_uses_the_decisions_rebalance_session() -> None:
         ingested_at=_T0_UTC,
     )
     order = _order(next_session(T0), phase="buy")
-    assert check_module._order_due_threshold(order, decision) == T1
+    assert check_module._order_due_threshold(order, decision, "month_end") == T1
 
 
 def test_order_due_threshold_falls_back_to_the_rebalance_before_the_order() -> None:
     order = _order(next_session(T1), phase="buy")
-    assert check_module._order_due_threshold(order, None) == T2
+    assert check_module._order_due_threshold(order, None, "month_end") == T2
 
 
 def test_override_reason_fails_on_a_whitespace_padded_reason_under_the_minimum(
@@ -746,10 +746,12 @@ def test_each_line_names_its_query(settings: Settings) -> None:
 
 def test_last_completed_rebalance_session() -> None:
     assert (
-        check_module._last_completed_rebalance_session(session_close(T2) + timedelta(seconds=1))
+        check_module._last_completed_rebalance_session(
+            session_close(T2) + timedelta(seconds=1), "month_end"
+        )
         == T2
     )
-    assert check_module._last_completed_rebalance_session(session_close(T2)) == T2
+    assert check_module._last_completed_rebalance_session(session_close(T2), "month_end") == T2
 
 
 @pytest.mark.parametrize(

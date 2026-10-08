@@ -18,6 +18,7 @@ import polars as pl
 import pytest
 
 from tradepartner.calendar import previous_session
+from tradepartner.config import Cadence
 from tradepartner.execution.lots import LedgerAccount, rebuild
 from tradepartner.execution.marks import UnreadableMarkError
 from tradepartner.execution.outcomes import (
@@ -43,6 +44,8 @@ from tradepartner.store.journal import (
 )
 from tradepartner.store.schema import in_transaction
 
+#: H1's window reads `month_end` through `frozen_values` (ADR 0015 seam 4).
+CADENCE: Cadence = "month_end"
 T_I = date(2026, 9, 30)
 F_I = date(2026, 10, 1)
 T_NEXT = date(2026, 10, 30)
@@ -172,6 +175,7 @@ class Book:
             session,
             decisions=decisions,
             actions=actions,
+            cadence=CADENCE,
         )
 
 
@@ -200,17 +204,17 @@ def test_outcome_horizon_is_the_orders_own_session_for_a_forced_exit() -> None:
     """Pins `outcome_horizon` (#597), the one place `_horizon`'s non-stop
     `base` and `check._order_due_threshold` both read it from."""
     order = _order(F_I, phase="exit")
-    assert outcome_horizon(order, None) == F_I
+    assert outcome_horizon(order, None, CADENCE) == F_I
 
 
 def test_outcome_horizon_uses_the_decision_rebalance_when_given() -> None:
     order = _order(date(2026, 11, 2), phase="buy")
-    assert outcome_horizon(order, T_I) == T_NEXT
+    assert outcome_horizon(order, T_I, CADENCE) == T_NEXT
 
 
 def test_outcome_horizon_falls_back_to_the_rebalance_before_the_orders_session() -> None:
     order = _order(F_I, phase="buy")
-    assert outcome_horizon(order, None) == T_NEXT
+    assert outcome_horizon(order, None, CADENCE) == T_NEXT
 
 
 def test_a_filled_buy_has_its_position_return_and_contribution() -> None:
@@ -335,6 +339,7 @@ def _due_without_lots(book: Book, window: OutcomeWindow | None = None) -> list[O
         None,
         book.price_of,
         DUE,
+        cadence=CADENCE,
     )
 
 
@@ -452,6 +457,7 @@ def test_realised_pnl_waits_when_the_lot_ledger_is_unavailable() -> None:
         None,
         book.price_of,
         DUE,
+        cadence=CADENCE,
     )
     assert (coid, "realised_pnl") not in _by_kind(outcomes)
 
@@ -699,10 +705,26 @@ def test_the_writer_appends_outcomes_and_lots_once(conn: duckdb.DuckDBPyConnecti
     errors: list[str] = []
 
     first = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=errors.append
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
     )
     second = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=errors.append
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
     )
 
     assert (first.outcomes, first.lot_rows, second.outcomes, second.lot_rows) == (1, 1, 0, 0)
@@ -729,7 +751,9 @@ def test_the_written_lots_and_disposals_carry_the_orders_book(
     book.order("SEC_B", "sell", "filled", [(10.0, 40.0)], book_id="fx")
     _journal(conn, book)
 
-    write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print, cadence=CADENCE
+    )
 
     assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
     assert conn.execute("SELECT DISTINCT book_id FROM lots").fetchall() == [("fx",)]
@@ -741,7 +765,9 @@ def _changed_ledger(conn: duckdb.DuckDBPyConnection) -> Book:
     book.order("SEC_B", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1))
     book.order("SEC_B", "sell", "filled", [(10.0, 40.0)])
     _journal(conn, book)
-    write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print, cadence=CADENCE
+    )
     assert (_count(conn, "lots"), _count(conn, "disposals")) == (1, 1)
     later = Book()
     later.order("SEC_B", "buy", "filled", [(5.0, 41.0)], session=date(2026, 10, 5))
@@ -762,6 +788,7 @@ def test_a_changed_ledger_is_appended_as_a_new_set(conn: duckdb.DuckDBPyConnecti
         date(2026, 10, 6),
         lambda: _utc(DUE, 15),
         on_lot_error=print,
+        cadence=CADENCE,
     )
 
     assert result.lot_rows == 2 + 1 + 1  # two lots, one disposal, one wash-sale flag
@@ -781,7 +808,15 @@ def test_a_changed_ledger_with_the_same_stamp_is_not_merged(
     errors: list[str] = []
 
     result = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, date(2026, 10, 6), _clock, on_lot_error=errors.append
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        date(2026, 10, 6),
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
     )
 
     assert result.lot_rows == 0
@@ -803,7 +838,15 @@ def test_a_lot_ledger_error_alerts_and_the_outcomes_still_run(
     errors: list[str] = []
 
     result = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=errors.append
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
     )
 
     assert len(errors) == 1 and "more than the ledger holds" in errors[0]
@@ -842,7 +885,7 @@ def test_a_bad_mark_appends_no_outcome(conn: duckdb.DuckDBPyConnection) -> None:
     _journal(conn, book)
     with pytest.raises(ValueError, match="mark"):
         write_outcomes_and_lots(
-            conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=print
+            conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=print, cadence=CADENCE
         )
     assert _count(conn, "outcomes") == 0
 
@@ -875,7 +918,15 @@ def test_a_crash_mid_write_leaves_the_previous_ledger_current(
     monkeypatch.setattr(journal, "append", failing_append)
     with pytest.raises(crash, match="crash mid-write"):
         write_outcomes_and_lots(
-            conn, 1, ACCOUNT, {}, book.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+            conn,
+            1,
+            ACCOUNT,
+            {},
+            book.price_of,
+            DUE,
+            lambda: _utc(DUE, 15),
+            on_lot_error=print,
+            cadence=CADENCE,
         )
     monkeypatch.undo()
 
@@ -899,7 +950,9 @@ def test_a_raising_lot_error_callback_leaves_the_write_committed(
         raise RuntimeError(message)
 
     with pytest.raises(RuntimeError, match="more than the ledger holds"):
-        write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=boom)
+        write_outcomes_and_lots(
+            conn, 1, ACCOUNT, {}, book.price_of, DUE, _clock, on_lot_error=boom, cadence=CADENCE
+        )
 
     assert _count(conn, "outcomes") == 1
     assert not in_transaction(conn)
@@ -913,7 +966,15 @@ def test_the_writer_joins_the_callers_transaction(conn: duckdb.DuckDBPyConnectio
 
     conn.execute("BEGIN TRANSACTION")
     result = write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, book.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        book.price_of,
+        DUE,
+        lambda: _utc(DUE, 15),
+        on_lot_error=print,
+        cadence=CADENCE,
     )
     assert result.lot_rows == 4 and in_transaction(conn)
     conn.execute("ROLLBACK")
@@ -930,7 +991,9 @@ def test_realised_pnl_waits_when_the_changed_ledger_is_not_saved(
     book = Book()
     book.order("SEC_B", "buy", "filled", [(10.0, 50.0)], session=date(2026, 9, 1))
     _journal(conn, book)
-    write_outcomes_and_lots(conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print)
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print, cadence=CADENCE
+    )
     later = Book()
     sell = later.order("SEC_B", "sell", "filled", [(10.0, 40.0)])
     for row in (*later.orders, *later.events, later.fills[0].fill):
@@ -938,7 +1001,15 @@ def test_realised_pnl_waits_when_the_changed_ledger_is_not_saved(
     errors: list[str] = []
 
     write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, later.price_of, DUE, _clock, on_lot_error=errors.append
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        later.price_of,
+        DUE,
+        _clock,
+        on_lot_error=errors.append,
+        cadence=CADENCE,
     )
 
     assert len(errors) == 1 and "did not advance" in errors[0]
@@ -948,7 +1019,15 @@ def test_realised_pnl_waits_when_the_changed_ledger_is_not_saved(
     assert _count(conn, "disposals") == 0
 
     write_outcomes_and_lots(
-        conn, 1, ACCOUNT, {}, later.price_of, DUE, lambda: _utc(DUE, 15), on_lot_error=print
+        conn,
+        1,
+        ACCOUNT,
+        {},
+        later.price_of,
+        DUE,
+        lambda: _utc(DUE, 15),
+        on_lot_error=print,
+        cadence=CADENCE,
     )
 
     [pnl] = [r for r in outcomes_for(conn, 1) if r.kind == "realised_pnl"]
