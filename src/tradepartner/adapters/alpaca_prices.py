@@ -321,6 +321,22 @@ def alpaca_symbol(ticker: str) -> str | None:
     return norm if _ALPACA_SYMBOL.fullmatch(norm) else None
 
 
+#: The exchange whose cover pages write a class ticker without the dot (#1219).
+CLASS_SYMBOL_EXCHANGE = "NYSE"
+
+
+def master_symbol(row: Mapping[str, Any], class_symbols: Mapping[str, str] | None) -> str | None:
+    """A listing row's ticker in Alpaca's form: `alpaca_symbol`, except that
+    a NYSE row whose folded ticker is a key of `class_symbols`
+    (`alpaca.class_symbols`, #1219: `BFB` -> `BF.B`) takes the named symbol.
+    Nothing is derived from the spelling: Nasdaq writes class shares
+    undotted as the real symbol (`SENEB`), and so do `CVNA` and `WLYB`."""
+    folded = alpaca_symbol(str(row["ticker"]))
+    if folded is not None and class_symbols and row.get("exchange") == CLASS_SYMBOL_EXCHANGE:
+        return class_symbols.get(folded, folded)
+    return folded
+
+
 # --- resolution ----------------------------------------------------------
 
 
@@ -497,6 +513,7 @@ def registrant_evidence(
     as_of: date,
     quiet_after_days: int,
     transfer_window_sessions: int,
+    class_symbols: Mapping[str, str] | None = None,
 ) -> RegistrantEvidence:
     """`RegistrantEvidence` from `facts` rows (`shares_outstanding` only;
     the UTC day of `known_at` is the filing day) and `listing_ends` rows
@@ -535,7 +552,7 @@ def registrant_evidence(
         if day is not None:
             ticker = str(row["ticker"])
             delisted[str(row["security_id"])].add(day)
-            keyed = alpaca_symbol(ticker) or ticker
+            keyed = master_symbol(row, class_symbols) or ticker
             ended[str(row["security_id"])].add((row["valid_from"], keyed, day))
             if row["end_session"] is not None:
                 last_bars[(str(row["security_id"]), row["valid_from"], keyed)] = row["end_session"]
@@ -616,6 +633,7 @@ class ListingResolver:
         rename_lead_days: int = 0,
         accepted_relistings: Collection[str] = (),
         first_sessions: Mapping[str, date] | None = None,
+        class_symbols: Mapping[str, str] | None = None,
     ) -> None:
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
@@ -628,7 +646,7 @@ class ListingResolver:
                 else listing_kind(ticker, row.get("class_title"))
             )
             if kind != _PLACEHOLDER:  # one ticker per Alpaca symbol (#737)
-                ticker = alpaca_symbol(ticker) or ticker
+                ticker = master_symbol(row, class_symbols) or ticker
             by_security[str(row["security_id"])].append(_Row(row["valid_from"], ticker, kind))
         self._by_ticker: dict[str, list[TickerSpan]] = defaultdict(list)
         self._by_security: dict[str, list[TickerSpan]] = defaultdict(list)

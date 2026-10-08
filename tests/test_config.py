@@ -1796,3 +1796,10 @@ def test_env_example_lists_phase_4_variables_but_never_alpaca_paper() -> None:
         "ALERT_EMAIL_TO",
     ):
         assert name in upper
+
+
+@pytest.mark.parametrize("pair", [{"BFB": "BFB"}, {"bfb": "BF.B"}, {"BFB": "BF-B"}, {"B1": "B.B"}])
+def test_alpaca_class_symbols_fails_closed_on_a_malformed_pair(pair: dict[str, str]) -> None:
+    """#1219: a pair is an undotted ticker and a dotted class symbol, or the config refuses."""
+    with pytest.raises(ValidationError, match="class_symbols"):
+        Settings(_env_file=None, alpaca={"class_symbols": pair})
