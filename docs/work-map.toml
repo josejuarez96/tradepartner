@@ -723,6 +723,11 @@ what = "Strategies are registered objects: one dispatch seam keyed on the stored
 why = "B3 cost six plan tasks because a family is read by a dozen places on its own; after this the third family is one module plus one registry entry, and the CLI, paper run and tracking re-run agree on which strategy a slug is."
 unblocks = ["plan:strategy-interface", "task:T85e"]
 
+[adr.0015]
+what = "Expansion seams: the owner's long-term direction (swing and day trading, possibly derivatives) recorded without moving the charter's Scope line; six cheap, behaviour-preserving seams opened before Phase 4 writes real paper rows (book id in the client_order_id, position side, read-side order and broker shape before T48c, explicit cadence, the frozen-key rule for expansion keys, a reserved instrument id); shorting, stops, intraday bars, other calendars, derivatives data, roll, tax and multi-book deferred, each with a trigger and its own ADR."
+why = "Each seam is a column, a field or a default argument now and a backfill migration during the six-month paper window later; the id format becomes Alpaca-side history on the first submit and can never be changed."
+unblocks = ["task:T48c", "task:T71"]
+
 [plan.strategy-interface]
 what = "How the strategy-interface refactor is built: T85e amended into the one seam, then generic exclusions and counts (T127) beside the family registry (T128), per-family benchmarks after the lab's rename (T129), and B4 combined through the registry as the proof (T130)."
 why = "Without a build order the ADR's guarantees (H1's fingerprint unchanged, paper closed to profitability until the path is generic, one seam not two) have no owner and the refactor would race T85c, T85d and T98."
