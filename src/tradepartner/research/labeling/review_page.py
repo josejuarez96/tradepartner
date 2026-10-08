@@ -8,10 +8,11 @@ research gold` and `tradepartner research review --run <id>` (T124) start with
 takes from it only `gold` (T131) and `review` (T123b), drawing what they hand it and
 writing only through them.
 
-**The session argument.** `--session` names the gold session's `session.json`
+**The arguments.** `--session` names the gold session's `session.json`
 (`gold.session_path`), which selects gold mode, or a run's review file
 (`reviews/departure-reason/<run_id>.jsonl`), which selects review mode; anything else
-is refused.
+is refused. Review mode also needs `--code-version`, written on every review record:
+the CLI reads it, since this package may not run `git` (ADR 0013 point 3).
 
 **Refusals before anything renders.** The running `server.address` must be
 `localhost` or `127.0.0.1` and `browser.gatherUsageStats` false (ADR 0011 point 3, the
@@ -61,6 +62,7 @@ import streamlit as st
 from tradepartner.config import Settings, get_settings
 from tradepartner.research.labeling import gold, review
 from tradepartner.store.db import StoreLockedError, open_read_only
+from tradepartner.store.research import ResearchError
 
 Mode = Literal["gold", "review"]
 
@@ -113,14 +115,26 @@ def server_options_ok(address: object, gather_usage_stats: object) -> tuple[bool
     )
 
 
-def session_argument(argv: Sequence[str]) -> Path:
-    """The `--session <path>` given after `--` on the `streamlit run` line."""
+@dataclass(frozen=True)
+class Arguments:
+    """What the CLI passes after `--`: the session, and in review mode the code
+    version written on every review record (the CLI reads it; this package may not
+    run `git`, ADR 0013 point 3)."""
+
+    session: Path
+    code_version: str | None
+
+
+def page_arguments(argv: Sequence[str]) -> Arguments:
+    """`--session <path>` (and `--code-version <v>`) given after `--` on the
+    `streamlit run` line."""
     parser = argparse.ArgumentParser(prog="review_page", add_help=False)
     parser.add_argument("--session", required=False)
+    parser.add_argument("--code-version", required=False)
     known, _ = parser.parse_known_args(list(argv))
     if not known.session:
         raise PageRefused("no --session <path> was given; start the page through the CLI")
-    return Path(known.session)
+    return Arguments(Path(known.session), known.code_version or None)
 
 
 def mode_of(settings: Settings, path: Path) -> tuple[Mode, int | None]:
@@ -159,7 +173,11 @@ if (doc.__reviewKeys) {{ doc.removeEventListener("keydown", doc.__reviewKeys); }
 doc.__reviewKeys = function (event) {{
   const target = event.target;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
-  if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+  const typing = ["text", "search", "url", "email", "number", "password"];
+  if (target && (target.tagName === "TEXTAREA" ||
+      (target.tagName === "INPUT" && typing.includes((target.type || "text").toLowerCase())))) {{
+    return;
+  }}
   const prefix = table[event.key];
   if (!prefix) return;
   for (const button of doc.querySelectorAll("button")) {{
@@ -176,11 +194,10 @@ doc.addEventListener("keydown", doc.__reviewKeys);
 
 def relied_on_choices(notice: str | None, eightk: gold.EightKView | None) -> list[str]:
     """C10's "relied on" choice: `notice` when the notice is text, each shown 8-K item,
-    then `outside`; the first entry is the default."""
+    then `outside`; the first entry is the default (`outside` alone when nothing is
+    shown as text, so no label claims a passage the page did not show)."""
     choices = ["notice"] if notice else []
     choices += [f"8-K item {item}" for item, _ in (eightk.items if eightk else ())]
-    if not choices:
-        choices = ["notice"]
     return [*choices, OUTSIDE]
 
 
@@ -227,7 +244,12 @@ def progress_line(position: int, total: int, dev_done: int, n_dev: int, mean: fl
 
 def budget_note(mean: float | None) -> str:
     """The one-line note after the `dev` cases: the mean against 2.0 minutes a case."""
-    minutes = 0.0 if mean is None else mean / 60
+    if mean is None:
+        return (
+            "The `dev` cases are done, with no timed answer to compare with the "
+            f"{BUDGET_MINUTES_PER_CASE:.1f} minutes a case budget."
+        )
+    minutes = mean / 60
     side = "within" if minutes <= BUDGET_MINUTES_PER_CASE else "over"
     return (
         f"The `dev` cases are done: mean {minutes:.1f} min a case, {side} the "
@@ -252,15 +274,6 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 # --- the server --------------------------------------------------------------------
-
-
-def _code_version() -> tuple[str, bool | None]:
-    """`store.registry.code_version` as `store.research` re-exports it (the store
-    module the boundary lets this package import whole; ADR 0013 point 3 (c))."""
-    from tradepartner.store import research as store_research
-
-    version: tuple[str, bool | None] = store_research.code_version()  # type: ignore[attr-defined]
-    return version
 
 
 def _stop_server() -> None:
@@ -302,16 +315,30 @@ def _shown_at(lid: str) -> float:
 
 
 def _elapsed(lid: str) -> float:
-    shown: dict[str, float] = st.session_state.get("shown_at", {})
-    return max(time.monotonic() - shown.get(lid, time.monotonic()), 0.0)
+    """Seconds since the case was drawn; the clock restarts the next time it is drawn
+    (a skipped case timed again from its return, not from its first showing)."""
+    shown: dict[str, float] = st.session_state.setdefault("shown_at", {})
+    start = shown.get(lid)
+    return 0.0 if start is None else max(time.monotonic() - start, 0.0)
+
+
+def _restart_clock(lid: str) -> None:
+    """After a saved answer or skip: the case's clock starts again when next drawn."""
+    st.session_state.setdefault("shown_at", {}).pop(lid, None)
 
 
 # --- gold mode: callbacks ---------------------------------------------------------
 
 
 def _gold_current(session: gold.GoldSession, lid: str) -> bool:
-    """The callback's check: unlocked, and `lid` is still the case on screen."""
+    """The callback's check: unlocked, no inference file (callbacks run before the
+    script body's refusal), and `lid` is still the case on screen."""
     if session.lock_path.exists():
+        return False
+    try:
+        gold.refuse_if_inference_files(session.settings)
+    except gold.InferenceFilesPresent as exc:
+        _flash("error", str(exc))
         return False
     i = gold.next_case(session)
     return i is not None and session.cases[i].listing_end_id == lid
@@ -343,6 +370,7 @@ def on_gold_answer(page: Page, lid: str, label: str) -> None:
     except gold.GoldRefused as exc:
         _flash("error", str(exc))
         return
+    _restart_clock(lid)
 
 
 def on_gold_skip(page: Page, lid: str) -> None:
@@ -356,6 +384,7 @@ def on_gold_skip(page: Page, lid: str) -> None:
     except gold.GoldRefused as exc:
         _flash("error", str(exc))
         return
+    _restart_clock(lid)
 
 
 def on_gold_back(page: Page, target: str) -> None:
@@ -365,11 +394,10 @@ def on_gold_back(page: Page, target: str) -> None:
     if session.lock_path.exists() or last_final(_read_jsonl(session.working_path)) != target:
         return
     try:
+        gold.refuse_if_inference_files(session.settings)
         gold.record_undo(session, target)
     except gold.GoldRefused as exc:
         _flash("error", str(exc))
-        return
-    st.session_state.setdefault("shown_at", {}).pop(target, None)
 
 
 # --- review mode: callbacks -------------------------------------------------------
@@ -442,7 +470,8 @@ def _form25(view: gold.CaseView | review.ItemView, provision: str | None) -> Non
     ]
     if provision is not None:
         fields.append(("Rule provision", provision))
-    st.markdown("  \n".join(f"**{name}:** {value or 'n/a'}" for name, value in fields))
+    # Filer text goes through `st.text`, never markdown (no link or image renders).
+    st.text("\n".join(f"{name}: {value or 'n/a'}" for name, value in fields))
 
 
 def _passages(view: gold.CaseView | review.ItemView) -> None:
@@ -452,10 +481,10 @@ def _passages(view: gold.CaseView | review.ItemView) -> None:
     else:
         st.caption("The notice is not text.")
     if view.eightk:
-        st.subheader(f"{view.eightk.form} {view.eightk.accession} ({view.eightk.filed_on})")
+        st.subheader("8-K")
+        st.text(f"{view.eightk.form} {view.eightk.accession} ({view.eightk.filed_on})")
         for item, text in view.eightk.items:
-            st.markdown(f"**Item {item}**")
-            st.text(text)
+            st.text(f"Item {item}\n{text}")
         if view.eightk.body_head:
             st.text(view.eightk.body_head)
     st.markdown(f"[The issuer's EDGAR filing index]({view.index_url})")
@@ -578,7 +607,21 @@ def draw_review(page: Page) -> None:
 # --- the script -------------------------------------------------------------------
 
 
-def _open(settings: Settings, path: Path, mode: Mode, run_id: int | None) -> Page:
+def _show_finished(path: Path, run_id: int | None) -> bool:
+    """A finished review only displays: its run is closed, so the session cannot be
+    rebuilt (`attach_run` refuses a closed run); `finish`'s marker beside the review
+    file holds what to show."""
+    marker = path.with_name(f"{run_id}.finished.json")
+    if not marker.is_file():
+        return False
+    done = json.loads(marker.read_text(encoding="utf-8"))
+    _closed("Items reviewed", done["metrics"]["n_reviewed"], done["sha256"])
+    return True
+
+
+def _open(
+    settings: Settings, path: Path, mode: Mode, run_id: int | None, code_version: str | None
+) -> Page:
     cached: Page | None = st.session_state.get("page")
     if cached is not None and cached.settings == settings:
         return cached
@@ -587,12 +630,13 @@ def _open(settings: Settings, path: Path, mode: Mode, run_id: int | None) -> Pag
         page = Page("gold", settings, gold=session)
     else:
         assert run_id is not None
-        commit, dirty = _code_version()
+        if not code_version:
+            raise PageRefused("review mode needs --code-version; start it through the CLI")
         built = review.build_review_session(
             run_id,
             settings=settings,
             connect=lambda: open_read_only(settings),
-            code_version=f"{commit}+dirty" if dirty else commit,
+            code_version=code_version,
         )
         if built.review_path.resolve() != path.resolve():
             raise PageRefused(f"--session {path} is not run {run_id}'s review file")
@@ -614,15 +658,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     settings = get_settings()
     try:
-        path = session_argument(sys.argv[1:] if argv is None else argv)
+        args = page_arguments(sys.argv[1:] if argv is None else argv)
+        path = args.session
         mode, run_id = mode_of(settings, path)
         if mode == "gold":
             gold.refuse_if_inference_files(settings)  # every start, every rerun
-        page = _open(settings, path, mode, run_id)
+        elif _show_finished(path, run_id):
+            return
+        page = _open(settings, path, mode, run_id, args.code_version)
     except StoreLockedError as exc:
         st.error(f"store busy: {exc}. Reload this page in a moment.")
         return
-    except (PageRefused, gold.GoldRefused, review.ReviewRefused) as exc:
+    except (PageRefused, gold.GoldRefused, review.ReviewRefused, ResearchError) as exc:
         st.error(f"Refusing to open the session: {exc}")
         return
     st.title("Gold labelling" if mode == "gold" else "Review")

@@ -93,10 +93,14 @@ def stops(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 def _app(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, session: Path, stops: list[int]
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    session: Path,
+    stops: list[int],
+    extra: tuple[str, ...] = (),
 ) -> AppTest:
     monkeypatch.setattr(review_page, "get_settings", lambda: settings)
-    monkeypatch.setattr(sys, "argv", ["review_page.py", "--session", str(session)])
+    monkeypatch.setattr(sys, "argv", ["review_page.py", "--session", str(session), *extra])
     at = AppTest.from_string(SCRIPT, default_timeout=30)
     at.run()
     assert not at.exception, at.exception
@@ -165,7 +169,28 @@ def test_mode_of_reads_the_session_argument(gsettings: Settings) -> None:
     with pytest.raises(review_page.PageRefused):
         review_page.mode_of(gsettings, Path("elsewhere.json"))
     with pytest.raises(review_page.PageRefused):
-        review_page.session_argument([])
+        review_page.page_arguments([])
+    args = review_page.page_arguments(["--session", "x.jsonl", "--code-version", "abc"])
+    assert args == review_page.Arguments(Path("x.jsonl"), "abc")
+
+
+def test_relied_on_defaults_to_shown_text_else_outside_alone() -> None:
+    eightk = gold.EightKView("8-K", "A1", None, (("2.01", "t"), ("8.01", "u")), None)
+    assert review_page.relied_on_choices("notice text", eightk) == [
+        "notice",
+        "8-K item 2.01",
+        "8-K item 8.01",
+        "outside",
+    ]
+    assert review_page.relied_on_choices(None, eightk)[0] == "8-K item 2.01"
+    assert review_page.relied_on_choices(None, None) == ["outside"]
+
+
+def test_budget_note_with_and_without_a_timed_answer() -> None:
+    assert "within the 2.0 minutes" in review_page.budget_note(90.0)
+    assert "over the 2.0 minutes" in review_page.budget_note(150.0)
+    note = review_page.budget_note(None)
+    assert "no timed answer" in note and "within" not in note
 
 
 def test_key_tables_gold_back_on_b_review_b_is_answer_b_only() -> None:
@@ -447,6 +472,51 @@ def test_the_keyboard_component_is_present(
     assert '"s": "s \\u00b7"' in review_page.keyboard_html(review_page.gold_key_table(()))
 
 
+def test_a_skipped_case_is_timed_from_its_return(
+    monkeypatch: pytest.MonkeyPatch, gold_session: gold.GoldSession, stops: list[int]
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(review_page.time, "monotonic", lambda: clock[0])
+    at = _gold_app(monkeypatch, gold_session, stops)
+    skipped = _current(at, gold_session)
+    clock[0] += 10
+    _press(at, "skip")
+    for _ in range(N - 1):
+        clock[0] += 100
+        _press(at, "opt-1")
+    assert _current(at, gold_session) == skipped
+    clock[0] += 30
+    _press(at, "opt-1")
+    final = _lines(gold_session.working_path)[-1]
+    assert final["listing_end_id"] == skipped
+    assert (final["seconds_spent"], final["idle"]) == (30.0, False)
+    assert [line["seconds_spent"] for line in _lines(gold_session.working_path)[1:-1]] == [
+        100.0
+    ] * (N - 1)
+
+
+def test_an_inference_file_planted_mid_session_stops_the_next_press(
+    monkeypatch: pytest.MonkeyPatch, gold_session: gold.GoldSession, stops: list[int]
+) -> None:
+    """Callbacks run before the script body: the press itself must refuse."""
+    at = _gold_app(monkeypatch, gold_session, stops)
+    planted = datafiles.data_dir(gold_session.settings) / "inferences" / "1.jsonl"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("{}\n", encoding="utf-8")
+    _press(at, "opt-1")
+    assert _lines(gold_session.working_path) == []
+    assert any("model output" in str(e.value) for e in at.error)
+
+
+def test_filer_text_is_never_rendered_as_markdown(
+    monkeypatch: pytest.MonkeyPatch, gold_session: gold.GoldSession, stops: list[int]
+) -> None:
+    at = _gold_app(monkeypatch, gold_session, stops)
+    markdown = "\n".join(str(m.value) for m in at.markdown)
+    assert "Issuer " not in markdown and "Completion." not in markdown
+    assert any(str(t.value).startswith("Issuer: Issuer ") for t in at.text)
+
+
 # --- review mode ------------------------------------------------------------------
 
 
@@ -472,7 +542,13 @@ def _review_app(
     monkeypatch.setattr(
         review_page, "open_read_only", lambda _s: contextlib.nullcontext(world.conn)
     )
-    return _app(monkeypatch, world.settings, datafiles.review_path(world.settings, run_id), stops)
+    return _app(
+        monkeypatch,
+        world.settings,
+        datafiles.review_path(world.settings, run_id),
+        stops,
+        ("--code-version", "abc123"),
+    )
 
 
 def _session(world: World, run_id: int) -> review.ReviewSession:
@@ -565,3 +641,41 @@ def test_review_last_decision_shows_done_stops_and_never_finishes(
     count = len(_lines(session.review_path))
     at.run()
     assert len(_lines(session.review_path)) == count
+
+
+def test_review_mode_needs_the_code_version(
+    monkeypatch: pytest.MonkeyPatch, world: World, stops: list[int]
+) -> None:
+    run_id = _batch(world)
+    at = _app(monkeypatch, world.settings, datafiles.review_path(world.settings, run_id), stops)
+    assert any("--code-version" in str(e.value) for e in at.error)
+    assert not at.button
+
+
+def test_review_record_carries_the_given_code_version(
+    monkeypatch: pytest.MonkeyPatch, world: World, stops: list[int]
+) -> None:
+    run_id = _batch(world)
+    session = _session(world, run_id)
+    at = _review_app(monkeypatch, world, run_id, stops)
+    _decide(at, session)
+    assert _lines(session.review_path)[0]["code_version"] == "abc123"
+
+
+def test_a_finished_review_only_displays(
+    monkeypatch: pytest.MonkeyPatch, world: World, stops: list[int]
+) -> None:
+    run_id = _batch(world)
+    session = _session(world, run_id)
+    session.finished_path.parent.mkdir(parents=True, exist_ok=True)
+    session.finished_path.write_text(
+        json.dumps({"sha256": "e" * 64, "metrics": {"n_reviewed": 8}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        review_page.review,
+        "build_review_session",
+        lambda *a, **k: pytest.fail("a finished run is not rebuilt"),
+    )
+    at = _review_app(monkeypatch, world, run_id, stops)
+    assert not at.button and not at.error
+    assert "e" * 64 in _text(at) and "Items reviewed: 8" in _text(at)
