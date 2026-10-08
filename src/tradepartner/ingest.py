@@ -58,7 +58,11 @@ only if it changes what an as-of read returns:
   later than every stored row of their key and changes the view. Stored
   history is never rewritten: if the key's latest row still differs from
   the builder's latest (a restatement, a late filing, A -> B -> A), one row
-  with the builder's latest values is stamped at `ingested_at`.
+  with the builder's latest values is stamped at `ingested_at`. A fact's
+  filing accession is then made whole (`_refiled`, #258): `facts_as_of`
+  serves only an accession's latest ingest, so when that no longer holds
+  the builder's date set for it (A -> B -> A), the builder's pairs not
+  written this run are re-inserted at `ingested_at`.
 
 The price side fetches bars for the expected session and actions with
 `ex_date` from the first of its month to it, so revisions within the month
@@ -1938,7 +1942,7 @@ def _add_rows(
     incoming: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
     for row in sorted(rows, key=lambda r: (key(r), r["known_at"])):
         incoming[key(row)].append(row)
-    added = 0
+    written: list[Row] = []
     for row_key, built in incoming.items():
         past = history[row_key]
         if current:  # the source's latest record per key is its value now
@@ -1952,8 +1956,106 @@ def _add_rows(
                     f"ingested_at {ingested_at.isoformat()}; it is not knowable yet"
                 )
             insert_row(conn, table, new)
-            added += 1
-    return added
+            written.append(new)
+    if table == "facts":
+        for new in _refiled(rows, history, written, ingested_at):
+            insert_row(conn, table, new)
+            written.append(new)
+    return len(written)
+
+
+def _refiled(
+    rows: Sequence[Mapping[str, Any]],
+    history: Mapping[tuple[Any, ...], Sequence[Mapping[str, Any]]],
+    written: Sequence[Mapping[str, Any]],
+    ingested_at: datetime,
+) -> list[Row]:
+    """The `facts` rows to re-insert so each stored filing accession's
+    latest ingest is the builder's current date set for it (#258, owner
+    option a; `store.asof.facts_as_of` serves only an accession's latest
+    ingest, plan T11e).
+
+    An accession is `(security_id, fact_name, class_member,
+    filing_accession)`; the builder's rows for one are its **complete
+    current snapshot** (the module's builders return full views), so a
+    date the source no longer gives leaves later reads. After the per-key
+    writes, an accession with stored rows whose latest ingest (its rows
+    written this run if any, else its stored latest ingest) holds a
+    different `(as_of_date, value)` set gets every builder pair not written
+    this run re-inserted with `known_at` and `ingested_at` at `ingested_at`:
+    the pair A in A -> B -> A, which the per-key writer skips because its
+    key already holds that value. Stored rows are never rewritten, and the
+    new rows are known only from this ingest, so no earlier as-of read
+    changes.
+
+    The store's key has no accession, and the per-key writer keeps each
+    key's latest row equal to the builder's latest (by `known_at`) across
+    accessions. So a pair whose key the builder's latest row gives another
+    value (a newer filing's) is *shadowed*: it is left out of both sets and
+    never re-inserted, which would make the two writers undo each other on
+    every run. And a key already given a row at `ingested_at` this run (by
+    the per-key writer or a newer filing's re-insert, newest stored
+    acceptance first) is not stamped twice (`UNIQUE`); its accession is
+    completed on a later run.
+    """
+
+    def key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (row["security_id"], row["fact_name"], row["as_of_date"], row["class_member"])
+
+    def accession(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (row["security_id"], row["fact_name"], row["class_member"], row["filing_accession"])
+
+    def pair(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (row["as_of_date"], row["value"])
+
+    by_time = sorted(rows, key=lambda r: r["known_at"])
+    newest_value = {key(row): row["value"] for row in by_time}
+    latest_built: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for row in by_time:
+        if row["filing_accession"] is not None:
+            latest_built[(*accession(row), row["as_of_date"])] = row
+    built: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in latest_built.values():
+        built[accession(row)].append(row)
+    stored: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for stored_rows in history.values():
+        for row in stored_rows:
+            if row["filing_accession"] is not None:
+                stored[accession(row)].append(row)
+    this_run: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in written:
+        this_run[accession(row)].append(row)
+    stamped = {key(row) for row in written if row["known_at"] == ingested_at}
+
+    out: list[Row] = []
+    newest_first = sorted(
+        (group for group in built if stored[group]),
+        key=lambda group: (max(row["known_at"] for row in stored[group]), group),
+        reverse=True,
+    )
+    for group in newest_first:
+        past = stored[group]
+        shadowed = {
+            row["as_of_date"] for row in built[group] if newest_value[key(row)] != row["value"]
+        }
+        target = [row for row in built[group] if row["as_of_date"] not in shadowed]
+        if this_run[group]:
+            latest: Sequence[Mapping[str, Any]] = this_run[group]
+        else:
+            last = max(row["ingested_at"] for row in past)
+            latest = [row for row in past if row["ingested_at"] == last]
+        now_served = {pair(row) for row in latest if row["as_of_date"] not in shadowed}
+        if {pair(row) for row in target} == now_served:
+            continue
+        if ingested_at <= max(max(row["known_at"], row["ingested_at"]) for row in past):
+            raise ValueError(f"facts {group}: revision at {ingested_at.isoformat()} is back-dated")
+        done = {pair(row) for row in this_run[group]}
+        for row in target:
+            if pair(row) in done or key(row) in stamped:
+                continue
+            stamped.add(key(row))
+            out.append({**row, "known_at": ingested_at, "ingested_at": ingested_at})
+    return out
 
 
 _Same = Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
