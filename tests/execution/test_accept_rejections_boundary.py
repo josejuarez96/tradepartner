@@ -409,8 +409,30 @@ _UNPACK_CALLEES = frozenset({"row_type"})
 #: computed name, so a default map could arrive another way; the attributes
 #: `.main` (Click's entry, which takes context settings) and `.info` (a Typer
 #: app's settings) as attributes only, so `cli.py`'s own `main()` still runs.
-_CLICK_REACH = frozenset({"setattr", "getattr", "get_command", "make_context"})
-_CLICK_ATTRIBUTES = frozenset({"main", "info", "context_settings", DEFAULT_MAP})
+#: An import alias of any of them is refused too.
+_CLICK_REACH = frozenset(
+    {
+        "setattr",
+        "getattr",
+        "vars",
+        "operator",
+        "attrgetter",
+        "setitem",
+        "get_command",
+        "make_context",
+    }
+)
+_CLICK_ATTRIBUTES = frozenset(
+    {
+        "main",
+        "info",
+        "context_settings",
+        DEFAULT_MAP,
+        "__setattr__",
+        "__getattr__",
+        "__getattribute__",
+    }
+)
 
 
 def _annotation_ids(tree: ast.Module) -> set[int]:
@@ -463,13 +485,20 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
             found.append(f"{node.lineno}: spells {DEFAULT_MAP}")
         if name in _CLICK_ATTRIBUTES and isinstance(node, ast.Attribute):
             found.append(f"{node.lineno}: names {name} as an attribute")
-        elif name in _CLICK_REACH:
-            found.append(f"{getattr(node, 'lineno', 0)}: names {name}")
-        elif name == "Typer":
+        elif isinstance(node, (ast.Name, ast.Attribute)) and name in _CLICK_REACH:
+            found.append(f"{node.lineno}: names {name}")
+        elif isinstance(node, (ast.Name, ast.Attribute)) and name == "Typer":
             parent = parents.get(id(node))
             called = isinstance(parent, ast.Call) and parent.func is node
             if not (called or id(node) in annotations):
-                found.append(f"{getattr(node, 'lineno', 0)}: aliases or wraps Typer")
+                found.append(f"{node.lineno}: aliases or wraps Typer")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                parts = {*alias.name.split("."), alias.asname}
+                if parts & _CLICK_REACH:
+                    found.append(f"{node.lineno}: imports {alias.name}")
+                elif "Typer" in parts and alias.asname not in (None, "Typer"):
+                    found.append(f"{node.lineno}: imports Typer as {alias.asname}")
     return found
 
 
@@ -939,6 +968,14 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "cmd = typer.main.get_command(app)\ncmd.context_settings = SETTINGS\n",
         CLI_PASS + "setattr(ctx, 'default_' + 'map', m)\n",
         CLI_PASS + "make_app().info = INFO\n",
+        CLI_PASS + "vars(vars(paper_app)['in' + 'fo'])['context_' + 'settings'] = S\n",
+        CLI_PASS + "object.__setattr__(operator.attrgetter('in' + 'fo')(paper_app), 'c', S)\n",
+        CLI_PASS + "attrgetter('in' + 'fo')(paper_app).__setattr__('context_' + 'settings', S)\n",
+        CLI_PASS + "type(paper_app).__getattribute__(paper_app, 'in' + 'fo')\n",
+        CLI_PASS + "from typer.main import get_command as gc\n",
+        CLI_PASS + "import operator as op\n",
+        CLI_PASS + "from operator import setitem as put\n",
+        CLI_PASS + "from typer import Typer as T\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
