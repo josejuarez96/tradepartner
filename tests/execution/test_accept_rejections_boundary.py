@@ -60,10 +60,12 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    loaded (no direct call, alias or `partial`), its `Annotated` option is
    exactly `typer.Option("--accept-rejections", help=...,
    allow_from_autoenv=False)` (no envvar, auto-envvar, callback, default or
-   flag value), the decorator takes no keyword (no `context_settings`), no
-   `Typer(...)`, `add_typer(...)` or `.callback(...)` call takes
-   `context_settings` or `**` (app-level settings reach `resume` too), nothing
-   names `default_map` as a keyword, attribute or string (#1309), no
+   flag value), the decorator takes no keyword (no `context_settings`), and
+   no default map can reach it (#1309): `context_settings` goes only to a
+   `.command(...)` decorator, `Typer` is only called or annotated, `**` goes
+   only into the ledger row types, nothing names `setattr`, `getattr`,
+   `get_command`, `make_context`, `.main`, `.info` or `.context_settings`,
+   and `default_map` appears nowhere (`_app_default_misuses`), no
    keyword names `accept_rejections_flag`,
    and no string in `cli.py` spells the flag except docstrings and that one
    option name (so the app cannot invoke itself with it). A second such pass, a
@@ -397,39 +399,78 @@ def _is_docstring(node: ast.Constant, parents: dict[int, ast.AST]) -> bool:
     )
 
 
-#: The Typer calls whose `context_settings` reach every command below them,
-#: `resume` included, so a `default_map` there could default the flag (#1309).
-_APP_LEVEL_CALLS = frozenset({"Typer", "add_typer", "callback"})
+#: `default_map` in Click's context settings defaults any option, the flag
+#: included, behind its back (#1309).
 DEFAULT_MAP = "default_map"
+#: Callees `cli.py` may `**`-unpack into: the ledger row types, whose keys are
+#: their own field names (`_set_rows`). Any other `**` could carry settings.
+_UNPACK_CALLEES = frozenset({"row_type"})
+#: Names that reach the Click command or context, or set attributes by a
+#: computed name, so a default map could arrive another way; the attributes
+#: `.main` (Click's entry, which takes context settings) and `.info` (a Typer
+#: app's settings) as attributes only, so `cli.py`'s own `main()` still runs.
+_CLICK_REACH = frozenset({"setattr", "getattr", "get_command", "make_context"})
+_CLICK_ATTRIBUTES = frozenset({"main", "info", "context_settings", DEFAULT_MAP})
 
 
-def _app_default_misuses(node: ast.AST) -> list[str]:
-    """#1309: in `cli.py`, no app-level `context_settings` (or `**` into an
-    app-level call, which could carry them), and no `default_map` at all, as a
-    keyword, an attribute or a string, so no default map can set the flag
-    behind the option's back. A command's own `context_settings` reach only
-    that command, and `resume`'s decorator takes no keyword."""
-    if isinstance(node, ast.Call):
-        func = node.func
+def _annotation_ids(tree: ast.Module) -> set[int]:
+    """The ids of every node inside a parameter, return or field annotation."""
+    roots: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+            roots.append(node.returns)
+        elif isinstance(node, (ast.arg, ast.AnnAssign)) and node.annotation is not None:
+            roots.append(node.annotation)
+    return {id(n) for root in roots for n in ast.walk(root)}
+
+
+def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
+    """#1309, fail closed: in `cli.py`, no default map can reach `resume`'s
+    flag. `context_settings` is passed only to a `.command(...)` decorator
+    (a command's own settings reach only it, and `resume`'s decorator takes no
+    keyword), never assigned or read as an attribute; `Typer` is only called
+    or annotated, never aliased or wrapped (`T = typer.Typer`, `partial`);
+    `**` goes only into `_UNPACK_CALLEES`; nothing names `_CLICK_REACH`
+    (`setattr`, `get_command(app).main(...)`, `app.info`); and `default_map`
+    appears nowhere, as a keyword, attribute or string."""
+    found = []
+    annotations = _annotation_ids(tree)
+    for node in ast.walk(tree):
         name = (
-            func.attr
-            if isinstance(func, ast.Attribute)
-            else func.id
-            if isinstance(func, ast.Name)
+            node.id
+            if isinstance(node, ast.Name)
+            else node.attr
+            if isinstance(node, ast.Attribute)
             else None
         )
-        if name in _APP_LEVEL_CALLS:
-            if any(k.arg == "context_settings" for k in node.keywords):
-                return [f"{node.lineno}: app-level context_settings on {name}"]
-            if any(k.arg is None for k in node.keywords):
-                return [f"{node.lineno}: ** into the app-level call {name}"]
-    if isinstance(node, ast.keyword) and node.arg == DEFAULT_MAP:
-        return [f"{node.value.lineno}: passes a {DEFAULT_MAP}"]
-    if isinstance(node, ast.Attribute) and node.attr == DEFAULT_MAP:
-        return [f"{node.lineno}: names {DEFAULT_MAP} as an attribute"]
-    if isinstance(node, ast.Constant) and isinstance(node.value, str) and DEFAULT_MAP in node.value:
-        return [f"{node.lineno}: spells {DEFAULT_MAP}"]
-    return []
+        if isinstance(node, ast.Call):
+            for k in node.keywords:
+                if k.arg == "context_settings" and not (
+                    isinstance(node.func, ast.Attribute) and node.func.attr == "command"
+                ):
+                    found.append(f"{node.lineno}: context_settings outside a command decorator")
+                elif k.arg is None and not (
+                    isinstance(node.func, ast.Name) and node.func.id in _UNPACK_CALLEES
+                ):
+                    found.append(f"{node.lineno}: ** into an unreviewed callee")
+        elif isinstance(node, ast.keyword) and node.arg == DEFAULT_MAP:
+            found.append(f"{node.value.lineno}: passes a {DEFAULT_MAP}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and DEFAULT_MAP in node.value
+        ):
+            found.append(f"{node.lineno}: spells {DEFAULT_MAP}")
+        if name in _CLICK_ATTRIBUTES and isinstance(node, ast.Attribute):
+            found.append(f"{node.lineno}: names {name} as an attribute")
+        elif name in _CLICK_REACH:
+            found.append(f"{getattr(node, 'lineno', 0)}: names {name}")
+        elif name == "Typer":
+            parent = parents.get(id(node))
+            called = isinstance(parent, ast.Call) and parent.func is node
+            if not (called or id(node) in annotations):
+                found.append(f"{getattr(node, 'lineno', 0)}: aliases or wraps Typer")
+    return found
 
 
 def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
@@ -487,7 +528,7 @@ def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
                 found.append(f"{node.lineno}: unreviewed use of {CLI_FLAG}")
         elif isinstance(node, ast.Attribute) and node.attr == CLI_FLAG:
             found.append(f"{node.lineno}: names {CLI_FLAG} as an attribute")
-        found.extend(_app_default_misuses(node))
+    found.extend(_app_default_misuses(tree, parents))
     if len(params) > 1:
         found.append(f"{CLI_FLAG} is bound as {len(params)} parameters, not one")
     if passes > 1:
@@ -834,6 +875,12 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
     # a command's own context settings stay open to the other commands (#1309)
     other = '@dataset_app.command("register", context_settings={"allow_extra_args": True})\n'
     assert misuses(ast.parse(CLI_PASS + other + "def register() -> None: ...\n"), CLI_MODULE) == []
+    # the ledger rows' reviewed `**`, and `Typer` called or annotated (#1309)
+    reviewed = (
+        "def make_app() -> typer.Typer:\n    return typer.Typer(no_args_is_help=True)\n"
+        "rows = [row_type(**dict(zip(names, row, strict=True))) for row in rows]\n"
+    )
+    assert misuses(ast.parse(CLI_PASS + reviewed), CLI_MODULE) == []
 
 
 @pytest.mark.parametrize(
@@ -883,6 +930,15 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "make_app()(default_map=m)\n",
         CLI_PASS + "OPTIONS = {'default_map': m}\n",
         CLI_PASS + "OPTIONS = dict(default_map=m)\n",
+        CLI_PASS + "paper_app.info.context_settings = SETTINGS\n",
+        CLI_PASS + "T = typer.Typer\npaper_app = T(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = functools.partial(typer.Typer, context_settings=SETTINGS)()\n",
+        CLI_PASS + "paper_app = functools.partial(Typer)()\n",
+        CLI_PASS + "make_app()(**OPTIONS)\n",
+        CLI_PASS + "typer.main.get_command(app).main(**OPTIONS)\n",
+        CLI_PASS + "cmd = typer.main.get_command(app)\ncmd.context_settings = SETTINGS\n",
+        CLI_PASS + "setattr(ctx, 'default_' + 'map', m)\n",
+        CLI_PASS + "make_app().info = INFO\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
