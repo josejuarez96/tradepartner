@@ -305,7 +305,8 @@ def _show_flash() -> None:
     flash = st.session_state.pop("flash", None)
     if flash:
         kind, text = flash
-        getattr(st, kind)(text)
+        show = {"error": st.error, "success": st.success, "info": st.info}[kind]
+        show(text)
 
 
 def _shown_at(lid: str) -> float:
