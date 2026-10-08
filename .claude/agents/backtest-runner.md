@@ -96,11 +96,13 @@ You never accept a store from anyone: you always build your own in step 1.
    from tradepartner.backtest.lab import run_sweep
    # register as in step 2 (sweep.register(conn, Path("<SWEEP>"), live, registered_by="backtest-runner"))
    outcome = run_sweep("<sweep-slug>", store_path=Path("<SCRATCH>/runner/store.duckdb"),
-                       run_by="backtest-runner")
-   print(outcome.n_ok, outcome.n_failed, outcome.completed, outcome.errors)
+                       time_budget_minutes=5, run_by="backtest-runner")
+   print(outcome.n_ok, outcome.n_failed, outcome.completed, outcome.stopped_by_budget)
+   for message in outcome.errors.values():
+       print(message.strip().splitlines()[-1])
    EOF
    ```
-   `run_sweep` refuses any `store_path` without the fixture marker (`UnmarkedStoreRefused`), and opens every trial `synthetic=True` under one. Report counts, failures and `errors`; fixture numbers say nothing about a family. Never pass `rerun` on a store you did not just build.
+   `run_sweep` refuses any `store_path` without the fixture marker (`UnmarkedStoreRefused`), and opens every trial `synthetic=True` under one. The run waits out the lab's quiet intervals, so the 5-minute budget makes it stop instead of sleeping for hours; if `stopped_by_budget` is true with nothing run, report that and stop. Report counts and each failure's last line only (never a traceback); fixture numbers say nothing about a family. The sweep file must sit under `TEAM_DIR/docs/sweeps/` or `SCRATCH`; refuse any other path.
 4. **Delete the temp store** (`rm -rf "$SCRATCH/runner"`) once the report is written, unless the window asked to keep it.
 
 ## Output
