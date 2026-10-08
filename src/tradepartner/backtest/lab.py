@@ -83,6 +83,7 @@ runner sleeps only through it, so a test drives every wait with a fake one.
 from __future__ import annotations
 
 import logging
+import math
 import time
 import traceback
 from collections.abc import Sequence
@@ -104,9 +105,9 @@ from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.backtest.results import family_n, write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import Connect, StoreProvider
-from tradepartner.config import Cadence, HypothesisFamily, Settings, get_settings, secret_values
+from tradepartner.config import Cadence, HypothesisFamily, Settings, clean_message, get_settings
 from tradepartner.store import journal, lab_queries, lab_registry, lab_schema, registry, schema
-from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
 from tradepartner.store.lab_queries import SHARED_READ_FAILED, PlannedVariant
 from tradepartner.store.lab_registry import LabRegistryError, SweepRecord
 from tradepartner.store.registry import STORE_CHANGED_MESSAGE, TrialHandle
@@ -265,6 +266,7 @@ class _Opened:
     message: str | None = None
     error: str | None = None
     results: dict[float, BacktestResult] | None = None
+    ran: bool = False
 
 
 def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
@@ -272,14 +274,6 @@ def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
         return live
     store = live.store.model_copy(update={"path": str(store_path)})
     return live.model_copy(update={"store": store})
-
-
-def _scrub(message: str, store: Settings) -> str:
-    """`message` with every configured secret value replaced (an exception's words
-    can carry one; #342)."""
-    for secret in secret_values(store):
-        message = message.replace(secret, "[redacted]")
-    return message
 
 
 def _describe(exc: BaseException) -> str:
@@ -349,8 +343,6 @@ def run_sweep(
     if not budget > 0:
         raise ValueError(f"the time budget must be positive, got {budget} minutes")
     store = _on_store(live, store_path)
-    started = clock.now()
-    deadline = started + timedelta(minutes=budget)
     synthetic = store_path is not None
 
     # The refusals read only; the configured quiet intervals are waited out before
@@ -375,6 +367,10 @@ def run_sweep(
     for warning in warnings:
         _log.warning(warning)
     timing.wait_out_interval()
+    # The budget counts from here: a quiet interval the run started inside is
+    # waited out first and spends none of it.
+    started = clock.now()
+    deadline = started + timedelta(minutes=budget)
 
     with open_for_write(store) as conn:
         schema.init_schema(conn)
@@ -385,7 +381,7 @@ def run_sweep(
         sweep_run_id = lab_registry.open_sweep_run(
             conn,
             sweep_id=sweep.sweep_id,
-            time_budget_minutes=round(budget),
+            time_budget_minutes=math.ceil(budget),
             n_declared=sweep.n_variants,
             n_planned=len(plan.variants),
             code_tree_sha256=code_vintage,
@@ -404,7 +400,10 @@ def run_sweep(
             outcomes.extend(
                 _run_group(group, sweep, sweep_run_id, store, live, synthetic, run_by, timing)
             )
-    except Exception:
+    except BaseException:
+        # An interrupt or an error mid-group: the run's row is still closed (not
+        # complete); trials of the group in flight stay unfinished (no result
+        # row), so they count nowhere and the next plain run reruns them.
         with suppress(Exception):
             _close_run(store, sweep, sweep_run_id, outcomes, timing, started, synthetic)
         raise
@@ -516,7 +515,7 @@ def _open_group(
                 entry.status, entry.message = "failed", _describe(exc)
                 entry.error = "".join(traceback.format_exception(exc))
         if entry.status is not None:
-            entry.message = _scrub(entry.message or "", store)
+            entry.message = clean_message(entry.message or "", store)
             registry.close_trial(conn, handle, entry.status, entry.message)
         opened.append(entry)
     return opened
@@ -546,10 +545,11 @@ def _run_group(
     if running:
         _run_engine(running, sweep, store, timing)
     elapsed = (timing.clock.now() - began).total_seconds()
-    seconds = max(elapsed - (timing.paused_seconds - paused_before), 0.0) / len(group)
+    seconds = max(elapsed - (timing.paused_seconds - paused_before), 0.0) / max(len(running), 1)
     timing.wait_out_interval()
     for entry in opened:
-        _close_variant(entry, sweep_run_id, store, live, seconds)
+        # A variant closed at its open never ran: its seconds are not a run time.
+        _close_variant(entry, sweep_run_id, store, live, seconds if entry.ran else 0.0)
     return opened
 
 
@@ -558,6 +558,8 @@ def _run_engine(
 ) -> None:
     """`engine.run_many` over the group, recording each variant's results or error."""
     first = running[0]
+    for entry in running:
+        entry.ran = True
     try:
         windows = {o.window for o in running}
         if len(windows) != 1:
@@ -599,34 +601,42 @@ def _run_engine(
 def _close_variant(
     entry: _Opened, sweep_run_id: int, store: Settings, live: Settings, seconds: float
 ) -> None:
-    """Write the variant's outcome and its `sweep_trials` row in one write chunk:
-    its result rows when it ran, `store changed during run` when the data vintage
-    at its cutoff moved since the open, else its failure; a write that raises is
-    closed `failed` in a chunk of its own."""
+    """Write the variant's outcome and its `sweep_trials` row in one write chunk.
+    A variant that entered the engine fails `store changed during run` when the
+    data vintage at its cutoff moved since the open, whatever its own outcome
+    (req 2: every open variant of the group; its own error would otherwise count
+    toward terminal failure on data that changed under it); else its result rows,
+    or its own failure. A write that raises is closed `failed` in a chunk of its
+    own, except a lock timeout, which is an infrastructure state and not the
+    variant's: that trial is left unfinished (no result row, so it neither counts
+    nor moves the terminal-failure count) and the next plain run reruns it."""
     try:
         with open_for_write(store) as conn:
-            if entry.results is not None and entry.status is None:
-                if registry.data_vintage(conn, entry.cutoff) != entry.vintage:
-                    entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE
-                    registry.close_trial(conn, entry.handle, "failed", STORE_CHANGED_MESSAGE)
-                else:
-                    assert entry.params is not None
-                    status = write_results(
-                        conn,
-                        entry.handle,
-                        entry.results,
-                        entry.params,
-                        detail_level=live.lab.sweep_detail_level,
-                    )
-                    entry.status = "ok" if status == "ok" else "failed"
-                    entry.message = None if status == "ok" else STORE_CHANGED_MESSAGE
+            changed = entry.ran and registry.data_vintage(conn, entry.cutoff) != entry.vintage
+            if changed:
+                entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE
+                registry.close_trial(conn, entry.handle, "failed", STORE_CHANGED_MESSAGE)
+            elif entry.results is not None and entry.status is None:
+                assert entry.params is not None
+                status = write_results(
+                    conn,
+                    entry.handle,
+                    entry.results,
+                    entry.params,
+                    detail_level=live.lab.sweep_detail_level,
+                )
+                entry.status = "ok" if status == "ok" else "failed"
+                entry.message = None if status == "ok" else STORE_CHANGED_MESSAGE
             elif _has_no_result(conn, entry.handle):
                 entry.status = entry.status if entry.status is not None else "failed"
-                entry.message = _scrub(entry.message or "", store)
+                entry.message = clean_message(entry.message or "", store)
                 registry.close_trial(conn, entry.handle, entry.status, entry.message)
             _write_sweep_trial(conn, entry, sweep_run_id, seconds)
+    except StoreLockedError as exc:
+        entry.status, entry.message = "failed", clean_message(_describe(exc), store)
+        entry.error = "".join(traceback.format_exception(exc))
     except Exception as exc:
-        entry.status, entry.message = "failed", _scrub(_describe(exc), store)
+        entry.status, entry.message = "failed", clean_message(_describe(exc), store)
         entry.error = "".join(traceback.format_exception(exc))
         with open_for_write(store) as conn:
             if _has_no_result(conn, entry.handle):

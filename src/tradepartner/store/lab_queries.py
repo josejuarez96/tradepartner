@@ -347,22 +347,20 @@ def terminal_failed(
     window carrying the same message, written with `code_dirty = false` at
     `code_vintage`, excluding `store changed during run` and `shared read
     failed`. A current `ok` trial clears it; a stale `ok` neither counts nor
-    blocks."""
+    blocks; a variant awaiting a stopped `--rerun` is not terminal-failed (the
+    same reading as `sweep_state` and `plan_run`)."""
     require_lab(conn)
-    window = default_window(conn, hypothesis_id, sweep.sweep_id)
-    counted = _counted_trial(conn, hypothesis_id, window, code_vintage, {}, synthetic)
-    if counted is not None and _is_current(conn, counted, code_vintage, {}):
-        return False
-    return _has_terminal_failures(
+    state = _variant_state(
         conn,
         hypothesis_id,
         sweep.sweep_id,
-        window,
         sweep.max_failures_per_variant,
         code_vintage,
-        epoch=rerun_epoch(conn, sweep.sweep_id),
-        synthetic=synthetic,
+        {},
+        rerun_epoch(conn, sweep.sweep_id),
+        synthetic,
     )
+    return state == "terminal_failed"
 
 
 def _has_terminal_failures(

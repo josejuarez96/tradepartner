@@ -476,6 +476,60 @@ def test_an_in_window_fact_mid_group_fails_that_group_and_the_next_run_resumes(
     assert second.n_ok == 2 and second.completed
 
 
+def test_a_variants_own_failure_on_changed_data_is_store_changed_not_its_error(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, cadence, top = next(v for v in _variants(store) if v[0] == 1)
+    real_plan = engine._plan
+    real = lab._PausingProvider.listing_ends
+    inserted: list[bool] = []
+
+    def failing_plan(view: Any, settings: Settings, *args: Any, **kwargs: Any) -> Any:
+        if settings.schedule.rebalance_cadence == cadence and settings.strategy.top_fraction == top:
+            raise RuntimeError("injected variant error")
+        return real_plan(view, settings, *args, **kwargs)
+
+    def inserting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not inserted:
+            inserted.append(True)
+            self.end_step()
+            _insert_bar(store, date(2018, 6, 1), _close(date(2018, 6, 1)))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_plan", failing_plan)
+    monkeypatch.setattr(lab._PausingProvider, "listing_ends", inserting)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    status = {t.variant_index: t.message for t in outcome.trials}
+    assert status[1] == registry.STORE_CHANGED_MESSAGE
+
+
+def test_an_interrupt_mid_group_closes_the_run_and_leaves_its_trials_unfinished(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(engine, "run_many", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        lab.run_sweep(SLUG, clock=clock)
+    with _read(store) as conn:
+        row = conn.execute(
+            "SELECT finished_at IS NOT NULL, completed FROM sweep_runs "
+            "ORDER BY sweep_run_id DESC LIMIT 1"
+        ).fetchone()
+        unfinished = conn.execute(
+            "SELECT COUNT(*) FROM trials WHERE trial_id NOT IN (SELECT trial_id FROM trial_results)"
+        ).fetchone()
+    assert row == (True, False)
+    assert unfinished == (2,)
+    monkeypatch.undo()
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store.parent / "none.env"))
+    monkeypatch.setenv("STORE__PATH", str(store))
+    monkeypatch.setattr(registry, "code_version", lambda repo_dir=None: _CLEAN)
+    monkeypatch.setattr(lab_registry, "code_version", lambda repo_dir=None: _CLEAN)
+    assert lab.run_sweep(SLUG, clock=clock).n_planned == 4
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="#1232: registry.write_result still fails a run on any ingest (Phase 3 rule)",
