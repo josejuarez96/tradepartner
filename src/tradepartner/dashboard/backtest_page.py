@@ -527,15 +527,20 @@ def _render_holdout_spends(view: TrialView) -> None:
     st.subheader("Holdout spends")
     family = view.hypothesis.family
     count = len(view.holdout_spends)
+    no_cap = "no family cap (strategy lab not initialised: the Phase 3 rules)"
+    if not view.holdout_spends:
+        cap = (
+            f"the family cap is {view.max_holdout_spends}"
+            if view.max_holdout_spends is not None
+            else no_cap
+        )
+        st.markdown(f"Holdout not spent in family `{family}`; {cap}.")
+        return
     st.caption(
         f"Family `{family}`: {count} of {view.max_holdout_spends} holdout spends (the family cap)."
         if view.max_holdout_spends is not None
-        else f"Family `{family}`: {count} holdout spends; no family cap (strategy lab not "
-        "initialised: the Phase 3 rules)."
+        else f"Family `{family}`: {count} holdout spends; {no_cap}."
     )
-    if not view.holdout_spends:
-        st.markdown(f"Holdout not spent in family `{view.hypothesis.family}`.")
-        return
     st.dataframe(
         pl.DataFrame(
             [

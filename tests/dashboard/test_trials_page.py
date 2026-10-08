@@ -930,3 +930,48 @@ def test_render_lab_not_initialised_on_a_store_without_the_lab_tables(
     text = _text(at).lower()
     assert "strategy lab not initialised" in text
     assert "trials" in text  # the trial table renders as before
+
+
+def test_one_unreadable_sweep_loses_only_its_row(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _build_lab(lab_store, settings, LAB_CODE)
+    # mom-edge's counted variant loses a metric the report needs.
+    lab_store.execute(
+        "DELETE FROM trial_metrics WHERE metric = 'skew_period_excess_spy' AND trial_id IN (SELECT "
+        "t.trial_id FROM trials t JOIN hypotheses h USING (hypothesis_id) "
+        "WHERE h.slug LIKE 'mom-edge%')"
+    )
+
+    view = trials_page.load_lab_view(lab_store, settings, code_vintage=LAB_CODE)
+
+    assert [s.report.slug for s in view.sweeps] == ["mom-grid"]
+    [error] = view.errors
+    assert error.startswith("sweep mom-edge:")
+    assert [c.family for c in view.families] == ["momentum"]
+
+
+def test_a_promotion_naming_only_a_trial_counts_for_its_family(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    lab = _build_lab(lab_store, settings, LAB_CODE)
+    decision_id = _next_id(lab_store, "owner_decisions", "decision_id")
+    insert_row(
+        lab_store,
+        "owner_decisions",
+        {
+            "decision_id": decision_id,
+            "made_at": utc_now(),
+            "kind": "promotion",
+            "hypothesis_id": None,
+            "trial_id": lab.holdout_trial,
+            "values_json": json.dumps({"sweep_id": 1}),
+            "reason": "named by its trial",
+        },
+    )
+
+    view = trials_page.load_lab_view(lab_store, settings, code_vintage=LAB_CODE)
+
+    [card] = view.families
+    assert [d.decision_id for d in card.promotions] == [lab.promotion, decision_id]
+    assert card.promotions[1].slug == "h1"

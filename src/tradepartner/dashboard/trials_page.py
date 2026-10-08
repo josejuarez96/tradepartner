@@ -18,8 +18,8 @@ shown only unfiltered.
 **Families and sweeps** (strategy-lab spec req 14; plan T112). Above the trial
 table, `load_lab_view` builds one card per family and one row per sweep (the
 latest registration of each slug) from `sweep_report.lab_status` (the family's N
-from `results.family_n`, V per basis from **one** `registry.family_sharpes` read,
-whose recompute is one set-based `trial_metrics` query per basis, the declared
+from `results.family_n`, V per basis from one `registry.family_sharpes` read per
+family, each one set-based `trial_metrics` query per basis, the declared
 count and the rules) and `sweep_report.sweep_report` per sweep (the counts, the
 state, the selection-statistic quartiles, the recomputed `dsr_excess` share, the
 red flags and, only for a complete sweep, the argmax and its verdicts), plus the
@@ -228,6 +228,7 @@ class LabView:
 
     families: tuple[FamilyCard, ...]
     sweeps: tuple[SweepLine, ...]
+    errors: tuple[str, ...] = ()
 
 
 def _sr_star(n: int, variance: float | None) -> float | None:
@@ -237,12 +238,16 @@ def _sr_star(n: int, variance: float | None) -> float | None:
 
 def _lab_decisions(conn: duckdb.DuckDBPyConnection) -> list[tuple[DecisionRow, str, int | None]]:
     """Every `promotion` and `sweep_retired` decision, oldest first, with the family
-    of the hypothesis it names and the `sweep_id` its values name (None when absent)."""
+    of the hypothesis it names (directly or through its trial, as `_decisions` reads
+    it) and the `sweep_id` its values name (None when absent)."""
     rows = conn.execute(
-        "SELECT d.decision_id, d.made_at, d.kind, h.slug, d.trial_id, d.values_json, "
-        "d.reason, h.family, TRY_CAST(json_extract_string(d.values_json, '$.sweep_id') "
-        "AS BIGINT) FROM owner_decisions d "
+        "SELECT d.decision_id, d.made_at, d.kind, COALESCE(h.slug, th.slug), d.trial_id, "
+        "d.values_json, d.reason, COALESCE(h.family, th.family), "
+        "TRY_CAST(json_extract_string(d.values_json, '$.sweep_id') AS BIGINT) "
+        "FROM owner_decisions d "
         "LEFT JOIN hypotheses h ON h.hypothesis_id = d.hypothesis_id "
+        "LEFT JOIN trials t ON t.trial_id = d.trial_id "
+        "LEFT JOIN hypotheses th ON th.hypothesis_id = t.hypothesis_id "
         "WHERE list_contains($kinds::VARCHAR[], d.kind) ORDER BY d.decision_id",
         {"kinds": list(_SWEEP_DECISION_KINDS)},
     ).fetchall()
@@ -255,7 +260,8 @@ def load_lab_view(
     """The families cards and sweeps table (module docstring) through `conn`.
     `code_vintage` is the checkout's `registry.code_tree_sha256()` unless given (a
     test passes one). Raises `LabNotInitialised` on a store without the lab tables,
-    and `ValueError` or `RegistryError` when a counted trial lacks a metric."""
+    and `RegistryError` when a family's V cannot be read; a sweep whose report fails
+    (a counted trial lacking a metric) is left out and named in `errors`."""
     require_lab(conn)
     vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
     status = sweep_report.lab_status(conn, settings, code_vintage=vintage)
@@ -265,7 +271,14 @@ def load_lab_view(
             "SELECT slug FROM sweeps GROUP BY slug ORDER BY MAX(sweep_id) DESC"
         ).fetchall()
     ]
-    reports = [sweep_report.sweep_report(conn, slug, code_vintage=vintage) for slug in slugs]
+    # One unreadable sweep (a counted trial missing a metric) loses its row only.
+    reports: list[sweep_report.SweepReport] = []
+    errors: list[str] = []
+    for slug in slugs:
+        try:
+            reports.append(sweep_report.sweep_report(conn, slug, code_vintage=vintage))
+        except (KeyError, ValueError, registry.RegistryError) as exc:
+            errors.append(f"sweep {slug}: {exc}")
     decisions = _lab_decisions(conn)
     declared: dict[str, tuple[int, float | None]] = {}
     for report in reports:
@@ -308,23 +321,29 @@ def load_lab_view(
                     if rules is not None
                     else settings.lab.max_family_promotions
                 ),
-                sr_star_high_water_annual=(
-                    lab_registry.family_sr_star_high_water_mark(
-                        conn,
-                        family.family,
-                        n_trials_today=family.n,
-                        sharpe_variance_annual_today=variance,
-                    )
-                    if rules is not None
-                    else None
-                ),
+                sr_star_high_water_annual=_high_water(conn, family.family, family.n, variance)
+                if rules is not None
+                else None,
             )
         )
     sweeps = tuple(
         SweepLine(r, tuple(d for d, _, sweep_id in decisions if sweep_id == r.sweep_id))
         for r in reports
     )
-    return LabView(tuple(cards), sweeps)
+    return LabView(tuple(cards), sweeps, tuple(errors))
+
+
+def _high_water(
+    conn: duckdb.DuckDBPyConnection, family: str, n: int, variance: float | None
+) -> float | None:
+    """The family's SR\\* high-water mark, or None when it cannot be read (the card
+    still shows the rest)."""
+    try:
+        return lab_registry.family_sr_star_high_water_mark(
+            conn, family, n_trials_today=n, sharpe_variance_annual_today=variance
+        )
+    except registry.RegistryError:
+        return None
 
 
 def _num(value: float | None, digits: int = 3) -> str:
@@ -425,12 +444,14 @@ def _decisions_text(decisions: tuple[DecisionRow, ...]) -> str:
     )
 
 
+_DSR_SHARE_COLUMN: Final = f"dsr_excess > {sweep_report.DSR_SHARE_THRESHOLD}"
+
 _SWEEPS_SCHEMA: Final[dict[str, pl.DataType]] = {
     "sweep": pl.Utf8(),
     "declared / run": pl.Utf8(),
     "state": pl.Utf8(),
     "q1 / median / q3": pl.Utf8(),
-    "dsr_excess > 0.5": pl.Float64(),
+    _DSR_SHARE_COLUMN: pl.Float64(),
     "red flags": pl.Int64(),
     "argmax": pl.Utf8(),
     "promotion / retirement": pl.Utf8(),
@@ -445,7 +466,7 @@ def _sweeps_table(sweeps: tuple[SweepLine, ...]) -> pl.DataFrame:
                 "declared / run": f"{s.report.n_declared} / {s.report.n_run}",
                 "state": _state_text(s.report),
                 "q1 / median / q3": _quartiles_text(s.report),
-                "dsr_excess > 0.5": s.report.dsr_excess_share_above,
+                _DSR_SHARE_COLUMN: s.report.dsr_excess_share_above,
                 "red flags": s.report.red_flag_count,
                 "argmax": _argmax_text(s.report),
                 "promotion / retirement": _decisions_text(s.decisions),
@@ -463,9 +484,12 @@ def _render_lab(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     except LabNotInitialised as exc:
         st.info(f"Strategy lab not initialised: {exc}")
         return
-    except (ValueError, registry.RegistryError) as exc:
+    except (KeyError, ValueError, registry.RegistryError, duckdb.Error) as exc:
+        # The trial table below still renders.
         st.error(f"Families and sweeps could not be read: {exc}")
         return
+    for error in view.errors:
+        st.error(f"Not shown: {error}")
     if not view.families:
         st.markdown("No families registered.")
     for card in view.families:
