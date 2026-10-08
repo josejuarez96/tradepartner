@@ -98,7 +98,7 @@ import subprocess
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import astuple, dataclass, field, fields
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -1072,8 +1072,11 @@ def record_decision(
     """Append an `owner_decisions` row (spec req 12) and return its id.
     `values` (the gap values at the time, say) are stored as canonical JSON.
     Refuses a blank reason and a trial or hypothesis id that does not exist.
-    `data_release` and `development_boundary` need a version-18 store; the
-    release writers below are the way to write a `data_release` row."""
+    `development_boundary` needs a version-18 store. A `data_release` row is
+    refused here: the release writers below are its only writers, so every such
+    row has the shape `data_vintage` reads."""
+    if kind == DATA_RELEASE_KIND:
+        raise ValueError("a data_release row is written by the release writers only")
     return _insert_decision(
         conn,
         kind=kind,
@@ -1511,7 +1514,7 @@ def _entry_problems(index: int, entry: Mapping[str, Any]) -> list[str]:
         problems.append(f"{where}: name {name!r} is not lowercase letters, digits and hyphens")
     for key in _DATETIME_KEYS:
         value = entry.get(key)
-        if key in entry and (not isinstance(value, datetime) or value.tzinfo is None):
+        if key in entry and (not isinstance(value, datetime) or value.utcoffset() != timedelta(0)):
             problems.append(f"{where}: {key} must be a UTC datetime with Z, got {value!r}")
     for key in _DATE_KEYS:
         value = entry.get(key)
@@ -1540,6 +1543,9 @@ def plan_release_import(
     release open (the store's open release counted)."""
     problems: list[str] = []
     for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, Mapping):
+            problems.append(f"entry {index} is not a table: {entry!r}")
+            continue
         problems.extend(_entry_problems(index, entry))
     if problems:
         raise ReleaseRefused("; ".join(problems))
@@ -1558,6 +1564,12 @@ def plan_release_import(
         all_stages = set(stages) | {s for (n, s) in pairs if n == name}
         if "record" in all_stages and all_stages != {"record"}:
             problems.append(f"{name}: a record entry shares its name with a before or after")
+        stored_before = pairs.get((name, "before"))
+        if "after" in stages and stored_before is not None and stored_before.imported_at is None:
+            problems.append(
+                f"{name}: its before row was written by `open`; close it with `close`, "
+                "not an imported after (an imported after moves no vintage)"
+            )
         if "after" in stages:
             before = next((e for e in group if e["stage"] == "before"), None)
             before_at = (
@@ -1607,7 +1619,11 @@ def import_release(
     now = utc_now()
     ids = []
     for entry in entries:
-        values = {key: value for key, value in entry.items() if key != "reason"}
+        values = {
+            key: value.astimezone(UTC) if isinstance(value, datetime) else value
+            for key, value in entry.items()
+            if key != "reason"
+        }
         values[IMPORTED_AT_KEY] = now
         ids.append(
             _write_release(conn, values, entry["reason"], trial_id=entry.get("trial"), made_at=now)

@@ -295,12 +295,13 @@ registry; #83 took version 2 first, so the registry is version 3):
   `lab_schema.widen_enum` as the lab migration rebuilt it (every row kept in
   insertion order, byte-identical, every kind kept), and `trials` gains a
   nullable `development_boundary DATE` by `ALTER TABLE` (NULL on every existing
-  row). `_migrate_release_kinds` runs on every writable store, a fresh one
-  included, since `_REGISTRY_TABLE_DDL` keeps its version-4 pin; it is
-  idempotent. No fact, journal, research or lab table changes, and nothing
-  writes the `development_boundary` kind or column until T142b. A read-only
-  connection accepts a version-17 store: every read works but the new column,
-  which nothing reads before T142b.
+  row). `_migrate_release_kinds` runs on every fresh or migrating writable
+  store (a fresh one too, since `_REGISTRY_TABLE_DDL` keeps its version-4
+  pin), never on one already at 18; it is idempotent. No fact, journal,
+  research or lab table changes, and nothing writes the `development_boundary`
+  kind or column until T142b. A read-only connection accepts a version-17
+  store: every read works but the new column, which nothing reads before
+  T142b.
 - **A later DDL change goes to version 19**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
@@ -2830,8 +2831,8 @@ def _migrate_release_kinds(conn: duckdb.DuckDBPyConnection) -> None:
     `owner_decisions.kind` with `lab_schema.RELEASE_DECISION_KINDS` by
     `lab_schema.widen_enum` (a no-op once present; every row kept in insertion
     order) and add the nullable `trials.development_boundary DATE` where missing
-    (NULL on every existing row). Idempotent; runs on every writable store, a
-    fresh one included, inside `init_schema`'s transaction, after
+    (NULL on every existing row). Idempotent; runs on a fresh or migrating
+    writable store (never one already at 18), inside `init_schema`'s transaction, after
     `_migrate_expansion_seams`. `lab_schema` imports this module, so it is
     imported here, at call time."""
     from tradepartner.store import lab_schema
@@ -3001,7 +3002,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_lab(conn)
         if max_version is not None and max_version <= _PRE_EXPANSION_SEAMS_VERSION:
             _migrate_expansion_seams(conn)
-        _migrate_release_kinds(conn)
+        if max_version is None or max_version <= _PRE_RELEASE_VERSION:
+            _migrate_release_kinds(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

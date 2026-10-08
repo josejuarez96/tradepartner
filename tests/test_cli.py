@@ -1154,5 +1154,8 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
     again = _invoke(settings, ["decision", "data-release", "import", str(path)])
     assert again.exit_code == 1 and "already stored" in again.output
     assert len(_releases(settings)) == 2
+    path.write_text("release = [1, 2]\n", encoding="utf-8")
+    not_tables = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    assert not_tables.exit_code == 2 and "must be a table" in not_tables.output
     path.write_text("[[release]\n", encoding="utf-8")
     assert _invoke(settings, ["decision", "data-release", "import", str(path)]).exit_code == 2

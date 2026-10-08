@@ -603,7 +603,9 @@ def _backup_connection(path: Path, settings: Settings) -> Iterator[duckdb.DuckDB
     try:
         conn = duckdb.connect(str(path), read_only=True)
     except duckdb.Error as exc:
-        raise _fail(f"cannot open --backup {path} read-only: {exc}", 1) from None
+        raise _fail(
+            f"cannot open --backup {path} read-only: {_scrubbed(str(exc), settings)}", 1
+        ) from None
     try:
         configure_connection(conn)
         yield conn
@@ -1636,19 +1638,20 @@ def make_app(
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
-        with _backup_connection(backup, s) as copy:
-            decision_id = _release_write(
-                lambda conn: registry.record_trial_state(
-                    conn, copy, name=name, backup_path=str(backup), trial_id=trial, reason=reason
-                ),
-                s,
+
+        def _record(conn: duckdb.DuckDBPyConnection) -> registry.DataRelease:
+            decision_id = registry.record_trial_state(
+                conn, copy, name=name, backup_path=str(backup), trial_id=trial, reason=reason
             )
-        with open_read_only(s) as conn:
             (row,) = [r for r in registry.data_releases(conn) if r.decision_id == decision_id]
+            return row
+
+        with _backup_connection(backup, s) as copy:
+            row = _release_write(_record, s)
         equal = row.values["vintage_equals_trial"]
         runs = len(row.values["repair_runs"])
         typer.echo(
-            f"decision {decision_id}: data_release {name} record for trial {trial}: "
+            f"decision {row.decision_id}: data_release {name} record for trial {trial}: "
             f"data_vintage {_fmt(row.data_vintage)} "
             f"{'equals' if equal else 'DIFFERS FROM'} the trial's "
             f"{row.values.get('trial_data_vintage', '-')}; {runs} repair run(s) since the trial"
@@ -1671,6 +1674,8 @@ def make_app(
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
+        if not all(isinstance(entry, dict) for entry in entries):
+            raise _fail(f"{path}: every [[release]] entry must be a table", USAGE_ERROR)
         groups = _release_write(lambda conn: registry.plan_release_import(conn, entries), s)
         for group in groups:
             ids = _release_write(partial(registry.import_release, entries=group), s)

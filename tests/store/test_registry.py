@@ -1340,11 +1340,10 @@ def test_the_version_18_kinds_are_recorded_by_record_decision(
     assert conn.execute(
         "SELECT kind FROM owner_decisions WHERE decision_id = ?", [decision_id]
     ).fetchone() == ("development_boundary",)
-    registry.record_decision(conn, kind="data_release", reason="r", values=_jsonable(_BEFORE))
-
-
-def _jsonable(entry: dict[str, Any]) -> dict[str, Any]:
-    return {k: v.isoformat() if isinstance(v, date) else v for k, v in entry.items()}
+    # A data_release row has one writer per stage, so `data_vintage` can parse it.
+    with pytest.raises(ValueError, match="release writers only"):
+        registry.record_decision(conn, kind="data_release", reason="r", values={})
+    assert registry.data_releases(conn) == []
 
 
 def test_open_and_close_a_release(conn: duckdb.DuckDBPyConnection) -> None:
@@ -1559,6 +1558,11 @@ def test_the_import_checks_every_entry_before_writing(
         ([_BEFORE, {**_BEFORE, "name": "other"}], "would leave 2 releases open"),
         ([_BEFORE, {**_AFTER, "made_at": datetime(2026, 9, 1, tzinfo=UTC)}], "made before"),
         ([{**_BEFORE, "stage": "record", "trial": 7}], "trial 7 does not exist"),
+        ([1, "x"], "entry 1 is not a table"),
+        (
+            [{**_BEFORE, "made_at": datetime.fromisoformat("2026-09-26T16:05:00+02:00")}],
+            "a UTC",
+        ),
         (
             [{**_BEFORE, "stage": "record", "trial": 1}, {**_AFTER}],
             "shares its name",
@@ -1596,3 +1600,14 @@ def test_development_boundary_is_the_newest_row(conn: duckdb.DuckDBPyConnection)
     boundary = registry.development_boundary(conn)
     assert boundary is not None
     assert (boundary.boundary, boundary.reason) == (date(2022, 12, 30), "set 2022-12-30")
+
+
+def test_the_import_refuses_an_after_for_a_release_opened_by_command(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """quant-auditor on #1336: an imported `after` moves no vintage, so it may not
+    close a release `open` wrote; that one closes with `close`."""
+    _open_release(conn, "repair-13-tickers")
+    with pytest.raises(registry.ReleaseRefused, match="written by `open`"):
+        registry.plan_release_import(conn, [_AFTER])
+    assert [r.stage for r in registry.data_releases(conn)] == ["before"]
