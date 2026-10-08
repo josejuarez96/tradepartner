@@ -36,10 +36,13 @@ from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection
 from tradepartner.store.delistings import DELISTED, LISTED, build_delistings, derive_listing_ends
 from tradepartner.store.master import (
+    BENCHMARK_PREFIX,
+    INSTRUMENT_ID_SEPARATOR,
     ClassTitle,
     MasterBuild,
     ShownSpan,
     Succession,
+    _refuse_separator,
     build_master,
     primary_security_id,
     securities_as_of,
@@ -463,6 +466,116 @@ class TestBenchmarks:
         ids = {row["security_id"] for row in built.securities}
         assert SPY_TRUST not in ids
         assert ISHARES not in ids
+
+
+#: The fixture master's ids, pinned byte-identical: ADR 0015 seam 6 reserves
+#: the instrument-id namespace but changes no bytes (T138).
+_FIXTURE_SECURITY_IDS = (
+    "0000000001",
+    "0000000003",
+    "0000000004",
+    "0000000005",
+    "0000000006",
+    "0000000007",
+    "0000000007:class-c-capital-stock",
+    "0000000007:6pct-preferred-stock",
+    "0000000008",
+    "0000000009",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000011",
+    "0000000011:depositary-shares",
+    "0000000012",
+    "0000000013",
+    "0000000014",
+    "0000000014:depositary-shares",
+    "0000000014:depositary-shares-2",
+    "0000000015",
+    "BENCH:SPY",
+    "BENCH:MTUM",
+)
+_FIXTURE_LISTING_IDS = (
+    "0000000001",
+    "0000000004",
+    "0000000004",
+    "0000000005",
+    "0000000006",
+    "0000000007",
+    "0000000007:class-c-capital-stock",
+    "0000000007:6pct-preferred-stock",
+    "0000000007",
+    "0000000008",
+    "0000000009",
+    "0000000009",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000011",
+    "0000000011:depositary-shares",
+    "0000000012",
+    "0000000012",
+    "0000000013",
+    "0000000013",
+    "0000000014",
+    "0000000014:depositary-shares",
+    "0000000014:depositary-shares-2",
+    "0000000015",
+    "0000000015",
+    "BENCH:SPY",
+    "BENCH:MTUM",
+)
+
+
+class TestInstrumentIdRule:
+    """ADR 0015 seam 6: every `security_id` is read as an *instrument id*; a
+    typed id carries a prefix and the separator (`BENCH:` today, the only
+    prefixed ids the master writes), and the master's own derivation can
+    never mint one. A derived class id's one `:` is its class separator,
+    whose token before it is a CIK, never an instrument type."""
+
+    def test_fixture_ids_are_byte_identical(self, built: MasterBuild) -> None:
+        assert tuple(row["security_id"] for row in built.securities) == _FIXTURE_SECURITY_IDS
+        assert tuple(row["security_id"] for row in built.listings) == _FIXTURE_LISTING_IDS
+
+    def test_no_derived_id_carries_an_instrument_type_prefix(self, built: MasterBuild) -> None:
+        ciks = {row["cik"] for row in built.securities if not row["benchmark"]}
+        derived = [row["security_id"] for row in built.securities if not row["benchmark"]]
+        assert derived
+        for security_id in derived:
+            prefix = security_id.partition(INSTRUMENT_ID_SEPARATOR)[0]
+            assert prefix in ciks, security_id
+
+    def test_primary_ids_carry_no_separator(self, built: MasterBuild) -> None:
+        ciks = {row["cik"] for row in built.securities if not row["benchmark"]}
+        assert all(INSTRUMENT_ID_SEPARATOR not in primary_security_id(cik) for cik in ciks)
+
+    def test_equity_derived_ids_carry_no_separator(self) -> None:
+        # A master whose only classes are the CIKs themselves: every id it
+        # derives for a share is a CIK, with no separator (the benchmarks are
+        # the only prefixed ids, checked separately).
+        source = FixtureFilingSource(
+            index=[_filing(ACME, "Acme Corp", "10-K", _at(2005, 3, 1))],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        equity_ids = [row["security_id"] for row in build.securities if not row["benchmark"]]
+        assert equity_ids == [ACME]
+        assert all(INSTRUMENT_ID_SEPARATOR not in sid for sid in equity_ids)
+
+    def test_every_benchmark_id_starts_with_the_prefix(self, built: MasterBuild) -> None:
+        benchmarks = [row["security_id"] for row in built.securities if row["benchmark"]]
+        assert benchmarks
+        prefix = f"{BENCHMARK_PREFIX}{INSTRUMENT_ID_SEPARATOR}"
+        assert all(security_id.startswith(prefix) for security_id in benchmarks)
+
+    def test_a_cik_holding_the_separator_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="separator"):
+            primary_security_id(f"{ACME}{INSTRUMENT_ID_SEPARATOR}x")
+
+    def test_a_base_holding_the_separator_is_refused(self) -> None:
+        base = f"{ACME}@2020-11-05{INSTRUMENT_ID_SEPARATOR}x"
+        with pytest.raises(ValueError, match="separator"):
+            _refuse_separator(base, "base")
 
 
 class TestWriteAndRead:
