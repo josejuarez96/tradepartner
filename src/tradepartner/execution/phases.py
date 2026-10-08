@@ -132,7 +132,7 @@ from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, is_ful
 from tradepartner.execution.reattempts import attempt_scope
 from tradepartner.execution.risk import BuyToSize, Skip, round_down, size_buys
 from tradepartner.store.journal import DecisionRow, OrderRow
-from tradepartner.store.schema import DELISTED_REASON, UNTARGETED_RECEIPT_REASON
+from tradepartner.store.schema import DELISTED_REASON, LONG, UNTARGETED_RECEIPT_REASON
 
 __all__ = ["HeldSell", "PhaseOrder", "PhaseOrders", "buy_orders", "requests_for", "sell_orders"]
 
@@ -154,7 +154,7 @@ class PhaseOrder:
     """One order of a phase before the risk check: exactly one of `notional`
     (a buy) and `quantity`. `decision` is the decision's kind; `full_exit` is
     `plan.is_full_exit`; `whole_share` the order's basis; `price` the reference
-    price on S; `target_weight` the decision's."""
+    price on S; `target_weight` and `position_side` the decision's."""
 
     decision_id: int
     security_id: str
@@ -166,6 +166,7 @@ class PhaseOrder:
     full_exit: bool = False
     whole_share: bool = False
     target_weight: float | None = None
+    position_side: str = LONG
 
     def to_risk(self, symbol: str, *, listing_ended: bool) -> risk.PhaseOrder:
         """The `risk.check_phase` candidate for this order, with the name's
@@ -183,6 +184,7 @@ class PhaseOrder:
             whole_share=self.whole_share,
             target_weight=self.target_weight,
             listing_ended=listing_ended,
+            position_side=self.position_side,
         )
 
 
@@ -447,6 +449,7 @@ def sell_orders(
                 full_exit=full_exit,
                 whole_share=whole,
                 target_weight=decision.target_weight,
+                position_side=decision.position_side,
             )
         )
     return PhaseOrders(tuple(orders), tuple(skips), session=session, held=tuple(held_sells))
@@ -545,6 +548,7 @@ def buy_orders(
                 quantity=sizing.quantity,
                 whole_share=whole,
                 target_weight=decision.target_weight,
+                position_side=decision.position_side,
             )
         )
     left = Decimal(repr(float(cash))) - spent

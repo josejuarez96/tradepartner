@@ -13,7 +13,8 @@ journal. Nothing here reads a clock or the store.
   disposal per lot touched, with proceeds, realised gain or loss before any
   wash-sale adjustment, and the tax year of the local trade date (R20). A sale
   of more than the ledger holds raises `LotLedgerError`: the vehicle is long
-  only.
+  only, and so does any order whose `position_side` is not long (ADR 0015
+  seam 2).
 - **Merged orders.** An order with any `price_implied` fill (the synthetic
   residual of `paper resume`) becomes one acquisition or one sale: its fills'
   total quantity at the order's average price (their total value over their
@@ -53,6 +54,7 @@ from zoneinfo import ZoneInfo
 
 from tradepartner.adapters.broker import Asset
 from tradepartner.store.journal import OrderedFill, OrderRow
+from tradepartner.store.schema import LONG
 
 #: IRC section 1091(a): the window runs from this many days before a loss sale
 #: to this many days after it (the "61-day period" of 26 CFR 1.1091-1(a)).
@@ -167,7 +169,16 @@ def rebuild(
     `LotLedgerError` on a sale beyond the holding, which a split, a spin-off
     receipt or a stock merger (none of them a fill) produces, and on a fill
     with a non-finite quantity or price or a naive `filled_at`: a writer must
-    catch it and alert rather than fail its run."""
+    catch it and alert rather than fail its run. Also raises it on any order
+    whose `position_side` is not `schema.LONG`: closing short lots is the
+    shorting ADR's (ADR 0015 seam 2), so every `Lot` and `Disposal` is long
+    and `LotRow` and `DisposalRow` keep the DDL default."""
+    for order in orders:
+        if order.position_side != LONG:
+            raise LotLedgerError(
+                f"order {order.client_order_id!r} has position_side "
+                f"{order.position_side!r}: the lot ledger is long only"
+            )
     lot_list: list[Lot] = []
     disposals: list[Disposal] = []
     same_sale: dict[int, dict[int, Decimal]] = {}  # disposal id -> lot id -> quantity sold

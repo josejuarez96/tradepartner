@@ -56,6 +56,11 @@ orders left to submit). In order:
      buy or trim of a name no longer `fractionable` goes by whole shares (the
      wrapper floors it); a full exit goes by its decision's `whole_share` flag
      alone, so a name that lost `fractionable` is still sold whole (#395).
+   - `refused_position_side`: an order of the phase, or a row of
+     `rows_on_session` (the session's `decisions` and `orders` rows the
+     wrapper read), whose `position_side` is not `schema.LONG`, one violation
+     per such order or row. Structural, like the two above: no short, ever,
+     until the shorting ADR (ADR 0015 seam 2, amending ADR 0010 point 1).
 
 Equity is the ledger's at `price_of` (the reference price, close(S-1)).
 
@@ -95,6 +100,7 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import _SPLIT as _SPLIT_ACTION
 from tradepartner.execution.plan import BuyCosts, Remainder, _split_factor
+from tradepartner.store import schema
 from tradepartner.store.journal import (
     TERMINAL_ORDER_STATUSES,
     DecisionRow,
@@ -124,6 +130,8 @@ _SELL = "sell"
 _FORCED_EXIT = "forced_exit"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
+#: The structural rule refusing any position side but long (ADR 0015 seam 2).
+_REFUSED_POSITION_SIDE = "refused_position_side"
 #: Cash is compared in cents (spec req 3 (c)).
 _CENT = Decimal(1).scaleb(-2)
 #: Skips exempt from `risk.max_skips_per_run` (spec req 3).
@@ -140,7 +148,8 @@ class PhaseOrder:
     holding; `whole_share` is the order's basis (the decision's flag, or, for
     a buy or trim, the name's lost `fractionable`); `price` is the reference price at close(S-1);
     `target_weight` is a buy decision's; `listing_ended` is true when the
-    name's listing ended at close(S-1)."""
+    name's listing ended at close(S-1); `position_side` is the decision's
+    (`check_phase` refuses anything but `schema.LONG`)."""
 
     decision_id: int
     security_id: str
@@ -154,6 +163,7 @@ class PhaseOrder:
     whole_share: bool = False
     target_weight: float | None = None
     listing_ended: bool = False
+    position_side: str = schema.LONG
 
     def shares(self) -> float:
         """The order in shares (a notional buy at its reference price)."""
@@ -453,11 +463,13 @@ def check_phase(
     open_sells: Sequence[OpenSell] = (),
     prior_orders: int = 0,
     prior_skips: int = 0,
+    rows_on_session: Sequence[DecisionRow | OrderRow] = (),
 ) -> Violations | Skips:
     """Check one phase's batch (module docstring). `assets` is keyed by
     `security_id`; `open_sells` are the non-terminal own sells from any session
     (`unfilled_sells`); `prior_orders` and `prior_skips` are this run's earlier
-    phases' counts."""
+    phases' counts; `rows_on_session` are the session's `decisions` and
+    `orders` rows, read only for `refused_position_side`."""
     for order in orders:
         if order.side not in (_BUY, _SELL):
             raise ValueError(f"order of decision {order.decision_id} has side {order.side!r}")
@@ -480,6 +492,25 @@ def check_phase(
 
     def breach(rule: str, detail: str, kind: str = _LIMIT_BREACH) -> None:
         violations.append(Violation(kind, rule, detail))
+
+    for order in orders:
+        if order.position_side != schema.LONG:
+            breach(
+                _REFUSED_POSITION_SIDE,
+                f"order of decision {order.decision_id} for {order.security_id} "
+                f"has position_side {order.position_side!r}",
+            )
+    for row in rows_on_session:
+        if row.position_side != schema.LONG:
+            what = (
+                f"order {row.client_order_id}"
+                if isinstance(row, OrderRow)
+                else f"decision {row.decision_id}"
+            )
+            breach(
+                _REFUSED_POSITION_SIDE,
+                f"{what} for {row.security_id} has position_side {row.position_side!r}",
+            )
 
     skips: list[Skip] = []
     left: list[PhaseOrder] = []

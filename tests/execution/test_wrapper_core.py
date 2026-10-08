@@ -69,7 +69,11 @@ from tradepartner.store.journal import (
     decisions_for,
     order_events_for,
 )
-from tradepartner.store.schema import HALT_REASON
+from tradepartner.store.schema import HALT_REASON, LONG
+
+from .test_wrapper_phases import T_I, A, Env, _execute, _gate, _missed, _submits
+
+pytest_plugins = ("execution.test_wrapper_phases",)
 
 FROZEN = RiskConfig()
 SESSION = date(2026, 10, 1)
@@ -1159,3 +1163,61 @@ def test_a_clock_error_from_the_replay_fetch_keeps_its_type(
     gate = _wrapper(journal_settings, scripted_fake, fixed_clock, alerter_conn)
     with pytest.raises(ClockError, match="adapter clock"):
         gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))
+
+
+# --- the position side (ADR 0015 seam 2, plan T134) ----------------------------------------
+
+
+def test_a_short_decision_halts_the_batch_before_any_submit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A `decisions` row with `position_side = 'short'` (which nothing in `src/`
+    writes: the row is the journal's, however it got there) halts the batch
+    with `LimitBreachError` naming `refused_position_side` before any submit,
+    through the batch's `missed` row; the run's halt path then writes the
+    `kill_switch` row. The batch's long buy beside it is not submitted either:
+    the batch halts whole, as for every structural rule."""
+    at = env.run.started_at
+    rows = []
+    for security_id, side in ((A, "short"), ("SEC_DUAL_B", LONG)):
+        row = DecisionRow(
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            rebalance_session=T_I,
+            security_id=security_id,
+            target_weight=0.04,
+            side="buy",
+            planned_notional=3000.0,
+            target_notional=3000.0,
+            whole_share=False,
+            decision="trade",
+            position_side=side,
+            known_at=at,
+            ingested_at=at,
+        )
+        (decision_id,) = _append(env.settings, row)
+        rows.append(replace(row, decision_id=decision_id))
+    short_id = rows[0].decision_id
+    gate = _gate(env, alerter_conn)
+
+    with pytest.raises(LimitBreachError, match="refused_position_side") as raised:
+        _execute(gate, env, rows)
+    message = str(raised.value)
+    # Both the journaled decision and the order `to_risk` built from it are named.
+    assert f"order of decision {short_id} " in message
+    assert f"refused_position_side: decision {short_id} " in message
+    assert "SEC_DUAL_B" not in message
+    assert _submits(env.fake) == []
+    orders_sql = "SELECT COUNT(*) FROM orders WHERE run_id = ?"
+    assert _query(env.settings, orders_sql, [env.run.run_id]) == [(0,)]
+    assert _missed(env.settings) == [("missed", "limit_breach")]
+
+    with pytest.raises(LimitBreachError):
+        _halt(gate, raised.value, env.run)
+    [(source, fault_type, reason)] = _query(
+        env.settings,
+        "SELECT source, fault_type, reason FROM kill_switch WHERE run_id = ?",
+        [env.run.run_id],
+    )
+    assert (source, fault_type) == ("fault", "LimitBreachError")
+    assert "refused_position_side" in reason
+    assert _submits(env.fake) == []

@@ -127,7 +127,9 @@ falling back to `settings.costs`. Each phase, in order:
    its amendments change this one read (`_buys_cash`), a size-S issue here;
 5. every `OrderRequest` built and validated (`phases.requests_for`): a
    `ValueError` halts the phase before any request reaches the broker;
-6. `risk.check_phase` against that same cash: a violation raises
+6. `risk.check_phase` against that same cash, with the batch's decisions and
+   the session's `orders` rows as `rows_on_session` (a `position_side` other
+   than long is `refused_position_side`, ADR 0015 seam 2): a violation raises
    `LimitBreachError` (any `limit_breach`) or `SkipCapError` with zero submits,
    after a `missed` `rebalance_events` row with that reason when the **batch**
    held the rebalance's decisions, whichever phase breached (a
@@ -254,7 +256,7 @@ from tradepartner.store.journal import (
     reconciliations_for,
     runs_for,
 )
-from tradepartner.store.schema import HALT_REASON
+from tradepartner.store.schema import HALT_REASON, LONG
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -699,6 +701,7 @@ class RiskGatedBroker:
                 _SELL if decisions else _EXIT,
                 0,
                 0,
+                rows=rows,
                 open_sells=open_sells,
             )
             # The skips and the held sells ride along: `buy_orders` never buys
@@ -765,6 +768,7 @@ class RiskGatedBroker:
             _BUY,
             prior_orders,
             prior_skips,
+            rows=rows,
             in_flight=not scope.last,
         )
         submitted = self._submit_all(gated.to_submit)
@@ -827,6 +831,7 @@ class RiskGatedBroker:
         prior_orders: int,
         prior_skips: int,
         *,
+        rows: Sequence[DecisionRow],
         in_flight: bool = True,
         open_sells: Sequence[OpenSell] | None = None,
     ) -> _Gated:
@@ -837,7 +842,10 @@ class RiskGatedBroker:
         `phases.sell_orders` (#605), so the trim it just capped is checked
         against the cap it was capped by. Left unset, it is read fresh from
         `book` here for the phase's own names (the buys phase, which never caps a
-        sell)."""
+        sell). `rows` are the batch's decisions: with the session's `orders`
+        rows from `book` they are `check_phase`'s `rows_on_session`, so a row
+        whose `position_side` is not long halts the batch here, before the
+        phase's first submit (`refused_position_side`, ADR 0015 seam 2)."""
         assert run.session is not None and run.run_id is not None
         session = run.session
         self._requests(built, book, session)
@@ -860,6 +868,7 @@ class RiskGatedBroker:
             open_sells=open_sells,
             prior_orders=prior_orders,
             prior_skips=counted,
+            rows_on_session=[*rows, *(o for o in book.orders if o.session == session)],
         )
         if isinstance(verdict, Violations):
             self._refuse(run, verdict, rebalance)
@@ -906,6 +915,10 @@ class RiskGatedBroker:
                     notional=request.notional,
                     quantity=request.quantity,
                     book_id=book.window.book_id,
+                    # Long, always: written explicitly, never left to the
+                    # default (ADR 0015 seam 2; `check_phase` refused any
+                    # other side above).
+                    position_side=LONG,
                     sells_in_flight_at_submit=True if order.side == _SELL else in_flight,
                     known_at=stamp,
                     ingested_at=stamp,
