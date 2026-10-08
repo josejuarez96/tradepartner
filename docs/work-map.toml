@@ -728,10 +728,20 @@ what = "Expansion seams: the owner's long-term direction (swing and day trading,
 why = "Each seam is a column, a field or a default argument now and a backfill migration during the six-month paper window later; the id format becomes Alpaca-side history on the first submit and can never be changed."
 unblocks = ["task:T48c", "task:T71"]
 
+[adr.0016]
+what = "One global development boundary (recommended 2023-12-29) as a frozen owner_decisions row that every in-sample window ends at or before; exams stay one-spend for frozen finalists; a holdout that lies in the future at registration is a forward exam judged by the paper book; moving the boundary is a recorded owner decision."
+why = "The lab derives a strategy's practice end from its own holdout start, so B4 (a child of momentum) would practise through momentum's spent exam and B3's unspent one; one global boundary fixes that without the per-strategy date knob the owner withdrew, and writes down that every new family's exam is forward until history is extended."
+unblocks = ["plan:data-foundation", "issue:1292"]
+
 [issue.1258]
 what = "Turn ADR 0015's plan sketch (TE0 to TE7) into Phase 4 plan tasks T132 to T139 with their files, tests, dependencies, declared chains and the T48b, T48c and T71 gates."
 why = "A seam the ADR opened is built only from a claimable task line; the lines fix the DDL, the id token and the refusal names so three teams can build them in parallel before paper start."
 unblocks = ["task:T132", "task:T133", "task:T134", "task:T135", "task:T135b", "task:T136", "task:T138", "task:T139"]
+
+[issue.1319]
+what = "The history-and-identity side track from the accepted data-architecture evaluation (#1303): ADR 0016 (the development boundary and forward exams) and the data-foundation plan amendment with its tasks (named data releases, the #1314 repair under a release, the boundary's code, the USD 69 Sharadar overlap test with its pass/fail numbers, the vendor ADR gate, adapters only if buying, deferred items with triggers)."
+why = "Short history is the real bottleneck for comparing strategies honestly; this track names the data the store holds, unblocks B4 on practice data, and settles with numbers whether a paid vendor is worth USD 499 a year, without building anything the decision record defers."
+unblocks = ["adr:0016", "plan:data-foundation"]
 
 [task.T132]
 what = "TE0: schema version 17, the book_id, position_side and order-shape columns on the eight journal tables with their defaults, one rebuild migration, the row types' matching fields."
