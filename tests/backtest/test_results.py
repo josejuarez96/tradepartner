@@ -144,6 +144,7 @@ def _open(
     synthetic: bool = False,
     start: date = START,
     slug: str = "h1",
+    detail_level: registry.DetailLevel = "full",
 ) -> registry.TrialHandle:
     return registry.open_trial(
         conn,
@@ -156,6 +157,7 @@ def _open(
         run_by="test",
         settings=settings,
         repo_dir=tmp_path,
+        detail_level=detail_level,
     )
 
 
@@ -1030,7 +1032,7 @@ def _detail_trial(
     start: date,
     detail_level: results_module.DetailLevel,
 ) -> tuple[registry.TrialHandle, dict[float, BacktestResult]]:
-    handle = _open(conn, settings, tmp_path, start=start)
+    handle = _open(conn, settings, tmp_path, start=start, detail_level=detail_level)
     results = _run(settings, handle, start=start)
     assert write_results(conn, handle, results, settings, detail_level=detail_level) == "ok"
     return handle, results
@@ -1118,6 +1120,31 @@ class TestDetailLevel:
         results = _run(settings, handle)
         with pytest.raises(ValueError, match="detail level"):
             write_results(conn, handle, results, settings, detail_level="partial")  # type: ignore[arg-type]
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+    @pytest.mark.parametrize("detail_level", ["summary", "full"])
+    def test_the_trials_row_records_the_detail_level_written(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, detail_level: str
+    ) -> None:
+        """#1197: a summary trial reads `summary` on its `trials` row, so the backtest
+        page (T112) does not look for rows a summary trial never stores."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle, _ = _detail_trial(conn, settings, tmp_path, START, detail_level)  # type: ignore[arg-type]
+        row = conn.execute(
+            "SELECT detail_level FROM trials WHERE trial_id = ?", [handle.trial_id]
+        ).fetchone()
+        assert row == (detail_level,)
+
+    def test_a_level_other_than_the_opened_one_is_refused_before_any_write(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)  # opened at `full`
+        results = _run(settings, handle)
+        with pytest.raises(ValueError, match="opened at detail level"):
+            write_results(conn, handle, results, settings, detail_level="summary")
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
 
 
