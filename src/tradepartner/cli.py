@@ -2093,7 +2093,7 @@ def make_app(
         accept_broker_fills: Annotated[
             bool, typer.Option("--accept-broker-fills", help="settle lagging fills (req 8)")
         ] = False,
-        accept_rejections: Annotated[
+        accept_rejections_flag: Annotated[
             bool,
             typer.Option("--accept-rejections", help="accept rejection-cap verdicts (req 5)"),
         ] = False,
@@ -2109,7 +2109,7 @@ def make_app(
                 clock,
                 reason,
                 accept_broker_fills,
-                accept_rejections=accept_rejections,
+                accept_rejections=accept_rejections_flag,
             ),
         )
         lines = [

@@ -46,12 +46,18 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    `accept_rejections = True`, no match, except, import, global or nonlocal
    capture, and no `def`, `async def` or `class` named for it), and every
    such parameter is keyword-only (so no positional argument can feed it).
-4. No module imports `execution.resume` except those in `RESUME_CALLERS`. There
-   are none yet: the `paper resume` CLI is T67. T67 adds `cli.py` here and to
-   `ALLOWED`, with the flag as an explicit `argparse` `store_true` option and one
-   reviewed exception to rule 3 for `accept_rejections=args.accept_rejections`
-   (an attribute, which rule 3 otherwise refuses), and adds `resume` to
-   `_KEYWORD_CALLEES`.
+4. No module imports `execution.resume` except those in `RESUME_CALLERS`: only
+   `cli.py`, the `paper resume` command (T67). `cli.py` is in `ALLOWED` and
+   `resume` in `_KEYWORD_CALLEES`, and rule 3 has exactly one reviewed exception
+   for it (`_is_cli_pass`): the Typer option `--accept-rejections` is the
+   parameter `accept_rejections_flag` (`CLI_FLAG`, a different name, so its
+   `False` default is the `store_true` default and rule 2 still holds for every
+   `accept_rejections` parameter), bound once, as a parameter whose default is
+   the constant `False`, and loaded only as the value of
+   `paper_resume.resume(..., accept_rejections=accept_rejections_flag)`. A
+   second such pass, a literal or any other expression under the keyword, any
+   other use or binding of `accept_rejections_flag`, or the same shape in any
+   other module, is refused.
 5. No config field anywhere in `Settings` is named for it.
 
 Known limits, not checked here (#696 closed what a name-based scan can):
@@ -89,14 +95,18 @@ SRC = ROOT / "src"
 FLAG = "accept_rejections"
 SPELLINGS = (FLAG, "accept-rejections")
 RESUME_MODULE = "tradepartner.execution.resume"
+CLI_MODULE = "tradepartner.cli"
 ALLOWED = frozenset(
     {
         RESUME_MODULE,  # takes the flag, journals it, applies it
+        CLI_MODULE,  # `paper resume --accept-rejections` (T67), rule 4's one exception
         "tradepartner.store.journal",  # ResumeInvocationRow.accept_rejections
         "tradepartner.store.schema",  # the column's DDL and its migration
     }
 )
-RESUME_CALLERS: frozenset[str] = frozenset()
+RESUME_CALLERS: frozenset[str] = frozenset({CLI_MODULE})
+#: The `paper resume` Typer parameter behind `--accept-rejections` (rule 4).
+CLI_FLAG = "accept_rejections_flag"
 #: Names the fence refuses to see rebound anywhere: `resume`'s own type
 #: check (`isinstance`, `type`) and the type `isinstance` is always checked
 #: against here (`bool`), so a custom `__instancecheck__` can't see the flag.
@@ -112,8 +122,9 @@ _REACH_ATTRIBUTES = frozenset({"__builtins__", "__globals__", "__dict__"})
 #: The only callees the flag may be passed on to under `accept_rejections=`:
 #: `resume`'s own `_start` and the journal row. Any other callee (`dict`, an
 #: alias of it, `OrderedDict`, `SimpleNamespace`, a local `def f(**kw)`) could
-#: collect it into a mapping and feed it on positionally. T67 adds `resume`.
-_KEYWORD_CALLEES = frozenset({"_start", "ResumeInvocationRow"})
+#: collect it into a mapping and feed it on positionally; and `resume`, which
+#: `resume.py` defines and `cli.py` reaches only through rule 4's one exception.
+_KEYWORD_CALLEES = frozenset({"_start", "resume", "ResumeInvocationRow"})
 JOURNAL_MODULE = "tradepartner.store.journal"
 
 
@@ -248,7 +259,7 @@ def _is_reviewed_callee_binding(node: ast.AST, name: str) -> bool:
     from the journal."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return (
-            name == "_start"
+            name in ("_start", "resume")
             and not node.decorator_list
             and node.args.kwarg is None
             and any(a.arg == FLAG for a in node.args.kwonlyargs)
@@ -282,7 +293,73 @@ def _is_unpacked(node: ast.expr, parents: dict[int, ast.AST]) -> bool:
     return isinstance(parent, ast.keyword) and parent.arg is None and parent.value is node
 
 
-def misuses(tree: ast.Module) -> list[str]:
+def _is_cli_pass(node: ast.keyword, parents: dict[int, ast.AST]) -> bool:
+    """Rule 4's one reviewed exception, by exact shape: the keyword
+    `accept_rejections=accept_rejections_flag` (a bare `Load` of `CLI_FLAG`)
+    of a call to `paper_resume.resume`."""
+    call = parents.get(id(node))
+    return (
+        node.arg == FLAG
+        and isinstance(node.value, ast.Name)
+        and node.value.id == CLI_FLAG
+        and isinstance(node.value.ctx, ast.Load)
+        and isinstance(call, ast.Call)
+        and node in call.keywords
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "resume"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "paper_resume"
+    )
+
+
+def _arg_default(arguments: ast.arguments, arg: ast.arg) -> ast.expr | None:
+    """The default of `arg` in `arguments`, or None when it has none."""
+    positional = [*arguments.posonlyargs, *arguments.args]
+    if arg in positional:
+        offset = positional.index(arg) - (len(positional) - len(arguments.defaults))
+        return arguments.defaults[offset] if offset >= 0 else None
+    if arg in arguments.kwonlyargs:
+        return arguments.kw_defaults[arguments.kwonlyargs.index(arg)]
+    return None
+
+
+def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
+    """Rule 4's exception, fail closed: in `cli.py`, `CLI_FLAG` is bound exactly
+    once, as a parameter whose default is the constant `False`, and loaded
+    only as the value of the one reviewed pass (`_is_cli_pass`), at most once."""
+    found = []
+    params = []
+    passes = 0
+    for node in ast.walk(tree):
+        for name, how in _bound(node):
+            if name == CLI_FLAG and not isinstance(node, ast.arg):
+                found.append(f"{getattr(node, 'lineno', 0)}: binds {CLI_FLAG} in {how}")
+        if isinstance(node, ast.arguments):
+            for arg in [*node.posonlyargs, *node.args, *node.kwonlyargs]:
+                if arg.arg == CLI_FLAG:
+                    params.append(arg)
+                    default = _arg_default(node, arg)
+                    if not (isinstance(default, ast.Constant) and default.value is False):
+                        found.append(f"{arg.lineno}: {CLI_FLAG}'s default is not False")
+            for loose in (node.vararg, node.kwarg):
+                if loose is not None and loose.arg == CLI_FLAG:
+                    found.append(f"{loose.lineno}: {CLI_FLAG} is a */** parameter")
+        if isinstance(node, ast.keyword) and _is_cli_pass(node, parents):
+            passes += 1
+        elif isinstance(node, ast.Name) and node.id == CLI_FLAG:
+            parent = parents.get(id(node))
+            if not (isinstance(parent, ast.keyword) and _is_cli_pass(parent, parents)):
+                found.append(f"{node.lineno}: unreviewed use of {CLI_FLAG}")
+        elif isinstance(node, ast.Attribute) and node.attr == CLI_FLAG:
+            found.append(f"{node.lineno}: names {CLI_FLAG} as an attribute")
+    if len(params) > 1:
+        found.append(f"{CLI_FLAG} is bound as {len(params)} parameters, not one")
+    if passes > 1:
+        found.append(f"{passes} reviewed passes of {CLI_FLAG}: rule 4 allows exactly one")
+    return found
+
+
+def misuses(tree: ast.Module, module: str = "") -> list[str]:
     """Rule 3, fail closed: a parameter that is not keyword-only (so no
     positional argument can feed it), a binding other than a keyword-only
     parameter or a bare annotated field, a PEP 695 type parameter named for
@@ -310,7 +387,8 @@ def misuses(tree: ast.Module) -> list[str]:
     )
     pinned = _TYPE_CHECKS | _REACH | (_KEYWORD_CALLEES if passes_keyword else frozenset())
     parents = _parent_map(tree)
-    found = []
+    cli = module == CLI_MODULE
+    found = _cli_flag_misuses(tree, parents) if cli else []
     for node in ast.walk(tree):
         for name, how in _bound(node):
             if name in pinned and not (
@@ -374,6 +452,8 @@ def misuses(tree: ast.Module) -> list[str]:
             found.append(f"{node.lineno}: binds the name in an import")
         elif isinstance(node, (ast.Global, ast.Nonlocal)) and FLAG in node.names:
             found.append(f"{node.lineno}: declares the name {type(node).__name__.lower()}")
+        elif cli and isinstance(node, ast.keyword) and _is_cli_pass(node, parents):
+            pass  # rule 4's one reviewed exception; `_cli_flag_misuses` pins it
         elif (
             isinstance(node, ast.keyword)
             and node.arg == FLAG
@@ -457,7 +537,7 @@ def test_nothing_gives_the_flag_a_default() -> None:
 
 
 def test_the_flag_is_only_ever_passed_on_by_its_own_name() -> None:
-    assert {name: found for name, tree in MODULES.items() if (found := misuses(tree))} == {}
+    assert {name: found for name, tree in MODULES.items() if (found := misuses(tree, name))} == {}
 
 
 def test_only_the_cli_may_import_resume() -> None:
@@ -594,6 +674,43 @@ def test_the_rules_let_the_callers_own_flag_through() -> None:
     )
     assert misuses(allowed) == []
     assert defaults(allowed) == []
+
+
+#: Rule 4's reviewed shape in `cli.py` (a Typer option under another name).
+CLI_PASS = (
+    "def paper_resume_(reason: str, accept_rejections_flag: bool = False) -> None:\n"
+    "    paper_resume.resume(s, c, b, k, reason, False, accept_rejections=accept_rejections_flag)\n"
+)
+
+
+def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
+    assert misuses(ast.parse(CLI_PASS), CLI_MODULE) == []
+    assert misuses(ast.parse(CLI_PASS))  # the same shape anywhere else is refused
+    assert defaults(ast.parse(CLI_PASS)) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a second reviewed exception
+        CLI_PASS + "    paper_resume.resume(s, accept_rejections=accept_rejections_flag)\n",
+        CLI_PASS + "def again(accept_rejections_flag: bool = False) -> None: ...\n",
+        # a literal or any other expression under the keyword
+        CLI_PASS.replace("accept_rejections=accept_rejections_flag", "accept_rejections=True"),
+        CLI_PASS.replace("=accept_rejections_flag)", "=not accept_rejections_flag)"),
+        CLI_PASS.replace("=accept_rejections_flag)", "=bool(accept_rejections_flag))"),
+        # another callee, another default, another binding or use
+        CLI_PASS.replace("paper_resume.resume(", "other.resume("),
+        CLI_PASS.replace("paper_resume.resume(", "paper_resume._start("),
+        CLI_PASS.replace("bool = False", "bool = True"),
+        CLI_PASS.replace(": bool = False", ": bool"),
+        CLI_PASS + "    accept_rejections_flag = True\n",
+        CLI_PASS + "    x = accept_rejections_flag\n",
+        CLI_PASS + "    other(flag=accept_rejections_flag)\n",
+    ],
+)
+def test_the_cli_exception_refuses_anything_but_its_one_shape(source: str) -> None:
+    assert misuses(ast.parse(source), CLI_MODULE), source
 
 
 def _field_names(model: type[BaseModel]) -> set[str]:

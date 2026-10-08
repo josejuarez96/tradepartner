@@ -27,6 +27,7 @@ from tradepartner import cli
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
+from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
 from tradepartner.execution import switch
 from tradepartner.execution.lock import run_lock
@@ -824,3 +825,23 @@ def test_commands_under_a_held_run_lock_exit_locked(clock: _Clock, factory: _Fac
     assert run.exit_code == 1  # the runbook's table: `locked` exits CRASH_EXIT_CODE
     assert "paper run: locked" in run.output
     assert factory.fake.calls == before
+
+
+@pytest.mark.parametrize(("flags", "accepted"), [((), False), (("--accept-rejections",), True)])
+def test_resume_passes_the_owners_flags_on_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _Clock,
+    factory: _Factory,
+    flags: tuple[str, ...],
+    accepted: bool,
+) -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        seen.append((args[5], kwargs))
+        return paper_resume.ResumeOutcome(paper_resume.RELEASED, 1)
+
+    monkeypatch.setattr(paper_resume, "resume", recording)
+    out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
+    assert out.exit_code == 0, out.output
+    assert seen == [(False, {"accept_rejections": accepted})]
