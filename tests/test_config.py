@@ -8,8 +8,10 @@ spec; T1 picked conservative ones under the gitignored `data/` directory.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import get_args
 
@@ -1448,8 +1450,34 @@ def test_alpaca_trading_defaults() -> None:
     assert a.trading_requests_per_minute == pytest.approx(150.0)
     assert a.trading_request_timeout_seconds == pytest.approx(30.0)
     assert a.trading_max_retries == 3
-    # Broker facts the recording task (T48b) sets; no default, so the adapter
-    # refuses to construct until they are known.
+    # Broker facts the recording task (T48b) set: 9 decimals, accepted and filled
+    # on paper (tests/fixtures/alpaca/paper/buy_fractional.json, flatten.json);
+    # 128 characters, Alpaca's documented `client_order_id` limit.
+    assert a.quantity_decimals == 9
+    assert a.client_order_id_max_length == 128
+
+
+PAPER_FIXTURES = Path(__file__).parent / "fixtures" / "alpaca" / "paper"
+
+
+def test_quantity_decimals_matches_the_recorded_paper_fills() -> None:
+    """The default precision is the finest quantity paper filled (T48b's
+    recording): every fill fits it, and at least one fill needs all of it."""
+    fills = json.loads((PAPER_FIXTURES / "fill_activities.json").read_text())
+    places = [
+        -Decimal(f["qty"]).normalize().as_tuple().exponent
+        for f in fills
+        if f["activity_type"] == "FILL"
+    ]
+    assert max(places) == _settings().alpaca.quantity_decimals
+
+
+def test_alpaca_broker_facts_may_still_be_unset() -> None:
+    """`None` stays valid, so the adapter's refusal to construct without the
+    recorded facts (T48c) can still be exercised."""
+    a = Settings(
+        _env_file=None, alpaca={"quantity_decimals": None, "client_order_id_max_length": None}
+    ).alpaca
     assert a.quantity_decimals is None
     assert a.client_order_id_max_length is None
 
