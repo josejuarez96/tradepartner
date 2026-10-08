@@ -868,3 +868,74 @@ def test_an_unmapped_or_ambiguous_symbol_raises_system_fault() -> None:
         ticker_for("BRK.B", both, class_symbols=CLASS_SYMBOLS)
     with pytest.raises(SystemFaultError, match="no Alpaca symbol"):
         symbol_for("PG25", exchange="NYSE", class_symbols=CLASS_SYMBOLS)
+
+
+# --- review fixes (pass 1) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [422, 404])
+def test_a_cancel_refused_because_the_order_finished_raises_order_not_open(status: int) -> None:
+    resting = _load("resting")["polls"][-1]
+    finished = dict(
+        _load("resting_cancelled")[0],
+        status="filled",
+        filled_qty="1",
+        filled_avg_price="78.19",
+        filled_at="2026-10-08T15:10:22.1Z",
+    )
+    state = {"rec20261008151015-5": resting}
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id(state))
+
+    def delete(_request: requests.PreparedRequest) -> tuple[int, Any]:
+        state["rec20261008151015-5"] = finished
+        return status, {"code": 42210000, "message": "order is not cancelable"}
+
+    http.route("DELETE", "/v2/orders/[^/]+", delete)
+    with pytest.raises(OrderNotOpenError):
+        broker.cancel("rec20261008151015-5")
+
+
+def test_a_cancel_refused_while_the_order_is_still_open_is_raised() -> None:
+    resting = _load("resting")["polls"][-1]
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", (200, resting))
+    http.route("DELETE", "/v2/orders/[^/]+", (422, {"code": 42210000, "message": "no"}))
+    with pytest.raises(AlpacaTradingError) as err:
+        broker.cancel("rec20261008151015-5")
+    assert err.value.status_code == 422
+
+
+def test_fills_before_since_resolve_no_order() -> None:
+    broker, http = _broker()
+    http.route("GET", "/v2/account/activities/FILL", (200, _load("fill_activities")))
+    finals = _final_orders()
+    first_order = _load("fill_activities")[0]["order_id"]
+    del finals[first_order]  # the first fill's order cannot be resolved
+    http.route("GET", "/v2/orders/[^/]+", _by_id(finals))
+
+    fills = broker.fills(datetime(2026, 10, 8, 15, 10, 19, tzinfo=UTC))
+
+    assert len(fills) == 5
+    resolved = [urlsplit(r.url or "").path for r in http.calls("GET", "/v2/orders/[^/]+")]
+    assert not any(path.endswith(first_order) for path in resolved)
+
+
+def test_a_whole_share_float_quantity_passes_a_zero_decimal_precision() -> None:
+    broker, http = _broker(settings=_settings(quantity_decimals=0))
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (200, _load("buy_whole")["submit"]))
+    request = _request(
+        client_order_id=_load("buy_whole")["submit"]["client_order_id"],
+        notional=None,
+        quantity=1.0,
+    )
+    assert broker.submit(request).quantity == 1.0
+
+
+def test_an_asset_read_answering_fewer_symbols_raises_system_fault() -> None:
+    settings = _settings()
+    raw = AlpacaTradingRaw(settings, clock=FakeClock())
+    raw.get_assets = lambda symbols: []  # type: ignore[method-assign]
+    with pytest.raises(SystemFaultError, match="0 of 1"):
+        AlpacaBroker(settings, lambda: NOW, client=raw).assets(["KO"])

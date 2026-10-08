@@ -34,10 +34,12 @@ the broker has it; the broker's own `client_order_id must be unique` refusal
 (HTTP 422, code 40010001, `duplicate_client_order_id.json`) raises the same.
 
 **Cancel** is a request: it returns `None`, and the outcome is read back through
-`get_order`.
+`get_order`. A cancel the broker refuses (404 or 422) is read again: an order
+that finished in between raises `OrderNotOpenError`, anything else the refusal.
 
 **Fills** come from `GET /v2/account/activities/FILL`, whose rows carry only the
-broker's `order_id`; each distinct id is resolved once per call to its
+broker's `order_id`; each distinct id of a fill kept by `since` is resolved once
+per call to its
 `client_order_id` through `get_order_by_id`, and an id that cannot be resolved
 raises `SystemFaultError` (#1298). `since=None` reads from the Unix epoch; the
 request asks from `since` less `_AFTER_MARGIN` (Alpaca's `after` is strict) and
@@ -65,6 +67,7 @@ code and a response body, and this module's own messages name no setting value.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -116,7 +119,9 @@ _SIMPLE_ORDER_CLASS = "simple"
 #: HTTP status and Alpaca code of the broker's duplicate-id refusal (T48b).
 _NOT_FOUND = 404
 _DUPLICATE_STATUS = 422
-_DUPLICATE_CODE = '"code":40010001'
+_DUPLICATE_CODE = 40010001
+#: A cancel refused because the order is no longer cancelable, or gone.
+_CANCEL_REFUSALS = frozenset({_NOT_FOUND, _DUPLICATE_STATUS})
 #: `fills(None)` reads from here.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 #: Alpaca's activities `after` is strict; ask from a second earlier, then filter.
@@ -234,8 +239,17 @@ def _mapped[A, T](what: str, build: Callable[[A], T], payload: A) -> T:
         raise SystemFaultError(f"malformed alpaca {what}: {type(exc).__name__}: {exc}") from exc
 
 
+def _error_code(error: AlpacaTradingError) -> object:
+    """Alpaca's `code` in a refusal's JSON body, or `None`."""
+    try:
+        body = json.loads(error.body)
+    except ValueError:
+        return None
+    return body.get("code") if isinstance(body, dict) else None
+
+
 def _decimals(value: float) -> int:
-    exponent = Decimal(repr(value)).as_tuple().exponent
+    exponent = Decimal(repr(value)).normalize().as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
 
 
@@ -301,9 +315,7 @@ class AlpacaBroker(Broker):
         try:
             payload = self._raw.submit_order(order_data)
         except AlpacaTradingError as error:
-            if error.status_code == _DUPLICATE_STATUS and _DUPLICATE_CODE in error.body.replace(
-                " ", ""
-            ):
+            if error.status_code == _DUPLICATE_STATUS and _error_code(error) == _DUPLICATE_CODE:
                 raise DuplicateClientOrderIdError(
                     f"the broker refused order {coid!r} as a duplicate"
                 ) from None
@@ -318,8 +330,21 @@ class AlpacaBroker(Broker):
         order = self.get_order(client_order_id)
         if order.status in TERMINAL_STATUSES:
             raise OrderNotOpenError(f"order {client_order_id!r} is {order.status.value}")
-        assert order.broker_order_id is not None
-        self._raw.cancel_order(order.broker_order_id)
+        if order.broker_order_id is None:
+            raise SystemFaultError(f"order {client_order_id!r} has no broker order id")
+        try:
+            self._raw.cancel_order(order.broker_order_id)
+        except AlpacaTradingError as error:
+            if error.status_code not in _CANCEL_REFUSALS:
+                raise
+            # Refused: the order may have finished between the read and the
+            # request. Read it again; a terminal order is `OrderNotOpenError`.
+            again = self.get_order(client_order_id)
+            if again.status in TERMINAL_STATUSES:
+                raise OrderNotOpenError(
+                    f"order {client_order_id!r} is {again.status.value}"
+                ) from None
+            raise
 
     def get_order(self, client_order_id: str) -> Order:
         """The broker's order with `client_order_id`, or `UnknownOrderError`."""
@@ -346,9 +371,13 @@ class AlpacaBroker(Broker):
         owners: dict[str, str] = {}
         fills: list[Fill] = []
         for activity in activities:
-            fill = _mapped("fill activity", lambda a: self._fill(a, owners), activity)
-            if fill.filled_at >= start:
-                fills.append(fill)
+            # Filter first, so no order is resolved for a fill the caller did not ask for.
+            if (
+                _mapped("fill activity", lambda a: _instant(a["transaction_time"]), activity)
+                < start
+            ):
+                continue
+            fills.append(_mapped("fill activity", lambda a: self._fill(a, owners), activity))
         return fills
 
     def positions(self) -> dict[str, Position]:
@@ -372,6 +401,8 @@ class AlpacaBroker(Broker):
         self._now()
         wanted = [canonical_symbol(symbol) for symbol in symbols]
         payloads = self._raw.get_assets(wanted)
+        if len(payloads) != len(wanted):
+            raise SystemFaultError(f"asset read answered {len(payloads)} of {len(wanted)} symbols")
         assets: dict[str, Asset] = {}
         for symbol, payload in zip(wanted, payloads, strict=True):
             if _mapped("asset", lambda p: canonical_symbol(p["symbol"]), payload) != symbol:
