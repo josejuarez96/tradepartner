@@ -628,10 +628,12 @@ def finish(session: ReviewSession) -> FinishResult:
     if session.finished_path.exists():
         done = json.loads(session.finished_path.read_text(encoding="utf-8"))
         return FinishResult(done["outcome"], done["dataset_id"], done["sha256"], done["metrics"])
-    finals = final_lines(session)
-    open_items = [lid for lid, line in finals.items() if line is None]
-    if open_items:
-        raise SessionPartial(f"{len(open_items)} item(s) have no decision: {open_items[:5]}")
+    with _locked(session):  # the check and the freeze are one step: no write between
+        finals = final_lines(session)
+        open_items = [lid for lid, line in finals.items() if line is None]
+        if open_items:
+            raise SessionPartial(f"{len(open_items)} item(s) have no decision: {open_items[:5]}")
+        session.finishing_path.touch()  # the review file is frozen from here on
     decided: dict[str, DecidedFor] = {
         lid: line["decided_for"] for lid, line in finals.items() if line is not None
     }
@@ -645,8 +647,6 @@ def finish(session: ReviewSession) -> FinishResult:
     )
     metrics["cost_usd"] = session.cost_usd
     path = session.review_path
-    with _locked(session):
-        session.finishing_path.touch()  # the review file is frozen from here on
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()  # a session with no item still registers its (empty) review file
     sha = _sha256(path)
