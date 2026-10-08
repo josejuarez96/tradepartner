@@ -144,6 +144,29 @@ def _spend_holdout(
     )
 
 
+def _direct(
+    conn: duckdb.DuckDBPyConnection, path: Path, settings: Settings
+) -> registry.HypothesisRecord:
+    """`path` registered straight through the registry, as before the lab (H1's twin)
+    or as `sweep promote` does: `hypothesis.register` refuses a plain standalone file
+    on a lab store (T104c)."""
+    parsed = hypothesis.parse_file(path)
+    return registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=path.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=hypothesis.frozen_params(parsed, settings),
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+
+
 def _twin(
     conn: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -155,9 +178,7 @@ def _twin(
 ) -> registry.HypothesisRecord:
     """H1's fixture twin registered, marked pre-lab, fingerprinted, its family rules
     written as the lab migration would, and (with `run`) run once."""
-    record = hypothesis.register(
-        conn, _copy(tmp_path, TWIN_SOURCE), registered_by="test", settings=settings
-    )
+    record = _direct(conn, _copy(tmp_path, TWIN_SOURCE), settings)
     mark_pre_lab(conn, record.hypothesis_id)
     lab_registry.write_fingerprint(
         conn,
@@ -378,9 +399,7 @@ def test_a_family_with_hypotheses_but_no_rules_is_refused(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     # A store the lab migration did not populate: the twin registered, no rules row.
-    hypothesis.register(
-        lab_store, _copy(tmp_path, TWIN_SOURCE), registered_by="test", settings=settings
-    )
+    _direct(lab_store, _copy(tmp_path, TWIN_SOURCE), settings)
 
     _refused(
         lab_store, _copy(tmp_path, SWEEP_SOURCE), settings, NoFamilyRulesError, "no family rules"
@@ -505,7 +524,7 @@ def test_an_unrun_promoted_hypothesis_blocks_the_next_sweep(
         ("top_fraction = 0.10", "top_fraction = 0.15"),
         slug="fixture-promoted",
     )
-    record = hypothesis.register(ready, promoted, registered_by="test", settings=settings)
+    record = _direct(ready, promoted, settings)
     path = _copy(tmp_path, SWEEP_SOURCE)
 
     _refused(ready, path, settings, FamilyNotReadyError, "'fixture-promoted'")
