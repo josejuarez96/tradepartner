@@ -11,6 +11,7 @@ one is written once the owner's first export exists.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -1014,7 +1015,7 @@ def test_settle_without_one_order_and_a_reason_is_a_usage_error_before_any_broke
 ) -> None:
     out = _settle(clock, factory, *args)
     assert out.exit_code == cli.USAGE_ERROR, out.output
-    assert says in out.output
+    assert says in re.sub(r"\x1b\[[0-9;]*m", "", out.output)  # rich colours it in CI
     assert factory.clocks == []
 
 
