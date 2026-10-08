@@ -517,6 +517,34 @@ def test_filer_text_is_never_rendered_as_markdown(
     assert any(str(t.value).startswith("Issuer: Issuer ") for t in at.text)
 
 
+def test_back_restarts_the_clock_of_both_cases(
+    monkeypatch: pytest.MonkeyPatch, gold_session: gold.GoldSession, stops: list[int]
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(review_page.time, "monotonic", lambda: clock[0])
+    at = _gold_app(monkeypatch, gold_session, stops)
+    clock[0] += 20
+    _press(at, "opt-1")  # case 1 answered; case 2 drawn at 1020
+    clock[0] += 50
+    _press(at, "back")  # case 1 reopened at 1070
+    clock[0] += 60
+    _press(at, "opt-2")  # case 1 re-answered: 60 s
+    clock[0] += 30
+    _press(at, "opt-3")  # case 2: 30 s since it was drawn again, not 140 s
+    answers = [line for line in _lines(gold_session.working_path) if line.get("gold_label")]
+    assert [line["seconds_spent"] for line in answers] == [20.0, 60.0, 30.0]
+
+
+def test_a_malformed_finish_marker_is_refused_not_a_traceback(
+    gsettings: Settings, monkeypatch: pytest.MonkeyPatch, stops: list[int]
+) -> None:
+    path = datafiles.review_path(gsettings, 5)
+    path.parent.mkdir(parents=True)
+    path.with_name("5.finished.json").write_text("{not json", encoding="utf-8")
+    at = _app(monkeypatch, gsettings, path, stops, ("--code-version", "abc"))
+    assert any("finish marker" in str(e.value) for e in at.error)
+
+
 # --- review mode ------------------------------------------------------------------
 
 

@@ -398,6 +398,9 @@ def on_gold_back(page: Page, target: str) -> None:
         gold.record_undo(session, target)
     except gold.GoldRefused as exc:
         _flash("error", str(exc))
+        return
+    # Both the reopened case and the one that was on screen start a fresh clock.
+    st.session_state["shown_at"] = {}
 
 
 # --- review mode: callbacks -------------------------------------------------------
@@ -614,8 +617,12 @@ def _show_finished(path: Path, run_id: int | None) -> bool:
     marker = path.with_name(f"{run_id}.finished.json")
     if not marker.is_file():
         return False
-    done = json.loads(marker.read_text(encoding="utf-8"))
-    _closed("Items reviewed", done["metrics"]["n_reviewed"], done["sha256"])
+    try:
+        done = json.loads(marker.read_text(encoding="utf-8"))
+        count, sha = done["metrics"]["n_reviewed"], done["sha256"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PageRefused(f"{marker} is not a readable finish marker ({exc!r})") from exc
+    _closed("Items reviewed", count, sha)
     return True
 
 
