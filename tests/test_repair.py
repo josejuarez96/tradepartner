@@ -538,3 +538,76 @@ def test_a_known_at_before_the_calendar_maps_to_its_first_session(led: Settings)
     assert sessions[REUSER] == date(1990, 1, 2)
     assert sessions[META] == date(2012, 2, 1)
     assert resolver.lead("FB", date(2012, 2, 1)) == META
+
+
+# --- rule 8 (#1314 item 2): a span ends when another issuer takes its ticker ---
+
+TOPW, LATER_HOLDER = "0000000011", "0000000022"
+TAKEN = date(2020, 6, 1)  # the later holder's first cover page naming TOPW (D)
+
+
+@pytest.fixture
+def handed(settings: Settings) -> Settings:
+    """TOPW trades to 2020-04-01 (its last traded bar, L) and keeps the
+    ticker on paper until another company's TOPW row of 2020-06-01. A
+    zero-volume placeholder sits on it after L, a traded bar known only
+    after the run, and a bar of another source."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _listing(TOPW, "TOPW", date(2020, 1, 2)),
+            _listing(LATER_HOLDER, "TOPW", TAKEN),
+        ):
+            insert_row(conn, "listings", row)
+        placeholder = {**_bar(TOPW, date(2020, 5, 28)), "volume": 0}
+        for row in (
+            _bar(TOPW, date(2020, 3, 31)),
+            _bar(TOPW, date(2020, 4, 1)),
+            placeholder,
+            {
+                **_bar(TOPW, date(2020, 5, 20), known=datetime(2026, 10, 5, tzinfo=UTC)),
+                "ingested_at": datetime(2026, 10, 5, tzinfo=UTC),
+            },
+            _bar(TOPW, date(2020, 5, 21), source="fixture"),
+        ):
+            insert_row(conn, "prices_daily", row)
+    return settings
+
+
+def test_rule_8_reads_the_last_traded_alpaca_bar_known_at_the_run(handed: Settings) -> None:
+    with duckdb.connect(handed.store.path, read_only=True) as conn:
+        assert repair.last_bar(conn, RUN, TOPW, date(2020, 1, 2), TAKEN) == date(2020, 4, 1)
+        resolver = store_resolver(conn, RUN, handed)
+    assert [(h.start, h.end) for h in resolver.handovers(TOPW)] == [(date(2020, 4, 2), TAKEN)]
+    assert resolver.resolve("TOPW", date(2020, 4, 1)) == TOPW
+    assert resolver.resolve("TOPW", date(2020, 5, 28)) is None
+    assert resolver.resolve("TOPW", TAKEN) == LATER_HOLDER
+
+
+def test_f_the_run_row_counts_the_spans_ended(handed: Settings) -> None:
+    from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
+
+    with duckdb.connect(handed.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, handed)
+    line = AlpacaPriceSource(resolver, settings=handed).resolution_summary()
+    assert "1 spans ended where another issuer took the ticker" in line
+
+
+def test_f_the_dry_run_lists_s_bars_from_the_hand_over_day(handed: Settings) -> None:
+    result = repair_resolution(handed, clock=lambda: RUN, dry_run=True)
+    assert result.found.securities == (TOPW,)
+    # The placeholder and the bar known only after the run (every stored row is
+    # judged, #819); never the other source's.
+    assert sorted(day for _, day in result.found.bars) == [date(2020, 5, 20), date(2020, 5, 28)]
+
+
+def test_rule_8_waits_while_the_contaminated_bars_run_on_to_d(handed: Settings) -> None:
+    # The fail-safe before #1314 item 3: S's stored bars run to the session
+    # before D, so nothing is cut and nothing is listed.
+    with open_for_write(handed) as conn:
+        insert_row(conn, "prices_daily", _bar(TOPW, date(2020, 5, 29), close=99.0))
+    result = repair_resolution(handed, clock=lambda: RUN, dry_run=True)
+    assert result.found.securities == ()
+    with duckdb.connect(handed.store.path, read_only=True) as conn:
+        assert repair.last_bar(conn, RUN, TOPW, date(2020, 1, 2), TAKEN) == date(2020, 5, 29)
+        assert store_resolver(conn, RUN, handed).handovers(TOPW) == ()

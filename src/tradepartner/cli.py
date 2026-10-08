@@ -302,9 +302,11 @@ class StorePriceSource(PriceSource):
         clock: Clock = utc_now,
         fetch_bars: FetchBars | None = None,
         fetch_actions: Callable[[list[str], date, date], Any] | None = None,
+        fill_handovers: bool = False,
     ) -> None:
         self._settings = settings
         self._clock = clock
+        self._fill_handovers = fill_handovers  # #1314: `--fill-holes` lands rule-8 bars
         self._fetch_bars = fetch_bars or (
             lambda symbols, start, end, *, asof=None: alpaca_raw.daily_bars(
                 symbols, start, end, asof=asof, settings=settings
@@ -327,6 +329,7 @@ class StorePriceSource(PriceSource):
                 fetch_bars=self._fetch_bars,
                 fetch_actions=self._fetch_actions,
                 settings=self._settings,
+                fill_handovers=self._fill_handovers,
             )
         return self._inner
 
@@ -1110,7 +1113,11 @@ def make_app(
         filings = EdgarFilingSource(
             s, client=edgar_client, clock=clock, reuse_cached=bulk_from_cache
         )
-        prices = price_source(s) if price_source else StorePriceSource(s, clock=clock)
+        prices = (
+            price_source(s)
+            if price_source
+            else StorePriceSource(s, clock=clock, fill_handovers=fill_holes_)
+        )
         if fill_holes_ and start is not None:
             filled = fill_holes(s, prices=prices, since=start, clock=clock, securities=named)
             _print_holes(filled)

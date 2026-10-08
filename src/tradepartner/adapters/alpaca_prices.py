@@ -145,6 +145,23 @@ identity is the master's at the run, the same back-dating a
 `snapshot_static` row gives a survivor, and `universe_as_of` still
 excludes the name (rule 2, `not_listed`) until its listing is known.
 
+**Rule 8: a span ends when another issuer takes its ticker (#1314).**
+With `last_bar` (`repair.store_resolver`: a security's last traded Alpaca
+bar in a range, known at the run), an assigned span S of T ends on the
+session after its last bar L before D, the start of the first span of T
+of another company (`_same_issuer` false; any non-placeholder kind) inside
+S's span, when more than `handover_sessions`
+(`master.transfer_window_sessions`) sessions lie strictly between L and D
+and D's span is no co-registrant or disputed claim on S (rule 6 without
+rule 8). From that hand-over day H the ticker resolves to nobody until D,
+as after a rule-7 end; a rename lead out of S's span keeps its original
+end. A new issuer's first span starting on D leads only from
+`max(first session, H)`, and the #974 refusal test runs over that window
+(`first_span_clipped`). `handovers` lists each window; `fill_resolve` and
+`AlpacaPriceSource(fill_handovers=True)` (`--fill-holes`) land S's own
+refetched bars there, never a lead's. Before the #1314 repair S's stored
+bars run on to D, so nothing is cut (fail-safe).
+
 **Asof per span (#1314).** Without `asof`, Alpaca maps a symbol to the
 company that holds it today, so a reused ticker serves the later company's
 history on the old company's sessions (VAL: Valspar's 2017 sessions priced
@@ -410,8 +427,10 @@ class ResolverReport:
     later row of their ticker, and the same-day typo rows dropped; (#844)
     the equity rows whose ticker is no symbol that were ignored; (#847) the
     spans ended at a stopped line; and (#943) the spans of an owner-accepted
-    relisting kept through one; and (#974) the securities given a
-    first-span lead and those refused one for a reused ticker."""
+    relisting kept through one; (#974) the securities given a first-span
+    lead and those refused one for a reused ticker; and (#1314, rule 8)
+    the spans ended where another issuer took the ticker and the first-span
+    leads clipped to such a hand-over."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -431,6 +450,8 @@ class ResolverReport:
     accepted_relistings: int = 0
     first_span_leads: int = 0
     first_span_refused: int = 0
+    handover_spans: int = 0
+    first_span_clipped: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -452,7 +473,9 @@ class ResolverReport:
             f"{self.accepted_relistings} kept through a stopped line by "
             "alpaca.accepted_relistings; "
             f"{self.first_span_leads} securities led by a first-span lead, "
-            f"{self.first_span_refused} refused one for a reused ticker"
+            f"{self.first_span_refused} refused one for a reused ticker, "
+            f"{self.first_span_clipped} clipped to a hand-over; "
+            f"{self.handover_spans} spans ended where another issuer took the ticker"
         )
 
 
@@ -625,6 +648,26 @@ class FirstSpanLead:
 
 
 @dataclass(frozen=True)
+class Handover:
+    """A rule-8 window (#1314): `security_id` held `ticker` until its last
+    bar; from `start` (the session after it, H) to `end` (the first span of
+    the ticker of another company, D) the ticker resolves to it no more.
+    `span` is its span as cut."""
+
+    security_id: str
+    ticker: str
+    start: date
+    end: date
+    span: TickerSpan
+
+
+#: `(security_id, start, before)` -> the session of the security's last
+#: traded Alpaca bar in `[start, before)` known at the run, or `None`
+#: (rule 8, #1314; `repair.store_resolver` reads it from `prices_daily`).
+LastBar = Callable[[str, date, date], date | None]
+
+
+@dataclass(frozen=True)
 class _Row:
     day: date
     ticker: str
@@ -655,6 +698,8 @@ class ListingResolver:
         accepted_relistings: Collection[str] = (),
         first_sessions: Mapping[str, date] | None = None,
         class_symbols: Mapping[str, str] | None = None,
+        last_bar: LastBar | None = None,
+        handover_sessions: int = 5,
     ) -> None:
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
@@ -773,6 +818,12 @@ class ListingResolver:
                 rivals.append(held)
                 own = self._by_security[span.security_id]
                 own[own.index(span)] = held
+        # Rule 8 (#1314): a span ends when another issuer takes its ticker.
+        self._handovers: dict[str, list[Handover]] = defaultdict(list)  # by ticker
+        self._handovers_of: dict[str, list[Handover]] = defaultdict(list)  # by security
+        self._end_before_handover: dict[TickerSpan, date | None] = {}
+        if last_bar is not None:
+            self._hand_over(last_bar, handover_sessions, claims)
         self._contested = frozenset(
             span
             for spans in self._by_ticker.values()
@@ -801,6 +852,9 @@ class ListingResolver:
         ]
         for span in ended:
             self._vacated[span.ticker].append(span)
+        for handovers in self._handovers.values():  # rule 8 vacates like rule 7
+            for handover in handovers:
+                self._vacated[handover.ticker].append(handover.span)
         self._leads: dict[str, list[RenameLead]] = defaultdict(list)  # by new ticker
         self._leads_of: dict[str, list[RenameLead]] = defaultdict(list)  # by security
         if rename_lead_days > 0:
@@ -808,7 +862,7 @@ class ListingResolver:
                 for old, new in itertools.pairwise(own):
                     if (
                         old.ticker != new.ticker
-                        and old.end == new.start
+                        and self._end_before_handover.get(old, old.end) == new.start
                         and old.start < new.start
                         and old in self._assigned_spans
                         and new in self._assigned_spans
@@ -820,10 +874,10 @@ class ListingResolver:
                         self._leads_of[security_id].append(lead)
         self._first_leads: dict[str, list[FirstSpanLead]] = defaultdict(list)  # by ticker
         self._first_lead_of: dict[str, FirstSpanLead] = {}  # by security
-        first_span_refused = (
+        first_span_refused, first_span_clipped = (
             self._first_span_leads(first_sessions, placeholder_spans, ambiguous)
             if first_sessions
-            else 0
+            else (0, 0)
         )
         self.report = ResolverReport(
             placeholder=placeholder,
@@ -844,23 +898,98 @@ class ListingResolver:
             accepted_relistings=accepted_spans,
             first_span_leads=len(self._first_lead_of),
             first_span_refused=first_span_refused,
+            handover_spans=sum(len(h) for h in self._handovers.values()),
+            first_span_clipped=first_span_clipped,
         )
+
+    def _hand_over(
+        self,
+        last_bar: LastBar,
+        handover_sessions: int,
+        claims: Mapping[TickerSpan, tuple[str, date | None]],
+    ) -> None:
+        """Rule 8 (#1314, spec): end each assigned span S of T on the
+        session after its last bar L before D, the start of the first span
+        of T of another company (non-placeholder, any kind) inside S's span,
+        when D's span is no co-registrant or disputed claim on S (rule 6
+        without rule 8) and more than `handover_sessions` sessions lie
+        strictly between L and D (#847's stopped-line test)."""
+        others: dict[str, list[TickerSpan]] = defaultdict(list)
+        for history in self._history.values():
+            for span in history:
+                others[span.ticker].append(span)
+        for ticker, spans in self._by_ticker.items():
+            for index, span in enumerate(list(spans)):
+                after = [
+                    other
+                    for other in others[ticker]
+                    if not _same_issuer(other.security_id, span.security_id)
+                    and span.start < other.start
+                    and (span.end is None or other.start < span.end)
+                ]
+                if not after:
+                    continue
+                taken = min(other.start for other in after)
+                if any(
+                    other.start == taken and other in claims and self._wait(span, other)
+                    for other in after
+                ):
+                    continue  # a claim on a holder that has not left: rule 6 decides
+                last = last_bar(span.security_id, span.start, taken)
+                if last is None or (
+                    _sessions_between(last, taken, handover_sessions + 1) <= handover_sessions
+                ):
+                    continue
+                handed = next_session(last)
+                cut = replace(span, end=handed)
+                spans[index] = cut
+                own = self._by_security[span.security_id]
+                own[own.index(span)] = cut
+                history = self._history[span.security_id]
+                if span in history:
+                    history[history.index(span)] = cut
+                self._end_before_handover[cut] = span.end
+                handover = Handover(span.security_id, ticker, handed, taken, cut)
+                self._handovers[ticker].append(handover)
+                self._handovers_of[span.security_id].append(handover)
+
+    def handovers(self, security_id: str) -> tuple[Handover, ...]:
+        """`security_id`'s rule-8 windows (#1314): each `[start, end)` of
+        a ticker it held until another issuer took it, which resolves to it
+        no more."""
+        return tuple(self._handovers_of.get(security_id, ()))
+
+    def fill_resolve(self, ticker: str, session: date) -> str | None:
+        """`resolve` for a `--fill-holes` refetch (#1314, rule 8 "Store
+        holes"): a session of a rule-8 window of `ticker` resolves to the
+        security whose span was cut, as if rule 8 had not cut it, never to
+        another span or a lead."""
+        owners = {
+            h.security_id for h in self._handovers.get(ticker, []) if h.start <= session < h.end
+        }
+        if len(owners) == 1:
+            return owners.pop()
+        return self.resolve(ticker, session)
 
     def _first_span_leads(
         self,
         first_sessions: Mapping[str, date],
         placeholder_spans: Collection[TickerSpan],
         ambiguous: Collection[TickerSpan],
-    ) -> int:
+    ) -> tuple[int, int]:
         """Record each security's `FirstSpanLead` (#974, module docstring)
-        and return how many were refused for a reused ticker. Placeholder
+        and return how many were refused for a reused ticker and how many
+        were clipped to a rule-8 window (#1314): a first span starting where
+        another security's span of the ticker was handed over (`D`) leads
+        only from `max(first session, H)`, and the refusal test runs over
+        that window. Placeholder
         spans are passed over; an `ambiguous` first span (rule 4: a tie the
         master refuses to assign) leads to nothing."""
         others: dict[str, list[TickerSpan]] = defaultdict(list)  # every non-placeholder span
         for history in self._history.values():
             for other in history:
                 others[other.ticker].append(other)
-        refused = 0
+        refused = clipped = 0
         for security_id, own in self._by_security.items():
             first_session = first_sessions.get(security_id)
             first = next((s for s in own if s not in placeholder_spans), None)
@@ -873,7 +1002,16 @@ class ListingResolver:
                 or first.start <= first_session
             ):
                 continue
-            lead = FirstSpanLead(security_id, first.ticker, first_session, first.start)
+            start = first_session
+            handed = [
+                h.start
+                for h in self._handovers.get(first.ticker, [])
+                if h.end == first.start and h.security_id != security_id
+            ]
+            if handed and max(handed) > start:
+                start = max(handed)
+                clipped += 1
+            lead = FirstSpanLead(security_id, first.ticker, start, first.start)
             if any(
                 other.security_id != security_id and _covers_a_session(other, lead.start, lead.end)
                 for other in others[first.ticker]
@@ -882,7 +1020,7 @@ class ListingResolver:
                 continue
             self._first_leads[lead.ticker].append(lead)
             self._first_lead_of[security_id] = lead
-        return refused
+        return refused, clipped
 
     def _own_delisting(
         self,
@@ -1079,9 +1217,13 @@ class ListingResolver:
             for rename in self._leads_of.get(security_id, [])
         )
 
-    def symbols(self, security_id: str, start: date, end: date) -> list[str]:
+    def symbols(
+        self, security_id: str, start: date, end: date, *, handovers: bool = False
+    ) -> list[str]:
         """Every ticker `security_id` traded under at some day in
-        `[start, end]`, in span order; `[]` for an unknown id."""
+        `[start, end]`, in span order; `[]` for an unknown id. With
+        `handovers` (a `--fill-holes` refetch, #1314) also the ticker of
+        each rule-8 window meeting the range."""
         out: list[str] = []
         for span in self._by_security.get(security_id, []):
             overlaps = span.start <= end and (span.end is None or start < span.end)
@@ -1098,6 +1240,11 @@ class ListingResolver:
             and first.ticker not in out
         ):
             out.insert(0, first.ticker)
+        if handovers:
+            for handover in self._handovers_of.get(security_id, []):
+                meets = handover.start <= end and start < handover.end
+                if meets and handover.ticker not in out:
+                    out.append(handover.ticker)
         return out
 
     def asof(self, security_id: str, ticker: str, offset_days: int) -> date | None:
@@ -1194,6 +1341,13 @@ def _succeeds(successor: str, security_id: str) -> bool:
         return _company(security_id) == match[1]
     mine = (match[2], int(match[3] or 1))
     return older[1] == match[1] and (older[2], int(older[3] or 1)) < mine
+
+
+def _same_issuer(one: str, other: str) -> bool:
+    """True for two ids of one company (rule 8, #1314): one CIK (`<cik>`,
+    `<cik>:<class>`), or a repair successor (`<cik>@<date>`, #820) of the
+    other's company."""
+    return _company(one) == _company(other) or _succeeds(one, other) or _succeeds(other, one)
 
 
 def _covers_a_session(span: TickerSpan, start: date, end: date) -> bool:
@@ -1596,8 +1750,13 @@ class AlpacaPriceSource(PriceSource):
         fetch_bars: FetchBars = _default_fetch_bars,
         fetch_actions: FetchActions = _default_fetch_actions,
         settings: Settings | None = None,
+        fill_handovers: bool = False,
     ) -> None:
         self._resolver = resolver
+        # #1314 rule 8 "Store holes": a `--fill-holes` source lands S's own
+        # bars on its rule-8 windows (`ListingResolver.fill_resolve`).
+        self._fill_handovers = fill_handovers
+        self._resolve: Resolve = resolver.fill_resolve if fill_handovers else resolver.resolve
         self._fetch_bars = fetch_bars
         self._fetch_actions = fetch_actions
         settings = settings or get_settings()
@@ -1619,7 +1778,11 @@ class AlpacaPriceSource(PriceSource):
             raise UnknownSecurityIdError(
                 f"unknown security_id(s) {unknown}; resolve tickers through the security master"
             )
-        tickers = {t for i in ids for t in self._resolver.symbols(i, symbols_from, end)}
+        tickers = {
+            t
+            for i in ids
+            for t in self._resolver.symbols(i, symbols_from, end, handovers=self._fill_handovers)
+        }
         symbols = {t: alpaca_symbol(t) for t in tickers}
         self.last_excluded_symbols = tuple(sorted(t for t, s in symbols.items() if s is None))
         return ids, sorted({s for s in symbols.values() if s is not None})
@@ -1651,7 +1814,9 @@ class AlpacaPriceSource(PriceSource):
         dated: dict[date, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
         since: dict[tuple[str, str], date] = {}
         for security_id in sorted(ids):
-            for ticker in self._resolver.symbols(security_id, start, end):
+            for ticker in self._resolver.symbols(
+                security_id, start, end, handovers=self._fill_handovers
+            ):
                 symbol = alpaca_symbol(ticker)
                 if symbol is None:
                     continue
@@ -1679,8 +1844,8 @@ class AlpacaPriceSource(PriceSource):
             fetched.append((self._fetch_bars(sorted(plain), start, end), plain))
         self.last_asof_fallbacks = tuple(sorted(fallbacks))
         parsed = parse_bars(
-            _own_rows(fetched, self._resolver.resolve, self._resolver.lead),
-            self._resolver.resolve,
+            _own_rows(fetched, self._resolve, self._resolver.lead),
+            self._resolve,
             self._resolver.lead,
         )
         self.last_bars_report = parsed

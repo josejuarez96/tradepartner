@@ -279,13 +279,17 @@ class Hole:
     lead, #974, whose partial month at the window's end is one).
 
     `ticker` is its listing's on the month's last day (else its first);
-    `between` is whether it has a stored bar before and after the month."""
+    `between` is whether it has a stored bar before and after the month;
+    `handover` (#1314, rule 8) is a month meeting a rule-8 window of it
+    (`ListingResolver.handovers`), refetched with its own `asof` request
+    and landed on it (`ListingResolver.fill_resolve`)."""
 
     security_id: str
     ticker: str | None
     window: tuple[date, date]
     between: bool
     rename_gap: bool = False
+    handover: bool = False  # #1314: a month meeting a rule-8 window of it
 
 
 @dataclass(frozen=True)
@@ -528,6 +532,24 @@ def _lands(resolver: ListingResolver, ticker: str, sid: str, day: date) -> bool:
     return resolver.resolve(ticker, day) == sid or resolver.lead(ticker, day) == sid
 
 
+def _handed_over(
+    resolver: ListingResolver, sids: Collection[str], window: tuple[date, date]
+) -> set[str]:
+    """Those of `sids` with a rule-8 window (#1314) meeting `window` under
+    a ticker that is an Alpaca symbol: a hole of the security, as if rule 8
+    had not cut its span (spec rule 8, "Store holes"). By construction it
+    has no bar there."""
+    first, last = window
+    return {
+        sid
+        for sid in sids
+        if any(
+            h.start <= last and first < h.end and alpaca_symbol(h.ticker) is not None
+            for h in resolver.handovers(sid)
+        )
+    }
+
+
 def _rename_gaps(
     conn: duckdb.DuckDBPyConnection,
     resolver: ListingResolver,
@@ -581,18 +603,21 @@ def _month_holes(
     ids: Collection[str],
     only: frozenset[str] | None,
     horizon: int,
-) -> tuple[list[str], set[str], set[str], dict[str, str]]:
+) -> tuple[list[str], set[str], set[str], dict[str, str], set[str]]:
     """The holes of `window` as of `t` among the fetched `ids` (of `only`,
     when given): the ids to fetch, sorted; those of them that are rename
-    gaps (`_rename_gaps`); the ids with a bar known at `t` in `window`; and
-    the ids with no bar that no fetched bar could land on, with why
-    (`_assignable`)."""
+    gaps (`_rename_gaps`); the ids with a bar known at `t` in `window`; the
+    ids with no bar that no fetched bar could land on, with why
+    (`_assignable`); and those with a rule-8 window in it (#1314,
+    `_handed_over`), holes whatever they store."""
     stored = _with_bars(conn, t, window)
     named = [sid for sid in ids if only is None or sid in only]
+    handed = _handed_over(resolver, named, window)
     empty, dropped = _assignable(resolver, [sid for sid in named if sid not in stored], window)
+    dropped = {sid: why for sid, why in dropped.items() if sid not in handed}
     with_bars = [sid for sid in named if sid in stored]
     gaps = _rename_gaps(conn, resolver, t, window, with_bars, horizon)
-    return sorted({*empty, *gaps}), gaps, stored, dropped
+    return sorted({*empty, *gaps, *handed}), gaps, stored, dropped, handed
 
 
 def _holes(
@@ -627,7 +652,7 @@ def _holes(
         first, last = window
         with _read(settings) as conn:
             ids, *_ = _window_names(conn, t, window, settings, resolver)
-            kept, gaps, _, dropped = _month_holes(
+            kept, gaps, _, dropped, handed = _month_holes(
                 conn, resolver, t, window, ids, only, settings.alpaca.rename_lead_days
             )
         if tally is not None:
@@ -638,7 +663,7 @@ def _holes(
             ticker = live[-1] if live else (rows[0][1] if rows else None)
             lo, hi = spans.get(sid, (None, None))
             between = lo is not None and hi is not None and lo < first and hi > last
-            holes.append(Hole(sid, ticker, window, between, sid in gaps))
+            holes.append(Hole(sid, ticker, window, between, sid in gaps, sid in handed))
     return holes, set(tickers)
 
 
@@ -715,10 +740,15 @@ def _price_chunk(
             renames: set[str] = set()
             stored: set[str] = set()
             dropped: dict[str, str] = {}
+            handed: set[str] = set()
+            windows8: dict[str, list[tuple[date, date]]] = {}
             if fill:
-                holes, renames, stored, dropped = _month_holes(
+                holes, renames, stored, dropped, handed = _month_holes(
                     conn, resolver, started, window, ids, only, settings.alpaca.rename_lead_days
                 )
+                windows8 = {
+                    sid: [(h.start, h.end) for h in resolver.handovers(sid)] for sid in handed
+                }
         if fill:
             if tally is not None:
                 tally.add((), dropped)
@@ -766,6 +796,14 @@ def _price_chunk(
             )
             added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
             renamed = f" and {len(renames)} with a lead gap" if renames else ""
+            # #1314 rule 8: a rule-8 hole whose refetch landed nothing on its window.
+            landed = {
+                bar.security_id
+                for bar in bars
+                if any(lo <= bar.session < hi for lo, hi in windows8.get(bar.security_id, []))
+            }
+            empty8 = len(handed - landed)
+            renamed += f"; {empty8} rule8_window holes with nothing stored" if empty8 else ""
             filled = (
                 f"holes of {len(holes) - len(renames)} names with no stored bar{renamed}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
