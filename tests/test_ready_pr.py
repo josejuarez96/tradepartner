@@ -321,6 +321,8 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", still_going), "abc") == "pending"
     later_green = (*cancelled_full, cr("checks", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", later_green), "abc") == "success"
+    other_failed = (*cancelled_full, cr("pytest-shard (1)", "COMPLETED", "FAILURE"))
+    assert ready_pr.checks_state(hc("abc", other_failed), "abc") == "failure"
     twice = (cr("checks", "COMPLETED", "FAILURE"), cr("checks", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", twice), "abc") == "failure"
 

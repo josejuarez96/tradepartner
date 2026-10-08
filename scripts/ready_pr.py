@@ -361,7 +361,10 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         return "pending"
     if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in runs):
         return "success"
-    if all(r.conclusion.upper() == "CANCELLED" for r in runs if r.name == "checks"):
+    ok = {"SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED"}
+    if all(r.conclusion.upper() == "CANCELLED" for r in runs if r.name == "checks") and all(
+        r.conclusion.upper() in ok for r in runs
+    ):
         return "cancelled"
     return "failure"
 
