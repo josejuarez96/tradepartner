@@ -193,7 +193,13 @@ timing preview in the PR that adds this file. That preview ran these exact six v
 a scratch copy of the owner's store to measure seconds per variant. Every grid and `[lab]`
 value in this file was fixed before that preview ran. The `[universe]` and `[master]` pins
 were added after it, and they leave every variant's fingerprint unchanged: the scratch store
-refused the pinned file's six variants as already registered. The copy was then deleted.
+refused the pinned file's six variants as already registered. Two of the preview's trials
+were full in-sample windows: v3 and v5, the two `month_end` variants. The real run will
+reproduce them exactly. None of their returns, Sharpe ratios or other per-variant metrics
+were read. The preview read only their status (`ok`), their row counts, their `red_flag`
+bit (false, read by the auditor) and `lab status`'s family-level V. V is meaningless there,
+because the other four variants ran on capped windows. The scratch copy was deleted after
+the preview.
 
 ## Retirement condition
 
