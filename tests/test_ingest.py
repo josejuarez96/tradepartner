@@ -2053,6 +2053,139 @@ def test_a_late_filing_behind_a_stored_revision_is_one_row_at_ingested_at() -> N
     assert rows == [("A", T1), ("B", one), ("C", two)]
 
 
+# --- a fact accession re-dated A -> B -> A (#258, option a) ------------------
+
+
+def _redated(
+    as_of_date: date, at: datetime, accession: str = f"{ACME}-18-000001"
+) -> dict[str, Any]:
+    return {
+        "security_id": ACME,
+        "fact_name": "shares_outstanding",
+        "as_of_date": as_of_date,
+        "class_member": "",
+        "value": 5_000_000.0,
+        "filing_accession": accession,
+        "known_at": T1,
+        "ingested_at": at,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _served(conn: duckdb.DuckDBPyConnection, t: datetime, accession: str) -> list[date]:
+    rows = facts_as_of(conn, t, [ACME])
+    return sorted(rows.filter(rows["filing_accession"] == accession)["as_of_date"].to_list())
+
+
+_A, _B = date(2018, 12, 31), date(2018, 12, 15)
+
+
+def test_fact_redated_a_to_b_to_a_serves_a_again() -> None:
+    """#258: the writer re-inserts a pair that is not the accession's latest
+    ingest, so A -> B -> A serves A again; stored rows are never rewritten."""
+    conn = _store()
+    accession = f"{ACME}-18-000001"
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+    for at, day in ((first, _A), (second, _B), (third, _A)):
+        assert _add_rows(conn, "facts", [_redated(day, at)], ingested_at=at, current=False) == 1
+    again = third + timedelta(hours=1)
+    assert _add_rows(conn, "facts", [_redated(_A, again)], ingested_at=again, current=False) == 0
+    assert _served(conn, again, accession) == [_A]
+    stored = conn.execute(
+        "SELECT as_of_date, known_at, ingested_at FROM facts ORDER BY ingested_at"
+    ).fetchall()
+    # B keeps its filing's acceptance (the T11e re-date, unchanged); the
+    # returned A is a revision row known only from the third ingest.
+    assert stored == [(_A, T1, first), (_B, T1, second), (_A, third, third)]
+
+
+def test_fact_redating_back_is_not_seen_before_its_ingest() -> None:
+    """No look-ahead: what each ingest left the store serving stays served
+    at every as-of time before the next one; the returned A only from it."""
+    conn = _store()
+    accession = f"{ACME}-18-000001"
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+    tick = timedelta(microseconds=1)
+    _add_rows(conn, "facts", [_redated(_A, first)], ingested_at=first, current=False)
+    assert _served(conn, second - tick, accession) == [_A]
+    _add_rows(conn, "facts", [_redated(_B, second)], ingested_at=second, current=False)
+    before_third = _served(conn, third - tick, accession)
+    assert before_third == [_B]
+    _add_rows(conn, "facts", [_redated(_A, third)], ingested_at=third, current=False)
+    assert _served(conn, T1 - tick, accession) == []
+    assert _served(conn, second, accession) == [_B]
+    assert _served(conn, third - tick, accession) == before_third
+    assert _served(conn, third, accession) == [_A]
+
+
+def test_fact_accession_set_is_the_complete_current_snapshot() -> None:
+    """An accession's incoming rows are its whole current date set: a date
+    the source drops leaves later reads, and comes back when restored."""
+    conn = _store()
+    accession = f"{ACME}-18-000001"
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+
+    def ingest(days: tuple[date, ...], at: datetime) -> int:
+        rows = [_redated(day, at) for day in days]
+        return _add_rows(conn, "facts", rows, ingested_at=at, current=False)
+
+    assert ingest((_A, _B), first) == 2
+    assert ingest((_B,), second) == 1
+    assert ingest((_A, _B), third) == 2
+    assert ingest((_A, _B), third + timedelta(hours=1)) == 0
+    tick = timedelta(microseconds=1)
+    assert _served(conn, second - tick, accession) == [_B, _A]
+    assert _served(conn, third - tick, accession) == [_B]
+    assert _served(conn, third, accession) == [_B, _A]
+
+
+def test_two_accessions_redated_back_onto_one_date_in_one_run_do_not_collide() -> None:
+    """The store's key has no accession: two accessions re-dated back onto
+    one date in one run stamp it once, with the newer filing's value (the
+    per-key writer's latest), and later runs add nothing (no churn)."""
+    conn = _store()
+    one, two = f"{ACME}-18-000001", f"{ACME}-18-000002"
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+
+    def ingest(day: date, at: datetime) -> int:
+        newer = {**_redated(day, at, two), "value": 6_000_000.0, "known_at": T2}
+        rows = [_redated(day, at, one), newer]
+        return _add_rows(conn, "facts", rows, ingested_at=at, current=False)
+
+    assert ingest(_A, first) == 2
+    assert ingest(_B, second) == 2
+    assert ingest(_A, third) == 1
+    served = facts_as_of(conn, third, [ACME])
+    assert served.filter(served["as_of_date"] == _A)["value"].to_list() == [6_000_000.0]
+    assert _served(conn, third, two) == [_A]
+    for hours in (1, 2):
+        assert ingest(_A, third + timedelta(hours=hours)) == 0
+
+
+def test_same_value_accessions_redated_back_in_one_run_stamp_the_date_once() -> None:
+    """Two accessions giving one date the same value, both re-dated back in
+    one run: the date is stamped once (`UNIQUE`), the other accession is
+    completed on the next run, and then nothing more is added."""
+    conn = _store()
+    one, two = f"{ACME}-18-000001", f"{ACME}-18-000002"
+    first, second, third = NOW, NOW + timedelta(days=1), NOW + timedelta(days=2)
+
+    def ingest(day: date, at: datetime, other: date) -> int:
+        rows = [_redated(day, at, one), {**_redated(other, at, two), "known_at": T2}]
+        return _add_rows(conn, "facts", rows, ingested_at=at, current=False)
+
+    c = date(2018, 11, 30)
+    assert ingest(_A, first, c) == 2
+    assert ingest(_B, second, _B) == 2  # one's B first seen; two's B re-inserted
+    assert ingest(_A, third, _A) == 1  # both back onto A: stamped once, two's
+    assert (_served(conn, third, one), _served(conn, third, two)) == ([_B], [_A])
+    fourth = third + timedelta(hours=1)
+    assert ingest(_A, fourth, _A) == 1
+    assert facts_as_of(conn, fourth, [ACME])["as_of_date"].to_list() == [_A]
+    assert ingest(_A, fourth + timedelta(hours=1), _A) == 0
+
+
 def test_cover_page_duplicate_pair_does_not_abort_the_listings_write() -> None:
     """#687: `build_master` must never hand `_add_rows` two `listings` rows
     with the same (security_id, ticker, exchange, valid_from, known_at)
