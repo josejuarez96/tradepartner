@@ -2,31 +2,28 @@
 criterion; plan task T108).
 
 `sweep_report(conn, slug)` reads a sweep's latest registration and its family in a
-fixed number of set-based reads, independent of how many trials the family holds:
-the `sweeps` row and the family rules (`lab_registry`), every variant of every sweep
-in the family (one `sweep_variants` read), their registrations (one `hypotheses`
-read), their in-sample trials with results (one `trials` read), the counted trials'
-base-level metrics (one `trial_metrics` read), the data vintage once per distinct
-cutoff, **one** `registry.family_sharpes` call (itself one `trial_metrics` query per
-basis) and **one** `results.family_n` call (plus the parent family's N when the rules
-name a parent). Everything after the reads is pure over those rows.
+number of reads that grows with the variants, never with the trials: the `sweeps`
+row and the family rules (`lab_registry`), every variant of every sweep in the
+family (one `sweep_variants` read), their registrations (one `hypotheses` read),
+their in-sample trials with results (one `trials` read), the variant states
+(`lab_queries.variant_states`, a few reads per variant), the counted trials'
+base-level metrics (one `trial_metrics` read), **one** `registry.family_sharpes`
+call (itself one `trial_metrics` query per basis) and **one** `results.family_n`
+call (plus the parent family's N when the rules name a parent). Everything after
+the reads is pure over those rows.
 
-**Variant states** (spec, Definitions "Selection statistic", "Complete sweep"; req 2).
-A variant's trials are its `in_sample`, non-synthetic trials with an `ok` or `failed`
-result. Its **counted** trial is the latest `ok` one over its default window
-(`holdout.default_in_sample_window` at its frozen cadence) that is **current**: its
-recorded data vintage equals `registry.data_vintage` at its own cutoff today, and its
-`code_tree_sha256` equals the checkout's code vintage (both recorded and equal). A
-variant is then, in this order: `counted`; `terminal_failed` when it has the sweep
-row's `max_failures_per_variant` `failed` trials with one message, each written with
-`code_dirty = false` at the current code vintage, excluding `store changed during
-run` and `shared read failed`; `stale` when it has an `ok` trial but none current;
-`failed` when it has failures only; `unrun` otherwise. The sweep is complete when
-every variant is `counted` or `terminal_failed`; otherwise `incomplete (stale)` when
-any variant is stale, else `incomplete (unrun)`. The run-planning reads of plan task
-T103b (`store/lab_queries.py`) state the same rule per variant; that module was not
-on `main` when this one was written, so the rule is applied here over the set-based
-rows the report needs anyway.
+**Variant states** (spec, Definitions "Selection statistic", "Complete sweep"; req 2;
+#1221). There is one classifier: `store.lab_queries.variant_states`, which the sweep
+runner's plan (T107) and `sweep_state` read too, so the report can never call a
+sweep complete that the runner would rerun, or the reverse. Its counted trial is the
+latest current `ok`, non-synthetic, in-sample trial over the variant's default window
+(from the sweep registration's copied window); terminal failure counts only this
+registration's runs (`sweep_trials`) since its rerun epoch, over that window, clean,
+at the current code vintage, excluding `store changed during run` and `shared read
+failed`. The report maps its states one to one (`current` reads `counted`) and adds
+one display state: an `unrun` variant with failed trials reads `failed`. The report's
+own trials read (one query) supplies only the shown trial's `red_flag` and that
+display state. The classifier's reads are per variant, never per trial.
 
 **Recomputed, never read back.** Each variant's `dsr_excess` is
 `metrics.deflated_sharpe` on its counted trial's base-level metrics with today's N
@@ -62,7 +59,6 @@ import numpy as np
 
 from tradepartner.backtest import results
 from tradepartner.backtest.frozen import frozen_values
-from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import (
     deflated_sharpe,
     expected_max_sharpe,
@@ -70,7 +66,7 @@ from tradepartner.backtest.metrics import (
 )
 from tradepartner.backtest.quiet import system_timezone_matches
 from tradepartner.config import Settings
-from tradepartner.store import lab_registry, registry
+from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import utc_now
 from tradepartner.store.lab_registry import (
     FamilyRules,
@@ -81,14 +77,12 @@ from tradepartner.store.lab_registry import (
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
     BASE_COST_KEY,
-    STORE_CHANGED_MESSAGE,
     HypothesisRecord,
 )
 from tradepartner.store.schema import REGISTRY_TABLE_NAMES
 
 __all__ = [
     "DSR_SHARE_THRESHOLD",
-    "EXCLUDED_FAILURE_MESSAGES",
     "LabStatus",
     "SweepReport",
     "VariantRow",
@@ -104,14 +98,6 @@ SweepState = Literal["complete", "incomplete (stale)", "incomplete (unrun)"]
 CADENCE_KEY: Final = "schedule.rebalance_cadence"
 ANCHOR_KEY: Final = "schedule.signal_anchor"
 FILL_KEY: Final = "execution.fill_price"
-
-#: The `engine.run_many` shared-read failure message (strategy-lab spec req 2; the
-#: constant lands with plan task T105's `engine.SHARED_READ_FAILED`).
-SHARED_READ_FAILED: Final = "shared read failed"
-
-#: Failure messages that never make a variant terminal-failed (spec req 2): both are
-#: failures of the group or the store, not of the variant.
-EXCLUDED_FAILURE_MESSAGES: Final = frozenset({STORE_CHANGED_MESSAGE, SHARED_READ_FAILED})
 
 #: The report's "share of variants with recomputed `dsr_excess` > 0.5" (spec req 3):
 #: a fixed reading of the spec's own text, "more likely skilled than not", not a gate.
@@ -289,8 +275,9 @@ class OpenSweep:
 
 @dataclass(frozen=True)
 class SweepRunLine:
-    """One `sweep_runs` row in `lab status`; `seconds_per_variant` is the run's seconds
-    over its `ok` and failed trials, None for an open run or one that ran none."""
+    """One `sweep_runs` row in `lab status`; `seconds_per_variant` is the mean of the
+    run's `ok` trials' `sweep_trials.seconds` (as `lab_queries` measures it), None
+    when the run has no `ok` trial."""
 
     sweep_run_id: int
     slug: str
@@ -392,13 +379,6 @@ def _trials(conn: duckdb.DuckDBPyConnection, ids: Iterable[int]) -> dict[int, li
     return by_hypothesis
 
 
-def _vintages(
-    conn: duckdb.DuckDBPyConnection, cutoffs: Iterable[datetime | None]
-) -> dict[datetime, datetime | None]:
-    """Today's data vintage at each distinct cutoff (`registry.data_vintage`)."""
-    return {cutoff: registry.data_vintage(conn, cutoff) for cutoff in set(cutoffs) if cutoff}
-
-
 def _metrics(
     conn: duckdb.DuckDBPyConnection, trials: Sequence[tuple[int, float]]
 ) -> dict[int, dict[str, float | None]]:
@@ -426,64 +406,30 @@ def _metrics(
 # --- variant states (pure) ---------------------------------------------------------
 
 
-def _is_current(
-    trial: _TrialRow, vintages: Mapping[datetime, datetime | None], code_vintage: str | None
-) -> bool:
-    if trial.data_cutoff is None or trial.data_cutoff not in vintages:
-        return False
-    if trial.code_tree_sha256 is None or trial.code_tree_sha256 != code_vintage:
-        return False
-    return trial.data_vintage == vintages[trial.data_cutoff]
-
-
-def _terminal_message(
-    trials: Sequence[_TrialRow], code_vintage: str | None, max_failures: int
-) -> str | None:
-    """The message carried by `max_failures` counting failures, if any (req 2)."""
-    counts: dict[str, int] = {}
-    for trial in trials:
-        if (
-            trial.status == "failed"
-            and trial.code_dirty is False
-            and code_vintage is not None
-            and trial.code_tree_sha256 == code_vintage
-            and trial.message is not None
-            and trial.message not in EXCLUDED_FAILURE_MESSAGES
-        ):
-            counts[trial.message] = counts.get(trial.message, 0) + 1
-            if counts[trial.message] >= max_failures:
-                return trial.message
-    return None
+#: The report's status for each `lab_queries` variant state; a variant that is
+#: `unrun` there but has failed trials reads `failed` here.
+_STATUS: Final[dict[str, VariantStatus]] = {
+    "current": "counted",
+    "terminal_failed": "terminal_failed",
+    "stale": "stale",
+    "unrun": "unrun",
+}
 
 
 def _state(
-    variant: SweepVariant,
+    classified: lab_queries.VariantState,
     record: HypothesisRecord,
     trials: Sequence[_TrialRow],
-    *,
-    vintages: Mapping[datetime, datetime | None],
-    code_vintage: str | None,
-    max_failures: int,
 ) -> _VariantState:
-    """One variant's state (module docstring, "Variant states")."""
-    cadence = frozen_values(record)[CADENCE_KEY]
-    window = default_in_sample_window(Frozen.from_hypothesis(record), cadence)
-    ok = [
-        t
-        for t in trials
-        if t.status == "ok" and (t.start_session, t.end_session) == (window.start, window.end)
-    ]
-    current = [t for t in ok if _is_current(t, vintages, code_vintage)]
-    if current:
-        return _VariantState(variant, record, "counted", current[-1], None)
-    message = _terminal_message(trials, code_vintage, max_failures)
-    if message is not None:
-        return _VariantState(variant, record, "terminal_failed", None, message)
-    if ok:
-        return _VariantState(variant, record, "stale", ok[-1], None)
-    if any(t.status == "failed" for t in trials):
-        return _VariantState(variant, record, "failed", None, None)
-    return _VariantState(variant, record, "unrun", None, None)
+    """One variant's report state from the one classifier
+    (`lab_queries.variant_states`, module docstring "Variant states"), with the
+    report's own trial row (its `red_flag`) for the trial it shows."""
+    by_id = {t.trial_id: t for t in trials}
+    shown = by_id.get(classified.trial.trial_id) if classified.trial is not None else None
+    status = _STATUS[classified.state]
+    if status == "unrun" and any(t.status == "failed" for t in trials):
+        status = "failed"
+    return _VariantState(classified.variant, record, status, shown, classified.terminal_message)
 
 
 def _sweep_state(states: Sequence[_VariantState]) -> SweepState:
@@ -514,38 +460,21 @@ class _FamilyStates:
 
 
 def _family_states(
-    conn: duckdb.DuckDBPyConnection,
-    family: str,
-    max_failures: Mapping[int, int],
-    code_vintage: str | None,
+    conn: duckdb.DuckDBPyConnection, family: str, code_vintage: str | None
 ) -> _FamilyStates:
-    """Read and classify every variant of `family`; `max_failures` maps each sweep id
-    to its copied `max_failures_per_variant`."""
+    """Read and classify every variant of `family`, sweep by sweep, through
+    `lab_queries.variant_states` (the one classifier)."""
     variants = _family_variants(conn, family)
     ids = [v.hypothesis_id for v in variants]
     records = _records(conn, ids)
     trials = _trials(conn, ids)
-    vintages = _vintages(conn, (t.data_cutoff for rows in trials.values() for t in rows))
     by_sweep: dict[int, list[_VariantState]] = {}
-    for variant in variants:
-        by_sweep.setdefault(variant.sweep_id, []).append(
-            _state(
-                variant,
-                records[variant.hypothesis_id],
-                trials[variant.hypothesis_id],
-                vintages=vintages,
-                code_vintage=code_vintage,
-                max_failures=max_failures[variant.sweep_id],
-            )
-        )
+    for sweep_id in sorted({v.sweep_id for v in variants}):
+        by_sweep[sweep_id] = [
+            _state(c, records[c.variant.hypothesis_id], trials[c.variant.hypothesis_id])
+            for c in lab_queries.variant_states(conn, sweep_id, code_vintage=code_vintage)
+        ]
     return _FamilyStates(by_sweep, frozenset(v.fingerprint for v in variants))
-
-
-def _max_failures(conn: duckdb.DuckDBPyConnection, family: str) -> dict[int, int]:
-    rows = conn.execute(
-        "SELECT sweep_id, max_failures_per_variant FROM sweeps WHERE family = ?", [family]
-    ).fetchall()
-    return {int(sweep_id): int(limit) for sweep_id, limit in rows}
 
 
 # --- the report ----------------------------------------------------------------------
@@ -674,7 +603,7 @@ def sweep_report(
         raise ValueError(f"no sweep is registered as {slug!r}")
     rules = lab_registry.family_rules(conn, sweep.family)
     vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
-    family = _family_states(conn, sweep.family, _max_failures(conn, sweep.family), vintage)
+    family = _family_states(conn, sweep.family, vintage)
     states = family.by_sweep.get(sweep.sweep_id, [])
     shown = [
         (s.trial.trial_id, float(frozen_values(s.record)[BASE_COST_KEY]))
@@ -862,16 +791,20 @@ def _table_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
 
 
 def _last_runs(conn: duckdb.DuckDBPyConnection) -> tuple[SweepRunLine, ...]:
+    # Seconds per variant as `lab_queries.seconds_per_variant_by_cadence` measures
+    # them: the mean of the run's `ok` trials' `sweep_trials.seconds`.
     rows = conn.execute(
         "SELECT r.sweep_run_id, s.slug, r.started_at, r.finished_at, r.n_planned, r.n_ok, "
-        "r.n_failed, r.seconds, r.completed FROM sweep_runs r JOIN sweeps s USING (sweep_id) "
+        "r.n_failed, r.seconds, r.completed, "
+        "(SELECT AVG(st.seconds) FROM sweep_trials st JOIN trial_results tr USING (trial_id) "
+        "WHERE st.sweep_run_id = r.sweep_run_id AND tr.status = 'ok') "
+        "FROM sweep_runs r JOIN sweeps s USING (sweep_id) "
         "ORDER BY r.sweep_run_id DESC LIMIT ?",
         [LAST_SWEEP_RUNS],
     ).fetchall()
     lines = []
-    for run_id, slug, started, finished, planned, ok, failed, seconds, completed in rows:
-        ran = (ok or 0) + (failed or 0)
-        per = seconds / ran if seconds is not None and ran > 0 else None
+    for run_id, slug, started, finished, planned, ok, failed, seconds, completed, mean in rows:
+        per = float(mean) if mean is not None else None
         lines.append(
             SweepRunLine(
                 run_id, slug, started, finished, planned, ok, failed, seconds, per, completed
@@ -910,7 +843,7 @@ def lab_status(
     }
     for family in families:
         sharpes = registry.family_sharpes(conn, family)
-        states = _family_states(conn, family, _max_failures(conn, family), vintage)
+        states = _family_states(conn, family, vintage)
         statuses.append(
             FamilyStatus(
                 family=family,

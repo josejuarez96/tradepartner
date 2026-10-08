@@ -23,8 +23,8 @@
    read-only connection per step, at the base level and every
    `costs.sensitivity_per_side_bps` level, from the frozen `Settings`.
 5. **Write** through `results.write_results` in one chunk; it records `failed`
-   (`store changed during run`) when the store's latest `ingested_at` moved
-   since the open.
+   (`store changed during run`) when the data vintage at the trial's cutoff
+   moved since the open (`registry.write_result`, #1232).
 
 Any exception after the open closes the trial `failed` with the exception's type
 and text as the message, and returns the formatted traceback in
@@ -33,8 +33,8 @@ row unless the process dies (then it lists as `unfinished`). An exception before
 the open (an unregistered slug, a synthetic trial on the real store) raises:
 there is no trial yet.
 
-Only `write_results` compares the store's latest `ingested_at` with the value at
-the open. A `refused_gap`, and the gap values stored with a `gap_override`, are
+Only `write_results` compares the data vintage at the cutoff with the one recorded
+at the open. A `refused_gap`, and the gap values stored with a `gap_override`, are
 not compared: an ingest after the open can at worst leave a refusal that newer
 data would have passed (a refusal spends nothing) or override values read from
 the newer data, whose run then fails at the write. Conservative, not exact.
