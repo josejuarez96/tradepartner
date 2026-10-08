@@ -803,3 +803,71 @@ why = "MTUM is wired in by name today, so a family cannot add a benchmark of its
 [task.T130]
 what = "B4 momentum plus profitability combined by fixed equal ranks, landed as one signal module, one registry entry whose sections freeze both sub-signals' keys, a Settings section and a fixture twin."
 why = "The proof of ADR 0014: a third family that touches nothing under execution/ or store/, nor engine.py, run.py, results.py or hypothesis.py."
+
+[task.T140]
+what = "Named data releases, the rule and the record with no schema: the runbook, the release record format in a file beside the store, the trial 4 back-fill and the paper-window rule, so the owner starts recording releases now."
+why = "Every store repair restates rows and makes in-window sweep trials stale; a named release gives each store state a name a trial row can cite, and is the link from H1's spent holdout to the backup it read."
+
+[task.T140b]
+what = "Named data releases in the store: schema version 18 adds the data_release and development_boundary kinds and the trial's boundary column, the release reads, a delete-only release moving the data vintage, and the decision data-release open/close/record/import commands."
+why = "A release recorded in the store is what a trial row and the vintage rule can read; the import carries the records written by hand under T140 into the store once."
+
+[task.T140c]
+what = "Every row-changing repair refuses to run without an open release, and repair-bars deletes one security's Alpaca bars and actions on named sessions under a release."
+why = "Releases are only a rule until the tools refuse to write without one; the #1314 repair needs a session-scoped delete the resolver-based repair cannot do."
+
+[task.T141]
+what = "Owner: the #1314 repair of the 13 securities that carry another company's bars, in one batch under a release name, after the T114 sweep and outside ingest windows."
+why = "The one measured identity defect in the store; its effect on trials 2 to 4 was zero, and after the repair the live store no longer holds what trial 4 read, which the release row records."
+
+[task.T141b]
+what = "Resolver rule 8 (#1314 item 2, spec amendment #1318): a ticker span ends the session after its security's last own bar when another issuer takes the symbol, with the dry-run listing, the fill-holes months and the run-row count."
+why = "Cover pages lag a ticker hand-over by weeks or months, so the old security's span carried the new holder's bars; the rule is fail-safe until the repair and closes the span-lag mechanism for future reuses."
+
+[task.T142]
+what = "ADR 0016's window rule: default_in_sample_window ends at the earlier of the family's holdout start and the global development boundary, and an in-sample window past the boundary is refused."
+why = "Makes the practice end one owner value in the store instead of a per-family derivation, so B4 practises on the same months as H1 and B3 and reads nothing after 2023-12."
+
+[task.T142b]
+what = "ADR 0016's boundary read at every caller that builds a window (run, sweep, lab queries, lab registry, research runs), each trial recording the boundary it ran under, the decision development-boundary command with its refusals, and lab status showing the boundary and marking a forward holdout."
+why = "A boundary nobody reads protects nothing; after this every run and registration reads it from the store, and the owner can see which exams are forward."
+
+[task.T142c]
+what = "paper start accepts a forward holdout once its start has passed and opens the window at the first rebalance on or after it; every other refusal unchanged and pinned."
+why = "A forward exam is the paper book inside the holdout, which today's paper start refuses until the holdout has ended."
+
+[task.T143]
+what = "A short Zones section in research-program.md: development data is permissive and counted, exams are one-spend for frozen finalists, forward exams are the paper book, the boundary and who moves it."
+why = "The #1301 decisions and ADR 0016 are rules agents must follow; a page they read every session beats a record they have to find."
+
+[task.T144]
+what = "Owner-gated spike: the USD 69 one-month Sharadar overlap test, read-only on a store copy, with pass/fail numbers written before the purchase (identity, delisted completeness, raw closes, actions, fundamentals timing) and a pre-2016 depth report."
+why = "Turns every vendor claim into a measurement on our own store and decides the USD 499/yr question with numbers rather than on the vendor's word."
+
+[task.T145]
+what = "The vendor and budget ADR amending ADR 0009, decided only from T144's numbers: buy or not, and if buying the fill-only rule, the stamping rule, the crosswalk first, synthetic fixtures only and the deletion clause for backups and exports."
+why = "A vendor enters only through a new ADR and a plan amendment (ADR 0009); this is the gate everything paid stands behind."
+
+[task.T146]
+what = "Only if buying: the identity crosswalk table and builder, security_id to the vendor's permanent id by CIK and CUSIP, never by ticker."
+why = "Matching vendor rows by ticker is the #1314 mistake again; the crosswalk is the first table a vendor adapter needs."
+
+[task.T147]
+what = "Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures; the per-row quality column stays deferred until this lands."
+why = "Fills history before 2016 and the delisted tails Alpaca lacks without changing a stored Alpaca row or a registered trial."
+
+[task.T148]
+what = "Only if buying: a listing-history source for the vendor's dated ticker spans, listing and delisting dates, stamped per the vendor ADR."
+why = "Before 2019 the point-in-time universe is empty because cover-page tagging did not exist; vendor listing history is what makes an earlier universe possible."
+
+[task.T149]
+what = "Only if buying: health counts and the data-health page block for vendor-filled rows and vendor-stamped listing dates."
+why = "Reliance on a vendor's assembled dates is counted on the health page the way snapshot_static reliance is."
+
+[task.T149b]
+what = "Owner, only if buying: the vendor backfill on the real store under a release name, with the gap metric at every 2017 to 2019 rebalance and a non-empty universe from the first vendor year as evidence."
+why = "The build is proven only on the owner's store; the release row names the state every later trial reads."
+
+[task.T150]
+what = "The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
+why = "Only with longer history does more than one exam slice exist; registering the new families as children keeps every trial counted, as charter principle 2 requires."
