@@ -58,6 +58,7 @@ literal but 0, 1 and -1 (spec; tested by AST in T14).
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -206,6 +207,54 @@ def _sessions_after(last_bar: date, reference: date) -> int:
     return bisect_right(sessions, reference) - bisect_right(sessions, last_bar)
 
 
+def stale_dark_sessions(last_bar: date | None, session: date, settings: Settings) -> int | None:
+    """The stale-listing test (ADR 0003 amendment #1199): the sessions after
+    `last_bar` up to `session` when they are more than
+    `gap.stale_listing_sessions`, else None. With no traded bar (`None`) a
+    listing is never stale. Which listings it applies to is the caller's
+    rule (the gap adds "last bar before W"; the ingest, #1234, none)."""
+    if last_bar is None:
+        return None
+    dark = _sessions_after(last_bar, session)
+    return dark if dark > settings.gap.stale_listing_sessions else None
+
+
+def stale_listings_at(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    ids: Iterable[str],
+    settings: Settings,
+    *,
+    anchor: str | None = None,
+) -> dict[str, tuple[date, int]]:
+    """Of `ids`, those whose latest traded bar on or before `session` known
+    at `t` (as `survivorship_gap` reads bars) is stale by
+    `stale_dark_sessions`: id -> (last bar, sessions dark). An id with no
+    traded bar is never in it. With `anchor`, the sessions dark are counted
+    up to `anchor`'s own last traded bar instead of `session` (none: no id
+    is stale), so a store that stopped being updated as a whole has no stale
+    listings. The ingest's missing-share check (#1234) reads it with the
+    reference symbol as `anchor`. A bare date `t` raises `TypeError`, a
+    naive one `ValueError`."""
+    t = _validate_t(t)
+    ids = set(ids)
+    wanted = ids | ({anchor} if anchor is not None else set())
+    bars = _last_bars(conn, t, session, sorted(wanted))
+    if anchor is not None:
+        if anchor not in bars:
+            return {}
+        session = bars[anchor][0]
+    out: dict[str, tuple[date, int]] = {}
+    for sid, (last_bar, _) in bars.items():
+        if sid == anchor or sid not in ids:
+            continue
+        dark = stale_dark_sessions(last_bar, session, settings)
+        if dark is not None:
+            out[sid] = (last_bar, dark)
+    return out
+
+
 def survivorship_gap(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -256,7 +305,6 @@ def survivorship_gap(
         by_security.setdefault(sid, []).append(listing)
 
     bars = _last_bars(conn, t, session, sorted(by_security.keys() & counted))
-    dark_limit = settings.gap.stale_listing_sessions
     active: set[str] = set()
     current: dict[str, dict[str, Any]] = {}
     stale: list[dict[str, Any]] = []
@@ -264,8 +312,8 @@ def survivorship_gap(
         latest = max(listings, key=lambda listing: listing["valid_from"])
         last_bar = bars[sid][0] if sid in bars else None  # only `counted` ids have bars
         if last_bar is not None and last_bar < low and _live(latest, session):
-            dark = _sessions_after(last_bar, session)
-            if dark > dark_limit:
+            dark = stale_dark_sessions(last_bar, session, settings)
+            if dark is not None:
                 # Stale (ADR 0003 amendment #1199): ended at its last bar for
                 # the gap. An older open-ended row is the same live line under
                 # an earlier cover page, so only a listing that ended inside W

@@ -48,11 +48,13 @@ from tradepartner.adapters.prices import (
 from tradepartner.config import Settings
 from tradepartner.health import statement_counts
 from tradepartner.ingest import (
+    DARK,
     FACT_NAMES,
     FAILED,
     LOCKED,
     OK,
     STALE,
+    STALE_LISTINGS,
     ConflictKey,
     IngestResult,
     SourceRun,
@@ -1736,6 +1738,135 @@ def test_may_count_reads_bars_ingested_by_t_and_always_the_benchmarks(
         window = (date(2019, 6, 27), date(2019, 6, 27))
         may = _may_count(conn, t, window, {}, {SPY})
     assert may == {ACME, SPY}
+
+
+# --- stale listings (#1234, the ADR 0003 #1199 rule in the missing share) -----
+
+MARCH = datetime(2019, 3, 6, 2, 0, tzinfo=UTC)  # 21:00 ET: expected session 2019-03-05
+JUNE_20 = datetime(2019, 6, 21, 2, 0, tzinfo=UTC)  # expected session 2019-06-20
+MARCH_FILINGS = _at(2019, 3, 5)  # every filing (and SPY's snapshot) known by MARCH
+
+
+def _missing_share(settings: Settings, share: float) -> Settings:
+    return settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_missing_share": share})}
+    )
+
+
+def _march_then_june(
+    settings: Settings,
+    prices: _Prices,
+    *,
+    dark: frozenset[str] = frozenset({ACME}),
+    bars: Sequence[dict[str, Any]] = (),
+) -> SourceRun:
+    """Every name gets a bar at 2019-03-05; at 06-20 every name but `dark`
+    does (a loose run); the store gets `bars`; then the 06-28 run (previous
+    session never ingested, so every miss would count) fetches with
+    `prices`. A name in `dark` is 75 sessions dark at the reference
+    symbol's last bar (06-20). Returns the 06-28 price run."""
+    filings = _filings(fetched_at=MARCH_FILINGS)
+    assert _run(settings, now=MARCH, filings=filings).ok
+    loose = _missing_share(settings, 0.5)
+    assert _run(loose, _Prices(missing=set(dark)), now=JUNE_20, filings=filings).ok
+    if bars:
+        with open_for_write(settings) as conn:
+            for row in bars:
+                insert_row(conn, "prices_daily", row)
+    return _run(settings, prices, filings=filings).runs[-1]
+
+
+def _stale_after(settings: Settings, sessions: int) -> Settings:
+    return settings.model_copy(
+        update={"gap": settings.gap.model_copy(update={"stale_listing_sessions": sessions})}
+    )
+
+
+def test_a_long_dark_listed_name_is_reported_not_counted(settings: Settings) -> None:
+    # ACME's last bar is 2019-03-05, 75 sessions before SPY's (06-20; > 63): a
+    # stale listing, out of both sides of the share (1 of 4 would be 25% > 5%).
+    run = _march_then_june(settings, _Prices(missing={ACME}))
+    assert run.status == OK, run.message
+    assert "0 of 3 listed names missing" in run.message
+    assert f"1 {STALE_LISTINGS} (not counted): {ACME}" in run.message
+
+
+def test_the_stale_listing_key_comes_from_gap_config(settings: Settings) -> None:
+    # The same 75 dark sessions at a key of 75 (not more than it): ACME counts.
+    run = _march_then_june(_stale_after(settings, 75), _Prices(missing={ACME}))
+    assert run.status == STALE and ACME in run.message
+    assert STALE_LISTINGS not in run.message
+
+
+def test_a_lapse_in_ingests_makes_no_name_stale(settings: Settings) -> None:
+    # Every name, the reference included, last traded 03-05: dark is counted
+    # up to the reference's last bar, so ACME's miss at 06-28 still counts.
+    filings = _filings(fetched_at=MARCH_FILINGS)
+    assert _run(settings, now=MARCH, filings=filings).ok
+    run = _run(settings, _Prices(missing={ACME}), filings=filings).runs[-1]
+    assert run.status == STALE and ACME in run.message
+    assert STALE_LISTINGS not in run.message
+
+
+def test_a_stale_listing_that_trades_again_counts(settings: Settings) -> None:
+    run = _march_then_june(settings, _Prices())
+    assert run.status == OK
+    assert "0 of 4 listed names missing" in run.message
+    assert STALE_LISTINGS not in run.message
+
+
+def test_a_long_dark_benchmark_still_counts(settings: Settings) -> None:
+    # SPY dark since 03-05 like a stale listing, but benchmarks are never left out.
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    run = _march_then_june(tuned, _Prices(missing={SPY}), dark=frozenset({SPY}))
+    assert run.status == STALE and SPY in run.message
+    assert STALE_LISTINGS not in run.message
+
+
+def test_stale_listings_stay_out_of_the_dark_share(settings: Settings) -> None:
+    run = _march_then_june(_dark_limited(settings, 0.0), _Prices(missing={ACME}))
+    assert run.status == OK, run.message
+
+
+def test_a_stale_listing_beside_a_dark_name_leaves_the_dark_denominator(
+    settings: Settings,
+) -> None:
+    # 06-27: DUB has no bar. 06-28: ACME (stale) and DUB (dark) have none.
+    # The dark share is 1 of 3 (ACME on neither side), and ACME is not dark.
+    filings = _filings(fetched_at=MARCH_FILINGS)
+    loose = _missing_share(settings, 0.5)
+    assert _run(settings, now=MARCH, filings=filings).ok
+    assert _run(loose, _Prices(missing={ACME}), now=JUNE_20, filings=filings).ok
+    both = {ACME, DUAL_B}
+    assert _run(loose, _Prices(missing=both), now=PREVIOUS, filings=filings).ok
+    run = _run(_dark_limited(settings, 0.3), _Prices(missing=both), filings=filings).runs[-1]
+    assert run.status == STALE, run.message
+    assert "1 of 3 listed names (33.3%, over 30.0%) are dark or snapshot-only" in run.message
+    assert f"1 {STALE_LISTINGS} (not counted): {ACME}" in run.message
+    assert f"1 {DARK} (not counted): {DUAL_B}" in run.message
+
+
+def test_bars_after_the_session_or_known_after_the_run_leave_a_name_stale(
+    settings: Settings,
+) -> None:
+    # No look-ahead: a bar past the expected session, and one known after the
+    # run's read time, cannot make ACME live again.
+    later = _bar(ACME, date(2019, 7, 1), NOW + timedelta(days=3))
+    later["known_at"] = later["ingested_at"]
+    late = _bar(ACME, date(2019, 6, 20), NOW + timedelta(hours=1))
+    late["known_at"] = late["ingested_at"]
+    run = _march_then_june(settings, _Prices(missing={ACME}), bars=[later, late])
+    assert run.status == OK, run.message
+    assert f"1 {STALE_LISTINGS} (not counted): {ACME}" in run.message
+
+
+def test_a_recent_bar_known_by_the_run_keeps_a_name_counted(settings: Settings) -> None:
+    # The control for the test above: the same 06-20 bar known before the run.
+    recent = _bar(ACME, date(2019, 6, 20), NOW - timedelta(days=1))
+    run = _march_then_june(settings, _Prices(missing={ACME}), bars=[recent])
+    assert run.status == STALE and ACME in run.message
 
 
 def test_run_messages_are_redacted_cleaned_and_capped(
