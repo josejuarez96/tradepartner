@@ -81,20 +81,34 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 ## Step by step: one release
 
 1. **Pick a name and the sessions.** The name says what the batch is (`repair-13-tickers`). List the securities and sessions the repair will touch.
-2. **Check the gates.** No paper window covers those sessions (once T71 starts). No ingest is running and none is due. No sweep is running. Stop the scheduled jobs as in [scheduling.md](scheduling.md), "Before pulling a schema migration".
+2. **Check the gates.** No paper window covers those sessions (once T71 starts). No ingest or `paper run` is running and none is due. No sweep is running. Stop the scheduled jobs as in [scheduling.md](scheduling.md), "Before pulling a schema migration".
 3. **Back up the store.** With nothing running:
    ```bash
-   cp data/tradepartner.duckdb data/tradepartner.<name>.duckdb
-   [ -f data/tradepartner.duckdb.wal ] && cp data/tradepartner.duckdb.wal data/tradepartner.<name>.duckdb.wal
+   NAME=<name>
+   if [ -e data/tradepartner.$NAME.duckdb ]; then
+     echo "backup exists: pick another name"
+   else
+     cp -n data/tradepartner.duckdb data/tradepartner.$NAME.duckdb
+     [ -f data/tradepartner.duckdb.wal ] && cp -n data/tradepartner.duckdb.wal data/tradepartner.$NAME.duckdb.wal
+   fi
    ```
-   Check free disk first (`df -h`): the store is over 1 GB.
+   Never overwrite an existing backup: it may be the only copy of a state a trial read. Check free disk first (`df -h`): the store is over 1 GB.
 4. **Write the `before` entry.** Run the command above on the live store, at the close of `sessions_to`, and append the entry.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
 7. **Write the `after` entry.** Same `name`, `stage = "after"`, the numbers read again on the live store, and the sessions actually touched.
 8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N. If the release deleted rows, also rerun the sweeps that read those sessions as "The record" above says.
 
-If the repair fails partway: restore the backup (scheduling.md, "To restore from a copy"), then write an `after` entry whose `reason` says it was rolled back. The release is closed; a retry is a new release with a new name.
+If the repair fails partway, restore the backup with the jobs still stopped and nothing holding the store:
+
+```bash
+NAME=<name>
+rm -f data/tradepartner.duckdb.wal   # else DuckDB replays the failed repair onto the restored file
+cp data/tradepartner.$NAME.duckdb data/tradepartner.duckdb
+[ -f data/tradepartner.$NAME.duckdb.wal ] && cp data/tradepartner.$NAME.duckdb.wal data/tradepartner.duckdb.wal
+```
+
+Keep the backup itself. Then write an `after` entry whose `reason` says it was rolled back. The release is closed; a retry is a new release with a new name.
 
 ## The back-fill: the state H1's holdout trial read
 
