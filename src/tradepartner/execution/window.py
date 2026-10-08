@@ -1337,10 +1337,12 @@ def _override_fields(
     kind: str,
     rebalance_session: date | None,
     security_id: str | None,
-    cadence: Cadence,
+    cadence: Callable[[], Cadence],
 ) -> None:
     """Refuse `override` for a kind outside the schema's set or fields it does
-    not take (module docstring)."""
+    not take (module docstring). `cadence` reads the window's frozen cadence, only
+    for a kind that names a rebalance session, so an `engage_kill_switch` override
+    never depends on the registry read."""
     kinds = JOURNAL_ENUMS[("overrides", "kind")]
     if kind not in kinds:
         raise WindowCommandRefused(OVERRIDE, f"override kind {kind!r} is not one of {kinds}")
@@ -1350,9 +1352,10 @@ def _override_fields(
         return
     if rebalance_session is None or not security_id:
         raise WindowCommandRefused(OVERRIDE, f"{kind} needs a rebalance session and a name")
-    if not _is_rebalance_session(rebalance_session, cadence):
+    at = cadence()
+    if not _is_rebalance_session(rebalance_session, at):
         raise WindowCommandRefused(
-            OVERRIDE, f"{rebalance_session} is not a rebalance session at cadence {cadence}"
+            OVERRIDE, f"{rebalance_session} is not a rebalance session at cadence {at}"
         )
     if rebalance_session < window.first_rebalance_session:
         raise WindowCommandRefused(
@@ -1385,7 +1388,9 @@ def override(
     note = reason.strip()
     with open_for_write(settings) as conn:
         window, window_id = _window_of(conn)
-        _override_fields(window, kind, rebalance_session, security_id, window_cadence(conn, window))
+        _override_fields(
+            window, kind, rebalance_session, security_id, lambda: window_cadence(conn, window)
+        )
         minimum = _min_override_reason_chars(window)
         if len(note) < minimum:
             raise WindowCommandRefused(
