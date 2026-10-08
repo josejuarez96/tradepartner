@@ -31,6 +31,18 @@ Added 2026-09-30 (#388). Phase 4 exits after at least six monthly rebalances of 
 3. **The `data-validator` and `journal-analyst` agents** ([agents.md](ways-of-working/agents.md) candidates): the first is Phase 2's T23, whose agent half does not need the owner's scheduling evidence and can be split from it by a Phase 2 plan amendment; the second needs a real journal.
 4. **The strategy-lab engine**, specified and its plan drafted: the [strategy-lab spec](specs/strategy-lab.md) (Accepted 2026-10-05, #931; #281 answered) and its [plan](plans/strategy-lab.md) (#933, T91 to T115) run as the Phase 4 side track above. **The event-data engine** once the owner answers #307, and the timestamped social collector side job, which needs its own ADR before it enters scope.
 
+The deferred capabilities of [ADR 0015](decisions/0015-expansion-seams.md) part C, each entering scope only through its own later ADR when its trigger arrives, and none built speculatively (not idle-window work):
+
+- **The journal clock** — trigger: the intraday ADR, since more than one run per session is what needs it.
+- **Shorting and margin** — trigger: a registered long/short hypothesis the owner wants to run, and a research report on borrow cost and availability.
+- **Price-triggered stop exits** — trigger: a swing hypothesis whose rule needs one.
+- **Intraday bars** — trigger: a day- or swing-trading hypothesis at a sub-daily interval, and a data source with honest bar-close timestamps and corporate-action handling.
+- **Other calendars** — trigger: the first non-XNYS instrument.
+- **Options and futures data** — trigger: an options or futures hypothesis, after a research report on point-in-time coverage.
+- **Roll** — trigger: the first futures hypothesis.
+- **Tax logic for shorts and derivatives** — trigger: live trading on such an instrument (Phase 6 or later).
+- **Multi-book aggregation** — trigger: a second paper book the owner wants on the same account, or a portfolio-level report across books.
+
 ## User experience
 
 The owner is the only user, and the system runs locally. The interface is a **cross-cutting slice of every phase**, not a phase of its own: each phase exits with its page in place (the **UX** items above).

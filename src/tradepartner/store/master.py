@@ -121,6 +121,18 @@ the snapshot entry with that ticker, `known_at` its fetch time. Their
 static listing starts at `calendar.start` (nominal; bars decide what
 exists). A benchmark absent from the snapshot is returned in
 `missing_benchmarks`.
+
+**Instrument ids** (ADR 0015 seam 6). Every `security_id` column in the
+journal and the backtest is read as an *instrument id*; for a share the
+instrument id equals the security id, so today's rows need no change. A
+future `instruments` table issues ids in the same namespace with a type
+prefix and `INSTRUMENT_ID_SEPARATOR` (`:`), as `BENCHMARK_PREFIX` (`BENCH`)
+already does for benchmarks; `securities` stays the equity master. The
+master's own id derivation — `primary_security_id` and the `{base}-{n}`
+class ids — refuses an input holding the separator, so it can never mint an
+id whose prefix is an instrument type. The one `:` a derived class id may
+hold is the class separator between its CIK and its title slug; the token
+before it is always a CIK, never a type.
 """
 
 from __future__ import annotations
@@ -151,6 +163,11 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
 _CONFIG = "config"
+#: The separator between an instrument id's type prefix and the rest
+#: (ADR 0015 seam 6), as `BENCH:<ticker>` has used since T8.
+INSTRUMENT_ID_SEPARATOR = ":"
+#: The type prefix of a benchmark's instrument id.
+BENCHMARK_PREFIX = "BENCH"
 _STATIC_LISTING_COLUMNS = frozenset({"ticker", "exchange"})
 #: A new 12(b) registration: near a Form 25, it marks the relisted shares as new equity.
 _NEW_REGISTRATION_FORMS = frozenset({"8-A12B"})
@@ -294,9 +311,36 @@ class _Class:
         return self.first_listing[:3]
 
 
+def _refuse_separator(value: str, what: str) -> None:
+    """Refuse an input that would put the instrument-id separator into a
+    derived id, so the master's own derivation can never mint a prefixed id."""
+    if INSTRUMENT_ID_SEPARATOR in value:
+        raise ValueError(
+            f"{what} {value!r} holds the instrument-id separator {INSTRUMENT_ID_SEPARATOR!r}"
+        )
+
+
 def primary_security_id(cik: str) -> str:
-    """The `security_id` of a CIK's first class."""
+    """The `security_id` of a CIK's first class.
+
+    Raises `ValueError` when the CIK holds the separator: the derived id
+    would then read as a prefixed instrument id.
+    """
+    _refuse_separator(cik, "cik")
     return cik
+
+
+def _numbered_id(base: str, taken: Collection[str]) -> str:
+    """`base`, then `{base}-{n}` for the first `n` whose id is free.
+
+    The caller refuses the separator on the parts that name the id, so a
+    derived id can never carry an instrument-type prefix.
+    """
+    security_id, n = base, 1
+    while security_id in taken:
+        n += 1
+        security_id = f"{base}-{n}"
+    return security_id
 
 
 #: Title words that mark a common-equity class, preferred as a CIK's primary.
@@ -730,11 +774,9 @@ class _Builder:
     ) -> _Class:
         """New equity succeeding `old` from `start` (its own security)."""
         base = f"{first.cik}@{start.isoformat()}"
+        _refuse_separator(base, "successor base")
         taken = {c.security_id for c in classes}
-        security_id, n = base, 1
-        while security_id in taken:
-            n += 1
-            security_id = f"{base}-{n}"
+        security_id = _numbered_id(base, taken)
         cls = _Class(security_id, known_at, titles=set(old.titles))
         old.retired = True
         self.security(security_id, first.cik, first.company_name, known_at)
@@ -749,12 +791,10 @@ class _Builder:
             cls = _Class(primary_security_id(first.cik), first.accepted_at)
         else:
             slug = re.sub(r"[^a-z0-9]+", "-", _norm_title(item.title).replace("%", "pct"))
-            base = f"{first.cik}:{slug.strip('-')}"
+            _refuse_separator(slug, "class slug")
+            base = f"{primary_security_id(first.cik)}{INSTRUMENT_ID_SEPARATOR}{slug.strip('-')}"
             taken = {c.security_id for c in classes}
-            security_id, n = base, 1
-            while security_id in taken:
-                n += 1
-                security_id = f"{base}-{n}"
+            security_id = _numbered_id(base, taken)
             cls = _Class(security_id, known_at)
             self.security(security_id, first.cik, first.company_name, known_at)
         classes.append(cls)
@@ -810,7 +850,7 @@ class _Builder:
         )
 
     def benchmark(self, entry: CompanySnapshotEntry) -> None:
-        security_id = f"BENCH:{entry.ticker}"
+        security_id = f"{BENCHMARK_PREFIX}{INSTRUMENT_ID_SEPARATOR}{entry.ticker}"
         static_name = "name" in self.settings.master.static_columns
         name_prov = "snapshot_static" if static_name else "snapshot"
         self.security(

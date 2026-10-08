@@ -531,6 +531,36 @@ def test_assets_of_no_symbols_is_empty() -> None:
     assert broker.assets([]) == {}
 
 
+def test_every_returned_object_carries_the_read_side_defaults() -> None:
+    broker, _ = make_broker(auto_fill=False, assets={"AAPL": Asset(True, True, "active", None)})
+    submitted = broker.submit(make_request())
+    # submit, get_order and the open-orders read all return an Order at the defaults.
+    for order in (submitted, broker.get_order("co-1"), broker.open_orders()[0]):
+        assert (order.order_type, order.time_in_force, order.asset_class, order.order_class) == (
+            "market",
+            "day",
+            "us_equity",
+            "simple",
+        )
+        assert (order.limit_price, order.stop_price, order.legs) == (None, None, ())
+
+    filled = broker.simulate_fill("co-1")
+    assert broker.get_order("co-1") == filled
+    [fill] = broker.fills()
+    assert fill.fee is None
+
+    account = broker.account()
+    assert (account.short_market_value, account.maintenance_margin, account.daytrade_count) == (
+        None,
+        None,
+        None,
+    )
+
+    assets = broker.assets(["AAPL", "MSFT"])
+    for asset in assets.values():
+        assert (asset.shortable, asset.easy_to_borrow, asset.marginable) == (False, False, False)
+
+
 # --- State isolation from returned collections -----------------------------
 
 
