@@ -1,0 +1,6 @@
+{
+  "error": {
+    "body": "{\"available\":\"0.557436865\",\"code\":40310000,\"existing_qty\":\"0.557436865\",\"held_for_orders\":\"0\",\"message\":\"insufficient qty available for order (requested: 1.057436865, available: 0.557436865)\",\"symbol\":\"KO\"}",
+    "status_code": 403
+  }
+}

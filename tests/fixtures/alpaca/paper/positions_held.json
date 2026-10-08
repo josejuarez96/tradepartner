@@ -1,0 +1,22 @@
+[
+  {
+    "asset_class": "us_equity",
+    "asset_id": "3795cafe-fd54-4f66-a31e-66774be875ca",
+    "asset_marginable": true,
+    "avg_entry_price": "86.879891",
+    "change_today": "0.01235",
+    "cost_basis": "48.430054",
+    "current_price": "86.88",
+    "exchange": "NYSE",
+    "lastday_price": "85.82",
+    "market_value": "48.430115",
+    "qty": "0.557436865",
+    "qty_available": "0.557436865",
+    "side": "long",
+    "symbol": "KO",
+    "unrealized_intraday_pl": "0.000061",
+    "unrealized_intraday_plpc": "0",
+    "unrealized_pl": "0.000061",
+    "unrealized_plpc": "0"
+  }
+]
