@@ -3105,3 +3105,212 @@ class TestAsofPerSpan:
             _listing(self.NEW, "VAL", date(2016, 1, 7)),
         ]
         assert ListingResolver(listings).asof(self.OLD, "VAL", 7) == date(2016, 1, 6)
+
+
+class TestRule8Handover:
+    """Rule 8 (#1314 item 2, spec acceptance "Span lag"): S's span of T ends
+    on the session after its last bar L when another company's span of T
+    starts on D more than `master.transfer_window_sessions` sessions later;
+    T resolves to nobody from there, or to the new issuer's first-span lead."""
+
+    S = "0000000011"  # Top Win, TOPW from 2020-01-02
+    N = "0000000022"  # the later TOPW holder, its first cover page on D
+    START = date(2020, 1, 2)
+    D = date(2020, 6, 1)
+    L = date(2020, 4, 1)  # S's last bar
+    H = date(2020, 4, 2)
+
+    def _resolver(
+        self,
+        last: date | None = L,
+        *,
+        listings: list[dict[str, object]] | None = None,
+        evidence: RegistrantEvidence | None = None,
+        first_sessions: dict[str, date] | None = None,
+    ) -> ListingResolver:
+        asked: list[tuple[str, date, date]] = []
+
+        def last_bar(security_id: str, start: date, before: date) -> date | None:
+            asked.append((security_id, start, before))
+            return last if security_id != self.N else None
+
+        rows = listings or [_listing(self.S, "TOPW", self.START), _listing(self.N, "TOPW", self.D)]
+        resolver = ListingResolver(
+            rows,
+            evidence,
+            first_sessions=first_sessions,
+            last_bar=last_bar,
+            handover_sessions=5,
+        )
+        self.asked = asked
+        return resolver
+
+    def test_a_ended_on_the_session_after_the_last_bar(self) -> None:
+        resolver = self._resolver()
+        assert resolver.resolve("TOPW", self.L) == self.S
+        assert resolver.resolve("TOPW", self.H) is None
+        assert resolver.resolve("TOPW", date(2020, 5, 29)) is None
+        assert resolver.resolve("TOPW", self.D) == self.N
+        assert [(h.ticker, h.start, h.end) for h in resolver.handovers(self.S)] == [
+            ("TOPW", self.H, self.D)
+        ]
+        assert self.asked == [(self.S, self.START, self.D)]
+        assert resolver.report.handover_spans == 1
+        assert "1 spans ended where another issuer took the ticker" in resolver.report.summary()
+
+    def test_a_the_new_issuers_first_span_lead_fills_from_the_hand_over(self) -> None:
+        first = {self.N: date(2020, 1, 15)}  # its S-1, before H
+        resolver = self._resolver(first_sessions=first)
+        assert resolver.lead("TOPW", date(2020, 4, 15)) == self.N
+        assert resolver.lead("TOPW", self.L) is None  # S's session
+        assert resolver.report.first_span_clipped == 1
+        assert resolver.report.first_span_refused == 0
+        # Without rule 8 the lead is refused whole: S's span covers its window.
+        plain = ListingResolver(
+            [_listing(self.S, "TOPW", self.START), _listing(self.N, "TOPW", self.D)],
+            first_sessions=first,
+        )
+        assert plain.lead("TOPW", date(2020, 4, 15)) is None
+        assert plain.report.first_span_refused == 1
+
+    @pytest.mark.parametrize(
+        "last",
+        [date(2020, 5, 22), date(2020, 5, 29), None],  # 4 sessions between; bars to D; none
+    )
+    def test_b_a_short_gap_bars_to_d_or_no_bar_change_nothing(self, last: date | None) -> None:
+        resolver = self._resolver(last)
+        assert resolver.resolve("TOPW", date(2020, 5, 28)) == self.S
+        assert resolver.handovers(self.S) == ()
+        assert resolver.report.handover_spans == 0
+
+    @pytest.mark.parametrize("later", ["0000000011:class-b", "0000000011@2020-06-01"])
+    def test_b_a_later_span_of_the_same_company_changes_nothing(self, later: str) -> None:
+        resolver = self._resolver(
+            listings=[_listing(self.S, "TOPW", self.START), _listing(later, "TOPW", self.D)]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert self.asked == []
+
+    def test_c_a_span_already_ended_before_d_is_unchanged(self) -> None:
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(self.S, "TOPX", date(2020, 3, 2)),  # its own next row
+                _listing(self.N, "TOPW", self.D),
+            ]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert resolver.resolve("TOPW", date(2020, 2, 28)) == self.S
+        assert resolver.resolve("TOPW", date(2020, 3, 2)) is None
+
+    def test_d_a_co_registrant_claim_on_s_changes_nothing(self) -> None:
+        resolver = ListingResolver(
+            AEP_LISTINGS,
+            _evidence(AEP_FACTS),
+            last_bar=lambda sid, start, before: date(2026, 6, 1),
+            handover_sessions=5,
+        )
+        assert resolver.handovers(AEP) == ()
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+
+    def test_d_a_disputed_claim_on_s_changes_nothing(self) -> None:
+        resolver = ListingResolver(
+            MGEE_LISTINGS,
+            _evidence(MGEE_FACTS),
+            last_bar=lambda sid, start, before: date(2025, 6, 2),
+            handover_sessions=5,
+        )
+        assert resolver.handovers(MGEE) == ()
+        assert resolver.report.disputed_spans == 1
+
+    def test_fill_resolve_lands_the_window_on_s_never_on_a_lead(self) -> None:
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        day = date(2020, 4, 15)
+        assert resolver.fill_resolve("TOPW", day) == self.S
+        assert resolver.fill_resolve("TOPW", self.D) == self.N
+        assert resolver.symbols(self.S, day, day) == []
+        assert resolver.symbols(self.S, day, day, handovers=True) == ["TOPW"]
+
+    def test_a_fill_source_stores_s_bars_in_its_window_and_a_plain_one_does_not(self) -> None:
+        days = [date(2020, 4, 14), date(2020, 4, 15)]
+        asof_seen: list[date | None] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            asof_seen.append(asof)
+            return {"feed": "sip", "bars": {"TOPW": [_row(d, 7.0) for d in days]}}
+
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        bars = fill.bars([self.S], days[0], days[-1])
+        assert [(b.security_id, b.session) for b in bars] == [(self.S, d) for d in days]
+        assert [b.known_at for b in bars] == [bar_known_at(d) for d in days]
+        assert asof_seen[0] is not None  # S's own asof request
+        plain = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        assert plain.bars([self.S], days[0], days[-1]) == []
+        led = plain.bars([self.N], days[0], days[-1])  # the new issuer's lead
+        assert {b.security_id for b in led} == {self.N}
+
+    def test_b_a_successor_of_s_inside_its_span_keeps_it_whole(self) -> None:
+        successor = "0000000011@2020-03-02"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(successor, "TOPW", date(2020, 3, 2)),
+                _listing(self.N, "TOPW", self.D),
+            ]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert resolver.fill_resolve("TOPW", date(2020, 4, 15)) == successor
+
+    def _alpaca(self, *, asof_known: bool) -> Any:
+        days = [date(2020, 4, 14), date(2020, 4, 15)]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            if asof is not None and not asof_known:
+                return {"feed": "sip", "bars": {}}
+            close = 7.0 if asof is not None else 99.0  # S's own, or today's holder N's
+            return {"feed": "sip", "bars": {"TOPW": [_row(d, close) for d in days]}}
+
+        return days, fetch
+
+    def test_a_fill_never_lands_todays_holders_fallback_rows_on_s(self) -> None:
+        days, fetch = self._alpaca(asof_known=False)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        assert fill.bars([self.S], days[0], days[-1]) == []
+        assert fill.last_asof_fallbacks == ("TOPW",)
+
+    def test_a_fill_lands_the_new_issuers_lead_rows_on_it(self) -> None:
+        days, fetch = self._alpaca(asof_known=True)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        led = fill.bars([self.N], days[0], days[-1])
+        assert [(b.security_id, b.close) for b in led] == [(self.N, 99.0)] * 2
+        both = fill.bars([self.S, self.N], days[0], days[-1])
+        assert {(b.security_id, b.close) for b in both} == {(self.S, 7.0)}  # S's own first
+
+    def test_a_clipped_lead_refused_by_a_third_span_counts_once(self) -> None:
+        third = "0000000033"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(third, "TOPW", date(2020, 5, 1), "Warrants"),
+                _listing(self.N, "TOPW", self.D),
+            ],
+            first_sessions={self.N: date(2020, 1, 15)},
+        )
+        assert (resolver.report.first_span_clipped, resolver.report.first_span_refused) == (0, 1)
+
+    def test_last_bar_needs_the_configured_window(self) -> None:
+        with pytest.raises(ValueError, match="handover_sessions"):
+            ListingResolver([], last_bar=lambda sid, start, before: None)

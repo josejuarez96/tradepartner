@@ -45,6 +45,7 @@ What the repair is and is not:
 
 from __future__ import annotations
 
+import functools
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -105,7 +106,27 @@ def store_resolver(
         first_sessions=first_sessions(conn, at, settings)
         if settings.alpaca.first_span_lead
         else None,
+        last_bar=functools.partial(last_bar, conn, at),
+        handover_sessions=settings.master.transfer_window_sessions,
     )
+
+
+def last_bar(
+    conn: duckdb.DuckDBPyConnection, at: datetime, security_id: str, start: date, before: date
+) -> date | None:
+    """The session of `security_id`'s last traded Alpaca bar in `[start,
+    before)` known at `at` (rule 8, #1314: L): per session the latest
+    revision known at `at`, from an Alpaca source, with volume above zero."""
+    row = conn.execute(
+        "SELECT max(session) FROM ("
+        "  SELECT session, volume FROM prices_daily"
+        "  WHERE security_id = ? AND session >= ? AND session < ? AND known_at <= ?"
+        "  AND list_contains(?, source)"
+        "  QUALIFY row_number() OVER (PARTITION BY session ORDER BY known_at DESC) = 1"
+        ") WHERE volume > 0",
+        [security_id, start, before, at, sorted(BAR_SOURCES)],
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 def first_sessions(

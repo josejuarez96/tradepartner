@@ -1473,3 +1473,69 @@ def test_named_securities_limit_the_led_holes(settings: Settings) -> None:
         securities=[FIRST_LED],
     )
     assert {sid for sid, _ in _holes(only_led)} == {FIRST_LED}
+
+
+# --- rule 8 (#1314 item 2): a hand-over window is a hole of the old holder ---
+
+TAKEN_ON = date(2019, 6, 20)  # NEWCO's first cover page naming ACME's ticker (D)
+STOPPED = (date(2019, 6, 3), date(2019, 6, 28))  # ACME's bars gone from H on
+
+
+def _taken(settings: Settings) -> Settings:
+    """A backfill, then NEWCO's cover page lists `ACME` from `TAKEN_ON`,
+    ACME having gone quiet (rule 6: newer wins), and ACME has no bar from
+    2019-06-03: its span ends there (H) by rule 8."""
+    quiet = settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"registrant_quiet_days": 1})}
+    )
+    accepted = datetime.combine(TAKEN_ON, datetime.min.time(), UTC).replace(hour=20, minute=30)
+    accession = f"{NEWCO}-19-000001"
+    page = CoverPage(NEWCO, accession, accepted, (CoverListing("Common Stock", "ACME", "NYSE"),))
+    filings = _filings(
+        extra_index=[FilingIndexEntry(NEWCO, "Newco Inc", "10-K", accession, accepted)],
+        extra_headers=[FilingHeader(NEWCO, accession, "10-K", 3571, accepted)],
+        extra_facts=[_fact(NEWCO, "", 2_000_000, accession, accepted)],
+        extra_covers=[page],
+    )
+    assert _backfill(_loose(quiet), _History(), filings=filings).ok
+    _drop_bars(quiet, ACME, STOPPED)
+    with duckdb.connect(quiet.store.path) as conn:  # an Alpaca feed's source, as ingest stores
+        conn.execute("UPDATE prices_daily SET source = 'alpaca_sip'")
+    return _loose(quiet)
+
+
+def test_e_a_hand_over_window_is_listed_as_a_hole_of_the_old_holder(settings: Settings) -> None:
+    taken = _taken(settings)
+    found = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    acme = [hole for hole in found.holes if hole.security_id == ACME]
+    assert [(hole.window, hole.handover) for hole in acme] == [(JUNE_WINDOW, True)]
+
+
+def test_e_an_empty_refetch_stores_nothing_and_is_counted(settings: Settings) -> None:
+    taken = _taken(settings)
+    gaps = {(ACME, day) for day in _sessions(*JUNE_WINDOW)}
+    result = fill_holes(
+        taken, prices=_History(gaps=gaps), since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert "1 rule8_window holes with nothing stored" in result.runs[0].message
+    again = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert (ACME, JUNE_WINDOW) in _holes(again)  # listed again on every run
+
+
+def test_e_a_refetched_bar_lands_on_the_old_holder_and_moves_the_end(settings: Settings) -> None:
+    taken = _taken(settings)
+    result = fill_holes(
+        taken, prices=_History(), since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    stored = _read(
+        taken,
+        f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-03' AND DATE '2019-06-19'",
+    )
+    assert stored[0][0] > 0
+    with duckdb.connect(taken.store.path) as conn:  # `_History` stamps `alpaca`
+        conn.execute("UPDATE prices_daily SET source = 'alpaca_sip'")
+    again = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert all(not hole.handover for hole in again.holes)
