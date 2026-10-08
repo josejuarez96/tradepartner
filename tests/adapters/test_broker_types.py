@@ -124,14 +124,25 @@ def test_notional_must_be_positive_finite(bad: float) -> None:
 
 
 def test_a_request_has_no_price_field() -> None:
-    assert "price" not in {f.name for f in fields(OrderRequest)}
-    assert [f.name for f in fields(OrderRequest)] == [
+    names = [f.name for f in fields(OrderRequest)]
+    assert names == [
         "client_order_id",
         "symbol",
         "side",
         "notional",
         "quantity",
     ]
+    # The read-side order-shape fields are read only: no request can carry a
+    # price, a type or a leg (ADR 0015 seam 3).
+    assert not {
+        "order_type",
+        "time_in_force",
+        "limit_price",
+        "stop_price",
+        "asset_class",
+        "order_class",
+        "legs",
+    } & set(names)
 
 
 # --- Order ------------------------------------------------------------------------
@@ -150,6 +161,13 @@ def test_order_fields() -> None:
         "filled_quantity",
         "filled_avg_price",
         "filled_at",
+        "order_type",
+        "time_in_force",
+        "limit_price",
+        "stop_price",
+        "asset_class",
+        "order_class",
+        "legs",
     ]
 
 
@@ -161,6 +179,45 @@ def test_the_last_four_order_fields_default_to_none() -> None:
         order.filled_avg_price,
         order.filled_at,
     ) == (None, None, None, None)
+
+
+def test_the_read_side_order_fields_carry_their_defaults() -> None:
+    order = _order()
+    assert (order.order_type, order.time_in_force, order.asset_class, order.order_class) == (
+        "market",
+        "day",
+        "us_equity",
+        "simple",
+    )
+    assert (order.limit_price, order.stop_price, order.legs) == (None, None, ())
+
+
+def test_a_legs_order_nests() -> None:
+    leg = _order(client_order_id="leg-1", symbol="MSFT")
+    order = _order(order_class="mleg", legs=(leg,))
+    assert isinstance(order.legs, tuple)
+    assert order.legs == (leg,)
+    assert order.legs[0].client_order_id == "leg-1"
+    with pytest.raises(ValueError, match="legs"):
+        _order(legs=("not-an-order",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="legs"):
+        _order(legs=[leg])  # type: ignore[arg-type]  # a list is not a tuple of Order
+
+
+@pytest.mark.parametrize(
+    "field_name", ["order_type", "time_in_force", "asset_class", "order_class"]
+)
+@pytest.mark.parametrize("bad", ["", " market", 7])
+def test_order_shape_strings_must_be_identifiers(field_name: str, bad: object) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        _order(**{field_name: bad})
+
+
+@pytest.mark.parametrize("field_name", ["limit_price", "stop_price"])
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf")])
+def test_order_prices_must_be_positive_finite(field_name: str, bad: float) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        _order(**{field_name: bad})
 
 
 def test_a_partial_fill_is_accepted_with_filled_quantity_and_average_price() -> None:
@@ -258,6 +315,15 @@ def test_broker_fill_id_must_be_an_identifier(bad: object) -> None:
         _fill(broker_fill_id=bad)
 
 
+def test_fee_is_none_until_set_and_must_be_non_negative_finite_when_set() -> None:
+    assert _fill().fee is None
+    assert _fill(fee=0.0).fee == 0.0
+    assert _fill(fee=1.25).fee == 1.25
+    for bad in (-0.01, float("nan"), float("inf"), float("-inf"), True, "0.1"):
+        with pytest.raises(ValueError, match="fee"):
+            _fill(fee=bad)
+
+
 # --- Account and Asset ----------------------------------------------------------------
 
 
@@ -275,9 +341,55 @@ def test_account_shape() -> None:
         "buying_power",
         "equity",
         "as_of",
+        "short_market_value",
+        "maintenance_margin",
+        "daytrade_count",
     ]
     assert account.buying_power == 2001.0 and isinstance(account.buying_power, float)
     assert account.as_of == T0 and account.as_of.tzinfo is UTC
+
+
+def test_account_read_side_fields_default_to_none() -> None:
+    account = Account("acct-1", 1.0, 1.0, 1.0, T0)
+    assert (account.short_market_value, account.maintenance_margin) == (None, None)
+    assert account.daytrade_count is None
+
+
+@pytest.mark.parametrize("field_name", ["short_market_value", "maintenance_margin"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True, "1"])
+def test_account_margin_fields_must_be_finite_when_set(field_name: str, bad: object) -> None:
+    values: dict[str, Any] = {
+        "account_id": "acct-1",
+        "cash": 1.0,
+        "buying_power": 1.0,
+        "equity": 1.0,
+        "as_of": T0,
+        field_name: bad,
+    }
+    with pytest.raises(ValueError, match=field_name):
+        Account(**values)
+
+
+def test_account_margin_fields_may_be_negative_and_set() -> None:
+    account = Account(
+        "acct-1", 1.0, 1.0, 1.0, T0, short_market_value=-250.0, maintenance_margin=30.0
+    )
+    assert (account.short_market_value, account.maintenance_margin) == (-250.0, 30.0)
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "1"])
+def test_account_daytrade_count_must_be_a_non_negative_int_when_set(bad: object) -> None:
+    values: dict[str, Any] = {
+        "account_id": "acct-1",
+        "cash": 1.0,
+        "buying_power": 1.0,
+        "equity": 1.0,
+        "as_of": T0,
+        "daytrade_count": bad,
+    }
+    with pytest.raises(ValueError, match="daytrade_count"):
+        Account(**values)
+    assert Account("acct-1", 1.0, 1.0, 1.0, T0, daytrade_count=2).daytrade_count == 2
 
 
 @pytest.mark.parametrize("field_name", ["cash", "buying_power", "equity"])
@@ -307,12 +419,27 @@ def test_account_needs_an_id_and_an_aware_as_of() -> None:
 
 
 def test_asset_shape_and_nullable_cusip() -> None:
-    assert [f.name for f in fields(Asset)] == ["tradable", "fractionable", "status", "cusip"]
+    assert [f.name for f in fields(Asset)] == [
+        "tradable",
+        "fractionable",
+        "status",
+        "cusip",
+        "shortable",
+        "easy_to_borrow",
+        "marginable",
+    ]
     assert Asset(tradable=True, fractionable=False, status="active", cusip=None).cusip is None
     assert Asset(True, True, "active", "037833100").cusip == "037833100"
 
 
-@pytest.mark.parametrize("field_name", ["tradable", "fractionable"])
+def test_asset_read_side_flags_default_to_false() -> None:
+    asset = Asset(True, True, "active", None)
+    assert (asset.shortable, asset.easy_to_borrow, asset.marginable) == (False, False, False)
+
+
+@pytest.mark.parametrize(
+    "field_name", ["tradable", "fractionable", "shortable", "easy_to_borrow", "marginable"]
+)
 def test_asset_flags_must_be_bools(field_name: str) -> None:
     values: dict[str, Any] = {"tradable": True, "fractionable": True, "status": "active"}
     values[field_name] = 1
