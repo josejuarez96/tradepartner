@@ -30,7 +30,7 @@ from tradepartner.backtest.metrics import (
     probabilistic_sharpe,
 )
 from tradepartner.config import Settings
-from tradepartner.store import lab_registry, registry
+from tradepartner.store import lab_queries, lab_registry, registry
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import LabNotInitialised
 from tradepartner.store.schema import REGISTRY_TABLE_NAMES
@@ -126,6 +126,8 @@ class Store:
         kind: str = "in_sample",
         red_flag: bool = False,
         stored_dsr_excess: float | None = None,
+        run_id: int | None = None,
+        seconds: float = 1.0,
     ) -> int:
         conn = self.conn
         (trial_id,) = conn.execute(  # type: ignore[misc]
@@ -181,7 +183,24 @@ class Store:
                     "value": value,
                 },
             )
+        if run_id is not None:
+            lab_registry.write_sweep_trial(
+                conn, sweep_run_id=run_id, trial_id=trial_id, read_group_index=1, seconds=seconds
+            )
         return int(trial_id)
+
+    def run(self, sweep: lab_registry.SweepRecord) -> int:
+        """An open `sweep_runs` row of `sweep`: a failure counts toward terminal
+        failure only as a trial of one of its registration's runs (#1221)."""
+        return lab_registry.open_sweep_run(
+            self.conn,
+            sweep_id=sweep.sweep_id,
+            time_budget_minutes=480,
+            n_declared=sweep.n_variants,
+            n_planned=sweep.n_variants,
+            code_tree_sha256=CODE,
+            run_by="test",
+        )
 
 
 def _rules(
@@ -496,22 +515,23 @@ def test_terminal_failed_variants_complete_the_sweep_and_never_select(
 ) -> None:
     store, _twin = world
     conn = store.conn
-    _sweep_record, records = _sweep(conn, settings, [0.15, 0.2, 0.25, 0.3, 0.35])
+    sweep_record, records = _sweep(conn, settings, [0.15, 0.2, 0.25, 0.3, 0.35])
     v1, v2, v3, v4, v5 = (r.hypothesis_id for r in records)
-    store.trial(v1, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.2))
+    run = store.run(sweep_record)
+    store.trial(v1, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.2), run_id=run)
     # Two identical clean current failures: terminal.
-    store.trial(v2, status="failed", message="boom")
-    store.trial(v2, status="failed", message="boom")
+    store.trial(v2, status="failed", message="boom", run_id=run)
+    store.trial(v2, status="failed", message="boom", run_id=run)
     # Excluded kinds, a dirty one and another code vintage: not terminal.
-    store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE)
-    store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE)
-    store.trial(v3, status="failed", message=sweep_report.SHARED_READ_FAILED)
-    store.trial(v4, status="failed", message="boom", dirty=True)
-    store.trial(v4, status="failed", message="boom", code=OTHER_CODE)
+    store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE, run_id=run)
+    store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE, run_id=run)
+    store.trial(v3, status="failed", message=sweep_report.SHARED_READ_FAILED, run_id=run)
+    store.trial(v4, status="failed", message="boom", dirty=True, run_id=run)
+    store.trial(v4, status="failed", message="boom", code=OTHER_CODE, run_id=run)
     # A current ok after two failures: counted.
-    store.trial(v5, status="failed", message="boom")
-    store.trial(v5, status="failed", message="boom")
-    store.trial(v5, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.7))
+    store.trial(v5, status="failed", message="boom", run_id=run)
+    store.trial(v5, status="failed", message="boom", run_id=run)
+    store.trial(v5, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.7), run_id=run)
 
     report = sweep_report.sweep_report(conn, "mom-grid", code_vintage=CODE)
     assert [r.status for r in report.rows] == [
@@ -524,6 +544,57 @@ def test_terminal_failed_variants_complete_the_sweep_and_never_select(
     assert report.terminal_failed == (records[1].slug,)
     assert report.state == "incomplete (unrun)"
     assert "terminal_failed (boom)" in sweep_report.format_report(report)
+
+
+_REPORT_STATUS = {
+    "current": "counted",
+    "terminal_failed": "terminal_failed",
+    "stale": "stale",
+    "unrun": "unrun",
+}
+
+
+@pytest.mark.parametrize("code", [CODE, OTHER_CODE])
+def test_report_states_equal_the_run_planners_one_classifier(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings, code: str
+) -> None:
+    """#1221: the report reads variant state from `lab_queries.variant_states`, so
+    its states and the sweep's state equal what the runner plans from, including
+    the four cases on which the report's own copy of the rule used to differ."""
+    store, _twin = world
+    conn = store.conn
+    sweep_record, records = _sweep(conn, settings, [0.15, 0.2, 0.25, 0.3, 0.35, 0.4])
+    v1, v2, v3, v4, v5, _v6 = (r.hypothesis_id for r in records)
+    run = store.run(sweep_record)
+    store.trial(v1, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.2), run_id=run)
+    store.trial(v2, status="failed", message="boom", run_id=run)
+    store.trial(v2, status="failed", message="boom", run_id=run)
+    # Two identical failures outside any run of this registration: not terminal.
+    store.trial(v3, status="failed", message="boom")
+    store.trial(v3, status="failed", message="boom")
+    # Two NULL-message failures in its runs: one (empty) message, terminal.
+    store.trial(v4, status="failed", message=None, run_id=run)
+    store.trial(v4, status="failed", message=None, run_id=run)
+    store.trial(v5, metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.3), stale=True)
+
+    report = sweep_report.sweep_report(conn, "mom-grid", code_vintage=code)
+    states = lab_queries.variant_states(conn, sweep_record.sweep_id, code_vintage=code)
+    planner = lab_queries.sweep_state(conn, sweep_record.sweep_id, code_vintage=code)
+    assert report.state == planner.state
+    for row, state in zip(report.rows, states, strict=True):
+        expected = _REPORT_STATUS[state.state]
+        if expected == "unrun" and row.status == "failed":
+            continue  # the report's one display state: unrun with failures
+        assert row.status == expected, row.slug
+    if code == CODE:
+        assert [r.status for r in report.rows] == [
+            "counted",
+            "terminal_failed",
+            "failed",
+            "terminal_failed",
+            "stale",
+            "unrun",
+        ]
 
 
 def test_a_code_change_makes_every_trial_stale(
@@ -541,9 +612,10 @@ def test_all_terminal_failed_is_complete_with_no_argmax(
     world: tuple[Store, registry.HypothesisRecord], settings: Settings
 ) -> None:
     store, _twin = world
-    _sweep_record, records = _sweep(store.conn, settings, [0.15])
-    store.trial(records[0].hypothesis_id, status="failed", message="boom")
-    store.trial(records[0].hypothesis_id, status="failed", message="boom")
+    sweep_record, records = _sweep(store.conn, settings, [0.15])
+    run = store.run(sweep_record)
+    store.trial(records[0].hypothesis_id, status="failed", message="boom", run_id=run)
+    store.trial(records[0].hypothesis_id, status="failed", message="boom", run_id=run)
     report = sweep_report.sweep_report(store.conn, "mom-grid", code_vintage=CODE)
     assert report.complete
     assert report.verdicts is None
@@ -605,11 +677,18 @@ def test_lab_status_lists_everything_named(
 ) -> None:
     store, twin = world
     conn = store.conn
-    _sweep_record, records = _sweep(conn, settings, [0.15, 0.2])
+    sweep_record, records = _sweep(conn, settings, [0.15, 0.2])
+    run_id = store.run(sweep_record)
     store.trial(
         records[0].hypothesis_id,
         metrics=_metrics(excess_cagr=0.01, sharpe_annual_excess=0.4),
         stale=True,
+        run_id=run_id,
+        seconds=15.0,
+    )
+    # A failed trial's near-zero seconds are not a run time (as `lab_queries` reads them).
+    store.trial(
+        records[1].hypothesis_id, status="failed", message="boom", run_id=run_id, seconds=0.001
     )
     # A grandfathered pair: two pre-lab registrations with one fingerprint, the second
     # with a different in-sample start (a grandfathered member).
@@ -631,15 +710,6 @@ def test_lab_status_lists_everything_named(
     lab_registry.write_fingerprint(conn, old.hypothesis_id, "f" * 64)
     mark_pre_lab(conn, twin.hypothesis_id)
     mark_pre_lab(conn, old.hypothesis_id)
-    run_id = lab_registry.open_sweep_run(
-        conn,
-        sweep_id=1,
-        time_budget_minutes=480,
-        n_declared=2,
-        n_planned=2,
-        code_tree_sha256=CODE,
-        run_by="test",
-    )
     lab_registry.close_sweep_run(
         conn,
         run_id,
