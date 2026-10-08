@@ -2846,3 +2846,84 @@ class TestSameAlpacaSymbolFold:
     )
     def test_different_tickers_are_not_one_symbol(self, one: str, other: str) -> None:
         assert same_alpaca_symbol(one, other) is False
+
+
+class TestClassSymbols:
+    """#1219: a NYSE cover page writes a class ticker without the dot (`BFB`),
+    Alpaca serves `BF.B`. `alpaca.class_symbols` names the pairs; nothing is
+    guessed from the spelling (CVNA, UAA and WLYB are real undotted symbols)."""
+
+    BF = "0000014693:class-b-common-stock-nonvoting"
+    DAYS: ClassVar[list[date]] = [date(2024, 6, 3), date(2024, 6, 4)]
+    MAP: ClassVar[dict[str, str]] = {"BFB": "BF.B"}
+
+    def _listing(self, ticker: str = "BFB", exchange: str | None = "NYSE") -> dict[str, object]:
+        row = _listing(self.BF, ticker, date(2019, 8, 28), "Class B Common Stock (nonvoting)")
+        if exchange is not None:
+            row["exchange"] = exchange
+        return row
+
+    def _asked(self, *rows: dict[str, object], class_symbols: dict[str, str] | None) -> list[str]:
+        asked: list[list[str]] = []
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            asked.append(symbols)
+            return {"feed": "sip", "bars": {}}
+
+        resolver = ListingResolver(rows, class_symbols=class_symbols)
+        AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings()).bars(
+            [self.BF], self.DAYS[0], self.DAYS[1]
+        )
+        return asked[0]
+
+    def test_the_nyse_class_ticker_is_asked_in_alpaca_form_and_fills(self) -> None:
+        payload = {"feed": "sip", "bars": {"BF.B": [_row(d, 50.0) for d in self.DAYS]}}
+        source = AlpacaPriceSource(
+            ListingResolver([self._listing()], class_symbols=self.MAP),
+            fetch_bars=lambda symbols, start, end: payload,
+            settings=_settings(),
+        )
+        bars = source.bars([self.BF], self.DAYS[0], self.DAYS[1])
+        assert [(b.security_id, b.session) for b in bars] == [(self.BF, d) for d in self.DAYS]
+
+    def test_without_the_map_the_undotted_ticker_is_asked(self) -> None:
+        assert self._asked(self._listing(), class_symbols=None) == ["BFB"]
+        assert self._asked(self._listing(), class_symbols=self.MAP) == ["BF.B"]
+
+    def test_only_a_nyse_listing_takes_the_mapped_symbol(self) -> None:
+        for exchange in ("NASDAQ", "NYSE_AMERICAN", None):
+            assert self._asked(self._listing(exchange=exchange), class_symbols=self.MAP) == ["BFB"]
+
+    def test_an_unlisted_ticker_is_never_dotted(self) -> None:
+        row = _listing("0000000007", "WLYB", date(2019, 8, 28), "Class B Common Stock")
+        row["exchange"] = "NYSE"
+        resolver = ListingResolver([row], class_symbols=self.MAP)
+        assert resolver.symbols("0000000007", date(2024, 1, 2), date(2024, 1, 3)) == ["WLYB"]
+
+    def test_no_bar_before_the_listing_starts(self) -> None:
+        resolver = ListingResolver([self._listing()], class_symbols=self.MAP)
+        assert resolver.resolve("BF.B", date(2019, 8, 27)) is None
+        assert resolver.resolve("BF.B", date(2019, 8, 28)) == self.BF
+
+    def test_a_delisting_is_keyed_to_the_mapped_symbol(self) -> None:
+        end = {**self._listing(), "status": "delisted", "effective_on": date(2024, 6, 4)}
+        end.update(end_session=None, delisting_filed_at=None)
+        evidence = registrant_evidence(
+            [],
+            [end],
+            as_of=date(2024, 6, 1),
+            quiet_after_days=90,
+            transfer_window_sessions=5,
+            class_symbols=self.MAP,
+        )
+        assert evidence.delisted_listings[self.BF] == (
+            (date(2019, 8, 28), "BF.B", date(2024, 6, 4)),
+        )
+
+    def test_the_default_config_names_the_four_known_pairs(self) -> None:
+        assert _settings().alpaca.class_symbols == {
+            "BFA": "BF.A",
+            "BFB": "BF.B",
+            "HVTA": "HVT.A",
+            "WSOB": "WSO.B",
+        }
