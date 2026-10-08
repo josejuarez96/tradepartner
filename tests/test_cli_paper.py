@@ -28,7 +28,10 @@ from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
 from tradepartner.execution import run as paper_run
+from tradepartner.execution import switch
+from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
+from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
 from tradepartner.store import journal, registry
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
@@ -776,3 +779,48 @@ def test_stop_reconcile_resume_abandon_and_check_on_an_open_window(
     assert abandon.exit_code == 0, abandon.output
     assert "paper abandon: abandoned" in abandon.output
     assert _paper(clock, factory, "run").exit_code == 1  # no window: `no_window`
+
+
+def test_a_broker_that_cannot_be_built_fails_scrubbed(clock: _Clock) -> None:
+    def broken(_settings: Settings, _clock: Any) -> FakeBroker:
+        raise RuntimeError(f"no paper client for key {ALPACA_KEY} / {ALPACA_SECRET}")
+
+    for args in (("run",), ("reconcile",), ("stop", "--reason", LONG_REASON)):
+        result = CliRunner().invoke(cli.make_app(clock=clock, broker=broken), ["paper", *args])
+        assert result.exit_code == 1, (args, result.output)
+        assert "RuntimeError" in result.output
+        assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0
+
+
+@pytest.mark.usefixtures("started")
+def test_paper_kill_exits_write_failed_when_its_row_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    monkeypatch.setattr(switch, "engage", lambda *_a, **_k: switch.WriteFailed("store gone"))
+    out = _paper(clock, factory, "kill", "--reason", LONG_REASON)
+    assert out.exit_code == WRITE_FAILED_EXIT_CODE == 3
+    assert "NOT engaged" in out.output
+
+
+def test_paper_run_passes_the_halt_paths_write_failed_exit_through(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    def halted(*_args: Any, **_kwargs: Any) -> None:
+        raise SystemExit(WRITE_FAILED_EXIT_CODE)
+
+    monkeypatch.setattr(paper_run, "tracking_run", halted)
+    assert _paper(clock, factory, "run").exit_code == WRITE_FAILED_EXIT_CODE
+
+
+@pytest.mark.usefixtures("started")
+def test_commands_under_a_held_run_lock_exit_locked(clock: _Clock, factory: _Factory) -> None:
+    before = factory.fake.calls  # `paper start`'s reads
+    with run_lock(_settings()):
+        stop = _paper(clock, factory, "stop", "--reason", LONG_REASON)
+        reconcile = _paper(clock, factory, "reconcile")
+        run = _paper(clock, factory, "run")
+    assert stop.exit_code == reconcile.exit_code == cli.PAPER_REFUSAL_EXIT["locked"]
+    assert "refused: locked" in stop.output
+    assert run.exit_code == 1  # the runbook's table: `locked` exits CRASH_EXIT_CODE
+    assert "paper run: locked" in run.output
+    assert factory.fake.calls == before

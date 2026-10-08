@@ -111,7 +111,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   from `execution.brokers.build_broker` (a test injects one through `make_app`'s
   `broker`), built with the command's one clock object, which the command also
   hands to the function, so the wrapper `run` builds holds the same clock as the
-  adapter (ADR 0007 point 5). A blank `--reason` is a usage error (2) before any
+  adapter (ADR 0007 point 5); a broker that cannot be built is a failure (1),
+  its message scrubbed like every other line. A blank `--reason` is a usage error (2) before any
   broker is built. `run` reads `TRADEPARTNER_INVOKED_BY` (`run.invoked_by`).
   No flag selects an endpoint, a run session or a store path, or bypasses the
   switch or a limit: `override --session` names the rebalance session the
@@ -122,7 +123,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   (0 for `ok`, `no_session` and `skipped_kill_switch`, else 1), 1 for a halt or
   failure, `wrapper.WRITE_FAILED_EXIT_CODE` (3) when the halt path cannot write
   the switch. Every other command exits 0 on success, 1 on a failure (an
-  exception, a reconciliation that is not `ok`, a failing `check`), 2 on a usage
+  exception, a reconciliation that is not `ok`, a failing `check`; `report` and
+  `check` with no window are such a failure), 2 on a usage
   error, 3 when `kill` cannot write its row, and `PAPER_REFUSAL_EXIT`'s code for
   `refused` (the reason code is printed), `locked` and `no_window`.
 - `tradepartner paper lots-reconcile --export <file> --tax-year <y>` parses the
@@ -810,10 +812,11 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
         return call()
     except (LockHeld, StoreLockedError) as exc:
         message, code = f"refused: locked: {exc}", PAPER_REFUSAL_EXIT["locked"]
-    except (reconcile_run.NoWindowError, window.WindowCommandRefused) as exc:
-        reason = getattr(exc, "reason", window.NO_WINDOW)
-        key = "no_window" if reason == window.NO_WINDOW else "refused"
-        message, code = f"refused: {reason}: {exc}", PAPER_REFUSAL_EXIT[key]
+    except reconcile_run.NoWindowError as exc:  # its message starts `no_window:`
+        message, code = f"refused: {exc}", PAPER_REFUSAL_EXIT["no_window"]
+    except window.WindowCommandRefused as exc:
+        key = "no_window" if exc.reason == window.NO_WINDOW else "refused"
+        message, code = f"refused: {exc.reason}: {exc}", PAPER_REFUSAL_EXIT[key]
     except window.StartRefusedError as exc:
         message, code = f"refused: {exc.reason}: {exc}", PAPER_REFUSAL_EXIT["refused"]
     except registry.UnknownHypothesis as exc:
@@ -2020,9 +2023,9 @@ def make_app(
     ) -> None:
         """Open a paper window for a signed-off hypothesis (spec req 14)."""
         s = paper_settings()
-        gate = broker(s, clock)
         result = _paper_call(
-            s, lambda: window.start(s, lambda: open_read_only(s), gate, clock, hypothesis)
+            s,
+            lambda: window.start(s, lambda: open_read_only(s), broker(s, clock), clock, hypothesis),
         )
         opened = result.window
         _echo_scrubbed(
@@ -2037,8 +2040,9 @@ def make_app(
     def paper_stop(reason: Annotated[str, _REASON_OPTION]) -> None:
         """Request the window's stop, or close it once the stop run is done (req 14)."""
         s = paper_settings(reason)
-        gate = broker(s, clock)
-        result = _paper_call(s, lambda: window.stop(s, write_chunk(s), gate, clock, reason))
+        result = _paper_call(
+            s, lambda: window.stop(s, write_chunk(s), broker(s, clock), clock, reason)
+        )
         _echo_scrubbed(
             f"paper stop: {result.state}; reconciliation {_fmt(result.reconciliation_id)}; "
             f"residues {result.residues_json or '-'}",
@@ -2049,9 +2053,8 @@ def make_app(
     def paper_run_() -> None:
         """The tracking run on the clock's session (spec req 7; the scheduler's job)."""
         s = paper_settings()
-        gate = broker(s, clock)
         try:
-            outcome = paper_run.tracking_run(s, write_chunk(s), gate, clock)
+            outcome = paper_run.tracking_run(s, write_chunk(s), broker(s, clock), clock)
         except Exception as exc:
             raise _fail(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
@@ -2070,9 +2073,8 @@ def make_app(
     def paper_reconcile() -> None:
         """Reconcile the journal with the broker now (spec req 6)."""
         s = paper_settings()
-        gate = broker(s, clock)
         result = _paper_call(
-            s, lambda: reconcile_run.reconcile_command(s, write_chunk(s), gate, clock)
+            s, lambda: reconcile_run.reconcile_command(s, write_chunk(s), broker(s, clock), clock)
         )
         _echo_scrubbed(f"paper reconcile: {result.status}; {result.mismatches_json}", s)
         if result.status != RECONCILE_OK:
@@ -2098,13 +2100,12 @@ def make_app(
     ) -> None:
         """Settle, collect, reconcile and release the kill switch (spec req 5)."""
         s = paper_settings(reason)
-        gate = broker(s, clock)
         outcome = _paper_call(
             s,
             lambda: paper_resume.resume(
                 s,
                 write_chunk(s),
-                gate,
+                broker(s, clock),
                 clock,
                 reason,
                 accept_broker_fills,
@@ -2189,8 +2190,9 @@ def make_app(
     def paper_abandon(reason: Annotated[str, _REASON_OPTION]) -> None:
         """End the window without flattening, owner-only (#247 Q13)."""
         s = paper_settings(reason)
-        gate = broker(s, clock)
-        result = _paper_call(s, lambda: window.abandon(s, write_chunk(s), gate, clock, reason))
+        result = _paper_call(
+            s, lambda: window.abandon(s, write_chunk(s), broker(s, clock), clock, reason)
+        )
         _echo_scrubbed(
             f"paper abandon: abandoned; reconciliation {result.reconciliation_id} "
             f"{result.reconciliation_status}; residues {result.residues_json}",
