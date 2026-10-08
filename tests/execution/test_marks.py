@@ -262,7 +262,7 @@ def test_split_on_session_marks_pre_split_quantity_and_raw_close(tmp_path) -> No
     _bar(conn, A, s_minus_1, 20.0)  # the raw, pre-split close
 
     order = OrderRow(
-        client_order_id=client_order_id("tp", d0, A, "buy", 1),
+        client_order_id=client_order_id("tp", "main", d0, A, "buy", 1),
         decision_id=1,
         run_id=1,
         session=d0,

@@ -849,7 +849,7 @@ def _order(
 ) -> OrderRow:
     assert decision.decision_id is not None
     return OrderRow(
-        client_order_id=client_order_id("tp", S, decision.security_id, side, attempt),
+        client_order_id=client_order_id("tp", "main", S, decision.security_id, side, attempt),
         decision_id=decision.decision_id,
         run_id=1,
         session=S,
@@ -898,39 +898,53 @@ LISTINGS = {"SEC_1": "AAA", "SEC_2": "BBB"}
 def test_requests_carry_the_listing_symbol_and_ids_counted_per_attempt() -> None:
     earlier = _order(_d(1, "sell"), quantity=1.0)  # an expired attempt earlier on S
     requests = requests_for(
-        PhaseOrders((SELL, BUY), (), session=S), LISTINGS, "tp", [earlier], None, session=S
+        PhaseOrders((SELL, BUY), (), session=S), LISTINGS, "tp", "main", [earlier], None, session=S
     )
     assert [(r.client_order_id, r.symbol, r.side, r.quantity, r.notional) for r in requests] == [
-        ("tp-20261002-SEC_1-sell-2", "AAA", Side.SELL, 3.0, None),
-        ("tp-20261002-SEC_2-buy-1", "BBB", Side.BUY, None, 500.0),
+        ("tp-main-20261002-SEC_1-sell-2", "AAA", Side.SELL, 3.0, None),
+        ("tp-main-20261002-SEC_2-buy-1", "BBB", Side.BUY, None, 500.0),
     ]
 
 
 def test_a_name_unknown_to_the_master_raises_before_any_request() -> None:
     with pytest.raises(ValueError, match="no listing known at close\\(S-1\\) for \\['SEC_2'\\]"):
         requests_for(
-            PhaseOrders((SELL, BUY), (), session=S), {"SEC_1": "AAA"}, "tp", [], None, session=S
+            PhaseOrders((SELL, BUY), (), session=S),
+            {"SEC_1": "AAA"},
+            "tp",
+            "main",
+            [],
+            None,
+            session=S,
         )
 
 
 def test_an_over_long_id_is_refused_when_max_length_is_set_and_accepted_when_none() -> None:
     batch = PhaseOrders((SELL,), (), session=S)
-    length = len("tp-20261002-SEC_1-sell-1")
-    assert len(requests_for(batch, LISTINGS, "tp", [], length, session=S)) == 1
-    assert len(requests_for(batch, LISTINGS, "tp", [], None, session=S)) == 1
+    length = len("tp-main-20261002-SEC_1-sell-1")
+    assert len(requests_for(batch, LISTINGS, "tp", "main", [], length, session=S)) == 1
+    assert len(requests_for(batch, LISTINGS, "tp", "main", [], None, session=S)) == 1
     with pytest.raises(ValueError, match="longer than"):
-        requests_for(batch, LISTINGS, "tp", [], length - 1, session=S)
+        requests_for(batch, LISTINGS, "tp", "main", [], length - 1, session=S)
 
 
 def test_a_sell_carrying_a_notional_and_a_stray_session_row_are_refused() -> None:
     notional_sell = PhaseOrder(1, "SEC_1", "sell", "trade", PRICE, notional=300.0)
     with pytest.raises(ValueError, match="carries a notional"):
         requests_for(
-            PhaseOrders((notional_sell,), (), session=S), LISTINGS, "tp", [], None, session=S
+            PhaseOrders((notional_sell,), (), session=S),
+            LISTINGS,
+            "tp",
+            "main",
+            [],
+            None,
+            session=S,
         )
     stray = OrderRow(**{**_order(_d(1, "sell"), quantity=1.0).__dict__, "session": T0})
     with pytest.raises(ValueError, match="not 2026-10-02"):
-        requests_for(PhaseOrders((SELL,), (), session=S), LISTINGS, "tp", [stray], None, session=S)
+        requests_for(
+            PhaseOrders((SELL,), (), session=S), LISTINGS, "tp", "main", [stray], None, session=S
+        )
 
 
 def test_orders_built_for_another_session_are_refused() -> None:
@@ -939,7 +953,13 @@ def test_orders_built_for_another_session_are_refused() -> None:
     for built_for in (T0, None):
         with pytest.raises(ValueError, match="built for"):
             requests_for(
-                PhaseOrders((SELL,), (), session=built_for), LISTINGS, "tp", [], None, session=S
+                PhaseOrders((SELL,), (), session=built_for),
+                LISTINGS,
+                "tp",
+                "main",
+                [],
+                None,
+                session=S,
             )
     assert _sells([_d(1, "sell", notional=300.0)], {"SEC_1": 10.0}).session == S
     assert _buys(THREE[:1], 1000.0).session == S

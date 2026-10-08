@@ -42,6 +42,7 @@ from tradepartner.config import (
     clean_message,
     render_validation_errors,
 )
+from tradepartner.store.schema import DEFAULT_BOOK_ID
 
 
 @pytest.fixture(autouse=True)
@@ -1472,6 +1473,7 @@ def test_paper_defaults() -> None:
     assert p.accept_wait_seconds == pytest.approx(30.0)
     assert p.fill_read_overlap_seconds == pytest.approx(60.0)
     assert p.order_id_prefix == "tp"
+    assert p.book_id == DEFAULT_BOOK_ID == "main"
     assert p.live_capital_reference == pytest.approx(100.0)
     assert p.min_override_reason_chars == 20
 
@@ -1506,6 +1508,9 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
         {"fill_read_overlap_seconds": -1.0},
         {"order_id_prefix": ""},
         {"order_id_prefix": "t p"},
+        {"book_id": ""},
+        {"book_id": "a-b"},
+        {"book_id": "a:b"},
         {"live_capital_reference": 0.0},
         {"min_override_reason_chars": 0},
         {"tracking_k": float("nan")},

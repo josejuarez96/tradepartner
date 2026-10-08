@@ -84,6 +84,7 @@ from tradepartner.execution.plan import DecisionState, State
 from tradepartner.execution.risk import OpenSell
 from tradepartner.store.journal import AdjustmentRow, DecisionEventRow, DecisionRow
 from tradepartner.store.schema import (
+    DEFAULT_BOOK_ID,
     DELISTED_REASON,
     UNTARGETED_RECEIPT_REASON,
     WINDOW_STOP_REASON,
@@ -134,9 +135,17 @@ class ExitDecision:
     session: date
     skipped_reason: str | None = None
 
-    def row(self, *, run_id: int, known_at: datetime, ingested_at: datetime) -> DecisionRow:
+    def row(
+        self,
+        *,
+        run_id: int,
+        known_at: datetime,
+        ingested_at: datetime,
+        book_id: str = DEFAULT_BOOK_ID,
+    ) -> DecisionRow:
         """The `decisions` row for run `run_id`; its id is assigned on insert.
-        A `known_at` whose New York date is not `session` raises."""
+        A `known_at` whose New York date is not `session` raises. `book_id` is
+        the window's book (ADR 0015 seam 1, plan T133)."""
         if known_at.tzinfo is None or known_at.astimezone(_NEW_YORK).date() != self.session:
             raise ValueError(
                 f"exit of {self.security_id} is stated for {self.session}; known_at "
@@ -151,6 +160,7 @@ class ExitDecision:
             whole_share=self.whole_share,
             decision=_FORCED_EXIT,
             reason=self.reason,
+            book_id=book_id,
             known_at=known_at,
             ingested_at=ingested_at,
         )

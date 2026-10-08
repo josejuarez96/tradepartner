@@ -845,7 +845,7 @@ def test_ids_are_per_attempt_off_the_run_session(
     """A buy whose first attempt on S expired while a sell was in flight is
     re-attempted with attempt 2 (ADR 0010 point 3)."""
     buy = _decision(env, A, "buy", notional=3000.0)
-    first = "tp-20261001-SEC_DUAL_A-buy-1"
+    first = "tp-main-20261001-SEC_DUAL_A-buy-1"
     at = env.run.started_at
     _append(
         env.settings,
@@ -870,7 +870,7 @@ def test_ids_are_per_attempt_off_the_run_session(
     )
     _execute(_gate(env, alerter_conn), env, [buy])
     (request,) = _submits(env.fake)
-    assert request.client_order_id == "tp-20261001-SEC_DUAL_A-buy-2"
+    assert request.client_order_id == "tp-main-20261001-SEC_DUAL_A-buy-2"
     (attempt,) = _query(
         env.settings,
         "SELECT attempt FROM orders WHERE client_order_id = ?",
@@ -898,7 +898,7 @@ def test_the_accepted_event_carries_the_brokers_order_id(
 def test_a_validation_error_on_the_last_request_halts_with_zero_submits(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
-    """`tp-20261001-SEC_STATIC_PRE2019-buy-1` is 36 characters, the others 28."""
+    """`tp-main-20261001-SEC_STATIC_PRE2019-buy-1` is 41 characters, the others 33."""
     env.settings = _settings(env.settings.store.path, alpaca={"client_order_id_max_length": 30})
     buys = [_decision(env, A, "buy", notional=3000.0), _decision(env, C, "buy", notional=3000.0)]
     with pytest.raises(ValueError, match="longer than 30"):

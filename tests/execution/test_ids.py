@@ -34,7 +34,7 @@ def _row(
     session: date = SESSION,
 ) -> OrderRow:
     return OrderRow(
-        client_order_id=client_order_id("tp", session, security_id, side, attempt),
+        client_order_id=client_order_id("tp", "main", session, security_id, side, attempt),
         decision_id=decision_id,
         run_id=1,
         session=session,
@@ -59,35 +59,43 @@ def _journal(rows: list[OrderRow], decision_id: int, security_id: str, side: str
 
 
 def test_derivation_is_pinned() -> None:
-    assert client_order_id("tp", SESSION, "0000320193", "buy", 1) == "tp-20261001-0000320193-buy-1"
     assert (
-        client_order_id("paper", date(2027, 1, 4), "0001652044:class-c-capital-stock", "sell", 12)
-        == "paper-20270104-0001652044:class-c-capital-stock-sell-12"
+        client_order_id("tp", "main", SESSION, "0000320193", "buy", 1)
+        == "tp-main-20261001-0000320193-buy-1"
+    )
+    assert (
+        client_order_id(
+            "paper", "fx", date(2027, 1, 4), "0001652044:class-c-capital-stock", "sell", 12
+        )
+        == "paper-fx-20270104-0001652044:class-c-capital-stock-sell-12"
     )
 
 
 @pytest.mark.parametrize(
-    ("prefix", "session", "security_id", "side", "attempt"),
+    ("prefix", "book", "session", "security_id", "side", "attempt"),
     [
-        ("", SESSION, "0000320193", "buy", 1),
-        ("tp", SESSION, "", "buy", 1),
-        ("tp", SESSION, "0000320193", "hold", 1),
-        ("tp", SESSION, "0000320193", "BUY", 1),
-        ("tp", SESSION, "0000320193", "buy", 0),
-        ("tp", SESSION, "0000320193", "buy", -1),
-        ("tp", AT, "0000320193", "buy", 1),
+        ("", "main", SESSION, "0000320193", "buy", 1),
+        ("tp", "", SESSION, "0000320193", "buy", 1),
+        ("tp", "a-b", SESSION, "0000320193", "buy", 1),
+        ("tp", "a:b", SESSION, "0000320193", "buy", 1),
+        ("tp", "main", SESSION, "", "buy", 1),
+        ("tp", "main", SESSION, "0000320193", "hold", 1),
+        ("tp", "main", SESSION, "0000320193", "BUY", 1),
+        ("tp", "main", SESSION, "0000320193", "buy", 0),
+        ("tp", "main", SESSION, "0000320193", "buy", -1),
+        ("tp", "main", AT, "0000320193", "buy", 1),
     ],
 )
 def test_bad_parts_are_refused(
-    prefix: str, session: date, security_id: str, side: str, attempt: int
+    prefix: str, book: str, session: date, security_id: str, side: str, attempt: int
 ) -> None:
     with pytest.raises(ValueError):
-        client_order_id(prefix, session, security_id, side, attempt)
+        client_order_id(prefix, book, session, security_id, side, attempt)
 
 
 def test_bool_attempt_is_refused() -> None:
     with pytest.raises(ValueError):
-        client_order_id("tp", SESSION, "0000320193", "buy", True)
+        client_order_id("tp", "main", SESSION, "0000320193", "buy", True)
 
 
 def test_first_attempt_on_an_empty_session_is_one() -> None:
@@ -98,8 +106,8 @@ def test_two_decisions_on_one_name_on_one_session_never_share_an_id() -> None:
     rows: list[OrderRow] = []
     first = _journal(rows, decision_id=1, security_id="0000320193", side="buy")
     second = _journal(rows, decision_id=2, security_id="0000320193", side="buy")
-    assert first == "tp-20261001-0000320193-buy-1"
-    assert second == "tp-20261001-0000320193-buy-2"
+    assert first == "tp-main-20261001-0000320193-buy-1"
+    assert second == "tp-main-20261001-0000320193-buy-2"
     assert first != second
 
 
@@ -112,10 +120,10 @@ def test_sides_and_names_count_separately() -> None:
         _journal(rows, 4, "0000320193", "sell"),
     ]
     assert ids == [
-        "tp-20261001-0000320193-sell-1",
-        "tp-20261001-0000320193-buy-1",
-        "tp-20261001-0000789019-buy-1",
-        "tp-20261001-0000320193-sell-2",
+        "tp-main-20261001-0000320193-sell-1",
+        "tp-main-20261001-0000320193-buy-1",
+        "tp-main-20261001-0000789019-buy-1",
+        "tp-main-20261001-0000320193-sell-2",
     ]
     assert len(set(ids)) == len(ids)
 
@@ -199,6 +207,11 @@ def test_id_fits_the_brokers_recorded_length() -> None:
     ):
         for side in ("buy", "sell"):
             order_id = client_order_id(
-                settings.paper.order_id_prefix, date(2099, 12, 31), security_id, side, attempt
+                settings.paper.order_id_prefix,
+                settings.paper.book_id,
+                date(2099, 12, 31),
+                security_id,
+                side,
+                attempt,
             )
             assert len(order_id) <= limit, order_id

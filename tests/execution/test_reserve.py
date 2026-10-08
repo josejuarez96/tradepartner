@@ -49,7 +49,7 @@ def _order(
 ) -> OrderRow:
     stamp = _utc(session, 13)
     return OrderRow(
-        client_order_id=client_order_id("tp", session, security_id, side, attempt),
+        client_order_id=client_order_id("tp", "main", session, security_id, side, attempt),
         decision_id=next(_IDS),
         run_id=1,
         session=session,

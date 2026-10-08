@@ -560,12 +560,13 @@ def _write(
     decided: Decisions,
     handle: registry.TrialHandle,
     now: datetime,
+    book_id: str,
 ) -> tuple[DecisionRow, ...]:
     for signal in decided.signals:
         journal.append(conn, signal.row(run_id=run_id, known_at=now, ingested_at=now))
     rows: list[DecisionRow] = []
     for decision in decided.decisions:
-        row = decision.row(run_id=run_id, known_at=now, ingested_at=now)
+        row = decision.row(run_id=run_id, known_at=now, ingested_at=now, book_id=book_id)
         decision_id = journal.append(conn, row)
         rows.append(DecisionRow(**{**row.__dict__, "decision_id": decision_id}))
     journal.append(
@@ -659,7 +660,7 @@ def plan_rebalance(
             actions_as_of=reads.actions,
             costs=BuyCosts(costs.per_side_bps, Commissions.from_config(costs)),
         )
-        rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now)
+        rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now, window.book_id)
         _trial(lambda: _close_ok(conn, handle), "its result")
     except BaseException:
         _rollback(conn)

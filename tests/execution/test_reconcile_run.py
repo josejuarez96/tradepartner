@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -463,6 +464,28 @@ def test_an_ended_listing_writes_corporate_action_cash_once(
     again = _reconcile(journal_settings, fake, open_window, fixed_clock)
     assert again.status == OK and again.adjustments == ()
     assert len(_adjustments(journal_settings, open_window)) == 1
+
+
+def test_the_written_rows_carry_the_windows_book(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """ADR 0015 seam 1 (T133): `reconcile_now` writes its `reconciliations` row
+    and every `adjustments` row with the window's book, never the DDL default."""
+    fx_window = replace(open_window, book_id="fx")
+    run_id = _hold(journal_settings, fake, fx_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))
+    fake.extra_cash = 5.0
+
+    result = _reconcile(journal_settings, fake, fx_window, fixed_clock, run_id=run_id)
+
+    assert result.status == OK
+    (row,) = _rows(journal_settings, fx_window)
+    (adjustment,) = _adjustments(journal_settings, fx_window)
+    assert row.book_id == "fx"
+    assert adjustment.book_id == "fx"
 
 
 def test_a_credited_dividend_writes_dividend_cash_once(

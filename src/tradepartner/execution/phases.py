@@ -559,6 +559,7 @@ def requests_for(
     phase_orders: PhaseOrders,
     listings_at: Mapping[str, str | None],
     prefix: str,
+    book: str,
     orders_on_session: Sequence[OrderRow],
     max_length: int | None,
     *,
@@ -569,11 +570,13 @@ def requests_for(
 
     `listings_at` maps a `security_id` to its ticker in the master's listing
     at close(S-1) (`None` or absent: none, a `ValueError` before any request is
-    built); `prefix` is `paper.order_id_prefix`; `orders_on_session` every
-    `orders` row journaled on S = `session`, every decision and phase (a row of
-    another session raises); `max_length` is `alpaca.client_order_id_max_length`
-    (`None` until T48b records it skips the check: T48c refuses to construct the
-    real adapter while it is unset). A sell carrying a notional raises.
+    built); `prefix` is `paper.order_id_prefix`; `book` is the window's
+    `book_id` (`ids.client_order_id`'s token, ADR 0015 seam 1);
+    `orders_on_session` every `orders` row journaled on S = `session`, every
+    decision and phase (a row of another session raises); `max_length` is
+    `alpaca.client_order_id_max_length` (`None` until T48b records it skips the
+    check: T48c refuses to construct the real adapter while it is unset). A
+    sell carrying a notional raises.
     """
     _check_session(session)
     if phase_orders.session != session:
@@ -599,7 +602,7 @@ def requests_for(
         key = (order.security_id, order.side)
         attempt = next_attempt(orders_on_session, *key) + built[key]
         built[key] += 1
-        coid = client_order_id(prefix, session, order.security_id, order.side, attempt)
+        coid = client_order_id(prefix, book, session, order.security_id, order.side, attempt)
         if max_length is not None and len(coid) > max_length:
             raise ValueError(f"client order id {coid!r} is longer than {max_length}")
         symbol = listings_at[order.security_id]
