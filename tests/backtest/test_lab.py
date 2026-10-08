@@ -348,6 +348,26 @@ def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
         assert len(registry.family_sharpes(conn, "momentum").excess_spy) == 5
 
 
+def test_a_variants_trials_row_records_the_sweep_detail_level(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1197: each variant is opened at `lab.sweep_detail_level`, so its `trials`
+    row says `summary` when its stored rows are the summary ones."""
+    monkeypatch.setenv("LAB__SWEEP_DETAIL_LEVEL", "summary")
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    ids = [t.trial_id for t in outcome.trials]
+    with _read(store) as conn:
+        levels = conn.execute(
+            "SELECT DISTINCT detail_level FROM trials WHERE trial_id IN (SELECT UNNEST(?))",
+            [ids],
+        ).fetchall()
+        weights = conn.execute(
+            "SELECT COUNT(*) FROM trial_weights WHERE trial_id IN (SELECT UNNEST(?))", [ids]
+        ).fetchone()
+    assert outcome.n_ok == 4
+    assert levels == [("summary",)] and weights == (0,)
+
+
 def test_a_store_path_run_is_synthetic_leaves_n_unchanged_and_completes(
     store: Path, clock: FakeClock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -493,6 +493,7 @@ def _open_group(
             synthetic=synthetic,
             run_by=run_by,
             settings=live,
+            detail_level=live.lab.sweep_detail_level,
         )
         (vintage,) = conn.execute(  # type: ignore[misc]
             "SELECT data_vintage FROM trials WHERE trial_id = ?", [handle.trial_id]

@@ -369,6 +369,11 @@ def write_results(
     """
     if detail_level not in DETAIL_LEVELS:
         raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
+    if detail_level != handle.detail_level:
+        raise ValueError(
+            f"trial {handle.trial_id} was opened at detail level {handle.detail_level!r}; "
+            f"writing it at {detail_level!r} would leave its trials row wrong (#1197)"
+        )
     _check_frozen(handle, params)
     schema.require_research(conn)
     cadence = hypothesis_cadence(conn, handle)
