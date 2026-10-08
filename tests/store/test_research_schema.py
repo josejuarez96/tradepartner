@@ -39,6 +39,35 @@ _V13_SIGNALS_CHECK = "CHECK (reason IN ('selected', 'below_cut', 'excluded_no_hi
 _V11_RETRACTION_DDL_SHA256 = "d976e81c40b6b212eab80165bb570ca5c23a835b7dc0efcf9a87d7167dd4a4eb"
 
 
+def _v11_journal_ddl() -> str:
+    """`_JOURNAL_TABLE_DDL` as version 11 left it: the current text with the
+    version-14 `signals.reason` widening undone (`_V13_SIGNALS_CHECK`) and the
+    version-17 ADR 0015 seam columns and `position_side` checks stripped (#1153,
+    T127; #1258, T132)."""
+    blob = "".join(schema._JOURNAL_TABLE_DDL).replace(
+        schema._SIGNALS_REASON_CHECK, _V13_SIGNALS_CHECK, 1
+    )
+    shape = schema.ORDER_SHAPE_DEFAULTS
+    for column in (
+        f"    book_id VARCHAR NOT NULL DEFAULT '{schema.DEFAULT_BOOK_ID}',\n",
+        f"    position_side VARCHAR NOT NULL DEFAULT '{schema.LONG}',\n",
+        f"    order_type VARCHAR NOT NULL DEFAULT '{shape['order_type']}',\n",
+        f"    time_in_force VARCHAR NOT NULL DEFAULT '{shape['time_in_force']}',\n",
+        "    limit_price DOUBLE,\n",
+        "    stop_price DOUBLE,\n",
+        f"    asset_class VARCHAR NOT NULL DEFAULT '{shape['asset_class']}',\n",
+        f"    order_class VARCHAR NOT NULL DEFAULT '{shape['order_class']}',\n",
+        f"    multiplier DOUBLE NOT NULL DEFAULT {shape['multiplier']},\n",
+        "    parent_order_id VARCHAR,\n",
+    ):
+        blob = blob.replace(column, "")
+    for table in ("orders", "lots", "disposals"):
+        blob = blob.replace(f",\n    {schema._check(table, 'position_side')}", "")
+    for table in ("decisions", "positions_daily"):
+        blob = blob.replace(f"    {schema._check(table, 'position_side')},\n", "")
+    return blob
+
+
 def _row(table: str, **overrides: Any) -> dict[str, Any]:
     """A minimal valid row for each research table (every NOT NULL column)."""
     rows: dict[str, dict[str, Any]] = {
@@ -236,8 +265,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_16() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 16
+def test_current_schema_version_is_17() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 17
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -306,9 +335,10 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
     """Version 12 is additive: no fact, registry, journal, statement-facts or
     master DDL text moves (`n_research` arrives by `ALTER TABLE`)."""
     for name, digest in _V11_DDL_SHA256.items():
-        blob = "".join(getattr(schema, name))
         if name == "_JOURNAL_TABLE_DDL":
-            blob = blob.replace(schema._SIGNALS_REASON_CHECK, _V13_SIGNALS_CHECK, 1)
+            blob = _v11_journal_ddl()
+        else:
+            blob = "".join(getattr(schema, name))
         assert hashlib.sha256(blob.encode()).hexdigest() == digest, name
     retraction = "".join(schema._RETRACTION_TABLE_DDL[t] for t in ("securities", "listings"))
     assert hashlib.sha256(retraction.encode()).hexdigest() == _V11_RETRACTION_DDL_SHA256
@@ -317,20 +347,20 @@ def test_every_pre_version_12_ddl_blob_is_unchanged() -> None:
 # --- fresh store ---------------------------------------------------------------------
 
 
-def test_a_fresh_store_has_every_research_table_at_version_16(
+def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [16]
+    assert _versions(conn) == [17]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
 
-def test_init_schema_is_idempotent_on_version_16(conn: duckdb.DuckDBPyConnection) -> None:
+def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection) -> None:
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [16]
+    assert _versions(conn) == [17]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -611,7 +641,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16]
+        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16, 17]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]

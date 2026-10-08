@@ -815,7 +815,7 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
     year, or a `no_window` refusal. Read-only."""
     try:
         journal.require_journal(conn)
-    except journal.JournalNotInitialised:
+    except (journal.JournalNotInitialised, schema.SchemaVersionError):
         raise _LotsRefused("no_window", "no_window: the store has no paper journal") from None
     windows = [
         (int(w), s)

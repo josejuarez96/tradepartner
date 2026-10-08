@@ -280,6 +280,20 @@ def test_no_window_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     assert "no_window" in _text(at)
 
 
+def test_a_version_16_store_renders_no_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#1261: `_render_window_state` catches `SchemaVersionError` too, so the
+    override page shows its no-window state instead of a traceback."""
+    store_path = _init(tmp_path / "v16.duckdb", with_window=False)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    assert "no paper window is open" in _text(at).lower()
+
+
 def test_a_field_the_kind_does_not_take_is_refused(
     monkeypatch: pytest.MonkeyPatch, store: Path
 ) -> None:

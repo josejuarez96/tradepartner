@@ -72,7 +72,12 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.execution import window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
-from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS, SETTLE_ORDER_KIND
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    SchemaVersionError,
+)
 
 #: The kinds the schema allows, in its order (spec req 9), except `settle_order`:
 #: `paper settle` alone writes it, after a broker read this page cannot make
@@ -216,7 +221,7 @@ def show_outcome(settings: Settings) -> None:
 def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
     try:
         current = open_window(conn)
-    except JournalNotInitialised:
+    except (JournalNotInitialised, SchemaVersionError):
         current = None
     except JournalIntegrityError as exc:
         st.error(f"{exc}; the writer refuses every override until this is resolved.")

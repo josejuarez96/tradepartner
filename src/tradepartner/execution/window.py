@@ -257,6 +257,7 @@ from tradepartner.store.schema import (
     ENGAGE_KILL_SWITCH_KIND,
     JOURNAL_ENUMS,
     SETTLE_ORDER_KIND,
+    SchemaVersionError,
     init_schema,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -627,7 +628,7 @@ def start(
                     raise StartRefusedError("window_open", "a paper window is already open")
                 previous = latest_window(conn)
                 previous_stop = _previous_stop(conn, previous)
-            except JournalNotInitialised:
+            except (JournalNotInitialised, SchemaVersionError):
                 previous = None
                 previous_stop = None
             today = _ny_date(now)
@@ -812,7 +813,7 @@ def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     by then the reconciliation row is already written."""
     try:
         window = open_window(conn)
-    except JournalNotInitialised:
+    except (JournalNotInitialised, SchemaVersionError):
         window = None
     except JournalIntegrityError as exc:
         raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc

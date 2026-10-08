@@ -278,6 +278,18 @@ def test_a_store_without_the_journal_is_refused_as_no_window(export_file: Path, 
     assert out.exit_code == EXIT["no_window"], out.output
 
 
+def test_a_version_16_store_is_refused_as_no_window(export_file: Path, live: Path) -> None:
+    """#1261: `require_journal` raises `SchemaVersionError` on a version-16 store;
+    `_read_ledger_set` catches it too, so the command refuses `no_window`."""
+    with duckdb.connect(str(live)) as conn:
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+
+    out = _reconcile(export_file, rows=AGREEING)
+
+    assert out.exit_code == EXIT["no_window"], out.output
+
+
 def test_a_locked_store_is_refused(export_file: Path, live: Path) -> None:
     _seed(live)
     writer = duckdb.connect(str(live))  # a read-write connection in this process

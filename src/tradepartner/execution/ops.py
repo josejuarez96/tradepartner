@@ -14,7 +14,10 @@ modules document for readers that must never block a run.
 raises `store.journal.JournalNotInitialised` from the first read; this module
 catches it and returns an `OpsData` with `journal_not_initialised=True` and
 every other field at its empty default (the T43 "registry not initialised"
-pattern: a page shows a state, not a traceback).
+pattern: a page shows a state, not a traceback). A read-only connection to a
+version-16 store raises `store.schema.SchemaVersionError` from the same read
+(the journal predates schema version 17); caught here too, for the same
+state.
 
 **No window yet.** Before the first `paper start`, the journal exists but
 `journal.latest_window` returns `None`; `OpsData` then carries
@@ -112,6 +115,7 @@ from tradepartner.store.journal import (
     RunWithResult,
     SignalRow,
 )
+from tradepartner.store.schema import SchemaVersionError
 
 __all__ = ["ChainStep", "OpsData", "OrderChain", "RankedSignal", "page_data"]
 
@@ -588,6 +592,7 @@ _RECONCILIATION_FIELDS: tuple[str, ...] = (
     "status",
     "broker_cash",
     "mismatches_json",
+    "book_id",
     "known_at",
     "ingested_at",
 )
@@ -671,7 +676,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     limit = settings.dashboard.page_row_limit
     try:
         window = journal.latest_window(conn)
-    except JournalNotInitialised:
+    except (JournalNotInitialised, SchemaVersionError):
         return OpsData(journal_not_initialised=True)
 
     if window is None:

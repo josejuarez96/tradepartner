@@ -201,6 +201,68 @@ def test_every_row_type_appends(conn: duckdb.DuckDBPyConnection, table: str) -> 
     assert (returned is None) == (row_type.ID_COLUMN is None)
 
 
+#: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17
+#: (plan T132).
+_EXPANSION_SEAM_TABLES = (
+    "paper_windows",
+    "decisions",
+    "orders",
+    "positions_daily",
+    "lots",
+    "disposals",
+    "adjustments",
+    "reconciliations",
+)
+
+
+@pytest.mark.parametrize("table", _EXPANSION_SEAM_TABLES)
+def test_the_expansion_seam_fields_default_to_their_column_defaults(table: str) -> None:
+    """ADR 0015 seams 1 to 3 (plan T132): the row type's `book_id`,
+    `position_side` and `orders` shape defaults equal the column defaults, so a
+    writer that passes no book (every writer until T133) leaves the default."""
+    defaults = {f.name: f.default for f in fields(ROW_TYPES[table])}
+    assert defaults["book_id"] == schema.DEFAULT_BOOK_ID
+    if "position_side" in defaults:
+        assert defaults["position_side"] == schema.LONG
+    if table == "orders":
+        for key, value in schema.ORDER_SHAPE_DEFAULTS.items():
+            assert defaults[key] == value
+
+
+def test_an_order_appends_with_the_expansion_defaults(conn: duckdb.DuckDBPyConnection) -> None:
+    append(conn, _sample(OrderRow))
+    assert conn.execute(
+        "SELECT position_side, order_type, time_in_force, limit_price, stop_price, "
+        "asset_class, order_class, multiplier, parent_order_id, book_id FROM orders"
+    ).fetchone() == (
+        "long",
+        "market",
+        "day",
+        None,
+        None,
+        "us_equity",
+        "simple",
+        1.0,
+        None,
+        "main",
+    )
+
+
+def test_a_decision_and_a_position_default_to_a_long_main_book(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    append(conn, _sample(DecisionRow))
+    append(conn, _sample(ROW_TYPES["positions_daily"]))
+    assert conn.execute("SELECT position_side, book_id FROM decisions").fetchone() == (
+        "long",
+        "main",
+    )
+    assert conn.execute("SELECT position_side, book_id FROM positions_daily").fetchone() == (
+        "long",
+        "main",
+    )
+
+
 # --- append -------------------------------------------------------------------------------
 
 

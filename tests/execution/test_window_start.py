@@ -21,7 +21,7 @@ from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settin
 from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.store import registry
+from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -1135,3 +1135,23 @@ def test_accepts_spinoff_with_a_parent_split_before_and_a_child_split_after(
     # 15.0, matching what the live broker actually holds.
     assert ledger.positions[CHILD] == pytest.approx(15.0)
     assert fake.positions()["SPLT"].quantity == pytest.approx(ledger.positions[CHILD])
+
+
+def test_window_of_refuses_no_window_on_a_version_16_store(tmp_path: Path) -> None:
+    """#1261: `_window_of` catches `SchemaVersionError` too, so a window command
+    over a version-16 journal (read-only; the eight expanded tables lack
+    `book_id`) refuses `no_window` instead of raising a binder error."""
+    path = tmp_path / "v16.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        schema.init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+    finally:
+        conn.close()
+    with (
+        duckdb.connect(str(path), read_only=True) as conn,
+        pytest.raises(window.WindowCommandRefused) as refused,
+    ):
+        window._window_of(conn)
+    assert refused.value.reason == window.NO_WINDOW
