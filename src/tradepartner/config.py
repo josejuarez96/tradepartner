@@ -1282,7 +1282,7 @@ class PaperConfig(BaseModel):
     timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
     `accept_wait_seconds`, `fill_read_overlap_seconds`) are the spec's placeholders until
     Probe 3 (#182) sets them (T70), which also switches `tracking_rule` to `residual`
-    (#247 Q4).     `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
+    (#247 Q4). `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
     the acknowledgement poll could never run before its own deadline. `order_id_prefix`
     is one token with no whitespace, since it heads every `client_order_id`.
     `book_id` names the book whose rows this window writes and whose token sits in

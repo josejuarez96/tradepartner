@@ -114,7 +114,6 @@ from tradepartner.store.journal import (
     SignalRow,
 )
 from tradepartner.store.schema import (
-    DEFAULT_BOOK_ID,
     DELISTED_REASON,
     EXCLUDE_NAME_REASON,
     EXCLUDED_REASON_PREFIX,
@@ -829,7 +828,7 @@ class Decision:
         run_id: int,
         known_at: datetime,
         ingested_at: datetime,
-        book_id: str = DEFAULT_BOOK_ID,
+        book_id: str,
     ) -> DecisionRow:
         """The `decisions` row for run `run_id`; its id is assigned on insert.
         `book_id` is the window's book (ADR 0015 seam 1, plan T133)."""

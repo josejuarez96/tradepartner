@@ -84,7 +84,6 @@ from tradepartner.execution.plan import DecisionState, State
 from tradepartner.execution.risk import OpenSell
 from tradepartner.store.journal import AdjustmentRow, DecisionEventRow, DecisionRow
 from tradepartner.store.schema import (
-    DEFAULT_BOOK_ID,
     DELISTED_REASON,
     UNTARGETED_RECEIPT_REASON,
     WINDOW_STOP_REASON,
@@ -141,7 +140,7 @@ class ExitDecision:
         run_id: int,
         known_at: datetime,
         ingested_at: datetime,
-        book_id: str = DEFAULT_BOOK_ID,
+        book_id: str,
     ) -> DecisionRow:
         """The `decisions` row for run `run_id`; its id is assigned on insert.
         A `known_at` whose New York date is not `session` raises. `book_id` is

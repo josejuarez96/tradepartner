@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import duckdb
 import polars as pl
@@ -22,6 +23,7 @@ from execution.test_run_trade import (
     F_0,
     F_0_PLUS_1,
     T_0,
+    Clock,
     Env,
     at,
     bought,
@@ -33,7 +35,7 @@ from execution.test_run_trade import (
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire
 from tradepartner.calendar import previous_session, session_close
-from tradepartner.config import RiskConfig
+from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.planning import PlanOutcome
@@ -86,6 +88,31 @@ def exit_orders(env: Env, security_id: str) -> list[tuple[str, int, str, float |
 def ended_before(env: Env, session: date, security_id: str = "SEC_TRANSFER") -> None:
     """The name's Form 25, accepted an hour before close(S-1)."""
     delist(env, security_id, session_close(previous_session(session)) - timedelta(hours=1))
+
+
+@pytest.fixture
+def fx_env(fixture_store_path: Path) -> Env:
+    """The scripted fake's `Env` with a non-default window book (T133)."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(fixture_store_path)},
+        alpaca={"quantity_decimals": 6, "client_order_id_max_length": 64},
+        paper={"book_id": "fx"},
+    )
+    return Env(settings, Clock(at(F_0)))
+
+
+def test_a_forced_exit_decision_carries_a_non_default_book(fx_env: Env, tmp_path: Path) -> None:
+    """ADR 0015 seam 1 (T133): `run._journal_exits` writes the exit
+    `DecisionRow` with the window's book, not the DDL default."""
+    fx_env.open_window(tmp_path=tmp_path)
+    bought(fx_env)
+    ended_before(fx_env, MAY_3)
+    outcome = fx_env.run(at(MAY_3))
+    assert outcome.status == "ok", fx_env.result(fx_env.latest_run())
+    assert fx_env.query(
+        "SELECT DISTINCT book_id FROM decisions WHERE decision = 'forced_exit'"
+    ) == [("fx",)]
 
 
 def test_a_delisted_name_is_sold_whole_by_the_next_in_window_run(
