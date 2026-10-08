@@ -3253,3 +3253,64 @@ class TestRule8Handover:
         assert plain.bars([self.S], days[0], days[-1]) == []
         led = plain.bars([self.N], days[0], days[-1])  # the new issuer's lead
         assert {b.security_id for b in led} == {self.N}
+
+    def test_b_a_successor_of_s_inside_its_span_keeps_it_whole(self) -> None:
+        successor = "0000000011@2020-03-02"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(successor, "TOPW", date(2020, 3, 2)),
+                _listing(self.N, "TOPW", self.D),
+            ]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert resolver.fill_resolve("TOPW", date(2020, 4, 15)) == successor
+
+    def _alpaca(self, *, asof_known: bool) -> Any:
+        days = [date(2020, 4, 14), date(2020, 4, 15)]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            if asof is not None and not asof_known:
+                return {"feed": "sip", "bars": {}}
+            close = 7.0 if asof is not None else 99.0  # S's own, or today's holder N's
+            return {"feed": "sip", "bars": {"TOPW": [_row(d, close) for d in days]}}
+
+        return days, fetch
+
+    def test_a_fill_never_lands_todays_holders_fallback_rows_on_s(self) -> None:
+        days, fetch = self._alpaca(asof_known=False)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        assert fill.bars([self.S], days[0], days[-1]) == []
+        assert fill.last_asof_fallbacks == ("TOPW",)
+
+    def test_a_fill_lands_the_new_issuers_lead_rows_on_it(self) -> None:
+        days, fetch = self._alpaca(asof_known=True)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        led = fill.bars([self.N], days[0], days[-1])
+        assert [(b.security_id, b.close) for b in led] == [(self.N, 99.0)] * 2
+        both = fill.bars([self.S, self.N], days[0], days[-1])
+        assert {(b.security_id, b.close) for b in both} == {(self.S, 7.0)}  # S's own first
+
+    def test_a_clipped_lead_refused_by_a_third_span_counts_once(self) -> None:
+        third = "0000000033"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(third, "TOPW", date(2020, 5, 1), "Warrants"),
+                _listing(self.N, "TOPW", self.D),
+            ],
+            first_sessions={self.N: date(2020, 1, 15)},
+        )
+        assert (resolver.report.first_span_clipped, resolver.report.first_span_refused) == (0, 1)
+
+    def test_last_bar_needs_the_configured_window(self) -> None:
+        with pytest.raises(ValueError, match="handover_sessions"):
+            ListingResolver([], last_bar=lambda sid, start, before: None)

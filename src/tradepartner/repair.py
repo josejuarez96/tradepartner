@@ -119,10 +119,11 @@ def last_bar(
     revision known at `at`, from an Alpaca source, with volume above zero."""
     row = conn.execute(
         "SELECT max(session) FROM ("
-        "  SELECT session, volume, source FROM prices_daily"
+        "  SELECT session, volume FROM prices_daily"
         "  WHERE security_id = ? AND session >= ? AND session < ? AND known_at <= ?"
+        "  AND list_contains(?, source)"
         "  QUALIFY row_number() OVER (PARTITION BY session ORDER BY known_at DESC) = 1"
-        ") WHERE volume > 0 AND list_contains(?, source)",
+        ") WHERE volume > 0",
         [security_id, start, before, at, sorted(BAR_SOURCES)],
     ).fetchone()
     return None if row is None else row[0]

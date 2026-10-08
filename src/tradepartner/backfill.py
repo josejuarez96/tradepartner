@@ -805,7 +805,8 @@ def _price_chunk(
             empty8 = len(handed - landed)
             renamed += f"; {empty8} rule8_window holes with nothing stored" if empty8 else ""
             filled = (
-                f"holes of {len(holes) - len(renames)} names with no stored bar{renamed}"
+                f"holes of {len(set(holes) - renames - (handed & stored))} names with no "
+                f"stored bar{renamed}"
                 f"{_dropped_note(dict(Counter(dropped.values())))}: "
                 if fill
                 else ""

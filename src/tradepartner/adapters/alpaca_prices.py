@@ -699,7 +699,7 @@ class ListingResolver:
         first_sessions: Mapping[str, date] | None = None,
         class_symbols: Mapping[str, str] | None = None,
         last_bar: LastBar | None = None,
-        handover_sessions: int = 5,
+        handover_sessions: int | None = None,
     ) -> None:
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
@@ -823,6 +823,8 @@ class ListingResolver:
         self._handovers_of: dict[str, list[Handover]] = defaultdict(list)  # by security
         self._end_before_handover: dict[TickerSpan, date | None] = {}
         if last_bar is not None:
+            if handover_sessions is None:  # `master.transfer_window_sessions`, from config
+                raise ValueError("last_bar needs handover_sessions")
             self._hand_over(last_bar, handover_sessions, claims)
         self._contested = frozenset(
             span
@@ -931,6 +933,13 @@ class ListingResolver:
                     continue
                 taken = min(other.start for other in after)
                 if any(
+                    other.security_id != span.security_id
+                    and _same_issuer(other.security_id, span.security_id)
+                    and span.start < other.start <= taken
+                    for other in others[ticker]
+                ):
+                    continue  # its own company carries on under T: S's bars stop for that
+                if any(
                     other.start == taken and other in claims and self._wait(span, other)
                     for other in after
                 ):
@@ -963,13 +972,15 @@ class ListingResolver:
         """`resolve` for a `--fill-holes` refetch (#1314, rule 8 "Store
         holes"): a session of a rule-8 window of `ticker` resolves to the
         security whose span was cut, as if rule 8 had not cut it, never to
-        another span or a lead."""
+        another span or a lead, and only where `resolve` gives the session to
+        no one."""
+        resolved = self.resolve(ticker, session)
+        if resolved is not None:
+            return resolved
         owners = {
             h.security_id for h in self._handovers.get(ticker, []) if h.start <= session < h.end
         }
-        if len(owners) == 1:
-            return owners.pop()
-        return self.resolve(ticker, session)
+        return owners.pop() if len(owners) == 1 else None
 
     def _first_span_leads(
         self,
@@ -1003,14 +1014,17 @@ class ListingResolver:
             ):
                 continue
             start = first_session
+            starts = {first.start} | {  # a held claim's copy starts later (rule 6)
+                o.start for o in self._history[security_id] if o.ticker == first.ticker
+            }
             handed = [
                 h.start
                 for h in self._handovers.get(first.ticker, [])
-                if h.end == first.start and h.security_id != security_id
+                if h.end in starts and h.security_id != security_id
             ]
-            if handed and max(handed) > start:
+            clip = bool(handed) and max(handed) > start
+            if clip:
                 start = max(handed)
-                clipped += 1
             lead = FirstSpanLead(security_id, first.ticker, start, first.start)
             if any(
                 other.security_id != security_id and _covers_a_session(other, lead.start, lead.end)
@@ -1020,6 +1034,7 @@ class ListingResolver:
                 continue
             self._first_leads[lead.ticker].append(lead)
             self._first_lead_of[security_id] = lead
+            clipped += clip
         return refused, clipped
 
     def _own_delisting(
@@ -1666,36 +1681,44 @@ def parse_corporate_actions(
     return ActionsParse(tuple(actions), tuple(unresolved), tuple(unsupported))
 
 
+Fetched = tuple[Mapping[str, Any], Mapping[str, set[str]], Resolve]
+
+
 @_fail_closed
 def _own_rows(
-    fetched: Sequence[tuple[Mapping[str, Any], Mapping[str, set[str]]]],
-    resolve: Resolve,
-    lead: Resolve,
-) -> dict[str, Any]:
+    fetched: Sequence[Fetched], lead: Resolve
+) -> tuple[dict[str, Any], dict[tuple[str, date], tuple[str, bool]]]:
     """One `daily_bars` payload from several requests (#1314), each with
-    the ids it was made for per symbol: a row is kept only from the request
-    made for the security it resolves (or leads) to, so a request without
-    `asof` never fills an old holder's sessions with today's holder's
-    bars, nor an `asof` request a later holder's. A row resolving to no
-    security is kept once, for `parse_bars` to report. Every payload must
-    carry one feed."""
-    feeds = {feed_source(payload) for payload, _ in fetched}
+    the ids it was made for per symbol and the `resolve` its rows are read
+    with, plus the owner decided for each kept row (and whether through
+    `lead`). A row is kept only from the request made for the security it
+    resolves (or leads) to, so a request without `asof` never fills an old
+    holder's sessions with today's holder's bars, nor an `asof` request a
+    later holder's; the first request deciding a `(symbol, session)` keeps
+    it. A row resolving to no security is kept once, for `parse_bars` to
+    report. Every payload must carry one feed."""
+    feeds = {feed_source(payload) for payload, _, _ in fetched}
     if len(feeds) != 1:
         raise ValueError(f"bar requests disagree on the feed: {sorted(feeds)}")
     merged: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    decided: dict[tuple[str, date], tuple[str, bool]] = {}
     nobody: set[tuple[str, date]] = set()
-    for payload, owners in fetched:
+    for payload, owners, resolve in fetched:
         for symbol, rows in payload["bars"].items():
             asked = owners.get(symbol, set())
             for row in rows:
-                session = _session_of(row["t"])
-                owner = resolve(symbol, session) or lead(symbol, session)
-                if owner is None and (symbol, session) not in nobody:
-                    nobody.add((symbol, session))
+                key = (symbol, _session_of(row["t"]))
+                if key in decided:
+                    continue
+                owner = resolve(*key)
+                led = owner is None and (owner := lead(*key)) is not None
+                if owner is None and key not in nobody:
+                    nobody.add(key)
                     merged[symbol].append(row)
                 elif owner is not None and owner in asked:
+                    decided[key] = (owner, led)
                     merged[symbol].append(row)
-    return {"feed": fetched[0][0]["feed"], "bars": dict(merged)}
+    return {"feed": fetched[0][0]["feed"], "bars": dict(merged)}, decided
 
 
 # --- the adapter -----------------------------------------------------------------
@@ -1827,11 +1850,11 @@ class AlpacaPriceSource(PriceSource):
                 dated[day][symbol].add(security_id)
                 first = self._resolver.since(security_id, ticker) or start
                 since[(security_id, symbol)] = min(first, start)
-        fetched: list[tuple[Mapping[str, Any], Mapping[str, set[str]]]] = []
+        fetched: list[Fetched] = []
         fallbacks: set[str] = set()
         for day, owners in sorted(dated.items()):
             payload = self._fetch_bars(sorted(owners), start, end, asof=day)
-            fetched.append((payload, owners))
+            fetched.append((payload, owners, self._resolve))
             for symbol, asked in owners.items():
                 for security_id in asked:
                     if payload["bars"].get(symbol) or self._asof_serves(
@@ -1841,12 +1864,21 @@ class AlpacaPriceSource(PriceSource):
                     plain[symbol].add(security_id)
                     fallbacks.add(symbol)
         if plain:
-            fetched.append((self._fetch_bars(sorted(plain), start, end), plain))
+            # Never `fill_resolve`: today's holder's rows are no old holder's (#1314).
+            fetched.append(
+                (self._fetch_bars(sorted(plain), start, end), plain, self._resolver.resolve)
+            )
         self.last_asof_fallbacks = tuple(sorted(fallbacks))
+        payload, decided = _own_rows(fetched, self._resolver.lead)
+
+        def owner(symbol: str, session: date, *, led: bool) -> str | None:
+            found = decided.get((symbol, session))
+            return found[0] if found is not None and found[1] == led else None
+
         parsed = parse_bars(
-            _own_rows(fetched, self._resolve, self._resolver.lead),
-            self._resolve,
-            self._resolver.lead,
+            payload,
+            functools.partial(owner, led=False),
+            functools.partial(owner, led=True),
         )
         self.last_bars_report = parsed
         return [b for b in parsed.bars if b.security_id in ids and start <= b.session <= end]
