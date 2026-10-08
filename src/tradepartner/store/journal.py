@@ -688,14 +688,18 @@ def _require_expansion_seams(conn: duckdb.DuckDBPyConnection) -> None:
     error selecting a row-type field the table has no column for. The caller
     (`require_journal`) has already ensured every table exists, so a missing
     table cannot reach here."""
-    for table in _EXPANSION_SEAM_TABLES:
-        columns = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
-        if "book_id" not in columns:
-            raise SchemaVersionError(
-                "the store's paper-trading journal predates schema version 17 "
-                f"({table} has no book_id column); open it for writing once "
-                "(any writing command migrates it) to read the journal"
-            )
+    (with_book_id,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND column_name = 'book_id' AND table_name IN "
+        f"({', '.join('?' for _ in _EXPANSION_SEAM_TABLES)})",
+        list(_EXPANSION_SEAM_TABLES),
+    ).fetchone()
+    if with_book_id != len(_EXPANSION_SEAM_TABLES):
+        raise SchemaVersionError(
+            "the store's paper-trading journal predates schema version 17 "
+            "(a journal table has no book_id column); open it for writing once "
+            "with a command that migrates it (for example `ingest`) to read the journal"
+        )
 
 
 def require_journal(conn: duckdb.DuckDBPyConnection) -> None:

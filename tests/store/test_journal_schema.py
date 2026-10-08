@@ -290,14 +290,33 @@ def _version_16_store(conn: duckdb.DuckDBPyConnection) -> None:
     )
     conn.execute(
         "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
-        "known_at, ingested_at) VALUES (1, 1, 'SEC_A', true, 'trade', ?, ?)",
-        [_NOW, _NOW],
+        "known_at, ingested_at) VALUES (3, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=3), _NOW.replace(second=3)],
     )
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) VALUES (1, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=1), _NOW.replace(second=1)],
+    )
+    conn.execute("DELETE FROM decisions WHERE decision_id = 1")
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) VALUES (2, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=2), _NOW.replace(second=2)],
+    )
+    for client_order_id, second in (("tp-3", 3), ("tp-1", 1)):
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+            "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) "
+            "VALUES (?, 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', true, ?, ?)",
+            [client_order_id, session, _NOW.replace(second=second), _NOW.replace(second=second)],
+        )
+    conn.execute("DELETE FROM orders WHERE client_order_id = 'tp-1'")
     conn.execute(
         "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
         "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) "
-        "VALUES ('tp-1', 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', true, ?, ?)",
-        [session, _NOW, _NOW],
+        "VALUES ('tp-2', 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', true, ?, ?)",
+        [session, _NOW.replace(second=2), _NOW.replace(second=2)],
     )
     conn.execute(
         "INSERT INTO positions_daily (run_id, session, security_id, quantity, known_at, "
@@ -345,40 +364,39 @@ def v16_path(tmp_path: Path) -> Path:
 
 def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns() -> None:
     """The spec's "Migration identity" for version 17: every row of the eight
-    expanded tables is kept in insertion order, its new columns at their
-    defaults (`book_id = 'main'`, `position_side = 'long'`, the `orders` shape
-    from `ORDER_SHAPE_DEFAULTS`)."""
+    expanded tables is kept in insertion order (not key order: `decisions` and
+    `orders` hold two rows inserted out of key order, with one deleted in
+    between), each pre-version-17 column — `known_at` and `ingested_at`
+    included — unchanged, and its new columns at their defaults
+    (`book_id = 'main'`, `position_side = 'long'`, the `orders` shape from
+    `ORDER_SHAPE_DEFAULTS`)."""
     conn = duckdb.connect(":memory:")
     try:
         _version_16_store(conn)
+        old_columns = {table: _column_order(conn, table) for table in _V17_ADDED_COLUMNS}
         for table in _V17_ADDED_COLUMNS:
-            assert "book_id" not in _columns(conn, table)
+            assert "book_id" not in old_columns[table]
+        before = {
+            table: conn.execute(
+                f"SELECT {', '.join(f'"{c}"' for c in columns)} FROM {table} ORDER BY rowid"
+            ).fetchall()
+            for table, columns in old_columns.items()
+        }
         schema.init_schema(conn)
         assert _versions(conn) == [16, 17]
         assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
             (1, "main")
         ]
         assert conn.execute(
-            "SELECT decision_id, position_side, book_id FROM decisions"
-        ).fetchall() == [(1, "long", "main")]
+            "SELECT decision_id, position_side, book_id FROM decisions ORDER BY rowid"
+        ).fetchall() == [(3, "long", "main"), (2, "long", "main")]
         assert conn.execute(
             "SELECT client_order_id, position_side, order_type, time_in_force, limit_price, "
             "stop_price, asset_class, order_class, multiplier, parent_order_id, book_id "
-            "FROM orders"
+            "FROM orders ORDER BY rowid"
         ).fetchall() == [
-            (
-                "tp-1",
-                "long",
-                "market",
-                "day",
-                None,
-                None,
-                "us_equity",
-                "simple",
-                1.0,
-                None,
-                "main",
-            )
+            ("tp-3", "long", "market", "day", None, None, "us_equity", "simple", 1.0, None, "main"),
+            ("tp-2", "long", "market", "day", None, None, "us_equity", "simple", 1.0, None, "main"),
         ]
         assert conn.execute(
             "SELECT run_id, position_side, book_id FROM positions_daily"
@@ -395,8 +413,17 @@ def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns(
         assert conn.execute(
             "SELECT reconciliation_id, book_id FROM reconciliations"
         ).fetchall() == [(1, "main")]
-        for table in _V17_ADDED_COLUMNS:
-            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (1,)
+        # Every pre-version-17 column of every row, `known_at` and `ingested_at`
+        # included, is identical in rowid order: the rebuild neither restamps
+        # nor reorders (quant-auditor finding on pass 1).
+        for table, columns in old_columns.items():
+            after = conn.execute(
+                f"SELECT {', '.join(f'"{c}"' for c in columns)} FROM {table} ORDER BY rowid"
+            ).fetchall()
+            assert after == before[table], table
+            assert _column_order(conn, table)[-2:] == ["known_at", "ingested_at"], table
+        assert [row[0] for row in before["decisions"]] == [3, 2]
+        assert [row[0] for row in before["orders"]] == ["tp-3", "tp-2"]
     finally:
         conn.close()
 
@@ -596,6 +623,18 @@ def _columns(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, bool]:
         [table],
     ).fetchall()
     return {name: nullable == "YES" for name, nullable in rows}
+
+
+def _column_order(conn: duckdb.DuckDBPyConnection, table: str) -> list[str]:
+    """The table's column names in ordinal order."""
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ? "
+            "ORDER BY ordinal_position",
+            [table],
+        ).fetchall()
+    ]
 
 
 @pytest.mark.parametrize("table", sorted(_EXPECTED_JOURNAL_TABLES))

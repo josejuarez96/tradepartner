@@ -221,8 +221,13 @@ def show_outcome(settings: Settings) -> None:
 def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
     try:
         current = open_window(conn)
-    except (JournalNotInitialised, SchemaVersionError):
+    except JournalNotInitialised:
         current = None
+    except SchemaVersionError as exc:
+        # A version-16 journal: the eight expanded tables lack `book_id`;
+        # `require_journal`'s message names the fix.
+        st.warning(str(exc))
+        return
     except JournalIntegrityError as exc:
         st.error(f"{exc}; the writer refuses every override until this is resolved.")
         return

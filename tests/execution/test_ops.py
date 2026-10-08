@@ -392,10 +392,10 @@ def test_reconciliation_fields_match_the_row_type_and_include_book_id() -> None:
     assert fields_list.index("book_id") + 1 == fields_list.index("known_at")
 
 
-def test_journal_not_initialised_on_a_read_only_version_16_store(tmp_path: Path) -> None:
+def test_journal_outdated_on_a_read_only_version_16_store(tmp_path: Path) -> None:
     """#1261: `require_journal` raises `SchemaVersionError` on a version-16 store
-    (the eight expanded tables lack `book_id`); `page_data` catches it too, so the
-    ops page renders its journal state instead of a traceback."""
+    (the eight expanded tables lack `book_id`); `page_data` catches it into
+    `journal_outdated`, whose message names the fix, not a false "no journal"."""
     path = tmp_path / "store_v16.duckdb"
     conn = duckdb.connect(str(path))
     try:
@@ -407,7 +407,9 @@ def test_journal_not_initialised_on_a_read_only_version_16_store(tmp_path: Path)
     settings = Settings(_env_file=None, store={"path": str(path)})
     with duckdb.connect(str(path), read_only=True) as conn:
         data = ops.page_data(conn, settings)
-    assert data.journal_not_initialised is True
+    assert data.journal_not_initialised is False
+    assert data.journal_outdated is not None
+    assert "open it for writing once" in data.journal_outdated
     assert data.window is None
 
 

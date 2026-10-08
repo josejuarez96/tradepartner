@@ -16,8 +16,9 @@ catches it and returns an `OpsData` with `journal_not_initialised=True` and
 every other field at its empty default (the T43 "registry not initialised"
 pattern: a page shows a state, not a traceback). A read-only connection to a
 version-16 store raises `store.schema.SchemaVersionError` from the same read
-(the journal predates schema version 17); caught here too, for the same
-state.
+(the journal predates schema version 17); caught too, into `journal_outdated`,
+which carries its message so the page shows "migrate first" rather than a
+traceback or a false "no journal" (#1261, T132).
 
 **No window yet.** Before the first `paper start`, the journal exists but
 `journal.latest_window` returns `None`; `OpsData` then carries
@@ -182,6 +183,11 @@ class OpsData:
     once over a read-only connection."""
 
     journal_not_initialised: bool = False
+    #: `require_journal`'s message when the journal predates schema version 17
+    #: (the eight expanded tables lack `book_id`; plan T132). Set instead of
+    #: `journal_not_initialised`, so the page shows the migrate-first message
+    #: (#1261).
+    journal_outdated: str | None = None
     window: PaperWindowRow | None = None
     as_of: datetime | None = None
     last_updated: datetime | None = None
@@ -676,8 +682,10 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     limit = settings.dashboard.page_row_limit
     try:
         window = journal.latest_window(conn)
-    except (JournalNotInitialised, SchemaVersionError):
+    except JournalNotInitialised:
         return OpsData(journal_not_initialised=True)
+    except SchemaVersionError as exc:
+        return OpsData(journal_outdated=str(exc))
 
     if window is None:
         return OpsData()

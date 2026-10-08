@@ -82,6 +82,10 @@ def _render_journal_not_initialised() -> None:
     )
 
 
+def _render_journal_outdated(message: str) -> None:
+    st.warning(f"Journal outdated: {message}")
+
+
 def _render_no_window() -> None:
     st.info("No paper window yet. Run `tradepartner paper start` to open one.")
 
@@ -254,6 +258,9 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
 
     if data.journal_not_initialised:
         _render_journal_not_initialised()
+        return
+    if data.journal_outdated is not None:
+        _render_journal_outdated(data.journal_outdated)
         return
     if data.window is None:
         _render_no_window()

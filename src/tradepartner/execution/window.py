@@ -97,7 +97,11 @@ a schema change) before it is relied on for a real spin-off.
 message)` for a refusal, whose `reason` is one of the codes below and whose
 message names everything that is missing. A blank `--reason` is refused
 (`reason`) before the lock, the clock or the broker is touched; every stored
-reason is the trimmed text.
+reason is the trimmed text. Every command reads the open window through
+`_window_of`, so a journal that predates schema version 17 (the eight expanded
+tables lack `book_id`, `store.journal.require_journal`) is refused
+`schema_version`, carrying that error's "open it for writing once" message, not
+a false `no_window` (#1261, T132).
 
 - **`stop(settings, connect, broker, clock, reason)`** is `paper stop`. It
   takes the run lock (`LockHeld` at once while a run holds it) and refuses
@@ -628,9 +632,11 @@ def start(
                     raise StartRefusedError("window_open", "a paper window is already open")
                 previous = latest_window(conn)
                 previous_stop = _previous_stop(conn, previous)
-            except (JournalNotInitialised, SchemaVersionError):
+            except JournalNotInitialised:
                 previous = None
                 previous_stop = None
+            except SchemaVersionError as exc:
+                raise StartRefusedError(SCHEMA_VERSION, str(exc)) from exc
             today = _ny_date(now)
             listings = listing_ends_as_of(conn, now, settings)
             actions = live_actions_as_of(conn, now)
@@ -729,6 +735,10 @@ def start(
 
 #: `WindowCommandRefused.reason` codes (module docstring).
 NO_WINDOW = "no_window"
+#: A journal that predates schema version 17: the eight expanded tables lack
+#: `book_id`, so `require_journal` raises. Distinct from `no_window` so the
+#: command says "migrate first" rather than a false "no window" (#1261, T132).
+SCHEMA_VERSION = "schema_version"
 REASON = "reason"
 KILL_SWITCH = "kill_switch"
 NOT_READY = "not_ready"
@@ -806,15 +816,20 @@ def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     """The open window and its id, or a `no_window` refusal (a store whose
     journal no write has migrated has no window either), or a
     `multiple_open_windows` refusal (spec req 14: only one window may ever be
-    open) when the journal has more than one open window. Every command that
-    calls this (`stop`, `abandon`, `kill`, `override`) refuses the same way.
-    `stop`, `kill` and `override` call it before writing anything; `abandon`'s
-    re-check (after its reconciliation row) still refuses the same way, but
-    by then the reconciliation row is already written."""
+    open) when the journal has more than one open window, or a
+    `schema_version` refusal when the journal predates schema version 17 (the
+    eight expanded tables lack `book_id`; `require_journal`'s message names
+    the fix). Every command that calls this (`stop`, `abandon`, `kill`,
+    `override`) refuses the same way. `stop`, `kill` and `override` call it
+    before writing anything; `abandon`'s re-check (after its reconciliation
+    row) still refuses the same way, but by then the reconciliation row is
+    already written."""
     try:
         window = open_window(conn)
-    except (JournalNotInitialised, SchemaVersionError):
+    except JournalNotInitialised:
         window = None
+    except SchemaVersionError as exc:
+        raise WindowCommandRefused(SCHEMA_VERSION, str(exc)) from exc
     except JournalIntegrityError as exc:
         raise WindowCommandRefused(MULTIPLE_OPEN_WINDOWS, str(exc)) from exc
     if window is None or window.window_id is None:

@@ -1545,3 +1545,47 @@ def test_the_engage_kind_is_the_shared_schema_constant() -> None:
     assert window_module._ENGAGE_KILL_SWITCH is schema.ENGAGE_KILL_SWITCH_KIND
     code = re.sub(r'"""[\s\S]*?"""', "", Path(window_module.__file__).read_text())
     assert f'"{schema.ENGAGE_KILL_SWITCH_KIND}"' not in code
+
+
+# --- a version-16 journal (#1261, T132) -------------------------------------------
+
+
+def _downgrade_to_version_16(settings: Settings) -> None:
+    """Make the seeded store a version-16 one: no `book_id` on `orders`, so
+    `require_journal` raises `SchemaVersionError`."""
+    with open_for_write(settings) as conn:
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+
+
+def test_kill_refuses_schema_version_on_a_version_16_store(
+    journal_settings: Settings, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1261: with an open window in an unmigrated version-16 store, `kill`
+    refuses `schema_version` naming the fix, not a false `no_window`, and writes
+    nothing."""
+    _downgrade_to_version_16(journal_settings)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+
+    reason, message = _refusal(excinfo)
+    assert reason == window_module.SCHEMA_VERSION
+    assert "open it for writing once" in message
+    assert _count(journal_settings, "kill_switch") == 0
+
+
+def test_override_refuses_schema_version_on_a_version_16_store(
+    journal_settings: Settings, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1261: the same for `override` with `engage_kill_switch`; nothing is
+    written."""
+    _downgrade_to_version_16(journal_settings)
+
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        override(journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON)
+
+    reason, message = _refusal(excinfo)
+    assert reason == window_module.SCHEMA_VERSION
+    assert "open it for writing once" in message
+    assert _count(journal_settings, "overrides") == 0
