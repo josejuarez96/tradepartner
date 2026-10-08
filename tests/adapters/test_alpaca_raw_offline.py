@@ -284,3 +284,29 @@ def test_corporate_actions_keeps_a_repeat_within_one_response(
     )
 
     assert out == {"reverse_splits": [_GMGI_REVERSE_SPLIT, _GMGI_REVERSE_SPLIT]}
+
+
+# --- #1314: asof names the company that held a reused ticker that day ---
+
+
+@pytest.mark.parametrize(("asof", "sent_asof"), [(None, None), (date(2017, 6, 1), "2017-06-01")])
+def test_daily_bars_sends_asof_on_every_batch(
+    monkeypatch: pytest.MonkeyPatch, asof: date | None, sent_asof: str | None
+) -> None:
+    sent: list[str | None] = []
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        sent.append(request_params.asof)
+        return {}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+    alpaca_raw.daily_bars(
+        ["VAL", "AAPL", "KO"],
+        date(2017, 2, 1),
+        date(2017, 2, 3),
+        asof=asof,
+        settings=_batched_settings(2),
+    )
+    assert sent == [sent_asof, sent_asof]
