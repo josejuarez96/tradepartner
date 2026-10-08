@@ -123,9 +123,22 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     settings = Settings(_env_file=None)
     with _env(path, directory):
         with open_for_write(Settings()) as conn:
-            twin = hypothesis.register(
+            # Straight through the registry, as H1 was registered before the lab:
+            # `hypothesis.register` refuses a plain standalone file on a lab store
+            # (T104c).
+            twin_file = _copy_file(directory / "files", TWIN_SOURCE)
+            parsed = hypothesis.parse_file(twin_file)
+            twin = registry.register_hypothesis(
                 conn,
-                _copy_file(directory / "files", TWIN_SOURCE),
+                slug=parsed.slug,
+                family=parsed.family,
+                title=parsed.title,
+                doc_path=twin_file.as_posix(),
+                doc_sha256=parsed.doc_sha256,
+                params=hypothesis.frozen_params(parsed, settings),
+                in_sample_start=parsed.in_sample_start,
+                holdout_start=parsed.holdout_start,
+                holdout_end=parsed.holdout_end,
                 registered_by="test",
                 settings=settings,
             )

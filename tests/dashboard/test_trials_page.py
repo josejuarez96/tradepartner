@@ -869,6 +869,25 @@ def _lab_file_store(tmp_path: Path) -> tuple[Path, Lab]:
     with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
         schema.init_schema(conn)
         lab_schema.apply_lab_schema(conn)
+        # One fact known before the cutoff, so the trials record a data vintage: a
+        # trial with none is never current (`lab_queries`, the one classifier, #1221).
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                "security_id": "SEC_LAB",
+                "session": date(2023, 12, 28),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "known_at": datetime(2023, 12, 28, 21, 0, tzinfo=UTC),
+                "ingested_at": datetime(2023, 12, 28, 22, 0, tzinfo=UTC),
+                "source": "test",
+                "provenance": "bar",
+            },
+        )
         lab = _build_lab(conn, seed_settings, code)
     return store_path, lab
 
