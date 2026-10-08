@@ -28,7 +28,7 @@ from typing import Any
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, Asset
+from tradepartner.adapters.broker import Account, Asset, Order, OrderStatus, Side
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
@@ -43,6 +43,7 @@ from tradepartner.execution.risk import (
     _spendable,
     check_phase,
     open_sold,
+    order_shape_violation,
     round_down,
     size_buys,
     unfilled_sells,
@@ -247,6 +248,84 @@ def test_a_short_row_on_the_session_halts_the_passing_phase(
     (violation,) = result.violations  # type: ignore[union-attr]
     assert (violation.kind, violation.rule) == ("limit_breach", "refused_position_side")
     assert named in violation.detail
+
+
+# --- the order shape (ADR 0015 seam 3, plan T135b) -----------------------------------------
+
+
+def _broker_order(**shape: Any) -> Order:
+    return Order(
+        client_order_id="tp-main-20261001-C-buy-1",
+        symbol="C",
+        side=Side.BUY,
+        notional=50.0,
+        quantity=None,
+        status=OrderStatus.ACCEPTED,
+        submitted_at=_NOW,
+        **shape,
+    )
+
+
+def test_orders_string_defaults_are_the_journals_shape_defaults() -> None:
+    """The one place the broker types and the journal are pinned together:
+    `Order`'s shape defaults equal `schema.ORDER_SHAPE_DEFAULTS`' values."""
+    order = _broker_order()
+    defaults = schema.ORDER_SHAPE_DEFAULTS
+    assert (order.order_type, order.time_in_force, order.asset_class, order.order_class) == (
+        defaults["order_type"],
+        defaults["time_in_force"],
+        defaults["asset_class"],
+        defaults["order_class"],
+    )
+    assert (order.limit_price, order.stop_price, order.legs) == (None, None, ())
+
+
+def test_the_default_shape_passes_as_an_order_and_as_a_row() -> None:
+    assert order_shape_violation(_broker_order()) is None
+    assert order_shape_violation(_session_order()) is None
+
+
+_ORDER_SHAPES = [
+    ("order_type", "limit"),
+    ("time_in_force", "gtc"),
+    ("asset_class", "us_option"),
+    ("order_class", "bracket"),
+    ("limit_price", 49.5),
+    ("stop_price", 45.0),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), [*_ORDER_SHAPES, ("legs", "one leg")])
+def test_each_order_field_alone_is_refused_order_shape(field: str, value: Any) -> None:
+    if field == "legs":
+        value = (_broker_order(),)
+    violation = order_shape_violation(_broker_order(**{field: value}))
+    assert violation is not None
+    assert (violation.kind, violation.rule) == ("limit_breach", "refused_order_shape")
+    assert "tp-main-20261001-C-buy-1" in violation.detail
+    assert (field if field != "legs" else "1 legs") in violation.detail
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [*_ORDER_SHAPES, ("multiplier", 100.0), ("multiplier", math.nan), ("parent_order_id", "p-1")],
+)
+def test_each_row_field_alone_is_refused_order_shape(field: str, value: Any) -> None:
+    violation = order_shape_violation(replace(_session_order(), **{field: value}))
+    assert violation is not None
+    assert (violation.kind, violation.rule) == ("limit_breach", "refused_order_shape")
+    assert f"order tp-main-20261001-A-sell-1 for A has {field} " in violation.detail
+
+
+def test_a_session_order_row_of_another_shape_halts_the_passing_phase() -> None:
+    """`check_phase` applies the predicate to the session's `orders` rows: a
+    limit row refuses the whole batch although every order of the phase is
+    the default shape; a `decisions` row has no shape and is not read for it."""
+    limit = replace(_session_order(), order_type="limit", limit_price=9.5)
+    result = _check(_passing_phase(), rows_on_session=[_session_decision(), limit])
+    (violation,) = result.violations  # type: ignore[union-attr]
+    assert (violation.kind, violation.rule) == ("limit_breach", "refused_order_shape")
+    assert "order_type 'limit', limit_price 9.5" in violation.detail
 
 
 def test_orders_submitted_earlier_in_the_run_count_toward_the_order_cap() -> None:

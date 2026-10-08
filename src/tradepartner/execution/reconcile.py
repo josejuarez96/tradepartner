@@ -22,7 +22,10 @@ caller (T61's `reconcile_now`) gathers every input, writes the
   separator is `foreign_order`. An own order the journal holds `pending` is a
   resume matter (req 4), not a mismatch. Any other own order the journal does
   not hold open is `unexplained_open_order`, and one it does hold open for
-  another symbol or side is `open_order_differs`. A journal order that was
+  another symbol or side, or whose shape is not the default
+  (`risk.order_shape_violation`: anything but a market day order of a
+  `us_equity`, `simple` order with no limit or stop price and no legs; ADR
+  0015 seam 3), is `open_order_differs`. A journal order that was
   acknowledged and is absent from `open_orders()` is `missing_open_order`
   unless its `get_order` reading is terminal (finished; the collector journals
   it once its fills arrive).
@@ -94,6 +97,7 @@ from dataclasses import dataclass, field
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Account, Order, Position
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.risk import order_shape_violation
 from tradepartner.store.journal import OrderRow, PaperWindowRow
 
 OK = "ok"
@@ -514,6 +518,8 @@ def _order_mismatches(
             kind, detail = "unexplained_open_order", "own open order the journal does not hold open"
         elif (order.symbol, order.side.value) != (item.order.symbol, item.order.side):
             kind, detail = "open_order_differs", "open order differs from its journal row"
+        elif (shape := order_shape_violation(order)) is not None:
+            kind, detail = "open_order_differs", f"{shape.rule}: {shape.detail}"
         else:
             continue
         found.append(Mismatch(kind, detail, symbol=order.symbol, client_order_id=coid))

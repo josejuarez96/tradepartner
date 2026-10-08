@@ -6,6 +6,7 @@ treats a repeated skew `ClockError` as "halt stands")."""
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -19,6 +20,7 @@ from tradepartner import calendar
 from tradepartner.adapters.broker import (
     Broker,
     DuplicateClientOrderIdError,
+    Order,
     OrderNotOpenError,
     OrderRequest,
     Side,
@@ -1221,3 +1223,147 @@ def test_a_short_decision_halts_the_batch_before_any_submit(
     assert (source, fault_type) == ("fault", "LimitBreachError")
     assert "refused_position_side" in reason
     assert _submits(env.fake) == []
+
+
+# --- the order shape (ADR 0015 seam 3, plan T135b) ------------------------------------------
+
+
+class ShapedBroker(FakeBroker):
+    """A `Broker` stub that returns, from the method named `shaped`, the fake's
+    order as a limit order, which `FakeBroker` itself never does; its book
+    stays the fake's market order."""
+
+    def __init__(self, *, shaped: str | None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.shaped = shaped
+
+    def _shape(self, method: str, order: Order) -> Order:
+        if method != self.shaped:
+            return order
+        return replace(order, order_type="limit", limit_price=99.5)
+
+    def submit(self, request: OrderRequest) -> Order:
+        return self._shape("submit", super().submit(request))
+
+    def get_order(self, client_order_id: str) -> Order:
+        return self._shape("get_order", super().get_order(client_order_id))
+
+
+def _shaped_env(env: Env, shaped: str | None) -> ShapedBroker:
+    env.fake = ShapedBroker(
+        shaped=shaped,
+        clock=env.clock,
+        price_of=lambda symbol: env.prices[symbol],
+        auto_fill=False,
+        account_id="PA1",
+    )
+    return env.fake
+
+
+def _two_buys(env: Env) -> list[DecisionRow]:
+    at = env.run.started_at
+    rows = []
+    for security_id in (A, "SEC_DUAL_B"):
+        row = DecisionRow(
+            run_id=env.run.run_id,  # type: ignore[arg-type]
+            rebalance_session=T_I,
+            security_id=security_id,
+            target_weight=0.04,
+            side="buy",
+            planned_notional=3000.0,
+            target_notional=3000.0,
+            whole_share=False,
+            decision="trade",
+            known_at=at,
+            ingested_at=at,
+        )
+        (decision_id,) = _append(env.settings, row)
+        rows.append(replace(row, decision_id=decision_id))
+    return rows
+
+
+@pytest.mark.parametrize("shaped", ["submit", "get_order"])
+def test_a_limit_order_from_the_broker_halts_after_its_event_is_journaled(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, shaped: str
+) -> None:
+    """The first of two buys comes back from `submit` (or its acknowledgement's
+    `get_order`) as a limit order: its `accepted` event is journaled first,
+    `raw_json` included, then the batch halts with `SystemFaultError` naming
+    `refused_order_shape`, a fault after a submit (no `missed` row, not
+    `LimitBreachError`), and the second buy is never submitted. The run's
+    halt path writes the `kill_switch` row with that reason and cancels the
+    limit order."""
+    fake = _shaped_env(env, shaped)
+    gate = _gate(env, alerter_conn)
+
+    with pytest.raises(SystemFaultError, match="refused_order_shape") as raised:
+        _execute(gate, env, _two_buys(env))
+    assert type(raised.value) is SystemFaultError
+    assert f"{shaped} returned order " in str(raised.value)
+    assert "order_type 'limit', limit_price 99.5" in str(raised.value)
+    (first,) = _submits(fake)
+    coid = first.client_order_id
+    [(status, broker_order_id, raw)] = _query(
+        env.settings,
+        "SELECT status, broker_order_id, raw_json FROM order_events "
+        "WHERE client_order_id = ? AND status != 'pending'",
+        [coid],
+    )
+    assert (status, broker_order_id) == ("accepted", fake.get_order(coid).broker_order_id)
+    assert json.loads(raw)["order_type"] == ("limit" if shaped == "get_order" else "market")
+    assert _missed(env.settings) == []
+    pending = "SELECT client_order_id FROM orders WHERE run_id = ? AND client_order_id != ?"
+    [(second,)] = _query(env.settings, pending, [env.run.run_id, coid])
+    assert _events(env.settings, second) == [("pending", None)]
+
+    with pytest.raises(SystemFaultError):
+        _halt(gate, raised.value, env.run)
+    [(source, fault_type, reason)] = _query(
+        env.settings,
+        "SELECT source, fault_type, reason FROM kill_switch WHERE run_id = ?",
+        [env.run.run_id],
+    )
+    assert (source, fault_type) == ("fault", "SystemFaultError")
+    assert "refused_order_shape" in reason
+    assert _events(env.settings, coid)[2:] == [
+        ("cancel_requested", HALT_REASON),
+        ("cancelled", None),
+    ]
+    assert _events(env.settings, second) == [("pending", None)]  # resume settles it
+    assert [r.client_order_id for r in _submits(fake)] == [coid]
+
+
+def test_the_market_day_order_passes_the_shape_check_unchanged(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The same stub returning the fake's own market day orders: both buys go
+    out and the batch ends `ok`."""
+    fake = _shaped_env(env, None)
+    outcome = _execute(_gate(env, alerter_conn), env, _two_buys(env))
+    assert outcome.status == "ok"
+    assert len(_submits(fake)) == 2
+    assert _query(env.settings, "SELECT COUNT(*) FROM kill_switch") == [(0,)]
+
+
+def test_a_replayed_limit_order_halts_after_its_replay_event(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A duplicate id whose fetched order matches the request field for field
+    but is a limit order: the `replay` event is journaled, then
+    `refused_order_shape`."""
+    fake = ShapedBroker(
+        shaped="get_order",
+        clock=fixed_clock,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA1",
+    )
+    run = _run(journal_settings, open_window, fixed_clock())
+    _order(journal_settings, fake, fixed_clock, run, "tp-r", acknowledge=False)
+    gate = _wrapper(journal_settings, fake, fixed_clock, alerter_conn)
+    with pytest.raises(SystemFaultError, match="refused_order_shape"):
+        gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))
+    assert _events(journal_settings, "tp-r") == [("pending", None), ("replay", None)]
