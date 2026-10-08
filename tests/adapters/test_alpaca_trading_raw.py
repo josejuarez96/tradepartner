@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -230,9 +232,18 @@ def test_a_timeout_is_retried_max_retries_times_then_raised() -> None:
     assert PAPER_KEY not in repr(vars(err.value)) and PAPER_KEY not in str(err.value)
 
 
-def _api_error(status: int) -> APIError:
+def _api_error(status: int, body: str = '{"code": 1, "message": "refused"}') -> APIError:
     http_error = SimpleNamespace(response=SimpleNamespace(status_code=status))
-    return APIError('{"code": 1, "message": "refused"}', http_error)
+    return APIError(body, http_error)
+
+
+PAPER = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca" / "paper"
+
+
+def _recorded_duplicate() -> APIError:
+    """Alpaca's recorded duplicate refusal (T48b): 422, code 40010001."""
+    error = json.loads((PAPER / "duplicate_client_order_id.json").read_text())["error"]
+    return _api_error(error["status_code"], error["body"])
 
 
 def test_a_429_is_retried_and_a_403_is_not() -> None:
@@ -294,7 +305,7 @@ def _request() -> Any:
 
 
 def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> None:
-    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422)])
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _recorded_duplicate()])
     assert _raw(client=client).submit_order(_request()) == {"client_order_id": "rec-1"}
     assert [name for name, _ in client.calls] == [
         "submit_order",
@@ -303,8 +314,33 @@ def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"code": 40010000, "message": "qty must be > 0"}',
+        '{"code": "40010001", "message": "client_order_id must be unique"}',
+        '{"message": "client_order_id must be unique"}',
+        '[{"code": 40010001}]',
+        "client_order_id must be unique",
+        "",
+    ],
+    ids=["other-code", "code-as-string", "no-code", "non-object", "not-json", "empty"],
+)
+def test_a_retried_submit_refused_422_for_anything_but_a_duplicate_is_raised(
+    body: str,
+) -> None:
+    """#1300: only Alpaca's duplicate code 40010001 means the first attempt landed;
+    any other 422, or a body that does not parse to that code, is the refusal."""
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422, body)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).submit_order(_request())
+    assert err.value.status_code == 422 and err.value.retried
+    assert err.value.body == body
+    assert [name for name, _ in client.calls] == ["submit_order", "submit_order"]
+
+
 def test_a_duplicate_on_the_first_submit_attempt_is_raised() -> None:
-    client = FakeClient(fail_with=[_api_error(422)])
+    client = FakeClient(fail_with=[_recorded_duplicate()])
     with pytest.raises(AlpacaTradingError) as err:
         _raw(client=client).submit_order(_request())
     assert err.value.status_code == 422 and len(client.calls) == 1
