@@ -31,7 +31,14 @@ benchmark or first listed on one of `universe.exchanges` this session (an
 up-listing from OTC is a first listing), or the store has no bar at all at
 the previous session. The names so reported (dark plus snapshot-only) make
 the run stale when they are more than `ingest.max_dark_share` of the listed
-names (#796).
+names (#796). Before both, a listed name with no bar that is a *stale
+listing* by the gap's rule (its last traded bar known at the read is more
+than `gap.stale_listing_sessions` sessions before the reference symbol's
+last traded bar so read, ADR 0003 amendment #1199, so a lapse in ingests
+makes nothing stale) is named in the
+message with its own count and left out of both shares and both sides
+(#1234); never a benchmark or the reference symbol. The backfill does not
+apply it.
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -131,6 +138,7 @@ from tradepartner.adapters.filings import (
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.calendar import last_completed_session, previous_session
 from tradepartner.config import Settings, clean_message
+from tradepartner.gap import stale_listings_at
 from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
@@ -1289,6 +1297,7 @@ def _fetch_prices(
     listed: set[str] = set()
     static_only: set[str] = set()
     may_count: set[str] | None = None
+    read_at = now
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
@@ -1303,15 +1312,17 @@ def _fetch_prices(
     bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
     action_window = (session.replace(day=1), session)
     actions = prices.corporate_actions(ids, *action_window)
+    have = {bar.security_id for bar in bars}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
+        stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
     actions, covered = _replay_actions(prices, actions, action_window, plan)
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
-    have = {bar.security_id for bar in bars}
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
-    counted, missing, reported = _staleness(listed, have, static_only, may_count)
-    share, limit = len(missing) / len(counted), settings.ingest.max_missing_share
+    counted, missing, reported = _staleness(listed, have, static_only, may_count, stale_ids)
+    share = len(missing) / len(counted) if counted else 0.0
+    limit = settings.ingest.max_missing_share
     if share > limit:
         raise _Stale(
             f"{len(missing)} of {len(counted)} listed names ({share:.1%}, over {limit:.1%}) "
@@ -1487,13 +1498,19 @@ def _first_listed(earliest: dict[str, date], row: Row, settings: Settings) -> No
 
 SNAPSHOT_ONLY = "snapshot-only names with no rows"
 DARK = "names with no bar in the previous chunk"
+STALE_LISTINGS = "stale listings (no bar in gap.stale_listing_sessions)"
 
 
 def _staleness(
-    listed: Iterable[str], have: set[str], static_only: set[str], may_count: set[str] | None
+    listed: Iterable[str],
+    have: set[str],
+    static_only: set[str],
+    may_count: set[str] | None,
+    stale: Container[str] = frozenset(),
 ) -> tuple[list[str], list[str], dict[str, list[str]]]:
     """`(counted, missing, reported)`. A listed name with no bar is reported
-    by cause, and left out of both sides of the share, if it is in
+    by cause, and left out of both sides of the share, if it is in `stale`
+    (`_stale_listed`; #1234), or else if it is in
     `static_only` (listed only by `snapshot_static` spans, never a
     benchmark: its back-dated ticker may not be the one it traded under
     then; #784, owner option a), or else if `may_count` is not `None` and
@@ -1501,16 +1518,42 @@ def _staleness(
     it went dark). Every other listed name counts and is missing if it has
     no bar."""
     absent = sorted(sid for sid in set(listed) if sid not in have)
-    static = [sid for sid in absent if sid in static_only]
+    old = [sid for sid in absent if sid in stale]
+    rest = [sid for sid in absent if sid not in stale]
+    static = [sid for sid in rest if sid in static_only]
     dark = [
         sid
-        for sid in absent
+        for sid in rest
         if sid not in static_only and may_count is not None and sid not in may_count
     ]
-    out = {*static, *dark}
+    out = {*old, *static, *dark}
     counted = sorted(set(listed) - out)
     missing = [sid for sid in absent if sid not in out]
-    return counted, missing, {SNAPSHOT_ONLY: static, DARK: dark}
+    return counted, missing, {STALE_LISTINGS: old, SNAPSHOT_ONLY: static, DARK: dark}
+
+
+def _stale_listed(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    absent: Iterable[str],
+    reference: str,
+    settings: Settings,
+) -> set[str]:
+    """The `absent` listed names that are stale listings by the gap's rule
+    (`gap.stale_listing_sessions`, ADR 0003 amendment #1199, applied to the
+    ingest by #1234): a traded bar on or before `session` known at `t`, the
+    last more than that many sessions before the `reference` symbol's own
+    last traded bar so read (a store whose ingests lapsed as a whole has
+    none). Never a benchmark or the reference symbol's id. A name that
+    trades again counts again (a read, no state)."""
+    benchmarks = {
+        row["security_id"]
+        for row in securities_as_of(conn, t).iter_rows(named=True)
+        if row["benchmark"]
+    }
+    ids = {sid for sid in absent if sid not in benchmarks and sid != reference}
+    return set(stale_listings_at(conn, t, session, ids, settings, anchor=reference))
 
 
 def _dark_stale(
@@ -1518,15 +1561,19 @@ def _dark_stale(
 ) -> str | None:
     """The stale message when the names `_staleness` reported rather than
     counted (dark and snapshot-only) are more than `ingest.max_dark_share`
-    of the `listed` names (#796), else None. A gradual dropout leaves the
+    of the `listed` names (#796), else None. Stale listings (#1234) are on
+    neither side. A gradual dropout leaves the
     missing share by going dark, so it is bounded here instead."""
-    out = sorted({sid for names in reported.values() for sid in names})
-    share = len(out) / len(listed) if len(listed) else 0.0
+    out = sorted(
+        {sid for cause, names in reported.items() if cause != STALE_LISTINGS for sid in names}
+    )
+    total = len(listed) - len(reported.get(STALE_LISTINGS, ()))
+    share = len(out) / total if total else 0.0
     limit = settings.ingest.max_dark_share
     if share <= limit:
         return None
     return (
-        f"{len(out)} of {len(listed)} listed names ({share:.1%}, over {limit:.1%}) "
+        f"{len(out)} of {total} listed names ({share:.1%}, over {limit:.1%}) "
         f"are dark or snapshot-only {where}{_reported_note(reported)}"
     )
 

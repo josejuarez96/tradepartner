@@ -182,6 +182,9 @@ TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
 FULL_CI_LABEL = "ci:full"
+# After re-triggering a cancelled full run, the rollup still shows the old cancelled run
+# until the new one reports; tolerate that this long before calling it cancelled again.
+RETRIGGER_GRACE_S = 300
 DRAFT_CHECKS = "checks (draft, no shards)"
 CI_POLL_S = 20
 
@@ -226,6 +229,7 @@ class Runner(Protocol):
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
     def add_label(self, number: int, label: str) -> None: ...
+    def remove_label(self, number: int, label: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
 
 
@@ -321,7 +325,7 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
-    """``pending`` | ``success`` | ``failure`` for the CI on one commit.
+    """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
     ``pending`` also covers "GitHub has not seen this commit yet", "no runs reported
     yet", and "the required ``checks`` run hasn't appeared in the rollup yet": none of
@@ -336,7 +340,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     so a draft's head stays pending until a full run reports ``checks``. That full run
     (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
     a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
-    the superseded run does not read as a failure. A lone ``CANCELLED`` still fails.
+    the superseded run does not read as a failure. A lone ``CANCELLED`` ``checks`` with
+    every run on the head completed is ``cancelled`` (#1201): the caller may re-trigger
+    once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
@@ -355,6 +361,11 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         return "pending"
     if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in runs):
         return "success"
+    ok = {"SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED"}
+    if all(r.conclusion.upper() == "CANCELLED" for r in runs if r.name == "checks") and all(
+        r.conclusion.upper() in ok for r in runs
+    ):
+        return "cancelled"
     return "failure"
 
 
@@ -504,6 +515,7 @@ def ready(
     wait: bool = True,
     timeout_s: int = CI_TIMEOUT_S,
     poll_s: int = CI_POLL_S,
+    retrigger_grace_s: int = RETRIGGER_GRACE_S,
 ) -> int:
     pr = r.pr(number)
 
@@ -650,7 +662,7 @@ def ready(
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
-    state = _wait_for_ci(r, number, sha, timeout_s, poll_s, say)
+    state = _wait_for_ci(r, number, sha, timeout_s, poll_s, say, retrigger_grace_s)
     if state != "success":
         raise ReadyError(f"CI {state} on {sha[:7]}; fix and run again")
     if pr.draft:
@@ -709,12 +721,35 @@ def _wait_for_head(r: Runner, number: int, sha: str, timeout_s: int, poll_s: int
 
 
 def _wait_for_ci(
-    r: Runner, number: int, sha: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
+    r: Runner,
+    number: int,
+    sha: str,
+    timeout_s: int,
+    poll_s: int,
+    say: Callable[[str], None],
+    retrigger_grace_s: int = RETRIGGER_GRACE_S,
 ) -> str:
+    """Poll until the head's CI is decided; returns the ``checks_state`` or ``timeout``.
+
+    A ``cancelled`` full run (a draft run created after the ``ci:full`` run cancelled it,
+    #1201) is re-triggered once by removing and re-adding the label; the old cancelled run
+    stays in the rollup for ``retrigger_grace_s`` while the new one starts. Only a
+    completed, successful ``checks`` on this exact head ever returns ``success``.
+    """
     deadline = time.monotonic() + timeout_s
     say(f"waiting for CI on {sha[:7]} (up to {timeout_s // 60} min)")
+    retriggered_at: float | None = None
     while True:
         state = checks_state(r.head_checks(number), sha)
+        if state == "cancelled":
+            if retriggered_at is None:
+                say(f"the full CI run on {sha[:7]} was cancelled; re-triggering {FULL_CI_LABEL}")
+                r.remove_label(number, FULL_CI_LABEL)
+                r.add_label(number, FULL_CI_LABEL)
+                retriggered_at = time.monotonic()
+                state = "pending"
+            elif time.monotonic() - retriggered_at < retrigger_grace_s:
+                state = "pending"
         if state != "pending":
             say(f"CI {state}")
             return state
@@ -808,6 +843,9 @@ class ShellRunner:
 
     def add_label(self, number: int, label: str) -> None:
         self._gh("pr", "edit", str(number), "--add-label", label)
+
+    def remove_label(self, number: int, label: str) -> None:
+        self._gh("pr", "edit", str(number), "--remove-label", label)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)

@@ -313,6 +313,16 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", lone), "abc") == "failure"
     lone_cancel = (cr("claims", "COMPLETED", "CANCELLED"), cr("checks", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", lone_cancel), "abc") == "failure"
+    # a cancelled `checks` with nothing else of that name is its own state (#1201), unless
+    # something on the head is still running (then a later run may supersede it)
+    cancelled_full = (cr("checks", "COMPLETED", "CANCELLED"), cr("claims", "COMPLETED", "SUCCESS"))
+    assert ready_pr.checks_state(hc("abc", cancelled_full), "abc") == "cancelled"
+    still_going = (*cancelled_full, cr("checks-fast", "IN_PROGRESS", ""))
+    assert ready_pr.checks_state(hc("abc", still_going), "abc") == "pending"
+    later_green = (*cancelled_full, cr("checks", "COMPLETED", "SUCCESS"))
+    assert ready_pr.checks_state(hc("abc", later_green), "abc") == "success"
+    other_failed = (*cancelled_full, cr("pytest-shard (1)", "COMPLETED", "FAILURE"))
+    assert ready_pr.checks_state(hc("abc", other_failed), "abc") == "failure"
     twice = (cr("checks", "COMPLETED", "FAILURE"), cr("checks", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", twice), "abc") == "failure"
 
@@ -337,7 +347,7 @@ class FakeRunner:
         main_files: dict[str, str] | None = None,
         body: str = BODY_OK,
         comments: Sequence[str] = ("quant-auditor: PASS",),
-        checks_after: Sequence[str] = ("success",),
+        checks_after: Sequence[str | tuple[ready_pr.CheckRun, ...]] = ("success",),
         draft: bool = True,
         dirty: bool = False,
         test_sources: dict[str, str] | None = None,
@@ -359,6 +369,7 @@ class FakeRunner:
         self.pushed: list[str] = []
         self.events: list[str] = []
         self.labelled: list[tuple[int, str]] = []
+        self.unlabelled: list[tuple[int, str]] = []
 
     def git(self, *args: str) -> str:
         self.calls.append(("git", *args))
@@ -420,6 +431,8 @@ class FakeRunner:
     def head_checks(self, number: int) -> ready_pr.HeadChecks:
         self.events.append("wait")
         state = self.checks_after.pop(0) if self.checks_after else "success"
+        if not isinstance(state, str):  # a scripted rollup, passed through as is
+            return ready_pr.HeadChecks("abc1234def", state)
         run = ready_pr.CheckRun(
             "checks", "COMPLETED", "SUCCESS" if state == "success" else "FAILURE"
         )
@@ -434,6 +447,10 @@ class FakeRunner:
     def add_label(self, number: int, label: str) -> None:
         self.labelled.append((number, label))
         self.events.append("label")
+
+    def remove_label(self, number: int, label: str) -> None:
+        self.unlabelled.append((number, label))
+        self.events.append("unlabel")
 
     def sleep(self, seconds: float) -> None:
         pass
@@ -462,6 +479,36 @@ def test_a_head_github_never_shows_gets_no_label() -> None:
     with pytest.raises(ready_pr.ReadyError, match="head is not abc1234 on GitHub yet"):
         ready_pr.ready(r, 69, poll_s=0, timeout_s=0)
     assert r.labelled == [] and r.readied == []
+
+
+CANCELLED_FULL = (
+    ready_pr.CheckRun("checks", "COMPLETED", "CANCELLED"),
+    ready_pr.CheckRun("claims", "COMPLETED", "SUCCESS"),
+)
+
+
+def test_a_cancelled_full_run_is_retriggered_once_then_goes_green() -> None:
+    # #1201: a draft run created after the ci:full run cancelled it. ready_pr removes and
+    # re-adds the label once instead of reporting a CI failure; green is still only a
+    # completed, successful `checks` on the exact head.
+    r = FakeRunner(checks_after=["success", CANCELLED_FULL, "pending", "success"])
+    assert ready_pr.ready(r, 69, poll_s=0, retrigger_grace_s=0) == 0
+    assert r.labelled == [(69, "ci:full"), (69, "ci:full")]
+    assert r.unlabelled == [(69, "ci:full")]
+    assert r.readied == [69]
+
+
+def test_a_second_cancel_fails_and_never_marks_ready() -> None:
+    r = FakeRunner(checks_after=["success", CANCELLED_FULL, CANCELLED_FULL, CANCELLED_FULL])
+    with pytest.raises(ready_pr.ReadyError, match="CI cancelled"):
+        ready_pr.ready(r, 69, poll_s=0, retrigger_grace_s=0)
+    assert r.unlabelled == [(69, "ci:full")] and r.readied == []
+
+
+def test_the_old_cancelled_run_is_tolerated_while_the_retrigger_starts() -> None:
+    r = FakeRunner(checks_after=["success", CANCELLED_FULL, CANCELLED_FULL, "success"])
+    assert ready_pr.ready(r, 69, poll_s=0, retrigger_grace_s=3600) == 0
+    assert r.readied == [69]
 
 
 def test_a_failed_full_run_leaves_the_draft_a_draft() -> None:
