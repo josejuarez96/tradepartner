@@ -102,7 +102,7 @@ You never accept a store from anyone: you always build your own in step 1.
        print(message.strip().splitlines()[-1])
    EOF
    ```
-   `run_sweep` refuses any `store_path` without the fixture marker (`UnmarkedStoreRefused`), and opens every trial `synthetic=True` under one. The run waits out the lab's quiet intervals, so the 5-minute budget makes it stop instead of sleeping for hours; if `stopped_by_budget` is true with nothing run, report that and stop. Report counts and each failure's last line only (never a traceback); fixture numbers say nothing about a family. The sweep file must sit under `TEAM_DIR/docs/sweeps/` or `SCRATCH`; refuse any other path.
+   `run_sweep` refuses any `store_path` without the fixture marker (`UnmarkedStoreRefused`), and opens every trial `synthetic=True` under one. The run first waits out any quiet interval, and the budget does not cover that opening wait. So before running, check the time in `lab.quiet_timezone` (`TZ=America/New_York date`; read the intervals with `get_settings().lab`): if it is inside `lab.quiet_intervals` on a day in `lab.quiet_weekdays`, or inside the paper interval (about two hours around the 09:30 ET open, applied on every run), do not run; report `sweep smoke skipped: quiet interval` and stop. The 5-minute budget only bounds waits between groups. Report counts and each failure's last line only (never a traceback); fixture numbers say nothing about a family. The sweep file must sit under `TEAM_DIR/docs/sweeps/` or `SCRATCH`; refuse any other path.
 4. **Delete the temp store** (`rm -rf "$SCRATCH/runner"`) once the report is written, unless the window asked to keep it.
 
 ## Output
