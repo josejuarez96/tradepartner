@@ -79,8 +79,9 @@ Unchanged:
 - every run is a trial;
 - the holdout is spent once;
 - results are reported beside SPY and MTUM;
-- deflated Sharpe uses the family's trial count;
-- which data a run may read is the [Zones](#zones) section's.
+- deflated Sharpe uses the family's trial count.
+
+Which data a run may read is [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md)'s rule; the principles behind it are in [Zones](#zones).
 
 ### 6. Result → register
 
@@ -100,15 +101,15 @@ When a claim would change **the tool itself** rather than a strategy, it goes to
 
 Data sits in three zones, and the evidence a run gives gets stronger from one to the next. The rules live in the [strategy-lab spec](../specs/strategy-lab.md) and [ADR 0016](../decisions/0016-development-boundary-and-forward-exams.md); the owner's decisions of 2026-10-08 are on #1301 (decisions 1 to 5, and his governance brief in comment 6065810154). This section states the principles so agents follow them; it adds no rule.
 
-1. **Development data**: the practice years, up to the development boundary. Permissive on purpose: run anything, compare anything, iterate. The price is counting: every run is a trial, every trial counts in its family's N, and the deflated Sharpe carries the search, so the bar a result must clear rises with every try. Nothing here is final evidence.
-2. **Exams**: a family's holdout. Strict: spent once, on a frozen finalist, chosen on development data. Never pick among several strategies on one exam, and never redesign after seeing one (#1301 decision 2). The lab refuses the rest, hard, with no override, because agents run backtests too. If a rule would depend on someone remembering which months a strategy saw, that is a defect to fix, not a procedure to follow.
+1. **Development data**: the practice years, up to the development boundary. Permissive on purpose: run any registered variant, compare anything, iterate. The price is counting: every run is a trial, every trial counts in its family's N, and the deflated Sharpe carries the search, so the bar a result must clear rises with every try. Nothing here is final evidence.
+2. **Exams**: a family's holdout. Strict: spent once, on a frozen finalist, chosen on development data. Never pick among several strategies on one exam (#1301 decision 2); a changed strategy is a new sweep, and its trials count (strategy-lab spec req 4). The lab refuses a window that reaches into exam months, or past the boundary, hard and with no override, because agents run backtests too; the rest is discipline. If a rule would depend on someone remembering which months a strategy saw, that is a defect to fix, not a procedure to follow.
 3. **Forward exams**: the paper book. A family whose holdout lies in the future when it registers takes its exam in its own paper book, with its promoted hypothesis, under the [ADR 0005](../decisions/0005-objective-benchmark-stop-criteria.md) tracking check. The data did not exist when the strategy was designed, which is why this is the strongest evidence and the final judge. On today's history every new family's exam is forward.
 
-**The boundary.** One date, written by the owner into the store, read by every run; no in-sample run reads a session after it. It is not a per-strategy choice (#1301 decision 1) and no hypothesis carries it as a key. Only the owner moves it, by a new recorded decision with a reason, never onto any family's exam months; trials run under the old value stay counted. ADR 0016 has the rule, the refusals and the open questions.
+**The boundary.** One date, written by the owner into the store. Once he writes it (ADR 0016 point 1; until then today's window rule applies, and the code is the data-foundation plan's T142 tasks), every run reads it and no in-sample run reads a session after it. It is not a per-strategy choice (#1301 decision 1) and no hypothesis carries it as a key. Only the owner moves it, by a new recorded decision with a reason, never onto any family's exam months; trials run under the old value stay counted and go stale: they count in N, never select, and are rerun. ADR 0016 has the rule, the refusals and the open questions.
 
-**Where things stand** (#1301 decisions 3 to 5): H1 goes into paper trading first, one track, to validate the app; B3's exam stays unspent until a profitability finalist exists; B4 is parked, and its exam, when it registers, is forward.
+**Where things stand** (#1301 decisions 3 to 5): one track now, H1 into paper trading, to validate the app; B3's exam stays unspent until a profitability finalist exists; B4 is parked, and its exam, when it registers, is forward.
 
-In one line, the owner's: research freedom in development, evidence discipline in exams, maximum skepticism at promotion, prospective data as the final judge.
+In one line, the owner's: research freedom in development, evidence discipline in validation, maximum skepticism at promotion, prospective data as the final judge.
 
 ## Who does what
 
