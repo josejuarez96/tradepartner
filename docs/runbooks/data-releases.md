@@ -51,12 +51,12 @@ The fields:
 | `backup_path` | `before`, `record` | The backup file, as a path from the project root. Leave it out on `after` (the `before` names it). |
 | `store_max_ingested_at` | all | The store's latest `ingested_at` at that moment (the command below prints it). |
 | `data_vintage` | all | The data vintage at `cutoff`: the latest `ingested_at` over fact rows with `known_at` on or before `cutoff`. |
-| `cutoff` | all | The UTC time the vintage is computed at. For `before` and `after`: the close of `sessions_to`. For `record`: the trial's `data_cutoff`. |
+| `cutoff` | all | The UTC time the vintage is computed at. For `before` and `after`: the close of `sessions_to`, read from the trading calendar (`tradepartner.calendar.session_close`), never assumed: it moves with daylight saving time and half days. For `record`: the trial's `data_cutoff`. |
 | `sessions_from`, `sessions_to` | all | On `before`: the sessions you plan to touch. On `after`: the sessions the repair actually touched. On `record`: the trial's window. |
 | `trial` | `record` | The trial id whose state the backup holds. |
 | `reason` | all | One line: why, and the issue number. On `after`, say anything that differs from the plan. |
 
-A delete-only repair (bars removed, nothing written) leaves `data_vintage` unchanged, because the vintage reads only rows still there. Until T140b counts `after` records in the vintage, such a release does not make trials stale on its own. Note it in `reason`, and rerun any sweep over those sessions with `--rerun` if its results matter.
+**A delete-only repair** (bars removed, nothing written) does not reliably stale the trials that read those sessions. The vintage reads only rows still in the store. If the deleted rows did not hold the latest `ingested_at` at or before a trial's cutoff, the vintage stays the same and the trial still reads as current, though its inputs changed. If they did hold it, the vintage moves backward and the trial goes stale. Either way, until T140b counts `after` records in the vintage, do this after every release that deletes rows: for each sweep whose trials read the touched sessions, run `sweep run <slug>` (it reruns any variant that went stale), then, once the sweep reads complete, `sweep run <slug> --rerun`, so no trial on the old rows can still select. Each rerun counts in N. Say in the `after` entry's `reason` that the release deleted rows and which sweeps you reran.
 
 ## Read the two numbers
 
@@ -92,7 +92,7 @@ Write the printed times into the entry with a `Z` in place of `+00:00`.
 5. **Run the repair.** Every command in the batch, back to back. Dry runs first where the command has one.
 6. **Check it.** `uv run tradepartner health --check` exits 0, and the checks the release's issue names pass.
 7. **Write the `after` entry.** Same `name`, `stage = "after"`, the numbers read again on the live store, and the sessions actually touched.
-8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N.
+8. **Restart the jobs** (scheduling.md). The next plain `sweep run` reruns any stale variants; each rerun counts in N. If the release deleted rows, also rerun the sweeps that read those sessions as "The record" above says.
 
 If the repair fails partway: restore the backup (scheduling.md, "To restore from a copy"), then write an `after` entry whose `reason` says it was rolled back. The release is closed; a retry is a new release with a new name.
 
