@@ -53,10 +53,15 @@ rule are written in.
 
 ## Parameters
 
-The fixed values are H1's family rules (the momentum family's first registration, H1). The
-keys H1's file pins outside `strategy.*` and `costs.*` (`universe.top_n_by_cap`,
-`execution.fill_price`, `alpaca.historical_feed`) are not repeated here. They come from the
-family rules on registration, as in the fixture sweeps.
+The fixed values are H1's family rules (the momentum family's first registration, H1). A
+frozen key this block leaves out is read from live settings at registration and refused
+there if it differs from the family rules (req 1(a)). So the block pins the owner-edited
+exception lists `universe.accepted_price_jumps`, `universe.accepted_same_day_pairs`,
+`universe.accepted_shares_facts` and `master.keep_successors` to the momentum family rules'
+values (the store's `family_rules.fixed_params_json`, H1's registration). A later `.env`
+entry, such as the same-day pairs B3's rules carry, then cannot refuse this file. The keys
+H1's own file pins (`universe.top_n_by_cap`, `execution.fill_price`,
+`alpaca.historical_feed`) are at their defaults in the family rules and are not repeated.
 
 ```toml sweep
 slug = "momentum-topfrac-cadence"
@@ -84,6 +89,14 @@ sensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]
 [schedule]
 # rebalance_cadence is a grid axis below
 signal_anchor = "month_end"
+
+[universe]
+accepted_price_jumps = []
+accepted_same_day_pairs = ["0001903392@2024-03-14"]
+accepted_shares_facts = []
+
+[master]
+keep_successors = ["0000891103@2020-08-10"]
 
 [grid]
 "strategy.top_fraction" = [0.05, 0.20]
@@ -177,8 +190,10 @@ Results already seen before registration:
 No result for any variant of this grid (`top_fraction` 0.05 or 0.20, or any `week_end` or
 `daily` run of 12-1 momentum on this store) has been seen, apart from the scratch-store
 timing preview in the PR that adds this file. That preview ran these exact six variants on
-a scratch copy of the owner's store to measure seconds per variant. Every value in this
-file was fixed before that preview ran, and the copy was deleted.
+a scratch copy of the owner's store to measure seconds per variant. Every grid and `[lab]`
+value in this file was fixed before that preview ran. The `[universe]` and `[master]` pins
+were added after it, and they leave every variant's fingerprint unchanged: the scratch store
+refused the pinned file's six variants as already registered. The copy was then deleted.
 
 ## Retirement condition
 
