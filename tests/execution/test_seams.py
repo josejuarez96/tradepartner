@@ -1,5 +1,5 @@
-"""The expansion-seam write-through, end to end (ADR 0015 seams 1 and 2, plans
-T133 and T134).
+"""The expansion-seam write-through, end to end (ADR 0015 seams 1 to 3, plans
+T133, T134 and T135b).
 
 Shared by the T133 -> T134 -> T135b chain. One `paper run` on `test_run_trade`'s
 scripted fake, with the window's book `"fx"` (never the DDL default `"main"`),
@@ -31,6 +31,9 @@ Seam 2 (T134): after the same run every row of the five tables with a
 side cannot differ: `Disposal` carries no side, so `DisposalRow` is written
 with the DDL default, and `lots.rebuild` refuses any order that is not long
 (`test_lots.py`).
+
+Seam 3 (T135b): after the same run every `orders` row reads the default shape,
+`schema.ORDER_SHAPE_DEFAULTS` with no limit price, stop price or parent.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from tradepartner.config import Settings
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.store.db import open_for_write
-from tradepartner.store.schema import LONG
+from tradepartner.store.schema import LONG, ORDER_SHAPE_DEFAULTS
 
 #: The book the window is started with: not `schema.DEFAULT_BOOK_ID`.
 BOOK = "fx"
@@ -132,3 +135,27 @@ def test_every_row_the_run_writes_is_long(fx_env: Env, tmp_path: Path) -> None:
     for table in SIDE_TABLES:
         assert fx_env.count(table) >= 1, table
         assert fx_env.query(f"SELECT DISTINCT position_side FROM {table}") == [(LONG,)], table
+
+
+def test_every_orders_row_the_run_writes_has_the_default_shape(fx_env: Env, tmp_path: Path) -> None:
+    """ADR 0015 seam 3 (T135b): the market day order, one share class."""
+    _fixture_run(fx_env, tmp_path)
+
+    assert fx_env.count("orders") >= 1
+    shapes = fx_env.query(
+        "SELECT DISTINCT order_type, time_in_force, asset_class, order_class, multiplier, "
+        "limit_price, stop_price, parent_order_id FROM orders"
+    )
+    defaults = ORDER_SHAPE_DEFAULTS
+    assert shapes == [
+        (
+            defaults["order_type"],
+            defaults["time_in_force"],
+            defaults["asset_class"],
+            defaults["order_class"],
+            defaults["multiplier"],
+            None,
+            None,
+            None,
+        )
+    ]

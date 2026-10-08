@@ -45,6 +45,7 @@ from tradepartner.store.journal import (
     PaperWindowRow,
     append,
 )
+from tradepartner.store.schema import ORDER_SHAPE_DEFAULTS
 
 
 class FixedClock(Protocol):
@@ -893,6 +894,53 @@ def test_the_accepted_event_carries_the_brokers_order_id(
         ("pending", None),
         ("accepted", env.fake.get_order(request.client_order_id).broker_order_id),
     ]
+
+
+#: `orders`' eight shape columns (ADR 0015 seam 3): the five defaulted ones and
+#: the three nullable ones.
+_SHAPE_DEFAULTED = ("order_type", "time_in_force", "asset_class", "order_class", "multiplier")
+_SHAPE_NULLABLE = ("limit_price", "stop_price", "parent_order_id")
+
+
+def test_the_journaled_order_rows_carry_the_default_shape(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Every `orders` row a batch journals, a sell and a buy, reads
+    `schema.ORDER_SHAPE_DEFAULTS` and no limit price, stop price or parent
+    (ADR 0015 seam 3, plan T135b)."""
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=500.0)
+    env.fake.script(FillAt())
+    _execute(_gate(env, alerter_conn), env, [trim, _decision(env, B, "buy", notional=3000.0)])
+    columns = ", ".join((*_SHAPE_DEFAULTED, *_SHAPE_NULLABLE))
+    rows = _query(
+        env.settings, f"SELECT side, {columns} FROM orders WHERE run_id = ?", [env.run.run_id]
+    )
+    expected = (*(ORDER_SHAPE_DEFAULTS[k] for k in _SHAPE_DEFAULTED), None, None, None)
+    assert sorted(rows) == [("buy", *expected), ("sell", *expected)]
+
+
+def test_the_wrapper_writes_every_shape_column_explicitly() -> None:
+    """Each `OrderRow(...)` the wrapper builds names all eight shape columns,
+    the five defaulted ones read from `ORDER_SHAPE_DEFAULTS` and the three
+    nullable ones `None`, never left to the row type's defaults (plan T135b)."""
+    calls = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(wrapper)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "OrderRow"
+    ]
+    assert calls
+    for call in calls:
+        given = {k.arg: k.value for k in call.keywords}
+        for name in _SHAPE_DEFAULTED:
+            value = given[name]
+            assert isinstance(value, ast.Subscript), name
+            assert ast.unparse(value) == f"ORDER_SHAPE_DEFAULTS['{name}']", name
+        for name in _SHAPE_NULLABLE:
+            value = given[name]
+            assert isinstance(value, ast.Constant) and value.value is None, name
 
 
 def test_a_validation_error_on_the_last_request_halts_with_zero_submits(
