@@ -77,14 +77,12 @@ from tradepartner.store.lab_registry import (
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
     BASE_COST_KEY,
-    STORE_CHANGED_MESSAGE,
     HypothesisRecord,
 )
 from tradepartner.store.schema import REGISTRY_TABLE_NAMES
 
 __all__ = [
     "DSR_SHARE_THRESHOLD",
-    "EXCLUDED_FAILURE_MESSAGES",
     "LabStatus",
     "SweepReport",
     "VariantRow",
@@ -100,14 +98,6 @@ SweepState = Literal["complete", "incomplete (stale)", "incomplete (unrun)"]
 CADENCE_KEY: Final = "schedule.rebalance_cadence"
 ANCHOR_KEY: Final = "schedule.signal_anchor"
 FILL_KEY: Final = "execution.fill_price"
-
-#: The `engine.run_many` shared-read failure message (strategy-lab spec req 2), as
-#: the one classifier (`lab_queries`) excludes it.
-SHARED_READ_FAILED: Final = lab_queries.SHARED_READ_FAILED
-
-#: Failure messages that never make a variant terminal-failed (spec req 2): both are
-#: failures of the group or the store, not of the variant.
-EXCLUDED_FAILURE_MESSAGES: Final = frozenset({STORE_CHANGED_MESSAGE, SHARED_READ_FAILED})
 
 #: The report's "share of variants with recomputed `dsr_excess` > 0.5" (spec req 3):
 #: a fixed reading of the spec's own text, "more likely skilled than not", not a gate.
@@ -285,8 +275,9 @@ class OpenSweep:
 
 @dataclass(frozen=True)
 class SweepRunLine:
-    """One `sweep_runs` row in `lab status`; `seconds_per_variant` is the run's seconds
-    over its `ok` and failed trials, None for an open run or one that ran none."""
+    """One `sweep_runs` row in `lab status`; `seconds_per_variant` is the mean of the
+    run's `ok` trials' `sweep_trials.seconds` (as `lab_queries` measures it), None
+    when the run has no `ok` trial."""
 
     sweep_run_id: int
     slug: str

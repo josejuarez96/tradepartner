@@ -525,7 +525,7 @@ def test_terminal_failed_variants_complete_the_sweep_and_never_select(
     # Excluded kinds, a dirty one and another code vintage: not terminal.
     store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE, run_id=run)
     store.trial(v3, status="failed", message=registry.STORE_CHANGED_MESSAGE, run_id=run)
-    store.trial(v3, status="failed", message=sweep_report.SHARED_READ_FAILED, run_id=run)
+    store.trial(v3, status="failed", message=lab_queries.SHARED_READ_FAILED, run_id=run)
     store.trial(v4, status="failed", message="boom", dirty=True, run_id=run)
     store.trial(v4, status="failed", message="boom", code=OTHER_CODE, run_id=run)
     # A current ok after two failures: counted.
