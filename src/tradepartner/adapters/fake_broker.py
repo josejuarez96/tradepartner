@@ -137,7 +137,15 @@ from tradepartner.adapters.broker import (
 from tradepartner.errors import ClockError
 from tradepartner.timeutil import ensure_tz_aware_utc
 
-_DEFAULT_ASSET = Asset(tradable=True, fractionable=True, status="active", cusip=None)
+_DEFAULT_ASSET = Asset(
+    tradable=True,
+    fractionable=True,
+    status="active",
+    cusip=None,
+    shortable=False,
+    easy_to_borrow=False,
+    marginable=False,
+)
 _NEW_YORK = ZoneInfo("America/New_York")
 _CENT = Decimal("0.01")
 

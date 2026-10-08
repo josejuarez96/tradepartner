@@ -18,6 +18,16 @@ journal-only state `pending` lives in `order_events.status`, never here.
 `get_order`. The ABC exposes no clock (ADR 0007 point 5): the wrapper and
 the adapter are handed the same clock callable at composition time.
 
+**Read-side reservations (ADR 0015 seam 3, plan T135).** `Order`, `Fill`,
+`Account` and `Asset` carry fields the adapter reads back from the broker —
+`order_type`, `time_in_force`, `limit_price`, `stop_price`, `asset_class`,
+`order_class`, `legs`, `fee`, `short_market_value`, `maintenance_margin`,
+`daytrade_count`, `shortable`, `easy_to_borrow`, `marginable` — that nothing
+in this system sends: `OrderRequest` is unchanged, so no request can carry a
+price, an order type or a leg (ADR 0015 seam 3). They are reserved so the
+Alpaca adapter maps a broker's response once; the risk wrapper refuses any
+non-default shape by name (`refused_order_shape`, T135b).
+
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
 raises `ValueError` at construction, and any tz-aware value that isn't
@@ -135,6 +145,38 @@ def _validate_bool(value: bool, *, field_name: str) -> bool:
     return value
 
 
+def _validate_optional_finite(value: float | None, *, field_name: str) -> float | None:
+    return None if value is None else _validate_finite(value, field_name=field_name)
+
+
+def _validate_optional_non_negative_finite(value: float | None, *, field_name: str) -> float | None:
+    """`_validate_optional_finite` that also refuses a negative value (a
+    broker fee is never negative)."""
+    if value is None:
+        return None
+    value = _validate_finite(value, field_name=field_name)
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {value!r}")
+    return value
+
+
+def _validate_optional_count(value: int | None, *, field_name: str) -> int | None:
+    """`None` or a non-negative `int` (never a `bool`, an `int` subclass)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative int or None, got {value!r}")
+    return value
+
+
+def _validate_legs(value: tuple[Order, ...], *, field_name: str) -> tuple[Order, ...]:
+    """A sequence of `Order` legs, stored as a tuple. Each leg was already
+    validated when it was built; this only pins the shape."""
+    if not isinstance(value, tuple | list) or not all(isinstance(leg, Order) for leg in value):
+        raise ValueError(f"{field_name} must be a tuple of Order, got {value!r}")
+    return tuple(value)
+
+
 def _validate_size(
     notional: float | None, quantity: float | None
 ) -> tuple[float | None, float | None]:
@@ -249,6 +291,13 @@ class Order:
     filled_quantity: float | None = None
     filled_avg_price: float | None = None
     filled_at: datetime | None = None
+    order_type: str = "market"
+    time_in_force: str = "day"
+    limit_price: float | None = None
+    stop_price: float | None = None
+    asset_class: str = "us_equity"
+    order_class: str = "simple"
+    legs: tuple[Order, ...] = ()
 
     def __post_init__(self) -> None:
         notional, quantity = _validate_size(self.notional, self.quantity)
@@ -273,6 +322,13 @@ class Order:
             if self.broker_order_id is None
             else _validate_identifier(self.broker_order_id, field_name="broker_order_id")
         )
+        order_type = _validate_identifier(self.order_type, field_name="order_type")
+        time_in_force = _validate_identifier(self.time_in_force, field_name="time_in_force")
+        limit_price = _validate_optional_positive(self.limit_price, field_name="limit_price")
+        stop_price = _validate_optional_positive(self.stop_price, field_name="stop_price")
+        asset_class = _validate_identifier(self.asset_class, field_name="asset_class")
+        order_class = _validate_identifier(self.order_class, field_name="order_class")
+        legs = _validate_legs(self.legs, field_name="legs")
         object.__setattr__(
             self,
             "client_order_id",
@@ -292,11 +348,20 @@ class Order:
         object.__setattr__(self, "filled_quantity", filled_quantity)
         object.__setattr__(self, "filled_avg_price", filled_avg_price)
         object.__setattr__(self, "filled_at", filled_at)
+        object.__setattr__(self, "order_type", order_type)
+        object.__setattr__(self, "time_in_force", time_in_force)
+        object.__setattr__(self, "limit_price", limit_price)
+        object.__setattr__(self, "stop_price", stop_price)
+        object.__setattr__(self, "asset_class", asset_class)
+        object.__setattr__(self, "order_class", order_class)
+        object.__setattr__(self, "legs", legs)
 
 
 @dataclass(frozen=True)
 class Fill:
-    """One execution record, identified by the broker's `broker_fill_id`."""
+    """One execution record, identified by the broker's `broker_fill_id`.
+    `fee` is `None` until an adapter derives it from Alpaca's account
+    activities (ADR 0015 seam 3); it is not a field of the fill itself."""
 
     client_order_id: str
     symbol: str
@@ -305,6 +370,7 @@ class Fill:
     price: float
     filled_at: datetime
     broker_fill_id: str
+    fee: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -325,6 +391,9 @@ class Fill:
             self,
             "broker_fill_id",
             _validate_identifier(self.broker_fill_id, field_name="broker_fill_id"),
+        )
+        object.__setattr__(
+            self, "fee", _validate_optional_non_negative_finite(self.fee, field_name="fee")
         )
 
 
@@ -349,13 +418,18 @@ class Position:
 @dataclass(frozen=True)
 class Account:
     """The broker account at `as_of`: cash (may be negative), buying
-    power and equity, in dollars."""
+    power and equity, in dollars. `short_market_value`,
+    `maintenance_margin` and `daytrade_count` are read-side reservations
+    (ADR 0015 seam 3): `None` until an adapter maps them, finite when set."""
 
     account_id: str
     cash: float
     buying_power: float
     equity: float
     as_of: datetime
+    short_market_value: float | None = None
+    maintenance_margin: float | None = None
+    daytrade_count: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -364,17 +438,37 @@ class Account:
         for name in ("cash", "buying_power", "equity"):
             object.__setattr__(self, name, _validate_finite(getattr(self, name), field_name=name))
         object.__setattr__(self, "as_of", ensure_tz_aware_utc(self.as_of, field_name="as_of"))
+        object.__setattr__(
+            self,
+            "short_market_value",
+            _validate_optional_finite(self.short_market_value, field_name="short_market_value"),
+        )
+        object.__setattr__(
+            self,
+            "maintenance_margin",
+            _validate_optional_finite(self.maintenance_margin, field_name="maintenance_margin"),
+        )
+        object.__setattr__(
+            self,
+            "daytrade_count",
+            _validate_optional_count(self.daytrade_count, field_name="daytrade_count"),
+        )
 
 
 @dataclass(frozen=True)
 class Asset:
     """What the broker says about one symbol. `cusip` is `None` when the
-    broker does not report one."""
+    broker does not report one. `shortable`, `easy_to_borrow` and
+    `marginable` are read-side reservations (ADR 0015 seam 3), `False`
+    until an adapter maps them."""
 
     tradable: bool
     fractionable: bool
     status: str
     cusip: str | None
+    shortable: bool = False
+    easy_to_borrow: bool = False
+    marginable: bool = False
 
     def __post_init__(self) -> None:
         _validate_bool(self.tradable, field_name="tradable")
@@ -382,6 +476,9 @@ class Asset:
         _validate_identifier(self.status, field_name="status")
         if self.cusip is not None:
             _validate_identifier(self.cusip, field_name="cusip")
+        _validate_bool(self.shortable, field_name="shortable")
+        _validate_bool(self.easy_to_borrow, field_name="easy_to_borrow")
+        _validate_bool(self.marginable, field_name="marginable")
 
 
 class Broker(abc.ABC):
