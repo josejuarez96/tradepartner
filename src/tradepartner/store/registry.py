@@ -1538,7 +1538,8 @@ def plan_release_import(
     name in file order, ready for `import_release`, one release each. Refuses, all
     problems listed at once and nothing written: a malformed entry, a (name,
     stage) pair the file repeats or the store holds, a name whose `record` is
-    mixed with a `before` or `after`, an `after` with no `before` before it, a
+    mixed with a `before` or `after`, an `after` with no `before` before it or
+    made on or after the version-18 migration (the commands record those), a
     `record` whose trial does not exist, and a file that would leave more than one
     release open (the store's open release counted)."""
     problems: list[str] = []
@@ -1549,6 +1550,17 @@ def plan_release_import(
         problems.extend(_entry_problems(index, entry))
     if problems:
         raise ReleaseRefused("; ".join(problems))
+    migrated = conn.execute(
+        "SELECT MIN(applied_at) FROM schema_version WHERE version = 18"
+    ).fetchone()
+    since = migrated[0] if migrated is not None else None
+    for entry in entries:
+        if entry["stage"] == "after" and since is not None and entry["made_at"] >= since:
+            problems.append(
+                f"{entry['name']}: an after made at {entry['made_at']} is after the store "
+                f"gained the release commands ({since}); record it with `close`, since an "
+                "imported after moves no vintage"
+            )
     stored = data_releases(conn)
     pairs = {(r.name, r.stage): r for r in stored}
     groups: dict[str, list[Mapping[str, Any]]] = {}
