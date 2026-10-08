@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -420,6 +421,11 @@ _CLICK_REACH = frozenset(
         "setitem",
         "get_command",
         "make_context",
+        "methodcaller",
+        "importlib",
+        "import_module",
+        "eval",
+        "exec",
     }
 )
 _CLICK_ATTRIBUTES = frozenset(
@@ -428,11 +434,36 @@ _CLICK_ATTRIBUTES = frozenset(
         "info",
         "context_settings",
         DEFAULT_MAP,
-        "__setattr__",
-        "__getattr__",
-        "__getattribute__",
+        "modules",
     }
 )
+#: The only dunders `cli.py` may name or spell; any other (`__setattr__`,
+#: `__dict__`, `__getattribute__`, ...) could set settings by a computed name.
+_CLI_DUNDERS = frozenset({"__name__", "__file__", "__init__", "__main__", "__future__"})
+#: The top-level modules `cli.py` may import. A new one is a reviewed change
+#: here, so `operator`, `importlib` and the like cannot arrive unseen.
+_CLI_IMPORT_ROOTS = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "duckdb",
+        "httpx",
+        "json",
+        "pathlib",
+        "polars",
+        "re",
+        "subprocess",
+        "sys",
+        "tradepartner",
+        "typer",
+        "types",
+        "typing",
+        "zoneinfo",
+    }
+)
+_DUNDER = re.compile(r"__\w+__")
 
 
 def _annotation_ids(tree: ast.Module) -> set[int]:
@@ -453,8 +484,11 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
     keyword), never assigned or read as an attribute; `Typer` is only called
     or annotated, never aliased or wrapped (`T = typer.Typer`, `partial`);
     `**` goes only into `_UNPACK_CALLEES`; nothing names `_CLICK_REACH`
-    (`setattr`, `get_command(app).main(...)`, `app.info`); and `default_map`
-    appears nowhere, as a keyword, attribute or string."""
+    (`setattr`, `vars`, `operator`, `importlib`, `get_command`) or
+    `_CLICK_ATTRIBUTES` (`.main`, `.info`, `.modules`), nor imports them under
+    any alias, nor imports a module outside `_CLI_IMPORT_ROOTS`; no dunder
+    outside `_CLI_DUNDERS` is named or spelt; and `default_map` appears
+    nowhere, as a keyword, attribute or string."""
     found = []
     annotations = _annotation_ids(tree)
     for node in ast.walk(tree):
@@ -483,6 +517,9 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
             and DEFAULT_MAP in node.value
         ):
             found.append(f"{node.lineno}: spells {DEFAULT_MAP}")
+        spelt = node.value if isinstance(node, ast.Constant) else name
+        if isinstance(spelt, str) and any(d not in _CLI_DUNDERS for d in _DUNDER.findall(spelt)):
+            found.append(f"{getattr(node, 'lineno', 0)}: names a dunder: {spelt!r}")
         if name in _CLICK_ATTRIBUTES and isinstance(node, ast.Attribute):
             found.append(f"{node.lineno}: names {name} as an attribute")
         elif isinstance(node, (ast.Name, ast.Attribute)) and name in _CLICK_REACH:
@@ -493,9 +530,14 @@ def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[
             if not (called or id(node) in annotations):
                 found.append(f"{node.lineno}: aliases or wraps Typer")
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = (node.module or "") if isinstance(node, ast.ImportFrom) else ""
             for alias in node.names:
-                parts = {*alias.name.split("."), alias.asname}
-                if parts & _CLICK_REACH:
+                path = f"{module}.{alias.name}" if module else alias.name
+                parts = {*path.split("."), alias.asname}
+                root = path.split(".")[0]
+                if root not in _CLI_IMPORT_ROOTS and not getattr(node, "level", 0):
+                    found.append(f"{node.lineno}: imports {path}, outside the reviewed roots")
+                elif parts & _CLICK_REACH:
                     found.append(f"{node.lineno}: imports {alias.name}")
                 elif "Typer" in parts and alias.asname not in (None, "Typer"):
                     found.append(f"{node.lineno}: imports Typer as {alias.asname}")
@@ -976,6 +1018,12 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS + "import operator as op\n",
         CLI_PASS + "from operator import setitem as put\n",
         CLI_PASS + "from typer import Typer as T\n",
+        CLI_PASS + "from operator import methodcaller\n",
+        CLI_PASS + "from operator import methodcaller as mc\n",
+        CLI_PASS + "importlib.import_module('oper' + 'ator')\n",
+        CLI_PASS + "m = getter(paper_app, '__dict__')\n",
+        CLI_PASS + "m = sys.modules['oper' + 'ator']\n",
+        CLI_PASS + "import pickle\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
