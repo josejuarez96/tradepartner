@@ -113,6 +113,31 @@ Paper trading (Phase 4 plan T90; ADR 0010 amendment 2026-10-04):
   rebuild (spec req 13), so the report names that window and every other
   window that reaches the tax year, whose disposals are not compared.
 
+Strategy lab (strategy-lab spec req 15; plan T111):
+
+- `tradepartner sweep register <file>` registers a sweep file
+  (`backtest.sweep.register`) and prints the registration and its variant
+  slugs; an unchanged file returns its registration and writes nothing.
+- `tradepartner sweep run <slug> [--time-budget-minutes M] [--rerun]
+  [--note TEXT]` runs the sweep's planned variants (`backtest.lab.run_sweep`)
+  on `settings.store.path` and prints the run's counts and every trial; it
+  exits 0 when every trial it opened is `ok`, 1 when any failed or was refused.
+- `tradepartner sweep status [<slug>]` prints every sweep's latest
+  registration and its state, or one sweep's state with its stale,
+  terminal-failed and unrun variants (`store.lab_queries.sweep_state`).
+- `tradepartner sweep report <slug>` prints `backtest.sweep_report`'s report.
+- `tradepartner sweep promote <slug> --file <path> --reason TEXT` and
+  `tradepartner sweep retire <slug> --reason TEXT` record a promotion (with the
+  promoted file's registration) or a retirement (`backtest.promotion`).
+- `tradepartner lab status` prints `sweep_report.lab_status`.
+
+A refusal of any of these exits 2 with nothing written; on a store without the
+lab tables each exits 2 naming the lab migration, while `backtest` and
+`hypothesis register` there keep the Phase 3 rules. `backtest <variant-slug>`
+records a `refused_variant` trial and exits 2. No lab command takes a store
+path, a window, a holdout, gap or synthetic flag, and all of their output is
+passed through the `cli_record` fixture scrub.
+
 There is no `--synthetic` flag, no store-path option, and no edit, delete,
 unseal, reopen or import command: every run the CLI opens is a non-synthetic
 run on the store it is configured for.
@@ -159,6 +184,9 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
+from tradepartner.backtest import lab, promotion, sweep_report
+from tradepartner.backtest import sweep as lab_sweep
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import GAP_THRESHOLD_KEY, Flags, Reasons
 from tradepartner.backtest.hypothesis import HypothesisFileError, register
 from tradepartner.backtest.metrics import METRIC_KEYS
@@ -191,8 +219,17 @@ from tradepartner.research.experiment import (
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
 from tradepartner.retract import RetractRefused, master_retract
-from tradepartner.store import journal, registry, research, schema
+from tradepartner.store import (
+    journal,
+    lab_queries,
+    lab_registry,
+    lab_schema,
+    registry,
+    research,
+    schema,
+)
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.lab_schema import LabNotInitialised
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
@@ -451,6 +488,7 @@ STATUS_EXIT: dict[str, int] = {
     "refused_window": USAGE_ERROR,
     "refused_holdout": USAGE_ERROR,
     "refused_gap": USAGE_ERROR,
+    "refused_variant": USAGE_ERROR,
 }
 _REGISTERED_BY = "owner"
 _SERIES_ORDER = ("strategy", "SPY", "MTUM")
@@ -513,7 +551,7 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
     if outcome.status != "ok":
         return
     hypothesis = registry.get_hypothesis_by_id(conn, int(trial["hypothesis_id"]))
-    base = float(hypothesis.params[registry.BASE_COST_KEY])
+    base = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
     rows = conn.execute(
         "SELECT series, cost_per_side_bps, metric, value FROM trial_metrics WHERE trial_id = ?",
         [outcome.trial_id],
@@ -550,6 +588,95 @@ def _print_trial(conn: duckdb.DuckDBPyConnection, outcome: RunOutcome, settings:
     ):
         if trial.get(key):
             typer.echo(f"{label}: {_scrubbed(str(trial[key]), settings)}")
+
+
+# --- Strategy lab: sweep, lab status (strategy-lab plan T111) -----------------------
+
+#: What every lab command says on a store without the lab tables (plan choice 2).
+LAB_MIGRATION_HINT = (
+    "lab not initialised: run the lab migration first; until then this store keeps "
+    "the Phase 3 rules (backtest, hypothesis register)"
+)
+#: Errors a lab command reports as a refusal (exit 2): raised before anything is
+#: written, or inside a write chunk that rolls back. `LabNotInitialised` is separate.
+_LAB_REFUSALS = (registry.RegistryError, ValueError)
+
+
+def _echo_scrubbed(text: str, settings: Settings) -> None:
+    """Print `text` through the `cli_record` fixture scrub (every lab command's output)."""
+    typer.echo(_scrubbed(text, settings))
+
+
+def _lab_fail(exc: BaseException, settings: Settings) -> typer.Exit:
+    """Exit 2: the migration hint for `LabNotInitialised` (or a store with no
+    registry at all), else the scrubbed refusal."""
+    if isinstance(exc, (LabNotInitialised, schema.RegistryNotInitialised)):
+        return _fail(LAB_MIGRATION_HINT, USAGE_ERROR)
+    return _fail(_scrubbed(f"refused: {type(exc).__name__}: {exc}", settings), USAGE_ERROR)
+
+
+def _hypothesis_slug(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> str:
+    return registry.get_hypothesis_by_id(conn, hypothesis_id).slug
+
+
+def _sweep_state_lines(
+    conn: duckdb.DuckDBPyConnection, sweep: lab_registry.SweepRecord
+) -> list[str]:
+    """One sweep's state and the slugs of its stale, terminal-failed and unrun variants."""
+    state = lab_queries.sweep_state(conn, sweep.sweep_id)
+    lines = [
+        f"sweep {sweep.slug} (registration {sweep.sweep_id}, {sweep.family}): "
+        f"{sweep.n_variants} variants; {state.state}"
+    ]
+    for label, variants in (
+        ("stale", state.stale),
+        ("terminal-failed", state.terminal_failed),
+        ("unrun", state.unrun),
+    ):
+        slugs = [_hypothesis_slug(conn, v.hypothesis_id) for v in variants]
+        lines.append(f"  {label}: {', '.join(slugs) or 'none'}")
+    return lines
+
+
+def _sweep_status_text(conn: duckdb.DuckDBPyConnection, slug: str | None) -> str:
+    """`sweep status [<slug>]`: one sweep, or every slug's latest registration."""
+    lab_schema.require_lab(conn)
+    if slug is not None:
+        record = lab_registry.sweep_by_slug(conn, slug)
+        if record is None:
+            raise ValueError(f"no sweep is registered as {slug!r}")
+        return "\n".join(_sweep_state_lines(conn, record))
+    slugs = [
+        str(s) for (s,) in conn.execute("SELECT DISTINCT slug FROM sweeps ORDER BY 1").fetchall()
+    ]
+    lines: list[str] = []
+    for each in slugs:
+        record = lab_registry.sweep_by_slug(conn, each)
+        assert record is not None
+        lines.extend(_sweep_state_lines(conn, record))
+    return "\n".join(lines) if lines else "no sweeps registered"
+
+
+def _sweep_run_text(outcome: lab.SweepRunOutcome, conn: duckdb.DuckDBPyConnection) -> str:
+    """`sweep run`'s summary: the run's counts, then one line per trial it opened."""
+    lines = [
+        f"sweep run {outcome.sweep_run_id} (registration {outcome.sweep_id}"
+        f"{', rerun' if outcome.rerun else ''}): {outcome.n_declared} declared, "
+        f"{outcome.n_planned} planned, {outcome.n_ok} ok, {outcome.n_failed} failed, "
+        f"{outcome.n_terminal_failed} terminal-failed; "
+        f"{'complete' if outcome.completed else 'incomplete'}"
+        f"{'; stopped by the time budget' if outcome.stopped_by_budget else ''}; "
+        f"{outcome.seconds:.1f} s"
+    ]
+    lines += [f"warning: {w}" for w in outcome.warnings]
+    for t in outcome.trials:
+        lines.append(
+            f"  trial {t.trial_id}: {_hypothesis_slug(conn, t.hypothesis_id)} "
+            f"(group {t.read_group_index}) {t.status}" + (f": {t.message}" if t.message else "")
+        )
+    for trial_id, error in sorted(outcome.errors.items()):
+        lines.append(f"  trial {trial_id} error: {error.strip()}")
+    return "\n".join(lines)
 
 
 # --- Research registry: experiment, experiments, dataset (plan T83) ----------------
@@ -763,6 +890,7 @@ def make_app(
     price_source: Callable[[Settings], PriceSource] | None = None,
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
+    sweep_clock: lab.Clock | None = None,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""
     app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
@@ -1185,8 +1313,9 @@ def make_app(
             f"to {record.holdout_end}"
         )
         typer.echo(f"frozen parameters sha256 {record.params_sha256}:")
-        for key in sorted(record.params):
-            typer.echo(f"  {key} = {json.dumps(record.params[key], default=str)}")
+        values = frozen_values(record)
+        for key in sorted(values):
+            typer.echo(f"  {key} = {json.dumps(values[key], default=str)}")
 
     @app.command()
     def trials(
@@ -1252,7 +1381,7 @@ def make_app(
                     values={
                         "gap_max_count_share": result["gap_max_count_share"],
                         "gap_max_size_share": result["gap_max_size_share"],
-                        "count_share_threshold": record.params[GAP_THRESHOLD_KEY],
+                        "count_share_threshold": frozen_values(record)[GAP_THRESHOLD_KEY],
                         "start_session": str(trial_row["start_session"]),
                         "end_session": str(trial_row["end_session"]),
                     },
@@ -1262,6 +1391,194 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
+
+    sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
+    app.add_typer(sweep_app, name="sweep")
+
+    @sweep_app.command("register")
+    def sweep_register(
+        file: Annotated[Path, typer.Argument(help="the sweep file (docs/sweeps/*.md)")],
+    ) -> None:
+        """Register a sweep file: its sweep row, one hypothesis per variant."""
+        s = settings()
+        if not file.is_file():
+            raise _fail(f"no sweep file at {file}", USAGE_ERROR)
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                registration = lab_sweep.register(conn, file, s, registered_by=_REGISTERED_BY)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (LabNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        record = registration.sweep
+        lines = [
+            f"sweep {record.slug} (registration {record.sweep_id}, {record.family}): "
+            f"{record.n_variants} variants, in-sample from {record.in_sample_start}, "
+            f"holdout {record.holdout_start} to {record.holdout_end}"
+            + ("" if registration.created else "; unchanged, nothing written"),
+            f"selection statistic {record.selection_statistic}, promote at least "
+            f"{record.promote_at_least}, retire below {record.retire_below}",
+        ]
+        lines += [
+            f"  {v.variant_index}: {h.slug} {json.dumps(v.variant_params, sort_keys=True)}"
+            for v, h in zip(registration.variants, registration.hypotheses, strict=True)
+        ]
+        _echo_scrubbed("\n".join(lines), s)
+
+    @sweep_app.command("run")
+    def sweep_run(
+        slug: Annotated[str, typer.Argument(help="the registered sweep slug")],
+        time_budget_minutes: Annotated[
+            float | None,
+            typer.Option(help="stop at a read-group boundary after this many minutes"),
+        ] = None,
+        rerun: Annotated[
+            bool, typer.Option(help="rerun every variant of a complete sweep")
+        ] = False,
+        note: Annotated[str | None, typer.Option(help="a note stored with the run")] = None,
+    ) -> None:
+        """Run a sweep's planned variants as trials on the store."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        if s.store.path != get_settings().store.path:
+            # run_sweep loads its own settings; the result is read back through `s`.
+            raise _fail("sweep run runs only on the loaded settings' store", USAGE_ERROR)
+        try:
+            outcome = lab.run_sweep(
+                slug,
+                time_budget_minutes=time_budget_minutes,
+                rerun=rerun,
+                note=note,
+                clock=sweep_clock,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (LabNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        except Exception as exc:
+            raise _fail(_scrubbed(f"{type(exc).__name__}: {exc}", s), 1) from None
+        with open_read_only(s) as conn:
+            _echo_scrubbed(_sweep_run_text(outcome, conn), s)
+        raise typer.Exit(0 if outcome.n_failed == 0 else 1)
+
+    @sweep_app.command("status")
+    def sweep_status(
+        slug: Annotated[
+            str | None, typer.Argument(help="one sweep slug; every sweep if none")
+        ] = None,
+    ) -> None:
+        """Every sweep's state, or one sweep's stale, terminal-failed and unrun variants."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                text = _sweep_status_text(conn, slug)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        _echo_scrubbed(text, s)
+
+    @sweep_app.command("report")
+    def sweep_report_(
+        slug: Annotated[str, typer.Argument(help="the registered sweep slug")],
+    ) -> None:
+        """The sweep's report: every variant, the distribution, the verdicts."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                text = sweep_report.format_report(sweep_report.sweep_report(conn, slug))
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        _echo_scrubbed(text, s)
+
+    @sweep_app.command("promote")
+    def sweep_promote(
+        slug: Annotated[str, typer.Argument(help="the complete sweep's slug")],
+        file: Annotated[Path, typer.Option(help="the argmax's hypothesis file")],
+        reason: Annotated[str, typer.Option(help="why the argmax is promoted")],
+    ) -> None:
+        """Promote a complete sweep's argmax: register its file with the decision."""
+        s = settings()
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        if not file.is_file():
+            raise _fail(f"no hypothesis file at {file}", USAGE_ERROR)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                outcome = promotion.promote(
+                    conn, slug, file, reason, s, registered_by=_REGISTERED_BY
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (LabNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        promoted = outcome.promoted
+        _echo_scrubbed(
+            f"decision {outcome.decision_id}: promotion of {outcome.variant.slug} "
+            f"(sweep registration {outcome.sweep_id}) as hypothesis "
+            f"{promoted.hypothesis_id}: {promoted.slug} ({promoted.family}), holdout "
+            f"{promoted.holdout_start} to {promoted.holdout_end}",
+            s,
+        )
+
+    @sweep_app.command("retire")
+    def sweep_retire(
+        slug: Annotated[str, typer.Argument(help="the sweep slug")],
+        reason: Annotated[str, typer.Option(help="why the sweep is retired")],
+    ) -> None:
+        """Retire a sweep: it promotes nothing afterwards."""
+        s = settings()
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                decision_id = promotion.retire(conn, slug, reason)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except (LabNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        _echo_scrubbed(f"decision {decision_id}: sweep_retired for {slug}", s)
+
+    lab_app = typer.Typer(no_args_is_help=True, help="The strategy lab's registry.")
+    app.add_typer(lab_app, name="lab")
+
+    @lab_app.command("status")
+    def lab_status_() -> None:
+        """The store size, registry row counts, families, open sweeps and last runs."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_read_only(s) as conn:
+                schema.init_schema(conn)  # read-only: checks the version, never migrates
+                status = sweep_report.lab_status(conn, s, now=clock())
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except (LabNotInitialised, schema.RegistryNotInitialised, *_LAB_REFUSALS) as exc:
+            raise _lab_fail(exc, s) from None
+        _echo_scrubbed(sweep_report.format_lab_status(status), s)
 
     experiment_app = typer.Typer(no_args_is_help=True, help="Pre-register and run experiments.")
     app.add_typer(experiment_app, name="experiment")
