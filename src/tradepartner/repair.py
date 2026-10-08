@@ -94,12 +94,14 @@ def store_resolver(
         as_of=at.date(),
         quiet_after_days=settings.alpaca.registrant_quiet_days,
         transfer_window_sessions=settings.master.transfer_window_sessions,
+        class_symbols=settings.alpaca.class_symbols,
     )
     return ListingResolver(
         listings_as_of(conn, at).iter_rows(named=True),
         evidence,
         rename_lead_days=settings.alpaca.rename_lead_days,
         accepted_relistings=settings.alpaca.accepted_relistings,
+        class_symbols=settings.alpaca.class_symbols,
         first_sessions=first_sessions(conn, at, settings)
         if settings.alpaca.first_span_lead
         else None,
