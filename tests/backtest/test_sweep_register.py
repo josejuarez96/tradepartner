@@ -874,3 +874,16 @@ def test_the_rules_are_copied_once_and_a_later_config_change_changes_nothing(
     assert second.created
     assert _counts(ready)["family_rules"] == before["family_rules"]
     assert lab_registry.family_rules(ready, "profitability") == written
+
+
+def test_a_non_oracle_family_missing_from_family_parents_is_refused(
+    ready: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(config.FAMILY_PARENTS, "profitability")
+
+    path = _profitability_sweep(tmp_path)
+
+    _refused(ready, path, settings, NewFamilyError, "no entry in FAMILY_PARENTS")

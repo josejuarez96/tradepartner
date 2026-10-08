@@ -639,7 +639,8 @@ class NoFamilyRulesError(SweepRegistrationError):
 
 class NewFamilyError(SweepRegistrationError):
     """A new family's first registration that breaks a lineage rule (Definitions,
-    Family rules): its holdout overlaps an existing non-oracle family's, or, for a
+    Family rules): its family has no `FAMILY_PARENTS` entry (oracle aside), its holdout
+    overlaps an existing non-oracle family's, or, for a
     child, starts on or before the parent's `holdout.end`, or the parent has neither
     a holdout spend nor a reached spend cap (or no rules at all)."""
 
@@ -785,6 +786,11 @@ def _new_family_seed(
     parents: dict[str, str | None] = {
         str(family): parent for family, parent in config.FAMILY_PARENTS.items()
     }
+    if file.family not in parents and file.family != registry.ORACLE_FAMILY:
+        raise NewFamilyError(
+            f"{path}: family {file.family!r} has no entry in FAMILY_PARENTS (a parent or "
+            "None), so its lineage is unknown"
+        )
     parent = parents.get(file.family)
     if file.parent_family is not None and file.parent_family != parent:
         raise FamilyRuleError(
@@ -792,16 +798,15 @@ def _new_family_seed(
             f"{file.family!r}'s entry in FAMILY_PARENTS ({parent!r})"
         )
     others = conn.execute(
-        "SELECT family FROM family_rules WHERE family <> ? ORDER BY family",
+        "SELECT family, holdout_start, holdout_end FROM family_rules WHERE family <> ? "
+        "ORDER BY family",
         [registry.ORACLE_FAMILY],
     ).fetchall()
-    for (other,) in others:
-        held = lab_registry.family_rules(conn, other)
-        assert held is not None
-        if file.holdout_start <= held.holdout_end and held.holdout_start <= file.holdout_end:
+    for other, start, end in others:
+        if file.holdout_start <= end and start <= file.holdout_end:
             raise NewFamilyError(
                 f"{path}: the holdout [{file.holdout_start}, {file.holdout_end}] overlaps "
-                f"family {other!r}'s [{held.holdout_start}, {held.holdout_end}]"
+                f"family {other!r}'s [{start}, {end}]"
             )
     if parent is None:
         return None, None
