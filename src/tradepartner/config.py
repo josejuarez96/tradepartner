@@ -1308,12 +1308,13 @@ class RiskConfig(BaseModel):
     (`max_gross_exposure`, the charter's rule) or a meaningless threshold.
     `max_fill_lag_sessions` is at least 1 (spec req 8). Defaults are the spec's
     reasoning for H1 at paper scale, not measurements; `min_order_notional` and the two
-    reconciliation tolerances were confirmed by the recording task (T48b, 2026-10-08,
+    reconciliation tolerances were kept by the recording task (T48b, 2026-10-08,
     docs/research/2026-10-08-alpaca-paper-facts.md): a $5 notional buy and a $0.98
     whole-share sell were accepted (`min_order_notional`, Alpaca's documented $1);
     position quantities equalled the summed 9-decimal fills exactly
     (`reconcile_quantity_tolerance`); `cash` is reported in cents and moved within
-    $0.0022 of the six fills' exact value (`reconcile_cash_tolerance`). After the
+    $0.0022 of the six fills' exact value (`reconcile_cash_tolerance`; its scaling with
+    the fill count is the owner's question in #1290). After the
     first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
     """
 

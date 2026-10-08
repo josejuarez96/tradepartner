@@ -1464,7 +1464,11 @@ def test_quantity_decimals_matches_the_recorded_paper_fills() -> None:
     """The default precision is the finest quantity paper filled (T48b's
     recording): every fill fits it, and at least one fill needs all of it."""
     fills = json.loads((PAPER_FIXTURES / "fill_activities.json").read_text())
-    places = [-Decimal(f["qty"]).normalize().as_tuple().exponent for f in fills]
+    places = [
+        -Decimal(f["qty"]).normalize().as_tuple().exponent
+        for f in fills
+        if f["activity_type"] == "FILL"
+    ]
     assert max(places) == _settings().alpaca.quantity_decimals
 
 
