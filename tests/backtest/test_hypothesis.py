@@ -1028,6 +1028,8 @@ def test_on_the_lab_a_promoted_file_with_an_infeasible_anchor_is_refused(
     far = _lab_file(tmp_path, ("formation_months = 12", "formation_months = 24"), slug="far")
     variant = _variant(lab_store, settings, far)
 
+    before = _counts(lab_store)
+
     with pytest.raises(LabRegistrationError, match="precedes the store's first session"):
         hypothesis.register(
             lab_store,
@@ -1036,6 +1038,7 @@ def test_on_the_lab_a_promoted_file_with_an_infeasible_anchor_is_refused(
             settings=settings,
             promotion_of=variant.hypothesis_id,
         )
+    assert _counts(lab_store) == before
 
 
 def test_on_the_lab_a_new_familys_first_standalone_file_is_refused(
@@ -1058,3 +1061,48 @@ def test_on_the_lab_a_new_familys_first_standalone_file_is_refused(
             promotion_of=variant.hypothesis_id,
         )
     assert _counts(lab_store) == before
+
+
+def test_a_file_stored_before_and_after_a_table_key_returns_its_latest_registration(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """The same file registered before `schedule.*` landed (id 1) and after (id 2, a
+    new raw hash): the unchanged file returns the latest, not a "not the latest"
+    refusal (quant-auditor, #1242)."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    full = hypothesis.frozen_params(parsed, settings)
+    old = {k: v for k, v in full.items() if not k.startswith(("schedule.", "gap.stale_listing"))}
+    ids = [
+        registry.register_hypothesis(
+            conn,
+            slug=parsed.slug,
+            family=parsed.family,
+            title=parsed.title,
+            doc_path=FIXTURE.as_posix(),
+            doc_sha256=parsed.doc_sha256,
+            params=params,
+            in_sample_start=parsed.in_sample_start,
+            holdout_start=parsed.holdout_start,
+            holdout_end=parsed.holdout_end,
+            registered_by="test",
+            settings=settings,
+        ).hypothesis_id
+        for params in (old, full)
+    ]
+    assert ids == [1, 2]
+
+    assert _register(conn, FIXTURE, settings).hypothesis_id == 2
+
+
+def test_without_the_lab_a_frozen_key_outside_the_fingerprint_is_a_new_hypothesis(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """`gap.count_share_threshold` is frozen but outside the fingerprint: changing it is
+    a new frozen set (Phase 3: a new hypothesis), never a prose-only edit."""
+    path = _copy(tmp_path)
+    first = _register(conn, path, settings)
+    path.write_text(
+        path.read_text().replace("count_share_threshold = 0.05", "count_share_threshold = 0.04")
+    )
+    second = _register(conn, path, settings)
+    assert second.hypothesis_id > first.hypothesis_id

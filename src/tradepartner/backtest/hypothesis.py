@@ -40,9 +40,11 @@ silently.
 
 **Registration after the lab** (strategy-lab spec reqs 1, 4 and 5; plan task T104c).
 In every state `register` returns the existing record for an unchanged slug, doc hash
-and canonical frozen set (never calling `registry.register_hypothesis`, so a
-registration from before a `FROZEN_KEY_DEFAULTS` key landed is still the record) and
-refuses a prose-only edit (same slug, same fingerprint, new doc hash). **When
+and canonical frozen set, newest first (never calling `registry.register_hypothesis`,
+so a registration from before a `FROZEN_KEY_DEFAULTS` key landed is still the record)
+and refuses a prose-only edit (the slug's latest canonical frozen set, hence its
+fingerprint, under a new doc hash; a change to a frozen key outside the fingerprint is
+a new frozen set, which a lab store refuses as a standalone file anyway). **When
 `lab_schema.is_lab_initialised`** it refuses every other standalone file unless the
 caller registers it as a promoted file (`promotion_of`, the variant it promotes,
 which `sweep promote` names in the `promotion` decision it appends next): a new
@@ -358,10 +360,6 @@ def _slug_registrations(
     ]
 
 
-def _fingerprint_of(record: registry.HypothesisRecord) -> str:
-    return frozen.fingerprint(record.family, frozen.frozen_values(record), record.in_sample_start)
-
-
 def _rule_differences(
     parsed: HypothesisFile, params: Mapping[str, Any], rules: lab_registry.FamilyRules
 ) -> list[str]:
@@ -406,7 +404,7 @@ def _anchor_refusal(
     first = lab_registry.first_session(conn)
     if first is None:
         return "the store has no bar sessions, so no formation anchor can be read"
-    cadence = params["schedule.rebalance_cadence"]
+    cadence = params[lab_registry.CADENCE_KEY]
     sessions = rebalance_sessions(
         parsed.in_sample_start, parsed.holdout_start - timedelta(days=1), cadence
     )
@@ -476,36 +474,50 @@ def register(
     """Register the hypothesis in `path` through `store.registry` and return its record.
 
     In every state: an unchanged file (same slug and doc hash) whose canonical frozen
-    set equals a stored registration's returns that record without writing; a
-    prose-only edit (same slug and fingerprint, new doc hash) raises
-    `ProseOnlyEditError`; a changed frozen set is a new hypothesis (the registry
-    refuses a family outside `hypotheses.families`). Refuses a file whose record is
-    not the slug's latest registration, since `load_frozen` would run the latest one
-    instead. When the lab is initialised, a new registration must be a promoted file:
-    `promotion_of` names the sweep variant it promotes (`sweep promote` passes it and
-    appends the `promotion` decision naming the returned record); otherwise, or when
-    it breaks a lab rule, `LabRegistrationError` (module docstring). `promotion_of` is
-    ignored on a store without the lab tables.
+    set equals a stored registration's returns that record without writing, newest
+    first; a prose-only edit (the slug's latest frozen set, so its fingerprint, with a
+    new doc hash) raises `ProseOnlyEditError`; a changed frozen set is a new
+    hypothesis. A family outside `hypotheses.families` is refused (`RegistryError`).
+    Refuses a file whose record is not the slug's latest registration, since
+    `load_frozen` would run the latest one instead. When the lab is initialised, a new
+    registration must be a promoted file: `promotion_of` names the sweep variant it
+    promotes (`sweep promote` passes it and appends the `promotion` decision naming
+    the returned record); otherwise, or when it breaks a lab rule,
+    `LabRegistrationError` (module docstring). `promotion_of` is ignored on a store
+    without the lab tables.
     """
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
     params = frozen_params(parsed, settings)
     canonical = frozen.canonical_frozen_set(params, parsed.family)
     fingerprint = frozen.fingerprint(parsed.family, params, parsed.in_sample_start)
-    registrations = _slug_registrations(conn, parsed.slug)
+    if parsed.family not in settings.hypotheses.families:
+        raise registry.RegistryError(
+            f"family {parsed.family!r} is not in hypotheses.families {settings.hypotheses.families}"
+        )
+    window = (parsed.in_sample_start, parsed.holdout_start, parsed.holdout_end)
+
+    def same_set(existing: registry.HypothesisRecord) -> bool:
+        return (
+            existing.in_sample_start,
+            existing.holdout_start,
+            existing.holdout_end,
+        ) == window and frozen.canonical_frozen_set(
+            frozen.frozen_values(existing), existing.family
+        ) == canonical
+
+    # Newest first: a file stored twice (before and after a table key landed) is its
+    # latest registration, the one runs use.
+    registrations = _slug_registrations(conn, parsed.slug)[::-1]
     for existing in registrations:
-        if existing.doc_sha256 == parsed.doc_sha256 and (
-            frozen.canonical_frozen_set(frozen.frozen_values(existing), existing.family)
-            == canonical
-        ):
+        if existing.doc_sha256 == parsed.doc_sha256 and same_set(existing):
             return _check_latest(conn, path, existing)
-    for existing in registrations:
-        if existing.doc_sha256 != parsed.doc_sha256 and _fingerprint_of(existing) == fingerprint:
-            raise ProseOnlyEditError(
-                f"{path}: a prose-only edit of registration {existing.hypothesis_id} of "
-                f"{parsed.slug!r} (same fingerprint, new doc hash) is refused; the "
-                "registered file is the record"
-            )
+    if registrations and same_set(registrations[0]):
+        raise ProseOnlyEditError(
+            f"{path}: a prose-only edit of registration {registrations[0].hypothesis_id} of "
+            f"{parsed.slug!r} (same frozen set and fingerprint, new doc hash) is refused; "
+            "the registered file is the record"
+        )
     if is_lab_initialised(conn):
         _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of)
     record = registry.register_hypothesis(
