@@ -88,9 +88,11 @@ carrying the broker's order id; any difference, or a failed fetch, raises
 `SystemFaultError`, which halts.
 
 **The order shape** (ADR 0015 seam 3, plan T135b). Every `Order` the broker
-returns from `submit` and `get_order` on the submit path (the acknowledgement
-poll and the replay fetch) is journaled as its event first (`accepted` or
-`replay`, `raw_json` included), then passed `risk.order_shape_violation`: an
+returns from `get_order` on the submit path (the acknowledgement poll and the
+replay fetch) is journaled as its event first (`accepted` or `replay`,
+`raw_json` included), and every `Order` from `submit` follows its
+acknowledgement's `accepted` event (no event carries `submit`'s own reply); each
+is then passed `risk.order_shape_violation`: an
 order that is not a market, day, `us_equity`, `simple` order with no limit or
 stop price and no legs raises `SystemFaultError` naming `refused_order_shape`,
 and nothing further is submitted. It is a fault after a submit, never a

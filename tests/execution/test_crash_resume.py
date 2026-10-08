@@ -464,7 +464,10 @@ def test_resume_settles_a_limit_order_halt_as_after_any_post_submit_fault(
         env.run(at(F_0))
     env.fake.submit = original_submit  # not monkeypatch.undo() (see above)
     halted = env.latest_run()
-    assert env.result(halted)[0] == "halted"
+    # A fault after a submit (`SystemFaultError`), not the pre-submit
+    # `LimitBreachError`: no `missed` row.
+    assert env.result(halted)[:2] == ("halted", "SystemFaultError")
+    assert [e for e in env.rebalance_events() if e[1] == "missed"] == []
     [(reason,)] = env.query("SELECT reason FROM kill_switch WHERE run_id = ?", [halted])
     assert "refused_order_shape" in reason
     (coid,) = shaped
