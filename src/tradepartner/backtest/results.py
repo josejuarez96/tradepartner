@@ -9,10 +9,12 @@ the caller's write transaction and only through `store.registry`:
    `family_sharpes` reads the frozen base level; the base level (`costs.per_side_bps`)
    and a 0 bp level must both be present (`cost_drag` is gross minus net CAGR, and
    gross is the 0 bp run); every result's own level must match its key; and both
-   benchmarks (`SPY`, `MTUM`) must have equity rows.
+   benchmarks (`SPY`, `MTUM`), and the family's declared benchmark when it names a
+   third series (`config.FAMILIES[family].benchmark`), must have equity rows.
 2. **Metrics** (req 7; strategy-lab spec req 8): per series (`strategy`, `SPY`,
-   `MTUM`) and level, from period returns (equity at close(T_{i+1}) over equity at
-   close(T_i), minus one, over the rebalance sessions of the run at the hypothesis's
+   `MTUM`, plus a family's declared third benchmark, `family_series`) and level, from
+   period returns (equity at close(T_{i+1}) over equity at close(T_i), minus one, over
+   the rebalance sessions of the run at the hypothesis's
    `schedule.rebalance_cadence`, read through `frozen_values`) annualised with that
    cadence's `periods_per_year`, the benchmarks at the same level, the 0 bp run of
    the same series as gross, every session's equity for drawdown, and the strategy's
@@ -64,7 +66,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from itertools import pairwise
-from typing import Literal
+from typing import Literal, cast
 
 import duckdb
 
@@ -79,7 +81,7 @@ from tradepartner.backtest.metrics import (
     series_metrics,
 )
 from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import FAMILIES, Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, research, schema
 from tradepartner.store.registry import (
     EquityRow,
@@ -93,6 +95,21 @@ from tradepartner.store.registry import (
 SPY_SERIES: Series = "SPY"
 MTUM_SERIES: Series = "MTUM"
 SERIES: tuple[Series, ...] = ("strategy", SPY_SERIES, MTUM_SERIES)
+
+
+def family_benchmark(family: str) -> str | None:
+    """The registered family's declared benchmark when it is a third series, else None.
+    SPY and MTUM are mandatory for every family (charter, ADR 0005, ADR 0014 point 4),
+    so a spec naming either adds nothing. Raises `KeyError` for an unregistered family."""
+    name = FAMILIES[cast(HypothesisFamily, family)].benchmark
+    return None if name in (None, SPY_SERIES, MTUM_SERIES) else name
+
+
+def family_series(family: str) -> tuple[Series, ...]:
+    """The series a `family` trial stores: `SERIES` plus its third benchmark, if any."""
+    extra = family_benchmark(family)
+    return SERIES if extra is None else (*SERIES, extra)
+
 
 #: The level whose run is the gross series for `cost_drag`.
 GROSS_LEVEL = 0.0
@@ -171,8 +188,10 @@ def _check_frozen(handle: TrialHandle, params: Settings) -> None:
         )
 
 
-def _check(results: Mapping[float, BacktestResult], params: Settings) -> None:
-    """Every refusal on the results, before any row is written."""
+def _check(results: Mapping[float, BacktestResult], params: Settings, family: str) -> None:
+    """Every refusal on the results, before any row is written: `SPY`, `MTUM` and the
+    family's declared benchmark, when it is a third series, must have equity rows."""
+    series_needed = family_series(family)
     for level, result in results.items():
         if result.cost_per_side_bps != level:
             raise ValueError(
@@ -187,7 +206,7 @@ def _check(results: Mapping[float, BacktestResult], params: Settings) -> None:
             )
     for level, result in results.items():
         present = {row.series for row in result.equity}
-        missing = [series for series in SERIES if series not in present]
+        missing = [series for series in series_needed if series not in present]
         if missing:
             raise ValueError(f"no equity rows for {missing} at {level} bp")
 
@@ -213,18 +232,25 @@ def _period_returns(rows: Sequence[EquityRow], ends: Sequence[date]) -> list[flo
 
 
 def metric_rows(
-    results: Mapping[float, BacktestResult], params: Settings, *, cadence: Cadence
+    results: Mapping[float, BacktestResult],
+    params: Settings,
+    *,
+    cadence: Cadence,
+    family: str,
 ) -> list[MetricRow]:
-    """Every req 8 metric per series and level at `cadence`, as `trial_metrics` rows."""
-    _check(results, params)
+    """Every req 8 metric per series and level at `cadence`, as `trial_metrics` rows;
+    a `family` benchmark beyond SPY and MTUM adds a series and two keys per series."""
+    _check(results, params, family)
+    third = family_benchmark(family)
+    all_series = family_series(family)
     gross = results[GROSS_LEVEL]
     ppy = periods_per_year(cadence)
     rows: list[MetricRow] = []
     for level in sorted(results):
         result = results[level]
         ends = _period_ends(result, cadence)
-        returns = {s: _period_returns(_series_equity(result, s), ends) for s in SERIES}
-        for series in SERIES:
+        returns = {s: _period_returns(_series_equity(result, s), ends) for s in all_series}
+        for series in all_series:
             values = series_metrics(
                 series,
                 period_returns=returns[series],
@@ -237,6 +263,7 @@ def metric_rows(
                 mtum_period_returns=returns[MTUM_SERIES],
                 periods_per_year=ppy,
                 risk_free_rate=params.metrics.risk_free_rate,
+                family_benchmark=None if third is None else (third, returns[third]),
             )
             rows.extend(MetricRow(series, level, key, value) for key, value in values.items())
     return rows
@@ -345,7 +372,7 @@ def write_results(
     _check_frozen(handle, params)
     schema.require_research(conn)
     cadence = hypothesis_cadence(conn, handle)
-    rows = metric_rows(results, params, cadence=cadence)
+    rows = metric_rows(results, params, cadence=cadence, family=handle.family)
     base_level = params.costs.per_side_bps
     base = results[base_level]
     equity = detail_equity(results, base_level, detail_level, cadence=cadence)

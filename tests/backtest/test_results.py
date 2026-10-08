@@ -44,7 +44,7 @@ from tradepartner.backtest.results import (
 )
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
-from tradepartner.config import Cadence, Settings
+from tradepartner.config import FAMILIES, Cadence, Settings
 from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
 from tradepartner.research.gates import Flags, Reasons
 from tradepartner.store import registry, research, schema
@@ -862,7 +862,7 @@ class TestCadence:
         _register(conn, settings)
         handle = _open(conn, settings, tmp_path)
         results = _run(settings, handle)
-        rows = metric_rows(results, settings, cadence="week_end")
+        rows = metric_rows(results, settings, cadence="week_end", family="momentum")
         base = {
             r.metric: r.value
             for r in rows
@@ -876,7 +876,7 @@ class TestCadence:
         net = [equity[b] / equity[a] - 1 for a, b in pairwise(weeks)]
         growth = math.prod(1 + v for v in net)
         assert base["cagr"] == pytest.approx(growth ** (52 / len(net)) - 1, rel=1e-9)
-        monthly = metric_rows(results, settings, cadence="month_end")
+        monthly = metric_rows(results, settings, cadence="month_end", family="momentum")
         assert {
             r.metric: r.value
             for r in monthly
@@ -1118,3 +1118,82 @@ class TestDetailLevel:
         with pytest.raises(ValueError, match="detail level"):
             write_results(conn, handle, results, settings, detail_level="partial")  # type: ignore[arg-type]
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+
+# --- per-family comparison benchmarks (T129, ADR 0014 point 4) -----------------------
+
+
+def _with_benchmark(
+    results: dict[float, BacktestResult], name: str, *, drift: float = 0.0004
+) -> dict[float, BacktestResult]:
+    """`results` plus an equity series `name`: SPY's rows with a daily drift on top."""
+    out: dict[float, BacktestResult] = {}
+    for level, result in results.items():
+        spy = sorted((r for r in result.equity if r.series == "SPY"), key=lambda r: r.session)
+        extra = [
+            replace(r, series=name, equity=r.equity * (1 + drift) ** i) for i, r in enumerate(spy)
+        ]
+        out[level] = replace(result, equity=[*result.equity, *extra])
+    return out
+
+
+class TestFamilyBenchmarks:
+    @pytest.fixture
+    def qual_family(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        """A test-only family declaring `QUAL` as its benchmark."""
+        monkeypatch.setitem(
+            FAMILIES,
+            "qualtest",
+            replace(FAMILIES["momentum"], benchmark="QUAL"),  # type: ignore[call-overload]
+        )
+        return "qualtest"
+
+    def test_momentum_without_mtum_is_still_refused(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        stripped = {
+            level: replace(r, equity=[e for e in r.equity if e.series != "MTUM"])
+            for level, r in results.items()
+        }
+        with pytest.raises(ValueError, match="MTUM"):
+            results_module._check(stripped, settings, "momentum")
+
+    def test_declared_third_benchmark_is_required(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, qual_family: str
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        with pytest.raises(ValueError, match="QUAL"):
+            results_module._check(results, settings, qual_family)
+        results_module._check(_with_benchmark(results, "QUAL"), settings, qual_family)
+        # Not required of a family that does not declare it.
+        results_module._check(results, settings, "momentum")
+
+    def test_third_benchmark_adds_a_series_and_two_keys_and_nothing_else_moves(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, qual_family: str
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        plain = metric_rows(results, settings, cadence="month_end", family="momentum")
+        rows = metric_rows(
+            _with_benchmark(results, "QUAL"), settings, cadence="month_end", family=qual_family
+        )
+        assert {r.series for r in rows} == {"strategy", "SPY", "MTUM", "QUAL"}
+        old = {(r.series, r.cost_per_side_bps, r.metric): r.value for r in plain}
+        new = {(r.series, r.cost_per_side_bps, r.metric): r.value for r in rows}
+        for key, value in old.items():
+            assert new[key] == value, key
+        extra = {k[2] for k in new if k[0] == "strategy"} - set(METRIC_KEYS)
+        assert extra == {"excess_cagr_qual", "tracking_error_qual"}
+
+    def test_registered_families_all_declare_mtum_and_add_no_series(self) -> None:
+        for family in FAMILIES:
+            assert results_module.family_benchmark(family) is None
+            assert results_module.family_series(family) == ("strategy", "SPY", "MTUM")
+        with pytest.raises(KeyError):
+            results_module.family_series("nosuch")
