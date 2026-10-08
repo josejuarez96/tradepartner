@@ -60,7 +60,12 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    loaded (no direct call, alias or `partial`), its `Annotated` option is
    exactly `typer.Option("--accept-rejections", help=...,
    allow_from_autoenv=False)` (no envvar, auto-envvar, callback, default or
-   flag value), the decorator takes no keyword (no `context_settings`), no
+   flag value), the decorator takes no keyword (no `context_settings`), and
+   no default map can reach it (#1309): `context_settings` goes only to a
+   `.command(...)` decorator, `Typer` is only called or annotated, `**` goes
+   only into the ledger row types, nothing names `setattr`, `getattr`,
+   `get_command`, `make_context`, `.main`, `.info` or `.context_settings`,
+   and `default_map` appears nowhere (`_app_default_misuses`), no
    keyword names `accept_rejections_flag`,
    and no string in `cli.py` spells the flag except docstrings and that one
    option name (so the app cannot invoke itself with it). A second such pass, a
@@ -89,6 +94,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -394,6 +400,150 @@ def _is_docstring(node: ast.Constant, parents: dict[int, ast.AST]) -> bool:
     )
 
 
+#: `default_map` in Click's context settings defaults any option, the flag
+#: included, behind its back (#1309).
+DEFAULT_MAP = "default_map"
+#: Callees `cli.py` may `**`-unpack into: the ledger row types, whose keys are
+#: their own field names (`_set_rows`). Any other `**` could carry settings.
+_UNPACK_CALLEES = frozenset({"row_type"})
+#: Names that reach the Click command or context, or set attributes by a
+#: computed name, so a default map could arrive another way; the attributes
+#: `.main` (Click's entry, which takes context settings) and `.info` (a Typer
+#: app's settings) as attributes only, so `cli.py`'s own `main()` still runs.
+#: An import alias of any of them is refused too.
+_CLICK_REACH = frozenset(
+    {
+        "setattr",
+        "getattr",
+        "vars",
+        "operator",
+        "attrgetter",
+        "setitem",
+        "get_command",
+        "make_context",
+        "methodcaller",
+        "importlib",
+        "import_module",
+        "eval",
+        "exec",
+    }
+)
+_CLICK_ATTRIBUTES = frozenset(
+    {
+        "main",
+        "info",
+        "context_settings",
+        DEFAULT_MAP,
+        "modules",
+    }
+)
+#: The only dunders `cli.py` may name or spell; any other (`__setattr__`,
+#: `__dict__`, `__getattribute__`, ...) could set settings by a computed name.
+_CLI_DUNDERS = frozenset({"__name__", "__file__", "__init__", "__main__", "__future__"})
+#: The top-level modules `cli.py` may import. A new one is a reviewed change
+#: here, so `operator`, `importlib` and the like cannot arrive unseen.
+_CLI_IMPORT_ROOTS = frozenset(
+    {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "duckdb",
+        "httpx",
+        "json",
+        "pathlib",
+        "polars",
+        "re",
+        "subprocess",
+        "sys",
+        "tradepartner",
+        "typer",
+        "types",
+        "typing",
+        "zoneinfo",
+    }
+)
+_DUNDER = re.compile(r"__\w+__")
+
+
+def _annotation_ids(tree: ast.Module) -> set[int]:
+    """The ids of every node inside a parameter, return or field annotation."""
+    roots: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+            roots.append(node.returns)
+        elif isinstance(node, (ast.arg, ast.AnnAssign)) and node.annotation is not None:
+            roots.append(node.annotation)
+    return {id(n) for root in roots for n in ast.walk(root)}
+
+
+def _app_default_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
+    """#1309, fail closed: in `cli.py`, no default map can reach `resume`'s
+    flag. `context_settings` is passed only to a `.command(...)` decorator
+    (a command's own settings reach only it, and `resume`'s decorator takes no
+    keyword), never assigned or read as an attribute; `Typer` is only called
+    or annotated, never aliased or wrapped (`T = typer.Typer`, `partial`);
+    `**` goes only into `_UNPACK_CALLEES`; nothing names `_CLICK_REACH`
+    (`setattr`, `vars`, `operator`, `importlib`, `get_command`) or
+    `_CLICK_ATTRIBUTES` (`.main`, `.info`, `.modules`), nor imports them under
+    any alias, nor imports a module outside `_CLI_IMPORT_ROOTS`; no dunder
+    outside `_CLI_DUNDERS` is named or spelt; and `default_map` appears
+    nowhere, as a keyword, attribute or string."""
+    found = []
+    annotations = _annotation_ids(tree)
+    for node in ast.walk(tree):
+        name = (
+            node.id
+            if isinstance(node, ast.Name)
+            else node.attr
+            if isinstance(node, ast.Attribute)
+            else None
+        )
+        if isinstance(node, ast.Call):
+            for k in node.keywords:
+                if k.arg == "context_settings" and not (
+                    isinstance(node.func, ast.Attribute) and node.func.attr == "command"
+                ):
+                    found.append(f"{node.lineno}: context_settings outside a command decorator")
+                elif k.arg is None and not (
+                    isinstance(node.func, ast.Name) and node.func.id in _UNPACK_CALLEES
+                ):
+                    found.append(f"{node.lineno}: ** into an unreviewed callee")
+        elif isinstance(node, ast.keyword) and node.arg == DEFAULT_MAP:
+            found.append(f"{node.value.lineno}: passes a {DEFAULT_MAP}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and DEFAULT_MAP in node.value
+        ):
+            found.append(f"{node.lineno}: spells {DEFAULT_MAP}")
+        spelt = node.value if isinstance(node, ast.Constant) else name
+        if isinstance(spelt, str) and any(d not in _CLI_DUNDERS for d in _DUNDER.findall(spelt)):
+            found.append(f"{getattr(node, 'lineno', 0)}: names a dunder: {spelt!r}")
+        if name in _CLICK_ATTRIBUTES and isinstance(node, ast.Attribute):
+            found.append(f"{node.lineno}: names {name} as an attribute")
+        elif isinstance(node, (ast.Name, ast.Attribute)) and name in _CLICK_REACH:
+            found.append(f"{node.lineno}: names {name}")
+        elif isinstance(node, (ast.Name, ast.Attribute)) and name == "Typer":
+            parent = parents.get(id(node))
+            called = isinstance(parent, ast.Call) and parent.func is node
+            if not (called or id(node) in annotations):
+                found.append(f"{node.lineno}: aliases or wraps Typer")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = (node.module or "") if isinstance(node, ast.ImportFrom) else ""
+            for alias in node.names:
+                path = f"{module}.{alias.name}" if module else alias.name
+                parts = {*path.split("."), alias.asname}
+                root = path.split(".")[0]
+                if root not in _CLI_IMPORT_ROOTS and not getattr(node, "level", 0):
+                    found.append(f"{node.lineno}: imports {path}, outside the reviewed roots")
+                elif parts & _CLICK_REACH:
+                    found.append(f"{node.lineno}: imports {alias.name}")
+                elif "Typer" in parts and alias.asname not in (None, "Typer"):
+                    found.append(f"{node.lineno}: imports Typer as {alias.asname}")
+    return found
+
+
 def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
     """Rule 4's exception, fail closed: in `cli.py`, `CLI_FLAG` is bound exactly
     once, as a parameter whose default is the constant `False`, and loaded
@@ -449,6 +599,7 @@ def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
                 found.append(f"{node.lineno}: unreviewed use of {CLI_FLAG}")
         elif isinstance(node, ast.Attribute) and node.attr == CLI_FLAG:
             found.append(f"{node.lineno}: names {CLI_FLAG} as an attribute")
+    found.extend(_app_default_misuses(tree, parents))
     if len(params) > 1:
         found.append(f"{CLI_FLAG} is bound as {len(params)} parameters, not one")
     if passes > 1:
@@ -792,6 +943,15 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
     assert misuses(ast.parse(CLI_PASS), CLI_MODULE) == []
     assert misuses(ast.parse(CLI_PASS))  # the same shape anywhere else is refused
     assert defaults(ast.parse(CLI_PASS)) == []
+    # a command's own context settings stay open to the other commands (#1309)
+    other = '@dataset_app.command("register", context_settings={"allow_extra_args": True})\n'
+    assert misuses(ast.parse(CLI_PASS + other + "def register() -> None: ...\n"), CLI_MODULE) == []
+    # the ledger rows' reviewed `**`, and `Typer` called or annotated (#1309)
+    reviewed = (
+        "def make_app() -> typer.Typer:\n    return typer.Typer(no_args_is_help=True)\n"
+        "rows = [row_type(**dict(zip(names, row, strict=True))) for row in rows]\n"
+    )
+    assert misuses(ast.parse(CLI_PASS + reviewed), CLI_MODULE) == []
 
 
 @pytest.mark.parametrize(
@@ -826,6 +986,44 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         CLI_PASS.replace(", allow_from_autoenv=False", ""),
         CLI_PASS.replace("allow_from_autoenv=False", "allow_from_autoenv=True"),
         CLI_PASS.replace('command("resume")', 'command("resume", context_settings=c)'),
+        # app-level context settings, or a default map from anywhere (#1309)
+        CLI_PASS + "paper_app = typer.Typer(context_settings={'default_map': m})\n",
+        CLI_PASS + "paper_app = typer.Typer(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = Typer(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = typer.Typer(**OPTIONS)\n",
+        CLI_PASS + "app.add_typer(paper_app, name='paper', context_settings=c)\n",
+        CLI_PASS + "app.add_typer(paper_app, **OPTIONS)\n",
+        CLI_PASS + "@paper_app.callback(context_settings=c)\ndef root() -> None: ...\n",
+        CLI_PASS + "@paper_app.callback(**OPTIONS)\ndef root() -> None: ...\n",
+        CLI_PASS + "@app.callback()\ndef root(ctx: typer.Context) -> None:\n"
+        "    ctx.default_map = load()\n",
+        CLI_PASS + "    ctx.default_map.update(m)\n",
+        CLI_PASS + "make_app()(default_map=m)\n",
+        CLI_PASS + "OPTIONS = {'default_map': m}\n",
+        CLI_PASS + "OPTIONS = dict(default_map=m)\n",
+        CLI_PASS + "paper_app.info.context_settings = SETTINGS\n",
+        CLI_PASS + "T = typer.Typer\npaper_app = T(context_settings=SETTINGS)\n",
+        CLI_PASS + "paper_app = functools.partial(typer.Typer, context_settings=SETTINGS)()\n",
+        CLI_PASS + "paper_app = functools.partial(Typer)()\n",
+        CLI_PASS + "make_app()(**OPTIONS)\n",
+        CLI_PASS + "typer.main.get_command(app).main(**OPTIONS)\n",
+        CLI_PASS + "cmd = typer.main.get_command(app)\ncmd.context_settings = SETTINGS\n",
+        CLI_PASS + "setattr(ctx, 'default_' + 'map', m)\n",
+        CLI_PASS + "make_app().info = INFO\n",
+        CLI_PASS + "vars(vars(paper_app)['in' + 'fo'])['context_' + 'settings'] = S\n",
+        CLI_PASS + "object.__setattr__(operator.attrgetter('in' + 'fo')(paper_app), 'c', S)\n",
+        CLI_PASS + "attrgetter('in' + 'fo')(paper_app).__setattr__('context_' + 'settings', S)\n",
+        CLI_PASS + "type(paper_app).__getattribute__(paper_app, 'in' + 'fo')\n",
+        CLI_PASS + "from typer.main import get_command as gc\n",
+        CLI_PASS + "import operator as op\n",
+        CLI_PASS + "from operator import setitem as put\n",
+        CLI_PASS + "from typer import Typer as T\n",
+        CLI_PASS + "from operator import methodcaller\n",
+        CLI_PASS + "from operator import methodcaller as mc\n",
+        CLI_PASS + "importlib.import_module('oper' + 'ator')\n",
+        CLI_PASS + "m = getter(paper_app, '__dict__')\n",
+        CLI_PASS + "m = sys.modules['oper' + 'ator']\n",
+        CLI_PASS + "import pickle\n",
         # not a `resume` command's parameter
         CLI_PASS.replace('command("resume")', 'command("run")'),
         CLI_PASS.replace('@paper_app.command("resume")\n', ""),
