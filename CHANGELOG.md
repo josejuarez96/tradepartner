@@ -221,6 +221,48 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - The look-ahead suites and the `bt` oracle run at every rebalance cadence (`month_end`, `week_end`, `daily`) (strategy-lab T98b).
 - `backtest/sweep.py`: the strategy-lab sweep file parser and grid, pure: `parse_sweep_file` with every file-level refusal of req 1 as a typed `SweepFileError`, `expand_grid` building each variant's frozen set as `hypothesis.frozen_params` does in canonical `params_sha256` order, `read_groups` and `variant_slug`; fixtures `tests/fixtures/sweeps/` (T102, #1096)
 - agents.md review-passes rule 6, the follow-up rule: fix under ~15 minutes in the PR, drop nits, file only real defects or owner decisions (one size:S issue per PR at most); teams.md, development-process.md rule 6 and the implementer, quant-auditor and safety-reviewer agents follow it (#1123)
+- Backtest provider reads `statement_facts(t, ids)` and `sics(t, ids)` for the profitability family, and fixture statement facts with a scored baseline and the amendment #720 point-in-time cases (T85c, #1071).
+- Family-keyed signal reads and counts, profitability backtests, and the #1088 own-section fingerprint rule
+- Tests: a first-span-lead case in the truncation-invariance harness (tests/lookahead/test_universe_invariance.py), and a test pinning the clock `_price_chunk` builds its store resolver at (#1122, #980, #990)
+- Statement facts are on by default (`edgar.statement_facts_enabled = true`, T78, #1127) after the real-store re-ingest passed; the EDGAR company-facts fixtures now carry the statement tags, cut at their recorded filing date.
+- research frame build: the rule answer (rule_status, rule_relisted, rule_successor_id, rule_form15_in_window) at a fixed as-of t, from a departure-reason corpus and the runtime store.
+- `tradepartner experiment register|open|abandon`, `tradepartner experiments` and `tradepartner dataset register`: the research registry's command groups (exit 2 on a recorded refusal; no synthetic, edit, unseal, reopen or import command).
+- `paper start` refuses a hypothesis whose rebalance cadence is not `month_end` (`refused_cadence`, strategy-lab spec req 11) before any broker call.
+- Strategy-lab tables as functions (`store/lab_schema.py`), the `lab_store` test fixture and the fixture-store marker (T101).
+- Schema version 14: `trial_rebalance_counts` (one row per count per rebalance, existing counts migrated), `Plan.exclusions`, and `signals.reason` accepting any `excluded_<reason>` (ADR 0014, T127).
+- B3 (gross profitability) registered and run in sample on the real store: trial 3, 2020-08-31..2023-12-29, 40 months (T85f, #1156)
+- `edgar.class_member_overrides`: per-CIK owner-reviewed class member whose shares facts go to the CIK's sole common class (defaults DKS, TR, VMEO -> `CommonClassA`, #1169).
+- Strategy-lab registry module (`store/lab_registry.py`): lab-table writes and registration-time reads (fingerprints, family rules, sweeps, sweep runs, SR* high-water mark, sweep readiness, pre-lab, promotions, grandfathered rows); lab modules and `execution` kept import-isolated (T103).
+- `tradepartner paper lots-reconcile --export --tax-year`: compares the broker's 1099-B export with the lot ledger on proceeds, cost basis and box 1g, reports every difference with both figures and writes nothing (T90, #1176).
+- Research labeling review logic (`research/labeling/review.py`, T123b): the blind review session over a frame batch's shortlist, `record_decision` with attribution after the save, `record_undo`, and `finish` with the batch metrics of req 10 (`yield`, stratum-weighted model and rule accuracy, `n_reviewed`, `n_deferred`).
+- Research labeling: the gold session logic (`research/labeling/gold.py`): the blind draw, the exclusion by issuer CIK, label/skip/undo records and the lock (T131, #1186).
+- Dashboard: the research view page over the registry — registrations with chain budgets and amendments, per-family research sums beside the backtest N, runs with every req 15 state and synthetic runs hidden by default, datasets with sealed-split spends, and decisions (T83c, #1189)
+- Backtest N counts research runs on return data: `n_trials` = counted backtest trials + `family_run_count`, the research share stored in `trial_results.n_research`; the backtest page shows today's N split (#1190, T83b).
+- `engine.run_many`: a sweep read group's variants from one read set per step, each result equal to a separate `engine.run` (`run` is `run_many` with one variant); `results.write_results(..., detail_level="summary")` stores base-level daily equity, rebalance-session equity at the other levels and no weights, with the full trial's metrics (strategy-lab T105).
+- Schema version 16 (strategy-lab T113): the lab migration creates the lab tables, marks every existing hypothesis pre-lab, writes one fingerprint per hypothesis and one family-rules row per family; fresh stores stay without the lab tables.
+- src/tradepartner/store/lab_queries.py and tests/store/test_lab_queries.py: counted trials, vintage, terminal failure, read groups, plan_run and sweep_state
+- Strategy-lab holdout rules on the backtest path: `refused_variant`, the pre-lab/promotion spend gate and the family holdout-spend cap (lab-initialised stores only; a store without the lab tables decides as Phase 3); `run_hypothesis(store_path=...)` refuses a store without the fixture marker unless it is `settings.store.path`, and runs every trial on a marked store as synthetic; the V pair's window key reads the hypothesis's cadence (T110).
+- `sweep.register`: registers a sweep file in an existing family with every store-level refusal of strategy-lab req 1 before any row is written; idempotent for an unchanged file (T104, #1205).
+- The sweep report and lab status (strategy-lab T108): `sweep_report`, `format_report`, `lab_status`, pure over set-based registry reads.
+- Research labeling job (T123): `run_batch`, `spend_check`, the drift probe, the per-call records and the batch shortlist, with `dry_run`; no real model call in tests.
+- The paper planner's `signals` rows journal every declared exclusion reason, generic over family (T127b, #1209).
+- Survivorship gap: the stale-listing rule (ADR 0003 amendment #1199), `gap.stale_listing_sessions = 63`, its `FROZEN_KEY_DEFAULTS` entry and the `stale_listings` side category on `SurvivorshipGap`, the health page and `health`.
+- Per-family comparison benchmarks: results._check requires the family's declared third benchmark, series_metrics takes an optional family benchmark (T129).
+- `sweep register` registers a new family's first sweep and writes its family rules once: parent from `FAMILY_PARENTS`, no holdout overlap with another real family, a child only after its parent's holdout is spent or capped, with the parent's SR* mark as its seed (T104b, #1225).
+- Trials page: families card (N, V, SR*, declared count, rules, parent N, holdout spends and promotions with their caps, SR* high-water mark) and sweeps table (argmax only for a complete sweep); backtest page: detail level, last weights for a full trial, holdout spend cap (strategy-lab T112).
+- `backtest.lab.run_sweep`: the strategy-lab sweep runner (T107), with the rerun epoch and synthetic-run planning in `store.lab_queries` (#1218).
+- `hypothesis register` after the strategy lab: only a promoted file (`promotion_of`, its variant's fingerprint, the family rules, a feasible anchor) registers on a lab store; a store without the lab keeps the Phase 3 rules (T104c, #1239).
+- Strategy-lab agent and runbook docs: sweep smoke for backtest-runner and the quiet intervals in the scheduling runbook (T115).
+- Strategy lab: `promotion.promote` and `promotion.retire` (req 4): a complete sweep's argmax becomes a standalone hypothesis after every refusal (caps, identity, provenance, SR* high-water floor), with its `promotion` decision; neither changes N.
+- ADR 0015 (Proposed): expansion seams before Phase 4, the charter direction note, the deferred capabilities with triggers, and a plan sketch (#1252).
+- CLI: `sweep register | run | status | report | promote | retire` and `lab status` (strategy lab, T111); `backtest <variant-slug>` exits 2 `refused_variant`.
+- Freeze the ops module clock to a single import-time instant in the shared _app helper and derive the fixture's S-1 from it; add a regression test that simulates the boundary crossing
+- Store: schema version 17 adds `book_id` to the eight journal tables, `position_side` to five and the `orders` shape columns, all defaulted; a version-16 journal makes `require_journal` raise `SchemaVersionError`, and the window commands, ops and override pages and lots CLI surface its "open it for writing once" message (#1266, #1261).
+- adapters: Order, Fill, Account and Asset carry the read-side fields Alpaca returns (order shape, fee, margin, borrow flags), all at their defaults; OrderRequest is unchanged (#1267)
+- The instrument-id rule in store/master.py's docstring, the INSTRUMENT_ID_SEPARATOR and BENCHMARK_PREFIX constants benchmark() builds its id from, and the guard that primary_security_id and the {base}-{n} class-id derivation raise ValueError rather than mint a prefixed id.
+- Docs: cite ADR 0015 part A from the charter, list its deferred capabilities and triggers in the roadmap, point ADR 0010 points 1 and 3 at ADR 0015, and state the instrument-id namespace rule in the data-foundation spec (#1271)
+- backtest/signals_combined.py, CombinedConfig and the combined FAMILIES entry, .env.example keys, frozen defaults, the strategies binding and the tests
+- A book_id token in every client_order_id and the window's book written through the journal (T133, ADR 0015 seam 1).
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -334,6 +376,22 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Backtest spec (Series, data model) and paper-trading spec (`signals`) carry dated ADR 0014 notes: an optional fourth series per family, `trial_rebalance_counts`, and `excluded_<reason>` journal reasons.
 - gross_profitability refuses a t that is not a session close, so freshness is never measured from the previous session (#1084).
 - git-workflow rule 7 and CLAUDE.md: ticking and collapsing a PR's own task line in docs/plans/ no longer makes the PR class B (#1110)
+- tests/lookahead/test_paper_invariance.py _derived uses window_journal_inputs on cut store; src/tradepartner/execution/run.py exposes WindowJournalInputs and window_journal_inputs; run's own reads (Tracking._executed, _locked_run, _skipped) now use it; _exit_book excluded per docstring
+- CI: pytest runs as a 4-way parallel matrix instead of serially inside `checks`; lint/format/mypy moved to a fast `checks-fast` job, and `checks` is now a thin aggregator that still succeeds/fails under the same name (#1112)
+- research-labeling spec and plan amended for #1121: gold exclusion by issuer CIK and amendments[].accession, review-mode back button, record_label/record_decision double-answer refusal, raw_response redaction, inference_paths lists every file, wider network-client ban (recommended option pending #1085); the code lands in T123/T123b/T123c.
+- STATUS and CHANGELOG folded from 34 fragments; the T77c, T121, T102 and T106 plan lines ticked (#1128)
+- ready_pr no longer runs pytest locally by default: CI runs the full suite (--tests runs the mapped tests, --full-tests all); team.py counts a plan task whose code PR is squash-merged on the plan ref as done, so a fold no longer gates its dependants (#1130)
+- B3 hypothesis file: status text and prior-evidence disclosure brought up to date before T85f; no parameter changed (#1143)
+- The family registry: config.FAMILIES is the source of truth; per-family tables and backtest/strategies.py signal records derive from it; the momentum fallbacks on an unlisted family are gone (ADR 0014 point 2, T128, #1157).
+- quant-auditor agent: targeted tests only (changed files plus new tests against the merge-base); never the full suite or tests/lookahead/ whole (#1161)
+- Backtest metrics are stored under period keys (`sharpe_period`, `turnover_period`, `n_periods`, ...) with `periods_per_year`, `turnover_annual` and `sharpe_annual_excess_spy`; the deflated Sharpe takes V over annualised Sharpes and SR* per trial period; schema version 15 adds `trials.detail_level`, `data_vintage`, `code_tree_sha256` and `trial_results.sharpe_unit` and copies every existing trial's monthly rows to the new keys (#1179).
+- Plan research-labeling: T123b's gold half moves to the new task T131 (`gold.py`); T123b depends on T123 (#1177).
+- CI: draft PRs run checks-fast only; ready_pr labels a draft `ci:full` for the full run and marks ready only on its green `checks`; a push to main whose tree already passed every shard on its PR head skips the shards (fails closed); shard weights re-measured on CI (#1192).
+- ADR 0003 and the data-foundation spec: the stale-listing rule for the survivorship gap (#1199 step 1); a live listing dark for more than `gap.stale_listing_sessions` sessions counts as ended at its last bar; code follows as step 2.
+- CI: a burst of merges to main runs the full suite once (shared main concurrency group, no in-progress cancel) instead of once per commit (#1222)
+- Plan boxes for T89, T121b, T122 and T128 ticked after their merges (#1235)
+- `hypothesis register` refuses a prose-only edit (same fingerprint, new doc hash) and returns an unchanged file's record by its canonical frozen set, in every state (T104c, #1239).
+- Paper-trading plan: ADR 0015's plan sketch becomes T132 to T139 with files, tests, dependencies and declared chains; T48c depends on T135, T71 on T132 and T133, T48b carries the recording gate (#1258)
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -472,6 +530,26 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - A mistyped edgar.* key now fails config loading instead of being silently ignored, and an empty statement_tags, statement_forms, statement_units or fallback list is refused; a config validation error no longer echoes the offending value, which may be a secret (#1037).
 - gross_profitability accepts a tz-aware t in any zone; it no longer fails comparing it to the UTC known_at column (#1051).
 - EdgarConfig refuses non-finite floats and caps requests_per_second at SEC's 10 req/s, so no config value can turn the SEC throttle off; config sections validated on their own no longer echo input values; a bad hypothesis-file value, or a bad frozen cost or risk value in a paper window, is named with its value through config.render_validation_errors (#1093).
+- Corpus fetch: a blank acceptanceDateTime no longer aborts the departure-reason fetch; amendments carry accepted_at.
+- config: LabConfig.quiet_intervals refuses a non-HH:MM time or an end not after its start at load (#1107)
+- Paper equity reads: the report and outcomes read a held session's cash from its position rows, an unreadable mark faults the drawdown check (run halts, resume refuses), a name held only on a back-filled session is flagged from the broker, and a split inside a carried gap adjusts the carried close (#1116).
+- Cash-limited buy batches can retain an affordable order after a smaller one is deferred, and settlement tests guard an unmapped security symbol.
+- Implausible dividends no longer distort jump reviews; halted zero-volume tails count as missing traded history; same-date actions yield bit-exact adjusted prices.
+- Configuration typos and non-finite thresholds fail validation, empty filing-form filters fail validation, and calendar-end dates no longer produce false rebalances or close-time errors.
+- Backfill: `_led` now reads the resolver's `first_span_lead` directly instead of recomputing the first ticker-bearing listing row, so an unreadable ticker or a dropped same-day typo can no longer disagree with which span the resolver treats as first (#1122, #990)
+- `edgar_source.reduce_submissions` no longer raises `KeyError`/`ValueError` on a blank `acceptanceDateTime`; `frame._match_delisting` resolves two same-second, same-exchange delistings of one CIK by `class_title` instead of raising
+- store.research.register_dataset refuses an unknown sealed split name and checks a sealed full/none split against the dataset's whole [event_start, event_end], so a direct API caller (not only the CLI) is protected (#1149)
+- Form 25s titled with several classes ("Common stock and warrants") now delist the common class they name, and a listing a stale cover page re-opened after a Form 25 reads as delisted until it trades again (#1163).
+- Shares facts after a de-SPAC reach the merged company's class: `ingest.fact_rows` drops a common class no cover page known at the fact's acceptance has shown since another class first appeared (`MasterBuild.shown`, #1165).
+- Shares facts with a class-letter member now match a 'Series X' title and a class's later cover-page titles known at the fact's acceptance (#1166).
+- A sweep variant written at summary now records trials.detail_level = summary, so the backtest page no longer looks for weights it never stored (#1197).
+- ready_pr no longer stalls a draft when a later draft run cancels the ci:full run: it re-triggers once, then fails as CI cancelled (#1201)
+- Brown-Forman, Hevi and Watsco class shares (NYSE, ticker written without the dot) are asked of Alpaca in dotted form through the new alpaca.class_symbols map (#1219).
+- The sweep report and `lab status` classify variants with `store.lab_queries.variant_states`, the runner's own rule, instead of a diverging copy (#1221).
+- registry.write_result applies the amended req-9 data-vintage rule, so a nightly ingest of a later session no longer fails a run or a sweep variant (#1232).
+- The daily price ingest no longer refuses every session over long-dead listings: a listed name dark more than gap.stale_listing_sessions sessions is reported and left out of the missing and dark shares (#1234).
+- tests/backtest/test_lab.py registers its fixture twin before the lab schema, as a lab store refuses a plain standalone file (#1249)
+- The backtest engine raises on a negative position value instead of silently dropping it (ADR 0015 TE5, #1255).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.
