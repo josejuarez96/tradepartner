@@ -22,6 +22,30 @@ report (T108) ask before they write anything:
 - `sweep_state`: complete, incomplete (stale) or incomplete (unrun), with the
   stale and terminal-failed lists.
 
+**The rerun epoch** (#1218; T107 writes the state it reads). A `--rerun` is the
+one run that plans every variant of a sweep that has already been complete, so
+its `sweep_runs` row is the latest one with `n_planned = n_declared` opened
+after a closed run with `completed = true` (`rerun_epoch`). From that row on,
+(1) a variant with no trial in a run of the epoch is **awaiting the rerun**: it
+is listed as stale and planned by the next plain run even though its earlier
+trial is still current, so a `--rerun` the budget stopped is finished by plain
+runs (req 2); (2) the terminal-failure count reads only the epoch's runs, so a
+rerun gives every variant "a fresh count under the new run" (req 2). The
+schema has no rerun flag, so a plain run after a completed run that happens to
+plan every variant (a code- or data-vintage change made them all stale) also
+opens an epoch. That costs nothing for (1), since such a run plans every
+variant anyway; for (2) it restarts a count that a code-vintage change had
+already restarted, and after a data-vintage change it can take one more
+identical failure before a variant reads terminal-failed: never fewer, so no
+variant leaves the argmax earlier than req 2 allows, and failures never enter N.
+
+**Synthetic runs** (#1218). `run_sweep(..., store_path=...)` opens every trial
+`synthetic=True` on a marked fixture store. The planning reads take
+`synthetic`: with it true they read only synthetic trials, with it false (the
+default, the real store) only non-synthetic ones, so a fixture sweep completes
+and is not rerun by its next plain run, while N, V and the selection statistic
+(`registry.family_sharpes`, `results.family_n`) never see a synthetic trial.
+
 Every public function calls `lab_schema.require_lab` first (like
 `lab_registry`), so on a store without the lab tables it raises
 `LabNotInitialised` and the Phase 3 rules stay in force. Every read of frozen
@@ -170,11 +194,14 @@ def _max_failures_per_variant(conn: duckdb.DuckDBPyConnection, sweep_id: int) ->
     return int(row[0])
 
 
-def _default_window(conn: duckdb.DuckDBPyConnection, hypothesis_id: int, sweep_id: int) -> Window:
+def default_window(conn: duckdb.DuckDBPyConnection, hypothesis_id: int, sweep_id: int) -> Window:
     """The variant's default in-sample window: `holdout.default_in_sample_window`
     at its own frozen cadence over the sweep registration's copied window (spec
     req 2), so a cadence-axis sweep's variants each key the window their own
-    rebalances resolve to. Raises `LabRegistryError` for an unknown sweep."""
+    rebalances resolve to. The window `counted_trial` reads and the runner (T107)
+    opens every variant's trial over. Raises `LabRegistryError` for an unknown
+    sweep."""
+    require_lab(conn)
     record = get_hypothesis_by_id(conn, hypothesis_id)
     in_sample_start, holdout_start, holdout_end = _sweep_window(conn, sweep_id)
     frozen = replace(
@@ -193,19 +220,21 @@ def _counted_trial(
     window: Window,
     code_vintage: str | None,
     vintages: dict[datetime, datetime | None],
+    synthetic: bool = False,
 ) -> TrialRow | None:
     """The counted trial over `window`: the latest **current** `ok`,
-    non-synthetic, `in_sample` trial, or, when none is current, the latest `ok`
+    `in_sample` trial (non-synthetic, or synthetic with `synthetic`; module
+    docstring, "Synthetic runs"), or, when none is current, the latest `ok`
     trial (stale), or None. The spec defines the counted trial as "the latest
     `ok` ... that is current" (Definitions "Selection statistic"); the stale
     latest is still returned so a caller can tell stale from unrun. Currentness
     is read against the caller's `code_vintage` and `vintages` memo, so a caller
     that already holds them computes nothing twice."""
     rows = conn.execute(
-        _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
+        _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND t.synthetic = ? "
         "AND r.status = 'ok' AND t.start_session = ? AND t.end_session = ? "
         "ORDER BY t.trial_id DESC",
-        [hypothesis_id, window.start, window.end],
+        [hypothesis_id, synthetic, window.start, window.end],
     ).fetchall()
     if not rows:
         return None
@@ -225,7 +254,7 @@ def counted_trial(
     when none is current (stale), or None. Call `is_current`/`is_stale` on the
     result. Raises `LabRegistryError` for an unknown sweep."""
     require_lab(conn)
-    window = _default_window(conn, hypothesis_id, sweep_id)
+    window = default_window(conn, hypothesis_id, sweep_id)
     return _counted_trial(conn, hypothesis_id, window, code_tree_sha256(), {})
 
 
@@ -264,27 +293,74 @@ def is_stale(conn: duckdb.DuckDBPyConnection, trial: TrialRow) -> bool:
     return trial.status == "ok" and not is_current(conn, trial)
 
 
+def rerun_epoch(conn: duckdb.DuckDBPyConnection, sweep_id: int) -> int | None:
+    """The `sweep_run_id` the sweep's current rerun epoch starts at, or None
+    (module docstring, "The rerun epoch"): its latest `sweep_runs` row that
+    planned every declared variant (`n_planned = n_declared > 0`) and was opened
+    after a closed run that left the sweep complete. Raises `LabRegistryError`
+    for an unknown sweep."""
+    require_lab(conn)
+    _require_sweep(conn, sweep_id)
+    row = conn.execute(
+        "SELECT MAX(r.sweep_run_id) FROM sweep_runs r "
+        "WHERE r.sweep_id = ? AND r.n_declared > 0 AND r.n_planned = r.n_declared "
+        "AND EXISTS (SELECT 1 FROM sweep_runs c WHERE c.sweep_id = r.sweep_id "
+        "AND c.sweep_run_id < r.sweep_run_id AND c.completed)",
+        [sweep_id],
+    ).fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _awaiting_rerun(
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    sweep_id: int,
+    epoch: int | None,
+    synthetic: bool,
+) -> bool:
+    """Whether the variant has no trial (of the run's kind of store, any status)
+    in a run of the rerun epoch `epoch`; False without an epoch."""
+    if epoch is None:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM sweep_trials st JOIN sweep_runs sr USING (sweep_run_id) "
+        "JOIN trials t USING (trial_id) "
+        "WHERE sr.sweep_id = ? AND sr.sweep_run_id >= ? AND t.hypothesis_id = ? "
+        "AND t.synthetic = ? LIMIT 1",
+        [sweep_id, epoch, hypothesis_id, synthetic],
+    ).fetchone()
+    return row is None
+
+
 def terminal_failed(
     conn: duckdb.DuckDBPyConnection,
     hypothesis_id: int,
     sweep: SweepRecord,
     code_vintage: str,
+    *,
+    synthetic: bool = False,
 ) -> bool:
     """Whether the variant is terminal-failed under req 2's counting rule: under
-    this sweep registration, the sweep row's copied `max_failures_per_variant`
-    in-sample, non-synthetic `failed` trials over the variant's default window
-    carrying the same message, written with `code_dirty = false` at
+    this sweep registration and since its rerun epoch (module docstring), the
+    sweep row's copied `max_failures_per_variant` in-sample `failed` trials
+    (non-synthetic, or synthetic with `synthetic`) over the variant's default
+    window carrying the same message, written with `code_dirty = false` at
     `code_vintage`, excluding `store changed during run` and `shared read
     failed`. A current `ok` trial clears it; a stale `ok` neither counts nor
-    blocks."""
+    blocks; a variant awaiting a stopped `--rerun` is not terminal-failed (the
+    same reading as `sweep_state` and `plan_run`)."""
     require_lab(conn)
-    window = _default_window(conn, hypothesis_id, sweep.sweep_id)
-    counted = _counted_trial(conn, hypothesis_id, window, code_vintage, {})
-    if counted is not None and _is_current(conn, counted, code_vintage, {}):
-        return False
-    return _has_terminal_failures(
-        conn, hypothesis_id, sweep.sweep_id, window, sweep.max_failures_per_variant, code_vintage
+    state = _variant_state(
+        conn,
+        hypothesis_id,
+        sweep.sweep_id,
+        sweep.max_failures_per_variant,
+        code_vintage,
+        {},
+        rerun_epoch(conn, sweep.sweep_id),
+        synthetic,
     )
+    return state == "terminal_failed"
 
 
 def _has_terminal_failures(
@@ -294,22 +370,26 @@ def _has_terminal_failures(
     window: Window,
     max_failures: int,
     code_vintage: str | None,
+    *,
+    epoch: int | None = None,
+    synthetic: bool = False,
 ) -> bool:
     """The failure count alone (the caller has already applied the current-`ok`
-    clear): this sweep registration's `sweep_trials` rows for the variant, whose
-    trials are in-sample, non-synthetic and over `window`, any single message
-    reaching `max_failures`. Scoping to the sweep's runs keeps a hypothesis that
-    is a variant of two sweep registrations from counting the other
-    registration's failures. A cap below 1 disables the state rather than making
-    every variant terminal at zero failures; a `None` checkout vintage (outside
-    a checkout) matches no failure."""
+    clear): this sweep registration's `sweep_trials` rows for the variant from
+    the rerun epoch `epoch` on (every run without one), whose trials are
+    in-sample, of the run's kind of store (`synthetic`) and over `window`, any
+    single message reaching `max_failures`. Scoping to the sweep's runs keeps a
+    hypothesis that is a variant of two sweep registrations from counting the
+    other registration's failures. A cap below 1 disables the state rather than
+    making every variant terminal at zero failures; a `None` checkout vintage
+    (outside a checkout) matches no failure."""
     if max_failures < 1:
         return False
     row = conn.execute(
         "SELECT 1 FROM trials t JOIN trial_results r USING (trial_id) "
         "JOIN sweep_trials st USING (trial_id) JOIN sweep_runs sr USING (sweep_run_id) "
-        "WHERE t.hypothesis_id = ? AND sr.sweep_id = ? AND r.status = 'failed' "
-        "AND t.kind = 'in_sample' AND NOT t.synthetic "
+        "WHERE t.hypothesis_id = ? AND sr.sweep_id = ? AND sr.sweep_run_id >= ? "
+        "AND r.status = 'failed' AND t.kind = 'in_sample' AND t.synthetic = ? "
         "AND t.start_session = ? AND t.end_session = ? "
         "AND t.code_dirty = false AND t.code_tree_sha256 = ? "
         "AND COALESCE(r.message, '') NOT IN (?, ?) "
@@ -317,6 +397,8 @@ def _has_terminal_failures(
         [
             hypothesis_id,
             sweep_id,
+            epoch if epoch is not None else 0,
+            synthetic,
             window.start,
             window.end,
             code_vintage,
@@ -379,77 +461,152 @@ def _read_groups(
     return list(groups.values())
 
 
-def plan_run(conn: duckdb.DuckDBPyConnection, sweep_id: int, rerun: bool = False) -> RunPlan:
+def plan_run(
+    conn: duckdb.DuckDBPyConnection,
+    sweep_id: int,
+    rerun: bool = False,
+    *,
+    synthetic: bool = False,
+) -> RunPlan:
     """The variants a run opens (spec req 2), in read-group order and canonical
     order within a group.
 
     A plain run lists every variant with no current counted trial that is not
-    terminal-failed (a stale `ok` is rerun, an unrun variant is run). `--rerun`
-    on a complete sweep lists every variant, terminal-failed ones included;
-    `--rerun` on an incomplete sweep raises `SweepNotCompleteError`. Raises
-    `LabRegistryError` for an unknown sweep.
+    terminal-failed (a stale `ok` is rerun, an unrun variant is run), and every
+    variant still awaiting a stopped `--rerun` (module docstring, "The rerun
+    epoch"). `--rerun` on a complete sweep lists every variant, terminal-failed
+    ones included; `--rerun` on an incomplete sweep raises
+    `SweepNotCompleteError`. `synthetic` reads the synthetic trials of a
+    `store_path` run instead of the non-synthetic ones (module docstring).
+    Raises `LabRegistryError` for an unknown sweep.
     """
     require_lab(conn)
     max_failures = _max_failures_per_variant(conn, sweep_id)
     code_vintage = code_tree_sha256()
     variants = lab_registry.sweep_variants(conn, sweep_id)
-    if rerun and not sweep_state(conn, sweep_id).complete:
+    if rerun and not sweep_state(conn, sweep_id, synthetic=synthetic).complete:
         raise SweepNotCompleteError(
             f"sweep {sweep_id} is not complete; --rerun reruns only a complete current sweep"
         )
+    epoch = rerun_epoch(conn, sweep_id)
+    vintages: dict[datetime, datetime | None] = {}
     planned: list[PlannedVariant] = []
     for group_index, group in enumerate(_read_groups(conn, variants), start=1):
         for variant in group:
-            if not rerun:
-                window = _default_window(conn, variant.hypothesis_id, sweep_id)
-                counted = _counted_trial(conn, variant.hypothesis_id, window, code_vintage, {})
-                if counted is not None and _is_current(conn, counted, code_vintage, {}):
-                    continue
-                if _has_terminal_failures(
-                    conn, variant.hypothesis_id, sweep_id, window, max_failures, code_vintage
-                ):
-                    continue
+            if not rerun and _variant_done(
+                conn,
+                variant.hypothesis_id,
+                sweep_id,
+                max_failures,
+                code_vintage,
+                vintages,
+                epoch,
+                synthetic,
+            ):
+                continue
             cadence = frozen_values(get_hypothesis_by_id(conn, variant.hypothesis_id))[CADENCE_KEY]
             planned.append(PlannedVariant(group_index, cadence, variant))
     return RunPlan(sweep_id=sweep_id, rerun=rerun, variants=tuple(planned))
 
 
-def sweep_state(conn: duckdb.DuckDBPyConnection, sweep_id: int) -> SweepState:
+_VariantState = Literal["current", "terminal_failed", "stale", "unrun"]
+
+
+def _variant_state(
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    sweep_id: int,
+    max_failures: int,
+    code_vintage: str | None,
+    vintages: dict[datetime, datetime | None],
+    epoch: int | None,
+    synthetic: bool,
+) -> _VariantState:
+    """One variant's state under req 2 (`sweep_state`'s docstring): a variant
+    awaiting a stopped `--rerun` is stale whatever its earlier trial."""
+    window = default_window(conn, hypothesis_id, sweep_id)
+    counted = _counted_trial(conn, hypothesis_id, window, code_vintage, vintages, synthetic)
+    awaiting = _awaiting_rerun(conn, hypothesis_id, sweep_id, epoch, synthetic)
+    if not awaiting and counted is not None and _is_current(conn, counted, code_vintage, vintages):
+        return "current"
+    if not awaiting and _has_terminal_failures(
+        conn,
+        hypothesis_id,
+        sweep_id,
+        window,
+        max_failures,
+        code_vintage,
+        epoch=epoch,
+        synthetic=synthetic,
+    ):
+        return "terminal_failed"
+    if counted is not None:
+        return "stale"
+    return "unrun"
+
+
+def _variant_done(
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    sweep_id: int,
+    max_failures: int,
+    code_vintage: str | None,
+    vintages: dict[datetime, datetime | None],
+    epoch: int | None,
+    synthetic: bool,
+) -> bool:
+    """Whether a plain run skips the variant: current or terminal-failed."""
+    state = _variant_state(
+        conn, hypothesis_id, sweep_id, max_failures, code_vintage, vintages, epoch, synthetic
+    )
+    return state in ("current", "terminal_failed")
+
+
+def sweep_state(
+    conn: duckdb.DuckDBPyConnection, sweep_id: int, *, synthetic: bool = False
+) -> SweepState:
     """The sweep's completeness and its stale, terminal-failed and unrun
     variants (spec, Definitions "Complete sweep"; req 2).
 
     A variant is complete when it has a current counted trial or is
     terminal-failed; otherwise it is **stale** (an `ok` that is not current and
-    no current one) or **unrun** (no `ok` trial at all). The state is
-    `incomplete (stale)` when any variant is stale, else `incomplete (unrun)`
-    when any is unrun, else `complete`. Raises `LabRegistryError` for an unknown
-    sweep.
+    no current one, or a variant awaiting a stopped `--rerun`: module
+    docstring, "The rerun epoch") or **unrun** (no `ok` trial at all). The
+    state is `incomplete (stale)` when any variant is stale, else `incomplete
+    (unrun)` when any is unrun, else `complete`. `synthetic` reads a
+    `store_path` run's synthetic trials (module docstring). Raises
+    `LabRegistryError` for an unknown sweep.
     """
     require_lab(conn)
     max_failures = _max_failures_per_variant(conn, sweep_id)
     code_vintage = code_tree_sha256()
+    epoch = rerun_epoch(conn, sweep_id)
     stale: list[SweepVariant] = []
     terminal: list[SweepVariant] = []
     unrun: list[SweepVariant] = []
     vintages: dict[datetime, datetime | None] = {}
     for variant in lab_registry.sweep_variants(conn, sweep_id):
-        window = _default_window(conn, variant.hypothesis_id, sweep_id)
-        counted = _counted_trial(conn, variant.hypothesis_id, window, code_vintage, vintages)
-        if counted is not None and _is_current(conn, counted, code_vintage, vintages):
-            continue
-        if _has_terminal_failures(
-            conn, variant.hypothesis_id, sweep_id, window, max_failures, code_vintage
-        ):
+        state = _variant_state(
+            conn,
+            variant.hypothesis_id,
+            sweep_id,
+            max_failures,
+            code_vintage,
+            vintages,
+            epoch,
+            synthetic,
+        )
+        if state == "terminal_failed":
             terminal.append(variant)
-        elif counted is not None:
+        elif state == "stale":
             stale.append(variant)
-        else:
+        elif state == "unrun":
             unrun.append(variant)
-    state: SweepStateName
+    overall: SweepStateName
     if stale:
-        state = "incomplete (stale)"
+        overall = "incomplete (stale)"
     elif unrun:
-        state = "incomplete (unrun)"
+        overall = "incomplete (unrun)"
     else:
-        state = "complete"
-    return SweepState(sweep_id, state, tuple(stale), tuple(terminal), tuple(unrun))
+        overall = "complete"
+    return SweepState(sweep_id, overall, tuple(stale), tuple(terminal), tuple(unrun))
