@@ -117,31 +117,20 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         configure_connection(conn)
         schema.init_schema(conn)
         load_universe_fixtures(conn, FIXTURES / "universe")
-        lab_schema.apply_lab_schema(conn)
     finally:
         conn.close()
     settings = Settings(_env_file=None)
     with _env(path, directory):
         with open_for_write(Settings()) as conn:
-            # Straight through the registry, as H1 was registered before the lab:
-            # `hypothesis.register` refuses a plain standalone file on a lab store
-            # (T104c).
-            twin_file = _copy_file(directory / "files", TWIN_SOURCE)
-            parsed = hypothesis.parse_file(twin_file)
-            twin = registry.register_hypothesis(
+            # Registered before the lab tables exist, as H1 was: a lab store refuses
+            # a plain standalone file (T104c).
+            twin = hypothesis.register(
                 conn,
-                slug=parsed.slug,
-                family=parsed.family,
-                title=parsed.title,
-                doc_path=twin_file.as_posix(),
-                doc_sha256=parsed.doc_sha256,
-                params=hypothesis.frozen_params(parsed, settings),
-                in_sample_start=parsed.in_sample_start,
-                holdout_start=parsed.holdout_start,
-                holdout_end=parsed.holdout_end,
+                _copy_file(directory / "files", TWIN_SOURCE),
                 registered_by="test",
                 settings=settings,
             )
+            lab_schema.apply_lab_schema(conn)
             mark_pre_lab(conn, twin.hypothesis_id)
             values = frozen.frozen_values(twin)
             lab_registry.write_fingerprint(
