@@ -414,19 +414,20 @@ class TestResultRow:
         _register(conn, settings)
         handle = _open(conn, settings, tmp_path)
         results = _run(settings, handle)
-        now = datetime(2030, 1, 2, 21, 0, tzinfo=UTC)  # an ingest lands mid-run
+        known = datetime(2024, 9, 30, 20, 0, tzinfo=UTC)  # before _CUTOFF: in the window
+        now = datetime(2030, 1, 2, 21, 0, tzinfo=UTC)  # a late fact's ingest lands mid-run
         insert_row(
             conn,
             "prices_daily",
             {
                 "security_id": "LATE",
-                "session": date(2030, 1, 2),
+                "session": known.date(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
                 "close": 1.0,
                 "volume": 1,
-                "known_at": now,
+                "known_at": known,
                 "ingested_at": now,
                 "source": "test",
                 "provenance": "bar",

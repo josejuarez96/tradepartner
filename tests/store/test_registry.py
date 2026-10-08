@@ -31,6 +31,7 @@ from tradepartner.store import registry, schema
 from tradepartner.store.db import insert_row
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+_AFTER_CUTOFF = datetime(2026, 9, 28, 20, 0, tzinfo=UTC)  # a session after `_open`'s cutoff
 _W1 = (date(2018, 1, 31), date(2022, 12, 30))
 _W2 = (date(2019, 1, 31), date(2022, 12, 30))
 #: A monthly trial's period Sharpe times this is its annualised Sharpe.
@@ -1111,6 +1112,46 @@ def test_open_trial_records_the_detail_level_it_is_given(
     with pytest.raises(ValueError, match="detail level"):
         _open(conn, settings, tmp_path, detail_level="partial")
     assert conn.execute("SELECT COUNT(*) FROM trials").fetchone() == (2,)
+
+
+def test_write_result_fails_on_an_in_window_fact_inserted_mid_run(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Backtest spec req 9 as amended (strategy-lab amendment 7, #1232): a late
+    fact known at or before the cutoff moves the data vintage and fails the run."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "B", _T0, _T0.replace(hour=13))  # known_at == cutoff is in the window
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "failed"
+    row = conn.execute("SELECT status, message, dsr FROM trial_results").fetchone()
+    assert row == ("failed", registry.STORE_CHANGED_MESSAGE, None)
+
+
+def test_write_result_keeps_a_run_when_only_a_session_after_the_cutoff_is_ingested(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A nightly ingest of a later session moves `store_max_ingested_at` but not the
+    data vintage at the trial's cutoff, so it fails nothing (#1232)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "A", _AFTER_CUTOFF, _AFTER_CUTOFF.replace(hour=23))
+    assert registry.store_max_ingested_at(conn) != handle.store_max_ingested_at
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "ok"
+    row = conn.execute("SELECT status, message, dsr FROM trial_results").fetchone()
+    assert row == ("ok", None, 0.9)
+
+
+def test_write_result_falls_back_to_the_store_max_without_a_recorded_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A trial opened with no fact known at its cutoff (no data vintage) keeps the
+    Phase 3 rule: any ingest fails it."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "A", _AFTER_CUTOFF, _AFTER_CUTOFF.replace(hour=23))
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "failed"
 
 
 def test_code_tree_sha256_hashes_package_sources_and_the_lock_only(tmp_path: Path) -> None:

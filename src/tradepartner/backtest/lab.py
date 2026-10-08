@@ -71,12 +71,11 @@ failed`, the excluded one; the provider's error is in
 `SweepRunOutcome.errors`.
 
 **The store-changed rule** is req 2's: by data vintage at each variant's own
-cutoff. `registry.write_result` still applies the Phase 3 rule (the store's
-latest `ingested_at` at open and write), so a row ingested during a group for
-a session after the cutoff still fails the group as `store changed during
-run` until #1232 moves `write_result` to the amended rule. That is the
-stricter of the two: it fails a run req 2 would keep, never keeps one it
-would fail, and the next plain run reruns it.
+cutoff, as `registry.write_result` applies it (#1232), so a row ingested
+during a group for a session after the cutoff fails nothing. One exception:
+a variant whose cutoff had no fact at its open (no vintage) passes this check
+but `write_result` falls back to the stricter store-max rule for it, so any
+ingest fails it; the next plain run reruns it.
 
 `clock` (default the system clock) is the one source of time: the budget,
 the quiet intervals and the seconds recorded per variant read it, and the
