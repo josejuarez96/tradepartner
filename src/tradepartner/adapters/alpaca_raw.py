@@ -183,6 +183,7 @@ def daily_bars(
     end: date,
     *,
     feed: DataFeed | None = None,
+    asof: date | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Raw, unadjusted daily bars for `symbols` over `[start, end]`.
@@ -194,6 +195,10 @@ def daily_bars(
     in the store, never at the source). Symbols go out in batches of at most
     `alpaca.symbols_per_request` (#789), each paged by the SDK, merged in order;
     any failing batch fails the whole call.
+
+    `asof` (#1314) is Alpaca's symbol-mapping day: each symbol names the
+    company that traded under it that day, not today's holder (a reused
+    ticker). `None` sends no `asof`, so Alpaca maps to today's holder.
     """
     settings = settings or get_settings()
     feed = feed or default_feed(settings)
@@ -209,6 +214,7 @@ def daily_bars(
                     timeframe=TimeFrame.Day,
                     adjustment=Adjustment.RAW,
                     feed=feed,
+                    asof=None if asof is None else asof.isoformat(),
                 )
             )
             for batch in _symbol_batches(symbols, settings)

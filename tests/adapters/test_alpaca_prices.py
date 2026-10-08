@@ -1878,10 +1878,12 @@ class TestRenameLead:
         assert resolver.lead("NEWT", date(2021, 9, 1)) is None
 
     def test_the_price_source_asks_for_both_symbols_and_fills(self) -> None:
-        calls: list[list[str]] = []
+        calls: list[tuple[list[str], bool]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
-            calls.append(symbols)
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append((symbols, asof is not None))
             return self._payload()
 
         source = AlpacaPriceSource(
@@ -1890,7 +1892,8 @@ class TestRenameLead:
             settings=_settings(),
         )
         bars = source.bars([self.FB], date(2022, 6, 1), date(2022, 6, 30))
-        assert calls == [["FB", "META"]]
+        # #1314: FB's span has ended, so FB is asked with asof inside it.
+        assert calls == [(["FB"], True), (["META"], False)]
         assert [b.session for b in bars] == [d for d in self.META_DAYS if d.month == 6]
 
 
@@ -2625,7 +2628,9 @@ class TestAlpacaSymbols:
         ]
         calls: list[list[str]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             calls.append(symbols)
             return self._bars_under({"BRK.B": "KO"})
 
@@ -2657,7 +2662,9 @@ class TestAlpacaSymbols:
         ]
         calls: list[list[str]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             calls.append(symbols)
             return self._bars_under({"CRD.A": "KO"})
 
@@ -2691,7 +2698,9 @@ class TestAlpacaSymbols:
         listings = [_listing("SEC_CRD", "CRD-A", START)]
         calls: list[list[str]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             calls.append(symbols)
             row = {**_json("corporate_actions.json")["cash_dividends"][0], "symbol": "CRD.A"}
             return {"cash_dividends": [row]}
@@ -2711,7 +2720,9 @@ class TestAlpacaSymbols:
             _listing("SEC_NEW", "CRD.A", date(2020, 1, 2)),
         ]
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             return self._bars_under({"CRD.A": "KO"})
 
         source = AlpacaPriceSource(
@@ -2732,7 +2743,9 @@ class TestAlpacaSymbols:
                 _listing("SEC_FB", "META", date(2020, 10, 1)),
             ]
 
-            def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            def fetch(
+                symbols: list[str], start: date, end: date, *, asof: date | None = None
+            ) -> dict[str, Any]:
                 return self._bars_under({"META": "KO"})
 
             source = AlpacaPriceSource(
@@ -2749,7 +2762,9 @@ class TestAlpacaSymbols:
         ]
         calls: list[list[str]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             calls.append(symbols)
             return self._bars_under({"CAAP": "KO"})
 
@@ -2767,7 +2782,9 @@ class TestAlpacaSymbols:
         # chunk goes on rather than raising.
         listings = [_listing("SEC_A", "Caap", START), _listing("SEC_B", "CAAP", START)]
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             return self._bars_under({"CAAP": "KO"})
 
         source = AlpacaPriceSource(
@@ -2866,7 +2883,9 @@ class TestClassSymbols:
     def _asked(self, *rows: dict[str, object], class_symbols: dict[str, str] | None) -> list[str]:
         asked: list[list[str]] = []
 
-        def fetch(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
             asked.append(symbols)
             return {"feed": "sip", "bars": {}}
 
@@ -2927,3 +2946,162 @@ class TestClassSymbols:
             "HVTA": "HVT.A",
             "WSOB": "WSO.B",
         }
+
+
+class TestAsofPerSpan:
+    """#1314: without `asof`, Alpaca maps a symbol to today's holder, so a
+    reused ticker serves the later company's history on the old company's
+    dates (VAL: Valspar's 2017 sessions priced as Valaris). Each security
+    whose span is not the ticker's latest, open span is asked with an
+    `asof` inside its own span; a symbol Alpaca names for no company then
+    falls back to a request without one."""
+
+    OLD = "0000000001"  # Valspar, VAL until the ticker passed on
+    NEW = "0000000002"  # Valaris, VAL from 2018
+    SPAN = date(2016, 1, 4)
+    TAKEN = date(2018, 1, 2)
+    DAYS: ClassVar[list[date]] = [date(2017, 6, 5), date(2017, 6, 6), date(2017, 6, 7)]
+    LATER: ClassVar[list[date]] = [date(2018, 6, 4), date(2018, 6, 5)]
+    LISTINGS: ClassVar[list[dict[str, object]]] = [
+        _listing(OLD, "VAL", SPAN),
+        _listing(NEW, "VAL", TAKEN),
+        _listing("SEC_AAPL", "AAPL", START),
+    ]
+
+    class _Alpaca:
+        """A fake Alpaca: `holders` maps (symbol, asof or None) to the
+        company it names; `prices` that company's closes by session."""
+
+        def __init__(
+            self,
+            holders: dict[tuple[str, date | None], str],
+            prices: dict[str, dict[date, float]],
+        ) -> None:
+            self.holders = holders
+            self.prices = prices
+            self.calls: list[tuple[list[str], date, date, date | None]] = []
+
+        def __call__(
+            self, symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            self.calls.append((symbols, start, end, asof))
+            bars: dict[str, list[dict[str, object]]] = {}
+            for symbol in symbols:
+                key = (symbol, None if asof is None else asof)
+                company = self.holders.get(key)
+                if company is None and asof is not None:
+                    company = next(
+                        (
+                            c
+                            for (s, a), c in self.holders.items()
+                            if s == symbol and a and a <= asof
+                        ),
+                        None,
+                    )
+                if company is None:
+                    continue
+                rows = [
+                    _row(day, close)
+                    for day, close in sorted(self.prices[company].items())
+                    if start <= day <= end
+                ]
+                if rows:
+                    bars[symbol] = rows
+            return {"feed": "sip", "bars": bars}
+
+    def _alpaca(self) -> TestAsofPerSpan._Alpaca:
+        old = {d: 110.0 for d in self.DAYS}
+        new = {d: 6.0 for d in [*self.DAYS, *self.LATER]}  # history copied back (#104)
+        return self._Alpaca(
+            {("VAL", None): "valaris", ("VAL", self.SPAN): "valspar", ("AAPL", None): "apple"},
+            {"valspar": old, "valaris": new, "apple": {d: 300.0 for d in self.DAYS}},
+        )
+
+    def _source(self, fetch: Any, listings: list[dict[str, object]] | None = None) -> Any:
+        return AlpacaPriceSource(
+            ListingResolver(self.LISTINGS if listings is None else listings),
+            fetch_bars=fetch,
+            settings=_settings(),
+        )
+
+    def test_a_reused_ticker_gets_the_old_company_bars_with_asof(self) -> None:
+        alpaca = self._alpaca()
+        bars = self._source(alpaca).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [(b.security_id, b.session, b.close) for b in bars] == [
+            (self.OLD, d, 110.0) for d in self.DAYS
+        ]
+        asof = self.SPAN + timedelta(days=7)  # alpaca.asof_offset_days after the span starts
+        assert alpaca.calls == [(["VAL"], self.DAYS[0], self.DAYS[-1], asof)]
+
+    def test_the_known_at_is_still_the_session_close(self) -> None:
+        bars = self._source(self._alpaca()).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [b.known_at for b in bars] == [bar_known_at(d) for d in self.DAYS]
+
+    def test_today_holder_rows_on_the_old_dates_are_dropped(self) -> None:
+        alpaca = self._alpaca()
+        bars = self._source(alpaca).bars(
+            [self.OLD, self.NEW, "SEC_AAPL"], self.DAYS[0], self.LATER[-1]
+        )
+        closes = {(b.security_id, b.session): b.close for b in bars}
+        assert closes == {
+            **{(self.OLD, d): 110.0 for d in self.DAYS},
+            **{(self.NEW, d): 6.0 for d in self.LATER},
+            **{("SEC_AAPL", d): 300.0 for d in self.DAYS},
+        }
+        # Today's holders share one request without asof, as before.
+        assert [c for c in alpaca.calls if c[3] is None] == [
+            (["AAPL", "VAL"], self.DAYS[0], self.LATER[-1], None)
+        ]
+
+    def test_an_ended_span_is_asked_with_asof_though_no_store_listing_took_it(self) -> None:
+        # The security renamed away from WTRE; an issuer the store never saw
+        # holds WTRE today (Watford, #1314).
+        listings = [_listing(self.OLD, "WTRE", self.SPAN), _listing(self.OLD, "WTX", self.TAKEN)]
+        alpaca = self._Alpaca(
+            {("WTRE", None): "later", ("WTRE", self.SPAN): "watford"},
+            {"later": {d: 9.0 for d in self.DAYS}, "watford": {d: 30.0 for d in self.DAYS}},
+        )
+        bars = self._source(alpaca, listings).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert {b.close for b in bars} == {30.0}
+
+    def test_a_symbol_asof_names_no_company_falls_back_to_no_asof(self) -> None:
+        # DAVE, AMCI, MBC, STRN, SMLR (#1314, #1311): asof returns nothing.
+        alpaca = self._alpaca()
+        del alpaca.holders[("VAL", self.SPAN)]
+        alpaca.prices["valaris"] = {d: 110.0 for d in self.DAYS}
+        source = self._source(alpaca)
+        bars = source.bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [(b.security_id, b.close) for b in bars] == [(self.OLD, 110.0)] * 3
+        asof = self.SPAN + timedelta(days=7)
+        assert alpaca.calls == [
+            (["VAL"], self.DAYS[0], self.DAYS[-1], asof),
+            (["VAL"], self.SPAN, self.DAYS[-1], asof),  # does Alpaca know it at all?
+            (["VAL"], self.DAYS[0], self.DAYS[-1], None),
+        ]
+        assert all(call[2] <= self.DAYS[-1] for call in alpaca.calls)  # never past the window
+        assert "1 symbol(s) asked without asof" in source.resolution_summary()
+
+    def test_an_empty_window_of_a_known_company_does_not_fall_back(self) -> None:
+        # Span lag (TOPW, #1314): the company stopped trading before its span
+        # ended; a window after its last bar must not take today's holder.
+        alpaca = self._alpaca()
+        source = self._source(alpaca)
+        late = [date(2017, 8, 14), date(2017, 8, 15)]
+        alpaca.prices["valaris"].update({d: 6.0 for d in late})
+        assert source.bars([self.OLD], late[0], late[-1]) == []
+        assert all(call[3] is not None for call in alpaca.calls)
+        assert source.bars([self.OLD], late[0], late[-1]) == []  # served once: no new probe
+        assert len(alpaca.calls) == 3
+
+    def test_the_resolver_names_no_asof_for_the_latest_open_span(self) -> None:
+        resolver = ListingResolver(self.LISTINGS)
+        assert resolver.asof(self.NEW, "VAL", 7) is None
+        assert resolver.asof("SEC_AAPL", "AAPL", 7) is None
+        assert resolver.asof(self.OLD, "VAL", 7) == self.SPAN + timedelta(days=7)
+
+    def test_the_asof_stays_inside_a_short_span(self) -> None:
+        listings = [
+            _listing(self.OLD, "VAL", self.SPAN),
+            _listing(self.NEW, "VAL", date(2016, 1, 7)),
+        ]
+        assert ListingResolver(listings).asof(self.OLD, "VAL", 7) == date(2016, 1, 6)
