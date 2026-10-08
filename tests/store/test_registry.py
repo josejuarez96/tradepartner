@@ -1097,6 +1097,23 @@ def test_open_trial_records_the_data_vintage_at_its_cutoff(
     assert row == ("full", ingested, None)  # tmp_path is no checkout
 
 
+def test_open_trial_records_the_detail_level_it_is_given(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """#1197: `full` by default; a sweep variant opened at `summary` reads `summary`
+    on its `trials` row and its handle; an unknown level is refused before the row."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path, detail_level="summary")
+    row = conn.execute(
+        "SELECT detail_level FROM trials WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone()
+    assert row == ("summary",) and handle.detail_level == "summary"
+    assert _open(conn, settings, tmp_path).detail_level == "full"
+    with pytest.raises(ValueError, match="detail level"):
+        _open(conn, settings, tmp_path, detail_level="partial")
+    assert conn.execute("SELECT COUNT(*) FROM trials").fetchone() == (2,)
+
+
 def test_write_result_fails_on_an_in_window_fact_inserted_mid_run(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:

@@ -66,10 +66,11 @@ trial still being written can be counted as the latest of its pair with
 records on every trial its `data_vintage` (`data_vintage(conn, cutoff)`,
 the latest `ingested_at` over fact rows known at its data cutoff),
 `code_tree_sha256` (`code_tree_sha256(repo_dir)`, over the git-tracked
-`*.py` files under `src/tradepartner/` and `uv.lock`) and `detail_level =
-full`; every result row records `sharpe_unit = annual` (V and SR* in
-annual units, req 9; NULL on rows written before schema version 15 means
-`monthly`). These two functions are the vintages' one home.
+`*.py` files under `src/tradepartner/` and `uv.lock`) and its `detail_level`
+(`full` unless the caller opens a sweep variant at `summary`, #1197); every
+result row records `sharpe_unit = annual` (V and SR* in annual units, req 9;
+NULL on rows written before schema version 15 means `monthly`). These two
+functions are the vintages' one home.
 """
 
 from __future__ import annotations
@@ -126,8 +127,11 @@ CADENCE_KEY: Final = "schedule.rebalance_cadence"
 #: The metric row each trial's annualisation reads (strategy-lab spec req 8).
 PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
 
-#: `trials.detail_level` until `summary` lands (strategy-lab spec, "Detail level").
+#: `trials.detail_level` (strategy-lab spec, "Detail level"): `full` for a standalone
+#: hypothesis, the sweep's `lab.sweep_detail_level` for a sweep variant (#1197).
+DetailLevel = Literal["full", "summary"]
 DETAIL_LEVEL_FULL: Final = "full"
+DETAIL_LEVELS: Final[tuple[DetailLevel, ...]] = ("full", "summary")
 
 #: `trial_results.sharpe_unit` on every row written from schema version 15 on.
 SHARPE_UNIT_ANNUAL: Final = "annual"
@@ -184,6 +188,7 @@ class TrialHandle:
     __slots__ = (
         "data_vintage",
         "database",
+        "detail_level",
         "family",
         "hypothesis_id",
         "kind",
@@ -202,6 +207,7 @@ class TrialHandle:
     synthetic: bool
     started_at: datetime
     store_max_ingested_at: datetime | None
+    detail_level: DetailLevel
     data_vintage: datetime | None
     database: str | None
 
@@ -730,6 +736,7 @@ def open_trial(
     note: str | None = None,
     settings: Settings | None = None,
     repo_dir: Path | None = None,
+    detail_level: DetailLevel = DETAIL_LEVEL_FULL,
 ) -> TrialHandle:
     """Insert a `trials` row for hypothesis `hypothesis_id` and return its
     handle. This is the moment a run becomes a trial (spec "Definitions").
@@ -742,11 +749,15 @@ def open_trial(
     the window rules are checked afterwards (spec req 11), so a refusal is
     still a trial. Captures the code version and the code vintage
     (`repo_dir`, default this checkout), the store's latest `ingested_at`
-    and the data vintage at `data_cutoff`, and records `detail_level =
-    full` (module docstring, "Vintages"). Refuses
+    and the data vintage at `data_cutoff`, and records `detail_level`
+    (`full` by default; a sweep variant's is the sweep's level, which
+    `backtest.results.write_results` then must write; module docstring,
+    "Vintages"). Refuses an unknown detail level and
     `synthetic=True` on the real store. Commit it in its own write chunk
     (module docstring, "Trial handle").
     """
+    if detail_level not in DETAIL_LEVELS:
+        raise ValueError(f"detail level must be one of {DETAIL_LEVELS}, got {detail_level!r}")
     settings = settings if settings is not None else get_settings()
     hypothesis = get_hypothesis_by_id(conn, hypothesis_id)
     if synthetic and _is_real_store(conn, settings):
@@ -781,7 +792,7 @@ def open_trial(
                 "gap_override_reason": gap_override_reason,
                 "run_by": run_by,
                 "note": note,
-                "detail_level": DETAIL_LEVEL_FULL,
+                "detail_level": detail_level,
                 "data_vintage": vintage,
                 "code_tree_sha256": code_tree_sha256(repo_dir),
             },
@@ -796,6 +807,7 @@ def open_trial(
         synthetic=synthetic,
         started_at=started_at,
         store_max_ingested_at=max_ingested,
+        detail_level=detail_level,
         data_vintage=vintage,
         database=_database_path(conn),
     )
