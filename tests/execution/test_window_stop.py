@@ -71,6 +71,7 @@ from tradepartner.store.journal import (
     unconsumed_kill_switch_overrides,
     window_stops_for,
 )
+from tradepartner.store.registry import UnknownHypothesis
 
 
 class FixedClock(Protocol):
@@ -993,6 +994,27 @@ def test_the_override_writer_stores_the_trimmed_reason(
     )
     assert row.reason == OVERRIDE_REASON
     assert row.made_at == row.known_at == DAY1
+
+
+def test_an_engage_kill_switch_override_never_reads_the_windows_hypothesis(
+    journal_settings: Settings, fixed_clock: FixedClock
+) -> None:
+    """T136: only a kind naming a rebalance session reads the window's cadence from
+    its hypothesis, so the halt override is written even when that read would fail."""
+    started = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    unregistered = replace(_new_window(journal_settings, started), window_id=None)
+    (window_id,) = _append(journal_settings, replace(unregistered, hypothesis_id=99_999))
+    with open_for_write(journal_settings) as conn:
+        conn.execute("DELETE FROM paper_windows WHERE window_id <> ?", [window_id])
+
+    override(journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON)
+    with pytest.raises(UnknownHypothesis):
+        override(
+            journal_settings, fixed_clock, "exclude_name", date(2026, 10, 30), SPY, OVERRIDE_REASON
+        )
+
+    with open_read_only(journal_settings) as conn:
+        assert [o.override.kind for o in overrides_for(conn, window_id)] == ["engage_kill_switch"]  # type: ignore[arg-type]
 
 
 def test_the_override_writer_refuses_a_reason_below_the_frozen_minimum(
