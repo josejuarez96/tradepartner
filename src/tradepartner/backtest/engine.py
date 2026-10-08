@@ -434,6 +434,13 @@ def _step(
     values = value_positions(
         fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
     )
+    negative = values.filter(pl.col("value") < 0)
+    if negative.height:
+        sid, session, value = negative.select("security_id", "session", "value").row(0)
+        raise ValueError(
+            f"negative position value {value} for {sid} on {session}: the backtester is "
+            "long-only (ADR 0014, 0015), a negative value would be silently dropped"
+        )
     exits = _exits(
         book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params
     )
