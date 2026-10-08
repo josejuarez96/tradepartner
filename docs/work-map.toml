@@ -724,7 +724,7 @@ why = "B3 cost six plan tasks because a family is read by a dozen places on its 
 unblocks = ["plan:strategy-interface", "task:T85e"]
 
 [adr.0015]
-what = "Expansion seams: the owner's long-term direction (swing and day trading, possibly derivatives) recorded without moving the charter's Scope line; six cheap, behaviour-preserving seams opened before Phase 4 writes real paper rows (book id in the client_order_id, position side, order and broker shape before T48c, explicit cadence, frozen keys at today's values, a reserved instrument id); shorting, stops, intraday bars, other calendars, derivatives data, roll, tax and multi-book deferred, each with a trigger and its own ADR."
+what = "Expansion seams: the owner's long-term direction (swing and day trading, possibly derivatives) recorded without moving the charter's Scope line; six cheap, behaviour-preserving seams opened before Phase 4 writes real paper rows (book id in the client_order_id, position side, read-side order and broker shape before T48c, explicit cadence, the frozen-key rule for expansion keys, a reserved instrument id); shorting, stops, intraday bars, other calendars, derivatives data, roll, tax and multi-book deferred, each with a trigger and its own ADR."
 why = "Each seam is a column, a field or a default argument now and a backfill migration during the six-month paper window later; the id format becomes Alpaca-side history on the first submit and can never be changed."
 unblocks = ["task:T48c", "task:T71"]
 
