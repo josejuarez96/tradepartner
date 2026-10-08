@@ -11,6 +11,7 @@ import polars as pl
 
 from tradepartner.backtest.provider import DataProvider
 from tradepartner.backtest.signals import anchor_sessions, gross_profitability, momentum
+from tradepartner.backtest.signals_combined import combined_rank
 from tradepartner.config import FAMILIES, HypothesisFamily, Settings
 
 
@@ -34,7 +35,14 @@ class _ProfitabilityRead:
     sics: Mapping[str, int | None]
 
 
-_Read = _MomentumRead | _ProfitabilityRead
+@dataclass(frozen=True)
+class _CombinedRead:
+    frame: pl.DataFrame
+    facts: pl.DataFrame
+    sics: Mapping[str, int | None]
+
+
+_Read = _MomentumRead | _ProfitabilityRead | _CombinedRead
 
 
 _Reader = Callable[[DataProvider, Settings, date, datetime, Sequence[str]], _Read]
@@ -134,6 +142,65 @@ def _profitability_signal(
     )
 
 
+def _combined_read(
+    provider: DataProvider,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
+) -> _Read:
+    """Momentum's price frame plus the profitability read: `statement_facts` and `sics`."""
+    strategy, schedule = params.strategy, params.schedule
+    a_form, _ = anchor_sessions(
+        session, strategy.formation_months, strategy.skip_months, schedule.signal_anchor
+    )
+    return _CombinedRead(
+        provider.adjusted_prices(
+            t,
+            members,
+            strategy.signal_total_return,
+            sessions_from=a_form,
+        ),
+        provider.statement_facts(t, members),
+        provider.sics(t, members),
+    )
+
+
+def _combined_signal(
+    readings: _Read,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
+) -> SignalResult:
+    data = cast(_CombinedRead, readings)
+    strategy, schedule, profitability = params.strategy, params.schedule, params.profitability
+    momentum_signal = momentum(
+        data.frame,
+        session,
+        strategy.formation_months,
+        strategy.skip_months,
+        schedule.signal_anchor,
+        schedule.rebalance_cadence,
+        security_ids=members,
+    )
+    profitability_signal = gross_profitability(
+        data.facts,
+        data.sics,
+        t,
+        security_ids=members,
+        annual_period_days=profitability.annual_period_days,
+        max_fact_age_days=profitability.max_fact_age_days,
+        exclude_sic_ranges=profitability.exclude_sic_ranges,
+        include_derived=profitability.include_derived,
+        basis=profitability.basis,
+    )
+    result = combined_rank(momentum_signal, profitability_signal)
+    return SignalResult(
+        result.scores, {str(reason): ids for reason, ids in result.excluded.items()}, result.counts
+    )
+
+
 # The reads and the (reader, signal) pair are family-specific code; `exclusion_reasons`,
 # `count_names` and `section` derive from `config.FAMILIES` (ADR 0014 point 2, T128), so
 # `Plan.exclusions` and `Plan.counts` carry exactly the names each family declares.
@@ -141,6 +208,7 @@ _FAMILY_IO: Mapping[HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal]] 
     "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal),
     "oracle": (("adjusted_prices",), _momentum_read, _momentum_signal),
     "profitability": (("statement_facts", "sics"), _profitability_read, _profitability_signal),
+    "combined": (("adjusted_prices", "statement_facts", "sics"), _combined_read, _combined_signal),
 }
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -12,13 +13,17 @@ import pytest
 
 from backtest.fake_provider import FakeProvider
 from backtest.test_engine import T0, T1, _handle, _params, _provider
-from tradepartner.backtest import engine
+from tradepartner.backtest import engine, hypothesis
 from tradepartner.backtest.engine import plan, run
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
+
+COMBINED_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-combined.md"
+)
 
 
 def _facts() -> pl.DataFrame:
@@ -201,3 +206,125 @@ def test_a_plan_refuses_an_exclusion_reason_its_family_does_not_declare(
     monkeypatch.setattr(engine, "signal_for", lambda family: undeclared)
     with pytest.raises(ValueError, match="no_history"):
         plan(_provider(), _params(), T0, family="momentum")
+
+
+# --- the `combined` family over the recording fake (B4; ADR 0014 point 6, T130) --
+
+
+def _combined_params() -> Settings:
+    return _params(
+        combined={"top_fraction": 0.5},
+        strategy={"top_fraction": 0.5},
+        profitability={"top_fraction": 0.5},
+    )
+
+
+def test_combined_reads_prices_facts_and_sics_only() -> None:
+    provider = _provider_with_facts()
+    params = _combined_params()
+    planned = plan(provider, params, T0, family="combined")
+    assert [call.method for call in provider.calls] == [
+        "universe",
+        "adjusted_prices",
+        "statement_facts",
+        "sics",
+        "static_listing_count",
+        "survivorship_gap",
+    ]
+    assert provider.read_times() == {read_time(T0)}
+    assert planned.counts == {
+        "n_excluded_no_history": 0,
+        "n_ranked": 4,
+        "n_excluded_no_facts": 0,
+        "n_excluded_stale_facts": 0,
+        "n_excluded_sector": 0,
+        "n_excluded_malformed": 0,
+        "n_derived": 0,
+        "n_combined": 4,
+    }
+    assert planned.n_excluded_no_history == 0
+    assert planned.exclusions == {
+        "no_history": (),
+        "sector": (),
+        "no_facts": (),
+        "stale_facts": (),
+        "malformed": (),
+        "one_signal_only": (),
+    }
+    # The count table takes the two sub-signals' counts plus `n_combined`.
+    result = run(params, _provider_with_facts(), T0, T1, _handle(), [15.0], family="combined")
+    row = result[15.0].rebalances[0]
+    with duckdb.connect(":memory:") as conn:
+        schema.init_schema(conn)
+        handle = _registered_combined_handle(conn, params)
+        registry.write_rebalances(conn, handle, result[15.0].rebalances)
+        assert registry.rebalance_counts(conn, handle.trial_id) == {row.session: planned.counts}
+
+
+def _registered_combined_handle(
+    conn: duckdb.DuckDBPyConnection, params: Settings
+) -> registry.TrialHandle:
+    """A synthetic `combined` trial on a scratch store, base level 15 bps."""
+    settings = Settings(_env_file=None)
+    hypothesis_record = registry.register_hypothesis(
+        conn,
+        slug="b4-fixture",
+        family="combined",
+        title="B4 fixture",
+        doc_path="docs/hypotheses/b4.md",
+        doc_sha256="0" * 64,
+        params={registry.BASE_COST_KEY: params.costs.per_side_bps},
+        in_sample_start=date(2010, 1, 1),
+        holdout_start=date(2025, 1, 1),
+        holdout_end=date(2025, 12, 31),
+        registered_by="test",
+        settings=settings,
+    )
+    return registry.open_trial(
+        conn,
+        hypothesis_id=hypothesis_record.hypothesis_id,
+        kind="in_sample",
+        start_session=T0,
+        end_session=T1,
+        data_cutoff=None,
+        synthetic=True,
+        run_by="test",
+        settings=settings,
+    )
+
+
+def test_combined_reads_are_the_declared_ones() -> None:
+    assert signal_for("combined").reads == (
+        "adjusted_prices",
+        "statement_facts",
+        "sics",
+    )
+    assert signal_for("combined").section == "combined"
+    assert signal_for("combined").count_names == (
+        "n_excluded_no_history",
+        "n_ranked",
+        "n_excluded_no_facts",
+        "n_excluded_stale_facts",
+        "n_excluded_sector",
+        "n_excluded_malformed",
+        "n_derived",
+        "n_combined",
+    )
+
+
+def test_combined_plan_unchanged_by_a_live_strategy_formation_months() -> None:
+    """The fixture pins `strategy.*` and `profitability.*`, so a live
+    `strategy.formation_months` change moves neither the frozen set nor the plan (T130)."""
+    settings = Settings(_env_file=None)
+    parsed = hypothesis.parse_file(COMBINED_FIXTURE)
+    frozen = hypothesis.frozen_params(parsed, settings)
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"formation_months": 6})}
+    )
+    assert hypothesis.frozen_params(parsed, live) == frozen
+    base = hypothesis._overlay(settings, frozen)
+    moved = hypothesis._overlay(live, frozen)
+    assert base.strategy.formation_months == moved.strategy.formation_months == 12
+    assert plan(_provider_with_facts(), base, T0, family="combined") == plan(
+        _provider_with_facts(), moved, T0, family="combined"
+    )
