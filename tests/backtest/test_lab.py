@@ -368,13 +368,21 @@ def test_a_store_path_run_is_synthetic_leaves_n_unchanged_and_completes(
 def test_an_unmarked_store_path_is_refused_before_any_trial(
     store: Path, clock: FakeClock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A lab store with no `store_markers` fixture row: built without the fixture
+    # loader (the only writer of the row), as a copy of the real store would be.
+    unmarked = tmp_path / "unmarked.duckdb"
+    conn = duckdb.connect(str(unmarked))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        lab_schema.apply_lab_schema(conn)
+    finally:
+        conn.close()
     monkeypatch.setenv("STORE__PATH", str(tmp_path / "real_store.duckdb"))
-    with open_for_write(Settings(_env_file=None, store={"path": str(store)})) as conn:
-        conn.execute("DELETE FROM store_markers")
-    before = _counts(store)
+    before = _counts(unmarked)
     with pytest.raises(registry.UnmarkedStoreRefused):
-        lab.run_sweep(SLUG, store_path=store, clock=clock)
-    assert _counts(store) == before
+        lab.run_sweep(SLUG, store_path=unmarked, clock=clock)
+    assert _counts(unmarked) == before
 
 
 def test_a_plain_fixture_store_raises_lab_not_initialised(

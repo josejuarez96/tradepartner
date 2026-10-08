@@ -53,8 +53,11 @@ between groups. Inside an interval it opens no trial, holds no connection and
 writes nothing: a group starts only outside one, a running group pauses
 between steps (the provider's step connection is closed before the pause and a
 new one opened after it), and the result writes and the run's close wait for
-the interval to end. Whether a paper window is open is read once, when the run
-opens; a window opened during a sweep is picked up by the next run.
+the interval to end. The paper interval is always applied, as if a paper window
+were open: nothing under `backtest/` may read the paper journal (the execution
+boundary, `tests/execution/test_boundaries.py`), so the runner cannot tell, and
+it takes the side that never contends with `paper run`; the paper interval is
+about an hour on each quiet weekday.
 
 **A shared read that keeps failing.** A provider read the group shares can
 fail for one variant's names alone (#1200's finding: bad data on a name only
@@ -106,7 +109,7 @@ from tradepartner.backtest.results import family_n, write_results
 from tradepartner.backtest.schedule import read_time
 from tradepartner.backtest.store_provider import Connect, StoreProvider
 from tradepartner.config import Cadence, HypothesisFamily, Settings, clean_message, get_settings
-from tradepartner.store import journal, lab_queries, lab_registry, lab_schema, registry, schema
+from tradepartner.store import lab_queries, lab_registry, lab_schema, registry, schema
 from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only
 from tradepartner.store.lab_queries import SHARED_READ_FAILED, PlannedVariant
 from tradepartner.store.lab_registry import LabRegistryError, SweepRecord
@@ -261,7 +264,7 @@ class _Opened:
     window: Window
     cutoff: datetime
     vintage: datetime | None
-    params: Settings | None = None
+    frozen_settings: Settings | None = None
     status: TrialStatus | None = None
     message: str | None = None
     error: str | None = None
@@ -278,15 +281,6 @@ def _on_store(live: Settings, store_path: Path | str | None) -> Settings:
 
 def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
-
-
-def _paper_window_open(conn: duckdb.DuckDBPyConnection) -> bool:
-    """Whether a paper window is open; more than one open reads as open (the paper
-    interval then applies, the cautious side)."""
-    try:
-        return journal.open_window(conn) is not None
-    except journal.JournalIntegrityError:
-        return True
 
 
 def _refuse_size(conn: duckdb.DuckDBPyConnection, live: Settings) -> list[str]:
@@ -345,10 +339,9 @@ def run_sweep(
     store = _on_store(live, store_path)
     synthetic = store_path is not None
 
-    # The refusals read only; the configured quiet intervals are waited out before
-    # the store is opened at all, the paper interval once the read says a window
-    # is open, and only then is anything written.
-    timing = _Timing(clock, live, paper_window_open=False)
+    # The quiet intervals are waited out before the store is opened at all; the
+    # refusals read only, and only then is anything written.
+    timing = _Timing(clock, live, paper_window_open=True)
     timing.wait_out_interval()
     with open_read_only(store) as conn:
         lab_schema.require_lab(conn)
@@ -360,7 +353,6 @@ def run_sweep(
         warnings = _refuse_size(conn, live)
         if lab_registry.sweep_by_slug(conn, slug) is None:
             raise LabRegistryError(f"no sweep is registered as {slug!r}")
-        timing.paper_window_open = _paper_window_open(conn)
     code_vintage = registry.code_tree_sha256()
     if code_vintage is None:
         raise NoCodeVintage("no code vintage outside a git checkout; run from the repo")
@@ -510,7 +502,7 @@ def _open_group(
             entry.status, entry.message = _refusal(decision.outcome), decision.message
         else:
             try:
-                entry.params = load_frozen(conn, record.slug, settings=live)
+                entry.frozen_settings = load_frozen(conn, record.slug, settings=live)
             except Exception as exc:
                 entry.status, entry.message = "failed", _describe(exc)
                 entry.error = "".join(traceback.format_exception(exc))
@@ -564,12 +556,12 @@ def _run_engine(
         windows = {o.window for o in running}
         if len(windows) != 1:
             raise ValueError(f"a read group runs over one window, got {sorted(map(str, windows))}")
-        assert first.params is not None
-        costs = first.params.costs
+        assert first.frozen_settings is not None
+        costs = first.frozen_settings.costs
         levels = sorted({costs.per_side_bps, *costs.sensitivity_per_side_bps})
-        variants = [(o.params, o.handle) for o in running if o.params is not None]
+        variants = [(o.frozen_settings, o.handle) for o in running if o.frozen_settings is not None]
         connect: Connect = partial(open_read_only, store)
-        with _PausingProvider(connect, first.handle, first.params, timing) as provider:
+        with _PausingProvider(connect, first.handle, first.frozen_settings, timing) as provider:
             results = engine.run_many(
                 variants,
                 provider,
@@ -617,12 +609,12 @@ def _close_variant(
                 entry.status, entry.message = "failed", STORE_CHANGED_MESSAGE
                 registry.close_trial(conn, entry.handle, "failed", STORE_CHANGED_MESSAGE)
             elif entry.results is not None and entry.status is None:
-                assert entry.params is not None
+                assert entry.frozen_settings is not None
                 status = write_results(
                     conn,
                     entry.handle,
                     entry.results,
-                    entry.params,
+                    entry.frozen_settings,
                     detail_level=live.lab.sweep_detail_level,
                 )
                 entry.status = "ok" if status == "ok" else "failed"
