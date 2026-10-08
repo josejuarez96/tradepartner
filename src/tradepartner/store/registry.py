@@ -71,6 +71,20 @@ the latest `ingested_at` over fact rows known at its data cutoff),
 result row records `sharpe_unit = annual` (V and SR* in annual units, req 9;
 NULL on rows written before schema version 15 means `monthly`). These two
 functions are the vintages' one home.
+
+**Named data releases** (#1319, data-foundation plan T140b; runbook
+`docs/runbooks/data-releases.md`). A release is `owner_decisions` rows of kind
+`data_release` (schema version 18) whose `values_json` carries the runbook's
+fields: a `before` row (`open_data_release`), its `after` row
+(`close_data_release`, with the sessions the repair touched), or a closed
+`record` row naming the backup that holds a trial's state
+(`record_trial_state`). At most one release is open (`open_release`); a name is
+used once. `data_vintage` also takes the `made_at` of every command-written
+`after` row whose `sessions_from` is on or before the cutoff, so a release that
+only deletes rows stales the trials whose window it touched. `plan_release_import`
+and `import_release` read the hand-written `data/releases.toml` once; imported
+`after` rows move no vintage (`_release_vintage`). `development_boundary` reads
+the newest `development_boundary` row (ADR 0016), which nothing writes yet.
 """
 
 from __future__ import annotations
@@ -78,12 +92,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import astuple, dataclass, field, fields
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -92,7 +107,13 @@ import duckdb
 import pyarrow as pa
 
 from tradepartner.backtest.frozen import canonical_frozen_set, frozen_values
-from tradepartner.calendar import all_sessions, last_session_of_month, last_session_of_week
+from tradepartner.calendar import (
+    all_sessions,
+    is_session,
+    last_session_of_month,
+    last_session_of_week,
+    session_close,
+)
 from tradepartner.config import Cadence, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.schema import (
@@ -107,6 +128,13 @@ STORE_CHANGED_MESSAGE: Final = "store changed during run"
 UNFINISHED: Final = "unfinished"
 
 TrialKind = Literal["in_sample", "holdout", "tracking"]
+
+#: `owner_decisions.kind` values `record_decision` writes: the Phase 3 three, then
+#: version 18's two (#1319, T140b; `lab_schema.RELEASE_DECISION_KINDS`). The lab's
+#: `promotion` and `sweep_retired` are written by `store.lab_registry`.
+DecisionKind = Literal[
+    "gap_signoff", "gap_override", "holdout_spend", "data_release", "development_boundary"
+]
 Basis = Literal["raw", "excess_spy"]
 
 #: Outcomes `close_trial` records; `ok` goes through `write_result`.
@@ -433,20 +461,28 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 
 def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
-    latest `ingested_at` over every fact table's rows with `known_at <= cutoff`; None
-    when there is none. A nightly ingest that only adds later sessions leaves it
-    unchanged; a late fact for an in-window session changes it. Guarded against an
-    absent table as `store_max_ingested_at` is."""
+    latest of the `ingested_at` over every fact table's rows with `known_at <=
+    cutoff` and the `made_at` of every closed data release whose touched sessions
+    start on or before `cutoff` (`_release_vintage`, #1319 T140b); None when there
+    is neither. A nightly ingest that only adds later sessions leaves it
+    unchanged; a late fact for an in-window session changes it, and so does a
+    release that only deletes rows. Guarded against an absent table as
+    `store_max_ingested_at` is."""
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
     tables = _present_fact_tables(conn)
-    if not tables:
-        return None
-    union = " UNION ALL ".join(
-        f"SELECT MAX(ingested_at) AS m FROM {table} WHERE known_at <= $cutoff" for table in tables
-    )
-    row = conn.execute(f"SELECT MAX(m) FROM ({union})", {"cutoff": cutoff}).fetchone()
-    return row[0] if row is not None else None
+    facts: datetime | None = None
+    if tables:
+        union = " UNION ALL ".join(
+            f"SELECT MAX(ingested_at) AS m FROM {table} WHERE known_at <= $cutoff"
+            for table in tables
+        )
+        row = conn.execute(f"SELECT MAX(m) FROM ({union})", {"cutoff": cutoff}).fetchone()
+        facts = row[0] if row is not None else None
+    release = _release_vintage(conn, cutoff)
+    if facts is None or (release is not None and release > facts):
+        return release
+    return facts
 
 
 #: The columns schema version 15 adds (`schema._PERIOD_COLUMNS`), by table.
@@ -1027,7 +1063,7 @@ def _write_values(
 def record_decision(
     conn: duckdb.DuckDBPyConnection,
     *,
-    kind: Literal["gap_signoff", "gap_override", "holdout_spend"],
+    kind: DecisionKind,
     reason: str,
     values: Mapping[str, Any],
     hypothesis_id: int | None = None,
@@ -1035,7 +1071,30 @@ def record_decision(
 ) -> int:
     """Append an `owner_decisions` row (spec req 12) and return its id.
     `values` (the gap values at the time, say) are stored as canonical JSON.
-    Refuses a blank reason and a trial or hypothesis id that does not exist."""
+    Refuses a blank reason and a trial or hypothesis id that does not exist.
+    `data_release` and `development_boundary` need a version-18 store; the
+    release writers below are the way to write a `data_release` row."""
+    return _insert_decision(
+        conn,
+        kind=kind,
+        reason=reason,
+        values=values,
+        hypothesis_id=hypothesis_id,
+        trial_id=trial_id,
+        made_at=utc_now(),
+    )
+
+
+def _insert_decision(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    kind: DecisionKind,
+    reason: str,
+    values: Mapping[str, Any],
+    hypothesis_id: int | None,
+    trial_id: int | None,
+    made_at: datetime,
+) -> int:
     if not reason.strip():
         raise ValueError("an owner decision needs a reason")
     for table, column, value in (
@@ -1052,7 +1111,7 @@ def record_decision(
         "owner_decisions",
         {
             "decision_id": decision_id,
-            "made_at": utc_now(),
+            "made_at": made_at,
             "kind": kind,
             "hypothesis_id": hypothesis_id,
             "trial_id": trial_id,
@@ -1061,6 +1120,499 @@ def record_decision(
         },
     )
     return decision_id
+
+
+# --- named data releases (#1319, data-foundation plan T140b) -----------------
+
+DATA_RELEASE_KIND: Final = "data_release"
+DEVELOPMENT_BOUNDARY_KIND: Final = "development_boundary"
+
+#: A release entry's stage (runbook `docs/runbooks/data-releases.md`, "The record").
+ReleaseStage = Literal["before", "after", "record"]
+RELEASE_STAGES: Final[tuple[ReleaseStage, ...]] = ("before", "after", "record")
+
+#: A release name: lowercase letters, digits and single hyphens (runbook).
+RELEASE_NAME: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+#: The `values_json` key every imported row carries (the time of the import).
+IMPORTED_AT_KEY: Final = "imported_at"
+
+#: `ingestion_runs.mode` of a repair run (`tradepartner.repair.REPAIR`).
+_REPAIR_MODE: Final = "repair"
+
+#: Every key a `data/releases.toml` entry may carry, and the keys each stage
+#: requires (runbook, "The fields").
+_ENTRY_KEYS: Final = frozenset(
+    {
+        "name",
+        "stage",
+        "made_at",
+        "backup_path",
+        "store_max_ingested_at",
+        "data_vintage",
+        "cutoff",
+        "sessions_from",
+        "sessions_to",
+        "trial",
+        "reason",
+    }
+)
+_COMMON_KEYS: Final = frozenset(_ENTRY_KEYS - {"backup_path", "trial"})
+_STAGE_KEYS: Final[dict[str, frozenset[str]]] = {
+    "before": _COMMON_KEYS | {"backup_path"},
+    "after": _COMMON_KEYS,
+    "record": _COMMON_KEYS | {"backup_path", "trial"},
+}
+_DATETIME_KEYS: Final = ("made_at", "store_max_ingested_at", "data_vintage", "cutoff")
+_DATE_KEYS: Final = ("sessions_from", "sessions_to")
+
+
+class ReleaseRefused(RegistryError):
+    """A data-release write the rules refuse: a bad name, a name already used, a
+    second open release, a close of a release that is not the open one, a backup
+    that is not the store's state, or an import entry that breaks the runbook."""
+
+
+@dataclass(frozen=True)
+class DataRelease:
+    """One `data_release` row of `owner_decisions`. `made_at` is the entry's own
+    time (the row's write time for a command, the file's `made_at` for an import,
+    whose write time is `imported_at`); `values` is the whole `values_json`."""
+
+    decision_id: int
+    name: str
+    stage: ReleaseStage
+    made_at: datetime
+    backup_path: str | None
+    store_max_ingested_at: datetime | None
+    data_vintage: datetime | None
+    cutoff: datetime | None
+    sessions_from: date | None
+    sessions_to: date | None
+    trial: int | None
+    reason: str
+    imported_at: datetime | None
+    values: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class DevelopmentBoundary:
+    """The newest `development_boundary` row (ADR 0016 points 1 and 6)."""
+
+    decision_id: int
+    made_at: datetime
+    boundary: date
+    reason: str
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    return None if value is None else datetime.fromisoformat(value)
+
+
+def _optional_date(value: Any) -> date | None:
+    return None if value is None else date.fromisoformat(value)
+
+
+def _release(decision_id: int, values_json: str, reason: str) -> DataRelease:
+    values = json.loads(values_json)
+    return DataRelease(
+        decision_id=decision_id,
+        name=values["name"],
+        stage=values["stage"],
+        made_at=datetime.fromisoformat(values["made_at"]),
+        backup_path=values.get("backup_path"),
+        store_max_ingested_at=_optional_datetime(values.get("store_max_ingested_at")),
+        data_vintage=_optional_datetime(values.get("data_vintage")),
+        cutoff=_optional_datetime(values.get("cutoff")),
+        sessions_from=_optional_date(values.get("sessions_from")),
+        sessions_to=_optional_date(values.get("sessions_to")),
+        trial=values.get("trial"),
+        reason=reason,
+        imported_at=_optional_datetime(values.get(IMPORTED_AT_KEY)),
+        values=values,
+    )
+
+
+def _has_table(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE database_name = current_database() "
+            "AND schema_name = current_schema() AND table_name = ?",
+            [table],
+        ).fetchone()
+        is not None
+    )
+
+
+def data_releases(conn: duckdb.DuckDBPyConnection) -> list[DataRelease]:
+    """Every `data_release` row, newest first by the entry's `made_at` (then by
+    id); empty on a store without `owner_decisions`."""
+    if not _has_table(conn, "owner_decisions"):
+        return []
+    rows = conn.execute(
+        "SELECT decision_id, values_json, reason FROM owner_decisions WHERE kind = ?",
+        [DATA_RELEASE_KIND],
+    ).fetchall()
+    releases = [_release(int(i), str(v), str(r)) for i, v, r in rows]
+    return sorted(releases, key=lambda r: (r.made_at, r.decision_id), reverse=True)
+
+
+def _open_releases(releases: Sequence[DataRelease]) -> list[DataRelease]:
+    closed = {r.name for r in releases if r.stage == "after"}
+    return [r for r in releases if r.stage == "before" and r.name not in closed]
+
+
+def open_release(conn: duckdb.DuckDBPyConnection) -> DataRelease | None:
+    """The open release's `before` row (a `before` with no `after` of its name), or
+    None. `record` rows are never open. The writers keep at most one open."""
+    found = _open_releases(data_releases(conn))
+    return found[0] if found else None
+
+
+def development_boundary(conn: duckdb.DuckDBPyConnection) -> DevelopmentBoundary | None:
+    """The newest `development_boundary` row by `made_at` (then by id), or None.
+    Nothing writes one until ADR 0016 is accepted and T142b lands."""
+    if not _has_table(conn, "owner_decisions"):
+        return None
+    row = conn.execute(
+        "SELECT decision_id, made_at, values_json, reason FROM owner_decisions "
+        "WHERE kind = ? ORDER BY made_at DESC, decision_id DESC LIMIT 1",
+        [DEVELOPMENT_BOUNDARY_KIND],
+    ).fetchone()
+    if row is None:
+        return None
+    return DevelopmentBoundary(
+        decision_id=int(row[0]),
+        made_at=row[1],
+        boundary=date.fromisoformat(json.loads(row[2])["date"]),
+        reason=str(row[3]),
+    )
+
+
+def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
+    """The latest `made_at` over the `after` rows written by `close_data_release`
+    whose `sessions_from` is on or before `cutoff`'s UTC date (a session's close
+    falls on its own UTC date), or None. A release that only deletes rows moves no
+    `ingested_at`, so this is what stales the trials whose window it touched; a
+    trial opened after the close read the new state and captured this value, so
+    it stays current. An imported `after` row (`IMPORTED_AT_KEY`) is left out: its
+    trials were rerun by hand under the runbook's rule before T140b, and counting
+    it now would stale every trial opened since its `made_at`, which read the
+    repaired store, and rerun them into N (#1321 pass-2 follow-up)."""
+    day = cutoff.astimezone(UTC).date()
+    latest: datetime | None = None
+    for release in data_releases(conn):
+        if (
+            release.stage == "after"
+            and release.imported_at is None
+            and release.sessions_from is not None
+            and release.sessions_from <= day
+            and (latest is None or release.made_at > latest)
+        ):
+            latest = release.made_at
+    return latest
+
+
+def _check_new_name(conn: duckdb.DuckDBPyConnection, name: str) -> None:
+    if RELEASE_NAME.fullmatch(name) is None:
+        raise ReleaseRefused(
+            f"release name {name!r} must be lowercase letters, digits and single hyphens"
+        )
+    if any(r.name == name for r in data_releases(conn)):
+        raise ReleaseRefused(f"release name {name!r} is already recorded; pick a new name")
+
+
+def _write_release(
+    conn: duckdb.DuckDBPyConnection,
+    values: Mapping[str, Any],
+    reason: str,
+    trial_id: int | None = None,
+    made_at: datetime | None = None,
+) -> int:
+    stored = {key: _json_value(value) for key, value in values.items() if value is not None}
+    return _insert_decision(
+        conn,
+        kind=DATA_RELEASE_KIND,
+        reason=reason,
+        values=stored,
+        hypothesis_id=None,
+        trial_id=trial_id,
+        made_at=made_at if made_at is not None else utc_now(),
+    )
+
+
+def open_data_release(
+    conn: duckdb.DuckDBPyConnection,
+    backup: duckdb.DuckDBPyConnection,
+    *,
+    name: str,
+    backup_path: str,
+    reason: str,
+) -> int:
+    """Write a release's `before` row and return its id (runbook, steps 3 and 4).
+    `backup` is a read-only connection to the backup file `backup_path` names. The
+    row records the store's latest `ingested_at` and the data vintage now (no
+    sessions are named yet, so the cutoff is the row's own time). Refuses a bad or
+    used name, a blank reason, a second open release, and a backup whose latest
+    `ingested_at` is not the store's (it would not hold the state before the
+    repair)."""
+    if not reason.strip():
+        raise ReleaseRefused("a release needs a reason")
+    _check_new_name(conn, name)
+    if (current := open_release(conn)) is not None:
+        raise ReleaseRefused(f"release {current.name!r} is open; close it before opening another")
+    live = store_max_ingested_at(conn)
+    copied = store_max_ingested_at(backup)
+    if copied != live:
+        raise ReleaseRefused(
+            f"backup {backup_path} is not the store's state: its latest ingested_at is "
+            f"{copied}, the store's is {live}; take the backup again"
+        )
+    now = utc_now()
+    values = {
+        "name": name,
+        "stage": "before",
+        "made_at": now,
+        "backup_path": backup_path,
+        "store_max_ingested_at": live,
+        "data_vintage": data_vintage(conn, now),
+        "cutoff": now,
+    }
+    return _write_release(conn, values, reason, made_at=now)
+
+
+def close_data_release(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    name: str,
+    sessions_from: date,
+    sessions_to: date,
+    reason: str | None = None,
+) -> int:
+    """Write the open release's `after` row with the sessions the repair touched
+    and return its id (runbook, step 7). The row records the store's latest
+    `ingested_at` and the data vintage at the close of `sessions_to`, read before
+    the row is written. Its `made_at` then enters `data_vintage` for every cutoff
+    on or after `sessions_from` (`_release_vintage`). Refuses a name that is not
+    the open release, a session that is not an XNYS session and a reversed range.
+    `reason` defaults to the `before` row's."""
+    current = open_release(conn)
+    if current is None or current.name != name:
+        found = "no release is open" if current is None else f"{current.name!r} is open"
+        raise ReleaseRefused(f"cannot close {name!r}: {found}")
+    for flag, day in (("--from", sessions_from), ("--to", sessions_to)):
+        if not is_session(day):
+            raise ReleaseRefused(f"{flag} {day.isoformat()} is not an XNYS session")
+    if sessions_from > sessions_to:
+        raise ReleaseRefused(f"--from {sessions_from} is after --to {sessions_to}")
+    if reason is not None and not reason.strip():
+        raise ReleaseRefused("--reason must not be blank")
+    cutoff = session_close(sessions_to)
+    now = utc_now()
+    values = {
+        "name": name,
+        "stage": "after",
+        "made_at": now,
+        "store_max_ingested_at": store_max_ingested_at(conn),
+        "data_vintage": data_vintage(conn, cutoff),
+        "cutoff": cutoff,
+        "sessions_from": sessions_from,
+        "sessions_to": sessions_to,
+    }
+    return _write_release(conn, values, reason or current.reason, made_at=now)
+
+
+def _repair_runs(backup: duckdb.DuckDBPyConnection, since: datetime) -> list[dict[str, Any]]:
+    """The backup's `ingestion_runs` rows of mode `repair` started at or after
+    `since`, oldest first: the deletions `data_vintage` cannot see."""
+    if not _has_table(backup, "ingestion_runs"):
+        return []
+    rows = backup.execute(
+        "SELECT run_id, started_at, finished_at, source, status, rows_added "
+        "FROM ingestion_runs WHERE mode = ? AND started_at >= ? ORDER BY started_at, run_id",
+        [_REPAIR_MODE, since],
+    ).fetchall()
+    keys = ("run_id", "started_at", "finished_at", "source", "status", "rows_added")
+    return [{k: _json_value(v) for k, v in zip(keys, row, strict=True)} for row in rows]
+
+
+def record_trial_state(
+    conn: duckdb.DuckDBPyConnection,
+    backup: duckdb.DuckDBPyConnection,
+    *,
+    name: str,
+    backup_path: str,
+    trial_id: int,
+    reason: str,
+) -> int:
+    """Write a closed `record` row naming the backup that holds the store state
+    trial `trial_id` read, and return its id (runbook, "The back-fill"). The
+    vintage and latest `ingested_at` are read on `backup` (read-only) at the
+    trial's `data_cutoff`; the row says whether that vintage equals the trial's
+    stored one (`vintage_equals_trial`) and lists the backup's repair runs started
+    since the trial (`repair_runs`, #1321 pass-2 follow-up: a deletion between the
+    trial and the backup moves no vintage). A `record` row is never open. Refuses a
+    bad or used name, a blank reason, and a trial without a `data_cutoff`."""
+    if not reason.strip():
+        raise ReleaseRefused("a release needs a reason")
+    _check_new_name(conn, name)
+    row = conn.execute(
+        "SELECT data_cutoff, data_vintage, store_max_ingested_at, start_session, "
+        "end_session, started_at FROM trials WHERE trial_id = ?",
+        [trial_id],
+    ).fetchone()
+    if row is None:
+        raise ReleaseRefused(f"trial {trial_id} does not exist")
+    cutoff, trial_vintage, trial_max, start, end, started_at = row
+    if cutoff is None:
+        raise ReleaseRefused(f"trial {trial_id} has no data_cutoff (a refused window)")
+    vintage = data_vintage(backup, cutoff)
+    now = utc_now()
+    values = {
+        "name": name,
+        "stage": "record",
+        "made_at": now,
+        "backup_path": backup_path,
+        "store_max_ingested_at": store_max_ingested_at(backup),
+        "data_vintage": vintage,
+        "cutoff": cutoff,
+        "sessions_from": start,
+        "sessions_to": end,
+        "trial": trial_id,
+        "trial_data_vintage": trial_vintage,
+        "trial_store_max_ingested_at": trial_max,
+        "vintage_equals_trial": vintage == trial_vintage,
+        "repair_runs": _repair_runs(backup, started_at),
+    }
+    return _write_release(conn, values, reason, trial_id=trial_id, made_at=now)
+
+
+def _entry_problems(index: int, entry: Mapping[str, Any]) -> list[str]:
+    where = f"entry {index}"
+    stage = entry.get("stage")
+    if stage not in _STAGE_KEYS:
+        return [f"{where}: stage {stage!r} is not one of {RELEASE_STAGES}"]
+    problems: list[str] = []
+    keys = set(entry)
+    if missing := sorted(_STAGE_KEYS[stage] - keys):
+        problems.append(f"{where}: {stage} entry lacks {missing}")
+    if extra := sorted(keys - _STAGE_KEYS[stage]):
+        problems.append(f"{where}: {stage} entry has unknown keys {extra}")
+    name = entry.get("name")
+    if not isinstance(name, str) or RELEASE_NAME.fullmatch(name) is None:
+        problems.append(f"{where}: name {name!r} is not lowercase letters, digits and hyphens")
+    for key in _DATETIME_KEYS:
+        value = entry.get(key)
+        if key in entry and (not isinstance(value, datetime) or value.tzinfo is None):
+            problems.append(f"{where}: {key} must be a UTC datetime with Z, got {value!r}")
+    for key in _DATE_KEYS:
+        value = entry.get(key)
+        if key in entry and (isinstance(value, datetime) or not isinstance(value, date)):
+            problems.append(f"{where}: {key} must be a date, got {value!r}")
+    if "trial" in entry and (
+        isinstance(entry["trial"], bool) or not isinstance(entry["trial"], int)
+    ):
+        problems.append(f"{where}: trial must be an integer, got {entry['trial']!r}")
+    for key in ("reason", "backup_path"):
+        if key in entry and (not isinstance(entry[key], str) or not entry[key].strip()):
+            problems.append(f"{where}: {key} must be a non-blank string")
+    return problems
+
+
+def plan_release_import(
+    conn: duckdb.DuckDBPyConnection, entries: Sequence[Mapping[str, Any]]
+) -> list[list[Mapping[str, Any]]]:
+    """Check every entry of `data/releases.toml` (its `[[release]]` tables, in file
+    order) against the runbook and the store, and return them grouped by release
+    name in file order, ready for `import_release`, one release each. Refuses, all
+    problems listed at once and nothing written: a malformed entry, a (name,
+    stage) pair the file repeats or the store holds, a name whose `record` is
+    mixed with a `before` or `after`, an `after` with no `before` before it, a
+    `record` whose trial does not exist, and a file that would leave more than one
+    release open (the store's open release counted)."""
+    problems: list[str] = []
+    for index, entry in enumerate(entries, start=1):
+        problems.extend(_entry_problems(index, entry))
+    if problems:
+        raise ReleaseRefused("; ".join(problems))
+    stored = data_releases(conn)
+    pairs = {(r.name, r.stage): r for r in stored}
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    for entry in entries:
+        groups.setdefault(entry["name"], []).append(entry)
+    for name, group in groups.items():
+        stages = [e["stage"] for e in group]
+        for stage in sorted(set(stages)):
+            if stages.count(stage) > 1:
+                problems.append(f"{name}: the file has {stages.count(stage)} {stage} entries")
+            if (name, stage) in pairs:
+                problems.append(f"{name}: a {stage} row is already stored")
+        all_stages = set(stages) | {s for (n, s) in pairs if n == name}
+        if "record" in all_stages and all_stages != {"record"}:
+            problems.append(f"{name}: a record entry shares its name with a before or after")
+        if "after" in stages:
+            before = next((e for e in group if e["stage"] == "before"), None)
+            before_at = (
+                before["made_at"]
+                if before
+                else getattr(pairs.get((name, "before")), "made_at", None)
+            )
+            after_at = next(e["made_at"] for e in group if e["stage"] == "after")
+            if before_at is None:
+                problems.append(f"{name}: an after entry with no before")
+            elif after_at < before_at:
+                problems.append(f"{name}: the after entry is made before its before entry")
+        for entry in group:
+            if entry["stage"] == "record" and (
+                conn.execute("SELECT 1 FROM trials WHERE trial_id = ?", [entry["trial"]]).fetchone()
+                is None
+            ):
+                problems.append(f"{name}: trial {entry['trial']} does not exist")
+    closed = {n for (n, s) in pairs if s == "after"} | {
+        e["name"] for e in entries if e["stage"] == "after"
+    }
+    still_open = sorted(
+        {n for (n, s) in pairs if s == "before"}
+        | {e["name"] for e in entries if e["stage"] == "before"}
+    )
+    still_open = [n for n in still_open if n not in closed]
+    if len(still_open) > 1:
+        problems.append(f"the import would leave {len(still_open)} releases open: {still_open}")
+    if problems:
+        raise ReleaseRefused("; ".join(problems))
+    return list(groups.values())
+
+
+def import_release(
+    conn: duckdb.DuckDBPyConnection, entries: Sequence[Mapping[str, Any]]
+) -> list[int]:
+    """Write one release's entries (one group of `plan_release_import`) as
+    `data_release` rows in file order and return their ids; the caller holds one
+    transaction per release. Each row's `values_json` is the entry as written, its
+    times in ISO form, plus `imported_at` (the write time, also the row's
+    `made_at` column; the entry's `made_at` stays in `values_json`). Refuses again
+    a (name, stage) pair already stored, so a second import of the file writes
+    nothing."""
+    stored = {(r.name, r.stage) for r in data_releases(conn)}
+    if clash := sorted({(e["name"], e["stage"]) for e in entries} & stored):
+        raise ReleaseRefused(f"already stored: {clash}")
+    now = utc_now()
+    ids = []
+    for entry in entries:
+        values = {key: value for key, value in entry.items() if key != "reason"}
+        values[IMPORTED_AT_KEY] = now
+        ids.append(
+            _write_release(conn, values, entry["reason"], trial_id=entry.get("trial"), made_at=now)
+        )
+    return ids
 
 
 # --- reads -----------------------------------------------------------------

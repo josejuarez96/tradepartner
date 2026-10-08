@@ -26,6 +26,7 @@ from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, N
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
+from tradepartner.store import registry
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
 
@@ -880,3 +881,278 @@ def test_console_script_points_at_main() -> None:
     scripts = tomllib.loads(pyproject.read_text())["project"]["scripts"]
     assert scripts["tradepartner"] == "tradepartner.cli:main"
     assert callable(cli.main)
+
+
+# --- decision data-release (#1319, data-foundation plan T140b) ------------------------
+
+
+def _release_store(settings: Settings, *, with_trial: bool = False) -> None:
+    """A migrated store at `settings.store.path` with one price row and, when asked,
+    one registered hypothesis and its trial 1."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                "security_id": "A",
+                "session": date(2020, 6, 30),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "known_at": T_END,
+                "ingested_at": NOW,
+                "source": "test",
+                "provenance": "bar",
+            },
+        )
+        if with_trial:
+            record = registry.register_hypothesis(
+                conn,
+                slug="h1",
+                family="momentum",
+                title="h1",
+                doc_path="docs/hypotheses/h1.md",
+                doc_sha256="d" * 64,
+                params={"costs.per_side_bps": 15.0},
+                in_sample_start=date(2016, 1, 29),
+                holdout_start=date(2023, 1, 3),
+                holdout_end=date(2025, 12, 31),
+                registered_by="owner",
+                settings=settings,
+            )
+            registry.open_trial(
+                conn,
+                hypothesis_id=record.hypothesis_id,
+                kind="in_sample",
+                start_session=date(2018, 1, 31),
+                end_session=date(2020, 6, 30),
+                data_cutoff=T_END,
+                synthetic=False,
+                run_by="test",
+                settings=settings,
+            )
+
+
+def _backup(settings: Settings, tmp_path: Path, name: str) -> Path:
+    path = tmp_path / f"tradepartner.{name}.duckdb"
+    path.write_bytes(Path(settings.store.path).read_bytes())
+    return path
+
+
+def _releases(settings: Settings) -> list[Any]:
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        return registry.data_releases(conn)
+
+
+def test_data_release_open_then_close(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _release_store(settings)
+    backup = _backup(settings, tmp_path, "repair-a")
+    opened = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "open",
+            "--name",
+            "repair-a",
+            "--backup",
+            str(backup),
+            "--reason",
+            "#1314 repair",
+        ],
+    )
+    assert opened.exit_code == 0, opened.output
+    assert "data_release repair-a before (open)" in opened.output
+    again = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "open",
+            "--name",
+            "repair-b",
+            "--backup",
+            str(backup),
+            "--reason",
+            "r",
+        ],
+    )
+    assert again.exit_code == 1 and "'repair-a' is open" in again.output
+    closed = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "close",
+            "--name",
+            "repair-a",
+            "--from",
+            "2020-06-01",
+            "--to",
+            "2020-06-30",
+        ],
+    )
+    assert closed.exit_code == 0, closed.output
+    after, before = _releases(settings)
+    assert (before.stage, before.backup_path, before.reason) == (
+        "before",
+        str(backup),
+        "#1314 repair",
+    )
+    assert before.store_max_ingested_at == NOW
+    assert (after.stage, after.sessions_from, after.cutoff) == ("after", date(2020, 6, 1), T_END)
+    bad_day = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "close",
+            "--name",
+            "repair-a",
+            "--from",
+            "2020-6-1",
+            "--to",
+            "2020-06-30",
+        ],
+    )
+    assert bad_day.exit_code == 2
+
+
+def test_data_release_open_refuses_a_missing_or_self_backup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _release_store(settings)
+    for backup, code, text in (
+        (tmp_path / "absent.duckdb", 2, "is not a file"),
+        (Path(settings.store.path), 2, "is the store itself"),
+    ):
+        result = _invoke(
+            settings,
+            [
+                "decision",
+                "data-release",
+                "open",
+                "--name",
+                "repair-a",
+                "--backup",
+                str(backup),
+                "--reason",
+                "r",
+            ],
+        )
+        assert result.exit_code == code and text in result.output
+    stale = _backup(settings, tmp_path, "stale")
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "prices_daily",
+            {
+                "security_id": "B",
+                "session": date(2020, 6, 30),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "known_at": T_END,
+                "ingested_at": NOW + timedelta(hours=1),
+                "source": "test",
+                "provenance": "bar",
+            },
+        )
+    result = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "open",
+            "--name",
+            "repair-a",
+            "--backup",
+            str(stale),
+            "--reason",
+            "r",
+        ],
+    )
+    assert result.exit_code == 1 and "not the store's state" in result.output
+    assert _releases(settings) == []
+
+
+def test_data_release_record_names_the_backup_of_a_trial(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _release_store(settings, with_trial=True)
+    backup = _backup(settings, tmp_path, "pre-sweep")
+    result = _invoke(
+        settings,
+        [
+            "decision",
+            "data-release",
+            "record",
+            "--name",
+            "pre-sweep",
+            "--backup",
+            str(backup),
+            "--trial",
+            "1",
+            "--reason",
+            "back-fill",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "equals the trial's" in result.output and "0 repair run(s)" in result.output
+    (row,) = _releases(settings)
+    assert (row.stage, row.trial, row.data_vintage) == ("record", 1, NOW)
+    assert row.values["vintage_equals_trial"] is True
+
+
+_RELEASES_TOML = """
+[[release]]
+name = "repair-13-tickers"
+stage = "before"
+made_at = 2026-10-10T14:05:00Z
+backup_path = "data/tradepartner.repair-13-tickers.duckdb"
+store_max_ingested_at = 2026-10-09T05:48:12.523886Z
+data_vintage = 2026-10-09T05:48:12.523886Z
+cutoff = 2026-04-29T20:00:00Z
+sessions_from = 2016-01-04
+sessions_to = 2026-04-29
+reason = "#1314: 13 names hold another company's prices"
+
+[[release]]
+name = "pre-sweep-20261008"
+stage = "record"
+made_at = 2026-10-08T21:50:00Z
+backup_path = "data/tradepartner.pre-sweep-20261008.duckdb"
+store_max_ingested_at = 2026-10-08T05:48:12.523886Z
+data_vintage = 2026-10-08T02:48:17.200099Z
+cutoff = 2026-09-30T20:00:00Z
+sessions_from = 2023-12-29
+sessions_to = 2026-09-30
+trial = 1
+reason = "Back-fill (#1303 item 1)"
+"""
+
+
+def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _release_store(settings, with_trial=True)
+    path = tmp_path / "releases.toml"
+    path.write_text(_RELEASES_TOML, encoding="utf-8")
+    result = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "repair-13-tickers: imported before" in result.output
+    assert "pre-sweep-20261008: imported record" in result.output
+    rows = _releases(settings)
+    assert [(r.name, r.stage) for r in rows] == [
+        ("repair-13-tickers", "before"),
+        ("pre-sweep-20261008", "record"),
+    ]
+    assert rows[1].data_vintage == datetime(2026, 10, 8, 2, 48, 17, 200099, tzinfo=UTC)
+    again = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    assert again.exit_code == 1 and "already stored" in again.output
+    assert len(_releases(settings)) == 2
+    path.write_text("[[release]\n", encoding="utf-8")
+    assert _invoke(settings, ["decision", "data-release", "import", str(path)]).exit_code == 2

@@ -73,6 +73,18 @@ Phase 3 (T42):
 - `tradepartner decision gap-signoff --trial <id> --reason` appends a
   `gap_signoff` owner decision for an `ok` trial, with its gap maxima and the
   frozen threshold (spec req 12, ADR 0003 rule 8).
+- `tradepartner decision data-release open --name --backup --reason`, `close
+  --name --from <session> --to <session> [--reason]`, `record --name --backup
+  --trial <id> --reason` and `import <path>` write the named data releases of
+  `docs/runbooks/data-releases.md` (#1319, data-foundation plan T140b) through
+  `store.registry`'s release writers: `open` the `before` row (the backup, read
+  read-only, must hold the store's latest `ingested_at`), `close` the open
+  release's `after` row with the sessions touched, `record` a closed row for the
+  backup that holds a trial's state (its vintage at the trial's cutoff, whether
+  it equals the trial's, and the repair runs since), and `import` the
+  hand-written `data/releases.toml` once, every entry checked before anything is
+  written, then one transaction per release. Exit 0 when written, 1 on a
+  refusal or a busy store, 2 on a usage error.
 
 Research registry (research-registry spec req 11 and req 14; plan T83):
 
@@ -194,12 +206,16 @@ the `paper` broker factory); `main` is the console script over the real ones.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+import tomllib
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import date, datetime
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any
@@ -268,7 +284,13 @@ from tradepartner.store import (
     research,
     schema,
 )
-from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.db import (
+    StoreLockedError,
+    configure_connection,
+    open_for_write,
+    open_read_only,
+    utc_now,
+)
 from tradepartner.store.lab_schema import LabNotInitialised
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -566,6 +588,27 @@ def _parse_day(flag: str, value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+
+
+@contextmanager
+def _backup_connection(path: Path, settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """A read-only connection to a release's backup file. Refuses (exit 2) a path
+    that is not a file or that is the store itself, so a release never names the
+    store as its own backup."""
+    if not path.is_file():
+        raise _fail(f"--backup {path} is not a file", USAGE_ERROR)
+    store = Path(settings.store.path).expanduser()
+    if store.exists() and os.path.samefile(path, store):
+        raise _fail(f"--backup {path} is the store itself, not a backup", USAGE_ERROR)
+    try:
+        conn = duckdb.connect(str(path), read_only=True)
+    except duckdb.Error as exc:
+        raise _fail(f"cannot open --backup {path} read-only: {exc}", 1) from None
+    try:
+        configure_connection(conn)
+        yield conn
+    finally:
+        conn.close()
 
 
 def _blank_text(value: str | None) -> bool:
@@ -1516,6 +1559,123 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
+
+    release_app = typer.Typer(no_args_is_help=True, help="Record a named data release.")
+    decision_app.add_typer(release_app, name="data-release")
+
+    def _release_write[T](write: Callable[[duckdb.DuckDBPyConnection], T], s: Settings) -> T:
+        """Run one release write in its own committed chunk on a migrated store."""
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                return write(conn)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except registry.ReleaseRefused as exc:
+            raise _fail(f"release refused: {_scrubbed(str(exc), s)}", 1) from None
+
+    @release_app.command("open")
+    def release_open(
+        name: Annotated[str, typer.Option(help="the release name (lowercase, digits, hyphens)")],
+        backup: Annotated[Path, typer.Option(help="the backup file taken just before")],
+        reason: Annotated[str, typer.Option(help="why, and the issue number")],
+    ) -> None:
+        """Open a release: write its `before` row (runbook steps 3 and 4)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        with _backup_connection(backup, s) as copy:
+            decision_id = _release_write(
+                lambda conn: registry.open_data_release(
+                    conn, copy, name=name, backup_path=str(backup), reason=reason
+                ),
+                s,
+            )
+        typer.echo(f"decision {decision_id}: data_release {name} before (open)")
+
+    @release_app.command("close")
+    def release_close(
+        name: Annotated[str, typer.Option(help="the open release's name")],
+        from_: Annotated[str, typer.Option("--from", help="the first session the repair touched")],
+        to: Annotated[str, typer.Option(help="the last session the repair touched")],
+        reason: Annotated[
+            str | None, typer.Option(help="what differs from the plan (default: open's)")
+        ] = None,
+    ) -> None:
+        """Close the open release: write its `after` row with the sessions touched."""
+        if reason is not None and not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        first = _parse_day("--from", from_)
+        last = _parse_day("--to", to)
+        assert first is not None and last is not None
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        decision_id = _release_write(
+            lambda conn: registry.close_data_release(
+                conn, name=name, sessions_from=first, sessions_to=last, reason=reason
+            ),
+            s,
+        )
+        typer.echo(f"decision {decision_id}: data_release {name} after ({first}..{last})")
+
+    @release_app.command("record")
+    def release_record(
+        name: Annotated[str, typer.Option(help="the record's name")],
+        backup: Annotated[Path, typer.Option(help="the backup that holds the trial's state")],
+        trial: Annotated[int, typer.Option(help="the trial whose state the backup holds")],
+        reason: Annotated[str, typer.Option(help="why, and the issue number")],
+    ) -> None:
+        """Record which backup holds the store state a trial read (a closed row)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        with _backup_connection(backup, s) as copy:
+            decision_id = _release_write(
+                lambda conn: registry.record_trial_state(
+                    conn, copy, name=name, backup_path=str(backup), trial_id=trial, reason=reason
+                ),
+                s,
+            )
+        with open_read_only(s) as conn:
+            (row,) = [r for r in registry.data_releases(conn) if r.decision_id == decision_id]
+        equal = row.values["vintage_equals_trial"]
+        runs = len(row.values["repair_runs"])
+        typer.echo(
+            f"decision {decision_id}: data_release {name} record for trial {trial}: "
+            f"data_vintage {_fmt(row.data_vintage)} "
+            f"{'equals' if equal else 'DIFFERS FROM'} the trial's "
+            f"{row.values.get('trial_data_vintage', '-')}; {runs} repair run(s) since the trial"
+        )
+
+    @release_app.command("import")
+    def release_import(
+        path: Annotated[Path, typer.Argument(help="the hand-written data/releases.toml")],
+    ) -> None:
+        """Import the hand-written release record once, one release per transaction."""
+        try:
+            doc = tomllib.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise _fail(f"cannot read {path}: {exc.strerror}", USAGE_ERROR) from None
+        except tomllib.TOMLDecodeError as exc:
+            raise _fail(f"{path} is not valid TOML: {exc}", USAGE_ERROR) from None
+        entries = doc.get("release", [])
+        if set(doc) - {"release"} or not isinstance(entries, list) or not entries:
+            raise _fail(f"{path} must hold one or more [[release]] tables only", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        groups = _release_write(lambda conn: registry.plan_release_import(conn, entries), s)
+        for group in groups:
+            ids = _release_write(partial(registry.import_release, entries=group), s)
+            stages = ", ".join(str(e["stage"]) for e in group)
+            typer.echo(f"{group[0]['name']}: imported {stages} (decisions {ids})")
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")

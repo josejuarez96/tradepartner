@@ -79,8 +79,16 @@ FIXTURE_MARKER_KIND = "fixture"
 #: `trial_results.status` values the lab adds (spec, Data / interfaces).
 LAB_TRIAL_STATUSES: tuple[str, ...] = ("refused_variant",)
 
-#: `owner_decisions.kind` values the lab adds (spec, Data / interfaces).
-LAB_DECISION_KINDS: tuple[str, ...] = ("promotion", "sweep_retired")
+#: `owner_decisions.kind` values schema version 18 adds (#1319, data-foundation plan
+#: T140b; ADR 0016 point 6): a named data release's record and the development
+#: boundary. `schema._migrate_release_kinds` widens every store with them, lab or
+#: not, by `widen_enum`; `apply_lab_schema` widens with them too, so a store that
+#: gains the lab after version 18 keeps them.
+RELEASE_DECISION_KINDS: tuple[str, ...] = ("data_release", "development_boundary")
+
+#: `owner_decisions.kind` values the lab adds (spec, Data / interfaces), then the
+#: two version 18 adds (`RELEASE_DECISION_KINDS`).
+LAB_DECISION_KINDS: tuple[str, ...] = ("promotion", "sweep_retired", *RELEASE_DECISION_KINDS)
 
 
 def _enum_check(column: str, values: tuple[str, ...]) -> str:
@@ -248,7 +256,7 @@ _LAB_TABLE_DDL: tuple[str, ...] = (
 )
 
 #: The two registry enumerations the lab widens: (table, column) -> the values
-#: it adds. Rebuilt by `_widen_enum`, never altered in place (DuckDB cannot).
+#: it adds. Rebuilt by `widen_enum`, never altered in place (DuckDB cannot).
 _WIDENED_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ("trial_results", "status"): LAB_TRIAL_STATUSES,
     ("owner_decisions", "kind"): LAB_DECISION_KINDS,
@@ -352,7 +360,7 @@ def _current_enum(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> t
     return str(constraint_text), match["values"]
 
 
-def _widen_enum(
+def widen_enum(
     conn: duckdb.DuckDBPyConnection, table: str, column: str, added: tuple[str, ...]
 ) -> None:
     """Rebuild `table` with `added` appended to its `column IN (...)` `CHECK`,
@@ -389,7 +397,8 @@ def _widen_enum(
 def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every `LAB_TABLE_NAMES` table and widen `trial_results.status`
     (`refused_variant`) and `owner_decisions.kind` (`promotion`,
-    `sweep_retired`) by the staging rebuild, every row kept byte-identical
+    `sweep_retired`, and version 18's `data_release` and `development_boundary`
+    where a store lacks them) by the staging rebuild, every row kept byte-identical
     (module docstring). Needs a store `init_schema` has created (the registry
     tables must exist). Idempotent: a second call changes nothing. One
     transaction (the caller's if open). Writes no `schema_version` row and is
@@ -398,5 +407,5 @@ def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
         for ddl in _LAB_TABLE_DDL:
             conn.execute(ddl)
         for (table, column), added in _WIDENED_ENUMS.items():
-            _widen_enum(conn, table, column, added)
+            widen_enum(conn, table, column, added)
     forget_column_types(conn)

@@ -1299,3 +1299,300 @@ def test_a_store_without_the_version_15_columns_records_trials_without_them(
     assert conn.execute(
         "SELECT status FROM trial_results WHERE trial_id = ?", [handle.trial_id]
     ).fetchone() == ("ok",)
+
+
+# --- named data releases (#1319, data-foundation plan T140b) --------------------------
+
+#: A runbook entry pair as `data/releases.toml` holds it (tomllib's types).
+_BEFORE = {
+    "name": "repair-13-tickers",
+    "stage": "before",
+    "made_at": datetime(2026, 9, 26, 14, 5, tzinfo=UTC),
+    "backup_path": "data/tradepartner.repair-13-tickers.duckdb",
+    "store_max_ingested_at": datetime(2026, 9, 26, 5, 48, tzinfo=UTC),
+    "data_vintage": datetime(2026, 9, 26, 5, 48, tzinfo=UTC),
+    "cutoff": datetime(2026, 9, 25, 20, 0, tzinfo=UTC),
+    "sessions_from": date(2026, 9, 1),
+    "sessions_to": date(2026, 9, 25),
+    "reason": "#1314: repair",
+}
+_AFTER = {
+    **{k: v for k, v in _BEFORE.items() if k != "backup_path"},
+    "stage": "after",
+    "made_at": datetime(2026, 9, 26, 15, 0, tzinfo=UTC),
+}
+
+
+def _open_release(conn: duckdb.DuckDBPyConnection, name: str = "repair-a") -> int:
+    # The registry reads the backup's latest `ingested_at` only; the store itself
+    # stands in for its own copy here (the CLI refuses that, `tests/test_cli.py`).
+    return registry.open_data_release(
+        conn, conn, name=name, backup_path=f"data/tradepartner.{name}.duckdb", reason="#1 fix"
+    )
+
+
+def test_the_version_18_kinds_are_recorded_by_record_decision(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    decision_id = registry.record_decision(
+        conn, kind="development_boundary", reason="r", values={"date": "2023-12-29"}
+    )
+    assert conn.execute(
+        "SELECT kind FROM owner_decisions WHERE decision_id = ?", [decision_id]
+    ).fetchone() == ("development_boundary",)
+    registry.record_decision(conn, kind="data_release", reason="r", values=_jsonable(_BEFORE))
+
+
+def _jsonable(entry: dict[str, Any]) -> dict[str, Any]:
+    return {k: v.isoformat() if isinstance(v, date) else v for k, v in entry.items()}
+
+
+def test_open_and_close_a_release(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.open_release(conn) is None and registry.data_releases(conn) == []
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    before_id = _open_release(conn)
+    opened = registry.open_release(conn)
+    assert opened is not None and opened.decision_id == before_id
+    assert (opened.name, opened.stage, opened.reason) == ("repair-a", "before", "#1 fix")
+    assert opened.store_max_ingested_at == _T0.replace(hour=13)
+    assert opened.backup_path == "data/tradepartner.repair-a.duckdb"
+    assert opened.sessions_from is None and opened.imported_at is None
+    after_id = registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    assert registry.open_release(conn) is None
+    after, before = registry.data_releases(conn)  # newest first
+    assert (after.decision_id, before.decision_id) == (after_id, before_id)
+    assert after.stage == "after" and after.reason == "#1 fix"  # the before's, by default
+    assert (after.sessions_from, after.sessions_to) == (date(2026, 9, 1), date(2026, 9, 25))
+    assert after.cutoff == datetime(2026, 9, 25, 20, 0, tzinfo=UTC)  # the session close
+    assert after.data_vintage == _T0.replace(hour=13)  # read before the row was written
+    assert after.backup_path is None
+
+
+def test_one_release_is_open_at_a_time(conn: duckdb.DuckDBPyConnection) -> None:
+    _open_release(conn)
+    with pytest.raises(registry.ReleaseRefused, match="'repair-a' is open"):
+        _open_release(conn, "repair-b")
+    with pytest.raises(registry.ReleaseRefused, match="cannot close 'repair-b'"):
+        registry.close_data_release(
+            conn, name="repair-b", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+        )
+    for start, end, match in (
+        (date(2026, 9, 5), date(2026, 9, 25), "not an XNYS session"),  # a Saturday
+        (date(2026, 9, 25), date(2026, 9, 1), "is after"),
+    ):
+        with pytest.raises(registry.ReleaseRefused, match=match):
+            registry.close_data_release(conn, name="repair-a", sessions_from=start, sessions_to=end)
+    registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    with pytest.raises(registry.ReleaseRefused, match="already recorded"):
+        _open_release(conn)  # a name is used once
+    with pytest.raises(registry.ReleaseRefused, match="lowercase"):
+        _open_release(conn, "Repair_B")
+    _open_release(conn, "repair-b")
+    assert conn.execute("SELECT COUNT(*) FROM owner_decisions").fetchone() == (3,)
+
+
+def test_open_refuses_a_backup_that_is_not_the_store_state(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    stale = _connect(tmp_path / "old-backup.duckdb")
+    _price(stale, "A", _T0, _T0.replace(hour=13))
+    _price(conn, "A", _T0, _T0.replace(hour=14))
+    with pytest.raises(registry.ReleaseRefused, match="not the store's state"):
+        registry.open_data_release(conn, stale, name="repair-a", backup_path="x", reason="r")
+    assert registry.open_release(conn) is None
+
+
+def test_a_delete_only_release_stales_the_trials_whose_window_it_touched(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The plan line's vintage rule: `data_vintage` takes the `made_at` of every
+    `after` row whose `sessions_from` is on or before the cutoff, so a release that
+    only deletes rows (no `ingested_at` moves) stales the in-window trials; a trial
+    whose cutoff precedes the touched sessions stays current, and a trial opened
+    after the close captured the new vintage and stays current too."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    _price(conn, "B", datetime(2026, 8, 3, 20, tzinfo=UTC), _T0.replace(hour=1))
+    in_window = _open(conn, settings, tmp_path)  # cutoff _T0, 2026-09-25
+    early_cutoff = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    early = registry.data_vintage(conn, early_cutoff)
+    assert registry.data_vintage(conn, _T0) == in_window.data_vintage == _T0.replace(hour=1)
+    _open_release(conn)
+    conn.execute("DELETE FROM prices_daily WHERE security_id = 'A'")  # the repair
+    assert registry.data_vintage(conn, _T0) == in_window.data_vintage  # deletion unseen
+    registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    (after, _) = registry.data_releases(conn)
+    assert registry.data_vintage(conn, _T0) == after.made_at != in_window.data_vintage
+    assert registry.data_vintage(conn, early_cutoff) == early  # before the touched sessions
+    assert registry.write_result(conn, in_window, registry.ResultStatistics()) == "failed"
+    later = _open(conn, settings, tmp_path)
+    assert later.data_vintage == after.made_at == registry.data_vintage(conn, _T0)
+    assert registry.write_result(conn, later, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
+def test_an_imported_after_row_moves_no_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """#1321 pass-2 follow-up: a trial opened after a hand-recorded release read the
+    repaired store; importing that release's `after` row must not stale it (its
+    in-window trials were rerun by hand under the runbook's rule)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    trial = _open(conn, settings, tmp_path)
+    (group,) = registry.plan_release_import(conn, [_BEFORE, _AFTER])
+    registry.import_release(conn, group)
+    assert registry.data_vintage(conn, _T0) == trial.data_vintage
+    assert registry.write_result(conn, trial, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
+def test_record_rows_are_never_open_and_say_whether_the_vintage_matches(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The back-fill (runbook): the vintage is read on the backup at the trial's
+    cutoff and compared with the trial's, and the backup's repair runs since the
+    trial are listed (#1321 pass-2 follow-up)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    trial = _open(conn, settings, tmp_path)
+    backup = _connect(tmp_path / "backup.duckdb")
+    _price(backup, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    for run_id, started, mode in (
+        ("r-old", _T0.replace(year=2025), "repair"),
+        ("r-new", datetime(2026, 12, 1, tzinfo=UTC), "repair"),
+        ("i-new", datetime(2026, 12, 1, tzinfo=UTC), "session"),
+    ):
+        insert_row(
+            backup,
+            "ingestion_runs",
+            {
+                "run_id": run_id,
+                "started_at": started,
+                "status": "repaired",
+                "source": "alpaca",
+                "mode": mode,
+                "rows_added": 0,
+            },
+        )
+    registry.record_trial_state(
+        conn,
+        backup,
+        name="pre-sweep",
+        backup_path="b.duckdb",
+        trial_id=trial.trial_id,
+        reason="back-fill",
+    )
+    _price(backup, "B", _T0, datetime(2026, 9, 26, tzinfo=UTC))  # the backup moved on
+    registry.record_trial_state(
+        conn,
+        backup,
+        name="pre-sweep-2",
+        backup_path="b.duckdb",
+        trial_id=trial.trial_id,
+        reason="back-fill",
+    )
+    assert registry.open_release(conn) is None
+    second, first = registry.data_releases(conn)
+    assert first.values["vintage_equals_trial"] is True
+    assert second.values["vintage_equals_trial"] is False
+    assert [run["run_id"] for run in first.values["repair_runs"]] == ["r-new"]
+    assert (first.trial, first.cutoff, first.sessions_from) == (trial.trial_id, _T0, _W1[0])
+    assert conn.execute(
+        "SELECT trial_id FROM owner_decisions WHERE decision_id = ?", [first.decision_id]
+    ).fetchone() == (trial.trial_id,)
+    with pytest.raises(registry.ReleaseRefused, match="does not exist"):
+        registry.record_trial_state(
+            conn, backup, name="pre-sweep-3", backup_path="b", trial_id=99, reason="r"
+        )
+    _open_release(conn)  # a record never blocks an open
+
+
+def test_the_import_checks_every_entry_before_writing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    trial = _open(conn, settings, tmp_path)
+    record = {
+        **_BEFORE,
+        "name": "pre-sweep-20261008",
+        "stage": "record",
+        "made_at": datetime(2026, 9, 26, 9, 0, tzinfo=UTC),
+        "trial": trial.trial_id,
+    }
+    groups = registry.plan_release_import(conn, [_BEFORE, record, _AFTER])
+    assert [[e["stage"] for e in g] for g in groups] == [["before", "after"], ["record"]]
+    for group in groups:
+        registry.import_release(conn, group)
+    rows = registry.data_releases(conn)
+    assert [(r.name, r.stage) for r in rows] == [
+        ("repair-13-tickers", "after"),
+        ("repair-13-tickers", "before"),
+        ("pre-sweep-20261008", "record"),
+    ]  # by the entries' own made_at, newest first
+    assert all(r.imported_at is not None for r in rows)
+    assert rows[1].made_at == _BEFORE["made_at"] and rows[1].sessions_to == date(2026, 9, 25)
+    assert registry.open_release(conn) is None
+    # A second import of the same file writes nothing.
+    with pytest.raises(registry.ReleaseRefused, match="already stored"):
+        registry.plan_release_import(conn, [_BEFORE, record, _AFTER])
+    with pytest.raises(registry.ReleaseRefused, match="already stored"):
+        registry.import_release(conn, groups[0])
+    assert len(registry.data_releases(conn)) == 3
+
+
+@pytest.mark.parametrize(
+    ("entries", "match"),
+    [
+        ([_AFTER], "an after entry with no before"),
+        ([_BEFORE, _BEFORE], "the file has 2 before entries"),
+        ([{**_BEFORE, "stage": "during"}], "stage 'during'"),
+        ([{**_BEFORE, "made_at": _BEFORE["made_at"].replace(tzinfo=None)}], "a UTC"),
+        ([{**_BEFORE, "sessions_from": datetime(2026, 9, 1, tzinfo=UTC)}], "must be a date"),
+        ([{k: v for k, v in _BEFORE.items() if k != "backup_path"}], "lacks"),
+        ([{**_BEFORE, "colour": "red"}], "unknown keys"),
+        ([{**_BEFORE, "name": "Bad Name"}], "lowercase"),
+        ([_BEFORE, {**_BEFORE, "name": "other"}], "would leave 2 releases open"),
+        ([_BEFORE, {**_AFTER, "made_at": datetime(2026, 9, 1, tzinfo=UTC)}], "made before"),
+        ([{**_BEFORE, "stage": "record", "trial": 7}], "trial 7 does not exist"),
+        (
+            [{**_BEFORE, "stage": "record", "trial": 1}, {**_AFTER}],
+            "shares its name",
+        ),
+    ],
+)
+def test_the_import_refuses_an_entry_that_breaks_the_runbook(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    entries: list[dict[str, Any]],
+    match: str,
+) -> None:
+    _register(conn, settings)
+    _open(conn, settings, tmp_path)  # trial 1
+    with pytest.raises(registry.ReleaseRefused, match=match):
+        registry.plan_release_import(conn, entries)
+    assert registry.data_releases(conn) == []
+
+
+def test_the_import_refuses_a_second_open_release_beside_the_stores(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _open_release(conn)
+    with pytest.raises(registry.ReleaseRefused, match="would leave 2 releases open"):
+        registry.plan_release_import(conn, [_BEFORE])
+
+
+def test_development_boundary_is_the_newest_row(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.development_boundary(conn) is None
+    for day in ("2023-12-29", "2022-12-30"):
+        registry.record_decision(
+            conn, kind="development_boundary", reason=f"set {day}", values={"date": day}
+        )
+    boundary = registry.development_boundary(conn)
+    assert boundary is not None
+    assert (boundary.boundary, boundary.reason) == (date(2022, 12, 30), "set 2022-12-30")
