@@ -14,6 +14,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 
 ## Scope
 - **In:** US equities, long-only, low frequency (daily or slower), no leverage, no options trading. The owner may revisit this through an ADR.
+- **Direction** ([ADR 0015](decisions/0015-expansion-seams.md) part A): the narrowness above is the current state, not the goal — the long-term direction also includes swing trading and day trading of US equities, and possibly options, futures and long/short spreads, each entering scope only through its own later ADR.
 - **Out:** the utility sector (owner compliance decision; the entire SIC 4900–4999 division, a guarded setting changeable only by amending this charter). Anything using material non-public information.
 - **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
 - **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
