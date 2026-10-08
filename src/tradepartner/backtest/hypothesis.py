@@ -37,6 +37,21 @@ for both keys, at its stored hash). It refuses a stored parameter set whose hash
 longer matches, or whose keys still differ from today's frozen list after that
 overlay (a drift the table does not cover), rather than letting a live value in
 silently.
+
+**Registration after the lab** (strategy-lab spec reqs 1, 4 and 5; plan task T104c).
+In every state `register` returns the existing record for an unchanged slug, doc hash
+and canonical frozen set (never calling `registry.register_hypothesis`, so a
+registration from before a `FROZEN_KEY_DEFAULTS` key landed is still the record) and
+refuses a prose-only edit (same slug, same fingerprint, new doc hash). **When
+`lab_schema.is_lab_initialised`** it refuses every other standalone file unless the
+caller registers it as a promoted file (`promotion_of`, the variant it promotes,
+which `sweep promote` names in the `promotion` decision it appends next): a new
+hypothesis is written as a one-value sweep. A promoted file must carry its variant's
+fingerprint, its family must have family rules (a new family's rules are written by
+`sweep.register` only), it must keep them (`costs.per_side_bps` may only rise) and its
+signal anchor must be feasible against the store's first session. **When the lab is
+not initialised** none of those lab refusals applies: the Phase 3 rules, so H1 and B3
+register on a pre-lab store as before.
 """
 
 from __future__ import annotations
@@ -45,7 +60,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -54,8 +69,17 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.backtest import frozen
-from tradepartner.config import FAMILIES, Settings, get_settings, render_validation_errors
-from tradepartner.store import registry
+from tradepartner.backtest.schedule import rebalance_sessions
+from tradepartner.backtest.signals import check_anchor_feasible
+from tradepartner.config import (
+    FAMILIES,
+    FORBIDDEN_AXIS_PREFIXES,
+    Settings,
+    get_settings,
+    render_validation_errors,
+)
+from tradepartner.store import lab_registry, registry
+from tradepartner.store.lab_schema import is_lab_initialised
 
 
 def _family_frozen_sections() -> tuple[str, ...]:
@@ -95,6 +119,17 @@ _DATE_KEYS: Final = ("in_sample_start", "holdout.start", "holdout.end")
 
 class HypothesisFileError(ValueError):
     """A hypothesis file, or its stored parameters, that breaks a req 10 rule."""
+
+
+class ProseOnlyEditError(HypothesisFileError):
+    """A registered file edited outside its frozen values: same slug and fingerprint,
+    new doc hash (strategy-lab spec, "Family rules" criterion). In every state."""
+
+
+class LabRegistrationError(HypothesisFileError):
+    """A standalone file refused after the lab (`is_lab_initialised`): not a promoted
+    file, a new family's first file, a promoted file off its variant's fingerprint or
+    its family rules, or with an infeasible signal anchor."""
 
 
 @dataclass(frozen=True)
@@ -299,22 +334,180 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     return frozen_params_of(_overlay(settings, parsed.file_params), family=parsed.family)
 
 
+def _check_latest(
+    conn: duckdb.DuckDBPyConnection, path: Path, record: registry.HypothesisRecord
+) -> registry.HypothesisRecord:
+    latest = registry.get_hypothesis(conn, record.slug)
+    if latest.hypothesis_id != record.hypothesis_id:
+        raise HypothesisFileError(
+            f"{path}: matches registration {record.hypothesis_id} of {record.slug!r}, "
+            f"which is not the latest ({latest.hypothesis_id}); runs use the latest. "
+            "Change the file (a new hypothesis) or use a new slug"
+        )
+    return record
+
+
+def _slug_registrations(
+    conn: duckdb.DuckDBPyConnection, slug: str
+) -> list[registry.HypothesisRecord]:
+    return [
+        registry.get_hypothesis_by_id(conn, hypothesis_id)
+        for (hypothesis_id,) in conn.execute(
+            "SELECT hypothesis_id FROM hypotheses WHERE slug = ? ORDER BY hypothesis_id", [slug]
+        ).fetchall()
+    ]
+
+
+def _fingerprint_of(record: registry.HypothesisRecord) -> str:
+    return frozen.fingerprint(record.family, frozen.frozen_values(record), record.in_sample_start)
+
+
+def _rule_differences(
+    parsed: HypothesisFile, params: Mapping[str, Any], rules: lab_registry.FamilyRules
+) -> list[str]:
+    """The family rules `parsed` (frozen set `params`) breaks, by name: the window, and
+    every forbidden-prefix value (`costs.per_side_bps` may only rise; a frozen key the
+    rules lack is accepted at its `FROZEN_KEY_DEFAULTS` default)."""
+    differences = [
+        name
+        for name, ours, theirs in (
+            ("holdout.start", parsed.holdout_start, rules.holdout_start),
+            ("holdout.end", parsed.holdout_end, rules.holdout_end),
+            ("in_sample_start", parsed.in_sample_start, rules.in_sample_start),
+        )
+        if ours != theirs
+    ]
+    for key, rule in sorted(rules.fixed_params.items()):
+        value = params.get(key)
+        if key == registry.BASE_COST_KEY:
+            if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
+                continue
+            differences.append(f"{key} (lower than the family's {rule})")
+        elif key not in params or not frozen.is_default(value, rule):
+            differences.append(key)
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    differences += sorted(
+        f"{key} (not fixed by the family rules)"
+        for key, value in params.items()
+        if key.startswith(FORBIDDEN_AXIS_PREFIXES)
+        and key not in rules.fixed_params
+        and not (key in defaults and frozen.is_default(value, defaults[key]))
+    )
+    return differences
+
+
+def _anchor_refusal(
+    conn: duckdb.DuckDBPyConnection, parsed: HypothesisFile, params: Mapping[str, Any]
+) -> str | None:
+    """Req 1(d) for a promoted file, or None. Only a family whose signal reads the
+    `strategy` anchors has anchors to check."""
+    if "strategy.formation_months" not in params:
+        return None
+    first = lab_registry.first_session(conn)
+    if first is None:
+        return "the store has no bar sessions, so no formation anchor can be read"
+    cadence = params["schedule.rebalance_cadence"]
+    sessions = rebalance_sessions(
+        parsed.in_sample_start, parsed.holdout_start - timedelta(days=1), cadence
+    )
+    if not sessions:
+        return (
+            f"no rebalance session at {cadence} between in_sample_start "
+            f"{parsed.in_sample_start} and holdout.start {parsed.holdout_start}"
+        )
+    return check_anchor_feasible(
+        params["strategy.formation_months"],
+        params["strategy.skip_months"],
+        params["schedule.signal_anchor"],
+        cadence,
+        sessions[0],
+        first,
+    )
+
+
+def _lab_refusal(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    parsed: HypothesisFile,
+    params: Mapping[str, Any],
+    fingerprint: str,
+    promotion_of: int | None,
+) -> None:
+    """Every lab refusal of a new standalone registration (module docstring)."""
+    if promotion_of is None:
+        raise LabRegistrationError(
+            f"{path}: after the strategy lab a standalone file is registered only as a "
+            "promoted file (`sweep promote`); write it as a one-value sweep "
+            "(docs/templates/sweep.md), run it and promote it"
+        )
+    row = conn.execute(
+        "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [promotion_of]
+    ).fetchone()
+    if row is None:
+        raise LabRegistrationError(f"{path}: promotion_of {promotion_of} is not a sweep variant")
+    if row[0] != fingerprint:
+        raise LabRegistrationError(
+            f"{path}: its fingerprint differs from variant {promotion_of}'s, which it promotes"
+        )
+    rules = lab_registry.family_rules(conn, parsed.family)
+    if rules is None:
+        raise LabRegistrationError(
+            f"{path}: family {parsed.family!r} has no family rules; a new family's first "
+            "registration is a sweep (`sweep register`)"
+        )
+    broken = _rule_differences(parsed, params, rules)
+    if broken:
+        raise LabRegistrationError(
+            f"{path}: differs from family {parsed.family!r}'s rules: {', '.join(broken)}"
+        )
+    reason = _anchor_refusal(conn, parsed, params)
+    if reason is not None:
+        raise LabRegistrationError(f"{path}: {reason}")
+
+
 def register(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
     *,
     registered_by: str,
     settings: Settings | None = None,
+    promotion_of: int | None = None,
 ) -> registry.HypothesisRecord:
     """Register the hypothesis in `path` through `store.registry` and return its record.
 
-    An unchanged file with unchanged live values returns the existing record; a changed
-    file or frozen set is a new hypothesis (the registry decides both, and refuses a
-    family outside `hypotheses.families`). Refuses a file whose record is not the
-    slug's latest registration, since `load_frozen` would run the latest one instead.
+    In every state: an unchanged file (same slug and doc hash) whose canonical frozen
+    set equals a stored registration's returns that record without writing; a
+    prose-only edit (same slug and fingerprint, new doc hash) raises
+    `ProseOnlyEditError`; a changed frozen set is a new hypothesis (the registry
+    refuses a family outside `hypotheses.families`). Refuses a file whose record is
+    not the slug's latest registration, since `load_frozen` would run the latest one
+    instead. When the lab is initialised, a new registration must be a promoted file:
+    `promotion_of` names the sweep variant it promotes (`sweep promote` passes it and
+    appends the `promotion` decision naming the returned record); otherwise, or when
+    it breaks a lab rule, `LabRegistrationError` (module docstring). `promotion_of` is
+    ignored on a store without the lab tables.
     """
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
+    params = frozen_params(parsed, settings)
+    canonical = frozen.canonical_frozen_set(params, parsed.family)
+    fingerprint = frozen.fingerprint(parsed.family, params, parsed.in_sample_start)
+    registrations = _slug_registrations(conn, parsed.slug)
+    for existing in registrations:
+        if existing.doc_sha256 == parsed.doc_sha256 and (
+            frozen.canonical_frozen_set(frozen.frozen_values(existing), existing.family)
+            == canonical
+        ):
+            return _check_latest(conn, path, existing)
+    for existing in registrations:
+        if existing.doc_sha256 != parsed.doc_sha256 and _fingerprint_of(existing) == fingerprint:
+            raise ProseOnlyEditError(
+                f"{path}: a prose-only edit of registration {existing.hypothesis_id} of "
+                f"{parsed.slug!r} (same fingerprint, new doc hash) is refused; the "
+                "registered file is the record"
+            )
+    if is_lab_initialised(conn):
+        _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of)
     record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
@@ -322,21 +515,14 @@ def register(
         title=parsed.title,
         doc_path=path.as_posix(),
         doc_sha256=parsed.doc_sha256,
-        params=frozen_params(parsed, settings),
+        params=params,
         in_sample_start=parsed.in_sample_start,
         holdout_start=parsed.holdout_start,
         holdout_end=parsed.holdout_end,
         registered_by=registered_by,
         settings=settings,
     )
-    latest = registry.get_hypothesis(conn, parsed.slug)
-    if latest.hypothesis_id != record.hypothesis_id:
-        raise HypothesisFileError(
-            f"{path}: matches registration {record.hypothesis_id} of {parsed.slug!r}, "
-            f"which is not the latest ({latest.hypothesis_id}); runs use the latest. "
-            "Change the file (a new hypothesis) or use a new slug"
-        )
-    return record
+    return _check_latest(conn, path, record)
 
 
 def load_frozen(
