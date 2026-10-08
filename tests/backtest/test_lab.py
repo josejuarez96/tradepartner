@@ -538,10 +538,6 @@ def test_an_interrupt_mid_group_closes_the_run_and_leaves_its_trials_unfinished(
     assert lab.run_sweep(SLUG, clock=clock).n_planned == 4
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1232: registry.write_result still fails a run on any ingest (Phase 3 rule)",
-)
 def test_a_row_after_the_cutoff_inserted_mid_group_fails_nothing(
     store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

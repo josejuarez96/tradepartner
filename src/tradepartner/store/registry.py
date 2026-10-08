@@ -34,9 +34,10 @@ first registered in, so moving it cannot reset N or hide holdout spends.
 
 **Result rows.** `close_trial` records any outcome other than `ok`
 (`failed` and the three refusals), with no statistics. `write_result`
-records `ok` with its statistics, unless the store's latest `ingested_at`
-differs from the value captured at `open_trial`: then it records `failed`
-with `STORE_CHANGED_MESSAGE` instead and returns `"failed"` (spec req 9).
+records `ok` with its statistics, unless the data vintage at the trial's
+cutoff differs from the one `open_trial` recorded (spec req 9 as amended,
+#1232; the store's latest `ingested_at` for a trial without one): then it
+records `failed` with `STORE_CHANGED_MESSAGE` instead and returns `"failed"`.
 It returns rather than raises so the row survives the caller's commit.
 Detail rows (`write_metrics`, `write_equity`, `write_weights`,
 `write_rebalances`) are refused once a trial has its result row.
@@ -819,8 +820,8 @@ def write_result(
     message: str | None = None,
 ) -> str:
     """Record an `ok` outcome with `stats` and return `"ok"`; or, when the
-    store's latest `ingested_at` moved since `open_trial`, record `failed`
-    with `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`.
+    store changed under the run (`_store_changed`), record `failed` with
+    `STORE_CHANGED_MESSAGE` and no statistics and return `"failed"`.
     Refuses a trial opened without a `data_cutoff`: only refusals lack one."""
     _check_open(conn, handle)
     cutoff = conn.execute(
@@ -831,11 +832,31 @@ def write_result(
             f"trial {handle.trial_id} has no data_cutoff; an ok run needs its resolved end "
             "(it keys the trial's V pair)"
         )
-    if store_max_ingested_at(conn) != handle.store_max_ingested_at:
+    if _store_changed(conn, handle, cutoff[0]):
         _insert_result(conn, handle, "failed", STORE_CHANGED_MESSAGE, ResultStatistics())
         return "failed"
     _insert_result(conn, handle, "ok", message, stats)
     return "ok"
+
+
+def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff: datetime) -> bool:
+    """Backtest spec req 9 as amended (strategy-lab spec amendment 7, #1232): the
+    data vintage at the trial's own `cutoff` differs from the one `open_trial`
+    recorded, so a late fact known at or before the cutoff fails the run and a row
+    for a session after it fails nothing. A trial without a recorded vintage (a
+    store before schema version 15, or no fact known at its cutoff when it opened)
+    keeps the Phase 3 rule, the stricter one: the store's latest `ingested_at` at
+    open and write."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info('trials')").fetchall()}
+    recorded: datetime | None = None
+    if "data_vintage" in columns:
+        row = conn.execute(
+            "SELECT data_vintage FROM trials WHERE trial_id = ?", [handle.trial_id]
+        ).fetchone()
+        recorded = row[0] if row is not None else None
+    if recorded is None:
+        return store_max_ingested_at(conn) != handle.store_max_ingested_at
+    return data_vintage(conn, cutoff) != recorded
 
 
 def _insert_result(
