@@ -501,6 +501,19 @@ class AlpacaConfig(BaseModel):
     #: later row of their ticker as before #905. Default empty. A malformed id
     #: refuses the config, so a typo never leaves a live name cut silently.
     accepted_relistings: list[str] = Field(default_factory=list)
+    #: Master ticker -> Alpaca symbol for NYSE class shares whose cover page
+    #: writes no dot (#1219: Brown-Forman, `BFB` is Alpaca's `BF.B`).
+    #: Applied to NYSE listings only (`master_symbol`); the spelling is never
+    #: guessed (CVNA, UAA, WLYB are real undotted symbols). Add a pair here
+    #: when a NYSE class name has no bars; a value must be an Alpaca symbol.
+    class_symbols: dict[str, str] = Field(
+        default_factory=lambda: {
+            "BFA": "BF.A",
+            "BFB": "BF.B",
+            "HVTA": "HVT.A",
+            "WSOB": "WSO.B",
+        }
+    )
     # --- Phase 4 trading keys (docs/specs/paper-trading.md req 2, T47) ---
     # Guarded: the trading client is constructed with `paper=True` on every path
     # and a `false` here is refused, even from the environment (validator below).
@@ -521,6 +534,17 @@ class AlpacaConfig(BaseModel):
     def _check_accepted_relistings(cls, value: list[str]) -> list[str]:
         for entry in value:
             check_security_id(entry, "alpaca.accepted_relistings")
+        return value
+
+    @field_validator("class_symbols")
+    @classmethod
+    def _check_class_symbols(cls, value: dict[str, str]) -> dict[str, str]:
+        for ticker, symbol in value.items():
+            if not re.fullmatch(r"[A-Z]+", ticker) or not re.fullmatch(r"[A-Z]+\.[A-Z]", symbol):
+                raise ValueError(
+                    f"alpaca.class_symbols: {ticker!r} -> {symbol!r} must map an undotted "
+                    "upper-case ticker to a dotted class symbol (BFB -> BF.B)"
+                )
         return value
 
     @field_validator("paper")
