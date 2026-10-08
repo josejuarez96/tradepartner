@@ -290,23 +290,54 @@ def test_yield_counts_rule_errors_only() -> None:
         "a_model": "model",
         "a_rule": "rule",
     }
-    metrics = review.batch_metrics(entries, decided, n_rows=40, n_deferred=3, n_unresolved=4)
+    metrics = review.batch_metrics(
+        entries, decided, n_rows=10, n_deferred=0, n_unresolved=3, n_disagreements=3
+    )
     # rule errors: d_model, d_wrong, u_wrong (never u_model) over six reviewed items
     assert metrics["yield"] == pytest.approx(3 / 6)
     assert metrics["yield_n"] == 6
-    # weights: 1 each, 2 for each agreement; `unresolved` decisions excluded (weight 9)
-    # model right: d_model, u_model, a_model; rule right: d_rule, u_model, a_model, a_rule
-    assert metrics["model_accuracy"] == pytest.approx((1 + 1 + 2) / 9)
-    assert metrics["rule_accuracy"] == pytest.approx((1 + 1 + 2 + 2) / 9)
+    # scored: d_* (3 of 3 rows, weight 1), u_wrong only (u_model and u_unsure say
+    # nothing: 1 scored for 3 rows, weight 3), a_* (2 scored for 4 rows, weight 2).
+    # model right: d_model, a_model; rule right: d_rule, a_model, a_rule.
+    assert metrics["model_accuracy"] == pytest.approx((1 + 2) / 10)
+    assert metrics["rule_accuracy"] == pytest.approx((1 + 2 + 2) / 10)
+    assert metrics["strata_unscored"] == []
     assert metrics["agreement_n"] == 2 and metrics["underpowered"] is True
-    assert (metrics["n_reviewed"], metrics["n_deferred"]) == (8, 3)
-    assert metrics["unresolved_share"] == pytest.approx(4 / 40)
+    assert (metrics["n_reviewed"], metrics["n_deferred"]) == (8, 0)
+    assert metrics["unresolved_share"] == pytest.approx(3 / 10)
     assert 0.0 < metrics["yield_lower_bound"] < 0.5
+
+
+def test_the_weights_are_post_stratified_when_items_are_deferred() -> None:
+    # four disagreements, two reviewed (two deferred); six agreements, one reviewed
+    entries = {
+        "d1": _sides("disagreement", model="transfer", row=5),
+        "d2": _sides("disagreement", model="transfer", row=5),
+        "a1": _sides("agreement_sample", model="terminal", row=5, rate=0.5),
+    }
+    decided: dict[str, Any] = {"d1": "model", "d2": "rule", "a1": "model"}
+    metrics = review.batch_metrics(
+        entries, decided, n_rows=10, n_deferred=4, n_unresolved=0, n_disagreements=4
+    )
+    # weights 4/2 per disagreement and 6/1 for the agreement (1/rate would give 0.75)
+    assert metrics["model_accuracy"] == pytest.approx((2 + 6) / 10)
+    assert metrics["rule_accuracy"] == pytest.approx((2 + 6) / 10)
+    only_disagreements = review.batch_metrics(
+        {k: v for k, v in entries.items() if k != "a1"},
+        {"d1": "model", "d2": "rule"},
+        n_rows=10,
+        n_deferred=6,
+        n_unresolved=0,
+        n_disagreements=4,
+    )
+    assert only_disagreements["strata_unscored"] == ["agreement_sample"]
 
 
 def test_a_single_class_rule_answer_chosen_makes_the_matching_model_right() -> None:
     entries = {"x": _sides("agreement_sample", model="transfer", row=1)}
-    metrics = review.batch_metrics(entries, {"x": "rule"}, n_rows=1, n_deferred=0, n_unresolved=0)
+    metrics = review.batch_metrics(
+        entries, {"x": "rule"}, n_rows=1, n_deferred=0, n_unresolved=0, n_disagreements=0
+    )
     assert (metrics["model_accuracy"], metrics["rule_accuracy"]) == (1.0, 1.0)
 
 
@@ -334,6 +365,32 @@ def test_finish_refuses_a_partial_session_then_writes_the_result(world: World) -
     with pytest.raises(review.SessionFinished):
         review.record_undo(session, session.items[0])
     assert review.finish(session) == done
+    # a `finish` interrupted after the result and before its marker completes on rerun
+    session.finished_path.unlink()
+    again = review.finish(session)
+    assert (again.outcome, again.dataset_id, again.sha256) == ("ok", done.dataset_id, done.sha256)
+    with pytest.raises(review.SessionFinished):
+        _decide(session, session.items[0], "b")
+
+
+def test_writes_stop_once_finish_has_begun(world: World, batch: int) -> None:
+    session = _session(world, batch)
+    session.finishing_path.parent.mkdir(parents=True, exist_ok=True)
+    session.finishing_path.touch()
+    with pytest.raises(review.SessionFinished):
+        _decide(session, session.items[0])
+
+
+def test_a_batch_with_no_records_file_can_be_reviewed(world: World, batch: int) -> None:
+    listed_path = datafiles.shortlist_path(world.settings, batch)
+    listed = json.loads(listed_path.read_text())
+    datafiles.inference_path(world.settings, batch).unlink()
+    with pytest.raises(review.ReviewRefused, match="differ"):
+        _session(world, batch)
+    listed_path.write_text(json.dumps({**listed, "records_sha256": ""}))
+    session = _session(world, batch)
+    views = [review.item_view(session, i.index) for i in session.items]
+    assert all(review.UNRESOLVED_PHRASE in (v.a, v.b) for v in views)
 
 
 # --- no runtime-store connection ---------------------------------------------------------

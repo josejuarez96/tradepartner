@@ -32,19 +32,23 @@ an undo line that reopens the item, so the next decision is accepted and wins.
 
 **`finish`** refuses a partial session, registers the review file under
 `departure-reason-reviews`, computes the batch metrics (`batch_metrics`) and writes
-the run's result, all on the caller's connection through `store.research`; a marker
-file beside the review file then refuses every later write. This module opens no
+the run's result, all on the caller's connection through `store.research`. A
+`finishing` marker written before the registry writes freezes the review file (a rerun
+after an interruption registers the same hash and reads back the closed run's outcome),
+and a `finished` marker after them returns the stored result. Every write takes a file
+lock beside the review file around its check and its append. This module opens no
 connection itself and reads no table outside the research registry.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import random
 import re
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -55,8 +59,10 @@ from tradepartner.research.labeling import crosswalk
 from tradepartner.research.labeling.gold import EDGAR_INDEX_URL, EightKView
 from tradepartner.research.labeling.scoring import clopper_pearson_lower_bound
 from tradepartner.store.research import (
+    RunAlreadyClosed,
     attach_run,
     get_registration,
+    list_runs,
     register_dataset,
     write_result,
 )
@@ -150,6 +156,7 @@ class ReviewSession:
     n_rows: int
     n_deferred: int
     n_unresolved: int
+    n_disagreements: int
     cost_usd: float
     entries: Mapping[str, ItemSides] = field(repr=False)
     rows: Mapping[str, Mapping[str, Any]] = field(repr=False)
@@ -168,6 +175,18 @@ class ReviewSession:
     def finished_path(self) -> Path:
         """Written once `finish` has written the run's result."""
         return self.review_path.with_name(f"{self.run_id}.finished.json")
+
+    @property
+    def finishing_path(self) -> Path:
+        """Written before `finish`'s registry writes: from then on the review file
+        never changes, even if `finish` is interrupted and run again."""
+        return self.review_path.with_name(f"{self.run_id}.finishing")
+
+    @property
+    def lock_path(self) -> Path:
+        """Held while a write checks the file and appends, so two pages on one run
+        cannot both pass the already-decided check."""
+        return self.review_path.with_name(f"{self.run_id}.lock")
 
 
 @dataclass(frozen=True)
@@ -236,6 +255,13 @@ def _rule_classes(rule_row: int) -> list[str]:
     return [c for c, members in crosswalk.CLASSES.items() if members & options]
 
 
+def _utc(lid: str, value: object) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        raise ReviewRefused(f"{lid}: form25_accepted_at {value!r} is not timezone-aware")
+    return parsed
+
+
 def build_review_session(
     run_id: int, *, settings: Settings, connect: Connect, code_version: str
 ) -> ReviewSession:
@@ -251,11 +277,13 @@ def build_review_session(
         raise ReviewRefused(f"run {run_id} has no shortlist at {shortlist_file}")
     listed = json.loads(shortlist_file.read_text(encoding="utf-8"))
     records_file = datafiles.inference_path(settings, run_id)
-    if not records_file.is_file() or _sha256(records_file) != listed["records_sha256"]:
+    present = records_file.is_file()
+    # A batch whose every packet was refused writes no records file and an empty hash.
+    if (_sha256(records_file) if present else "") != listed["records_sha256"]:
         raise ReviewRefused(f"run {run_id}'s inference records differ from its shortlist's")
     finals: dict[str, Mapping[str, Any]] = {}
     cost = 0.0
-    for record in datafiles.read_jsonl(records_file):
+    for record in datafiles.read_jsonl(records_file) if present else []:
         finals[str(record["listing_end_id"])] = record
         cost += float(record.get("cost_usd") or 0.0)
     rows = {str(r["listing_end_id"]): r for r in load_dataset(handle).iter_rows(named=True)}
@@ -276,9 +304,7 @@ def build_review_session(
             model_class=None if option is None else crosswalk.class_of(option),
             rule_row=crosswalk.crosswalk_row(_rule_answer(rows[lid])),
             a_side=a_side(run_id, lid),
-            accepted_at=accepted
-            if isinstance(accepted, datetime)
-            else datetime.fromisoformat(accepted),
+            accepted_at=_utc(lid, accepted),
         )
         items.append(ReviewItem(len(items), lid))
     return ReviewSession(
@@ -290,6 +316,7 @@ def build_review_session(
         n_rows=int(listed["n_rows"]),
         n_deferred=int(listed["n_deferred"]),
         n_unresolved=sum(1 for raw in listed["items"] if raw["stratum"] == "unresolved"),
+        n_disagreements=sum(1 for raw in listed["items"] if raw["stratum"] == "disagreement"),
         cost_usd=cost,
         entries=entries,
         rows={lid: rows[lid] for lid in entries},
@@ -374,8 +401,19 @@ def final_lines(session: ReviewSession) -> dict[str, dict[str, Any] | None]:
     return finals
 
 
+@contextmanager
+def _locked(session: ReviewSession) -> Iterator[None]:
+    session.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with session.lock_path.open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _writable(session: ReviewSession, item: ReviewItem | str) -> tuple[str, dict[str, Any] | None]:
-    if session.finished_path.exists():
+    if session.finished_path.exists() or session.finishing_path.exists():
         raise SessionFinished(f"the review of run {session.run_id} is finished")
     lid = item.listing_end_id if isinstance(item, ReviewItem) else item
     finals = final_lines(session)
@@ -414,6 +452,18 @@ def record_decision(
     outside `a`, `b`, `both_wrong`, `unresolved`, an empty reason, a `relied_on`
     other than `notice`, `8-K item N.NN` or `outside`, and `outside` without
     `passage_ref`."""
+    with _locked(session):
+        return _record_decision(session, item, decision, reason, relied_on, passage_ref)
+
+
+def _record_decision(
+    session: ReviewSession,
+    item: ReviewItem | str,
+    decision: str,
+    reason: str,
+    relied_on: str,
+    passage_ref: str | None,
+) -> Decision:
     lid, final = _writable(session, item)
     if final is not None:
         raise AlreadyDecided(f"{lid} is already decided; undo it first")
@@ -453,21 +503,22 @@ def record_decision(
 def record_undo(session: ReviewSession, item: ReviewItem | str) -> None:
     """Append an undo line that reopens a decided item; the next `record_decision`
     is accepted and, as the last line, wins at `finish`."""
-    lid, final = _writable(session, item)
-    if final is None:
-        raise ReviewRefused(f"{lid} has no decision to undo")
-    datafiles.append_jsonl(
-        session.review_path,
-        [
-            {
-                "review_id": _review_id(session),
-                "run_id": session.run_id,
-                "listing_end_id": lid,
-                "undo": True,
-                "known_at": _now(),
-            }
-        ],
-    )
+    with _locked(session):
+        lid, final = _writable(session, item)
+        if final is None:
+            raise ReviewRefused(f"{lid} has no decision to undo")
+        datafiles.append_jsonl(
+            session.review_path,
+            [
+                {
+                    "review_id": _review_id(session),
+                    "run_id": session.run_id,
+                    "listing_end_id": lid,
+                    "undo": True,
+                    "known_at": _now(),
+                }
+            ],
+        )
 
 
 def next_item(session: ReviewSession) -> int | None:
@@ -479,14 +530,23 @@ def next_item(session: ReviewSession) -> int | None:
 # --- the batch metrics and finish -------------------------------------------------
 
 
-def _correct(entry: ItemSides, decided_for: str) -> tuple[bool, bool]:
-    """`(model right, rule right)` for one decided item (decided `rule` or `model`).
-    The chosen side is right; the other is right too when the chosen answer implies
-    it: the model's class inside the rule's class set (or a model `unresolved`, not
-    a rule error, req 10), or the rule's set that one class itself."""
+def _correct(entry: ItemSides, decided_for: str) -> tuple[bool, bool] | None:
+    """`(model right, rule right)` for one decided item, or `None` when the item says
+    nothing about either side's accuracy: an owner `unresolved`, or a `model` decision
+    on a model `unresolved` (the filings do not state the reason: not a rule error for
+    yield, but no confirmation of the rule's class either; QA pass 1). Otherwise the
+    chosen side is right, and the other is right too when the chosen answer implies
+    it: the model's class inside the rule's class set, or the rule's set that one
+    class itself. `both_wrong` makes both wrong."""
+    if decided_for == "unresolved":
+        return None
+    if decided_for == "both_wrong":
+        return False, False
     rule_classes = _rule_classes(entry.rule_row)
     if decided_for == "model":
-        return True, entry.model_class is None or entry.model_class in rule_classes
+        if entry.model_class is None:
+            return None
+        return True, entry.model_class in rule_classes
     return rule_classes == [entry.model_class], True
 
 
@@ -497,18 +557,27 @@ def batch_metrics(
     n_rows: int,
     n_deferred: int,
     n_unresolved: int,
+    n_disagreements: int,
 ) -> dict[str, Any]:
     """Req 10's batch metrics over the reviewed items (`decided`: the final
-    `decided_for` per listing end). `yield`: over reviewed `disagreement` and
-    `unresolved` items, the share on which the rule was wrong (`both_wrong`, or
-    `model` on a `disagreement`; never `model` on an `unresolved` item). Model and
-    rule accuracy: each item decided `rule`, `model` or `both_wrong` weighted by the
-    inverse of its stratum's sampling rate (an `unresolved` decision is excluded);
-    the agreement stratum's own Clopper-Pearson lower bounds beside them, flagged
-    `underpowered` below `MIN_AGREEMENTS` reviewed agreements."""
+    `decided_for` per listing end).
+
+    `yield`: over reviewed `disagreement` and `unresolved` items, the share on which
+    the rule was wrong (`both_wrong`, or `model` on a `disagreement`; never `model` on
+    an `unresolved` item). Model and rule accuracy: post-stratified, each scored item
+    weighted `N_h / r_h` (the stratum's rows in the batch over its scored items), which
+    is the inverse of the stratum's sampling rate when nothing is deferred and stays
+    unbiased when `max_items` defers part of a stratum (QA pass 1); a stratum with rows
+    but no scored item is listed under `strata_unscored`. `N_h` is the shortlist's
+    count for `disagreement` and `unresolved` (deferred included) and the remaining
+    rows for the agreements. The agreement stratum's Clopper-Pearson lower bounds are
+    reported beside them, flagged `underpowered` below `MIN_AGREEMENTS`."""
     errors = considered = 0
-    weight = model_w = rule_w = 0.0
-    agreements = agree_model = agree_rule = 0
+    scored: dict[str, list[tuple[bool, bool]]] = {
+        "disagreement": [],
+        "unresolved": [],
+        "agreement_sample": [],
+    }
     for lid, decided_for in decided.items():
         entry = entries[lid]
         if entry.stratum in ("disagreement", "unresolved"):
@@ -516,31 +585,37 @@ def batch_metrics(
             errors += decided_for == "both_wrong" or (
                 decided_for == "model" and entry.stratum == "disagreement"
             )
-        if decided_for == "unresolved":
-            continue
-        model_ok, rule_ok = (False, False)
-        if decided_for in ("rule", "model"):
-            model_ok, rule_ok = _correct(entry, decided_for)
-        w = 1.0 / entry.sampling_rate
-        weight += w
-        model_w += w * model_ok
-        rule_w += w * rule_ok
-        if entry.stratum == "agreement_sample":
-            agreements += 1
-            agree_model += model_ok
-            agree_rule += rule_ok
+        result = _correct(entry, decided_for)
+        if result is not None:
+            scored[entry.stratum].append(result)
+    population = {
+        "disagreement": n_disagreements,
+        "unresolved": n_unresolved,
+        "agreement_sample": max(n_rows - n_disagreements - n_unresolved, 0),
+    }
+    weight = model_w = rule_w = 0.0
+    for stratum, results in scored.items():
+        if results:
+            w = population[stratum] / len(results)
+            weight += w * len(results)
+            model_w += w * sum(m for m, _ in results)
+            rule_w += w * sum(r for _, r in results)
+    agreements = scored["agreement_sample"]
     return {
         "yield": errors / considered if considered else 0.0,
         "yield_lower_bound": clopper_pearson_lower_bound(errors, considered),
         "yield_n": considered,
         "model_accuracy": model_w / weight if weight else None,
         "rule_accuracy": rule_w / weight if weight else None,
-        "agreement_n": agreements,
+        "strata_unscored": sorted(h for h, n in population.items() if n and not scored[h]),
+        "agreement_n": len(agreements),
         "agreement_model_accuracy_lower_bound": clopper_pearson_lower_bound(
-            agree_model, agreements
+            sum(m for m, _ in agreements), len(agreements)
         ),
-        "agreement_rule_accuracy_lower_bound": clopper_pearson_lower_bound(agree_rule, agreements),
-        "underpowered": agreements < MIN_AGREEMENTS,
+        "agreement_rule_accuracy_lower_bound": clopper_pearson_lower_bound(
+            sum(r for _, r in agreements), len(agreements)
+        ),
+        "underpowered": len(agreements) < MIN_AGREEMENTS,
         "unresolved_share": n_unresolved / n_rows if n_rows else 0.0,
         "n_reviewed": len(decided),
         "n_deferred": n_deferred,
@@ -566,11 +641,19 @@ def finish(session: ReviewSession) -> FinishResult:
         n_rows=session.n_rows,
         n_deferred=session.n_deferred,
         n_unresolved=session.n_unresolved,
+        n_disagreements=session.n_disagreements,
     )
     metrics["cost_usd"] = session.cost_usd
     path = session.review_path
+    with _locked(session):
+        session.finishing_path.touch()  # the review file is frozen from here on
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()  # a session with no item still registers its (empty) review file
     sha = _sha256(path)
-    days = [e.accepted_at.astimezone(UTC).date() for e in session.entries.values()]
+    days = [e.accepted_at.astimezone(UTC).date() for e in session.entries.values()] or [
+        session.handle.dataset.event_start,
+        session.handle.dataset.event_end,
+    ]
     with session.connect() as conn:
         record = register_dataset(
             conn,
@@ -584,23 +667,46 @@ def finish(session: ReviewSession) -> FinishResult:
             note=f"review records of research run {session.run_id}",
         )
         declared = set(get_registration(conn, session.handle.slug).secondary)
-        outcome = write_result(
-            conn,
-            session.handle,
-            primary_value=metrics["yield"],
-            primary_ci_low=metrics["yield_lower_bound"],
-            primary_ci_high=1.0,
-            n_observations=metrics["n_reviewed"],
-            n_clusters=metrics["yield_n"],
-            n_configurations=1,
-            artifact_sha256=sha,
-            artifact_path=str(path),
-            secondary={k: v for k, v in metrics.items() if k in declared},
-            exploratory={
-                "reviews_dataset_id": record.dataset_id,
-                **{k: v for k, v in metrics.items() if k not in declared},
-            },
-        )
+        try:
+            outcome = _write_result(conn, session, metrics, sha, declared, record.dataset_id)
+        except RunAlreadyClosed:
+            # an earlier `finish` wrote the result and stopped before its marker
+            outcome = _closed_outcome(conn, session)
     done = {"outcome": outcome, "dataset_id": record.dataset_id, "sha256": sha, "metrics": metrics}
     session.finished_path.write_text(json.dumps(done, indent=2) + "\n", encoding="utf-8")
     return FinishResult(outcome, record.dataset_id, sha, metrics)
+
+
+def _closed_outcome(conn: duckdb.DuckDBPyConnection, session: ReviewSession) -> str:
+    for run in list_runs(conn, session.handle.slug, include_synthetic=True):
+        if run.run_id == session.run_id:
+            return run.outcome
+    raise ReviewRefused(f"run {session.run_id} is closed but not listed")
+
+
+def _write_result(
+    conn: duckdb.DuckDBPyConnection,
+    session: ReviewSession,
+    metrics: Mapping[str, Any],
+    sha: str,
+    declared: set[str],
+    dataset_id: int,
+) -> str:
+    path = session.review_path
+    return write_result(
+        conn,
+        session.handle,
+        primary_value=metrics["yield"],
+        primary_ci_low=metrics["yield_lower_bound"],
+        primary_ci_high=1.0,
+        n_observations=metrics["n_reviewed"],
+        n_clusters=metrics["yield_n"],
+        n_configurations=1,
+        artifact_sha256=sha,
+        artifact_path=str(path),
+        secondary={k: v for k, v in metrics.items() if k in declared},
+        exploratory={
+            "reviews_dataset_id": dataset_id,
+            **{k: v for k, v in metrics.items() if k not in declared},
+        },
+    )
