@@ -26,6 +26,7 @@ concatenation (`"typesafe" + ".ai"`) passes them; reviewers read diffs for that.
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
 import io
 import json
@@ -36,6 +37,7 @@ import tokenize
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -67,7 +69,6 @@ SCANNED_ROOTS = ("src", "scripts")
 #: vendor host unseen.
 TESTS_ROOT = "tests"
 
-PENDING = "labeling modules pending"
 RECORDINGS_PENDING = "owner recordings pending"
 
 
@@ -766,10 +767,122 @@ def test_d_store_tables_cover_every_named_table(tmp_path: Path) -> None:
     assert named | set(REGISTRY_TABLE_NAMES) | set(RESEARCH_TABLE_NAMES) <= set(_snapshot(store))
 
 
-def _register_two_row_frame(settings: Any) -> int:
-    """Register the scenario's registration and two-row fixture frame; the dataset id.
-    Written by whichever of T123 and T123b lands second (see `_labeling_scenario`)."""
-    pytest.fail("test (d) un-skipped: write _register_two_row_frame (T118's declared stub)")
+def _register_two_row_frame(settings: Any) -> tuple[int, Any]:
+    """Register the scenario's registrations, a one-row gold export with its baseline
+    `dev` run (the drift probe a frame batch runs first, C5) and the two-row fixture
+    frame on the fixture store; returns the frame's dataset id and the drift probe.
+    Written by T123b, the second of T123 and T123b to land (T118's declared stub)."""
+    from research.fake_model_client import (  # type: ignore[import-not-found]
+        Answer,
+        ScriptedModelClient,
+    )
+    from research.labeling.test_job import (  # type: ignore[import-not-found]
+        MERGER,
+        MODEL,
+        _experiment,
+        _gold_row,
+        _row,
+        _write,
+    )
+
+    from tradepartner.research.labeling import job
+    from tradepartner.store import research
+
+    workspace = Path(settings.store.path).parent
+    start = datetime(2019, 1, 2, 15, tzinfo=UTC)
+    frame_rows = [
+        _row("F1", start, eightk=False),
+        _row("F2", start + timedelta(days=1), eightk=False),
+    ]
+    gold_rows = [_gold_row("D1", datetime(2016, 3, 1, 15, tzinfo=UTC), MERGER)]
+    conn = duckdb.connect(settings.store.path)
+    try:
+        for slug, kind, dataset, splits, metric, direction, threshold in (
+            (
+                "departure-reason-batches",
+                "benchmark",
+                "departure-reason-frame",
+                ("full",),
+                "yield",
+                "greater",
+                None,
+            ),
+            (
+                "departure-reason-pilot",
+                "benchmark",
+                "departure-reason-gold",
+                ("dev", "pilot"),
+                "class_accuracy",
+                "greater",
+                0.80,
+            ),
+            (
+                "departure-reason-drift",
+                "robustness",
+                "departure-reason-gold",
+                ("dev",),
+                "flip_rate",
+                "less",
+                0.10,
+            ),
+        ):
+            parsed = _experiment(
+                slug,
+                kind=kind,
+                dataset=dataset,
+                splits=splits,
+                metric=metric,
+                direction=direction,
+                threshold=threshold,
+            )
+            research.register_experiment(conn, parsed, "owner")
+        gold_path, gold_sha = _write(workspace, "gold", gold_rows)
+        split_file = workspace / "gold.splits.json"
+        split_file.write_text(json.dumps({"splits": ["dev"]}))
+        day = gold_rows[0]["form25_accepted_at"].date()
+        gold_id = research.register_dataset(
+            conn,
+            name="departure-reason-gold",
+            version=gold_sha[:12],
+            path=str(gold_path),
+            sha256=gold_sha,
+            event_start=day,
+            event_end=day,
+            n_rows=1,
+            event_column="form25_accepted_at",
+            split_path=str(split_file),
+            split_sha256=sha256(split_file.read_bytes()).hexdigest(),
+            split_spans={"dev": (day, day)},
+            locked=True,
+            seed=11,
+        ).dataset_id
+        baseline = job.run_batch(
+            conn,
+            settings,
+            lambda _s, _h: ScriptedModelClient([Answer(MERGER)]),
+            "departure-reason-pilot",
+            gold_id,
+            "dev",
+            model=MODEL,
+            sleep=lambda _s: None,
+        )
+        assert baseline.outcome == "ok", baseline
+        frame_path, frame_sha = _write(workspace, "frame", frame_rows)
+        days = [r["form25_accepted_at"].date() for r in frame_rows]
+        frame_id = research.register_dataset(
+            conn,
+            name="departure-reason-frame",
+            version=frame_sha[:12],
+            path=str(frame_path),
+            sha256=frame_sha,
+            event_start=min(days),
+            event_end=max(days),
+            n_rows=2,
+            event_column="form25_accepted_at",
+        ).dataset_id
+    finally:
+        conn.close()
+    return frame_id, job.DriftProbe(dataset_id=gold_id, baseline_run_id=baseline.run_id)
 
 
 def _labeling_scenario(
@@ -783,21 +896,18 @@ def _labeling_scenario(
     file hashes before and after (the events file among them), and the tracked-file
     status before and after.
 
-    `run_batch`, `build_review_session(run)` and `finish(session)` are called as the
-    T123 and T123b lines write them; `record_decision(...)` has no signature on its
-    line, so its call is a guess. The task that lands the
-    second of them may edit these calls to match and names that in its PR. The
-    two-row frame and its registration need T122's frame columns and a
-    `departure-reason-batches` registration fixture, neither of which exists yet,
-    so that same task writes `_register_two_row_frame`. The assertions in the tests
-    below are this task's and do not change."""
-    from tradepartner.research.labeling import job
-
-    review = pytest.importorskip("tradepartner.research.labeling.review", reason=PENDING)
-    pytest.importorskip("tradepartner.research.models", reason=PENDING)
-    from research.fake_model_client import ScriptedModelClient  # type: ignore[import-not-found]
+    The calls follow the landed entry points (T123b edited them, as T118's stub
+    allowed): `run_batch` returns a `BatchResult` and a frame batch runs the drift
+    probe first, and the review takes the registry connection as `connect`. The
+    assertions in the tests below are T118's and do not change."""
+    from research.fake_model_client import (  # type: ignore[import-not-found]
+        Answer,
+        ScriptedModelClient,
+    )
+    from research.labeling.test_job import MERGER, MODEL  # type: ignore[import-not-found]
 
     from tradepartner.config import Settings
+    from tradepartner.research.labeling import job, review
 
     store = tmp_path / "store.duckdb"
     data_dir = tmp_path / "research"
@@ -808,8 +918,12 @@ def _labeling_scenario(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("STORE__PATH", str(store))
     monkeypatch.setenv("RESEARCH__DATA_DIR", str(data_dir))
+    # The scripted double spends nothing, but the job's spend check refuses every call
+    # under the zero defaults (C4), so the scenario sets the two ceilings (T123b).
+    for name in _CEILING_ENV:
+        monkeypatch.setenv(name, "40")
     settings = Settings(_env_file=None)
-    frame_id = _register_two_row_frame(settings)
+    frame_id, drift = _register_two_row_frame(settings)
 
     before_tables = _snapshot(store)
     before_files = file_hashes(tmp_path, skip=(store, data_dir))
@@ -829,19 +943,39 @@ def _labeling_scenario(
 
         monkeypatch.setattr(review, "finish", finish_with_planted_write)
 
-    def client_factory(*_args: object, **_kwargs: object) -> Any:
-        return ScriptedModelClient()
+    drift_client = ScriptedModelClient([Answer(MERGER)])
+    batch_client = ScriptedModelClient([Answer(MERGER), Answer("exchange_transfer")])
 
-    conn = duckdb.connect(str(store))
-    try:
-        run_id = job.run_batch(
-            conn, settings, client_factory, "departure-reason-batches", frame_id, "full"
+    def client_factory(_settings: object, handle: Any) -> Any:
+        return drift_client if handle.slug == job.DRIFT_SLUG else batch_client
+
+    @contextlib.contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        conn = duckdb.connect(str(store))
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    with connect() as conn:
+        batch = job.run_batch(
+            conn,
+            settings,
+            client_factory,
+            "departure-reason-batches",
+            frame_id,
+            "full",
+            model=MODEL,
+            drift=drift,
+            sleep=lambda _s: None,
         )
-    finally:
-        conn.close()
-    session = review.build_review_session(run_id)
+    assert batch.outcome == "unfinished", batch
+    session = review.build_review_session(
+        batch.run_id, settings=settings, connect=connect, code_version="fixture"
+    )
+    assert len(session.items) == 2
     for item in session.items:
-        review.record_decision(session, item, decision="a", reason="fixture")
+        review.record_decision(session, item, decision="a", reason="fixture", relied_on="notice")
     review.finish(session)
 
     return (
