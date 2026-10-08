@@ -795,12 +795,16 @@ what = "B4 momentum plus profitability combined by fixed equal ranks, landed as 
 why = "The proof of ADR 0014: a third family that touches nothing under execution/ or store/, nor engine.py, run.py, results.py or hypothesis.py."
 
 [task.T140]
-what = "Named data releases, store side: owner_decisions gains the data_release and development_boundary kinds in one migration, with the release reads (open release, release list, boundary date)."
-why = "Every store repair re-stamps rows and makes in-window sweep trials stale; a named release gives each store state a name a trial row can cite, and is the link from H1's spent holdout to the backup it read."
+what = "Named data releases, the rule and the record with no schema: the runbook, the release record format in a file beside the store, the trial 4 back-fill and the paper-window rule, so the owner starts recording releases now."
+why = "Every store repair restates rows and makes in-window sweep trials stale; a named release gives each store state a name a trial row can cite, and is the link from H1's spent holdout to the backup it read."
 
 [task.T140b]
-what = "Named data releases, the working side: the decision data-release open/close commands, every row-changing repair refusing to run without an open release, the repair-bars command the #1314 repair needs, and the runbook with the back-fill for trial 4 and the paper-window rule."
-why = "Releases are only a rule until the tools refuse to write without one; the runbook keeps repairs few, batched and named."
+what = "Named data releases in the store: schema version 18 adds the data_release and development_boundary kinds and the trial's boundary column, the release reads, a delete-only release moving the data vintage, and the decision data-release open/close/record/import commands."
+why = "A release recorded in the store is what a trial row and the vintage rule can read; the import carries the records written by hand under T140 into the store once."
+
+[task.T140c]
+what = "Every row-changing repair refuses to run without an open release, and repair-bars deletes one security's Alpaca bars and actions on named sessions under a release."
+why = "Releases are only a rule until the tools refuse to write without one; the #1314 repair needs a session-scoped delete the resolver-based repair cannot do."
 
 [task.T141]
 what = "Owner: the #1314 repair of the 13 securities that carry another company's bars, in one batch under a release name, after the T114 sweep and outside ingest windows."
@@ -815,8 +819,12 @@ what = "ADR 0016's window rule: default_in_sample_window ends at the earlier of 
 why = "Makes the practice end one owner value in the store instead of a per-family derivation, so B4 practises on the same months as H1 and B3 and reads nothing after 2023-12."
 
 [task.T142b]
-what = "ADR 0016's boundary read at every caller that builds a window (run, sweep, lab queries, lab registry), the decision development-boundary command, and lab status showing the boundary and marking a forward holdout."
+what = "ADR 0016's boundary read at every caller that builds a window (run, sweep, lab queries, lab registry, research runs), each trial recording the boundary it ran under, the decision development-boundary command with its refusals, and lab status showing the boundary and marking a forward holdout."
 why = "A boundary nobody reads protects nothing; after this every run and registration reads it from the store, and the owner can see which exams are forward."
+
+[task.T142c]
+what = "paper start accepts a forward holdout once its start has passed and opens the window at the first rebalance on or after it; every other refusal unchanged and pinned."
+why = "A forward exam is the paper book inside the holdout, which today's paper start refuses until the holdout has ended."
 
 [task.T143]
 what = "A short Zones section in research-program.md: development data is permissive and counted, exams are one-spend for frozen finalists, forward exams are the paper book, the boundary and who moves it."
@@ -835,7 +843,7 @@ what = "Only if buying: the identity crosswalk table and builder, security_id to
 why = "Matching vendor rows by ticker is the #1314 mistake again; the crosswalk is the first table a vendor adapter needs."
 
 [task.T147]
-what = "Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures."
+what = "Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures; the per-row quality column stays deferred until this lands."
 why = "Fills history before 2016 and the delisted tails Alpaca lacks without changing a stored Alpaca row or a registered trial."
 
 [task.T148]
