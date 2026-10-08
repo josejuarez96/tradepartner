@@ -1,6 +1,6 @@
 ---
 name: backtest-runner
-description: Runs ONE hypothesis file through the backtester on a temp-file copy of the fixture store it builds itself (never the owner's store) and reports the synthetic trial's metrics, gap and refusals. Use to check a hypothesis file, an engine change or a cost assumption end to end before the owner runs it for real. Never touches the holdout.
+description: Runs ONE hypothesis file (or, when asked, one sweep file) through the backtester on a temp-file copy of the fixture store it builds itself (never the owner's store) and reports the synthetic trial's metrics, gap and refusals. Use to check a hypothesis file, an engine change or a cost assumption end to end before the owner runs it for real. Never touches the holdout.
 tools: Read, Grep, Glob, Bash
 model: sonnet
 ---
@@ -88,6 +88,21 @@ You never accept a store from anyone: you always build your own in step 1.
    conn.close()
    EOF
    ```
+3b. **Sweep smoke (only when the window asks for one).** A sweep file is registered and run on the same temp store, which already carries the `store_markers` `fixture` row from step 1:
+   ```bash
+   cd "$TEAM_DIR" && TRADEPARTNER_ENV_FILE="$SCRATCH/no-such.env" uv run python - <<'EOF'
+   from pathlib import Path
+   from tradepartner.backtest import sweep
+   from tradepartner.backtest.lab import run_sweep
+   # register as in step 2 (sweep.register(conn, Path("<SWEEP>"), live, registered_by="backtest-runner"))
+   outcome = run_sweep("<sweep-slug>", store_path=Path("<SCRATCH>/runner/store.duckdb"),
+                       time_budget_minutes=5, run_by="backtest-runner")
+   print(outcome.n_ok, outcome.n_failed, outcome.completed, outcome.stopped_by_budget)
+   for message in outcome.errors.values():
+       print(message.strip().splitlines()[-1])
+   EOF
+   ```
+   `run_sweep` refuses any `store_path` without the fixture marker (`UnmarkedStoreRefused`), and opens every trial `synthetic=True` under one. The run first waits out any quiet interval (the budget does not cover that wait) and sleeps inside one that begins mid-run. So before running, compute `quiet.next_quiet_interval(now_utc, get_settings(), paper_window_open=True, session_open=lab._session_open)` (the paper interval is always applied; with the defaults it is 07:30 to 10:15 ET); if that interval contains now or starts before now + 30 minutes, do not run: report `sweep smoke skipped: quiet interval` and stop. Pass `time_budget_minutes=5`. Report counts and each failure's last line only (never a traceback); fixture numbers say nothing about a family. The sweep file must sit under `TEAM_DIR/docs/sweeps/` or `SCRATCH`; refuse any other path.
 4. **Delete the temp store** (`rm -rf "$SCRATCH/runner"`) once the report is written, unless the window asked to keep it.
 
 ## Output
@@ -100,7 +115,7 @@ A short report to the window, not a file in the repo:
 
 ## Never
 - Run on the owner's store, on `settings.store.path`, on any file under `data/`, or on any store you did not build in step 1; read `.env`; set `STORE__PATH`.
-- Call `run_hypothesis` without `store_path`, or with `synthetic=False`.
+- Call `run_hypothesis` or `run_sweep` without `store_path`, or `run_hypothesis` with `synthetic=False`; pass either a store without the `store_markers` `fixture` row, the real store, or any copy of it.
 - Pass a holdout or gap-override flag or reason, or edit a hypothesis file to get a run through. The one exception is the H1 scratch-copy procedure above: only `$SCRATCH/h1-smoke.md`'s `in_sample_start` may be edited, through the prescribed `cp` + single anchored substitution + `diff` + `git status` checks, never the real file under `docs/hypotheses/`, and the report always says the run used that edited copy with the one-line diff.
 - Run `tradepartner backtest`, `hypothesis register`, `decision` or any other command that writes the real store.
 - Print `get_settings()`, `os.environ`, a settings `model_dump()` or a whole traceback. On a settings validation error report only the exception type and the field name.
