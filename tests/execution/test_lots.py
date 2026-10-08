@@ -393,6 +393,19 @@ def test_a_lot_and_a_disposal_carry_their_orders_book() -> None:
     assert disposal.book_id == "fx"
 
 
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_a_short_order_is_a_lot_ledger_error(side: str) -> None:
+    """ADR 0015 seam 2 (T134): closing short lots is the shorting ADR's, so an
+    order whose `position_side` is not long refuses the whole rebuild, either
+    side: a sell-short opens and a buy-short closes a short position."""
+    book = Book()
+    book.trade("buy", 5, 10.0, date(2025, 1, 2))
+    coid = book.trade(side, 1, 10.0, date(2025, 1, 3))
+    book.orders[-1] = replace(book.orders[-1], position_side="short")
+    with pytest.raises(LotLedgerError, match=f"{coid}.*position_side 'short'"):
+        book.run()
+
+
 def test_an_order_with_an_implied_fill_merges_into_one_lot_at_its_average() -> None:
     """Two real fills and a synthetic residual at a negative implied price:
     the order is one lot at its average price, basis never below zero."""

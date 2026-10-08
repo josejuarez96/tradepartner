@@ -1,4 +1,5 @@
-"""The expansion-seam write-through, end to end (ADR 0015 seam 1, plan T133).
+"""The expansion-seam write-through, end to end (ADR 0015 seams 1 and 2, plans
+T133 and T134).
 
 Shared by the T133 -> T134 -> T135b chain. One `paper run` on `test_run_trade`'s
 scripted fake, with the window's book `"fx"` (never the DDL default `"main"`),
@@ -23,6 +24,13 @@ their writers' own tests instead:
   a non-default book: the spin-off receipt `AdjustmentRow` (`test_window_start.py`),
   the lag-bound `MISMATCH` `ReconciliationRow` (`test_run_core.py`), and the exit
   `DecisionRow` (`test_run_exits.py`).
+
+Seam 2 (T134): after the same run every row of the five tables with a
+`position_side` column reads `long`. Four are filled here (`decisions`,
+`orders`, `positions_daily`, `lots`); `disposals` is covered as above, and its
+side cannot differ: `Disposal` carries no side, so `DisposalRow` is written
+with the DDL default, and `lots.rebuild` refuses any order that is not long
+(`test_lots.py`).
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ from tradepartner.config import Settings
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.store.db import open_for_write
+from tradepartner.store.schema import LONG
 
 #: The book the window is started with: not `schema.DEFAULT_BOOK_ID`.
 BOOK = "fx"
@@ -50,6 +59,9 @@ RUN_TABLES = (
     "lots",
     "reconciliations",
 )
+
+#: The tables with a `position_side` column the run fills (module docstring).
+SIDE_TABLES = ("decisions", "orders", "positions_daily", "lots")
 
 
 @pytest.fixture(autouse=True)
@@ -73,9 +85,9 @@ def fx_env(fixture_store_path: Path) -> Env:
     return Env(settings, Clock(at(F_0)))
 
 
-def test_a_run_writes_its_windows_book_through_every_table_it_fills(
-    fx_env: Env, tmp_path: Path
-) -> None:
+def _fixture_run(fx_env: Env, tmp_path: Path) -> None:
+    """The window with book `"fx"`, the live key moved off it, the scripted
+    fill-session run, and the lot-ledger write after it."""
     window = fx_env.open_window(tmp_path=tmp_path)
     # Move the live key off the window's book: every writer must read the row.
     fx_env.settings = fx_env.settings.model_copy(
@@ -98,6 +110,12 @@ def test_a_run_writes_its_windows_book_through_every_table_it_fills(
             cadence="month_end",
         )
 
+
+def test_a_run_writes_its_windows_book_through_every_table_it_fills(
+    fx_env: Env, tmp_path: Path
+) -> None:
+    _fixture_run(fx_env, tmp_path)
+
     for table in RUN_TABLES:
         assert fx_env.count(table) >= 1, table
         assert fx_env.query(f"SELECT DISTINCT book_id FROM {table}") == [(BOOK,)], table
@@ -105,3 +123,12 @@ def test_a_run_writes_its_windows_book_through_every_table_it_fills(
     ids = [row[0] for row in fx_env.query("SELECT client_order_id FROM orders ORDER BY known_at")]
     assert ids
     assert all(coid.split("-")[1] == BOOK for coid in ids), ids
+
+
+def test_every_row_the_run_writes_is_long(fx_env: Env, tmp_path: Path) -> None:
+    """ADR 0015 seam 2 (T134): each table filled, and every row `long`."""
+    _fixture_run(fx_env, tmp_path)
+
+    for table in SIDE_TABLES:
+        assert fx_env.count(table) >= 1, table
+        assert fx_env.query(f"SELECT DISTINCT position_side FROM {table}") == [(LONG,)], table

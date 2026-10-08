@@ -47,6 +47,7 @@ from tradepartner.execution.risk import (
     size_buys,
     unfilled_sells,
 )
+from tradepartner.store import schema
 from tradepartner.store.journal import DecisionRow, OrderedFill, OrderEventRow, OrderRow
 
 _NOW = datetime(2026, 10, 1, 13, 0, tzinfo=UTC)
@@ -168,6 +169,84 @@ def test_each_limit_turns_the_passing_phase_into_a_violation_naming_it(
     assert _rules(result) == {key}
     (violation,) = result.violations  # type: ignore[union-attr]
     assert violation.kind == "limit_breach"
+
+
+# --- the position side (ADR 0015 seam 2, plan T134) ----------------------------------------
+
+
+def _session_decision(position_side: str = schema.LONG) -> DecisionRow:
+    return DecisionRow(
+        decision_id=2,
+        run_id=1,
+        rebalance_session=_S,
+        security_id="C",
+        side="buy",
+        planned_notional=50.0,
+        target_notional=50.0,
+        whole_share=False,
+        decision="trade",
+        position_side=position_side,
+        known_at=_NOW,
+        ingested_at=_NOW,
+    )
+
+
+def _session_order(position_side: str = schema.LONG) -> OrderRow:
+    return OrderRow(
+        client_order_id="tp-main-20261001-A-sell-1",
+        decision_id=1,
+        run_id=1,
+        session=_S,
+        attempt=1,
+        phase="sell",
+        security_id="A",
+        symbol="A",
+        side="sell",
+        quantity=2.0,
+        sells_in_flight_at_submit=True,
+        position_side=position_side,
+        known_at=_NOW,
+        ingested_at=_NOW,
+    )
+
+
+def test_a_phase_order_is_long_by_default() -> None:
+    assert _order("C", "buy").position_side == schema.LONG == "long"
+
+
+def test_one_short_order_names_refused_position_side_and_nothing_else() -> None:
+    """The passing phase with its buy's position side `short`: one violation,
+    a structural `limit_breach`, so the wrapper halts with `LimitBreachError`."""
+    sell, buy = _passing_phase()
+    result = _check([sell, replace(buy, position_side="short")])
+    (violation,) = result.violations  # type: ignore[union-attr]
+    assert (violation.kind, violation.rule) == ("limit_breach", "refused_position_side")
+    assert "decision 2" in violation.detail
+
+
+def test_long_rows_on_the_session_pass() -> None:
+    result = _check(_passing_phase(), rows_on_session=[_session_decision(), _session_order()])
+    assert isinstance(result, Skips)
+    assert [o.security_id for o in result.orders] == ["A", "C"]
+
+
+@pytest.mark.parametrize(
+    ("row", "named"),
+    [
+        (_session_decision("short"), "decision 2"),
+        (_session_order("short"), "order tp-main-20261001-A-sell-1"),
+    ],
+    ids=["decision", "order"],
+)
+def test_a_short_row_on_the_session_halts_the_passing_phase(
+    row: DecisionRow | OrderRow, named: str
+) -> None:
+    """A `decisions` or `orders` row of the session that is not long refuses
+    the whole batch, although every order of the phase is long."""
+    result = _check(_passing_phase(), rows_on_session=[_session_decision(), row])
+    (violation,) = result.violations  # type: ignore[union-attr]
+    assert (violation.kind, violation.rule) == ("limit_breach", "refused_position_side")
+    assert named in violation.detail
 
 
 def test_orders_submitted_earlier_in_the_run_count_toward_the_order_cap() -> None:
