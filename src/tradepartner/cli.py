@@ -109,7 +109,8 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   `run.tracking_run`, `reconcile_run.reconcile_command`, `window.kill`,
   `resume.resume`, `report.report`, `check.check`, `ops.page_data`,
   `window.abandon`, `window.override`, the page's own writer,
-  `window.settle_order`). The broker comes
+  `window.settle_order`; `settle` refuses each of req 17's gates by its reason
+  code, and a `ClockError` or a broker error is a failure). The broker comes
   from `execution.brokers.build_broker` (a test injects one through `make_app`'s
   `broker`), built with the command's one clock object, which the command also
   hands to the function, so the wrapper `run` builds holds the same clock as the
@@ -2223,13 +2224,18 @@ def make_app(
     @paper_app.command("settle")
     def paper_settle(
         order: Annotated[
-            list[str], typer.Option("--order", help="the order's client_order_id, once")
+            list[str],
+            typer.Option(
+                "--order", help="the order's client_order_id, once", allow_from_autoenv=False
+            ),
         ],
         reason: Annotated[str, _REASON_OPTION],
     ) -> None:
         """Settle one order no collector can close, owner-only (spec req 17)."""
         if len(order) != 1:
             raise _fail("--order is given exactly once", USAGE_ERROR)
+        if _blank_text(order[0]):
+            raise _fail("--order must be non-blank", USAGE_ERROR)
         (client_order_id,) = order
         s = paper_settings(reason)
         result = _paper_call(

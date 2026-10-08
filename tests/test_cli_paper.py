@@ -1006,6 +1006,7 @@ def _settle(clock: _Clock, factory: _Factory, *args: str) -> Out:
             "--order is given exactly once",
         ),
         (("--order", "tp-a", "--reason", "   "), "--reason must be non-blank"),
+        (("--order", "  ", "--reason", LONG_REASON), "--order must be non-blank"),
     ],
 )
 def test_settle_without_one_order_and_a_reason_is_a_usage_error_before_any_broker(
@@ -1143,10 +1144,12 @@ def test_settle_journals_an_order_the_broker_forgot(clock: _Clock, factory: _Fac
     _vanished(factory.fake)
     _engage(clock, factory)
     factory.clocks.clear()
+    mark = len(factory.fake.calls)
     out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
     assert out.exit_code == 0, out.output
     assert "paper settle: tp-a settled (override 1" in out.output
     assert "reset" in out.output
+    assert {c.method for c in factory.fake.calls[mark:]} <= SETTLE_READS
     assert factory.clocks == [clock]
     with duckdb.connect(_settings().store.path, read_only=True) as conn:
         assert conn.execute("SELECT kind, client_order_id FROM overrides").fetchall() == [
@@ -1156,6 +1159,23 @@ def test_settle_journals_an_order_the_broker_forgot(clock: _Clock, factory: _Fac
             "SELECT status, reason FROM order_events WHERE client_order_id = 'tp-a' "
             "AND reason = 'owner_settled_unknown'"
         ).fetchall() == [("cancelled", "owner_settled_unknown")]
+
+
+@pytest.mark.usefixtures("started")
+def test_settle_journals_an_order_the_broker_reports_finished(
+    clock: _Clock, factory: _Factory
+) -> None:
+    """Not the reset case: the broker knows the order expired, holds nothing."""
+    _place(factory.fake, "tp-a")
+    factory.fake.apply("tp-a", Expire())
+    _engage(clock, factory)
+    mark = len(factory.fake.calls)
+    out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert "paper settle: tp-a settled (override 1" in out.output
+    assert "reset" not in out.output
+    assert {c.method for c in factory.fake.calls[mark:]} <= SETTLE_READS
+    assert _count("overrides") == 1
 
 
 @pytest.mark.usefixtures("started")
@@ -1177,3 +1197,11 @@ def test_settle_hands_the_writer_the_built_broker_and_the_one_clock(
     assert settle_clock is clock is factory.clocks[0]
     assert (coid, reason) == ("tp-a", LONG_REASON)
     assert settings.store.path == _settings().store.path
+
+
+def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
+    group: Any = typer.main.get_command(cli.make_app())
+    settle = group.commands["paper"].commands["settle"]
+    (param,) = [p for p in settle.params if "--order" in p.opts]
+    assert param.envvar is None
+    assert param.allow_from_autoenv is False
