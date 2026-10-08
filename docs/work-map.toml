@@ -728,6 +728,47 @@ what = "Expansion seams: the owner's long-term direction (swing and day trading,
 why = "Each seam is a column, a field or a default argument now and a backfill migration during the six-month paper window later; the id format becomes Alpaca-side history on the first submit and can never be changed."
 unblocks = ["task:T48c", "task:T71"]
 
+[issue.1258]
+what = "Turn ADR 0015's plan sketch (TE0 to TE7) into Phase 4 plan tasks T132 to T139 with their files, tests, dependencies, declared chains and the T48b, T48c and T71 gates."
+why = "A seam the ADR opened is built only from a claimable task line; the lines fix the DDL, the id token and the refusal names so three teams can build them in parallel before paper start."
+unblocks = ["task:T132", "task:T133", "task:T134", "task:T135", "task:T135b", "task:T136", "task:T138", "task:T139"]
+
+[task.T132]
+what = "TE0: schema version 17, the book_id, position_side and order-shape columns on the eight journal tables with their defaults, one rebuild migration, the row types' matching fields."
+why = "The one journal migration before paper start; after real rows exist each column is a rebuild under safety review during the paper window."
+
+[task.T133]
+what = "TE1: paper.book_id on the window row, the book token in the client_order_id, every row the run writes carrying the window's book, pinned end to end on the fixture run."
+why = "The id becomes Alpaca-side history on the first submit; a book token from the first order lets a second book on the account be told apart from the id alone."
+
+[task.T134]
+what = "TE2: the position side carried by phase orders and lots, and refused_position_side as a structural rule, so any short row halts the batch by name."
+why = "ADR 0010's no-shorts rule becomes a pinned refusal as well as a structural fact, before the shorting ADR extends it."
+
+[task.T135]
+what = "TE3a: the read-side fields Alpaca already returns (order type, time in force, prices, asset class, order class, legs; fee; margin fields; shortable, easy_to_borrow, marginable) on the broker types and the fake, OrderRequest unchanged."
+why = "T48c maps the response once against T48b's recordings; a field added after it is a second adapter edit under safety review and an orders rebuild."
+
+[task.T135b]
+what = "TE3b: refused_order_shape, the structural rule that halts on any broker order or journal row that is not a market, day, us_equity, simple, multiplier-1 order, and the reconciliation mismatch for one found open."
+why = "The reserved columns and fields cannot be used by accident: an order of another kind on the account halts rather than reconciles."
+
+[task.T136]
+what = "TE4: the window's frozen cadence passed explicitly through planning, plan, marks, run, outcomes, check, report and window, and first_tracking_session at any cadence."
+why = "Fixes the latent week_end and daily bug in first_tracking_session and removes the hard-coded month end from ten functions before Phase 4 adds more call sites."
+
+[task.T137]
+what = "TE5: the engine raises on a negative position value instead of dropping it; zero and dust still dropped; in progress as #1255 (PR #1256)."
+why = "A silent drop would hide a sign error the moment a signed position enters the engine."
+
+[task.T138]
+what = "TE6: the instrument-id rule in master.py's docstring and a guard that the master's own derivation never produces a prefixed id, BENCH: covered."
+why = "Fixing the id's meaning now means no re-keying of the journal's security_id columns when an instruments table arrives."
+
+[task.T139]
+what = "TE7: the charter's direction sentence, the roadmap's deferred-capabilities list, the ADR 0010 pointers (point 3 superseded, point 1 amended) and the data-foundation spec's namespace rule; class B."
+why = "The owner's direction is on record without moving the Scope line, and ADR 0010 point 5's requirement that a changed id derivation or limit be recorded on it is met."
+
 [plan.strategy-interface]
 what = "How the strategy-interface refactor is built: T85e amended into the one seam, then generic exclusions and counts (T127) beside the family registry (T128), per-family benchmarks after the lab's rename (T129), and B4 combined through the registry as the proof (T130)."
 why = "Without a build order the ADR's guarantees (H1's fingerprint unchanged, paper closed to profitability until the path is generic, one seam not two) have no owner and the refactor would race T85c, T85d and T98."

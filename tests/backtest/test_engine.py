@@ -436,6 +436,35 @@ class TestInvariance:
         assert set(stitched["security_id"].unique()) >= {"A", "B", "C"}
 
 
+class TestNegativeValueGuard:
+    """ADR 0015 TE5: a negative position value raises; zero is still dropped."""
+
+    @staticmethod
+    def _patched(monkeypatch: pytest.MonkeyPatch, value: float) -> None:
+        real = engine.value_positions
+
+        def patched(*args: Any, **kwargs: Any) -> pl.DataFrame:
+            frame = real(*args, **kwargs)
+            first = frame["security_id"][0]
+            return frame.with_columns(
+                pl.when(pl.col("security_id") == first)
+                .then(value)
+                .otherwise(pl.col("value"))
+                .alias("value")
+            )
+
+        monkeypatch.setattr(engine, "value_positions", patched)
+
+    def test_a_negative_value_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patched(monkeypatch, -1.0)
+        with pytest.raises(ValueError, match="negative position value"):
+            _run(_provider())
+
+    def test_a_zero_value_is_still_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patched(monkeypatch, 0.0)
+        assert _run(_provider())[15.0].equity
+
+
 class TestApplyTrades:
     COMMISSIONS = Commissions(per_share=0.01, per_order=1.0)
     FRAME = pl.DataFrame(
