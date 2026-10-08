@@ -19,12 +19,15 @@ time out after `alpaca.trading_request_timeout_seconds`, and a timeout (or a 429
 the SDK's own retry codes, whose internal retry is switched off) is retried
 `alpaca.trading_max_retries` times, then raised. `submit_order` requires a
 `client_order_id`, so the broker refuses a second order with it; when a retry of a
-submit is refused with 422, the first attempt landed, and the order is read back by
-that id and returned instead of the refusal.
+submit is refused as a duplicate (422 with Alpaca code 40010001, recorded in
+`duplicate_client_order_id.json`), the first attempt landed, and the order is read
+back by that id and returned instead of the refusal. Any other 422, or a body that
+does not parse to that code, is raised as the refusal (#1300).
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -49,6 +52,7 @@ OPEN_ORDERS_LIMIT = 500
 ACTIVITIES_PAGE_SIZE = 100
 _RETRY_STATUS_CODES = frozenset({429, 504})
 _DUPLICATE_STATUS_CODE = 422
+_DUPLICATE_ERROR_CODE = 40010001  # "client_order_id must be unique" (recorded, T48b)
 
 
 class AlpacaPaperCredentialsError(RuntimeError):
@@ -173,6 +177,21 @@ def _describe(error: APIError | requests.RequestException) -> tuple[int | None, 
     return None, type(error).__name__
 
 
+def _is_duplicate(error: AlpacaTradingError) -> bool:
+    """Alpaca's duplicate `client_order_id` refusal: 422 whose JSON body's `code` is
+    40010001. Fails closed: an unparseable or non-object body is not a duplicate."""
+    if error.status_code != _DUPLICATE_STATUS_CODE:
+        return False
+    try:
+        body = json.loads(error.body)
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    code = body.get("code")
+    return type(code) is int and code == _DUPLICATE_ERROR_CODE
+
+
 def market_day_order(
     symbol: str,
     side: str,
@@ -252,14 +271,15 @@ class AlpacaTradingRaw:
         raise AssertionError("unreachable")  # pragma: no cover
 
     def submit_order(self, request: OrderRequest) -> Any:
-        """`POST /v2/orders`; `request` must carry a `client_order_id`. A 422 on a
-        retry means the first attempt landed: the order is read back and returned."""
+        """`POST /v2/orders`; `request` must carry a `client_order_id`. A duplicate
+        refusal (422, code 40010001) on a retry means the first attempt landed: the
+        order is read back and returned. Any other refusal is raised."""
         if not request.client_order_id:
             raise ValueError("submit_order needs a client_order_id (retries rely on it)")
         try:
             return self._call(self._client.submit_order, request)
         except AlpacaTradingError as error:
-            if not (error.retried and error.status_code == _DUPLICATE_STATUS_CODE):
+            if not (error.retried and _is_duplicate(error)):
                 raise
         return self.get_order_by_client_id(request.client_order_id)
 
