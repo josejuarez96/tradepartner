@@ -50,10 +50,20 @@ _APP_PATH = str(_ROOT / "src" / "tradepartner" / "dashboard" / "app.py")
 _PAGE = "Operations"
 _ACCOUNT_ID = "PA1"
 
-# Computed from the real clock, like `tests/execution/test_ops.py`'s own
-# `_S_MINUS_1`, so the fixture's "finished run" always satisfies `stale`
-# whatever day the suite runs.
-_S_MINUS_1 = ops._required_run_session(utc_now())
+# The fixture's seeding and the page's own `_required_run_session(utc_now())`
+# at render must read the same instant, or a shard that imports before a
+# session boundary and renders after it sees the finished run on "S-1 at
+# import" as stale against "S-1 at render" (#1263). Capture the clock once
+# here, derive S-1 from it, and freeze the page's clock to it in `_app`; import
+# and render then cannot straddle a boundary.
+_NOW = utc_now()
+_S_MINUS_1 = ops._required_run_session(_NOW)
+#: The session after S-1: the one a boundary crossing would advance the page
+#: to, so the regression test's `_AFTER_BOUNDARY` clock is the session past it.
+_S = next_session(_S_MINUS_1)
+_AFTER_BOUNDARY = datetime.combine(next_session(_S), datetime.min.time(), tzinfo=UTC) + timedelta(
+    hours=14
+)
 _T0 = datetime.combine(_S_MINUS_1, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
 
 
@@ -244,6 +254,10 @@ def seeded_store(tmp_path: Path) -> Path:
 def _app(monkeypatch: pytest.MonkeyPatch, store_path: Path) -> AppTest:
     monkeypatch.setenv("STORE__PATH", str(store_path))
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(store_path.parent / "does-not-exist.env"))
+    # Freeze the clock the page reads to the instant S-1 was derived from, so a
+    # slow shard whose wall clock crosses a session boundary between import and
+    # render cannot advance the required session past the fixture's run (#1263).
+    monkeypatch.setattr(ops, "utc_now", lambda: _NOW)
     at = AppTest.from_file(_APP_PATH)
     at.run()
     at.sidebar.radio[0].set_value(_PAGE).run()
@@ -314,6 +328,20 @@ def test_header_shows_as_of_last_updated_and_stale_chip(
     assert "as of" in text and "last updated" in text
     # S-1 has a finished run in the fixture, so the page is not stale.
     assert "stale" not in text.lower()
+
+
+def test_stale_chip_survives_a_session_boundary(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    """Regression for #1263: a shard that imports before a session boundary and
+    renders after it must not paint `stale` for the fixture's finished run.
+    Simulates the ambient clock one session past S-1; a page that reads that
+    clock (instead of the fixture's own frozen instant) then requires a later
+    session the fixture has no run for."""
+    monkeypatch.setattr(ops, "utc_now", lambda: _AFTER_BOUNDARY)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    assert "stale" not in _text(at).lower()
 
 
 def test_render_kpis_and_switch_chip(monkeypatch: pytest.MonkeyPatch, seeded_store: Path) -> None:
