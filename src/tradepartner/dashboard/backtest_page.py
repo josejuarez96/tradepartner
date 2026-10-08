@@ -36,6 +36,16 @@ stored `trial_results.n_research` beside the stored N. On a store a read-only
 connection opened before the research registry (no research tables, no
 `n_research` column) both research cells are blank and today's N is the
 backtest count.
+
+**Detail level and the spend cap** (strategy-lab spec req 12 and amendment 12 to the
+backtest spec's req 17; plan T112). A `full` trial shows its target weights at the
+last rebalance; a `summary` trial (a sweep variant's) stores no weights, so the page
+states its detail level beside its base-level equity, which it stores daily like a
+`full` trial, and shows no weights table. A row without `detail_level` (a store
+before schema version 15) is `full`. The holdout spends show the family cap
+`holdout.decide` applies: the family rules' `max_family_holdout_spends`, or the live
+`lab.max_family_holdout_spends` for a family without a rules row; on a store without
+the lab tables there is no cap (the Phase 3 rules).
 """
 
 from __future__ import annotations
@@ -56,8 +66,9 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.metrics import METRIC_KEYS, Basis, DeflatedSharpe, deflated_sharpe
 from tradepartner.backtest.results import CADENCE_KEY, FamilyN, family_n_split
 from tradepartner.backtest.schedule import MONTHS_PER_YEAR, periods_per_year
+from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.store import registry, schema
+from tradepartner.store import lab_registry, lab_schema, registry, schema
 
 _BASES: Final[tuple[Basis, ...]] = ("raw", "excess_spy")
 
@@ -89,6 +100,13 @@ Row = dict[str, Any]
 
 #: `trial_results.sharpe_unit` values; NULL (a pre-version-15 row) reads as monthly.
 _ANNUAL: Final = "annual"
+
+#: `trials.detail_level` values (strategy-lab spec, Definitions "Detail level"); a
+#: row without the column (before schema version 15) is `full`.
+_FULL: Final = "full"
+_SUMMARY: Final = "summary"
+
+_WEIGHT_COLUMNS: Final = ("fill_session", "security_id", "target_weight", "fill_price", "shares")
 
 
 def annual_stored(
@@ -145,6 +163,9 @@ class TrialView:
     metrics: list[Row]
     dsr_rows: tuple[DsrRow, ...]
     holdout_spends: list[registry.HoldoutSpend]
+    detail_level: str = _FULL
+    weights: list[Row] | None = None
+    max_holdout_spends: int | None = None
 
 
 def drawdowns(equity: Sequence[Mapping[str, Any]]) -> list[Row]:
@@ -222,18 +243,44 @@ def _dsr_rows(
     return tuple(out)
 
 
-def load_trial_view(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialView:
-    """Read trial `trial_id` and everything the page shows for it."""
+def family_holdout_cap(
+    conn: duckdb.DuckDBPyConnection, family: str, settings: Settings | None = None
+) -> int | None:
+    """The family's holdout spend cap (module docstring): None on a store without the
+    lab tables; else the rules' cap, or the live `lab.max_family_holdout_spends`
+    (`settings`, default `get_settings()`) for a family without a rules row."""
+    if not lab_schema.is_lab_initialised(conn):
+        return None
+    rules = lab_registry.family_rules(conn, family)
+    if rules is not None:
+        return rules.max_family_holdout_spends
+    live = settings if settings is not None else get_settings()
+    return live.lab.max_family_holdout_spends
+
+
+def _last_weights(conn: duckdb.DuckDBPyConnection, trial_id: int) -> list[Row]:
+    """The trial's target weights at its last fill session, largest first."""
+    return _rows(
+        conn,
+        f"SELECT {', '.join(_WEIGHT_COLUMNS)} FROM trial_weights WHERE trial_id = ? "
+        "AND fill_session = (SELECT MAX(fill_session) FROM trial_weights WHERE trial_id = ?) "
+        "ORDER BY target_weight DESC, security_id",
+        [trial_id, trial_id],
+    )
+
+
+def load_trial_view(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, settings: Settings | None = None
+) -> TrialView:
+    """Read trial `trial_id` and everything the page shows for it; `settings` is
+    read only for the live spend cap of a family without a rules row."""
     [trial] = [
         t for t in registry.list_trials(conn, include_synthetic=True) if t.trial_id == trial_id
     ]
     hypothesis = registry.get_hypothesis_by_id(conn, trial.hypothesis_id)
-    [extra] = _rows(
-        conn,
-        "SELECT code_version, code_dirty, data_cutoff, holdout_reason, gap_override_reason "
-        "FROM trials WHERE trial_id = ?",
-        [trial_id],
-    )
+    # Every column, so a store before schema version 15 (no `detail_level`) still reads.
+    [extra] = _rows(conn, "SELECT * FROM trials WHERE trial_id = ?", [trial_id])
+    detail_level = str(extra.get("detail_level") or _FULL)
     results = _rows(conn, "SELECT * FROM trial_results WHERE trial_id = ?", [trial_id])
     result = results[0] if results else None
     frozen = frozen_values(hypothesis)
@@ -283,6 +330,9 @@ def load_trial_view(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialView
         metrics=metrics,
         dsr_rows=dsr,
         holdout_spends=registry.family_holdout_spends(conn, hypothesis.family),
+        detail_level=detail_level,
+        weights=None if detail_level == _SUMMARY else _last_weights(conn, trial_id),
+        max_holdout_spends=family_holdout_cap(conn, hypothesis.family, settings),
     )
 
 
@@ -421,7 +471,16 @@ def _render_states(view: TrialView) -> None:
 def _render_results(view: TrialView) -> None:
     palette = theme.palette()
     st.subheader("Equity")
-    st.caption(f"Strategy, SPY and MTUM at {view.base_cost} bps per side, log axis.")
+    st.caption(
+        f"Strategy, SPY and MTUM at {view.base_cost} bps per side, log axis. "
+        f"Detail level `{view.detail_level}`"
+        + (
+            ": daily equity at the base level only, other cost levels at rebalance "
+            "sessions, no weights stored (strategy-lab spec req 12)."
+            if view.detail_level == _SUMMARY
+            else "."
+        )
+    )
     _line_chart(view.equity, "equity", "equity (log)", palette, log=True)
 
     st.subheader("Drawdowns")
@@ -454,12 +513,34 @@ def _render_results(view: TrialView) -> None:
     st.caption("Survivorship gap, universe size, static-listing reliance and late dividends.")
     st.dataframe(pl.DataFrame(view.rebalances), hide_index=True)
 
+    if view.weights is not None:
+        st.subheader("Weights")
+        if view.weights:
+            last = view.weights[0]["fill_session"]
+            st.caption(f"Target weights at the last fill session, {last}.")
+            st.dataframe(pl.DataFrame(view.weights), hide_index=True)
+        else:
+            st.caption("No weights stored for this trial.")
+
 
 def _render_holdout_spends(view: TrialView) -> None:
     st.subheader("Holdout spends")
+    family = view.hypothesis.family
+    count = len(view.holdout_spends)
+    no_cap = "no family cap (strategy lab not initialised: the Phase 3 rules)"
     if not view.holdout_spends:
-        st.markdown(f"Holdout not spent in family `{view.hypothesis.family}`.")
+        cap = (
+            f"the family cap is {view.max_holdout_spends}"
+            if view.max_holdout_spends is not None
+            else no_cap
+        )
+        st.markdown(f"Holdout not spent in family `{family}`; {cap}.")
         return
+    st.caption(
+        f"Family `{family}`: {count} of {view.max_holdout_spends} holdout spends (the family cap)."
+        if view.max_holdout_spends is not None
+        else f"Family `{family}`: {count} holdout spends; {no_cap}."
+    )
     st.dataframe(
         pl.DataFrame(
             [
@@ -478,8 +559,9 @@ def _render_holdout_spends(view: TrialView) -> None:
     )
 
 
-def render(conn: duckdb.DuckDBPyConnection) -> None:
-    """Draw the backtest page from the shell's read-only connection."""
+def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
+    """Draw the backtest page from the shell's read-only connection; `settings`
+    defaults to `get_settings()` when the live spend cap is needed."""
     st.header("Backtest")
     header.render_freshness(header.store_freshness(conn, header.now()))
     try:
@@ -501,7 +583,7 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     picked = st.selectbox(
         "Trial", list(by_id), format_func=lambda i: _trial_label(by_id[i]), key="backtest_trial"
     )
-    view = load_trial_view(conn, picked if picked is not None else trials[0].trial_id)
+    view = load_trial_view(conn, picked if picked is not None else trials[0].trial_id, settings)
 
     _render_states(view)
     if view.trial.status == "ok":
