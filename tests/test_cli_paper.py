@@ -845,3 +845,14 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
     assert out.exit_code == 0, out.output
     assert seen == [(False, {"accept_rejections": accepted})]
+
+
+def test_accept_rejections_is_a_plain_off_by_default_flag() -> None:
+    group: Any = typer.main.get_command(cli.make_app())
+    resume_command = group.commands["paper"].commands["resume"]
+    (param,) = [p for p in resume_command.params if "--accept-rejections" in p.opts]
+    assert param.opts == ["--accept-rejections"]
+    assert param.secondary_opts == []
+    assert param.default is False
+    assert param.envvar is None
+    assert param.callback is None

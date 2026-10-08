@@ -54,10 +54,17 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    `False` default is the `store_true` default and rule 2 still holds for every
    `accept_rejections` parameter), bound once, as a parameter whose default is
    the constant `False`, and loaded only as the value of
-   `paper_resume.resume(..., accept_rejections=accept_rejections_flag)`. A
-   second such pass, a literal or any other expression under the keyword, any
-   other use or binding of `accept_rejections_flag`, or the same shape in any
-   other module, is refused.
+   `paper_resume.resume(..., accept_rejections=accept_rejections_flag)`. Its
+   value can come only from the owner's command line: the parameter belongs to
+   the function decorated `@<app>.command("resume")`, whose name is never
+   loaded (no direct call, alias or `partial`), its `Annotated` option is
+   exactly `typer.Option("--accept-rejections", help=...)` (no envvar,
+   callback, default or flag value), no keyword names `accept_rejections_flag`,
+   and no string in `cli.py` spells the flag except docstrings and that one
+   option name (so the app cannot invoke itself with it). A second such pass, a
+   literal or any other expression under the keyword, any other use or binding
+   of `accept_rejections_flag`, or the same shape in any other module, is
+   refused.
 5. No config field anywhere in `Settings` is named for it.
 
 Known limits, not checked here (#696 closed what a name-based scan can):
@@ -323,6 +330,60 @@ def _arg_default(arguments: ast.arguments, arg: ast.arg) -> ast.expr | None:
     return None
 
 
+def _is_resume_command(node: ast.AST | None) -> bool:
+    """Whether `node` is a function decorated `@<app>.command("resume")`."""
+    return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+        isinstance(d, ast.Call)
+        and isinstance(d.func, ast.Attribute)
+        and d.func.attr == "command"
+        and len(d.args) == 1
+        and isinstance(d.args[0], ast.Constant)
+        and d.args[0].value == "resume"
+        for d in node.decorator_list
+    )
+
+
+def _cli_option(arg: ast.arg) -> ast.Call | None:
+    """The `typer.Option("--accept-rejections", help=...)` call in `arg`'s
+    `Annotated[bool, ...]` annotation, when it is exactly that, else None."""
+    annotation = arg.annotation
+    if not (
+        isinstance(annotation, ast.Subscript)
+        and isinstance(annotation.value, ast.Name)
+        and annotation.value.id == "Annotated"
+        and isinstance(annotation.slice, ast.Tuple)
+        and len(annotation.slice.elts) == 2
+        and isinstance(annotation.slice.elts[0], ast.Name)
+        and annotation.slice.elts[0].id == "bool"
+    ):
+        return None
+    option = annotation.slice.elts[1]
+    if (
+        isinstance(option, ast.Call)
+        and isinstance(option.func, ast.Attribute)
+        and option.func.attr == "Option"
+        and isinstance(option.func.value, ast.Name)
+        and option.func.value.id == "typer"
+        and len(option.args) == 1
+        and isinstance(option.args[0], ast.Constant)
+        and option.args[0].value == "--accept-rejections"
+        and all(k.arg == "help" for k in option.keywords)
+    ):
+        return option
+    return None
+
+
+def _is_docstring(node: ast.Constant, parents: dict[int, ast.AST]) -> bool:
+    expr = parents.get(id(node))
+    owner = parents.get(id(expr))
+    return (
+        isinstance(expr, ast.Expr)
+        and isinstance(owner, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and bool(owner.body)
+        and owner.body[0] is expr
+    )
+
+
 def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str]:
     """Rule 4's exception, fail closed: in `cli.py`, `CLI_FLAG` is bound exactly
     once, as a parameter whose default is the constant `False`, and loaded
@@ -330,7 +391,33 @@ def _cli_flag_misuses(tree: ast.Module, parents: dict[int, ast.AST]) -> list[str
     found = []
     params = []
     passes = 0
+    commands: set[str] = set()
+    options: list[ast.Call] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and node.arg == CLI_FLAG:
+            command = parents.get(id(parents.get(id(node))))
+            option = _cli_option(node)
+            if not _is_resume_command(command):
+                found.append(f"{node.lineno}: {CLI_FLAG} is not a `resume` command's parameter")
+            else:
+                commands.add(command.name)  # type: ignore[union-attr]
+            if option is None:
+                found.append(f"{node.lineno}: {CLI_FLAG} is not the bare reviewed typer.Option")
+            else:
+                options.append(option)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == CLI_FLAG:
+            found.append(f"{node.value.lineno}: passes {CLI_FLAG} by keyword")
+        elif isinstance(node, ast.Name) and node.id in commands and isinstance(node.ctx, ast.Load):
+            found.append(f"{node.lineno}: loads the resume command {node.id}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and any(s in node.value for s in SPELLINGS)
+            and not _is_docstring(node, parents)
+            and not any(node is option.args[0] for option in options)
+        ):
+            found.append(f"{node.lineno}: spells the flag outside its option: {node.value!r}")
         for name, how in _bound(node):
             if name == CLI_FLAG and not isinstance(node, ast.arg):
                 found.append(f"{getattr(node, 'lineno', 0)}: binds {CLI_FLAG} in {how}")
@@ -678,7 +765,14 @@ def test_the_rules_let_the_callers_own_flag_through() -> None:
 
 #: Rule 4's reviewed shape in `cli.py` (a Typer option under another name).
 CLI_PASS = (
-    "def paper_resume_(reason: str, accept_rejections_flag: bool = False) -> None:\n"
+    '"""The module docstring may name --accept-rejections."""\n'
+    '@paper_app.command("resume")\n'
+    "def paper_resume_(\n"
+    "    reason: str,\n"
+    "    accept_rejections_flag: Annotated[\n"
+    '        bool, typer.Option("--accept-rejections", help="accept verdicts")\n'
+    "    ] = False,\n"
+    ") -> None:\n"
     "    paper_resume.resume(s, c, b, k, reason, False, accept_rejections=accept_rejections_flag)\n"
 )
 
@@ -702,8 +796,25 @@ def test_the_cli_exception_lets_exactly_its_reviewed_shape_through() -> None:
         # another callee, another default, another binding or use
         CLI_PASS.replace("paper_resume.resume(", "other.resume("),
         CLI_PASS.replace("paper_resume.resume(", "paper_resume._start("),
-        CLI_PASS.replace("bool = False", "bool = True"),
-        CLI_PASS.replace(": bool = False", ": bool"),
+        CLI_PASS.replace("] = False", "] = True"),
+        CLI_PASS.replace("] = False", "]"),
+        # the value's source: a direct call, alias or partial of the command
+        CLI_PASS + "paper_resume_('r', accept_rejections_flag=True)\n",
+        CLI_PASS + "paper_resume_('r', True)\n",
+        CLI_PASS + "f = functools.partial(paper_resume_, accept_rejections_flag=True)\n",
+        CLI_PASS + "alias = paper_resume_\n",
+        # the app invoking itself with the flag, or the flag spelt elsewhere
+        CLI_PASS + "app(['paper', 'resume', '--reason', 'r', '--accept-rejections'])\n",
+        CLI_PASS + "ARGS = 'resume --accept-rejections'\n",
+        # an envvar, callback, default or flag value on the option, or another option
+        CLI_PASS.replace('help="accept verdicts"', 'help="x", envvar="ACCEPT"'),
+        CLI_PASS.replace('help="accept verdicts"', 'help="x", callback=always_true'),
+        CLI_PASS.replace('help="accept verdicts"', 'help="x", flag_value=True'),
+        CLI_PASS.replace('"--accept-rejections", help', '"--accept-rejections", "-a", help'),
+        CLI_PASS.replace('"--accept-rejections"', '"--yes"'),
+        # not a `resume` command's parameter
+        CLI_PASS.replace('command("resume")', 'command("run")'),
+        CLI_PASS.replace('@paper_app.command("resume")\n', ""),
         CLI_PASS + "    accept_rejections_flag = True\n",
         CLI_PASS + "    x = accept_rejections_flag\n",
         CLI_PASS + "    other(flag=accept_rejections_flag)\n",
@@ -727,3 +838,9 @@ def test_no_config_key_reaches_the_flag() -> None:
     names = _field_names(Settings)
     assert names  # the walk sees the config
     assert not any("reject" in n and "accept" in n for n in names)
+
+
+def test_every_cli_refusal_sample_changes_the_reviewed_shape() -> None:
+    marks = test_the_cli_exception_refuses_anything_but_its_one_shape.pytestmark  # type: ignore[attr-defined]
+    samples = next(m.args[1] for m in marks if m.name == "parametrize")
+    assert all(sample != CLI_PASS for sample in samples)
