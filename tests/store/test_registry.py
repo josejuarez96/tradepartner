@@ -1129,8 +1129,8 @@ def test_write_result_keeps_a_run_when_only_a_session_after_the_cutoff_is_ingest
 def test_write_result_falls_back_to_the_store_max_without_a_recorded_vintage(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
-    """A trial with no recorded `data_vintage` (opened before schema version 15, or
-    with no fact known at its cutoff) keeps the Phase 3 rule: any ingest fails it."""
+    """A trial opened with no fact known at its cutoff (no data vintage) keeps the
+    Phase 3 rule: any ingest fails it."""
     _register(conn, settings)
     handle = _open(conn, settings, tmp_path)
     _price(conn, "A", _AFTER_CUTOFF, _AFTER_CUTOFF.replace(hour=23))
