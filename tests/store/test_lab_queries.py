@@ -13,6 +13,9 @@ registration's failures not); `sweep_state`'s complete, incomplete (stale) and
 incomplete (unrun); `plan_run`'s stale and unrun variants, its read-group order
 and its `--rerun` refusal; the measured seconds per variant by cadence from
 `ok` trials only; and vintage at the trial's own cutoff with a realistic fact.
+The rerun epoch (#1218): a `--rerun` the budget stopped is finished by a plain
+run, a plain first run opens none, terminal-failure counts start fresh under a
+rerun; and a `store_path` run's planning reads its synthetic trials only.
 Every function raises `LabNotInitialised` on a plain `fixture_store`.
 """
 
@@ -724,6 +727,152 @@ def test_plan_run_refuses_rerun_on_an_incomplete_sweep(
     _insert_trial(lab_store, first.hypothesis_id)
     with pytest.raises(lab_queries.SweepNotCompleteError):
         lab_queries.plan_run(lab_store, sweep.sweep_id, rerun=True)
+
+
+# --- the rerun epoch and synthetic runs (#1218) --------------------------------
+
+
+def _closed_run(
+    conn: duckdb.DuckDBPyConnection,
+    sweep: lab_registry.SweepRecord,
+    tmp_path: Path,
+    *,
+    n_planned: int,
+    completed: bool | None,
+    trials: tuple[int, ...] = (),
+) -> int:
+    """A `sweep_runs` row planning `n_planned` variants, linked to `trials` and
+    closed with `completed` (left open with None), as the runner (T107) writes
+    one."""
+    run_id = lab_registry.open_sweep_run(
+        conn,
+        sweep_id=sweep.sweep_id,
+        time_budget_minutes=480,
+        n_declared=sweep.n_variants,
+        n_planned=n_planned,
+        code_tree_sha256=_checkout(),
+        run_by="test",
+        repo_dir=tmp_path,
+    )
+    for trial_id in trials:
+        lab_registry.write_sweep_trial(
+            conn, sweep_run_id=run_id, trial_id=trial_id, read_group_index=1, seconds=1.0
+        )
+    if completed is None:
+        return run_id
+    lab_registry.close_sweep_run(
+        conn,
+        run_id,
+        n_ok=len(trials),
+        n_failed=0,
+        n_terminal_failed=0,
+        seconds=1.0,
+        n_trials_at_end=0,
+        sr_star_annual_at_end=0.0,
+        completed=completed,
+    )
+    return run_id
+
+
+def test_a_rerun_stopped_by_the_budget_is_finished_by_a_plain_run(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    first = _variant(lab_store, settings, sweep, 1)
+    second = _variant(lab_store, settings, sweep, 2)
+    before = (_insert_trial(lab_store, first.hypothesis_id),)
+    before += (_insert_trial(lab_store, second.hypothesis_id),)
+    _closed_run(lab_store, sweep, tmp_path, n_planned=2, completed=True, trials=before)
+    assert lab_queries.sweep_state(lab_store, sweep.sweep_id).complete
+    assert lab_queries.rerun_epoch(lab_store, sweep.sweep_id) is None
+    # A --rerun plans both; the budget stops it after variant 1.
+    rerun_trial = _insert_trial(lab_store, first.hypothesis_id)
+    epoch = _closed_run(
+        lab_store, sweep, tmp_path, n_planned=2, completed=False, trials=(rerun_trial,)
+    )
+    assert lab_queries.rerun_epoch(lab_store, sweep.sweep_id) == epoch
+    state = lab_queries.sweep_state(lab_store, sweep.sweep_id)
+    assert state.state == "incomplete (stale)"
+    assert [v.variant_index for v in state.stale] == [2]
+    plan = lab_queries.plan_run(lab_store, sweep.sweep_id)
+    assert [planned.variant.variant_index for planned in plan.variants] == [2]
+    with pytest.raises(lab_queries.SweepNotCompleteError):
+        lab_queries.plan_run(lab_store, sweep.sweep_id, rerun=True)
+    # The next plain run (one variant planned) finishes it.
+    finishing = _insert_trial(lab_store, second.hypothesis_id)
+    _closed_run(lab_store, sweep, tmp_path, n_planned=1, completed=True, trials=(finishing,))
+    assert lab_queries.sweep_state(lab_store, sweep.sweep_id).complete
+    assert lab_queries.plan_run(lab_store, sweep.sweep_id).variants == ()
+
+
+def test_a_plain_first_run_opens_no_epoch(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    first = _variant(lab_store, settings, sweep, 1)
+    _variant(lab_store, settings, sweep, 2)
+    trial = _insert_trial(lab_store, first.hypothesis_id)
+    _closed_run(lab_store, sweep, tmp_path, n_planned=2, completed=False, trials=(trial,))
+    assert lab_queries.rerun_epoch(lab_store, sweep.sweep_id) is None
+    state = lab_queries.sweep_state(lab_store, sweep.sweep_id)
+    assert [v.variant_index for v in state.unrun] == [2]
+
+
+def test_terminal_failure_counts_start_fresh_under_a_rerun(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    first = _variant(lab_store, settings, sweep, 1)
+    second = _variant(lab_store, settings, sweep, 2)
+    ok = _insert_trial(lab_store, first.hypothesis_id)
+    run_id = _open_run(lab_store, sweep, tmp_path)
+    for _ in range(2):
+        _record_failure(lab_store, second.hypothesis_id, run_id)
+    lab_registry.write_sweep_trial(
+        lab_store, sweep_run_id=run_id, trial_id=ok, read_group_index=1, seconds=1.0
+    )
+    lab_registry.close_sweep_run(
+        lab_store,
+        run_id,
+        n_ok=1,
+        n_failed=2,
+        n_terminal_failed=1,
+        seconds=1.0,
+        n_trials_at_end=0,
+        sr_star_annual_at_end=0.0,
+        completed=True,
+    )
+    assert lab_queries.terminal_failed(lab_store, second.hypothesis_id, sweep, _checkout())
+    # A --rerun fails variant 2 once with the same message: a fresh count of one.
+    rerun_ok = _insert_trial(lab_store, first.hypothesis_id)
+    rerun = _closed_run(lab_store, sweep, tmp_path, n_planned=2, completed=None)
+    _record_failure(lab_store, second.hypothesis_id, rerun)
+    lab_registry.write_sweep_trial(
+        lab_store, sweep_run_id=rerun, trial_id=rerun_ok, read_group_index=1, seconds=1.0
+    )
+    assert not lab_queries.terminal_failed(lab_store, second.hypothesis_id, sweep, _checkout())
+    state = lab_queries.sweep_state(lab_store, sweep.sweep_id)
+    assert state.terminal_failed == ()
+    assert [v.variant_index for v in state.unrun] == [2]
+    # A second identical failure inside the epoch makes it terminal again.
+    _record_failure(lab_store, second.hypothesis_id, rerun)
+    assert lab_queries.terminal_failed(lab_store, second.hypothesis_id, sweep, _checkout())
+
+
+def test_synthetic_planning_reads_only_synthetic_trials(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    sweep = _sweep(lab_store, settings, n_variants=2)
+    first = _variant(lab_store, settings, sweep, 1)
+    second = _variant(lab_store, settings, sweep, 2)
+    _insert_trial(lab_store, first.hypothesis_id, synthetic=True)
+    _insert_trial(lab_store, second.hypothesis_id, synthetic=False)
+    synthetic = lab_queries.sweep_state(lab_store, sweep.sweep_id, synthetic=True)
+    assert [v.variant_index for v in synthetic.unrun] == [2]
+    real = lab_queries.sweep_state(lab_store, sweep.sweep_id)
+    assert [v.variant_index for v in real.unrun] == [1]
+    plan = lab_queries.plan_run(lab_store, sweep.sweep_id, synthetic=True)
+    assert [planned.variant.variant_index for planned in plan.variants] == [2]
 
 
 # --- seconds per variant by cadence --------------------------------------------
