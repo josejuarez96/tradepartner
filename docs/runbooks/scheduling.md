@@ -434,6 +434,18 @@ uv run tradepartner paper abandon --reason "why stop could not close this window
 
 **After an `abandoned` window, the account must be strictly flat before the next `paper start` — no residue is carried forward, unlike a normal `closed` window.** The owner never trades by hand (spec req 14), so the one approved way to reach that strictly-flat state is **resetting the paper account at Alpaca directly** (its paper-account reset in the Alpaca dashboard), not placing manual offsetting trades. Do this before attempting the next `paper start`; it will otherwise refuse on a non-flat account. **Check whether the reset changes the account id or issues new paper keys.** `paper start` checks `account().account_id` and records it for the new window, and if Alpaca issued new `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` values, update them in `.env` before running `paper start` again — only `.env`, never a command line, a commit, or this runbook.
 
+## Sweeps and the quiet intervals
+
+The strategy lab's `run_sweep` (T107; the `sweep run` command is T111) reads and writes the store, which `ingest` and `paper run` also use. So it keeps out of their way by **quiet intervals**: inside one it opens no trial, holds no connection and writes nothing. A group about to start whose predicted time would reach an interval waits; a group running when one begins pauses between steps with its connection closed and resumes after.
+
+Two sources, both from `lab.*` and `paper.*` config:
+- **`lab.quiet_intervals`** (default `[("16:00", "21:00")]`), local `HH:MM` pairs in `lab.quiet_timezone` (default `America/New_York`), on each day in `lab.quiet_weekdays` (default Monday to Friday, `[0, 1, 2, 3, 4]`). These must cover **every other launchd job's run**: the ingest plist (18:30 ET, plus the time it can run late or coalesce after a wake) and any job added later. Move them whenever the ingest plist's time moves.
+- **The paper interval**, derived from `paper.submit_window_before_open_minutes`, `lab.paper_run_lead_minutes` (default 30), `paper.submit_window_after_open_minutes` and `paper.sell_wait_seconds`. With today's defaults it brackets the 08:05 ET paper plist; it moves with the `paper.*` keys, so nothing here needs editing when T70 sets them. On a weekday holiday it uses the regular 09:30 open.
+
+`lab.quiet_timezone` must equal the machine's system time zone, the one launchd fires in. `lab status` (T111) warns when it does not.
+
+A sweep only starts or resumes a group; it never blocks `ingest` or `paper run`, but a group that overruns into a plist's start is the failure this avoids, so check the intervals after any plist change. Every `run_sweep` applies the paper interval, whether or not a paper window is open.
+
 ## Placeholder: the `collect` job (after the collectors merge)
 
 **Do not install this yet.** The [event-data spec](../specs/event-data.md) schedules `tradepartner collect` as a second, independent launchd job once its collectors merge. Until then the owner runs `collect` by hand. The task that merges the collectors replaces this section with the final plist. The shape is known now:
