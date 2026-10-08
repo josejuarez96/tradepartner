@@ -22,8 +22,10 @@ this order, raising `PromotionRefused` before anything is written:
    won, and a `FROZEN_KEY_DEFAULTS` entry the file writes out at its default changes
    nothing;
 7. a file without a `## Sweep provenance` section whose `**Sweep:**` line names this
-   sweep's slug and registration id and whose `**Variant:**` line names the argmax
-   variant's slug (`docs/templates/hypothesis.md`);
+   sweep's slug, registration id and the family's declared count n and whose
+   `**Variant:**` line names the argmax variant's slug at rank 1
+   (`docs/templates/hypothesis.md`), or a file whose slug is already registered (the
+   promoted file is a new registration, never an existing record returned unchanged);
 8. a promotion identity (the fingerprint without `costs.per_side_bps`) that any
    earlier `promotion` decision's hypothesis already holds, from this or any sweep, at
    any cost base;
@@ -78,8 +80,10 @@ __all__ = [
 #: The section a promoted file must carry (`docs/templates/hypothesis.md`).
 PROVENANCE_HEADING: Final = "## Sweep provenance"
 
-_SWEEP_LINE: Final = re.compile(r"\*\*Sweep:\*\*\s*`([^`]+)`,\s*registration id\s+(\d+)")
-_VARIANT_LINE: Final = re.compile(r"\*\*Variant:\*\*\s*`([^`]+)`")
+_SWEEP_LINE: Final = re.compile(
+    r"\*\*Sweep:\*\*\s*`([^`]+)`,\s*registration id\s+(\d+);.*?declared count n\s*=\s*(\d+)"
+)
+_VARIANT_LINE: Final = re.compile(r"\*\*Variant:\*\*\s*`([^`]+)`,\s*rank\s+(\d+)")
 
 #: `registry.record_decision` with its `kind` open to the lab's two decision kinds
 #: (`lab_schema.LAB_DECISION_KINDS`): its `Literal` annotation predates them, and the
@@ -170,12 +174,17 @@ def _provenance_refusal(text: str, report: SweepReport, argmax: VariantRow) -> s
             f"its {PROVENANCE_HEADING!r} section names {named} as the sweep, not "
             f"`{report.slug}`, registration id {report.sweep_id}"
         )
+    if int(sweep.group(3)) != report.declared_count:
+        return (
+            f"its {PROVENANCE_HEADING!r} section names declared count n = {sweep.group(3)}, "
+            f"not the family's {report.declared_count}"
+        )
     variant = _VARIANT_LINE.search(section)
-    if variant is None or variant.group(1) != argmax.slug:
-        named = "nothing" if variant is None else repr(variant.group(1))
+    if variant is None or (variant.group(1), variant.group(2)) != (argmax.slug, "1"):
+        named = "nothing" if variant is None else f"{variant.group(1)!r} rank {variant.group(2)}"
         return (
             f"its {PROVENANCE_HEADING!r} section names {named} as the variant, not the "
-            f"argmax `{argmax.slug}`"
+            f"argmax `{argmax.slug}` at rank 1"
         )
     return None
 
@@ -287,6 +296,11 @@ def promote(
     refusal = _provenance_refusal(file.read_text(), report, argmax)
     if refusal is not None:
         raise PromotionRefused(f"{file}: {refusal}")
+    if conn.execute("SELECT 1 FROM hypotheses WHERE slug = ?", [parsed.slug]).fetchone():
+        raise PromotionRefused(
+            f"{file}: slug {parsed.slug!r} is already registered; a promoted file is a new "
+            "hypothesis under its own slug"
+        )
     identity = _record_identity(variant)
     for promoted_id, _, _ in promotions:
         if promoted_id is None:

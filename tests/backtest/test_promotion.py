@@ -295,7 +295,8 @@ class Lab:
             assert old in text, old
             text = text.replace(old, new, 1)
         if provenance is None:
-            provenance = _provenance(sweep.slug, sweep.sweep_id, variant.slug)
+            declared = lab_registry.family_declared_count(self.conn, "momentum")
+            provenance = _provenance(sweep.slug, sweep.sweep_id, variant.slug, declared=declared)
         path = self.root / f"{slug}.md"
         path.write_text(text + provenance)
         return path
@@ -307,12 +308,14 @@ class Lab:
         return sweep_report.sweep_report(self.conn, slug, code_vintage=CODE)
 
 
-def _provenance(sweep_slug: str, sweep_id: int, variant_slug: str) -> str:
+def _provenance(
+    sweep_slug: str, sweep_id: int, variant_slug: str, *, declared: int = 2, rank: int = 1
+) -> str:
     return (
         "\n## Sweep provenance\n\n"
         f"- **Sweep:** `{sweep_slug}`, registration id {sweep_id}; the family's declared "
-        "count n = 2 at promotion\n"
-        f"- **Variant:** `{variant_slug}`, rank 1 (the argmax) of the registration's 2 "
+        f"count n = {declared} at promotion\n"
+        f"- **Variant:** `{variant_slug}`, rank {rank} (the argmax) of the registration's 2 "
         "variants by sharpe_annual_excess_spy\n"
         "- **Base-level in-sample statistics at promotion:** placeholders\n"
     )
@@ -494,8 +497,17 @@ def test_a_frozen_key_default_added_after_the_sweep_changes_nothing(lab: Lab) ->
         (_provenance("other-grid", 1, f"{GRID}--r1-v1"), "as the sweep"),
         (_provenance(GRID, 7, f"{GRID}--r1-v1"), "as the sweep"),
         (_provenance(GRID, 1, f"{GRID}--r1-v2"), "as the variant"),
+        (_provenance(GRID, 1, f"{GRID}--r1-v1", rank=2), "at rank 1"),
+        (_provenance(GRID, 1, f"{GRID}--r1-v1", declared=3), "declared count n = 3"),
     ],
-    ids=["missing", "other-sweep", "other-registration", "other-variant"],
+    ids=[
+        "missing",
+        "other-sweep",
+        "other-registration",
+        "other-variant",
+        "other-rank",
+        "other-declared-count",
+    ],
 )
 def test_refused_without_a_matching_sweep_provenance_section(
     lab: Lab, provenance: str, match: str
@@ -503,6 +515,13 @@ def test_refused_without_a_matching_sweep_provenance_section(
     sweep, (winner, _other) = _won(lab)
     assert sweep.sweep_id == 1
     _refused(lab, lab.promoted_file(sweep, winner, provenance=provenance), match)
+
+
+def test_refused_for_a_slug_already_registered(lab: Lab) -> None:
+    """A slug already in the registry (here the twin's) never comes back from
+    `register` as an existing record that `promote` would then mark promoted."""
+    sweep, (winner, _other) = _won(lab)
+    _refused(lab, lab.promoted_file(sweep, winner, slug=TWIN), "already registered")
 
 
 def test_refused_below_promote_at_least_at_the_high_water_mark(lab: Lab) -> None:
@@ -622,7 +641,8 @@ def test_v_shrink_a_refusal_at_completion_survives_a_later_clustered_sweep(lab: 
 
     today = lab.report()
     assert today.sr_star_annual is not None and today.sr_star_annual < sr_star_at_completion
-    _refused(lab, path, "below promote_at_least")
+    # The file restated at today's declared count.
+    _refused(lab, lab.promoted_file(sweep, winner), "below promote_at_least")
 
 
 def test_v_shrink_a_clustered_sweep_is_judged_at_an_earlier_sweeps_mark(lab: Lab) -> None:
