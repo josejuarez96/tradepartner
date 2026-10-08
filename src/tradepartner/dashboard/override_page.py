@@ -72,7 +72,12 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.execution import window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
-from tradepartner.store.schema import ENGAGE_KILL_SWITCH_KIND, JOURNAL_ENUMS, SETTLE_ORDER_KIND
+from tradepartner.store.schema import (
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_ENUMS,
+    SETTLE_ORDER_KIND,
+    SchemaVersionError,
+)
 
 #: The kinds the schema allows, in its order (spec req 9), except `settle_order`:
 #: `paper settle` alone writes it, after a broker read this page cannot make
@@ -218,6 +223,11 @@ def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
         current = open_window(conn)
     except JournalNotInitialised:
         current = None
+    except SchemaVersionError as exc:
+        # A version-16 journal: the eight expanded tables lack `book_id`;
+        # `require_journal`'s message names the fix.
+        st.warning(str(exc))
+        return
     except JournalIntegrityError as exc:
         st.error(f"{exc}; the writer refuses every override until this is resolved.")
         return

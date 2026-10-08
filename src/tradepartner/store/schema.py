@@ -265,7 +265,30 @@ registry; #83 took version 2 first, so the registry is version 3):
   A read-only connection accepts a version-15 store without migrating it:
   every read but the lab tables works (`lab_schema.require_lab` raises
   `LabNotInitialised`).
-- **A later DDL change goes to version 17**, with its own migration and a
+- **Version 17** (#1258, ADR 0015 seams 1 to 3, plan T132): the expansion
+  seams. `book_id VARCHAR NOT NULL DEFAULT 'main'` (`DEFAULT_BOOK_ID`, the
+  one book every row written before T133 belongs to) on `paper_windows`,
+  `decisions`, `orders`, `positions_daily`, `lots`, `disposals`,
+  `adjustments` and `reconciliations`; `position_side VARCHAR NOT NULL
+  DEFAULT 'long'` (`POSITION_SIDES`, a `CHECK` like every other closed set)
+  on `decisions`, `orders`, `positions_daily`, `lots` and `disposals`; and,
+  on `orders`, the read-side shape seam 3 reserves (`order_type`,
+  `time_in_force`, `limit_price`, `stop_price`, `asset_class`, `order_class`,
+  `multiplier`, `parent_order_id`; the five defaults in `ORDER_SHAPE_DEFAULTS`
+  the DDL is generated from, and no `CHECK` on them: T135b's refusal is the
+  guard). DuckDB cannot add a NOT NULL column in place, so the migration
+  `_migrate_expansion_seams`, run by `init_schema` after `_migrate_lab`,
+  rebuilds each of the eight tables that lacks `book_id` with the version-17
+  DDL, every row kept in insertion order with the new columns at their
+  defaults; a table another migration already rebuilt from the current
+  `_CREATE_*` DDL (a version-6 `decisions`) is left alone, as
+  `_migrate_retracted` tests. A read-only connection accepts a version-16
+  store for fact, registry and lab reads, but a journal read raises
+  `SchemaVersionError` (`store.journal.require_journal`, naming the fix:
+  open it for writing once): `journal._select` selects every row-type field,
+  so every read of the eight tables, the ops page and `open_window` included,
+  would otherwise fail with a binder error.
+- **A later DDL change goes to version 18**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -336,7 +359,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Final
+from typing import Final, TypedDict
 
 import duckdb
 
@@ -465,9 +488,17 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `hypothesis_fingerprints` and `family_rules` rows for every existing
 #:   hypothesis and family, on a migrating store only (module docstring,
 #:   "Schema versions").
-#: - A later DDL change goes to version 17, with its own migration and a
+#: - 17 (#1258, ADR 0015 seams 1 to 3, plan T132): `book_id` on the eight
+#:   journal tables, `position_side` on five of them and the `orders` shape
+#:   columns, all defaulted. Migration from version 16 (or any earlier
+#:   migratable version, after its steps): every one of the eight tables
+#:   that lacks `book_id` is rebuilt with the version-17 DDL, every row kept
+#:   in insertion order with the new columns at their defaults
+#:   (`_migrate_expansion_seams`), after `_migrate_lab` (module docstring,
+#:   "Schema versions").
+#: - A later DDL change goes to version 18, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -532,6 +563,12 @@ _PRE_PERIOD_KEYS_VERSION = 14
 #: The last version without the strategy-lab tables (#1195, T113; version
 #: "P"): read-only connections serve every read but the lab tables.
 _PRE_LAB_VERSION = 15
+
+#: The last version without the ADR 0015 expansion-seam columns (#1258, T132,
+#: version 17): read-only connections serve fact, registry and lab reads, but
+#: a journal read raises `SchemaVersionError` (`store.journal.require_journal`),
+#: since the eight expanded tables lack `book_id`.
+_PRE_EXPANSION_SEAMS_VERSION = 16
 
 
 class SchemaVersionError(RuntimeError):
@@ -1097,6 +1134,45 @@ _JOURNAL_TIMESTAMPS = """
 
 SIDES: tuple[str, ...] = ("buy", "sell")
 
+#: The one book every journal row written before T133 belongs to (ADR 0015
+#: seam 1, plan T132): the `book_id` columns' default and the migration's
+#: backfill. T133 makes every writer pass the window's own book, so the
+#: default is dead after it.
+DEFAULT_BOOK_ID = "main"
+
+#: The position a lot, disposal, position mark, decision or order closes or
+#: opens (ADR 0015 seam 2, plan T132). `SIDES` stays `buy`/`sell`, so an
+#: order's intent is the pair (`side`, `position_side`); every row written
+#: before the shorting ADR is `LONG`.
+POSITION_SIDES: tuple[str, ...] = ("long", "short")
+LONG = "long"
+
+
+class OrderShapeDefaults(TypedDict):
+    """The five `orders` shape columns ADR 0015 seam 3 reserves, each with the
+    default its DDL column and its journal row-type field take (plan T132). The
+    DDL is generated from this mapping, so the two can never drift."""
+
+    order_type: str
+    time_in_force: str
+    asset_class: str
+    order_class: str
+    multiplier: int
+
+
+#: `orders`' five defaulted shape columns (ADR 0015 seam 3, plan T132):
+#: `limit_price`, `stop_price` and `parent_order_id` are nullable and take
+#: no default, and none of the eight carries a `CHECK` (T135b's refusal is
+#: the guard; a `CHECK` would cost a rebuild when the first other kind is
+#: allowed).
+ORDER_SHAPE_DEFAULTS: OrderShapeDefaults = {
+    "order_type": "market",
+    "time_in_force": "day",
+    "asset_class": "us_equity",
+    "order_class": "simple",
+    "multiplier": 1,
+}
+
 #: `order_events.reason` of the `cancel_requested` (and `cancel_failed`) event the
 #: halt path journals before each cancel call.
 HALT_REASON = "halt"
@@ -1173,6 +1249,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         WINDOW_STOP_REASON,
     ),
     ("decisions", "side"): SIDES,
+    ("decisions", "position_side"): POSITION_SIDES,
     ("decisions", "decision"): (
         "trade",
         "skip_below_minimum",
@@ -1197,6 +1274,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("orders", "phase"): ("sell", "buy", "exit"),
     ("orders", "side"): SIDES,
+    ("orders", "position_side"): POSITION_SIDES,
     ("order_events", "status"): (
         "pending",
         "accepted",
@@ -1229,6 +1307,9 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         ENGAGE_KILL_SWITCH_KIND,
         SETTLE_ORDER_KIND,
     ),
+    ("positions_daily", "position_side"): POSITION_SIDES,
+    ("lots", "position_side"): POSITION_SIDES,
+    ("disposals", "position_side"): POSITION_SIDES,
 }
 
 NULLABLE_JOURNAL_ENUMS: frozenset[tuple[str, str]] = frozenset(
@@ -1266,6 +1347,7 @@ CREATE TABLE IF NOT EXISTS paper_windows (
     started_at TIMESTAMPTZ NOT NULL,
     frozen_json VARCHAR NOT NULL,
     frozen_sha256 VARCHAR NOT NULL,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS}
 )
 """
@@ -1406,8 +1488,11 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision VARCHAR NOT NULL,
     reason VARCHAR,
     override_id BIGINT,
+    position_side VARCHAR NOT NULL DEFAULT '{LONG}',
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS},
     {_check("decisions", "side")},
+    {_check("decisions", "position_side")},
     {_check("decisions", "decision")},
     {_check("decisions", "reason")}
 )
@@ -1440,10 +1525,21 @@ CREATE TABLE IF NOT EXISTS orders (
     side VARCHAR NOT NULL,
     notional DOUBLE,
     quantity DOUBLE,
+    position_side VARCHAR NOT NULL DEFAULT '{LONG}',
+    order_type VARCHAR NOT NULL DEFAULT '{ORDER_SHAPE_DEFAULTS["order_type"]}',
+    time_in_force VARCHAR NOT NULL DEFAULT '{ORDER_SHAPE_DEFAULTS["time_in_force"]}',
+    limit_price DOUBLE,
+    stop_price DOUBLE,
+    asset_class VARCHAR NOT NULL DEFAULT '{ORDER_SHAPE_DEFAULTS["asset_class"]}',
+    order_class VARCHAR NOT NULL DEFAULT '{ORDER_SHAPE_DEFAULTS["order_class"]}',
+    multiplier DOUBLE NOT NULL DEFAULT {ORDER_SHAPE_DEFAULTS["multiplier"]},
+    parent_order_id VARCHAR,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     sells_in_flight_at_submit BOOLEAN NOT NULL,
     {_JOURNAL_TIMESTAMPS},
     {_check("orders", "phase")},
-    {_check("orders", "side")}
+    {_check("orders", "side")},
+    {_check("orders", "position_side")}
 )
 """
 
@@ -1552,7 +1648,10 @@ CREATE TABLE IF NOT EXISTS positions_daily (
     value DOUBLE,
     cash DOUBLE,
     tradable BOOLEAN,
+    position_side VARCHAR NOT NULL DEFAULT '{LONG}',
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS},
+    {_check("positions_daily", "position_side")},
     CHECK (security_id IS NOT NULL OR quantity = 0)
 )
 """
@@ -1569,6 +1668,7 @@ CREATE TABLE IF NOT EXISTS adjustments (
     quantity DOUBLE,
     cash DOUBLE,
     explanation_json VARCHAR,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS},
     {_check("adjustments", "kind")},
     {_check("adjustments", "origin")}
@@ -1584,6 +1684,7 @@ CREATE TABLE IF NOT EXISTS reconciliations (
     status VARCHAR NOT NULL,
     broker_cash DOUBLE,
     mismatches_json VARCHAR,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS},
     {_check("reconciliations", "status")}
 )
@@ -1670,7 +1771,10 @@ CREATE TABLE IF NOT EXISTS lots (
     quantity DOUBLE NOT NULL,
     cost_basis DOUBLE NOT NULL,
     fill_id BIGINT,
-    {_JOURNAL_TIMESTAMPS}
+    position_side VARCHAR NOT NULL DEFAULT '{LONG}',
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
+    {_JOURNAL_TIMESTAMPS},
+    {_check("lots", "position_side")}
 )
 """
 
@@ -1686,7 +1790,10 @@ CREATE TABLE IF NOT EXISTS disposals (
     realised_pnl DOUBLE NOT NULL,
     tax_year INTEGER NOT NULL,
     fill_id BIGINT,
-    {_JOURNAL_TIMESTAMPS}
+    position_side VARCHAR NOT NULL DEFAULT '{LONG}',
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
+    {_JOURNAL_TIMESTAMPS},
+    {_check("disposals", "position_side")}
 )
 """
 
@@ -2131,6 +2238,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_REBALANCE_COUNTS_VERSION,
         _PRE_PERIOD_KEYS_VERSION,
         _PRE_LAB_VERSION,
+        _PRE_EXPANSION_SEAMS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2144,7 +2252,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version 13 every read but `trial_rebalance_counts`; version 14 every
         # read but the version-15 columns and the `*_period` metric rows;
         # version 15 every read but the lab tables (`lab_schema.require_lab`
-        # raises `LabNotInitialised`).
+        # raises `LabNotInitialised`); version 16 serves fact, registry and lab
+        # reads, but every journal read raises `SchemaVersionError`
+        # (`store.journal.require_journal`, naming the fix): the eight expanded
+        # tables lack `book_id`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2647,9 +2758,47 @@ def _migrate_lab(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
+#: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17,
+#: each with the version-17 DDL `_migrate_expansion_seams` rebuilds it from.
+_EXPANSION_SEAM_TABLE_DDL: Final[dict[str, str]] = {
+    "paper_windows": _CREATE_PAPER_WINDOWS,
+    "decisions": _CREATE_DECISIONS,
+    "orders": _CREATE_ORDERS,
+    "positions_daily": _CREATE_POSITIONS_DAILY,
+    "lots": _CREATE_LOTS,
+    "disposals": _CREATE_DISPOSALS,
+    "adjustments": _CREATE_ADJUSTMENTS,
+    "reconciliations": _CREATE_RECONCILIATIONS,
+}
+
+
+def _migrate_expansion_seams(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild each of `_EXPANSION_SEAM_TABLE_DDL`'s eight tables that lacks
+    `book_id` with its version-17 DDL (module docstring, "Schema versions",
+    version 17), every row kept in insertion order with the new columns at
+    their defaults (`book_id = DEFAULT_BOOK_ID`, `position_side = LONG`, the
+    `orders` shape from `ORDER_SHAPE_DEFAULTS`; no row before version 17 could
+    hold anything else). Idempotent: a table that already has `book_id` is left
+    alone, as `_migrate_retracted` tests, because an older migration rebuilding
+    from the current `_CREATE_*` DDL may already have given a table the
+    version-17 shape (a version-6 `decisions`). Runs inside `init_schema`'s
+    transaction, after `_migrate_lab`."""
+    for table, ddl in _EXPANSION_SEAM_TABLE_DDL.items():
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        if "book_id" in columns:
+            continue
+        staging = f"{table}_v17"
+        conn.execute(
+            ddl.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 15 store to version 16.
+    version-2 to 16 store to version 17.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2661,8 +2810,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; a version-2 to 15 store gets,
-    last, the lab tables, the two widened enumerations and the
+    `CURRENT_SCHEMA_VERSION` and no lab table; a version-16 or earlier store
+    gets each of the eight journal tables ADR 0015 seams 1 to 3 expand
+    rebuilt with the version-17 DDL where it lacks `book_id` (every row kept
+    in insertion order, the new columns at their defaults; #1258, T132);
+    a version-2 to 15 store gets, last, the lab tables, the two widened
+    enumerations and the
     `pre_lab_hypotheses`, `hypothesis_fingerprints` and `family_rules` rows
     for its existing hypotheses and families (#1195, T113); every store gets
     the version-15 columns
@@ -2698,7 +2851,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-16, 15 (every read but
+    On a read-only connection no DDL runs: a version-17 store passes, and a
+    version-16 store serves fact, registry and lab reads while every journal
+    read raises `SchemaVersionError` (`store.journal.require_journal`, naming
+    the fix); 15 (every read but
     the lab tables, which `lab_schema.require_lab` reports as
     `LabNotInitialised`), 14 (every read but
     the version-15 columns and period rows), 13 (every read but
@@ -2740,6 +2896,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_REBALANCE_COUNTS_VERSION,
         _PRE_PERIOD_KEYS_VERSION,
         _PRE_LAB_VERSION,
+        _PRE_EXPANSION_SEAMS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2790,6 +2947,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         forget_column_types(conn)
         if max_version is not None and max_version <= _PRE_LAB_VERSION:
             _migrate_lab(conn)
+        if max_version is not None and max_version <= _PRE_EXPANSION_SEAMS_VERSION:
+            _migrate_expansion_seams(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

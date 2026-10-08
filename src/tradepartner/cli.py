@@ -109,9 +109,10 @@ Paper trading (Phase 4 plan T90; ADR 0010 amendment 2026-10-04):
   on any difference (an unmatched row on either side is one), and
   `LOTS_RECONCILE_REFUSAL_EXIT`'s code per refusal: `unknown_export_format`,
   `no_disposals` (none in the tax year), `locked` (store busy), `no_window`
-  (no journal or no window) and `no_store`. The ledger holds one window's
-  rebuild (spec req 13), so the report names that window and every other
-  window that reaches the tax year, whose disposals are not compared.
+  (no journal or no window), `schema_version` (a journal predating schema
+  version 17; its message names the fix) and `no_store`. The ledger holds one
+  window's rebuild (spec req 13), so the report names that window and every
+  other window that reaches the tax year, whose disposals are not compared.
 
 Strategy lab (strategy-lab spec req 15; plan T111):
 
@@ -768,6 +769,7 @@ LOTS_RECONCILE_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
         "locked": 6,
         "no_window": 7,
         "no_store": 8,
+        "schema_version": 9,
     }
 )
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -817,6 +819,8 @@ def _read_ledger_set(conn: duckdb.DuckDBPyConnection, tax_year: int) -> _LedgerS
         journal.require_journal(conn)
     except journal.JournalNotInitialised:
         raise _LotsRefused("no_window", "no_window: the store has no paper journal") from None
+    except schema.SchemaVersionError as exc:
+        raise _LotsRefused("schema_version", f"schema_version: {exc}") from None
     windows = [
         (int(w), s)
         for w, s in conn.execute(

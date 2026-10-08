@@ -9,6 +9,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -20,6 +21,7 @@ from conftest import version_4_store
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.execution import ops
+from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, open_read_only, utc_now
 from tradepartner.store.journal import (
     AlertRow,
@@ -377,6 +379,38 @@ def test_journal_not_initialised_on_a_version_4_store(tmp_path: Path) -> None:
     assert data.fills == ()
     assert data.chains == ()
     assert data.alerts == ()
+
+
+def test_reconciliation_fields_match_the_row_type_and_include_book_id() -> None:
+    """Version 17 (ADR 0015 seam 1, plan T132) adds `book_id` to
+    `reconciliations`; `_RECONCILIATION_FIELDS` is the select list
+    `_latest_reconciliation` zips into `ReconciliationRow`, so it must name
+    every row-type field in order."""
+    names = tuple(f.name for f in dataclass_fields(ReconciliationRow))
+    assert names == ops._RECONCILIATION_FIELDS
+    fields_list = ops._RECONCILIATION_FIELDS
+    assert fields_list.index("book_id") + 1 == fields_list.index("known_at")
+
+
+def test_journal_outdated_on_a_read_only_version_16_store(tmp_path: Path) -> None:
+    """#1261: `require_journal` raises `SchemaVersionError` on a version-16 store
+    (the eight expanded tables lack `book_id`); `page_data` catches it into
+    `journal_outdated`, whose message names the fix, not a false "no journal"."""
+    path = tmp_path / "store_v16.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        schema.init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE paper_windows DROP COLUMN book_id")
+    finally:
+        conn.close()
+    settings = Settings(_env_file=None, store={"path": str(path)})
+    with duckdb.connect(str(path), read_only=True) as conn:
+        data = ops.page_data(conn, settings)
+    assert data.journal_not_initialised is False
+    assert data.journal_outdated is not None
+    assert "open it for writing once" in data.journal_outdated
+    assert data.window is None
 
 
 def test_no_window_returns_empty_data(journal_settings: Settings) -> None:

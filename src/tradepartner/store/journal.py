@@ -36,6 +36,13 @@ pointer).
 - **`JournalNotInitialised`**: raised by `append`, `fills_for` and `all_fill_ids`
   when the journal tables are absent (a version-4 store no write has migrated;
   read-only connections never migrate), for the pages' "not initialised" state.
+- **`SchemaVersionError`**: raised by `require_journal` when the journal
+  predates schema version 17: a read-only connection to a version-16 store has
+  every journal table but none of them carries `book_id` (ADR 0015 seams 1 to
+  3, plan T132; read-only connections never migrate). The message names the
+  fix (open the store for writing once). `_select` selects every row-type
+  field, so without this guard every read of the eight expanded tables, the
+  ops page and `open_window` included, would fail with a binder error.
 
 Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 `insert_row` quotes every column.
@@ -53,9 +60,13 @@ import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
 from tradepartner.store.schema import (
+    DEFAULT_BOOK_ID,
     ENGAGE_KILL_SWITCH_KIND,
     JOURNAL_TABLE_NAMES,
     LATER_JOURNAL_TABLE_NAMES,
+    LONG,
+    ORDER_SHAPE_DEFAULTS,
+    SchemaVersionError,
 )
 
 
@@ -99,6 +110,7 @@ class PaperWindowRow:
     started_at: datetime
     frozen_json: str
     frozen_sha256: str
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -242,6 +254,8 @@ class DecisionRow:
     decision: str
     reason: str | None = None
     override_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -280,6 +294,16 @@ class OrderRow:
     side: str
     notional: float | None = None
     quantity: float | None = None
+    position_side: str = LONG
+    order_type: str = ORDER_SHAPE_DEFAULTS["order_type"]
+    time_in_force: str = ORDER_SHAPE_DEFAULTS["time_in_force"]
+    limit_price: float | None = None
+    stop_price: float | None = None
+    asset_class: str = ORDER_SHAPE_DEFAULTS["asset_class"]
+    order_class: str = ORDER_SHAPE_DEFAULTS["order_class"]
+    multiplier: float = ORDER_SHAPE_DEFAULTS["multiplier"]
+    parent_order_id: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     sells_in_flight_at_submit: bool
     known_at: datetime
     ingested_at: datetime
@@ -401,6 +425,8 @@ class PositionDailyRow:
     value: float | None = None
     cash: float | None = None
     tradable: bool | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -422,6 +448,7 @@ class AdjustmentRow:
     quantity: float | None = None
     cash: float | None = None
     explanation_json: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -440,6 +467,7 @@ class ReconciliationRow:
     status: str
     broker_cash: float | None = None
     mismatches_json: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -539,6 +567,8 @@ class LotRow:
     quantity: float
     cost_basis: float
     fill_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -560,6 +590,8 @@ class DisposalRow:
     realised_pnl: float
     tax_year: int
     fill_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -634,11 +666,49 @@ class OrderedFill:
 #: read-only connection to an older journal store may lack (#472).
 _REQUIRED_TABLES = tuple(t for t in JOURNAL_TABLE_NAMES if t not in LATER_JOURNAL_TABLE_NAMES)
 
+#: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17
+#: (plan T132); a read-only connection to a version-16 store has every one of
+#: them but none carries `book_id`.
+_EXPANSION_SEAM_TABLES = (
+    "paper_windows",
+    "decisions",
+    "orders",
+    "positions_daily",
+    "lots",
+    "disposals",
+    "adjustments",
+    "reconciliations",
+)
+
+
+def _require_expansion_seams(conn: duckdb.DuckDBPyConnection) -> None:
+    """Raise `SchemaVersionError` naming the fix when any of the eight journal
+    tables ADR 0015 seams 1 to 3 expand lacks `book_id`: a read-only connection
+    to a version-16 store, where `_select` would otherwise fail with a binder
+    error selecting a row-type field the table has no column for. The caller
+    (`require_journal`) has already ensured every table exists, so a missing
+    table cannot reach here."""
+    (with_book_id,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND column_name = 'book_id' AND table_name IN "
+        f"({', '.join('?' for _ in _EXPANSION_SEAM_TABLES)})",
+        list(_EXPANSION_SEAM_TABLES),
+    ).fetchone()
+    if with_book_id != len(_EXPANSION_SEAM_TABLES):
+        raise SchemaVersionError(
+            "the store's paper-trading journal predates schema version 17 "
+            "(a journal table has no book_id column); open it for writing once "
+            "with a command that migrates it (for example `ingest`) to read the journal"
+        )
+
 
 def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
     """Raise `JournalNotInitialised` unless every journal table exists, those in
     `schema.LATER_JOURNAL_TABLE_NAMES` aside (a read-only connection to a
-    version-7 store lacks them; a write connection has migrated)."""
+    version-7 store lacks them; a write connection has migrated). Raise
+    `SchemaVersionError` when the tables exist but predate schema version 17
+    (no `book_id`; a read-only connection to a version-16 store), naming the
+    fix: open the store for writing once."""
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
@@ -650,6 +720,7 @@ def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
             "the store has no paper-trading journal (a journal table is missing); "
             "any writing command migrates it to the current version"
         )
+    _require_expansion_seams(conn)
 
 
 def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:

@@ -21,7 +21,7 @@ from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settin
 from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
-from tradepartner.store import registry
+from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -1135,3 +1135,47 @@ def test_accepts_spinoff_with_a_parent_split_before_and_a_child_split_after(
     # 15.0, matching what the live broker actually holds.
     assert ledger.positions[CHILD] == pytest.approx(15.0)
     assert fake.positions()["SPLT"].quantity == pytest.approx(ledger.positions[CHILD])
+
+
+def test_window_of_refuses_schema_version_on_a_version_16_store(tmp_path: Path) -> None:
+    """#1261: `_window_of` refuses `schema_version` (not a false `no_window`)
+    over a version-16 journal, the eight expanded tables lacking `book_id`, with
+    the fix in the message."""
+    path = tmp_path / "v16.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        schema.init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+    finally:
+        conn.close()
+    with (
+        duckdb.connect(str(path), read_only=True) as conn,
+        pytest.raises(window.WindowCommandRefused) as refused,
+    ):
+        window._window_of(conn)
+    assert refused.value.reason == window.SCHEMA_VERSION
+    assert "open it for writing once" in str(refused.value)
+
+
+def test_start_refuses_schema_version_on_a_version_16_store(
+    tmp_path: Path, fixed_clock: FixedClock
+) -> None:
+    """#1261: `start` refuses `schema_version`, naming the fix, rather than
+    treating the store as having no journal and then refusing `not_flat`."""
+    path = tmp_path / "v16.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+        hyp = _register(conn, settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, settings, hyp, tmp_path)
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+
+    fake = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as refused:
+        window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+
+    assert refused.value.reason == window.SCHEMA_VERSION
+    assert "open it for writing once" in str(refused.value)

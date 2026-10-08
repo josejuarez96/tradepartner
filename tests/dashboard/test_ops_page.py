@@ -309,6 +309,22 @@ def test_render_journal_not_initialised(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert "version 4" not in text
 
 
+def test_render_journal_outdated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """#1261: a version-16 journal shows the migrate-first message, not a false
+    "no journal"."""
+    store_path = tmp_path / "v16.duckdb"
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        schema.init_schema(conn)
+        conn.execute("UPDATE schema_version SET version = 16")
+        conn.execute("ALTER TABLE orders DROP COLUMN book_id")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "journal outdated" in text.lower()
+    assert "open it for writing once" in text
+
+
 def test_render_no_window_yet(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     store_path = tmp_path / "empty.duckdb"
     settings = Settings(_env_file=None, store={"path": str(store_path)})
