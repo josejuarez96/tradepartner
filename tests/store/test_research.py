@@ -1320,3 +1320,22 @@ def test_a_research_spend_marks_a_later_backtest_holdout_run_a_repeat(
         [spend],
     )
     assert (decision.outcome, decision.holdout_repeat) == ("needs_gap", True)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"sealed_periods": [], "sealed_split": None},
+        {"family_holdouts": [], "sealed_split": None},
+        {"family_holdouts": "bad", "sealed_periods": [], "sealed_split": None},
+        {"family_holdouts": [], "sealed_periods": [["bad", "2024-12-31"]], "sealed_split": None},
+    ],
+)
+def test_malformed_holdout_spend_is_refused_without_a_decision_row(
+    conn: duckdb.DuckDBPyConnection, values: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="holdout_spend"):
+        research.record_decision(
+            conn, kind="holdout_spend", reason="test", values=values, made_by="owner"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM research_decisions").fetchone() == (0,)

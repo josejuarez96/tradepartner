@@ -34,8 +34,9 @@ spec order (window, split, holdout, budget, confirmatory basis), and inserts the
 run row whatever the answer: a refusal is a run row plus its refusal result, and
 the handle carries `refusal` so no data are read. Holdout spends, flags and
 reasons are recorded only on a run that opens. Commit `open_run` in its own write
-chunk before any other work. `synthetic=True` is refused on `settings.store.path`
-(file identity, `store.registry`'s check).
+chunk before any other work, including `load_dataset`: a rolled-back open has
+no durable run record, even if its handle remains in memory. `synthetic=True`
+is refused on `settings.store.path` (file identity, `store.registry`'s check).
 
 **The development boundary** (ADR 0016 point 2; data-foundation plan T142b). For a
 registration that names a backtest family (one with registered hypotheses), `open_run` reads
@@ -243,6 +244,13 @@ def _span_list(spans: Sequence[tuple[date, date]]) -> list[list[str]]:
 
 def _decode_spans(raw: Sequence[Sequence[str]]) -> tuple[tuple[date, date], ...]:
     return tuple((date.fromisoformat(s), date.fromisoformat(e)) for s, e in raw)
+
+
+def _valid_spend_span(start: str, end: str) -> bool:
+    try:
+        return date.fromisoformat(start) <= date.fromisoformat(end)
+    except ValueError:
+        return False
 
 
 def _next_run_id(conn: duckdb.DuckDBPyConnection) -> int:
@@ -1038,6 +1046,21 @@ def record_decision(
     """Append a `research_decisions` row and return its id. Refuses a blank
     reason and a registration or run id that does not exist."""
     require_research(conn)
+    if kind == "holdout_spend":
+        for key in ("family_holdouts", "sealed_periods"):
+            spans = values.get(key)
+            if not isinstance(spans, (list, tuple)) or any(
+                not isinstance(span, (list, tuple))
+                or len(span) != 2
+                or not all(isinstance(day, str) for day in span)
+                or not _valid_spend_span(span[0], span[1])
+                for span in spans
+            ):
+                raise ValueError(f"holdout_spend needs valid {key} date spans")
+        if "sealed_split" not in values or (
+            values["sealed_split"] is not None and not isinstance(values["sealed_split"], str)
+        ):
+            raise ValueError("holdout_spend needs a sealed_split string or null")
     if not reason.strip():
         raise ValueError("a research decision needs a reason")
     for table, column, value in (

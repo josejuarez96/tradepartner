@@ -867,3 +867,22 @@ def test_render_no_spend_cap_without_the_lab_tables(
     at = _pick(_app(monkeypatch, store_path), full)
     assert not at.exception
     assert "1 holdout spends; no family cap" in _text(at)
+
+
+def test_holdout_spend_table_names_trial_and_research_sources(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    store_path, seeded = seeded_store
+    with duckdb.connect(str(store_path), read_only=True) as conn:
+        view = backtest_page.load_trial_view(conn, seeded.holdout)
+    trial = view.holdout_spends[0]
+    research_spend = replace(trial, trial_id=99, source="research_run")
+    view = replace(view, holdout_spends=(trial, research_spend))
+    frames: list[Any] = []
+    monkeypatch.setattr(backtest_page.st, "subheader", lambda *_: None)
+    monkeypatch.setattr(backtest_page.st, "caption", lambda *_: None)
+    monkeypatch.setattr(backtest_page.st, "dataframe", lambda frame, **_: frames.append(frame))
+
+    backtest_page._render_holdout_spends(view)
+
+    assert frames[0]["source"].to_list() == ["trial", "research_run"]
