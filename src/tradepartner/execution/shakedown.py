@@ -17,7 +17,8 @@ the last completed session (`calendar.last_completed_session(now)`). A
 `reconciliations` row with `status = 'mismatch'`, or a `paper_run_results` row
 with `status = 'halted'`, written after the row restarts the span at the session
 after the first `kill_switch` row with `state = 'released'` of the same window
-that follows it; until that row exists the span is **pending** (no sessions) and
+that follows it (or that window's closing stop after it, since a closed window
+never trades again); until that row exists the span is **pending** (no sessions) and
 starts at the restart event itself, so E.2 and the rest still see it. With
 several restart events the latest restart wins. The span's instant lower bound
 (`Span.start_at`) is New York midnight of its first session (or the earliest
@@ -37,13 +38,14 @@ and the day it closes may hold a run or not, so neither is required (ADR 0017:
 
 1. **`E.1 sessions`**: for every span session and every window open on it, a
    scheduler-invoked `paper_runs` row of that window and session whose
-   `paper_run_results.status` is `ok`; or `skipped_kill_switch` while the
-   window's latest `kill_switch` row at the run's start is an owner `engaged`
-   one (the E.4 drill); or `stale` with a `shakedown_note` naming a `stale_data`
-   alert of that run. A session with no scheduler row passes only when the
-   book's `missed_run` alert for it (`alerts.session` is the next session:
-   `run.py` alerts S-1 from the run on S) has a `shakedown_note`; the count is
-   printed. Across all books, at least M span sessions on which a
+   `paper_run_results.status` is `ok`; or `skipped_kill_switch` when the run
+   started between an owner `engaged` row and the first `released` row after it in
+   that window (write order) and wrote no `orders` row (the E.4 drill: an
+   engagement never released excuses nothing); or `stale` with a `shakedown_note`
+   naming a `stale_data` alert of that run. A session with no scheduler row passes
+   only when the book's `missed_run` alert for it (`alerts.session` is the next
+   session: `run.py` alerts S-1 from the run on S) has a `shakedown_note`; the
+   count is printed. Across all books, at least M span sessions on which a
    scheduler-invoked run submitted an order with a live fill (`fills_for`, which
    hides superseded rows). The span must hold at least N sessions and not be
    pending.
@@ -88,7 +90,7 @@ import duckdb
 
 from tradepartner.calendar import last_completed_session, next_session, previous_session
 from tradepartner.config import Settings
-from tradepartner.execution.check import _chain_line, _override_line
+from tradepartner.execution.check import _chain_line, _frozen, _override_line
 from tradepartner.execution.window import window_cadence
 from tradepartner.health import health_report
 from tradepartner.store import journal as store_journal
@@ -292,7 +294,7 @@ def _runs(conn: duckdb.DuckDBPyConnection, first_day: date) -> list[_Run]:
 
 def _switches(conn: duckdb.DuckDBPyConnection) -> list[_Switch]:
     rows = conn.execute(
-        'SELECT event_id, window_id, "at", state, source FROM kill_switch ORDER BY "at", event_id'
+        'SELECT event_id, window_id, "at", state, source FROM kill_switch ORDER BY event_id'
     ).fetchall()
     return [_Switch(event_id=r[0], window_id=r[1], at=r[2], state=r[3], source=r[4]) for r in rows]
 
@@ -326,19 +328,20 @@ def _ordered_runs(conn: duckdb.DuckDBPyConnection) -> set[int]:
 
 
 def _restart_events(
-    conn: duckdb.DuckDBPyConnection, after: datetime
+    conn: duckdb.DuckDBPyConnection, after: datetime, now: datetime
 ) -> list[tuple[int, datetime, str]]:
     """(window_id, at, what) for every `mismatch` reconciliation and `halted` run
-    result written after `after`."""
+    result written after `after` and at or before `now`."""
     mismatches = conn.execute(
         'SELECT window_id, "at", reconciliation_id FROM reconciliations '
-        'WHERE status = ? AND "at" > ?',
-        [_MISMATCH, after],
+        'WHERE status = ? AND "at" > ? AND "at" <= ?',
+        [_MISMATCH, after, now],
     ).fetchall()
     halts = conn.execute(
         "SELECT r.window_id, res.finished_at, r.run_id FROM paper_run_results res "
-        "JOIN paper_runs r ON r.run_id = res.run_id WHERE res.status = ? AND res.finished_at > ?",
-        [_HALTED, after],
+        "JOIN paper_runs r ON r.run_id = res.run_id "
+        "WHERE res.status = ? AND res.finished_at > ? AND res.finished_at <= ?",
+        [_HALTED, after, now],
     ).fetchall()
     return [
         (int(w), at, f"mismatch reconciliation {rid} ({at.isoformat()})")
@@ -349,31 +352,44 @@ def _restart_events(
 def read_span(conn: duckdb.DuckDBPyConnection, now: datetime) -> Span:
     """The span (module docstring) at `now`. `ValueError` when no `shakedown_span`
     row exists."""
+    return _read_span(conn, now, _switches(conn), _closed_at(conn))
+
+
+def _read_span(
+    conn: duckdb.DuckDBPyConnection,
+    now: datetime,
+    switch_rows: Sequence[_Switch],
+    closed: dict[int, datetime],
+) -> Span:
     row = registry.shakedown_span(conn)
     if row is None:
         raise ValueError(
             "no shakedown_span decision: open the span with "
             "`tradepartner decision shakedown-span --sessions N --order-sessions M --reason`"
         )
-    switch_rows = _switches(conn)
     start = next_session(_local_date(row.made_at))
     restart: str | None = None
     pending: list[tuple[datetime, str]] = []
-    for window_id, at, what in _restart_events(conn, row.made_at):
-        released = next(
+    for window_id, at, what in _restart_events(conn, row.made_at, now):
+        released = min(
             (
-                s
+                s.at
                 for s in switch_rows
                 if s.window_id == window_id and s.state == _RELEASED and s.at > at
             ),
-            None,
+            default=None,
         )
+        # a window closed or abandoned after the event never trades again: its
+        # closing stop ends the restart as a release would
+        ended = closed.get(window_id)
+        if released is None and ended is not None and ended > at:
+            released = ended
         if released is None:
             pending.append((at, what))
             continue
-        candidate = next_session(_local_date(released.at))
+        candidate = next_session(_local_date(released))
         if candidate > start:
-            start, restart = candidate, f"{what}, released {released.at.isoformat()}"
+            start, restart = candidate, f"{what}, released {released.isoformat()}"
     if pending:
         at, what = min(pending)
         return Span(
@@ -408,13 +424,43 @@ def _open_on(window: PaperWindowRow, closed: datetime | None, session: date) -> 
 # --- E.1 ------------------------------------------------------------------------
 
 
-def _drill_engaged(switches: Iterable[_Switch], window_id: int, at: datetime) -> bool:
-    """The window's latest `kill_switch` row at or before `at` is an owner engagement."""
-    latest = None
+@dataclass(frozen=True, kw_only=True)
+class _Bracket:
+    """An owner `engaged` row and the first `released` row after it in the same
+    window (write order): the only interval a skipped run is a drill in."""
+
+    window_id: int
+    engaged: _Switch
+    released: _Switch
+
+
+def _brackets(switches: Iterable[_Switch]) -> list[_Bracket]:
+    by_window: dict[int, list[_Switch]] = {}
     for s in switches:
-        if s.window_id == window_id and s.at <= at:
-            latest = s
-    return latest is not None and latest.state == _ENGAGED and latest.source == _OWNER
+        by_window.setdefault(s.window_id, []).append(s)
+    out: list[_Bracket] = []
+    for window_id, rows in by_window.items():
+        for index, engaged in enumerate(rows):
+            if engaged.state != _ENGAGED or engaged.source != _OWNER:
+                continue
+            released = next((s for s in rows[index + 1 :] if s.state == _RELEASED), None)
+            if released is not None:
+                out.append(_Bracket(window_id=window_id, engaged=engaged, released=released))
+    return out
+
+
+def _drill_bracket(run: _Run, brackets: Iterable[_Bracket]) -> _Bracket | None:
+    """The released owner bracket a `skipped_kill_switch` scheduler run lies in."""
+    if run.invoked_by != _SCHEDULER or run.status != _SKIPPED_KILL_SWITCH:
+        return None
+    return next(
+        (
+            b
+            for b in brackets
+            if b.window_id == run.window_id and b.engaged.at < run.started_at < b.released.at
+        ),
+        None,
+    )
 
 
 def _sessions_line(
@@ -423,16 +469,17 @@ def _sessions_line(
     windows: Sequence[PaperWindowRow],
     closed: dict[int, datetime],
     runs: Sequence[_Run],
-    switches: Sequence[_Switch],
+    brackets: Sequence[_Bracket],
+    ordered: set[int],
     alerts: Sequence[_Alert],
     noted: set[int],
 ) -> ShakedownLine:
     rows = "paper_runs, paper_run_results, kill_switch, alerts, owner_decisions, orders, fills"
     query = (
         "per span session and open window: a scheduler run whose result is ok, "
-        "skipped_kill_switch under an owner engagement, or stale with a noted stale_data "
-        "alert; no run only with a noted missed_run alert; and distinct sessions whose "
-        "scheduler run submitted an order with a live fill"
+        "skipped_kill_switch inside a released owner engagement with no order, or stale "
+        "with a noted stale_data alert; no run only with a noted missed_run alert; "
+        "and distinct sessions whose scheduler run submitted an order with a live fill"
     )
     thresholds = (
         f"sessions >= {span.sessions_needed}, order sessions >= {span.order_sessions_needed} "
@@ -459,8 +506,7 @@ def _sessions_line(
             if any(r.status == _OK for r in mine):
                 continue
             if any(
-                r.status == _SKIPPED_KILL_SWITCH and _drill_engaged(switches, wid, r.started_at)
-                for r in mine
+                _drill_bracket(r, brackets) is not None and r.run_id not in ordered for r in mine
             ):
                 continue
             if any(
@@ -681,31 +727,19 @@ def _drill_line(
     windows: Sequence[PaperWindowRow],
     runs: Sequence[_Run],
     switches: Sequence[_Switch],
+    brackets: Sequence[_Bracket],
     ordered: set[int],
 ) -> ShakedownLine:
     drills: list[str] = []
     spoiled: list[str] = []
     in_span = [s for s in switches if s.at >= span.start_at]
-    for window in windows:
-        wid = window.window_id
-        mine = [s for s in in_span if s.window_id == wid]
-        for index, engaged in enumerate(mine):
-            if engaged.state != _ENGAGED or engaged.source != _OWNER:
-                continue
-            released = next((s for s in mine[index + 1 :] if s.state == _RELEASED), None)
-            if released is None:
-                continue
-            for run in runs:
-                if not (
-                    run.window_id == wid
-                    and run.invoked_by == _SCHEDULER
-                    and run.kind in _DRILL_KINDS
-                    and run.status == _SKIPPED_KILL_SWITCH
-                    and engaged.at < run.started_at < released.at
-                ):
-                    continue
-                text = f"book {window.book_id} run {run.run_id} on {run.session}"
-                (spoiled if run.run_id in ordered else drills).append(text)
+    books = {w.window_id: w.book_id for w in windows}
+    spans = [b for b in brackets if b.engaged.at >= span.start_at]
+    for run in runs:
+        if run.kind not in _DRILL_KINDS or _drill_bracket(run, spans) is None:
+            continue
+        text = f"book {books.get(run.window_id)} run {run.run_id} on {run.session}"
+        (spoiled if run.run_id in ordered else drills).append(text)
     halts = [
         f"window {s.window_id} {s.source} at {s.at.isoformat()}"
         for s in in_span
@@ -747,7 +781,7 @@ def _journal_line(
         if wid in closed and closed[wid] < span.start_at:
             continue
         checked += 1
-        frozen = json.loads(window.frozen_json)
+        frozen = _frozen(window)
         for line in (
             _chain_line(conn, wid, window_cadence(conn, window)),
             _override_line(conn, window, wid, frozen),
@@ -841,9 +875,10 @@ def shakedown(
     a window's `frozen_json` lacks a tolerance key E.3 needs."""
     at = utc_now() if now is None else now
     switches = _switches(conn)
-    span = read_span(conn, at)
-    windows = _windows(conn)
     closed = _closed_at(conn)
+    span = _read_span(conn, at, switches, closed)
+    brackets = _brackets(switches)
+    windows = _windows(conn)
     runs = _runs(conn, span.first_day)
     alerts = _alerts(conn, span.first_day)
     noted = _noted_alerts(conn)
@@ -852,10 +887,10 @@ def shakedown(
     return Shakedown(
         span=span,
         lines=(
-            _sessions_line(conn, span, windows, closed, runs, switches, alerts, noted),
+            _sessions_line(conn, span, windows, closed, runs, brackets, ordered, alerts, noted),
             _reconciliation_line(conn, span),
             _orders_line(conn, span, by_id),
-            _drill_line(span, windows, runs, switches, ordered),
+            _drill_line(span, windows, runs, switches, brackets, ordered),
             _journal_line(conn, span, windows, closed),
             _alerts_line(conn, span, settings),
             _data_line(conn, span, settings, at, alerts, noted),

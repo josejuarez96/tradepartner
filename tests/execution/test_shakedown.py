@@ -827,3 +827,32 @@ def test_shakedown_writes_nothing_and_runs_on_a_read_only_connection(
             read.execute("CREATE TABLE probe (x INTEGER)")
     assert result.passed
     assert counts() == before
+
+
+@pytest.mark.usefixtures("health")
+def test_e1_an_owner_engagement_never_released_excuses_no_skipped_session(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn)
+    conn.execute("DELETE FROM kill_switch WHERE state = 'released'")
+    conn.close()
+    line = _line(_run(settings), "E.1 sessions")
+    assert not line.passed
+    assert "run 3 skipped_kill_switch" in line.detail
+
+
+@pytest.mark.usefixtures("health")
+def test_a_restart_in_a_window_closed_after_it_ends_at_the_close(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    j = _clean(conn, drill=False)
+    conn.execute("UPDATE paper_run_results SET status = 'halted' WHERE run_id = 1")
+    j.window(window_id=2, book_id="b", started=_at(D1, 13))
+    conn.execute(
+        'INSERT INTO paper_window_stops (window_id, "at", state, known_at, ingested_at) '
+        "VALUES (1, ?, 'abandoned', ?, ?)",
+        [_at(D1, 22), _at(D1, 22), _at(D1, 22)],
+    )
+    conn.close()
+    span = _run(settings).span
+    assert span.start == D2
