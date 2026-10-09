@@ -501,3 +501,52 @@ def test_no_module_reads_record_params_outside_the_accessor() -> None:
     allowed = {"backtest/frozen.py", "backtest/hypothesis.py"}
     assert readers - allowed - NOT_A_RECORD <= PARAMS_READERS_ALLOWLIST
     assert "store/registry.py" not in readers
+
+
+# --- literal pins taken on `main`'s code before the turnover key (#1358, T165) -------
+
+#: B3 (the profitability fixture twin and the real B3 file) and `oracle` (the momentum
+#: fixture twin read as `oracle`), computed on `main` at 3de454d7 over
+#: `Settings(_env_file=None)`, before `strategy.turnover_top_fraction` existed. Canonical
+#: sets are pinned by `registry.params_sha256` of the set.
+B3_TWIN_FINGERPRINT = "0d4670860b79d1591c1d00ad34ba98c34ba5451745d3257ec3b42c5a1d9caf1c"
+B3_TWIN_CANONICAL_SHA256 = "6059282b4af951d4ac6088150a8eacc3c7e6877410660bcc1f3e169843869642"
+B3_TWIN_PARAMS_SHA256 = "7e72f97a0594055f002d33de2dde181a1fda8341e2a67117a57f50b7bed643f0"
+B3_FILE_FINGERPRINT = "0ef4ebf725560b73ccc8157e4d477f07facc16116bea44016bbef4f06ec9ae83"
+B3_FILE_CANONICAL_SHA256 = "ada9a26f7a0172abbc27419bf6adca29443be3d64032847c024951df0f398a2c"
+B3_FILE_PARAMS_SHA256 = "c1b7e7002cf6160828210c3fbc72483113622740b9c21b526762d8d63d72f1d4"
+ORACLE_TWIN_FINGERPRINT = "2fc196fad5d1fbe618d51a1adc7d8e02f664fae55b32d3cbfef90d011ca17ae5"
+ORACLE_TWIN_CANONICAL_SHA256 = "22fedb1cf5f53d68ecf69f9e6d5ec912cb573aee07ba2932728dcab3c178403d"
+B3_FILE = H1_FILE.with_name("b3-gross-profitability.md")
+
+
+@pytest.mark.parametrize(
+    ("path", "fingerprint", "canonical_sha256", "params_sha256"),
+    [
+        (PROF_FIXTURE, B3_TWIN_FINGERPRINT, B3_TWIN_CANONICAL_SHA256, B3_TWIN_PARAMS_SHA256),
+        (B3_FILE, B3_FILE_FINGERPRINT, B3_FILE_CANONICAL_SHA256, B3_FILE_PARAMS_SHA256),
+    ],
+)
+def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
+    path: Path, fingerprint: str, canonical_sha256: str, params_sha256: str
+) -> None:
+    from tradepartner.store import registry
+
+    parsed = hypothesis.parse_file(path)
+    params = hypothesis.frozen_params(parsed, _defaults_settings())
+    assert registry.params_sha256(params) == params_sha256
+    assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
+    canonical = frozen.canonical_frozen_set(params, parsed.family)
+    assert registry.params_sha256(canonical) == canonical_sha256
+    # B3's seven keys stay in its canonical set (decision 13 holds for them).
+    assert {key for key, _default, _version in PROFITABILITY_DEFAULTS} <= set(canonical)
+
+
+def test_oracle_fingerprint_and_canonical_set_are_pinned() -> None:
+    from tradepartner.store import registry
+
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = hypothesis.frozen_params(parsed, _defaults_settings())
+    assert frozen.fingerprint("oracle", params, parsed.in_sample_start) == ORACLE_TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(params, "oracle")
+    assert registry.params_sha256(canonical) == ORACLE_TWIN_CANONICAL_SHA256
