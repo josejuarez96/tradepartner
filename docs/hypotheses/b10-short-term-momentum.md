@@ -1,6 +1,6 @@
 # Hypothesis: B10, long-only short-term momentum (STMOM), last month's winners among the highest-turnover names, monthly
 
-**Family:** `momentum` (by amendment: one new frozen key, `strategy.turnover_top_fraction`; see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, rank 2, accepted for its information value and as a fast paper book)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs a backtest spec amendment for the key and its engine task (listed in #1358's PR body; nothing is built), and the owner's answers to B10-1 to B10-5 below
+**Family:** `momentum` (by amendment: one new frozen key, `strategy.turnover_top_fraction`; see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, rank 2, accepted for its information value and as a fast paper book)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs a backtest spec amendment for the key and its engine tasks (listed under "The family question" below, which is the handoff; nothing is built), and the owner's answers to B10-1 to B10-5 below
 
 Merging this file does not register it. The strategy lab's migration (T113) is merged,
 so a new hypothesis enters as a **one-value sweep** (strategy-lab spec req 1 and req 5(b):
@@ -10,9 +10,23 @@ registers `docs/sweeps/b10-short-term-momentum.md`, whose fixed block reproduces
 parameter block below, in the `momentum` family, runs it, and promotes its one variant to
 this file (which then gains `## Sweep provenance`). Before that, the key
 `strategy.turnover_top_fraction` must exist (a reviewed config change behind a backtest
-spec amendment, with a `FROZEN_KEY_DEFAULTS` entry of `1.0`, "no screen", so that H1's
-and the T114 sweep's fingerprints do not move; strategy-lab spec, Out of scope: "a new
-`strategy.*` key by spec amendment ... with a `FROZEN_KEY_DEFAULTS` entry"). Under
+spec amendment, with a `FROZEN_KEY_DEFAULTS` entry of `1.0`, "no screen"; strategy-lab
+spec, Out of scope: "a new `strategy.*` key by spec amendment ... with a
+`FROZEN_KEY_DEFAULTS` entry"). **That entry alone does not keep H1's fingerprint still
+under today's code:** backtest spec decision 13 (strategy-lab Definitions "Fingerprint",
+amendment #951; `backtest/frozen.py` `canonical_frozen_set`) keeps every key of a
+family's **own** section in the canonical set even at its default, so a new `strategy.*`
+key would be overlaid at 1.0 onto H1's, the T114 variants', `oracle`'s and `combined`'s
+stored params and move each recomputed fingerprint. The spec amendment must therefore
+also amend decision 13's own-section rule for **post-baseline keys**: a key added after
+`LAB_BASELINE_FROZEN_KEYS` with a `FROZEN_KEY_DEFAULTS` entry is left out of the
+canonical set at its default even in its own section, so a registration that never named
+it hashes as before, while B10 (which names 0.20) and any later file that names 1.0
+explicitly hash the same as one that leaves it out (two registrations with one canonical
+set are one test, as the rule intends). The alternative, re-recording every stored
+fingerprint under a named data release, is the fallback the amendment may choose; either
+way the engine task's pinned test checks the rule the amendment states, not an assertion.
+Under
 research-program §4, promotion condition 1 (data) **is met**: bars with volume, the
 shares-outstanding fact and corporate actions are in the store; condition 2 (engine) is
 not met until the key and the screen land; this file is condition 3; its trial budget is
@@ -58,7 +72,8 @@ SH-1's inventory story in Nagel and in Dai et al.).
   the spread; nothing says STMOM's is better.
 - One-sided turnover is 89-90%/month in the paper, "a real chance of surviving costs"
   only at fills well below the backtester's 15 bp default (the report's Answer); Blitz
-  et al. put every short-term signal's break-even below 25 bp.
+  et al. put the break-even of the short-term signals they study, at 1,300 to 2,000%
+  annual turnover, below 25 bp.
 - SH-1: in large caps the plain one-month sort is reversal at best and nothing at worst;
   a **mis-measured turnover** (unadjusted volume over a pre-split share count) sorts
   names into the wrong bucket and "gives a reversal book" (the report's STMOM note). Rule
@@ -75,12 +90,15 @@ sweep can later vary the screen:
    formation month (the sessions after the previous rebalance session through T) divided
    by shares outstanding known at `t`: the rule-7 fact (`EntityCommonStockSharesOutstanding`,
    `facts_as_of(t)`, `known_at` = its filing's acceptance, at most
-   `universe.max_shares_age_days` old), with **both** series expressed in post-split units
-   for every corporate action with ex-date ≤ T, so a split inside the formation month
-   adjusts the pre-ex volume and the pre-ex share count alike. A member with no usable
-   shares fact at `t` (rule 7 already excludes it) or with no bar on any session of the
-   month is excluded and counted (`n_excluded_no_turnover`), never given a turnover of
-   zero.
+   `universe.max_shares_age_days` old), with **both** series expressed in the share
+   units of T: the share count is the universe's rule-7 pick, already moved through every
+   split whose ex-date falls **after the fact's own date** and at or before T (the
+   `shares_as_of` walk of rule 7 and T117; a fact dated after an ex-date is not adjusted
+   again), and each session's volume is multiplied by the ratio of every split whose
+   ex-date falls after that session and at or before T. A member with no usable shares
+   fact at `t` (rule 7 already excludes it) or with a bar missing on **any** session of
+   the formation month is excluded and counted (`n_excluded_no_turnover`), never given a
+   turnover of zero.
 3. **Screen:** the top `strategy.turnover_top_fraction` (0.20) of the universe by
    turnover, ties by `security_id` ascending; about 200 names. Counted (`n_screened`).
 4. **Score** inside the screened set: H1's momentum score with `formation_months = 1`,
@@ -98,8 +116,10 @@ prefix invariance with the screen on; a revision case with teeth (a shares fact 
 **after** close(T_i) that would move a name across the screen at T_i: `run(end=T_i)`
 unchanged, `run(end=T_{i+1})` changed); a split-month case (a 2-for-1 with ex-date inside
 the formation month leaves the name's turnover rank unchanged against a no-split twin);
-and a pinned check that H1's fingerprint and reference metrics are unchanged with the key
-at its default.
+and a pinned check that H1's reference metrics are unchanged with the key at its default
+and that H1's canonical frozen set and fingerprint are unchanged **under the amended
+own-section rule** (above): the key, absent from H1's stored params, is left out of its
+canonical set at the default.
 
 ## Parameters
 
@@ -152,11 +172,14 @@ historical_feed = "sip"
 Proposed answers, one line each (the owner confirms or changes them on #1358):
 
 - **Cadence**: `month_end`, the evidence's cadence (SH-9 is a monthly sort with a one-month
-  hold). `week_end` is pre-declared variant (i) below, not the first file: a weekly refresh
-  of a monthly signal is a different turnover and cost profile that the paper does not
-  report. `formation_months = 1` with `skip_months = 0` passes `StrategyConfig`'s rule
-  (formation greater than skip); at `month_end` the anchor cannot fall after T, so
-  strategy-lab refusal 1(d) does not apply.
+  hold). `week_end` is pre-declared variant (i) below, not the first file: at a weekly
+  cadence with `skip_months = 0` the month-end anchor can fall after T, which strategy-lab
+  refusal 1(d) refuses, so the variant must carry `schedule.signal_anchor = "offset"`, a
+  **rolling** one-month return read at each week-end, a different signal with a different
+  turnover and cost profile that the paper does not report. `formation_months = 1` with
+  `skip_months = 0` passes `StrategyConfig`'s rule (formation greater than skip); at
+  `month_end` with the `month_end` anchor the anchor is T itself, so refusal 1(d) does not
+  apply to this file.
 - **Universe**: ADR 0006's, `top_n_by_cap = 1000`; the screen is a signal rule inside it,
   not a universe rule (ADR 0006 guard (a) is untouched: nothing here is a `universe.*`
   key, and the turnover screen is never tuned on P&L).
@@ -244,8 +267,12 @@ quarter for this construction; the run computes it.
   reversal book the report warns of.
 - A result that changes when the run is truncated (truncation and prefix invariance), or
   a revision case (a late shares fact) that does not change the later run: look-ahead.
-- H1's fingerprint or reference metrics moving when the key lands: the default is not
-  behaviour-preserving, and every `momentum` registration is at risk.
+- H1's reference metrics moving when the key lands, or H1's canonical frozen set gaining
+  the key at 1.0 under the amended own-section rule (the stored `hypothesis_fingerprints`
+  row no longer matching the recomputed one): the default is not behaviour-preserving or
+  the rule was not amended, and every `momentum` registration is at risk of an uncounted
+  duplicate (a file repeating H1's strategy with the key written as 1.0 passing refusal
+  1(b) as new).
 - A survivorship gap above `gap.count_share_threshold` at any rebalance, a non-zero
   `n_static_listings`, or an `n_universe` below `universe.top_n_by_cap`: a biased or holed
   universe, as for H1 (its red-flag bullet says why).
@@ -287,8 +314,10 @@ look at momentum.
 `momentum`'s N). Proposed, for the owner (B10-5): this registration (one sweep variant),
 one run over the default in-sample window, no holdout spend, a paper book at the owner's
 word, and at most **three pre-declared variants**, each a new sweep variant: (i)
-`schedule.rebalance_cadence = week_end` (the same monthly signal refreshed weekly; the
-faster book, at a turnover the paper does not report); (ii) `turnover_top_fraction = 1.0`
+`schedule.rebalance_cadence = week_end` **with `schedule.signal_anchor = "offset"`** (a
+rolling one-month return read at each week-end, held a week: the faster book, at a
+turnover the paper does not report; without the `offset` anchor strategy-lab refusal 1(d)
+refuses it); (ii) `turnover_top_fraction = 1.0`
 (**the control**: the plain one-month sort over the whole universe, which SH-1 says should
 show no edge or reversal; its sign against this file's is the information the owner is
 buying); (iii) `top_fraction = 0.10` (the decile of the screened set, about 20 names).
@@ -377,11 +406,15 @@ return sort is neither: it is momentum's own signal at a different horizon, in t
 world (same window, costs, universe and fill convention), with one extra rule. The spec's
 Out of scope paragraph names the mechanism for exactly this: a new `strategy.*` key by
 spec amendment, with a `FROZEN_KEY_DEFAULTS` entry that preserves behaviour (`1.0`, no
-screen) so no registration is re-registered and no fingerprint moves. It needs no family
-code, no new N, and no slot in the forward-exam queue, and it lets a later `momentum`
-sweep vary the screen as an axis (`lab.sweepable_keys` gains the key by reviewed config
-change). Its cost is stated above: B10 counts in momentum's N and has no exam of record of
-its own.
+screen) so no registration is re-registered. **One rule must change with it:** decision
+13's own-section rule keeps every `strategy.*` key in a `momentum` canonical set even at
+its default, so without an amendment the new key moves H1's, the T114 variants',
+`oracle`'s and `combined`'s fingerprints (the first paragraph of this file says how); the
+amendment carves out post-baseline own-section keys at their default, or re-records the
+fingerprints under a data release. With that, the route needs no family code, no new N,
+and no slot in the forward-exam queue, and it lets a later `momentum` sweep vary the
+screen as an axis (`lab.sweepable_keys` gains the key by reviewed config change). Its
+cost is stated above: B10 counts in momentum's N and has no exam of record of its own.
 
 **What it would need** (estimates for the plan that follows an accepted spec amendment;
 nothing is built here):
@@ -390,15 +423,20 @@ nothing is built here):
    `strategy.turnover_top_fraction` (a share in (0, 1], default 1.0, "the top fraction of
    the universe by formation-period share turnover that is ranked; 1.0 ranks everyone"),
    rule 2's turnover definition and its adjustment, the exclusion reason `no_turnover`, the
-   counts `n_screened` and `n_excluded_no_turnover`, the look-ahead cases above, and the
-   `FROZEN_KEY_DEFAULTS` entry. Size S.
-2. **Config:** `config.py` gains the key on `StrategyConfig`, the `FROZEN_KEY_DEFAULTS`
-   entry, the reason and counts on `FAMILIES["momentum"]` (and on `oracle` and `combined`,
-   which read the `strategy` section; `combined` applies the screen to its momentum half
-   only if its spec says so, otherwise it ignores the key at its default), and optionally
-   the `lab.sweepable_keys` entry; `tests/test_config.py` pins the default and that H1's
-   frozen set is unchanged. Size S. `quant-auditor`, `safety-reviewer` (`config.py` is on
-   both lists).
+   counts `n_screened` and `n_excluded_no_turnover`, the look-ahead cases above, the
+   `FROZEN_KEY_DEFAULTS` entry, **and the decision 13 amendment** (post-baseline
+   own-section keys left out of the canonical set at their default, or the re-record
+   fallback), with the strategy-lab Definitions "Fingerprint" sentence pointed at it.
+   Size S.
+2. **Config and the canonical set:** `config.py` gains the key on `StrategyConfig`, the
+   `FROZEN_KEY_DEFAULTS` entry, the reason and counts on `FAMILIES["momentum"]` (and on
+   `oracle` and `combined`, which read the `strategy` section; `combined` applies the
+   screen to its momentum half only if its spec says so, otherwise it ignores the key at
+   its default), and optionally the `lab.sweepable_keys` entry; `backtest/frozen.py`
+   `canonical_frozen_set` implements the amended own-section rule; `tests/test_config.py`
+   and `tests/backtest/test_frozen.py` pin the default, and H1's, the T114 variants' and
+   `combined`'s canonical sets and fingerprints unchanged. Size S. `quant-auditor`,
+   `safety-reviewer` (`config.py` is on both lists).
 3. **The read and the screen:** `backtest/strategies.py` reads the formation month's
    volume from the bars frame, the shares fact through `facts_as_of(t)` and the actions
    the adjustment path already applies; `backtest/signals.py` applies the screen before

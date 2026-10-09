@@ -1,6 +1,6 @@
 # Hypothesis: B9, long-only earnings-reaction (EAR) drift, top quintile, 20-session hold, daily
 
-**Family:** `earnings_drift` (proposed root family; not in `hypotheses.families` yet, see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, #1352 direction)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs the 8-K `items` field in the store (data-foundation plan task T151), a backtest spec amendment for the family and its engine tasks (listed in #1358's PR body; nothing is built), and the owner's answers to B9-1 to B9-7 below
+**Family:** `earnings_drift` (proposed root family; not in `hypotheses.families` yet, see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, #1352 direction)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs the 8-K `items` field in the store (data-foundation plan tasks T151 to T151e), a backtest spec amendment for the family and its engine tasks (listed under "The family question" below, which is the handoff; nothing is built), the owner's `development_boundary` row, ADR 0017 accepted (its parts B and C are what let a `daily` book be this family's forward exam; the in-sample run needs neither), and the owner's answers to B9-1 to B9-7 below
 
 Merging this file does not register it. Three things stand between this draft and a
 registration, in order: (1) the data: EDGAR 8-K `items` with acceptance times are not
@@ -21,16 +21,16 @@ registration makes a new hypothesis.
 Backlog item [B9](../research/hypothesis-backlog.md#b9-earnings-reaction-ear-drift). Claims
 it tests, by id in [claims.toml](../research/claims.toml): **SH-6** (MIXED, the drift
 after the announcement return), **SH-7** (revenue surprise alone, weak; the market-adjusted
-reaction subsumes it), **SH-12** (T1 primary: the release time is in the free EDGAR
-record). Disconfirmation it must survive: **SH-5** (NOT SUPPORTED: surprise-based PEAD is
+reaction subsumes it), **SH-12** (a fact from a T1 primary source, the EDGAR submissions
+payload, recorded UNGRADED as facts are: the release time is in the free record). Disconfirmation it must survive: **SH-5** (NOT SUPPORTED: surprise-based PEAD is
 gone outside microcaps since 2006) and **SH-2** (costs exceed most short-horizon spreads;
 Chen & Velikov's 4 bp/month average). The research rules are in
 [research-program.md](../ways-of-working/research-program.md).
 
 ## Economic rationale
 
-**The claim.** A long-only book that buys, at the close of the three-session reaction
-window, the stocks whose market-adjusted return around their earnings release sits in the
+**The claim.** A long-only book that buys, at the close of the four-session reaction
+window ([−1, +2]), the stocks whose market-adjusted return around their earnings release sits in the
 top fifth of recent reactions, and holds each for about twenty sessions, earns about the
 market's return net of costs. The prior for its excess over SPY is **below zero at the
 backtester's 15 bp per side**, and positive only at fills near 5 bp per side. That is not
@@ -101,12 +101,20 @@ look-ahead tests have one source.
    session of the window is excluded and counted (`n_excluded_no_window_bars`), never
    scored on a partial window.
 4. **Breakpoints come only from windows closed at or before the read.** At read time
-   `t = close(T)` the breakpoint set is the EAR of every universe event whose window
-   closed within the trailing `breakpoint_lookback_sessions` (63, about a quarter)
-   ending at T, with close(day +2) ≤ t. An event closing at T is scored against that
-   set (itself excluded). Fewer than `min_breakpoint_events` (100) in the set means no
-   entries that session, counted (`n_excluded_no_breakpoints`); that case is expected at
-   the window's first sessions and in no later quarter.
+   `t = close(T)` the breakpoint set is the EAR of every event whose issuer was in
+   `universe_as_of(close(day +2))` of **that event** (membership judged once, at the
+   event's own window close, so the set never changes retroactively as names enter or
+   leave the universe later) and whose window closed within the trailing
+   `breakpoint_lookback_sessions` (63, about a quarter) ending at T, with close(day +2)
+   ≤ t. The cut is the **empirical** (1 − `top_fraction`) quantile with no
+   interpolation: sort the set's n EARs ascending and take the value at position
+   ⌈0.8 n⌉ (one-based); an event closing at T is scored against that set (itself
+   excluded) and enters when its EAR is **at or above** the cut, ties entering. Fewer
+   than `min_breakpoint_events` (100) in the set means no entries that session, counted
+   (`n_excluded_no_breakpoints`). The engine reads events and bars **before**
+   `in_sample_start` for the breakpoints (the submissions record and the Alpaca bars
+   from 2016-01-04 both exist), so the set is full from the first read and the count is
+   expected to be zero at every read; a non-zero value is a hole in the event feed.
 5. **Entry at the window's close, fill one session later.** An event whose EAR is at or
    above the set's (1 − `top_fraction`) quantile (the 80th percentile: the top quintile)
    enters at the read T = day +2 and fills on session T + 1 at the family's frozen
@@ -118,9 +126,11 @@ look-ahead tests have one source.
 6. **Hold twenty reads, then exit.** An event is live at every read T_e, T_e + 1, …,
    T_e + 19 (`hold_sessions` = 20) and leaves the target set at read T_e + 20 (fill
    T_e + 21). A name is held while **any** of its events is live. A second 2.02 8-K from
-   the same CIK within `event_dedupe_sessions` (30) of the previous one is ignored and
-   counted (`n_events_deduped`): an 8-K/A, a second furnishing, a presentation furnished
-   under 2.02. `event_forms` lists `8-K` only (B9-6).
+   the same CIK whose day 0 falls within `event_dedupe_sessions` (30) of the day 0 of
+   the **last kept** event is ignored and counted (`n_events_deduped`): a second
+   furnishing, a presentation furnished under 2.02 (an 8-K/A never enters, since
+   `event_forms` lists `8-K` only, B9-6). A kept event is one that was not deduped,
+   whether or not it entered the book.
 7. **Equal weight across live names, each capped at `max_weight` (0.05), the remainder
    cash; re-targeted at every read.** The cap equals the paper risk rule
    `risk.max_position_weight` (ADR 0010), so no paper plan is refused for size. Under the
@@ -231,10 +241,23 @@ Proposed answers, one line each (the owner confirms or changes them on #1358):
   its open question 2 recommends 63 at `daily`, a quarter; 123 sessions leave room), under
   the ADR 0005 tracking check. It must start after 2026-09-30 (the strategy-lab overlap
   rule: `momentum` and `profitability` hold out [2024-01-01, 2026-09-30]) and after the
-  registration day. January 2027 leaves a quarter for T151, the spec amendment, the family
-  tasks, the sweep registration and the in-sample run; the owner may move both dates, and
-  a later start is always allowed. A book may run past `holdout.end` as an ordinary Phase
-  4 window.
+  registration day. The same overlap rule binds it against **B4's** forward holdout:
+  `combined` registers with a `holdout.start` after 2026-09-30 and after its own
+  registration day (ADR 0016 point 5), so B4's and B9's exam months may not overlap and
+  one queues behind the other (B9-2 asks the owner which). ADR 0016 point 4's "at least
+  `paper.min_rebalances` months after `holdout.start`" is read here as ADR 0017 C reads
+  it, in rebalance periods of the hypothesis's cadence: 123 daily periods against a
+  recommended 63. **Preconditions the exam depends on, beyond the data and engine
+  tasks:** ADR 0017 accepted with its part B (one Alpaca paper account per book) and
+  part C (`daily` on paper; today `execution/window.py` refuses any cadence but
+  `month_end` with `refused_cadence`, and ADR 0016 point 4 keeps month-end paper). If
+  ADR 0017 is not accepted, B9 has no exam of record on today's history: its in-sample
+  trial still runs and counts, but no paper book can open for it and the forward holdout
+  cannot be judged, so the file would wait, or re-register at `month_end` as a different
+  hypothesis (a monthly book of twenty-session events is a different design). January
+  2027 leaves a quarter for T151 to T151e, the spec amendment, the family tasks, the sweep
+  registration and the in-sample run; the owner may move both dates, and a later start is
+  always allowed. A book may run past `holdout.end` as an ordinary Phase 4 window.
 - **Costs**: the spec's placeholder base of 15 bp per side and H1's ladder, **plus a 5 bp
   rung** (B9-4): the report's whole verdict on this candidate turns on whether fills sit
   near 5 or near 15 bp, so the trial should print both. Sensitivities never select (spec
@@ -266,30 +289,43 @@ t 1.88) over the average portfolio in 2010-2024 (SH-6), that is **about +0.8 to 
 pp/yr** before costs, with the truth for the ADR 0006 universe probably between the two
 files (the report's "Universe mismatch"). The 2019-2023 figures alone are insignificant.
 
-**Costs at our scale, stated plainly.** Entries and exits turn the book over about once
-a month (a twenty-session hold is about a month), so one-sided turnover is about
-**100%/month**: at 15 bp per side that is 2 × 100% × 15 bp ≈ **0.30%/month, about 3.6
-pp/yr**, the whole gross long leg in the size-screened file and most of it in the
-value-weighted one. Daily re-targeting to equal weight adds a drift cost: with about 65
-names at about 1.5% each and a 1.5% daily idiosyncratic dispersion, each name's weight
-drifts by about 0.02 pp a session, about 1.5% of NAV traded a session across the book,
-0.75% one-sided, 16%/month one-sided, **about 0.05%/month at 15 bp**. The net prior over
-SPY at the base level is therefore **centred at about −1 pp/yr, plausible range −5 to +2
-pp/yr**, positive only at the 5 bp rung, and at the handoff's HO-14 floor (5-10 bp plus
-half the spread) at or below zero, which is the report's verdict restated: "~zero net
-long-only at 15 bp per side". The cash share under the 5% cap (rule 7) is a second drag
-in a rising market: between earnings seasons the book may hold 10 to 20 names and 0 to 50%
-cash, so part of any shortfall against SPY is exposure, not selection, and `cash_share` is
-reported per read so the two can be told apart.
+**Costs at our scale, stated plainly.** Three sources of turnover, each shown:
+
+- *Entries and exits.* A twenty-session hold is about a month, so the book turns over
+  about once a month: one-sided turnover about **100%/month** when an entry and an exit
+  pair off, at 15 bp per side 2 × 100% × 15 bp ≈ **0.30%/month, about 3.6 pp/yr**, the
+  whole gross long leg in the size-screened file and most of it in the value-weighted one.
+- *Re-weighting.* Once more than 20 names are live (the 5% cap no longer binds), every
+  unpaired entry or exit rescales every other weight: a book of n equal weights that
+  admits one name sells 1/(n+1) of NAV spread over the others, and one that drops a name
+  buys the same. Entries cluster in season and exits come twenty sessions later, so most
+  are unpaired; in the limit every entry and exit is rescaled, and one-sided turnover is
+  about **twice** the paired figure, about 195%/month. The truth sits between the two.
+- *Drift.* Daily re-targeting to equal weight: with about 65 names at about 1.5% each and
+  a 1.5% daily idiosyncratic dispersion, each name's weight drifts by about 0.02 pp a
+  session, about 1.5% of NAV traded a session across the book, 0.75% one-sided, about
+  **16%/month one-sided, about 0.05%/month at 15 bp**.
+
+So one-sided turnover is about **100 to 200%/month** and the base-level cost about **3.6
+to 7 pp/yr** (about 4.2 pp/yr at paired entries plus drift, about 7 pp/yr fully unpaired).
+Against a gross long leg of +0.8 to +3.8 pp/yr (midpoint about +2.3), the net prior over
+SPY at the base level is **centred at about −2 pp/yr, plausible range −6 to +2 pp/yr**:
+the midpoint gross minus the lower cost bound is about −1.9, and the upper cost bound
+takes it to about −5. It is positive only at the 5 bp rung, and at the handoff's HO-14
+floor (5-10 bp plus half the spread) at or below zero, which is the report's verdict
+restated: near zero net at 15 bp, long-only. The cash share under the 5% cap (rule 7) is a
+further drag in a rising market: between earnings seasons the book may hold 10 to 20 names
+and 0 to 50% cash, so part of any shortfall against SPY is exposure, not selection, and
+`cash_share` is reported per read so the two can be told apart.
 
 **Tracking error against SPY.** Unknown; assumed **10%/yr** for the power arithmetic: a
 20-to-65-name book of names that just moved on news, with a seasonal cash share, is
 noisier than H1's 100-name decile (8.4%) or B3's 60-name annual book (6%).
 
-**Turnover and cost drag.** One-sided monthly turnover of about 100 to 120% (entries and
-exits plus drift), seasonal with the earnings calendar; cost drag at 15 bp of roughly 3.5
-to 4.5 pp/yr, at the 100 bp rung roughly 24 to 30 pp/yr. A `cost_drag` far from
-≈ 12 × `turnover_monthly` × 2 × `per_side_bps` is a cost-model bug.
+**Turnover and cost drag.** One-sided monthly turnover of about 100 to 200% (entries and
+exits, their re-weighting, and drift), seasonal with the earnings calendar; cost drag at
+15 bp of roughly 3.6 to 7 pp/yr, at the 100 bp rung roughly 24 to 48 pp/yr. A `cost_drag`
+far from ≈ 12 × `turnover_monthly` × 2 × `per_side_bps` is a cost-model bug.
 
 **Losses.** A long-only, event-concentrated equity book: a full-crisis drawdown about the
 market's, with a seasonal exposure that may make it shallower or deeper by accident. No
@@ -306,8 +342,9 @@ source in the register gives a worst quarter for this construction; the run comp
 - `n_held` above about 150 or below 10 for more than two weeks inside an earnings season
   (February, late April to May, late July to August, late October to November): the
   event feed, the dedupe rule or the breakpoint quantile is wrong, not the market.
-- One-sided `turnover_monthly` far below 70% or far above 150%: the hold length or the
-  membership rule is not doing what rule 6 says.
+- One-sided `turnover_monthly` far below 70% or far above 250%: the hold length, the
+  membership rule or the re-weighting is not doing what rules 6 and 7 say (the band's
+  arithmetic is under Expected magnitudes; 200% is the fully unpaired case).
 - `n_excluded_no_breakpoints` non-zero after the first quarter of the window: the event
   feed has a hole (T151's coverage count is the baseline).
 - An EAR computed across a split without adjustment (a ±50% or ±90% "reaction" on a
@@ -462,7 +499,14 @@ forward-exam calendar ("new families' exams queue one after another in calendar 
 ADR 0016's Consequences). The alternative, a child of `momentum`, would inherit momentum's
 SR* mark and show its N for no reason the signal gives. Because B10's recommendation is a
 `momentum`-family amendment, not a second root family, B9 is the only new family these two
-files create, so no two forward holdouts need sequencing (B9-1).
+files create. It is not the only forward exam in the queue: **B4** (`combined`, a child
+of `momentum`, parked) registers with a forward holdout after 2026-09-30 and after its own
+registration day (ADR 0016 point 5), and the overlap rule binds B4 and B9 against each
+other, so their exam months must not overlap and the owner orders them (B9-2).
+Recommendation: whichever registers first takes the earlier slot, and the other's
+`holdout.start` is set after the first's `holdout.end`; on today's dates B9's proposed
+[2027-01-04, 2027-06-30] leaves B4 the slot from 2027-07 unless B4 registers first, in
+which case B9 moves to after B4's `holdout.end`.
 
 **What it would need** (sizes and files are estimates for the plan that follows an accepted
 spec amendment; none of it is built here):
@@ -477,13 +521,16 @@ spec amendment; none of it is built here):
    and `FAMILIES` (`sections = ("earnings_drift",)`, an `EarningsDriftConfig` params model,
    `parent = None`, `engine_ready = True`, `paper_ready = False` until ADR 0014 point 5's
    test exists, the reasons and counts, `benchmark = None` or SPY only), with the
-   `FAMILY_PARENTS` entry it derives; a new section is inert for other families
-   (`backtest/hypothesis.py`), so H1's, B3's and the T114 sweep's fingerprints do not move,
-   and `tests/test_config.py` pins that. Size S. `quant-auditor`, `safety-reviewer`
-   (`config.py` is on both lists).
-3. **The as-of read:** `store/asof.py` `filing_events_as_of(t, forms, items)` over T151's
-   table (`known_at ≤ t`), returning one row per listed class of a CIK as
-   `statement_facts_as_of` does. Size S. `quant-auditor`.
+   `FAMILY_PARENTS` entry it derives, and a `FROZEN_KEY_DEFAULTS` entry for every
+   `earnings_drift.*` key (the lab's baseline test requires one for each frozen key
+   outside `LAB_BASELINE_FROZEN_KEYS`, as `profitability.*` has); a new section is inert
+   for other families (`backtest/hypothesis.py`), so H1's, B3's and the T114 sweep's
+   fingerprints do not move, and `tests/test_config.py` pins that. Size S.
+   `quant-auditor`, `safety-reviewer` (`config.py` is on both lists).
+3. **The as-of read** is **T151d's** (`store/asof.py` `filing_events_as_of(t, forms,
+   items)`, `known_at ≤ t`, one row per listed class of a CIK as `statement_facts_as_of`
+   does, with its look-ahead cases), in the data-foundation plan; the engine reads it and
+   builds nothing of its own here.
 4. **The signal:** a pure function in `backtest/signals.py` (events → day 0 → window
    returns → breakpoints → live set → target weights with the cap), with the calendar's
    session opens and the adjusted price frame as inputs, and its read in
@@ -493,12 +540,17 @@ spec amendment; none of it is built here):
 5. **The paper side:** `execution/strategies.py` and `execution/planning.py` read the same
    table and dispatch on the family; the `paper_ready` flip lands with a fixture-store
    round-trip test (ADR 0014 point 5; ADR 0017 D's pattern), class A, labelled `hold`.
-   Size S. `safety-reviewer`, `quant-auditor`. Its book needs ADR 0017 B (its own key pair
-   and account) and C (`daily` on paper), neither of which this file depends on for the
-   in-sample run.
+   Size S. `safety-reviewer`, `quant-auditor`. Its book needs ADR 0017 accepted, with
+   part B (its own key pair and account) and part C (`daily` on paper) built (ADR 0017's
+   plan sketch P1 and P4 to P6); the in-sample run depends on none of that, the forward
+   exam depends on all of it (Forward holdout, above).
 6. **The sweep file and registration** (owner): `docs/sweeps/b9-earnings-reaction-drift.md`,
    one variant, after the `development_boundary` row exists; then `sweep run`, the audit,
    and the promotion to this file.
+
+This section is the handoff for the family's tasks (development-process "Plan shape" rule
+5): the backtest plan's amendment that creates them copies these items as task lines and
+points back here; until then nothing is claimable.
 
 ## Open questions for the owner (B9-1 to B9-7; none decided)
 
@@ -515,8 +567,12 @@ spec amendment; none of it is built here):
   question 2 sets that default (63 recommended). The file is not registered before the
   owner writes the `development_boundary` row (ADR 0016 point 1; T142b's command): with
   no row, today's rule would end the default window at the last rebalance before
-  2027-01-04 and read 2024-2026 in sample. Recommendation: the dates as proposed; write
-  the boundary row first.
+  2027-01-04 and read 2024-2026 in sample. The same months must not overlap **B4's**
+  forward holdout (`combined`, ADR 0016 point 5), so the owner also orders the two exams:
+  B9 first on the proposed dates, with B4's `holdout.start` after 2027-06-30, or B4 first
+  and B9 after B4's `holdout.end`. Recommendation: the dates as proposed; write the
+  boundary row first; B9 first unless B4 registers before T151e lands, since B4 is parked
+  and B9's book is the daily one the ADR 0017 shakedown wants.
 - **B9-3. The fill convention.** `close` (H1's and B3's; the engine fills at close(T + 1))
   or `open` (`execution.fill_price = open` exists; the literature's entry; Alpaca's daily
   open is "the first valid trade", T3's reason for `close`, and the SIP bar open differs
