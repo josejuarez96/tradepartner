@@ -168,8 +168,9 @@ with the new plan fields compared.
 
 The block below is the only part the registry parses. It is **proposed**: the
 `earnings_drift` section, the family name and its required-keys rule do not exist in
-`backtest/hypothesis.py` or `config.py` (the spec amendment and engine tasks named in
-#1358's PR body), so registering this file today fails on `family` and on unknown keys.
+`backtest/hypothesis.py` or `config.py` (the spec amendment and engine tasks are listed
+under "The family question" below), so registering this file today fails on `family` and
+on unknown keys.
 The file names the family's own section and no inert `strategy.*` keys (B3-1's rule, keyed
 per family). The holdout, `in_sample_start`, universe and fill convention follow H1's and
 B3's so the three families are one data-and-cost world, except where a root family sets
@@ -317,7 +318,7 @@ to 7.6 pp/yr** (about 4.2 pp/yr at paired entries plus drift, about 7.6 pp/yr fu
 unpaired plus drift). Against a gross long leg of +0.8 to +3.8 pp/yr (midpoint about
 +2.3), the net prior over SPY at the base level is **centred at about −2 pp/yr, plausible
 range −7 to 0 pp/yr**: the midpoint gross minus the lower cost bound is about −1.9; the
-best gross minus the least cost is about +0.2, the upper end; the least gross minus the
+best gross minus the least cost (the paired 3.6, before drift) is about +0.2, the upper end, which drift takes to about −0.4; the least gross minus the
 most cost about −6.8. It is positive only at the 5 bp rung, and at the handoff's HO-14
 floor (5-10 bp plus half the spread) at or below zero, which is the report's verdict
 restated: near zero net at 15 bp, long-only. The cash share under the 5% cap (rule 7) is a
@@ -331,7 +332,7 @@ noisier than H1's 100-name decile (8.4%) or B3's 60-name annual book (6%).
 
 **Turnover and cost drag.** One-sided monthly turnover of about 100 to 200% (entries and
 exits, their re-weighting, and drift), seasonal with the earnings calendar; cost drag at
-15 bp of roughly 3.6 to 7 pp/yr, at the 100 bp rung roughly 24 to 48 pp/yr. A `cost_drag`
+15 bp of roughly 3.6 to 7.6 pp/yr, at the 100 bp rung roughly 24 to 48 pp/yr. A `cost_drag`
 far from ≈ 12 × `turnover_monthly` × 2 × `per_side_bps` is a cost-model bug.
 
 **Losses.** A long-only, event-concentrated equity book: a full-crisis drawdown about the
@@ -354,8 +355,9 @@ source in the register gives a worst quarter for this construction; the run comp
 - One-sided `turnover_monthly` far below 70% or far above 250%: the hold length, the
   membership rule or the re-weighting is not doing what rules 6 and 7 say (the band's
   arithmetic is under Expected magnitudes; 200% is the fully unpaired case).
-- `n_excluded_no_breakpoints` non-zero after the first quarter of the window: the event
-  feed has a hole (T151's coverage count is the baseline).
+- `n_excluded_no_breakpoints` non-zero at any read: the engine reads events before
+  `in_sample_start` for the breakpoints (rule 4), so the set is full from the first read
+  and a non-zero count is a hole in the event feed (T151's coverage count is the baseline).
 - An EAR computed across a split without adjustment (a ±50% or ±90% "reaction" on a
   split's ex-date): rule 3 reads the adjusted series, and such a value is the proof it did
   not.

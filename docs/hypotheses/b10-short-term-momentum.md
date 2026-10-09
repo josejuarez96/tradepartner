@@ -128,7 +128,7 @@ prefix invariance with the screen on; a revision case with teeth (a shares fact 
 unchanged, `run(end=T_{i+1})` changed); a split-month case (a 2-for-1 with ex-date inside
 the formation month leaves the name's turnover rank unchanged against a no-split twin);
 and a pinned check that H1's reference metrics are unchanged with the key at its default
-and that H1's, the T114 variants', B3's and `combined`'s canonical frozen sets and
+and that H1's, the T114 variants', `oracle`'s, B3's and `combined`'s canonical frozen sets and
 fingerprints are unchanged **under the amended own-section rule** (above): the new key,
 absent from their stored params, is left out of each canonical set at the default, while
 B3's seven `profitability.*` keys at their defaults stay in B3's.
@@ -449,7 +449,7 @@ nothing is built here):
    its default), and optionally the `lab.sweepable_keys` entry; `backtest/frozen.py`
    `canonical_frozen_set` implements the amended own-section rule; `tests/test_config.py`
    and `tests/backtest/test_frozen.py` pin the default, and H1's, the T114 variants',
-   **B3's** and `combined`'s canonical sets and fingerprints unchanged. Size S. `quant-auditor`,
+   `oracle`'s, **B3's** and `combined`'s canonical sets and fingerprints unchanged. Size S. `quant-auditor`,
    `safety-reviewer` (`config.py` is on both lists).
 3. **The read and the screen:** `backtest/strategies.py` reads the formation month's
    volume from the bars frame, the shares fact through `facts_as_of(t)` and the actions
