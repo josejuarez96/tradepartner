@@ -154,6 +154,18 @@ def _dataset(
 ) -> research.DatasetRecord:
     dates = dates if dates is not None else [date(2021, 1, 4), date(2022, 6, 30)]
     csv, split_file = _export(tmp_path, stem or name, dates, splits)
+    row_dates = (
+        {
+            s: (
+                list(dates)
+                if s in research.EVERY_ROW_SPLITS
+                else [d for d, x in zip(dates, splits or (), strict=False) if x == s]
+            )
+            for s in sealed
+        }
+        if sealed
+        else None
+    )
     return research.register_dataset(
         conn,
         name=name,
@@ -169,6 +181,7 @@ def _dataset(
         split_spans=split_event_spans(dates, splits) if splits else None,
         sealed_splits=sealed,
         sealed_periods=periods,
+        split_row_dates=row_dates,
         locked=locked,
         seed=seed,
         repo_dir=tmp_path,
@@ -522,6 +535,48 @@ def test_register_dataset_checks_a_sealed_none_against_the_whole_event_span(
             sealed=("none",),
             periods=_TEST_PERIOD,
         )
+
+
+def test_register_dataset_refuses_a_sealed_row_that_falls_between_two_periods(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174: the sealed-span check tested only the split's two endpoints, so a row
+    sitting in the gap between two disjoint sealed periods passed, though no period
+    holds it. With the per-split row dates the store refuses it, extending #1149 from
+    the endpoints to every row."""
+    periods = (
+        (date(2020, 1, 1), date(2020, 12, 31)),
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    with pytest.raises(research.ResearchError, match="sealed split without period"):
+        _dataset(
+            conn,
+            tmp_path,
+            dates=[date(2020, 1, 2), date(2022, 6, 1), date(2024, 1, 2)],
+            sealed=("full",),
+            periods=periods,
+        )
+
+
+def test_register_dataset_accepts_a_sealed_split_confined_to_disjoint_periods(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174: disjoint sealed periods are refused only when a row falls in the gap
+    between them; a rowless gap is fine, so the store must not require the merged
+    periods to cover the whole span."""
+    periods = (
+        (date(2020, 1, 1), date(2020, 12, 31)),
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    record = _dataset(
+        conn,
+        tmp_path,
+        dates=[date(2020, 1, 2), date(2024, 1, 2)],
+        sealed=("full",),
+        periods=periods,
+    )
+    assert record.sealed_splits == ("full",)
+    assert record.sealed_periods == periods
 
 
 # --- gates: every refusal is a run row with its outcome --------------------------------

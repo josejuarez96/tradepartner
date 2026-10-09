@@ -2436,6 +2436,7 @@ def make_app(
                 else None
             )
             all_sealed = effective_sealed_splits(explicit_sealed, assignment or ())
+            sealed_row_dates: dict[str, list[date]] = {}
             for split in sorted(all_sealed):
                 if values is None:
                     raise ExperimentFileError(
@@ -2450,6 +2451,7 @@ def make_app(
                     else [v for v, a in zip(values, assignment, strict=True) if a == split]
                 )
                 check_sealed_split_has_period(split, rows, periods)
+                sealed_row_dates[split] = rows
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
                 record = research.register_dataset(
@@ -2467,6 +2469,7 @@ def make_app(
                     split_spans=spans,
                     sealed_splits=sorted(all_sealed),
                     sealed_periods=periods,
+                    split_row_dates=sealed_row_dates or None,
                     locked=locked,
                     seed=seed,
                     note=note,

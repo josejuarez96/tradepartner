@@ -25,8 +25,10 @@ event column and labels no row `full` or `none`, a sealed split name must be one
 of `RESEARCH_SPLITS`, and a sealed split needs an event column and sealed
 periods holding its event span (`full` and `none` against the whole declared
 `[event_start, event_end]`, since a split file never labels a row `full` or
-`none`; #1149). The row-level check for a labelled split's actual rows is T82's
-`check_sealed_split_has_period`, run by the CLI, which has the rows to check.
+`none`; #1149). The two span endpoints can hide a row in a gap between two sealed
+periods, so when the periods do not cover the whole span the store also checks
+the split's per-row event dates (`split_row_dates`, every row for `full`/`none`,
+the same rows the CLI already reads); #1174.
 
 **Runs** (reqs 3 to 7). `open_run` and `attach_run` are the only constructors of
 `RunHandle`. `open_run` reads the rows the gates need, asks `research.gates` in
@@ -243,6 +245,26 @@ def _span_list(spans: Sequence[tuple[date, date]]) -> list[list[str]]:
 
 def _decode_spans(raw: Sequence[Sequence[str]]) -> tuple[tuple[date, date], ...]:
     return tuple((date.fromisoformat(s), date.fromisoformat(e)) for s, e in raw)
+
+
+def _covers_span(span: tuple[date, date], periods: Sequence[tuple[date, date]]) -> bool:
+    """Whether the merged `periods` cover every day of `[span[0], span[1]]` with no gap.
+
+    A split whose rows all lie inside its span is fully held as soon as the periods cover
+    the whole interval, so the store needs no per-row dates then. A gap means the span's
+    two endpoints can hide a row in it (#1174): the store cannot tell from the endpoints
+    alone and must read the rows."""
+    start, end = span
+    cursor = start
+    for p_start, p_end in sorted(periods):
+        if p_end < cursor:
+            continue
+        if p_start > cursor:
+            return False
+        cursor = max(cursor, p_end)
+        if cursor >= end:
+            return True
+    return cursor >= end
 
 
 def _next_run_id(conn: duckdb.DuckDBPyConnection) -> int:
@@ -509,6 +531,7 @@ def register_dataset(
     split_spans: Mapping[str, tuple[date, date]] | None = None,
     sealed_splits: Sequence[str] = (),
     sealed_periods: Sequence[tuple[date, date]] = (),
+    split_row_dates: Mapping[str, Sequence[date]] | None = None,
     locked: bool = False,
     seed: int | None = None,
     note: str | None = None,
@@ -519,11 +542,14 @@ def register_dataset(
     `split_spans` are the per-split event spans the caller computed from the
     event column and the split file; without a split file the one split `full`
     spans `[event_start, event_end]`. `test` in `split_spans` seals `test` by
-    implication. Refuses `split without event column`, `sealed split without
-    period`, `sealed set shrinks` and a split file labelling rows `full` or
-    `none`; returns the existing row for the same `(name, sha256,
-    split_sha256)` and sealed set when the path, split path, `locked` and seed
-    match too (a moved export, or one locked after protocol §10 step 5, is a new
+    implication. `split_row_dates` maps a split to the event dates of its rows
+    (`full` and `none` are every row); when the sealed periods do not cover a
+    sealed split's whole span, the store checks every one of those rows, since the
+    two endpoints can hide a row between them (#1174). Refuses `split without event
+    column`, `sealed split without period`, `sealed set shrinks` and a split file
+    labelling rows `full` or `none`; returns the existing row for the same `(name,
+    sha256, split_sha256)` and sealed set when the path, split path, `locked` and
+    seed match too (a moved export, or one locked after protocol §10 step 5, is a new
     version rather than the stale row)."""
     require_research(conn)
     if event_end < event_start:
@@ -544,6 +570,7 @@ def register_dataset(
     spans = dict(split_spans) if split_spans is not None else {"full": (event_start, event_end)}
     sealed = set(sealed_splits) | ({"test"} if "test" in spans else set())
     periods = sorted(set(sealed_periods))
+    row_dates = {split: tuple(values) for split, values in (split_row_dates or {}).items()}
     for split in sorted(sealed):
         if event_column is None or not periods:
             raise ResearchError(
@@ -556,12 +583,23 @@ def register_dataset(
         # (with or without a split file). Check the dataset's whole declared
         # event span instead (#1149).
         span = (event_start, event_end) if split in EVERY_ROW_SPLITS else spans.get(split)
-        if span is not None and not all(
-            any(start <= day <= end for start, end in periods) for day in span
-        ):
+        if span is None or _covers_span(span, periods):
+            continue
+        # The span's two endpoints can each sit in a different sealed period while a row
+        # between them is held by none (#1174). Where the periods do not cover the whole
+        # span, only the split's row dates can show it, so require and check them.
+        rows = row_dates.get(split)
+        if rows is None or (rows and (min(rows), max(rows)) != span):
             raise ResearchError(
-                f"sealed split without period: {split!r} spans [{span[0]}, {span[1]}], "
-                f"outside the sealed periods {periods}"
+                f"sealed split without period: {split!r} spans [{span[0]}, {span[1]}], which "
+                f"the sealed periods {periods} do not cover; sealing it needs split_row_dates "
+                f"for {split!r} to check every row"
+            )
+        uncovered = [day for day in rows if not any(start <= day <= end for start, end in periods)]
+        if uncovered:
+            raise ResearchError(
+                f"sealed split without period: {split!r} row with event date {uncovered[0]} "
+                f"falls outside every sealed period {periods}"
             )
     old_splits, old_periods = _name_sealing(conn, name)
     if not old_splits <= sealed or not old_periods <= set(periods):
