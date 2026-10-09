@@ -18,7 +18,8 @@ message if either is missing, before any network call.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from collections.abc import Callable
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from alpaca.data.enums import Adjustment, DataFeed
@@ -164,17 +165,23 @@ def _drop_actions_seen_in_earlier_batches(payloads: list[Any]) -> list[Any]:
     return kept
 
 
-def _session_bounds_utc(start: date, end: date) -> tuple[datetime, datetime]:
+def _session_bounds_utc(
+    start: date, end: date, *, not_after: datetime | None = None
+) -> tuple[datetime, datetime]:
     """`[start, end]` session dates as an inclusive tz-aware UTC instant range.
 
     `alpaca-py` requests take instants, not dates; callers of this module
     pass session dates, matching `calendar.py`'s convention (a session is a
     `date`, an instant is a tz-aware UTC `datetime`).
+
+    `not_after` (#1356) caps the end: the range ends at the earlier of the
+    last session's `23:59:59.999999 UTC` and `not_after`, so the cap can only
+    shorten the range, never extend it past the last session.
     """
-    return (
-        datetime.combine(start, time.min, tzinfo=UTC),
-        datetime.combine(end, time.max, tzinfo=UTC),
-    )
+    end_utc = datetime.combine(end, time.max, tzinfo=UTC)
+    if not_after is not None:
+        end_utc = min(end_utc, not_after)
+    return datetime.combine(start, time.min, tzinfo=UTC), end_utc
 
 
 def daily_bars(
@@ -185,6 +192,7 @@ def daily_bars(
     feed: DataFeed | None = None,
     asof: date | None = None,
     settings: Settings | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     """Raw, unadjusted daily bars for `symbols` over `[start, end]`.
 
@@ -199,11 +207,26 @@ def daily_bars(
     `asof` (#1314) is Alpaca's symbol-mapping day: each symbol names the
     company that traded under it that day, not today's holder (a reused
     ticker). `None` sends no `asof`, so Alpaca maps to today's holder.
+
+    On the SIP feed the request's end is capped at `clock()` minus
+    `alpaca.sip_delay_minutes` (#1356): the free plan refuses SIP data from
+    the last 15 minutes, and a range ending today otherwise ends at
+    23:59:59 UTC, in the future. If the cap falls before the range's start,
+    nothing is servable yet: no request is sent and the bars are empty.
+    `clock` defaults to the wall clock, read once.
     """
     settings = settings or get_settings()
     feed = feed or default_feed(settings)
+    not_after = None
+    if feed == DataFeed.SIP:
+        now = (clock or (lambda: datetime.now(UTC)))()
+        if now.tzinfo is None:
+            raise ValueError("clock() returned a naive datetime; it must be tz-aware UTC")
+        not_after = now.astimezone(UTC) - timedelta(minutes=settings.alpaca.sip_delay_minutes)
+    start_utc, end_utc = _session_bounds_utc(start, end, not_after=not_after)
+    if end_utc < start_utc:
+        return {"feed": feed.value, "bars": {}}
     client = _stock_data_client(settings)
-    start_utc, end_utc = _session_bounds_utc(start, end)
     raw_bars = _merge_batches(
         [
             client.get_stock_bars(

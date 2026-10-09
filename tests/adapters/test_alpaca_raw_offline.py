@@ -8,10 +8,11 @@ would happen (T2 review round 2, safety-reviewer MUST FIX/tests).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pytest
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
@@ -310,3 +311,116 @@ def test_daily_bars_sends_asof_on_every_batch(
         settings=_batched_settings(2),
     )
     assert sent == [sent_asof, sent_asof]
+
+
+# --- #1356: the free plan refuses SIP data from the last 15 minutes ---------------
+
+
+def _sent_utc(instant: datetime | None) -> datetime:
+    """`StockBarsRequest` keeps instants as naive UTC; read them back as aware."""
+    assert instant is not None
+    return instant.replace(tzinfo=UTC) if instant.tzinfo is None else instant
+
+
+def _capture_bar_requests(monkeypatch: pytest.MonkeyPatch) -> list[StockBarsRequest]:
+    sent: list[StockBarsRequest] = []
+
+    def fake_get_stock_bars(
+        self: StockHistoricalDataClient, request_params: StockBarsRequest
+    ) -> dict[str, Any]:
+        sent.append(request_params)
+        return {}
+
+    monkeypatch.setattr(StockHistoricalDataClient, "get_stock_bars", fake_get_stock_bars)
+    return sent
+
+
+def test_sip_delay_minutes_defaults_to_15() -> None:
+    assert Settings(_env_file=None).alpaca.sip_delay_minutes == 15
+
+
+def test_daily_bars_caps_a_same_day_sip_end_at_now_minus_the_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2026-10-08 18:30 ET ingest: the session's 23:59:59 UTC end was in the
+    future, inside the free plan's SIP delay, and Alpaca refused the request."""
+    sent = _capture_bar_requests(monkeypatch)
+    now = datetime(2026, 10, 8, 22, 30, tzinfo=UTC)  # 18:30 ET
+
+    alpaca_raw.daily_bars(
+        ["SPY"], date(2026, 10, 1), date(2026, 10, 8), settings=_settings(), clock=lambda: now
+    )
+
+    (request,) = sent
+    assert _sent_utc(request.end) == now - timedelta(minutes=15)
+    assert _sent_utc(request.start) == datetime(2026, 10, 1, tzinfo=UTC)
+
+
+def test_daily_bars_delay_comes_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _capture_bar_requests(monkeypatch)
+    now = datetime(2026, 10, 8, 22, 30, tzinfo=UTC)
+    settings = _settings().model_copy(
+        update={"alpaca": _settings().alpaca.model_copy(update={"sip_delay_minutes": 40})}
+    )
+
+    alpaca_raw.daily_bars(
+        ["SPY"], date(2026, 10, 1), date(2026, 10, 8), settings=settings, clock=lambda: now
+    )
+
+    assert _sent_utc(sent[0].end) == now - timedelta(minutes=40)
+
+
+def test_daily_bars_keeps_a_past_end_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No look-ahead: the cap only ever lowers the end, never past the session's end."""
+    sent = _capture_bar_requests(monkeypatch)
+    now = datetime(2026, 10, 9, 0, 10, tzinfo=UTC)  # 5 min old cap still after 10-08's end
+
+    alpaca_raw.daily_bars(
+        ["SPY"], date(2026, 10, 1), date(2026, 10, 7), settings=_settings(), clock=lambda: now
+    )
+
+    assert _sent_utc(sent[0].end) == datetime.combine(date(2026, 10, 7), time.max, tzinfo=UTC)
+
+
+def test_daily_bars_iex_end_is_not_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _capture_bar_requests(monkeypatch)
+    now = datetime(2026, 10, 8, 22, 30, tzinfo=UTC)
+
+    alpaca_raw.daily_bars(
+        ["SPY"],
+        date(2026, 10, 1),
+        date(2026, 10, 8),
+        feed=DataFeed.IEX,
+        settings=_settings(),
+        clock=lambda: now,
+    )
+
+    assert _sent_utc(sent[0].end) == datetime.combine(date(2026, 10, 8), time.max, tzinfo=UTC)
+
+
+def test_daily_bars_skips_the_request_when_the_cap_is_before_the_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Minutes after midnight UTC, a range of today alone has nothing SIP may serve yet."""
+    sent = _capture_bar_requests(monkeypatch)
+    now = datetime(2026, 10, 8, 0, 5, tzinfo=UTC)
+
+    out = alpaca_raw.daily_bars(
+        ["SPY"], date(2026, 10, 8), date(2026, 10, 8), settings=_settings(), clock=lambda: now
+    )
+
+    assert sent == []
+    assert out == {"feed": "sip", "bars": {}}
+
+
+def test_session_bounds_never_end_after_the_last_session() -> None:
+    """No look-ahead: for any clock reading the capped end stays inside the range."""
+    start, end = date(2026, 10, 1), date(2026, 10, 8)
+    session_end = datetime.combine(end, time.max, tzinfo=UTC)
+    for hours in range(-48, 72):
+        now = session_end + timedelta(hours=hours)
+        _, capped = alpaca_raw._session_bounds_utc(
+            start, end, not_after=now - timedelta(minutes=15)
+        )
+        assert capped <= session_end
+        assert capped <= now - timedelta(minutes=15)

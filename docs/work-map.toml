@@ -27,16 +27,16 @@ what = "A backtester with realistic costs, a locked holdout and a registry of ev
 why = "The MVP's first hypothesis, monthly momentum, gets tested here. Without the registry we cannot tell luck from skill."
 
 [phase.4]
-what = "Unattended paper trading with risk rules, a kill switch and a full decision journal."
-why = "Six months of clean paper runs is the MVP's finish line."
+what = "Unattended paper trading with risk rules, a kill switch and a full decision journal; several books at every cadence since ADR 0017."
+why = "A clean machine-readiness shakedown on paper (real orders every session, clean reconciliation, a kill-switch drill, complete chains) is the MVP's finish line; strategy evidence keeps accruing per book."
 
 [phase.5]
 what = "An optional LLM memo beside each signal, only if a decision record grants it that role."
 why = "Deferred: no evidence yet that it adds predictive value."
 
 [phase.6]
-what = "A small live account, about $100, under exactly the paper-trading rules."
-why = "The first real money, only after the MVP has proven the process."
+what = "A small live account, about $100, under exactly the paper-trading rules, as one more book on the live endpoint under its own ADR."
+why = "The first real money, only after the machine has passed the paper shakedown (ADR 0017) and the compliance, stop-criteria and cash-account gates."
 
 [task.T1]
 what = "Configuration keys, dependency pins and a real trading calendar."
@@ -311,7 +311,7 @@ why = "The acceptance criteria every Phase 2 task answers to."
 
 [spec.paper-trading]
 what = "What Phase 4 builds and how we know it is done: the risk-gated broker wrapper, the Alpaca paper adapter, the scheduled tracking run, the journal, the operations and override pages, alerts and the wash-sale lot ledger."
-why = "The acceptance criteria every Phase 4 task answers to; six unattended paper rebalances under these rules are the MVP's finish line."
+why = "The acceptance criteria every Phase 4 task answers to; a passed paper shakedown under these rules (ADR 0017) is the MVP's finish line, with the tracking check reported per book."
 unblocks = ["phase:4"]
 
 [spec.strategy-lab]
@@ -330,8 +330,8 @@ why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pag
 unblocks = ["spec:paper-trading"]
 
 [plan.paper-trading]
-what = "The Phase 4 build document: 50 tasks, one PR each, from broker types to the phase-close evidence, grouped in chains."
-why = "What the ready frontier is computed from once Phase 3 closes; six unattended paper rebalances under these tasks are the MVP's finish line."
+what = "The Phase 4 build document: 85 tasks, one PR each, from broker types to the phase-close evidence and the fast-paper tasks of ADR 0017, grouped in chains."
+why = "What the ready frontier is computed from; a passed paper shakedown over several books under these tasks is the MVP's finish line."
 unblocks = ["phase:4"]
 
 [issue.255]
@@ -733,6 +733,16 @@ what = "One global development boundary (recommended 2023-12-29) as a frozen own
 why = "The lab derives a strategy's practice end from its own holdout start, so B4 (a child of momentum) would practise through momentum's spent exam and B3's unspent one; one global boundary fixes that without the per-strategy date knob the owner withdrew, and writes down that every new family's exam is forward until history is extended."
 unblocks = ["plan:data-foundation", "issue:1292"]
 
+[adr.0017]
+what = "Fast paper: several paper books at once, one Alpaca paper account per book; every cadence (month_end, week_end, daily) on paper with paper.min_rebalances per cadence; profitability and combined opened to paper; and Phase 6 gated on a machine-readiness shakedown (paper shakedown: real fills on at least half of a ten-session span, clean reconciliation, no duplicate or mis-sized orders, a kill-switch drill, complete chains, alert delivery) instead of one strategy's months of tracking."
+why = "One monthly strategy at a time made the Phase 4 exit a six-month wait that measured the strategy, not the machine; several books at daily and weekly cadence give the operations evidence in weeks while each strategy's exam of record stays ADR 0016's."
+unblocks = ["plan:paper-trading", "issue:1352"]
+
+[issue.1352]
+what = "Turn ADR 0017 into the spec amendments (paper spec, strategy-lab req 11, the ADR pointers) and the Phase 4 plan tasks T151 to T163c: cadence lift, the family flip, one account per book, the multi-book run, the per-book surfaces, paper shakedown, the runbook, the owner's accounts, hypotheses, starts and span, and the Phase 6 live book."
+why = "A decision the owner merged is built only from claimable task lines; the lines fix the schema chain, the drill's host book and the counted selection of the daily variant so several teams can build in parallel."
+unblocks = ["task:T151", "task:T152", "task:T153", "task:T154", "task:T155", "task:T155b", "task:T156", "task:T157", "task:T157b", "task:T158", "task:T159", "task:T160", "task:T161", "task:T162", "task:T163", "task:T163b", "task:T163c"]
+
 [issue.1258]
 what = "Turn ADR 0015's plan sketch (TE0 to TE7) into Phase 4 plan tasks T132 to T139 with their files, tests, dependencies, declared chains and the T48b, T48c and T71 gates."
 why = "A seam the ADR opened is built only from a claimable task line; the lines fix the DDL, the id token and the refusal names so three teams can build them in parallel before paper start."
@@ -871,3 +881,111 @@ why = "The build is proven only on the owner's store; the release row names the 
 [task.T150]
 what = "The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
 why = "Only with longer history does more than one exam slice exist; registering the new families as children keeps every trial counted, as charter principle 2 requires."
+
+[task.T151]
+what = "paper start accepts every cadence: the month_end constant and refused_cadence go, the window's cadence reaches the holdout-end check, T_0, the report and the check (#1286), and paper.min_rebalances is frozen per cadence (6, 13, 63)."
+why = "A daily or weekly book is what makes the shakedown a matter of weeks; this is the one-constant change that lets it start."
+unblocks = ["task:T155", "task:T156", "task:T161"]
+
+[task.T152]
+what = "profitability and combined become paper_ready, with a fixture-store round trip of each family's plan through the planner and the journal; class A, labelled hold, landed by the owner."
+why = "B3's book cannot open while its family is refused at paper start; ADR 0014 point 5 reserved this one line for the owner's word, which ADR 0017 gives."
+unblocks = ["task:T160"]
+
+[task.T153]
+what = "One Alpaca key pair per book, named by token, read by the raw client and the broker factory for that book only; main keeps today's variables."
+why = "One account is one book: every reconciliation, flatness and risk rule keeps its meaning because a second book never shares main's account or its keys."
+unblocks = ["task:T155b", "task:T159"]
+
+[task.T154]
+what = "The journal readers take the book (open_window and latest_window per book, still failing closed per book) and alerts gain book_id, schema version 19."
+why = "Every paper command reads 'the' open window today; per-book readers are what let two windows exist without any rule relaxing."
+unblocks = ["task:T155", "task:T156", "task:T157"]
+
+[task.T155]
+what = "The book flows through window start/stop/kill/abandon/settle, resume, reconcile, the switch and the wrapper, with one run lock per book."
+why = "The order path must address one book's window and account and no other; the per-book lock keeps two books' runs from ever sharing a run identity."
+unblocks = ["task:T155b"]
+
+[task.T155b]
+what = "paper run iterates every open book in token order, each its own run under its own lock, and every paper command takes --book (paper kill --all)."
+why = "One scheduled job runs all the books; a crash in one book's run is that book's row and never stops the next."
+unblocks = ["task:T158", "task:T161"]
+
+[task.T156]
+what = "paper status, the operations page (a book selector and a one-row-per-book summary), the override page, paper report and paper check per book, with the comparison named per period."
+why = "The owner reads several books on one page and gets each book's tracking evidence in its own cadence's periods."
+unblocks = ["task:T161"]
+
+[task.T157]
+what = "The shakedown_span and shakedown_note decision kinds (schema version 20), the registry read of the newest span row and the decision shakedown-span and shakedown-note commands."
+why = "The gate's thresholds are a frozen owner row, written before the span opens, so the bar cannot move after a failing span; the migration lands alone, as T84 did."
+unblocks = ["task:T157b"]
+
+[task.T157b]
+what = "paper shakedown: the seven machine-readiness criteria of ADR 0017 part E as read-only queries over the journal, thresholds from the span row, one line per criterion, exit 0 only when all pass, writes nothing."
+why = "The Phase 4 exit becomes a command over rows the journal already writes, so the gate measures the machine and not a strategy."
+unblocks = ["task:T158", "task:T162"]
+
+[task.T158]
+what = "The scheduling runbook for several books: one job, each book's run time against the submit window, the kill-switch drill procedure on main, the span and note commands, and where the shakedown output goes."
+why = "The owner runs the drill and reads the seven lines by this page; a procedure that is not written is one that is remembered."
+unblocks = ["task:T162"]
+
+[task.T159]
+what = "Owner: the second (and third) Alpaca paper account, the per-login cap verified, each key pair in .env under the book's names."
+why = "Agents never hold keys; without the accounts no book beyond main can start."
+unblocks = ["task:T161"]
+
+[task.T160]
+what = "Owner: the hypotheses for the books; the daily momentum variant promoted from the T114 sweep on development data as a counted selection (ADR 0016 point 3), B3's finalist, short-term momentum when registered."
+why = "A book trades a frozen, promoted hypothesis chosen on development data; writing the pick down as a counted promotion is what keeps it from being read as an uncounted choice."
+unblocks = ["task:T161"]
+
+[task.T161]
+what = "Owner: paper start --book per book in the decided order (the daily momentum book, B3, short-term momentum), with the first two-book scheduled run as evidence."
+why = "Several books trading on paper is the point of ADR 0017; this is the moment it is true on the real store."
+unblocks = ["task:T162"]
+
+[task.T162]
+what = "Owner: the shakedown_span row (N = 10, M = 5, the live-first strategy named in its reason), the kill-switch drill on main on an H1 fill session, and paper shakedown exit 0 over every book."
+why = "This is the Phase 4 exit and the Phase 6 entry: the machine shown ready by frozen criteria, not a strategy shown profitable."
+unblocks = ["task:T71b", "task:T163"]
+
+[task.T163]
+what = "The Phase 6 ADR: the live book as one more book on the live endpoint, the guard lifted for that book only, live keys, settled cash, the stop criteria frozen into its window, and which strategy goes live from its exam of record."
+why = "Nothing in ADR 0017 lifts the alpaca.paper guard; real money needs its own record, after the shakedown and the compliance, stop-criteria and cash-account gates."
+unblocks = ["task:T163b", "task:T163c", "phase:6"]
+
+[task.T163b]
+what = "The live switch for one named book: the guard, the live key names, a paper=False client behind that book's config and a second guard in the adapter, broker facts recorded on the live endpoint."
+why = "The first live order goes through the same wrapper and journal as paper; only the endpoint and the keys differ, and both are guarded twice."
+
+[task.T163c]
+what = "A settled-cash read for the buys phase of a cash account, so the live book never buys with unsettled sale proceeds."
+why = "The live account is a taxable cash account (#813) while paper is margin; buying on unsettled proceeds is a good-faith violation the paper book can never show."
+
+
+[task.T164]
+what = "The data-foundation spec amendment for filing_events (the EDGAR 8-K items field with its acceptance time) and the read-only coverage count of 2.02 8-Ks across the universe."
+why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; the count says how many issuers the rule reaches before anything is built."
+
+[task.T164b]
+what = "The filing_events table, the FilingEvent record, the FilingSource question and three fixture 8-K rows (a same-day-filed 2.02, an after-hours 2.02, a 5.02)."
+why = "The table and the fixture are what every later task and the look-ahead tests read."
+
+[task.T164c]
+what = "The EDGAR adapter keeps the submissions items field in its stamps cache under a new layout constant, with a test that no existing stamp changes."
+why = "The adapter already reads the field and drops it; keeping it must not move a single known_at, so the stamps are diffed rather than trusted."
+
+[task.T164d]
+what = "The as-of read filing_events_as_of and its look-ahead cases: an 8-K accepted after the close is invisible at that close, and the filed date is never the event's time."
+why = "The event signal is only as point-in-time as this read; the filed-date trap would move day 0 a session early."
+
+[task.T164e]
+what = "The ingest write, the config switch and keys, the health count, and the first real-store run under a named data release."
+why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
+
+[issue.1358]
+what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
+why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."
