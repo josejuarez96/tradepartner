@@ -21,7 +21,7 @@ TypeSafe's terms meet ADR 0013's bar: a vendor that trains on inputs without an 
 | 6 | Purchased credits expire | S3 | 1 | "Purchased Credits expire ... 12 months after the purchase date" | n/a | n/a |
 | 7 | Promotional credits carry their own terms | S3 | 1 | "Promotional Credits are subject to any additional terms ... including terms with respect to expiration, revocation" | n/a | n/a |
 | 8 | Retention not time-bound (data processing) | S4, Data Processing Addendum (last updated 2026-04-24) | 1 | retained "for as long as necessary taking into account the purpose of the Processing" | n/a | n/a |
-| 9 | Zero data retention is an enterprise option | S4 | 1 | zero data retention is offered as an enterprise option, not on our plan | n/a | n/a |
+| 9 | Zero data retention is an enterprise option | S4 | 1 | (paraphrase, as the spec records it) zero data retention is an enterprise option | n/a | n/a |
 
 ## Disconfirmation
 - Searches run: none for this file. The line transcribes the spec's req 17, which records the pages read on 2026-10-05.
@@ -33,6 +33,7 @@ TypeSafe's terms meet ADR 0013's bar: a vendor that trains on inputs without an 
 - The expiry of the owner's promotional credit is not in the public terms (row 7). The owner records it on #946 before the pilot (spec req 17).
 
 ## UNVERIFIED items
+- How data is deleted (ADR 0013 point 6): not stated in the passages the spec records from S2 to S4. The owner reads the deletion route (a request to the vendor, or account deletion) in S2/S4 before the pilot and records it on #946 with the credit's expiry.
 - Whether the vendor honours the no-training and no-disclosure statements in practice. This cannot be verified from outside, and the bar rests on the stated terms.
 
 ## Follow-up questions (not answered here)

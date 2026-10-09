@@ -26,14 +26,14 @@ The sample test of 2026-10-05/06 (outside the repo, spec amendment E1 to E14) la
 
 ## Seeded error set (as registered with `departure-reason-pilot`)
 
-The seeds are scored by `departure-reason-pilot` (`seeded_recall`); a batch shortlists them like any listing end. Recorded here, as req 10 asks of every file, with the same pre-fix readings. A seed whose Form 25 the frame does not hold is dropped and noted at registration. Each seed's **pre-fix rule answer** is the output of the pre-fix rule function at the fix's parent `code_version`, as traced on its issue; the crosswalk row that output gives is written into `config_json` with that commit at registration. The traced reading from each issue:
+The seeds are scored by `departure-reason-pilot` (`seeded_recall`); a batch shortlists them like any listing end. Recorded here, as req 10 asks of every file, with the same pre-fix readings. A seed whose Form 25 the frame does not hold is dropped and noted at registration. Each seed's **pre-fix rule answer** is the output of the pre-fix rule function at the fix's parent `code_version`, as traced on its issue; the crosswalk row that output gives is written into `config_json` with that commit at registration. **Open (#1351):** no command adds the seeds to the gold session yet and `seeded_recall` is not computed against these answers; and on the traced rows 4 or 5 a correct label is an agreement, so the `seeded_recall = 1.0` gate below waits on the owner's decision there. The traced reading from each issue:
 
 | Seed | Issue | Form 25 | Parent `code_version` | Pre-fix behaviour as traced on the issue | Pre-fix rule answer (crosswalk reading) |
 |---|---|---|---|---|---|
 | Valaris (Class A, `0000314808`) | #921 | 25-NSE filed 2020-09-04, effective 2020-09-14 | `f2b5261` | the footnote alias `VAL*` folded into `VAL` kept the Form-25-delisted span alive; the post-emergence common became a plain class of the old company, not a `<cik>@<date>` successor | the line the rule did not end, no successor: row 6 |
 | Seagate 2021 (`0001137789`) | #943 | the Ireland redomicile, effective 2021-05-28 | `ca79641` | a repair dry run would cut the live STX line (1,714 bars): the redomicile and relisting filings read as an end | delisted, no relisting, no successor: row 4 or 5, by the Form 15 marker |
 | MiMedx 2019 (`0001376339`) | #943 | Nasdaq delisting effective 2019-03-08 (relisted 2020-11) | `ca79641` | the long-gap relisting (#905's accepted cost) cut the 2020 relisting off the same security | delisted, no relisting: row 4 or 5, by the Form 15 marker |
-| Sotheby's 2019 (`0000823094`) | #905 | 25-NSE effective 2019-10-13 | #847's parent | a debt cover page after the stopped line kept the delisted `BID` span alive | the line the rule did not end: row 6 |
+| Sotheby's 2019 (`0000823094`) | #905 | 25-NSE effective 2019-10-13 | `6d0b17b` (the parent of #905's fix) | a debt cover page after the stopped line kept the delisted `BID` span alive | the line the rule did not end: row 6 |
 | Match Group 2020 separation (`0000891103`) | #828, #922 | the July 2020 IAC/Match separation | `f2b5261` | the #835 rules no longer derive the owner-accepted successor `0000891103@2020-08-10` | delisted, no successor: row 4 or 5, by the Form 15 marker |
 
 Seagate 2010 is outside the population and is not a seed; #893's rename holes have no Form 25 and are not seeds.
@@ -74,6 +74,8 @@ Seagate 2010 is outside the population and is not a seed; #893's rename holes ha
 | `12d2-2(b)` | `compliance_delisting`, `bankruptcy` |
 | `12d2-2(c)` | `exchange_transfer`, `voluntary_withdrawal` |
 | anything else | `unresolved` |
+
+**Window.** `[window] end = 2026-12-31` stands in for spec req 10's "to the freeze": the freeze date does not exist when the file is merged, and the registry needs a literal date. What keeps post-freeze filings out is the frame: it is built once at `t` before the freeze (the frame drops every listing end accepted after `t`), the freeze date is recorded on #963, and a frame rebuilt after the freeze is bound by a prospective registration (spec C7), never by this one.
 
 ## Parameters
 

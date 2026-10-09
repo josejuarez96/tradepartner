@@ -619,8 +619,59 @@ def test_label_an_unexpected_error_keeps_the_failed_close_and_scrubs(s: Settings
         client=explode,
     )
     assert result.exit_code == 1
-    assert "failed: RuntimeError" in result.output
+    assert "failed (run 1): RuntimeError" in result.output
     # The job closed its run `failed`; the command committed that close.
+    assert _count(s, "SELECT count(*) FROM research_results WHERE outcome = 'failed'") == 1
+
+
+@pytest.mark.parametrize("error", [ValueError("bad reply"), OSError("disk full")])
+def test_label_a_refusal_class_error_after_the_run_opened_is_a_failure(
+    s: Settings, error: Exception
+) -> None:
+    """A ValueError or OSError is a refusal (2) only before any run opens."""
+    gold_id = _gold(s, _dev(1), _pilot(1))
+
+    def explode(_s: Settings, _h: RunHandle) -> ScriptedModelClient:
+        raise error
+
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-pilot",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        client=explode,
+    )
+    assert result.exit_code == 1, result.output
+    assert "failed (run 1)" in result.output
+
+
+def test_label_ctrl_c_closes_the_open_run_failed(s: Settings) -> None:
+    gold_id = _gold(s, _dev(1), _pilot(1))
+
+    def interrupt(_s: Settings, _h: RunHandle) -> ScriptedModelClient:
+        raise KeyboardInterrupt
+
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-pilot",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        client=interrupt,
+    )
+    assert result.exit_code == cli.INTERRUPTED_EXIT, result.output
+    assert "interrupted: run(s) opened and closed failed: 1" in result.output
     assert _count(s, "SELECT count(*) FROM research_results WHERE outcome = 'failed'") == 1
 
 

@@ -141,7 +141,8 @@ and `store.registry.code_version`, and prints through the `cli_record` scrub:
   register` line that would.
 - `tradepartner research gold [--frame <id> --seed <s> [--n 150] --exclude
   <csv>] [--lock]` builds the gold session (`gold.build_gold_session`, the
-  frame's export read by its registered row's path) or, with no flags, resumes
+  frame's export read at its content address in the research store and checked
+  against the row's SHA-256) or, with no flags, resumes
   it (`gold.open_gold_session`, which refuses flags that differ from the
   session); `--lock` alone locks an existing complete session and launches
   nothing.
@@ -942,6 +943,25 @@ def _export_path(settings: Settings, record: research.DatasetRecord) -> Path:
     )
 
 
+def _latest_run_id(conn: duckdb.DuckDBPyConnection) -> int:
+    """The newest research run id (0 when none), to tell a refusal before any run
+    opened from a failure after one did."""
+    return max((r.run_id for r in research.list_runs(conn, include_synthetic=True)), default=0)
+
+
+def _close_open_runs(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, after: int, why: str
+) -> list[int]:
+    """The run ids above `after` (the ones this command opened), each still-open one
+    closed `failed` with `why`; the caller commits them."""
+    runs = [r for r in research.list_runs(conn, include_synthetic=True) if r.run_id > after]
+    for run in runs:
+        if run.outcome == research.UNFINISHED:
+            handle = research.attach_run(conn, run.run_id, settings=settings)
+            research.close_run(conn, handle, "failed", _scrubbed(f"interrupted: {why}", settings))
+    return sorted(r.run_id for r in runs)
+
+
 def _page_argv(session: Path, *page_args: str) -> list[str]:
     """`streamlit run` on the review page, bound to localhost with usage stats off
     (ADR 0011 point 3), the page's own arguments after `--` (C10, #1330)."""
@@ -1020,11 +1040,16 @@ def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: boo
     )
 
 
+def _review_open_count(session: review.ReviewSession) -> int:
+    """Items with no final decision: a partial session is never finished."""
+    return sum(1 for line in review.final_lines(session).values() if line is None)
+
+
 def _settle_review(session: review.ReviewSession, settings: Settings, *, recovery: bool) -> None:
     """After the page (or for `--finish`): finish a fully decided session on an
     `open_for_write` connection and print `n_reviewed` and the review file's hash; a
     partial one prints its open count and stays unfinished (#1330 point 3)."""
-    open_count = sum(1 for line in review.final_lines(session).values() if line is None)
+    open_count = _review_open_count(session)
     if open_count:
         message = (
             f"review session: {open_count} of {len(session.items)} items open; "
@@ -2493,8 +2518,8 @@ def make_app(
         end = _parse_day("--until", until)
         if limit is not None and limit < 1:
             raise _fail("--limit must be at least 1", USAGE_ERROR)
-        ciks = tuple(cik or ())
-        bad = [c for c in ciks if not c.strip().isdigit()]
+        ciks = tuple(c.strip() for c in cik or ())
+        bad = [c for c in ciks if not (c.isascii() and c.isdigit())]
         if bad:
             raise _fail(f"--cik must be digits: {', '.join(bad)}", USAGE_ERROR)
         s = settings()
@@ -2504,7 +2529,8 @@ def make_app(
         now = ensure_tz_aware_utc(clock(), field_name="clock()")
         last = end if end is not None else now.date()
         if last < start:
-            raise _fail(f"--until {last} is before --since {start}", USAGE_ERROR)
+            what = f"--until {last}" if end is not None else f"today ({last}, the default --until)"
+            raise _fail(f"--since {start} is after {what}", USAGE_ERROR)
         try:
             result = departure_fetch.fetch_departure_corpus(
                 since=start,
@@ -2542,6 +2568,8 @@ def make_app(
         """Build the departure-reason frame: the rule answer of every listing end at t."""
         t = _parse_as_of(as_of)
         s = settings()
+        if t > ensure_tz_aware_utc(clock(), field_name="clock()"):
+            raise _fail(f"--as-of {t.isoformat()} is in the future", USAGE_ERROR)
         if not corpus.is_file():
             raise _fail(f"no corpus file at {corpus}", USAGE_ERROR)
         if (missing := _store_missing(s)) is not None:
@@ -2652,9 +2680,8 @@ def make_app(
             f"{splits.count('pilot')} pilot), {_gold_open_count(session)} open"
         )
         _launch(launcher, _page_argv(session.session_file))
-        try:
-            reopened = gold.open_gold_session(path, gold.GoldFlags(), settings=s)
-            _settle_gold(reopened, s, recovery=False)
+        try:  # the session's state is its working file, read again by every step
+            _settle_gold(session, s, recovery=False)
         except _LABELING_REFUSALS as exc:
             raise _refusal(exc, s) from None
 
@@ -2682,7 +2709,7 @@ def make_app(
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except _LABELING_REFUSALS as exc:
             raise _refusal(exc, s) from None
-        open_count = sum(1 for line in review.final_lines(session).values() if line is None)
+        open_count = _review_open_count(session)
         typer.echo(f"review session: run {run}, {len(session.items)} items, {open_count} open")
         _launch(launcher, _page_argv(session.review_path, "--code-version", version))
         try:
@@ -2752,7 +2779,10 @@ def make_app(
                 raise _refusal(exc, s) from None
             for line in report.lines():
                 typer.echo(line)
-            typer.echo("dry run: no run opened, no call made")
+            typer.echo(
+                "dry run: no run opened, no call made; the estimate covers every row of "
+                "the export, an upper bound for the split"
+            )
             return
         if model is None:
             raise _fail("--model is required (a pinned jev-X.Y.Z id)", USAGE_ERROR)
@@ -2774,9 +2804,11 @@ def make_app(
             raise _fail("--drift-gold and --drift-baseline-run go with a batch split", USAGE_ERROR)
         failure: BaseException | None = None
         result: job.BatchResult | None = None
+        opened: list[int] = []
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
+                before = _latest_run_id(conn)
                 try:
                     result = job.run_batch(
                         conn,
@@ -2796,23 +2828,27 @@ def make_app(
                         run_by=_REGISTERED_BY,
                     )
                 except (Exception, KeyboardInterrupt) as exc:
-                    # Commit what the job wrote (its run row, a `failed` close) rather
-                    # than roll it back: the run's records file already exists.
+                    # Commit what the job wrote (its run rows, a `failed` close) rather
+                    # than roll it back: the run's records file already exists. A run
+                    # the job left open (Ctrl-C reaches no `close_run`) is closed here.
                     failure = exc
+                    opened = _close_open_runs(conn, s, before, _describe(exc))
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except Exception as exc:
             raise _fail(_scrubbed(f"failed: {_describe(exc)}", s), 1) from None
-        if isinstance(failure, KeyboardInterrupt):
-            raise _fail(
-                "interrupted: the run's row is kept; see `tradepartner experiments`",
-                INTERRUPTED_EXIT,
-            )
-        if isinstance(failure, StoreLockedError):
-            raise _fail(_scrubbed(f"store busy: {failure}", s), 1)
-        if isinstance(failure, _LABELING_REFUSALS):
-            raise _refusal(failure, s)
         if failure is not None:
+            if isinstance(failure, KeyboardInterrupt):
+                runs = ", ".join(str(r) for r in opened) or "none"
+                raise _fail(
+                    f"interrupted: run(s) opened and closed failed: {runs}", INTERRUPTED_EXIT
+                )
+            if opened:
+                # A run opened: whatever went wrong after it is a failure, never a refusal.
+                runs = ", ".join(str(r) for r in opened)
+                raise _fail(_scrubbed(f"failed (run {runs}): {_describe(failure)}", s), 1)
+            if isinstance(failure, _LABELING_REFUSALS):
+                raise _refusal(failure, s)
             raise _fail(_scrubbed(f"failed: {_describe(failure)}", s), 1)
         assert result is not None
         typer.echo(f"run {result.run_id}: {result.outcome}")
