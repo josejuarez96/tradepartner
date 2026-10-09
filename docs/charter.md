@@ -9,7 +9,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 ## Objective & success criteria ([ADR 0005](decisions/0005-objective-benchmark-stop-criteria.md))
 - **Primary objective, ranked:** (1) disciplined, evidence-based decisions, shown by process metrics; (2) calibration, once anything emits probabilities; (3) beating a benchmark, optional and never a phase-exit criterion.
 - **Benchmarks:** SPY and MTUM, total return, computed inside the system with the same data and cost model. Measured against, never targeted.
-- **Success looks like:** the phase exit criteria in [roadmap.md](roadmap.md), plus at Phase 4 exit: paper tracks backtest within the configured tolerance; every order has a complete journal chain; every override has a reason; every backtest run is in the trial registry.
+- **Success looks like:** the phase exit criteria in [roadmap.md](roadmap.md), plus at Phase 4 exit: the machine-readiness shakedown passes ([ADR 0017](decisions/0017-fast-paper-and-machine-readiness-gate.md), 2026-10-09; before it, "paper tracks backtest within the configured tolerance", which is now reported per paper book for as long as it runs and required for a strategy to go live, not for the phase to exit); every order has a complete journal chain; every override has a reason; every backtest run is in the trial registry.
 - **Stop / failure criteria:** no phase exit within 6 months of the last tag forces an explicit continue-or-stop decision at the retro; exceeding the budget halts paid ingestion; any reported result found to have look-ahead, or any untracked run, halts the phase. Live capital is never topped up without amending this charter.
 
 ## Scope
@@ -19,7 +19,7 @@ A personal, local system for researching, testing and paper-trading (then small-
 - **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
 - **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
 - **Universe** ([ADR 0006](decisions/0006-universe-and-cadence.md)): US common stocks on NYSE, Nasdaq and NYSE American; ranked by market cap with liquidity and price floors, rebuilt point-in-time at each rebalance. The numbers (proposed defaults: top 1000, $5M median dollar volume, $5 price) are config, frozen per hypothesis at pre-registration.
-- **Cadence** ([ADR 0012](decisions/0012-cadence-as-a-hypothesis-parameter.md), superseding ADR 0006's cadence): a frozen hypothesis parameter, `month_end` by default (the last session of the month, orders for the next session at the frozen fill convention, one-period hold); the MVP's paper and live cadence is monthly.
+- **Cadence** ([ADR 0012](decisions/0012-cadence-as-a-hypothesis-parameter.md), superseding ADR 0006's cadence): a frozen hypothesis parameter, `month_end` by default (the last session of the month, orders for the next session at the frozen fill convention, one-period hold); paper trading accepts `month_end`, `week_end` and `daily`, several books at once ([ADR 0017](decisions/0017-fast-paper-and-machine-readiness-gate.md), 2026-10-09; before it, "the MVP's paper and live cadence is monthly"); the live cadence is the Phase 6 ADR's.
 
 ## Constraints
 - Runs locally, for personal use only.
