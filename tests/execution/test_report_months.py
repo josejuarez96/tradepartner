@@ -12,6 +12,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -25,7 +26,9 @@ from tradepartner.execution.report import (
     PriceOf,
     TrialMonths,
     compare_months,
+    compare_targets,
 )
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
@@ -940,3 +943,95 @@ def test_report_stop_session_is_plan_stop_session(requested_at: datetime, expect
     ]
     assert report_module._stop_session_of(stops) == stop_session(requested_at) == expected
     assert report_module._stop_session_of([_stop_row(requested_at, "closed")]) is None
+
+
+# --- the window's cadence (ADR 0017 part C, #1286) -----------------------------------
+
+#: Three consecutive ISO-week ends (Fridays); at `month_end` these dates hold one
+#: rebalance session (2026-11-30) and no compared period.
+W0, W1, W2 = date(2026, 11, 27), date(2026, 12, 4), date(2026, 12, 11)
+WEEK_TRIAL_ID = 1
+
+
+def _week_end_trial_store(settings: Settings) -> None:
+    """A `week_end` hypothesis and its tracking trial over [W0, W2] on the fixture
+    store: base-level equity at each week-end, a modelled cost at W0 and W1."""
+    params = json.dumps({"costs.per_side_bps": 5.0, "schedule.rebalance_cadence": "week_end"})
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
+            "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
+            "registered_at, registered_by) VALUES (1, 'h-week', 'momentum', 'week', "
+            "'docs/hypotheses/h-week.md', repeat('0', 64), ?, repeat('0', 64), ?, ?, ?, ?, "
+            "'test')",
+            [params, W0, W0, W0, _utc(W0)],
+        )
+        conn.execute(
+            "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+            "end_session, code_version, synthetic, run_by) VALUES "
+            "(?, 1, 'tracking', ?, ?, ?, 'test', FALSE, 'test')",
+            [WEEK_TRIAL_ID, _utc(W0), W0, W2],
+        )
+        for session, equity in ((W0, 100_000.0), (W1, 100_500.0), (W2, 101_000.0)):
+            conn.execute(
+                "INSERT INTO trial_equity (trial_id, series, cost_per_side_bps, session, equity) "
+                "VALUES (?, 'strategy', 5.0, ?, ?)",
+                [WEEK_TRIAL_ID, session, equity],
+            )
+        for session, cost_paid in ((W0, 50.0), (W1, 25.0)):
+            conn.execute(
+                "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, "
+                "fill_session, n_universe, n_static_listings, n_targets, turnover, cost_paid, "
+                "n_missing_fill, n_delisting_exits, n_stale_exits, n_excluded_no_history, "
+                "n_dropped_dividends, n_late_dividends) "
+                "VALUES (?, 5.0, ?, ?, 1, 1, 1, 0.0, ?, 0, 0, 0, 0, 0, 0)",
+                [WEEK_TRIAL_ID, session, session, cost_paid],
+            )
+
+
+@pytest.fixture
+def week_settings(fixture_store_path: Path) -> Settings:
+    return Settings(_env_file=None, store={"path": str(fixture_store_path)})
+
+
+def test_week_end_report_compares_per_iso_week(week_settings: Settings) -> None:
+    """At `week_end` the report's trial periods are the ISO weeks of the window's
+    cadence: `_trial_months` reads [W0, W1, W2] (a `month_end` read finds no period
+    here), and `compare_months` compares (W0, W1) and (W1, W2), each against its own
+    week's modelled cost."""
+    _week_end_trial_store(week_settings)
+    with open_read_only(week_settings) as conn:
+        trial = report_module._trial_months(conn, WEEK_TRIAL_ID, "week_end")
+    assert tuple(trial.sessions) == (W0, W1, W2)
+    assert trial.cadence == "week_end"
+    assert dict(trial.equity) == {W0: 100_000.0, W1: 100_500.0, W2: 101_000.0}
+
+    equity = {W0: 100_000.0, W1: 100_500.0, W2: 101_000.0}
+    window = replace(_window(), first_rebalance_session=W0)
+    result = compare_months(
+        window,
+        trial,
+        _journal(positions_daily=_flat_marks(equity), runs=()),
+        _no_actions(),
+        _no_price,
+        _no_price,
+        None,
+    )
+    assert [(m.rebalance_session, m.next_session) for m in result.months] == [(W0, W1), (W1, W2)]
+    assert [m.modelled_cost for m in result.months] == [
+        pytest.approx(50.0 / 100_000.0),
+        pytest.approx(25.0 / 100_500.0),
+    ]
+
+
+def test_week_end_target_comparison_reads_fill_sessions_at_the_window_cadence(
+    week_settings: Settings,
+) -> None:
+    """`compare_targets` passes the trial's cadence to `fill_session` (#1286): a week-end
+    T_i is not a `month_end` rebalance session, so the `month_end` fallback raised here;
+    with no decision and no trial weight there is nothing to report."""
+    _week_end_trial_store(week_settings)
+    with open_read_only(week_settings) as conn:
+        trial = report_module._trial_months(conn, WEEK_TRIAL_ID, "week_end")
+        result = compare_targets(_window(), trial, _journal(runs=()), conn)
+    assert result.rows == ()

@@ -286,29 +286,74 @@ def test_refuses_a_family_paper_cannot_run(
         assert latest_window(conn) is None
 
 
-@pytest.mark.parametrize("cadence", ["week_end", "daily"])
-def test_refuses_a_non_monthly_cadence_before_any_broker_call(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, cadence: str
+#: The conftest clock (2026-10-01, a Thursday) is mid-week: the first week-end and the
+#: first session strictly after it are both Friday 2026-10-02.
+NEXT_WEEK_END = date(2026, 10, 2)
+#: A completed week-end at the conftest clock (Friday 2026-09-25; 2026-09-30 is not one).
+WEEK_END_PAST = date(2026, 9, 25)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "holdout_end", "t_0", "min_rebalances"),
+    [
+        pytest.param("week_end", WEEK_END_PAST, NEXT_WEEK_END, 13, id="week_end"),
+        pytest.param("daily", HOLDOUT_END_PAST, date(2026, 10, 2), 63, id="daily"),
+    ],
+)
+def test_accepts_a_week_end_and_a_daily_registration(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    cadence: str,
+    holdout_end: date,
+    t_0: date,
+    min_rebalances: int,
 ) -> None:
-    """Strategy-lab spec req 11 (T100): a hypothesis whose `frozen_values` cadence
-    is not `month_end` is refused `refused_cadence`, before any broker call or write."""
+    """ADR 0017 part C (strategy-lab spec req 11 as amended 2026-10-09): a `week_end`
+    and a `daily` hypothesis start; T_0 is the first rebalance session at that cadence
+    strictly after both `holdout.end` and today, and the window freezes that cadence's
+    `paper.min_rebalances` as a scalar under the same key."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "h1",
+            holdout_end,
+            params=_params(**{"schedule.rebalance_cadence": cadence}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+    assert result.window.first_rebalance_session == t_0
+    frozen = json.loads(result.window.frozen_json)
+    assert frozen["paper.min_rebalances"] == min_rebalances
+    # One k at every cadence (ADR 0017 open question 6).
+    assert frozen["paper.tracking_k"] == 2.0
+
+
+def test_refuses_a_week_end_registration_whose_holdout_end_is_not_a_week_end(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The holdout-end check runs at the hypothesis's cadence: Wednesday 2026-09-30 is a
+    completed month-end but not a week-end, so a `week_end` registration ending there is
+    refused `holdout_not_complete`, before any broker call."""
     with open_for_write(journal_settings) as conn:
         hyp = _register(
             conn,
             journal_settings,
             "h1",
             HOLDOUT_END_PAST,
-            params=_params(**{"schedule.rebalance_cadence": cadence}),
+            params=_params(**{"schedule.rebalance_cadence": "week_end"}),
         )
         _sign_off(conn, journal_settings, hyp, tmp_path)
     broker = _fake(fixed_clock)
     with pytest.raises(window.StartRefusedError) as exc:
         window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
-    assert exc.value.reason == "refused_cadence"
-    assert cadence in str(exc.value)
+    assert exc.value.reason == "holdout_not_complete"
+    assert str(exc.value) == ("'h1''s frozen holdout.end (2026-09-30) is not a completed week-end")
     assert broker.calls == ()
-    with open_for_write(journal_settings) as conn:
-        assert latest_window(conn) is None
 
 
 @pytest.mark.parametrize("stored", [{"schedule.rebalance_cadence": "month_end"}, {}])
@@ -316,7 +361,8 @@ def test_accepts_a_month_end_and_a_pre_lab_registration(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, stored: dict[str, Any]
 ) -> None:
     """A `month_end` registration and one without `schedule.*` keys (a pre-lab
-    registration, read as `month_end` through `frozen_values`) both start."""
+    registration, read as `month_end` through `frozen_values`) both start, at the
+    first month-end, freezing `paper.min_rebalances` 6 as before ADR 0017."""
     with open_for_write(journal_settings) as conn:
         hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST, params=_params(**stored))
         _sign_off(conn, journal_settings, hyp, tmp_path)
@@ -325,6 +371,10 @@ def test_accepts_a_month_end_and_a_pre_lab_registration(
         journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
     )
     assert result.window.window_id is not None
+    assert result.window.first_rebalance_session == date(2026, 10, 30)
+    frozen = json.loads(result.window.frozen_json)
+    assert frozen["paper.min_rebalances"] == 6
+    assert frozen["paper.tracking_k"] == 2.0
 
 
 def test_refuses_on_synthetic_signoff_trial(
@@ -1371,19 +1421,21 @@ def test_forward_holdout_still_needs_a_paper_family(
     assert exc.value.reason == "family_not_runnable"
 
 
-def test_forward_holdout_still_needs_month_end_cadence(
+def test_forward_holdout_at_week_end_starts_at_the_first_week_end(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:
+    """ADR 0017 part C: a forward `week_end` holdout opens at the first week-end on or
+    after `holdout.start` and after today, freezing `paper.min_rebalances` 13."""
     _register_forward(
         journal_settings,
         tmp_path,
         params=_params(**{"schedule.rebalance_cadence": "week_end", GAP_KEY: 0.05}),
     )
-    broker = _fake(fixed_clock)
-    with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
-    assert exc.value.reason == "refused_cadence"
-    assert broker.calls == ()
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.first_rebalance_session == NEXT_WEEK_END
+    assert json.loads(result.window.frozen_json)["paper.min_rebalances"] == 13
 
 
 def test_forward_holdout_still_allows_one_open_window(
