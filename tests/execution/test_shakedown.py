@@ -856,3 +856,16 @@ def test_a_restart_in_a_window_closed_after_it_ends_at_the_close(
     conn.close()
     span = _run(settings).span
     assert span.start == D2
+
+
+@pytest.mark.usefixtures("health")
+def test_e1_an_owner_engagement_from_before_the_span_excuses_no_skipped_session(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _clean(conn)
+    conn.execute("UPDATE kill_switch SET \"at\" = ? WHERE state = 'engaged'", [MADE_AT])
+    conn.close()
+    result = _run(settings)
+    assert "run 3 skipped_kill_switch" in _line(result, "E.1 sessions").detail
+    assert not _line(result, "E.1 sessions").passed
+    assert not _line(result, "E.4 kill-switch drill").passed

@@ -734,9 +734,8 @@ def _drill_line(
     spoiled: list[str] = []
     in_span = [s for s in switches if s.at >= span.start_at]
     books = {w.window_id: w.book_id for w in windows}
-    spans = [b for b in brackets if b.engaged.at >= span.start_at]
     for run in runs:
-        if run.kind not in _DRILL_KINDS or _drill_bracket(run, spans) is None:
+        if run.kind not in _DRILL_KINDS or _drill_bracket(run, brackets) is None:
             continue
         text = f"book {books.get(run.window_id)} run {run.run_id} on {run.session}"
         (spoiled if run.run_id in ordered else drills).append(text)
@@ -877,7 +876,10 @@ def shakedown(
     switches = _switches(conn)
     closed = _closed_at(conn)
     span = _read_span(conn, at, switches, closed)
-    brackets = _brackets(switches)
+    # only drills engaged and released inside the span count, in E.1 and E.4 alike
+    brackets = [
+        b for b in _brackets(switches) if b.engaged.at >= span.start_at and b.released.at <= at
+    ]
     windows = _windows(conn)
     runs = _runs(conn, span.first_day)
     alerts = _alerts(conn, span.first_day)
