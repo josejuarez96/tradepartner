@@ -295,7 +295,7 @@ class StoreProvider:
         sessions_from = check_sessions_from(sessions_from)
         conn, session = self._at(t), last_completed_session(t)
         bars = (
-            prices_as_of(conn, t, wanted, traded_only=True)
+            prices_as_of(conn, t, wanted, traded_only=True, sessions_from=sessions_from)
             .filter(pl.col("session").is_between(sessions_from, session))
             .select(TURNOVER_BAR_COLUMNS)
             .sort("security_id", "session")

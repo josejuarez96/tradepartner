@@ -78,8 +78,8 @@ import polars as pl
 import pytest
 from conftest import load_universe_fixtures
 
-from lookahead.harness import TruncatedStore
-from tradepartner.backtest.engine import BacktestResult, run
+from lookahead.harness import TruncatedStore, screened_strategy
+from tradepartner.backtest.engine import BacktestResult, Plan, plan, run
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
@@ -120,10 +120,14 @@ class Case:
     seed_to: date
     seed_step: int = 1
     family: HypothesisFamily = "momentum"
+    screened: bool = False
 
     @property
     def id(self) -> str:
-        """The pytest id: the cadence for a momentum case (ids unchanged), else the family."""
+        """The pytest id: the cadence for a momentum case (ids unchanged), else the family;
+        the turnover-screened momentum case is `momentum-turnover`."""
+        if self.screened:
+            return "momentum-turnover"
         return self.cadence if self.family == "momentum" else self.family
 
     @property
@@ -205,9 +209,24 @@ CASES: dict[str, Case] = {
             seed_to=date(2019, 11, 30),
             family="combined",
         ),
+        # B10's turnover screen (#1358, T165c): the screened twin's `strategy` block
+        # (`harness.SCREENED_FIXTURE`), from 2018 as the families above (the universe is
+        # empty before), so the truncated set includes the shares facts and splits the
+        # screen reads.
+        Case(
+            "month_end",
+            date(2018, 1, 2),
+            FIXTURE_END,
+            teeth=date(2019, 1, 31),
+            seed_from=date(2018, 6, 1),
+            seed_to=date(2019, 11, 30),
+            screened=True,
+        ),
     )
 }
-assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
+assert tuple(
+    c.cadence for c in CASES.values() if c.family == "momentum" and not c.screened
+) == get_args(Cadence)
 
 #: SEC_TRANSFER's FY2018 10-K (fixture README): its cik, acceptance and the close before.
 LATE_10K = ("CIK0001000007", datetime(2019, 2, 28, 21, 30, tzinfo=UTC), date(2019, 2, 28))
@@ -223,7 +242,7 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
+def _frozen(cadence: Cadence, family: HypothesisFamily, *, screened: bool = False) -> Settings:
     # The `month_end` runs start in 2017, before the fixture benchmarks' first bar
     # (2018-01-02). Benchmarks are read by symbol (#840) and the engine refuses one with
     # no bar at F_0, so these runs name none, as they effectively did before (master
@@ -237,7 +256,7 @@ def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
         extra["combined"] = {"top_fraction": 0.5}
     return Settings(
         _env_file=None,
-        strategy={"top_fraction": 0.5},
+        strategy=screened_strategy() if screened else {"top_fraction": 0.5},
         schedule={"rebalance_cadence": cadence},
         benchmarks=[],
         **extra,
@@ -359,7 +378,7 @@ class Fixture:
 def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
     case: Case = request.param
     conn = _store(case)
-    settings = _frozen(case.cadence, case.family)
+    settings = _frozen(case.cadence, case.family, screened=case.screened)
     try:
         yield Fixture(
             case=case,
@@ -427,7 +446,8 @@ def test_the_run_is_not_vacuous(fixture: Fixture, longest: Results) -> None:
     assert len(fixture.sessions) >= 30
     # The frozen cadence reached the engine: it rebalanced on exactly the case's sessions.
     assert [row.session for row in result.rebalances] == list(fixture.sessions[:-1])
-    assert max(row.n_targets for row in result.rebalances) >= 3
+    # The screened case ranks at most three screened names, so it targets at most two.
+    assert max(row.n_targets for row in result.rebalances) >= (2 if fixture.case.screened else 3)
     assert sum(row.turnover > 0 for row in result.rebalances) >= 10
     # The walk crosses seeded revisions on held names: at most seeded T_k a seeded
     # name is held at the close whose bar is revised, and late dividends are counted.
@@ -648,3 +668,55 @@ def test_a_run_under_the_boundary_reads_nothing_after_it(fixture: Fixture) -> No
         _assert_same(cut, full, f"run under the boundary {boundary} (window end {window.end})")
     finally:
         conn.execute("DELETE FROM owner_decisions WHERE decision_id = ?", [decision_id])
+
+
+#: The screened case's revision with teeth (#1358, T165c): SEC_TRANSFER's shares fact
+#: doubled to 12,000,000 (as of 2018-12-31), accepted an hour after close(2018-12-31).
+#: Read at that close it would halve the name's turnover and drop it below the screen,
+#: where it is a target; it is first read at close(2019-01-31).
+SHARES_REVISION = ("SEC_TRANSFER", date(2018, 12, 31), 12_000_000.0)
+
+
+def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
+    fixture: Fixture,
+) -> None:
+    if not fixture.case.screened:
+        pytest.skip("only the turnover-screened case reads shares facts in its signal")
+    sid, t_i, value = SHARES_REVISION
+    i = fixture.sessions.index(t_i)
+    t_next, t_after = fixture.sessions[i + 1], fixture.sessions[i + 2]
+
+    def store(known_at: datetime) -> duckdb.DuckDBPyConnection:
+        conn = _store(fixture.case)
+        fact = {"security_id": sid, "fact_name": "shares_outstanding", "as_of_date": t_i}
+        fact |= {"class_member": "", "value": value, "filing_accession": ""}
+        fact |= {"known_at": known_at, "ingested_at": known_at, "source": "edgar"}
+        insert_row(conn, "facts", fact | {"provenance": "filing"})
+        return conn
+
+    def plans(conn: duckdb.DuckDBPyConnection) -> list[Plan]:
+        settings, registry_connect = fixture.settings, _factory(fixture.conn)
+        with StoreProvider(
+            _factory(conn), fixture.handle, settings, registry_connect=registry_connect
+        ) as provider:
+            return [plan(provider, settings, t, "momentum") for t in (t_i, t_next)]
+
+    base_i, base_next = plans(fixture.conn)
+    assert sid in base_i.targets and sid not in base_i.exclusions["no_turnover"]
+    early = store(fixture.read_time(t_i) - REVISION_DELAY)
+    try:  # known at close(T_i), the fact moves the name across the screen there
+        assert sid in plans(early)[0].exclusions["no_turnover"]
+    finally:
+        early.close()
+    late = store(fixture.read_time(t_i) + REVISION_DELAY)
+    try:
+        late_i, late_next = plans(late)
+        assert late_i == base_i
+        assert sid in late_next.exclusions["no_turnover"]
+        assert sid not in base_next.exclusions["no_turnover"]
+        _assert_same(fixture.run(t_next, conn=late), fixture.run(t_next), f"run to {t_next}")
+        got, want = fixture.run(t_after, conn=late), fixture.run(t_after)
+    finally:
+        late.close()
+    for level in COST_LEVELS:
+        assert got[level].targets != want[level].targets, f"run to {t_after}, level {level}"
