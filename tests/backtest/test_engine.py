@@ -1010,6 +1010,28 @@ def test_h1_twin_run_on_the_fake_provider_is_pinned() -> None:
     assert finals == pytest.approx(TWIN_FINAL_EQUITY, rel=1e-12)
 
 
+def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pin above has teeth (T165c): with the screen forced on at 1.0, the twin's run
+    makes a turnover read and reports the screen's counts, so its log and digests move."""
+    import hashlib
+    import json
+
+    from tradepartner.backtest import strategies
+
+    monkeypatch.setattr(strategies, "_screens", lambda params: True)
+    settings = _twin_settings()
+    assert settings.strategy.turnover_top_fraction == 1.0
+    provider = _provider()
+    provider.raw = provider.prices.with_columns(pl.lit(1000.0).alias("volume"))
+    results = run(settings, provider, T0, T4, _handle(), (0.0,), family="momentum")
+    assert "turnover_inputs" in {call.method for call in provider.calls}
+    log = _call_log(provider)
+    assert hashlib.sha256(json.dumps(log).encode()).hexdigest() != TWIN_CALL_LOG_SHA256
+    assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
+
+
 #: The provider methods the twin's run calls: no turnover read.
 TWIN_CALL_METHODS = {
     "universe",
