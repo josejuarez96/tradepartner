@@ -43,7 +43,8 @@ is refused. Every function above `register` reads a file and `Settings` only.
 
 **The development boundary** (ADR 0016 point 2; data-foundation plan T142b).
 `register` reads `registry.development_boundary` once: a file whose `in_sample_start`
-is on or after it is `DevelopmentBoundaryError`, so no default window is ever empty,
+is on or after it, or whose variant has no rebalance session at its cadence on or
+before it, is `DevelopmentBoundaryError`, so no default window is ever empty,
 and the readiness check's default windows (`_unrun_standalone`,
 `lab_registry.family_ready_for_sweep`) end at it. With no boundary row nothing changes.
 """
@@ -919,6 +920,15 @@ def register(
             f"{file}: in_sample_start {parsed.in_sample_start} is on or after the "
             f"development boundary {boundary}: no in-sample session would remain"
         )
+    if boundary is not None:
+        for variant in variants:
+            cadence = variant.frozen_set[lab_registry.CADENCE_KEY]
+            if not rebalance_sessions(parsed.in_sample_start, boundary, cadence):
+                raise DevelopmentBoundaryError(
+                    f"{file}: variant {variant.values} has no {cadence} rebalance session "
+                    f"between in_sample_start {parsed.in_sample_start} and the development "
+                    f"boundary {boundary}"
+                )
 
     rules = lab_registry.family_rules(conn, parsed.family)
     new_family: tuple[str | None, float | None] | None = None

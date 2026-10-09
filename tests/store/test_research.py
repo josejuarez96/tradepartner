@@ -653,6 +653,18 @@ def test_a_window_reading_past_the_boundary_outside_the_holdout_is_refused(
     assert registry.family_holdout_spends(conn, "momentum") == []
 
 
+def test_a_family_with_no_registered_hypothesis_has_no_boundary_edge(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """The edge protects a backtest family's months; a family with no registered
+    hypothesis has none (code-review and quant-auditor on #1345)."""
+    _hypothesis(conn, settings)
+    registry.write_development_boundary(conn, boundary=date(2022, 12, 30), reason="test")
+    research.register_experiment(conn, _returns(e1h, "r1", family="profitability"), "owner")
+    ds = _dataset(conn, tmp_path, dates=[date(2021, 1, 4), date(2022, 6, 30)])
+    assert _open(conn, settings, tmp_path, "r1", ds.dataset_id).refusal is None
+
+
 def test_a_research_spend_after_a_backtest_holdout_trial_is_a_repeat(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:

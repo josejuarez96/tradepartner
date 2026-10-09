@@ -628,6 +628,18 @@ def _first_rebalance_on_or_after(day: date, cadence: Cadence) -> date:
     return last_session_of_week(iso_year, iso_week)
 
 
+def _fits_boundary(in_sample_start: date, cadence: Cadence, boundary: date) -> bool:
+    """Whether a default in-sample window from `in_sample_start` under `boundary` is
+    non-empty: `in_sample_start` is before the boundary and the first rebalance session
+    at `cadence` on or after it is on or before the boundary (ADR 0016 points 2, 6)."""
+    if in_sample_start >= boundary:
+        return False
+    try:
+        return _first_rebalance_on_or_after(in_sample_start, cadence) <= boundary
+    except ValueError:
+        return False
+
+
 # --- hypotheses ------------------------------------------------------------
 
 
@@ -655,7 +667,10 @@ def register_hypothesis(
     original family. Refuses a family outside `settings.hypotheses.families`,
     parameters without a numeric `costs.per_side_bps`, `holdout.start`,
     `holdout.end` or `in_sample_start` params that disagree with the window
-    arguments, and `family="oracle"` on the real store.
+    arguments, and `family="oracle"` on the real store. With a development boundary
+    in force (ADR 0016 point 2), refuses (`BoundaryRefused`) an `in_sample_start` on
+    or after it, or one with no rebalance session at the frozen cadence on or before
+    it, so no registration's default window is ever empty.
     """
     settings = settings if settings is not None else get_settings()
     if family not in settings.hypotheses.families:
@@ -676,6 +691,14 @@ def register_hypothesis(
         if key in params and params[key] != window[column].isoformat():
             raise RegistryError(
                 f"params {key}={params[key]!r} disagrees with {column}={window[column]}"
+            )
+    boundary = boundary_date(conn)
+    if boundary is not None:
+        cadence = frozen_values(_Stored(params, family))[CADENCE_KEY]
+        if not _fits_boundary(in_sample_start, cadence, boundary):
+            raise BoundaryRefused(
+                f"{slug!r}: in_sample_start {in_sample_start} leaves no {cadence} rebalance "
+                f"session on or before the development boundary {boundary}"
             )
     families = conn.execute(
         "SELECT DISTINCT family FROM hypotheses WHERE slug = ?", [slug]
@@ -1395,13 +1418,19 @@ def write_development_boundary(
     (`BoundaryRefused`, nothing written) a boundary on or after the `holdout.start` of
     any registered non-oracle family, spent, unspent or forward, so no exam month can
     become a development month, and a boundary on or before any such family's
-    `in_sample_start`, so every family keeps an in-sample session (the same line
-    `backtest.sweep.register` holds for a new registration). A blank reason is refused
-    as for every owner decision. Families are read from `hypotheses`, so a store
-    without the lab tables is checked too."""
+    `in_sample_start` or before the first rebalance session at any registration's
+    frozen cadence, so every default window keeps a session (the same line
+    `register_hypothesis` and `backtest.sweep.register` hold for a new registration).
+    A blank reason is refused as for every owner decision. Families are read from
+    `hypotheses`, so a store without the lab tables is checked too."""
     rows = conn.execute(
         "SELECT family, MIN(holdout_start), MAX(in_sample_start) FROM hypotheses "
         "WHERE family <> ? GROUP BY family ORDER BY family",
+        [ORACLE_FAMILY],
+    ).fetchall()
+    registered = conn.execute(
+        "SELECT slug, family, params_json, in_sample_start FROM hypotheses "
+        "WHERE family <> ? ORDER BY hypothesis_id",
         [ORACLE_FAMILY],
     ).fetchall()
     exams = [f"{family} ({start})" for family, start, _ in rows if boundary >= start]
@@ -1415,6 +1444,16 @@ def write_development_boundary(
         raise BoundaryRefused(
             f"development boundary {boundary} is on or before the in_sample_start of "
             f"{', '.join(early)}: no in-sample session would remain"
+        )
+    empty = []
+    for slug, family, params_json, start in registered:
+        cadence = frozen_values(_Stored(json.loads(params_json), family))[CADENCE_KEY]
+        if not _fits_boundary(start, cadence, boundary):
+            empty.append(f"{slug} ({cadence} from {start})")
+    if empty:
+        raise BoundaryRefused(
+            f"development boundary {boundary} leaves no rebalance session in the default "
+            f"window of {', '.join(sorted(set(empty)))}"
         )
     return _insert_decision(
         conn,

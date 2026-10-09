@@ -547,6 +547,16 @@ def test_an_in_sample_start_on_or_after_the_boundary_is_refused(
     _refused(ready, path, settings, DevelopmentBoundaryError, "development boundary 2021-06-30")
 
 
+def test_a_variant_with_no_rebalance_session_before_the_boundary_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """code-review on #1345: in_sample_start before the boundary but no month-end
+    rebalance between them would leave an empty default window."""
+    registry.write_development_boundary(ready, boundary=date(2021, 6, 15), reason="test")
+    path = _copy(tmp_path, SWEEP_SOURCE, (IN_SAMPLE_START, "in_sample_start = 2021-06-01"))
+    _refused(ready, path, settings, DevelopmentBoundaryError, "no month_end rebalance session")
+
+
 def test_an_unrun_promoted_hypothesis_blocks_the_next_sweep(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:

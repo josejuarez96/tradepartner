@@ -277,7 +277,8 @@ def run_hypothesis(
             hypothesis, registered_on=registry.family_registered_on(conn, hypothesis.family)
         )
         cadence = params.schedule.rebalance_cadence
-        boundary = registry.boundary_date(conn)
+        # The tracking rule does not read the boundary (ADR 0016 point 2; `holdout`).
+        boundary = None if tracking else registry.boundary_date(conn)
         window = tracking_window if tracking else _window(frozen, start, end, cadence, boundary)
         spends = registry.family_holdout_spends(conn, hypothesis.family)
         lab = _lab_state(conn, hypothesis, live)

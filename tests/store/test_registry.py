@@ -1759,3 +1759,28 @@ def test_family_registered_on_is_the_first_registration_day(
         [datetime(2026, 9, 1, 23, 30, tzinfo=UTC), first.hypothesis_id],
     )
     assert registry.family_registered_on(conn, "momentum") == date(2026, 9, 1)
+
+
+def test_a_boundary_leaving_no_rebalance_session_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """code-review on #1345: a boundary after in_sample_start but before its first
+    month-end rebalance would leave an empty default window."""
+    _family(conn, settings, "momentum", date(2010, 1, 4), (date(2024, 1, 1), date(2026, 9, 30)))
+    with pytest.raises(registry.BoundaryRefused, match=r"momentum-h \(month_end from 2010-01-04\)"):
+        registry.write_development_boundary(conn, boundary=date(2010, 1, 15), reason="r")
+    assert _boundaries(conn) == 0
+    registry.write_development_boundary(conn, boundary=date(2010, 1, 29), reason="r")
+
+
+@pytest.mark.parametrize("start", [date(2023, 12, 20), date(2024, 2, 1), date(2023, 12, 4)])
+def test_a_registration_with_an_empty_default_window_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, start: date
+) -> None:
+    """ADR 0016 point 2 at the one registration writer: an in_sample_start on or after
+    the boundary, or with no month-end rebalance on or before it, is refused."""
+    registry.write_development_boundary(conn, boundary=date(2023, 12, 20), reason="r")
+    with pytest.raises(registry.BoundaryRefused, match="development boundary 2023-12-20"):
+        _family(conn, settings, "momentum", start, (date(2024, 1, 1), date(2026, 9, 30)))
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+    _family(conn, settings, "momentum", date(2023, 11, 30), (date(2024, 1, 1), date(2026, 9, 30)))

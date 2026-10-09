@@ -673,6 +673,30 @@ def test_a_forward_holdouts_tracking_window_starts_inside_it(
     assert _row(read(), "trials", outcome.trial_id)["kind"] == "tracking"
 
 
+def test_a_tracking_run_does_not_read_the_boundary(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """safety-reviewer on #1345: a standalone registration whose in_sample_start is
+    after the boundary (possible through `hypothesis register`) still tracks."""
+    _set_boundary(tracking_store, BOUNDARY)
+    with open_for_write(_store(tracking_store)) as conn:
+        conn.execute(
+            "UPDATE hypotheses SET in_sample_start = ? WHERE slug = ?",
+            [date(2019, 1, 31), TRACKING_SLUG],
+        )
+    _spy(monkeypatch)
+    outcome = run_hypothesis(
+        TRACKING_SLUG,
+        TRACKING_START,
+        TRACKING_END,
+        Flags(),
+        synthetic=True,
+        store_path=tracking_store,
+        kind="tracking",
+    )
+    assert outcome.status == "ok"
+
+
 def test_tracking_run_needs_an_explicit_start_and_end(tracking_store: Path) -> None:
     with pytest.raises(ValueError, match="explicit start and end"):
         run_hypothesis(
