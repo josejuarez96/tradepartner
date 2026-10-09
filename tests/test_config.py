@@ -1572,10 +1572,10 @@ def test_paper_defaults() -> None:
     assert p.max_catch_up_sessions == 5
     assert p.submit_window_before_open_minutes == 90
     assert p.submit_window_after_open_minutes == 30
-    # T70, ADR 0006 amendment 2026-10-09: set from Probe 3's measured paper fill latency
-    # (worst whole-share fill 118.5 s after the open; fills from 1 s after it).
-    assert p.sell_wait_seconds == pytest.approx(300.0)
-    assert p.poll_interval_seconds == pytest.approx(5.0)
+    # T70, ADR 0006 amendment 2026-10-09: checked against Probe 3's measured paper fill
+    # latency (worst whole-share fill 118.5 s after the open) and kept.
+    assert p.sell_wait_seconds == pytest.approx(900.0)
+    assert p.poll_interval_seconds == pytest.approx(15.0)
     assert p.accept_wait_seconds == pytest.approx(30.0)
     assert p.fill_read_overlap_seconds == pytest.approx(60.0)
     assert p.order_id_prefix == "tp"
