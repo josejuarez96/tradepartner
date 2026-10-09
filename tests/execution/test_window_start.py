@@ -269,6 +269,28 @@ def test_refuses_without_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
+def test_refuses_a_family_outside_paper_families(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate itself, with `PAPER_FAMILIES` narrowed back to momentum's pair: a
+    family outside it is refused `family_not_runnable`, before any write."""
+    monkeypatch.setattr(window, "PAPER_FAMILIES", ("momentum", "oracle"))
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "b3"
+        )
+    assert exc.value.reason == "family_not_runnable"
+    assert "profitability" in str(exc.value)
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
 @pytest.mark.parametrize("family", ["profitability", "combined"])
 def test_accepts_a_family_paper_now_runs(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, family: str

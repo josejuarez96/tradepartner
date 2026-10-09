@@ -696,6 +696,24 @@ def test_profitability_passes_the_paper_family_gate(
     assert seen == ["profitability"]
 
 
+def test_a_family_outside_paper_families_is_refused_before_any_read(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planning gate itself, with `PAPER_FAMILIES` narrowed back to momentum's
+    pair: no provider opens and no row is written."""
+    monkeypatch.setattr(planning, "PAPER_FAMILIES", ("momentum", "oracle"))
+
+    def provider_used(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("provider must not open for a non-paper family")
+
+    monkeypatch.setattr(planning, "StoreProvider", provider_used)
+    with open_env(fixture_store_path, tmp_path, "profitability") as env:
+        counts = env.counts()
+        with pytest.raises(PlanTrialError, match="cannot run yet"):
+            env.plan()
+        assert env.counts() == counts
+
+
 def test_momentum_plan_uses_the_windows_stored_family(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
