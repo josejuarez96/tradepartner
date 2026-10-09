@@ -1141,7 +1141,7 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
     _release_store(settings, with_trial=True)
     path = tmp_path / "releases.toml"
     path.write_text(_RELEASES_TOML, encoding="utf-8")
-    result = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    result = _invoke(settings, ["decision", "data-release", "import-file", str(path)])
     assert result.exit_code == 0, result.output
     assert "repair-13-tickers: imported before" in result.output
     assert "pre-sweep-20261008: imported record" in result.output
@@ -1151,11 +1151,11 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
         ("pre-sweep-20261008", "record"),
     ]
     assert rows[1].data_vintage == datetime(2026, 10, 8, 2, 48, 17, 200099, tzinfo=UTC)
-    again = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    again = _invoke(settings, ["decision", "data-release", "import-file", str(path)])
     assert again.exit_code == 1 and "already stored" in again.output
     assert len(_releases(settings)) == 2
     path.write_text("release = [1, 2]\n", encoding="utf-8")
-    not_tables = _invoke(settings, ["decision", "data-release", "import", str(path)])
+    not_tables = _invoke(settings, ["decision", "data-release", "import-file", str(path)])
     assert not_tables.exit_code == 2 and "must be a table" in not_tables.output
     path.write_text("[[release]\n", encoding="utf-8")
-    assert _invoke(settings, ["decision", "data-release", "import", str(path)]).exit_code == 2
+    assert _invoke(settings, ["decision", "data-release", "import-file", str(path)]).exit_code == 2

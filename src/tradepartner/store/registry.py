@@ -95,6 +95,7 @@ import os
 import re
 import statistics
 import subprocess
+import tomllib
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import astuple, dataclass, field, fields
@@ -115,7 +116,7 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import Cadence, Settings, get_settings
-from tradepartner.store.db import insert_row, utc_now
+from tradepartner.store.db import configure_connection, insert_row, utc_now
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
     REBALANCE_COUNTS_TABLE_NAME,
@@ -1174,6 +1175,53 @@ class ReleaseRefused(RegistryError):
     """A data-release write the rules refuse: a bad name, a name already used, a
     second open release, a close of a release that is not the open one, a backup
     that is not the store's state, or an import entry that breaks the runbook."""
+
+
+class BackupRefused(ReleaseRefused):
+    """A `--backup` path that is not a file, is the store itself, or cannot be
+    opened read-only."""
+
+
+class ReleaseFileError(ValueError):
+    """`data/releases.toml` cannot be read, is not TOML, or is not one or more
+    `[[release]]` tables and nothing else."""
+
+
+def open_backup(path: Path, store_path: Path) -> duckdb.DuckDBPyConnection:
+    """A read-only connection to a release's backup file (the caller closes it).
+    Refuses a path that is not a file or that is the store itself (file identity,
+    so a link to the store is refused too), so no release names the store as its
+    own backup."""
+    if not path.is_file():
+        raise BackupRefused(f"--backup {path} is not a file")
+    store = store_path.expanduser()
+    if store.exists() and os.path.samefile(path, store):
+        raise BackupRefused(f"--backup {path} is the store itself, not a backup")
+    try:
+        conn = duckdb.connect(str(path), read_only=True)
+    except duckdb.Error as exc:
+        raise BackupRefused(f"cannot open --backup {path} read-only: {exc}") from None
+    configure_connection(conn)
+    return conn
+
+
+def read_release_file(path: Path) -> list[Any]:
+    """The `[[release]]` tables of the hand-written `data/releases.toml`, in file
+    order, unchecked (`plan_release_import` checks them). Raises
+    `ReleaseFileError` for an unreadable or non-TOML file, any other top-level
+    key, no entry, or an entry that is not a table."""
+    try:
+        doc = tomllib.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ReleaseFileError(f"cannot read {path}: {exc.strerror}") from None
+    except tomllib.TOMLDecodeError as exc:
+        raise ReleaseFileError(f"{path} is not valid TOML: {exc}") from None
+    entries = doc.get("release", [])
+    if set(doc) - {"release"} or not isinstance(entries, list) or not entries:
+        raise ReleaseFileError(f"{path} must hold one or more [[release]] tables only")
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise ReleaseFileError(f"{path}: every [[release]] entry must be a table")
+    return entries
 
 
 @dataclass(frozen=True)

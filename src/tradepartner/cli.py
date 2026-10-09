@@ -75,13 +75,13 @@ Phase 3 (T42):
   frozen threshold (spec req 12, ADR 0003 rule 8).
 - `tradepartner decision data-release open --name --backup --reason`, `close
   --name --from <session> --to <session> [--reason]`, `record --name --backup
-  --trial <id> --reason` and `import <path>` write the named data releases of
+  --trial <id> --reason` and `import-file <path>` write the named data releases of
   `docs/runbooks/data-releases.md` (#1319, data-foundation plan T140b) through
   `store.registry`'s release writers: `open` the `before` row (the backup, read
   read-only, must hold the store's latest `ingested_at`), `close` the open
   release's `after` row with the sessions touched, `record` a closed row for the
   backup that holds a trial's state (its vintage at the trial's cutoff, whether
-  it equals the trial's, and the repair runs since), and `import` the
+  it equals the trial's, and the repair runs since), and `import-file` the
   hand-written `data/releases.toml` once, every entry checked before anything is
   written, then one transaction per release. Exit 0 when written, 1 on a
   refusal or a busy store, 2 on a usage error.
@@ -206,16 +206,12 @@ the `paper` broker factory); `main` is the console script over the real ones.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
-import tomllib
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import date, datetime
-from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any
@@ -286,7 +282,6 @@ from tradepartner.store import (
 )
 from tradepartner.store.db import (
     StoreLockedError,
-    configure_connection,
     open_for_write,
     open_read_only,
     utc_now,
@@ -588,29 +583,6 @@ def _parse_day(flag: str, value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
-
-
-@contextmanager
-def _backup_connection(path: Path, settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
-    """A read-only connection to a release's backup file. Refuses (exit 2) a path
-    that is not a file or that is the store itself, so a release never names the
-    store as its own backup."""
-    if not path.is_file():
-        raise _fail(f"--backup {path} is not a file", USAGE_ERROR)
-    store = Path(settings.store.path).expanduser()
-    if store.exists() and os.path.samefile(path, store):
-        raise _fail(f"--backup {path} is the store itself, not a backup", USAGE_ERROR)
-    try:
-        conn = duckdb.connect(str(path), read_only=True)
-    except duckdb.Error as exc:
-        raise _fail(
-            f"cannot open --backup {path} read-only: {_scrubbed(str(exc), settings)}", 1
-        ) from None
-    try:
-        configure_connection(conn)
-        yield conn
-    finally:
-        conn.close()
 
 
 def _blank_text(value: str | None) -> bool:
@@ -1565,6 +1537,17 @@ def make_app(
     release_app = typer.Typer(no_args_is_help=True, help="Record a named data release.")
     decision_app.add_typer(release_app, name="data-release")
 
+    def _backup(path: Path, s: Settings) -> duckdb.DuckDBPyConnection:
+        try:
+            return registry.open_backup(path, Path(s.store.path))
+        except registry.BackupRefused as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+
+    def _importer(
+        group: Sequence[Mapping[str, Any]],
+    ) -> Callable[[duckdb.DuckDBPyConnection], list[int]]:
+        return lambda conn: registry.import_release(conn, group)
+
     def _release_write[T](write: Callable[[duckdb.DuckDBPyConnection], T], s: Settings) -> T:
         """Run one release write in its own committed chunk on a migrated store."""
         try:
@@ -1590,13 +1573,16 @@ def make_app(
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
-        with _backup_connection(backup, s) as copy:
+        copy = _backup(backup, s)
+        try:
             decision_id = _release_write(
                 lambda conn: registry.open_data_release(
                     conn, copy, name=name, backup_path=str(backup), reason=reason
                 ),
                 s,
             )
+        finally:
+            copy.close()
         typer.echo(f"decision {decision_id}: data_release {name} before (open)")
 
     @release_app.command("close")
@@ -1646,8 +1632,11 @@ def make_app(
             (row,) = [r for r in registry.data_releases(conn) if r.decision_id == decision_id]
             return row
 
-        with _backup_connection(backup, s) as copy:
+        copy = _backup(backup, s)
+        try:
             row = _release_write(_record, s)
+        finally:
+            copy.close()
         equal = row.values["vintage_equals_trial"]
         runs = len(row.values["repair_runs"])
         typer.echo(
@@ -1657,28 +1646,21 @@ def make_app(
             f"{row.values.get('trial_data_vintage', '-')}; {runs} repair run(s) since the trial"
         )
 
-    @release_app.command("import")
+    @release_app.command("import-file")
     def release_import(
         path: Annotated[Path, typer.Argument(help="the hand-written data/releases.toml")],
     ) -> None:
         """Import the hand-written release record once, one release per transaction."""
         try:
-            doc = tomllib.loads(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise _fail(f"cannot read {path}: {exc.strerror}", USAGE_ERROR) from None
-        except tomllib.TOMLDecodeError as exc:
-            raise _fail(f"{path} is not valid TOML: {exc}", USAGE_ERROR) from None
-        entries = doc.get("release", [])
-        if set(doc) - {"release"} or not isinstance(entries, list) or not entries:
-            raise _fail(f"{path} must hold one or more [[release]] tables only", USAGE_ERROR)
+            entries = registry.read_release_file(path)
+        except registry.ReleaseFileError as exc:
+            raise _fail(str(exc), USAGE_ERROR) from None
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
-        if not all(isinstance(entry, dict) for entry in entries):
-            raise _fail(f"{path}: every [[release]] entry must be a table", USAGE_ERROR)
         groups = _release_write(lambda conn: registry.plan_release_import(conn, entries), s)
         for group in groups:
-            ids = _release_write(partial(registry.import_release, entries=group), s)
+            ids = _release_write(_importer(group), s)
             stages = ", ".join(str(e["stage"]) for e in group)
             typer.echo(f"{group[0]['name']}: imported {stages} (decisions {ids})")
 
