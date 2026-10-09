@@ -77,7 +77,12 @@ import polars as pl
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
 from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.portfolio import target_weights
-from tradepartner.backtest.provider import DataProvider, GapReading, TurnoverInputs
+from tradepartner.backtest.provider import (
+    TURNOVER_BAR_COLUMNS,
+    DataProvider,
+    GapReading,
+    TurnoverInputs,
+)
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
@@ -804,7 +809,11 @@ class _Requests:
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
     ) -> TurnoverInputs:
-        return self.view.turnover_inputs(t, ids, sessions_from)
+        # Not a keyed read: nothing is declared or read here (an empty value the
+        # reader only wraps); `_plan` makes the real read once per step (T165b).
+        return TurnoverInputs(
+            t=t, bars=pl.DataFrame(schema=list(TURNOVER_BAR_COLUMNS)), shares={}, splits={}
+        )
 
 
 @dataclass
