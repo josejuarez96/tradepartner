@@ -16,6 +16,7 @@ import ast
 import functools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -31,7 +32,7 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.schedule import fill_session, read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
-from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.config import Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
 from tradepartner.execution import planning, reconcile_run, wrapper
 from tradepartner.execution import window as window_module
@@ -89,9 +90,13 @@ def _utc(day: date, hour: int) -> datetime:
 
 
 def _frozen_settings() -> Settings:
+    # `profitability` and `combined` take the same top fraction from their own
+    # sections (T152); a momentum registration freezes only `strategy.*`.
     return Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},
+        profitability={"top_fraction": 0.5},
+        combined={"top_fraction": 0.5},
         holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
     )
 
@@ -174,6 +179,15 @@ class Env:
 
 @pytest.fixture
 def env(fixture_store_path: Path, tmp_path: Path) -> Iterator[Env]:
+    with open_env(fixture_store_path, tmp_path) as opened:
+        yield opened
+
+
+@contextmanager
+def open_env(
+    fixture_store_path: Path, tmp_path: Path, family: HypothesisFamily = "momentum"
+) -> Iterator[Env]:
+    """The module's planning environment for a hypothesis of `family` (T152)."""
     conn = duckdb.connect(str(fixture_store_path))
     configure_connection(conn)
     live = Settings(
@@ -185,11 +199,11 @@ def env(fixture_store_path: Path, tmp_path: Path) -> Iterator[Env]:
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-paper-plan",
-        family="momentum",
+        family=family,
         title="planning step test",
         doc_path="docs/hypotheses/h-paper-plan.md",
         doc_sha256="0" * 64,
-        params=frozen_params_of(params, family="momentum"),
+        params=frozen_params_of(params, family=family),
         in_sample_start=IN_SAMPLE_START,
         holdout_start=HOLDOUT_START,
         holdout_end=HOLDOUT_END,
@@ -663,20 +677,23 @@ def test_a_historical_holdout_still_refuses_a_tracking_trial_inside_it(env: Env)
     assert env.counts() == counts
 
 
-def test_profitability_is_refused_by_the_paper_family_gate(
-    env: Env, monkeypatch: pytest.MonkeyPatch
+def test_profitability_passes_the_paper_family_gate(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Profitability is engine-ready but cannot open a paper plan or provider."""
-    env.conn.execute("UPDATE hypotheses SET family = 'profitability'")
-    counts = env.counts()
+    """`profitability` is paper-ready (ADR 0017 part D, T152): its window plans, and
+    the engine is called with the stored family. The full round trip of a
+    `profitability` and a `combined` plan is `test_families_paper.py`."""
+    real_plan = engine.plan
+    seen: list[str] = []
 
-    def provider_used(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("provider must not open for a non-paper family")
+    def record(*args: Any, **kwargs: Any) -> engine.Plan:
+        seen.append(kwargs["family"])
+        return real_plan(*args, **kwargs)
 
-    monkeypatch.setattr(planning, "StoreProvider", provider_used)
-    with pytest.raises(PlanTrialError, match="cannot run yet"):
-        env.plan()
-    assert env.counts() == counts
+    monkeypatch.setattr(engine, "plan", record)
+    with open_env(fixture_store_path, tmp_path, "profitability") as env:
+        assert env.plan().status == "planned"
+    assert seen == ["profitability"]
 
 
 def test_momentum_plan_uses_the_windows_stored_family(
