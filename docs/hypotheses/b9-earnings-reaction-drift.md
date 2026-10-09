@@ -1,10 +1,10 @@
 # Hypothesis: B9, long-only earnings-reaction (EAR) drift, top quintile, 20-session hold, daily
 
-**Family:** `earnings_drift` (proposed root family; not in `hypotheses.families` yet, see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, #1352 direction)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs the 8-K `items` field in the store (data-foundation plan tasks T151 to T151e), a backtest spec amendment for the family and its engine tasks (listed under "The family question" below, which is the handoff; nothing is built), the owner's `development_boundary` row, ADR 0017 accepted (its parts B and C are what let a `daily` book be this family's forward exam; the in-sample run needs neither), and the owner's answers to B9-1 to B9-7 below
+**Family:** `earnings_drift` (proposed root family; not in `hypotheses.families` yet, see "The family question")  ·  **Author:** team hypfiles (agent draft on Fable 5.1, #1358); owner approval to draft 2026-10-09 (#1353 shortlist, #1352 direction)  ·  **Date:** 2026-10-09  ·  **Status:** draft, not registrable: it needs the 8-K `items` field in the store (data-foundation plan tasks T164 to T164e), a backtest spec amendment for the family and its engine tasks (listed under "The family question" below, which is the handoff; nothing is built), the owner's `development_boundary` row, ADR 0017 accepted (its parts B and C are what let a `daily` book be this family's forward exam; the in-sample run needs neither), and the owner's answers to B9-1 to B9-7 below
 
 Merging this file does not register it. Three things stand between this draft and a
 registration, in order: (1) the data: EDGAR 8-K `items` with acceptance times are not
-stored today (the adapter reads the submissions field and drops it; T151 keeps it);
+stored today (the adapter reads the submissions field and drops it; T164 keeps it);
 (2) the engine: no family reads an event table, and `earnings_drift` must enter
 `HypothesisFamily` and `FAMILIES` by a reviewed code change behind a backtest spec
 amendment, as `profitability` did (#720); (3) the registration path: the strategy lab's
@@ -70,7 +70,7 @@ over 2019-2023 alone.
   long-short, and the short leg carries much of the spread.
 - Our event is not the paper's: CZ keys on I/B/E/S dates; the 8-K 2.02 acceptance misses
   releases not furnished on an 8-K and catches 2.02 items that are not quarterly results
-  (the report's "Event timing" caveat). T151's coverage count is the first measurement.
+  (the report's "Event timing" caveat). T164's coverage count is the first measurement.
 
 **Design.** An event book inside the ADR 0006 universe, expressed through the engine's
 existing schedule: a `daily` cadence (ADR 0012) with a one-session hold, where the
@@ -82,7 +82,7 @@ look-ahead tests have one source.
 ### Point-in-time rules, stated so the auditor can check them
 
 1. **An event is an 8-K whose `items` names 2.02, known at its acceptance.** The row
-   comes from the `filing_events` table T151 adds (`cik`, `accession`, `form`, `items`,
+   comes from the `filing_events` table T164 adds (`cik`, `accession`, `form`, `items`,
    `accepted_at`), with `known_at` = the submissions `acceptanceDateTime` (UTC), never
    the filing index's `filed` date. The trap: an 8-K accepted between 16:00 and about
    17:30 New York on a session carries **that** session's `filed` date (EDGAR dates a
@@ -148,7 +148,7 @@ look-ahead tests have one source.
    volume condition, no analyst data (we hold none), no 10-Q or 10-K keyed fallback: a
    release first seen at the 10-Q is a different and untested event (ER-6, the report's
    "On keyed on 10-Q/10-K acceptance"), so a name whose results are not furnished on an
-   8-K 2.02 is simply never an event here, and T151 counts how many universe names that
+   8-K 2.02 is simply never an event here, and T164 counts how many universe names that
    is.
 
 What the look-ahead suites must see for this family (backtest spec req 13, as the #720
@@ -262,7 +262,7 @@ Proposed answers, one line each (the owner confirms or changes them on #1358):
   trial still runs and counts, but no paper book can open for it and the forward holdout
   cannot be judged, so the file would wait, or re-register at `month_end` as a different
   hypothesis (a monthly book of twenty-session events is a different design). January
-  2027 leaves a quarter for T151 to T151e, the spec amendment, the family tasks, the sweep
+  2027 leaves a quarter for T164 to T164e, the spec amendment, the family tasks, the sweep
   registration and the in-sample run; the owner may move both dates, and a later start is
   always allowed. A book may run past `holdout.end` as an ordinary Phase 4 window.
 - **Costs**: the spec's placeholder base of 15 bp per side and H1's ladder, **plus a 5 bp
@@ -278,7 +278,7 @@ Proposed answers, one line each (the owner confirms or changes them on #1358):
   seasonal: 3 to 8 orders a session in the six peak weeks of each quarter, 0 to 2 a
   session between seasons, each side; plus the small daily drift trades of rule 7. The
   paper run's `risk.max_orders_per_run` (250) is far above any session's count.
-- **Data each rule needs**: rule 1, the 8-K `items` field with acceptance (**T151**, not
+- **Data each rule needs**: rule 1, the 8-K `items` field with acceptance (**T164**, not
   held today); rules 2 and 4, the XNYS calendar (held); rule 3, bars and corporate
   actions through the engine's adjusted series and SPY's bars (held; SPY is a seeded
   benchmark); rule 7, nothing new; rule 8, `universe_as_of` (held). Nothing needs a
@@ -357,7 +357,7 @@ source in the register gives a worst quarter for this construction; the run comp
   arithmetic is under Expected magnitudes; 200% is the fully unpaired case).
 - `n_excluded_no_breakpoints` non-zero at any read: the engine reads events before
   `in_sample_start` for the breakpoints (rule 4), so the set is full from the first read
-  and a non-zero count is a hole in the event feed (T151's coverage count is the baseline).
+  and a non-zero count is a hole in the event feed (T164's coverage count is the baseline).
 - An EAR computed across a split without adjustment (a ±50% or ±90% "reaction" on a
   split's ex-date): rule 3 reads the adjusted series, and such a value is the proof it did
   not.
@@ -451,7 +451,7 @@ nothing in the design was tuned on it. The dead months are not unseen in that se
 holdout months do not exist yet.
 
 **Not seen.** No TradePartner trial of this family exists; no store holds `filing_events`;
-no coverage spike has been run (T151's coverage count is the first). The Probe 3 fills
+no coverage spike has been run (T164's coverage count is the first). The Probe 3 fills
 (P3-1 to P3-5) are two megacaps on two sessions in October 2026 and are execution facts,
 not returns.
 
@@ -538,7 +538,7 @@ spec amendment; none of it is built here):
    for other families (`backtest/hypothesis.py`), so H1's, B3's and the T114 sweep's
    fingerprints do not move, and `tests/test_config.py` pins that. Size S.
    `quant-auditor`, `safety-reviewer` (`config.py` is on both lists).
-3. **The as-of read** is **T151d's** (`store/asof.py` `filing_events_as_of(t, forms,
+3. **The as-of read** is **T164d's** (`store/asof.py` `filing_events_as_of(t, forms,
    items)`, `known_at ≤ t`, one row per listed class of a CIK as `statement_facts_as_of`
    does, with its look-ahead cases), in the data-foundation plan; the engine reads it and
    builds nothing of its own here.
@@ -582,7 +582,7 @@ points back here; until then nothing is claimable.
   forward holdout (`combined`, ADR 0016 point 5), so the owner also orders the two exams:
   B9 first on the proposed dates, with B4's `holdout.start` after 2027-06-30, or B4 first
   and B9 after B4's `holdout.end`. Recommendation: the dates as proposed; write the
-  boundary row first; B9 first unless B4 registers before T151e lands, since B4 is parked
+  boundary row first; B9 first unless B4 registers before T164e lands, since B4 is parked
   and B9's book is the daily one the ADR 0017 shakedown wants. One more constraint on
   `holdout.end`: ADR 0016 point 4 as accepted says "at least `paper.min_rebalances`
   **months** after `holdout.start`", and 2027-06-30 is under six calendar months after
@@ -606,7 +606,7 @@ points back here; until then nothing is claimable.
   risk rule would refuse). Recommendation: 0.05.
 - **B9-6. The event definition.** `event_forms = ["8-K"]` with a 30-session dedupe
   (proposed); or 8-K and 8-K/A; or a 10-Q/10-K acceptance fallback for names with no 2.02
-  8-K. Recommendation: 8-K only, no fallback (a different event, ER-6); T151's coverage
+  8-K. Recommendation: 8-K only, no fallback (a different event, ER-6); T164's coverage
   count says how many universe names the rule leaves out, and a fallback, if ever wanted,
   is a new hypothesis.
 - **B9-7. The trial budget.** This file plus the three pre-declared variants above, or a
