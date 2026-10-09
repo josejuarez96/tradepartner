@@ -313,6 +313,23 @@ def test_a_changed_frozen_value_is_a_new_hypothesis(
     assert second.params_sha256 != first.params_sha256
 
 
+def test_a_slug_moved_between_families_is_refused_not_a_prose_only_edit(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """#1247: `same_set` compared the window and the canonical frozen set but not the
+    family. `momentum` and `oracle` list the same `strategy` section, so their canonical
+    sets compare equal; a file that keeps its slug and changes `family` must be refused
+    as a move between families, never accepted as a prose-only edit or as the other
+    family's record."""
+    path = _copy(tmp_path)
+    first = _register(conn, path, settings)
+    assert first.family == "momentum"
+    path.write_text(path.read_text().replace('family = "momentum"', 'family = "oracle"', 1))
+    with pytest.raises(registry.RegistryError, match="cannot move"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+
+
 def test_reverting_to_an_older_registration_is_refused(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:

@@ -1097,7 +1097,7 @@ def test_engine_families_derives_at_today_s_value() -> None:
 
 
 def test_paper_families_derives_at_today_s_value() -> None:
-    assert PAPER_FAMILIES == ("momentum", "oracle")
+    assert PAPER_FAMILIES == ("momentum", "oracle", "profitability", "combined")
 
 
 def test_default_sweepable_keys_derives_at_today_s_value() -> None:
@@ -1151,7 +1151,7 @@ def test_profitability_family_spec() -> None:
     assert spec.params_model is ProfitabilityConfig
     assert spec.parent is None
     assert spec.engine_ready is True
-    assert spec.paper_ready is False
+    assert spec.paper_ready is True
     assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
     assert spec.count_names == (
         "n_ranked",
@@ -1213,7 +1213,7 @@ def test_combined_family_spec() -> None:
     assert spec.params_model is CombinedConfig
     assert spec.parent == "momentum"
     assert spec.engine_ready is True
-    assert spec.paper_ready is False
+    assert spec.paper_ready is True
     assert spec.exclusion_reasons == (
         "no_history",
         "sector",
