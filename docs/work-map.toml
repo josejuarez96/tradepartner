@@ -330,7 +330,7 @@ why = "Phase 4 has no spec or plan; without one the wrapper, the run and the pag
 unblocks = ["spec:paper-trading"]
 
 [plan.paper-trading]
-what = "The Phase 4 build document: 84 tasks, one PR each, from broker types to the phase-close evidence and the fast-paper tasks of ADR 0017, grouped in chains."
+what = "The Phase 4 build document: 85 tasks, one PR each, from broker types to the phase-close evidence and the fast-paper tasks of ADR 0017, grouped in chains."
 why = "What the ready frontier is computed from; a passed paper shakedown over several books under these tasks is the MVP's finish line."
 unblocks = ["phase:4"]
 
@@ -741,7 +741,7 @@ unblocks = ["plan:paper-trading", "issue:1352"]
 [issue.1352]
 what = "Turn ADR 0017 into the spec amendments (paper spec, strategy-lab req 11, the ADR pointers) and the Phase 4 plan tasks T151 to T163c: cadence lift, the family flip, one account per book, the multi-book run, the per-book surfaces, paper shakedown, the runbook, the owner's accounts, hypotheses, starts and span, and the Phase 6 live book."
 why = "A decision the owner merged is built only from claimable task lines; the lines fix the schema chain, the drill's host book and the counted selection of the daily variant so several teams can build in parallel."
-unblocks = ["task:T151", "task:T152", "task:T153", "task:T154", "task:T155", "task:T155b", "task:T156", "task:T157", "task:T158", "task:T159", "task:T160", "task:T161", "task:T162", "task:T163", "task:T163b", "task:T163c"]
+unblocks = ["task:T151", "task:T152", "task:T153", "task:T154", "task:T155", "task:T155b", "task:T156", "task:T157", "task:T157b", "task:T158", "task:T159", "task:T160", "task:T161", "task:T162", "task:T163", "task:T163b", "task:T163c"]
 
 [issue.1258]
 what = "Turn ADR 0015's plan sketch (TE0 to TE7) into Phase 4 plan tasks T132 to T139 with their files, tests, dependencies, declared chains and the T48b, T48c and T71 gates."
@@ -918,8 +918,13 @@ why = "The owner reads several books on one page and gets each book's tracking e
 unblocks = ["task:T161"]
 
 [task.T157]
-what = "paper shakedown: the seven machine-readiness criteria of ADR 0017 part E as read-only queries over the journal, thresholds from the owner's shakedown_span row, plus the shakedown_span and shakedown_note decision kinds (schema version 20)."
-why = "The Phase 4 exit becomes a command whose bar is frozen before the span opens, so the gate measures the machine and cannot be moved after a failing span."
+what = "The shakedown_span and shakedown_note decision kinds (schema version 20), the registry read of the newest span row and the decision shakedown-span and shakedown-note commands."
+why = "The gate's thresholds are a frozen owner row, written before the span opens, so the bar cannot move after a failing span; the migration lands alone, as T84 did."
+unblocks = ["task:T157b"]
+
+[task.T157b]
+what = "paper shakedown: the seven machine-readiness criteria of ADR 0017 part E as read-only queries over the journal, thresholds from the span row, one line per criterion, exit 0 only when all pass, writes nothing."
+why = "The Phase 4 exit becomes a command over rows the journal already writes, so the gate measures the machine and not a strategy."
 unblocks = ["task:T158", "task:T162"]
 
 [task.T158]
