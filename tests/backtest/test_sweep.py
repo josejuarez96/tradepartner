@@ -630,13 +630,13 @@ def test_a_momentum_sweep_grids_the_screen_and_its_control(tmp_path: Path) -> No
 
 def test_a_combined_sweep_gridding_the_key_is_refused(tmp_path: Path) -> None:
     path = _turnover_sweep(tmp_path, family="combined", grid="[0.20, 1.0]")
-    with pytest.raises(AxisNotSweepableError, match=re.escape(TURNOVER_KEY)):
+    with pytest.raises(AxisNotSweepableError, match=f"{TURNOVER_KEY} is a 'momentum' rule"):
         parse_sweep_file(path, _settings())
 
 
 def test_a_combined_fixed_block_naming_a_screen_is_refused(tmp_path: Path) -> None:
     path = _turnover_sweep(tmp_path, family="combined", fixed="turnover_top_fraction = 0.5\n")
-    with pytest.raises(SweepFileError, match=re.escape(TURNOVER_KEY)):
+    with pytest.raises(SweepFileError, match=f"fixed block's {TURNOVER_KEY} is a 'momentum' rule"):
         parse_sweep_file(path, _settings())
 
 

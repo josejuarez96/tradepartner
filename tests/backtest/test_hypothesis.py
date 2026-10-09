@@ -1206,6 +1206,7 @@ def _with_turnover(tmp_path: Path, source: Path, slug: str, value: str) -> Path:
 
 @pytest.mark.parametrize("family", ["momentum", "oracle", "combined"])
 def test_required_keys_leave_out_the_post_registration_key(family: str) -> None:
+    assert TURNOVER_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
     assert TURNOVER_KEY not in hypothesis.required_keys(family)
     assert "strategy.top_fraction" in hypothesis.required_keys(family)
 
@@ -1243,7 +1244,7 @@ def test_a_momentum_file_naming_the_key_freezes_its_value(
 def test_a_value_outside_zero_one_is_refused(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings, value: str
 ) -> None:
-    with pytest.raises(HypothesisFileError, match="turnover_top_fraction"):
+    with pytest.raises(HypothesisFileError, match=r"fail validation.*turnover_top_fraction"):
         _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, value), settings)
 
 
@@ -1261,7 +1262,7 @@ def test_another_family_naming_a_screen_is_refused_naming_the_key(
 ) -> None:
     path = _with_turnover(tmp_path, source, slug, "0.5")
     path.write_text(path.read_text().replace('family = "momentum"', f'family = "{family}"'))
-    with pytest.raises(HypothesisFileError, match=TURNOVER_KEY):
+    with pytest.raises(HypothesisFileError, match=f"{TURNOVER_KEY} is a 'momentum' rule"):
         _register(conn, path, settings)
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
 
