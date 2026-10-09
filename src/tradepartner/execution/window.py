@@ -20,7 +20,14 @@ keys, reads as `month_end`). Then, in order, it refuses, before any write:
    matters).
 2. **`holdout.end` not a completed month-end.** The hypothesis's frozen
    `holdout_end` must be the last XNYS session of its calendar month, and
-   its close must already be in the past at the clock's reading.
+   its close must already be in the past at the clock's reading. For a
+   **forward** holdout (ADR 0016 point 4, `holdout.is_forward` with the
+   family's first registration day, `registry.family_registered_on`), and
+   only then, the rule is instead that `holdout.start` has passed: the
+   clock's New York date is on or after it (refused `holdout_not_complete`
+   otherwise), because a forward exam is judged by the paper book inside the
+   holdout. `holdout.end` is then the declared last month of the exam and is
+   not read here.
 3. **A window is already open.**
 4. **`account()` fails** on the paper endpoint (whatever the broker raises
    propagates as the refusal's cause).
@@ -38,9 +45,12 @@ keys, reads as `month_end`). Then, in order, it refuses, before any write:
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
 rebalance session strictly after both `holdout_end` and today, per the spec
-Definitions' "Paper window"; `starting_cash` and `starting_equity` from
-`account()`; `code_version`; `frozen_json`/`frozen_sha256`, the canonicalised
-and hashed `risk.*` section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
+Definitions' "Paper window"; for a forward holdout, the first rebalance
+session on or after `holdout.start` and strictly after today, so the window
+sits inside the holdout and never starts on a session already past;
+`starting_cash` and `starting_equity` from `account()`; `code_version`;
+`frozen_json`/`frozen_sha256`, the canonicalised and hashed `risk.*`
+section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
 `FROZEN_EXECUTION_KEYS`, exactly as `registry.canonical_params_json`/
 `params_sha256` do for hypothesis parameters), the `carried_residue`
 adjustments copied from the previous window's listed residues (quantity and
@@ -199,6 +209,7 @@ import polars as pl
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
 from tradepartner.backtest.frozen import frozen_values
+from tradepartner.backtest.holdout import Frozen, is_forward
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import (
@@ -348,6 +359,25 @@ def _first_rebalance_session(holdout_end: date, today: date, cadence: Cadence) -
     `cadence` strictly after both `holdout_end` and `today`."""
     lower = max(holdout_end, today) + timedelta(days=1)
     return rebalance_sessions(lower, lower + _REBALANCE_SEARCH, cadence)[0]
+
+
+def _forward(conn: duckdb.DuckDBPyConnection, hyp: registry.HypothesisRecord) -> bool:
+    """Whether `hyp`'s holdout is forward (`holdout.is_forward` with the family's first
+    registration day, ADR 0016 point 4). `Frozen` is built only for a holdout that
+    starts after that day, so a historical registration reads nothing it did not read
+    before T142c (a pre-lab one without a frozen `gap.count_share_threshold` still
+    starts); a forward one without it raises `ValueError` here, before any broker
+    call or write, as the daily run's tracking rule would."""
+    registered_on = registry.family_registered_on(conn, hyp.family)
+    if registered_on is None or hyp.holdout_start <= registered_on:
+        return False
+    return is_forward(Frozen.from_hypothesis(hyp, registered_on=registered_on))
+
+
+def _forward_first_session(holdout_start: date, today: date, cadence: Cadence) -> date:
+    """T_0 for a forward holdout (ADR 0016 point 4): the first rebalance session at
+    `cadence` on or after `holdout_start` and strictly after `today`."""
+    return _first_rebalance_session(holdout_start - timedelta(days=1), today, cadence)
 
 
 def _holdout_end_completed(holdout_end: date, now: datetime, cadence: Cadence) -> bool:
@@ -636,7 +666,14 @@ def start(
                     "in_sample trial of this hypothesis",
                 )
             now = _read_clock(clock)
-            if not _holdout_end_completed(hyp.holdout_end, now, _PAPER_CADENCE):
+            forward = _forward(conn, hyp)
+            if forward:
+                if _ny_date(now) < hyp.holdout_start:
+                    raise StartRefusedError(
+                        "holdout_not_complete",
+                        f"{slug!r}'s forward holdout.start ({hyp.holdout_start}) has not passed",
+                    )
+            elif not _holdout_end_completed(hyp.holdout_end, now, _PAPER_CADENCE):
                 raise StartRefusedError(
                     "holdout_not_complete",
                     f"{slug!r}'s frozen holdout.end ({hyp.holdout_end}) is not a "
@@ -677,7 +714,11 @@ def start(
             now=today,
         )
 
-        t_0 = _first_rebalance_session(hyp.holdout_end, today, _PAPER_CADENCE)
+        t_0 = (
+            _forward_first_session(hyp.holdout_start, today, _PAPER_CADENCE)
+            if forward
+            else _first_rebalance_session(hyp.holdout_end, today, _PAPER_CADENCE)
+        )
         commit, _dirty = registry.code_version()
         params = _frozen_params(settings, registered)
         frozen_json = registry.canonical_params_json(params)
