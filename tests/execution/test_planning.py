@@ -185,9 +185,14 @@ def env(fixture_store_path: Path, tmp_path: Path) -> Iterator[Env]:
 
 @contextmanager
 def open_env(
-    fixture_store_path: Path, tmp_path: Path, family: HypothesisFamily = "momentum"
+    fixture_store_path: Path,
+    tmp_path: Path,
+    family: HypothesisFamily = "momentum",
+    *,
+    drop_keys: Sequence[str] = (),
 ) -> Iterator[Env]:
-    """The module's planning environment for a hypothesis of `family` (T152)."""
+    """The module's planning environment for a hypothesis of `family` (T152), its stored
+    params less `drop_keys` (a registration stored before those keys existed, T165)."""
     conn = duckdb.connect(str(fixture_store_path))
     configure_connection(conn)
     live = Settings(
@@ -203,7 +208,9 @@ def open_env(
         title="planning step test",
         doc_path="docs/hypotheses/h-paper-plan.md",
         doc_sha256="0" * 64,
-        params=frozen_params_of(params, family=family),
+        params={
+            k: v for k, v in frozen_params_of(params, family=family).items() if k not in drop_keys
+        },
         in_sample_start=IN_SAMPLE_START,
         holdout_start=HOLDOUT_START,
         holdout_end=HOLDOUT_END,
@@ -1082,3 +1089,40 @@ def test_current_listings_keeps_the_first_row_on_a_valid_from_tie() -> None:
     assert window_module.current_listings is planning.current_listings
     assert not hasattr(reconcile_run, "_current_listings")
     assert not hasattr(window_module, "_current_tickers")
+
+
+# --- literal pins of H1's paper rows, taken on `main`'s code (#1358, T165) -------------
+
+#: The key H1's registration never stored (T165; T165d keeps the pin green).
+TURNOVER_KEY = "strategy.turnover_top_fraction"
+
+
+def _rows_digest(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[int, str]:
+    import hashlib
+
+    cursor = conn.execute(f"SELECT * FROM {table} ORDER BY ALL")
+    columns = [d[0] for d in cursor.description]
+    rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    payload = json.dumps(rows, sort_keys=True, default=str)
+    return len(rows), hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path) -> None:
+    """H1's registration (no turnover key stored) plans the same `signals`, `decisions`
+    and `paper_plans` rows as on `main`'s code before the key existed (T165)."""
+    with open_env(fixture_store_path, tmp_path, drop_keys=(TURNOVER_KEY,)) as env:
+        stored = registry.get_hypothesis_by_id(env.conn, env.hypothesis_id).params
+        assert TURNOVER_KEY not in stored
+        outcome = env.plan()
+        assert outcome.status == "planned"
+        digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
+    assert digests == H1_PAPER_ROWS
+
+
+#: Row count and SHA-256 of each table's rows (every column, `ORDER BY ALL`, JSON with
+#: `default=str`) after H1's plan at T_i, on `main` at 3de454d7.
+H1_PAPER_ROWS = {
+    "signals": (6, "31f4d58d4188196ec5fe48cde2df02d5f61ce21325a2b6cb641dbfc6dbd29f04"),
+    "decisions": (5, "e2f38d001a59a863c63aedf09d7311c5e1796df3e451b6351b69b649554ae7d4"),
+    "paper_plans": (1, "c6d327ddf9ce1660fac83ba6addca3434d6a9399707bf9d51e3887f78364fc03"),
+}

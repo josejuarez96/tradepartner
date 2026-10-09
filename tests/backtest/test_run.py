@@ -728,11 +728,14 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     `month_end`, and its stored hash is untouched (strategy-lab T96)."""
     frozen = _frozen()
     all_params = frozen_params_of(frozen, family="momentum")
-    # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
+    # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
+    # `strategy.turnover_top_fraction` (#1358) landed.
     params = {
         k: v
         for k, v in all_params.items()
-        if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+        if not k.startswith(
+            ("schedule.", "gap.stale_listing_sessions", "strategy.turnover_top_fraction")
+        )
     }
     hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with open_for_write(_store(fixture_store_path)) as conn:
@@ -820,8 +823,9 @@ def _register_more(
     frozen = Settings(_env_file=None, **overrides)
     params = frozen_params_of(frozen, family="momentum")
     if drop_schedule:
-        # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) landed.
-        later = ("schedule.", "gap.stale_listing_sessions")
+        # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
+        # `strategy.turnover_top_fraction` (#1358) landed.
+        later = ("schedule.", "gap.stale_listing_sessions", "strategy.turnover_top_fraction")
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
         record = registry.register_hypothesis(
