@@ -177,7 +177,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    assert versions == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
@@ -210,7 +210,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        assert _versions(conn) == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(
@@ -332,7 +332,7 @@ def test_write_open_of_a_version_8_store_migrates_to_9_and_keeps_every_row(
     assert overrides_after == overrides_before
     assert [row[0] for row in overrides_after] == [3, 1, 2]
     assert order_ids == [(None,)] * 3
-    assert versions == [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    assert versions == [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -344,7 +344,7 @@ def test_a_version_8_store_reopens_at_current_without_another_version_row(tmp_pa
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        assert _versions(conn) == [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 
 
 def test_read_only_open_of_a_version_8_store_passes(tmp_path: Path) -> None:

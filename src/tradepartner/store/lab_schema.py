@@ -86,9 +86,22 @@ LAB_TRIAL_STATUSES: tuple[str, ...] = ("refused_variant",)
 #: gains the lab after version 18 keeps them.
 RELEASE_DECISION_KINDS: tuple[str, ...] = ("data_release", "development_boundary")
 
+#: `owner_decisions.kind` values schema version 20 adds (#1388, paper-trading plan
+#: T157; ADR 0017 part E): the owner's `shakedown_span` row (the span's start and
+#: its two thresholds) and a `shakedown_note` naming an alert. As with version 18,
+#: `schema._migrate_shakedown_kinds` widens every store with them, lab or not, and
+#: `apply_lab_schema` widens with them too.
+SHAKEDOWN_DECISION_KINDS: tuple[str, ...] = ("shakedown_span", "shakedown_note")
+
 #: `owner_decisions.kind` values the lab adds (spec, Data / interfaces), then the
-#: two version 18 adds (`RELEASE_DECISION_KINDS`).
-LAB_DECISION_KINDS: tuple[str, ...] = ("promotion", "sweep_retired", *RELEASE_DECISION_KINDS)
+#: two version 18 adds (`RELEASE_DECISION_KINDS`) and the two version 20 adds
+#: (`SHAKEDOWN_DECISION_KINDS`).
+LAB_DECISION_KINDS: tuple[str, ...] = (
+    "promotion",
+    "sweep_retired",
+    *RELEASE_DECISION_KINDS,
+    *SHAKEDOWN_DECISION_KINDS,
+)
 
 
 def _enum_check(column: str, values: tuple[str, ...]) -> str:
@@ -397,11 +410,12 @@ def widen_enum(
 def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every `LAB_TABLE_NAMES` table and widen `trial_results.status`
     (`refused_variant`) and `owner_decisions.kind` (`promotion`,
-    `sweep_retired`, and version 18's `data_release` and `development_boundary`
-    where a store lacks them) by the staging rebuild, every row kept byte-identical
-    (module docstring). Needs a store `init_schema` has created (the registry
-    tables must exist). Idempotent: a second call changes nothing. One
-    transaction (the caller's if open). Writes no `schema_version` row and is
+    `sweep_retired`, version 18's `data_release` and `development_boundary` and
+    version 20's `shakedown_span` and `shakedown_note` where a store lacks them)
+    by the staging rebuild, every row kept byte-identical (module docstring).
+    Needs a store `init_schema` has created (the registry tables must exist).
+    Idempotent: a second call changes nothing. One transaction (the caller's if
+    open). Writes no `schema_version` row and is
     called by nothing in `schema.py` until the lab migration (T113)."""
     with atomic(conn):
         for ddl in _LAB_TABLE_DDL:
