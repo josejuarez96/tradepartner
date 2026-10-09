@@ -21,16 +21,18 @@ import polars as pl
 import pytest
 from conftest import load_universe_fixtures
 
+from backtest.fake_provider import Call, FakeProvider
 from tradepartner import gap as gap_module
 from tradepartner.backtest import store_provider as store_provider_module
 from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, DataProvider, GapReading
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.calendar import session_close
+from tradepartner.calendar import last_completed_session, session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
+    live_actions_as_of,
     prices_as_of,
     statement_facts_as_of,
 )
@@ -43,7 +45,7 @@ from tradepartner.store.db import (
     open_read_only,
 )
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.universe import universe_as_of
+from tradepartner.universe import shares_as_of, universe_as_of
 
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 BACKTEST_DIR = Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "backtest"
@@ -831,3 +833,175 @@ def test_statement_reads_refuse_a_bare_date_and_string_ids(store: Store) -> None
             provider.statement_facts(T_JAN, "SEC_DUAL_A")
         with pytest.raises(TypeError):
             provider.sics(T_JAN, "SEC_DUAL_A")
+
+
+# --- the turnover read (backtest spec amendment #1358, plan T165b) ----------------------
+
+T_APR = session_close(date(2019, 4, 30))
+TURNOVER_IDS = [
+    "SEC_FACTS_RESTATED",
+    "SEC_FACTS_STALE",
+    "SEC_SPLIT_BETWEEN",
+    "SEC_SPLIT_PLAIN",
+    "SEC_SPLIT_FUTURE",
+    "SEC_SPLIT_REDATED",
+    "SEC_SPLIT_REDATED_NOID",
+    "SEC_DIV_REVISED",
+    "SEC_WINDOW_DELIST",
+    "SEC_DUAL_A",
+]
+TURNOVER_TS = [
+    T_DUAL,
+    T_JAN,
+    T_FEB,
+    T_MAR,
+    T_APR,
+    session_close(date(2019, 6, 28)),
+    session_close(date(2019, 10, 17)),
+    session_close(date(2019, 10, 31)),
+]
+
+
+def _month_start(t: datetime) -> date:
+    return last_completed_session(t).replace(day=1)
+
+
+@pytest.mark.parametrize("t", TURNOVER_TS)
+def test_turnover_inputs_are_the_three_as_of_reads(store: Store, t: datetime) -> None:
+    """The bars are `prices_as_of(traded_only=True)` from `sessions_from` through
+    `t`'s session, the shares are rule 7's raw picks, and the splits are the live
+    actions known at `t` with `ex_date` at or before its session."""
+    start = _month_start(t)
+    with store.provider() as provider:
+        got = provider.turnover_inputs(t, TURNOVER_IDS, start)
+    session = last_completed_session(t)
+    with store.direct() as conn:
+        bars = prices_as_of(conn, t, TURNOVER_IDS, traded_only=True).filter(
+            pl.col("session").is_between(start, session)
+        )
+        pick = shares_as_of(conn, t, TURNOVER_IDS, store.settings)
+        actions = live_actions_as_of(conn, t, TURNOVER_IDS).filter(
+            (pl.col("action_type") == "split") & (pl.col("ex_date") <= session)
+        )
+    assert got.t == t
+    assert got.bars.columns == ["security_id", "session", "volume", "known_at"]
+    assert got.bars.equals(bars.select(got.bars.columns).sort("security_id", "session"))
+    assert got.bars.height > 0
+    assert got.bars["known_at"].max() <= t  # type: ignore[operator]
+    assert dict(got.shares) == pick.shares
+    want_splits: dict[str, list[tuple[date, float]]] = {}
+    for sid, ex_date, ratio in actions.select(
+        "security_id", "ex_date", "ratio_or_amount"
+    ).iter_rows():
+        want_splits.setdefault(sid, []).append((ex_date, ratio))
+    assert {sid: list(v) for sid, v in got.splits.items()} == {
+        sid: sorted(v) for sid, v in want_splits.items()
+    }
+
+
+def test_a_shares_fact_accepted_after_the_close_is_read_at_the_next_rebalance(
+    store: Store,
+) -> None:
+    """SEC_FACTS_RESTATED's restated 2019-01-16 fact is accepted 2019-03-29T20:30Z,
+    after that session's close: absent at close(2019-03-29), read at close(2019-04-30).
+    SEC_FACTS_STALE's first fact (accepted 2019-02-08) is absent at January's close."""
+    with store.provider() as provider:
+        jan = provider.turnover_inputs(T_JAN, TURNOVER_IDS, _month_start(T_JAN)).shares
+        feb = provider.turnover_inputs(T_FEB, TURNOVER_IDS, _month_start(T_FEB)).shares
+        mar = provider.turnover_inputs(T_MAR, TURNOVER_IDS, _month_start(T_MAR)).shares
+        apr = provider.turnover_inputs(T_APR, TURNOVER_IDS, _month_start(T_APR)).shares
+    assert "SEC_FACTS_STALE" not in jan
+    assert feb["SEC_FACTS_STALE"] == (date(2019, 2, 1), 2_000_000.0)
+    assert mar["SEC_FACTS_RESTATED"] == (date(2019, 1, 16), 1_000_000.0)
+    assert apr["SEC_FACTS_RESTATED"] == (date(2019, 1, 16), 1_050_000.0)
+    # Raw, not split-moved: SEC_SPLIT_BETWEEN's fact predates its 3-for-1.
+    assert feb["SEC_SPLIT_BETWEEN"] == (date(2018, 10, 29), 5_000_000.0)
+
+
+def test_a_split_is_absent_before_its_known_at_and_counts_once(store: Store) -> None:
+    """SEC_SPLIT_REDATED_NOID's 2019-10-14 split is first known 2019-10-18T22:00Z
+    (after its ex-date) and its 2019-10-21 date is cancelled: absent at
+    close(2019-10-17), once at close(2019-10-31). SEC_SPLIT_REDATED's re-dated split
+    counts once, at its latest ex-date; SEC_SPLIT_FUTURE's known split with a later
+    ex-date is not yet a split of the read."""
+    ids = ["SEC_SPLIT_REDATED", "SEC_SPLIT_REDATED_NOID", "SEC_SPLIT_FUTURE"]
+    before_t, after_t = session_close(date(2019, 10, 17)), session_close(date(2019, 10, 31))
+    with store.provider() as provider:
+        jan = provider.turnover_inputs(T_JAN, ids, _month_start(T_JAN)).splits
+        before = provider.turnover_inputs(before_t, ids, _month_start(before_t)).splits
+        after = provider.turnover_inputs(after_t, ids, _month_start(after_t)).splits
+    assert "SEC_SPLIT_FUTURE" not in jan
+    assert "SEC_SPLIT_REDATED_NOID" not in before
+    assert before["SEC_SPLIT_REDATED"] == ((date(2019, 6, 17), 2.0),)
+    assert after["SEC_SPLIT_REDATED_NOID"] == ((date(2019, 10, 14), 2.0),)
+    assert after["SEC_SPLIT_FUTURE"] == ((date(2019, 2, 14), 4.0),)
+
+
+def test_a_missing_formation_bar_is_a_missing_row_never_a_zero(store: Store) -> None:
+    """#787: SEC_DIV_REVISED's 2019-03-05 bar is re-fetched with no volume on
+    2019-03-06: at March's close it is absent, not a zero-volume row; read before the
+    revision is known it is an ordinary bar."""
+    ids = [ZERO_VOLUME_ID]
+    start = date(2019, 3, 1)
+    with store.provider() as provider:
+        mar = provider.turnover_inputs(T_MAR, ids, start).bars
+        early = provider.turnover_inputs(datetime(2019, 3, 5, 21, 0, tzinfo=UTC), ids, start).bars
+    assert ZERO_VOLUME_SESSION not in mar["session"].to_list()
+    assert mar.height > 0 and mar["volume"].min() > 0  # type: ignore[operator]
+    assert early.filter(pl.col("session") == ZERO_VOLUME_SESSION)["volume"].item() > 0
+
+
+def test_the_bars_run_from_sessions_from_through_the_session_of_t(store: Store) -> None:
+    ids = ["SEC_SPLIT_BETWEEN"]
+    with store.provider() as provider:
+        got = provider.turnover_inputs(T_JAN, ids, date(2019, 1, 2)).bars
+        with pytest.raises(TypeError, match="sessions_from"):
+            provider.turnover_inputs(T_JAN, ids, T_DUAL)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            provider.turnover_inputs(T_JAN, "SEC_SPLIT_BETWEEN", date(2019, 1, 2))
+    sessions = got["session"].to_list()
+    assert sessions[0] == date(2019, 1, 2) and sessions[-1] == date(2019, 1, 31)
+    assert len(sessions) == 21  # every January 2019 session, the split's ex-date among them
+
+
+def test_the_turnover_read_shares_the_step_connection(store: Store) -> None:
+    provider = store.provider()
+    opened = store.opened
+    provider.universe(T_JAN)
+    provider.turnover_inputs(T_JAN, ["SEC_DUAL_A"], _month_start(T_JAN))
+    assert store.opened == opened + 1 and store.open_now == 1
+    provider.close()
+
+
+def _fixture_fake(store: Store) -> FakeProvider:
+    """A `FakeProvider` over the fixture store's own rows: raw bars, shares facts and
+    split actions (identity: `source_action_id`, else the ex-date, as in #108)."""
+    with store.direct() as conn:
+        raw = conn.execute("SELECT * FROM prices_daily").pl()
+        facts = conn.execute(
+            "SELECT security_id, as_of_date, value, known_at FROM facts "
+            "WHERE fact_name = 'shares_outstanding'"
+        ).pl()
+        splits = conn.execute(
+            "SELECT security_id, "
+            "CASE WHEN source_action_id = '' THEN CAST(ex_date AS VARCHAR) "
+            "ELSE source_action_id END AS action_id, "
+            "ex_date, ratio_or_amount AS ratio, cancelled, known_at "
+            "FROM corporate_actions WHERE action_type = 'split'"
+        ).pl()
+    return FakeProvider(prices=raw, members={}, benchmarks={}, shares_rows=facts, split_rows=splits)
+
+
+@pytest.mark.parametrize("t", TURNOVER_TS)
+def test_the_fake_and_store_providers_answer_alike_on_the_fixture(
+    store: Store, t: datetime
+) -> None:
+    fake = _fixture_fake(store)
+    start = _month_start(t)
+    with store.provider() as provider:
+        want = provider.turnover_inputs(t, TURNOVER_IDS, start)
+    got = fake.turnover_inputs(t, TURNOVER_IDS, start)
+    assert got.bars.equals(want.bars)
+    assert dict(got.shares) == dict(want.shares)
+    assert dict(got.splits) == dict(want.splits)
+    assert fake.calls == [Call("turnover_inputs", t, ids=tuple(TURNOVER_IDS), sessions_from=start)]

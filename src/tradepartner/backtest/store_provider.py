@@ -59,6 +59,14 @@ read like any others, through `adjusted_prices` and `raw_prices` at `t`.
 the step's connection like every other method (backtest spec amendment
 #720, plan T85c).
 
+`turnover_inputs(t, ids, sessions_from)` (backtest spec amendment #1358,
+plan T165b) is three reads on the step's connection with the frozen
+`Settings`: `prices_as_of(traded_only=True)` kept to `[sessions_from,
+session(t)]` (after the as-of read, so the latest revision is chosen as in
+an unbounded read), `universe.shares_as_of`'s raw picks, and the splits
+`universe._split_factors` takes from `live_actions_as_of`, the same split
+list rule 7's age and the gap read.
+
 A security's **current listing** is the one with the latest `valid_from` on
 or before `t`'s session; between two rows with the same `valid_from` the
 first in `listings_as_of` order wins, the same rule `universe_as_of` uses,
@@ -78,7 +86,14 @@ import duckdb
 import polars as pl
 
 from tradepartner import gap as gap_module
-from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, GapReading, check_t
+from tradepartner.backtest.provider import (
+    STATEMENT_FACT_NAMES,
+    TURNOVER_BAR_COLUMNS,
+    GapReading,
+    TurnoverInputs,
+    check_sessions_from,
+    check_t,
+)
 from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
@@ -94,7 +109,7 @@ from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.universe import Universe, universe_as_of
+from tradepartner.universe import Universe, _split_factors, shares_as_of, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
@@ -272,6 +287,27 @@ class StoreProvider:
         rows = classifications_as_of(self._at(t), t, wanted)
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in wanted}
+
+    def turnover_inputs(
+        self, t: datetime, ids: Sequence[str], sessions_from: date
+    ) -> TurnoverInputs:
+        t, wanted = check_t(t), _ids(ids)
+        sessions_from = check_sessions_from(sessions_from)
+        conn, session = self._at(t), last_completed_session(t)
+        bars = (
+            prices_as_of(conn, t, wanted, traded_only=True)
+            .filter(pl.col("session").is_between(sessions_from, session))
+            .select(TURNOVER_BAR_COLUMNS)
+            .sort("security_id", "session")
+        )
+        shares = shares_as_of(conn, t, wanted, self.settings).shares
+        splits = _split_factors(conn, t, wanted, session)
+        return TurnoverInputs(
+            t=t,
+            bars=bars,
+            shares={sid: shares[sid] for sid in wanted if sid in shares},
+            splits={sid: tuple(sorted(splits[sid])) for sid in wanted if splits.get(sid)},
+        )
 
     # --- helpers --------------------------------------------------------------------
 
