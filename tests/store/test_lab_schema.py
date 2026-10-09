@@ -295,7 +295,8 @@ def test_rebuild_keeps_a_value_another_version_added() -> None:
     )
     conn.execute(
         "CREATE TABLE owner_decisions (decision_id BIGINT PRIMARY KEY, kind VARCHAR NOT "
-        "NULL, CHECK (kind IN ('gap_signoff', 'promotion', 'sweep_retired')))"
+        "NULL, CHECK (kind IN ('gap_signoff', 'promotion', 'sweep_retired', 'data_release', "
+        "'development_boundary')))"
     )
     conn.execute("INSERT INTO trial_results VALUES (1, ?, 'other_plan')", [AT])
     owner_ddl = conn.execute(

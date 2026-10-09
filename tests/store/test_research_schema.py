@@ -254,7 +254,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
             continue
         later_columns = [
             column
-            for column in ("n_research", "sharpe_unit", *_TRIALS_V15)
+            for column in ("n_research", "sharpe_unit", *_TRIALS_V15, "development_boundary")
             if column in _columns(c, table)
         ]
         exclude = f" EXCLUDE ({', '.join(later_columns)})" if later_columns else ""
@@ -265,8 +265,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_17() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 17
+def test_current_schema_version_is_18() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 18
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -351,7 +351,7 @@ def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [17]
+    assert _versions(conn) == [18]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
@@ -360,7 +360,7 @@ def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [17]
+    assert _versions(conn) == [18]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -641,7 +641,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16, 17]
+        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16, 17, 18]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
@@ -673,10 +673,17 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     assert all(c in ddl_after["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS)
     assert rows_after == rows_before
     # And the migrated store is shaped exactly as a fresh one.
+    # (A fresh store gets version 18's two kinds before the lab's two, a migrating
+    # one after them: the same set of kinds, in another order.)
     fresh = duckdb.connect(":memory:")
     schema.init_schema(fresh)
     lab_schema.apply_lab_schema(fresh)  # a fresh store has no lab table
-    assert ddl_after == _ddl(fresh)
+    fresh_ddl = _ddl(fresh)
+    release = ", ".join(f"'{k}'" for k in lab_schema.RELEASE_DECISION_KINDS)
+    fresh_ddl["owner_decisions"] = fresh_ddl["owner_decisions"].replace(
+        f"{release}, 'promotion', 'sweep_retired'", f"'promotion', 'sweep_retired', {release}"
+    )
+    assert ddl_after == fresh_ddl
 
 
 def test_a_failed_migration_leaves_the_version_11_store_as_it_was(

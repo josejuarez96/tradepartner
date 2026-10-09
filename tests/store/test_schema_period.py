@@ -66,7 +66,9 @@ def _version_14_store(conn: duckdb.DuckDBPyConnection) -> None:
     for three series at two levels), a refused trial, a price row and a journal
     row."""
     schema.init_schema(conn)
-    for table, columns in (("trials", _TRIALS_V15), ("trial_results", ("sharpe_unit",))):
+    # `development_boundary` is version 18's (#1319, T140b), dropped too.
+    trials = (*_TRIALS_V15, "development_boundary")
+    for table, columns in (("trials", trials), ("trial_results", ("sharpe_unit",))):
         for column in columns:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute("DELETE FROM schema_version")
@@ -147,8 +149,8 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
         conn.close()
 
 
-def test_current_schema_version_is_17() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 17
+def test_current_schema_version_is_18() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 18
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -211,6 +213,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (15,),
         (16,),
         (17,),
+        (18,),
     ]
 
 
@@ -222,7 +225,7 @@ def test_every_other_table_is_byte_identical(v14: duckdb.DuckDBPyConnection) -> 
     schema.init_schema(v14)
     assert [t for t in _tables(v14) if t not in _CHANGED | _LAB] == others
     assert _snapshot(v14, others) == before
-    v15 = ", ".join(_TRIALS_V15)
+    v15 = ", ".join((*_TRIALS_V15, "development_boundary"))
     assert v14.execute(f"SELECT * EXCLUDE ({v15}) FROM trials ORDER BY rowid").fetchall() == trials
     assert (
         v14.execute("SELECT * EXCLUDE (sharpe_unit) FROM trial_results ORDER BY rowid").fetchall()
@@ -247,7 +250,7 @@ def test_a_second_open_inserts_nothing_more(v14: duckdb.DuckDBPyConnection) -> N
     rows = _metric_rows(v14)
     schema.init_schema(v14)
     assert _metric_rows(v14) == rows
-    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (4,)
+    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (5,)
 
 
 def test_new_trials_after_the_migration_carry_no_detail_default(
