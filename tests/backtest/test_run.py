@@ -576,6 +576,127 @@ def test_tracking_window_on_or_before_holdout_end_is_refused(
     assert trial["kind"] == "in_sample"
 
 
+# --- the development boundary (ADR 0016 points 2 and 4; plan T142b) -----------------
+
+#: A boundary inside the fixture's in-sample years; the default window then ends at the
+#: last month end on or before it.
+BOUNDARY = date(2018, 12, 15)
+BOUNDARY_END = date(2018, 11, 30)
+
+
+def _set_boundary(store: Path, day: date) -> None:
+    with open_for_write(_store(store)) as conn:
+        registry.write_development_boundary(conn, boundary=day, reason="test")
+
+
+def test_the_default_window_ends_at_the_boundary_and_the_trial_records_it(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_boundary(store, BOUNDARY)
+    calls = _spy(monkeypatch)
+    outcome = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["start_session"], trial["end_session"]) == (IN_SAMPLE_START, BOUNDARY_END)
+    assert trial["development_boundary"] == BOUNDARY
+    assert calls.read_times() and max(calls.read_times()) <= read_time(BOUNDARY_END)
+
+
+@pytest.mark.parametrize(
+    ("window", "flags", "match"),
+    [
+        # An in-sample window ending after the boundary, whatever its flags.
+        ((IN_SAMPLE_START, DEFAULT_END), Flags(), "after the development boundary"),
+        ((IN_SAMPLE_START, DEFAULT_END), SPEND, "after the development boundary"),
+        # A spend starting before holdout.start (a dead session), flag or not.
+        (HOLDOUT_WINDOW, SPEND, "before holdout.start 2019-06-03"),
+    ],
+    ids=["in-sample", "in-sample-with-spend-flag", "spend-from-a-dead-session"],
+)
+def test_a_window_past_the_boundary_is_refused_window_with_no_spend(
+    store: Path,
+    read: Read,
+    monkeypatch: pytest.MonkeyPatch,
+    window: tuple[date, date],
+    flags: Flags,
+    match: str,
+) -> None:
+    _set_boundary(store, BOUNDARY if window[1] == DEFAULT_END else DEFAULT_END)
+    calls = _spy(monkeypatch)
+    outcome = run_hypothesis(SLUG, *window, flags, reasons=SPEND_REASON, store_path=store)
+
+    assert (outcome.status, outcome.results) == ("refused_window", None)
+    assert calls == []
+    conn = read()
+    result = _row(conn, "trial_results", outcome.trial_id)
+    assert result["status"] == "refused_window" and match in result["message"]
+    assert _row(conn, "trials", outcome.trial_id)["kind"] == "in_sample"
+    assert _decisions(conn, outcome.trial_id) == {}
+
+
+def test_a_spend_inside_the_holdout_runs_under_the_boundary(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary leaves a spend that lies inside the holdout to the holdout and gap
+    rules, as before (here the gap gate refuses the June 2019 session)."""
+    _set_boundary(store, DEFAULT_END)
+    _spy(monkeypatch)
+    outcome = run_hypothesis(
+        SLUG, date(2019, 6, 3), date(2019, 8, 30), SPEND, reasons=SPEND_REASON, store_path=store
+    )
+    assert outcome.status == "refused_gap"
+
+
+def test_a_forward_holdouts_tracking_window_starts_inside_it(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0016 point 4: the run passes the family's first registration day, so a
+    holdout that starts after it is forward and its tracking window may start at its
+    first rebalance session. Registered today, the same holdout is historical and the
+    window is refused."""
+    _spy(monkeypatch)
+    window = (date(2019, 6, 28), date(2019, 9, 30))
+    refused = run_hypothesis(
+        SLUG, *window, Flags(), synthetic=True, store_path=tracking_store, kind="tracking"
+    )
+    assert refused.status == "refused_window"
+    with open_for_write(_store(tracking_store)) as conn:
+        conn.execute(
+            "UPDATE hypotheses SET registered_at = ? WHERE family = 'momentum'",
+            [datetime(2019, 5, 1, 12, tzinfo=UTC)],
+        )
+    outcome = run_hypothesis(
+        SLUG, *window, Flags(), synthetic=True, store_path=tracking_store, kind="tracking"
+    )
+    assert outcome.status == "ok"
+    assert _row(read(), "trials", outcome.trial_id)["kind"] == "tracking"
+
+
+def test_a_tracking_run_does_not_read_the_boundary(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """safety-reviewer on #1345: a standalone registration whose in_sample_start is
+    after the boundary (possible through `hypothesis register`) still tracks."""
+    _set_boundary(tracking_store, BOUNDARY)
+    with open_for_write(_store(tracking_store)) as conn:
+        conn.execute(
+            "UPDATE hypotheses SET in_sample_start = ? WHERE slug = ?",
+            [date(2019, 1, 31), TRACKING_SLUG],
+        )
+    _spy(monkeypatch)
+    outcome = run_hypothesis(
+        TRACKING_SLUG,
+        TRACKING_START,
+        TRACKING_END,
+        Flags(),
+        synthetic=True,
+        store_path=tracking_store,
+        kind="tracking",
+    )
+    assert outcome.status == "ok"
+
+
 def test_tracking_run_needs_an_explicit_start_and_end(tracking_store: Path) -> None:
     with pytest.raises(ValueError, match="explicit start and end"):
         run_hypothesis(

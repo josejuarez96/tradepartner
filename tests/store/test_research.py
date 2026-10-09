@@ -608,6 +608,63 @@ def test_a_family_holdout_is_refused_then_spent_then_a_repeat(
     ).fetchone() == (True,)
 
 
+def test_the_boundary_before_the_holdout_leaves_the_holdout_gate_as_it_was(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """ADR 0016 point 2 (plan T142b): every session after a 2023-12-29 boundary in the
+    window is the family's holdout, so the holdout gate decides as before."""
+    _gated(conn, settings, e1h)
+    registry.write_development_boundary(conn, boundary=date(2023, 12, 29), reason="test")
+    ds = _dataset(conn, tmp_path, dates=[date(2023, 1, 3), date(2024, 6, 28)])
+    assert _open(conn, settings, tmp_path, "r1", ds.dataset_id).refusal == "refused_holdout"
+    spent = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
+    assert spent.refusal is None
+
+
+@pytest.mark.parametrize(
+    ("boundary", "window_end", "dead"),
+    [
+        # The dead months between the boundary and holdout.start.
+        (date(2022, 12, 30), date(2024, 12, 31), "(2023-01-03..2023-12-29)"),
+        # Sessions past the last holdout.end.
+        (date(2023, 12, 29), date(2025, 6, 30), "(2025-01-02..2025-06-30)"),
+    ],
+)
+def test_a_window_reading_past_the_boundary_outside_the_holdout_is_refused(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    e1h: ParsedExperiment,
+    tmp_path: Path,
+    boundary: date,
+    window_end: date,
+    dead: str,
+) -> None:
+    """The boundary is one more protected edge, and no flag reads past it."""
+    _hypothesis(conn, settings)
+    research.register_experiment(conn, _returns(e1h, "r1", window_end=window_end), "owner")
+    registry.write_development_boundary(conn, boundary=boundary, reason="test")
+    ds = _dataset(conn, tmp_path, dates=[date(2021, 1, 4), date(2022, 6, 30)])
+    for flags in (None, SPEND):
+        handle = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=flags, reasons=WHY)
+        assert handle.refusal == "refused_window"
+        assert f"development boundary {boundary}" in str(handle.message)
+        assert dead in str(handle.message)
+        assert _result(conn, handle.run_id)[0] == "refused_window"  # type: ignore[index]
+    assert registry.family_holdout_spends(conn, "momentum") == []
+
+
+def test_a_family_with_no_registered_hypothesis_has_no_boundary_edge(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """The edge protects a backtest family's months; a family with no registered
+    hypothesis has none (code-review and quant-auditor on #1345)."""
+    _hypothesis(conn, settings)
+    registry.write_development_boundary(conn, boundary=date(2022, 12, 30), reason="test")
+    research.register_experiment(conn, _returns(e1h, "r1", family="profitability"), "owner")
+    ds = _dataset(conn, tmp_path, dates=[date(2021, 1, 4), date(2022, 6, 30)])
+    assert _open(conn, settings, tmp_path, "r1", ds.dataset_id).refusal is None
+
+
 def test_a_research_spend_after_a_backtest_holdout_trial_is_a_repeat(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:

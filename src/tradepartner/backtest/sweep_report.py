@@ -41,8 +41,12 @@ value: no variant has one, and the window dates are not part of it.
 each family's N, V per basis, declared count and rules, the grandfathered pairs and
 members, every open (incomplete) sweep with its completion and stale counts, the last
 ten `sweep_runs` with seconds per variant, and a warning when `lab.quiet_timezone`
-is not the system time zone. Both raise `LabNotInitialised` on a store without the
-lab tables. Reads only: nothing here writes, deletes, drops, truncates or vacuums.
+is not the system time zone. It also prints the development boundary (ADR 0016; the
+newest `development_boundary` row, or none) and says `forward` beside a family's
+holdout whose `holdout.start` is after the family's first registration day
+(`registry.family_registered_on`; ADR 0016 point 4), derived, never stored. Both raise
+`LabNotInitialised` on a store without the lab tables. Reads only: nothing here
+writes, deletes, drops, truncates or vacuums.
 """
 
 from __future__ import annotations
@@ -257,6 +261,7 @@ class FamilyStatus:
     sharpe_variance_annual_excess: float | None
     declared_count: int
     rules: FamilyRules | None
+    forward: bool = False
 
 
 @dataclass(frozen=True)
@@ -303,6 +308,7 @@ class LabStatus:
     open_sweeps: tuple[OpenSweep, ...]
     last_runs: tuple[SweepRunLine, ...]
     timezone_warning: str | None
+    development_boundary: registry.DevelopmentBoundary | None = None
 
 
 # --- reads -----------------------------------------------------------------------
@@ -844,6 +850,8 @@ def lab_status(
     for family in families:
         sharpes = registry.family_sharpes(conn, family)
         states = _family_states(conn, family, vintage)
+        rules = lab_registry.family_rules(conn, family)
+        first = registry.family_registered_on(conn, family)
         statuses.append(
             FamilyStatus(
                 family=family,
@@ -851,7 +859,8 @@ def lab_status(
                 sharpe_variance_annual_raw=sharpes.variance("raw"),
                 sharpe_variance_annual_excess=sharpes.variance("excess_spy"),
                 declared_count=len(states.declared),
-                rules=lab_registry.family_rules(conn, family),
+                rules=rules,
+                forward=rules is not None and first is not None and rules.holdout_start > first,
             )
         )
         for sweep_id, variant_states in sorted(states.by_sweep.items()):
@@ -884,6 +893,7 @@ def lab_status(
         grandfathered_members=tuple(lab_registry.grandfathered_members(conn)),
         open_sweeps=tuple(open_sweeps),
         last_runs=_last_runs(conn),
+        development_boundary=registry.development_boundary(conn),
         timezone_warning=None
         if matches
         else (
@@ -893,10 +903,11 @@ def lab_status(
     )
 
 
-def _rules_text(rules: FamilyRules) -> str:
+def _rules_text(rules: FamilyRules, forward: bool = False) -> str:
     return (
         f"rules: parent {rules.parent_family or 'none (root)'}; in_sample_start "
-        f"{rules.in_sample_start}; holdout {rules.holdout_start}..{rules.holdout_end}; "
+        f"{rules.in_sample_start}; holdout {rules.holdout_start}..{rules.holdout_end}"
+        f"{' (forward)' if forward else ''}; "
         f"fixed {json.dumps(rules.fixed_params, sort_keys=True)}; max holdout spends "
         f"{rules.max_family_holdout_spends}; max promotions {rules.max_family_promotions}; "
         f"V floor {rules.min_sharpe_variance_annual}; lattice "
@@ -908,13 +919,22 @@ def format_lab_status(status: LabStatus) -> str:
     """`lab status` as text."""
     lines = [f"store size: {status.store_size_bytes / 1e9:.3f} GB"]
     lines += [f"  {table}: {n} rows" for table, n in status.table_rows.items()]
+    b = status.development_boundary
+    lines.append(
+        "development boundary: none"
+        if b is None
+        else f"development boundary: {b.boundary} (decision {b.decision_id}, "
+        f"{b.made_at.isoformat()}): {b.reason}"
+    )
     lines.append("families:")
     for f in status.families:
         lines.append(
             f"  {f.family}: N {f.n}; V raw {_fmt(f.sharpe_variance_annual_raw)}; V excess "
             f"{_fmt(f.sharpe_variance_annual_excess)}; declared count {f.declared_count}"
         )
-        lines.append("    " + (_rules_text(f.rules) if f.rules is not None else "rules: none"))
+        lines.append(
+            "    " + (_rules_text(f.rules, f.forward) if f.rules is not None else "rules: none")
+        )
     lines.append("grandfathered pairs:")
     lines += [
         f"  {fp[:12]}: hypotheses {', '.join(map(str, ids))}"

@@ -883,6 +883,125 @@ def test_console_script_points_at_main() -> None:
     assert callable(cli.main)
 
 
+# --- decision development-boundary (#1319, ADR 0016 point 6, plan T142b) -------------
+
+#: Today's families (#1333): momentum's spent holdout, profitability's unspent one on
+#: the same months, combined's forward one.
+_SPENT = ("momentum", date(2024, 1, 1), date(2026, 9, 30))
+_UNSPENT = ("profitability", date(2024, 1, 1), date(2026, 9, 30))
+_FORWARD = ("combined", date(2027, 1, 1), date(2027, 6, 30))
+
+
+def _boundary_store(settings: Settings, *families: tuple[str, date, date]) -> None:
+    """A migrated store with one hypothesis per family (in-sample from 2020-08-31);
+    momentum's holdout is spent by a holdout trial."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for family, start, end in families:
+            record = registry.register_hypothesis(
+                conn,
+                slug=f"{family}-h",
+                family=family,
+                title=family,
+                doc_path=f"docs/hypotheses/{family}-h.md",
+                doc_sha256="d" * 64,
+                params={"costs.per_side_bps": 15.0},
+                in_sample_start=date(2020, 8, 31),
+                holdout_start=start,
+                holdout_end=end,
+                registered_by="owner",
+                settings=settings,
+            )
+            if family == "momentum":
+                registry.open_trial(
+                    conn,
+                    hypothesis_id=record.hypothesis_id,
+                    kind="holdout",
+                    start_session=start,
+                    end_session=end,
+                    data_cutoff=None,
+                    synthetic=False,
+                    run_by="test",
+                    holdout_reason="spent",
+                    settings=settings,
+                )
+
+
+def _set_boundary(settings: Settings, day: str, reason: str = "ADR 0016") -> Any:
+    return _invoke(
+        settings, ["decision", "development-boundary", "--date", day, "--reason", reason]
+    )
+
+
+def _boundary_rows(settings: Settings) -> int:
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        (n,) = conn.execute(  # type: ignore[misc]
+            "SELECT COUNT(*) FROM owner_decisions WHERE kind = 'development_boundary'"
+        ).fetchone()
+    return int(n)
+
+
+@pytest.mark.parametrize(
+    ("family", "day"),
+    [
+        (_SPENT, "2024-01-01"),
+        (_SPENT, "2025-03-31"),
+        (_UNSPENT, "2024-01-01"),
+        (_FORWARD, "2027-01-01"),
+        (_FORWARD, "2027-03-31"),
+    ],
+    ids=["spent-start", "spent-inside", "unspent-start", "forward-start", "forward-inside"],
+)
+def test_development_boundary_is_refused_on_or_after_any_holdout_start(
+    tmp_path: Path, family: tuple[str, date, date], day: str
+) -> None:
+    settings = _settings(tmp_path)
+    _boundary_store(settings, family)
+    result = _set_boundary(settings, day)
+    assert result.exit_code == 1, result.output
+    assert f"boundary refused: development boundary {day} is on or after" in result.output
+    assert f"{family[0]} ({family[1]})" in result.output
+    assert _boundary_rows(settings) == 0
+
+
+@pytest.mark.parametrize("day", ["2020-08-31", "2019-12-31"])
+def test_development_boundary_is_refused_on_or_before_an_in_sample_start(
+    tmp_path: Path, day: str
+) -> None:
+    settings = _settings(tmp_path)
+    _boundary_store(settings, _SPENT, _UNSPENT, _FORWARD)
+    result = _set_boundary(settings, day)
+    assert result.exit_code == 1, result.output
+    assert "in_sample_start of combined (2020-08-31), momentum" in result.output
+    assert _boundary_rows(settings) == 0
+
+
+def test_development_boundary_writes_a_new_row_each_time(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _boundary_store(settings, _SPENT, _UNSPENT, _FORWARD)
+    first = _set_boundary(settings, "2023-12-29", "ADR 0016, #1320")
+    assert first.exit_code == 0, first.output
+    assert "development_boundary 2023-12-29" in first.output
+    moved = _set_boundary(settings, "2022-12-30", "moved; momentum, profitability ran")
+    assert moved.exit_code == 0, moved.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        found = registry.development_boundary(conn)
+    assert found is not None
+    assert (found.boundary, found.reason) == (
+        date(2022, 12, 30),
+        "moved; momentum, profitability ran",
+    )
+    assert _boundary_rows(settings) == 2
+
+
+def test_development_boundary_usage_errors_write_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _boundary_store(settings, _SPENT)
+    assert _set_boundary(settings, "2023-12-29", " ").exit_code == 2
+    assert _set_boundary(settings, "2023-12-1").exit_code == 2
+    assert _boundary_rows(settings) == 0
+
+
 # --- decision data-release (#1319, data-foundation plan T140b) ------------------------
 
 

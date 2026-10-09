@@ -673,6 +673,79 @@ def test_sweep_state_stale_takes_precedence_over_unrun(
     assert [variant.variant_index for variant in state.unrun] == [2]
 
 
+# --- the development boundary (ADR 0016 points 2 and 6; plan T142b) --------------
+
+#: A moved boundary: the default window then ends at its last month end.
+_MOVED = date(2022, 12, 30)
+
+
+def _boundary(conn: duckdb.DuckDBPyConnection, day: date) -> None:
+    registry.write_development_boundary(conn, boundary=day, reason="test")
+
+
+def test_the_default_window_ends_at_the_boundary(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    sweep, record = _one_variant(lab_store, settings)
+    window = lab_queries.default_window(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert (window.start, window.end) == (IN_SAMPLE_START, DEFAULT_END)
+    _boundary(lab_store, date(2023, 6, 15))
+    window = lab_queries.default_window(lab_store, record.hypothesis_id, sweep.sweep_id)
+    assert (window.start, window.end) == (IN_SAMPLE_START, date(2023, 5, 31))
+
+
+def test_the_first_boundary_at_the_practice_end_stales_nothing(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """#1333: writing 2023-12-29 leaves every default window as it was, so a trial with
+    a NULL recorded boundary stays current and nothing is replanned."""
+    sweep, record = _one_variant(lab_store, settings)
+    trial = _insert_trial(lab_store, record.hypothesis_id)
+    _boundary(lab_store, DEFAULT_END)
+    (recorded,) = lab_store.execute(  # type: ignore[misc]
+        "SELECT development_boundary FROM trials WHERE trial_id = ?", [trial]
+    ).fetchone()
+    assert recorded is None
+    (state,) = lab_queries.variant_states(lab_store, sweep.sweep_id)
+    assert (state.state, state.trial.trial_id if state.trial else None) == ("current", trial)
+    assert lab_queries.sweep_state(lab_store, sweep.sweep_id).complete
+    assert lab_queries.plan_run(lab_store, sweep.sweep_id).variants == ()
+
+
+def test_a_moved_boundary_stales_the_trial_over_the_old_window(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """The window test: a trial whose window is not the default window under the
+    current boundary is stale (counted in N, never selected) and replanned; a trial
+    over the new default window is current again."""
+    sweep, record = _one_variant(lab_store, settings)
+    old = _insert_trial(lab_store, record.hypothesis_id)
+    _boundary(lab_store, _MOVED)
+    (state,) = lab_queries.variant_states(lab_store, sweep.sweep_id)
+    assert state.state == "stale"
+    assert state.trial is not None and state.trial.trial_id == old
+    assert lab_queries.counted_trial(lab_store, record.hypothesis_id, sweep.sweep_id) is None
+    assert lab_queries.sweep_state(lab_store, sweep.sweep_id).state == "incomplete (stale)"
+    assert [
+        p.variant.hypothesis_id for p in lab_queries.plan_run(lab_store, sweep.sweep_id).variants
+    ] == [record.hypothesis_id]
+    new = _insert_trial(lab_store, record.hypothesis_id, window=(IN_SAMPLE_START, _MOVED))
+    (state,) = lab_queries.variant_states(lab_store, sweep.sweep_id)
+    assert state.state == "current"
+    assert state.trial is not None and state.trial.trial_id == new
+
+
+def test_without_a_boundary_another_window_is_not_stale(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """With no boundary row the window test is not applied: an `ok` trial over another
+    window leaves the variant unrun, as before T142b."""
+    sweep, record = _one_variant(lab_store, settings)
+    _insert_trial(lab_store, record.hypothesis_id, window=(IN_SAMPLE_START, _MOVED))
+    (state,) = lab_queries.variant_states(lab_store, sweep.sweep_id)
+    assert (state.state, state.trial) == ("unrun", None)
+
+
 # --- plan_run ------------------------------------------------------------------
 
 

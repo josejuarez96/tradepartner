@@ -66,6 +66,14 @@ hypothesis's lab state (a sweep variant, pre-lab, promoted) and the family rules
 `refused_variant`: a trial with that status, no provider call. A family without a
 rules row (none exists once the lab migration has run) is capped at the live
 `lab.max_family_holdout_spends`.
+
+**The development boundary** (ADR 0016 point 2; data-foundation plan T142b). The open
+reads `registry.development_boundary` once and passes it to the default window
+(`holdout.default_in_sample_window`) and to both `decide` calls, so no in-sample run
+reads a session after it and a spend lies inside the holdout; with no boundary row
+every rule is as before. `Frozen.registered_on` is the family's first registration day
+(`registry.family_registered_on`), so a forward holdout's tracking window may start
+inside it (`holdout.tracking_start`).
 """
 
 from __future__ import annotations
@@ -171,8 +179,14 @@ def _lab_state(
     )
 
 
-def _window(frozen: Frozen, start: date | None, end: date | None, cadence: Cadence) -> Window:
-    default = default_in_sample_window(frozen, cadence)
+def _window(
+    frozen: Frozen,
+    start: date | None,
+    end: date | None,
+    cadence: Cadence,
+    boundary: date | None = None,
+) -> Window:
+    default = default_in_sample_window(frozen, cadence, boundary)
     return Window(
         start if start is not None else default.start,
         end if end is not None else default.end,
@@ -259,9 +273,13 @@ def run_hypothesis(
                 f"yet (engine families: {', '.join(ENGINE_FAMILIES)})"
             )
         params = load_frozen(conn, slug, settings=live)
-        frozen = Frozen.from_hypothesis(hypothesis)
+        frozen = Frozen.from_hypothesis(
+            hypothesis, registered_on=registry.family_registered_on(conn, hypothesis.family)
+        )
         cadence = params.schedule.rebalance_cadence
-        window = tracking_window if tracking else _window(frozen, start, end, cadence)
+        # The tracking rule does not read the boundary (ADR 0016 point 2; `holdout`).
+        boundary = None if tracking else registry.boundary_date(conn)
+        window = tracking_window if tracking else _window(frozen, start, end, cadence, boundary)
         spends = registry.family_holdout_spends(conn, hypothesis.family)
         lab = _lab_state(conn, hypothesis, live)
         decision = decide(
@@ -274,6 +292,7 @@ def run_hypothesis(
             tracking=tracking,
             cadence=cadence,
             lab=lab,
+            boundary=boundary,
         )
         sessions = gap_sessions(window, cadence)
         refused = decision.outcome not in ("run", "needs_gap")
@@ -323,7 +342,15 @@ def run_hypothesis(
                 }
                 provider.end_step()
                 decision = decide(
-                    window, frozen, flags, reasons, series, spends, cadence=cadence, lab=lab
+                    window,
+                    frozen,
+                    flags,
+                    reasons,
+                    series,
+                    spends,
+                    cadence=cadence,
+                    lab=lab,
+                    boundary=boundary,
                 )
                 if decision.outcome != "run":
                     return _close(store, handle, cast(Status, decision.outcome), decision.message)

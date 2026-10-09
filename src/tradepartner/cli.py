@@ -96,6 +96,13 @@ Phase 3 (T42):
   hand-written `data/releases.toml` once, every entry checked before anything is
   written, then one transaction per release. Exit 0 when written, 1 on a
   refusal or a busy store, 2 on a usage error.
+- `tradepartner decision development-boundary --date <YYYY-MM-DD> --reason` writes
+  a new `development_boundary` row (ADR 0016 points 1 and 6; data-foundation plan
+  T142b) through `registry.write_development_boundary`, which refuses a date on or
+  after the `holdout.start` of any registered non-oracle family (spent, unspent or
+  forward) or on or before any such family's `in_sample_start`. The boundary moves
+  only by a new row. Exit 0 when written, 1 on a refusal or a busy store, 2 on a
+  usage error.
 
 Research registry (research-registry spec req 11 and req 14; plan T83):
 
@@ -1743,6 +1750,33 @@ def make_app(
             ids = _release_write(_importer(group), s)
             stages = ", ".join(str(e["stage"]) for e in group)
             typer.echo(f"{group[0]['name']}: imported {stages} (decisions {ids})")
+
+    @decision_app.command("development-boundary")
+    def development_boundary(
+        date_: Annotated[str, typer.Option("--date", help="the last development day (YYYY-MM-DD)")],
+        reason: Annotated[
+            str, typer.Option(help="why, naming every family registered or run under the old one")
+        ],
+    ) -> None:
+        """Set the development boundary: a new row, never an edit (ADR 0016)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        day = _parse_day("--date", date_)
+        assert day is not None
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                decision_id = registry.write_development_boundary(conn, boundary=day, reason=reason)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except registry.BoundaryRefused as exc:
+            raise _fail(f"boundary refused: {exc}", 1) from None
+        typer.echo(f"decision {decision_id}: development_boundary {day}")
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")

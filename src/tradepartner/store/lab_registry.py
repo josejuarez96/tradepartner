@@ -54,8 +54,11 @@ from tradepartner.store.db import insert_row, utc_now
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
     BASE_COST_KEY,
+    UNREAD,
     HypothesisRecord,
     RegistryError,
+    Unread,
+    boundary_date,
     canonical_params_json,
     code_version,
     family_holdout_spends,
@@ -593,14 +596,20 @@ def family_declared_count(conn: duckdb.DuckDBPyConnection, family: str) -> int:
     return int(count)
 
 
-def family_ready_for_sweep(conn: duckdb.DuckDBPyConnection, family: str) -> bool:
+def family_ready_for_sweep(
+    conn: duckdb.DuckDBPyConnection, family: str, boundary: date | Unread | None = UNREAD
+) -> bool:
     """Req 1(c): false while any standalone hypothesis of `family` (one that is
     no sweep's variant: H1, a promoted file), read as the latest registration
     of each slug (the one `backtest <slug>` runs; an older row of a re-registered
     slug never gets a trial), has no `ok`, non-synthetic `in_sample` trial over
     its default window (`holdout.default_in_sample_window` at its frozen
-    cadence). True for a family with no standalone hypothesis."""
+    cadence, under the development `boundary`, ADR 0016 point 2). True for a
+    family with no standalone hypothesis. `boundary` is read from the store
+    (`registry.development_boundary`) unless the caller already read it."""
     require_lab(conn)
+    if isinstance(boundary, Unread):
+        boundary = boundary_date(conn)
     standalone = conn.execute(
         "SELECT MAX(hypothesis_id) FROM hypotheses WHERE family = ? AND hypothesis_id NOT IN "
         "(SELECT hypothesis_id FROM sweep_variants) GROUP BY slug ORDER BY 1",
@@ -609,7 +618,7 @@ def family_ready_for_sweep(conn: duckdb.DuckDBPyConnection, family: str) -> bool
     for (hypothesis_id,) in standalone:
         record = get_hypothesis_by_id(conn, hypothesis_id)
         cadence = frozen_values(record)[CADENCE_KEY]
-        window = default_in_sample_window(Frozen.from_hypothesis(record), cadence)
+        window = default_in_sample_window(Frozen.from_hypothesis(record), cadence, boundary)
         found = conn.execute(
             "SELECT 1 FROM trials t JOIN trial_results r USING (trial_id) "
             "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND NOT t.synthetic "

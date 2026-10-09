@@ -778,6 +778,43 @@ def test_lab_status_warns_when_the_quiet_timezone_is_not_the_system_zone(
     assert "warning: lab.quiet_timezone" in sweep_report.format_lab_status(status)
 
 
+def test_lab_status_prints_the_boundary_and_a_forward_holdout(
+    world: tuple[Store, registry.HypothesisRecord], settings: Settings
+) -> None:
+    """ADR 0016 (plan T142b): the newest boundary row, or none; `forward` beside a
+    family holdout that starts after the family's first registration day, derived."""
+    conn = world[0].conn
+
+    def status() -> sweep_report.LabStatus:
+        return sweep_report.lab_status(
+            conn, settings, system_tz=ZoneInfo("America/New_York"), code_vintage=CODE
+        )
+
+    before = status()
+    assert before.development_boundary is None
+    (momentum,) = [f for f in before.families if f.family == "momentum"]
+    assert not momentum.forward
+    text = sweep_report.format_lab_status(before)
+    assert "development boundary: none" in text
+    assert "(forward)" not in text
+
+    decision_id = registry.write_development_boundary(
+        conn, boundary=DEFAULT_END, reason="ADR 0016, #1320"
+    )
+    conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE family = 'momentum'",
+        [datetime(2023, 12, 31, 23, tzinfo=UTC)],
+    )
+    after = status()
+    assert after.development_boundary == registry.development_boundary(conn)
+    (momentum,) = [f for f in after.families if f.family == "momentum"]
+    assert momentum.forward
+    text = sweep_report.format_lab_status(after)
+    assert f"development boundary: {DEFAULT_END} (decision {decision_id}, " in text
+    assert text.count("): ADR 0016, #1320") == 1
+    assert f"holdout {HOLDOUT_START}..{HOLDOUT_END} (forward); " in text
+
+
 def test_lab_status_lists_the_last_ten_runs_newest_first(
     world: tuple[Store, registry.HypothesisRecord], settings: Settings
 ) -> None:

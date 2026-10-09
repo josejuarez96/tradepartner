@@ -40,6 +40,13 @@ parent's; a root (`None`) has no parent, its own mark and the overlap rule only.
 `family_rules` row is written once, with the live caps, `min_sharpe_variance_annual`
 and lattice, and never read live afterwards. A family with hypotheses but no rules row
 is refused. Every function above `register` reads a file and `Settings` only.
+
+**The development boundary** (ADR 0016 point 2; data-foundation plan T142b).
+`register` reads `registry.development_boundary` once: a file whose `in_sample_start`
+is on or after it, or whose variant has no rebalance session at its cadence on or
+before it, is `DevelopmentBoundaryError`, so no default window is ever empty,
+and the readiness check's default windows (`_unrun_standalone`,
+`lab_registry.family_ready_for_sweep`) end at it. With no boundary row nothing changes.
 """
 
 from __future__ import annotations
@@ -669,6 +676,11 @@ class FamilyLatticeError(SweepRegistrationError):
     """Req 1(e): a grid value off its axis's step in the family rules' lattice."""
 
 
+class DevelopmentBoundaryError(SweepRegistrationError):
+    """ADR 0016 point 2: the file's `in_sample_start` is on or after the development
+    boundary, so its default in-sample window would be empty."""
+
+
 @dataclass(frozen=True)
 class SweepRegistration:
     """A sweep registration: its `sweeps` row, its variants' `sweep_variants` rows and
@@ -723,10 +735,13 @@ def _rule_differences(
     return differences
 
 
-def _unrun_standalone(conn: duckdb.DuckDBPyConnection, family: str) -> list[str]:
+def _unrun_standalone(
+    conn: duckdb.DuckDBPyConnection, family: str, boundary: date | None = None
+) -> list[str]:
     """The slugs of `family`'s standalone hypotheses (latest registration per slug, no
     sweep's variant) without an `ok`, non-synthetic, in-sample trial over the default
-    window: the names refusal 1(c) gives. `lab_registry.family_ready_for_sweep` decides."""
+    window under the development `boundary`: the names refusal 1(c) gives.
+    `lab_registry.family_ready_for_sweep` decides."""
     rows = conn.execute(
         "SELECT MAX(hypothesis_id) FROM hypotheses WHERE family = ? AND hypothesis_id NOT IN "
         "(SELECT hypothesis_id FROM sweep_variants) GROUP BY slug ORDER BY 1",
@@ -736,7 +751,7 @@ def _unrun_standalone(conn: duckdb.DuckDBPyConnection, family: str) -> list[str]
     for (hypothesis_id,) in rows:
         record = registry.get_hypothesis_by_id(conn, hypothesis_id)
         cadence = frozen.frozen_values(record)[lab_registry.CADENCE_KEY]
-        window = default_in_sample_window(Frozen.from_hypothesis(record), cadence)
+        window = default_in_sample_window(Frozen.from_hypothesis(record), cadence, boundary)
         found = conn.execute(
             "SELECT 1 FROM trials t JOIN trial_results r USING (trial_id) "
             "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND NOT t.synthetic "
@@ -899,6 +914,21 @@ def register(
     existing = _existing_registration(conn, parsed, variants)
     if existing is not None:
         return existing
+    boundary = registry.boundary_date(conn)
+    if boundary is not None and parsed.in_sample_start >= boundary:
+        raise DevelopmentBoundaryError(
+            f"{file}: in_sample_start {parsed.in_sample_start} is on or after the "
+            f"development boundary {boundary}: no in-sample session would remain"
+        )
+    if boundary is not None:
+        for variant in variants:
+            cadence = variant.frozen_set[lab_registry.CADENCE_KEY]
+            if not rebalance_sessions(parsed.in_sample_start, boundary, cadence):
+                raise DevelopmentBoundaryError(
+                    f"{file}: variant {variant.values} has no {cadence} rebalance session "
+                    f"between in_sample_start {parsed.in_sample_start} and the development "
+                    f"boundary {boundary}"
+                )
 
     rules = lab_registry.family_rules(conn, parsed.family)
     new_family: tuple[str | None, float | None] | None = None
@@ -928,8 +958,8 @@ def register(
                 f"hypothesis {holder.slug!r} (id {holder.hypothesis_id}); the existing "
                 "registration is the record"
             )
-    if not lab_registry.family_ready_for_sweep(conn, parsed.family):
-        unrun = _unrun_standalone(conn, parsed.family)
+    if not lab_registry.family_ready_for_sweep(conn, parsed.family, boundary):
+        unrun = _unrun_standalone(conn, parsed.family, boundary)
         raise FamilyNotReadyError(
             f"{file}: family {parsed.family!r} is not ready for a sweep: "
             f"{', '.join(repr(s) for s in unrun)} has no ok, non-synthetic, in-sample "

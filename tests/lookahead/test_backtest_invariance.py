@@ -31,6 +31,11 @@ session T_i of the case's window:
   are compared whole, at every cost level.
 - **Prefix invariance**: `run(end=T_i)` equals the prefix through T_i of
   `run(end=T_n)`.
+- **The development boundary** (ADR 0016 point 2; plan T142b): with a boundary row in
+  the store (a non-session day inside the walk), the run over the default window the
+  callers build from it (`holdout.default_in_sample_window` with
+  `registry.development_boundary`) equals the same run on the store truncated at the
+  boundary's last session close: nothing after the boundary is read.
 - **Teeth**: on a synthetic copy of the store, three revisions each known an hour
   after close(T_i) leave `run(end=T_i)` unchanged and change `run(end=T_{i+1})`: a
   bar revision at T_i on a held name, a dividend revision with ex-date T_i on a name
@@ -75,9 +80,10 @@ from conftest import load_universe_fixtures
 
 from lookahead.harness import TruncatedStore
 from tradepartner.backtest.engine import BacktestResult, run
+from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.calendar import next_session, previous_session, session_close
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import prices_as_of
@@ -601,3 +607,44 @@ def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
         without.close()
     for level in COST_LEVELS:
         assert got[level].targets != want[level].targets, f"run to {t_after}, level {level}"
+
+
+def test_a_run_under_the_boundary_reads_nothing_after_it(fixture: Fixture) -> None:
+    """Module docstring, "The development boundary". The boundary is the Saturday after
+    the walk's middle rebalance (and its first month end), so the window's end and the
+    truncation differ."""
+    # Past the first month end too: the fixture hypothesis freezes the default
+    # `month_end` cadence, which the boundary writer checks (the daily case's walk is a
+    # month and a half long).
+    middle = max(
+        fixture.sessions[len(fixture.sessions) // 2],
+        rebalance_sessions(fixture.case.start, fixture.case.end, "month_end")[0],
+    )
+    boundary = middle + timedelta(days=(5 - middle.weekday()) % 7 or 7)
+    assert not is_session(boundary)
+    conn = fixture.conn
+    decision_id = registry.write_development_boundary(conn, boundary=boundary, reason="test")
+    try:
+        found = registry.development_boundary(conn)
+        assert found is not None and found.boundary == boundary
+        record = registry.get_hypothesis(conn, "h-lookahead")
+        # The fixture hypothesis freezes no gap threshold (no run here reads the gate).
+        frozen = Frozen(
+            record.hypothesis_id,
+            record.in_sample_start,
+            record.holdout_start,
+            record.holdout_end,
+            gap_count_share_threshold=0.05,
+        )
+        window = default_in_sample_window(frozen, fixture.case.cadence, found.boundary)
+        assert window.end <= boundary < fixture.sessions[-1]
+        full = fixture.run(window.end)
+        truncated = TruncatedStore(conn)
+        try:
+            cut_conn = truncated.at(session_close(previous_session(boundary)))
+            cut = fixture.run(window.end, connect=_factory(cut_conn))
+        finally:
+            truncated.close()
+        _assert_same(cut, full, f"run under the boundary {boundary} (window end {window.end})")
+    finally:
+        conn.execute("DELETE FROM owner_decisions WHERE decision_id = ?", [decision_id])
