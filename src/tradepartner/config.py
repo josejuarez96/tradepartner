@@ -1270,7 +1270,8 @@ class LabConfig(BaseModel):
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
 
 # The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
-# whole `risk.*` section; every other `paper.*` key is read at run time.
+# whole `risk.*` section; every other `paper.*` key is read at run time. `min_rebalances`
+# is frozen as its window's cadence's entry of the per-cadence table (ADR 0017 part C).
 FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "tracking_k",
     "min_rebalances",
@@ -1391,6 +1392,17 @@ class RiskConfig(BaseModel):
     reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
 
 
+# `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
+# spec's amendment of 2026-10-09): six months, a quarter of weeks, a quarter of sessions.
+# `paper start` freezes the window's cadence's entry as the scalar `paper.min_rebalances`
+# in `frozen_json`, so every reader of the frozen key reads one number.
+_DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
+    "month_end": 6,
+    "week_end": 13,
+    "daily": 63,
+}
+
+
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
@@ -1410,12 +1422,17 @@ class PaperConfig(BaseModel):
     `^[A-Za-z0-9]+$` (no `-` or `:`, so the prefix and the book parse from the
     left of the id, whose `security_id` may contain a `:`), is not in
     `FROZEN_PAPER_KEYS`, and defaults to `store.schema.DEFAULT_BOOK_ID`'s `"main"`.
+    `min_rebalances` is the per-cadence table (ADR 0017 part C): an entry for every
+    `Cadence`, each above zero; `paper start` freezes the window's cadence's entry as
+    the scalar `paper.min_rebalances` (`execution.window._frozen_params`).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     book_id: str = Field(default="main", min_length=1, pattern=r"^[A-Za-z0-9]+$")
-    min_rebalances: int = Field(default=6, gt=0)
+    min_rebalances: dict[Cadence, int] = Field(
+        default_factory=lambda: dict(_DEFAULT_MIN_REBALANCES)
+    )
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
@@ -1428,6 +1445,17 @@ class PaperConfig(BaseModel):
     order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
     live_capital_reference: float = Field(default=100.0, gt=0)
     min_override_reason_chars: int = Field(default=20, ge=1)
+
+    @field_validator("min_rebalances")
+    @classmethod
+    def _validate_min_rebalances(cls, value: dict[Cadence, int]) -> dict[Cadence, int]:
+        missing = sorted(set(get_args(Cadence)) - set(value))
+        if missing:
+            raise ValueError(f"paper.min_rebalances is missing an entry for {missing}")
+        not_positive = sorted(cadence for cadence, count in value.items() if count <= 0)
+        if not_positive:
+            raise ValueError(f"paper.min_rebalances must be above 0 for {not_positive}")
+        return value
 
     @model_validator(mode="after")
     def _validate_poll_within_accept_wait(self) -> PaperConfig:

@@ -5,10 +5,13 @@ T84b).
 
 `start(settings, connect, broker, clock, slug)` is `paper start --hypothesis
 <slug>`. First it refuses a family paper trading cannot run
-(`family_not_runnable`) and a hypothesis whose cadence, read through
-`backtest.frozen.frozen_values`, is not `month_end` (`refused_cadence`,
-strategy-lab spec req 11; a pre-lab registration, stored without `schedule.*`
-keys, reads as `month_end`). Then, in order, it refuses, before any write:
+(`family_not_runnable`). Every cadence is accepted (ADR 0017 part C,
+strategy-lab spec req 11 as amended 2026-10-09): the hypothesis's
+`schedule.rebalance_cadence`, read through `backtest.frozen.frozen_values` (a
+pre-lab registration, stored without `schedule.*` keys, reads as `month_end`),
+is the cadence of the holdout-end check, of T_0 and of the forward first
+session below, and picks the frozen `paper.min_rebalances`. Then, in order, it
+refuses, before any write:
 
 1. **No `gap_signoff`.** `owner_decisions` must hold a row of kind
    `gap_signoff` for the hypothesis, referencing a trial that is `ok`,
@@ -18,9 +21,10 @@ keys, reads as `month_end`). Then, in order, it refuses, before any write:
    against the trial as it is *now* (a trial could in principle be amended
    only by a fresh row, never updated, but the check is cheap and the gate
    matters).
-2. **`holdout.end` not a completed month-end.** The hypothesis's frozen
-   `holdout_end` must be the last XNYS session of its calendar month, and
-   its close must already be in the past at the clock's reading. For a
+2. **`holdout.end` not a completed rebalance session.** The hypothesis's
+   frozen `holdout_end` must be a rebalance session at its cadence (at
+   `month_end`, the last XNYS session of its calendar month), and its close
+   must already be in the past at the clock's reading. For a
    **forward** holdout (ADR 0016 point 4, `holdout.is_forward` with the
    family's first registration day, `registry.family_registered_on`), and
    only then, the rule is instead that `holdout.start` has passed: the
@@ -44,13 +48,15 @@ keys, reads as `month_end`). Then, in order, it refuses, before any write:
    prices paper fills against the trial's own convention.
 
 Once accepted, `start` appends the `paper_windows` row (`T_0`, the first
-rebalance session strictly after both `holdout_end` and today, per the spec
+rebalance session at the hypothesis's cadence strictly after both
+`holdout_end` and today, per the spec
 Definitions' "Paper window"; for a forward holdout, the first rebalance
 session on or after `holdout.start` and strictly after today, so the window
 sits inside the holdout and never starts on a session already past;
 `starting_cash` and `starting_equity` from `account()`; `code_version`;
 `frozen_json`/`frozen_sha256`, the canonicalised and hashed `risk.*`
-section plus `FROZEN_PAPER_KEYS`, `FROZEN_COSTS_KEYS` and
+section plus `FROZEN_PAPER_KEYS` (`paper.min_rebalances` as the cadence's
+entry of the per-cadence table), `FROZEN_COSTS_KEYS` and
 `FROZEN_EXECUTION_KEYS`, exactly as `registry.canonical_params_json`/
 `params_sha256` do for hypothesis parameters), the `carried_residue`
 adjustments copied from the previous window's listed residues (quantity and
@@ -285,9 +291,13 @@ _RISK_PREFIX = "risk."
 _PAPER_PREFIX = "paper."
 _COSTS_PREFIX = "costs."
 _EXECUTION_PREFIX = "execution."
-#: The one cadence a paper window accepts (strategy-lab spec req 11; ADR 0005).
 _CADENCE_KEY = "schedule.rebalance_cadence"
-_PAPER_CADENCE: Cadence = "month_end"
+#: How `holdout_not_complete` names a completed rebalance session at each cadence.
+_CADENCE_END: dict[Cadence, str] = {
+    "month_end": "month-end",
+    "week_end": "week-end",
+    "daily": "session",
+}
 _ABANDONED = "abandoned"
 _DUST = "dust"
 _UNTRADABLE = "untradable"
@@ -344,9 +354,15 @@ def window_cadence(conn: duckdb.DuckDBPyConnection, window: PaperWindowRow) -> C
     `frozen_values` (ADR 0015 seam 4): the cadence every paper-path call is passed.
     `ValueError` for a value outside `Cadence`."""
     hypothesis = registry.get_hypothesis_by_id(conn, window.hypothesis_id)
-    cadence = frozen_values(hypothesis)[_CADENCE_KEY]
+    return _cadence_of(frozen_values(hypothesis), f"window {window.window_id}'s hypothesis")
+
+
+def _cadence_of(values: Mapping[str, Any], owner: str) -> Cadence:
+    """`values`' `schedule.rebalance_cadence`; `ValueError` naming `owner` for a value
+    outside `Cadence`."""
+    cadence = values.get(_CADENCE_KEY)
     if cadence not in get_args(Cadence):
-        raise ValueError(f"window {window.window_id}'s hypothesis has cadence {cadence!r}")
+        raise ValueError(f"{owner} has cadence {cadence!r}")
     return cast(Cadence, cadence)
 
 
@@ -398,11 +414,16 @@ def _cost_drifted(registered_value: Any, live_value: float) -> bool:
         return True
 
 
-def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[str, Any]:
+def _frozen_params(
+    settings: Settings, registered: Mapping[str, Any], cadence: Cadence
+) -> dict[str, Any]:
     """The flat dict `frozen_json` canonicalises: every `risk.*` key plus
     `FROZEN_PAPER_KEYS` under `paper.*`, `FROZEN_COSTS_KEYS` under `costs.*` and
     `FROZEN_EXECUTION_KEYS` under `execution.*` (spec req 14; the costs #534; the
     fill price #366 Q20, #526, which `paper report` reads back).
+    `paper.min_rebalances` is frozen as `cadence`'s entry of the per-cadence table,
+    a scalar under the same key (ADR 0017 part C), so every reader of the frozen
+    key is unchanged.
 
     The frozen costs must equal the hypothesis's `registered` parameters,
     which planning sizes the decisions with, so the plan and the wrapper share
@@ -413,6 +434,7 @@ def _frozen_params(settings: Settings, registered: Mapping[str, Any]) -> dict[st
     convention (`execution_drift`)."""
     risk = settings.risk.model_dump()
     paper = settings.paper.model_dump()
+    paper["min_rebalances"] = settings.paper.min_rebalances[cadence]
     costs = settings.costs.model_dump()
     execution = settings.execution.model_dump()
     drift = [
@@ -652,13 +674,7 @@ def start(
                     f"yet (paper families: {', '.join(PAPER_FAMILIES)})",
                 )
             registered = frozen_values(hyp)
-            cadence = registered.get(_CADENCE_KEY)
-            if cadence != _PAPER_CADENCE:
-                raise StartRefusedError(
-                    "refused_cadence",
-                    f"{slug!r} rebalances at cadence {cadence!r}; a paper window "
-                    f"accepts only {_PAPER_CADENCE!r} (strategy-lab spec req 11)",
-                )
+            cadence = _cadence_of(registered, f"hypothesis {slug!r}")
             if not _gap_signoff_ok(conn, hyp.hypothesis_id):
                 raise StartRefusedError(
                     "gap_signoff",
@@ -673,11 +689,11 @@ def start(
                         "holdout_not_complete",
                         f"{slug!r}'s forward holdout.start ({hyp.holdout_start}) has not passed",
                     )
-            elif not _holdout_end_completed(hyp.holdout_end, now, _PAPER_CADENCE):
+            elif not _holdout_end_completed(hyp.holdout_end, now, cadence):
                 raise StartRefusedError(
                     "holdout_not_complete",
                     f"{slug!r}'s frozen holdout.end ({hyp.holdout_end}) is not a "
-                    "completed month-end",
+                    f"completed {_CADENCE_END[cadence]}",
                 )
             try:
                 if open_window(conn) is not None:
@@ -715,12 +731,12 @@ def start(
         )
 
         t_0 = (
-            _forward_first_session(hyp.holdout_start, today, _PAPER_CADENCE)
+            _forward_first_session(hyp.holdout_start, today, cadence)
             if forward
-            else _first_rebalance_session(hyp.holdout_end, today, _PAPER_CADENCE)
+            else _first_rebalance_session(hyp.holdout_end, today, cadence)
         )
         commit, _dirty = registry.code_version()
-        params = _frozen_params(settings, registered)
+        params = _frozen_params(settings, registered, cadence)
         frozen_json = registry.canonical_params_json(params)
         frozen_sha256 = registry.params_sha256(params)
 

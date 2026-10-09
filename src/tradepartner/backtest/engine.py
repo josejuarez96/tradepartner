@@ -77,7 +77,12 @@ import polars as pl
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
 from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.portfolio import target_weights
-from tradepartner.backtest.provider import DataProvider, GapReading
+from tradepartner.backtest.provider import (
+    TURNOVER_BAR_COLUMNS,
+    DataProvider,
+    GapReading,
+    TurnoverInputs,
+)
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
@@ -737,6 +742,15 @@ class _SharedReads:
     def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
         return cast(Mapping[str, int | None], self._read(("sics", t), ids))
 
+    def turnover_inputs(
+        self, t: datetime, ids: Sequence[str], sessions_from: date
+    ) -> TurnoverInputs:
+        # Made as asked, once per step for one `(t, ids, sessions_from)` (T165b).
+        return self._once(
+            ("turnover_inputs", t, tuple(ids), sessions_from),
+            lambda: self._provider.turnover_inputs(t, ids, sessions_from),
+        )
+
 
 class _Requests:
     """A stand-in provider a variant's signal reader runs against to say which keyed
@@ -791,6 +805,15 @@ class _Requests:
     def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
         self._ask(("sics", t), ids)
         return {}
+
+    def turnover_inputs(
+        self, t: datetime, ids: Sequence[str], sessions_from: date
+    ) -> TurnoverInputs:
+        # Not a keyed read: nothing is declared or read here (an empty value the
+        # reader only wraps); `_plan` makes the real read once per step (T165b).
+        return TurnoverInputs(
+            t=t, bars=pl.DataFrame(schema=list(TURNOVER_BAR_COLUMNS)), shares={}, splits={}
+        )
 
 
 @dataclass

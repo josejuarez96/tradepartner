@@ -152,6 +152,11 @@ class TrialMonths:
     #: this dataclass's other maps. `None` only for a caller (an existing test) that
     #: never calls `compare_targets`; `compare_months` never reads this field.
     trial_id: int | None = None
+    #: The cadence `sessions` are rebalance sessions at: the window's frozen cadence
+    #: (`window.window_cadence`, #1286), which `_trial_months` reads `sessions` at and
+    #: `compare_targets` passes to `fill_session`. The `month_end` default serves only a
+    #: hand-built test trial; `paper report` and `paper check` always set it.
+    cadence: Cadence = "month_end"
 
 
 @dataclass(frozen=True)
@@ -640,7 +645,7 @@ def compare_targets(
     trial_weights = _trial_weights_at(store, trial.trial_id)
     rows: list[TargetRow] = []
     for t_i in trial.sessions[:-1]:
-        f_i = fill_session(t_i)
+        f_i = fill_session(t_i, trial.cadence)
         session_decisions = {
             d.security_id: d for d in journal.decisions if d.rebalance_session == t_i
         }
@@ -779,12 +784,13 @@ def _journal_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> Journal:
     )
 
 
-def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths:
+def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Cadence) -> TrialMonths:
     """`TrialMonths` for `trial_id`'s base cost level (backtest spec: "targets are
     identical across levels"; `trial_id` carried so `compare_targets` can read
-    `trial_weights` itself).
+    `trial_weights` itself), at the window's `cadence` (#1286: one period per
+    rebalance period of that cadence, an ISO week at `week_end`).
 
-    `sessions` is `schedule.rebalance_sessions(start, end)` over the trial's own
+    `sessions` is `schedule.rebalance_sessions(start, end, cadence)` over the trial's own
     window, never every `trial_equity` row: that table carries one row per
     calendar session (the daily equity curve `engine.run` marks through), not
     one per rebalance, so reading its `session` column directly would hand
@@ -798,7 +804,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
     hypothesis_id, start_session, end_session = found
     hypothesis = registry.get_hypothesis_by_id(conn, hypothesis_id)
     base_level = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
-    sessions = tuple(rebalance_sessions(start_session, end_session))
+    sessions = tuple(rebalance_sessions(start_session, end_session, cadence))
     equity_rows = conn.execute(
         "SELECT session, equity FROM trial_equity "
         "WHERE trial_id = ? AND series = 'strategy' AND cost_per_side_bps = ?",
@@ -816,6 +822,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
         equity={session: equity[session] for session in sessions if session in equity},
         cost_paid=cost_paid,
         trial_id=trial_id,
+        cadence=cadence,
     )
 
 
@@ -882,7 +889,7 @@ def report(settings: Settings, connect: Connect) -> Report:
         raise ValueError(f"tracking trial {outcome.trial_id} did not run ({outcome.status})")
 
     with connect() as conn:
-        trial = _trial_months(conn, outcome.trial_id)
+        trial = _trial_months(conn, outcome.trial_id, cadence)
         journal = _journal_for(conn, window_id)
         actions = conn.execute("SELECT * FROM corporate_actions").pl()
         prices = _price_of(conn, fill_price_key)
