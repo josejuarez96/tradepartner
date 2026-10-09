@@ -324,6 +324,26 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", other_failed), "abc") == "failure"
     twice = (cr("checks", "COMPLETED", "FAILURE"), cr("checks", "COMPLETED", "SUCCESS"))
     assert ready_pr.checks_state(hc("abc", twice), "abc") == "failure"
+    # #1254 review: only a cancelled run's *exact* name is excused by a same-named success.
+    # A cancelled sibling shard is not excused by the other shards passing ...
+    siblings = tuple(cr(f"pytest-shard ({i})", "COMPLETED", "SUCCESS") for i in range(8) if i != 3)
+    cancelled_sibling = (
+        *siblings,
+        cr("pytest-shard (3)", "COMPLETED", "CANCELLED"),
+        cr("checks", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", cancelled_sibling), "abc") == "failure"
+    # ... a lone cancelled bare matrix name with no full run on the head is never green ...
+    lone_bare = (cr("pytest-shard", "COMPLETED", "CANCELLED"),)
+    assert ready_pr.checks_state(hc("abc", lone_bare), "abc") == "pending"
+    # ... and a non-matrix job is excused only by its own name, never by a matrix stem: a
+    # cancelled `build (2)` is not the cancelled parent of a successful `build`.
+    non_matrix = (
+        cr("build (2)", "COMPLETED", "CANCELLED"),
+        cr("build", "COMPLETED", "SUCCESS"),
+        cr("checks", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", non_matrix), "abc") == "failure"
 
 
 def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> None:
