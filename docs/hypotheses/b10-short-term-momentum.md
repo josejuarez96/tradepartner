@@ -18,14 +18,22 @@ amendment #951; `backtest/frozen.py` `canonical_frozen_set`) keeps every key of 
 family's **own** section in the canonical set even at its default, so a new `strategy.*`
 key would be overlaid at 1.0 onto H1's, the T114 variants', `oracle`'s and `combined`'s
 stored params and move each recomputed fingerprint. The spec amendment must therefore
-also amend decision 13's own-section rule for **post-baseline keys**: a key added after
-`LAB_BASELINE_FROZEN_KEYS` with a `FROZEN_KEY_DEFAULTS` entry is left out of the
-canonical set at its default even in its own section, so a registration that never named
-it hashes as before, while B10 (which names 0.20) and any later file that names 1.0
-explicitly hash the same as one that leaves it out (two registrations with one canonical
-set are one test, as the rule intends). The alternative, re-recording every stored
-fingerprint under a named data release, is the fallback the amendment may choose; either
-way the engine task's pinned test checks the rule the amendment states, not an assertion.
+also amend decision 13's own-section rule, **narrowly**: a key added to a family's own
+section **after that family's first registration** (its `FROZEN_KEY_DEFAULTS` schema
+version later than the family's first-registration version, or an explicit
+post-registration marker on the entry) is left out of the canonical set at its default
+even in its own section, so a registration that never named it hashes as before, while
+B10 (which names 0.20) and any later file that names 1.0 explicitly hash the same as one
+that leaves it out (two registrations with one canonical set are one test, as the rule
+intends). The carve-out must **not** reach keys that existed at a family's first
+registration: every `profitability.*` key and both `combined.*` keys are post-baseline
+entries in `FROZEN_KEY_DEFAULTS` too, and B3 registered at exactly their defaults, so a
+rule keyed on the lab baseline rather than on the family's first registration would strip
+B3's seven keys from its canonical set and move its fingerprint, the same hazard for
+`profitability`. The alternative, re-recording every stored fingerprint under a named
+data release, is the fallback the amendment may choose; either way the engine task's
+pinned tests check the rule the amendment states, for H1, the T114 variants, B3 and
+`combined` alike, not an assertion.
 Under
 research-program §4, promotion condition 1 (data) **is met**: bars with volume, the
 shares-outstanding fact and corporate actions are in the store; condition 2 (engine) is
@@ -91,15 +99,18 @@ sweep can later vary the screen:
    by shares outstanding known at `t`: the rule-7 fact (`EntityCommonStockSharesOutstanding`,
    `facts_as_of(t)`, `known_at` = its filing's acceptance, at most
    `universe.max_shares_age_days` old), with **both** series expressed in the share
-   units of T: the share count is the universe's rule-7 pick, already moved through every
-   split whose ex-date falls **after the fact's own date** and at or before T (the
-   `shares_as_of` walk of rule 7 and T117; a fact dated after an ex-date is not adjusted
-   again), and each session's volume is multiplied by the ratio of every split whose
+   units of T: the share count is the universe's rule-7 pick (`shares_as_of`, whose
+   `SharesPick.shares` is the **raw** filed count), moved by this signal as rule 8's cap
+   loop moves it, by every split known at `t` whose ex-date falls **after the fact's own
+   date** and at or before T (`as_of_date < ex_date ≤ T`; a fact dated after an ex-date
+   is not adjusted again, and a fact dated before an earlier split is moved by that split
+   too), and each session's volume is multiplied by the ratio of every split whose
    ex-date falls after that session and at or before T. A member with no usable shares
    fact at `t` (rule 7 already excludes it) or with a bar missing on **any** session of
    the formation month is excluded and counted (`n_excluded_no_turnover`), never given a
    turnover of zero.
-3. **Screen:** the top `strategy.turnover_top_fraction` (0.20) of the universe by
+3. **Screen:** the top `strategy.turnover_top_fraction` (0.20) **of the members with a
+   usable turnover** (`n_universe − n_excluded_no_turnover`, the denominator) by
    turnover, ties by `security_id` ascending; about 200 names. Counted (`n_screened`).
 4. **Score** inside the screened set: H1's momentum score with `formation_months = 1`,
    `skip_months = 0`, `signal_total_return = true`, `signal_anchor = month_end`: the
@@ -117,9 +128,10 @@ prefix invariance with the screen on; a revision case with teeth (a shares fact 
 unchanged, `run(end=T_{i+1})` changed); a split-month case (a 2-for-1 with ex-date inside
 the formation month leaves the name's turnover rank unchanged against a no-split twin);
 and a pinned check that H1's reference metrics are unchanged with the key at its default
-and that H1's canonical frozen set and fingerprint are unchanged **under the amended
-own-section rule** (above): the key, absent from H1's stored params, is left out of its
-canonical set at the default.
+and that H1's, the T114 variants', B3's and `combined`'s canonical frozen sets and
+fingerprints are unchanged **under the amended own-section rule** (above): the new key,
+absent from their stored params, is left out of each canonical set at the default, while
+B3's seven `profitability.*` keys at their defaults stay in B3's.
 
 ## Parameters
 
@@ -410,8 +422,9 @@ screen) so no registration is re-registered. **One rule must change with it:** d
 13's own-section rule keeps every `strategy.*` key in a `momentum` canonical set even at
 its default, so without an amendment the new key moves H1's, the T114 variants',
 `oracle`'s and `combined`'s fingerprints (the first paragraph of this file says how); the
-amendment carves out post-baseline own-section keys at their default, or re-records the
-fingerprints under a data release. With that, the route needs no family code, no new N,
+amendment carves out own-section keys added **after the family's first registration** at
+their default (never the keys a family registered with: B3's `profitability.*` stay in
+its set), or re-records the fingerprints under a data release. With that, the route needs no family code, no new N,
 and no slot in the forward-exam queue, and it lets a later `momentum` sweep vary the
 screen as an axis (`lab.sweepable_keys` gains the key by reviewed config change). Its
 cost is stated above: B10 counts in momentum's N and has no exam of record of its own.
@@ -424,18 +437,19 @@ nothing is built here):
    the universe by formation-period share turnover that is ranked; 1.0 ranks everyone"),
    rule 2's turnover definition and its adjustment, the exclusion reason `no_turnover`, the
    counts `n_screened` and `n_excluded_no_turnover`, the look-ahead cases above, the
-   `FROZEN_KEY_DEFAULTS` entry, **and the decision 13 amendment** (post-baseline
-   own-section keys left out of the canonical set at their default, or the re-record
-   fallback), with the strategy-lab Definitions "Fingerprint" sentence pointed at it.
-   Size S.
+   `FROZEN_KEY_DEFAULTS` entry, **and the decision 13 amendment** (own-section keys
+   added after the family's first registration left out of the canonical set at their
+   default, keyed on the family's first-registration schema version or a marker, never on
+   the lab baseline; or the re-record fallback), with the strategy-lab Definitions
+   "Fingerprint" sentence pointed at it. Size S.
 2. **Config and the canonical set:** `config.py` gains the key on `StrategyConfig`, the
    `FROZEN_KEY_DEFAULTS` entry, the reason and counts on `FAMILIES["momentum"]` (and on
    `oracle` and `combined`, which read the `strategy` section; `combined` applies the
    screen to its momentum half only if its spec says so, otherwise it ignores the key at
    its default), and optionally the `lab.sweepable_keys` entry; `backtest/frozen.py`
    `canonical_frozen_set` implements the amended own-section rule; `tests/test_config.py`
-   and `tests/backtest/test_frozen.py` pin the default, and H1's, the T114 variants' and
-   `combined`'s canonical sets and fingerprints unchanged. Size S. `quant-auditor`,
+   and `tests/backtest/test_frozen.py` pin the default, and H1's, the T114 variants',
+   **B3's** and `combined`'s canonical sets and fingerprints unchanged. Size S. `quant-auditor`,
    `safety-reviewer` (`config.py` is on both lists).
 3. **The read and the screen:** `backtest/strategies.py` reads the formation month's
    volume from the bars frame, the shares fact through `facts_as_of(t)` and the actions

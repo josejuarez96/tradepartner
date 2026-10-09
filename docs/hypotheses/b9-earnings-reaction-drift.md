@@ -84,9 +84,12 @@ look-ahead tests have one source.
 1. **An event is an 8-K whose `items` names 2.02, known at its acceptance.** The row
    comes from the `filing_events` table T151 adds (`cik`, `accession`, `form`, `items`,
    `accepted_at`), with `known_at` = the submissions `acceptanceDateTime` (UTC), never
-   the filing index's `filed` date: an 8-K accepted at 20:30 New York carries the next
-   calendar day's `filed` date, and keying on it would move day 0 a session late or, for
-   a pre-open acceptance, make the window start before the release was public. The
+   the filing index's `filed` date. The trap: an 8-K accepted between 16:00 and about
+   17:30 New York on a session carries **that** session's `filed` date (EDGAR dates a
+   filing the next business day only after about 17:30), so a read keyed on `filed` (at
+   the day's open, or at its close) would know the release before it was public and put
+   day 0 on the session the release came **after**; one accepted at 20:30 carries the next
+   day's date, which is merely a session's lag, not a look-ahead. The
    universe member is the CIK's listed class(es) through the master, as for every other
    filing-derived fact (data-foundation spec req 8).
 2. **Day 0 is the first XNYS session whose open is after the acceptance instant**
@@ -154,9 +157,12 @@ amendment extended them for statement facts): truncation and prefix invariance w
 **after** close(T_i) whose event would enter at T_i: `run(end=T_i)` unchanged,
 `run(end=T_{i+1})` changed); a breakpoint case (an event whose window closes after
 close(T_i) and would move the 80th percentile at T_i: unchanged at T_i); a `filed`-date
-trap (an 8-K accepted after the close whose `filed` date is the next day: day 0 is the
-next session, never that day); and the plan-read timing check with the new plan fields
-compared.
+trap **with teeth** (an 8-K accepted between 16:00 and 17:30 New York on session T, so
+that its `filed` date equals T: the event is invisible at T's open and at close(T), and
+day 0 is T + 1; a `filed`-keyed read would fail both assertions), beside a 20:30
+acceptance as the lag case (`filed` = T + 1, day 0 = T + 1, which a `filed`-keyed read
+gets right by accident and so proves nothing on its own); and the plan-read timing check
+with the new plan fields compared.
 
 ## Parameters
 
@@ -307,11 +313,12 @@ files (the report's "Universe mismatch"). The 2019-2023 figures alone are insign
   **16%/month one-sided, about 0.05%/month at 15 bp**.
 
 So one-sided turnover is about **100 to 200%/month** and the base-level cost about **3.6
-to 7 pp/yr** (about 4.2 pp/yr at paired entries plus drift, about 7 pp/yr fully unpaired).
-Against a gross long leg of +0.8 to +3.8 pp/yr (midpoint about +2.3), the net prior over
-SPY at the base level is **centred at about −2 pp/yr, plausible range −6 to +2 pp/yr**:
-the midpoint gross minus the lower cost bound is about −1.9, and the upper cost bound
-takes it to about −5. It is positive only at the 5 bp rung, and at the handoff's HO-14
+to 7.6 pp/yr** (about 4.2 pp/yr at paired entries plus drift, about 7.6 pp/yr fully
+unpaired plus drift). Against a gross long leg of +0.8 to +3.8 pp/yr (midpoint about
++2.3), the net prior over SPY at the base level is **centred at about −2 pp/yr, plausible
+range −7 to 0 pp/yr**: the midpoint gross minus the lower cost bound is about −1.9; the
+best gross minus the least cost is about +0.2, the upper end; the least gross minus the
+most cost about −6.8. It is positive only at the 5 bp rung, and at the handoff's HO-14
 floor (5-10 bp plus half the spread) at or below zero, which is the report's verdict
 restated: near zero net at 15 bp, long-only. The cash share under the 5% cap (rule 7) is a
 further drag in a rising market: between earnings seasons the book may hold 10 to 20 names
@@ -339,7 +346,9 @@ source in the register gives a worst quarter for this construction; the run comp
 - Day 0 derived from `filed` instead of `accepted_at`, or a breakpoint set that includes an
   event whose window closes after close(T): both are look-aheads, and both are what the
   revision and breakpoint cases above exist to catch.
-- `n_held` above about 150 or below 10 for more than two weeks inside an earnings season
+- `n_held` above about 200 (about 85% of a quarter's ~200 top-quintile entries fall in
+  ~25 sessions, so a correct engine peaks near 135 under a 20-session hold) or below 10
+  for more than two weeks inside an earnings season
   (February, late April to May, late July to August, late October to November): the
   event feed, the dedupe rule or the breakpoint quantile is wrong, not the market.
 - One-sided `turnover_monthly` far below 70% or far above 250%: the hold length, the
@@ -572,7 +581,13 @@ points back here; until then nothing is claimable.
   B9 first on the proposed dates, with B4's `holdout.start` after 2027-06-30, or B4 first
   and B9 after B4's `holdout.end`. Recommendation: the dates as proposed; write the
   boundary row first; B9 first unless B4 registers before T151e lands, since B4 is parked
-  and B9's book is the daily one the ADR 0017 shakedown wants.
+  and B9's book is the daily one the ADR 0017 shakedown wants. One more constraint on
+  `holdout.end`: ADR 0016 point 4 as accepted says "at least `paper.min_rebalances`
+  **months** after `holdout.start`", and 2027-06-30 is under six calendar months after
+  2027-01-04; the file reads it in rebalance periods because ADR 0017 C says so, and
+  ADR 0017 is proposed. If ADR 0017 is not accepted as written, `holdout.end` moves to
+  2027-07-30 or later before registration (a date change before registration is not a
+  new hypothesis).
 - **B9-3. The fill convention.** `close` (H1's and B3's; the engine fills at close(T + 1))
   or `open` (`execution.fill_price = open` exists; the literature's entry; Alpaca's daily
   open is "the first valid trade", T3's reason for `close`, and the SIP bar open differs
