@@ -1235,9 +1235,6 @@ def test_a_momentum_file_naming_the_key_freezes_its_value(
 ) -> None:
     record = _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     assert record.params[TURNOVER_KEY] == 0.2
-    assert hypothesis.load_frozen(conn, SLUG, settings=settings).strategy.turnover_top_fraction == (
-        0.2
-    )
 
 
 @pytest.mark.parametrize("value", ["0", "1.5"])
@@ -1320,3 +1317,14 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
     assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
     assert _register(conn, FIXTURE, live).hypothesis_id == record.hypothesis_id
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+
+
+def test_a_screened_registration_cannot_run_until_the_screen_exists(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """quant-auditor on #1387: until T165c applies the key, a run or paper plan of a
+    registration at 0.20 would record unscreened results under a screened label."""
+    assert frozenset({TURNOVER_KEY}) == hypothesis.NOT_YET_APPLIED_KEYS
+    _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
+    with pytest.raises(HypothesisFileError, match=f"{TURNOVER_KEY} is registered off"):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)

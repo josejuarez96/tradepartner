@@ -192,6 +192,13 @@ def required_keys(family: str) -> frozenset[str]:
 FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": "momentum"}
 
 
+#: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
+#: a value other than the table default, so no run or paper plan records "screened"
+#: results that are the unscreened signal's. T165c (the screen, #1358) empties this when
+#: `strategies.py` reads the key.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"strategy.turnover_top_fraction"})
+
+
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
     """Why `params` (a `family` registration's frozen values, JSON form) may not be
     registered, or None: a `FAMILY_ONLY_KEYS` key of another family whose value is not
@@ -589,7 +596,8 @@ def load_frozen(
 ) -> Settings:
     """`Settings` for a run of `slug`'s latest registration: its frozen values (read
     through `frozen.frozen_values`) over the live `settings` (default: loaded config)
-    for every other key, the family's inert sections included.
+    for every other key, the family's inert sections included. Refuses a
+    `NOT_YET_APPLIED_KEYS` value other than its default.
     `UnknownHypothesis` for an unregistered slug."""
     record = registry.get_hypothesis(conn, slug)
     if registry.params_sha256(record.params) != record.params_sha256:
@@ -604,6 +612,17 @@ def load_frozen(
         raise HypothesisFileError(
             f"{slug!r}: registered with a different frozen key set ({', '.join(drift)}); "
             "re-register the hypothesis"
+        )
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    pending = sorted(
+        key
+        for key in NOT_YET_APPLIED_KEYS
+        if key in values and not frozen.is_default(values[key], defaults[key])
+    )
+    if pending:
+        raise HypothesisFileError(
+            f"{slug!r}: {', '.join(pending)} is registered off its default but no signal "
+            "applies it yet (backtest plan T165c); it cannot run"
         )
     live = settings if settings is not None else get_settings()
     return _overlay(live, values)
