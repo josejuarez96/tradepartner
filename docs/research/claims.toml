@@ -888,7 +888,7 @@ scope = "Tier 1 paper-trading doc plus Tier 2 staff answers"
 source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
 section = "Answer"
 bears_on = ["spec:paper-trading"]
-note = "The OPG part conflicts with P3-3 (2026-10-09): on paper, OPG orders expired unfilled in 4 of 4 cases; the NBBO and omissions parts stand (P3-1 found fractional fills at the opening print, not the NBBO)."
+note = "Conflicts with P3-3 (2026-10-09) on OPG: on paper, OPG orders expired unfilled in 4 of 4 cases. The NBBO part holds for pre-open whole-share orders (P3-2) but conflicts with P3-1 for pre-open fractional orders, which filled at the listing exchange's auction print. The omissions part (price improvement, latency slippage) stands."
 
 [[claim]]
 id = "AO-4"
@@ -2682,11 +2682,11 @@ id = "P3-1"
 statement = "On Alpaca paper, a $5 notional fractional market DAY buy queued at 09:01-09:05 ET filled at the listing exchange's official opening print, to the cent, 0.9 to 2.0 s after 09:30:00 ET, in 4 of 4 cases (KO and AAPL, 2026-10-05 and 2026-10-09)."
 kind = "empirical"
 grade = "SUPPORTED"
-scope = "Paper simulator only; two sessions, two liquid names, four orders; the mechanism (last-trade pricing on release) is inferred, not documented; nothing transfers to live"
+scope = "Paper simulator only; two sessions, two liquid names, four buy orders; the last trade before each fill was a different price, so the simulator priced the order at the official open itself, a mechanism inferred, not documented; nothing transfers to live"
 source = "docs/research/2026-10-09-probe3-preopen-fills.md"
 section = "Evidence"
 bears_on = ["adr:0005", "adr:0006", "spec:paper-trading"]
-note = "The protocol's reading table expected the first NBBO after the open (its row 1); the fill was the opening print instead. Magnitudes are INSUFFICIENT as a distribution (n = 4)."
+note = "Conflicts with AO-3 (paper matches against the NBBO) for pre-open fractional orders: the fill was the opening print, not the NBBO and not the last trade. The protocol's reading table expected the first NBBO after the open (its row 1). Magnitudes are INSUFFICIENT as a distribution (n = 4)."
 
 [[claim]]
 id = "P3-2"
@@ -2697,11 +2697,11 @@ scope = "Paper simulator only; two sessions, two liquid names, four orders; the 
 source = "docs/research/2026-10-09-probe3-preopen-fills.md"
 section = "Evidence"
 bears_on = ["adr:0005", "adr:0006", "spec:paper-trading"]
-note = "Reading-table rows 1 and 4: first NBBO after the open, with a release delay; two of four were not filled by 09:31. Sets paper.sell_wait_seconds and the other timing keys (T70, #294)."
+note = "SUPPORTED is for the direction (fills at the ask, delayed); magnitudes are INSUFFICIENT as a distribution (n = 4). Reading-table rows 1 and 4: first NBBO after the open, with a release delay; two of four were not filled by 09:31. Informs the paper.* timing keys (T70, #294); sells were not probed, so this buy-side delay is only a proxy for paper.sell_wait_seconds."
 
 [[claim]]
 id = "P3-3"
-statement = "On Alpaca paper, a 1-share OPG order submitted at 09:01-09:05 ET expired unfilled 52 to 168 s after the open in 4 of 4 cases; paper does not simulate OPG as a market order."
+statement = "On Alpaca paper, a 1-share OPG order submitted at 09:01-09:05 ET expired unfilled 53 to 168 s after the open in 4 of 4 cases; paper does not simulate OPG as a market order."
 kind = "fact"
 grade = "SUPPORTED"
 scope = "Paper simulator, 2026-10-05 and 2026-10-09, KO and AAPL; contradicts the 2024 staff statement S26 in the #86 report"
