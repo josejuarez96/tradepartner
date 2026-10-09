@@ -58,6 +58,28 @@ it from the frozen `Settings` (`hypothesis.load_frozen`, through
 `frozen.frozen_values`). The tracking rule's first session (`first_tracking_session`)
 is at the same cadence (ADR 0015 seam 4); `paper start` still refuses any cadence but
 `month_end` (strategy-lab spec req 11), so a paper window's is a month end.
+
+**The development boundary** (ADR 0016 points 2 and 4; plan T142). `decide` and
+`default_in_sample_window` take `boundary`, the owner's newest `development_boundary`
+date, which the caller reads from the store (never live config; it is not a frozen key
+and enters no fingerprint). With `boundary=None`, the default, every rule above applies
+exactly as written. With a boundary:
+
+- The default in-sample window ends at the earlier of the last rebalance session
+  strictly before `holdout.start` and the last one on or before the boundary.
+- Rule 1 gains two refusals, checked before its others (and so before the holdout and
+  gap rules): a window that does not touch the holdout (an in-sample window) and ends
+  after the boundary, and a window that touches the holdout (a holdout spend, flag or
+  not) but starts before `holdout.start`. No flag overrides either. The sessions
+  between the boundary and `holdout.start` are dead months: no window may read them.
+- A boundary before the frozen `in_sample_start` raises `ValueError`.
+
+**Forward holdouts** (ADR 0016 point 4). `Frozen.registered_on` is the day the family
+was first registered, passed by the caller (`None` when not read); `is_forward` is true
+when `holdout.start` is after it. A forward holdout's tracking window may start at the
+first rebalance session on or after `holdout.start` (`tracking_start`), because its exam
+of record is the paper book inside the holdout; every other tracking window keeps
+`first_tracking_session`. The tracking rule does not read the boundary.
 """
 
 from __future__ import annotations
@@ -99,6 +121,7 @@ class Frozen:
     holdout_start: date
     holdout_end: date
     gap_count_share_threshold: float
+    registered_on: date | None = None
 
     def __post_init__(self) -> None:
         if not self.in_sample_start < self.holdout_start <= self.holdout_end:
@@ -113,9 +136,15 @@ class Frozen:
             )
 
     @classmethod
-    def from_hypothesis(cls, hypothesis: HypothesisRecord) -> Frozen:
+    def from_hypothesis(
+        cls, hypothesis: HypothesisRecord, *, registered_on: date | None = None
+    ) -> Frozen:
         """Read the decision inputs from a `hypotheses` row and its frozen params,
-        through `frozen.frozen_values` (the one accessor of a registration's values)."""
+        through `frozen.frozen_values` (the one accessor of a registration's values).
+
+        `registered_on` is the day the hypothesis's **family** was first registered
+        (ADR 0016 point 4), which one `hypotheses` row cannot know; `None` leaves the
+        holdout historical (`is_forward` false), as every caller had it before T142."""
         threshold = frozen_values(hypothesis).get(GAP_THRESHOLD_KEY)
         if isinstance(threshold, bool) or not isinstance(threshold, int | float):
             raise ValueError(
@@ -127,7 +156,15 @@ class Frozen:
             holdout_start=hypothesis.holdout_start,
             holdout_end=hypothesis.holdout_end,
             gap_count_share_threshold=float(threshold),
+            registered_on=registered_on,
         )
+
+
+def is_forward(frozen: Frozen) -> bool:
+    """Whether the holdout is forward: its `holdout.start` is after the day the family
+    was first registered, so no session of it existed at registration (ADR 0016 point 4).
+    False when `registered_on` is unknown."""
+    return frozen.registered_on is not None and frozen.holdout_start > frozen.registered_on
 
 
 @dataclass(frozen=True)
@@ -212,6 +249,15 @@ def window_touches_holdout(window: Window, frozen: Frozen) -> bool:
     return window.start <= frozen.holdout_end and window.end >= frozen.holdout_start
 
 
+def _first_rebalance_on_or_after(day: date, cadence: Cadence, what: str) -> date:
+    sessions = rebalance_sessions(day, day + _TRACKING_SEARCH, cadence)
+    if not sessions:
+        raise ValueError(
+            f"no rebalance session at {cadence} within {_TRACKING_SEARCH.days} days {what}"
+        )
+    return sessions[0]
+
+
 def first_tracking_session(frozen: Frozen, cadence: Cadence) -> date:
     """The first rebalance session at `cadence` strictly after the frozen `holdout.end`:
     where a `kind=tracking` window may start (Phase 4 spec req 10; ADR 0015 seam 4).
@@ -220,47 +266,109 @@ def first_tracking_session(frozen: Frozen, cadence: Cadence) -> date:
     from `schedule.rebalance_sessions`, so a week end before Good Friday or a session
     after a holiday is found by the calendar, never by weekday arithmetic.
     """
-    start = frozen.holdout_end + timedelta(days=1)
-    sessions = rebalance_sessions(start, start + _TRACKING_SEARCH, cadence)
-    if not sessions:
-        raise ValueError(
-            f"no rebalance session at {cadence} within {_TRACKING_SEARCH.days} days "
-            f"after holdout.end {frozen.holdout_end}"
+    return _first_rebalance_on_or_after(
+        frozen.holdout_end + timedelta(days=1),
+        cadence,
+        f"after holdout.end {frozen.holdout_end}",
+    )
+
+
+def tracking_start(frozen: Frozen, cadence: Cadence) -> date:
+    """Where a `kind=tracking` window may start: for a forward holdout (`is_forward`),
+    the first rebalance session at `cadence` on or after `holdout.start` (ADR 0016
+    point 4, the paper book inside the holdout); otherwise `first_tracking_session`."""
+    if is_forward(frozen):
+        return _first_rebalance_on_or_after(
+            frozen.holdout_start, cadence, f"from holdout.start {frozen.holdout_start}"
         )
-    return sessions[0]
+    return first_tracking_session(frozen, cadence)
 
 
 def _tracking(window: Window, frozen: Frozen, cadence: Cadence) -> Decision:
-    first = first_tracking_session(frozen, cadence)
+    first = tracking_start(frozen, cadence)
     if window.end < window.start:
         return Decision(
             "refused_window", None, f"window end {window.end} is before its start {window.start}"
         )
     if window.start < first:
+        where = (
+            f"on or after holdout.start {frozen.holdout_start} (a forward holdout)"
+            if is_forward(frozen)
+            else f"after holdout.end {frozen.holdout_end}"
+        )
         return Decision(
             "refused_window",
             None,
             f"tracking window start {window.start} is before {first}, the first rebalance "
-            f"session after holdout.end {frozen.holdout_end}",
+            f"session {where}",
         )
     return Decision("run", "tracking", "tracking run; holdout and gap flags are not read")
 
 
-def default_in_sample_window(frozen: Frozen, cadence: Cadence = "month_end") -> Window:
+def _check_boundary(frozen: Frozen, boundary: date | None) -> None:
+    if boundary is not None and boundary < frozen.in_sample_start:
+        raise ValueError(
+            f"development boundary {boundary} is before in_sample_start "
+            f"{frozen.in_sample_start}: no in-sample session would remain"
+        )
+
+
+def default_in_sample_window(
+    frozen: Frozen, cadence: Cadence = "month_end", boundary: date | None = None
+) -> Window:
     """`[in_sample_start, last rebalance session at cadence strictly before
-    holdout.start]`, so an ordinary run cannot drift into the holdout."""
-    sessions = rebalance_sessions(
-        frozen.in_sample_start, frozen.holdout_start - timedelta(days=1), cadence
-    )
+    holdout.start]`, so an ordinary run cannot drift into the holdout.
+
+    With a development `boundary` (ADR 0016 point 2) the window ends at the earlier
+    of that session and the last rebalance session on or before the boundary. Raises
+    `ValueError` when the boundary is before `in_sample_start` or no rebalance session
+    remains."""
+    _check_boundary(frozen, boundary)
+    if boundary is None:
+        sessions = rebalance_sessions(
+            frozen.in_sample_start, frozen.holdout_start - timedelta(days=1), cadence
+        )
+        if not sessions:
+            raise ValueError(
+                f"no rebalance session at {cadence} between in_sample_start "
+                f"{frozen.in_sample_start} and holdout.start {frozen.holdout_start}"
+            )
+        return Window(frozen.in_sample_start, sessions[-1])
+    last = min(frozen.holdout_start - timedelta(days=1), boundary)
+    sessions = rebalance_sessions(frozen.in_sample_start, last, cadence)
     if not sessions:
         raise ValueError(
             f"no rebalance session at {cadence} between in_sample_start "
-            f"{frozen.in_sample_start} and holdout.start {frozen.holdout_start}"
+            f"{frozen.in_sample_start} and {last} (holdout.start {frozen.holdout_start}, "
+            f"development boundary {boundary})"
         )
     return Window(frozen.in_sample_start, sessions[-1])
 
 
-def _window_refusal(window: Window, frozen: Frozen) -> str | None:
+def _boundary_refusal(window: Window, frozen: Frozen, boundary: date) -> str | None:
+    """ADR 0016 point 2: an in-sample window ends on or before the boundary; a window
+    touching the holdout (a spend) lies inside it. Its end past `holdout.end` is rule 1's."""
+    if window_touches_holdout(window, frozen):
+        if window.start < frozen.holdout_start:
+            return (
+                f"window start {window.start} is before holdout.start {frozen.holdout_start}: "
+                f"with the development boundary {boundary}, a window touching the holdout "
+                f"lies inside [{frozen.holdout_start}, {frozen.holdout_end}]"
+            )
+        return None
+    if window.end > boundary:
+        return (
+            f"window end {window.end} is after the development boundary {boundary}; "
+            "in-sample runs read no session after it"
+        )
+    return None
+
+
+def _window_refusal(window: Window, frozen: Frozen, boundary: date | None = None) -> str | None:
+    if boundary is not None:
+        refusal = _boundary_refusal(window, frozen, boundary)
+        if refusal is not None:
+            return refusal
     if window.end < window.start:
         return f"window end {window.end} is before its start {window.start}"
     if window.start < frozen.in_sample_start:
@@ -302,6 +410,7 @@ def decide(
     tracking: bool = False,
     cadence: Cadence = "month_end",
     lab: LabState | None = None,
+    boundary: date | None = None,
 ) -> Decision:
     """Apply the window, holdout and gap rules (module docstring) to one run.
 
@@ -320,7 +429,11 @@ def decide(
     `lab` is `None` on a store without the lab tables, and then nothing here differs
     from Phase 3; otherwise the variant, spend-gate and family-cap rules apply
     (module docstring, "Strategy-lab rules").
+
+    `boundary` is the development boundary (module docstring); `None` leaves every rule
+    as before it existed. Raises `ValueError` when it is before `in_sample_start`.
     """
+    _check_boundary(frozen, boundary)
     if lab is not None and lab.is_variant:
         return Decision(
             "refused_variant",
@@ -329,7 +442,7 @@ def decide(
         )
     if tracking:
         return _tracking(window, frozen, cadence)
-    refusal = _window_refusal(window, frozen)
+    refusal = _window_refusal(window, frozen, boundary)
     if refusal is not None:
         return Decision("refused_window", None, refusal)
 

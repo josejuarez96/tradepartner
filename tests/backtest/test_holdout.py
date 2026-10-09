@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tradepartner.backtest import hypothesis as hypothesis_module
 from tradepartner.backtest import run as run_module
+from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS
 from tradepartner.backtest.holdout import (
     Decision,
     Flags,
@@ -22,6 +24,8 @@ from tradepartner.backtest.holdout import (
     default_in_sample_window,
     first_tracking_session,
     gap_sessions,
+    is_forward,
+    tracking_start,
     window_touches_holdout,
 )
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -741,3 +745,304 @@ def test_the_cap_counts_spends_of_any_outcome() -> None:
 def test_lab_state_refuses_a_cap_below_one() -> None:
     with pytest.raises(ValueError, match="positive"):
         _lab(max_family_holdout_spends=0)
+
+
+# --- the development boundary (ADR 0016 points 2 and 4; plan T142) -------------------
+
+#: The owner's boundary (answer 1 on #1320): the last practice rebalance of H1 and B3.
+BOUNDARY = date(2023, 12, 29)
+#: A boundary well inside FROZEN_2025's practice years (2022-06-15 is a Wednesday).
+EARLY_BOUNDARY = date(2022, 6, 15)
+HYPOTHESES = Path(__file__).resolve().parents[2] / "docs" / "hypotheses"
+
+
+@pytest.mark.parametrize(
+    ("cadence", "end"),
+    [
+        ("month_end", date(2022, 5, 31)),
+        ("week_end", date(2022, 6, 10)),
+        ("daily", date(2022, 6, 15)),
+    ],
+)
+def test_the_boundary_shortens_the_default_window_at_each_cadence(
+    cadence: Cadence, end: date
+) -> None:
+    window = default_in_sample_window(FROZEN_2025, cadence, EARLY_BOUNDARY)
+    assert window == Window(FROZEN_2025.in_sample_start, end)
+    assert end == rebalance_sessions(date(2022, 5, 1), EARLY_BOUNDARY, cadence)[-1]
+
+
+@pytest.mark.parametrize("cadence", ["month_end", "week_end", "daily"])
+def test_a_boundary_after_the_holdout_start_leaves_the_default_window(cadence: Cadence) -> None:
+    """The earlier of the two ends: a later boundary never stretches the window."""
+    later = default_in_sample_window(FROZEN_2025, cadence, date(2025, 6, 30))
+    assert later == default_in_sample_window(FROZEN_2025, cadence)
+
+
+def test_a_boundary_on_a_rebalance_session_is_the_default_window_end() -> None:
+    """'On or before' the boundary: a boundary on a month end keeps that month end."""
+    window = default_in_sample_window(FROZEN_2025, "month_end", date(2022, 6, 30))
+    assert window.end == date(2022, 6, 30)
+
+
+@pytest.mark.parametrize("slug", ["h1-momentum-12-1", "b3-gross-profitability"])
+@pytest.mark.parametrize("cadence", ["month_end", "week_end", "daily"])
+def test_h1_and_b3_default_windows_are_unchanged_by_the_owners_boundary(
+    slug: str, cadence: Cadence
+) -> None:
+    """ADR 0016 open question 1: at 2023-12-29 no registered family's window moves."""
+    parsed = hypothesis_module.parse_file(HYPOTHESES / f"{slug}.md")
+    frozen = Frozen(
+        hypothesis_id=1,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        gap_count_share_threshold=0.05,
+    )
+    assert default_in_sample_window(frozen, cadence, BOUNDARY) == default_in_sample_window(
+        frozen, cadence
+    )
+    if cadence == "month_end":
+        assert default_in_sample_window(frozen, cadence, BOUNDARY) == Window(
+            date(2020, 8, 31), BOUNDARY
+        )
+
+
+def test_the_boundary_is_not_a_frozen_key() -> None:
+    """It enters no fingerprint and no family rule (ADR 0016 point 1)."""
+    keys = {key for key, _default, _version in FROZEN_KEY_DEFAULTS}
+    assert not any("boundary" in key for key in keys)
+    assert not any("boundary" in key for key in hypothesis_module.frozen_keys())
+
+
+def test_a_boundary_before_in_sample_start_raises() -> None:
+    before = FROZEN.in_sample_start - timedelta(days=1)
+    with pytest.raises(ValueError, match="development boundary"):
+        default_in_sample_window(FROZEN, "month_end", before)
+    with pytest.raises(ValueError, match="development boundary"):
+        decide(IN_SAMPLE, FROZEN, NO_FLAGS, NO_REASONS, None, (), boundary=before)
+
+
+def test_a_boundary_leaving_no_rebalance_session_raises() -> None:
+    """A boundary on in_sample_start's day but before its month's last session."""
+    frozen = Frozen(**{**FROZEN.__dict__, "in_sample_start": date(2017, 1, 3)})
+    with pytest.raises(ValueError, match="no rebalance session"):
+        default_in_sample_window(frozen, "month_end", date(2017, 1, 3))
+
+
+def _decide_bounded(
+    window: Window,
+    boundary: date | None = EARLY_BOUNDARY,
+    flags: Flags = NO_FLAGS,
+    reasons: Reasons = NO_REASONS,
+    lab: LabState | None = None,
+) -> Decision:
+    return decide(window, FROZEN, flags, reasons, None, (), lab=lab, boundary=boundary)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        Window(date(2017, 1, 31), date(2022, 6, 16)),  # one day past the boundary
+        Window(date(2017, 1, 31), date(2023, 12, 29)),  # today's default window
+        Window(date(2023, 1, 31), date(2023, 6, 30)),  # wholly in the dead months
+    ],
+)
+def test_an_in_sample_window_past_the_boundary_is_refused_window(window: Window) -> None:
+    for flags in (NO_FLAGS, Flags(spend_holdout=True, override_gap=True, holdout_repeat=True)):
+        decision = _decide_bounded(window, flags=flags, reasons=SPEND_REASON)
+        assert (decision.outcome, decision.kind) == ("refused_window", None)
+        assert "development boundary 2022-06-15" in decision.message
+    # Without a boundary the same window runs in sample, as before T142.
+    assert _decide_bounded(window, boundary=None).outcome == "run"
+
+
+def test_an_in_sample_window_ending_on_the_boundary_runs() -> None:
+    decision = _decide_bounded(Window(date(2017, 1, 31), EARLY_BOUNDARY))
+    assert (decision.outcome, decision.kind) == ("run", "in_sample")
+
+
+def test_the_boundary_refusal_comes_before_the_lab_rules_except_the_variant_rule() -> None:
+    late = Window(date(2017, 1, 31), date(2023, 12, 29))
+    decision = _decide_bounded(late, lab=_lab())
+    assert decision.outcome == "refused_window"
+    variant = _decide_bounded(late, lab=_lab(is_variant=True))
+    assert variant.outcome == "refused_variant"
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        Window(date(2017, 1, 31), date(2024, 3, 31)),  # practice through the holdout
+        Window(date(2023, 12, 29), date(2024, 3, 31)),  # one session before holdout.start
+    ],
+)
+def test_a_spend_window_starting_before_the_holdout_is_refused_window(window: Window) -> None:
+    """ADR 0016 point 2: a spend covers only [holdout.start, holdout.end], with or
+    without the flag, before the holdout rule and the gap gate are read."""
+    for flags in (NO_FLAGS, SPEND):
+        decision = _decide_bounded(window, flags=flags, reasons=SPEND_REASON)
+        assert (decision.outcome, decision.kind) == ("refused_window", None)
+        assert "before holdout.start 2024-01-01" in decision.message
+    # Without a boundary today's rule spends it.
+    before = _decide_bounded(window, boundary=None, flags=SPEND, reasons=SPEND_REASON)
+    assert (before.outcome, before.kind) == ("needs_gap", "holdout")
+
+
+def test_a_spend_window_inside_the_holdout_follows_the_holdout_rules() -> None:
+    assert _decide_bounded(HOLDOUT).outcome == "refused_holdout"
+    spend = _decide_bounded(HOLDOUT, flags=SPEND, reasons=SPEND_REASON)
+    assert (spend.outcome, spend.kind) == ("needs_gap", "holdout")
+    assert spend.gap_sessions == HOLDOUT_GAP_SESSIONS
+
+
+def test_a_spend_window_past_holdout_end_is_still_refused_window() -> None:
+    decision = _decide_bounded(
+        Window(date(2024, 1, 1), date(2026, 9, 30)), flags=SPEND, reasons=SPEND_REASON
+    )
+    assert decision.outcome == "refused_window"
+    assert "after holdout.end" in decision.message
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        IN_SAMPLE,
+        HOLDOUT,
+        Window(date(2017, 1, 31), date(2024, 3, 31)),
+        Window(date(2016, 1, 4), date(2020, 1, 31)),
+        Window(date(2020, 1, 31), date(2019, 1, 31)),
+        Window(date(2026, 9, 30), date(2027, 3, 31)),
+    ],
+)
+@pytest.mark.parametrize("flags", [NO_FLAGS, SPEND])
+def test_no_boundary_decides_exactly_as_before(window: Window, flags: Flags) -> None:
+    """`boundary=None`, passed or omitted, is the pre-T142 rule."""
+    implicit = decide(window, FROZEN, flags, SPEND_REASON, None, ())
+    explicit = decide(window, FROZEN, flags, SPEND_REASON, None, (), boundary=None)
+    assert implicit == explicit
+
+
+def test_the_boundary_does_not_touch_a_tracking_window() -> None:
+    window = Window(FIRST_TRACKING, date(2027, 3, 31))
+    decision = decide(
+        window, FROZEN, NO_FLAGS, NO_REASONS, None, (), tracking=True, boundary=EARLY_BOUNDARY
+    )
+    assert (decision.outcome, decision.kind) == ("run", "tracking")
+
+
+# --- forward holdouts (ADR 0016 point 4) ------------------------------------------------
+
+#: A family registered on 2026-10-09 whose holdout starts on 2026-11-02 (a Monday).
+FORWARD = Frozen(
+    hypothesis_id=11,
+    in_sample_start=date(2020, 8, 31),
+    holdout_start=date(2026, 11, 2),
+    holdout_end=date(2027, 4, 30),
+    gap_count_share_threshold=0.05,
+    registered_on=date(2026, 10, 9),
+)
+
+
+@pytest.mark.parametrize(
+    ("registered_on", "forward"),
+    [
+        (None, False),
+        (date(2026, 10, 9), True),
+        (date(2026, 11, 1), True),  # the day before: forward by one day (ADR 0016)
+        (date(2026, 11, 2), False),  # the holdout's first day existed at registration
+        (date(2026, 12, 1), False),
+    ],
+)
+def test_is_forward_is_holdout_start_after_the_registration_day(
+    registered_on: date | None, forward: bool
+) -> None:
+    assert is_forward(replace(FORWARD, registered_on=registered_on)) is forward
+
+
+def test_h1_is_not_forward() -> None:
+    """H1 registered in October 2026 with a holdout from 2024-01-01."""
+    assert is_forward(replace(FROZEN, registered_on=date(2026, 10, 5))) is False
+
+
+def test_frozen_from_hypothesis_takes_the_family_registration_day() -> None:
+    record = _record({"gap.count_share_threshold": 0.03})
+    assert Frozen.from_hypothesis(record).registered_on is None
+    frozen = Frozen.from_hypothesis(record, registered_on=date(2023, 6, 1))
+    assert frozen.registered_on == date(2023, 6, 1)
+    assert is_forward(frozen)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "first"),
+    [
+        ("month_end", date(2026, 11, 30)),
+        ("week_end", date(2026, 11, 6)),
+        ("daily", date(2026, 11, 2)),
+    ],
+)
+def test_a_forward_holdouts_tracking_starts_at_the_first_rebalance_from_holdout_start(
+    cadence: Cadence, first: date
+) -> None:
+    assert tracking_start(FORWARD, cadence) == first
+    inside = Window(first, date(2027, 6, 30))
+    decision = decide(
+        inside, FORWARD, NO_FLAGS, NO_REASONS, None, (), tracking=True, cadence=cadence
+    )
+    assert (decision.outcome, decision.kind) == ("run", "tracking")
+    early = decide(
+        Window(first - timedelta(days=1), date(2027, 6, 30)),
+        FORWARD,
+        NO_FLAGS,
+        NO_REASONS,
+        None,
+        (),
+        tracking=True,
+        cadence=cadence,
+    )
+    assert early.outcome == "refused_window"
+    assert "on or after holdout.start 2026-11-02 (a forward holdout)" in early.message
+
+
+def test_a_forward_holdout_starting_on_a_rebalance_session_tracks_from_that_session() -> None:
+    frozen = replace(FORWARD, holdout_start=date(2026, 11, 30))
+    assert tracking_start(frozen, "month_end") == date(2026, 11, 30)
+
+
+def test_a_historical_holdouts_tracking_start_is_unchanged() -> None:
+    for registered_on in (None, date(2026, 10, 5)):
+        frozen = replace(FROZEN, registered_on=registered_on)
+        for cadence in ("month_end", "week_end", "daily"):
+            assert tracking_start(frozen, cadence) == first_tracking_session(FROZEN, cadence)
+    without = replace(FORWARD, registered_on=None)
+    assert tracking_start(without, "month_end") == date(2027, 5, 28)
+    refused = decide(
+        Window(date(2026, 11, 30), date(2027, 6, 30)),
+        without,
+        NO_FLAGS,
+        NO_REASONS,
+        None,
+        (),
+        tracking=True,
+    )
+    assert refused.outcome == "refused_window"
+    assert "after holdout.end 2027-04-30" in refused.message
+
+
+def test_a_forward_holdouts_in_sample_window_stops_at_the_boundary() -> None:
+    """B4's case (ADR 0016 point 5): practice [2020-08-31, 2023-12-29], dead months to
+    the holdout."""
+    assert default_in_sample_window(FORWARD, "month_end", BOUNDARY) == Window(
+        date(2020, 8, 31), BOUNDARY
+    )
+    dead = decide(
+        Window(date(2020, 8, 31), date(2026, 9, 30)),
+        FORWARD,
+        NO_FLAGS,
+        NO_REASONS,
+        None,
+        (),
+        boundary=BOUNDARY,
+    )
+    assert dead.outcome == "refused_window"
+    assert "development boundary" in dead.message
