@@ -21,7 +21,9 @@ from `connect`; `end_step()` releases the current one early, and `close()`
 the store between steps. If a writer (the ingest job) holds the lock when a
 step opens, the open is retried until `store.lock_retry_seconds` of the
 frozen settings has passed, so a write between steps delays the next step
-instead of failing it.
+instead of failing it. The step's universe is built once on its connection
+and shared by `universe(t)` and the gap's side categories (#1305); it ends
+with the step.
 
 **The handle.** Construction takes a `TrialHandle` (a plain id is refused:
 ADR 0005, no id, no run) and checks it once against `registry_connect`
@@ -137,6 +139,7 @@ class StoreProvider:
         self._step: ExitStack | None = None
         self._step_t: datetime | None = None
         self._conn: duckdb.DuckDBPyConnection | None = None
+        self._universe: Universe | None = None
 
     # --- connections ---------------------------------------------------------
 
@@ -166,6 +169,7 @@ class StoreProvider:
     def end_step(self) -> None:
         """Close the current step's connection (if any); the next read opens one."""
         step, self._step, self._conn, self._step_t = self._step, None, None, None
+        self._universe = None
         if step is not None:
             step.close()
 
@@ -188,7 +192,7 @@ class StoreProvider:
 
     def universe(self, t: datetime) -> Universe:
         t = check_t(t)
-        return universe_as_of(self._at(t), t, self.settings)
+        return self._step_universe(t)
 
     def adjusted_prices(
         self,
@@ -225,7 +229,9 @@ class StoreProvider:
 
     def survivorship_gap(self, t: datetime) -> GapReading:
         t = check_t(t)
-        reading = gap_module.survivorship_gap(self._at(t), t, self.settings)
+        universe = self._step_universe(t)  # opens the step's connection at `t`
+        conn = self._at(t)
+        reading = gap_module.survivorship_gap(conn, t, self.settings, universe=universe)
         return GapReading(count_share=reading.count_share, size_share=reading.size_share)
 
     def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
@@ -268,6 +274,14 @@ class StoreProvider:
         return {sid: known.get(sid) for sid in wanted}
 
     # --- helpers --------------------------------------------------------------------
+
+    def _step_universe(self, t: datetime) -> Universe:
+        """`universe_as_of` at `t` on the step's connection, built once per step:
+        `universe` and the gap's side categories share it (#1305)."""
+        conn = self._at(t)  # a new `t` ends the step, and its universe with it
+        if self._universe is None:
+            self._universe = universe_as_of(conn, t, self.settings)
+        return self._universe
 
     @staticmethod
     def _current_listings(

@@ -908,7 +908,8 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         params_model=ProfitabilityConfig,
         parent=None,
         engine_ready=True,
-        paper_ready=False,
+        # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
+        paper_ready=True,
         # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
         exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
         # The six count names of spec amendment #720 (T85d).
@@ -933,9 +934,8 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # `FAMILY_PARENTS` (ADR 0014 open question 2).
         parent="momentum",
         engine_ready=True,
-        # Not paper-ready: `combined` lands through the engine registry only (ADR 0014
-        # point 5), so the paper planner never sees it.
-        paper_ready=False,
+        # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
+        paper_ready=True,
         # Momentum's reason, profitability's four, then the combination's own reason,
         # in the precedence `combined_rank` reports and pairwise disjoint (T130).
         exclusion_reasons=(
@@ -984,9 +984,10 @@ FAMILY_SIGNAL_SECTIONS: dict[HypothesisFamily, str] = {
 }
 
 # The families the engine can run today (#1053, folded into T85 by owner decision
-# 2026-10-06): `backtest run` enforces `ENGINE_FAMILIES`. Paper retains a smaller gate,
-# `PAPER_FAMILIES`, enforced by `paper start` and paper planning, until its journal
-# supports arbitrary signal exclusions (ADR 0014 point 5).
+# 2026-10-06): `backtest run` enforces `ENGINE_FAMILIES`. Paper keeps its own gate,
+# `PAPER_FAMILIES`, enforced by `paper start` and paper planning; a family joins it only
+# by the owner's word (ADR 0014 point 5; `profitability` and `combined` by ADR 0017
+# part D, T152).
 ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = tuple(
     family for family, spec in FAMILIES.items() if spec.engine_ready
 )
