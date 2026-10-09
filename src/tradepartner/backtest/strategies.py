@@ -9,8 +9,14 @@ from typing import cast
 
 import polars as pl
 
-from tradepartner.backtest.provider import DataProvider
-from tradepartner.backtest.signals import anchor_sessions, gross_profitability, momentum
+from tradepartner.backtest.provider import DataProvider, TurnoverInputs
+from tradepartner.backtest.signals import (
+    anchor_sessions,
+    formation_sessions,
+    gross_profitability,
+    momentum,
+    turnover_screen,
+)
 from tradepartner.backtest.signals_combined import combined_rank
 from tradepartner.config import FAMILIES, HypothesisFamily, Settings
 
@@ -27,6 +33,8 @@ class SignalResult:
 @dataclass(frozen=True)
 class _MomentumRead:
     frame: pl.DataFrame
+    turnover: TurnoverInputs | None = None
+    formation: tuple[date, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,12 @@ class Strategy:
     section: str
 
 
+def _screens(params: Settings) -> bool:
+    """B10's turnover screen is on (spec amendment #1358): at the default 1.0 nothing
+    new is read, screened or reported."""
+    return params.strategy.turnover_top_fraction < 1.0
+
+
 def _momentum_read(
     provider: DataProvider,
     params: Settings,
@@ -72,14 +86,31 @@ def _momentum_read(
     a_form, _ = anchor_sessions(
         session, strategy.formation_months, strategy.skip_months, schedule.signal_anchor
     )
-    return _MomentumRead(
-        provider.adjusted_prices(
-            t,
-            members,
-            strategy.signal_total_return,
-            sessions_from=a_form,
-        )
+    frame = provider.adjusted_prices(
+        t,
+        members,
+        strategy.signal_total_return,
+        sessions_from=a_form,
     )
+    if not _screens(params):
+        return _MomentumRead(frame)
+    formation = formation_sessions(session, schedule.rebalance_cadence)
+    return _MomentumRead(frame, provider.turnover_inputs(t, members, formation[0]), formation)
+
+
+def _oracle_read(
+    provider: DataProvider,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
+) -> _Read:
+    """Momentum's price read without the screen: B10's key is `momentum`'s alone
+    (registration refuses `oracle` off 1.0), so `oracle` never screens or reports it."""
+    unscreened = params.model_copy(
+        update={"strategy": params.strategy.model_copy(update={"turnover_top_fraction": 1.0})}
+    )
+    return _momentum_read(provider, unscreened, session, t, members)
 
 
 def _momentum_signal(
@@ -89,21 +120,41 @@ def _momentum_signal(
     t: datetime,
     members: Sequence[str],
 ) -> SignalResult:
-    frame = cast(_MomentumRead, readings).frame
+    read = cast(_MomentumRead, readings)
     strategy, schedule = params.strategy, params.schedule
+    screen = None
+    if read.turnover is not None:
+        screen = turnover_screen(
+            read.turnover,
+            read.formation,
+            session,
+            strategy.turnover_top_fraction,
+            security_ids=members,
+        )
     result = momentum(
-        frame,
+        read.frame,
         session,
         strategy.formation_months,
         strategy.skip_months,
         schedule.signal_anchor,
         schedule.rebalance_cadence,
-        security_ids=members,
+        security_ids=members if screen is None else screen.kept,
     )
+    if screen is None:
+        return SignalResult(
+            result.scores,
+            {"no_history": result.excluded},
+            {"n_excluded_no_history": result.n_excluded},
+        )
+    # The screen drops a name before the rank, so the two reasons are disjoint.
     return SignalResult(
         result.scores,
-        {"no_history": result.excluded},
-        {"n_excluded_no_history": result.n_excluded},
+        {"no_history": result.excluded, "no_turnover": screen.excluded},
+        {
+            "n_excluded_no_history": result.n_excluded,
+            "n_screened": screen.n_screened,
+            "n_excluded_no_turnover": screen.n_excluded_no_turnover,
+        },
     )
 
 
@@ -206,7 +257,7 @@ def _combined_signal(
 # `Plan.exclusions` and `Plan.counts` carry exactly the names each family declares.
 _FAMILY_IO: Mapping[HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal]] = {
     "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal),
-    "oracle": (("adjusted_prices",), _momentum_read, _momentum_signal),
+    "oracle": (("adjusted_prices",), _oracle_read, _momentum_signal),
     "profitability": (("statement_facts", "sics"), _profitability_read, _profitability_signal),
     "combined": (("adjusted_prices", "statement_facts", "sics"), _combined_read, _combined_signal),
 }

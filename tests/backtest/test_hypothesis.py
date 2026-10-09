@@ -1319,12 +1319,13 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
 
 
-def test_a_screened_registration_cannot_run_until_the_screen_exists(
+def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """quant-auditor on #1387: until T165c applies the key, a run or paper plan of a
-    registration at 0.20 would record unscreened results under a screened label."""
-    assert frozenset({TURNOVER_KEY}) == hypothesis.NOT_YET_APPLIED_KEYS
+    """T165c applies the key (#1358), so `NOT_YET_APPLIED_KEYS` is empty and a
+    registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
+    refused)."""
+    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
-    with pytest.raises(HypothesisFileError, match=f"{TURNOVER_KEY} is registered off"):
-        hypothesis.load_frozen(conn, SLUG, settings=settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.strategy.turnover_top_fraction == 0.20
