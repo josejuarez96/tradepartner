@@ -67,13 +67,14 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     append,
     decisions_for,
     order_events_for,
 )
 from tradepartner.store.schema import HALT_REASON, LONG
 
-from .test_wrapper_phases import T_I, A, Env, _execute, _gate, _missed, _submits
+from .test_wrapper_phases import T_I, A, Env, _decision, _execute, _gate, _missed, _submits
 
 pytest_plugins = ("execution.test_wrapper_phases",)
 
@@ -1367,3 +1368,43 @@ def test_a_replayed_limit_order_halts_after_its_replay_event(
     with pytest.raises(SystemFaultError, match="refused_order_shape"):
         gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))
     assert _events(journal_settings, "tp-r") == [("pending", None), ("replay", None)]
+
+
+# --- books (ADR 0017 B.2, plan T155) ----------------------------------------------------
+
+
+def test_another_book_s_open_window_never_stops_this_run_s_phase(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The phase reads its run's own book's open window: book `b`'s open window
+    beside `main`'s is not a second open window, and `main`'s buy is submitted
+    as it is with `main` alone."""
+    _append(env.settings, replace(env.window, window_id=None, book_id="b", account_id="PB1"))
+
+    _execute(_gate(env, alerter_conn), env, [_decision(env, A, "buy", notional=300.0)])
+
+    assert [r.symbol for r in _submits(env.fake)] == ["DUALA"]
+
+
+def test_a_run_whose_window_is_closed_is_refused_before_any_submit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """With the run's window closed, another book's open window never stands in
+    for it: the phase refuses before any broker call."""
+    _append(env.settings, replace(env.window, window_id=None, book_id="b", account_id="PB1"))
+    at = env.run.started_at
+    _append(
+        env.settings,
+        PaperWindowStopRow(
+            window_id=env.window.window_id,  # type: ignore[arg-type]
+            at=at,
+            state="closed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    calls = len(env.fake.calls)
+
+    with pytest.raises(ValueError, match="is not the open one"):
+        _execute(_gate(env, alerter_conn), env, [_decision(env, A, "buy", notional=300.0)])
+    assert not env.fake.calls[calls:]

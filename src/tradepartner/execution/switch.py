@@ -328,8 +328,8 @@ def release(
     seen = seen_event_id
     now = clock()
     with open_for_write(settings) as conn:
-        window = open_window(conn)
-        if window is None or window.window_id != window_id:
+        window = open_window_of(conn, window_id)
+        if window is None:
             raise ReleaseRefused(f"window {window_id} is not the open window")
         reconciliations = reconciliations_for(conn, window_id)
         reconciliation = next(
@@ -414,6 +414,20 @@ def release(
                 f"{'; '.join(after.causes)}"
             )
         return _append(conn, row)
+
+
+def open_window_of(conn: duckdb.DuckDBPyConnection, window_id: int) -> PaperWindowRow | None:
+    """Window `window_id` when it is its book's open window, else None (ADR 0017
+    B.2 and B.5: another book's windows are never read, so another book's open
+    window neither hides nor stands in for this one). `JournalIntegrityError`
+    when the book has more than one open window, as `open_window`."""
+    row = conn.execute(
+        "SELECT book_id FROM paper_windows WHERE window_id = ?", [window_id]
+    ).fetchone()
+    if row is None:
+        return None
+    window = open_window(conn, str(row[0]))
+    return window if window is not None and window.window_id == window_id else None
 
 
 def drawdown_peak(window: PaperWindowRow, kill_switch_rows: Sequence[KillSwitchRow]) -> float:

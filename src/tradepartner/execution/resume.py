@@ -3,8 +3,10 @@ reqs 4 and 8 for the settlement and the lag bound; plan T61b).
 
 The only way the kill switch is released. In the req 5 order:
 
-1. Take the run lock (T59). `LockHeld` propagates. With no open window the
-   outcome is `no_window`: no broker call, no write.
+1. Take the book's run lock (T59; per book, ADR 0017 B.3, `book_id` defaulting
+   to `paper.book_id`). `LockHeld` propagates. With no open window for the
+   book the outcome is `no_window`: no broker call, no write. Another book's
+   window, switch and lock are never read or touched (B.5).
 2. Journal the `resume_invocations` row first, so a refused resume is still
    on record and its fill cursor has a writer id.
 3. Close every unfinished run of the window `crashed`.
@@ -147,6 +149,7 @@ from tradepartner.store.journal import (
     ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
+    check_book_id,
     kill_switch_events_for,
     non_terminal_orders,
     open_window,
@@ -521,6 +524,7 @@ def resume(
     accept_broker_fills: bool,
     *,
     accept_rejections: bool,
+    book_id: str | None = None,
 ) -> ResumeOutcome:
     """`paper resume --reason` (module docstring). `accept_rejections` is the
     owner's `--accept-rejections` and has no default; anything but a `bool` raises
@@ -528,14 +532,18 @@ def resume(
     (`lambda: store.db.open_for_write(settings)`). Raises `ValueError` for a
     blank `reason` before anything, `LockHeld` while another process holds the
     run lock, `ClockError` for a bad clock reading, and whatever the broker or
-    the store raises; a refusal is an outcome, never an exception."""
+    the store raises; a refusal is an outcome, never an exception. `book_id`
+    (default `paper.book_id`, `ValueError` outside the token grammar) names the
+    book: its run lock and its open window only (ADR 0017 B.3 and B.5)."""
     if not reason.strip():
         raise ValueError("paper resume needs a non-blank --reason")
     if not isinstance(accept_rejections, bool):
         raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
-    with run_lock(settings):
+    book = settings.paper.book_id if book_id is None else book_id
+    check_book_id(book)
+    with run_lock(settings, book):
         with connect() as conn:
-            window = open_window(conn)
+            window = open_window(conn, book)
         if window is None:
             return ResumeOutcome(NO_WINDOW, None, ("no_window: no paper window is open",))
         window_id = _window_id(window)

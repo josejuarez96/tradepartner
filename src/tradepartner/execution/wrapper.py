@@ -267,7 +267,6 @@ from tradepartner.store.journal import (
     fills_for,
     kill_switch_events_for,
     non_terminal_orders,
-    open_window,
     order_events_for,
     orders_for,
     pending_orders,
@@ -1001,8 +1000,10 @@ class RiskGatedBroker:
         session = run.session
         cut = session_close(previous_session(session))
         with self._journal() as conn:
-            window = open_window(conn)
-            if window is None or window.window_id != run.window_id:
+            # The run's own book's open window (ADR 0017 B.2): another book's
+            # open window is never read and never refuses this one.
+            window = switch.open_window_of(conn, run.window_id)
+            if window is None:
                 raise ValueError(f"run {run.run_id}'s window {run.window_id} is not the open one")
             costs = _frozen_costs(window)
             window_id = run.window_id

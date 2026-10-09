@@ -1,6 +1,7 @@
-"""The paper run lock (Phase 4 plan T59): one exclusive `fcntl.flock` holder at a
-time on `<store.path>.paper.lock`, refused at once, visible from another process,
-released on exception."""
+"""The paper run lock (Phase 4 plan T59; per book since ADR 0017 B.3, plan T155):
+one exclusive `fcntl.flock` holder at a time on `<store.path>.paper.<book>.lock`,
+refused at once, visible from another process, released on exception; another
+book's lock is another file."""
 
 from __future__ import annotations
 
@@ -53,7 +54,48 @@ def holder(settings: Settings) -> Iterator[subprocess.Popen[str]]:
 
 
 def test_the_lock_file_sits_beside_the_store(settings: Settings) -> None:
-    assert lock_path(settings) == Path(f"{settings.store.path}.paper.lock")
+    """Per book (ADR 0017 B.3): `paper.book_id`'s (`main`) by default."""
+    assert lock_path(settings) == Path(f"{settings.store.path}.paper.main.lock")
+    assert lock_path(settings, "main") == lock_path(settings)
+    assert lock_path(settings, "b") == Path(f"{settings.store.path}.paper.b.lock")
+
+
+def test_the_default_book_is_paper_book_id(settings: Settings) -> None:
+    other = Settings(_env_file=None, store={"path": settings.store.path}, paper={"book_id": "fx"})
+    assert lock_path(other) == Path(f"{settings.store.path}.paper.fx.lock")
+
+
+@pytest.mark.parametrize("book_id", ["", "../x", "a/b", "a.b", "a b"])
+def test_a_book_outside_the_token_grammar_is_refused(settings: Settings, book_id: str) -> None:
+    """The token can never name a path outside the store's directory."""
+    with pytest.raises(ValueError, match="book_id"):
+        lock_path(settings, book_id)
+    with pytest.raises(ValueError, match="book_id"), run_lock(settings, book_id):
+        pass
+
+
+def test_two_books_hold_two_locks_at_once(settings: Settings) -> None:
+    """Spec acceptance (ADR 0017): a second book's lock is taken while `main`'s is
+    held, and each book's second holder is still refused."""
+    with run_lock(settings, "main"), run_lock(settings, "b"):
+        assert is_held(settings, "main")
+        assert is_held(settings, "b")
+        assert not is_held(settings, "c")
+        with pytest.raises(LockHeld), run_lock(settings, "main"):
+            pass
+        with pytest.raises(LockHeld), run_lock(settings, "b"):
+            pass
+    assert not is_held(settings, "main")
+    assert not is_held(settings, "b")
+
+
+def test_another_process_holding_main_leaves_b_free(
+    settings: Settings, holder: subprocess.Popen[str]
+) -> None:
+    assert is_held(settings, "main")
+    assert not is_held(settings, "b")
+    with run_lock(settings, "b"):
+        pass
 
 
 def test_a_second_holder_in_the_same_process_is_refused_at_once(settings: Settings) -> None:

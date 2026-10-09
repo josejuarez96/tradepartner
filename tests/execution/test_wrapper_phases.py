@@ -1483,7 +1483,7 @@ def test_a_window_without_frozen_costs_fails_closed_before_any_broker_call(
     and the broker is never called."""
     _hold(env, A, 10.0)
     older = replace(env.window, frozen_json="{}")
-    monkeypatch.setattr(wrapper, "open_window", lambda _conn: older)
+    monkeypatch.setattr(wrapper.switch, "open_window_of", lambda _conn, _window_id: older)
     batch = [_decision(env, A, "sell", notional=500.0), _decision(env, B, "buy", notional=300.0)]
     calls = len(env.fake.calls)
 

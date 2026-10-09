@@ -32,12 +32,18 @@ refuses, before any write:
    otherwise), because a forward exam is judged by the paper book inside the
    holdout. `holdout.end` is then the declared last month of the exam and is
    not read here.
-3. **A window is already open.**
+3. **A window is already open for the book** (`window_open`). Another
+   book's open window never refuses (ADR 0017 B.3).
 4. **`account()` fails** on the paper endpoint (whatever the broker raises
    propagates as the refusal's cause).
+4a. **The account is another book's** (`account_in_use`): its `account_id` is
+   the `paper_windows.account_id` of any window, open, closed or abandoned, of
+   another book (ADR 0017 B.1 and B.4: one account per book, so a book can
+   never trade another book's account nor inherit its residues). Checked
+   again in the write chunk.
 5. **The account is not flat**: `open_orders()` is non-empty, or a
-   position exists that is not explained by the previous window's listed
-   residues (see "Flatness" below).
+   position exists that is not explained by the book's own previous window's
+   listed residues (see "Flatness" below).
 6. **The live costs differ from the hypothesis's registered costs**
    (`costs_drift`, #534): every `FROZEN_COSTS_KEYS` value must equal the
    registration's, which planning sizes with, so the frozen costs the wrapper
@@ -67,7 +73,20 @@ adjustments a spin-off explained (see below). It takes the run lock (T59) for
 its writes, and migrates a store version 4 has left behind (`init_schema` on
 the write connection) before writing.
 
-**Flatness.** With no previous window, or the latest one `abandoned`, the
+**The book (ADR 0017 B.2 to B.5, plan T155).** Every command here takes
+`book_id` (keyword, default `paper.book_id`, the spec's `--book` default;
+`ValueError` outside the token grammar), takes that book's run lock
+(`execution.lock`, `<store.path>.paper.<book>.lock`) and reads only that
+book's windows (`store.journal.open_window(conn, book)`,
+`latest_window(conn, book)`). `start` writes the book into
+`paper_windows.book_id`. With one book, `main`, every command reads and writes
+exactly what it did before books existed.
+
+**Flatness.** "The previous window" is the **book's** latest window, never
+another book's: a book's first `start` has none, so its account must hold no
+position at all, whatever another book's closed window lists as residues (a
+residue is explained only on the account it was left on). With no previous
+window, or the latest one `abandoned`, the
 account must hold no position at all: an `abandoned` window carries no
 residue forward, by spec req 14 ("after an `abandoned` window the account
 must be strictly flat"), whatever its own `residues_json` still lists (that
@@ -169,11 +188,12 @@ a false `no_window` (#1261, T132).
   strictly flat). It releases nothing.
 - **`kill(settings, connect, clock, reason)`** is `paper kill`. It takes no
   run lock, so the owner can engage while a run holds it, refuses
-  `no_window` and `multiple_open_windows` (spec req 14: only one window may
-  ever be open; nothing is written for either refusal) and appends an
-  `engaged` row with source `owner` (`switch.engage`), returning its
-  `event_id`. A row that cannot be written, for any reason (the store, or
-  the clock it is stamped with), raises `KillWriteFailed`.
+  `no_window` and `multiple_open_windows` (spec req 14: only one window per
+  book may ever be open; nothing is written for either refusal) and appends an
+  `engaged` row with source `owner` (`switch.engage`) on the book's window
+  only, returning its `event_id`; every other book keeps running. A row
+  that cannot be written, for any reason (the store, or the clock it is
+  stamped with), raises `KillWriteFailed`.
 - **`override(settings, clock, kind, rebalance_session, security_id,
   reason)`** is the one writer the override page (T69b) and the CLI (T67)
   share. It first refuses `override` for kind `settle_order` (#571, spec req
@@ -259,6 +279,7 @@ from tradepartner.store.journal import (
     adjustments_for,
     all_fill_ids,
     append,
+    check_book_id,
     decisions_for,
     fills_for,
     kill_switch_events_for,
@@ -306,6 +327,8 @@ _SPINOFF_RECEIPT = "spinoff_receipt"
 _SPLIT = "split"
 _SPINOFF = "spinoff"
 _GAP_SIGNOFF = "gap_signoff"
+#: `StartRefusedError.reason` when the account is another book's (ADR 0017 B.4).
+ACCOUNT_IN_USE = "account_in_use"
 
 
 class StartRefusedError(RuntimeError):
@@ -653,18 +676,53 @@ def _check_flat(
     )
 
 
+def _book(settings: Settings, book_id: str | None) -> str:
+    """The command's book: `book_id`, or `paper.book_id` when none is given (the
+    spec's `--book` default); `ValueError` outside the token grammar."""
+    book = settings.paper.book_id if book_id is None else book_id
+    check_book_id(book)
+    return book
+
+
+def _other_books_accounts(conn: duckdb.DuckDBPyConnection, book: str) -> dict[str, str]:
+    """Every account id another book's window (open, closed or abandoned) was
+    opened on, mapped to that book (the lowest token when several share one)."""
+    rows = conn.execute(
+        "SELECT account_id, MIN(book_id) FROM paper_windows WHERE book_id <> ? GROUP BY account_id",
+        [book],
+    ).fetchall()
+    return {str(account_id): str(other) for account_id, other in rows}
+
+
+def _refuse_account_in_use(account_id: str, other_accounts: Mapping[str, str]) -> None:
+    """`account_in_use` when the broker's account is one another book has opened a
+    window on (ADR 0017 B.1 and B.4: one account per book, so a book can never
+    trade, nor inherit the residues of, another book's account)."""
+    other = other_accounts.get(account_id)
+    if other is not None:
+        raise StartRefusedError(
+            ACCOUNT_IN_USE,
+            f"the paper account {account_id!r} belongs to book {other!r}: "
+            "every book trades its own account",
+        )
+
+
 def start(
     settings: Settings,
     connect: Connect,
     broker: Broker,
     clock: Callable[[], datetime],
     slug: str,
+    *,
+    book_id: str | None = None,
 ) -> StartResult:
-    """`paper start --hypothesis <slug>` (module docstring). Raises
-    `LockHeld` while another process holds the run lock,
-    `registry.UnknownHypothesis` for an unregistered slug, and
-    `StartRefusedError` for every other refusal, all before any write."""
-    with run_lock(settings):
+    """`paper start --book <book> --hypothesis <slug>` (module docstring; `book_id`
+    defaults to `paper.book_id`). Raises `LockHeld` while another process holds
+    the book's run lock, `registry.UnknownHypothesis` for an unregistered slug,
+    `ValueError` for a book outside the token grammar, and `StartRefusedError`
+    for every other refusal, all before any write."""
+    book = _book(settings, book_id)
+    with run_lock(settings, book):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
             if hyp.family not in PAPER_FAMILIES:
@@ -696,13 +754,15 @@ def start(
                     f"completed {_CADENCE_END[cadence]}",
                 )
             try:
-                if open_window(conn) is not None:
+                if open_window(conn, book) is not None:
                     raise StartRefusedError("window_open", "a paper window is already open")
-                previous = latest_window(conn)
+                previous = latest_window(conn, book)
                 previous_stop = _previous_stop(conn, previous)
+                other_accounts = _other_books_accounts(conn, book)
             except JournalNotInitialised:
                 previous = None
                 previous_stop = None
+                other_accounts = {}
             except SchemaVersionError as exc:
                 raise StartRefusedError(SCHEMA_VERSION, str(exc)) from exc
             today = _ny_date(now)
@@ -716,6 +776,7 @@ def start(
                 "account_unavailable",
                 f"account() failed on the paper endpoint ({type(exc).__name__})",
             ) from exc
+        _refuse_account_in_use(account.account_id, other_accounts)
         open_orders = broker.open_orders()
         positions = broker.positions()
         tolerance = settings.risk.reconcile_quantity_tolerance
@@ -750,15 +811,16 @@ def start(
             started_at=now,
             frozen_json=frozen_json,
             frozen_sha256=frozen_sha256,
-            book_id=settings.paper.book_id,
+            book_id=book,
             known_at=now,
             ingested_at=now,
         )
 
         with open_for_write(settings) as write_conn:
             init_schema(write_conn)
-            if open_window(write_conn) is not None:
+            if open_window(write_conn, book) is not None:
                 raise StartRefusedError("window_open", "a paper window is already open")
+            _refuse_account_in_use(account.account_id, _other_books_accounts(write_conn, book))
             window_id = append(write_conn, row)
             assert window_id is not None
             session = plan.carried_session or t_0
@@ -887,11 +949,12 @@ def _note(reason: str, command: str) -> str:
     return note
 
 
-def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
-    """The open window and its id, or a `no_window` refusal (a store whose
+def _window_of(conn: duckdb.DuckDBPyConnection, book: str) -> tuple[PaperWindowRow, int]:
+    """Book `book`'s open window and its id (another book's windows are never
+    read, ADR 0017 B.2), or a `no_window` refusal (a store whose
     journal no write has migrated has no window either), or a
-    `multiple_open_windows` refusal (spec req 14: only one window may ever be
-    open) when the journal has more than one open window, or a
+    `multiple_open_windows` refusal (spec req 14: only one window per book may
+    ever be open) when the book has more than one open window, or a
     `schema_version` refusal when the journal predates schema version 17 (the
     eight expanded tables lack `book_id`; `require_journal`'s message names
     the fix). Every command that calls this (`stop`, `abandon`, `kill`,
@@ -900,7 +963,7 @@ def _window_of(conn: duckdb.DuckDBPyConnection) -> tuple[PaperWindowRow, int]:
     row) still refuses the same way, but by then the reconciliation row is
     already written."""
     try:
-        window = open_window(conn)
+        window = open_window(conn, book)
     except JournalNotInitialised:
         window = None
     except SchemaVersionError as exc:
@@ -1140,6 +1203,8 @@ def stop(
     broker: Broker,
     clock: Callable[[], datetime],
     reason: str,
+    *,
+    book_id: str | None = None,
 ) -> StopResult:
     """`paper stop --reason` (module docstring). `connect` opens a write chunk
     (`lambda: store.db.open_for_write(settings)`). Raises `WindowCommandRefused`
@@ -1147,9 +1212,10 @@ def stop(
     `ClockError` for a bad clock reading, and whatever the broker or the store
     raises."""
     note = _note(reason, "paper stop")
-    with run_lock(settings):
+    book = _book(settings, book_id)
+    with run_lock(settings, book):
         with connect() as conn:
-            window, window_id = _window_of(conn)
+            window, window_id = _window_of(conn, book)
             _refuse_if_engaged(conn, window)
             requested = any(s.state == REQUESTED for s in window_stops_for(conn, window_id))
         now = _command_clock(clock)
@@ -1247,6 +1313,8 @@ def abandon(
     broker: Broker,
     clock: Callable[[], datetime],
     reason: str,
+    *,
+    book_id: str | None = None,
 ) -> AbandonResult:
     """`paper abandon --reason`, owner-only (module docstring; #247 Q13).
     Raises `WindowCommandRefused` for a blank reason, no open window or an
@@ -1257,9 +1325,10 @@ def abandon(
     after a mismatch; a note on the error says when that engagement could
     not be written, so the switch is NOT engaged)."""
     note = _note(reason, "paper abandon")
-    with run_lock(settings):
+    book = _book(settings, book_id)
+    with run_lock(settings, book):
         with connect() as conn:
-            window, window_id = _window_of(conn)
+            window, window_id = _window_of(conn, book)
             still_open = _open_orders(conn, window_id)
         if still_open:
             raise WindowCommandRefused(
@@ -1285,7 +1354,7 @@ def abandon(
         except ReconciliationError as exc:
             mismatch = exc  # its row is written before the error: abandon lists it
         try:
-            return _abandon_row(connect, broker, clock, window_id, note)
+            return _abandon_row(connect, broker, clock, window_id, note, book)
         except Exception as exc:
             # The window stays open over a mismatch row: engage, as `stop` does,
             # so it is never left unwatched, and say so when that fails too.
@@ -1304,6 +1373,7 @@ def _abandon_row(
     clock: Callable[[], datetime],
     window_id: int,
     note: str,
+    book: str,
 ) -> AbandonResult:
     """`abandon`'s positions read and its `abandoned` row, after the final
     reconciliation."""
@@ -1331,7 +1401,7 @@ def _abandon_row(
             f"clock went back from {reconciliation.at.isoformat()} to {stamp.isoformat()}"
         )
     with connect() as conn:
-        _window_of(conn)
+        _window_of(conn, book)
         append(
             conn,
             PaperWindowStopRow(
@@ -1353,15 +1423,20 @@ def kill(
     connect: Connect,
     clock: Callable[[], datetime],
     reason: str,
+    *,
+    book_id: str | None = None,
 ) -> int:
-    """`paper kill --reason` (module docstring): the `engaged` row's
-    `event_id`. Takes no run lock. Raises `WindowCommandRefused` for a blank
-    reason, no open window, or more than one open window (only one window
-    may ever be open, spec req 14; nothing is written for any of these) and
-    `KillWriteFailed` when the row cannot be written."""
+    """`paper kill --book <book> --reason` (module docstring; `book_id` defaults
+    to `paper.book_id`): the `engaged` row's `event_id`, on the book's open window
+    only, so every other book keeps running (ADR 0017 B.5). Takes no run lock.
+    Raises `WindowCommandRefused` for a blank reason, no open window for the book,
+    or more than one (only one window per book may ever be open, spec req 14;
+    nothing is written for any of these), `ValueError` for a book outside the
+    token grammar, and `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
+    book = _book(settings, book_id)
     with connect() as conn:
-        _, window_id = _window_of(conn)
+        _, window_id = _window_of(conn, book)
     try:
         engaged = switch.engage(settings, clock, window_id=window_id, source=_OWNER, reason=note)
     except Exception as exc:  # a bad clock reading, say: still not engaged
@@ -1429,8 +1504,11 @@ def override(
     rebalance_session: date | None,
     security_id: str | None,
     reason: str,
+    *,
+    book_id: str | None = None,
 ) -> int:
-    """Append one `overrides` row to the open window and return its
+    """Append one `overrides` row to the book's open window (`book_id`, default
+    `paper.book_id`) and return its
     `override_id` (module docstring; spec req 9). Raises
     `WindowCommandRefused` for every refusal, nothing written, and
     `StoreLockedError` when the store stays locked ("store busy"). Kind
@@ -1441,10 +1519,11 @@ def override(
             f"override kind {kind!r} is written only by `paper settle --order --reason`, "
             "whose gate reads the broker first",
         )
+    book = _book(settings, book_id)
     now = _command_clock(clock)
     note = reason.strip()
     with open_for_write(settings) as conn:
-        window, window_id = _window_of(conn)
+        window, window_id = _window_of(conn, book)
         _override_fields(
             window, kind, rebalance_session, security_id, lambda: window_cadence(conn, window)
         )
@@ -1517,11 +1596,12 @@ class _SettleTarget:
 
 
 def _settle_journal_gate(
-    conn: duckdb.DuckDBPyConnection, client_order_id: str, reason: str
+    conn: duckdb.DuckDBPyConnection, client_order_id: str, reason: str, book: str
 ) -> _SettleTarget:
-    """Req 17's journal refusals, in its order: `no_window`, `unknown_order`,
-    `already_terminal`, `pending_order`, `reason`, `not_engaged`."""
-    window, window_id = _window_of(conn)
+    """Req 17's journal refusals, in its order, on book `book`'s open window:
+    `no_window`, `unknown_order`, `already_terminal`, `pending_order`, `reason`,
+    `not_engaged`."""
+    window, window_id = _window_of(conn, book)
     order = next(
         (o for o in orders_for(conn, window_id=window_id) if o.client_order_id == client_order_id),
         None,
@@ -1679,6 +1759,8 @@ def settle_order(
     clock: Callable[[], datetime],
     client_order_id: str,
     reason: str,
+    *,
+    book_id: str | None = None,
 ) -> SettleResult:
     """`paper settle --order <client_order_id> --reason` (spec req 17, #571):
     journal one acknowledged order of the open window terminal (`cancelled`,
@@ -1712,9 +1794,10 @@ def settle_order(
     the order's events and refuses `already_terminal` if one appeared. No other
     row is written and no `submit` or `cancel` is ever called. The only caller
     is the owner's CLI (#542 item 5)."""
-    with run_lock(settings):
+    book = _book(settings, book_id)
+    with run_lock(settings, book):
         with connect() as conn:
-            target = _settle_journal_gate(conn, client_order_id, reason)
+            target = _settle_journal_gate(conn, client_order_id, reason, book)
         window = target.window
         tolerance = frozen_risk(window).reconcile_quantity_tolerance
         now = _command_clock(clock)
