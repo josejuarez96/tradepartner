@@ -12,9 +12,13 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 
+from tradepartner import universe as universe_module
+from tradepartner.calendar import all_sessions, last_completed_session, sessions_in_month_window
 from tradepartner.config import Settings
+from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row
 from tradepartner.universe import MISSING_DATA_REASONS, RULES, Universe, universe_as_of
 
@@ -423,3 +427,63 @@ def test_first_span_lead_bars_admit_no_name_before_its_listing_is_known() -> Non
     after = universe_as_of(conn, session_close(date(2019, 11, 29)), _settings())
     assert sid in _members(after)  # past rule 6 on the lead bars, and the rest
     conn.close()
+
+
+# --- #1305: the bar read is bounded by the rules' windows ---------------------------
+
+
+def _first_needed_session(t: datetime, settings: Settings) -> date:
+    """The earliest session rules 4-6 look at: the history window's first session or
+    the liquidity window's, whichever is earlier."""
+    session = last_completed_session(t)
+    history = sessions_in_month_window(session, settings.universe.min_history_months)
+    sessions = all_sessions()
+    liquidity_first = sessions[sessions.index(session) - settings.universe.liquidity_window + 1]
+    return min(history[0], liquidity_first)
+
+
+@pytest.mark.parametrize("t", [T_SPLIT_BETWEEN, T_LATE, T_STALE])
+def test_the_bar_read_starts_at_the_rules_windows_not_the_store_start(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch, t: datetime
+) -> None:
+    # #1305: the universe read every traded bar since the store's first session, so
+    # its cost grew with the calendar date of the step. Rules 4-6 look only at the
+    # session, the liquidity window and the history window: a bar before them is
+    # never read, however much history the store holds.
+    settings = _settings()
+    read: list[pl.DataFrame] = []
+    real = universe_module.prices_as_of
+
+    def recording(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        frame = real(*args, **kwargs)
+        read.append(frame)
+        return frame
+
+    monkeypatch.setattr(universe_module, "prices_as_of", recording)
+    universe_as_of(fixture_store, t, settings)
+    first = _first_needed_session(t, settings)
+    older = prices_as_of(fixture_store, t).filter(pl.col("session") < first)
+    assert older.height > 0  # the store does hold bars before the windows
+    assert read and all(frame.height > 0 for frame in read)
+    assert min(frame["session"].min() for frame in read) >= first  # type: ignore[type-var]
+
+
+@pytest.mark.parametrize("t", [T_DUAL, T_SPLIT_BETWEEN, T_STALE, T_WINDOW_DELIST, T_LATE])
+def test_the_bounded_bar_read_gives_the_full_history_universe(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch, t: datetime
+) -> None:
+    # The bound is an optimisation only: with the bar read made unbounded again the
+    # universe is identical, member for member and exclusion for exclusion.
+    settings = _settings()
+    bounded = universe_as_of(fixture_store, t, settings)
+    real = universe_module.prices_as_of
+
+    def unbounded(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        kwargs.pop("sessions_from", None)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(universe_module, "prices_as_of", unbounded)
+    full = universe_as_of(fixture_store, t, settings)
+    assert bounded.members.equals(full.members)
+    assert bounded.exclusions.equals(full.exclusions)
+    assert bounded.shares_fallbacks.equals(full.shares_fallbacks)

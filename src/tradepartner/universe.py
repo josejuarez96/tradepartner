@@ -487,10 +487,21 @@ def universe_as_of(
 
     apply("sector", {sid: utility(sid) for sid in alive})
 
+    # Rules 4-6 look at the session, the liquidity window and the history window
+    # only, so the bar read starts at the earliest of them: its cost stays flat
+    # however much history the store holds before `t` (#1305).
+    window = (
+        _last_sessions(session, cfg.liquidity_window) if cfg.liquidity_rule_enabled else frozenset()
+    )
+    history = sessions_in_month_window(session, cfg.min_history_months)
+    first = min(session, *history, *window)
     bars: dict[str, dict[date, tuple[float, int]]] = defaultdict(dict)
-    for row in prices_as_of(conn, t, alive, traded_only=True).iter_rows(named=True):
-        if row["session"] <= session:
-            bars[row["security_id"]][row["session"]] = (row["close"], row["volume"])
+    frame = prices_as_of(conn, t, alive, traded_only=True, sessions_from=first)
+    for sid, day, close_, volume in frame.select(
+        "security_id", "session", "close", "volume"
+    ).iter_rows():
+        if day <= session:
+            bars[sid][day] = (close_, volume)
     sized = list(alive)  # passed rules 1-3: the classes a company's cap may sum
     close = {sid: bars[sid][session][0] for sid in alive if session in bars[sid]}
     apply(
@@ -502,7 +513,6 @@ def universe_as_of(
     )
 
     if cfg.liquidity_rule_enabled:
-        window = _last_sessions(session, cfg.liquidity_window)
 
         def illiquid(sid: str) -> str:
             dollars = [c * v for s, (c, v) in bars[sid].items() if s in window]
@@ -511,7 +521,6 @@ def universe_as_of(
 
         apply("liquidity", {sid: illiquid(sid) for sid in alive})
 
-    history = sessions_in_month_window(session, cfg.min_history_months)
     apply(
         "history",
         {sid: "" if all(s in bars[sid] for s in history) else "missing_bars" for sid in alive},

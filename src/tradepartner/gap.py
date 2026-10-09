@@ -87,6 +87,7 @@ from tradepartner.store.delistings import (
 from tradepartner.store.master import securities_as_of
 from tradepartner.universe import (
     MISSING_DATA_REASONS,
+    Universe,
     _split_factors,
     latest_shares_as_of,
     universe_as_of,
@@ -261,15 +262,25 @@ def survivorship_gap(
     settings: Settings | None = None,
     *,
     previous_rebalance: date | None = None,
+    universe: Universe | None = None,
 ) -> SurvivorshipGap:
     """The survivorship gap at `t` from rows known at `t` (see the module
     docstring). `settings` defaults to `get_settings()` and is the only
     source of every `gap.*` and `universe.*` value, also passed to
     `listing_ends_as_of` and `universe_as_of`. `previous_rebalance`, when
-    given, must be a session before `t`'s. A bare date raises
+    given, must be a session before `t`'s. `universe`, when given, is
+    `universe_as_of(conn, t, settings)` already built by the caller on the
+    same connection (the backtest provider's step, #1305), used for the side
+    categories instead of building it again; one at another `t` or with
+    other `universe` settings raises `ValueError`. A bare date raises
     `TypeError`, a naive datetime `ValueError`."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
+    if universe is not None and (
+        universe.t != t
+        or universe.settings.get("universe") != settings.universe.model_dump(mode="json")
+    ):
+        raise ValueError(f"the universe passed is not the universe at {t.isoformat()}")
     session = last_completed_session(t)
     if previous_rebalance is None:
         previous_rebalance = _default_previous_rebalance(session)
@@ -371,7 +382,9 @@ def survivorship_gap(
 
     listed_value = sum(values.values())
     missing_value = sum(r["value"] for r in missing)
-    exclusions = universe_as_of(conn, t, settings).exclusions.iter_rows(named=True)
+    if universe is None:
+        universe = universe_as_of(conn, t, settings)
+    exclusions = universe.exclusions.iter_rows(named=True)
     side: dict[str, list[str]] = {"unclassifiable": [], "history": [], "shares": []}
     in_m = {r["security_id"] for r in missing}
     for r in exclusions:
