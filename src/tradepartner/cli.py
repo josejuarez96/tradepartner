@@ -217,6 +217,12 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   `check` with no window are such a failure), 2 on a usage
   error, 3 when `kill` cannot write its row, and `PAPER_REFUSAL_EXIT`'s code for
   `refused` (the reason code is printed), `locked` and `no_window`.
+- `tradepartner paper shakedown` (ADR 0017 part E; plan T157b) prints
+  `execution.shakedown.shakedown`'s seven lines, E.1 to E.7, over every book,
+  each with the rows, query and thresholds it read, through
+  `store.db.open_read_only` (it writes nothing). The thresholds come from the
+  newest `shakedown_span` decision, never `Settings`. It exits 0 only when every
+  line passes and 1 otherwise, or when no `shakedown_span` row exists.
 - `tradepartner paper lots-reconcile --export <file> --tax-year <y>` parses the
   broker's realised-gains or 1099-B export (`execution.lots_reconcile_export`,
   a stub that refuses every file until the first real export) and compares it,
@@ -320,6 +326,7 @@ from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
 from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
+from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import LockHeld
 from tradepartner.execution.lots_reconcile import BrokerLotRow
@@ -3109,6 +3116,28 @@ def make_app(
             verdict = "PASS" if line.passed else "FAIL"
             _echo_scrubbed(f"{verdict} {line.name}: {line.detail} (query: {line.query})", s)
         if not all(line.passed for line in lines):
+            raise typer.Exit(CRASH_EXIT_CODE)
+
+    @paper_app.command("shakedown")
+    def paper_shakedown_() -> None:
+        """The machine-readiness gate's seven lines over every book; exit 0 only when
+        all pass (ADR 0017 part E; spec req 15 as amended 2026-10-09). Read-only."""
+        s = paper_settings()
+        now = ensure_tz_aware_utc(clock(), field_name="clock()")
+
+        def run_shakedown() -> paper_shakedown.Shakedown:
+            with open_read_only(s) as conn:
+                return paper_shakedown.shakedown(conn, s, now=now)
+
+        result = _paper_call(s, run_shakedown)
+        for line in result.lines:
+            verdict = "PASS" if line.passed else "FAIL"
+            _echo_scrubbed(
+                f"{verdict} {line.name}: {line.detail} (rows: {line.rows}; query: "
+                f"{line.query}; thresholds: {line.thresholds})",
+                s,
+            )
+        if not result.passed:
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("status")

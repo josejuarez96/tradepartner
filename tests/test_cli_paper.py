@@ -31,6 +31,7 @@ from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
+from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution import switch, window
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
@@ -509,6 +510,7 @@ PAPER_OPTIONS = {
     "settle": {"--order", "--reason"},
     "override": {"--kind", "--session", "--name", "--reason"},
     "lots-reconcile": {"--export", "--tax-year"},
+    "shakedown": set(),
 }
 
 
@@ -1206,3 +1208,74 @@ def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
     (param,) = [p for p in settle.params if "--order" in p.opts]
     assert param.envvar is None
     assert param.allow_from_autoenv is False
+
+
+# --- `paper shakedown` (ADR 0017 part E; plan T157b) --------------------------------
+
+
+def _shakedown_line(name: str, passed: bool) -> paper_shakedown.ShakedownLine:
+    return paper_shakedown.ShakedownLine(
+        name=name, passed=passed, rows="r", query="q", thresholds="t", detail="d"
+    )
+
+
+def test_paper_shakedown_with_no_span_row_fails(clock: _Clock, factory: _Factory) -> None:
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 1
+    assert "no shakedown_span decision" in out.output
+    assert factory.fake.calls == ()
+
+
+def test_paper_shakedown_prints_seven_lines_and_fails_on_an_empty_journal(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    class _Healthy:
+        ok = True
+        failures: tuple[str, ...] = ()
+
+    monkeypatch.setattr(paper_shakedown, "health_report", lambda conn, t, s: _Healthy())
+    with open_for_write(_settings()) as conn:
+        registry.record_decision(
+            conn,
+            kind=registry.SHAKEDOWN_SPAN_KIND,
+            reason="H1 goes live first",
+            values={"sessions": 10, "order_sessions": 5},
+        )
+    clock.now = datetime(2026, 12, 1, 14, tzinfo=UTC)
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 1
+    lines = out.output.strip().splitlines()
+    assert len(lines) == 7
+    assert lines[0].startswith("FAIL E.1 sessions:")
+    assert "sessions >= 10, order sessions >= 5" in lines[0]
+    assert [line.split(":")[0].split(" ", 1)[1] for line in lines] == [
+        "E.1 sessions",
+        "E.2 reconciliation",
+        "E.3 orders",
+        "E.4 kill-switch drill",
+        "E.5 journal",
+        "E.6 alerts",
+        "E.7 data",
+    ]
+    assert factory.fake.calls == ()
+
+
+def test_paper_shakedown_exits_zero_when_every_line_passes_on_a_read_only_store(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    seen: list[datetime] = []
+
+    def fake(
+        conn: duckdb.DuckDBPyConnection, s: Settings, *, now: datetime
+    ) -> paper_shakedown.Shakedown:
+        seen.append(now)
+        with pytest.raises(duckdb.Error):
+            conn.execute("CREATE TABLE probe (x INTEGER)")
+        lines = tuple(_shakedown_line(f"E.{i}", True) for i in range(1, 8))
+        return paper_shakedown.Shakedown(span=None, lines=lines)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper_shakedown, "shakedown", fake)
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 0, out.output
+    assert out.output.count("PASS E.") == 7
+    assert seen == [SESSION_CLOCK]
