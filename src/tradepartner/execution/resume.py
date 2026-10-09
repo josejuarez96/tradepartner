@@ -137,7 +137,7 @@ from tradepartner.execution.collect import (
     lag_verdict,
     rejection_breaches,
 )
-from tradepartner.execution.lock import run_lock
+from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.reconcile import OK
 from tradepartner.execution.reconcile_run import command_session, frozen_risk, reconcile_now
 from tradepartner.store.journal import (
@@ -149,7 +149,6 @@ from tradepartner.store.journal import (
     ResumeAcceptanceRow,
     ResumeInvocationRow,
     append,
-    check_book_id,
     kill_switch_events_for,
     non_terminal_orders,
     open_window,
@@ -539,8 +538,7 @@ def resume(
         raise ValueError("paper resume needs a non-blank --reason")
     if not isinstance(accept_rejections, bool):
         raise TypeError(f"accept_rejections must be a bool, got {type(accept_rejections).__name__}")
-    book = settings.paper.book_id if book_id is None else book_id
-    check_book_id(book)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             window = open_window(conn, book)

@@ -251,7 +251,7 @@ from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import plan as plan_rules
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import from_journal
-from tradepartner.execution.lock import run_lock
+from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import OK
@@ -279,7 +279,6 @@ from tradepartner.store.journal import (
     adjustments_for,
     all_fill_ids,
     append,
-    check_book_id,
     decisions_for,
     fills_for,
     kill_switch_events_for,
@@ -676,19 +675,12 @@ def _check_flat(
     )
 
 
-def _book(settings: Settings, book_id: str | None) -> str:
-    """The command's book: `book_id`, or `paper.book_id` when none is given (the
-    spec's `--book` default); `ValueError` outside the token grammar."""
-    book = settings.paper.book_id if book_id is None else book_id
-    check_book_id(book)
-    return book
-
-
 def _other_books_accounts(conn: duckdb.DuckDBPyConnection, book: str) -> dict[str, str]:
     """Every account id another book's window (open, closed or abandoned) was
     opened on, mapped to that book (the lowest token when several share one)."""
     rows = conn.execute(
-        "SELECT account_id, MIN(book_id) FROM paper_windows WHERE book_id <> ? GROUP BY account_id",
+        "SELECT account_id, MIN(book_id) FROM paper_windows "
+        "WHERE book_id <> ? AND account_id IS NOT NULL GROUP BY account_id",
         [book],
     ).fetchall()
     return {str(account_id): str(other) for account_id, other in rows}
@@ -721,7 +713,7 @@ def start(
     the book's run lock, `registry.UnknownHypothesis` for an unregistered slug,
     `ValueError` for a book outside the token grammar, and `StartRefusedError`
     for every other refusal, all before any write."""
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
@@ -1212,7 +1204,7 @@ def stop(
     `ClockError` for a bad clock reading, and whatever the broker or the store
     raises."""
     note = _note(reason, "paper stop")
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             window, window_id = _window_of(conn, book)
@@ -1325,7 +1317,7 @@ def abandon(
     after a mismatch; a note on the error says when that engagement could
     not be written, so the switch is NOT engaged)."""
     note = _note(reason, "paper abandon")
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             window, window_id = _window_of(conn, book)
@@ -1434,7 +1426,7 @@ def kill(
     nothing is written for any of these), `ValueError` for a book outside the
     token grammar, and `KillWriteFailed` when the row cannot be written."""
     note = _note(reason, "paper kill")
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     with connect() as conn:
         _, window_id = _window_of(conn, book)
     try:
@@ -1519,7 +1511,7 @@ def override(
             f"override kind {kind!r} is written only by `paper settle --order --reason`, "
             "whose gate reads the broker first",
         )
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     now = _command_clock(clock)
     note = reason.strip()
     with open_for_write(settings) as conn:
@@ -1794,7 +1786,7 @@ def settle_order(
     the order's events and refuses `already_terminal` if one appeared. No other
     row is written and no `submit` or `cancel` is ever called. The only caller
     is the owner's CLI (#542 item 5)."""
-    book = _book(settings, book_id)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             target = _settle_journal_gate(conn, client_order_id, reason, book)

@@ -104,7 +104,7 @@ from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import run_lock
+from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
     MISMATCH,
@@ -124,7 +124,6 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
-    check_book_id,
     fills_for,
     non_terminal_orders,
     open_window,
@@ -573,8 +572,7 @@ def reconcile_command(
     and re-raises `ReconciliationError`; if that row cannot be written (the
     store, or the clock it is stamped with, failing), the error says so and
     still names the mismatch."""
-    book = settings.paper.book_id if book_id is None else book_id
-    check_book_id(book)
+    book = resolve_book(settings, book_id)
     with run_lock(settings, book):
         with connect() as conn:
             window = open_window(conn, book)

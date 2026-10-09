@@ -16,7 +16,14 @@ from pathlib import Path
 import pytest
 
 from tradepartner.config import Settings
-from tradepartner.execution.lock import LockHeld, is_held, lock_path, run_lock
+from tradepartner.execution.lock import (
+    LockHeld,
+    _flock,
+    is_held,
+    legacy_lock_path,
+    lock_path,
+    run_lock,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -160,3 +167,20 @@ def test_the_lock_is_released_when_the_holder_dies(settings: Settings) -> None:
 def test_the_holder_records_its_pid(settings: Settings) -> None:
     with run_lock(settings):
         assert f"pid {os.getpid()}" in lock_path(settings).read_text(encoding="utf-8")
+
+
+def test_main_also_holds_the_pre_book_lock_across_the_upgrade(settings: Settings) -> None:
+    """A process on the old code holds `<store.path>.paper.lock`: `main`'s run lock
+    is refused and `main` reads as held, while `b` is unaffected; and `main`'s
+    holder takes the old file too, so old code is refused while new code runs."""
+    with _flock(legacy_lock_path(settings)):
+        assert is_held(settings, "main")
+        assert not is_held(settings, "b")
+        with pytest.raises(LockHeld, match=r"\.paper\.lock"), run_lock(settings):
+            pass
+        with run_lock(settings, "b"):
+            pass
+    with run_lock(settings), pytest.raises(LockHeld), _flock(legacy_lock_path(settings)):
+        pass
+    assert legacy_lock_path(settings) == Path(f"{settings.store.path}.paper.lock")
+    assert not is_held(settings)

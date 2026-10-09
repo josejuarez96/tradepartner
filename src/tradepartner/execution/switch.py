@@ -93,6 +93,7 @@ from tradepartner.store.journal import (
     kill_switch_events_for,
     open_window,
     reconciliations_for,
+    require_journal,
     resume_invocations,
     runs_for,
     unconsumed_kill_switch_overrides,
@@ -420,7 +421,10 @@ def open_window_of(conn: duckdb.DuckDBPyConnection, window_id: int) -> PaperWind
     """Window `window_id` when it is its book's open window, else None (ADR 0017
     B.2 and B.5: another book's windows are never read, so another book's open
     window neither hides nor stands in for this one). `JournalIntegrityError`
-    when the book has more than one open window, as `open_window`."""
+    when the book has more than one open window, as `open_window`, and the same
+    typed errors as `open_window` for a journal it cannot read
+    (`require_journal`)."""
+    require_journal(conn)
     row = conn.execute(
         "SELECT book_id FROM paper_windows WHERE window_id = ?", [window_id]
     ).fetchone()

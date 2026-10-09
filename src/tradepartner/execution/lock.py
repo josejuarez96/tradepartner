@@ -39,10 +39,10 @@ from __future__ import annotations
 import fcntl
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from tradepartner.config import Settings
+from tradepartner.config import MAIN_BOOK_ID, Settings
 from tradepartner.store.journal import check_book_id
 
 #: Owner read and write only: the file names a pid, nothing else.
@@ -53,12 +53,25 @@ class LockHeld(RuntimeError):
     """Another process holds the paper run lock."""
 
 
+def resolve_book(settings: Settings, book_id: str | None) -> str:
+    """The command's book: `book_id`, or `paper.book_id` when none is given (the
+    spec's `--book` default); `ValueError` outside the book token grammar."""
+    book = settings.paper.book_id if book_id is None else book_id
+    check_book_id(book)
+    return book
+
+
 def lock_path(settings: Settings, book_id: str | None = None) -> Path:
     """`<store.path>.paper.<book>.lock`, beside the store it guards; `book_id`
     defaults to `paper.book_id`. `ValueError` outside the book token grammar."""
-    book = settings.paper.book_id if book_id is None else book_id
-    check_book_id(book)
-    return Path(f"{settings.store.path}.paper.{book}.lock")
+    return Path(f"{settings.store.path}.paper.{resolve_book(settings, book_id)}.lock")
+
+
+def legacy_lock_path(settings: Settings) -> Path:
+    """`<store.path>.paper.lock`, the one lock before books (T59). Book `main`
+    takes it too (after its own), so a process still on the old code and one on
+    the new exclude each other across the upgrade while H1's window is open."""
+    return Path(f"{settings.store.path}.paper.lock")
 
 
 def _holder(path: Path) -> str:
@@ -74,8 +87,19 @@ def run_lock(settings: Settings, book_id: str | None = None) -> Iterator[None]:
     """Hold the book's exclusive run lock for the `with` block, or raise
     `LockHeld` at once when another holder of that book's lock exists (in this
     process or another). Released when the block exits, normally or by an
-    exception. `book_id` defaults to `paper.book_id`."""
-    path = lock_path(settings, book_id)
+    exception. `book_id` defaults to `paper.book_id`. Book `main` also holds
+    `legacy_lock_path` for the whole block, refused the same way."""
+    book = resolve_book(settings, book_id)
+    with ExitStack() as stack:
+        stack.enter_context(_flock(lock_path(settings, book)))
+        if book == MAIN_BOOK_ID:
+            stack.enter_context(_flock(legacy_lock_path(settings)))
+        yield
+
+
+@contextmanager
+def _flock(path: Path) -> Iterator[None]:
+    """The exclusive non-blocking `flock` on `path` for the block (`LockHeld`)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, _LOCK_FILE_MODE)
     try:
@@ -97,8 +121,15 @@ def is_held(settings: Settings, book_id: str | None = None) -> bool:
     """True while some process holds the book's run lock (`book_id` defaults to
     `paper.book_id`). Never creates the lock file: before the book's first run
     there is no file and nothing holds it. A process that holds the lock gets
-    True here for its own lock; it must not ask."""
-    path = lock_path(settings, book_id)
+    True here for its own lock; it must not ask. For book `main`, a holder of
+    `legacy_lock_path` (old code) counts as held too."""
+    book = resolve_book(settings, book_id)
+    if _held(lock_path(settings, book)):
+        return True
+    return book == MAIN_BOOK_ID and _held(legacy_lock_path(settings))
+
+
+def _held(path: Path) -> bool:
     try:
         fd = os.open(path, os.O_RDONLY)
     except FileNotFoundError:

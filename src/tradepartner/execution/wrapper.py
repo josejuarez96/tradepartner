@@ -263,6 +263,7 @@ from tradepartner.store.journal import (
     RebalanceEventRow,
     adjustments_for,
     append,
+    check_book_id,
     decisions_for,
     fills_for,
     kill_switch_events_for,
@@ -274,7 +275,7 @@ from tradepartner.store.journal import (
     reconciliations_for,
     runs_for,
 )
-from tradepartner.store.schema import HALT_REASON, LONG, ORDER_SHAPE_DEFAULTS
+from tradepartner.store.schema import DEFAULT_BOOK_ID, HALT_REASON, LONG, ORDER_SHAPE_DEFAULTS
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -538,7 +539,12 @@ class RiskGatedBroker:
     each phase's book, #534), and every `paper.*` and `alpaca.*` key comes from
     `settings`,
     `alerter` writes the halt's alert, `calendar` gives session opens and
-    closes, and `sleep` waits between polls (tests advance a fake clock)."""
+    closes, and `sleep` waits between polls (tests advance a fake clock).
+    `book_id`, when given, is the book whose runs it executes (ADR 0017 B.2): a
+    phase whose run's window is another book's is refused before any broker
+    call. The halt's alert is journaled under the run's window's book (the window
+    row's, never the live `paper.book_id`, ADR 0015 seam 1), which is `book_id`
+    when given."""
 
     def __init__(
         self,
@@ -551,7 +557,12 @@ class RiskGatedBroker:
         alerter: Alerter,
         *,
         sleep: Callable[[float], None] = time.sleep,
+        book_id: str | None = None,
     ) -> None:
+        if book_id is not None:
+            check_book_id(book_id)
+        self._book_id = book_id
+        self._window_books: dict[int, str] = {}
         self._broker = broker
         self._clock = clock
         self._frozen = frozen
@@ -994,6 +1005,23 @@ class RiskGatedBroker:
                     )
         raise (LimitBreachError if breaches else SkipCapError)(message)
 
+    def _run_book(self, run: PaperRunRow) -> str:
+        """The book the run's alert is journaled under: `book_id` when given, else
+        the run's window row's, else (the store unreadable on the halt path, where
+        the alert write itself then most likely fails too) `main`."""
+        if self._book_id is not None:
+            return self._book_id
+        if run.window_id in self._window_books:
+            return self._window_books[run.window_id]
+        try:
+            with self._journal() as conn:
+                row = conn.execute(
+                    "SELECT book_id FROM paper_windows WHERE window_id = ?", [run.window_id]
+                ).fetchone()
+        except Exception:
+            return DEFAULT_BOOK_ID
+        return DEFAULT_BOOK_ID if row is None else str(row[0])
+
     def _read_book(self, run: PaperRunRow, rows: Sequence[DecisionRow]) -> _Book:
         """One read of the journal and the store for a phase (`_Book`)."""
         assert run.session is not None
@@ -1005,6 +1033,12 @@ class RiskGatedBroker:
             window = switch.open_window_of(conn, run.window_id)
             if window is None:
                 raise ValueError(f"run {run.run_id}'s window {run.window_id} is not the open one")
+            self._window_books[run.window_id] = window.book_id
+            if self._book_id is not None and window.book_id != self._book_id:
+                raise ValueError(
+                    f"run {run.run_id}'s window {run.window_id} is book {window.book_id!r}, "
+                    f"not this wrapper's {self._book_id!r}"
+                )
             costs = _frozen_costs(window)
             window_id = run.window_id
             actions = live_actions_as_of(conn, cut)
@@ -1372,6 +1406,7 @@ class RiskGatedBroker:
                 self._session(run, stamp),
                 message,
                 clock_fault=stamp.fault,
+                book_id=self._run_book(run),
             )
         except Exception as exc:
             notes.append(f"alert not written ({type(exc).__name__})")
