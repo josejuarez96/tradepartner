@@ -871,3 +871,12 @@ why = "The build is proven only on the owner's store; the release row names the 
 [task.T150]
 what = "The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
 why = "Only with longer history does more than one exam slice exist; registering the new families as children keeps every trial counted, as charter principle 2 requires."
+
+[task.T151]
+what = "The EDGAR 8-K items field, with its acceptance time, stored as filing_events: the adapter already reads it from the submissions payload and drops it."
+why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; without the field the event cannot be dated point-in-time."
+unblocks = ["issue:1358"]
+
+[issue.1358]
+what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
+why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."
