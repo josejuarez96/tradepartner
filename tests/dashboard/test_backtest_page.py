@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -21,11 +22,12 @@ import duckdb
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from tradepartner.backtest.metrics import deflated_sharpe
+from tradepartner.backtest.metrics import METRIC_KEYS, deflated_sharpe
 from tradepartner.config import Settings
 from tradepartner.dashboard import backtest_page, theme
-from tradepartner.store import registry, schema
-from tradepartner.store.db import open_for_write
+from tradepartner.research.experiment import hash_file, parse_experiment_file
+from tradepartner.store import lab_registry, lab_schema, registry, research, schema
+from tradepartner.store.db import insert_row, open_for_write
 
 _APP_PATH = str(
     Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "dashboard" / "app.py"
@@ -41,21 +43,24 @@ def _metrics(sharpe: float, excess: float) -> dict[str, float | None]:
     return {
         "cagr": 0.08,
         "vol_annual": 0.15,
-        "sharpe_monthly": sharpe,
+        "sharpe_period": sharpe,
         "sharpe_annual": sharpe * math.sqrt(12),
-        "sharpe_monthly_excess_spy": excess,
+        "sharpe_period_excess_spy": excess,
+        "sharpe_annual_excess_spy": excess * math.sqrt(12),
         "max_drawdown": -0.2,
-        "turnover_monthly": 0.1,
+        "turnover_period": 0.1,
+        "turnover_annual": 1.2,
         "cost_drag": 0.002,
         "excess_cagr_spy": 0.01,
         "excess_cagr_mtum": -0.005,
         "tracking_error_spy": 0.05,
         "tracking_error_mtum": 0.04,
-        "skew_monthly": -0.3,
-        "kurtosis_monthly": 3.5,
-        "skew_monthly_excess_spy": 0.1,
-        "kurtosis_monthly_excess_spy": 3.2,
-        "n_months": 36.0,
+        "skew_period": -0.3,
+        "kurtosis_period": 3.5,
+        "skew_period_excess_spy": 0.1,
+        "kurtosis_period_excess_spy": 3.2,
+        "n_periods": 36.0,
+        "periods_per_year": 12.0,
     }
 
 
@@ -144,7 +149,7 @@ def _ok_trial(
                     n_missing_fill=0,
                     n_delisting_exits=1,
                     n_stale_exits=0,
-                    n_excluded_no_history=3,
+                    counts={"n_excluded_no_history": 3},
                     n_dropped_dividends=2,
                     n_late_dividends=5 + i,
                 )
@@ -260,12 +265,22 @@ def test_recomputed_dsr_uses_todays_n_and_v(seeded_store: tuple[Path, Seeded]) -
     finally:
         conn.close()
 
-    # Today: three ok non-synthetic in-sample trials, three distinct pairs.
+    # Today: three ok non-synthetic in-sample trials, three distinct pairs, each
+    # Sharpe annualised with its trial's periods per year (strategy-lab spec req 9).
+    r12 = math.sqrt(12)
     expected_raw = deflated_sharpe(
-        _metrics(0.20, 0.05), "raw", n_trials=3, pair_sharpes=[0.20, 0.10, 0.30]
+        _metrics(0.20, 0.05),
+        "raw",
+        n_trials=3,
+        pair_sharpes=[0.20 * r12, 0.10 * r12, 0.30 * r12],
+        periods_per_year=12,
     )
     expected_excess = deflated_sharpe(
-        _metrics(0.20, 0.05), "excess_spy", n_trials=3, pair_sharpes=[0.05, 0.02, 0.09]
+        _metrics(0.20, 0.05),
+        "excess_spy",
+        n_trials=3,
+        pair_sharpes=[0.05 * r12, 0.02 * r12, 0.09 * r12],
+        periods_per_year=12,
     )
     raw, excess = view.dsr_rows
     assert raw.basis == "raw"
@@ -273,7 +288,55 @@ def test_recomputed_dsr_uses_todays_n_and_v(seeded_store: tuple[Path, Seeded]) -
     assert raw.stored_dsr == pytest.approx(0.9)
     assert raw.today == expected_raw
     assert excess.today == expected_excess
+    assert raw.today is not None and raw.today.sharpe_variance == pytest.approx(12 * 0.01)
     assert excess.stored_dsr == pytest.approx(0.6)
+
+
+def _stored(conn: duckdb.DuckDBPyConnection, trial_id: int, unit: str | None) -> None:
+    """Give an `ok` trial stored statistics V = 0.01 and SR* = 0.19 in `unit`. A
+    pre-version-15 row has NULL there; only a test rewrites a result row."""
+    conn.execute(
+        "UPDATE trial_results SET sharpe_variance = 0.01, sr_star = 0.19, "
+        "sharpe_variance_excess = 0.004, sr_star_excess = 0.12, sharpe_unit = ? "
+        "WHERE trial_id = ?",
+        [unit, trial_id],
+    )
+
+
+@pytest.mark.parametrize(
+    ("unit", "scale_v", "scale_sr"),
+    [(None, 12.0, math.sqrt(12)), ("monthly", 12.0, math.sqrt(12)), ("annual", 1.0, 1.0)],
+)
+def test_stored_v_and_sr_star_are_shown_in_annual_units(
+    seeded_store: tuple[Path, Seeded], unit: str | None, scale_v: float, scale_sr: float
+) -> None:
+    """A pre-lab row (`sharpe_unit` NULL, read as monthly) is converted to annual
+    beside today's values; an `annual` row is shown as stored (req 9)."""
+    store_path, seeded = seeded_store
+    with duckdb.connect(str(store_path)) as conn:
+        _stored(conn, seeded.detailed, unit)
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, excess = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    assert raw.stored_v == pytest.approx(0.01 * scale_v, rel=1e-12)
+    assert raw.stored_sr_star == pytest.approx(0.19 * scale_sr, rel=1e-12)
+    assert excess.stored_v == pytest.approx(0.004 * scale_v, rel=1e-12)
+    assert excess.stored_sr_star == pytest.approx(0.12 * scale_sr, rel=1e-12)
+
+
+def test_annual_stored_keeps_none() -> None:
+    assert backtest_page.annual_stored(None, 0.0, None) == (None, 0.0)
+    assert backtest_page.annual_stored(None, None, "annual") == (None, None)
+
+
+def test_page_reads_only_the_period_keys() -> None:
+    """Text check (strategy-lab spec, "Metrics" acceptance): the page reads no
+    `*_monthly` key and no `n_months`; the metrics table lists `METRIC_KEYS`."""
+    source = Path(backtest_page.__file__).read_text(encoding="utf-8")
+    assert "_monthly" not in source and "n_months" not in source
+    assert not any("monthly" in key for key in METRIC_KEYS)
 
 
 def test_view_reads_base_level_rows(seeded_store: tuple[Path, Seeded]) -> None:
@@ -312,7 +375,14 @@ def test_page_is_in_the_shell_navigation(
     store_path, _ = seeded_store
     at = _app(monkeypatch, store_path)
     assert not at.exception
-    assert at.sidebar.radio[0].options == ["Data health", "Backtest", "Trial registry"]
+    assert at.sidebar.radio[0].options == [
+        "Data health",
+        "Backtest",
+        "Trial registry",
+        "Research",
+        "Operations",
+        "Override",
+    ]
 
 
 def test_render_detailed_trial_shows_every_element(
@@ -338,6 +408,8 @@ def test_render_detailed_trial_shows_every_element(
 
     charts = at.get("vega_lite_chart")
     assert len(charts) == 4  # equity, drawdowns, turnover, costs
+    titles = [json.loads(c.proto.spec)["encoding"]["y"]["title"] for c in charts[2:]]
+    assert titles == ["turnover per period (one-sided)", "cost paid per period ($)"]
     equity_spec = json.loads(charts[0].proto.spec)
     assert equity_spec["encoding"]["y"]["scale"] == {"type": "log"}
     assert equity_spec["encoding"]["color"]["field"] == "series"
@@ -506,3 +578,292 @@ def test_equity_chart_accents_the_strategy_and_mutes_benchmarks(
     dash = spec["encoding"]["strokeDash"]["scale"]["range"]
     assert dash[0] == [] and all(d for d in dash[1:])
     assert spec["config"]["axis"]["gridColor"] == palette.border
+
+
+# --- today's N split: backtest trials and research runs (T83b) ------------------------
+
+_EXPERIMENTS = Path(__file__).resolve().parents[1] / "fixtures" / "experiments"
+
+
+def _research_run(store_path: Path, tmp_path: Path, configurations: int) -> None:
+    """One counted research run in family `momentum` (an `ok`, non-synthetic return
+    run outside the seeded holdout) evaluating `configurations` configurations."""
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    parsed = replace(
+        parse_experiment_file(
+            _EXPERIMENTS / "e1h-demand-deterioration-revenue.md",
+            _EXPERIMENTS,
+            settings=seed_settings,
+        ),
+        slug="r0",
+        params_sha256="e" * 64,
+        kind="return",
+        stage=6,
+        touches_returns=True,
+        family="momentum",
+        confirmatory=False,
+        window_start=date(2018, 1, 1),
+        window_end=date(2022, 12, 31),
+        splits=("full",),
+        dataset_name="panel",
+        budget_runs=10,
+        budget_configurations=20,
+    )
+    dates = [date(2019, 6, 28), date(2021, 6, 30)]
+    csv = tmp_path / "panel.csv"
+    csv.write_text(
+        "event_date,value\n" + "".join(f"{d.isoformat()},{i}\n" for i, d in enumerate(dates)),
+        encoding="utf-8",
+    )
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        research.register_experiment(conn, parsed, "owner")
+        dataset = research.register_dataset(
+            conn,
+            name="panel",
+            version="v1",
+            path=str(csv),
+            sha256=hash_file(csv),
+            event_start=min(dates),
+            event_end=max(dates),
+            n_rows=len(dates),
+            event_column="event_date",
+            repo_dir=tmp_path,
+        )
+        handle = research.open_run(
+            conn,
+            "r0",
+            dataset.dataset_id,
+            "full",
+            {"seed": 1},
+            "owner",
+            settings=seed_settings,
+            repo_dir=tmp_path,
+            configurations=configurations,
+        )
+        assert handle.refusal is None, handle.message
+        outcome = research.write_result(
+            conn,
+            handle,
+            primary_value=-0.5,
+            primary_ci_low=-0.9,
+            primary_ci_high=-0.1,
+            n_observations=400,
+            n_clusters=40,
+            n_configurations=configurations,
+            artifact_sha256="a" * 64,
+            artifact_path="/tmp/report.html",
+        )
+        assert outcome == "ok"
+
+
+def _pre_migration(store_path: Path) -> None:
+    """Turn the seeded store into one a read-only connection sees before version 12:
+    no research table, no `trial_results.n_research`, and version 11 its latest."""
+    with duckdb.connect(str(store_path)) as conn:
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("ALTER TABLE trial_results DROP COLUMN n_research")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (11, now())")
+
+
+def test_todays_n_is_split_into_backtest_trials_and_research_runs(
+    seeded_store: tuple[Path, Seeded], tmp_path: Path
+) -> None:
+    """Today's N = the three counted trials + the research run's three configurations;
+    V is the three trials' pairs alone (research-registry spec req 9)."""
+    store_path, seeded = seeded_store
+    _research_run(store_path, tmp_path, configurations=3)
+    with duckdb.connect(str(store_path)) as conn:
+        conn.execute(
+            "UPDATE trial_results SET n_research = 2 WHERE trial_id = ?", [seeded.detailed]
+        )
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, excess = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    r12 = math.sqrt(12)
+    expected = deflated_sharpe(
+        _metrics(0.20, 0.05),
+        "raw",
+        n_trials=6,
+        pair_sharpes=[0.20 * r12, 0.10 * r12, 0.30 * r12],
+        periods_per_year=12,
+    )
+    assert raw.today == expected
+    for row in (raw, excess):
+        assert (row.today_n_backtest, row.today_n_research) == (3, 3)
+        assert row.today is not None and row.today.n_trials == 6
+        assert row.stored_n_research == 2
+
+
+def test_render_shows_the_n_split(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded], tmp_path: Path
+) -> None:
+    store_path, seeded = seeded_store
+    _research_run(store_path, tmp_path, configurations=3)
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [6, 6]
+    assert list(dsr["today N backtest"]) == [3, 3]
+    assert list(dsr["today N research"]) == [3, 3]
+    assert "stored N research" in dsr.columns
+    assert "research runs" in _text(at)
+
+
+def test_a_pre_migration_store_renders_with_n_research_blank(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: tuple[Path, Seeded]
+) -> None:
+    """A read-only open of a store before the research registry: the trial renders,
+    today's N is the backtest count, and both research cells are blank."""
+    store_path, seeded = seeded_store
+    _pre_migration(store_path)
+    conn = duckdb.connect(str(store_path), read_only=True)
+    try:
+        raw, _ = backtest_page.load_trial_view(conn, seeded.detailed).dsr_rows
+    finally:
+        conn.close()
+    assert (raw.stored_n_research, raw.today_n_research, raw.today_n_backtest) == (None, None, 3)
+    assert raw.today is not None and raw.today.n_trials == 3
+    at = _pick(_app(monkeypatch, store_path), seeded.detailed)
+    assert not at.exception
+    dsr = next(df.value for df in at.dataframe if "stored DSR (N at run time)" in df.value.columns)
+    assert list(dsr["today N"]) == [3, 3]
+    assert dsr["today N research"].isna().all()
+    assert dsr["stored N research"].isna().all()
+
+
+# --- detail level and the spend cap (strategy-lab spec req 12, amendment 12; T112) -----
+
+
+def _detail_store(tmp_path: Path, *, lab: bool) -> tuple[Path, int, int]:
+    """A store with one `full` trial carrying weights at two fill sessions and one
+    `summary` trial (detail rows written, then `detail_level` set as a sweep variant's
+    is), plus one holdout spend; with `lab`, the lab tables and the family rules."""
+    store_path = tmp_path / "detail.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        if lab:
+            lab_schema.apply_lab_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        full = _ok_trial(conn, seed_settings, h1, 0.20, 0.05, details=True)
+        # The result row is written, so the weights go in as rows (the writer refuses
+        # a closed trial).
+        for fill, security, weight, price, shares in (
+            (FILLS[0], "SEC-A", 0.5, 10.0, 5.0),
+            (FILLS[1], "SEC-A", 0.4, 11.0, 4.0),
+            (FILLS[1], "SEC-B", 0.6, 20.0, 3.0),
+        ):
+            insert_row(
+                conn,
+                "trial_weights",
+                {
+                    "trial_id": full.trial_id,
+                    "fill_session": fill,
+                    "security_id": security,
+                    "target_weight": weight,
+                    "fill_price": price,
+                    "shares": shares,
+                },
+            )
+        summary = _ok_trial(conn, seed_settings, h1, 0.10, 0.02, details=True)
+        conn.execute(
+            "UPDATE trials SET detail_level = 'summary' WHERE trial_id = ?", [summary.trial_id]
+        )
+        _ok_trial(conn, seed_settings, h1, 0.25, 0.07, kind="holdout", holdout_reason="spend")
+        if lab:
+            lab_registry.write_family_rules(
+                conn,
+                family="momentum",
+                first_hypothesis_id=h1,
+                parent_family=None,
+                holdout_start=date(2023, 1, 1),
+                holdout_end=date(2025, 12, 31),
+                in_sample_start=date(2017, 1, 31),
+                fixed_params={"costs.per_side_bps": BASE},
+                sr_star_seed_annual=None,
+                settings=seed_settings.model_copy(
+                    update={
+                        "lab": seed_settings.lab.model_copy(update={"max_family_holdout_spends": 2})
+                    }
+                ),
+            )
+    return store_path, full.trial_id, summary.trial_id
+
+
+def test_view_reads_the_detail_level_and_the_last_weights(tmp_path: Path) -> None:
+    store_path, full, summary = _detail_store(tmp_path, lab=False)
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        full_view = backtest_page.load_trial_view(conn, full)
+        summary_view = backtest_page.load_trial_view(conn, summary)
+    assert full_view.detail_level == "full"
+    assert full_view.weights is not None
+    assert [(w["security_id"], w["target_weight"]) for w in full_view.weights] == [
+        ("SEC-B", 0.6),
+        ("SEC-A", 0.4),
+    ]
+    assert summary_view.detail_level == "summary"
+    assert summary_view.weights is None
+    assert summary_view.equity  # its base-level equity is still shown
+    assert {r["series"] for r in summary_view.equity} == {"strategy", "SPY", "MTUM"}
+
+
+def test_render_full_trial_shows_weights_and_its_detail_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    text = _text(at)
+    assert "Detail level `full`." in text
+    assert "Weights" in text
+    weights = next(df.value for df in at.dataframe if "target_weight" in df.value.columns)
+    assert list(weights["security_id"]) == ["SEC-B", "SEC-A"]
+
+
+def test_render_summary_trial_shows_equity_and_no_weights_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, _full, summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), summary)
+    assert not at.exception
+    text = _text(at)
+    assert "Detail level `summary`" in text
+    assert "no weights stored" in text
+    assert "Weights" not in [h.value for h in at.subheader]
+    assert not any("target_weight" in df.value.columns for df in at.dataframe)
+    equity_spec = json.loads(at.get("vega_lite_chart")[0].proto.spec)
+    assert equity_spec["encoding"]["y"]["scale"] == {"type": "log"}
+
+
+def test_render_spend_cap_from_the_family_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=True)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert "Family `momentum`: 1 of 2 holdout spends (the family cap)." in _text(at)
+
+
+def test_render_spend_cap_live_for_a_family_without_rules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=True)
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        conn.execute("DELETE FROM family_rules")
+    live = Settings(_env_file=None).lab.max_family_holdout_spends
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert f"Family `momentum`: 1 of {live} holdout spends (the family cap)." in _text(at)
+
+
+def test_render_no_spend_cap_without_the_lab_tables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store_path, full, _summary = _detail_store(tmp_path, lab=False)
+    at = _pick(_app(monkeypatch, store_path), full)
+    assert not at.exception
+    assert "1 holdout spends; no family cap" in _text(at)

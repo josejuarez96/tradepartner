@@ -30,7 +30,9 @@ must be in that store and have no result row yet. T40
 passes a truncated data store as `connect` and the untruncated fixture
 store as `registry_connect`.
 
-**Frames** are the as-of functions' own frames, unchanged. Two reads have no
+**Frames** are the as-of functions' own frames, read with `traded_only=True`
+(#787): a zero-volume bar is missing, not a price, so it can be neither a
+fill, a mark nor a signal anchor. Two reads have no
 single as-of function and are built from `store.asof` reads:
 
 - `late_dividends(t_prev, t, ids)`: dividend keys known at `t` but not at
@@ -41,14 +43,24 @@ single as-of function and are built from `store.asof` reads:
   (latest `valid_from` on or before it, among rows known at `t`) is a
   `snapshot_static` row.
 
-`benchmark_ids(t)` maps each benchmark security known at `t`
-(`securities.benchmark`) to the ticker of its current listing (`SPY`,
-`MTUM`), keeping only the frozen `benchmarks` names.
+`benchmark_ids(t, through)` maps each frozen `benchmarks` name (`SPY`,
+`MTUM`) to its security **by symbol** (#840, owner decision 2026-10-04):
+`store.benchmarks.benchmark_security_ids` over `[session(t), through]`,
+not through the point-in-time listing gate, and refusing a missing,
+ambiguous or reused symbol by name. The bars stay point-in-time: they are
+read like any others, through `adjusted_prices` and `raw_prices` at `t`.
+
+`statement_facts(t, ids)` is `store.asof.statement_facts_as_of` kept to
+`STATEMENT_FACT_NAMES` (the `profitability` family's two names), and
+`sics(t, ids)` is `store.classify.classifications_as_of`'s `sic` per id
+(`None` for an id with no row known at `t`, or no SIC). Both read through
+the step's connection like every other method (backtest spec amendment
+#720, plan T85c).
 
 A security's **current listing** is the one with the latest `valid_from` on
 or before `t`'s session; between two rows with the same `valid_from` the
 first in `listings_as_of` order wins, the same rule `universe_as_of` uses,
-so the static count and benchmark tickers agree with the universe.
+so the static count agrees with the universe.
 """
 
 from __future__ import annotations
@@ -64,7 +76,7 @@ import duckdb
 import polars as pl
 
 from tradepartner import gap as gap_module
-from tradepartner.backtest.provider import GapReading, check_t
+from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, GapReading, check_t
 from tradepartner.calendar import last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.store import registry
@@ -74,10 +86,12 @@ from tradepartner.store.asof import (
     dropped_dividends_as_of,
     listings_as_of,
     prices_as_of,
+    statement_facts_as_of,
 )
+from tradepartner.store.benchmarks import benchmark_security_ids
+from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.store.master import securities_as_of
 from tradepartner.universe import Universe, universe_as_of
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
@@ -177,31 +191,37 @@ class StoreProvider:
         return universe_as_of(self._at(t), t, self.settings)
 
     def adjusted_prices(
-        self, t: datetime, ids: Sequence[str], include_dividends: bool
+        self,
+        t: datetime,
+        ids: Sequence[str],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
     ) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
         return adjusted_prices_as_of(
-            self._at(t), t, wanted, include_dividends=include_dividends, settings=self.settings
+            self._at(t),
+            t,
+            wanted,
+            include_dividends=include_dividends,
+            settings=self.settings,
+            traded_only=True,
+            sessions_from=sessions_from,
         )
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
-        return prices_as_of(self._at(t), t, wanted)
+        return prices_as_of(self._at(t), t, wanted, traded_only=True)
 
     def listing_ends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)
         return listing_ends_as_of(self._at(t), t, self.settings, wanted)
 
-    def benchmark_ids(self, t: datetime) -> Mapping[str, str]:
+    def benchmark_ids(self, t: datetime, through: date | None = None) -> Mapping[str, str]:
         t = check_t(t)
-        conn = self._at(t)
-        benchmarks = securities_as_of(conn, t).filter(pl.col("benchmark"))["security_id"].to_list()
-        names = set(self.settings.benchmarks)
-        out: dict[str, str] = {}
-        for row in self._current_listings(conn, t, benchmarks).values():
-            if row["ticker"] in names:
-                out[row["ticker"]] = row["security_id"]
-        return dict(sorted(out.items()))
+        return benchmark_security_ids(
+            self._at(t), self.settings.benchmarks, start=last_completed_session(t), through=through
+        )
 
     def survivorship_gap(self, t: datetime) -> GapReading:
         t = check_t(t)
@@ -235,6 +255,17 @@ class StoreProvider:
         t, wanted = check_t(t), _ids(ids)
         current = self._current_listings(self._at(t), t, wanted)
         return sum(1 for row in current.values() if row["provenance"] == "snapshot_static")
+
+    def statement_facts(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        t, wanted = check_t(t), _ids(ids)
+        frame = statement_facts_as_of(self._at(t), t, wanted)
+        return frame.filter(pl.col("fact_name").is_in(STATEMENT_FACT_NAMES))
+
+    def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
+        t, wanted = check_t(t), _ids(ids)
+        rows = classifications_as_of(self._at(t), t, wanted)
+        known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
+        return {sid: known.get(sid) for sid in wanted}
 
     # --- helpers --------------------------------------------------------------------
 

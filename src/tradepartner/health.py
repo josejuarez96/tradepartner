@@ -14,8 +14,9 @@ here is this module's and is stated once:
 
 - **Last ingest per source** (`last_ingests`): from `ingestion_runs` rows
   known at `t`, i.e. finished at or before `t` (ingest writes a run's row when
-  the run ends), per source (`ingest.SOURCES` first, then any other source in
-  the table, alphabetically): the finish time and cursor of the last `ok` run,
+  the run ends), other than `master-retract`'s (#859), per source
+  (`ingest.SOURCES` first, then any other source in the table,
+  alphabetically): the finish time and cursor of the last `ok` run,
   and the status, start and message of the latest run of any status. A source
   that never ran shows `None`s.
 - **Coverage** (`coverage`): the population of ingest's staleness check
@@ -34,8 +35,8 @@ here is this module's and is stated once:
   the survivorship gap report it. The history is not split at listing
   boundaries, so a security delisted and later relisted shows the break between
   its two listings as one gap.
-- **Survivorship gap** with its three side categories: `gap.survivorship_gap`
-  at `t`, unchanged.
+- **Survivorship gap** with its four side categories (the stale listings,
+  #1199, among them): `gap.survivorship_gap` at `t`, unchanged.
 - **Unclassifiable** (`unclassifiable`): securities known at `t` whose latest
   classification is `unclassifiable`, and those with no classification row at
   all (`unclassified`), the two missing-data reasons of universe rule 1.
@@ -47,7 +48,45 @@ here is this module's and is stated once:
   delisted at `t` (Forms 25 and 25-NSE; a transfer counts as delisted until its
   new listing is known, spec req 4), with ticker, exchange, class, form, filing
   time, end session and effective date.
+- **Price jumps** (`price_jumps`): the owner's review list (#787),
+  `store.asof.price_jumps_as_of` at `t` over every security: each one-day
+  close move between traded bars outside the `universe` jump bounds that no
+  split or dividend known at `t` explains, with `accepted` from
+  `universe.accepted_price_jumps`. An unaccepted jump fails universe rule 6
+  while it is in the history window; accepting one is a config change.
+  `jumps_before`, when given, keeps only jumps on sessions before it (a
+  hypothesis's `holdout.start`), so the list never shows the holdout period.
+- **Shares outliers** (`shares_outliers`): the owner's review list (#845),
+  `universe.shares_as_of` at `t` over every security: each shares fact out
+  of line with the security's last accepted earlier fact (ratio after the
+  splits known at `t` outside `universe.max_shares_ratio`), with `accepted`
+  from `universe.accepted_shares_facts`. Universe rules 7 and 8 use the last
+  accepted fact instead of an unaccepted one. `jumps_before` keeps only
+  facts with an `as_of_date` before it.
+- **Accepted same-day pairs** (`accepted_same_day_pairs`, #855): every
+  same-start pair of different tickers that `non_overlapping_listings` would
+  fail but the owner accepted in `universe.accepted_same_day_pairs`
+  (`"<security_id>@<valid_from>"`), in that rule's row shape, so an accepted
+  pair is listed, never silently hidden.
 - **Settings**: `universe.liquidity_rule_enabled` and `execution.fill_price`.
+- **Statement facts** (`statement`, #660, T77c): `edgar.statement_facts_enabled`'s
+  state; while it is on, `statement_coverage`'s share of `universe_as_of(T)`
+  names whose issuer has a `revenue` and a `total_assets` row known at `t`
+  with `period_end` within `universe.max_shares_age_days` of the last
+  completed session at `t` (rule 7's own bound, measured the same way;
+  not any backtest family's own `max_fact_age_days`,
+  which can be wider; report-only, no rule reads it), and the derived share
+  of every known `gross_profit` row (`basis = derived`, over every CIK with
+  a `securities` row known at `t`, not only `universe_as_of(T)`'s members,
+  one row per `(cik, period_end, period_days)`: a parse-quality count, not
+  a portfolio one); while it is off, `coverage` is `None` -- nothing to
+  report on, and `universe_as_of` is not paid for. `counts` is
+  `statement_counts` of the latest EDGAR run's message, empty when it
+  names none. The data-health page's own card (dashboard T77c) shows a
+  warning badge while `vintage_late` is positive; `health --check` does
+  not, since this is a reported figure, not one of the integrity rules
+  below. A CLI warning, like the quarantined-count one `cli._quarantined`
+  already prints, is T77b's to add alongside the run message it reads.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
@@ -66,43 +105,110 @@ derived at `t`, as the data is read.
 - `non_overlapping_listings`: per security, ordered by `valid_from`, no two
   listings start on the same session, and no listing ended by a Form 25 was
   filed on more than `master.transfer_window_sessions` sessions after the next
-  listing started (both lines live at once: a dual listing, or a filing or
-  listing resolved to the wrong security). The filing session is the raw fact
-  to test: the derived end of a delisted or transferred listing is clipped
-  before the next listing's start by construction (spec req 4). A listing with
-  no Form 25 is superseded by the next one (a ticker change), as the as-of
-  reads treat it.
+  exchange line started (both lines live at once: a dual listing, or a filing
+  or listing resolved to the wrong security). The filing session is the raw
+  fact to test: the derived end of a delisted or transferred listing is
+  clipped before the next listing's start by construction (spec req 4). A
+  listing with no Form 25 is superseded by the next one (a ticker change), as
+  the as-of reads treat it. Two cases are not a second line (#822): rows of
+  the same ticker starting the same day, which differ only in the exchange
+  their filers tagged (or the class title's wording), are one line; and a
+  row on `OFF_EXCHANGE` (NONE or OTC) is no exchange line at all (the normal
+  suspension, OTC quote, late Form 25 sequence), so a late filing is tested
+  against the next row that is neither. Every other same-start pair of
+  different tickers fails unless the owner lists it in
+  `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
+  line: a late Form 25 on its rows is still tested, against the next
+  exchange line after that day, and the report lists the pair.
 - `no_bars_after_delisting`: no bar known at `t` for a delisted listing's
-  security dated after the delisting's `effective_on` and before the
-  security's next listing, if any. The derived end of a delisted listing is its
-  last bar (spec req 4), so the bound that can be broken is the date the
-  delisting takes effect; trading between the filing and that date is normal.
-  A bar past it means a wrong delisting or a bar resolved to the wrong security
-  (a reused ticker).
+  security that *resumes* after the delisting's `effective_on` and before the
+  security's next listing on an exchange, if any (a NONE or OTC row, often
+  started before `effective_on` in the suspension sequence, does not end the
+  check: the feed has no OTC bars, spec req 10). A listing's end is its last bar (spec req
+  4), so a line that keeps trading past `effective_on` without a break (a
+  holding-company or redomicile Form 25 on the same line, CMPR) is its own
+  tail and passes. A bar that comes after more than
+  `master.transfer_window_sessions` missing sessions fails, with every bar
+  after it up to that listing. Missing sessions are XNYS sessions strictly
+  between two bars; the first gap is counted from the last bar on or before
+  `effective_on`, or from `effective_on` when there is none, so a delisting
+  that took effect long before the store's first bar fails its line's bars:
+  the store cannot show the line kept trading.
+  Such a bar is another equity's resolved to this one (a reused ticker,
+  EGLE), a relisting with no listing row, or bars on both sides of a hole in
+  the store. A delisting whose next *equity* listing of the security
+  carries the same ticker (compared as `alpaca_symbol` keys it) raises no
+  violation at all (#829): the resolver's own rule 7 (`docs/specs/data-foundation.md`,
+  "Resolver rules"; #819) keeps the span running under that ticker through
+  the delisting, so the bars between are the security's own, never a
+  resumption to flag, however long the gap. A later row that shares the
+  ticker but is not EQUITY (a note, a right, a unit) does not count: the
+  resolver's rule only runs a span on when both rows are EQUITY. **Known
+  limit (#827):** when there is no bar at all on or before `effective_on`
+  (the line's own history is unknown, not merely absent), `effective_on`
+  itself stands in for "the last bar on or before it" when counting the
+  first gap; a bar that is some other security's reused ticker, not this
+  line's own, still passes if it starts within
+  `master.transfer_window_sessions` of `effective_on`, the same grace a
+  genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
+  store.
 - `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
   value (ADR 0006). `Settings` refuses any other value, so this fails only on
   settings built around the guard.
+- `underived_master_rows` (#859): the stored `securities` and `listings` rows
+  the latest master check finished by `t` (an EDGAR ingest chunk or a
+  `master-retract --apply`) found the current rules no longer derive, and
+  that are still live at `t` (`store.retraction.underived_as_of`): table,
+  key, stored `known_at` and the check's run id. `tradepartner
+  master-retract` lists the same set from a fresh build and retracts it.
+- `statement_period_days` (#660, T77c): every `statement_facts` row has
+  `period_start` NULL exactly when `period_days = 0`, else `period_days =
+  period_end - period_start` in days. The schema's own `CHECK` already
+  blocks the first half; this restates both for a store's own confidence
+  (the schema comment's words), the shape a store built by other code, or
+  a future schema, could still break.
+- `statement_derived_matches_components`: every `basis = derived`
+  `gross_profit` row equals the difference of the two stored `revenue` and
+  `cost_of_revenue` rows sharing its `cik`, `period_end`, `period_days` and
+  `filing_accession`, both present -- a missing component row fails it too.
+  Cannot fail on correct data (spec "Health").
+- `statement_basis_allowed`: `statement_facts.basis` is in
+  `schema.STATEMENT_FACT_BASIS_VALUES` (`{reported, derived}`). The
+  schema's own `CHECK` already blocks this too.
 
 This module holds no threshold; the only numbers in it are 0 and 1.
 """
 
 from __future__ import annotations
 
+import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from itertools import pairwise
 from typing import Any
 
 import duckdb
 import polars as pl
 
+from tradepartner.adapters.alpaca_prices import (
+    alpaca_symbol,
+    is_placeholder_ticker,
+    is_same_day_typo,
+    same_alpaca_symbol,
+)
 from tradepartner.calendar import all_sessions, last_completed_session
-from tradepartner.config import _GUARDED_EXCLUDE_SIC_RANGES, Settings, get_settings
+from tradepartner.config import (
+    _GUARDED_EXCLUDE_SIC_RANGES,
+    Settings,
+    get_settings,
+    parse_accepted_same_day_pair,
+)
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import OK, SOURCES
-from tradepartner.store.asof import _validate_t
-from tradepartner.store.classify import UNCLASSIFIABLE, classifications_as_of
+from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
+from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
     LISTED,
@@ -112,11 +218,20 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import securities_as_of
-from tradepartner.store.schema import TABLE_PROVENANCE_VALUES
+from tradepartner.store.retraction import RETRACT, underived_as_of
+from tradepartner.store.schema import STATEMENT_FACT_BASIS_VALUES, TABLE_PROVENANCE_VALUES
+from tradepartner.universe import shares_as_of, universe_as_of
 
 STATIC = "snapshot_static"
 #: The classification ingest's staleness check counts, with benchmarks.
 _COMMON = "common"
+#: The exchange codes `adapters.edgar.normalize_exchange` gives a class
+#: registered with no exchange ("None") or quoted over the counter: a row on
+#: one of them is never a second exchange line (#822).
+OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
+#: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
+#: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
+_PLACEHOLDER_KIND = "placeholder"
 
 KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
@@ -127,6 +242,10 @@ NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
 GUARDED_SIC_DEFAULT = "guarded_sic_default"
+UNDERIVED_MASTER_ROWS = "underived_master_rows"
+STATEMENT_PERIOD_DAYS = "statement_period_days"
+STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
+STATEMENT_BASIS_ALLOWED = "statement_basis_allowed"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -139,6 +258,10 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
     GUARDED_SIC_DEFAULT,
+    UNDERIVED_MASTER_ROWS,
+    STATEMENT_PERIOD_DAYS,
+    STATEMENT_DERIVED_MATCHES_COMPONENTS,
+    STATEMENT_BASIS_ALLOWED,
 )
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
@@ -171,6 +294,24 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "effective_on": pl.Date,
 }
 _GUARD_SCHEMA: dict[str, Any] = {"setting": pl.Utf8, "value": pl.Utf8, "expected": pl.Utf8}
+_STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
+    "cik": pl.Utf8,
+    "fact_name": pl.Utf8,
+    "period_end": pl.Date,
+    "period_days": pl.Int64,
+    "period_start": pl.Date,
+    "filing_accession": pl.Utf8,
+}
+_STATEMENT_DERIVED_SCHEMA: dict[str, Any] = {
+    "cik": pl.Utf8,
+    "period_end": pl.Date,
+    "period_days": pl.Int64,
+    "filing_accession": pl.Utf8,
+    "value": pl.Float64,
+    "revenue": pl.Float64,
+    "cost_of_revenue": pl.Float64,
+}
+_STATEMENT_BASIS_SCHEMA: dict[str, Any] = {"basis": pl.Utf8, "rows": pl.Int64}
 _GAP_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "first_bar": pl.Date,
@@ -272,6 +413,91 @@ class DelistedNames:
 
 
 @dataclass(frozen=True, eq=False)
+class PriceJumps:
+    """The price-jump review list at `t` (#787), one row per jump, only sessions
+    before `before` when it is set."""
+
+    frame: pl.DataFrame
+    before: date | None = None
+
+    @property
+    def pending(self) -> pl.DataFrame:
+        """The jumps the owner has not accepted."""
+        return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
+class SharesOutliers:
+    """The shares-outlier review list at `t` (#845), one row per out-of-line
+    fact, only `as_of_date`s before `before` when it is set."""
+
+    frame: pl.DataFrame
+    before: date | None = None
+
+    @property
+    def pending(self) -> pl.DataFrame:
+        """The out-of-line facts the owner has not accepted."""
+        return self.frame.filter(~pl.col("accepted"))
+
+
+@dataclass(frozen=True, eq=False)
+class AcceptedSameDayPairs:
+    """Same-start listing pairs the owner accepted (#855), one row per pair in
+    `non_overlapping_listings`' violation shape; each would fail that rule
+    without its `universe.accepted_same_day_pairs` entry."""
+
+    frame: pl.DataFrame
+
+
+@dataclass(frozen=True)
+class StatementCoverage:
+    """Statement-facts freshness and derived share at `t` (module
+    docstring, #660, T77c). `fresh`/`total` are over `universe_as_of(T)`
+    names (`total`); `derived`/`reported` count every known `gross_profit`
+    row by `basis`, one per `(cik, period_end, period_days)`, over every
+    CIK with a `securities` row known at `t` -- not only `universe_as_of`'s
+    members, so a name excluded from today's universe (delisted, stale
+    shares, ...) still counts here."""
+
+    fresh: int
+    total: int
+    derived: int
+    reported: int
+
+    @property
+    def share(self) -> float:
+        """Coverage share, 0.0 when `total` is 0 (this module's usual
+        empty-population convention, as `Coverage.share`)."""
+        return self.fresh / self.total if self.total else 0.0
+
+    @property
+    def derived_share(self) -> float:
+        """Derived share of known `gross_profit` rows, 0.0 when none."""
+        n = self.derived + self.reported
+        return self.derived / n if n else 0.0
+
+
+@dataclass(frozen=True)
+class StatementFacts:
+    """Statement-facts health at `t` (#660, T77c). `enabled` is
+    `edgar.statement_facts_enabled`; `coverage` is `None` while it is off
+    (nothing to report on, and `universe_as_of` is not run for nothing).
+    `counts` is `statement_counts` of the latest EDGAR run's message,
+    empty when it names none (the switch has always been off, or the run
+    predates T77b)."""
+
+    enabled: bool
+    coverage: StatementCoverage | None
+    counts: dict[str, int]
+
+    @property
+    def vintage_late(self) -> int:
+        """`statement_vintage_late` from the latest run's counts, 0 if
+        unnamed."""
+        return self.counts.get("vintage_late", 0)
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -297,7 +523,11 @@ class HealthReport:
     unclassifiable: Unclassifiable
     static_reliance: StaticReliance
     delisted: DelistedNames
+    price_jumps: PriceJumps
+    shares_outliers: SharesOutliers
+    accepted_same_day_pairs: AcceptedSameDayPairs
     settings: dict[str, Any]
+    statement: StatementFacts
     integrity: tuple[IntegrityCheck, ...]
 
     @property
@@ -312,11 +542,17 @@ class HealthReport:
 
 
 def health_report(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings | None = None,
+    *,
+    jumps_before: date | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
-    ends, securities and classifications are read once and shared."""
+    ends, securities and classifications are read once and shared.
+    `jumps_before` limits the price-jump list to sessions before it, and the
+    shares-outlier list to `as_of_date`s before it."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -324,36 +560,170 @@ def health_report(
     current = _current_from(listings, session)
     securities = securities_as_of(conn, t)
     classes = classifications_as_of(conn, t)
+    overlaps, accepted_pairs = _overlapping_listings(listings, settings)
+    ingests = last_ingests(conn, t)
     return HealthReport(
         t=t,
         session=session,
-        ingests=last_ingests(conn, t),
+        ingests=ingests,
         coverage=_coverage(conn, t, session, current, securities, classes),
         gaps=bar_gaps(conn, t),
         survivorship=survivorship_gap(conn, t, settings),
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
+        price_jumps=_price_jumps(conn, t, settings, jumps_before),
+        shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
+        accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
         settings={
             "liquidity_rule_enabled": settings.universe.liquidity_rule_enabled,
             "fill_price": settings.execution.fill_price,
         },
-        integrity=_integrity_checks(conn, t, settings, listings),
+        statement=_statement_facts_report(conn, t, settings, ingests),
+        integrity=_integrity_checks(conn, t, settings, listings, overlaps),
+    )
+
+
+def _price_jumps(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> PriceJumps:
+    frame = price_jumps_as_of(conn, t, settings=settings)
+    if before is not None:
+        frame = frame.filter(pl.col("session") < before)
+    return PriceJumps(frame, before)
+
+
+def _shares_outliers(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, before: date | None
+) -> SharesOutliers:
+    frame = shares_as_of(conn, t, None, settings).outliers
+    if before is not None:
+        frame = frame.filter(pl.col("as_of_date") < before)
+    return SharesOutliers(frame, before)
+
+
+#: `statement_<name>: <N>` (T77b's run-message convention, not yet built:
+#: `ingest._source_counts`'s `"label: N"` shape and `cli._QUARANTINED`'s
+#: pattern, generalised over every `statement_*` run-row count the spec
+#: names -- `held`, `unstampable`, `vintage_late`, `conflicts`, `restated`,
+#: `non_usd`, `malformed`, `derived`, `none` -- so this parser needs no
+#: change whichever of them, or in whatever order, a message carries.
+_STATEMENT_COUNT = re.compile(r"\bstatement_(\w+): (\d+)\b")
+
+
+def statement_counts(message: str | None) -> dict[str, int]:
+    """Every `statement_<name>: <N>` figure in an EDGAR run's message
+    (T77b, #660), keyed by `name` with the `statement_` prefix stripped
+    (e.g. `{"held": 3, "vintage_late": 0, "derived": 2}`). Empty when
+    `message` is `None` or names none (the switch has always been off, or
+    the run predates T77b)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _STATEMENT_COUNT.findall(message)}
+
+
+def statement_coverage(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> StatementCoverage:
+    """`StatementCoverage` at `t` (module docstring), computed whether or
+    not `edgar.statement_facts_enabled` is on. `health_report` skips this
+    while the switch is off: there is nothing in the table to report on,
+    and no reason to pay for `universe_as_of`."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    return _statement_coverage(conn, t, settings)
+
+
+def _statement_coverage(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> StatementCoverage:
+    if "statement_facts" not in _present_tables(conn):
+        return StatementCoverage(fresh=0, total=0, derived=0, reported=0)
+    frame = statement_facts_as_of(conn, t)
+    members = universe_as_of(conn, t, settings).members["security_id"].to_list()
+    member_frame = frame.filter(pl.col("security_id").is_in(members)) if members else frame.clear()
+    session = last_completed_session(t)
+    fresh = _fresh_count(member_frame, members, session, settings.universe.max_shares_age_days)
+    derived, reported = _gross_profit_basis_counts(frame)
+    return StatementCoverage(fresh=fresh, total=len(members), derived=derived, reported=reported)
+
+
+def _fresh_count(frame: pl.DataFrame, members: Sequence[str], session: date, bound: int) -> int:
+    """How many of `members` have both a `revenue` and a `total_assets`
+    row in `frame` (already filtered to `members`) whose latest known
+    `period_end` is within `bound` days of `session` (module docstring:
+    rule 7's own freshness bound, measured the same way rule 7 measures
+    it -- from the last completed session, not `t` itself)."""
+    if not members or frame.is_empty():
+        return 0
+    latest = (
+        frame.filter(pl.col("fact_name").is_in(["revenue", "total_assets"]))
+        .group_by(["security_id", "fact_name"])
+        .agg(pl.col("period_end").max())
+    )
+    by_sid: dict[str, dict[str, date]] = defaultdict(dict)
+    for row in latest.iter_rows(named=True):
+        by_sid[row["security_id"]][row["fact_name"]] = row["period_end"]
+    fresh = 0
+    for sid in members:
+        facts = by_sid.get(sid)
+        if (
+            facts
+            and "revenue" in facts
+            and "total_assets" in facts
+            and all((session - pe).days <= bound for pe in facts.values())
+        ):
+            fresh += 1
+    return fresh
+
+
+def _gross_profit_basis_counts(frame: pl.DataFrame) -> tuple[int, int]:
+    """`(derived, reported)` counts of every known `gross_profit` row in
+    `frame` (every CIK with a `securities` row known at `t`, per
+    `_statement_coverage`'s caller), deduplicated to one per `(cik,
+    period_end, period_days)` (`frame` may repeat a dual-class issuer's
+    row once per class)."""
+    if frame.is_empty():
+        return 0, 0
+    gross_profit = frame.filter(pl.col("fact_name") == "gross_profit").unique(
+        ["cik", "period_end", "period_days"]
+    )
+    if gross_profit.is_empty():
+        return 0, 0
+    derived = int((gross_profit["basis"] == "derived").sum())
+    reported = int((gross_profit["basis"] == "reported").sum())
+    return derived, reported
+
+
+def _statement_facts_report(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    ingests: tuple[IngestStatus, ...],
+) -> StatementFacts:
+    message = next((i.latest_message for i in ingests if i.source == "edgar"), None)
+    enabled = settings.edgar.statement_facts_enabled
+    return StatementFacts(
+        enabled=enabled,
+        coverage=_statement_coverage(conn, t, settings) if enabled else None,
+        counts=statement_counts(message),
     )
 
 
 def last_ingests(conn: duckdb.DuckDBPyConnection, t: datetime) -> tuple[IngestStatus, ...]:
     """Per source, the last `ok` run and the latest run whose row is known at
     `t` (finished at or before `t`); `ingest.SOURCES` first, then any other
-    source."""
+    source. A `master-retract` run row (mode `retract`, #859) is not an
+    ingest and is left out, so it never hides the latest EDGAR run's status
+    or quarantine count."""
     t = _validate_t(t)
     runs = conn.execute(
         """
         SELECT source, status, started_at, finished_at, chunk_cursor, message
-        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ?
+        FROM ingestion_runs WHERE coalesce(finished_at, started_at) <= ? AND mode <> ?
         ORDER BY started_at, run_id
         """,
-        [t],
+        [t, RETRACT],
     ).fetchall()
     by_source: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
     for run in runs:
@@ -587,12 +957,20 @@ def integrity_checks(
 ) -> tuple[IntegrityCheck, ...]:
     """Every rule in `INTEGRITY_RULES`, in that order (module docstring)."""
     t = _validate_t(t)
-    return _integrity_checks(conn, t, settings, listing_ends_as_of(conn, t, settings))
+    listings = listing_ends_as_of(conn, t, settings)
+    overlaps, _ = _overlapping_listings(listings, settings)
+    return _integrity_checks(conn, t, settings, listings, overlaps)
 
 
 def _integrity_checks(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    listings: pl.DataFrame,
+    overlaps: pl.DataFrame,
 ) -> tuple[IntegrityCheck, ...]:
+    """`overlaps` is `_overlapping_listings`' violation frame for `listings`,
+    computed once by the caller, which also needs its accepted pairs."""
     window = settings.master.transfer_window_sessions
     violations: dict[str, pl.DataFrame] = {
         KNOWN_AT_NOT_NULL: _count_per_table(conn, "known_at IS NULL"),
@@ -601,16 +979,35 @@ def _integrity_checks(
         PROVENANCE_ALLOWED: _bad_provenance(conn),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
-        NON_OVERLAPPING_LISTINGS: _overlapping_listings(listings, window),
-        NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings),
+        NON_OVERLAPPING_LISTINGS: overlaps,
+        NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
         GUARDED_SIC_DEFAULT: _guarded_sic(settings),
+        UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
+        STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
+        STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
+        STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
 
+def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:
+    """Table names `conn` actually has, per `dashboard.header.store_freshness`'s
+    pattern: a read-only connection never migrates (`store.schema.init_schema`),
+    so a store opened before a later `_FACT_TABLES` addition (e.g.
+    `statement_facts`, version 9, #660) is missing it until the next writable
+    open -- querying it directly would raise `duckdb.CatalogException` instead
+    of the loud-but-graceful "run `tradepartner ingest`" health already gives
+    for an uninitialised store."""
+    rows = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    return {name for (name,) in rows}
+
+
 def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         row = conn.execute(f"SELECT count(*) FROM {table} WHERE {condition}").fetchone()
         count = int(row[0]) if row is not None else 0
         if count:
@@ -619,8 +1016,11 @@ def _count_per_table(conn: duckdb.DuckDBPyConnection, condition: str) -> pl.Data
 
 
 def _bad_provenance(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    present = _present_tables(conn)
     rows: list[dict[str, Any]] = []
     for table in _FACT_TABLES:
+        if table not in present:
+            continue
         allowed = TABLE_PROVENANCE_VALUES[table]
         marks = ", ".join("?" for _ in allowed)
         found = conn.execute(
@@ -667,49 +1067,219 @@ def _by_security(listings: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
-def _overlapping_listings(listings: pl.DataFrame, window_sessions: int) -> pl.DataFrame:
+def _same_line(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Two rows of one ticker from one day: one line tagged with two
+    exchanges by its filers (#822), never two lines."""
+    return bool(a["valid_from"] == b["valid_from"] and a["ticker"] == b["ticker"])
+
+
+def _row_kind(row: dict[str, Any]) -> str:
+    """`row`'s kind by the resolver's own classification (`EQUITY` or one
+    of `NON_EQUITY_KINDS`, or placeholder for no ticker), shared, never
+    copied, so a row health reads the same way the resolver would."""
+    ticker = str(row["ticker"])
+    if is_placeholder_ticker(ticker):
+        return _PLACEHOLDER_KIND
+    return listing_kind(ticker, row.get("class_title"))
+
+
+def _resolver_ticker(ticker: str) -> str:
+    """`ticker` as `ListingResolver` keys it (#846): `alpaca_symbol`'s
+    spelling fold (`BF-A` -> `BF.A`), or the raw ticker when it has none,
+    so health compares the same strings the resolver's own same-day-typo
+    rule does."""
+    return alpaca_symbol(ticker) or ticker
+
+
+def _held_ticker(
+    ordered: list[dict[str, Any]], index: int, day: date, pair_kind: str
+) -> str | None:
+    """The ticker (resolver-folded) `ordered[index]`'s security held just
+    before `day`, by the resolver's own rule: the row immediately before
+    `day`, and only when that row is itself `EQUITY` too while
+    `pair_kind` is `EQUITY` (either of the pair's own rows; a pair reads
+    a non-equity row's ticker no more than the resolver's
+    `_same_day_pair` does, #846) -- except a pair with neither row
+    `EQUITY`, which the resolver's EQUITY-only path never examines in the
+    first place, so there is no resolver opinion for health to drift
+    from; its own last ticker, of whatever kind, decides."""
+    previous = next((r for r in reversed(ordered[:index]) if r["valid_from"] < day), None)
+    if previous is None:
+        return None
+    if pair_kind == EQUITY and _row_kind(previous) != EQUITY:
+        return None
+    return _resolver_ticker(str(previous["ticker"]))
+
+
+def _same_day_typo_pair(
+    ordered: list[dict[str, Any]], index: int, current: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    """True when `current`/`following`'s same-start pair is a cover
+    page's filer noise, not a genuine overlap (#846): the ticker the
+    security held just before is one of the tied tickers (the resolver's
+    own rule, `is_same_day_typo`, shared here, never copied, over the
+    same resolver-folded ticker spellings), or the two tickers are one
+    Alpaca symbol under different filer spellings (`same_alpaca_symbol`;
+    `MOTV U`/`MOTV.U`)."""
+    day = current["valid_from"]
+    tickers = {
+        _resolver_ticker(str(current["ticker"])),
+        _resolver_ticker(str(following["ticker"])),
+    }
+    # Either row being equity puts the pair on the resolver's EQUITY-only
+    # path (quant-auditor pass 2 on #846): gating on `current` alone let a
+    # mixed equity/non-equity pair's gate depend on which ticker happened
+    # to sort first in `ordered`, not on kind.
+    current_kind, following_kind = _row_kind(current), _row_kind(following)
+    pair_kind = EQUITY if EQUITY in (current_kind, following_kind) else current_kind
+    held = _held_ticker(ordered, index, day, pair_kind)
+    return is_same_day_typo(held, tickers) or same_alpaca_symbol(
+        str(current["ticker"]), str(following["ticker"])
+    )
+
+
+def _overlap_row(
+    current: dict[str, Any], flagged: dict[str, Any], filing_session: date | None
+) -> dict[str, Any]:
+    return {
+        "security_id": current["security_id"],
+        "ticker": current["ticker"],
+        "exchange": current["exchange"],
+        "valid_from": current["valid_from"],
+        "status": current["status"],
+        "filing_session": filing_session,
+        "next_ticker": flagged["ticker"],
+        "next_exchange": flagged["exchange"],
+        "next_valid_from": flagged["valid_from"],
+    }
+
+
+def _overlapping_listings(
+    listings: pl.DataFrame, settings: Settings
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """`non_overlapping_listings`' violations, and the same-start pairs the
+    owner accepted in `universe.accepted_same_day_pairs` (#855), both in
+    `_OVERLAP_SCHEMA`. An accepted pair is excused from the same-start test
+    only, and counts as one line: the late-Form-25 test still runs on its
+    rows, against the next exchange line after that day."""
+    window_sessions = settings.master.transfer_window_sessions
+    accepted_days = {
+        parse_accepted_same_day_pair(entry) for entry in settings.universe.accepted_same_day_pairs
+    }
     rows: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
     for sid, ordered in sorted(_by_security(listings).items()):
-        for current, following in pairwise(ordered):
+        for i, current in enumerate(ordered[:-1]):
+            following = ordered[i + 1]
+            same_start = current["valid_from"] == following["valid_from"]
+            flagged = (
+                following
+                if same_start
+                and not _same_line(current, following)
+                and not _same_day_typo_pair(ordered, i, current, following)
+                else None
+            )
             filed = current["delisting_filed_at"]
             filing_session = None if filed is None else _filing_session(filed)
-            same_start = current["valid_from"] == following["valid_from"]
-            filed_late = (
-                filing_session is not None
-                and following["valid_from"] < _window(filing_session, window_sessions)[0]
-            )
-            if same_start or filed_late:
-                rows.append(
-                    {
-                        "security_id": sid,
-                        "ticker": current["ticker"],
-                        "exchange": current["exchange"],
-                        "valid_from": current["valid_from"],
-                        "status": current["status"],
-                        "filing_session": filing_session,
-                        "next_ticker": following["ticker"],
-                        "next_exchange": following["exchange"],
-                        "next_valid_from": following["valid_from"],
-                    }
+            # An accepted day is one line, as the owner reviewed it: for every
+            # row of that day (also a ticker's second exchange tag, #822), no
+            # same-day row is a second line for the late-Form-25 test.
+            accepted_day = (sid, current["valid_from"]) in accepted_days
+            one_line_day = current["valid_from"] if accepted_day else None
+            if flagged is not None and accepted_day:
+                accepted.append(_overlap_row(current, flagged, filing_session))
+                flagged = None
+            if flagged is None and filing_session is not None:
+                exchange_line = next(
+                    (
+                        r
+                        for r in ordered[i + 1 :]
+                        if r["exchange"] not in OFF_EXCHANGE
+                        and not _same_line(current, r)
+                        and r["valid_from"] != one_line_day
+                    ),
+                    None,
                 )
-    return pl.DataFrame(rows, schema=_OVERLAP_SCHEMA)
+                if (
+                    exchange_line is not None
+                    and exchange_line["valid_from"] < _window(filing_session, window_sessions)[0]
+                ):
+                    flagged = exchange_line
+            if flagged is not None:
+                rows.append(_overlap_row(current, flagged, filing_session))
+    return (
+        pl.DataFrame(rows, schema=_OVERLAP_SCHEMA),
+        pl.DataFrame(accepted, schema=_OVERLAP_SCHEMA),
+    )
+
+
+def _missing_sessions(sessions: tuple[date, ...], after: date, before: date) -> int:
+    """XNYS sessions strictly between `after` and `before`."""
+    return max(0, bisect_left(sessions, before) - bisect_right(sessions, after))
+
+
+def _resumed_bars(
+    bars: list[date],
+    effective_on: date,
+    next_start: date | None,
+    window_sessions: int,
+    sessions: tuple[date, ...],
+) -> list[date]:
+    """The bars of `bars` (sorted) after `effective_on` and before
+    `next_start` that come back after more than `window_sessions` missing
+    sessions, and every bar after the first of them; the bars before it are
+    the listing's own tail. The first gap is counted from the last bar on or
+    before `effective_on`, or from `effective_on` when there is none."""
+    start = bisect_right(bars, effective_on)
+    previous = bars[start - 1] if start else effective_on
+    resumed: list[date] = []
+    for session in bars[start:]:
+        if next_start is not None and session >= next_start:
+            break
+        if resumed or _missing_sessions(sessions, previous, session) > window_sessions:
+            resumed.append(session)
+        previous = session
+    return resumed
 
 
 def _bars_after_delisting(
-    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame, window_sessions: int
 ) -> pl.DataFrame:
     bounds: list[dict[str, Any]] = []
     for ordered in _by_security(listings).values():
         for row in ordered:
             if row["status"] != DELISTED:
                 continue
-            later = [o["valid_from"] for o in ordered if o["valid_from"] > row["valid_from"]]
-            bounds.append({**row, "_next": min(later, default=None)})
+            later = sorted(
+                (
+                    o
+                    for o in ordered
+                    if o["valid_from"] > row["valid_from"] and o["exchange"] not in OFF_EXCHANGE
+                ),
+                key=lambda o: o["valid_from"],
+            )
+            next_valid_from = later[0]["valid_from"] if later else None
+            if next_valid_from is not None and _row_kind(row) == EQUITY:
+                # The resolver's own rule 7 (spec data-foundation.md,
+                # "Resolver rules"; #819) only keeps a span running under a
+                # later row of the same ticker when both rows are EQUITY,
+                # and only from the day that row actually holds the ticker:
+                # a same-day filer-typo pair (#846) is tied on `valid_from`,
+                # so every row of that day, not just the one `later` sorts
+                # first, is checked (#829).
+                own_ticker = _resolver_ticker(str(row["ticker"]))
+                same_day = [o for o in later if o["valid_from"] == next_valid_from]
+                if any(
+                    _row_kind(o) == EQUITY and _resolver_ticker(str(o["ticker"])) == own_ticker
+                    for o in same_day
+                ):
+                    continue
+            bounds.append({**row, "_next": next_valid_from})
     if not bounds:
         return pl.DataFrame([], schema=_AFTER_DELISTING_SCHEMA)
     ids = sorted({b["security_id"] for b in bounds})
     marks = ", ".join("?" for _ in ids)
-    sessions: dict[str, list[date]] = defaultdict(list)
+    bars: dict[str, list[date]] = defaultdict(list)
     for sid, session in conn.execute(
         f"""
         SELECT DISTINCT security_id, session FROM prices_daily
@@ -718,7 +1288,8 @@ def _bars_after_delisting(
         """,
         [t, *ids],
     ).fetchall():
-        sessions[sid].append(session)
+        bars[sid].append(session)
+    sessions = all_sessions()
     rows = [
         {
             "security_id": b["security_id"],
@@ -728,8 +1299,9 @@ def _bars_after_delisting(
             "effective_on": b["effective_on"],
         }
         for b in bounds
-        for s in sessions[b["security_id"]]
-        if s > b["effective_on"] and (b["_next"] is None or s < b["_next"])
+        for s in _resumed_bars(
+            bars[b["security_id"]], b["effective_on"], b["_next"], window_sessions, sessions
+        )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
 
@@ -746,3 +1318,96 @@ def _guarded_sic(settings: Settings) -> pl.DataFrame:
             }
         )
     return pl.DataFrame(rows, schema=_GUARD_SCHEMA)
+
+
+def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_period_days` (module docstring): `period_start` NULL
+    exactly when `period_days = 0`, else `period_days = period_end -
+    period_start` in days."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_PERIOD_SCHEMA)
+    found = conn.execute(
+        """
+        SELECT cik, fact_name, period_end, period_days, period_start, filing_accession
+        FROM statement_facts
+        WHERE (period_days = 0) != (period_start IS NULL)
+           OR (period_days != 0 AND period_days != date_diff('day', period_start, period_end))
+        ORDER BY cik, fact_name, period_end, filing_accession
+        """
+    ).fetchall()
+    rows = [
+        {
+            "cik": cik,
+            "fact_name": fact_name,
+            "period_end": period_end,
+            "period_days": int(period_days),
+            "period_start": period_start,
+            "filing_accession": accession,
+        }
+        for cik, fact_name, period_end, period_days, period_start, accession in found
+    ]
+    return pl.DataFrame(rows, schema=_STATEMENT_PERIOD_SCHEMA)
+
+
+def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_derived_matches_components` (module docstring): every
+    `basis = derived` `gross_profit` row must equal the difference of the
+    two stored `revenue` and `cost_of_revenue` rows sharing its `cik`,
+    `period_end`, `period_days` and `filing_accession`, both present (a
+    missing component row fails it too). Exact `DOUBLE` equality, no
+    tolerance: the ingest (T77b) derives the row by this same subtraction
+    at insert time (spec decision (e)), so a correct row's stored value
+    and this recomputation are bit-identical -- no config threshold is
+    needed, or would mean anything, for a check that cannot legitimately
+    differ by any amount on correct data."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
+    found = conn.execute(
+        """
+        SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,
+               r.value, c.value
+        FROM statement_facts d
+        LEFT JOIN statement_facts r
+          ON r.cik = d.cik AND r.period_end = d.period_end AND r.period_days = d.period_days
+         AND r.filing_accession = d.filing_accession AND r.fact_name = 'revenue'
+        LEFT JOIN statement_facts c
+          ON c.cik = d.cik AND c.period_end = d.period_end AND c.period_days = d.period_days
+         AND c.filing_accession = d.filing_accession AND c.fact_name = 'cost_of_revenue'
+        WHERE d.fact_name = 'gross_profit' AND d.basis = 'derived'
+          AND (r.value IS NULL OR c.value IS NULL OR d.value != (r.value - c.value))
+        ORDER BY d.cik, d.period_end, d.filing_accession
+        """
+    ).fetchall()
+    rows = [
+        {
+            "cik": cik,
+            "period_end": period_end,
+            "period_days": int(period_days),
+            "filing_accession": accession,
+            "value": value,
+            "revenue": revenue,
+            "cost_of_revenue": cost,
+        }
+        for cik, period_end, period_days, accession, value, revenue, cost in found
+    ]
+    return pl.DataFrame(rows, schema=_STATEMENT_DERIVED_SCHEMA)
+
+
+def _statement_basis_allowed(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """`statement_basis_allowed` (module docstring): `basis` outside
+    `schema.STATEMENT_FACT_BASIS_VALUES` (the schema's own `CHECK` already
+    blocks this, as `_statement_period_days`'s docstring notes)."""
+    if "statement_facts" not in _present_tables(conn):
+        return pl.DataFrame(schema=_STATEMENT_BASIS_SCHEMA)
+    allowed = STATEMENT_FACT_BASIS_VALUES
+    marks = ", ".join("?" for _ in allowed)
+    found = conn.execute(
+        f"""
+        SELECT basis, count(*) FROM statement_facts
+        WHERE basis IS NULL OR basis NOT IN ({marks})
+        GROUP BY basis ORDER BY basis NULLS FIRST
+        """,
+        list(allowed),
+    ).fetchall()
+    rows = [{"basis": basis, "rows": int(n)} for basis, n in found]
+    return pl.DataFrame(rows, schema=_STATEMENT_BASIS_SCHEMA)

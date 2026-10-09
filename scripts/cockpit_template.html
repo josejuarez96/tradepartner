@@ -126,7 +126,6 @@ __COCKPIT_REFRESH__
   .node.state-in_progress .lbl { fill: var(--warn); }
   .node.state-ready rect { stroke: var(--accent); stroke-dasharray: 5 3; }
   .node.state-blocked rect { stroke-dasharray: 2 3; }
-  .node.state-blocked text { fill: var(--muted); }
   .node.kind-phase rect { stroke-width: 2.5; }
   .node.kind-phase .lbl { font-size: 13px; }
   .node.state-current rect { fill: var(--accent-soft); stroke: var(--accent); }
@@ -139,6 +138,31 @@ __COCKPIT_REFRESH__
   .edge.dim { opacity: .1; }
   .edge.lit { stroke: var(--accent); stroke-width: 2.2; }
   .arrowhead { fill: var(--muted); }
+  .arrowhead-crit { fill: var(--ink); }
+  section.wide { align-self: center; width: min(1720px, calc(100vw - 48px)); }
+  .graph-wrap { cursor: grab; }
+  .graph-wrap.dragging { cursor: grabbing; user-select: none; }
+  .lane { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+  .lane.alt { fill: var(--code-bg); }
+  .lane-lbl { font: 600 12px "IBM Plex Sans", system-ui, sans-serif; fill: var(--muted); cursor: pointer; }
+  .lane-lbl:hover { fill: var(--accent); }
+  .node.crit rect { stroke: var(--ink); stroke-width: 2.4; stroke-dasharray: none; }
+  .edge.crit { stroke: var(--ink); stroke-width: 2.4; }
+  .crit-line { font-size: 13px; margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+  .crit-line .k { color: var(--muted); }
+  .legend .sw.crit { border: 2.4px solid var(--ink); }
+  .now { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .now .card h3 { margin: 0; font-size: 14px; }
+  .now ul.plain li { display: grid; grid-template-columns: 46px 1fr; gap: 2px 8px; align-items: baseline; }
+  .now li .id { font: 500 12px "IBM Plex Mono", monospace; }
+  .now li .body { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; min-width: 0; }
+  .now li .pill { white-space: normal; }
+  .chain-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .chain-head:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+  .chain-head .pn { font-weight: 600; font-size: 14px; }
+  .cell .tt { font-family: "IBM Plex Sans", sans-serif; font-weight: 400; }
+  details.fold.small > summary { font-size: 13px; font-weight: 500; color: var(--muted); margin: 4px 0 8px; }
+  details.fold.small .chains { gap: 6px; }
   .detail { margin-top: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-height: 60px; }
   .detail h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
   .detail p { margin: 8px 0; font-size: 14px; }
@@ -174,22 +198,30 @@ __COCKPIT_REFRESH__
   </section>
 
   <section>
+    <h2>What matters now</h2>
+    <p class="sub">Plan tasks only. Click an id to find it in the picture below.</p>
+    <div class="now" id="now"></div>
+  </section>
+
+  <section>
     <h2>How far to the MVP</h2>
     <p class="sub" id="mvp-sub"></p>
     <div class="phases" id="phases"></div>
   </section>
 
-  <section>
+  <section class="wide">
     <h2>The web of work</h2>
-    <p class="sub">Every open piece of work and what it feeds. Left to right is the order things have to happen. Solid arrows are hard dependencies from the plan; dashed arrows are "this informs that" links from <code>docs/work-map.toml</code>; thick arrows join the phases. Click anything for the plain-English version. The map is wide: scroll it sideways, or tick "fit to width".</p>
+    <p class="sub">What is still open and what it waits on. One band per phase; left to right is the order things have to happen. The heavy outline is the longest chain to the finish. Click a box to light up everything before and after it; click the background to clear; drag to move around.</p>
+    <p class="crit-line" id="crit-line"></p>
     <div class="graph-tools">
-      <label><input type="checkbox" id="hide-done"> hide finished work</label>
+      <label><input type="checkbox" id="show-done"> show finished work</label>
       <label><input type="checkbox" id="fit-width"> fit to width (overview, small text)</label>
       <span class="legend">
-        <span><i class="sw done"></i>merged</span> <span><i class="sw in_review"></i>in review</span> <span><i class="sw in_progress"></i>being built</span> <span><i class="sw ready"></i>ready to pick up</span> <span><i class="sw blocked"></i>waiting on others</span> <span><i class="sw"></i>not started</span>
+        <span><i class="sw crit"></i>longest chain</span> <span><i class="sw in_review"></i>in review</span> <span><i class="sw in_progress"></i>being built</span> <span><i class="sw ready"></i>ready to pick up</span> <span><i class="sw blocked"></i>waiting on others</span> <span><i class="sw done"></i>merged</span>
       </span>
     </div>
-    <div class="graph-wrap"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <div class="graph-wrap" id="graph-wrap"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <p class="sub" id="graph-note"></p>
     <div class="detail" id="detail"></div>
     <p class="sub" id="map-missing"></p>
   </section>
@@ -209,13 +241,18 @@ __COCKPIT_REFRESH__
     <h2>Teams</h2>
     <p class="sub" id="teams-sub"></p>
     <div class="cards" id="teams"></div>
+    <details class="fold" id="teams-fold" style="margin-top:14px">
+      <summary id="teams-fold-sum"></summary>
+      <div class="cards" id="teams-inactive"></div>
+    </details>
   </section>
 
   <section>
     <h2>Plan by chain</h2>
+    <p class="sub">Grouped by phase, the phase with the most open work first. Finished chains are folded away; open tasks show their title.</p>
     <div class="chains" id="chains"></div>
     <div class="legend">
-      <span>✓ done</span><span>● in progress (holder shown)</span><span>○ ready, unclaimed</span><span>· blocked</span><span>⚿ owner task</span>
+      <span>✓ done</span><span>● in progress (holder shown)</span><span>○ ready, unclaimed</span><span>· blocked</span><span>“· you” owner task</span>
     </div>
   </section>
 
@@ -342,9 +379,27 @@ __COCKPIT_REFRESH__
     phasesEl.appendChild(box);
   });
 
-  // ── the web: layered layout, no library
-  var NW = 170, NH = 46, GX = 64, GY = 14;
-  function layoutGraph(nodes, edges) {
+  // ── the web: one band per phase, open work by default, no library
+  var NH = 58, GX = 26, GY = 12, LANE_HEAD = 26, LANE_PAD = 10, MIN_NW = 112, MAX_NW = 190;
+  var critIds = G.critical_path || [], CRIT = {}, critEdge = {};
+  critIds.forEach(function (id, i) { CRIT[id] = true; if (i) critEdge[critIds[i - 1] + '>' + id] = true; });
+  var phaseName = {}; prog.forEach(function (p) { phaseName[p.phase] = p.name; });
+  var STATE_ORDER = { in_review: 0, in_progress: 1, ready: 2, blocked: 3, open: 4, done: 5 };
+
+  function visibleGraph(showDone) {
+    // Phases are the bands, not boxes. Finished work is hidden unless asked for.
+    var cand = G.nodes.filter(function (n) { return n.kind !== 'phase' && (showDone || n.state !== 'done'); });
+    var ids = {}; cand.forEach(function (n) { ids[n.id] = true; });
+    var edges = G.edges.filter(function (e) { return ids[e.from] && ids[e.to]; });
+    var linked = {}; edges.forEach(function (e) { linked[e.from] = true; linked[e.to] = true; });
+    // A box with no arrow to another visible box says nothing about order: plan tasks stay, the rest live in the lists.
+    return {
+      nodes: cand.filter(function (n) { return n.kind === 'task' || linked[n.id]; }),
+      edges: edges,
+      loose: cand.filter(function (n) { return n.kind !== 'task' && !linked[n.id]; })
+    };
+  }
+  function layoutGraph(nodes, edges, avail) {
     var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
     var preds = {}, succs = {};
     nodes.forEach(function (n) { preds[n.id] = []; succs[n.id] = []; });
@@ -358,81 +413,148 @@ __COCKPIT_REFRESH__
       depth[id] = m; return m;
     }
     nodes.forEach(function (n) { d(n.id); });
-    // A node with no prerequisites sits just left of the first thing it feeds, not in column 0.
-    nodes.forEach(function (n) { if (!preds[n.id].length && succs[n.id].length) depth[n.id] = Math.min.apply(null, succs[n.id].map(function (x) { return depth[x]; })) - 1; });
-    var layers = [];
-    nodes.forEach(function (n) { var k = depth[n.id]; (layers[k] = layers[k] || []).push(n.id); });
-    for (var i = 0; i < layers.length; i++) layers[i] = layers[i] || [];
-    var pos = {};
-    layers.forEach(function (L) { L.forEach(function (id, i) { pos[id] = i; }); });
-    function bary(id, nb) { var ns = nb[id]; if (!ns.length) return pos[id]; var s = 0; ns.forEach(function (x) { s += pos[x]; }); return s / ns.length; }
-    for (var sweep = 0; sweep < 6; sweep++) {
-      var down = sweep % 2 === 0;
-      for (var k = 0; k < layers.length; k++) {
-        var li = down ? k : layers.length - 1 - k, L = layers[li], nb = down ? preds : succs, b = {};
-        L.forEach(function (id) { b[id] = bary(id, nb); });
-        L.sort(function (a, c) { return b[a] - b[c] || pos[a] - pos[c]; });
-        L.forEach(function (id, i) { pos[id] = i; });
-      }
+    // A box with no prerequisites sits just left of the first thing it feeds, not in the first column.
+    nodes.forEach(function (n) { if (!preds[n.id].length && succs[n.id].length) depth[n.id] = Math.max(0, Math.min.apply(null, succs[n.id].map(function (x) { return depth[x]; })) - 1); });
+    var nCols = 1; nodes.forEach(function (n) { nCols = Math.max(nCols, depth[n.id] + 1); });
+    var NW = Math.max(MIN_NW, Math.min(MAX_NW, Math.floor((avail - 2 * LANE_PAD + GX) / nCols) - GX));
+    // The band: a task's own phase; anything else joins the earliest phase it feeds.
+    var memo = {};
+    function laneOf(n) {
+      if (n.phase != null) return n.phase;
+      if (memo[n.id] !== undefined) return memo[n.id];
+      memo[n.id] = 'other';
+      var best = null;
+      succs[n.id].forEach(function (s) { var l = laneOf(byId[s]); if (l !== 'other' && (best == null || l < best)) best = l; });
+      memo[n.id] = best == null ? 'other' : best;
+      return memo[n.id];
     }
-    var tallest = Math.max.apply(null, layers.map(function (L) { return L.length; }).concat([1]));
-    var height = tallest * (NH + GY) - GY, xy = {};
-    layers.forEach(function (L, li) {
-      var off = (height - (L.length * (NH + GY) - GY)) / 2;
-      L.forEach(function (id, i) { xy[id] = { x: li * (NW + GX), y: off + i * (NH + GY) }; });
+    var laneKey = {}, seenLane = {}, laneKeys = [];
+    nodes.forEach(function (n) { var k = laneOf(n); laneKey[n.id] = k; if (!seenLane[k]) { seenLane[k] = true; laneKeys.push(k); } });
+    laneKeys.sort(function (a, b) { return (a === 'other') - (b === 'other') || a - b; });
+    var laneIdx = {}; laneKeys.forEach(function (k, i) { laneIdx[k] = i; });
+    var cells = laneKeys.map(function () { var row = []; for (var c = 0; c < nCols; c++) row.push([]); return row; });
+    nodes.slice().sort(function (a, b) { return (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || a.label.localeCompare(b.label, undefined, { numeric: true }); })
+      .forEach(function (n) { cells[laneIdx[laneKey[n.id]]][depth[n.id]].push(n.id); });
+    var rank = {};
+    function rerank() { cells.forEach(function (row, li) { row.forEach(function (cell) { cell.forEach(function (id, i) { rank[id] = li * 1000 + i; }); }); }); }
+    rerank();
+    function bary(id, nb) { var ns = nb[id]; if (!ns.length) return rank[id]; var s = 0; ns.forEach(function (x) { s += rank[x]; }); return s / ns.length; }
+    for (var sweep = 0; sweep < 6; sweep++) {
+      var nb = sweep % 2 === 0 ? preds : succs;
+      cells.forEach(function (row) {
+        row.forEach(function (cell) {
+          var b = {}; cell.forEach(function (id) { b[id] = bary(id, nb); });
+          cell.sort(function (a, c) { return b[a] - b[c] || rank[a] - rank[c]; });
+        });
+      });
+      rerank();
+    }
+    var xy = {}, lanes = [], y = 0;
+    laneKeys.forEach(function (k, li) {
+      var rows = 1; cells[li].forEach(function (cell) { rows = Math.max(rows, cell.length); });
+      var inner = rows * (NH + GY) - GY, h = LANE_HEAD + inner + 2 * LANE_PAD;
+      cells[li].forEach(function (cell, c) {
+        var off = (inner - (cell.length * (NH + GY) - GY)) / 2;
+        cell.forEach(function (id, i) { xy[id] = { x: LANE_PAD + c * (NW + GX), y: y + LANE_HEAD + LANE_PAD + off + i * (NH + GY) }; });
+      });
+      lanes.push({ key: k, top: y, height: h });
+      y += h + 8;
     });
-    return { xy: xy, width: Math.max(1, layers.length * (NW + GX) - GX), height: Math.max(1, height), preds: preds, succs: succs };
+    return { xy: xy, NW: NW, lanes: lanes, width: Math.max(1, 2 * LANE_PAD + nCols * (NW + GX) - GX), height: Math.max(1, y - 8), preds: preds, succs: succs };
   }
   var svgNS = 'http://www.w3.org/2000/svg';
   function svgEl(tag, attrs) { var e = document.createElementNS(svgNS, tag); Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); }); return e; }
-  var selected = null, layoutNow = null;
+  function wrapTitle(s, perLine) {
+    var words = String(s || '').replace(/`/g, '').split(/\s+/), lines = [''], i = 0;
+    for (; i < words.length; i++) {
+      var cur = lines[lines.length - 1], next = cur ? cur + ' ' + words[i] : words[i];
+      if (next.length <= perLine) { lines[lines.length - 1] = next; continue; }
+      if (lines.length === 2) { lines[1] = trunc(cur + ' ' + words[i], perLine); return lines; }
+      if (!cur) { lines[0] = trunc(words[i], perLine); lines.push(''); } else lines.push(words[i].length > perLine ? trunc(words[i], perLine) : words[i]);
+    }
+    return lines;
+  }
+  function laneLabel(key, showDone) {
+    if (key === 'other') return 'Research, decisions and issues that feed the plan';
+    var open = 0, done = 0;
+    G.nodes.forEach(function (n) { if (n.kind === 'task' && n.phase === key) { if (n.state === 'done') done++; else open++; } });
+    return 'Phase ' + key + ' · ' + (phaseName[key] || '') + ' · ' + open + ' open' + (done ? ', ' + done + ' merged' + (showDone ? '' : ' (hidden)') : '');
+  }
+  var selected = null, layoutNow = null, dragged = false;
+  var wrapEl = document.getElementById('graph-wrap');
   function drawGraph() {
-    var hideDone = document.getElementById('hide-done').checked;
-    var nodes = G.nodes.filter(function (n) { return !(hideDone && n.state === 'done' && n.kind !== 'phase'); });
-    var ids = {}; nodes.forEach(function (n) { ids[n.id] = true; });
-    var edges = G.edges.filter(function (e) { return ids[e.from] && ids[e.to]; });
-    var L = layoutGraph(nodes, edges); layoutNow = L;
-    var svg = document.getElementById('graph'); while (svg.firstChild) svg.removeChild(svg.firstChild);
-    var pad = 10, W = L.width + 2 * pad, H = L.height + 2 * pad;
-    svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', (-pad) + ' ' + (-pad) + ' ' + W + ' ' + H);
-    var defs = svgEl('defs'); var marker = svgEl('marker', { id: 'arrow', viewBox: '0 0 10 10', refX: '10', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' });
-    marker.appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', class: 'arrowhead' })); defs.appendChild(marker); svg.appendChild(defs);
+    var showDone = document.getElementById('show-done').checked;
+    var V = visibleGraph(showDone), nodes = V.nodes, edges = V.edges;
+    var L = layoutGraph(nodes, edges, Math.max(320, wrapEl.clientWidth - 22)); layoutNow = L;
+    var NW = L.NW, svg = document.getElementById('graph'); while (svg.firstChild) svg.removeChild(svg.firstChild);
+    svg.setAttribute('width', L.width); svg.setAttribute('height', L.height); svg.setAttribute('viewBox', '0 0 ' + L.width + ' ' + L.height);
+    var defs = svgEl('defs');
+    [['arrow', 'arrowhead'], ['arrow-crit', 'arrowhead-crit']].forEach(function (m) {
+      var marker = svgEl('marker', { id: m[0], viewBox: '0 0 10 10', refX: '10', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' });
+      marker.appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', class: m[1] })); defs.appendChild(marker);
+    });
+    svg.appendChild(defs);
+    var lg = svgEl('g');
+    L.lanes.forEach(function (ln, i) {
+      lg.appendChild(svgEl('rect', { x: 0.5, y: ln.top + 0.5, width: L.width - 1, height: ln.height - 1, rx: 8, class: 'lane' + (i % 2 ? ' alt' : '') }));
+      var lbl = svgEl('text', { x: 12, y: ln.top + 18, class: 'lane-lbl' }); lbl.textContent = laneLabel(ln.key, showDone);
+      if (ln.key !== 'other') lbl.addEventListener('click', function (ev) { ev.stopPropagation(); if (!dragged) select('phase:' + ln.key); });
+      lg.appendChild(lbl);
+    });
+    svg.appendChild(lg);
     var eg = svgEl('g');
     edges.forEach(function (e) {
-      var a = L.xy[e.from], b = L.xy[e.to], x1 = a.x + NW, y1 = a.y + NH / 2, x2 = b.x, y2 = b.y + NH / 2, cx = Math.max(24, (x2 - x1) / 2);
-      eg.appendChild(svgEl('path', { d: 'M' + x1 + ' ' + y1 + ' C' + (x1 + cx) + ' ' + y1 + ' ' + (x2 - cx) + ' ' + y2 + ' ' + x2 + ' ' + y2, class: 'edge ' + e.kind, 'marker-end': 'url(#arrow)', 'data-from': e.from, 'data-to': e.to }));
+      var a = L.xy[e.from], b = L.xy[e.to]; if (!a || !b) return;
+      var crit = !!critEdge[e.from + '>' + e.to];
+      var x1 = a.x + NW, y1 = a.y + NH / 2, x2 = b.x, y2 = b.y + NH / 2, cx = Math.max(18, (x2 - x1) / 2);
+      eg.appendChild(svgEl('path', { d: 'M' + x1 + ' ' + y1 + ' C' + (x1 + cx) + ' ' + y1 + ' ' + (x2 - cx) + ' ' + y2 + ' ' + x2 + ' ' + y2, class: 'edge ' + e.kind + (crit ? ' crit' : ''), 'marker-end': 'url(#' + (crit ? 'arrow-crit' : 'arrow') + ')', 'data-from': e.from, 'data-to': e.to }));
     });
     svg.appendChild(eg);
-    var ng = svgEl('g');
+    var ng = svgEl('g'), perLine = Math.max(10, Math.floor((NW - 18) / 5.9));
     nodes.forEach(function (n) {
       var p = L.xy[n.id];
-      var g = svgEl('g', { class: 'node kind-' + n.kind + ' state-' + n.state, transform: 'translate(' + p.x + ',' + p.y + ')', 'data-id': n.id });
-      g.appendChild(svgEl('rect', { width: NW, height: NH, rx: n.kind === 'phase' ? 14 : 7 }));
-      var t1 = svgEl('text', { x: 10, y: 18, class: 'lbl' }); t1.textContent = n.label + (n.holder ? ' · ' + n.holder : n.kind === 'phase' && n.mvp ? ' · MVP' : '');
-      var t2 = svgEl('text', { x: 10, y: 35, class: 'ttl' }); t2.textContent = trunc(n.title, 27);
-      var tip = svgEl('title'); tip.textContent = n.label + ': ' + n.title + ' — ' + word(n.state);
-      g.appendChild(t1); g.appendChild(t2); g.appendChild(tip);
-      g.addEventListener('click', function () { select(n.id); });
+      var g = svgEl('g', { class: 'node kind-' + n.kind + ' state-' + n.state + (CRIT[n.id] ? ' crit' : ''), transform: 'translate(' + p.x + ',' + p.y + ')', 'data-id': n.id });
+      g.appendChild(svgEl('rect', { width: NW, height: NH, rx: 7 }));
+      var t1 = svgEl('text', { x: 9, y: 17, class: 'lbl' }); t1.textContent = trunc(n.label + (n.holder ? ' · ' + n.holder : n.owner ? ' · you' : ''), Math.floor((NW - 14) / 7.3));
+      g.appendChild(t1);
+      wrapTitle(n.title, perLine).forEach(function (line, i) { var tx = svgEl('text', { x: 9, y: 33 + i * 14, class: 'ttl' }); tx.textContent = line; g.appendChild(tx); });
+      var tip = svgEl('title'); tip.textContent = n.label + ': ' + n.title + ' — ' + word(n.state) + (n.holder ? ' (' + n.holder + ')' : '') + (CRIT[n.id] ? ' · on the longest chain' : '');
+      g.appendChild(tip);
+      g.addEventListener('click', function (ev) { ev.stopPropagation(); if (!dragged) select(n.id); });
       ng.appendChild(g);
     });
     svg.appendChild(ng);
-    highlight(selected && ids[selected] ? selected : null);
+    var note = document.getElementById('graph-note');
+    note.textContent = V.loose.length ? V.loose.length + (showDone ? ' issues, questions and documents have no arrow to anything shown' : ' open issues and questions have no arrow to other open work') + ', so they are in the lists below (Research in flight, Unclaimed queue), not in this picture.' : '';
+    fitWidth();
+    highlight(selected && L.xy[selected] ? selected : null);
   }
+  function reach(id, nb) { var seen = {}, stack = [id]; while (stack.length) { var x = stack.pop(); (nb[x] || []).forEach(function (y) { if (!seen[y]) { seen[y] = true; stack.push(y); } }); } return seen; }
   function highlight(id) {
-    var svg = document.getElementById('graph'), L = layoutNow, keep = {};
-    if (id) { keep[id] = true; (L.preds[id] || []).forEach(function (x) { keep[x] = true; }); (L.succs[id] || []).forEach(function (x) { keep[x] = true; }); }
-    svg.querySelectorAll('.node').forEach(function (g) { var nid = g.getAttribute('data-id'); g.classList.toggle('dim', !!id && !keep[nid]); g.classList.toggle('selected', nid === id); });
-    svg.querySelectorAll('.edge').forEach(function (p) { var on = !id || p.getAttribute('data-from') === id || p.getAttribute('data-to') === id; p.classList.toggle('dim', !on); p.classList.toggle('lit', !!id && on); });
+    var svg = document.getElementById('graph'), L = layoutNow;
+    var up = id ? reach(id, L.preds) : {}, down = id ? reach(id, L.succs) : {};
+    function inUp(x) { return x === id || up[x]; } function inDown(x) { return x === id || down[x]; }
+    svg.querySelectorAll('.node').forEach(function (g) { var nid = g.getAttribute('data-id'); g.classList.toggle('dim', !!id && !inUp(nid) && !inDown(nid)); g.classList.toggle('selected', nid === id); });
+    svg.querySelectorAll('.edge').forEach(function (p) {
+      var f = p.getAttribute('data-from'), to = p.getAttribute('data-to');
+      var on = !id || (inUp(f) && inUp(to)) || (inDown(f) && inDown(to));
+      p.classList.toggle('dim', !on); p.classList.toggle('lit', !!id && on);
+    });
   }
-  function nodeRef(id) { var n = nodeById[id]; var s = el('span', 'linkish', n ? n.label + ' ' + trunc(n.title, 40) : id); s.addEventListener('click', function () { select(id); }); return s; }
+  function nodeRef(id, short) { var n = nodeById[id]; var s = el('span', 'linkish', n ? (short ? n.label : n.label + ' ' + trunc(n.title, 40)) : id); if (n && short) s.title = n.title; s.addEventListener('click', function () { select(id); }); return s; }
+  function detailHint() { var box = document.getElementById('detail'); box.innerHTML = ''; box.appendChild(el('p', 'empty', 'Click a box to see what it is, why it matters, what it needs and what it feeds. Its whole chain lights up.')); }
   function select(id) {
-    selected = id; highlight(id);
+    selected = id;
+    var onMap = layoutNow && layoutNow.xy[id];
+    highlight(onMap ? id : null);
+    if (onMap) { var p = layoutNow.xy[id]; if (p.x < wrapEl.scrollLeft || p.x + layoutNow.NW > wrapEl.scrollLeft + wrapEl.clientWidth) wrapEl.scrollLeft = Math.max(0, p.x - wrapEl.clientWidth / 2); }
     var n = nodeById[id], box = document.getElementById('detail'); box.innerHTML = '';
     if (!n) return;
     box.appendChild(el('h3', null, n.label + ' · ' + n.title));
     var chips = el('div', 'chips');
     chips.appendChild(pill('inactive', KIND[n.kind] || n.kind));
     chips.appendChild(pill(stateClass(n.state), word(n.state)));
+    if (CRIT[id]) chips.appendChild(pill('owner', 'on the longest chain'));
     if (n.holder) chips.appendChild(pill('idle', 'held by ' + n.holder));
     if (n.owner) chips.appendChild(pill('owner', 'owner task: needs your keys'));
     (n.prs || []).forEach(function (p) { chips.appendChild(prPill(p)); });
@@ -440,6 +562,7 @@ __COCKPIT_REFRESH__
     if (n.doc_status) chips.appendChild(pill(n.doc_status === 'Accepted' ? 'pass' : 'pending', n.doc_status.toLowerCase()));
     (n.labels || []).forEach(function (l) { chips.appendChild(pill('inactive', l)); });
     box.appendChild(chips);
+    if (!onMap && n.kind !== 'phase') box.appendChild(el('p', 'sub', n.state === 'done' ? 'Merged, so it is not in the picture. Tick "show finished work" to see it there.' : 'It has no arrow to other open work, so it is not in the picture.'));
     var what = el('p'); what.appendChild(el('span', 'k', 'What it is'));
     what.appendChild(document.createTextNode(n.what || 'No plain-English entry yet. Add [' + n.id.replace(':', '.') + '] to docs/work-map.toml.'));
     box.appendChild(what);
@@ -449,12 +572,33 @@ __COCKPIT_REFRESH__
     if (su.length) { var b = el('p'); b.appendChild(el('span', 'k', 'Feeds into')); su.forEach(function (x, i) { if (i) b.appendChild(document.createTextNode(' · ')); b.appendChild(nodeRef(x)); }); box.appendChild(b); }
     if (n.url) { var lk = el('p'); var aEl = el('a', null, n.kind === 'task' || n.issue && !/blob/.test(n.url) ? 'Open issue #' + n.issue + ' on GitHub' : 'Open the document on GitHub'); aEl.href = n.url; aEl.target = '_blank'; aEl.rel = 'noopener'; lk.appendChild(aEl); box.appendChild(lk); }
   }
-  document.getElementById('hide-done').addEventListener('change', drawGraph);
   function fitWidth() { var svg = document.getElementById('graph'); var on = document.getElementById('fit-width').checked; svg.style.width = on ? '100%' : ''; svg.style.height = on ? 'auto' : ''; }
+  document.getElementById('show-done').addEventListener('change', drawGraph);
   document.getElementById('fit-width').addEventListener('change', fitWidth);
+  // drag to pan; a drag is not a click
+  var drag = null;
+  wrapEl.addEventListener('mousedown', function (ev) { if (ev.button !== 0) return; drag = { x: ev.clientX, y: ev.clientY, l: wrapEl.scrollLeft, t: wrapEl.scrollTop }; dragged = false; });
+  window.addEventListener('mousemove', function (ev) {
+    if (!drag) return;
+    var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (!dragged && Math.abs(dx) + Math.abs(dy) > 4) { dragged = true; wrapEl.classList.add('dragging'); }
+    if (dragged) { wrapEl.scrollLeft = drag.l - dx; wrapEl.scrollTop = drag.t - dy; ev.preventDefault(); }
+  });
+  window.addEventListener('mouseup', function () { drag = null; wrapEl.classList.remove('dragging'); });
+  wrapEl.addEventListener('click', function () { if (dragged) return; selected = null; highlight(null); detailHint(); });
+  var resizeTimer = null;
+  window.addEventListener('resize', function () { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawGraph, 150); });
+  // the longest chain, spelled out
+  var critLine = document.getElementById('crit-line');
+  if (critIds.length) {
+    critLine.appendChild(el('span', 'k', 'Longest chain to the finish: ' + critIds.length + ' pieces in a row ·'));
+    critIds.forEach(function (id, i) { if (i) critLine.appendChild(el('span', 'k', '→')); critLine.appendChild(nodeRef(id, true)); });
+  }
+  var hash = decodeURIComponent(location.hash || '');
+  if (/(^#|&)all\b/.test(hash)) document.getElementById('show-done').checked = true;
   drawGraph();
-  var det0 = document.getElementById('detail');
-  det0.appendChild(el('p', 'empty', 'Click a box to see what it is, why it matters, what it needs and what it feeds.'));
+  detailHint();
+  var hm = /node=([^&]+)/.exec(hash); if (hm && nodeById[hm[1]]) select(hm[1]);
   var missing = G.missing_map_entries || [], unknown = G.unknown_map_entries || [];
   var mapMsg = missing.length ? 'No plain-English entry yet for: ' + missing.join(', ') + '. Add them to docs/work-map.toml.' : 'Every piece of work has a plain-English entry in docs/work-map.toml.';
   if (unknown.length) mapMsg += ' Map ids that match nothing (closed, renamed or misspelled): ' + unknown.join(', ') + '.';
@@ -507,7 +651,7 @@ __COCKPIT_REFRESH__
   var order = { active: 0, idle: 1, inactive: 2 };
   teams.sort(function (a, b) { return (order[a.state] - order[b.state]) || (b.last_seen || '').localeCompare(a.last_seen || ''); });
   document.getElementById('teams-sub').textContent = teams.length + ' teams seen in labels, team files or session logs. A team with no directory and no claims is a retired name.';
-  var teamsEl = document.getElementById('teams');
+  var teamsEl = document.getElementById('teams'), teamsInactiveEl = document.getElementById('teams-inactive'), nFolded = 0;
   teams.forEach(function (t) {
     var c = el('div', 'card ' + t.state);
     var top = el('div', 'top'); top.appendChild(el('div', 'name', t.name));
@@ -532,29 +676,77 @@ __COCKPIT_REFRESH__
       cl.prs.forEach(function (p) { chips.appendChild(pill(p.ci, 'PR #' + p.number + ' ' + (p.draft ? 'draft' : 'ready') + ' · CI ' + p.ci)); });
       box.appendChild(chips); c.appendChild(box);
     });
-    teamsEl.appendChild(c);
+    // a retired name with no claim is noise; an inactive team that still holds a claim is not
+    if (t.state === 'inactive' && !t.claims.length) { teamsInactiveEl.appendChild(c); nFolded++; } else teamsEl.appendChild(c);
   });
+  document.getElementById('teams-fold-sum').textContent = nFolded + ' inactive teams with no claim';
+  if (!nFolded) document.getElementById('teams-fold').style.display = 'none';
 
-  // chains
-  var byId = {}; (D.plan.tasks || []).forEach(function (t) { byId[t.id] = t; });
+  // ── what matters now
+  var planTasks = D.plan.tasks || [];
+  var byId = {}; planTasks.forEach(function (t) { byId[t.id] = t; });
+  function liveState(t) { var n = nodeById['task:' + t.id]; return n ? n.state : t.state; }
+  function nowCard(title, items, emptyText, extra) {
+    var c = el('div', 'card'); c.appendChild(el('h3', null, title + ' (' + items.length + ')'));
+    if (!items.length) { c.appendChild(el('div', 'empty', emptyText)); document.getElementById('now').appendChild(c); return; }
+    var ul = el('ul', 'plain');
+    items.forEach(function (t) {
+      var li = el('li'); var id = el('span', 'id linkish', t.id); id.addEventListener('click', function () { select('task:' + t.id); document.getElementById('graph-wrap').scrollIntoView({ block: 'center' }); });
+      var body = el('span', 'body'); body.appendChild(el('span', null, trunc(t.title, 60)));
+      var x = extra ? extra(t) : null; if (x) body.appendChild(x);
+      li.appendChild(id); li.appendChild(body);
+      ul.appendChild(li);
+    });
+    c.appendChild(ul); document.getElementById('now').appendChild(c);
+  }
+  var openTasks = planTasks.filter(function (t) { return t.state !== 'done'; });
+  nowCard('Ready to pick up', openTasks.filter(function (t) { return !t.owner && liveState(t) === 'ready'; }), 'nothing unclaimed is ready');
+  nowCard('Being built or in review', openTasks.filter(function (t) { var s = liveState(t); return !t.owner && (s === 'in_progress' || s === 'in_review'); }), 'nothing in flight',
+    function (t) { var s = liveState(t); return pill(s === 'in_review' ? 'owner' : 'idle', (t.holder || 'unheld') + (s === 'in_review' ? ' · in review' : '')); });
+  nowCard('Waiting on you', openTasks.filter(function (t) { return t.owner; }), 'no owner task open',
+    function (t) { var w = t.depends_on.filter(function (d) { return byId[d] && byId[d].state !== 'done'; }); return pill(w.length ? 'inactive' : 'owner', w.length ? 'after ' + w.slice(0, 3).join(', ') + (w.length > 3 ? ' and ' + (w.length - 3) + ' more' : '') : 'you can do this now'); });
+
+  // ── chains, grouped by phase
   var placed = {};
   var chainsEl = document.getElementById('chains');
   function cell(t) {
-    var mark = t.state === 'done' ? '✓' : t.state === 'in_progress' ? '●' : t.state === 'ready' ? '○' : '·';
-    var c = el('span', 'cell ' + t.state, (t.owner ? '⚿ ' : '') + mark + ' ' + t.id);
+    var s = liveState(t), isDone = t.state === 'done';
+    var mark = isDone ? '✓' : s === 'in_progress' || s === 'in_review' ? '●' : s === 'ready' ? '○' : '·';
+    var c = el('span', 'cell ' + (isDone ? 'done' : s === 'in_review' ? 'in_progress' : s), mark + ' ' + t.id + (t.owner ? ' · you' : ''));
+    if (!isDone) c.appendChild(el('span', 'tt', trunc(t.title, 34)));
     if (t.holder) c.appendChild(el('span', 'who', t.holder));
-    c.title = t.title + ' — ' + t.state.replace('_', ' ') + (t.depends_on.length ? ' · depends on ' + t.depends_on.join(', ') : '');
+    c.title = t.title + ' — ' + word(s) + (t.depends_on.length ? ' · depends on ' + t.depends_on.join(', ') : '');
     return c;
   }
-  function chainRow(name, ids) {
+  function chainRow(parent, name, ts) {
     var r = el('div', 'chain'); r.appendChild(el('div', 'cn', name));
-    var cells = el('div', 'cells');
-    ids.forEach(function (id) { if (byId[id]) { cells.appendChild(cell(byId[id])); placed[id] = true; } });
-    r.appendChild(cells); chainsEl.appendChild(r);
+    var cells = el('div', 'cells'); ts.forEach(function (t) { cells.appendChild(cell(t)); });
+    r.appendChild(cells); parent.appendChild(r);
   }
-  (D.plan.chains || []).forEach(function (ch) { chainRow(ch.name, ch.tasks); });
-  var rest = (D.plan.tasks || []).filter(function (t) { return !placed[t.id]; }).map(function (t) { return t.id; });
-  if (rest.length) chainRow('other', rest);
+  var groups = {};
+  function group(ph) { return groups[ph] = groups[ph] || { open: [], done: [] }; }
+  (D.plan.chains || []).forEach(function (ch) {
+    // a chain row may name a task twice ("T63i beside T63d"); show it once
+    var seenIn = {}, ts = ch.tasks.filter(function (id) { if (seenIn[id]) return false; seenIn[id] = true; return true; }).map(function (id) { return byId[id]; }).filter(Boolean); if (!ts.length) return;
+    ts.forEach(function (t) { placed[t.id] = true; });
+    group(ts[0].phase)[ts.every(function (t) { return t.state === 'done'; }) ? 'done' : 'open'].push({ name: ch.name, tasks: ts });
+  });
+  var restBy = {}; planTasks.forEach(function (t) { if (!placed[t.id]) (restBy[t.phase] = restBy[t.phase] || []).push(t); });
+  Object.keys(restBy).forEach(function (ph) { var ts = restBy[ph]; group(ph)[ts.every(function (t) { return t.state === 'done'; }) ? 'done' : 'open'].push({ name: 'other', tasks: ts }); });
+  function openCount(ph) { return planTasks.filter(function (t) { return String(t.phase) === String(ph) && t.state !== 'done'; }).length; }
+  Object.keys(groups).sort(function (a, b) { return openCount(b) - openCount(a) || Number(b) - Number(a); }).forEach(function (ph) {
+    var g = groups[ph], all = planTasks.filter(function (t) { return String(t.phase) === String(ph); }), nDone = all.filter(function (t) { return t.state === 'done'; }).length;
+    var head = el('div', 'chain-head'); head.appendChild(el('span', 'pn', 'Phase ' + ph + ' · ' + (phaseName[ph] || '')));
+    head.appendChild(el('span', 'sub num', nDone + ' of ' + all.length + ' merged'));
+    chainsEl.appendChild(head);
+    g.open.forEach(function (ch) { chainRow(chainsEl, ch.name, ch.tasks); });
+    if (g.done.length) {
+      var det = el('details', 'fold small'); var n = 0; g.done.forEach(function (ch) { n += ch.tasks.length; });
+      det.appendChild(el('summary', null, g.done.length + ' finished chains · ' + n + ' tasks merged'));
+      var inner = el('div', 'chains'); g.done.forEach(function (ch) { chainRow(inner, ch.name, ch.tasks); });
+      det.appendChild(inner); chainsEl.appendChild(det);
+    }
+  });
 
   // tokens
   var barsEl = document.getElementById('bars');

@@ -22,11 +22,19 @@ import pytest
 from conftest import load_universe_fixtures
 
 from tradepartner import gap as gap_module
-from tradepartner.backtest.provider import DataProvider, GapReading
+from tradepartner.backtest import store_provider as store_provider_module
+from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, DataProvider, GapReading
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import adjusted_prices_as_of, dropped_dividends_as_of, prices_as_of
+from tradepartner.store.asof import (
+    adjusted_prices_as_of,
+    dropped_dividends_as_of,
+    prices_as_of,
+    statement_facts_as_of,
+)
+from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import (
     StoreLockedError,
     configure_connection,
@@ -48,6 +56,8 @@ T_AFTER_DELIST = datetime(2019, 7, 31, 20, 0, tzinfo=UTC)
 T_JAN = datetime(2019, 1, 31, 21, 0, tzinfo=UTC)
 T_FEB = datetime(2019, 2, 28, 21, 0, tzinfo=UTC)
 T_MAR = datetime(2019, 3, 29, 20, 0, tzinfo=UTC)
+ZERO_VOLUME_ID = "SEC_DIV_REVISED"
+ZERO_VOLUME_SESSION = date(2019, 3, 5)
 
 
 def _settings(path: Path, **universe: Any) -> Settings:
@@ -143,6 +153,17 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Store:
                 "source": "alpaca",
                 "provenance": "action",
             },
+        )
+        # A zero-volume revision (#787): SEC_DIV_REVISED's 2019-03-05 bar is
+        # re-fetched on 2019-03-06 with no volume, so the provider drops it.
+        (bar,) = (
+            prices_as_of(conn, T_MAR, [ZERO_VOLUME_ID])
+            .filter(pl.col("session") == ZERO_VOLUME_SESSION)
+            .iter_rows(named=True)
+        )
+        revised = datetime(2019, 3, 6, 21, 0, tzinfo=UTC)
+        insert_row(
+            conn, "prices_daily", bar | {"volume": 0, "known_at": revised, "ingested_at": revised}
         )
     finally:
         conn.close()
@@ -242,7 +263,9 @@ def test_transfer_is_delisted_until_the_new_listing_is_known(store: Store) -> No
 def test_benchmark_ids_from_securities_benchmark(store: Store) -> None:
     with store.provider() as provider:
         assert provider.benchmark_ids(T_JAN) == {"MTUM": "SEC_MTUM", "SPY": "SEC_SPY"}
-        assert provider.benchmark_ids(datetime(2017, 6, 30, 20, tzinfo=UTC)) == {}
+        # By symbol (#840): before the master rows are known too; the bars stay as-of.
+        early = datetime(2017, 6, 30, 20, tzinfo=UTC)
+        assert provider.benchmark_ids(early) == {"MTUM": "SEC_MTUM", "SPY": "SEC_SPY"}
     only_spy = Settings(_env_file=None, store={"path": str(store.path)}, benchmarks=["SPY"])
     with store.provider(only_spy) as provider:
         assert provider.benchmark_ids(T_JAN) == {"SPY": "SEC_SPY"}
@@ -263,10 +286,77 @@ def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: b
         got = provider.adjusted_prices(T_MAR, ids, include_dividends)
     with store.direct() as conn:
         want = adjusted_prices_as_of(
-            conn, T_MAR, ids, include_dividends=include_dividends, settings=store.settings
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
         )
     assert got.equals(want)
     assert _ids(got) == set(ids)
+
+
+def _spy_on_adjusted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record the keyword arguments of every `adjusted_prices_as_of` call the provider
+    makes, passing each through to the real read."""
+    seen: list[dict[str, Any]] = []
+
+    def spy(*args: Any, **kwargs: Any) -> pl.DataFrame:
+        seen.append(kwargs)
+        return adjusted_prices_as_of(*args, **kwargs)
+
+    monkeypatch.setattr(store_provider_module, "adjusted_prices_as_of", spy)
+    return seen
+
+
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_sessions_from_reaches_the_as_of_read(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """T99: the bound is passed through to `adjusted_prices_as_of`, and the frame is
+    the as-of read's bounded frame."""
+    ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
+    bound = date(2019, 2, 22)
+    seen = _spy_on_adjusted(monkeypatch)
+    with store.provider() as provider:
+        got = provider.adjusted_prices(T_MAR, ids, include_dividends, sessions_from=bound)
+    assert [call["sessions_from"] for call in seen] == [bound]
+    with store.direct() as conn:
+        want = adjusted_prices_as_of(
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
+            sessions_from=bound,
+        )
+    assert got.equals(want)
+    assert got["session"].min() == bound
+
+
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_the_default_bounds_nothing(
+    store: Store, monkeypatch: pytest.MonkeyPatch, include_dividends: bool
+) -> None:
+    """T99: without the keyword the provider passes no bound, so every existing call
+    reads exactly the frame it read before."""
+    ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
+    seen = _spy_on_adjusted(monkeypatch)
+    with store.provider() as provider:
+        got = provider.adjusted_prices(T_MAR, ids, include_dividends)
+    assert [call["sessions_from"] for call in seen] == [None]
+    with store.direct() as conn:
+        want = adjusted_prices_as_of(
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=include_dividends,
+            settings=store.settings,
+            traded_only=True,
+        )
+    assert got.equals(want)
 
 
 def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
@@ -276,7 +366,7 @@ def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
     with store.provider() as provider:
         got = provider.raw_prices(T_MAR, ids)
     with store.direct() as conn:
-        want = prices_as_of(conn, T_MAR, ids)
+        want = prices_as_of(conn, T_MAR, ids, traded_only=True)
     assert got.equals(want)
     assert _ids(got) == set(ids)
     # Unadjusted: the 3:1 split on SEC_SPLIT_BETWEEN (ex-date 2019-01-11) leaves the
@@ -285,6 +375,27 @@ def test_raw_prices_equal_the_as_of_read(store: Store) -> None:
         pl.col("session") == date(2019, 1, 10)
     )
     assert got.filter(split_eve)["close"].item() == 58.39
+
+
+def test_a_zero_volume_bar_is_missing_from_both_frames(store: Store) -> None:
+    """#787: a bar whose latest revision has no volume is neither a mark, a fill
+    nor a signal anchor; before the revision is known it is an ordinary bar."""
+    ids = [ZERO_VOLUME_ID]
+    bar = pl.col("session") == ZERO_VOLUME_SESSION
+    with store.provider() as provider:
+        frames = [
+            provider.raw_prices(T_MAR, ids),
+            provider.adjusted_prices(T_MAR, ids, True),
+            provider.adjusted_prices(T_MAR, ids, False),
+        ]
+        before = provider.raw_prices(datetime(2019, 3, 5, 21, 0, tzinfo=UTC), ids)
+    with store.direct() as conn:
+        stored = prices_as_of(conn, T_MAR, ids).filter(bar)
+    assert stored["volume"].to_list() == [0]
+    for frame in frames:
+        assert frame.filter(bar).is_empty()
+        assert frame.filter(pl.col("session") > ZERO_VOLUME_SESSION).height > 0
+    assert before.filter(bar).height == 1
 
 
 def test_raw_prices_exclude_a_revision_not_yet_known(store: Store) -> None:
@@ -498,3 +609,199 @@ def test_nothing_under_backtest_imports_adapters() -> None:
             ):
                 offenders.append(f"{path.name}:{node.lineno}")
     assert offenders == []
+
+
+# --- the statement reads (backtest spec amendment #720, plan T85c) -------------------
+
+#: Reads at these closes, around the fixture's statement-fact cases (README "Statement
+#: facts"): the five acceptance stamps, the 10-K accepted after close(2019-02-28), and
+#: the issuer whose total_assets is accepted after its gross-profit filing.
+STATEMENT_TS = [
+    session_close(date(2017, 6, 30)),
+    T_DUAL,
+    session_close(date(2019, 1, 31)),
+    T_FEB,
+    T_MAR,
+    session_close(date(2019, 11, 29)),
+    session_close(date(2019, 12, 31)),
+    session_close(date(2020, 1, 31)),
+    session_close(date(2020, 6, 30)),
+]
+STATEMENT_IDS = [
+    "SEC_DUAL_A",
+    "SEC_DUAL_B",
+    "SEC_DUAL_PFD",
+    "SEC_TRANSFER",
+    "SEC_WINDOW_DELIST",
+    "SEC_SPLIT_FUTURE",
+    "SEC_SPLIT_BETWEEN",
+    "SEC_SPLIT_REDATED",
+    "SEC_FACTS_RESTATED",
+    "SEC_BOUNDARY_DELIST",
+    "SEC_TRUNC_DELIST",
+    "SEC_CLEAN_MERGER",
+    "SEC_REUSE_2",
+    "SEC_SPY",
+]
+
+
+def _fiscal_years(frame: pl.DataFrame, sid: str, fact_name: str) -> set[int]:
+    rows = frame.filter(pl.col("security_id") == sid, pl.col("fact_name") == fact_name)
+    return {period_end.year for period_end in rows["period_end"].to_list()}
+
+
+@pytest.mark.parametrize("t", STATEMENT_TS)
+def test_statement_facts_are_the_as_of_read_of_the_family_names(store: Store, t: datetime) -> None:
+    with store.provider() as provider:
+        got = provider.statement_facts(t, STATEMENT_IDS)
+    with store.direct() as conn:
+        full = statement_facts_as_of(conn, t, STATEMENT_IDS)
+    assert got.equals(full.filter(pl.col("fact_name").is_in(STATEMENT_FACT_NAMES)))
+    assert set(got["fact_name"].to_list()) <= set(STATEMENT_FACT_NAMES)
+    assert got.filter(pl.col("known_at") > t).is_empty()
+
+
+def test_statement_facts_leave_out_every_other_fact_name(store: Store) -> None:
+    t = session_close(date(2020, 6, 30))
+    with store.provider() as provider:
+        got = provider.statement_facts(t, STATEMENT_IDS)
+    with store.direct() as conn:
+        full = statement_facts_as_of(conn, t, STATEMENT_IDS)
+    # The fixture's revenue and cost_of_revenue rows are known at t.
+    assert {"revenue", "cost_of_revenue"} <= set(full["fact_name"])
+    assert set(got["fact_name"].to_list()) == set(STATEMENT_FACT_NAMES)
+
+
+def test_statement_facts_one_row_per_listed_class(store: Store) -> None:
+    ids = ["SEC_DUAL_A", "SEC_DUAL_B", "SEC_DUAL_PFD"]
+    with store.provider() as provider:
+        got = provider.statement_facts(T_FEB, ids)
+    by_class = got.partition_by("security_id", as_dict=True, include_key=False)
+    assert sorted(key for (key,) in by_class) == ids
+    frames = list(by_class.values())
+    assert frames[0].height == 2  # FY2018 gross_profit and total_assets, once per class
+    assert all(frame.equals(frames[0]) for frame in frames)
+
+
+def test_statement_facts_nothing_for_a_cik_with_no_securities_row_at_t(store: Store) -> None:
+    # CIK0001000001's FY2016 10-K is accepted 2017-06-15; its securities row
+    # (SEC_TRUNC_DELIST) is known only from 2017-12-01.
+    with store.provider() as provider:
+        before = provider.statement_facts(session_close(date(2017, 6, 30)), ["SEC_TRUNC_DELIST"])
+        after = provider.statement_facts(session_close(date(2017, 12, 29)), ["SEC_TRUNC_DELIST"])
+    assert before.is_empty()
+    assert _fiscal_years(after, "SEC_TRUNC_DELIST", "gross_profit") == {2015, 2016}
+
+
+def test_statement_facts_restricted_to_the_ids(store: Store) -> None:
+    with store.provider() as provider:
+        got = provider.statement_facts(T_MAR, ["SEC_TRANSFER"])
+        none = provider.statement_facts(T_MAR, [])
+    assert _ids(got) == {"SEC_TRANSFER"}
+    assert none.is_empty() and "fact_name" in none.columns
+
+
+def test_ordinary_month_end_stamps(store: Store) -> None:
+    # 2019-01-31 closes at 16:00 New York: accepted 15:00 (SEC_WINDOW_DELIST's
+    # issuer) and exactly 16:00 (SEC_SPLIT_FUTURE's) are visible at the close,
+    # 17:30 (the dual-class issuer's) only at the next rebalance.
+    close = session_close(date(2019, 1, 31))
+    ids = ["SEC_WINDOW_DELIST", "SEC_SPLIT_FUTURE", "SEC_DUAL_A"]
+    with store.provider() as provider:
+        at_close = provider.statement_facts(close, ids)
+        next_close = provider.statement_facts(T_FEB, ids)
+    stamp = at_close.filter(
+        pl.col("security_id") == "SEC_SPLIT_FUTURE", pl.col("period_end") == date(2018, 12, 31)
+    )
+    assert set(stamp["known_at"].to_list()) == {close}
+    for sid in ("SEC_WINDOW_DELIST", "SEC_SPLIT_FUTURE"):
+        assert 2018 in _fiscal_years(at_close, sid, "gross_profit")
+        assert 2018 in _fiscal_years(at_close, sid, "total_assets")
+    assert _fiscal_years(at_close, "SEC_DUAL_A", "gross_profit") == set()
+    assert _fiscal_years(next_close, "SEC_DUAL_A", "gross_profit") == {2018}
+
+
+def test_half_day_month_end_stamps(store: Store) -> None:
+    # 2019-11-29 closes at 13:00 New York: SEC_SPLIT_BETWEEN's FY2019 10-K,
+    # accepted 12:30, is visible at that close; its 10-K/A with the FY2019
+    # total_assets, accepted 14:00, is not.
+    close = session_close(date(2019, 11, 29))
+    sid = "SEC_SPLIT_BETWEEN"
+    with store.provider() as provider:
+        at_close = provider.statement_facts(close, [sid])
+        next_close = provider.statement_facts(session_close(date(2019, 12, 31)), [sid])
+    assert 2019 in _fiscal_years(at_close, sid, "gross_profit")
+    assert 2019 not in _fiscal_years(at_close, sid, "total_assets")
+    assert 2019 in _fiscal_years(next_close, sid, "total_assets")
+
+
+def test_ten_k_accepted_after_the_close_is_read_at_the_next_rebalance(store: Store) -> None:
+    with store.provider() as provider:
+        at_t_i = provider.statement_facts(T_FEB, ["SEC_TRANSFER"])
+        at_next = provider.statement_facts(T_MAR, ["SEC_TRANSFER"])
+    assert max(_fiscal_years(at_t_i, "SEC_TRANSFER", "gross_profit")) == 2017
+    assert max(_fiscal_years(at_next, "SEC_TRANSFER", "gross_profit")) == 2018
+
+
+def test_total_assets_accepted_after_the_gross_profit_filing(store: Store) -> None:
+    sid = "SEC_FACTS_RESTATED"
+    with store.provider() as provider:
+        december = provider.statement_facts(session_close(date(2019, 12, 31)), [sid])
+        january = provider.statement_facts(session_close(date(2020, 1, 31)), [sid])
+    fy2019 = pl.col("period_end") == date(2019, 9, 30)
+    assert set(december.filter(fy2019)["fact_name"].to_list()) == {"gross_profit"}
+    assert set(january.filter(fy2019)["fact_name"].to_list()) == {"gross_profit", "total_assets"}
+
+
+def test_restated_issuer_keeps_its_original_fy2018_values(store: Store) -> None:
+    sid = "SEC_BOUNDARY_DELIST"
+    with store.provider() as provider:
+        first = provider.statement_facts(session_close(date(2019, 2, 28)), [sid])
+        later = provider.statement_facts(session_close(date(2020, 6, 30)), [sid])
+    fy2018 = pl.col("period_end") == date(2018, 12, 31)
+    assert first.filter(fy2018).equals(later.filter(fy2018))
+    assert first.filter(fy2018).height == 2
+
+
+@pytest.mark.parametrize("t", [T_DUAL, T_FEB, session_close(date(2020, 6, 30))])
+def test_sics_equal_classifications_as_of(store: Store, t: datetime) -> None:
+    with store.provider() as provider:
+        got = provider.sics(t, STATEMENT_IDS)
+    with store.direct() as conn:
+        rows = classifications_as_of(conn, t, STATEMENT_IDS)
+    want = dict(rows.select("security_id", "sic").iter_rows())
+    assert got == {sid: want.get(sid) for sid in STATEMENT_IDS}
+
+
+def test_sics_none_for_no_row_at_t_and_for_no_sic(store: Store) -> None:
+    # SEC_REUSE_2's classification is known only from 2019-07-03; SPY has no SIC.
+    with store.provider() as provider:
+        got = provider.sics(T_DUAL, ["SEC_REUSE_2", "SEC_SPY", "SEC_DUAL_A"])
+        later = provider.sics(session_close(date(2019, 7, 31)), ["SEC_REUSE_2"])
+    assert got == {"SEC_REUSE_2": None, "SEC_SPY": None, "SEC_DUAL_A": 7372}
+    assert later == {"SEC_REUSE_2": 7372}
+
+
+def test_statement_reads_share_the_step_connection(store: Store) -> None:
+    provider = store.provider()
+    after_check = store.opened
+    provider.universe(T_FEB)
+    provider.statement_facts(T_FEB, ["SEC_DUAL_A"])
+    provider.sics(T_FEB, ["SEC_DUAL_A"])
+    assert store.opened == after_check + 1 and store.open_now == 1
+    provider.statement_facts(T_MAR, ["SEC_DUAL_A"])
+    assert store.opened == after_check + 2 and store.open_now == 1
+    provider.close()
+    assert store.open_now == 0
+
+
+def test_statement_reads_refuse_a_bare_date_and_string_ids(store: Store) -> None:
+    with store.provider() as provider:
+        with pytest.raises(TypeError):
+            provider.statement_facts(date(2019, 1, 31), ["SEC_DUAL_A"])  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            provider.sics(datetime(2019, 1, 31, 21), ["SEC_DUAL_A"])  # noqa: DTZ001
+        with pytest.raises(TypeError):
+            provider.statement_facts(T_JAN, "SEC_DUAL_A")
+        with pytest.raises(TypeError):
+            provider.sics(T_JAN, "SEC_DUAL_A")

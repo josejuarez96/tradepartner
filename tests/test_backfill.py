@@ -19,9 +19,31 @@ from typing import Any
 
 import duckdb
 import pytest
-from test_ingest import ACME, DUAL, DUAL_B, NOW, SPY, _at, _filings
+from test_ingest import (
+    ACME,
+    DUAL,
+    DUAL_B,
+    NEWCO,
+    NOT_COMMON,
+    NOW,
+    OTC_B,
+    SPY,
+    STAT,
+    _at,
+    _fact,
+    _filings,
+    _loose,
+    _with_newco,
+    _with_stat,
+)
 
-from tradepartner.adapters.filings import CoverListing, CoverPage, DelistingFiling
+from tradepartner.adapters.filings import (
+    CoverListing,
+    CoverPage,
+    DelistingFiling,
+    FilingHeader,
+    FilingIndexEntry,
+)
 from tradepartner.adapters.prices import (
     ActionType,
     Bar,
@@ -30,7 +52,20 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
-from tradepartner.backfill import BACKFILL, backfill, month_windows
+from tradepartner.backfill import (
+    BACKFILL,
+    FILLED,
+    HALTED,
+    HOLES,
+    NO_HOLE,
+    NOT_ALPACA,
+    UNASSIGNED,
+    UNKNOWN,
+    NamedSecurity,
+    backfill,
+    fill_holes,
+    month_windows,
+)
 from tradepartner.calendar import is_session
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, LOCKED, OK, STALE, ingest_session
@@ -175,6 +210,48 @@ def test_edgar_is_one_full_history_chunk(settings: Settings) -> None:
     ]
     # Filings from 2018, before --since, are in the master (spec open question 2).
     assert _read(settings, "SELECT count(*) FROM securities WHERE known_at < '2019-04-10'")[0][0]
+
+
+def test_backfill_edgar_chunk_calls_record_failures_after_a_committed_ok(
+    settings: Settings,
+) -> None:
+    """T11h: `backfill`'s edgar chunk passes `after_commit` exactly as
+    `ingest_session` does (both read from `tests.test_ingest`'s
+    `_RecordFailures`, imported here so the wiring is exercised, not
+    re-implemented)."""
+    from test_ingest import _RecordFailures
+
+    calls: list[str] = []
+    filings = _filings(cls=lambda **kw: _RecordFailures(calls, **kw))
+    result = _backfill(settings, _History(), filings=filings, source="edgar")
+    assert result.runs[0].status == OK
+    assert calls == ["called"]
+
+
+def test_backfill_check_failures_raising_fails_the_edgar_chunk(settings: Settings) -> None:
+    from tradepartner.adapters.fixture_filings import FixtureFilingSource
+
+    class Unhealthy(FixtureFilingSource):
+        def check_failures(self) -> None:
+            raise RuntimeError("too many failures")
+
+    result = _backfill(settings, _History(), filings=_filings(cls=Unhealthy), source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "too many failures" in result.runs[0].message
+
+
+def test_backfill_input_validation_fails_the_edgar_chunk(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """#578: the backfill runs the same `_prefetch` gate (the crashes it
+    exists for were backfills: #599, #609)."""
+    from test_ingest import _CRASHES, _validating
+
+    filings = _validating(tmp_path, _CRASHES)
+    result = _backfill(settings, _History(), filings=filings, source="edgar")
+    assert result.runs[0].status == FAILED
+    assert "3 input(s) failed to parse" in result.runs[0].message
+    assert _read(settings, "SELECT count(*) FROM securities") == [(0,)]
 
 
 def test_actions_are_fetched_per_month_window(settings: Settings) -> None:
@@ -515,6 +592,124 @@ def test_a_name_delisted_after_the_month_still_counts_toward_its_staleness(
     assert ACME in result.runs[-1].message
 
 
+MAY = _sessions(date(2019, 5, 1), date(2019, 5, 31))
+
+
+@pytest.mark.parametrize(("missing", "status"), [(DUAL_B, OK), (ACME, STALE)])
+def test_an_otc_common_name_is_not_counted_in_a_months_staleness(
+    settings: Settings, missing: str, status: str
+) -> None:
+    # #784: OTC is not one of `universe.exchanges`; a NYSE name still counts.
+    prices = _History(gaps={(missing, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_filings(dual_listings=OTC_B))
+    assert result.runs[-1].status == status, result.runs[-1].message
+
+
+def test_a_month_fetches_no_notes_preferreds_or_otc_listings(
+    settings: Settings,
+) -> None:
+    # #794: a note, a preferred and an OTC listing are never fetched; a
+    # common NYSE name and a benchmark are.
+    prices = _History()
+    filings = _filings(acme_extra=NOT_COMMON, dual_listings=OTC_B)
+    result = _backfill(settings, prices, filings=filings)
+    assert result.runs[-1].status == OK, result.runs[-1].message
+    for fetched in prices.fetched.values():
+        assert {ACME, SPY} <= fetched
+        assert DUAL_B not in fetched
+        assert not any(sid.startswith(f"{ACME}:") for sid in fetched)  # preferred, note
+
+
+def test_a_snapshot_static_only_name_with_no_rows_in_a_month_is_reported_not_counted(
+    settings: Settings,
+) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 4 listed names without a bar" in may.message
+    assert f"1 snapshot-only names with no rows (not counted): {STAT}" in may.message
+
+
+def test_a_name_with_a_filing_based_span_in_the_month_still_counts(settings: Settings) -> None:
+    prices = _History(gaps={(STAT, s) for s in MAY})
+    result = _backfill(settings, prices, filings=_with_stat(cover=True))
+    assert result.runs[-1].status == STALE and STAT in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+def test_a_snapshot_static_only_name_with_some_rows_follows_the_existing_rule(
+    settings: Settings,
+) -> None:
+    # Bars on some May sessions: not missing, so neither counted nor reported.
+    prices = _History(gaps={(STAT, s) for s in MAY[1:]})
+    result = _backfill(settings, prices, filings=_with_stat())
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 5 listed names without a bar" in may.message
+    assert "snapshot-only" not in may.message
+
+
+def test_a_benchmark_with_no_rows_in_a_month_still_counts(settings: Settings) -> None:
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"reference_symbol": "ACME"})}
+    )
+    result = _backfill(tuned, _History(gaps={(SPY, s) for s in MAY}))
+    assert result.runs[-1].status == STALE and SPY in result.runs[-1].message
+    assert "snapshot-only" not in result.runs[-1].message
+
+
+APRIL_END = datetime(2019, 5, 1, 2, 0, tzinfo=UTC)  # expected session 2019-04-30
+APRIL = _sessions(SINCE, date(2019, 4, 30))
+
+
+def test_a_name_dark_since_before_the_month_is_reported_not_counted(settings: Settings) -> None:
+    # #784 (dark names): ACME has no bar in April (committed under a looser
+    # share), so its May and June misses are reported, not counted.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    first = _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END)
+    assert first.ok, first.runs[-1].message
+    result = _backfill(settings, _History(gaps=dark), filings=early)
+    assert result.ok, result.runs[-1].message
+    may = next(r for r in result.runs if r.chunk_cursor.endswith("through=2019-05-31"))
+    assert "0 of 3 listed names without a bar" in may.message
+    assert f"1 names with no bar in the previous chunk (not counted): {ACME}" in may.message
+
+
+def test_too_many_dark_names_make_the_month_stale(settings: Settings) -> None:
+    # #796 (i a): ACME dark since April is 1 of 4 listed names in May.
+    early = _filings(fetched_at=_at(2019, 4, 1))
+    dark = {(ACME, s) for s in _sessions(SINCE, date(2019, 6, 30))}
+    assert _backfill(_loose(settings), _History(gaps=dark), filings=early, now=APRIL_END).ok
+    tuned = settings.model_copy(
+        update={"ingest": settings.ingest.model_copy(update={"max_dark_share": 0.2})}
+    )
+    result = _backfill(tuned, _History(gaps=dark), filings=early)
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    message = result.runs[-1].message
+    assert "1 of 4 listed names (25.0%, over 20.0%) are dark or snapshot-only" in message
+    assert ACME in message
+
+
+def test_a_name_with_a_bar_last_month_and_none_now_counts(settings: Settings) -> None:
+    result = _backfill(settings, _History(gaps={(ACME, s) for s in MAY}))
+    assert (result.runs[-1].status, result.runs[-1].chunk_cursor) == (
+        STALE,
+        "since=2019-04-10;through=2019-05-31",
+    )
+    assert ACME in result.runs[-1].message
+
+
+def test_a_name_first_listed_in_the_month_with_no_bar_counts(settings: Settings) -> None:
+    filings = _with_newco(_at(2019, 5, 1))
+    result = _backfill(settings, _History(gaps={(NEWCO, s) for s in MAY}), filings=filings)
+    assert result.runs[-1].status == STALE and NEWCO in result.runs[-1].message
+
+
 def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
     secret = "sk-sentinel-backfill"
     settings = Settings(
@@ -535,10 +730,812 @@ def test_backfill_run_messages_are_redacted(tmp_path: Path) -> None:
     assert all(secret not in m for (m,) in stored) and "[redacted]" in stored[0][0]
 
 
+# --- #573: a failed run row names where the error was raised --------------
+
+
+def test_backfill_failed_run_message_names_the_raising_file_line_and_function(
+    settings: Settings,
+) -> None:
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            raise RuntimeError("actions endpoint down")
+
+    result = _backfill(settings, Boom())
+    assert result.runs[-1].status == FAILED
+    message = result.runs[-1].message
+    assert "RuntimeError: actions endpoint down" in message
+    assert " | at: " in message
+    where = message.split(" | at: ", 1)[1]
+    assert "test_backfill.py" in where
+    assert " in corporate_actions" in where
+
+
+def test_backfill_failed_run_message_has_no_local_or_argument_values(
+    settings: Settings,
+) -> None:
+    def _inner(argument: str) -> None:
+        local_secret = "sk-local-backfill-5c1a"
+        assert local_secret  # kept "in scope" for the frame, never read back
+        raise ValueError("boom")
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            _inner("sk-argument-backfill-9d4e")
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "ValueError: boom" in message
+    assert "sk-local-backfill-5c1a" not in message
+    assert "sk-argument-backfill-9d4e" not in message
+    assert "_inner" in message
+
+
+def test_backfill_failed_run_message_includes_the_chained_causes_frame(
+    settings: Settings,
+) -> None:
+    def _root_cause() -> None:
+        raise KeyError("cik")
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            try:
+                _root_cause()
+            except KeyError as exc:
+                raise RuntimeError("wrapped") from exc
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    where = message.split(" | at: ", 1)[1]
+    assert "_root_cause" in where
+    assert "corporate_actions" in where
+
+
+def test_backfill_failed_run_message_where_is_length_bounded(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "store.duckdb"), "lock_retry_seconds": 1},
+        ingest={"max_where_chars": 60},
+    )
+
+    def _deep(n: int) -> None:
+        if n == 0:
+            raise RuntimeError("deep failure")
+        _deep(n - 1)
+
+    class Boom(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            _deep(20)
+
+    result = _backfill(settings, Boom())
+    message = result.runs[-1].message
+    assert result.runs[-1].status == FAILED
+    assert "RuntimeError: deep failure" in message
+    assert len(message) <= 60
+
+
 def test_the_edgar_commit_never_reaches_the_source() -> None:
     from tradepartner.ingest import _prefetch, _Recorded
 
     recorded = _Recorded(_filings())
-    _prefetch(recorded, Settings(_env_file=None))
+    _prefetch(recorded, Settings(_env_file=None), dry_run=False)
     with pytest.raises(RuntimeError, match="after the fetch pass"):
         recorded.facts(ACME, ["SomethingNew"])
+
+
+# --- #735: the resolver's exclusions are counted on the run row ---------------
+
+
+@dataclass
+class _Resolving(_History):
+    def resolution_summary(self) -> str:
+        return "resolver left out 3 placeholder-ticker listings"
+
+
+def test_the_resolution_summary_is_on_every_backfill_price_run(settings: Settings) -> None:
+    result = _backfill(settings, _Resolving())
+    alpaca = [run for run in result.runs if run.source == "alpaca"]
+    assert alpaca and all("resolver left out 3" in run.message for run in alpaca)
+
+
+def test_the_resolution_summary_is_on_the_daily_price_run(settings: Settings) -> None:
+    result = ingest_session(settings, prices=_Resolving(), filings=_filings(), clock=lambda: NOW)
+    assert result.ok, result.runs[-1].message
+    assert "resolver left out 3" in result.runs[-1].message
+
+
+# --- refetching holes (#831) --------------------------------------------------
+
+LATER = NOW + timedelta(days=2)
+MAY_WINDOW = (date(2019, 5, 1), date(2019, 5, 31))
+JUNE_WINDOW = (date(2019, 6, 1), date(2019, 6, 28))
+
+
+def _drop_bars(settings: Settings, sid: str, window: tuple[date, date]) -> None:
+    """Make a hole: the store loses `sid`'s bars in `window` (as a stale
+    listing end once kept the backfill from fetching them)."""
+    with duckdb.connect(settings.store.path) as conn:
+        conn.execute(
+            "DELETE FROM prices_daily WHERE security_id = ? AND session BETWEEN ? AND ?",
+            [sid, *window],
+        )
+
+
+def _holes(result: Any) -> list[tuple[str, tuple[date, date]]]:
+    return [(hole.security_id, hole.window) for hole in result.holes]
+
+
+def test_a_dry_run_lists_live_months_with_no_stored_bar_and_changes_nothing(
+    settings: Settings,
+) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    before = _read(settings, "SELECT count(*) FROM prices_daily")
+    runs = _read(settings, "SELECT count(*) FROM ingestion_runs")
+    prices = _History()
+    found = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, MAY_WINDOW)]
+    assert found.holes[0].ticker == "ACME"
+    assert found.runs == () and found.exit_code == 0
+    assert prices.calls == []
+    assert _read(settings, "SELECT count(*) FROM prices_daily") == before
+    assert _read(settings, "SELECT count(*) FROM ingestion_runs") == runs
+
+
+def test_only_months_the_backfill_committed_are_searched(settings: Settings) -> None:
+    # A backfill halted after April: May and June are the resume's job.
+    prices = _History(gaps={(SPY, date(2019, 5, 15))})
+    assert not _backfill(settings, prices).ok
+    _drop_bars(settings, ACME, (date(2019, 4, 10), date(2019, 4, 30)))
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, (date(2019, 4, 10), date(2019, 4, 30)))]
+    other = fill_holes(
+        settings, prices=_History(), since=date(2019, 4, 11), clock=lambda: LATER, dry_run=True
+    )
+    assert other.holes == ()  # no committed month for that --since
+
+
+def test_filling_fetches_only_the_holes_and_the_reference_and_records_its_own_run(
+    settings: Settings,
+) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    prices = _History()
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=_ticking(LATER, timedelta(minutes=1))
+    )
+    assert result.exit_code == 0, result.runs
+    assert [r.status for r in result.runs] == [FILLED]
+    # Staleness counts the stored bars of the names not fetched (DUAL, DUAL_B).
+    assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
+    assert [c[1:] for c in prices.calls if c[0] == "actions"] == [MAY_WINDOW]
+    rows = _read(
+        settings,
+        f"SELECT session, known_at, ingested_at FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-05-01' AND DATE '2019-05-31' ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(*MAY_WINDOW)
+    # First-seen bars take the timing rule's stamp; the fetch is `ingested_at`.
+    assert all(known == bar_known_at(s) and ingested > LATER for s, known, ingested in rows)
+    holes_runs = _read(
+        settings,
+        f"SELECT status, mode, chunk_cursor FROM ingestion_runs WHERE mode = '{HOLES}'",
+    )
+    assert holes_runs == [(FILLED, HOLES, "holes;since=2019-04-10;through=2019-05-31")]
+    # Never an `ok` row: a hole fill is not a fresh ingest.
+    assert _read(
+        settings, f"SELECT count(*) FROM ingestion_runs WHERE mode = '{HOLES}' AND status = 'ok'"
+    ) == [(0,)]
+
+
+def test_a_filled_store_has_no_holes_and_the_backfill_still_resumes_to_nothing(
+    settings: Settings,
+) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    assert fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER).exit_code == 0
+    listed = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert listed.holes == ()
+    prices = _History()
+    again = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert again.runs == () and prices.calls == []
+    resumed = _History()
+    assert _backfill(settings, resumed, now=LATER, source="alpaca").ok
+    assert [c for c in resumed.calls if c[0] == "bars"] == []
+
+
+def test_a_month_without_holes_is_not_fetched(settings: Settings) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, DUAL, JUNE_WINDOW)
+    prices = _History()
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.chunk_cursor for r in result.runs] == ["holes;since=2019-04-10;through=2019-06-28"]
+    assert set(prices.fetched) == {date(2019, 6, 1)}
+
+
+def test_a_hole_fill_with_a_reference_gap_is_stale_and_writes_no_bar(settings: Settings) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    prices = _History(gaps={(SPY, date(2019, 5, 15))})
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.status for r in result.runs] == [STALE] and result.exit_code == 1
+    assert _read(
+        settings,
+        f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-05-01' AND DATE '2019-05-31'",
+    ) == [(0,)]
+    assert _read(settings, f"SELECT status FROM ingestion_runs WHERE mode = '{HOLES}'") == [
+        (STALE,)
+    ]
+
+
+def test_a_hole_the_source_still_cannot_fill_is_stale_by_the_existing_share(
+    settings: Settings,
+) -> None:
+    # One of four counted names (25%) has no bar in May even after the fetch.
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    prices = _History(gaps={(ACME, s) for s in _sessions(*MAY_WINDOW)})
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.status for r in result.runs] == [STALE]
+    assert ACME in result.runs[0].message
+
+
+def test_holes_are_read_as_of_the_clock(settings: Settings) -> None:
+    # NEWCO is first listed by a cover page accepted on 2019-06-27: before
+    # that is known, its missing June bars are no hole (no look-ahead).
+    accepted = _at(2019, 6, 27)
+    assert _backfill(settings, _History(), filings=_with_newco(accepted)).ok
+    _drop_bars(settings, NEWCO, JUNE_WINDOW)
+    early = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: accepted - timedelta(hours=1),
+        dry_run=True,
+    )
+    assert early.holes == ()
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(NEWCO, JUNE_WINDOW)]
+
+
+def test_a_bar_known_after_the_clock_does_not_close_a_hole(settings: Settings) -> None:
+    assert _backfill(settings, _History()).ok
+    with duckdb.connect(settings.store.path) as conn:
+        conn.execute(
+            "UPDATE prices_daily SET known_at = $1, ingested_at = $1 WHERE security_id = $2 "
+            "AND session BETWEEN $3 AND $4",
+            [LATER + timedelta(days=1), ACME, *MAY_WINDOW],
+        )
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, MAY_WINDOW)]
+
+
+def test_hole_lines_group_months_and_mark_those_between_stored_bars(settings: Settings) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    _drop_bars(settings, DUAL, MAY_WINDOW)
+    _drop_bars(settings, DUAL, JUNE_WINDOW)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert found.summary().startswith("3 holes (security, month) over 2 securities")
+    assert found.lines() == [
+        f"  {ACME} ACME: 2019-05 (1 months, 1 between its stored bars)",
+        f"  {DUAL} DUA: 2019-05..2019-06 (2 months, 0 between its stored bars)",
+    ]
+
+
+def test_a_listing_that_now_runs_on_makes_a_hole_that_the_fill_refetches(
+    settings: Settings,
+) -> None:
+    # End to end: a Form 25 ended ACME in May, so June was never fetched.
+    # A later EDGAR run learns that ACME moved to NASDAQ instead (a cover
+    # page accepted before the Form 25 took effect): ACME now runs on
+    # through June, which the store has no bar for.
+    form_25 = DelistingFiling(
+        ACME, "25", "Common Stock", "NYSE", f"{ACME}-19-000025", _at(2019, 5, 6), date(2019, 5, 16)
+    )
+    gone = {(ACME, s) for s in _sessions(date(2019, 5, 17), date(2019, 6, 30))}
+    assert _backfill(settings, _History(gaps=gone), filings=_filings(delistings=[form_25])).ok
+    moved = CoverPage(
+        ACME,
+        f"{ACME}-19-000030",
+        _at(2019, 5, 8),
+        (CoverListing("Common Stock", "ACME", "NASDAQ"),),
+    )
+    filings = _filings(delistings=[form_25])
+    filings._cover_pages = sorted(
+        [*filings._cover_pages, moved], key=lambda e: (e.accepted_at, e.accession)
+    )
+    assert _backfill(settings, _History(), filings=filings, now=LATER, source="edgar").ok
+    clock = LATER + timedelta(hours=1)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: clock, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    prices = _History()
+    result = fill_holes(settings, prices=prices, since=SINCE, clock=lambda: clock)
+    assert [r.status for r in result.runs] == [FILLED]
+    assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
+    assert _read(
+        settings,
+        f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-01' AND DATE '2019-06-28'",
+    ) == [(len(_sessions(*JUNE_WINDOW)),)]
+
+
+# --- holes the resolver cannot assign, and named securities (#876) -----------
+
+SPAC = "0000000005"  # SIC 6770: its unit and warrant class ids are typed spac
+SPAC_UNITS = f"{SPAC}:units"
+SPAC_WARRANTS = f"{SPAC}:redeemable-warrants"
+TWIN, TWIN_2 = "0000000006", "0000000007"  # both list TWIN on one day: ambiguous
+ODD = "0000000008"  # a common class under "ODD1", not an Alpaca symbol
+UNASSIGNABLE = (SPAC_UNITS, SPAC_WARRANTS, TWIN, TWIN_2, ODD)
+
+
+def _with_unassignable() -> Any:
+    """`_filings` plus ids no fetched bar can land on: a SPAC's units and
+    warrants (non-equity rows the resolver drops; since #875 not in the
+    fetch set either, so never a hole), and, in the fetch set, two
+    companies listing one ticker on one day (ambiguous) and a common class
+    whose ticker has no Alpaca symbol."""
+    units = (
+        "Units, each consisting of one share of Class A Common Stock and one-half of one warrant"
+    )
+    companies = [
+        (
+            SPAC,
+            6770,
+            5,
+            (
+                CoverListing(units, "SPCU", "NASDAQ"),
+                CoverListing("Class A Common Stock", "SPC", "NASDAQ"),
+                CoverListing("Redeemable Warrants", "SPCW", "NASDAQ"),
+            ),
+        ),
+        (TWIN, 3571, 7, (CoverListing("Common Stock", "TWIN", "NYSE"),)),
+        (TWIN_2, 3571, 7, (CoverListing("Common Stock", "TWIN", "NYSE"),)),
+        (ODD, 3571, 8, (CoverListing("Common Stock", "ODD1", "NYSE"),)),
+    ]
+    index, headers, covers, facts = [], [], [], []
+    for cik, sic, day, listings in companies:
+        accession = f"{cik}-19-000001"
+        accepted = _at(2019, 3, day)
+        index.append(FilingIndexEntry(cik, f"Co {cik}", "10-K", accession, accepted))
+        headers.append(FilingHeader(cik, accession, "10-K", sic, accepted))
+        covers.append(CoverPage(cik, accession, accepted, listings))
+        facts.append(_fact(cik, "", 1_000_000, accession, accepted))
+    return _filings(
+        extra_index=index, extra_headers=headers, extra_covers=covers, extra_facts=facts
+    )
+
+
+def _unassignable_holes(settings: Settings, ids: Sequence[str] = UNASSIGNABLE) -> None:
+    """A backfill with the unassignable ids (the stub source has bars for
+    every id), then ACME and each of `ids` lose May."""
+    assert _backfill(settings, _History(), filings=_with_unassignable()).ok
+    for sid in (ACME, *ids):
+        _drop_bars(settings, sid, MAY_WINDOW)
+
+
+def test_a_dry_run_lists_only_holes_the_resolver_can_assign_and_counts_the_rest(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, MAY_WINDOW)]
+    assert dict(found.dropped) == {UNASSIGNED: 2, NOT_ALPACA: 1}  # units, warrants: no hole
+    assert found.summary().endswith(
+        f"; 3 holes the resolver cannot assign, not fetched (1 {NOT_ALPACA}, 2 {UNASSIGNED})"
+    )
+    assert found.named == ()
+
+
+def test_a_fill_fetches_no_hole_the_resolver_cannot_assign(settings: Settings) -> None:
+    # ODD stays without a bar: 1 of 7 counted names is under the loosened
+    # share, so May fills (a counted name the fill skips still counts).
+    loose = _loose(settings)
+    _unassignable_holes(loose, (SPAC_UNITS, SPAC_WARRANTS, ODD))
+    prices = _History()
+    result = fill_holes(loose, prices=prices, since=SINCE, clock=lambda: LATER)
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
+    assert result.runs[0].message.startswith(
+        "holes of 1 names with no stored bar; 1 holes the resolver cannot assign, not fetched"
+    )
+    assert dict(result.dropped) == {NOT_ALPACA: 1}
+
+
+def test_named_securities_limit_the_holes_and_each_unfetched_one_is_listed(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings, (TWIN,))
+    _drop_bars(settings, DUAL, JUNE_WINDOW)
+    named = [ACME, TWIN, DUAL_B, "0000009999"]
+    found = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=named,
+    )
+    assert _holes(found) == [(ACME, MAY_WINDOW)]  # not DUAL's June: not named
+    expected = (
+        NamedSecurity(DUAL_B, NO_HOLE),
+        NamedSecurity(TWIN, f"1 holes not fetched (1 {UNASSIGNED})"),
+        NamedSecurity("0000009999", UNKNOWN),
+    )
+    assert found.named == expected
+    assert dict(found.dropped) == {UNASSIGNED: 1}
+    assert found.lines()[-3:] == [
+        f"  {DUAL_B}: not fetched, {NO_HOLE}",
+        f"  {TWIN}: not fetched, 1 holes not fetched (1 {UNASSIGNED})",
+        f"  0000009999: not fetched, {UNKNOWN}",
+    ]
+    prices = _History()
+    result = fill_holes(
+        _loose(settings), prices=prices, since=SINCE, clock=lambda: LATER, securities=named
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 5, 1): {ACME, SPY}}
+    assert result.named == expected
+    assert [r[2] for r in _alpaca_runs(settings) if r[1] == HOLES] == [
+        "holes;since=2019-04-10;through=2019-05-31"
+    ]
+    # No committed month for that --since: a known id has no hole, not "unknown".
+    other = fill_holes(
+        settings,
+        prices=_History(),
+        since=date(2019, 4, 11),
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[ACME],
+    )
+    assert other.holes == () and other.named == (NamedSecurity(ACME, NO_HOLE),)
+
+
+def test_a_named_security_in_a_month_that_halts_is_listed_as_not_filled(
+    settings: Settings,
+) -> None:
+    _unassignable_holes(settings, ())
+    prices = _History(gaps={(SPY, date(2019, 5, 15))})
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [STALE]
+    assert result.named == (NamedSecurity(ACME, HALTED),)
+
+
+def test_named_securities_must_be_ids(settings: Settings) -> None:
+    with pytest.raises(TypeError):
+        fill_holes(settings, prices=_History(), since=SINCE, securities=ACME)
+    with pytest.raises(ValueError):
+        fill_holes(settings, prices=_History(), since=SINCE, securities=[])
+
+
+# --- rename-lead gaps in months with stored bars (#891) ----------------------
+
+RENAMED_ON = date(2019, 6, 20)  # the first cover page naming ACME's new ticker
+GAP = (date(2019, 6, 10), date(2019, 6, 19))  # old symbol stopped, cover page not yet out
+
+
+def _with_rename(**kwargs: Any) -> Any:
+    """`_filings` plus a cover page that renames ACME to `ACMX` on
+    `RENAMED_ON`: from then ACMX resolves to ACME, and before it, inside
+    `alpaca.rename_lead_days`, ACMX leads to ACME (#843)."""
+    accession = f"{ACME}-19-000002"
+    accepted = datetime.combine(RENAMED_ON, datetime.min.time(), UTC).replace(hour=20, minute=30)
+    page = CoverPage(ACME, accession, accepted, (CoverListing("Common Stock", "ACMX", "NYSE"),))
+    return _filings(
+        extra_index=[FilingIndexEntry(ACME, "Acme Corp", "10-Q", accession, accepted)],
+        extra_headers=[FilingHeader(ACME, accession, "10-Q", 3571, accepted)],
+        extra_covers=[page],
+        **kwargs,
+    )
+
+
+def _rename_gap(settings: Settings) -> None:
+    """A backfill of the renamed ACME, then ACME loses the gap's sessions:
+    June keeps its bars before and after the gap (FB -> META's June)."""
+    assert _backfill(settings, _History(), filings=_with_rename()).ok
+    _drop_bars(settings, ACME, GAP)
+
+
+def _no_lead(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"rename_lead_days": 0})}
+    )
+
+
+def test_a_rename_gap_inside_a_month_with_stored_bars_is_a_hole(settings: Settings) -> None:
+    _rename_gap(settings)
+    before = _read(settings, "SELECT count(*) FROM prices_daily")
+    runs = _read(settings, "SELECT count(*) FROM ingestion_runs")
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _read(settings, "SELECT count(*) FROM prices_daily") == before
+    assert _read(settings, "SELECT count(*) FROM ingestion_runs") == runs
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    assert [hole.rename_gap for hole in found.holes] == [True]
+    assert found.summary() == (
+        "1 holes (security, month) over 1 securities in 1 months; 0 of them between a "
+        "security's stored bars (0 securities); 1 of them lead gaps in a month with "
+        "stored bars"
+    )
+    assert found.lines() == [
+        f"  {ACME} ACMX: 2019-06 (1 months, 0 between its stored bars, 1 lead gaps)"
+    ]
+
+
+def test_a_rename_gap_fill_stores_each_session_once_at_its_close(settings: Settings) -> None:
+    _rename_gap(settings)
+    prices = _History()
+    result = fill_holes(
+        settings, prices=prices, since=SINCE, clock=_ticking(LATER, timedelta(minutes=1))
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert prices.fetched == {date(2019, 6, 1): {ACME, SPY}}
+    assert result.runs[0].message.startswith(
+        "holes of 0 names with no stored bar and 1 with a lead gap: "
+    )
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-01' AND DATE '2019-06-30' ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(*JUNE_WINDOW)  # each session once
+    assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert again.holes == ()
+
+
+def test_a_partial_month_gap_without_a_rename_lead_is_no_hole(settings: Settings) -> None:
+    # The lead off: the gap is no session a fetched bar could newly land on
+    # (`parse_bars` assigns the new symbol's rows only from its span).
+    _rename_gap(settings)
+    found = fill_holes(
+        _no_lead(settings), prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True
+    )
+    assert found.holes == ()
+    # And a gap after the rename, under ACMX's own span, is no rename gap.
+    plain = _no_lead(settings).model_copy(
+        update={"store": settings.store.model_copy(update={"path": settings.store.path + "2"})}
+    )
+    assert _backfill(plain, _History(), filings=_with_rename()).ok
+    _drop_bars(plain, ACME, (date(2019, 6, 24), date(2019, 6, 26)))
+    later = fill_holes(plain, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert later.holes == ()
+
+
+def test_a_named_rename_gap_is_fetched_and_others_are_not(settings: Settings) -> None:
+    _rename_gap(settings)
+    _drop_bars(settings, DUAL, MAY_WINDOW)
+    found = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[ACME],
+    )
+    assert _holes(found) == [(ACME, JUNE_WINDOW)] and found.named == ()
+
+
+def test_a_month_only_the_rename_lead_can_fill_is_assignable(settings: Settings) -> None:
+    # TWIN shares its old ticker with TWIN_2 from one day (ambiguous: no one
+    # resolves it), then is renamed to TWNX in June: before that, only the
+    # lead can land a bar on TWIN. TWIN_2 has no lead and stays unassigned.
+    accession = f"{TWIN}-19-000002"
+    accepted = _at(2019, 6, 20)
+    filings = _with_unassignable()
+    filings._cover_pages = sorted(
+        [
+            *filings._cover_pages,
+            CoverPage(TWIN, accession, accepted, (CoverListing("Common Stock", "TWNX", "NYSE"),)),
+        ],
+        key=lambda e: (e.accepted_at, e.accession),
+    )
+    assert _backfill(settings, _History(), filings=filings).ok
+    for sid in (TWIN, TWIN_2):
+        _drop_bars(settings, sid, MAY_WINDOW)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(TWIN, MAY_WINDOW)]
+    assert dict(found.dropped) == {UNASSIGNED: 1}
+
+
+def test_a_missing_session_the_old_symbol_traded_after_is_no_rename_gap(
+    settings: Settings,
+) -> None:
+    # A halt (or a no-trade day) inside the lead window, with old-symbol bars
+    # after it, is no rename gap: the new symbol has no bar there to fill
+    # it, so it would be refetched on every run. Only the run of sessions
+    # from the old symbol's last bar to the new span is.
+    assert _backfill(settings, _History(), filings=_with_rename()).ok
+    _drop_bars(settings, ACME, (date(2019, 5, 15), date(2019, 5, 15)))
+    _drop_bars(settings, ACME, (date(2019, 6, 28), date(2019, 6, 28)))  # after the rename
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert found.holes == ()
+    _drop_bars(settings, ACME, GAP)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+
+
+# --- first-span lead months (#974) ---------------------------------------------
+
+FIRST_LED = "0000000031"  # first filing 2018-03-05; first cover page naming LEDY 2019-06-20
+LED_COVER = date(2019, 6, 20)
+APRIL_WINDOW = (SINCE, date(2019, 4, 30))
+
+
+def _with_first_span(**kwargs: Any) -> Any:
+    """`_filings` plus FIRST_LED, whose first ticker-bearing cover page
+    (LEDY, 2019-06-20) comes long after its first filing: LEDY leads to it
+    from 2018-03-05 (#974)."""
+    first, accession = f"{FIRST_LED}-18-000001", f"{FIRST_LED}-19-000001"
+    cover = _at(2019, 6, 20)
+    return _filings(
+        extra_index=[
+            FilingIndexEntry(FIRST_LED, "Led Co", "10-K", first, _at(2018, 3, 5)),
+            FilingIndexEntry(FIRST_LED, "Led Co", "10-Q", accession, cover),
+        ],
+        extra_headers=[FilingHeader(FIRST_LED, accession, "10-Q", 3571, cover)],
+        extra_covers=[
+            CoverPage(FIRST_LED, accession, cover, (CoverListing("Common Stock", "LEDY", "NYSE"),))
+        ],
+        **kwargs,
+    )
+
+
+def _led_store(settings: Settings) -> None:
+    """A backfill with FIRST_LED, then the store loses its bars before the
+    cover page, as a backfill before #974 left it: April and May empty, June
+    from the cover page on."""
+    assert _backfill(_loose(settings), _History(), filings=_with_first_span()).ok
+    _drop_bars(settings, FIRST_LED, (SINCE, LED_COVER - timedelta(days=1)))
+
+
+def test_the_backfill_fetches_a_led_id_in_the_months_its_lead_covers(settings: Settings) -> None:
+    prices = _History()
+    assert _backfill(_loose(settings), prices, filings=_with_first_span()).ok
+    assert all(FIRST_LED in ids for ids in prices.fetched.values())
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{FIRST_LED}' "
+        "ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(SINCE, JUNE_WINDOW[1])
+    assert all(known == bar_known_at(s) for s, known in rows)  # no look-ahead
+
+
+def test_a_dry_run_lists_a_led_ids_empty_months_and_its_partial_month(
+    settings: Settings,
+) -> None:
+    _led_store(settings)
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [
+        (FIRST_LED, APRIL_WINDOW),
+        (FIRST_LED, MAY_WINDOW),
+        (FIRST_LED, JUNE_WINDOW),
+    ]
+    assert [hole.rename_gap for hole in found.holes] == [False, False, True]
+    assert found.summary().endswith("; 1 of them lead gaps in a month with stored bars")
+    assert found.lines() == [
+        f"  {FIRST_LED} LEDY: 2019-04..2019-06 (3 months, 0 between its stored bars, 1 lead gaps)"
+    ]
+
+
+def test_a_led_fill_stores_each_session_once_at_its_close(settings: Settings) -> None:
+    _led_store(settings)
+    result = fill_holes(
+        _loose(settings),
+        prices=_History(),
+        since=SINCE,
+        clock=_ticking(LATER, timedelta(minutes=1)),
+    )
+    assert [r.status for r in result.runs] == [FILLED] * 3, result.runs
+    assert "1 with a lead gap" in result.runs[-1].message
+    rows = _read(
+        settings,
+        f"SELECT session, known_at FROM prices_daily WHERE security_id = '{FIRST_LED}' "
+        "ORDER BY session",
+    )
+    assert [r[0] for r in rows] == _sessions(SINCE, JUNE_WINDOW[1])  # each session once
+    assert all(known == bar_known_at(s) for s, known in rows)
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert again.holes == ()
+
+
+def test_named_securities_limit_the_led_holes(settings: Settings) -> None:
+    _led_store(settings)
+    _drop_bars(settings, DUAL, MAY_WINDOW)
+    only_dual = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[DUAL],
+    )
+    assert _holes(only_dual) == [(DUAL, MAY_WINDOW)]
+    only_led = fill_holes(
+        settings,
+        prices=_History(),
+        since=SINCE,
+        clock=lambda: LATER,
+        dry_run=True,
+        securities=[FIRST_LED],
+    )
+    assert {sid for sid, _ in _holes(only_led)} == {FIRST_LED}
+
+
+# --- rule 8 (#1314 item 2): a hand-over window is a hole of the old holder ---
+
+TAKEN_ON = date(2019, 6, 20)  # NEWCO's first cover page naming ACME's ticker (D)
+STOPPED = (date(2019, 6, 3), date(2019, 6, 28))  # ACME's bars gone from H on
+
+
+def _taken(settings: Settings) -> Settings:
+    """A backfill, then NEWCO's cover page lists `ACME` from `TAKEN_ON`,
+    ACME having gone quiet (rule 6: newer wins), and ACME has no bar from
+    2019-06-03: its span ends there (H) by rule 8."""
+    quiet = settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"registrant_quiet_days": 1})}
+    )
+    accepted = datetime.combine(TAKEN_ON, datetime.min.time(), UTC).replace(hour=20, minute=30)
+    accession = f"{NEWCO}-19-000001"
+    page = CoverPage(NEWCO, accession, accepted, (CoverListing("Common Stock", "ACME", "NYSE"),))
+    filings = _filings(
+        extra_index=[FilingIndexEntry(NEWCO, "Newco Inc", "10-K", accession, accepted)],
+        extra_headers=[FilingHeader(NEWCO, accession, "10-K", 3571, accepted)],
+        extra_facts=[_fact(NEWCO, "", 2_000_000, accession, accepted)],
+        extra_covers=[page],
+    )
+    assert _backfill(_loose(quiet), _History(), filings=filings).ok
+    _drop_bars(quiet, ACME, STOPPED)
+    with duckdb.connect(quiet.store.path) as conn:  # an Alpaca feed's source, as ingest stores
+        conn.execute("UPDATE prices_daily SET source = 'alpaca_sip'")
+    return _loose(quiet)
+
+
+def test_e_a_hand_over_window_is_listed_as_a_hole_of_the_old_holder(settings: Settings) -> None:
+    taken = _taken(settings)
+    found = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    acme = [hole for hole in found.holes if hole.security_id == ACME]
+    assert [(hole.window, hole.handover) for hole in acme] == [(JUNE_WINDOW, True)]
+
+
+def test_e_an_empty_refetch_stores_nothing_and_is_counted(settings: Settings) -> None:
+    taken = _taken(settings)
+    gaps = {(ACME, day) for day in _sessions(*JUNE_WINDOW)}
+    result = fill_holes(
+        taken, prices=_History(gaps=gaps), since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    assert "1 rule8_window holes with nothing stored" in result.runs[0].message
+    again = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert (ACME, JUNE_WINDOW) in _holes(again)  # listed again on every run
+
+
+def test_e_a_refetched_bar_lands_on_the_old_holder_and_moves_the_end(settings: Settings) -> None:
+    taken = _taken(settings)
+    result = fill_holes(
+        taken, prices=_History(), since=SINCE, clock=lambda: LATER, securities=[ACME]
+    )
+    assert [r.status for r in result.runs] == [FILLED], result.runs
+    stored = _read(
+        taken,
+        f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' "
+        "AND session BETWEEN DATE '2019-06-03' AND DATE '2019-06-19'",
+    )
+    assert stored[0][0] > 0
+    with duckdb.connect(taken.store.path) as conn:  # `_History` stamps `alpaca`
+        conn.execute("UPDATE prices_daily SET source = 'alpaca_sip'")
+    again = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert all(not hole.handover for hole in again.holes)

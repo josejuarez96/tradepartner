@@ -25,13 +25,14 @@ than hunting for a fixture case that happens to fit.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import duckdb
 import polars as pl
 import pytest
 
+from tradepartner.calendar import next_session
 from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import (
@@ -40,6 +41,7 @@ from tradepartner.store.asof import (
     facts_as_of,
     listings_as_of,
     prices_as_of,
+    statement_facts_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
 
@@ -378,14 +380,15 @@ class TestAdjustedPricesAsOfSynthetic:
     control over the numbers, built directly on a `synthetic_store` rather
     than hunted for in the CSV fixture."""
 
-    def test_dividend_at_or_above_prior_close_raises(
+    def test_dividend_at_or_above_prior_close_is_dropped_not_raised(
         self, synthetic_store: duckdb.DuckDBPyConnection
     ) -> None:
-        # Finding 2. A dividend amount >= the prior close makes
-        # `1 - amount / prior_close` zero or negative -- DuckDB's LN()
-        # (used by the cumulative-factor window) raises on that input
-        # rather than returning -inf/NaN, so this must be caught and
-        # turned into a clean ValueError before LN() ever runs.
+        # Finding 2, revised by #841. A dividend amount >= the prior close
+        # would make `1 - amount / prior_close` zero or negative, and
+        # DuckDB's LN() (the cumulative-factor window) raises on that. It
+        # is bad source data on one name (Alpaca's CG 2017-09-13 $25 on a
+        # $22 stock), so it is left unapplied and reported by
+        # `dropped_dividends_as_of` rather than failing every read.
         _bar(
             synthetic_store,
             "SEC_BAD_DIV",
@@ -402,8 +405,10 @@ class TestAdjustedPricesAsOfSynthetic:
             known_at=datetime(2021, 1, 4, 22, 0, tzinfo=UTC),
         )
         t = datetime(2021, 2, 1, tzinfo=UTC)
-        with pytest.raises(ValueError, match="SEC_BAD_DIV"):
-            adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+        adjusted = adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+        assert _one(adjusted, session=date(2021, 1, 4))["close"] == pytest.approx(10.0)
+        row = _one(dropped_dividends_as_of(synthetic_store, t), security_id="SEC_BAD_DIV")
+        assert row["reason"] == "implausible_amount"
 
     def test_negative_dividend_amount_raises(
         self, synthetic_store: duckdb.DuckDBPyConnection
@@ -788,6 +793,177 @@ class TestDividendPriorCloseStaleness:
             dropped_dividends_as_of(synthetic_store, date(2021, 3, 1))  # type: ignore[arg-type]
 
 
+#: A bar's `known_at` time of day: 21:00 UTC, after the 16:00 New York close.
+_CLOSE_UTC = time(21, tzinfo=UTC)
+
+
+def _amount_settings(max_share: float) -> Settings:
+    """Settings with `adjust.max_dividend_to_prior_close = max_share`, no `.env`."""
+    return Settings(_env_file=None, adjust=AdjustConfig(max_dividend_to_prior_close=max_share))
+
+
+class TestImplausibleDividendAmount:
+    """Issue #841: a dividend whose amount is at or above
+    `adjust.max_dividend_to_prior_close` times its prior close is bad
+    source data on one name. It is left unapplied (NULL factor) and
+    reported by `dropped_dividends_as_of` as `implausible_amount`, so one
+    such row no longer fails every adjusted read that includes the name."""
+
+    T = datetime(2017, 10, 31, 21, tzinfo=UTC)
+
+    def _carlyle(self, conn: duckdb.DuckDBPyConnection, *, amount: float = 25.0) -> None:
+        # The #841 shape: an ordinary dividend, then a $25 "dividend" on
+        # a $22.35 close with no drop on the ex-date.
+        sid = "SEC_CG"
+        for session, close in (
+            (date(2017, 8, 9), 20.00),
+            (date(2017, 8, 10), 19.58),
+            (date(2017, 9, 12), 22.35),
+            (date(2017, 9, 13), 22.80),
+        ):
+            _bar(conn, sid, session, close, known_at=datetime.combine(session, _CLOSE_UTC))
+        _action(
+            conn,
+            sid,
+            "dividend",
+            date(2017, 8, 10),
+            0.42,
+            known_at=datetime(2017, 8, 9, 20, tzinfo=UTC),
+        )
+        _action(
+            conn,
+            sid,
+            "dividend",
+            date(2017, 9, 13),
+            amount,
+            known_at=datetime(2017, 9, 12, 20, tzinfo=UTC),
+        )
+
+    def test_the_841_dividend_is_dropped_and_the_good_one_still_applies(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._carlyle(synthetic_store)
+        adjusted = adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+        # Only the 0.42 dividend adjusts the 08-09 bar; the $25 row is ignored.
+        assert _one(adjusted, session=date(2017, 8, 9))["close"] == pytest.approx(
+            20.0 * (1 - 0.42 / 20.0)
+        )
+        assert _one(adjusted, session=date(2017, 9, 12))["close"] == pytest.approx(22.35)
+        dropped = dropped_dividends_as_of(synthetic_store, self.T)
+        row = _one(dropped, security_id="SEC_CG")
+        assert row["ex_date"] == date(2017, 9, 13)
+        assert row["ratio_or_amount"] == pytest.approx(25.0)
+        assert row["prior_session"] == date(2017, 9, 12)
+        assert row["gap_sessions"] == 1
+        assert row["reason"] == "implausible_amount"
+
+    def test_not_a_drop_before_it_is_known(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._carlyle(synthetic_store)
+        before_known = datetime(2017, 9, 12, 19, tzinfo=UTC)
+        assert dropped_dividends_as_of(synthetic_store, before_known).height == 0
+
+    def test_bound_comes_from_config(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
+        # 6.0 on a 22.35 close is 27% of it: applied at the default bound
+        # (1.0), dropped at 0.25, applied again at 0.30.
+        self._carlyle(synthetic_store, amount=6.0)
+        bar = date(2017, 9, 12)
+        applied = 22.35 * (1 - 6.0 / 22.35)
+        for share, expected, n_dropped in (
+            (None, applied, 0),
+            (0.25, 22.35, 1),
+            (0.30, applied, 0),
+        ):
+            cfg = None if share is None else _amount_settings(share)
+            adjusted = adjusted_prices_as_of(
+                synthetic_store, self.T, include_dividends=True, settings=cfg
+            )
+            assert _one(adjusted, session=bar)["close"] == pytest.approx(expected), share
+            dropped = dropped_dividends_as_of(synthetic_store, self.T, settings=cfg)
+            assert dropped.height == n_dropped, share
+
+    def test_stale_prior_bar_keeps_its_own_reason(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # A gap drop is reported as such even when the amount is also too big.
+        sid = "SEC_BOTH"
+        _bar(
+            synthetic_store,
+            sid,
+            date(2021, 1, 4),
+            5.0,
+            known_at=datetime(2021, 1, 4, 21, tzinfo=UTC),
+        )
+        _action(
+            synthetic_store,
+            sid,
+            "dividend",
+            date(2021, 1, 11),
+            9.0,
+            known_at=datetime(2021, 1, 8, 21, tzinfo=UTC),
+        )
+        t = datetime(2021, 3, 1, tzinfo=UTC)
+        row = _one(
+            dropped_dividends_as_of(synthetic_store, t, settings=_gap_settings(4)), security_id=sid
+        )
+        assert row["reason"] == "stale_prior_bar"
+
+    def test_a_prior_bar_revision_known_after_t_does_not_change_the_drop_at_t(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        # The 09-12 close is revised to 30.00 after T: at T the $25 row is
+        # still sized against 22.35 and dropped; once the revision is known
+        # it is under the close and applies.
+        self._carlyle(synthetic_store)
+        _bar(
+            synthetic_store,
+            "SEC_CG",
+            date(2017, 9, 12),
+            30.0,
+            known_at=datetime(2017, 11, 15, 21, tzinfo=UTC),
+        )
+        assert dropped_dividends_as_of(synthetic_store, self.T).height == 1
+        later = datetime(2017, 11, 30, 21, tzinfo=UTC)
+        assert dropped_dividends_as_of(synthetic_store, later).height == 0
+        adjusted = adjusted_prices_as_of(synthetic_store, later, include_dividends=True)
+        assert _one(adjusted, session=date(2017, 9, 12))["close"] == pytest.approx(5.0)
+
+    @pytest.mark.parametrize("amount", [float("nan"), float("inf")])
+    def test_non_finite_amount_still_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection, amount: float
+    ) -> None:
+        self._carlyle(synthetic_store, amount=amount)
+        with pytest.raises(ValueError, match="SEC_CG"):
+            adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+        with pytest.raises(ValueError, match="SEC_CG"):
+            dropped_dividends_as_of(synthetic_store, self.T)
+
+    def test_zero_prior_close_still_raises(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._carlyle(synthetic_store)
+        _bar(
+            synthetic_store,
+            "SEC_CG",
+            date(2017, 9, 12),
+            0.0,
+            known_at=datetime(2017, 9, 12, 22, tzinfo=UTC),
+        )
+        with pytest.raises(ValueError, match="SEC_CG"):
+            adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+
+    def test_negative_amount_still_raises(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
+        self._carlyle(synthetic_store, amount=-1.0)
+        with pytest.raises(ValueError, match="SEC_CG"):
+            adjusted_prices_as_of(synthetic_store, self.T, include_dividends=True)
+
+    @pytest.mark.parametrize("share", [0.0, -0.1, 1.01])
+    def test_bound_outside_zero_one_is_refused(self, share: float) -> None:
+        with pytest.raises(ValueError):
+            AdjustConfig(max_dividend_to_prior_close=share)
+
+
 def _fact(
     conn: duckdb.DuckDBPyConnection,
     as_of: date,
@@ -1006,6 +1182,239 @@ class TestListingsAsOf:
             listings_as_of(fixture_store, date(2020, 1, 15))  # type: ignore[arg-type]
 
 
+def _security(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    cik: str,
+    *,
+    known_at: datetime,
+) -> None:
+    """One `securities` row (T76b synthetic-store tests)."""
+    insert_row(
+        conn,
+        "securities",
+        {
+            "security_id": security_id,
+            "cik": cik,
+            "name": f"{security_id} Inc",
+            "benchmark": False,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+def _statement_fact(
+    conn: duckdb.DuckDBPyConnection,
+    cik: str,
+    fact_name: str,
+    period_end: date,
+    value: float,
+    *,
+    known_at: datetime,
+    period_start: date | None = None,
+    accession: str = "0000000001-21-000001",
+) -> None:
+    """One `statement_facts` row (T76b synthetic-store tests): an instant
+    fact (`period_start=None`, `period_days=0`) unless `period_start` is
+    given."""
+    insert_row(
+        conn,
+        "statement_facts",
+        {
+            "cik": cik,
+            "fact_name": fact_name,
+            "xbrl_tag": f"us-gaap:{fact_name}",
+            "period_start": period_start,
+            "period_end": period_end,
+            "period_days": 0 if period_start is None else (period_end - period_start).days,
+            "value": value,
+            "unit": "USD",
+            "form": "10-K",
+            "filing_accession": accession,
+            "basis": "reported",
+            "comparative": False,
+            "known_at": known_at,
+            "ingested_at": known_at,
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+
+
+class TestStatementFactsAsOf:
+    """T76b (#660): `statement_facts_as_of` joins through
+    `store.master.securities_as_of(t)` on `cik`. The fixture's
+    CIK0001000006 ("Dual Class Holdings") carries SEC_DUAL_A, SEC_DUAL_B
+    and SEC_DUAL_PFD, all known at 2016-12-23, and a `revenue` statement
+    fact known at 2020-02-03T20:30:00+00:00 -- the multi-class case; the
+    other cases use a `synthetic_store` for exact control.
+    """
+
+    _DUAL_CIK = "CIK0001000006"
+    _DUAL_KNOWN_AT = datetime(2020, 2, 3, 20, 30, 0, tzinfo=UTC)
+
+    def test_invisible_before_known_at_visible_after(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        just_before = self._DUAL_KNOWN_AT - timedelta(microseconds=1)
+        just_after = self._DUAL_KNOWN_AT
+        before = statement_facts_as_of(fixture_store, just_before, security_ids=["SEC_DUAL_A"])
+        assert before.filter(pl.col("fact_name") == "revenue").height == 0
+        after = statement_facts_as_of(fixture_store, just_after, security_ids=["SEC_DUAL_A"])
+        assert after.filter(pl.col("fact_name") == "revenue").height == 1
+
+    def test_dual_class_cik_rows_appear_once_per_class(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(fixture_store, self._DUAL_KNOWN_AT)
+        revenue = rows.filter(
+            (pl.col("cik") == self._DUAL_CIK) & (pl.col("fact_name") == "revenue")
+        )
+        assert sorted(revenue["security_id"]) == ["SEC_DUAL_A", "SEC_DUAL_B", "SEC_DUAL_PFD"]
+        assert revenue["value"].n_unique() == 1  # same statement row, repeated per class
+
+    def test_security_ids_restricts_to_the_requested_class(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(
+            fixture_store, self._DUAL_KNOWN_AT, security_ids=["SEC_DUAL_B"]
+        )
+        assert rows["security_id"].unique().to_list() == ["SEC_DUAL_B"]
+
+    def test_cik_with_no_securities_row_returns_nothing(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        known_at = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store, "CIK0009999999", "revenue", date(2020, 12, 31), 1.0, known_at=known_at
+        )
+        rows = statement_facts_as_of(synthetic_store, known_at + timedelta(days=1))
+        assert rows.height == 0
+
+    def test_cik_whose_security_is_not_yet_known_at_t_returns_nothing(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The statement fact is known at T, but the master's own
+        `securities` row for its CIK is not known until later -- the join
+        through `securities_as_of(t)` must still hide it (spec: a CIK with
+        no `securities` row at T is invisible at T)."""
+        fact_known = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        security_known = datetime(2021, 6, 10, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234567",
+            "revenue",
+            date(2020, 12, 31),
+            1.0,
+            known_at=fact_known,
+        )
+        _security(synthetic_store, "SEC_LATE_MASTER", "CIK0001234567", known_at=security_known)
+
+        between = statement_facts_as_of(synthetic_store, fact_known + timedelta(hours=1))
+        assert between.height == 0
+        after_both = statement_facts_as_of(synthetic_store, security_known)
+        assert after_both.height == 1
+        assert after_both.row(0, named=True)["security_id"] == "SEC_LATE_MASTER"
+
+    def test_no_revision_first_vintage_only(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """`statement_facts` holds no revision (its `UNIQUE (cik, fact_name,
+        period_end, period_days)` excludes `known_at`), so this is a plain
+        `known_at <= t` filter, never a latest-revision query: a second row
+        for a *different* period on the same CIK simply adds a row, never
+        replaces the first, and the schema itself -- not this function --
+        is what stops a second row for the *same* key (quant-auditor on
+        #904: the earlier version of this test never inserted a colliding
+        row, so it tested nothing about that)."""
+        security_known = datetime(2021, 1, 1, tzinfo=UTC)
+        _security(synthetic_store, "SEC_FIRST_VINTAGE", "CIK0001234568", known_at=security_known)
+        first_known = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234568",
+            "revenue",
+            date(2020, 12, 31),
+            100.0,
+            known_at=first_known,
+        )
+        # A different period adds a second row.
+        _statement_fact(
+            synthetic_store,
+            "CIK0001234568",
+            "revenue",
+            date(2021, 3, 31),
+            25.0,
+            known_at=first_known + timedelta(days=90),
+            period_start=date(2021, 1, 1),
+        )
+        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=200))
+        assert sorted(rows["period_end"]) == [date(2020, 12, 31), date(2021, 3, 31)]
+
+        # A later row for the *same* key (even a different value, even a
+        # later known_at) is not a revision -- the UNIQUE constraint itself
+        # raises, which is the schema enforcing "no revision" at the DDL
+        # level rather than this function silently picking one.
+        with pytest.raises(duckdb.ConstraintException):
+            _statement_fact(
+                synthetic_store,
+                "CIK0001234568",
+                "revenue",
+                date(2020, 12, 31),
+                999.0,
+                known_at=first_known + timedelta(days=30),
+            )
+        rows = statement_facts_as_of(synthetic_store, first_known + timedelta(days=200))
+        assert rows.filter(pl.col("period_end") == date(2020, 12, 31)).row(0, named=True)[
+            "value"
+        ] == pytest.approx(100.0)
+
+    def test_empty_security_ids_returns_empty_frame_with_schema(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = statement_facts_as_of(fixture_store, self._DUAL_KNOWN_AT, security_ids=[])
+        assert rows.height == 0
+        assert "security_id" in rows.columns
+        assert "fact_name" in rows.columns
+
+    def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(TypeError):
+            statement_facts_as_of(fixture_store, date(2020, 1, 1))  # type: ignore[arg-type]
+
+    def test_naive_datetime_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError):
+            statement_facts_as_of(fixture_store, datetime(2020, 1, 1, 21, 0, 0))  # noqa: DTZ001
+
+    def test_view_is_dropped_after_the_call_even_on_a_read_only_connection(
+        self, tmp_path: Path
+    ) -> None:
+        path = str(tmp_path / "statement_facts_ro.duckdb")
+        conn = duckdb.connect(path)
+        try:
+            configure_connection(conn)
+            schema.init_schema(conn)
+            known_at = datetime(2021, 1, 1, tzinfo=UTC)
+            _security(conn, "SEC_RO_STMT", "CIK0001234569", known_at=known_at)
+            _statement_fact(
+                conn, "CIK0001234569", "revenue", date(2020, 12, 31), 1.0, known_at=known_at
+            )
+        finally:
+            conn.close()
+
+        ro = duckdb.connect(path, read_only=True)
+        try:
+            configure_connection(ro)
+            rows = statement_facts_as_of(ro, known_at + timedelta(days=1))
+            assert rows.height == 1
+            with pytest.raises(duckdb.CatalogException):
+                ro.execute("SELECT * FROM _asof_statement_securities")
+        finally:
+            ro.close()
+
+
 def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
     tmp_path: Path,
 ) -> None:
@@ -1046,3 +1455,63 @@ def test_dividend_queries_work_on_a_read_only_connection_and_drop_their_view(
             rw.execute("SELECT * FROM _asof_xnys_sessions")
     finally:
         rw.close()
+
+
+#: Two ex-dates, each carrying a split and a dividend (#1099, #1119 item 3). These
+#: amounts made the pre-#1119 read differ in the last bit by insertion order and
+#: between the table and a truncated view.
+_SAME_DAY_ACTIONS = [
+    ("split", date(2021, 1, 11), 0.409),
+    ("dividend", date(2021, 1, 11), 2.113),
+    ("split", date(2021, 1, 19), 4.919),
+    ("dividend", date(2021, 1, 19), 0.301),
+]
+
+
+def _same_day_store(actions: list[tuple[str, date, float]]) -> duckdb.DuckDBPyConnection:
+    # Several threads, as production reads run: under the test suite's
+    # threads=1 (#953) the scan order never varies, so the old sum never showed it.
+    conn = duckdb.connect(":memory:", config={"threads": 4})
+    configure_connection(conn)
+    schema.init_schema(conn)
+    known = datetime(2021, 1, 4, 21, 0, tzinfo=UTC)
+    closes = [10.3, 10.7, 11.1, 9.9, 33.7, 31.9, 32.3, 33.1, 47.3, 46.9]
+    day = date(2021, 1, 4)
+    for close in closes:
+        _bar(conn, "SEC_X", day, close, known_at=known)
+        day = next_session(day)
+    for kind, ex_date, amount in actions:
+        _action(conn, "SEC_X", kind, ex_date, amount, known_at=known)
+    return conn
+
+
+def test_a_split_and_dividend_on_one_ex_date_read_bit_equal_full_and_cut() -> None:
+    """One ex-date's factors sum in a fixed order (#1099): the full table and a
+    truncated view yield bit-identical adjusted frames, whatever the actions'
+    insertion order, and the factor is the split's times the dividend's."""
+    from lookahead.harness import TruncatedStore
+
+    t = datetime(2021, 1, 29, 21, 0, tzinfo=UTC)
+    forward = _same_day_store(_SAME_DAY_ACTIONS)
+    backward = _same_day_store(list(reversed(_SAME_DAY_ACTIONS)))
+    try:
+        full = adjusted_prices_as_of(forward, t, include_dividends=True)
+        # The old scan-order sum differed on about 3 reads in 5; repeat to catch it.
+        for _ in range(10):
+            for store in (forward, backward):
+                assert full.equals(adjusted_prices_as_of(store, t, include_dividends=True))
+                cut = TruncatedStore(store)
+                try:
+                    cut_frame = adjusted_prices_as_of(cut.at(t), t, include_dividends=True)
+                    assert full.equals(cut_frame)
+                finally:
+                    cut.close()
+        raw = prices_as_of(forward, t)
+        prior_1 = _one(raw, session=date(2021, 1, 8))["close"]
+        prior_2 = _one(raw, session=date(2021, 1, 15))["close"]
+        assert isinstance(prior_1, float) and isinstance(prior_2, float)
+        factor = (1 - 2.113 / prior_1) / 0.409 * (1 - 0.301 / prior_2) / 4.919
+        assert _one(full, session=date(2021, 1, 8))["close"] == pytest.approx(prior_1 * factor)
+    finally:
+        forward.close()
+        backward.close()

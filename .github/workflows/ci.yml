@@ -1,24 +1,74 @@
 name: CI
 
+# A draft PR runs `checks-fast` only (#1192): the pytest shards run on a non-draft PR, on
+# a draft that carries the `ci:full` label, and on every push to main or `train/**`.
+# `scripts/ready_pr.py` adds `ci:full` to a draft once its pushed head shows on the PR, so
+# that head gets the full run as a `pull_request` run (the only kind a PR's checks, and the `protect-main` ruleset's
+# required `checks`, are read from; a `workflow_dispatch` run on the branch does not show on
+# the PR), and marks the PR ready only once it is green. `labeled` starts a run for any
+# label; `ready_for_review` is deliberately not a trigger: marking ready after that green
+# run would only repeat it. A PR marked ready by hand without a full run has no `checks` on
+# its head until its next push or label, so the required check blocks its merge (fail
+# closed).
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
-    branches: [main]
+    branches: [main, 'train/**']
 
-# PR branches cancel superseded runs. Main never does, so every merge gets a completed run
-# (#198): one group per commit, since a shared group would still drop a pending run.
+# PR branches cancel superseded runs. Main and merge-train branches (`train/**`) never
+# cancel a run in progress, so a red main is always seen (#198). Main pushes share ONE
+# group (#1222): the run in progress completes, and of the commits that land meanwhile
+# GitHub keeps only the newest pending run, which tests the cumulative tree, so a burst of
+# merges costs one full run, not one per commit, and PR runs stop queueing behind them. A
+# red newest run is bisected by re-running CI on the burst's earlier commits (such a re-run
+# joins `ci-main` too, so start it when no merge is landing). `train/**`
+# keeps one group per commit, so every train batch gets a completed run (merge-train spec req 4).
 concurrency:
-  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ci-${{ github.ref == 'refs/heads/main' && 'main' || (startsWith(github.ref, 'refs/heads/train/') && github.sha || github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/train/') }}
+
+# Pytest shard count (#1112): tests/conftest.py's `pytest_collection_modifyitems` buckets
+# test FILES (not individual tests, so a file's module/session fixtures build once per
+# shard, never once per shard that happens to draw one of its tests) across this many
+# shards by a static, duration-weighted assignment. 8, not the original 4: a real CI run
+# at 4 put tests/lookahead/test_backtest_invariance.py's shard at 24.6 min (the other three
+# shards, each with no single file anywhere near as heavy, ran 7-11 min) — the weight table
+# predicts additive cost well for ordinary files, but badly for this one outlier, which is
+# slower on a shared 4-core CI runner than the sum of its own measured seconds suggests. At
+# 8 shards the bin-packer isolates it alone (weight 373, nothing else fits beside it without
+# pushing some other shard over), and every other shard's weight roughly halves (~306
+# instead of ~628) with it. Raise this (and the matrix list below, kept in sync by hand) if
+# the suite grows enough to push shards back over the wall-clock target; `scripts/ready_pr.py`'s
+# targeted runs and local `uv run pytest` never set the shard env vars, so they always see
+# the whole suite.
+env:
+  PYTEST_SHARD_COUNT: 8
 
 jobs:
-  checks:
+  checks-fast:
     runs-on: ubuntu-latest
+    # Read-only: a `train/**` push runs batch code with the repository's token, and this job
+    # only reads (merge-train spec, CI amendment; req 1 (0) is the first line of defence).
+    # `pull-requests` and `checks` (read) let main's tested-tree lookup find the merged PR
+    # and its head's check runs (#1192); both are public on this repository anyway.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      tests-needed: ${{ steps.scope.outputs.needed }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # uv cache keyed on uv.lock (a changed lock misses it). Only main saves it: a `train/**`
+      # or PR run only restores, so a batch's code cannot poison main's cache (#582).
       - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
       - name: Install
         run: uv sync --locked
       - name: Hygiene (pre-commit hooks)
@@ -32,12 +82,17 @@ jobs:
       - name: Types
         run: uv run mypy
       # A PR that touches no code, tests, scripts, deps or CI skips pytest (same rule as
-      # ready_pr.py). Gated per step, not with `paths:`, so `checks` still reports. Fails
-      # closed: a failed diff fails the step, an empty diff or anything but "no" runs tests.
+      # ready_pr.py), which skips every shard below too (their `if:` reads this output).
+      # A push to main skips the shards only when scripts/ci_tested_tree.py prints exactly
+      # `skip`: the commit's tree is a PR head's tree that already passed every shard (#1192).
+      # `train/**` pushes always need tests. Fails closed: a failed diff fails
+      # the step, an empty diff or anything but "no" runs tests, and the tree lookup prints
+      # `run` (or fails, read as `run`) on any doubt.
       - name: Test scope
         id: scope
         env:
           BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           needed=yes
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -45,12 +100,93 @@ jobs:
             if [ -n "$files" ]; then
               needed=$(printf '%s\n' "$files" | python3 scripts/ready_pr.py --tests-needed)
             fi
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            decision=$(python3 scripts/ci_tested_tree.py "$GITHUB_SHA") || decision=run
+            if [ "$decision" = "skip" ]; then
+              echo "Main: this tree already passed the full suite on its PR head; skipping the pytest shards (#1192)."
+              needed=no
+            else
+              echo "Main: running the full suite."
+            fi
           fi
           echo "Tests needed: $needed"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
-      - name: Tests
-        if: steps.scope.outputs.needed != 'no'
-        run: uv run pytest
+
+  # Skipped when no tests are needed, and on a draft PR without `ci:full` (#1192): `checks`
+  # below then takes a name the ruleset does not require, so such a run never reports it.
+  pytest-shard:
+    needs: checks-fast
+    if: needs.checks-fast.outputs.tests-needed != 'no' && !(github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      PYTEST_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install
+        run: uv sync --locked
+      # Printed so a run's shard counts can be summed and compared against the unsharded
+      # `pytest --collect-only -q` count (verified by hand on this issue's PR).
+      - name: Collected count (this shard)
+        run: uv run pytest --collect-only -q | tail -1
+      # xdist: one worker per core; each test already gets its own tmp_path (#581). The
+      # durations table is what tests/conftest.py's shard weights are re-measured from.
+      - name: Tests (this shard)
+        run: uv run pytest -n auto --durations=0 --durations-min=1.0
+
+  # Required check name every piece of merge tooling reads literally: the `protect-main`
+  # ruleset, scripts/ready_pr.py's `checks_state`, and scripts/merge_train.py's
+  # `_REQUIRED_CHECKS`. It must stay named exactly `checks` and must succeed if and only if
+  # checks-fast and (when tests ran) every pytest shard succeeded. On a draft PR without
+  # `ci:full` that needs tests no shard runs (#1192), so the job takes another name there:
+  # the required `checks` is never reported for that run, and it stays missing (merge
+  # blocked, ready_pr waiting) until a full run reports it. The job always runs rather than
+  # being skipped there, since a skipped job reports success.
+  checks:
+    name: ${{ (github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full') && needs.checks-fast.outputs.tests-needed != 'no') && 'checks (draft, no shards)' || 'checks' }}
+    needs: [checks-fast, pytest-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify checks-fast and every pytest shard passed
+        run: |
+          echo "checks-fast: ${{ needs.checks-fast.result }}"
+          echo "pytest-shard: ${{ needs.pytest-shard.result }} (tests-needed: ${{ needs.checks-fast.outputs.tests-needed }}, draft without ci:full: ${{ github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full') }})"
+          if [ "${{ needs.checks-fast.result }}" != "success" ]; then
+            echo "checks-fast did not succeed" >&2
+            exit 1
+          fi
+          if [ "${{ github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full') && needs.checks-fast.outputs.tests-needed != 'no' }}" = "true" ]; then
+            # Draft: reported as `checks (draft, no shards)`, never as the required `checks`.
+            echo "Draft PR: no pytest shard ran. ready_pr adds ci:full for the full run before it marks the PR ready."
+            exit 0
+          fi
+          if [ "${{ needs.checks-fast.outputs.tests-needed }}" = "no" ]; then
+            # No shard ran (job-level `if:` skipped the whole matrix): that is the
+            # expected, successful outcome for a docs-only PR, or for a push to main
+            # whose tree already passed every shard on its PR head (#1192).
+            if [ "${{ needs.pytest-shard.result }}" != "skipped" ]; then
+              echo "tests-needed was 'no' but pytest-shard did not report skipped" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          if [ "${{ needs.pytest-shard.result }}" != "success" ]; then
+            echo "a pytest shard failed or was cancelled" >&2
+            exit 1
+          fi
 
   claims:
     if: github.event_name == 'pull_request'

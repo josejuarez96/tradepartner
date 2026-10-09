@@ -1,6 +1,9 @@
-"""`bt` oracle for the backtest engine (backtest spec req 14, ADR 0004; plan T41).
+"""`bt` oracle for the backtest engine (backtest spec req 14, ADR 0004; plan T41), at
+every rebalance cadence (strategy-lab spec req 6; plan T98b).
 
-A synthetic `family=oracle` hypothesis is registered on a temp-file copy of the
+Every test runs once per cadence in `CADENCES` (`month_end`, `week_end`, `daily`): the
+hypothesis freezes `schedule.rebalance_cadence` to it and nothing else changes. A
+synthetic `family=oracle` hypothesis is registered on a temp-file copy of the
 fixture universe and run through `run_hypothesis(..., store_path=...)` at zero costs.
 `bt` then replays the run from what the returned `BacktestResult` holds: the **stitched
 frame** (per name, each session's return from the marking frame of the step that
@@ -25,7 +28,10 @@ close, booked on the fill session 2019-07-01, where it is not a target. `bt` hol
 forward-filled stitched level, leaves it untraded in the 2019-07-01 fill (no bar), as
 the engine does, then closes it at that same last close. The test asserts both, and
 that no other exit or missing fill occurs, so a fixture change that breaks this
-premise fails loudly instead of passing by accident.
+premise fails loudly instead of passing by accident. The exit rebalance and its fill
+session are the same at every cadence: 2019-06-28 is a month end, a week end and a
+session, its read at close(2019-06-28) precedes the Form 25, and the next read (at the
+next rebalance) sees it.
 
 The oracle checks the accounting loop (fills, drift, carry, splits and dividends
 through the stitched ratios, the delisting exit), not the signal or the adjustment:
@@ -36,23 +42,29 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import get_args
 
 import bt
 import duckdb
 import pandas as pd
 import polars as pl
 import pytest
+from conftest import load_universe_fixtures
 
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.run import run_hypothesis
+from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import next_session
-from tradepartner.config import Settings
-from tradepartner.store import registry
-from tradepartner.store.db import open_for_write
+from tradepartner.config import Cadence, Settings
+from tradepartner.store import registry, schema
+from tradepartner.store.db import configure_connection, open_for_write
+
+UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 
 #: Maximum absolute relative equity difference allowed between `bt` and our engine
 #: (ADR 0004). A constant, not config: changing it needs review in the PR.
@@ -67,17 +79,21 @@ DELISTED_LAST_BAR = date(2019, 6, 24)
 EXIT_REBALANCE = date(2019, 6, 28)
 EXIT_FILL = date(2019, 7, 1)
 ZERO_COSTS = 0.0
+#: Every rebalance cadence the engine runs at (`config.Cadence`); each test runs at each.
+CADENCES: tuple[Cadence, ...] = get_args(Cadence)
 #: The forced exit `bt` is told about (ADR 0004): the delisted fixture name, on the
 #: session our engine books it.
 EXITS = {EXIT_FILL: (DELISTED,)}
 
 
-def _frozen() -> Settings:
-    """Zero costs, no sensitivity levels, close fills; half the ranked names so the
-    book turns over (names enter and leave, both fixture split cases are held)."""
+def _frozen(cadence: Cadence) -> Settings:
+    """Zero costs, no sensitivity levels, close fills, rebalancing at `cadence`; half the
+    ranked names so the book turns over (names enter and leave, both fixture split
+    cases are held)."""
     return Settings(
         _env_file=None,
         strategy={"top_fraction": 0.5},
+        schedule={"rebalance_cadence": cadence},
         costs={
             "per_side_bps": ZERO_COSTS,
             "sensitivity_per_side_bps": [],
@@ -89,43 +105,70 @@ def _frozen() -> Settings:
     )
 
 
-@pytest.fixture(autouse=True)
-def live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Live settings without a `.env`, whose store is another temp file, so the
-    fixture store is never `settings.store.path` and the oracle family is allowed."""
-    real = tmp_path / "real_store.duckdb"
-    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
-    monkeypatch.setenv("STORE__PATH", str(real))
-    return real
+@dataclass(frozen=True)
+class OracleRun:
+    """One cadence's oracle run: the store, the live settings' store (never written),
+    the trial id and the zero-cost result."""
+
+    cadence: Cadence
+    store: Path
+    live: Path
+    trial_id: int
+    result: BacktestResult
 
 
-@pytest.fixture
-def run(fixture_store_path: Path) -> tuple[Path, int, BacktestResult]:
-    """Register the oracle hypothesis and run it once: the store, trial id and the
-    zero-cost result."""
-    frozen = _frozen()
-    store = Settings(_env_file=None, store={"path": str(fixture_store_path)})
-    with open_for_write(store) as conn:
-        registry.register_hypothesis(
-            conn,
-            slug=SLUG,
-            family="oracle",
-            title="bt oracle",
-            doc_path="tests/oracle/test_bt_oracle.py",
-            doc_sha256="0" * 64,
-            params=frozen_params_of(frozen),
-            in_sample_start=IN_SAMPLE_START,
-            holdout_start=HOLDOUT[0],
-            holdout_end=HOLDOUT[1],
-            registered_by="test",
-            settings=frozen,
+def _fixture_store(path: Path) -> Path:
+    """A temp-file store with the fixture universe loaded, closed (as the shared
+    `fixture_store_path` fixture builds it, at module scope)."""
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+    finally:
+        conn.close()
+    return path
+
+
+@pytest.fixture(scope="module", params=CADENCES)
+def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> OracleRun:
+    """Register the oracle hypothesis at the cadence `request.param` on a fresh fixture
+    store and run it once, under live settings without a `.env` whose store is another
+    temp file, so the fixture store is never `settings.store.path` and the oracle family
+    is allowed. Once per cadence: the tests only read the result."""
+    cadence: Cadence = request.param
+    tmp = tmp_path_factory.mktemp(f"oracle-{cadence}")
+    path, live = _fixture_store(tmp / "fixture_store.duckdb"), tmp / "real_store.duckdb"
+    frozen = _frozen(cadence)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp / "none.env"))
+        monkeypatch.setenv("STORE__PATH", str(live))
+        store = Settings(_env_file=None, store={"path": str(path)})
+        with open_for_write(store) as conn:
+            registry.register_hypothesis(
+                conn,
+                slug=SLUG,
+                family="oracle",
+                title="bt oracle",
+                doc_path="tests/oracle/test_bt_oracle.py",
+                doc_sha256="0" * 64,
+                params=frozen_params_of(frozen, family="momentum"),
+                in_sample_start=IN_SAMPLE_START,
+                holdout_start=HOLDOUT[0],
+                holdout_end=HOLDOUT[1],
+                registered_by="test",
+                settings=frozen,
+            )
+        outcome = run_hypothesis(
+            SLUG, None, None, Flags(), synthetic=True, store_path=path, run_by="oracle"
         )
-    outcome = run_hypothesis(
-        SLUG, None, None, Flags(), synthetic=True, store_path=fixture_store_path, run_by="oracle"
-    )
     assert (outcome.status, outcome.error) == ("ok", None)
     assert outcome.results is not None and set(outcome.results) == {ZERO_COSTS}
-    return fixture_store_path, outcome.trial_id, outcome.results[ZERO_COSTS]
+    result = outcome.results[ZERO_COSTS]
+    # The frozen cadence reached the engine: it rebalanced on exactly that schedule.
+    planned = [row.session for row in result.rebalances]
+    assert planned == rebalance_sessions(planned[0], planned[-1], cadence)
+    return OracleRun(cadence, path, live, outcome.trial_id, result)
 
 
 def _our_equity(result: BacktestResult) -> dict[date, float]:
@@ -194,7 +237,7 @@ def _run_bt(
     backtest = bt.Backtest(
         bt.Strategy("oracle", [_Fill(targets, bars, exits)]),
         prices,
-        initial_capital=_frozen().backtest.initial_capital,
+        initial_capital=_frozen(CADENCES[0]).backtest.initial_capital,  # any cadence
         commissions=lambda quantity, price: 0.0,
         integer_positions=False,
         progress_bar=False,
@@ -217,9 +260,9 @@ def _max_relative_difference(ours: Mapping[date, float], theirs: pd.Series) -> f
 
 
 def test_bt_and_engine_agree_on_equity_at_every_session(
-    run: tuple[Path, int, BacktestResult],
+    run: OracleRun,
 ) -> None:
-    _, _, result = run
+    result = run.result
     ours = _our_equity(result)
     assert len(ours) > 200
     assert sum(bool(target) for target in result.targets.values()) >= 10
@@ -230,13 +273,17 @@ def test_bt_and_engine_agree_on_equity_at_every_session(
 
 
 def test_the_delisted_name_is_sold_at_its_last_close_in_both_engines(
-    run: tuple[Path, int, BacktestResult],
+    run: OracleRun,
 ) -> None:
-    _, _, result = run
-    # The premise: WNDX is the window's only exit and only missing fill, on EXIT_FILL.
+    result = run.result
+    # The premise: WNDX is the window's only exit, at EXIT_REBALANCE, and its only missing
+    # fills are on the fill sessions after its last bar through EXIT_FILL (one at
+    # `month_end` and `week_end`; at `daily` every fill from 2019-06-25 on).
     rows = {row.session: row for row in result.rebalances}
+    missing = {s for s, r in rows.items() if DELISTED_LAST_BAR < r.fill_session <= EXIT_FILL}
+    assert EXIT_REBALANCE in missing
     exits = {s: (r.n_delisting_exits, r.n_stale_exits, r.n_missing_fill) for s, r in rows.items()}
-    assert exits == {s: (1, 0, 1) if s == EXIT_REBALANCE else (0, 0, 0) for s in rows}
+    assert exits == {s: (int(s == EXIT_REBALANCE), 0, int(s in missing)) for s in rows}
     assert rows[EXIT_REBALANCE].fill_session == EXIT_FILL
     assert DELISTED not in result.targets[EXIT_FILL]
     stitched = result.stitched_returns().filter(pl.col("security_id") == DELISTED)
@@ -265,9 +312,9 @@ def test_the_delisted_name_is_sold_at_its_last_close_in_both_engines(
 
 
 def test_a_one_session_lag_in_bt_fails_the_comparison(
-    run: tuple[Path, int, BacktestResult],
+    run: OracleRun,
 ) -> None:
-    _, _, result = run
+    result = run.result
     late = {next_session(fill): target for fill, target in result.targets.items()}
 
     backtest = _run_bt(result, late, EXITS)
@@ -275,16 +322,13 @@ def test_a_one_session_lag_in_bt_fails_the_comparison(
     assert _max_relative_difference(_our_equity(result), backtest.strategy.values) > TOLERANCE
 
 
-def test_the_oracle_trial_is_synthetic_in_the_oracle_family(
-    run: tuple[Path, int, BacktestResult], live: Path
-) -> None:
-    store, trial_id, _ = run
-    with duckdb.connect(str(store), read_only=True) as conn:
+def test_the_oracle_trial_is_synthetic_in_the_oracle_family(run: OracleRun) -> None:
+    with duckdb.connect(str(run.store), read_only=True) as conn:
         row = conn.execute(
             "SELECT t.synthetic, t.kind, h.family, r.status FROM trials t "
             "JOIN hypotheses h USING (hypothesis_id) "
             "JOIN trial_results r USING (trial_id) WHERE t.trial_id = ?",
-            [trial_id],
+            [run.trial_id],
         ).fetchone()
     assert row == (True, "in_sample", "oracle", "ok")
-    assert not live.exists()
+    assert not run.live.exists()

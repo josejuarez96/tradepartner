@@ -14,16 +14,17 @@ A personal, local system for researching, testing and paper-trading (then small-
 
 ## Scope
 - **In:** US equities, long-only, low frequency (daily or slower), no leverage, no options trading. The owner may revisit this through an ADR.
+- **Direction** ([ADR 0015](decisions/0015-expansion-seams.md) part A): the narrowness above is the current state, not the goal — the long-term direction also includes swing trading and day trading of US equities, and possibly options, futures and long/short spreads, each entering scope only through its own later ADR.
 - **Out:** the utility sector (owner compliance decision; the entire SIC 4900–4999 division, a guarded setting changeable only by amending this charter). Anything using material non-public information.
 - **Deferred beyond the MVP** (ADR required to enter scope): social and Google Trends data, news-text signals, and the LLM analyst layer. See [roadmap.md](roadmap.md), "MVP scope".
 - **Interface:** the owner interacts through a CLI and a local, read-only dashboard that reads the system's own database. The only write action is a logged override with a reason. See [roadmap.md](roadmap.md), "User experience".
 - **Universe** ([ADR 0006](decisions/0006-universe-and-cadence.md)): US common stocks on NYSE, Nasdaq and NYSE American; ranked by market cap with liquidity and price floors, rebuilt point-in-time at each rebalance. The numbers (proposed defaults: top 1000, $5M median dollar volume, $5 price) are config, frozen per hypothesis at pre-registration.
-- **Cadence** ([ADR 0006](decisions/0006-universe-and-cadence.md)): monthly rebalance at the last session of the month, orders at the next open, one-month hold.
+- **Cadence** ([ADR 0012](decisions/0012-cadence-as-a-hypothesis-parameter.md), superseding ADR 0006's cadence): a frozen hypothesis parameter, `month_end` by default (the last session of the month, orders for the next session at the frozen fill convention, one-period hold); the MVP's paper and live cadence is monthly.
 
 ## Constraints
 - Runs locally, for personal use only.
-- Paper trading first. Live capital is about $100 at most until the charter is amended. ⬜ Account type (taxable or retirement): decide before Phase 6.
-- ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier.
+- Paper trading first. Live capital is about $100 at most until the charter is amended. ✅ Account type, *decided 2026-10-04 ([#813](https://github.com/josejuarez96/tradepartner/issues/813#issuecomment-5982649128))*: a **taxable cash account**; falling back to a taxable margin account with margin never used only if the live API needs margin, in which case the Phase 6 live ADR must keep [ADR 0010](decisions/0010-phase-4-risk-rules.md) point 1 (buys sized within `account().cash`, never `buying_power`) and its item 6 reserve of our own open buys. That ADR also records the two broker facts this choice rests on (whether the live API needs margin; whether `account().cash` on a cash account includes unsettled sell proceeds) and the account actually opened. Retirement account rejected (#813).
+- ⬜ **Compliance:** employer personal-trading policy reviewed. Required before Phase 6; blocks nothing earlier. *Procedure decided 2026-10-04 ([#813](https://github.com/josejuarez96/tradepartner/issues/813#issuecomment-5982649128), option (a)):* the owner obtains the policy, records on #813 what it requires (pre-clearance, restricted list, holding period, duplicate statements), and ticks this line with the date, before plan task T75b.
 - **Budget:** set by [ADR 0009](decisions/0009-price-vendor.md) at $0/month for spend **by the running system** (data, APIs, LLM calls; development tooling excluded) from Phase 3 until a later ADR changes it (data-vendor spend had been deferred to the start of Phase 3 per [ADR 0003](decisions/0003-data-adapters-local-first.md)).
 - **Time:** no fixed weekly hours. Build and review hours are recorded in each phase retro, and the 6-month stop criterion above applies. The owner reviews and merges every PR (~≤400 lines each).
 

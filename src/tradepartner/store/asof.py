@@ -5,14 +5,38 @@ Every function here takes a tz-aware UTC `t` ("T" in the spec's
 `known_at <= t`, the **latest revision** per natural key (spec
 "Definitions" > Revision: "the row with the greatest `known_at <= T`").
 Rows are never updated in place, so "latest revision" is always a query,
-never a stored flag.
+never a stored flag. In `securities` and `listings` the latest revision may
+be a retraction (#859, `retracted = TRUE`, `store.retraction`): the key then
+has no row from that revision's `known_at` on, and the old row still answers
+every T before it.
 
-Only four of the six as-of functions the spec lists live here:
-`prices_as_of`, `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of`,
-plus `dropped_dividends_as_of`, which reports the dividends
-`adjusted_prices_as_of` leaves unapplied (#72).
-`securities_as_of`, `universe_as_of` and `survivorship_gap` are later plan
-tasks (T8, T13, T15) and are out of scope for this module.
+Five of the eight as-of functions the spec lists live here: `prices_as_of`,
+`adjusted_prices_as_of`, `facts_as_of`, `listings_as_of` and
+`statement_facts_as_of` (#660, T76b), plus `dropped_dividends_as_of`, which
+reports the dividends `adjusted_prices_as_of` leaves unapplied (#72) and is
+not itself one of the spec's eight. The other three live elsewhere, each
+owned by the module that writes its own table: `securities_as_of` in
+`store.master` (T8; the security master owns `securities`/`listings`
+writes, and `statement_facts_as_of` below calls it rather than duplicating
+its latest-revision query), `universe_as_of` in `universe.py` (T13) and
+`survivorship_gap` in `gap.py` (T15) -- all three shipped; out of scope
+for this module, not later tasks.
+
+**`statement_facts_as_of` has no revision to pick** (spec "Definitions" >
+Revision, exception): `statement_facts`'s `UNIQUE (cik, fact_name,
+period_end, period_days)` excludes `known_at`, so each key has at most one
+row ever -- "latest known at T" and "known at T" coincide, and the read is
+a plain `known_at <= t` filter, no `ROW_NUMBER()` needed. The join through
+`securities_as_of(t)` on `cik` is what makes this read point-in-time
+overall: a CIK with no `securities` row known at `t` contributes no rows
+(invisible at `t`, same as everywhere else in this module), and a
+multi-class CIK's one statement row is repeated once per `security_id`
+`securities_as_of(t)` lists for it at `t` -- so a class added after `t`
+does not yet pull the CIK's statement facts in under its own id. A class
+`securities_as_of` ever stops listing at some T (a delisted class stays
+listed today; #859's retraction is a later task) would drop out here too,
+the same way every other function in this module defers to whatever that
+one function decides a security's existence is.
 
 **Return type: `polars.DataFrame`.** ADR 0004 adopts polars for
 dataframes, and it is already a T1 runtime dependency. Every function
@@ -135,17 +159,31 @@ of scope here -- no acceptance criterion in this task requires an
 adjusted-volume convention, and the spec's "Data / interfaces" table
 documents `prices_daily` volume as raw only).
 
-**Every event's factor must be positive and finite, or this raises
+**Implausible dividend amounts are dropped, not applied (#841).** A
+dividend `amount >= prior_close` would make `1 - amount / prior_close`
+zero or negative, and DuckDB's `LN()` (used by the cumulative-factor
+window function below) *raises* on a non-positive input rather than
+returning `-inf`/`NaN`. Such a row is bad source data on one name (Alpaca
+attached Carlyle's $25 preferred issue price to CG's common on
+2017-09-13, a $22 stock), and raising failed every read that included
+the name, so a whole backtest trial. It is left unapplied (`NULL`
+factor) like a stale-prior-bar dividend and `dropped_dividends_as_of`
+reports it as `implausible_amount`: an amount at or above
+`adjust.max_dividend_to_prior_close` (default `1.0`, at most `1.0`)
+times the prior close. The bound is checked only on a usable prior close
+(the gap reasons come first), and only for a finite amount on a positive,
+finite close: a NaN or infinite amount, or a zero or NaN prior close, is
+corrupt data of another kind and still raises below.
+
+**Every other event's factor must be positive and finite, or this raises
 `ValueError`.** A split `ratio_or_amount` of `0` divides by zero (DuckDB
-returns `inf`, not an error, for `1.0 / 0.0`); a dividend `amount >=
-prior_close` makes `1 - amount / prior_close` zero or negative, and
-DuckDB's `LN()` (used by the cumulative-factor window function below)
-*raises* on a non-positive input rather than returning `-inf`/`NaN`. Both
-are bad store data, not "no factor" (`NULL`, which a dividend with no
-known prior bar can legitimately produce and which this function treats
-as "no adjustment from this event", not an error). Before ever computing
-`LN()`, a dedicated query checks every non-`NULL` event factor for
-`factor > 0 AND isfinite(factor)`, **and separately** rejects any
+returns `inf`, not an error, for `1.0 / 0.0`), and so does a NaN or
+infinite dividend amount or a zero or NaN prior close. That is bad store
+data, not "no factor" (`NULL`, which a dropped dividend produces and which
+this function treats as "no adjustment from this event", not an error).
+Before ever computing `LN()`, a dedicated query checks every non-`NULL`
+event factor for `factor > 0 AND isfinite(factor)`, **and separately**
+rejects any
 dividend with a negative `ratio_or_amount` even though `1 - (negative) /
 prior_close` is itself a perfectly positive, finite number greater than
 `1` (a dividend that *raises* the price is not a validation failure the
@@ -159,10 +197,14 @@ series (for the negative-dividend case) reach the caller.
 
 **Why this runs as one SQL statement, not a Python loop per bar.** Every
 step -- the latest-revision-as-of-`t` filter for both `prices_daily` and
-`corporate_actions`, each event's own factor, the **cumulative** factor per
-security (a running product of an event's factor and every later event's,
-expressed as `EXP(SUM(LN(factor)) OVER (PARTITION BY security_id ORDER BY
-ex_date DESC))` so it is a plain window aggregate, not a recursive query),
+`corporate_actions`, each event's own factor, one log factor per
+`(security_id, ex_date)` (the events sharing an ex-date summed as
+`SUM(LN(factor) ORDER BY action_type, ratio_or_amount)`, so a split and a
+dividend on one day sum in a fixed order whatever the scan order, #1099),
+the **cumulative** factor per security (a running product of an ex-date's
+factor and every later ex-date's, expressed as `EXP(SUM(log_factor) OVER
+(PARTITION BY security_id ORDER BY ex_date DESC))` so it is a plain window
+aggregate, not a recursive query),
 and attaching that cumulative factor to each bar -- happens inside one
 query (plus the small validation query above, which shares the same CTEs).
 Attaching uses DuckDB's `ASOF LEFT JOIN` (the same range-join operator used
@@ -186,7 +228,8 @@ import duckdb
 import polars as pl
 
 from tradepartner.calendar import all_sessions
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, parse_accepted_jump
+from tradepartner.store.schema import RETRACTABLE_TABLES, has_retracted
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Natural key (excluding `known_at`) each table's rows are keyed by for
@@ -201,6 +244,16 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 _PRICE_KEY: tuple[str, ...] = ("security_id", "session")
 _FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "as_of_date", "class_member")
 _LISTING_KEY: tuple[str, ...] = ("security_id", "ticker", "exchange", "valid_from")
+#: `statement_facts_as_of`'s result key (after the `cik` -> `security_id`
+#: join, spec "Data / interfaces" > Amendment 2026-10-03): not
+#: `statement_facts`'s own natural key (`cik, fact_name, period_end,
+#: period_days`, its `UNIQUE` constraint) -- a multi-class CIK's one row
+#: becomes one row per `security_id`, so `security_id` replaces `cik` here.
+_STATEMENT_FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "period_end", "period_days")
+
+#: View name `statement_facts_as_of` registers the `securities_as_of(t)`
+#: frame under, to join `statement_facts` against it by `cik` in SQL.
+_STATEMENT_SECURITIES_VIEW = "_asof_statement_securities"
 
 #: `PARTITION BY` for an action's identity (#108): the source's id when it
 #: gave one, else `(action_type, ex_date)`. Every reader of
@@ -266,7 +319,10 @@ def _latest_as_of(
     """The latest-revision-as-of-`t` rows of `table`, as a `polars.
     DataFrame` sorted by `key_columns`: one row per distinct `key_columns`
     tuple among rows with `known_at <= t`, the one with the greatest
-    `known_at` (spec "Definitions" > Revision).
+    `known_at` (spec "Definitions" > Revision). For `securities` and
+    `listings` a key whose latest revision is a retraction (#859) returns
+    nothing, and the `retracted` column is left out (every row returned is
+    live), so a frame reads as it did before version 11.
 
     `security_ids`, when given, restricts to those `security_id` values
     (an empty sequence restricts to none, returning an empty frame with
@@ -276,8 +332,16 @@ def _latest_as_of(
     partition = ", ".join(key_columns)
     params: list[Any] = [t]
     security_filter = _security_filter(security_ids, params)
+    # A retraction (#859) is the latest revision of its key, so the filter
+    # applies after choosing it, as `cancelled` does for actions: the key is
+    # withdrawn from the retraction's `known_at` on, never before.
+    # A store below version 11 (a read-only connection never migrates) has
+    # no `retracted` column and no retraction: every row is live there.
+    retractable = table in RETRACTABLE_TABLES and has_retracted(conn, table)
+    excluded = "_rn, retracted" if retractable else "_rn"
+    live = "AND NOT retracted" if retractable else ""
     sql = f"""
-        SELECT * EXCLUDE (_rn) FROM (
+        SELECT * EXCLUDE ({excluded}) FROM (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY {partition} ORDER BY known_at DESC
             ) AS _rn
@@ -285,7 +349,7 @@ def _latest_as_of(
             WHERE known_at <= ?
             {security_filter}
         )
-        WHERE _rn = 1
+        WHERE _rn = 1 {live}
         ORDER BY {partition}
     """
     return conn.execute(sql, params).pl()
@@ -327,6 +391,8 @@ def prices_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
     security_ids: Sequence[str] | None = None,
+    *,
+    traded_only: bool = False,
 ) -> pl.DataFrame:
     """Raw `prices_daily` rows known by `t`: one per `(security_id,
     session)`, the latest revision as of `t` (spec acceptance: "A bar
@@ -334,9 +400,132 @@ def prices_as_of(
     `prices_as_of` returns each in its interval" -- i.e. calling this with a
     `t` before the revision's `known_at` returns the original row, and with
     a `t` at or after it returns the revision).
+
+    `traded_only=True` drops bars whose latest revision has zero volume
+    (#787): a session nobody traded is missing, not a price. The universe and
+    the backtest provider read with it; a later revision with volume brings
+    the bar back.
     """
     t = _validate_t(t)
-    return _latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids)
+    frame = _latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids)
+    return _traded(frame) if traded_only else frame
+
+
+def _traded(frame: pl.DataFrame) -> pl.DataFrame:
+    """`frame` without its zero-volume bars (#787)."""
+    return frame.filter(pl.col("volume") > 0)
+
+
+#: `price_jumps_as_of`'s columns, in order.
+_JUMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "prev_session": pl.Date,
+    "session": pl.Date,
+    "prev_close": pl.Float64,
+    "close": pl.Float64,
+    "ratio": pl.Float64,
+    "accepted": pl.Boolean,
+}
+
+
+def price_jumps_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Unexplained one-day price jumps known at `t` (#787), sorted by
+    `(security_id, session)`.
+
+    Over each security's traded bars known at `t` (latest revision, volume
+    above zero, as `prices_as_of(traded_only=True)`), a bar whose raw close
+    over the previous traded bar's close (`ratio`) is above
+    `universe.max_jump_ratio` or below `universe.min_jump_ratio` is a jump
+    unless the splits and dividends known at `t` with an ex-date in
+    `(prev_session, session]` explain it: `(close + dividends) * split
+    ratios / prev_close` is back inside the bounds. A dividend reported as
+    `implausible_amount` by `dropped_dividends_as_of` does not explain a
+    jump; that bound is judged against the dividend's as-of prior close
+    (the latest bar before the ex-date, traded or not), while the jump
+    check uses the previous traded close. `accepted` is true when
+    `universe.accepted_price_jumps` names `<security_id>@<session>`.
+    `settings` defaults to `get_settings()`.
+
+    Raises `ValueError` naming the security when a jump candidate carries
+    an action `adjusted_prices_as_of` refuses (a negative dividend amount,
+    a non-positive or non-finite factor; `dropped_dividends_as_of`'s
+    validation). Fail loud on purpose: bad action data stops
+    `universe_as_of` (rule 6) and `health` rather than being read as an
+    explanation, or not, of a jump. Only candidates' actions are checked.
+
+    Only rows known at `t` are read, so the list at `t` never depends on a
+    later bar or a later-known action: a split first known after `t` leaves
+    its jump on the list at `t`.
+    """
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    cfg = settings.universe
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
+    sql = f"""
+        WITH latest AS (
+            SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
+                PARTITION BY security_id, session ORDER BY known_at DESC
+            ) AS _rn
+            FROM prices_daily
+            WHERE known_at <= ?
+            {security_filter}
+        ), traded AS (
+            SELECT security_id, session, close,
+                LAG(session) OVER w AS prev_session,
+                LAG(close) OVER w AS prev_close
+            FROM latest
+            WHERE _rn = 1 AND volume > 0
+            WINDOW w AS (PARTITION BY security_id ORDER BY session)
+        )
+        SELECT security_id, prev_session, session, prev_close, close,
+            close / prev_close AS ratio
+        FROM traded
+        WHERE prev_close > 0 AND (close / prev_close > ? OR close / prev_close < ?)
+        ORDER BY security_id, session
+    """
+    candidates = conn.execute(sql, params).pl()
+    if candidates.is_empty():
+        return pl.DataFrame(schema=_JUMP_SCHEMA)
+    candidate_ids = candidates["security_id"].unique().sort().to_list()
+    actions = live_actions_as_of(conn, t, candidate_ids)
+    implausible = {
+        (sid, ex_date, amount)
+        for sid, ex_date, amount, reason in dropped_dividends_as_of(
+            conn, t, candidate_ids, settings=settings
+        )
+        .select("security_id", "ex_date", "ratio_or_amount", "reason")
+        .iter_rows()
+        if reason == "implausible_amount"
+    }
+    by_security: dict[str, list[tuple[str, date, float]]] = {}
+    for sid, kind, ex_date, amount in actions.select(
+        "security_id", "action_type", "ex_date", "ratio_or_amount"
+    ).iter_rows():
+        by_security.setdefault(sid, []).append((kind, ex_date, amount))
+    accepted = {parse_accepted_jump(entry) for entry in cfg.accepted_price_jumps}
+    rows: list[dict[str, Any]] = []
+    for row in candidates.iter_rows(named=True):
+        splits, dividends = 1.0, 0.0
+        for kind, ex_date, amount in by_security.get(row["security_id"], []):
+            if not row["prev_session"] < ex_date <= row["session"]:
+                continue
+            if kind == "split":
+                splits *= amount
+            elif kind == "dividend" and (row["security_id"], ex_date, amount) not in implausible:
+                dividends += amount
+        explained = (row["close"] + dividends) * splits / row["prev_close"]
+        if cfg.min_jump_ratio <= explained <= cfg.max_jump_ratio:
+            continue
+        rows.append(row | {"accepted": (row["security_id"], row["session"]) in accepted})
+    return pl.DataFrame(rows, schema=_JUMP_SCHEMA)
 
 
 def facts_as_of(
@@ -403,6 +592,61 @@ def listings_as_of(
     """
     t = _validate_t(t)
     return _latest_as_of(conn, "listings", _LISTING_KEY, t, security_ids)
+
+
+def statement_facts_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """`statement_facts` rows known by `t` (amendment 2026-10-03, #660; plan
+    T76b), joined through `securities_as_of(t)` on `cik`: one row per
+    `(security_id, fact_name, period_end, period_days)`, sorted by that key.
+    Columns: `security_id` then every `statement_facts` column in schema
+    order (`cik` included).
+
+    `statement_facts` holds only the first-accepted vintage of each key
+    (its `UNIQUE` excludes `known_at` -- see this module's docstring), so
+    this is a plain `known_at <= t` filter, not a latest-revision query.
+
+    The join is what makes this point-in-time: a CIK with no `securities`
+    row known at `t` contributes nothing, and a dual- (or multi-) class
+    CIK's one row is repeated once per `security_id` that
+    `tradepartner.store.master.securities_as_of` lists for it at `t` --
+    this function calls that one rather than re-deriving which `security_id`s
+    a `cik` maps to.
+
+    `security_ids`, when given, is passed straight to `securities_as_of`
+    (an empty sequence therefore joins against no securities, returning no
+    rows -- `_security_filter`'s usual meaning); every row this returns
+    already carries a `security_id` from that call, so no second filter is
+    needed here.
+
+    `t` must be tz-aware (a bare date raises `TypeError`, a naive
+    `datetime` raises `ValueError` -- same rules as every other function in
+    this module).
+    """
+    t = _validate_t(t)
+    # Imported here, not at module level: `store.master` imports
+    # `_latest_as_of` from this module, so a top-level import the other way
+    # would be circular. `securities_as_of` already applies every rule
+    # (including any retraction, #859) for "which securities exist at t" --
+    # this function must not re-implement that query.
+    from tradepartner.store.master import securities_as_of
+
+    securities = securities_as_of(conn, t, security_ids).select("security_id", "cik")
+    conn.register(_STATEMENT_SECURITIES_VIEW, securities)
+    try:
+        sql = f"""
+            SELECT s.security_id, f.*
+            FROM statement_facts f
+            JOIN {_STATEMENT_SECURITIES_VIEW} s ON s.cik = f.cik
+            WHERE f.known_at <= ?
+            ORDER BY {", ".join(_STATEMENT_FACT_KEY)}
+        """
+        return conn.execute(sql, [t]).pl()
+    finally:
+        conn.unregister(_STATEMENT_SECURITIES_VIEW)
 
 
 def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> str:
@@ -488,17 +732,40 @@ def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> 
             ASOF LEFT JOIN {_SESSIONS_VIEW} xe ON xe.session < ep.ex_date
             ASOF LEFT JOIN {_SESSIONS_VIEW} xp ON xp.session < ep.prior_session
         ),
-        -- Each event's own factor; NULL for a dividend with no prior bar,
-        -- one more than `max_prior_close_gap_sessions` sessions back, or
-        -- one outside the calendar (gap NULL).
+        -- Why a dividend is left unapplied, in this order; NULL when it
+        -- applies, and always for a split. `dropped_dividends_as_of`
+        -- reports this column as `reason`.
+        event_drop AS (
+            SELECT
+                *,
+                CASE WHEN action_type = 'dividend' THEN
+                    CASE
+                        WHEN prior_session IS NULL THEN 'no_prior_bar'
+                        WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
+                        WHEN gap_sessions > ? THEN 'stale_prior_bar'
+                        -- Only a finite amount on a positive, finite close: a
+                        -- NaN or infinite amount, or a zero or NaN close, is
+                        -- corrupt data `_raise_on_invalid_factor` names.
+                        WHEN isfinite(ratio_or_amount) AND isfinite(prior_close)
+                            AND prior_close > 0
+                            AND ratio_or_amount >= ? * prior_close
+                            THEN 'implausible_amount'
+                    END
+                END AS drop_reason
+            FROM event_gap
+        ),
+        -- Each event's own factor; NULL for a dividend with a drop reason:
+        -- no prior bar, one more than `max_prior_close_gap_sessions`
+        -- sessions back, one outside the calendar (gap NULL), or an amount
+        -- at or above `max_dividend_to_prior_close` of the prior close.
         event_factor AS (
             SELECT
                 *,
                 CASE
                     WHEN action_type = 'split' THEN 1.0 / ratio_or_amount
-                    WHEN gap_sessions <= ? THEN 1.0 - ratio_or_amount / prior_close
+                    WHEN drop_reason IS NULL THEN 1.0 - ratio_or_amount / prior_close
                 END AS factor
-            FROM event_gap
+            FROM event_drop
         )
     """
 
@@ -512,25 +779,26 @@ def _adjusted_params(
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
     `t` and the bars filter (`latest_bars`), `t`, the actions filter and
-    `t_session` (`latest_actions`), and `max_prior_close_gap_sessions`
-    (`event_factor`). `t` must already be validated.
+    `t_session` (`latest_actions`), then `max_prior_close_gap_sessions`
+    and `max_dividend_to_prior_close` (`event_drop`). `t` must already be
+    validated.
 
-    The gap limit only matters for a dividend, so a splits-only query
-    binds `0` and never loads settings (`get_settings()` rereads the
+    Both limits only matter for a dividend, so a splits-only query binds
+    `0` and `1.0` and never loads settings (`get_settings()` rereads the
     environment on every call).
     """
     t_session = t.astimezone(_EXCHANGE_TZ).date()
     action_types = "'split', 'dividend'" if include_dividends else "'split'"
-    max_gap = 0
+    max_gap, max_share = 0, 1.0
     if include_dividends:
-        max_gap = (settings or get_settings()).adjust.max_prior_close_gap_sessions
+        adjust = (settings or get_settings()).adjust
+        max_gap, max_share = adjust.max_prior_close_gap_sessions, adjust.max_dividend_to_prior_close
 
     params: list[Any] = [t]
     bars_filter = _security_filter(security_ids, params)
     params.append(t)
     actions_filter = _security_filter(security_ids, params)
-    params.append(t_session)
-    params.append(max_gap)
+    params += [t_session, max_gap, max_share]
     return _adjusted_ctes(action_types, bars_filter, actions_filter), params
 
 
@@ -582,6 +850,8 @@ def adjusted_prices_as_of(
     *,
     include_dividends: bool = False,
     settings: Settings | None = None,
+    traded_only: bool = False,
+    sessions_from: date | None = None,
 ) -> pl.DataFrame:
     """`prices_as_of(conn, t, security_ids)`, with `open`/`high`/`low`/
     `close` adjusted for every split known by `t` with `ex_date <= t`
@@ -598,17 +868,40 @@ def adjusted_prices_as_of(
     that has no prior bar at all) is left unapplied; `dropped_dividends_
     as_of` lists those. `settings` defaults to `get_settings()`.
 
+    A dividend whose amount is at or above `settings.adjust.
+    max_dividend_to_prior_close` times its prior close is left unapplied
+    too, and reported as `implausible_amount` (#841).
+
     Raises `ValueError` if any known, effective event's own factor is
-    non-positive or non-finite (a split `ratio_or_amount` of `0`, or a
-    dividend `amount >= prior_close`), or a dividend amount is negative.
+    non-positive or non-finite (a split `ratio_or_amount` of `0`), or a
+    dividend amount is negative.
+
+    `traded_only=True` drops zero-volume bars after adjusting, as
+    `prices_as_of(traded_only=True)` (#787); the factors themselves are
+    computed over every stored bar, so a dividend's prior close is the one
+    the unfiltered read would use.
+
+    `sessions_from` (strategy-lab T99) leaves bars with `session <
+    sessions_from` out of the returned frame, **after** the as-of selection:
+    the `known_at` cut, the latest revision per bar and every factor are
+    computed exactly as the unbounded read computes them (a dividend whose
+    prior close falls before the bound still adjusts), so the result is the
+    unbounded frame's rows at or after the bound, row for row. `None` (the
+    default) bounds nothing. Raises `TypeError` for a `datetime`: the bound is
+    a session date, not a read time.
     """
     t = _validate_t(t)
+    if isinstance(sessions_from, datetime):
+        raise TypeError(f"sessions_from must be a session date, not a datetime: {sessions_from!r}")
     common_ctes, params = _adjusted_params(
         t, security_ids, settings, include_dividends=include_dividends
     )
     with _sessions_registered(conn, include_dividends=include_dividends):
         _raise_on_invalid_factor(conn, common_ctes, params)
-        return conn.execute(_adjusted_select(common_ctes), params).pl()
+        frame = conn.execute(_adjusted_select(common_ctes), params).pl()
+    if sessions_from is not None:
+        frame = frame.filter(pl.col("session") >= sessions_from)
+    return _traded(frame) if traded_only else frame
 
 
 def _raise_on_invalid_factor(
@@ -642,23 +935,24 @@ def _adjusted_select(common_ctes: str) -> str:
     """`adjusted_prices_as_of`'s main query over `common_ctes`."""
     return f"""
         WITH {common_ctes},
-        -- Cumulative factor per security: the product of this event's own
-        -- factor and every later event's (spec: a split or dividend
-        -- adjusts every bar before its ex-date, and multiple later events
-        -- compound). Expressed as EXP(SUM(LN(...))) so it is a plain
-        -- window aggregate, not a recursive query. ORDER BY ex_date DESC
-        -- is load-bearing: it accumulates from the latest event backward,
-        -- so each event's cum_factor is "itself and everything after it";
-        -- ASC would accumulate the wrong direction (see
-        -- tests/store/test_asof.py's compounding test, which asserts
-        -- distinct expected factors per date range and fails under ASC).
-        cum AS (
+        -- One factor per ex-date before the cumulative window: a split and
+        -- dividend on the same day must sum in a stable order, independent
+        -- of the table or truncated-view scan order (#1099).
+        event_day AS (
             SELECT security_id, ex_date,
-                EXP(SUM(LN(factor)) OVER (
-                    PARTITION BY security_id ORDER BY ex_date DESC
-                )) AS cum_factor
+                SUM(LN(factor) ORDER BY action_type, ratio_or_amount) AS log_factor
             FROM event_factor
             WHERE factor IS NOT NULL
+            GROUP BY security_id, ex_date
+        ),
+        -- Accumulate from the latest ex-date backward, so each date's factor
+        -- includes itself and every later date (ASC would be wrong).
+        cum AS (
+            SELECT security_id, ex_date,
+                EXP(SUM(log_factor) OVER (
+                    PARTITION BY security_id ORDER BY ex_date DESC
+                )) AS cum_factor
+            FROM event_day
         )
         SELECT
             b.security_id,
@@ -688,9 +982,9 @@ def dropped_dividends_as_of(
 ) -> pl.DataFrame:
     """Dividends known by `t` with `ex_date <= t` that `adjusted_prices_as_of(
     ..., include_dividends=True)` leaves unapplied because it has no usable
-    prior close (#72): one row per `(security_id, ex_date)`, sorted by
-    both, with `ratio_or_amount`, `prior_session`, `gap_sessions` and
-    `reason`, one of:
+    prior close (#72) or an implausible amount (#841): one row per
+    `(security_id, ex_date)`, sorted by both, with `ratio_or_amount`,
+    `prior_session`, `gap_sessions` and `reason`, one of:
 
     - `"no_prior_bar"`: no bar before the ex-date is known at `t`
       (`prior_session` and `gap_sessions` are `NULL`);
@@ -698,7 +992,10 @@ def dropped_dividends_as_of(
       outside `calendar.start`..`calendar.end`, so the gap cannot be
       counted (`gap_sessions` is `NULL`);
     - `"stale_prior_bar"`: more than `settings.adjust.
-      max_prior_close_gap_sessions` XNYS sessions before the ex-date.
+      max_prior_close_gap_sessions` XNYS sessions before the ex-date;
+    - `"implausible_amount"` (#841): the amount is at or above
+      `settings.adjust.max_dividend_to_prior_close` times the prior close
+      (bad source data, e.g. a preferred issue price on the common).
 
     For `health` to count; `settings` defaults to `get_settings()`.
     Raises `ValueError` on the same invalid data `adjusted_prices_as_of`
@@ -715,13 +1012,9 @@ def dropped_dividends_as_of(
             ratio_or_amount,
             prior_session,
             gap_sessions,
-            CASE
-                WHEN prior_session IS NULL THEN 'no_prior_bar'
-                WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
-                ELSE 'stale_prior_bar'
-            END AS reason
+            drop_reason AS reason
         FROM event_factor
-        WHERE action_type = 'dividend' AND factor IS NULL
+        WHERE drop_reason IS NOT NULL
         ORDER BY security_id, ex_date
     """
     with _sessions_registered(conn, include_dividends=True):

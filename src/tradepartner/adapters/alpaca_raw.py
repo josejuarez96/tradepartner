@@ -90,6 +90,80 @@ def _trading_client(settings: Settings) -> TradingClient:
     return TradingClient(api_key=api_key, secret_key=secret_key, raw_data=True, paper=True)
 
 
+def _symbol_batches(symbols: list[str], settings: Settings) -> list[list[str]]:
+    """`symbols` in order, in batches of at most `alpaca.symbols_per_request` (#789).
+
+    alpaca-py sends the whole list comma-joined in one GET, which Alpaca refuses
+    with HTTP 414 once the URL grows too long. Repeats are dropped (first one
+    kept) so a symbol split across two batches cannot return its bars twice. An
+    empty list stays one request, unchanged from the unbatched behaviour.
+    """
+    unique = list(dict.fromkeys(symbols))
+    size = settings.alpaca.symbols_per_request
+    return [unique[i : i + size] for i in range(0, len(unique), size)] or [unique]
+
+
+def _merge_batches(payloads: list[Any]) -> dict[str, Any]:
+    """Merge per-batch raw payloads key by key, list values concatenated in batch order.
+
+    The same rule alpaca-py's own paging loop applies across pages; any exception
+    from a batch has already propagated, so a partial merge is never returned.
+    """
+    merged: dict[str, Any] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict):  # raw_data=True always returns a dict
+            raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+        for key, value in payload.items():
+            if isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+            else:
+                merged[key] = value
+    return merged
+
+
+def _drop_actions_seen_in_earlier_batches(payloads: list[Any]) -> list[Any]:
+    """`payloads` without the action rows an earlier batch already returned (#816).
+
+    Alpaca returns an action that names two symbols (e.g. a reverse split with
+    a `new_symbol`) to the batch holding either symbol, so the same `id` can
+    come back once per batch. A row is dropped only when an earlier batch held
+    a row of the same category and `id` that is identical in every field; a
+    differing row with that `id` raises `ValueError` (fail closed). Rows
+    without an `id`, and repeats inside one response, are left alone for the
+    parser to judge.
+    """
+    seen: dict[tuple[str, str], Any] = {}
+    kept: list[Any] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):  # raw_data=True always returns a dict
+            raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+        batch_seen: dict[tuple[str, str], Any] = {}
+        filtered: dict[str, Any] = {}
+        for category, rows in payload.items():
+            if not isinstance(rows, list):
+                filtered[category] = rows
+                continue
+            filtered[category] = []
+            for row in rows:
+                action_id = row.get("id") if isinstance(row, dict) else None
+                if action_id is None:
+                    filtered[category].append(row)
+                    continue
+                key = (category, action_id)
+                if key in seen:
+                    if row != seen[key]:
+                        raise ValueError(
+                            f"batches disagree on the {category} action {action_id!r}: "
+                            f"{seen[key]!r} != {row!r}"
+                        )
+                    continue
+                batch_seen.setdefault(key, row)
+                filtered[category].append(row)
+        seen.update(batch_seen)
+        kept.append(filtered)
+    return kept
+
+
 def _session_bounds_utc(start: date, end: date) -> tuple[datetime, datetime]:
     """`[start, end]` session dates as an inclusive tz-aware UTC instant range.
 
@@ -109,6 +183,7 @@ def daily_bars(
     end: date,
     *,
     feed: DataFeed | None = None,
+    asof: date | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Raw, unadjusted daily bars for `symbols` over `[start, end]`.
@@ -117,21 +192,34 @@ def daily_bars(
     produced the bars travels with them (spec: "expose the feed used").
     `feed=None` means the configured `alpaca.historical_feed`. Always
     `adjustment=raw` per ADR 0003 rule 1 (adjustment happens at read time
-    in the store, never at the source).
+    in the store, never at the source). Symbols go out in batches of at most
+    `alpaca.symbols_per_request` (#789), each paged by the SDK, merged in order;
+    any failing batch fails the whole call.
+
+    `asof` (#1314) is Alpaca's symbol-mapping day: each symbol names the
+    company that traded under it that day, not today's holder (a reused
+    ticker). `None` sends no `asof`, so Alpaca maps to today's holder.
     """
     settings = settings or get_settings()
     feed = feed or default_feed(settings)
     client = _stock_data_client(settings)
     start_utc, end_utc = _session_bounds_utc(start, end)
-    request = StockBarsRequest(
-        symbol_or_symbols=symbols,
-        start=start_utc,
-        end=end_utc,
-        timeframe=TimeFrame.Day,
-        adjustment=Adjustment.RAW,
-        feed=feed,
+    raw_bars = _merge_batches(
+        [
+            client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    start=start_utc,
+                    end=end_utc,
+                    timeframe=TimeFrame.Day,
+                    adjustment=Adjustment.RAW,
+                    feed=feed,
+                    asof=None if asof is None else asof.isoformat(),
+                )
+            )
+            for batch in _symbol_batches(symbols, settings)
+        ]
     )
-    raw_bars = client.get_stock_bars(request)
     return {"feed": feed.value, "bars": raw_bars}
 
 
@@ -156,12 +244,24 @@ def corporate_actions(
     paging is governed only by `get_corporate_actions`'s own fixed
     `page_size=1000`/`page_limit=1000` per-page arguments and continues
     until the API stops returning a `next_page_token` — i.e. it always
-    fetches everything.
+    fetches everything. Symbols go out in batches of at most
+    `alpaca.symbols_per_request` (#789), each paged to completion, and the
+    per-type lists are concatenated in batch order; any failing batch fails
+    the whole call. An action an earlier batch already returned identically is
+    dropped, and one returned differently fails the call (#816).
     """
     settings = settings or get_settings()
     client = _corporate_actions_client(settings)
-    request = CorporateActionsRequest(symbols=symbols, start=start, end=end, limit=None)
-    return client.get_corporate_actions(request)
+    return _merge_batches(
+        _drop_actions_seen_in_earlier_batches(
+            [
+                client.get_corporate_actions(
+                    CorporateActionsRequest(symbols=batch, start=start, end=end, limit=None)
+                )
+                for batch in _symbol_batches(symbols, settings)
+            ]
+        )
+    )
 
 
 def assets_snapshot(

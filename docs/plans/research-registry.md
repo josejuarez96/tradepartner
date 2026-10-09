@@ -1,0 +1,50 @@
+# Plan: Research-experiment registry
+
+**Spec:** [specs/research-registry.md](../specs/research-registry.md) (every open question decided on #810, PR #877)  ·  **Status:** Accepted (owner, 2026-10-05, #931)  ·  **Issue:** #901
+
+## Approach (short)
+
+Pure modules first, then the store, then the one API that writes it, then the surfaces: the experiment-file parser over explicit inputs (T82) and the gate arithmetic over explicit inputs (T81a) have no store and start at once beside the schema and additive migration (T80); the append-only `store/research.py` with the two `RunHandle` constructors and the one dataset reader (T81) composes the three; then the `experiment` and `dataset` CLI groups (T83), the one edit to the backtest's N with the backtest spec's req 8 amendment (T83b), and the read-only research view (T83c). The spec's design choices stand unchanged: the registry lives in the runtime store so N is one query (Q1), research data live content-addressed under `data/research/` and are reached only through `load_dataset` (Q2, req 3), every evaluated configuration of a return-touching run adds one to N (Q3), sealed means sealed with no flag (Q4), there is no import path of any kind (Q5, req 12 dropped), code computes `verdict` from the interval (Q6), and a closed trial's `trial_equity` export is an ordinary dataset version built by the diagnostic's own spec, not a task here (Q7 (d)). ADR 0008 holds by construction: nothing here calls a model, and req 13's isolation test lands with the first guarded modules (T81).
+
+**Schema version.** The spec's req 1 wrote "whichever plan lands first takes 9 and the other takes 10" when `CURRENT_SCHEMA_VERSION` was 8; on `main` today it is 10. T80 takes **the next free version at merge time**, additive, and the strategy-lab plan (not written) takes the one after whichever lands later, as req 1 intends; neither edits the other's DDL. **When the owner's store migrates:** `init_schema` migrates on every writable open (`ingest`, `backfill`, `backtest`, the paper window's run), so the owner's store takes T80's version at its **first writing job after T80 merges**, which may fall inside the open paper window; the migration is additive (five new tables, one nullable column, a version row), touches no journal or fact table, and the read-only path keeps accepting the previous version (T80's line), so the paper run and the dashboard are not disturbed. Rollback is stated accordingly below.
+
+**No LLM, no new dependency, one config key** (`research.experiments_dir`, T82), no env var, nothing under `execution/`. Agents build and test on fixture and temp-file stores only; the first real registration, every holdout spend and every budget amendment are the owner's, on his store, after the plan is built.
+
+**Plan shape numbers** (development-process.md, "Plan shape"; from `uv run python scripts/team.py graph --ref <this branch>` on 2026-10-05): seven tasks, no owner task; this plan's longest chain **3** PRs (T80 or T82 or T81a → T81 → T83), the longest open chain across all plans unchanged at **5** (the paper-trading plan's T48b → T48c → T67 → T71 → T71b); depth 1: T80, T81a, T82; depth 2: T81; depth 3: T83, T83b, T83c. Files named by more than one task in this plan: `src/tradepartner/research/__init__.py`, created empty by T82 and filled by T81, the two in one declared chain (rule 1); `research/experiment.py` is written by T82 and read by T81 and T83 (the `dataset register` helpers); `research/gates.py` is written by T81a and read by T81 only. Files shared with open tasks of other plans: `src/tradepartner/cli.py`, named by the open T67 and T84c (paper-trading), T77b (data-foundation), T90 (lot-ledger comparison) and T83 here, which adds two new command groups that touch none of theirs; `src/tradepartner/config.py` and `tests/test_config.py`, named by the open T48b, T70, T77, T78 and T82 here, which adds one key under a new `research` section. Both fall under rule 3's disjoint-parts clause: whichever lands later merges `main` first. No other file here is named by an open task of any plan (`schema.py`, `registry.py`, `results.py`, `backtest_page.py`, `app.py`, `docs/README.md`, `docs/specs/backtest.md`, `tests/test_no_forbidden_imports.py` checked against the graph).
+
+**Lanes.** T80, T81a and T82 run beside each other from the start on disjoint files. T81 waits for all three and is the one place the store, the parser and the gates meet. T83, T83b and T83c start when T81 merges and run beside each other on disjoint files: T83 in `cli.py`; T83b in `backtest/results.py`, `dashboard/backtest_page.py` and `docs/specs/backtest.md`; T83c in a new `dashboard/research_page.py` and `dashboard/app.py`. Three windows are useful at both ends.
+
+**Owner items, ordered by what they unblock:** none before the build. T80's merge migrates the owner's store at its next writing job (above); after T83 the owner registers the first experiment file; after T83b the backtest page shows N with its research share. The agreement run of the annotation pilot (protocol §10 step 6) waits for T81 and T83, never the other way round (req 12 dropped: no interim log).
+
+## Tasks
+
+Each task = one branch = one PR (~≤400 lines). Tasks with no shared files may run in parallel.
+Shape (development-process.md, "Plan shape"): slice by file, not by step; no open chain over six PRs without a reason; no file named by more than two unticked tasks unless they are one chain; owner tasks gate only the edge, with the stub declared on the waiting line; the numbers above come from `uv run python scripts/team.py graph`. Task ids are global across plans (T90 is the last id in use). Every PR touching `src/tradepartner/cli.py` runs `safety-reviewer`; every task here runs `quant-auditor` (the registry is the research-side trial count, backtest spec reqs 8 to 12).
+
+- [x] **T80: Research registry schema and migration.** (#926, PR #940) · Files: `src/tradepartner/store/schema.py` · Tests: `tests/store/test_research_schema.py` · Depends on: n/a
+- [x] **T81a: Gate arithmetic, pure.** (#929, PR #934) · Files: `src/tradepartner/research/gates.py`, `src/tradepartner/research/__init__.py` · Tests: `tests/research/test_gates.py` · Depends on: n/a
+- [x] **T82: Experiment file parser, template and docs.** (#928, PR #935) · Files: `src/tradepartner/research/{__init__,experiment}.py`, `src/tradepartner/config.py`, `docs/templates/experiment.md`, `docs/README.md`, `tests/fixtures/experiments/`, `tests/fixtures/research/claims.toml` · Depends on: n/a
+- [x] **T81: Research registry API, run handle and the one reader.** (#993, PR #1007) · Files: `src/tradepartner/store/research.py`, `src/tradepartner/research/__init__.py`, `src/tradepartner/store/registry.py`, `docs/research/trial-registry.md` · Depends on: T80, T81a, T82
+- [x] **T83: CLI.** (#1140, PR #1148) · Files: `src/tradepartner/cli.py` · Depends on: T81
+- [x] **T83b: N integration and the backtest spec amendment.** (#1190, PR #1191) · Files: `src/tradepartner/backtest/results.py`, `src/tradepartner/dashboard/backtest_page.py`, `docs/specs/backtest.md` · Depends on: T81
+- [x] **T83c: Research view.** (#1189, PR #1193) · Files: `src/tradepartner/dashboard/research_page.py`, tests · Depends on: T81
+
+## Chains (for team claims)
+
+| Chain | Tasks | Starts when |
+|---|---|---|
+| schema | T80 | this plan merges |
+| gates | T81a | this plan merges; beside T80 and T82 |
+| parser | T82 → T81 → T83 | this plan merges; T81 also needs T80 and T81a |
+| count | T83b | T81 merged; beside T83 |
+| view | T83c | T81 merged; beside T83 |
+
+## Verification
+
+1. Any checkout, no `.env`, no network: `uv run pytest tests/store/test_research_schema.py tests/research/test_gates.py tests/research/test_experiment.py tests/store/test_research.py tests/test_no_forbidden_imports.py tests/test_cli_research.py tests/backtest/test_results.py tests/dashboard/test_backtest_page.py tests/dashboard/test_research_page.py` green; the spec's acceptance list maps onto them task by task (schema and append-only: T80, T81; registration: T82 for the file-level refusals, T81 for the store-level ones; runs, windows and protected windows: T81a by case, T81 as recorded rows; results and counts: T81, T83b; datasets: T82's helpers, T81's store rules; isolation: T81; CLI and page: T83, T83c).
+2. End to end on a temp-file fixture store (an agent may run it): `experiment register` the two fixture files, `dataset register` a fixture export with a sealed test period, `experiment open` a `dev` run that opens without flags, a `test` run that is `refused_holdout` without the flags and opens with them as a spend, a `write_result` with an interval verdict, a backtest on the same store whose `n_research` equals the counted configurations, and the research view rendering every row.
+3. Owner: after T80 merges, the next writing job (an `ingest`, or the paper window's run) migrates his store: the version row is appended, every other table's DDL is unchanged, `health --check` and `paper check` are unchanged, and the dashboard still renders; after T83 he registers the first experiment file; after T83b the backtest page shows N with its research share.
+
+## Rollback
+
+Every change is additive, and a migration is never reverted in place (schema versions are append-only). Before the owner's store has migrated, T80 is a plain revert. After it has migrated, which happens at the first writing job after T80 merges, reverting T80 would make every command raise `SchemaVersionError` on the higher version, so T80 stays; T81 to T83c can be reverted in reverse dependency order (T83, T83b and T83c before T81, since they import it), leaving the five tables empty and `n_research` NULL, with the backtest's N falling back to the Phase 3 computation and nothing reading the tables. If the owner nonetheless wants the tables gone, that is a by-hand version-row removal and table drop on his store, by him, after a copy. No scheduled job, no data file outside the store and no config key other than `research.experiments_dir` is added; `docs/experiments/` files are inert until registered.

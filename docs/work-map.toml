@@ -256,7 +256,7 @@ why = "One toolchain every agent uses."
 unblocks = ["phase:0"]
 
 [adr.0002]
-what = "Trunk-based git: a PR for every change, the owner approves every merge."
+what = "Trunk-based git: a PR for every change; the owner's word lands class-B PRs, the orchestrator lands class-A PRs under rule 7 (amended 2026-10-04)."
 why = "Keeps main always releasable with many agents pushing."
 unblocks = ["phase:0"]
 
@@ -295,6 +295,11 @@ unblocks = ["phase:4"]
 what = "Streamlit under the design standard for every dashboard page, no separate API; the override form is the only write and calls the store's own writer; React behind an API is the rejected option with its revisit conditions."
 why = "Closes the design standard's one open decision so the operations page (T69) can be built; keeps one code path for the override write."
 unblocks = ["task:T69"]
+
+[adr.0013]
+what = "The research-measurement boundary under which a pretrained classification model (Jev first) may label facts in public filings and headlines for the owner's review; labels live only in the research store, fixes enter only as reviewed changes, tests hold the line, each task is a registered pilot under a spend ceiling."
+why = "Unlocks the ML brief's model arms and the owner's data-refinement use (security-master second opinions, 8-K subtypes, headline types) without letting a model write a fact or touch the decision path; answers ADR 0008's open reading for typed classifiers."
+unblocks = ["research:2026-10-03-prospective-semantic-feature-spec"]
 
 [plan.data-foundation]
 what = "The Phase 2 build document: 25 tasks, one PR each, grouped in chains."
@@ -391,8 +396,12 @@ what = "The residue a name carries (dust, untradable, carried) and the derived s
 why = "A window must be able to close around residues, and a rebalance nobody ran must still lapse on schedule."
 
 [task.T53]
-what = "The backtest engine's plan function made public, tracking-trial windows, and the step that turns a plan into journaled decisions."
+what = "The backtest engine's plan function made public, and tracking-trial windows."
 why = "Paper plans with the same code the backtest ran, so paper and backtest can be compared honestly."
+
+[task.T53b]
+what = "The step that turns a plan into one buy, sell, skip or override decision per name, with the signal rows and the live-capital count."
+why = "Paper trades exactly what the plan says, journaled before any order, so every order can be traced back to its plan."
 
 [task.T54]
 what = "The risk checks on each batch of orders and the rule that sizes buys from the cash the sells raised."
@@ -514,6 +523,11 @@ why = "The design standard deferred this to Phase 4; the page task needs it sett
 what = "The operations page: positions, orders, today's ranking with reasons, fills, the chain per order, alerts, kill-switch state."
 why = "Phase 4's exit requires the owner to see the system's state, not trust it."
 
+[task.T54d]
+what = "A pure function that adds up the unfilled notional of our own buys still open at the broker, so the buys phase sizes from cash minus that reserve."
+why = "Broker cash does not hold back our own open buys; without the reserve two runs' buys could both fill and borrow, which the charter forbids (ADR 0010 amendment 2026-10-01)."
+unblocks = ["task:T60b", "task:T71"]
+
 [task.T69b]
 what = "The override screen: the dashboard's one write, a reasoned exclude, keep or kill-switch row."
 why = "Every human override is logged with a reason and passes the same risk rules."
@@ -533,3 +547,327 @@ why = "The first unattended paper run; only the owner holds the keys and the sto
 [task.T71b]
 what = "The phase close: the exit-criteria command exits 0 on the real store after six unattended rebalances."
 why = "The MVP's finish line."
+
+[issue.469]
+what = "Writes the owner's #366 batch 2 answers into the documents: the ADR 0010 amendment and T54d for the open-buy cash reserve, the spin-off rules in the spec, and the decisions_from confirmations."
+why = "Answers left only in an issue comment are invisible to the next implementer; the plan line and the spec are what a task reads."
+unblocks = ["task:T54d", "task:T60b", "task:T64b"]
+
+[issue.473]
+what = "Stores spin-off actions (child, parent, ratio) so reconciliation can explain a spin-off instead of halting for a manual fix."
+why = "Until then a spin-off the broker books halts the paper window; it needs T48b's recording of how Alpaca paper books one."
+
+[issue.352]
+what = "team.py claim and show print a task's plan line and its dependencies' lines; implementers read those, not the plan; reviewers post the full report on the PR and return ten lines."
+why = "Implementers started at ~65k tokens of docs and orchestrators carried every reviewer report; the always-loaded context is the main usage cost (brief of 2026-09-28)."
+unblocks = ["issue:351", "issue:353"]
+
+[issue.353]
+what = "Collapses every finished plan task to one line (title, issue, PR, Files paths, Depends on), caps finished lines at 400 characters in CI, and puts a one-screen command card at the top of teams.md."
+why = "The three plans were about 50k tokens, mostly finished tasks; an implementer's brief reads dependency lines, so shorter finished lines keep each session's context for the work itself."
+
+[issue.351]
+what = "Slims the always-loaded STATUS to a board with the last 10 done lines, one bookkeeping fragment per PR, and a CI budget on STATUS and CLAUDE.md."
+why = "Every session re-read a 10k-token STATUS on every turn; a smaller, bounded board keeps each session's context for the work itself."
+
+[issue.460]
+what = "Spec and plan for a merge train: batch the ready PRs, build one combined branch, run CI once, bisect on red, squash-merge only trees that ran green, on the owner's word per batch."
+why = "Green PRs merged one after another broke main twice on 2026-10-01 (#430 after #387, #444 with #429); refreshing each PR costs a 30-minute run per merge, which serialises every window behind the owner."
+unblocks = ["spec:merge-train", "plan:merge-train"]
+
+[issue.517]
+what = "Writes the owner's #366 answers of 2026-10-01 (Q4–Q7, Q9, Q19–Q24) into the paper-trading spec: the lot ledger takes adjustments, a lot_ledger alert kind, the stricter release rule, the lapse reason, the frozen fill-price bar, the resume refusal on a lag, and the fault-path exits and channels."
+why = "An answer left in an issue comment is invisible to the next implementer; the spec paragraph a task line cites is what it reads, and #514, #515 and #516 build from these paragraphs."
+unblocks = ["issue:514", "issue:515", "issue:516", "task:T63", "task:T65b"]
+
+[spec.merge-train]
+what = "What the merge train does and how we know it works: eligibility, batch order, the combined branch, one full CI run, bisect on red, tree-equality before and after each squash merge, owner authority, reporting, the main ruleset."
+why = "Lets many windows' PRs land together in one tested tree instead of one refresh-and-rerun per PR, without any discretion between the test and the merge."
+unblocks = ["plan:merge-train"]
+
+[plan.merge-train]
+what = "Seven tasks: the script's pure core, its runner with build, its merge command, the CI trigger for train branches, the review-prefix and ask-rule wiring, the ways-of-working update with the ruleset file, and the owner's activation and first real run."
+why = "The build document for the train; the owner's ruleset activation is the edge and gates nothing."
+
+[task.T72]
+what = "The merge train's pure half: records, eligibility reusing ready_pr's checks, batch order, run classification, bisect arithmetic, the mergeable prefix and the comment text."
+why = "Every rule of the spec is a pure function tested without the network, so the merge path has no judgment call in it."
+
+[task.T72b]
+what = "The merge train's runner and the build command: the squash-built train branch, one full run, the confirming rerun, the bisect, the comments and the record, over git and gh in the train's own worktree."
+why = "Everything that tests a batch, and nothing that lands one."
+
+[task.T72c]
+what = "The merge train's merge command (re-verify, head re-read, squash merge with --match-head-commit, retries, tree check, resume), plus status and prune."
+why = "The one command that merges, bound to a frozen batch id and the owner's word; reviewed on its own."
+
+[task.T73]
+what = "CI runs the full suite on train/** branches, one run per SHA."
+why = "The combined branch needs one full run that nothing cancels; the push event already forces the whole suite."
+
+[task.T74]
+what = "ready_pr's safety-review prefixes cover the train script, and settings.json asks before merge_train.py merge."
+why = "The merge path gets the same review gate as the order path, and an agent cannot merge a batch without a prompt."
+
+[task.T75]
+what = "The train in git-workflow, teams, development-process and CLAUDE.md rule 1, plus the non-strict ruleset file."
+why = "The ways of working say how a PR lands now; the ruleset makes main refuse what the train does not do."
+
+[task.T75b]
+what = "The owner activates the main ruleset, pushes a smoke train branch and runs the first real batch."
+why = "The only steps that need the owner's admin rights and a real batch; they gate nothing."
+
+[issue.618]
+what = "The first five research artifacts for semantic disclosure features: taxonomy v0, annotation protocol, evidence review, ML validation brief and prospective feature contract."
+why = "Decides, before any model is chosen or any return is tested, whether filing language can be measured reliably and whether it carries economic information; side track, not on the MVP path."
+unblocks = ["phase:5"]
+
+[research.2026-10-03-semantic-taxonomy-v0]
+what = "Defines demand, inventory pressure and liquidity pressure as two-part labels: evidence status, then direction only when evidence is sufficient."
+why = "Humans must be able to label a concept consistently before any model is measured against it."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-annotation-protocol]
+what = "A 200-pair, two-annotator pilot (third on 25%) with prespecified agreement gates per dimension and class."
+why = "Shows whether the taxonomy is labelable; a concept that fails is revised or dropped before benchmarking."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-disclosure-change-evidence-review]
+what = "Graded evidence on filing-change, cross-document and LLM disclosure research, with a replication ledger, novelty map and a source audit of the typed-classifiers note."
+why = "Separates what is replicated from what is claimed, so TradePartner tests what is genuinely open."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-ml-validation-methodology-brief]
+what = "Stage gates, splits, multiplicity, calibration and registry rules for the semantic benchmark, economic tests, insider and conditional-PEAD streams."
+why = "Fixes how results will be judged before any are seen, and records which steps ADR 0008 still forbids."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-prospective-semantic-feature-spec]
+what = "The append-only record contract for forward-captured semantic features: versions, probabilities, spans, routing, cost, known_at."
+why = "Prospective frozen outputs are the only evidence free of pretrained-model look-ahead."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-typed-classifiers-financial-disclosures-research]
+what = "Desk research on typed decision models (Jev) vs generative LLMs for structured disclosure extraction; recommends a provider-neutral pilot and a cascade hypothesis."
+why = "The main argument for testing Jev; its sources are audited in the disclosure-change evidence review."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-claims-pilot]
+what = "Hand-built claims-and-evidence graph over five reports, surfacing tensions X1 to X5 (universe, ADR 0008, insider evidence, momentum grade, analyst data)."
+why = "Records the owner's X1 decision (test inside the ADR 0006 universe) and the ADR 0008 conflict the semantic program must resolve."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-ml-llm-neglected-equities-research]
+what = "Research note on neglected equities: conditional PEAD, insider purchase context, filing-text extraction and cross-document change."
+why = "Source of the insider, conditional-PEAD and cross-document hypotheses the ML validation brief designs tests for."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-quantitative-investing-research-brief]
+what = "Graded brief on the fundamentals of quantitative investing: where returns come from, what survives costs, how to tell an edge is real, and where ML fits."
+why = "Supplies the publication-decay and power priors every new hypothesis must state."
+unblocks = ["issue:618"]
+
+[research.2026-10-03-tradepartner-ml-research-integration]
+what = "Architecture note: add a research layer (events, features, labels, model runs) on top of the PIT store, deterministic text before LLM features."
+why = "Frames how ML research fits the existing store, registry and holdout without touching execution."
+unblocks = ["issue:618"]
+
+[issue.620]
+what = "A research program page, a graded claims register over every research report, and a ranked hypothesis backlog."
+why = "Answers what the tool should test next and how results flow back into what we believe."
+unblocks = ["phase:3"]
+
+[spec.research-labeling]
+what = "What the research-labeling job under ADR 0013 does for its first pilot (task A, the security-master departure reason) and how we know it is done: a corpus build of Form 25 and 8-K text, a pinned typed classifier answering one closed question per listing end, a crosswalk onto the resolver's conclusion, the owner's blind gold labels and shortlist review, the boundary tests (a) to (e), two spend ceilings against the $20 credit."
+why = "ADR 0013 builds nothing until this spec is Accepted; the master's rules are patched one hand-read filing at a time (#921, #943, #905, #922) and this turns that pile into a reviewed shortlist without a model ever writing a fact."
+unblocks = ["issue:963"]
+
+[issue.963]
+what = "Write the research-labeling spec (docs/specs/research-labeling.md, Draft) that ADR 0013 requires before any model client exists, scoped to pilot A."
+why = "The spec is the key ADR 0013's tests turn on and the owner's acceptance gate for the labeling plan (size L)."
+unblocks = ["spec:research-labeling"]
+
+
+[spec.research-registry]
+what = "What the research-experiment registry records and refuses: pre-registered agreement runs, classifier benchmarks, regressions and feature studies as append-only rows with known_at, beside the backtest trial registry, with protected windows, run budgets and the family's N raised by any run on return data."
+why = "The charter halts a phase on any untracked run; without this the annotation pilot, B5 and E1 have nowhere to register and cannot start honestly."
+unblocks = ["issue:618"]
+
+[issue.661]
+what = "Draft the research-experiment registry spec (runs that are not backtests), with its plan task lines, as a spec only."
+why = "Answers the ML validation brief's registry proposal and the annotation protocol's interim log before any such run happens."
+unblocks = ["spec:research-registry"]
+
+[issue.931]
+what = "Flip the Status fields of the strategy-lab spec and the research-registry spec and plan to Accepted, recording the owner's decision of 2026-10-05."
+why = "A plan is written only from an accepted spec; the flip is the record in git that the owner approved these three documents."
+unblocks = ["plan:research-registry", "spec:strategy-lab"]
+
+[issue.946]
+what = "Draft ADR 0013, the research-measurement boundary for pretrained classification models used as factual labelers under human review, with the owner questions that decide its scope, spend ceiling and first pilot."
+why = "The ML brief and the prospective feature spec name this ADR as the precondition for any model arm; the owner wants Jev tested on data refinement, not signals, and this is the record that says how."
+unblocks = ["adr:0013"]
+
+[plan.strategy-lab]
+what = "How the strategy lab is built: twenty-nine tasks from the accepted spec, docs first (the ADR and the spec amendments), then the pure cadence, anchor, frozen-default, parser and quiet-interval modules, then the period-key rename, the engine at cadence, the lab registry, registration, the runner, the report, promotion and the spend rules, then the CLI, the page and the lab migration after T45b."
+why = "The owner wants to test many strategies across horizons beside H1's paper run; without a plan the spec's guarantees (every variant a counted trial, no sweep near the holdout, one promotion per fingerprint) have no build order and no team can claim a task."
+unblocks = ["phase:3", "phase:4"]
+
+[issue.933]
+what = "Write the strategy-lab plan from the accepted spec, with T-numbers, chains for team claims and the dependencies on the research-registry plan."
+why = "Turns the accepted spec into claimable tasks so the lab can be built beside the paper window."
+unblocks = ["plan:strategy-lab"]
+
+[adr.0014]
+what = "Strategies are registered objects: one dispatch seam keyed on the stored family inside run_hypothesis and plan_rebalance, one family registry the config, frozen and hypothesis tables derive from (momentum fallbacks removed), generic per-strategy exclusions and counts, per-family benchmarks; B4 is the proof."
+why = "B3 cost six plan tasks because a family is read by a dozen places on its own; after this the third family is one module plus one registry entry, and the CLI, paper run and tracking re-run agree on which strategy a slug is."
+unblocks = ["plan:strategy-interface", "task:T85e"]
+
+[adr.0015]
+what = "Expansion seams: the owner's long-term direction (swing and day trading, possibly derivatives) recorded without moving the charter's Scope line; six cheap, behaviour-preserving seams opened before Phase 4 writes real paper rows (book id in the client_order_id, position side, read-side order and broker shape before T48c, explicit cadence, the frozen-key rule for expansion keys, a reserved instrument id); shorting, stops, intraday bars, other calendars, derivatives data, roll, tax and multi-book deferred, each with a trigger and its own ADR."
+why = "Each seam is a column, a field or a default argument now and a backfill migration during the six-month paper window later; the id format becomes Alpaca-side history on the first submit and can never be changed."
+unblocks = ["task:T48c", "task:T71"]
+
+[adr.0016]
+what = "One global development boundary (recommended 2023-12-29) as a frozen owner_decisions row that every in-sample window ends at or before; exams stay one-spend for frozen finalists; a holdout that lies in the future at registration is a forward exam judged by the paper book; moving the boundary is a recorded owner decision."
+why = "The lab derives a strategy's practice end from its own holdout start, so B4 (a child of momentum) would practise through momentum's spent exam and B3's unspent one; one global boundary fixes that without the per-strategy date knob the owner withdrew, and writes down that every new family's exam is forward until history is extended."
+unblocks = ["plan:data-foundation", "issue:1292"]
+
+[issue.1258]
+what = "Turn ADR 0015's plan sketch (TE0 to TE7) into Phase 4 plan tasks T132 to T139 with their files, tests, dependencies, declared chains and the T48b, T48c and T71 gates."
+why = "A seam the ADR opened is built only from a claimable task line; the lines fix the DDL, the id token and the refusal names so three teams can build them in parallel before paper start."
+unblocks = ["task:T132", "task:T133", "task:T134", "task:T135", "task:T135b", "task:T136", "task:T138", "task:T139"]
+
+[issue.1319]
+what = "The history-and-identity side track from the accepted data-architecture evaluation (#1303): ADR 0016 (the development boundary and forward exams) and the data-foundation plan amendment with its tasks (named data releases, the #1314 repair under a release, the boundary's code, the USD 69 Sharadar overlap test with its pass/fail numbers, the vendor ADR gate, adapters only if buying, deferred items with triggers)."
+why = "Short history is the real bottleneck for comparing strategies honestly; this track names the data the store holds, unblocks B4 on practice data, and settles with numbers whether a paid vendor is worth USD 499 a year, without building anything the decision record defers."
+unblocks = ["adr:0016", "plan:data-foundation"]
+
+[task.T132]
+what = "TE0: schema version 17, the book_id, position_side and order-shape columns on the eight journal tables with their defaults, one rebuild migration, the row types' matching fields."
+why = "The one journal migration before paper start; after real rows exist each column is a rebuild under safety review during the paper window."
+
+[task.T133]
+what = "TE1: paper.book_id on the window row, the book token in the client_order_id, every row the run writes carrying the window's book, pinned end to end on the fixture run."
+why = "The id becomes Alpaca-side history on the first submit; a book token from the first order lets a second book on the account be told apart from the id alone."
+
+[task.T134]
+what = "TE2: the position side carried by phase orders and lots, and refused_position_side as a structural rule, so any short row halts the batch by name."
+why = "ADR 0010's no-shorts rule becomes a pinned refusal as well as a structural fact, before the shorting ADR extends it."
+
+[task.T135]
+what = "TE3a: the read-side fields Alpaca already returns (order type, time in force, prices, asset class, order class, legs; fee; margin fields; shortable, easy_to_borrow, marginable) on the broker types and the fake, OrderRequest unchanged."
+why = "T48c maps the response once against T48b's recordings; a field added after it is a second adapter edit under safety review and an orders rebuild."
+
+[task.T135b]
+what = "TE3b: refused_order_shape, the structural rule that halts on any broker order or journal row that is not a market, day, us_equity, simple, multiplier-1 order, and the reconciliation mismatch for one found open."
+why = "The reserved columns and fields cannot be used by accident: an order of another kind on the account halts rather than reconciles."
+
+[task.T136]
+what = "TE4: the window's frozen cadence passed explicitly through planning, plan, marks, run, outcomes, check, report and window, and first_tracking_session at any cadence."
+why = "Fixes the latent week_end and daily bug in first_tracking_session and removes the hard-coded month end from ten functions before Phase 4 adds more call sites."
+
+[task.T137]
+what = "TE5: the engine raises on a negative position value instead of dropping it; zero and dust still dropped; in progress as #1255 (PR #1256)."
+why = "A silent drop would hide a sign error the moment a signed position enters the engine."
+
+[task.T138]
+what = "TE6: the instrument-id rule in master.py's docstring and a guard that the master's own derivation never produces a prefixed id, BENCH: covered."
+why = "Fixing the id's meaning now means no re-keying of the journal's security_id columns when an instruments table arrives."
+
+[task.T139]
+what = "TE7: the charter's direction sentence, the roadmap's deferred-capabilities list, the ADR 0010 pointers (point 3 superseded, point 1 amended) and the data-foundation spec's namespace rule; class B."
+why = "The owner's direction is on record without moving the Scope line, and ADR 0010 point 5's requirement that a changed id derivation or limit be recorded on it is met."
+
+[plan.strategy-interface]
+what = "How the strategy-interface refactor is built: T85e amended into the one seam, then generic exclusions and counts (T127) beside the family registry (T128), per-family benchmarks after the lab's rename (T129), and B4 combined through the registry as the proof (T130)."
+why = "Without a build order the ADR's guarantees (H1's fingerprint unchanged, paper closed to profitability until the path is generic, one seam not two) have no owner and the refactor would race T85c, T85d and T98."
+unblocks = ["phase:3", "phase:4"]
+
+[task.T127]
+what = "Plan.exclusions and the trial_rebalance_counts table (once per rebalance); the paper signals.reason CHECK widens to a prefix rule; T85d's six columns copied into the table."
+why = "The one real schema boundary the spike hit: today a strategy can only report 'no history', in Plan, a NOT NULL column and the journal CHECK."
+
+[task.T127b]
+what = "The paper planner's _signals partitions members over every declared exclusion reason and journals excluded_<reason> rows; H1's rows unchanged."
+why = "Without it the paper path refuses any exclusion but 'no history' with a raw ValueError; kept its own small task because it edits execution/."
+
+[task.T128]
+what = "config.FAMILIES, the one family registry; FAMILY_PARENTS, ENGINE_FAMILIES, PAPER_FAMILIES, FAMILY_SIGNAL_SECTIONS, REQUIRED_SECTIONS and the sweep prefixes derive from it; the momentum fallbacks go."
+why = "An unlisted family today silently freezes, hashes and requires momentum's keys; after this it fails, and the family list lives in one place."
+
+[task.T129]
+what = "A family's registry entry may add one comparison benchmark beside SPY and MTUM, which stay required; momentum's MTUM keys unchanged byte for byte."
+why = "MTUM is wired in by name today, so a family cannot add a benchmark of its own; whether MTUM stays mandatory for every family is ADR 0014 open question 1."
+
+[task.T130]
+what = "B4 momentum plus profitability combined by fixed equal ranks, landed as one signal module, one registry entry whose sections freeze both sub-signals' keys, a Settings section and a fixture twin."
+why = "The proof of ADR 0014: a third family that touches nothing under execution/ or store/, nor engine.py, run.py, results.py or hypothesis.py."
+
+[task.T140]
+what = "Named data releases, the rule and the record with no schema: the runbook, the release record format in a file beside the store, the trial 4 back-fill and the paper-window rule, so the owner starts recording releases now."
+why = "Every store repair restates rows and makes in-window sweep trials stale; a named release gives each store state a name a trial row can cite, and is the link from H1's spent holdout to the backup it read."
+
+[task.T140b]
+what = "Named data releases in the store: schema version 18 adds the data_release and development_boundary kinds and the trial's boundary column, the release reads, a delete-only release moving the data vintage, and the decision data-release open/close/record/import commands."
+why = "A release recorded in the store is what a trial row and the vintage rule can read; the import carries the records written by hand under T140 into the store once."
+
+[task.T140c]
+what = "Every row-changing repair refuses to run without an open release, and repair-bars deletes one security's Alpaca bars and actions on named sessions under a release."
+why = "Releases are only a rule until the tools refuse to write without one; the #1314 repair needs a session-scoped delete the resolver-based repair cannot do."
+
+[task.T141]
+what = "Owner: the #1314 repair of the 13 securities that carry another company's bars, in one batch under a release name, after the T114 sweep and outside ingest windows."
+why = "The one measured identity defect in the store; its effect on trials 2 to 4 was zero, and after the repair the live store no longer holds what trial 4 read, which the release row records."
+
+[task.T141b]
+what = "Resolver rule 8 (#1314 item 2, spec amendment #1318): a ticker span ends the session after its security's last own bar when another issuer takes the symbol, with the dry-run listing, the fill-holes months and the run-row count."
+why = "Cover pages lag a ticker hand-over by weeks or months, so the old security's span carried the new holder's bars; the rule is fail-safe until the repair and closes the span-lag mechanism for future reuses."
+
+[task.T142]
+what = "ADR 0016's window rule: default_in_sample_window ends at the earlier of the family's holdout start and the global development boundary, and an in-sample window past the boundary is refused."
+why = "Makes the practice end one owner value in the store instead of a per-family derivation, so B4 practises on the same months as H1 and B3 and reads nothing after 2023-12."
+
+[task.T142b]
+what = "ADR 0016's boundary read at every caller that builds a window (run, sweep, lab queries, lab registry, research runs), each trial recording the boundary it ran under, the decision development-boundary command with its refusals, and lab status showing the boundary and marking a forward holdout."
+why = "A boundary nobody reads protects nothing; after this every run and registration reads it from the store, and the owner can see which exams are forward."
+
+[task.T142c]
+what = "paper start accepts a forward holdout once its start has passed and opens the window at the first rebalance on or after it; every other refusal unchanged and pinned."
+why = "A forward exam is the paper book inside the holdout, which today's paper start refuses until the holdout has ended."
+
+[task.T143]
+what = "A short Zones section in research-program.md: development data is permissive and counted, exams are one-spend for frozen finalists, forward exams are the paper book, the boundary and who moves it."
+why = "The #1301 decisions and ADR 0016 are rules agents must follow; a page they read every session beats a record they have to find."
+
+[task.T144]
+what = "Owner-gated spike: the USD 69 one-month Sharadar overlap test, read-only on a store copy, with pass/fail numbers written before the purchase (identity, delisted completeness, raw closes, actions, fundamentals timing) and a pre-2016 depth report."
+why = "Turns every vendor claim into a measurement on our own store and decides the USD 499/yr question with numbers rather than on the vendor's word."
+
+[task.T145]
+what = "The vendor and budget ADR amending ADR 0009, decided only from T144's numbers: buy or not, and if buying the fill-only rule, the stamping rule, the crosswalk first, synthetic fixtures only and the deletion clause for backups and exports."
+why = "A vendor enters only through a new ADR and a plan amendment (ADR 0009); this is the gate everything paid stands behind."
+
+[task.T146]
+what = "Only if buying: the identity crosswalk table and builder, security_id to the vendor's permanent id by CIK and CUSIP, never by ticker."
+why = "Matching vendor rows by ticker is the #1314 mistake again; the crosswalk is the first table a vendor adapter needs."
+
+[task.T147]
+what = "Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures; the per-row quality column stays deferred until this lands."
+why = "Fills history before 2016 and the delisted tails Alpaca lacks without changing a stored Alpaca row or a registered trial."
+
+[task.T148]
+what = "Only if buying: a listing-history source for the vendor's dated ticker spans, listing and delisting dates, stamped per the vendor ADR."
+why = "Before 2019 the point-in-time universe is empty because cover-page tagging did not exist; vendor listing history is what makes an earlier universe possible."
+
+[task.T149]
+what = "Only if buying: health counts and the data-health page block for vendor-filled rows and vendor-stamped listing dates."
+why = "Reliance on a vendor's assembled dates is counted on the health page the way snapshot_static reliance is."
+
+[task.T149b]
+what = "Owner, only if buying: the vendor backfill on the real store under a release name, with the gap metric at every 2017 to 2019 rebalance and a non-empty universe from the first vendor year as evidence."
+why = "The build is proven only on the owner's store; the release row names the state every later trial reads."
+
+[task.T150]
+what = "The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
+why = "Only with longer history does more than one exam slice exist; registering the new families as children keeps every trial counted, as charter principle 2 requires."

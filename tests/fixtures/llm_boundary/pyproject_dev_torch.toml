@@ -1,0 +1,7 @@
+# Test (a): a listed name in a group other than research fails.
+[project]
+name = "fixture"
+dependencies = ["httpx>=0.27"]
+
+[dependency-groups]
+dev = ["pytest>=8", "Torch==2.4"]

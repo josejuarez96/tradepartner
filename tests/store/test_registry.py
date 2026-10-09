@@ -5,14 +5,16 @@ holdout" acceptance lines: inserts and reads only; ids increase; closing
 twice raises; a handle is built only by `open_trial`; the oracle family
 and synthetic trials are refused on `settings.store.path`; `family_sharpes`
 counts N over every `ok`, non-synthetic, `in_sample` trial and takes V per
-basis over the latest trial per (parameter hash, window) pair, never
-reading an annualized value; holdout spends; `unfinished` listing;
-decision rows; code version and dirty flag.
+basis over the latest trial per (canonical frozen set hash, window) pair,
+in annual units from the period keys and `periods_per_year` (strategy-lab
+spec reqs 3, 9); holdout spends; `unfinished` listing; decision rows; code
+version and dirty flag; the data and code vintages.
 """
 
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import re
 import statistics
@@ -24,13 +26,21 @@ from typing import Any
 import duckdb
 import pytest
 
-from tradepartner.config import Settings
+from tradepartner.config import Cadence, Settings
 from tradepartner.store import registry, schema
 from tradepartner.store.db import insert_row
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+_AFTER_CUTOFF = datetime(2026, 9, 28, 20, 0, tzinfo=UTC)  # a session after `_open`'s cutoff
 _W1 = (date(2018, 1, 31), date(2022, 12, 30))
 _W2 = (date(2019, 1, 31), date(2022, 12, 30))
+#: A monthly trial's period Sharpe times this is its annualised Sharpe.
+R12 = math.sqrt(12)
+
+
+def _annual(*monthly: float) -> Any:
+    """`pytest.approx` of monthly period Sharpes annualised."""
+    return pytest.approx(tuple(v * R12 for v in monthly), rel=1e-12)
 
 
 def _params(per_side_bps: float = 15.0, **extra: Any) -> dict[str, Any]:
@@ -110,17 +120,19 @@ def _metrics(
     raw: float,
     excess: float,
     level: float = 15.0,
+    ppy: float | None = 12.0,
 ) -> None:
-    registry.write_metrics(
-        conn,
-        handle,
-        [
-            registry.MetricRow("strategy", level, "sharpe_monthly", raw),
-            registry.MetricRow("strategy", level, "sharpe_monthly_excess_spy", excess),
-            registry.MetricRow("strategy", level, "sharpe_annual", 99.0),
-            registry.MetricRow("SPY", level, "sharpe_monthly", 5.0),
-        ],
-    )
+    rows = [
+        registry.MetricRow("strategy", level, "sharpe_period", raw),
+        registry.MetricRow("strategy", level, "sharpe_period_excess_spy", excess),
+        registry.MetricRow("strategy", level, "sharpe_annual", 99.0),
+        registry.MetricRow("strategy", level, "sharpe_annual_excess_spy", 99.0),
+        registry.MetricRow("strategy", level, "sharpe_monthly", 77.0),
+        registry.MetricRow("SPY", level, "sharpe_period", 5.0),
+    ]
+    if ppy is not None:
+        rows.append(registry.MetricRow("strategy", level, "periods_per_year", ppy))
+    registry.write_metrics(conn, handle, rows)
 
 
 def _ok_trial(
@@ -129,11 +141,12 @@ def _ok_trial(
     tmp_path: Path,
     raw: float,
     excess: float,
+    ppy: float | None = 12.0,
     **kwargs: Any,
 ) -> registry.TrialHandle:
     handle = _open(conn, settings, tmp_path, **kwargs)
-    _metrics(conn, handle, raw, excess)
-    _metrics(conn, handle, raw + 7.0, excess + 7.0, level=50.0)
+    _metrics(conn, handle, raw, excess, ppy=ppy)
+    _metrics(conn, handle, raw + 7.0, excess + 7.0, level=50.0, ppy=ppy)
     assert registry.write_result(conn, handle, registry.ResultStatistics()) == "ok"
     return handle
 
@@ -434,6 +447,18 @@ def test_open_trial_captures_the_store_max_ingested_at(
     assert stored == _T0
 
 
+def test_store_max_ingested_at_tolerates_a_missing_fact_table(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """Defensive guard added alongside `health`'s (#660/T76 code review):
+    every caller here migrates first today, so `statement_facts` always
+    exists in practice, but `store_max_ingested_at` itself must not raise
+    `duckdb.CatalogException` if some future caller does not."""
+    _insert_fact(conn, _T0)
+    conn.execute("DROP TABLE statement_facts")
+    assert registry.store_max_ingested_at(conn) == _T0
+
+
 def _insert_fact(conn: duckdb.DuckDBPyConnection, ingested_at: datetime) -> None:
     insert_row(
         conn,
@@ -533,7 +558,7 @@ def test_detail_rows_are_written(
         for table in ("trial_metrics", "trial_equity", "trial_weights", "trial_rebalances")
     }
     assert counts == {
-        "trial_metrics": 4,
+        "trial_metrics": 7,  # `_metrics` writes seven rows
         "trial_equity": 2,
         "trial_weights": 2,
         "trial_rebalances": 1,
@@ -591,25 +616,128 @@ def test_a_handle_from_another_store_is_refused(
         registry.close_trial(other, handle, "failed")
 
 
-def _rebalance_row() -> registry.RebalanceRow:
-    return registry.RebalanceRow(
-        cost_per_side_bps=15.0,
-        session=date(2018, 1, 31),
-        fill_session=date(2018, 2, 1),
-        n_universe=10,
-        n_static_listings=1,
-        n_targets=2,
-        turnover=0.5,
-        cost_paid=0.001,
-        gap_count_share=0.01,
-        gap_size_share=0.001,
-        n_missing_fill=0,
-        n_delisting_exits=0,
-        n_stale_exits=0,
-        n_excluded_no_history=1,
-        n_dropped_dividends=0,
-        n_late_dividends=0,
+def _rebalance_row(**overrides: Any) -> registry.RebalanceRow:
+    defaults: dict[str, Any] = {
+        "cost_per_side_bps": 15.0,
+        "session": date(2018, 1, 31),
+        "fill_session": date(2018, 2, 1),
+        "n_universe": 10,
+        "n_static_listings": 1,
+        "n_targets": 2,
+        "turnover": 0.5,
+        "cost_paid": 0.001,
+        "gap_count_share": 0.01,
+        "gap_size_share": 0.001,
+        "n_missing_fill": 0,
+        "n_delisting_exits": 0,
+        "n_stale_exits": 0,
+        "counts": {"n_excluded_no_history": 1},
+        "n_dropped_dividends": 0,
+        "n_late_dividends": 0,
+    }
+    return registry.RebalanceRow(**{**defaults, **overrides})
+
+
+#: `schema.PROFITABILITY_REBALANCE_COLUMNS`, read back in the same order.
+_PROFITABILITY_READER = (
+    "SELECT n_ranked, n_excluded_no_facts, n_excluded_stale_facts, "
+    "n_excluded_sector, n_excluded_malformed, n_derived FROM trial_rebalances "
+    "WHERE trial_id = ?"
+)
+
+
+def test_a_rebalance_row_written_with_the_six_counts_reads_back(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A `profitability` trial's rebalance row carries its ranking and
+    exclusion counts (#720, #1033, T85d)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(
+        conn,
+        handle,
+        [
+            _rebalance_row(
+                counts={
+                    "n_ranked": 58,
+                    "n_excluded_no_facts": 12,
+                    "n_excluded_stale_facts": 3,
+                    "n_excluded_sector": 2,
+                    "n_excluded_malformed": 1,
+                    "n_derived": 4,
+                }
+            )
+        ],
     )
+    assert conn.execute(_PROFITABILITY_READER, [handle.trial_id]).fetchall() == [
+        (58, 12, 3, 2, 1, 4)
+    ]
+
+
+def test_a_rebalance_row_written_without_the_six_counts_reads_null(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A `momentum` trial never ranks or excludes by `statement_facts`/`sics`,
+    so its rebalance row leaves the six counts NULL, as it does today
+    (#720, #1033, T85d)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(conn, handle, [_rebalance_row()])
+    assert conn.execute(_PROFITABILITY_READER, [handle.trial_id]).fetchall() == [
+        (None, None, None, None, None, None)
+    ]
+
+
+_FIXED_COUNTS_READER = (
+    "SELECT cost_per_side_bps, n_excluded_no_history, n_ranked, n_excluded_no_facts, "
+    "n_excluded_stale_facts, n_excluded_sector, n_excluded_malformed, n_derived "
+    "FROM trial_rebalances WHERE trial_id = ? ORDER BY cost_per_side_bps"
+)
+
+
+def test_counts_are_one_table_row_per_name_and_equal_columns_on_every_level(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A rebalance's counts reach `trial_rebalance_counts` once (the base level,
+    15 bps here) and the fixed columns by name on every level's row, NULL for
+    a name not reported, so both reads agree (#1153, T127)."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    counts = {"n_ranked": 58, "n_excluded_sector": 2, "n_excluded_no_facts": 12}
+    for level in (0.0, 15.0):
+        registry.write_rebalances(
+            conn, handle, [_rebalance_row(cost_per_side_bps=level, counts=counts)]
+        )
+    assert registry.rebalance_counts(conn, handle.trial_id) == {date(2018, 1, 31): counts}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trial_rebalance_counts WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone() == (3,)
+    assert conn.execute(_FIXED_COUNTS_READER, [handle.trial_id]).fetchall() == [
+        (level, None, 58, 12, None, 2, None, None) for level in (0.0, 15.0)
+    ]
+
+
+def test_a_rebalance_without_counts_reads_null_columns_and_no_rows(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    registry.write_rebalances(conn, handle, [_rebalance_row(counts={})])
+    assert registry.rebalance_counts(conn, handle.trial_id) == {}
+    assert conn.execute(_FIXED_COUNTS_READER, [handle.trial_id]).fetchall() == [
+        (15.0, None, None, None, None, None, None, None)
+    ]
+
+
+def test_a_count_that_is_not_an_int_is_refused_before_any_write(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    for bad in (1.5, True, None):
+        with pytest.raises(TypeError, match="n_ranked"):
+            registry.write_rebalances(conn, handle, [_rebalance_row(counts={"n_ranked": bad})])
+    assert conn.execute("SELECT COUNT(*) FROM trial_rebalances").fetchone() == (0,)
 
 
 # --- owner decisions -----------------------------------------------------
@@ -674,10 +802,10 @@ def test_family_sharpes_counts_n_over_ok_in_sample_and_v_over_latest_per_pair(
     result = registry.family_sharpes(conn, "momentum")
 
     assert result.n_trials == 3
-    assert result.raw == (0.30, 0.20)
-    assert result.excess_spy == (0.03, 0.02)
-    assert result.variance("raw") == pytest.approx(statistics.variance([0.30, 0.20]))
-    assert result.variance("excess_spy") == pytest.approx(statistics.variance([0.03, 0.02]))
+    assert result.raw == _annual(0.30, 0.20)
+    assert result.excess_spy == _annual(0.03, 0.02)
+    assert result.variance("raw") == pytest.approx(12 * statistics.variance([0.30, 0.20]))
+    assert result.variance("excess_spy") == pytest.approx(12 * statistics.variance([0.03, 0.02]))
 
 
 def test_family_sharpes_with_one_pair_has_no_variance(
@@ -687,7 +815,7 @@ def test_family_sharpes_with_one_pair_has_no_variance(
     _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
     _ok_trial(conn, settings, tmp_path, 0.2, 0.02)
     result = registry.family_sharpes(conn, "momentum")
-    assert (result.n_trials, result.raw) == (2, (0.2,))
+    assert (result.n_trials, result.raw) == (2, _annual(0.2))
     assert result.variance("raw") is None
 
 
@@ -702,7 +830,7 @@ def test_family_sharpes_counts_a_pending_trial_as_the_latest_of_its_pair(
     assert registry.family_sharpes(conn, "momentum").n_trials == 2
     result = registry.family_sharpes(conn, "momentum", pending=pending)
     assert result.n_trials == 3
-    assert result.raw == (0.2, 0.5)
+    assert result.raw == _annual(0.2, 0.5)
 
 
 def test_requested_windows_that_resolve_alike_are_one_pair(
@@ -715,7 +843,7 @@ def test_requested_windows_that_resolve_alike_are_one_pair(
     _ok_trial(conn, settings, tmp_path, 0.3, 0.03, window=(date(2018, 1, 31), date(2022, 12, 31)))
     _ok_trial(conn, settings, tmp_path, 0.2, 0.02, window=_W2)
     result = registry.family_sharpes(conn, "momentum")
-    assert (result.n_trials, result.raw) == (3, (0.3, 0.2))
+    assert (result.n_trials, result.raw) == (3, _annual(0.3, 0.2))
 
 
 def test_family_sharpes_refuses_a_nan_sharpe(
@@ -747,7 +875,7 @@ def test_family_sharpes_reads_the_base_level_of_each_hypothesis(
     _metrics(conn, handle, 0.4, 0.04, level=5.0)
     _metrics(conn, handle, 0.9, 0.09, level=15.0)
     registry.write_result(conn, handle, registry.ResultStatistics())
-    assert registry.family_sharpes(conn, "momentum").raw == (0.4,)
+    assert registry.family_sharpes(conn, "momentum").raw == _annual(0.4)
 
 
 def test_family_sharpes_raises_when_an_ok_trial_lacks_its_base_sharpe(
@@ -756,13 +884,319 @@ def test_family_sharpes_raises_when_an_ok_trial_lacks_its_base_sharpe(
     _register(conn, settings)
     handle = _open(conn, settings, tmp_path)
     registry.write_result(conn, handle, registry.ResultStatistics())
-    with pytest.raises(registry.RegistryError, match="sharpe_monthly"):
+    with pytest.raises(registry.RegistryError, match="sharpe_period"):
         registry.family_sharpes(conn, "momentum")
 
 
-def test_family_sharpes_never_reads_an_annualized_value() -> None:
-    source = inspect.getsource(registry.family_sharpes) + inspect.getsource(registry._base_sharpes)
-    assert "annual" not in source
+def test_family_sharpes_reads_only_the_new_keys() -> None:
+    """The text check on the SQL (strategy-lab spec, "Metrics" acceptance): the
+    period Sharpes and `periods_per_year`, never a `*_monthly` key or `n_months`, and
+    never a stored annual Sharpe (the annualisation is the trial's own ppy)."""
+    source = (
+        inspect.getsource(registry.family_sharpes)
+        + inspect.getsource(registry._annual_sharpes)
+        + registry._COUNTED_FROM
+    )
+    read = " ".join(registry._BASIS_METRICS.values()) + " " + registry.PERIODS_PER_YEAR_METRIC
+    assert "monthly" not in source + read
+    assert "n_months" not in source
+    assert "sharpe_annual" not in source + read
+    assert set(registry._BASIS_METRICS.values()) == {"sharpe_period", "sharpe_period_excess_spy"}
+
+
+def test_family_sharpes_returns_monthly_and_weekly_trials_in_annual_units(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Each trial's period Sharpe times the square root of its own periods per year
+    (strategy-lab spec req 9), so V is over one unit across cadences."""
+    _register(conn, settings)
+    _register(
+        conn, settings, slug="weekly", params=_params(**{"schedule.rebalance_cadence": "week_end"})
+    )
+    _ok_trial(conn, settings, tmp_path, 0.25, 0.05)
+    _ok_trial(conn, settings, tmp_path, 0.12, 0.03, ppy=52.0, slug="weekly")
+    result = registry.family_sharpes(conn, "momentum")
+    assert result.n_trials == 2
+    assert result.raw == pytest.approx((0.25 * R12, 0.12 * math.sqrt(52)), rel=1e-12)
+    assert result.excess_spy == pytest.approx((0.05 * R12, 0.03 * math.sqrt(52)), rel=1e-12)
+
+
+def test_frozen_sets_differing_only_in_a_default_schedule_key_share_one_pair(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The V pair key is the canonical frozen set's hash (strategy-lab spec req 3):
+    a registration that writes `schedule.rebalance_cadence = month_end` out and one
+    that omits it are one pair; a changed strategy key is another."""
+    _register(conn, settings)
+    _register(
+        conn,
+        settings,
+        slug="explicit",
+        params=_params(**{"schedule.rebalance_cadence": "month_end"}),
+    )
+    _register(conn, settings, slug="tighter", params={**_params(), "strategy.top_fraction": 0.2})
+    assert (
+        registry.get_hypothesis(conn, "h1").params_sha256
+        != registry.get_hypothesis(conn, "explicit").params_sha256
+    )
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, slug="explicit")
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, result.raw) == (2, _annual(0.3))
+    _ok_trial(conn, settings, tmp_path, 0.2, 0.02, slug="tighter")
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, result.raw) == (3, _annual(0.3, 0.2))
+
+
+@pytest.mark.parametrize(
+    ("day", "cadence", "expected"),
+    [
+        (date(2024, 3, 1), "month_end", date(2024, 3, 28)),  # Good Friday: March ends Thu
+        (date(2024, 3, 29), "month_end", date(2024, 4, 30)),
+        (date(2024, 3, 25), "week_end", date(2024, 3, 28)),  # the Good Friday week
+        (date(2024, 3, 29), "week_end", date(2024, 4, 5)),  # the holiday itself: next week
+        (date(2025, 6, 30), "week_end", date(2025, 7, 3)),  # Independence Day week
+        (date(2024, 3, 22), "week_end", date(2024, 3, 22)),  # a week end is its own key
+        (date(2024, 3, 29), "daily", date(2024, 4, 1)),  # a holiday: the next session
+        (date(2024, 3, 30), "daily", date(2024, 4, 1)),  # a Saturday
+        (date(2024, 3, 26), "daily", date(2024, 3, 26)),
+    ],
+)
+def test_the_window_key_is_the_first_rebalance_session_at_the_cadence(
+    day: date, cadence: Cadence, expected: date
+) -> None:
+    assert registry._first_rebalance_on_or_after(day, cadence) == expected
+
+
+@pytest.mark.parametrize(
+    ("cadence", "same_pair", "next_pair"),
+    [
+        # Tue 2018-01-02 and Fri 2018-01-05 share the first ISO week's key; Mon 01-08 does not.
+        ("week_end", date(2018, 1, 5), date(2018, 1, 8)),
+        # Sat 2018-01-06 resolves to Mon 01-08; Tue 01-09 is its own key.
+        ("daily", date(2018, 1, 6), date(2018, 1, 9)),
+    ],
+)
+def test_family_sharpes_keys_a_window_by_the_first_rebalance_at_its_cadence(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    cadence: str,
+    same_pair: date,
+    next_pair: date,
+) -> None:
+    """Strategy-lab spec req 6 (plan T110): the V pair's window is the first rebalance
+    session **at the hypothesis's frozen cadence** on or after the requested start.
+    Under the month key all three starts would be one January pair."""
+    first = {"week_end": date(2018, 1, 2), "daily": date(2018, 1, 8)}[cadence]
+    end = _W1[1]
+    _register(conn, settings, params=_params(**{"schedule.rebalance_cadence": cadence}))
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, ppy=52.0, window=(first, end))
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, ppy=52.0, window=(same_pair, end))
+    result = registry.family_sharpes(conn, "momentum")
+    assert (result.n_trials, len(result.raw)) == (2, 1)
+    _ok_trial(conn, settings, tmp_path, 0.2, 0.02, ppy=52.0, window=(next_pair, end))
+    result = registry.family_sharpes(conn, "momentum")
+    assert result.n_trials == 3
+    assert result.raw == pytest.approx((0.3 * math.sqrt(52), 0.2 * math.sqrt(52)), rel=1e-12)
+
+
+def test_a_pre_lab_registration_keys_its_window_by_month(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A registration with no stored `schedule.*` reads `month_end` through
+    `frozen_values`: starts in one month are one pair, as in Phase 3."""
+    _register(conn, settings)
+    assert not any(k.startswith("schedule.") for k in registry.get_hypothesis(conn, "h1").params)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, window=(date(2018, 1, 2), _W1[1]))
+    _ok_trial(conn, settings, tmp_path, 0.3, 0.03, window=(date(2018, 1, 9), _W1[1]))
+    assert registry.family_sharpes(conn, "momentum").raw == _annual(0.3)
+
+
+@pytest.mark.parametrize("ppy", [None, 0.0, float("nan")])
+def test_family_sharpes_refuses_a_trial_without_a_positive_periods_per_year(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path, ppy: float | None
+) -> None:
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01, ppy=ppy)
+    with pytest.raises(registry.RegistryError, match="periods_per_year"):
+        registry.family_sharpes(conn, "momentum")
+
+
+def test_count_counted_trials_matches_family_sharpes(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    _ok_trial(conn, settings, tmp_path, 9.0, 9.0, synthetic=True)
+    pending = _open(conn, settings, tmp_path)
+    _metrics(conn, pending, 0.5, 0.05)
+    for p in (None, pending):
+        assert (
+            registry.count_counted_trials(conn, "momentum", p)
+            == registry.family_sharpes(conn, "momentum", pending=p).n_trials
+        )
+    assert registry.count_counted_trials(conn, "momentum", pending) == 2
+
+
+# --- vintages ------------------------------------------------------------------
+
+
+def _price(conn: duckdb.DuckDBPyConnection, sid: str, known: datetime, ingested: datetime) -> None:
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": sid,
+            "session": known.date(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "known_at": known,
+            "ingested_at": ingested,
+            "source": "test",
+            "provenance": "bar",
+        },
+    )
+
+
+def test_data_vintage_is_the_latest_ingest_of_facts_known_at_the_cutoff(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A later session's ingest leaves it unchanged; a late fact for an in-window
+    session changes it (strategy-lab spec, Definitions "Vintage")."""
+    cutoff = datetime(2024, 6, 28, 20, 0, tzinfo=UTC)
+    assert registry.data_vintage(conn, cutoff) is None
+    known = datetime(2024, 6, 27, 20, 0, tzinfo=UTC)
+    first = datetime(2024, 6, 28, 1, 0, tzinfo=UTC)
+    _price(conn, "A", known, first)
+    assert registry.data_vintage(conn, cutoff) == first
+    nightly = datetime(2024, 7, 2, 1, 0, tzinfo=UTC)
+    _price(conn, "A", datetime(2024, 7, 1, 20, 0, tzinfo=UTC), nightly)
+    assert registry.data_vintage(conn, cutoff) == first
+    late = datetime(2024, 7, 3, 1, 0, tzinfo=UTC)
+    _price(conn, "B", known, late)
+    assert registry.data_vintage(conn, cutoff) == late
+    with pytest.raises(ValueError, match="timezone"):
+        registry.data_vintage(conn, datetime(2024, 6, 28, 20, 0))  # noqa: DTZ001
+
+
+def test_open_trial_records_the_data_vintage_at_its_cutoff(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    ingested = _T0.replace(hour=1)
+    _price(conn, "A", _T0.replace(hour=0), ingested)
+    handle = _open(conn, settings, tmp_path)
+    row = conn.execute(
+        "SELECT detail_level, data_vintage, code_tree_sha256 FROM trials WHERE trial_id = ?",
+        [handle.trial_id],
+    ).fetchone()
+    assert row == ("full", ingested, None)  # tmp_path is no checkout
+
+
+def test_open_trial_records_the_detail_level_it_is_given(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """#1197: `full` by default; a sweep variant opened at `summary` reads `summary`
+    on its `trials` row and its handle; an unknown level is refused before the row."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path, detail_level="summary")
+    row = conn.execute(
+        "SELECT detail_level FROM trials WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone()
+    assert row == ("summary",) and handle.detail_level == "summary"
+    assert _open(conn, settings, tmp_path).detail_level == "full"
+    with pytest.raises(ValueError, match="detail level"):
+        _open(conn, settings, tmp_path, detail_level="partial")
+    assert conn.execute("SELECT COUNT(*) FROM trials").fetchone() == (2,)
+
+
+def test_write_result_fails_on_an_in_window_fact_inserted_mid_run(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Backtest spec req 9 as amended (strategy-lab amendment 7, #1232): a late
+    fact known at or before the cutoff moves the data vintage and fails the run."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "B", _T0, _T0.replace(hour=13))  # known_at == cutoff is in the window
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "failed"
+    row = conn.execute("SELECT status, message, dsr FROM trial_results").fetchone()
+    assert row == ("failed", registry.STORE_CHANGED_MESSAGE, None)
+
+
+def test_write_result_keeps_a_run_when_only_a_session_after_the_cutoff_is_ingested(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A nightly ingest of a later session moves `store_max_ingested_at` but not the
+    data vintage at the trial's cutoff, so it fails nothing (#1232)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "A", _AFTER_CUTOFF, _AFTER_CUTOFF.replace(hour=23))
+    assert registry.store_max_ingested_at(conn) != handle.store_max_ingested_at
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "ok"
+    row = conn.execute("SELECT status, message, dsr FROM trial_results").fetchone()
+    assert row == ("ok", None, 0.9)
+
+
+def test_write_result_falls_back_to_the_store_max_without_a_recorded_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A trial opened with no fact known at its cutoff (no data vintage) keeps the
+    Phase 3 rule: any ingest fails it."""
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    _price(conn, "A", _AFTER_CUTOFF, _AFTER_CUTOFF.replace(hour=23))
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "failed"
+
+
+def test_code_tree_sha256_hashes_package_sources_and_the_lock_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src" / "tradepartner").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    _git(repo, "init", "-q")
+    module = repo / "src" / "tradepartner" / "m.py"
+    module.write_text("x = 1\n")
+    (repo / "uv.lock").write_text("lock 1\n")
+    (repo / "docs" / "d.md").write_text("doc\n")
+    (repo / "src" / "tradepartner" / "data.toml").write_text("a = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "c")
+    base = registry.code_tree_sha256(repo)
+    assert base is not None and re.fullmatch(r"[0-9a-f]{64}", base)
+    assert registry.code_tree_sha256(repo / "docs") == base  # any directory in the checkout
+    (repo / "docs" / "d.md").write_text("changed doc\n")
+    (repo / "src" / "tradepartner" / "data.toml").write_text("a = 2\n")
+    (repo / "src" / "tradepartner" / "__pycache__").mkdir()
+    (repo / "src" / "tradepartner" / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\0")
+    (repo / "src" / "tradepartner" / "untracked.py").write_text("y = 2\n")
+    assert registry.code_tree_sha256(repo) == base
+    module.write_text("x = 2\n")  # uncommitted source change counts
+    changed = registry.code_tree_sha256(repo)
+    assert changed != base
+    module.write_text("x = 1\n")
+    (repo / "uv.lock").write_text("lock 2\n")
+    assert registry.code_tree_sha256(repo) not in (base, changed)
+
+
+def test_code_tree_sha256_is_none_outside_a_checkout(tmp_path: Path) -> None:
+    assert registry.code_tree_sha256(tmp_path) is None
+
+
+def test_result_rows_record_the_annual_sharpe_unit(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    ok = _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    failed = _open(conn, settings, tmp_path)
+    registry.close_trial(conn, failed, "failed", "boom")
+    units = conn.execute("SELECT sharpe_unit FROM trial_results ORDER BY trial_id").fetchall()
+    assert units == [("annual",), ("annual",)]
+    assert ok.trial_id < failed.trial_id
 
 
 # --- holdout spends and listing ------------------------------------------
@@ -846,3 +1280,507 @@ def test_code_version_defaults_to_this_checkout() -> None:
     version, dirty = registry.code_version()
     assert re.fullmatch(r"[0-9a-f]{40}", version)
     assert isinstance(dirty, bool)
+
+
+def test_a_store_without_the_version_15_columns_records_trials_without_them(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """A store written through the registry before `init_schema` migrated it (a
+    test's version-4 store) still records trials; only the new columns are absent."""
+    for table, column in (
+        ("trials", "detail_level"),
+        ("trials", "data_vintage"),
+        ("trials", "code_tree_sha256"),
+        ("trial_results", "sharpe_unit"),
+    ):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    _register(conn, settings)
+    handle = _ok_trial(conn, settings, tmp_path, 0.1, 0.01)
+    assert conn.execute(
+        "SELECT status FROM trial_results WHERE trial_id = ?", [handle.trial_id]
+    ).fetchone() == ("ok",)
+
+
+# --- named data releases (#1319, data-foundation plan T140b) --------------------------
+
+#: A runbook entry pair as `data/releases.toml` holds it (tomllib's types).
+_BEFORE = {
+    "name": "repair-13-tickers",
+    "stage": "before",
+    "made_at": datetime(2026, 9, 26, 14, 5, tzinfo=UTC),
+    "backup_path": "data/tradepartner.repair-13-tickers.duckdb",
+    "store_max_ingested_at": datetime(2026, 9, 26, 5, 48, tzinfo=UTC),
+    "data_vintage": datetime(2026, 9, 26, 5, 48, tzinfo=UTC),
+    "cutoff": datetime(2026, 9, 25, 20, 0, tzinfo=UTC),
+    "sessions_from": date(2026, 9, 1),
+    "sessions_to": date(2026, 9, 25),
+    "reason": "#1314: repair",
+}
+_AFTER = {
+    **{k: v for k, v in _BEFORE.items() if k != "backup_path"},
+    "stage": "after",
+    "made_at": datetime(2026, 9, 26, 15, 0, tzinfo=UTC),
+}
+
+
+def _open_release(conn: duckdb.DuckDBPyConnection, name: str = "repair-a") -> int:
+    # The registry reads the backup's latest `ingested_at` only; the store itself
+    # stands in for its own copy here (the CLI refuses that, `tests/test_cli.py`).
+    return registry.open_data_release(
+        conn, conn, name=name, backup_path=f"data/tradepartner.{name}.duckdb", reason="#1 fix"
+    )
+
+
+def test_the_version_18_kinds_are_recorded_by_their_writers(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    decision_id = registry.write_development_boundary(conn, boundary=date(2023, 12, 29), reason="r")
+    assert conn.execute(
+        "SELECT kind FROM owner_decisions WHERE decision_id = ?", [decision_id]
+    ).fetchone() == ("development_boundary",)
+    # A development_boundary row has one writer, so every boundary passes its refusals
+    # (T142b).
+    with pytest.raises(ValueError, match="write_development_boundary only"):
+        registry.record_decision(
+            conn, kind="development_boundary", reason="r", values={"date": "2023-12-29"}
+        )
+    # A data_release row has one writer per stage, so `data_vintage` can parse it.
+    with pytest.raises(ValueError, match="release writers only"):
+        registry.record_decision(conn, kind="data_release", reason="r", values={})
+    assert registry.data_releases(conn) == []
+
+
+def test_open_and_close_a_release(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.open_release(conn) is None and registry.data_releases(conn) == []
+    _price(conn, "A", _T0, _T0.replace(hour=13))
+    before_id = _open_release(conn)
+    opened = registry.open_release(conn)
+    assert opened is not None and opened.decision_id == before_id
+    assert (opened.name, opened.stage, opened.reason) == ("repair-a", "before", "#1 fix")
+    assert opened.store_max_ingested_at == _T0.replace(hour=13)
+    assert opened.backup_path == "data/tradepartner.repair-a.duckdb"
+    assert opened.sessions_from is None and opened.imported_at is None
+    after_id = registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    assert registry.open_release(conn) is None
+    after, before = registry.data_releases(conn)  # newest first
+    assert (after.decision_id, before.decision_id) == (after_id, before_id)
+    assert after.stage == "after" and after.reason == "#1 fix"  # the before's, by default
+    assert (after.sessions_from, after.sessions_to) == (date(2026, 9, 1), date(2026, 9, 25))
+    assert after.cutoff == datetime(2026, 9, 25, 20, 0, tzinfo=UTC)  # the session close
+    assert after.data_vintage == _T0.replace(hour=13)  # read before the row was written
+    assert after.backup_path is None
+
+
+def test_one_release_is_open_at_a_time(conn: duckdb.DuckDBPyConnection) -> None:
+    _open_release(conn)
+    with pytest.raises(registry.ReleaseRefused, match="'repair-a' is open"):
+        _open_release(conn, "repair-b")
+    with pytest.raises(registry.ReleaseRefused, match="cannot close 'repair-b'"):
+        registry.close_data_release(
+            conn, name="repair-b", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+        )
+    for start, end, match in (
+        (date(2026, 9, 5), date(2026, 9, 25), "not an XNYS session"),  # a Saturday
+        (date(2026, 9, 25), date(2026, 9, 1), "is after"),
+    ):
+        with pytest.raises(registry.ReleaseRefused, match=match):
+            registry.close_data_release(conn, name="repair-a", sessions_from=start, sessions_to=end)
+    registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    with pytest.raises(registry.ReleaseRefused, match="already recorded"):
+        _open_release(conn)  # a name is used once
+    with pytest.raises(registry.ReleaseRefused, match="lowercase"):
+        _open_release(conn, "Repair_B")
+    _open_release(conn, "repair-b")
+    assert conn.execute("SELECT COUNT(*) FROM owner_decisions").fetchone() == (3,)
+
+
+def test_open_refuses_a_backup_that_is_not_the_store_state(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    stale = _connect(tmp_path / "old-backup.duckdb")
+    _price(stale, "A", _T0, _T0.replace(hour=13))
+    _price(conn, "A", _T0, _T0.replace(hour=14))
+    with pytest.raises(registry.ReleaseRefused, match="not the store's state"):
+        registry.open_data_release(conn, stale, name="repair-a", backup_path="x", reason="r")
+    assert registry.open_release(conn) is None
+
+
+def test_a_delete_only_release_stales_the_trials_whose_window_it_touched(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The plan line's vintage rule: `data_vintage` takes the `made_at` of every
+    `after` row whose `sessions_from` is on or before the cutoff, so a release that
+    only deletes rows (no `ingested_at` moves) stales the in-window trials; a trial
+    whose cutoff precedes the touched sessions stays current, and a trial opened
+    after the close captured the new vintage and stays current too."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    _price(conn, "B", datetime(2026, 8, 3, 20, tzinfo=UTC), _T0.replace(hour=1))
+    in_window = _open(conn, settings, tmp_path)  # cutoff _T0, 2026-09-25
+    early_cutoff = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    early = registry.data_vintage(conn, early_cutoff)
+    assert registry.data_vintage(conn, _T0) == in_window.data_vintage == _T0.replace(hour=1)
+    _open_release(conn)
+    conn.execute("DELETE FROM prices_daily WHERE security_id = 'A'")  # the repair
+    assert registry.data_vintage(conn, _T0) == in_window.data_vintage  # deletion unseen
+    registry.close_data_release(
+        conn, name="repair-a", sessions_from=date(2026, 9, 1), sessions_to=date(2026, 9, 25)
+    )
+    (after, _) = registry.data_releases(conn)
+    assert registry.data_vintage(conn, _T0) == after.made_at != in_window.data_vintage
+    assert registry.data_vintage(conn, early_cutoff) == early  # before the touched sessions
+    assert registry.write_result(conn, in_window, registry.ResultStatistics()) == "failed"
+    later = _open(conn, settings, tmp_path)
+    assert later.data_vintage == after.made_at == registry.data_vintage(conn, _T0)
+    assert registry.write_result(conn, later, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
+def test_an_imported_after_row_moves_no_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """#1321 pass-2 follow-up: a trial opened after a hand-recorded release read the
+    repaired store; importing that release's `after` row must not stale it (its
+    in-window trials were rerun by hand under the runbook's rule)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    trial = _open(conn, settings, tmp_path)
+    (group,) = registry.plan_release_import(conn, [_BEFORE, _AFTER])
+    registry.import_release(conn, group)
+    assert registry.data_vintage(conn, _T0) == trial.data_vintage
+    assert registry.write_result(conn, trial, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
+def test_record_rows_are_never_open_and_say_whether_the_vintage_matches(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """The back-fill (runbook): the vintage is read on the backup at the trial's
+    cutoff and compared with the trial's, and the backup's repair runs since the
+    trial are listed (#1321 pass-2 follow-up)."""
+    _register(conn, settings)
+    _price(conn, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    trial = _open(conn, settings, tmp_path)
+    backup = _connect(tmp_path / "backup.duckdb")
+    _price(backup, "A", _T0.replace(hour=0), _T0.replace(hour=1))
+    for run_id, started, mode in (
+        ("r-old", _T0.replace(year=2025), "repair"),
+        ("r-new", datetime(2026, 12, 1, tzinfo=UTC), "repair"),
+        ("i-new", datetime(2026, 12, 1, tzinfo=UTC), "session"),
+    ):
+        insert_row(
+            backup,
+            "ingestion_runs",
+            {
+                "run_id": run_id,
+                "started_at": started,
+                "status": "repaired",
+                "source": "alpaca",
+                "mode": mode,
+                "rows_added": 0,
+            },
+        )
+    registry.record_trial_state(
+        conn,
+        backup,
+        name="pre-sweep",
+        backup_path="b.duckdb",
+        trial_id=trial.trial_id,
+        reason="back-fill",
+    )
+    _price(backup, "B", _T0, datetime(2026, 9, 26, tzinfo=UTC))  # the backup moved on
+    registry.record_trial_state(
+        conn,
+        backup,
+        name="pre-sweep-2",
+        backup_path="b.duckdb",
+        trial_id=trial.trial_id,
+        reason="back-fill",
+    )
+    assert registry.open_release(conn) is None
+    second, first = registry.data_releases(conn)
+    assert first.values["vintage_equals_trial"] is True
+    assert second.values["vintage_equals_trial"] is False
+    assert [run["run_id"] for run in first.values["repair_runs"]] == ["r-new"]
+    assert (first.trial, first.cutoff, first.sessions_from) == (trial.trial_id, _T0, _W1[0])
+    assert conn.execute(
+        "SELECT trial_id FROM owner_decisions WHERE decision_id = ?", [first.decision_id]
+    ).fetchone() == (trial.trial_id,)
+    with pytest.raises(registry.ReleaseRefused, match="does not exist"):
+        registry.record_trial_state(
+            conn, backup, name="pre-sweep-3", backup_path="b", trial_id=99, reason="r"
+        )
+    _open_release(conn)  # a record never blocks an open
+
+
+def test_the_import_checks_every_entry_before_writing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    trial = _open(conn, settings, tmp_path)
+    record = {
+        **_BEFORE,
+        "name": "pre-sweep-20261008",
+        "stage": "record",
+        "made_at": datetime(2026, 9, 26, 9, 0, tzinfo=UTC),
+        "trial": trial.trial_id,
+    }
+    groups = registry.plan_release_import(conn, [_BEFORE, record, _AFTER])
+    assert [[e["stage"] for e in g] for g in groups] == [["before", "after"], ["record"]]
+    for group in groups:
+        registry.import_release(conn, group)
+    rows = registry.data_releases(conn)
+    assert [(r.name, r.stage) for r in rows] == [
+        ("repair-13-tickers", "after"),
+        ("repair-13-tickers", "before"),
+        ("pre-sweep-20261008", "record"),
+    ]  # by the entries' own made_at, newest first
+    assert all(r.imported_at is not None for r in rows)
+    assert rows[1].made_at == _BEFORE["made_at"] and rows[1].sessions_to == date(2026, 9, 25)
+    assert registry.open_release(conn) is None
+    # A second import of the same file writes nothing.
+    with pytest.raises(registry.ReleaseRefused, match="already stored"):
+        registry.plan_release_import(conn, [_BEFORE, record, _AFTER])
+    with pytest.raises(registry.ReleaseRefused, match="already stored"):
+        registry.import_release(conn, groups[0])
+    assert len(registry.data_releases(conn)) == 3
+
+
+@pytest.mark.parametrize(
+    ("entries", "match"),
+    [
+        ([_AFTER], "an after entry with no before"),
+        ([_BEFORE, _BEFORE], "the file has 2 before entries"),
+        ([{**_BEFORE, "stage": "during"}], "stage 'during'"),
+        ([{**_BEFORE, "made_at": _BEFORE["made_at"].replace(tzinfo=None)}], "a UTC"),
+        ([{**_BEFORE, "sessions_from": datetime(2026, 9, 1, tzinfo=UTC)}], "must be a date"),
+        ([{k: v for k, v in _BEFORE.items() if k != "backup_path"}], "lacks"),
+        ([{**_BEFORE, "colour": "red"}], "unknown keys"),
+        ([{**_BEFORE, "name": "Bad Name"}], "lowercase"),
+        ([_BEFORE, {**_BEFORE, "name": "other"}], "would leave 2 releases open"),
+        ([_BEFORE, {**_AFTER, "made_at": datetime(2026, 9, 1, tzinfo=UTC)}], "made before"),
+        ([{**_BEFORE, "stage": "record", "trial": 7}], "trial 7 does not exist"),
+        ([1, "x"], "entry 1 is not a table"),
+        (
+            [{**_BEFORE, "made_at": datetime.fromisoformat("2026-09-26T16:05:00+02:00")}],
+            "a UTC",
+        ),
+        (
+            [{**_BEFORE, "stage": "record", "trial": 1}, {**_AFTER}],
+            "shares its name",
+        ),
+    ],
+)
+def test_the_import_refuses_an_entry_that_breaks_the_runbook(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    entries: list[dict[str, Any]],
+    match: str,
+) -> None:
+    _register(conn, settings)
+    _open(conn, settings, tmp_path)  # trial 1
+    with pytest.raises(registry.ReleaseRefused, match=match):
+        registry.plan_release_import(conn, entries)
+    assert registry.data_releases(conn) == []
+
+
+def test_the_import_refuses_a_second_open_release_beside_the_stores(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _open_release(conn)
+    with pytest.raises(registry.ReleaseRefused, match="would leave 2 releases open"):
+        registry.plan_release_import(conn, [_BEFORE])
+
+
+def test_development_boundary_is_the_newest_row(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.development_boundary(conn) is None
+    for day in (date(2023, 12, 29), date(2022, 12, 30)):
+        registry.write_development_boundary(conn, boundary=day, reason=f"set {day}")
+    boundary = registry.development_boundary(conn)
+    assert boundary is not None
+    assert (boundary.boundary, boundary.reason) == (date(2022, 12, 30), "set 2022-12-30")
+
+
+def test_the_import_refuses_an_after_for_a_release_opened_by_command(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """quant-auditor on #1336: an imported `after` moves no vintage, so it may not
+    close a release `open` wrote; that one closes with `close`."""
+    _open_release(conn, "repair-13-tickers")
+    with pytest.raises(registry.ReleaseRefused, match="written by `open`"):
+        registry.plan_release_import(conn, [_AFTER])
+    assert [r.stage for r in registry.data_releases(conn)] == ["before"]
+
+
+def test_the_import_refuses_an_after_made_since_the_version_18_migration(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """quant-auditor pass 2 on #1336: once the store has the commands, a hand-written
+    `after` would hide a delete-only repair from the vintage; only `close` records it."""
+    (migrated,) = conn.execute(  # type: ignore[misc]
+        "SELECT applied_at FROM schema_version WHERE version = 18"
+    ).fetchone()
+    late = {**_AFTER, "made_at": migrated + (_AFTER["made_at"] - _BEFORE["made_at"])}
+    with pytest.raises(registry.ReleaseRefused, match="gained the release commands"):
+        registry.plan_release_import(conn, [_BEFORE, late])
+    assert registry.data_releases(conn) == []
+
+
+# --- the development boundary (ADR 0016 points 1, 2 and 6; plan T142b) -------------
+
+
+def _family(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    family: str,
+    in_sample_start: date,
+    holdout: tuple[date, date],
+) -> registry.HypothesisRecord:
+    return registry.register_hypothesis(
+        conn,
+        slug=f"{family}-h",
+        family=family,
+        title=family,
+        doc_path=f"docs/hypotheses/{family}-h.md",
+        doc_sha256="d" * 64,
+        params=_params(),
+        in_sample_start=in_sample_start,
+        holdout_start=holdout[0],
+        holdout_end=holdout[1],
+        registered_by="owner",
+        settings=settings,
+    )
+
+
+@pytest.fixture
+def families(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> duckdb.DuckDBPyConnection:
+    """Today's families: momentum's spent holdout, profitability's unspent one on the
+    same months, and a forward one (combined, registered before its holdout starts)."""
+    _family(conn, settings, "momentum", date(2020, 8, 31), (date(2024, 1, 1), date(2026, 9, 30)))
+    spend = _open(conn, settings, tmp_path, "momentum-h", kind="holdout")
+    registry.close_trial(conn, spend, "failed", "spent")
+    _family(
+        conn, settings, "profitability", date(2020, 8, 31), (date(2024, 1, 1), date(2026, 9, 30))
+    )
+    _family(conn, settings, "combined", date(2021, 1, 29), (date(2099, 1, 1), date(2099, 6, 30)))
+    return conn
+
+
+def _boundaries(conn: duckdb.DuckDBPyConnection) -> int:
+    (n,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM owner_decisions WHERE kind = 'development_boundary'"
+    ).fetchone()
+    return int(n)
+
+
+@pytest.mark.parametrize(
+    ("day", "named"),
+    [
+        # Momentum's spent holdout.start and profitability's unspent one (#1333).
+        (date(2024, 1, 1), "momentum (2024-01-01), profitability (2024-01-01)"),
+        (date(2025, 6, 30), "momentum (2024-01-01), profitability (2024-01-01)"),
+        # A date past every historical exam still reaches the forward one.
+        (date(2099, 1, 1), "combined (2099-01-01), momentum"),
+    ],
+)
+def test_a_boundary_on_or_after_any_holdout_start_is_refused(
+    families: duckdb.DuckDBPyConnection, day: date, named: str
+) -> None:
+    with pytest.raises(registry.BoundaryRefused, match=re.escape(named)):
+        registry.write_development_boundary(families, boundary=day, reason="r")
+    assert _boundaries(families) == 0
+
+
+@pytest.mark.parametrize(
+    ("day", "named"),
+    [
+        (date(2019, 12, 31), "combined (2021-01-29), momentum (2020-08-31), profitability"),
+        (date(2020, 8, 31), "combined (2021-01-29), momentum (2020-08-31), profitability"),
+        # The orchestrator's reading on #1343: before ANY family's in_sample_start, not
+        # every family's. A family starting later than the others decides alone.
+        (date(2020, 12, 31), "of combined (2021-01-29):"),
+        (date(2021, 1, 29), "of combined (2021-01-29):"),
+    ],
+)
+def test_a_boundary_on_or_before_any_in_sample_start_is_refused(
+    families: duckdb.DuckDBPyConnection, day: date, named: str
+) -> None:
+    with pytest.raises(registry.BoundaryRefused, match=re.escape(named)):
+        registry.write_development_boundary(families, boundary=day, reason="r")
+    assert _boundaries(families) == 0
+
+
+def test_the_recommended_boundary_is_written_and_oracle_is_not_read(
+    families: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _family(
+        families, settings, "oracle", date(2023, 12, 1), (date(2023, 12, 4), date(2023, 12, 29))
+    )
+    decision_id = registry.write_development_boundary(
+        families, boundary=date(2023, 12, 29), reason="ADR 0016"
+    )
+    found = registry.development_boundary(families)
+    assert found is not None
+    assert (found.decision_id, found.boundary, found.reason) == (
+        decision_id,
+        date(2023, 12, 29),
+        "ADR 0016",
+    )
+    with pytest.raises(ValueError, match="needs a reason"):
+        registry.write_development_boundary(families, boundary=date(2023, 6, 30), reason=" ")
+
+
+def test_open_trial_records_the_boundary_in_force(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    before = _open(conn, settings, tmp_path)
+    registry.write_development_boundary(conn, boundary=date(2022, 12, 30), reason="r")
+    after = _open(conn, settings, tmp_path)
+    rows = conn.execute(
+        "SELECT trial_id, development_boundary FROM trials ORDER BY trial_id"
+    ).fetchall()
+    assert rows == [(before.trial_id, None), (after.trial_id, date(2022, 12, 30))]
+
+
+def test_family_registered_on_is_the_first_registration_day(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert registry.family_registered_on(conn, "momentum") is None
+    first = _register(conn, settings)
+    _register(conn, settings, slug="h2", params=_params(20.0))
+    conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE hypothesis_id = ?",
+        [datetime(2026, 9, 1, 23, 30, tzinfo=UTC), first.hypothesis_id],
+    )
+    assert registry.family_registered_on(conn, "momentum") == date(2026, 9, 1)
+
+
+def test_a_boundary_leaving_no_rebalance_session_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """code-review on #1345: a boundary after in_sample_start but before its first
+    month-end rebalance would leave an empty default window."""
+    _family(conn, settings, "momentum", date(2010, 1, 4), (date(2024, 1, 1), date(2026, 9, 30)))
+    with pytest.raises(registry.BoundaryRefused, match=r"momentum-h \(month_end from 2010-01-04\)"):
+        registry.write_development_boundary(conn, boundary=date(2010, 1, 15), reason="r")
+    assert _boundaries(conn) == 0
+    registry.write_development_boundary(conn, boundary=date(2010, 1, 29), reason="r")
+
+
+@pytest.mark.parametrize("start", [date(2023, 12, 20), date(2024, 2, 1), date(2023, 12, 4)])
+def test_a_registration_with_an_empty_default_window_is_refused(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, start: date
+) -> None:
+    """ADR 0016 point 2 at the one registration writer: an in_sample_start on or after
+    the boundary, or with no month-end rebalance on or before it, is refused."""
+    registry.write_development_boundary(conn, boundary=date(2023, 12, 20), reason="r")
+    with pytest.raises(registry.BoundaryRefused, match="development boundary 2023-12-20"):
+        _family(conn, settings, "momentum", start, (date(2024, 1, 1), date(2026, 9, 30)))
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+    _family(conn, settings, "momentum", date(2023, 11, 30), (date(2024, 1, 1), date(2026, 9, 30)))

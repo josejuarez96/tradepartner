@@ -15,16 +15,23 @@ import importlib.util
 import re
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
 from conftest import load_universe_fixtures
 from dateutil.relativedelta import relativedelta
 
-from tradepartner.calendar import is_session, next_session, previous_session, session_close
-from tradepartner.config import MasterConfig, UniverseConfig
+from tradepartner.calendar import (
+    is_half_day,
+    is_session,
+    next_session,
+    previous_session,
+    session_close,
+)
+from tradepartner.config import MasterConfig, ProfitabilityConfig, UniverseConfig
 from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
 
@@ -83,13 +90,38 @@ _CSV_TABLES = (
     "prices_daily",
     "corporate_actions",
     "facts",
+    "statement_facts",
 )
+
+#: Every statement-facts fixture case (#660, T76) as a keyword that must
+#: appear in the README's "Statement facts" section, mirroring
+#: `_REQ13_CASE_KEYWORDS` above.
+_STATEMENT_FACTS_CASE_KEYWORDS = [
+    "Plain issuer",
+    "Derived gross profit",
+    "Restated revenue",
+    "10-K/A first carrier",
+    "Dual-class cik",
+    "No securities row yet",
+    "Profitability baseline",
+    "10-K accepted after close(T_i)",
+    "Restated FY (profitability)",
+    "total_assets accepted after its gross-profit filing",
+    "Acceptance stamps on an ordinary month-end",
+    "Acceptance stamps on the half-day month-end",
+]
 
 
 def test_readme_documents_every_req13_case() -> None:
     readme = (_FIXTURES_DIR / "README.md").read_text()
     missing = [kw for kw in _REQ13_CASE_KEYWORDS if kw not in readme]
     assert not missing, f"README missing case(s): {missing}"
+
+
+def test_readme_documents_every_statement_facts_case() -> None:
+    readme = (_FIXTURES_DIR / "README.md").read_text()
+    missing = [kw for kw in _STATEMENT_FACTS_CASE_KEYWORDS if kw not in readme]
+    assert not missing, f"README missing statement-facts case(s): {missing}"
 
 
 def test_regeneration_is_byte_identical(tmp_path: Path) -> None:
@@ -150,11 +182,16 @@ _DATE_COLUMNS = {
     "prices_daily": {"session"},
     "corporate_actions": {"ex_date"},
     "facts": {"as_of_date"},
+    "statement_facts": {"period_end"},
 }
 _TZ_COLUMNS_COMMON = {"known_at", "ingested_at"}
 _EXTRA_TZ_COLUMNS = {"delistings": {"filed_at"}}
 #: Nullable timestamp columns: an empty cell is NULL, a set one needs an offset.
 _NULLABLE_TZ_COLUMNS = {"corporate_actions": {"announced_at"}}
+#: Nullable date columns: an empty cell is NULL (statement_facts.period_start,
+#: NULL exactly for an instant fact -- spec "Statement facts" > Schema), a
+#: set one still needs a bare YYYY-MM-DD.
+_NULLABLE_DATE_COLUMNS = {"statement_facts": {"period_start"}}
 
 
 def test_timestamp_and_date_cell_formats() -> None:
@@ -181,6 +218,11 @@ def test_timestamp_and_date_cell_formats() -> None:
                 assert _BARE_DATE_PATTERN.fullmatch(value), (
                     f"{table}.csv:{i} column {column} = {value!r} is not a bare date"
                 )
+            for column in _NULLABLE_DATE_COLUMNS.get(table, set()):
+                value = row[column]
+                assert not value or _BARE_DATE_PATTERN.fullmatch(value), (
+                    f"{table}.csv:{i} column {column} = {value!r} is not a bare date"
+                )
 
 
 @pytest.mark.parametrize(
@@ -196,6 +238,10 @@ def test_timestamp_and_date_cell_formats() -> None:
             ("security_id", "action_type", "ex_date", "source_action_id", "known_at"),
         ),
         ("facts", ("security_id", "fact_name", "as_of_date", "class_member", "known_at")),
+        # No known_at: statement_facts holds one vintage per key for ever
+        # (spec "Statement facts" > Schema), the deliberate exception to
+        # every other table's known_at-keyed uniqueness above.
+        ("statement_facts", ("cik", "fact_name", "period_end", "period_days")),
     ],
 )
 def test_no_unique_key_violations(table: str, unique_cols: tuple[str, ...]) -> None:
@@ -520,3 +566,157 @@ def test_boundary_delisting_gap_equals_threshold_exactly() -> None:
         day = next_session(day)
         gap += 1
     assert gap == GapConfig().missing_tail_sessions
+
+
+# --- profitability statement facts (backtest spec amendment #720, plan T85c) ---------
+
+_NEW_YORK = ZoneInfo("America/New_York")
+#: The fixture profitability hypothesis's book needs a scored cross-section: at
+#: least this many issuers with a fresh annual pair at every month-end close.
+_MIN_BASELINE_ISSUERS = 15
+
+
+def _statement_rows() -> list[dict[str, str]]:
+    with (_FIXTURES_DIR / "statement_facts.csv").open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _known(row: dict[str, str]) -> datetime:
+    return datetime.fromisoformat(row["known_at"])
+
+
+def _new_york(day: date, hour: int, minute: int = 0) -> datetime:
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=_NEW_YORK).astimezone(UTC)
+
+
+def _month_end_closes(start: date, end: date) -> list[datetime]:
+    """`session_close` of every month's last session from `start`'s month to `end`'s."""
+    closes = []
+    month = start.replace(day=1)
+    while month <= end:
+        last = month + relativedelta(months=1) - timedelta(days=1)
+        while not is_session(last):
+            last = previous_session(last)
+        closes.append(session_close(last))
+        month += relativedelta(months=1)
+    return closes
+
+
+def _pair(rows: list[dict[str, str]], cik: str, period_end: str) -> dict[str, dict[str, str]]:
+    """`{fact_name: row}` of `cik`'s gross_profit and total_assets rows at `period_end`."""
+    return {
+        r["fact_name"]: r
+        for r in rows
+        if r["cik"] == cik
+        and r["period_end"] == period_end
+        and r["fact_name"] in ("gross_profit", "total_assets")
+    }
+
+
+def _gp_over_assets(pair: dict[str, dict[str, str]]) -> float:
+    return float(pair["gross_profit"]["value"]) / float(pair["total_assets"]["value"])
+
+
+def _fresh_pair_issuers(rows: list[dict[str, str]], t: datetime) -> set[str]:
+    """Ciks whose latest annual gross_profit known at `t` has its total_assets row at
+    the same period_end known at `t`, no older than `max_fact_age_days` (the signal's
+    rules 2 to 4, at the fixture's cik level: before the securities join)."""
+    config = ProfitabilityConfig()
+    low, high = config.annual_period_days
+    known = [r for r in rows if _known(r) <= t]
+    latest: dict[str, date] = {}
+    for r in known:
+        if r["fact_name"] == "gross_profit" and low <= int(r["period_days"]) <= high:
+            end = date.fromisoformat(r["period_end"])
+            latest[r["cik"]] = max(end, latest.get(r["cik"], end))
+    assets = {
+        (r["cik"], date.fromisoformat(r["period_end"]))
+        for r in known
+        if r["fact_name"] == "total_assets"
+    }
+    session = t.date() if is_session(t.date()) else previous_session(t.date())
+    return {
+        cik
+        for cik, end in latest.items()
+        if (cik, end) in assets and (session - end).days <= config.max_fact_age_days
+    }
+
+
+def test_profitability_baseline_covers_every_month_end() -> None:
+    rows = _statement_rows()
+    for t in _month_end_closes(date(2017, 1, 31), date(2020, 6, 30)):
+        fresh = _fresh_pair_issuers(rows, t)
+        assert len(fresh) >= _MIN_BASELINE_ISSUERS, f"{len(fresh)} fresh issuers at {t}"
+
+
+def test_baseline_issuers_are_existing_issuers() -> None:
+    with (_FIXTURES_DIR / "securities.csv").open(newline="") as fh:
+        securities = {r["cik"] for r in csv.DictReader(fh)}
+    ciks = {r["cik"] for r in _statement_rows()}
+    assert ciks <= securities
+
+
+def test_ten_k_accepted_after_the_close_crosses_the_cut() -> None:
+    rows = _statement_rows()
+    t_i, t_next = session_close(date(2019, 2, 28)), session_close(date(2019, 3, 29))
+    late = _pair(rows, "CIK0001000007", "2018-12-31")
+    assert {_known(r) for r in late.values()} == {_new_york(date(2019, 2, 28), 16, 30)}
+    assert all(t_i < _known(r) <= t_next for r in late.values())
+    # Its old pair is the lowest ratio known at T_i, its new one the highest at T_i+1.
+    earlier = _pair(rows, "CIK0001000007", "2017-12-31")
+    ratios_at = {
+        t: [
+            _gp_over_assets(_pair(rows, cik, end))
+            for cik, end in {(r["cik"], r["period_end"]) for r in rows if _known(r) <= t}
+            if set(_pair(rows, cik, end)) == {"gross_profit", "total_assets"}
+            and all(_known(r) <= t for r in _pair(rows, cik, end).values())
+        ]
+        for t in (t_i, t_next)
+    }
+    assert _gp_over_assets(earlier) == min(ratios_at[t_i])
+    assert _gp_over_assets(late) == max(ratios_at[t_next])
+
+
+def test_restated_issuer_stores_only_its_first_fy2018_vintage() -> None:
+    rows = _statement_rows()
+    fy2018 = _pair(rows, "CIK0001000005", "2018-12-31")
+    assert {r["filing_accession"] for r in fy2018.values()} == {"0001000005-19-000001"}
+    fy2019 = _pair(rows, "CIK0001000005", "2019-12-31")
+    assert fy2019["gross_profit"]["filing_accession"] == "0001000005-20-000001"
+    # The restating filing comes later and carries no FY2018 row of its own.
+    assert _known(fy2019["gross_profit"]) > _known(fy2018["gross_profit"])
+    assert not [
+        r
+        for r in rows
+        if r["filing_accession"] == "0001000005-20-000001" and r["period_end"] != "2019-12-31"
+    ]
+
+
+def test_total_assets_accepted_after_its_gross_profit_filing() -> None:
+    pair = _pair(_statement_rows(), "CIK0001000016", "2019-09-30")
+    gross_profit, assets = pair["gross_profit"], pair["total_assets"]
+    assert gross_profit["filing_accession"] != assets["filing_accession"]
+    assert assets["form"] == "10-K/A"
+    # A month-end close falls between the two acceptances.
+    between = session_close(date(2019, 12, 31))
+    assert _known(gross_profit) <= between < _known(assets) <= session_close(date(2020, 1, 31))
+
+
+def test_five_acceptance_stamps() -> None:
+    ordinary, half_day = date(2019, 1, 31), date(2019, 11, 29)
+    assert not is_half_day(ordinary) and session_close(ordinary) == _new_york(ordinary, 16)
+    assert is_half_day(half_day) and session_close(half_day) == _new_york(half_day, 13)
+    both = {"gross_profit", "total_assets"}
+    stamps = {
+        _new_york(ordinary, 15): ("CIK0001000002", both),
+        _new_york(ordinary, 16): ("CIK0001000013", both),
+        _new_york(ordinary, 17, 30): ("CIK0001000006", both),
+        # On the half day, one issuer (that session's only universe member):
+        # its 10-K before the close, its 10-K/A with the assets after it.
+        _new_york(half_day, 12, 30): ("CIK0001000012", {"gross_profit"}),
+        _new_york(half_day, 14): ("CIK0001000012", {"total_assets"}),
+    }
+    for known_at, (cik, fact_names) in stamps.items():
+        filed = [r for r in _statement_rows() if _known(r) == known_at]
+        assert {r["cik"] for r in filed} == {cik}, known_at
+        assert {r["fact_name"] for r in filed} == fact_names, known_at

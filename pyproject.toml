@@ -20,6 +20,9 @@ dependencies = [
     "typer>=0.27.2",
 ]
 
+[project.scripts]
+tradepartner = "tradepartner.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -29,6 +32,7 @@ dev = [
     "pandas-stubs>=3.0.5.260914",
     "types-python-dateutil>=2.9.0.20260807",
     "bt==1.2.3",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]
@@ -57,6 +61,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+tmp_path_retention_policy = "failed"
 markers = [
     "network: needs real network access to Alpaca/EDGAR; skipped unless RUN_NETWORK_TESTS=1",
 ]

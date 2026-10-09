@@ -33,6 +33,7 @@ from tradepartner.store.journal import (
     JournalNotInitialised,
     OrderRow,
     PaperRunRow,
+    ReconciliationRow,
     all_fill_ids,
     append,
     fills_for,
@@ -43,6 +44,12 @@ _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
 _SESSION = date(2026, 10, 1)
 #: Nullable columns a valid sample row still needs (a position row names its security).
 _SAMPLE_EXTRAS: dict[str, dict[str, Any]] = {"positions_daily": {"security_id": "SEC_A"}}
+#: The closed enums plus `signals.reason`'s closed part (its own prefix `CHECK`
+#: since version 14, #1153), so a sample row takes a value its `CHECK` accepts.
+_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
+    **schema.JOURNAL_ENUMS,
+    ("signals", "reason"): schema.SIGNAL_REASONS,
+}
 _PYTHON_TYPES = {
     "BIGINT": "int",
     "INTEGER": "int",
@@ -78,7 +85,7 @@ def _sample(row_type: type[Any], **values: Any) -> Any:
     for f in fields(row_type):
         if f.default is not MISSING:
             continue
-        enum = schema.JOURNAL_ENUMS.get((row_type.TABLE, f.name))
+        enum = _ENUMS.get((row_type.TABLE, f.name))
         kwargs[f.name] = enum[0] if enum else _TYPES[_field_type(row_type, f.name)]
     return row_type(**{**kwargs, **_SAMPLE_EXTRAS.get(row_type.TABLE, {}), **values})
 
@@ -194,6 +201,68 @@ def test_every_row_type_appends(conn: duckdb.DuckDBPyConnection, table: str) -> 
     assert (returned is None) == (row_type.ID_COLUMN is None)
 
 
+#: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17
+#: (plan T132).
+_EXPANSION_SEAM_TABLES = (
+    "paper_windows",
+    "decisions",
+    "orders",
+    "positions_daily",
+    "lots",
+    "disposals",
+    "adjustments",
+    "reconciliations",
+)
+
+
+@pytest.mark.parametrize("table", _EXPANSION_SEAM_TABLES)
+def test_the_expansion_seam_fields_default_to_their_column_defaults(table: str) -> None:
+    """ADR 0015 seams 1 to 3 (plan T132): the row type's `book_id`,
+    `position_side` and `orders` shape defaults equal the column defaults, so a
+    writer that passes no book (every writer until T133) leaves the default."""
+    defaults = {f.name: f.default for f in fields(ROW_TYPES[table])}
+    assert defaults["book_id"] == schema.DEFAULT_BOOK_ID
+    if "position_side" in defaults:
+        assert defaults["position_side"] == schema.LONG
+    if table == "orders":
+        for key, value in schema.ORDER_SHAPE_DEFAULTS.items():
+            assert defaults[key] == value
+
+
+def test_an_order_appends_with_the_expansion_defaults(conn: duckdb.DuckDBPyConnection) -> None:
+    append(conn, _sample(OrderRow))
+    assert conn.execute(
+        "SELECT position_side, order_type, time_in_force, limit_price, stop_price, "
+        "asset_class, order_class, multiplier, parent_order_id, book_id FROM orders"
+    ).fetchone() == (
+        "long",
+        "market",
+        "day",
+        None,
+        None,
+        "us_equity",
+        "simple",
+        1.0,
+        None,
+        "main",
+    )
+
+
+def test_a_decision_and_a_position_default_to_a_long_main_book(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    append(conn, _sample(DecisionRow))
+    append(conn, _sample(ROW_TYPES["positions_daily"]))
+    assert conn.execute("SELECT position_side, book_id FROM decisions").fetchone() == (
+        "long",
+        "main",
+    )
+    assert conn.execute("SELECT position_side, book_id FROM positions_daily").fetchone() == (
+        "long",
+        "main",
+    )
+
+
 # --- append -------------------------------------------------------------------------------
 
 
@@ -237,6 +306,37 @@ def test_known_at_is_stored_as_given_whatever_the_broker_says(
         _NOW - timedelta(hours=1),
         learned,
     )
+
+
+@pytest.mark.parametrize("status", schema.JOURNAL_ENUMS[("reconciliations", "status")])
+@pytest.mark.parametrize(
+    "offset", [timedelta(0), -timedelta(microseconds=1)], ids=["tie", "before"]
+)
+def test_a_fill_not_stamped_after_every_reconciliation_is_refused(
+    conn: duckdb.DuckDBPyConnection, status: str, offset: timedelta
+) -> None:
+    """#650: a ledger counts a fill's cash only when its `known_at` is strictly
+    after its base reconciliation's, so a fill journaled after a reconciliation
+    with a stamp that ties it (a frozen clock) or precedes it would vanish from
+    every later ledger's cash. The writer refuses it instead."""
+    append(conn, _sample(ReconciliationRow, status=status, known_at=_NOW, ingested_at=_NOW))
+    stamp = _NOW + offset
+    with pytest.raises(ValueError, match="not after the latest reconciliation"):
+        append(conn, _sample(FillRow, known_at=stamp, ingested_at=_NOW))
+    assert conn.execute("SELECT COUNT(*) FROM fills").fetchone() == (0,)
+
+
+def test_a_fill_stamped_after_every_reconciliation_appends(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """The floor is the latest reconciliation in any window; one microsecond
+    later is enough, and a fill with no reconciliation yet has no floor."""
+    append(conn, _sample(FillRow, broker_fill_id="before", known_at=_NOW, ingested_at=_NOW))
+    for window_id, at in ((1, _NOW - timedelta(hours=1)), (2, _NOW)):
+        append(conn, _sample(ReconciliationRow, window_id=window_id, known_at=at, ingested_at=at))
+    later = _NOW + timedelta(microseconds=1)
+    append(conn, _sample(FillRow, broker_fill_id="after", known_at=later, ingested_at=later))
+    assert conn.execute("SELECT COUNT(*) FROM fills").fetchone() == (2,)
 
 
 def test_append_refuses_what_is_not_a_row_type(conn: duckdb.DuckDBPyConnection) -> None:
@@ -344,12 +444,29 @@ def test_a_bad_superseded_pointer_raises(seeded: duckdb.DuckDBPyConnection, shap
         "dangling": 999,
         "feed-target": feed,
         "other-order": other,
-        "chained": _fill(seeded, "a", "bf-a-2", superseded_by=synthetic),
+        # chained and self targets are live-looking broker_status rows of the same order,
+        # so only `s.superseded_by IS NOT NULL` can catch them (#405)
+        "chained": _fill(
+            seeded,
+            "a",
+            "synthetic:a-2",
+            source="broker_status",
+            price_implied=True,
+            superseded_by=synthetic,
+        ),
         "self": None,
     }[shape]
     if shape == "self":
         target = 10
-        _fill(seeded, "a", "bf-self", fill_id=10, superseded_by=10)
+        _fill(
+            seeded,
+            "a",
+            "synthetic:self",
+            source="broker_status",
+            price_implied=True,
+            fill_id=10,
+            superseded_by=10,
+        )
     else:
         _fill(seeded, "a", f"bf-{shape}", superseded_by=target)
     if shape == "chained":  # a pointer at a row that is itself superseded
@@ -386,3 +503,39 @@ def test_journal_calls_raise_journal_not_initialised_on_a_version_4_store(
         pytest.raises(JournalNotInitialised),
     ):
         append(conn, _sample(DecisionRow))
+
+
+def test_a_fills_limit_reads_the_newest_live_fills_newest_first(
+    seeded: duckdb.DuckDBPyConnection,
+) -> None:
+    """#435: `limit` bounds the read in SQL to the newest live fills by `fill_id`."""
+    ids = [_fill(seeded, coid, f"bf-{coid}-{i}") for i in range(3) for coid in ("a", "c", "b")]
+    synthetic = _fill(seeded, "a", "synthetic:a", source="broker_status", price_implied=True)
+    _fill(seeded, "a", "bf-a-late", superseded_by=synthetic)  # hidden, newest id
+    window_1 = [f.fill.fill_id for f in fills_for(seeded, window_id=1)]
+    assert window_1 == sorted(window_1)  # unchanged: fill_id order, every live fill
+    assert len(window_1) == 7
+
+    newest = [f.fill.fill_id for f in fills_for(seeded, window_id=1, limit=3)]
+    assert newest == sorted(window_1, reverse=True)[:3]
+    assert newest[0] == synthetic
+    assert [f.fill.fill_id for f in fills_for(seeded, limit=2)] == [synthetic, ids[-1]]
+    assert [
+        f.fill.client_order_id for f in fills_for(seeded, client_order_ids=["c"], limit=10)
+    ] == ["c", "c", "c"]
+    with pytest.raises(ValueError, match="limit"):
+        fills_for(seeded, limit=0)
+
+
+@pytest.mark.parametrize("window_id", [None, 1])
+def test_a_fills_limit_still_fails_closed_on_an_orphan_past_the_limit(
+    seeded: duckdb.DuckDBPyConnection, window_id: int | None
+) -> None:
+    """The orphan is the oldest fill, so the limited read never fetches its row."""
+    _fill(seeded, "nobody", "bf-orphan")
+    _order(seeded, "lost", run_id=99, side="buy")
+    _fill(seeded, "lost", "bf-lost")
+    for i in range(3):
+        _fill(seeded, "a", f"bf-a-{i}")
+    with pytest.raises(JournalIntegrityError, match=r"nobody.*orders row"):
+        fills_for(seeded, window_id=window_id, limit=1)

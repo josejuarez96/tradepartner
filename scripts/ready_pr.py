@@ -13,22 +13,31 @@ Steps, in order (each one stops the run with a reason on failure):
    ``CHANGELOG.md`` and every conflict block is a pure insertion at one spot: the base
    section is empty and both sides hold only list bullets. Both sides are kept, ``main``'s
    first. Anything else (a line one side deleted or edited) aborts the merge and reports.
-3. Fragment check (``scripts/fragments.py check``); the branch's issue has a status fragment
-   (and a changelog fragment on ``feat/``/``fix/`` branches); and the PR adds no bullets to
-   the shared lists ("## Done" in ``STATUS.md``, "[Unreleased]" in ``CHANGELOG.md``) unless
+3. Fragment check (``scripts/fragments.py check``); the branch's issue has its fragment
+   (``changelog.d/<issue>-<slug>.md``, or the pre-#351 ``docs/status.d/`` one); and the PR
+   adds no bullets to the shared lists ("## Recently done" in ``STATUS.md``,
+   "[Unreleased]" in ``CHANGELOG.md``) unless
    it is a fold (it also deletes fragment files) or ``--allow-shared-files`` was given.
    Other STATUS sections ("Blocked", "Decisions needed") may be edited freely.
-4. Local checks: ruff check, ruff format --check, mypy and the fragment check always;
-   pytest only when the diff touches code, tests, scripts, dependencies or CI (``src/``,
+4. Local checks: ruff check, ruff format --check, mypy, the fragment check and
+   ``tests/test_docs_budget.py`` always. No local pytest by default: CI runs the full suite
+   on every diff that touches code, tests, scripts, dependencies or CI (``src/``,
    ``tests/``, ``scripts/``, ``.github/``, ``pyproject.toml``, ``uv.lock``,
-   ``.python-version``).
-   CI applies the same rule on PRs (``--tests-needed``) and runs the full suite on every
-   push to main. ``--tests`` forces the local run, ``--no-tests`` skips it.
+   ``.python-version``; ``--tests-needed``) and on every push to main, sharded (#1113,
+   #1130). ``--tests`` runs the test files the diff maps to (``targeted_tests``), or the
+   full suite when the mapping is unclear (#456); ``--full-tests`` runs the full suite
+   locally; ``--no-tests`` skips it.
 5. The PR body has no unticked template boxes and says ``Closes #<issue>`` for the branch's
    issue. Every specialist review the touched paths require (``quant-auditor``,
    ``safety-reviewer``) has a verdict line in a PR **comment** (not the body, which carries
-   the template's own wording): ``quant-auditor: PASS`` or ``PASS WITH FIXES``.
-6. Push, wait for CI on **that exact commit**, then ``gh pr ready``.
+   the template's own wording), and the latest one is ``quant-auditor: PASS``. A
+   ``PASS WITH FIXES`` needs a re-review after the fixes that posts ``PASS``.
+6. Push, wait for CI on **that exact commit**, then ``gh pr ready``. A draft PR's own CI
+   runs ``checks-fast`` only (#1192) and never reports the required ``checks``, so for a
+   draft this step, once the PR's head is the pushed commit, adds the ``ci:full`` label:
+   the label's run shards the suite on that head like a ready PR's (superseding the
+   push's draft run), and the PR is marked ready only once a ``checks`` on this commit is
+   green. Marking ready does not start another run.
 
 Usage::
 
@@ -36,6 +45,7 @@ Usage::
     uv run python scripts/ready_pr.py 69 --dry-run            # stop before pushing
     uv run python scripts/ready_pr.py 70 --allow-shared-files # process PRs only
     uv run python scripts/ready_pr.py 69 --tests              # force local pytest
+    uv run python scripts/ready_pr.py 69 --full-tests         # full suite, not targeted
     git diff --name-only origin/main...HEAD | python3 scripts/ready_pr.py --tests-needed
                                                    # prints yes/no; CI gates its Tests step on it
 """
@@ -43,12 +53,13 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -64,11 +75,11 @@ CONFLICT_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 VERDICT_RE = re.compile(
-    r"\A\s*(?P<agent>quant-auditor|safety-reviewer):\s*(?P<verdict>pass(?: with fixes)?|fail)\b",
+    r"\A[ \t]*(?P<agent>quant-auditor|safety-reviewer):(?P<verdict>[^\r\n]*)",
     re.IGNORECASE,
 )
 CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
-STATUS_LIST = "## Done"
+STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 
@@ -76,7 +87,9 @@ FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
 # "Review:" field (docs/plans/*.md) is the authority; these prefixes mirror it plus the
 # CLAUDE.md rule (data/backtests/signals -> quant-auditor; broker/orders/secrets/LLM inputs
 # -> safety-reviewer). Modules that do not exist yet are listed so the rule is right when
-# they appear. Widening a list needs no review; shrinking one is a safety-reviewer change.
+# they appear; tests/test_ready_pr.py names them in PLANNED_PREFIXES and fails on any other
+# prefix missing from the tree, so a rename cannot silently disable the gate.
+# Widening a list needs no review; shrinking one is a safety-reviewer change.
 QUANT_AUDITOR = "quant-auditor"
 SAFETY_REVIEWER = "safety-reviewer"
 QUANT_PREFIXES = (
@@ -86,6 +99,7 @@ QUANT_PREFIXES = (
     "src/tradepartner/adapters/fixture_",
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
+    "src/tradepartner/adapters/edgar_source.py",
     "src/tradepartner/calendar.py",
     "src/tradepartner/config.py",
     "src/tradepartner/timeutil.py",
@@ -94,8 +108,8 @@ QUANT_PREFIXES = (
     "src/tradepartner/ingest.py",
     "src/tradepartner/backfill.py",
     "src/tradepartner/health.py",
-    "src/tradepartner/signals/",
     "src/tradepartner/backtest/",
+    "src/tradepartner/execution/",
     "scripts/make_fixture_universe.py",
     "tests/lookahead/",
     "tests/fixtures/universe/",
@@ -104,6 +118,8 @@ SAFETY_PREFIXES = (
     "src/tradepartner/adapters/broker",
     "src/tradepartner/adapters/fake_broker",
     "src/tradepartner/adapters/alpaca_raw",
+    "src/tradepartner/adapters/alpaca_trading_raw",
+    "src/tradepartner/adapters/alpaca_broker",
     "src/tradepartner/adapters/edgar_raw",
     "src/tradepartner/adapters/alpaca_prices",
     "src/tradepartner/adapters/edgar.py",
@@ -111,13 +127,19 @@ SAFETY_PREFIXES = (
     "src/tradepartner/cli.py",
     "src/tradepartner/config.py",
     "src/tradepartner/ingest.py",
-    "src/tradepartner/exec/",
-    "src/tradepartner/risk/",
+    "src/tradepartner/execution/",
+    "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
     "scripts/ready_pr.py",
+    "tests/test_ready_pr.py",
     "scripts/fragments.py",
     "scripts/no_push_to_main.sh",
+    "scripts/merge_train.py",
+    "tests/test_merge_train.py",
+    "scripts/ci_tested_tree.py",
+    "tests/test_ci_tested_tree.py",
     ".github/workflows/",
+    ".github/rulesets/",
     ".claude/agents/",
     ".claude/skills/",
     "tests/fixtures/alpaca/",
@@ -127,19 +149,43 @@ SAFETY_PREFIXES = (
     ".claude/settings.json",
     ".pre-commit-config.yaml",
     "pyproject.toml",
+    "uv.lock",
 )
 LOCAL_CHECKS: tuple[tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "check", "."),
     ("uv", "run", "ruff", "format", "--check", "."),
     ("uv", "run", "mypy"),
     ("uv", "run", "python", "scripts/fragments.py", "check"),
+    ("uv", "run", "pytest", "-q", "tests/test_docs_budget.py"),
 )
 PYTEST_CHECK: tuple[str, ...] = ("uv", "run", "pytest", "-q")
+# The full suite runs in parallel when pytest-xdist is installed (#581), as CI does. xdist
+# workers each get their own subdirectory of any --basetemp, so that flag still works.
+XDIST_ARGS: tuple[str, ...] = ("-n", "auto")
+# Targeted local pytest (#456): the tests a diff maps to, or the full suite when the mapping
+# is unclear. CI always runs the full suite, so a miss here is caught there, later.
+FULL_SUITE_FILES = ("pyproject.toml", "uv.lock", ".python-version")
+DOCS_BUDGET_TEST = "tests/test_docs_budget.py"
+# Static checks that scan a whole subtree: any change under the prefix can fail them.
+TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
+    "src/": (
+        "tests/execution/test_boundaries.py",
+        "tests/execution/test_sdk_boundary.py",
+        "tests/test_no_forbidden_imports.py",
+        "tests/test_no_literals.py",
+    ),
+    "src/tradepartner/backtest/": ("tests/backtest/test_store_provider.py",),
+}
 # A diff touching any of these runs pytest, locally and in CI on a PR; anything else skips it
 # (pushes to main always run the full suite).
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CI_TIMEOUT_S = 25 * 60
+FULL_CI_LABEL = "ci:full"
+# After re-triggering a cancelled full run, the rollup still shows the old cancelled run
+# until the new one reports; tolerate that this long before calling it cancelled again.
+RETRIGGER_GRACE_S = 300
+DRAFT_CHECKS = "checks (draft, no shards)"
 CI_POLL_S = 20
 
 
@@ -155,6 +201,7 @@ class Pr:
     draft: bool
     body: str
     comments: tuple[str, ...]
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,10 +228,22 @@ class Runner(Protocol):
     def pr(self, number: int) -> Pr: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
+    def add_label(self, number: int, label: str) -> None: ...
+    def remove_label(self, number: int, label: str) -> None: ...
     def sleep(self, seconds: float) -> None: ...
 
 
 # ── pure logic ──────────────────────────────────────────────────────────────────
+
+
+def parallel_if_full_suite(cmd: Sequence[str], *, xdist: bool) -> tuple[str, ...]:
+    """The full-suite pytest command with ``-n auto`` added when xdist is installed (#581).
+
+    Targeted runs (pytest plus file paths) and every other command pass through unchanged.
+    """
+    if xdist and tuple(cmd) == PYTEST_CHECK:
+        return (*cmd, *XDIST_ARGS)
+    return tuple(cmd)
 
 
 def resolve_append_conflicts(text: str) -> str | None:
@@ -246,10 +305,13 @@ def required_reviews(paths: Sequence[str]) -> set[str]:
 
 
 def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
-    """Required reviews whose latest verdict comment is not PASS / PASS WITH FIXES.
+    """Required reviews whose latest verdict comment is not PASS.
 
     A verdict is the **first line** of a PR comment, ``<agent>: PASS``, ``PASS WITH FIXES``
-    or ``FAIL``; comments are read in order and the latest verdict per agent wins. The PR
+    or ``FAIL``; comments are read in order and the latest verdict per agent wins. Only
+    ``PASS`` passes: ``PASS WITH FIXES`` leaves SHOULD FIX findings open, so it counts once
+    the re-review after the fixes posts a later ``PASS`` (#356). The whole rest of the first
+    line is the verdict, so ``PASS (with fixes)`` or ``PASS / FAIL`` is not a pass. The PR
     body does not count: the template itself names both agents there. In this solo repo
     every comment comes from the owner's account, so this is a process gate, not an
     authentication boundary.
@@ -258,22 +320,52 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     for c in comments:
         m = VERDICT_RE.match(c)
         if m:
-            latest[m.group("agent").lower()] = m.group("verdict").lower()
-    return sorted(r for r in required if not latest.get(r, "").startswith("pass"))
+            latest[m.group("agent").lower()] = " ".join(m.group("verdict").split()).lower()
+    return sorted(r for r in required if latest.get(r) != "pass")
 
 
 def checks_state(checks: HeadChecks, sha: str) -> str:
-    """``pending`` | ``success`` | ``failure`` for the CI on one commit.
+    """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
-    ``pending`` also covers "GitHub has not seen this commit yet" and "no runs reported
-    yet": neither is green (git-workflow: CI must have run on the exact commit).
+    ``pending`` also covers "GitHub has not seen this commit yet", "no runs reported
+    yet", and "the required ``checks`` run hasn't appeared in the rollup yet": none of
+    those is green (git-workflow: CI must have run on the exact commit). The last case
+    matters since #1112: ``checks`` now ``needs:`` other jobs, so GitHub does not create
+    its check run until those finish, and a rollup can otherwise show every run so far
+    (e.g. ``checks-fast``, ``claims``) green while the run that actually gates pytest
+    hasn't started.
+
+    Since #1192 a draft's run (no ``ci:full`` label) never reports ``checks``: its
+    aggregator is ``checks (draft, no shards)``, which gates nothing and is ignored here,
+    so a draft's head stays pending until a full run reports ``checks``. That full run
+    (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
+    a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
+    the superseded run does not read as a failure. A lone ``CANCELLED`` ``checks`` with
+    every run on the head completed is ``cancelled`` (#1201): the caller may re-trigger
+    once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
-    if any(r.status.upper() != "COMPLETED" for r in checks.runs):
+    live = [r for r in checks.runs if r.name != DRAFT_CHECKS]
+    not_cancelled = {
+        r.name
+        for r in live
+        if r.conclusion.upper() != "CANCELLED" or r.status.upper() != "COMPLETED"
+    }
+    runs = [
+        r for r in live if not (r.conclusion.upper() == "CANCELLED" and r.name in not_cancelled)
+    ]
+    if not any(r.name == "checks" for r in runs):
         return "pending"
-    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in checks.runs):
+    if any(r.status.upper() != "COMPLETED" for r in runs):
+        return "pending"
+    if all(r.conclusion.upper() in {"SUCCESS", "NEUTRAL", "SKIPPED"} for r in runs):
         return "success"
+    ok = {"SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED"}
+    if all(r.conclusion.upper() == "CANCELLED" for r in runs if r.name == "checks") and all(
+        r.conclusion.upper() in ok for r in runs
+    ):
+        return "cancelled"
     return "failure"
 
 
@@ -304,19 +396,109 @@ def is_fold(diff_names: Sequence[str], deleted: Sequence[str]) -> bool:
 
 
 def missing_fragments(branch: str, diff_names: Sequence[str]) -> list[str]:
-    """Fragment files the branch's issue needs but the diff does not add."""
+    """The fragment file the branch's issue needs but the diff does not add: one
+    ``changelog.d/<issue>-<slug>.md`` (#351), or the pre-#351 ``docs/status.d/`` one."""
     issue = issue_of_branch(branch)
     if issue is None:
         return []
-    need = [f"docs/status.d/{issue}-"]
-    if branch.startswith(("feat/", "fix/")):
-        need.append(f"changelog.d/{issue}-")
-    return [f"{p}<slug>.md" for p in need if not any(d.startswith(p) for d in diff_names)]
+    have = tuple(f"{d}{issue}-" for d in FRAGMENT_DIRS)
+    if any(d.startswith(have) for d in diff_names):
+        return []
+    return [f"changelog.d/{issue}-<slug>.md"]
+
+
+def own_changelog_fragments(
+    branch: str, diff_names: Sequence[str], deleted: Collection[str]
+) -> list[str]:
+    """The ``changelog.d/<issue>-*`` fragments of the branch's issue that the diff adds or
+    edits (not deletes): the texts ``lacks_changelog_bullets`` reads. Shared with
+    ``merge_train`` (#764) so both read the same files."""
+    issue = issue_of_branch(branch)
+    if issue is None:
+        return []
+    return [p for p in diff_names if p.startswith(f"changelog.d/{issue}-") and p not in deleted]
+
+
+def lacks_changelog_bullets(branch: str, fragment_texts: Sequence[str]) -> bool:
+    """On a ``feat/`` or ``fix/`` branch, whether none of the issue's added
+    ``changelog.d`` fragments holds a CHANGELOG heading with a bullet (a STATUS-only
+    fragment, or only an old ``docs/status.d`` one, does not record the change)."""
+    if not branch.startswith(("feat/", "fix/")):
+        return False
+    for text in fragment_texts:
+        heading = False
+        for line in text.splitlines():
+            if line.startswith("### "):
+                heading = True
+            elif heading and BULLET_RE.match(line):
+                return False
+    return True
 
 
 def tests_needed(paths: Sequence[str]) -> bool:
     """Whether the diff can make pytest fail: it touches code, tests, scripts or deps."""
     return any(p.startswith(TEST_TRIGGER_PREFIXES) or p in TEST_TRIGGER_FILES for p in paths)
+
+
+def _module_tests(path: str, test_sources: Mapping[str, str]) -> set[str]:
+    """Test files that import the module at ``src/<dotted>.py``, by name."""
+    dotted = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+    parent, _, stem = dotted.rpartition(".")
+    direct = re.compile(rf"\b{re.escape(dotted)}\b")
+    from_parent = re.compile(
+        rf"\bfrom\s+{re.escape(parent)}\s+import\s+(?:\([^)]*|[^\n]*)\b{re.escape(stem)}\b"
+    )
+    return {
+        test
+        for test, text in test_sources.items()
+        if direct.search(text) or from_parent.search(text)
+    }
+
+
+def targeted_tests(
+    paths: Sequence[str], test_sources: Mapping[str, str], deleted: Collection[str] = ()
+) -> tuple[str, ...] | None:
+    """The test files a diff maps to, or ``None`` for the full suite (#456).
+
+    ``test_sources`` maps every tracked ``tests/**/test_*.py`` path to its text. A changed
+    test file runs itself; a ``src/`` module runs every test file that imports it by name plus
+    the static checks over its subtree (``TREE_SCAN_TESTS``); a file under ``scripts/`` or
+    ``.github/`` runs the tests that name it. Anything whose effect cannot be told falls back
+    to the full suite: a ``conftest.py``, a dependency or Python-version file, a non-test file
+    under ``tests/`` (fixtures, helpers), a package ``__init__``, a non-Python file under
+    ``src/``, a deleted module, and a module or script no test names. A ``.github/`` file no
+    test names, and docs, map to nothing. A test file not in ``test_sources`` (deleted or
+    renamed away) is not run. ``tests/test_docs_budget.py`` is left out: it always runs on
+    its own. Pass ``deleted`` from a ``--no-renames`` diff, so a moved module counts as gone.
+    """
+    selected: set[str] = set()
+    for p in paths:
+        name = p.rpartition("/")[2]
+        if p in FULL_SUITE_FILES or name == "conftest.py":
+            return None
+        if p.startswith("tests/"):
+            if not (name.startswith("test_") and name.endswith(".py")):
+                return None
+            selected.add(p)
+        elif p.startswith("src/"):
+            if p in deleted or not p.endswith(".py") or name == "__init__.py":
+                return None
+            found = _module_tests(p, test_sources)
+            if not found:
+                return None
+            selected |= found
+            for prefix, scans in TREE_SCAN_TESTS.items():
+                if p.startswith(prefix):
+                    selected.update(scans)
+        elif p.startswith(("scripts/", ".github/")):
+            mention = re.compile(rf"\b{re.escape(name)}\b")
+            found = {t for t, text in test_sources.items() if mention.search(text)}
+            if not found and p.startswith("scripts/"):
+                return None
+            selected |= found
+    selected &= set(test_sources)
+    selected.discard(DOCS_BUDGET_TEST)
+    return tuple(sorted(selected))
 
 
 # ── the flow ────────────────────────────────────────────────────────────────────
@@ -329,9 +511,11 @@ def ready(
     dry_run: bool = False,
     allow_shared_files: bool = False,
     run_tests: bool | None = None,
+    full_tests: bool = False,
     wait: bool = True,
     timeout_s: int = CI_TIMEOUT_S,
     poll_s: int = CI_POLL_S,
+    retrigger_grace_s: int = RETRIGGER_GRACE_S,
 ) -> int:
     pr = r.pr(number)
 
@@ -392,17 +576,47 @@ def ready(
                 + " and ".join(missing_frag)
                 + " with `uv run python scripts/fragments.py add <issue> --slug <slug> ...`"
             )
+        issue = issue_of_branch(pr.branch)
+        own = own_changelog_fragments(pr.branch, touched, deleted)
+        if lacks_changelog_bullets(pr.branch, [r.read(p) for p in own]):
+            raise ReadyError(
+                "a feat/fix PR records its change in CHANGELOG: add a bullet to "
+                f"changelog.d/{issue}-<slug>.md (`fragments.py add ... --added/--fixed ...`)"
+            )
 
-    # 4. local checks; pytest only when the diff can fail it (None = decide from the paths)
+    # 4. local checks; pytest only when the diff can fail it (None = decide from the paths),
+    # and then only the tests it maps to unless --full-tests (CI runs the full suite)
     checks = list(LOCAL_CHECKS)
-    if run_tests is None:
-        run_tests = tests_needed(touched)
-        if not run_tests:
-            say("skipping local pytest: no code, test, script, dependency or CI changes")
-    elif not run_tests:
-        say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
-    if run_tests:
+    if full_tests:
+        say("local pytest: the full suite (--full-tests)")
         checks.append(PYTEST_CHECK)
+    elif run_tests is False:
+        say("skipping local pytest (--no-tests); CI still runs it if the diff touches code")
+    elif run_tests is None and tests_needed(touched):
+        # CI runs the full suite on this diff in ~11 min (sharded, #1113); a local run of
+        # the mapped tests took 40+ min for a config.py diff on the owner's Mac (#1130)
+        say("skipping local pytest: CI runs the full suite on this diff (--tests forces it)")
+    elif run_tests:
+        sources = {
+            p: r.read(p)
+            for p in r.git("ls-files", "tests").splitlines()
+            if p.rpartition("/")[2].startswith("test_") and p.endswith(".py")
+        }
+        # --no-renames: a module moved within src/ must count as deleted at its old path
+        gone = r.git(
+            "diff", "--no-renames", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD"
+        ).splitlines()
+        selected = targeted_tests(touched, sources, gone)
+        if selected is None or (run_tests and not selected):
+            say("local pytest: the full suite (the diff's tests cannot be told from its paths)")
+            checks.append(PYTEST_CHECK)
+        elif selected:
+            say(f"local pytest: {len(selected)} targeted file(s); CI runs the full suite")
+            checks.append((*PYTEST_CHECK, *selected))
+        else:
+            say("skipping local pytest: no test maps to the diff; CI runs the full suite")
+    else:
+        say("skipping local pytest: no code, test, script, dependency or CI changes")
     for cmd in checks:
         say(f"$ {' '.join(cmd)}")
         if not r.run_check(cmd):
@@ -421,8 +635,9 @@ def ready(
     missing = missing_reviews(required, pr.comments)
     if missing:
         raise ReadyError(
-            "run these reviews, address findings, then post a PR comment with a verdict line "
-            "`<agent>: PASS` or `<agent>: PASS WITH FIXES` for each: " + ", ".join(missing)
+            "run these reviews, address findings and re-run them until the latest PR comment "
+            "verdict line is `<agent>: PASS` (PASS WITH FIXES needs a re-review) for each: "
+            + ", ".join(missing)
         )
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 
@@ -434,10 +649,20 @@ def ready(
     sha = r.git("rev-parse", "HEAD")
     r.git("push", "origin", f"HEAD:{pr.branch}")
     say(f"pushed {sha[:7]}")
+    if pr.draft and FULL_CI_LABEL not in pr.labels:
+        # A draft's run skips the shards and never reports `checks` (#1192). Labelled only
+        # once GitHub shows the pushed head on the PR, the label's run is on this head and
+        # comes after the push's draft run (which it cancels; `checks_state` reads that as
+        # superseded). Labelling before the push could let the label's run on the old head
+        # start last and cancel the full run on this one (code review on #1196).
+        if not _wait_for_head(r, number, sha, timeout_s, poll_s):
+            raise ReadyError(f"PR #{number} head is not {sha[:7]} on GitHub yet; run again")
+        r.add_label(number, FULL_CI_LABEL)
+        say(f"draft PR: added {FULL_CI_LABEL} so CI runs every shard on {sha[:7]}")
     if not wait:
         say("not waiting for CI (--no-wait); PR left as is")
         return 0
-    state = _wait_for_ci(r, number, sha, timeout_s, poll_s, say)
+    state = _wait_for_ci(r, number, sha, timeout_s, poll_s, say, retrigger_grace_s)
     if state != "success":
         raise ReadyError(f"CI {state} on {sha[:7]}; fix and run again")
     if pr.draft:
@@ -485,13 +710,46 @@ def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
     r.git("commit", "--no-edit")
 
 
+def _wait_for_head(r: Runner, number: int, sha: str, timeout_s: int, poll_s: int) -> bool:
+    """Wait until GitHub reports ``sha`` as the PR's head; False on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while r.head_checks(number).sha != sha:
+        if time.monotonic() >= deadline:
+            return False
+        r.sleep(poll_s)
+    return True
+
+
 def _wait_for_ci(
-    r: Runner, number: int, sha: str, timeout_s: int, poll_s: int, say: Callable[[str], None]
+    r: Runner,
+    number: int,
+    sha: str,
+    timeout_s: int,
+    poll_s: int,
+    say: Callable[[str], None],
+    retrigger_grace_s: int = RETRIGGER_GRACE_S,
 ) -> str:
+    """Poll until the head's CI is decided; returns the ``checks_state`` or ``timeout``.
+
+    A ``cancelled`` full run (a draft run created after the ``ci:full`` run cancelled it,
+    #1201) is re-triggered once by removing and re-adding the label; the old cancelled run
+    stays in the rollup for ``retrigger_grace_s`` while the new one starts. Only a
+    completed, successful ``checks`` on this exact head ever returns ``success``.
+    """
     deadline = time.monotonic() + timeout_s
     say(f"waiting for CI on {sha[:7]} (up to {timeout_s // 60} min)")
+    retriggered_at: float | None = None
     while True:
         state = checks_state(r.head_checks(number), sha)
+        if state == "cancelled":
+            if retriggered_at is None:
+                say(f"the full CI run on {sha[:7]} was cancelled; re-triggering {FULL_CI_LABEL}")
+                r.remove_label(number, FULL_CI_LABEL)
+                r.add_label(number, FULL_CI_LABEL)
+                retriggered_at = time.monotonic()
+                state = "pending"
+            elif time.monotonic() - retriggered_at < retrigger_grace_s:
+                state = "pending"
         if state != "pending":
             say(f"CI {state}")
             return state
@@ -527,6 +785,7 @@ class ShellRunner:
         return self._git(*args, check=False).returncode == 0
 
     def run_check(self, cmd: Sequence[str]) -> bool:
+        cmd = parallel_if_full_suite(cmd, xdist=importlib.util.find_spec("xdist") is not None)
         return subprocess.run(list(cmd), cwd=self.root, check=False).returncode == 0
 
     def read(self, path: str) -> str:
@@ -552,7 +811,7 @@ class ShellRunner:
                 "view",
                 str(number),
                 "--json",
-                "number,headRefName,baseRefName,isDraft,body,comments",
+                "number,headRefName,baseRefName,isDraft,body,comments,labels",
             )
         )
         return Pr(
@@ -562,6 +821,7 @@ class ShellRunner:
             bool(raw["isDraft"]),
             str(raw.get("body") or ""),
             tuple(str(c.get("body", "")) for c in raw.get("comments", [])),
+            tuple(str(lb.get("name", "")) for lb in raw.get("labels") or []),
         )
 
     def head_checks(self, number: int) -> HeadChecks:
@@ -580,6 +840,12 @@ class ShellRunner:
 
     def mark_ready(self, number: int) -> None:
         self._gh("pr", "ready", str(number))
+
+    def add_label(self, number: int, label: str) -> None:
+        self._gh("pr", "edit", str(number), "--add-label", label)
+
+    def remove_label(self, number: int, label: str) -> None:
+        self._gh("pr", "edit", str(number), "--remove-label", label)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
@@ -615,7 +881,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="run pytest locally even if the diff touches no code, tests, scripts or deps",
+        help="run the mapped tests locally (default: CI runs the full suite instead)",
     )
     tests.add_argument(
         "--no-tests",
@@ -623,6 +889,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=False,
         help="skip local pytest (CI still runs it when the diff touches code)",
+    )
+    tests.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="run the full pytest suite locally instead of the tests the diff maps to",
     )
     parser.add_argument("--no-wait", action="store_true", help="push but do not wait for CI")
     parser.add_argument("--timeout-min", type=int, default=CI_TIMEOUT_S // 60)
@@ -650,6 +921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             allow_shared_files=args.allow_shared_files,
             run_tests=args.tests,
+            full_tests=args.full_tests,
             wait=not args.no_wait,
             timeout_s=args.timeout_min * 60,
         )

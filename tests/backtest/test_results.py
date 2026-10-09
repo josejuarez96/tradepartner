@@ -2,7 +2,7 @@
 
 Each test registers a hypothesis on `fixture_store_path`, opens a trial, runs the engine
 on the fake provider at every cost level and hands the results to `write_results`.
-Prices are a seeded random walk: constant growth would make every monthly return equal,
+Prices are a seeded random walk: constant growth would make every period return equal,
 and `series_metrics` refuses a zero-variance series.
 """
 
@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,7 @@ import pytest
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest import results as results_module
 from tradepartner.backtest.engine import BacktestResult, run
-from tradepartner.backtest.hypothesis import frozen_params_of
+from tradepartner.backtest.hypothesis import frozen_params_of, load_frozen
 from tradepartner.backtest.metrics import (
     EXCESS_SPY_KEYS,
     METRIC_KEYS,
@@ -32,11 +34,20 @@ from tradepartner.backtest.metrics import (
     series_metrics,
 )
 from tradepartner.backtest.provider import GapReading
-from tradepartner.backtest.results import write_results
+from tradepartner.backtest.results import (
+    FamilyN,
+    family_n,
+    family_n_split,
+    hypothesis_cadence,
+    metric_rows,
+    write_results,
+)
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
-from tradepartner.config import Settings
-from tradepartner.store import registry
+from tradepartner.config import FAMILIES, Cadence, Settings
+from tradepartner.research.experiment import ParsedExperiment, hash_file, parse_experiment_file
+from tradepartner.research.gates import Flags, Reasons
+from tradepartner.store import registry, research, schema
 from tradepartner.store.db import insert_row
 
 HISTORY_START, HISTORY_END = date(2022, 12, 1), date(2024, 10, 31)
@@ -115,7 +126,7 @@ def _register(
         title=f"{slug} title",
         doc_path=f"docs/hypotheses/{slug}.md",
         doc_sha256="d" * 64,
-        params=frozen_params_of(settings),
+        params=frozen_params_of(settings, family="momentum"),
         in_sample_start=START,
         holdout_start=HOLDOUT[0],
         holdout_end=HOLDOUT[1],
@@ -133,6 +144,7 @@ def _open(
     synthetic: bool = False,
     start: date = START,
     slug: str = "h1",
+    detail_level: registry.DetailLevel = "full",
 ) -> registry.TrialHandle:
     return registry.open_trial(
         conn,
@@ -145,6 +157,7 @@ def _open(
         run_by="test",
         settings=settings,
         repo_dir=tmp_path,
+        detail_level=detail_level,
     )
 
 
@@ -156,7 +169,7 @@ def _run(
     start: date = START,
     levels: tuple[float, ...] = LEVELS,
 ) -> dict[float, BacktestResult]:
-    return run(settings, _provider(seed), start, END, handle, levels)
+    return run(settings, _provider(seed), start, END, handle, levels, family="momentum")
 
 
 def _trial(
@@ -192,6 +205,13 @@ def _metrics(
             [trial_id, series, level],
         ).fetchall()
     )
+
+
+def _annual(metrics: dict[str, float | None], key: str) -> float:
+    """A stored period Sharpe annualised with the trial's own periods per year."""
+    sharpe, ppy = metrics[key], metrics["periods_per_year"]
+    assert sharpe is not None and ppy is not None
+    return sharpe * math.sqrt(ppy)
 
 
 def _monthly(result: BacktestResult, series: str) -> list[float]:
@@ -289,12 +309,13 @@ class TestMetrics:
         base = results[BASE]
         expected = series_metrics(
             "strategy",
-            monthly=_monthly(base, "strategy"),
-            gross_monthly=_monthly(results[0.0], "strategy"),
+            period_returns=_monthly(base, "strategy"),
+            gross_period_returns=_monthly(results[0.0], "strategy"),
             daily_equity=[r.equity for r in base.equity if r.series == "strategy"],
             turnover=[r.turnover for r in base.rebalances],
-            spy_monthly=_monthly(base, "SPY"),
-            mtum_monthly=_monthly(base, "MTUM"),
+            spy_period_returns=_monthly(base, "SPY"),
+            mtum_period_returns=_monthly(base, "MTUM"),
+            periods_per_year=12,
             risk_free_rate=settings.metrics.risk_free_rate,
         )
         assert _metrics(conn, handle.trial_id, "strategy", BASE) == pytest.approx(expected)
@@ -320,7 +341,7 @@ class TestMetrics:
         _register(conn, settings)
         handle, _, _ = _trial(conn, settings, tmp_path)
         for series in ("SPY", "MTUM"):
-            assert _metrics(conn, handle.trial_id, series, BASE)["turnover_monthly"] == 0.0
+            assert _metrics(conn, handle.trial_id, series, BASE)["turnover_period"] == 0.0
 
 
 class TestResultRow:
@@ -332,12 +353,19 @@ class TestResultRow:
         handle, _, _ = _trial(conn, settings, tmp_path)
         row = _result_row(conn, handle.trial_id)
         base = _metrics(conn, handle.trial_id, "strategy", BASE)
-        raw = deflated_sharpe(base, "raw", n_trials=1, pair_sharpes=[base["sharpe_monthly"]])  # type: ignore[list-item]
+        raw = deflated_sharpe(
+            base,
+            "raw",
+            n_trials=1,
+            pair_sharpes=[_annual(base, "sharpe_period")],
+            periods_per_year=12,
+        )
         excess = deflated_sharpe(
             base,
             "excess_spy",
             n_trials=1,
-            pair_sharpes=[base["sharpe_monthly_excess_spy"]],  # type: ignore[list-item]
+            pair_sharpes=[_annual(base, "sharpe_period_excess_spy")],
+            periods_per_year=12,
         )
         assert row["status"] == "ok"
         assert row["n_trials"] == 1
@@ -386,19 +414,20 @@ class TestResultRow:
         _register(conn, settings)
         handle = _open(conn, settings, tmp_path)
         results = _run(settings, handle)
-        now = datetime(2030, 1, 2, 21, 0, tzinfo=UTC)  # an ingest lands mid-run
+        known = datetime(2024, 9, 30, 20, 0, tzinfo=UTC)  # before _CUTOFF: in the window
+        now = datetime(2030, 1, 2, 21, 0, tzinfo=UTC)  # a late fact's ingest lands mid-run
         insert_row(
             conn,
             "prices_daily",
             {
                 "security_id": "LATE",
-                "session": date(2030, 1, 2),
+                "session": known.date(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
                 "close": 1.0,
                 "volume": 1,
-                "known_at": now,
+                "known_at": known,
                 "ingested_at": now,
                 "source": "test",
                 "provenance": "bar",
@@ -435,15 +464,21 @@ class TestTrialCount:
         second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         row = _result_row(conn, second.trial_id)
         sharpes = {
-            basis: [_metrics(conn, h.trial_id, "strategy", BASE)[key] for h in (first, second)]
+            basis: [
+                _annual(_metrics(conn, h.trial_id, "strategy", BASE), key) for h in (first, second)
+            ]
             for basis, key in (
-                ("raw", "sharpe_monthly"),
-                ("excess_spy", "sharpe_monthly_excess_spy"),
+                ("raw", "sharpe_period"),
+                ("excess_spy", "sharpe_period_excess_spy"),
             )
         }
         base = _metrics(conn, second.trial_id, "strategy", BASE)
-        raw = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=sharpes["raw"])  # type: ignore[arg-type]
-        excess = deflated_sharpe(base, "excess_spy", n_trials=2, pair_sharpes=sharpes["excess_spy"])  # type: ignore[arg-type]
+        raw = deflated_sharpe(
+            base, "raw", n_trials=2, pair_sharpes=sharpes["raw"], periods_per_year=12
+        )
+        excess = deflated_sharpe(
+            base, "excess_spy", n_trials=2, pair_sharpes=sharpes["excess_spy"], periods_per_year=12
+        )
         assert row["n_trials"] == 2
         assert row["dsr_basis"] == "dsr"
         assert row["sharpe_variance"] == pytest.approx(raw.sharpe_variance)
@@ -496,15 +531,360 @@ class TestTrialCount:
         second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
         holdout, _, _ = _trial(conn, settings, tmp_path, seed=11, kind="holdout")
         pairs = [
-            _metrics(conn, h.trial_id, "strategy", BASE)["sharpe_monthly"] for h in (first, second)
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
         ]
         base = _metrics(conn, holdout.trial_id, "strategy", BASE)
-        expected = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=pairs)  # type: ignore[arg-type]
+        expected = deflated_sharpe(base, "raw", n_trials=2, pair_sharpes=pairs, periods_per_year=12)
         row = _result_row(conn, holdout.trial_id)
         assert row["n_trials"] == 2
         assert row["dsr_basis"] == "dsr"
         assert row["sr_star"] == pytest.approx(expected.sr_star)
         assert row["dsr"] == pytest.approx(expected.dsr)
+
+
+class TestFamilyN:
+    """`family_n` is the one place N is computed; `write_results` stores what it
+    returns (strategy-lab plan, "One N function")."""
+
+    def test_family_n_equals_the_n_write_results_stores(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        assert family_n(conn, "momentum") == 0
+        stored = []
+        for kwargs in ({}, {"start": LATER_START}, {"synthetic": True}, {"kind": "holdout"}, {}):
+            handle, _, _ = _trial(conn, settings, tmp_path, **kwargs)  # type: ignore[arg-type]
+            counts = kwargs.get("synthetic") is None and kwargs.get("kind") is None
+            stored.append(_result_row(conn, handle.trial_id)["n_trials"])
+            if counts:
+                assert stored[-1] == family_n(conn, "momentum")
+        assert stored == [1, 2, 2, 2, 3]
+        assert family_n(conn, "momentum") == 3
+        assert family_n(conn, "momentum") == registry.family_sharpes(conn, "momentum").n_trials
+
+    def test_family_n_counts_a_pending_trial_once(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        pending = _open(conn, settings, tmp_path)
+        assert family_n(conn, "momentum") == 1
+        assert family_n(conn, "momentum", pending=pending) == 2
+        write_results(conn, pending, _run(settings, pending), settings)
+        assert family_n(conn, "momentum") == 2 == _result_row(conn, pending.trial_id)["n_trials"]
+
+
+# --- research runs in N (research-registry spec req 9; T83b) ---------------------------
+
+_EXPERIMENTS = Path(__file__).resolve().parents[1] / "fixtures" / "experiments"
+#: Before the fixture hypothesis's holdout (2025-01-02 on); its window ends 2024-12-31.
+_IN_SAMPLE_DATES = [date(2024, 2, 1), date(2024, 6, 28)]
+#: Reaches the fixture hypothesis's holdout; its window then ends 2025-12-31.
+_HOLDOUT_DATES = [date(2024, 2, 1), date(2025, 3, 31)]
+
+
+def _experiment(
+    settings: Settings, slug: str, *, kind: str = "return", **changes: Any
+) -> ParsedExperiment:
+    """The T82 fixture E1-H as an exploratory `kind` experiment of family `momentum`."""
+    base = parse_experiment_file(
+        _EXPERIMENTS / "e1h-demand-deterioration-revenue.md", _EXPERIMENTS, settings=settings
+    )
+    fields: dict[str, Any] = {
+        "slug": slug,
+        "params_sha256": sha256(slug.encode()).hexdigest(),
+        "kind": kind,
+        "stage": 6 if kind == "return" else 3,
+        "touches_returns": kind == "return",
+        "family": "momentum",
+        "confirmatory": False,
+        "window_start": date(2020, 1, 1),
+        "window_end": date(2024, 12, 31),
+        "splits": ("full",),
+        "dataset_name": f"{slug}-panel",
+        "budget_runs": 10,
+        "budget_configurations": 20,
+    }
+    fields.update(changes)
+    return replace(base, **fields)
+
+
+def _research_run(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    slug: str,
+    *,
+    kind: str = "return",
+    configurations: int = 1,
+    dates: list[date] = _IN_SAMPLE_DATES,
+    flags: Flags | None = None,
+) -> str:
+    """Register `slug`, its dataset, open one run and close it `ok` with
+    `configurations` evaluated; return the outcome."""
+    window_end = date(2025, 12, 31) if flags is not None else date(2024, 12, 31)
+    parsed = _experiment(settings, slug, kind=kind, window_end=window_end)
+    research.register_experiment(conn, parsed, "owner")
+    csv = tmp_path / f"{slug}.csv"
+    csv.write_text(
+        "event_date,value\n" + "".join(f"{d.isoformat()},{i}\n" for i, d in enumerate(dates)),
+        encoding="utf-8",
+    )
+    dataset = research.register_dataset(
+        conn,
+        name=parsed.dataset_name,
+        version="v1",
+        path=str(csv),
+        sha256=hash_file(csv),
+        event_start=min(dates),
+        event_end=max(dates),
+        n_rows=len(dates),
+        event_column="event_date",
+        repo_dir=tmp_path,
+    )
+    spend = flags is not None
+    handle = research.open_run(
+        conn,
+        slug,
+        dataset.dataset_id,
+        "full",
+        {"seed": 1},
+        "test",
+        settings=settings,
+        repo_dir=tmp_path,
+        configurations=configurations,
+        **({"flags": flags, "reasons": Reasons(holdout_reason="planned look")} if spend else {}),
+    )
+    assert handle.refusal is None, handle.message
+    return research.write_result(
+        conn,
+        handle,
+        primary_value=-0.5,
+        primary_ci_low=-0.9,
+        primary_ci_high=-0.1,
+        n_observations=400,
+        n_clusters=40,
+        n_configurations=configurations,
+        artifact_sha256="a" * 64,
+        artifact_path="/tmp/report.html",
+    )
+
+
+class TestResearchRunsInN:
+    """N = the family's counted backtest trials plus `family_run_count`; V is the
+    backtest pairs' alone (research-registry spec req 9; backtest spec req 8 as
+    amended by T83b)."""
+
+    def test_a_counted_run_raises_n_by_its_configurations_and_leaves_v(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        first, _, _ = _trial(conn, settings, tmp_path)
+        assert _result_row(conn, first.trial_id)["n_research"] == 0
+        assert _research_run(conn, settings, tmp_path, "r0", configurations=3) == "ok"
+        assert family_n(conn, "momentum") == 1 + 3
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=3)
+        second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        row = _result_row(conn, second.trial_id)
+        assert row["n_trials"] == 2 + 3
+        assert row["n_research"] == 3
+        # V and the pair Sharpes are the two backtest pairs' only.
+        family = registry.family_sharpes(conn, "momentum")
+        assert family.n_trials == 2
+        pairs = [
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
+        ]
+        assert sorted(family.raw) == pytest.approx(sorted(pairs))
+        base = _metrics(conn, second.trial_id, "strategy", BASE)
+        expected = deflated_sharpe(base, "raw", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+        assert row["sharpe_variance"] == pytest.approx(expected.sharpe_variance)
+        assert row["sr_star"] == pytest.approx(expected.sr_star)
+        assert row["dsr"] == pytest.approx(expected.dsr)
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            {"kind": "return", "dates": _HOLDOUT_DATES, "flags": Flags(spend_holdout=True)},
+            {"kind": "agreement"},
+            {"kind": "benchmark"},
+        ],
+        ids=["holdout-spending", "agreement", "benchmark"],
+    )
+    def test_an_uncounted_run_leaves_n_unchanged(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, run: dict[str, Any]
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        assert _research_run(conn, settings, tmp_path, "x0", configurations=3, **run) == "ok"
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=0)
+        after, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        row = _result_row(conn, after.trial_id)
+        assert (row["n_trials"], row["n_research"]) == (2, 0)
+
+    def test_a_store_without_the_research_registry_reads_research_as_none(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """A read-only open of a pre-version-12 store has no research tables: the split
+        says so (None) and N is the backtest count alone."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        _trial(conn, settings, tmp_path)
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        assert family_n_split(conn, "momentum") == FamilyN(trials=1, research=None)
+        assert family_n(conn, "momentum") == 1
+
+    def test_write_results_refuses_a_store_without_the_research_registry(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """Writing commands migrate first, so an unmigrated store here is a bug: refused
+        before any row, never stored with the research share silently left out."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        for table in reversed(schema.RESEARCH_TABLE_NAMES):
+            conn.execute(f"DROP TABLE {table}")
+        with pytest.raises(schema.ResearchNotInitialised):
+            write_results(conn, handle, results, settings)
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+
+class TestVersionPColumns:
+    """Every trial records `detail_level`, `data_vintage` and `code_tree_sha256`, and
+    every result row `sharpe_unit = annual` (strategy-lab spec reqs 8, 9, Vintage)."""
+
+    def test_the_four_columns_are_written(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        checkout = Path(__file__).resolve().parent
+        handle = registry.open_trial(
+            conn,
+            hypothesis_id=registry.get_hypothesis(conn, "h1").hypothesis_id,
+            kind="in_sample",
+            start_session=START,
+            end_session=END,
+            data_cutoff=_CUTOFF,
+            synthetic=False,
+            run_by="test",
+            settings=settings,
+            repo_dir=checkout,
+        )
+        assert write_results(conn, handle, _run(settings, handle), settings) == "ok"
+        detail, vintage, tree = conn.execute(  # type: ignore[misc]
+            "SELECT detail_level, data_vintage, code_tree_sha256 FROM trials WHERE trial_id = ?",
+            [handle.trial_id],
+        ).fetchone()
+        assert detail == "full"
+        assert vintage is not None and vintage == registry.data_vintage(conn, _CUTOFF)
+        assert tree == registry.code_tree_sha256(checkout)
+        assert tree is not None and len(tree) == 64
+        assert _result_row(conn, handle.trial_id)["sharpe_unit"] == "annual"
+
+    def test_v_and_sr_star_are_stored_in_annual_units(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """With two pairs, the stored V is the variance of the annualised Sharpes and
+        SR* is SR*_annual; the DSR uses SR*_annual / sqrt(12)."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        first, _, _ = _trial(conn, settings, tmp_path)
+        second, _, _ = _trial(conn, settings, tmp_path, start=LATER_START)
+        annual = [
+            _annual(_metrics(conn, h.trial_id, "strategy", BASE), "sharpe_period")
+            for h in (first, second)
+        ]
+        row = _result_row(conn, second.trial_id)
+        assert row["sharpe_unit"] == "annual"
+        assert row["sharpe_variance"] == pytest.approx(float(np.var(annual, ddof=1)), rel=1e-12)
+        monthly_v = float(np.var([a / math.sqrt(12) for a in annual], ddof=1))
+        assert row["sharpe_variance"] == pytest.approx(12 * monthly_v, rel=1e-12)
+
+    def test_a_refused_trial_row_carries_the_unit_too(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        registry.close_trial(conn, handle, "refused_window", "test")
+        assert _result_row(conn, handle.trial_id)["sharpe_unit"] == "annual"
+
+
+class TestCadence:
+    """Period ends come from `schedule.rebalance_sessions` at the hypothesis's cadence,
+    read through `frozen_values` (strategy-lab plan T97)."""
+
+    def test_a_registration_without_schedule_keys_reads_month_end(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        params = {
+            k: v
+            for k, v in frozen_params_of(settings, family="momentum").items()
+            if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+        }
+        registry.register_hypothesis(
+            conn,
+            slug="h1",
+            family="momentum",
+            title="h1 title",
+            doc_path="docs/hypotheses/h1.md",
+            doc_sha256="d" * 64,
+            params=params,
+            in_sample_start=START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="owner",
+            settings=settings,
+        )
+        handle = _open(conn, settings, tmp_path)
+        assert hypothesis_cadence(conn, handle) == "month_end"
+
+    def test_a_week_end_registration_is_read_at_week_end(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        weekly = _settings(tmp_path, schedule={"rebalance_cadence": "week_end"})
+        _register(conn, weekly)
+        handle = _open(conn, weekly, tmp_path)
+        assert hypothesis_cadence(conn, handle) == "week_end"
+
+    def test_metric_rows_at_week_end_use_weekly_period_ends(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """The same daily equity read at week ends: one period per ISO week, 52 per
+        year, the period return between consecutive week-end sessions."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        rows = metric_rows(results, settings, cadence="week_end", family="momentum")
+        base = {
+            r.metric: r.value
+            for r in rows
+            if r.series == "strategy" and r.cost_per_side_bps == BASE
+        }
+        sessions = sorted({r.session for r in results[BASE].equity})
+        weeks = rebalance_sessions(sessions[0], sessions[-1], "week_end")
+        assert base["periods_per_year"] == 52.0
+        assert base["n_periods"] == len(weeks) - 1
+        equity = {r.session: r.equity for r in results[BASE].equity if r.series == "strategy"}
+        net = [equity[b] / equity[a] - 1 for a, b in pairwise(weeks)]
+        growth = math.prod(1 + v for v in net)
+        assert base["cagr"] == pytest.approx(growth ** (52 / len(net)) - 1, rel=1e-9)
+        monthly = metric_rows(results, settings, cadence="month_end", family="momentum")
+        assert {
+            r.metric: r.value
+            for r in monthly
+            if r.series == "strategy" and r.cost_per_side_bps == BASE
+        }["periods_per_year"] == 12.0
 
 
 class TestRefusals:
@@ -539,6 +919,43 @@ class TestRefusals:
             write_results(conn, handle, results, live)
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
 
+    def test_a_pre_lab_registration_records_through_the_defaults(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """A registration stored without `schedule.*` (before T96) runs through
+        `load_frozen` and its results are recorded (strategy-lab T96)."""
+        settings = _settings(tmp_path)
+        all_params = frozen_params_of(settings, family="momentum")
+        params = {
+            k: v
+            for k, v in all_params.items()
+            if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+        }
+        registry.register_hypothesis(
+            conn,
+            slug="h1",
+            family="momentum",
+            title="h1 title",
+            doc_path="docs/hypotheses/h1.md",
+            doc_sha256="d" * 64,
+            params=params,
+            in_sample_start=START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="owner",
+            settings=settings,
+        )
+        frozen = load_frozen(conn, "h1", settings=settings)
+        handle = _open(conn, frozen, tmp_path)
+        write_results(conn, handle, _run(frozen, handle), frozen)
+        assert _count(conn, "trial_metrics", handle.trial_id) > 0
+        daily = frozen.model_copy(
+            update={"schedule": frozen.schedule.model_copy(update={"rebalance_cadence": "daily"})}
+        )
+        handle2 = _open(conn, frozen, tmp_path)
+        with pytest.raises(ValueError, match="frozen"):
+            write_results(conn, handle2, _run(frozen, handle2), daily)
+
     def test_missing_benchmark_is_refused(
         self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
     ) -> None:
@@ -547,7 +964,7 @@ class TestRefusals:
         handle = _open(conn, settings, tmp_path)
         members = {s: list(NAMES) for s in rebalance_sessions(START, HISTORY_END)}
         provider = FakeProvider(prices=_prices(7), members=members, benchmarks={"SPY": "S"})
-        results = run(settings, provider, START, END, handle, LEVELS)
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
         with pytest.raises(ValueError, match="MTUM"):
             write_results(conn, handle, results, settings)
         assert _count(conn, "trial_metrics", handle.trial_id) == 0
@@ -569,3 +986,242 @@ def test_module_writes_only_through_the_registry() -> None:
     source = Path(results_module.__file__).read_text(encoding="utf-8")
     assert "INSERT" not in source.upper().replace("INSERTS", "")
     assert "insert_row" not in source
+
+
+def test_a_profitability_trial_verifies_against_its_own_family(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """`_check_frozen` hashes the trial's own family's frozen set (T85, #1053): a
+    profitability registration stores no `strategy.*`, so a momentum-keyed hash could
+    never match it."""
+    settings = _settings(tmp_path)
+    registry.register_hypothesis(
+        conn,
+        slug="b3",
+        family="profitability",
+        title="b3 title",
+        doc_path="docs/hypotheses/b3.md",
+        doc_sha256="d" * 64,
+        params=frozen_params_of(settings, family="profitability"),
+        in_sample_start=START,
+        holdout_start=HOLDOUT[0],
+        holdout_end=HOLDOUT[1],
+        registered_by="owner",
+        settings=settings,
+    )
+    frozen = load_frozen(conn, "b3", settings=settings)
+    handle = _open(conn, frozen, tmp_path, slug="b3")
+    write_results(conn, handle, _run(frozen, handle), frozen)
+    assert _count(conn, "trial_metrics", handle.trial_id) > 0
+
+
+# --- detail level (strategy-lab spec req 12 and 13, "Storage and compute"; plan T105) --
+
+#: (cadence, start): each cadence's window ends at END; daily starts later to stay short.
+DETAIL_WINDOWS: dict[str, tuple[Cadence, date]] = {
+    "month_end": ("month_end", START),
+    "week_end": ("week_end", START),
+    "daily": ("daily", date(2024, 8, 1)),
+}
+
+
+def _detail_trial(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    start: date,
+    detail_level: results_module.DetailLevel,
+) -> tuple[registry.TrialHandle, dict[float, BacktestResult]]:
+    handle = _open(conn, settings, tmp_path, start=start, detail_level=detail_level)
+    results = _run(settings, handle, start=start)
+    assert write_results(conn, handle, results, settings, detail_level=detail_level) == "ok"
+    return handle, results
+
+
+def _all_metrics(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, level: float
+) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT series, metric, value FROM trial_metrics "
+        "WHERE trial_id = ? AND cost_per_side_bps = ? ORDER BY ALL",
+        [trial_id, level],
+    ).fetchall()
+
+
+class TestDetailLevel:
+    """A `summary` trial stores the req 13 arithmetic's rows and a `full` trial's
+    metrics; a standalone hypothesis writes `full`."""
+
+    @pytest.mark.parametrize("window", list(DETAIL_WINDOWS.values()), ids=list(DETAIL_WINDOWS))
+    def test_a_summary_trial_has_the_req_13_row_counts(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, window: tuple[Cadence, date]
+    ) -> None:
+        cadence, start = window
+        settings = _settings(tmp_path, schedule={"rebalance_cadence": cadence})
+        _register(conn, settings)
+        handle, _ = _detail_trial(conn, settings, tmp_path, start, "summary")
+        # From the calendar: T_0..T_n at the cadence, every session from T_0 to T_n.
+        ends = rebalance_sessions(start, END, cadence)
+        sessions = [s for s in all_sessions() if ends[0] <= s <= ends[-1]]
+        series, levels = 3, len(LEVELS)
+        trial = handle.trial_id
+        assert _count(conn, "trial_equity", trial) == (
+            series * len(sessions) + series * (levels - 1) * len(ends)
+        )
+        assert _count(conn, "trial_weights", trial) == 0
+        assert _count(conn, "trial_rebalances", trial) == levels * (len(ends) - 1)
+        assert _count(conn, "trial_metrics", trial) == series * levels * len(METRIC_KEYS)
+        base = conn.execute(
+            "SELECT COUNT(*) FROM trial_equity WHERE trial_id = ? AND cost_per_side_bps = ?",
+            [trial, BASE],
+        ).fetchone()
+        assert base == (series * len(sessions),)
+        if cadence == "daily":  # every session is a rebalance: summary saves no equity rows
+            assert _count(conn, "trial_equity", trial) == series * levels * len(sessions)
+
+    @pytest.mark.parametrize("level", LEVELS)
+    def test_a_summary_trials_metrics_equal_the_full_trials(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, level: float
+    ) -> None:
+        """`max_drawdown` included: the metrics come from the full in-memory result."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        summary, _ = _detail_trial(conn, settings, tmp_path, START, "summary")
+        full, _ = _detail_trial(conn, settings, tmp_path, START, "full")
+        got, want = (
+            _all_metrics(conn, summary.trial_id, level),
+            _all_metrics(conn, full.trial_id, level),
+        )
+        assert got == want
+        assert any(metric == "max_drawdown" for _, metric, _ in got)
+        # Fewer rows stored, the same metrics: they come from the full in-memory curve.
+        assert _count(conn, "trial_equity", summary.trial_id) < _count(
+            conn, "trial_equity", full.trial_id
+        )
+
+    def test_a_standalone_trial_writes_full_by_default(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle, results, status = _trial(conn, settings, tmp_path)
+        assert status == "ok"
+        assert _count(conn, "trial_equity", handle.trial_id) == sum(
+            len(r.equity) for r in results.values()
+        )
+        assert _count(conn, "trial_weights", handle.trial_id) == len(results[BASE].weights) > 0
+
+    def test_an_unknown_detail_level_is_refused_before_any_write(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        results = _run(settings, handle)
+        with pytest.raises(ValueError, match="detail level"):
+            write_results(conn, handle, results, settings, detail_level="partial")  # type: ignore[arg-type]
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+    @pytest.mark.parametrize("detail_level", ["summary", "full"])
+    def test_the_trials_row_records_the_detail_level_written(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, detail_level: str
+    ) -> None:
+        """#1197: a summary trial reads `summary` on its `trials` row, so the backtest
+        page (T112) does not look for rows a summary trial never stores."""
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle, _ = _detail_trial(conn, settings, tmp_path, START, detail_level)  # type: ignore[arg-type]
+        row = conn.execute(
+            "SELECT detail_level FROM trials WHERE trial_id = ?", [handle.trial_id]
+        ).fetchone()
+        assert row == (detail_level,)
+
+    def test_a_level_other_than_the_opened_one_is_refused_before_any_write(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)  # opened at `full`
+        results = _run(settings, handle)
+        with pytest.raises(ValueError, match="opened at detail level"):
+            write_results(conn, handle, results, settings, detail_level="summary")
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+
+# --- per-family comparison benchmarks (T129, ADR 0014 point 4) -----------------------
+
+
+def _with_benchmark(
+    results: dict[float, BacktestResult], name: str, *, drift: float = 0.0004
+) -> dict[float, BacktestResult]:
+    """`results` plus an equity series `name`: SPY's rows with a daily drift on top."""
+    out: dict[float, BacktestResult] = {}
+    for level, result in results.items():
+        spy = sorted((r for r in result.equity if r.series == "SPY"), key=lambda r: r.session)
+        extra = [
+            replace(r, series=name, equity=r.equity * (1 + drift) ** i) for i, r in enumerate(spy)
+        ]
+        out[level] = replace(result, equity=[*result.equity, *extra])
+    return out
+
+
+class TestFamilyBenchmarks:
+    @pytest.fixture
+    def qual_family(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        """A test-only family declaring `QUAL` as its benchmark."""
+        monkeypatch.setitem(
+            FAMILIES,
+            "qualtest",
+            replace(FAMILIES["momentum"], benchmark="QUAL"),  # type: ignore[call-overload]
+        )
+        return "qualtest"
+
+    def test_momentum_without_mtum_is_still_refused(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        stripped = {
+            level: replace(r, equity=[e for e in r.equity if e.series != "MTUM"])
+            for level, r in results.items()
+        }
+        with pytest.raises(ValueError, match="MTUM"):
+            results_module._check(stripped, settings, "momentum")
+
+    def test_declared_third_benchmark_is_required(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, qual_family: str
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        with pytest.raises(ValueError, match="QUAL"):
+            results_module._check(results, settings, qual_family)
+        results_module._check(_with_benchmark(results, "QUAL"), settings, qual_family)
+        # Not required of a family that does not declare it.
+        results_module._check(results, settings, "momentum")
+
+    def test_third_benchmark_adds_a_series_and_two_keys_and_nothing_else_moves(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path, qual_family: str
+    ) -> None:
+        settings = _settings(tmp_path)
+        _register(conn, settings)
+        results = _run(settings, _open(conn, settings, tmp_path))
+        plain = metric_rows(results, settings, cadence="month_end", family="momentum")
+        rows = metric_rows(
+            _with_benchmark(results, "QUAL"), settings, cadence="month_end", family=qual_family
+        )
+        assert {r.series for r in rows} == {"strategy", "SPY", "MTUM", "QUAL"}
+        old = {(r.series, r.cost_per_side_bps, r.metric): r.value for r in plain}
+        new = {(r.series, r.cost_per_side_bps, r.metric): r.value for r in rows}
+        for key, value in old.items():
+            assert new[key] == value, key
+        extra = {k[2] for k in new if k[0] == "strategy"} - set(METRIC_KEYS)
+        assert extra == {"excess_cagr_qual", "tracking_error_qual"}
+
+    def test_registered_families_all_declare_mtum_and_add_no_series(self) -> None:
+        for family in FAMILIES:
+            assert results_module.family_benchmark(family) is None
+            assert results_module.family_series(family) == ("strategy", "SPY", "MTUM")
+        with pytest.raises(KeyError):
+            results_module.family_series("nosuch")

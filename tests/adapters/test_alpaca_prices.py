@@ -11,18 +11,24 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
     ListingResolver,
+    RegistrantEvidence,
+    alpaca_symbol,
     feed_source,
+    is_same_day_typo,
     parse_bars,
     parse_corporate_actions,
+    registrant_evidence,
+    same_alpaca_symbol,
 )
 from tradepartner.adapters.prices import (
     ActionType,
@@ -39,8 +45,15 @@ def _json(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text())
 
 
-def _listing(security_id: str, ticker: str, valid_from: date) -> dict[str, object]:
-    return {"security_id": security_id, "ticker": ticker, "valid_from": valid_from}
+def _listing(
+    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+) -> dict[str, object]:
+    return {
+        "security_id": security_id,
+        "ticker": ticker,
+        "valid_from": valid_from,
+        "class_title": class_title,
+    }
 
 
 START = date(2016, 1, 4)
@@ -85,10 +98,18 @@ class TestResolver:
         assert resolver.resolve("AAPL", date(2015, 12, 31)) is None
         assert resolver.resolve("NOPE", date(2020, 1, 2)) is None
 
-    def test_same_ticker_same_start_is_ambiguous(self) -> None:
-        resolver = ListingResolver([_listing("A", "DUP", START), _listing("B", "DUP", START)])
-        with pytest.raises(ValueError, match="ambiguous"):
-            resolver.resolve("DUP", date(2020, 1, 2))
+    def test_two_equities_starting_on_one_day_are_unassigned_not_raised(self) -> None:
+        # Owner rule 3 (#735): Revlon and its parent both listed REV from
+        # 2020-03-12; neither gets the rows, the run does not abort.
+        resolver = ListingResolver(
+            [
+                _listing("0000887921", "REV", date(2020, 3, 12), "Class A Common Stock"),
+                _listing("0000890547", "REV", date(2020, 3, 12), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("REV", date(2020, 6, 1)) is None
+        assert resolver.report.ambiguous_spans == 2
+        assert "2 ambiguous" in resolver.report.summary()
 
     def test_second_exchange_listing_same_ticker_is_one_span(self) -> None:
         resolver = ListingResolver(
@@ -97,9 +118,176 @@ class TestResolver:
         assert resolver.resolve("XX", date(2020, 1, 2)) == "SEC_X"
         assert resolver.symbols("SEC_X", START, date(2020, 1, 2)) == ["XX"]
 
-    def test_one_security_two_tickers_same_day_raises(self) -> None:
-        with pytest.raises(ValueError, match="same day"):
-            ListingResolver([_listing("SEC_X", "AA", START), _listing("SEC_X", "BB", START)])
+    def test_a_same_day_typo_keeps_the_ticker_the_security_held(self) -> None:
+        # #819 (was owner rule 2, #735): FutureFuel's cover page of
+        # 2024-05-10 lists Ford's F beside its own FF. FutureFuel held FF
+        # the day before, so F is a typo: FutureFuel keeps FF from that day
+        # on (it lost about 600 sessions before), and Ford keeps F.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0000037996", "F", date(1994, 2, 10)),
+                _listing("0000037996", "F", date(2019, 7, 24), "Common Stock"),
+                _listing("0001337298", "FF", date(2005, 9, 2)),
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FF", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2024, 5, 9)) == "0001337298"
+        assert resolver.resolve("FF", day) == "0001337298"
+        assert resolver.resolve("FF", date(2026, 9, 30)) == "0001337298"
+        assert resolver.resolve("F", day) == "0000037996"
+        assert resolver.resolve("F", date(2026, 9, 30)) == "0000037996"
+        assert resolver.symbols("0001337298", day, date(2026, 9, 30)) == ["FF"]
+        assert resolver.report.same_day_typos == 1
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (0, 0)
+        assert "1 same-day typo listings dropped" in resolver.report.summary()
+
+    def test_a_same_day_typo_after_a_second_exchange_keeps_the_ticker(self) -> None:
+        # TMPM (2022-03-17) names its warrants' TMPMW on the common's row;
+        # CLRC (2024-03-14) names CLCR, its ticker of 2022, again.
+        tmpm, clrc = "0001823524", "0001903392"
+        resolver = ListingResolver(
+            [
+                _listing(tmpm, "TMPM", date(2020, 11, 30), "Class A Ordinary Shares"),
+                _listing(tmpm, "TMPM", date(2022, 3, 17), "Class A Ordinary Shares"),
+                _listing(tmpm, "TMPMW", date(2022, 3, 17), "Class A Ordinary Shares"),
+                _listing(clrc, "CLCR", date(2022, 6, 10), "Class A Ordinary Share"),
+                _listing(clrc, "CLRC", date(2022, 11, 9), "Class A Ordinary Share"),
+                _listing(clrc, "CLCR", date(2024, 3, 14), "Class A Ordinary Share"),
+                _listing(clrc, "CLRC", date(2024, 3, 14), "Class A Ordinary Share"),
+            ]
+        )
+        assert resolver.resolve("TMPM", date(2022, 3, 17)) == tmpm
+        assert resolver.resolve("TMPM", date(2023, 1, 3)) == tmpm
+        assert resolver.resolve("TMPMW", date(2022, 3, 17)) is None
+        assert resolver.resolve("CLRC", date(2024, 3, 14)) == clrc
+        assert resolver.resolve("CLCR", date(2024, 3, 14)) is None
+        assert resolver.resolve("CLCR", date(2022, 7, 1)) == clrc
+        assert resolver.report.same_day_typos == 2
+
+    def test_two_new_tickers_on_one_day_are_unassigned_from_that_day(self) -> None:
+        # Owner rule 2 (#735) where neither ticker is the one held before:
+        # nothing shows which is right, so neither is assigned.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0000037996", "F", date(1994, 2, 10)),
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FFX", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2024, 5, 9)) == "0001337298"
+        assert resolver.resolve("FFX", day) is None
+        assert resolver.resolve("F", day) == "0000037996"
+        assert resolver.symbols("0001337298", day, date(2024, 5, 31)) == []
+        assert (resolver.report.same_day_securities, resolver.report.same_day_listings) == (1, 2)
+        assert resolver.report.same_day_typos == 0
+
+    def test_notes_and_preferred_under_the_common_ticker_are_left_out(self) -> None:
+        # Owner rule 1 (#735): JNJ's notes and KSU's preferred list under
+        # the common's ticker; the common resolves, the others are counted.
+        jnj, ksu = "0000200406", "0000054480"
+        resolver = ListingResolver(
+            [
+                _listing(jnj, "JNJ", START),
+                _listing(
+                    f"{jnj}:0-650pct-notes-due-may-2024",
+                    "JNJ",
+                    date(2019, 7, 29),
+                    "0.650% Notes due May 2024",
+                ),
+                _listing(
+                    f"{jnj}:floating-rate-notes",
+                    "JNJ",
+                    date(2019, 7, 29),
+                    "Floating Rate Notes due 2020",
+                ),
+                _listing(ksu, "KSU", date(2019, 7, 19), "Common Stock, $.01 Par Value"),
+                _listing(
+                    f"{ksu}:preferred-stock",
+                    "KSU",
+                    date(2019, 7, 19),
+                    "Preferred Stock, Par Value $25 Per Share",
+                ),
+                _listing(
+                    f"{ksu}:rights", "KSU", date(2019, 7, 19), "Preferred Stock Purchase Rights"
+                ),
+            ]
+        )
+        assert resolver.resolve("JNJ", date(2020, 1, 2)) == jnj
+        assert resolver.resolve("KSU", date(2020, 1, 2)) == ksu
+        assert resolver.report.non_equity == {"debt": 1, "coupon": 1, "preferred": 2}
+        notes = f"{jnj}:0-650pct-notes-due-may-2024"
+        assert resolver.knows(notes)
+        assert resolver.symbols(notes, START, date(2020, 1, 2)) == []
+
+    def test_a_note_starting_after_the_common_does_not_take_its_ticker(self) -> None:
+        # The silent case: the latest span wins a ticker, so a note listed
+        # under MSFT years after the common would otherwise price as MSFT.
+        resolver = ListingResolver(
+            [
+                _listing("0000789019", "MSFT", START),
+                _listing(
+                    "0000789019:2-125pct-notes-due-2021",
+                    "MSFT",
+                    date(2019, 10, 23),
+                    "2.125% Notes due 2021",
+                ),
+            ]
+        )
+        assert resolver.resolve("MSFT", date(2020, 1, 2)) == "0000789019"
+
+    def test_a_later_class_of_the_company_never_takes_its_ticker(self) -> None:
+        # AIN: the cover page of 2019 lists the unlisted Class B under the
+        # Class A's ticker. The Class A keeps it; the Class B never holds
+        # it, not even after the Class A moves to another ticker.
+        resolver = ListingResolver(
+            [
+                _listing("0000819793", "AIN", START),
+                _listing(
+                    "0000819793:class-b-common-stock",
+                    "AIN",
+                    date(2019, 7, 31),
+                    "Class B Common Stock",
+                ),
+                _listing("0000819793", "AINX", date(2023, 1, 3), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("AIN", date(2020, 1, 2)) == "0000819793"
+        assert resolver.resolve("AIN", date(2023, 6, 1)) is None
+        assert resolver.report.later_class_spans == 1
+
+    def test_another_company_taking_the_ticker_later_still_wins(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "REUSE", START, "Common Stock"),
+                _listing("0000000002", "REUSE", date(2022, 3, 1), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("REUSE", date(2022, 3, 1)) == "0000000002"
+        assert resolver.report.later_class_spans == 0
+
+    @pytest.mark.parametrize(
+        "ticker",
+        ["", "N/A", "n/a", "NA", "None", "NONE", "Not applicable", "-", " 0 ", "true", "No"],
+    )
+    def test_placeholder_tickers_are_left_out(self, ticker: str) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", ticker, START, "Common Stock"),
+                _listing("0000000002", ticker, START, "Common Stock"),
+                _listing("0000000003", "ABC", START, "Common Stock"),
+                _listing("0000000003", ticker, START, "Common Stock"),  # no second ticker
+            ]
+        )
+        assert resolver.resolve(ticker, date(2020, 1, 2)) is None
+        assert resolver.resolve("ABC", date(2020, 1, 2)) == "0000000003"
+        assert resolver.report.placeholder == 3
+        assert resolver.report.same_day_securities == 0
+        assert resolver.symbols("0000000001", START, date(2020, 1, 2)) == []
 
     def test_ticker_taken_through_a_rename_is_contested(self) -> None:
         # Roundhill's ETF traded as META before Facebook renamed FB -> META;
@@ -143,6 +331,106 @@ class TestResolver:
         )
         assert resolver.contested_spans == ()
 
+    @pytest.mark.parametrize("ticker", ["TRUE", "NO"])
+    def test_a_word_ticker_in_capitals_resolves(self, ticker: str) -> None:
+        resolver = ListingResolver([_listing("0000000001", ticker, START, "Common Stock")])
+        assert resolver.resolve(ticker, date(2020, 1, 2)) == "0000000001"
+
+    def test_a_later_not_applicable_row_never_takes_na(self) -> None:
+        # #736 review: Nano Labs trades as NA; Courtside's cover page (2023,
+        # exchange NONE) and BioCancell's untraded ordinary shares (2024)
+        # also write NA. NA holds nothing: no row goes to the wrong company.
+        resolver = ListingResolver(
+            [
+                _listing(
+                    "0001872302",
+                    "NA",
+                    date(2022, 6, 10),
+                    "American depositary shares, each representing two Class A shares",
+                ),
+                _listing("0001940177", "NA", date(2023, 8, 14), "NA"),
+                _listing(
+                    "0001534248:ordinary-shares",
+                    "NA",
+                    date(2024, 3, 28),
+                    "Ordinary shares, no par-value",
+                ),
+            ]
+        )
+        for session in (date(2022, 7, 1), date(2023, 8, 15), date(2024, 3, 29), date(2026, 9, 30)):
+            assert resolver.resolve("NA", session) is None
+        assert resolver.report.placeholder == 3
+
+    def test_a_left_out_listing_still_shadows_an_older_company(self) -> None:
+        # Company 3's units take T in 2015: company 1's span (2005, never
+        # ended by a later listing) must not get 2016's bars back.
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "T", date(2005, 1, 3), "Common Stock"),
+                _listing("0000000003:units", "T", date(2015, 1, 2), "Units"),
+            ]
+        )
+        assert resolver.resolve("T", date(2014, 12, 31)) == "0000000001"
+        assert resolver.resolve("T", date(2016, 1, 4)) is None
+
+    def test_a_later_class_still_shadows_an_older_company(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "T", date(2005, 1, 3), "Common Stock"),
+                _listing("0000000002", "T", date(2010, 1, 4), "Class A Common Stock"),
+                _listing("0000000002:class-b", "T", date(2012, 1, 3), "Class B Common Stock"),
+                _listing("0000000002", "U", date(2014, 1, 2), "Class A Common Stock"),
+            ]
+        )
+        assert resolver.resolve("T", date(2011, 1, 3)) == "0000000002"
+        assert resolver.resolve("T", date(2013, 1, 2)) == "0000000002"
+        assert resolver.resolve("T", date(2015, 1, 2)) is None
+
+    def test_a_warrant_row_on_the_commons_day_does_not_cost_the_common(self) -> None:
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "ABC", START, "Class A Common Stock"),
+                _listing("0000000001", "ABCW", START, "Redeemable Warrants"),
+            ]
+        )
+        assert resolver.resolve("ABC", date(2020, 1, 2)) == "0000000001"
+        assert resolver.report.same_day_securities == 0
+
+    def test_listings_from_a_later_day_never_change_an_earlier_mapping(self) -> None:
+        # No look-ahead: dropping every row from `cut` on leaves each
+        # earlier session's mapping as it was (renames aside: contested
+        # spans are the documented exception).
+        cut = date(2019, 7, 1)
+        rows = [
+            _listing("0000000001", "AAA", START),
+            _listing(
+                "0000000001",
+                "AAA",
+                date(2020, 2, 3),
+                "Common Shares (including Rights under Shareholder Rights Plan)",
+            ),
+            _listing("0000000001:notes", "AAA", date(2019, 10, 1), "1.5% Notes due 2029"),
+            _listing("0000000002", "BBB", START),
+            _listing("0000000002", "BB", date(2021, 3, 1), "Common Stock"),
+            _listing("0000000002", "BBB", date(2021, 3, 1), "Common Stock"),
+            _listing("0000000003", "CCC", START),
+            _listing("0000000003:class-b", "CCC", date(2019, 8, 1), "Class B Common Stock"),
+            _listing("0000000004", "DDD", START),
+            _listing("0000000005:warrants", "DDD", date(2020, 6, 1), "Warrants"),
+            _listing("0000000006", "EEE", date(2017, 5, 1), "Common Stock"),
+            _listing("0000000007", "EEE", date(2019, 9, 3), "Common Stock"),
+        ]
+        full = ListingResolver(rows)
+        early = ListingResolver([r for r in rows if r["valid_from"] < cut])  # type: ignore[operator]
+        sessions = [date(y, m, 1) for y in range(2016, 2020) for m in range(1, 13)]
+        for ticker in ("AAA", "BBB", "BB", "CCC", "DDD", "EEE"):
+            for session in (s for s in sessions if s < cut):
+                assert full.resolve(ticker, session) == early.resolve(ticker, session), (
+                    ticker,
+                    session,
+                )
+        assert full.resolve("AAA", date(2019, 3, 1)) == "0000000001"
+
     def test_symbols_over_a_range(self) -> None:
         resolver = ListingResolver(
             [
@@ -153,6 +441,991 @@ class TestResolver:
         assert resolver.symbols("SEC_META", date(2022, 1, 3), date(2022, 12, 30)) == ["FB", "META"]
         assert resolver.symbols("SEC_META", date(2023, 1, 3), date(2023, 12, 29)) == ["META"]
         assert resolver.symbols("SEC_NONE", date(2023, 1, 3), date(2023, 12, 29)) == []
+
+
+def _shares(security_id: str, as_of: date, value: float, known: date) -> dict[str, object]:
+    return {
+        "security_id": security_id,
+        "fact_name": "shares_outstanding",
+        "as_of_date": as_of,
+        "value": value,
+        "known_at": datetime(known.year, known.month, known.day, 16, tzinfo=UTC),
+    }
+
+
+def _ended(
+    security_id: str,
+    ticker: str,
+    class_title: str,
+    effective_on: date,
+    status: str = "delisted",
+    valid_from: date = date(1994, 1, 3),
+    end_session: date | None = None,
+) -> dict[str, object]:
+    """A `listing_ends_as_of` row: the listing (from `valid_from`) ended by a
+    Form 25, its last bar before the security's next row `end_session`."""
+    return {
+        "security_id": security_id,
+        "ticker": ticker,
+        "class_title": class_title,
+        "valid_from": valid_from,
+        "status": status,
+        "effective_on": effective_on,
+        "end_session": end_session,
+    }
+
+
+RUN_DAY = date(2026, 10, 4)
+
+
+def _evidence(
+    facts: list[dict[str, object]],
+    ends: list[dict[str, object]] | None = None,
+    as_of: date = RUN_DAY,
+) -> RegistrantEvidence:
+    return registrant_evidence(
+        facts, ends or [], as_of=as_of, quiet_after_days=180, transfer_window_sessions=5
+    )
+
+
+# Real cases from backfill pre-flight F (#793), store values as filed.
+AEP, AEP_TEXAS = "0000004904", "0001721781"
+AEP_LISTINGS = [
+    _listing(AEP, "AEP", date(1994, 5, 16)),
+    _listing(AEP, "AEP", date(2025, 2, 13), "Common Stock, $6.50 par value"),
+    _listing(AEP_TEXAS, "AEP", date(2026, 7, 30), "Common Stock, $6.50 par value"),
+]
+AEP_FACTS = [
+    _shares(AEP, date(2026, 5, 5), 544104955, date(2026, 5, 5)),
+    _shares(AEP, date(2026, 7, 30), 544397352, date(2026, 7, 30)),
+    _shares(AEP_TEXAS, date(2026, 7, 30), 544397352, date(2026, 7, 30)),
+]
+MGEE, MGE = "0001161728", "0000061339"
+MGEE_LISTINGS = [
+    _listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value"),
+    _listing(MGE, "MGEE", date(2026, 2, 27), "Common Stock, $1 Par Value"),
+]
+MGEE_FACTS = [
+    _shares(MGE, date(2015, 7, 31), 34668370, date(2015, 8, 6)),
+    _shares(MGE, date(2026, 2, 20), 17347894, date(2026, 2, 27)),
+    _shares(MGEE, date(2026, 7, 31), 37784012, date(2026, 8, 5)),
+]
+
+
+class TestRegistrantCheck:
+    """Rule 6 (#793): another company's later span of a ticker takes it only
+    from a holder that has left it (a delisted equity listing) or gone
+    quiet; until then it is a co-registrant or disputed claim."""
+
+    def test_a_subsidiary_citing_the_parents_ticker_never_takes_it(self) -> None:
+        # AEP Texas's cover page of 2026-07-30 lists AEP's common stock and
+        # reports AEP's share count: a co-registrant, AEP keeps its bars.
+        resolver = ListingResolver(AEP_LISTINGS, _evidence(AEP_FACTS))
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+        assert resolver.symbols(AEP_TEXAS, date(2026, 1, 2), date(2026, 9, 30)) == []
+        assert resolver.report.co_registrant_spans == 1
+        assert "1 co-registrant and 0 disputed claims" in resolver.report.summary()
+
+    def test_an_operating_partnership_citing_the_reits_ticker_never_takes_it(self) -> None:
+        maa, maa_lp = "0000912595", "0001581776"
+        resolver = ListingResolver(
+            [
+                _listing(maa, "MAA", date(1996, 5, 14)),
+                _listing(maa, "MAA", date(2019, 10, 31), "Common Stock, par value $.01"),
+                _listing(maa_lp, "MAA", date(2025, 10, 31), "Common Stock, par value $.01"),
+            ],
+            _evidence(
+                [
+                    _shares(maa_lp, date(2013, 11, 4), 74776229, date(2013, 11, 7)),
+                    _shares(maa, date(2025, 10, 27), 117081742, date(2025, 10, 31)),
+                    _shares(maa_lp, date(2025, 10, 27), 117081742, date(2025, 10, 31)),
+                    _shares(maa, date(2026, 7, 30), 116021957, date(2026, 7, 30)),
+                ],
+                # A preferred listing's delisting is not the common leaving.
+                [_ended(maa, "MAA-PI", "8.50% Series I Preferred Stock", date(2026, 10, 1))],
+            ),
+        )
+        assert resolver.resolve("MAA", date(2026, 9, 15)) == maa
+
+    def test_a_co_registrant_never_inherits_the_parents_old_ticker(self) -> None:
+        # MPT's operating partnership cites MPW; the REIT moves to MPT. The
+        # partnership never traded MPW and does not take it then.
+        listings = [*AEP_LISTINGS, _listing(AEP, "AEPX", date(2026, 9, 1), "Common Stock")]
+        resolver = ListingResolver(listings, _evidence(AEP_FACTS))
+        assert resolver.resolve("AEP", date(2026, 8, 31)) == AEP
+        assert resolver.resolve("AEP", date(2026, 9, 15)) is None
+        assert resolver.symbols(AEP_TEXAS, date(2026, 1, 2), date(2026, 12, 31)) == []
+
+    def test_an_old_shared_count_is_no_proof_of_a_combined_filing(self) -> None:
+        # Two counts that match years before the claim are a coincidence,
+        # not the combined filing that produced the claimant's listing.
+        facts = [
+            _shares(MGE, date(2019, 3, 31), 5000000, date(2019, 4, 30)),
+            _shares(MGEE, date(2019, 3, 31), 5000000, date(2019, 4, 30)),
+            *MGEE_FACTS,
+        ]
+        resolver = ListingResolver(MGEE_LISTINGS, _evidence(facts))
+        assert resolver.resolve("MGEE", date(2026, 9, 15)) is None
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_waiting_claim_never_ties_with_a_new_listing_on_its_first_day(self) -> None:
+        holdings, spinco, newco = "0001808834", "0001821393", "0009999999"
+        resolver = ListingResolver(
+            [
+                _listing(holdings, "AAN", date(2020, 10, 29), "Common Stock"),
+                _listing(holdings, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(spinco, "AAN", date(2021, 2, 23), "Common Stock"),
+                _listing(newco, "AAN", date(2021, 2, 25), "Common Stock"),
+            ],
+            _evidence([_shares(holdings, date(2026, 7, 24), 39000000, date(2026, 7, 29))]),
+        )
+        assert resolver.resolve("AAN", date(2021, 3, 1)) == newco
+        assert resolver.report.ambiguous_spans == 0
+
+    def test_an_exchange_transfer_is_not_the_holder_leaving(self) -> None:
+        ends = [_ended(AEP, "AEP", "Common Stock", date(2019, 3, 1), status="transferred")]
+        resolver = ListingResolver(AEP_LISTINGS, _evidence(AEP_FACTS, ends))
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+
+    def test_a_claim_on_a_live_holders_ticker_without_proof_is_disputed(self) -> None:
+        # Madison Gas & Electric lists MGE Energy's MGEE from 2026-02-27 but
+        # reports its own share count: nothing shows which registrant's
+        # stock trades, so the ticker resolves to nothing while both last.
+        resolver = ListingResolver(MGEE_LISTINGS, _evidence(MGEE_FACTS))
+        assert resolver.resolve("MGEE", date(2026, 2, 26)) == MGEE
+        assert resolver.resolve("MGEE", date(2026, 9, 15)) is None
+        assert resolver.symbols(MGE, date(2026, 1, 2), date(2026, 9, 30)) == []
+        assert resolver.report.disputed_spans == 1
+        assert "0 co-registrant and 1 disputed claims" in resolver.report.summary()
+
+    def test_the_verdict_does_not_turn_on_which_company_filed_last(self) -> None:
+        later = _shares(MGE, date(2026, 8, 31), 17347894, date(2026, 9, 3))
+        resolver = ListingResolver(MGEE_LISTINGS, _evidence([*MGEE_FACTS, later]))
+        assert resolver.resolve("MGEE", date(2026, 9, 15)) is None
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_disputed_claim_stops_shadowing_when_the_claimant_moves_on(self) -> None:
+        listings = [*MGEE_LISTINGS, _listing(MGE, "MGEX", date(2026, 6, 1), "Common Stock")]
+        resolver = ListingResolver(listings, _evidence(MGEE_FACTS))
+        assert resolver.resolve("MGEE", date(2026, 5, 1)) is None
+        assert resolver.resolve("MGEE", date(2026, 7, 1)) == MGEE
+
+    def test_a_disputed_claim_waits_for_the_holder_to_move_off_the_ticker(self) -> None:
+        # Aaron's SpinCo lists AAN from 2021-02-23; Aaron's Holdings, still
+        # filing, moves to PRG on 2021-02-25. The spin-off holds AAN from then.
+        holdings, spinco = "0001808834", "0001821393"
+        resolver = ListingResolver(
+            [
+                _listing(holdings, "AAN", date(2020, 10, 29), "Common Stock"),
+                _listing(holdings, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(spinco, "AAN", date(2021, 2, 23), "Common Stock"),
+            ],
+            _evidence(
+                [
+                    _shares(spinco, date(2021, 2, 19), 33000000, date(2021, 2, 23)),
+                    _shares(spinco, date(2024, 7, 31), 31000000, date(2024, 8, 5)),
+                    _shares(holdings, date(2026, 7, 24), 39000000, date(2026, 7, 29)),
+                ]
+            ),
+        )
+        assert resolver.resolve("AAN", date(2021, 2, 23)) is None
+        assert resolver.resolve("AAN", date(2021, 2, 25)) == spinco
+        assert resolver.resolve("AAN", date(2022, 1, 14)) == spinco
+        assert resolver.symbols(spinco, date(2021, 1, 4), date(2021, 2, 24)) == []
+        assert resolver.symbols(spinco, date(2021, 1, 4), date(2021, 3, 31)) == ["AAN"]
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_holder_leaving_later_never_hands_its_earlier_bars_to_the_claimant(self) -> None:
+        # Were AEP delisted in 2027, AEP Texas would take AEP only from then;
+        # the sessions before are unassigned, no longer AEP's on proof.
+        ends = [_ended(AEP, "AEP", "Common Stock", date(2027, 3, 1), valid_from=date(2025, 2, 13))]
+        facts = [*AEP_FACTS, _shares(AEP, date(2027, 2, 15), 545000000, date(2027, 2, 20))]
+        resolver = ListingResolver(AEP_LISTINGS, _evidence(facts, ends, date(2027, 6, 1)))
+        assert resolver.resolve("AEP", date(2026, 7, 29)) == AEP
+        assert resolver.resolve("AEP", date(2026, 9, 15)) is None
+        assert resolver.resolve("AEP", date(2027, 3, 1)) == AEP_TEXAS
+        assert resolver.report.disputed_spans == 1
+
+    def test_a_holding_company_successor_takes_the_ticker_after_the_old_common_is_delisted(
+        self,
+    ) -> None:
+        # NorthWestern Energy Group (2023 reorganization): the old company's
+        # common was delisted by a 25-NSE before the group's first listing.
+        nwe, group = "0000073088", "0001993004"
+        resolver = ListingResolver(
+            [
+                _listing(nwe, "NWE", date(2019, 7, 23), "Common stock"),
+                _listing(nwe, "NWE", date(2020, 10, 21), "Common stock"),
+                _listing(group, "NWE", date(2023, 10, 26), "Common stock"),
+            ],
+            _evidence(
+                [
+                    _shares(nwe, date(2023, 10, 20), 61242238, date(2023, 10, 26)),
+                    _shares(group, date(2023, 10, 20), 61242238, date(2023, 10, 26)),
+                    _shares(group, date(2026, 7, 24), 61517850, date(2026, 7, 29)),
+                ],
+                [
+                    _ended(
+                        nwe, "NWE", "Common stock", date(2023, 10, 9), valid_from=date(2020, 10, 21)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("NWE", date(2023, 10, 6)) == nwe
+        # #819: the old common ends at its delisting; the group's bars
+        # before its first listing (2023-10-26) are unassigned, never the
+        # old company's.
+        assert resolver.resolve("NWE", date(2023, 10, 25)) is None
+        assert resolver.resolve("NWE", date(2024, 1, 16)) == group
+        assert resolver.report.co_registrant_spans == 0
+        assert resolver.report.disputed_spans == 0
+
+    def test_a_successor_takes_the_ticker_once_the_old_company_is_quiet(self) -> None:
+        # Xerox Holdings (2019): the old registrant's last share count was
+        # filed before the new one's first listing.
+        old, new = "0000108772", "0001770450"
+        resolver = ListingResolver(
+            [
+                _listing(old, "XRX", date(2019, 8, 6), "Common Stock, $1 par value"),
+                _listing(new, "XRX", date(2019, 11, 6), "Common Stock, $1 par value"),
+            ],
+            _evidence(
+                [
+                    _shares(old, date(2019, 7, 31), 221283933, date(2019, 8, 6)),
+                    _shares(new, date(2019, 10, 31), 216188261, date(2019, 11, 6)),
+                    _shares(new, date(2026, 7, 31), 131314511, date(2026, 8, 6)),
+                ]
+            ),
+        )
+        assert resolver.resolve("XRX", date(2022, 1, 14)) == new
+        assert resolver.report.disputed_spans == 0
+
+    def test_an_early_successor_listing_waits_for_the_old_company_to_go_quiet(self) -> None:
+        # First Seacoast's second step: the new company lists FSEA from
+        # 2022-09-13, the old one files until 2023-03-24 and then stops.
+        old, new = "0001769267", "0001943802"
+        resolver = ListingResolver(
+            [
+                _listing(old, "FSEA", date(2019, 8, 13), "Common Stock"),
+                _listing(new, "FSEA", date(2022, 9, 13), "Common Stock"),
+            ],
+            _evidence(
+                [  # the same count on the same day, but the old one went quiet
+                    _shares(old, date(2023, 3, 14), 5075345, date(2023, 3, 24)),
+                    _shares(new, date(2023, 3, 14), 5075345, date(2023, 3, 24)),
+                    _shares(new, date(2026, 8, 3), 4704425, date(2026, 8, 7)),
+                ]
+            ),
+        )
+        assert resolver.resolve("FSEA", date(2022, 9, 12)) == old
+        assert resolver.resolve("FSEA", date(2022, 12, 15)) is None
+        assert resolver.resolve("FSEA", date(2023, 3, 27)) == new
+
+    def test_a_holder_whose_common_was_delisted_loses_the_ticker_though_it_still_files(
+        self,
+    ) -> None:
+        # Crane: the old registrant's common had a 25-NSE in 2022 and the
+        # company still files; the new Crane Co takes CR as before.
+        old, new = "0000025445", "0001944013"
+        resolver = ListingResolver(
+            [
+                _listing(old, "CR", date(2019, 7, 30), "Common Stock"),
+                _listing(new, "CR", date(2022, 12, 15), "Common Stock"),
+            ],
+            _evidence(
+                [
+                    _shares(old, date(2026, 7, 31), 57561304, date(2026, 8, 5)),
+                    _shares(new, date(2026, 7, 29), 57800356, date(2026, 7, 31)),
+                ],
+                [
+                    _ended(
+                        old, "CR", "Common Stock", date(2022, 5, 27), valid_from=date(2019, 7, 30)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("CR", date(2024, 1, 16)) == new
+
+    def test_without_evidence_on_the_holder_the_newer_company_still_wins(self) -> None:
+        assert ListingResolver(AEP_LISTINGS).resolve("AEP", date(2026, 9, 15)) == AEP_TEXAS
+        only_claimant = _evidence([AEP_FACTS[2]])
+        resolver = ListingResolver(AEP_LISTINGS, only_claimant)
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP_TEXAS
+        assert resolver.report.co_registrant_spans == 0
+
+    def test_registrant_evidence_reads_shares_and_delisted_equity_listings(self) -> None:
+        evidence = registrant_evidence(
+            [
+                *AEP_FACTS,
+                _shares("0000000001:class-b", date(2020, 1, 2), 5, date(2020, 1, 3)),
+                {**_shares(AEP, date(2027, 1, 2), 9, date(2027, 1, 2)), "fact_name": "revenue"},
+            ],
+            [
+                _ended(
+                    "0000000001:class-a",
+                    "XA",
+                    "Class A Common Stock",
+                    date(2021, 1, 4),
+                    end_session=date(2020, 12, 31),
+                ),
+                _ended("0000000001", "XA", "5.25% Notes due 2030", date(2022, 1, 4)),
+                _ended("0000000001", "XA", "Common Stock", date(2023, 1, 4), "transferred"),
+            ],
+            as_of=RUN_DAY,
+            quiet_after_days=180,
+            transfer_window_sessions=5,
+        )
+        assert evidence.last_filed[AEP] == date(2026, 7, 30)
+        assert evidence.same_count(AEP, AEP_TEXAS, date(2026, 7, 30))
+        assert not evidence.same_count(AEP, AEP_TEXAS, date(2027, 2, 1))
+        assert evidence.left_on(AEP, date(1994, 5, 16)) is None
+        assert evidence.delisted_on == {"0000000001:class-a": (date(2021, 1, 4),)}
+        assert evidence.delisted_listings == {
+            "0000000001:class-a": ((date(1994, 1, 3), "XA", date(2021, 1, 4)),)
+        }
+        # #847: the last bar of each delisted listing, and the stop window.
+        assert evidence.last_bars == {
+            ("0000000001:class-a", date(1994, 1, 3), "XA"): date(2020, 12, 31)
+        }
+        assert evidence.stop_after_sessions == 5
+        # quiet: no share count for more than 180 days before the run
+        assert evidence.left_on("0000000001:class-b", date(2019, 1, 2)) == date(2020, 1, 4)
+        assert evidence.left_on("0000000001:class-a", date(2019, 1, 2)) == date(2020, 1, 4)
+        assert evidence.left_on("0000000001:class-a", date(2020, 6, 1)) == date(2020, 1, 4)
+
+    def test_a_leaving_day_is_never_before_the_form_25_is_accepted(self) -> None:
+        # quant-auditor on #830: a stated effective day before the filing's
+        # acceptance would end sessions before anyone knew of the Form 25.
+        row = {
+            **_ended("0000000001", "XA", "Common Stock", date(2021, 1, 4)),
+            "delisting_filed_at": datetime(2021, 1, 8, 21, tzinfo=UTC),
+        }
+        evidence = registrant_evidence(
+            [], [row], as_of=RUN_DAY, quiet_after_days=180, transfer_window_sessions=5
+        )
+        assert evidence.delisted_on == {"0000000001": (date(2021, 1, 9),)}
+
+
+class TestOwnDelisting:
+    """#819: a span ends at its own delisting, so a reused ticker never
+    prices a delisted security; a later row of the ticker keeps it."""
+
+    def test_a_reused_ticker_never_prices_a_delisted_security(self) -> None:
+        # Eagle Bulk (EGLE) merged into Star Bulk; its NYSE listing (from
+        # 2023-03-10, after a move from NASDAQ) was delisted from
+        # 2024-04-19. Alpaca served another equity's EGLE bars from 2025.
+        egle = "0001322439"
+        resolver = ListingResolver(
+            [
+                _listing(egle, "EGLE", date(2020, 3, 12), "Common Stock"),
+                _listing(egle, "EGLE", date(2023, 3, 10), "Common Stock"),
+            ],
+            _evidence(
+                [_shares(egle, date(2024, 2, 23), 10000000, date(2024, 3, 1))],
+                [
+                    _ended(
+                        egle,
+                        "EGLE",
+                        "Common Stock",
+                        date(2024, 4, 19),
+                        valid_from=date(2023, 3, 10),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("EGLE", date(2024, 4, 18)) == egle
+        for session in (date(2024, 4, 19), date(2025, 4, 16), date(2026, 10, 2)):
+            assert resolver.resolve("EGLE", session) is None
+            assert not resolver.holds(egle, session)
+        assert resolver.holds(egle, date(2024, 4, 18))
+        assert resolver.symbols(egle, date(2024, 5, 1), date(2026, 10, 2)) == []
+        assert resolver.symbols(egle, date(2024, 4, 1), date(2026, 10, 2)) == ["EGLE"]
+        assert resolver.report.ended_spans == 1
+        assert "1 spans ended at their own delisting" in resolver.report.summary()
+
+    def test_a_delisted_holder_never_hands_its_ticker_back_to_an_older_company(self) -> None:
+        older, dead = "0000000001", "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(older, "REUSE", date(2005, 1, 3), "Common Stock"),
+                _listing(dead, "REUSE", date(2018, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        dead, "REUSE", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("REUSE", date(2017, 1, 3)) == older
+        assert resolver.resolve("REUSE", date(2020, 1, 2)) == dead
+        assert resolver.resolve("REUSE", date(2022, 1, 3)) is None
+
+    def test_a_successor_listed_before_the_delisting_keeps_the_ticker(self) -> None:
+        # DraftKings' 2022 reorganization: the new company lists DKNG from
+        # 2022-05-06, the old one's Form 25 takes effect 2022-05-15. The
+        # newer span holds DKNG; the old one's end never shadows it.
+        old, new = "0001772757", "0001883685"
+        resolver = ListingResolver(
+            [
+                _listing(old, "DKNG", date(2020, 11, 13), "Class A common stock"),
+                _listing(new, "DKNG", date(2022, 5, 6), "Class A Common Stock"),
+            ],
+            _evidence(
+                [_shares(new, date(2026, 7, 31), 490000000, date(2026, 8, 5))],
+                [
+                    _ended(
+                        old,
+                        "DKNG",
+                        "Class A Common Stock",
+                        date(2022, 5, 15),
+                        valid_from=date(2020, 11, 13),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("DKNG", date(2022, 5, 5)) == old
+        assert resolver.resolve("DKNG", date(2022, 5, 16)) == new
+        assert resolver.resolve("DKNG", date(2026, 9, 30)) == new
+
+    def test_a_new_company_takes_a_dead_ticker_only_from_its_own_listing(self) -> None:
+        # MRLN: Marlin delisted 2022; Bleichroeder lists MRLN from
+        # 2026-05-15. The flat 2024 bars belong to neither.
+        marlin, bleichroeder = "0001260968", "0002028707:common-stock"
+        resolver = ListingResolver(
+            [
+                _listing(marlin, "MRLN", date(2020, 3, 13), "Common Stock"),
+                _listing(bleichroeder, "MRLN", date(2026, 5, 15), "Common Stock"),
+            ],
+            _evidence(
+                [_shares(marlin, date(2021, 10, 22), 12026394, date(2021, 10, 29))],
+                [
+                    _ended(
+                        marlin,
+                        "MRLN",
+                        "Common Stock",
+                        date(2022, 1, 30),
+                        valid_from=date(2020, 3, 13),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("MRLN", date(2022, 1, 28)) == marlin
+        assert resolver.resolve("MRLN", date(2024, 12, 2)) is None
+        assert resolver.resolve("MRLN", date(2026, 5, 15)) == bleichroeder
+
+    def test_a_renamed_security_loses_its_old_ticker_at_the_delisting(self) -> None:
+        # Old IAC (now Match Group): its IAC common was delisted from
+        # 2020-07-10 and its MTCH row starts 2020-08-10; the new IAC lists
+        # IAC from 2020-08-10. The new IAC's July bars are nobody's.
+        old, new = "0000891103", "0001800227"
+        resolver = ListingResolver(
+            [
+                _listing(old, "IAC", date(2019, 8, 8), "Common Stock"),
+                _listing(old, "MTCH", date(2020, 8, 10), "Common Stock"),
+                _listing(new, "IAC", date(2020, 8, 10), "Common stock"),
+            ],
+            _evidence(
+                [_shares(old, date(2026, 7, 31), 229550985, date(2026, 8, 5))],
+                [
+                    _ended(
+                        old, "IAC", "Common Stock", date(2020, 7, 10), valid_from=date(2019, 8, 8)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("IAC", date(2020, 7, 9)) == old
+        assert resolver.resolve("IAC", date(2020, 7, 13)) is None
+        assert resolver.resolve("IAC", date(2020, 8, 10)) == new
+        assert resolver.resolve("MTCH", date(2020, 8, 10)) == old
+
+    def test_a_later_row_of_the_ticker_keeps_the_span_through_an_old_form_25(self) -> None:
+        # Citigroup (causes 3): an undated snapshot listing of C, a 2012
+        # Form 25 against it, and the first cover page in 2019. C traded
+        # throughout; its 2016-2019 bars stay.
+        citi = "0000831001"
+        resolver = ListingResolver(
+            [
+                _listing(citi, "C", date(1994, 1, 13)),
+                _listing(citi, "C", date(2019, 8, 1), "Common Stock, par value $.01 per share"),
+            ],
+            _evidence(
+                [_shares(citi, date(2026, 7, 31), 1800000000, date(2026, 8, 5))],
+                [
+                    _ended(
+                        citi, "C", "Common Stock", date(2012, 12, 28), valid_from=date(1994, 1, 13)
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("C", date(2016, 1, 4)) == citi
+        assert resolver.resolve("C", date(2026, 9, 30)) == citi
+        assert resolver.report.ended_spans == 0
+        assert resolver.report.kept_spans == 1
+        assert "1 kept through one by a later row" in resolver.report.summary()
+
+    def test_a_reorganized_security_with_a_new_row_keeps_its_ticker(self) -> None:
+        # CMPR (#820): a reorganization's Form 25 ends the old shares'
+        # listing from 2019-12-13; the same ticker's new row starts later.
+        # The span runs on, through the sessions before the new row.
+        cimpress = "0001262976"
+        listings = [
+            _listing(cimpress, "CMPR", date(2019, 8, 7), "Ordinary Shares"),
+            _listing(cimpress, "CMPR", date(2020, 2, 5), "Ordinary Shares"),
+        ]
+        ends = [
+            _ended(
+                cimpress, "CMPR", "Ordinary Shares", date(2019, 12, 13), valid_from=date(2019, 8, 7)
+            )
+        ]
+        facts = [_shares(cimpress, date(2026, 7, 31), 25000000, date(2026, 8, 5))]
+        resolver = ListingResolver(listings, _evidence(facts, ends))
+        assert resolver.resolve("CMPR", date(2019, 12, 20)) == cimpress
+        assert resolver.resolve("CMPR", date(2026, 9, 30)) == cimpress
+        # Without the new row (before #820), the span ends at the delisting.
+        alone = ListingResolver(listings[:1], _evidence(facts, ends))
+        assert alone.resolve("CMPR", date(2019, 12, 20)) is None
+
+    def test_a_delisted_co_registrant_never_blanks_the_holders_ticker(self) -> None:
+        # code-review on #830: AEP Texas never held AEP (co-registrant); its
+        # own listing's delisting must not shadow AEP from then on.
+        ends = [
+            _ended(
+                AEP_TEXAS,
+                "AEP",
+                "Common Stock",
+                date(2026, 9, 1),
+                valid_from=date(2026, 7, 30),
+            )
+        ]
+        resolver = ListingResolver(AEP_LISTINGS, _evidence(AEP_FACTS, ends))
+        assert resolver.report.co_registrant_spans == 1
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+        assert resolver.report.ended_spans == 0
+
+    def test_a_later_placeholder_row_never_hands_the_ticker_back(self) -> None:
+        # code-review on #830: a delisted shell keeps filing with trading
+        # symbol "None"; the older company does not get REUSE back then.
+        older, dead = "0000000001", "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(older, "REUSE", date(2005, 1, 3), "Common Stock"),
+                _listing(dead, "REUSE", date(2018, 3, 1), "Common Stock"),
+                _listing(dead, "None", date(2022, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        dead,
+                        "REUSE",
+                        "Common Stock",
+                        date(2021, 6, 1),
+                        valid_from=date(2018, 3, 1),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("REUSE", date(2021, 6, 1)) is None
+        assert resolver.resolve("REUSE", date(2023, 1, 3)) is None
+
+    def test_a_delisted_typo_listing_never_ends_the_held_tickers_span(self) -> None:
+        # code-review on #830: the dropped typo row shares its day with the
+        # held ticker's row; its delisting must not end FutureFuel's FF.
+        day = date(2024, 5, 10)
+        resolver = ListingResolver(
+            [
+                _listing("0001337298", "FF", date(2020, 8, 7), "Common Stock"),
+                _listing("0001337298", "F", day, "Common Stock"),
+                _listing("0001337298", "FF", day, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [_ended("0001337298", "F", "Common Stock", date(2024, 6, 1), valid_from=day)],
+            ),
+        )
+        assert resolver.resolve("FF", date(2024, 7, 1)) == "0001337298"
+        assert resolver.report.ended_spans == 0
+
+    def test_the_cut_acts_only_from_the_effective_day(self) -> None:
+        # No look-ahead: the Form 25 is accepted before its effective day,
+        # and every session before that day keeps its mapping.
+        dead = "0000000002"
+        listings = [_listing(dead, "GONE", date(2018, 3, 1), "Common Stock")]
+        ends = [_ended(dead, "GONE", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1))]
+        with_end = ListingResolver(listings, _evidence([], ends))
+        without = ListingResolver(listings, _evidence([]))
+        sessions = [date(y, m, 1) for y in range(2018, 2022) for m in range(1, 13)]
+        for session in (s for s in sessions if s < date(2021, 6, 1)):
+            assert with_end.resolve("GONE", session) == without.resolve("GONE", session)
+
+    SOTHEBYS = "0000823094"
+
+    def _sothebys(self, last_bar: date | None, later: date) -> ListingResolver:
+        # #847: Sotheby's went private (25-NSE 2019-10-03, effective 10-13;
+        # last bar 10-02) but filed a cover page for its debt on 2019-11-12
+        # naming BID; another issuer lists BID in 2026.
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        return ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", later, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_cover_page_after_the_line_stopped_never_keeps_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2019, 10, 2)) == self.SOTHEBYS
+        assert resolver.resolve("BID", date(2019, 10, 14)) is None
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+        assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (1, 0)
+        assert resolver.report.stopped_spans == 1
+        assert "1 spans ended at a stopped line despite a later row" in (resolver.report.summary())
+
+    def test_a_relisting_after_a_long_gap_is_cut_too(self) -> None:
+        # Accepted cost (spec rule 7, #847): a bar gap cannot tell a real
+        # relisting after months off-exchange from a cover page filed after
+        # going private; the span is cut and counted, and the repair's dry
+        # run lists its later bars for the owner to review.
+        resolver = self._sothebys(date(2019, 10, 2), date(2021, 3, 1))
+        assert resolver.resolve("BID", date(2021, 6, 1)) is None
+        assert resolver.report.stopped_spans == 1
+
+    def test_a_row_within_the_transfer_window_of_the_last_bar_still_keeps_it(self) -> None:
+        # Five sessions strictly between the last bar and the next row: the
+        # line may still have traded (a relisting the session after the
+        # Form 25 took effect, #835).
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 10))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (0, 1)
+
+    def test_a_row_after_more_than_the_window_ends_the_span(self) -> None:
+        resolver = self._sothebys(date(2019, 10, 2), date(2019, 10, 11))  # six between
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+
+    def test_without_a_last_bar_the_later_row_still_keeps_it(self) -> None:
+        # No bar evidence (a listing before the store's first bar): as before.
+        resolver = self._sothebys(None, date(2019, 11, 12))
+        assert resolver.resolve("BID", date(2026, 7, 20)) == self.SOTHEBYS
+
+    def test_a_new_issuer_of_the_dead_ticker_takes_it(self) -> None:
+        sid, listed = self.SOTHEBYS, date(2019, 7, 30)
+        resolver = ListingResolver(
+            [
+                _listing(sid, "BID", listed, "Common Stock"),
+                _listing(sid, "BID", date(2019, 11, 12), "Common Stock"),
+                _listing("0002000001", "BID", date(2026, 7, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=listed,
+                        end_session=date(2019, 10, 2),
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("BID", date(2026, 7, 20)) == "0002000001"
+
+    def test_the_stopped_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: every session before the effective day keeps its
+        # mapping, with or without the stop.
+        stopped = self._sothebys(date(2019, 10, 2), date(2019, 11, 12))
+        kept = self._sothebys(None, date(2019, 11, 12))
+        day = date(2019, 7, 30)
+        while day < date(2019, 10, 13):
+            assert stopped.resolve("BID", day) == kept.resolve("BID", day), day
+            day += timedelta(days=1)
+
+    SEAGATE = "0001137789"
+
+    def _seagate(self, first_last_bar: date = date(2016, 1, 29)) -> ListingResolver:
+        # #943, the owner's store's facts: Seagate's untitled snapshot row
+        # lists STX from 2002-10-11; the 2010 Cayman->Ireland 25-NSE
+        # (effective 2010-07-12) ends it, and its last bar before the next
+        # row is 2016-01-29 (the store's bars start 2016-01-04 and have a
+        # hole to 2019-10); cover pages list STX from 2019-11-01, 2021-06-01
+        # and 2021-08-06; the 2021 redomicile 25-NSE (effective 2021-05-28)
+        # ends the 2019 row, last bar 2021-05-28. STX never stopped trading.
+        sid, title = self.SEAGATE, "Ordinary Shares, par value $0.00001 per share"
+        return ListingResolver(
+            [
+                _listing(sid, "STX", date(2002, 10, 11)),
+                _listing(sid, "STX", date(2019, 11, 1), title),
+                _listing(sid, "STX", date(2021, 6, 1), title),
+                _listing(sid, "STX", date(2021, 8, 6), title),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "STX",
+                        "",
+                        date(2010, 7, 12),
+                        valid_from=date(2002, 10, 11),
+                        end_session=first_last_bar,
+                    ),
+                    _ended(
+                        sid,
+                        "STX",
+                        title,
+                        date(2021, 5, 28),
+                        valid_from=date(2019, 11, 1),
+                        end_session=date(2021, 5, 28),
+                    ),
+                ],
+            ),
+        )
+
+    def test_a_line_that_traded_past_its_form_25_never_stopped_at_it(self) -> None:
+        # #943 root cause: a bar on or after the delisting's effective day
+        # shows the line went on trading through it (Seagate's redomicile),
+        # so a later bar hole before the next row is no stop: the span runs
+        # on and keeps every bar, 2016 to 2026.
+        resolver = self._seagate()
+        for day in (date(2016, 1, 4), date(2018, 6, 1), date(2021, 5, 28), date(2026, 10, 2)):
+            assert resolver.resolve("STX", day) == self.SEAGATE, day
+            assert resolver.holds(self.SEAGATE, day), day
+        assert resolver.report.stopped_spans == 0
+        assert (resolver.report.ended_spans, resolver.report.kept_spans) == (0, 1)
+
+    def test_a_last_bar_before_the_effective_day_still_stops_the_line(self) -> None:
+        # The #847 cut is unchanged where the line's last bar precedes its
+        # Form 25's effective day (Sotheby's, Valaris, MiMedx).
+        resolver = self._seagate(first_last_bar=date(2010, 7, 9))
+        assert resolver.resolve("STX", date(2016, 1, 4)) is None
+        assert resolver.report.stopped_spans == 1
+
+    def test_a_last_bar_on_the_effective_day_traded_through_it(self) -> None:
+        resolver = self._seagate(first_last_bar=date(2010, 7, 12))
+        assert resolver.resolve("STX", date(2016, 1, 4)) == self.SEAGATE
+
+    def test_the_seagate_fix_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the 2010 effective day every session maps
+        # the same whatever the last bar.
+        through, stopped = self._seagate(), self._seagate(first_last_bar=date(2010, 7, 9))
+        day = date(2002, 10, 11)
+        while day < date(2010, 7, 12):
+            assert through.resolve("STX", day) == stopped.resolve("STX", day) == self.SEAGATE
+            day += timedelta(days=7)
+
+    MIMEDX = "0001376339"
+    MDXG_EFFECTIVE = date(2019, 3, 8)
+    MDXG_RELISTED = date(2020, 11, 4)
+
+    def _mimedx(
+        self, accepted: frozenset[str] = frozenset(), last_bar: date | None = date(2018, 11, 7)
+    ) -> ListingResolver:
+        # #943, the issue's facts: MiMedx lists MDXG; Nasdaq delists it from
+        # 2019-03-08 (last Nasdaq bar long before), it trades OTC (no Alpaca
+        # bars) and relists on Nasdaq in November 2020 under the same id and
+        # ticker, then trades to 2026. Sotheby's (#847) sits beside it.
+        listed = date(2016, 3, 1)
+        sothebys = self.SOTHEBYS
+        return ListingResolver(
+            [
+                _listing(self.MIMEDX, "MDXG", listed, "Common Stock"),
+                _listing(self.MIMEDX, "MDXG", self.MDXG_RELISTED, "Common Stock"),
+                _listing(sothebys, "BID", date(2019, 7, 30), "Common Stock"),
+                _listing(sothebys, "BID", date(2019, 11, 12), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.MIMEDX,
+                        "MDXG",
+                        "Common Stock",
+                        self.MDXG_EFFECTIVE,
+                        valid_from=listed,
+                        end_session=last_bar,
+                    ),
+                    _ended(
+                        sothebys,
+                        "BID",
+                        "Common Stock",
+                        date(2019, 10, 13),
+                        valid_from=date(2019, 7, 30),
+                        end_session=date(2019, 10, 2),
+                    ),
+                ],
+            ),
+            accepted_relistings=accepted,
+        )
+
+    def test_a_long_gap_relisting_is_cut_unless_the_owner_accepts_it(self) -> None:
+        # #943: without the owner's list the #847 accepted cost holds, as on
+        # the store: MiMedx loses its 2020-2026 bars.
+        resolver = self._mimedx()
+        assert resolver.resolve("MDXG", self.MDXG_RELISTED) is None
+        assert not resolver.holds(self.MIMEDX, date(2026, 10, 2))
+        assert resolver.report.stopped_spans == 2  # MiMedx and Sotheby's
+
+    def test_an_accepted_relisting_keeps_its_span(self) -> None:
+        # #943: `alpaca.accepted_relistings` lifts the stopped-line cut for
+        # that id only: the span runs on as before #905, kept through its
+        # delisting by the later row.
+        resolver = self._mimedx(frozenset({self.MIMEDX}))
+        for day in (self.MDXG_RELISTED, date(2023, 5, 1), date(2026, 10, 2)):
+            assert resolver.resolve("MDXG", day) == self.MIMEDX, day
+            assert resolver.holds(self.MIMEDX, day), day
+        assert resolver.report.stopped_spans == 1  # Sotheby's only
+        assert resolver.report.accepted_relistings == 1
+        assert resolver.report.kept_spans == 1
+        assert "1 kept through a stopped line by alpaca.accepted_relistings" in (
+            resolver.report.summary()
+        )
+
+    def test_the_accepted_list_never_lifts_another_ids_cut(self) -> None:
+        # The list keys on the security id: Sotheby's stays cut.
+        resolver = self._mimedx(frozenset({self.MIMEDX}))
+        assert resolver.resolve("BID", date(2026, 7, 20)) is None
+        assert not resolver.holds(self.SOTHEBYS, date(2026, 7, 20))
+
+    def test_a_listed_id_that_never_stopped_counts_nothing(self) -> None:
+        # Listing an id whose line traded through changes nothing.
+        resolver = self._mimedx(frozenset({self.MIMEDX}), last_bar=None)
+        assert resolver.resolve("MDXG", date(2026, 10, 2)) == self.MIMEDX
+        assert resolver.report.accepted_relistings == 0
+
+    def test_the_accepted_list_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the Form 25's effective day every session
+        # maps the same with or without the list, and with or without the
+        # bar evidence.
+        cut = self._mimedx()
+        kept = self._mimedx(frozenset({self.MIMEDX}))
+        silent = self._mimedx(last_bar=None)
+        day = date(2016, 3, 1)
+        while day < self.MDXG_EFFECTIVE:
+            assert cut.resolve("MDXG", day) == kept.resolve("MDXG", day) == self.MIMEDX, day
+            assert silent.resolve("MDXG", day) == self.MIMEDX, day
+            day += timedelta(days=1)
+
+    MINIM = "0001467761"
+
+    def _minim(self, accepted: frozenset[str] = frozenset()) -> ListingResolver:
+        # #943, the owner's store's facts: Minim lists MINM from 2021-08-16;
+        # Nasdaq suspends it (last bar 2024-07-23) and its 25-NSE takes
+        # effect 2024-11-03; a cover page names MINM on 2024-11-19; Nasdaq
+        # trading resumes 2025-06-02 and the ticker becomes FIEE (row
+        # 2025-07-28). A genuine relisting the stopped-line cut cannot tell.
+        sid, title = self.MINIM, "Common Stock, $0.01 per share"
+        return ListingResolver(
+            [
+                _listing(sid, "MINM", date(2021, 8, 16), title),
+                _listing(sid, "MINM", date(2024, 11, 19), title),
+                _listing(sid, "FIEE", date(2025, 7, 28), title),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        sid,
+                        "MINM",
+                        title,
+                        date(2024, 11, 3),
+                        valid_from=date(2021, 8, 16),
+                        end_session=date(2024, 7, 23),
+                    )
+                ],
+            ),
+            accepted_relistings=accepted,
+        )
+
+    def test_minims_relisting_needs_the_owners_list(self) -> None:
+        # #943 verdict: the 2025 MINM bars are Minim's own (Nasdaq resumed
+        # 2025-06-02); the cut drops them, and listing the id keeps them.
+        assert self._minim().resolve("MINM", date(2025, 6, 2)) is None
+        kept = self._minim(frozenset({self.MINIM}))
+        assert kept.resolve("MINM", date(2025, 6, 2)) == self.MINIM
+        assert kept.resolve("MINM", date(2025, 7, 28)) is None
+        assert kept.resolve("FIEE", date(2025, 7, 28)) == self.MINIM
+
+    VALARIS = "0000314808"
+    VALARIS_NEW = "0000314808:common-shares"
+
+    def _valaris(self, last_bar: date | None = date(2020, 8, 14)) -> ListingResolver:
+        # #921, the store's facts: Valaris lists VAL (Class A) from
+        # 2019-08-01; a 25-NSE (filed 2020-09-04) delists the Class A from
+        # 2020-09-14, last bar 2020-08-14; a Chapter 11 10-Q on 2020-10-29
+        # writes `VAL*` (#844: read as VAL); the post-bankruptcy Common
+        # Shares list VAL from 2021-08-03 under a new class id.
+        listed = date(2019, 8, 1)
+        return ListingResolver(
+            [
+                _listing(self.VALARIS, "VAL", listed, "Class A Ordinary Shares"),
+                _listing(self.VALARIS, "VAL*", date(2020, 10, 29), "Class A Ordinary Shares"),
+                _listing(self.VALARIS_NEW, "VAL", date(2021, 8, 3), "Common Shares"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        self.VALARIS,
+                        "VAL",
+                        "Class A Ordinary Shares",
+                        date(2020, 9, 14),
+                        valid_from=listed,
+                        end_session=last_bar,
+                    )
+                ],
+            ),
+        )
+
+    def test_a_footnoted_cover_page_after_a_form_25_never_keeps_the_span(self) -> None:
+        # #921 cause 1: the `VAL*` row after the line stopped does not keep
+        # the pre-bankruptcy span alive (the #847 stopped-line cut).
+        resolver = self._valaris()
+        assert resolver.resolve("VAL", date(2020, 8, 14)) == self.VALARIS
+        assert resolver.resolve("VAL", date(2020, 9, 14)) is None
+        assert resolver.resolve("VAL", date(2021, 6, 1)) is None
+        assert not resolver.holds(self.VALARIS, date(2022, 1, 3))
+        assert resolver.report.stopped_spans == 1
+
+    def test_the_post_bankruptcy_class_takes_the_ticker(self) -> None:
+        # #921 cause 2: once the old class's span ended, the new class of
+        # the same company is no later class (rule 3) and holds VAL.
+        resolver = self._valaris()
+        for day in (date(2021, 8, 3), date(2023, 5, 1), date(2026, 10, 2)):
+            assert resolver.resolve("VAL", day) == self.VALARIS_NEW, day
+            assert resolver.holds(self.VALARIS_NEW, day), day
+        assert resolver.report.later_class_spans == 0
+
+    def test_the_valaris_cut_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: before the Form 25's effective day every session
+        # maps as without the bar evidence.
+        cut, kept = self._valaris(), self._valaris(last_bar=None)
+        day = date(2019, 8, 1)
+        while day < date(2020, 9, 14):
+            assert cut.resolve("VAL", day) == kept.resolve("VAL", day) == self.VALARIS, day
+            day += timedelta(days=1)
+
+    def test_without_evidence_nothing_is_cut(self) -> None:
+        resolver = ListingResolver([_listing("0000000002", "GONE", date(2018, 3, 1))])
+        assert resolver.resolve("GONE", date(2026, 9, 30)) == "0000000002"
+        assert resolver.report.ended_spans == 0
 
 
 class TestBars:
@@ -438,6 +1711,706 @@ class TestCorporateActions:
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
 
 
+def _row(day: date, close: float) -> dict[str, object]:
+    return {
+        "t": f"{day.isoformat()}T04:00:00Z",
+        "o": close,
+        "h": close,
+        "l": close,
+        "c": close,
+        "v": 1_000_000,
+        "n": 10_000,
+        "vw": close,
+    }
+
+
+class TestRenameLead:
+    """#843 (owner decision (d) -> (b)): a renamed company's new ticker also
+    resolves to it, inside the old ticker's span, on the sessions where the
+    company has no bar under its own symbols in the same payload, so the
+    hole between the old symbol's last bar and the cover page that shows
+    the new ticker closes. Alpaca copies a renamed company's history onto
+    the new symbol (#104 research: META's pre-rename bars equal FB's)."""
+
+    FB = "0001326801"
+    CHANGE = date(2022, 6, 9)  # META's first session
+    COVER = date(2022, 7, 27)  # the first cover page naming META
+    FB_DAYS: ClassVar[list[date]] = [date(2022, 6, 6), date(2022, 6, 7), date(2022, 6, 8)]
+    META_DAYS: ClassVar[list[date]] = [
+        *FB_DAYS,
+        date(2022, 6, 9),
+        date(2022, 6, 10),
+        date(2022, 7, 26),
+        date(2022, 7, 27),
+    ]
+
+    def _listings(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.FB, "FB", START, "Class A Common Stock"),
+            _listing(self.FB, "META", self.COVER, "Class A Common Stock"),
+        ]
+
+    def _payload(self, **extra: list[dict[str, object]]) -> dict[str, Any]:
+        return {
+            "feed": "sip",
+            "bars": {
+                "FB": [_row(d, 190.0 + i) for i, d in enumerate(self.FB_DAYS)],
+                # Alpaca's META history repeats FB's closes before the change.
+                "META": [_row(d, 190.0 + i) for i, d in enumerate(self.META_DAYS)],
+                **extra,
+            },
+        }
+
+    def test_the_new_symbol_closes_the_hole_from_the_old_symbols_last_bar(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        sessions = [b.session for b in parsed.bars if b.security_id == self.FB]
+        assert sessions == self.META_DAYS  # each once: FB's three, then META's
+        assert [b.close for b in parsed.bars][:3] == [190.0, 191.0, 192.0]
+        assert set(parsed.unresolved) == {("META", d) for d in self.FB_DAYS}
+        for bar in parsed.bars:
+            assert bar.known_at == bar_known_at(bar.session)  # no record stamped early
+
+    def test_without_a_lead_window_the_hole_stays(self) -> None:
+        resolver = ListingResolver(self._listings())
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [b.session for b in parsed.bars] == [*self.FB_DAYS, date(2022, 7, 27)]
+
+    def test_the_lead_never_changes_what_resolve_says(self) -> None:
+        # No look-ahead in the key mapping: the lead only fills sessions the
+        # security has no bar on, and `resolve` is the same with or without it.
+        sessions = [date(2022, m, d) for m in (5, 6, 7, 8) for d in (2, 9, 15, 27)]
+        with_lead = ListingResolver(self._listings(), rename_lead_days=400)
+        without = ListingResolver(self._listings())
+        for ticker in ("FB", "META"):
+            for session in sessions:
+                assert with_lead.resolve(ticker, session) == without.resolve(ticker, session)
+
+    def test_the_window_is_bounded_by_config(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=30)
+        assert resolver.lead("META", date(2022, 6, 27)) == self.FB
+        assert resolver.lead("META", date(2022, 6, 24)) is None  # 33 days before
+        assert resolver.lead("META", self.COVER) is None  # META's own span from here
+
+    def test_the_lead_is_fetched_held_and_kept_by_the_repair(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        assert resolver.symbols(self.FB, date(2022, 6, 1), date(2022, 6, 30)) == ["FB", "META"]
+        assert resolver.symbols(self.FB, date(2020, 6, 1), date(2020, 6, 30)) == ["FB"]
+        assert resolver.holds(self.FB, date(2022, 6, 10))  # repair-resolution keeps it
+
+    def test_a_contested_holder_of_the_new_ticker_never_blocks_the_lead(self) -> None:
+        # Roundhill's META ETF (a span the rename contests) resolves to
+        # nothing; Alpaca's META history there is Facebook's.
+        resolver = ListingResolver(
+            [*self._listings(), _listing("SEC_ROUNDHILL", "META", date(2021, 6, 30))],
+            rename_lead_days=400,
+        )
+        assert resolver.lead("META", date(2022, 6, 10)) == self.FB
+        assert resolver.lead("META", date(2021, 9, 1)) == self.FB  # FB has bars: never used
+
+    def test_an_old_ticker_reused_at_once_takes_no_lead(self) -> None:
+        # PROG -> PRG while the new Aaron's lists AAN the same day: AAN's
+        # rows resolve to Aaron's, and the lead steps aside (#869's case;
+        # code-review on #893: a stale AAN bar on PROG must stay repairable).
+        prog, aarons = "0001808834", "0001821393"
+        resolver = ListingResolver(
+            [
+                _listing(prog, "AAN", START, "Common Stock"),
+                _listing(prog, "PRG", date(2021, 2, 25), "Common Stock"),
+                _listing(aarons, "AAN", date(2020, 12, 1), "Common Stock"),
+            ],
+            rename_lead_days=400,
+        )
+        day = date(2020, 12, 2)
+        payload = {"feed": "sip", "bars": {"AAN": [_row(day, 18.41)], "PRG": [_row(day, 48.0)]}}
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert {(b.security_id, b.close) for b in parsed.bars} == {(aarons, 18.41)}
+        assert not resolver.holds(prog, day)
+        assert resolver.lead("PRG", date(2020, 11, 30)) == prog  # before the reuse
+
+    def test_a_placeholder_under_the_old_symbol_stops_the_lead(self) -> None:
+        resolver = ListingResolver(self._listings(), rename_lead_days=400)
+        day = date(2022, 6, 9)
+        placeholder = {**_row(day, 192.0), "v": 0, "n": 0}
+        payload = self._payload()
+        payload["bars"]["FB"].append(placeholder)
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert day not in [b.session for b in parsed.bars]
+        assert (self.FB, day) in parsed.placeholders
+        assert ("META", day) in parsed.unresolved
+
+    def test_the_repair_judges_actions_without_the_lead(self) -> None:
+        # quant-auditor and code-review on #893: actions take no lead. Here
+        # OLD is contested (another company renames into it later), so only
+        # the lead holds the renamed company's gap sessions.
+        from tradepartner.repair import misattributed
+
+        sid, other = "0000000003", "0000000004"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", START, "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
+                _listing(other, "XO", START, "Common Stock"),
+                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+            ],
+            rename_lead_days=400,
+        )
+        day = date(2022, 6, 15)
+        assert resolver.holds(sid, day)
+        assert not resolver.holds(sid, day, actions=True)
+        found = misattributed(resolver, [(sid, day, 1)], [(sid, date(2022, 6, 16), 1)])
+        assert dict(found.bars) == {}
+        assert dict(found.actions) == {(sid, date(2022, 6, 16)): 1}
+
+    def test_a_span_ended_at_its_own_delisting_has_no_lead(self) -> None:
+        sid = "0000000002"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", date(2018, 3, 1), "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 3, 1), "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [_ended(sid, "OLD", "Common Stock", date(2021, 6, 1), valid_from=date(2018, 3, 1))],
+            ),
+            rename_lead_days=400,
+        )
+        assert resolver.lead("NEWT", date(2021, 9, 1)) is None
+
+    def test_the_price_source_asks_for_both_symbols_and_fills(self) -> None:
+        calls: list[tuple[list[str], bool]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append((symbols, asof is not None))
+            return self._payload()
+
+        source = AlpacaPriceSource(
+            ListingResolver(self._listings(), rename_lead_days=400),
+            fetch_bars=fetch,
+            settings=_settings(),
+        )
+        bars = source.bars([self.FB], date(2022, 6, 1), date(2022, 6, 30))
+        # #1314: FB's span has ended, so FB is asked with asof inside it.
+        assert calls == [(["FB"], True), (["META"], False)]
+        assert [b.session for b in bars] == [d for d in self.META_DAYS if d.month == 6]
+
+
+class TestFirstSpanLead:
+    """#974 (owner decision 2026-10-05, option (a)): a security's first
+    assigned equity span also leads back to the security's first session,
+    under the span's ticker. A META-shaped case: Facebook's first
+    ticker-bearing cover page (`FB`) is from 2019-07-24, its first filing
+    from 2012, and Alpaca serves `FB` bars from 2016 on."""
+
+    META = "0001326801"
+    FIRST = date(2012, 5, 18)  # the first session of the earliest securities row
+    COVER = date(2019, 7, 24)  # the first cover page naming FB
+    DAYS: ClassVar[list[date]] = [
+        date(2016, 6, 1),
+        date(2017, 5, 31),
+        date(2017, 6, 1),
+        date(2018, 7, 2),
+        date(2019, 7, 23),
+        date(2019, 7, 24),
+        date(2019, 7, 25),
+    ]
+    OTHER = "0000000099"
+
+    def _listings(self, *extra: dict[str, object]) -> list[dict[str, object]]:
+        return [_listing(self.META, "FB", self.COVER, "Class A Common Stock"), *extra]
+
+    def _resolver(
+        self, *extra: dict[str, object], first: date | None = FIRST, **kwargs: Any
+    ) -> ListingResolver:
+        sessions = None if first is None else {self.META: first}
+        return ListingResolver(self._listings(*extra), first_sessions=sessions, **kwargs)
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "feed": "sip",
+            "bars": {"FB": [_row(d, 150.0 + i) for i, d in enumerate(self.DAYS)]},
+        }
+
+    def _split(self, symbol: str, ex_date: date) -> dict[str, Any]:
+        row = {"symbol": symbol, "ex_date": ex_date.isoformat(), "new_rate": 2, "old_rate": 1}
+        return {"forward_splits": [row | {"id": f"split-{symbol}-{ex_date}"}]}
+
+    def test_bars_before_the_first_cover_page_are_assigned(self) -> None:
+        resolver = self._resolver()
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [(b.security_id, b.session) for b in parsed.bars] == [
+            (self.META, d) for d in self.DAYS
+        ]
+        assert parsed.unresolved == ()
+        for bar in parsed.bars:
+            assert bar.known_at == bar_known_at(bar.session)  # no record stamped early
+        # From the span's start its own rows win: the lead stops there.
+        assert resolver.lead("FB", self.COVER) is None
+        assert resolver.resolve("FB", self.COVER) == self.META
+        assert resolver.report.first_span_leads == 1
+        assert resolver.report.first_span_refused == 0
+        assert "1 securities led by a first-span lead" in resolver.report.summary()
+
+    def test_the_lead_never_changes_what_resolve_says(self) -> None:
+        # No look-ahead in the key mapping: the lead only fills sessions no
+        # span resolves, and `resolve` is the same with or without it.
+        listings = (
+            _listing(self.OTHER, "XO", date(2015, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "XOX", date(2018, 3, 1), "Common Stock"),
+        )
+        with_lead = self._resolver(*listings)
+        without = self._resolver(*listings, first=None)
+        assert with_lead.report.first_span_leads == 1
+        sessions = [date(y, m, 3) for y in range(2011, 2023) for m in (1, 4, 7, 10)]
+        sessions += [self.FIRST, self.COVER, *self.DAYS]
+        for ticker in ("FB", "XO", "XOX"):
+            for session in sessions:
+                assert with_lead.resolve(ticker, session) == without.resolve(ticker, session)
+
+    def test_no_lead_before_the_first_session(self) -> None:
+        resolver = self._resolver()
+        assert resolver.lead("FB", date(2012, 5, 17)) is None
+        assert resolver.lead("FB", self.FIRST) == self.META
+        assert not resolver.holds(self.META, date(2012, 5, 17))
+        assert resolver.holds(self.META, self.FIRST)
+
+    def test_a_first_span_starting_on_the_first_session_has_no_lead(self) -> None:
+        resolver = self._resolver(first=self.COVER)
+        assert resolver.lead("FB", date(2019, 7, 23)) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_a_reused_ticker_refuses_the_whole_lead(self) -> None:
+        # Another security's assigned FB span covering 2017: a reuse the
+        # master knows of. No lead on any session, not only the reuse's.
+        resolver = self._resolver(
+            _listing(self.OTHER, "FB", date(2016, 6, 1), "Common Stock"),
+            _listing(self.OTHER, "OTHR", date(2017, 9, 1), "Common Stock"),
+        )
+        for session in (self.FIRST, date(2014, 1, 2), date(2017, 6, 1), date(2019, 7, 23)):
+            assert resolver.lead("FB", session) is None
+            assert not resolver.holds(self.META, session)
+        assert resolver.symbols(self.META, date(2013, 1, 2), date(2015, 12, 31)) == []
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 1
+        assert "1 refused one for a reused ticker" in resolver.report.summary()
+        payload = self._payload()
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert all(b.session >= self.COVER for b in parsed.bars if b.security_id == self.META)
+
+    def test_a_non_equity_span_of_the_ticker_in_the_window_refuses(self) -> None:
+        resolver = self._resolver(_listing(self.OTHER, "FB", date(2017, 3, 1), "Senior Notes"))
+        assert resolver.lead("FB", date(2014, 1, 2)) is None
+        assert resolver.report.first_span_refused == 1
+
+    def test_a_placeholder_span_of_the_ticker_never_refuses(self) -> None:
+        # Another security's rows under a placeholder never name FB.
+        resolver = self._resolver(_listing(self.OTHER, "N/A", date(2017, 3, 1), "Common Stock"))
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.report.first_span_refused == 0
+
+    def test_another_securitys_span_outside_the_window_never_refuses(self) -> None:
+        resolver = self._resolver(
+            _listing(self.OTHER, "FB", date(2008, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "OTHR", date(2011, 1, 3), "Common Stock"),
+        )
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.report.first_span_refused == 0
+
+    def test_a_contested_first_span_takes_no_lead(self) -> None:
+        # Another security renames into FB later: META's span is contested.
+        resolver = self._resolver(
+            _listing(self.OTHER, "XO", date(2015, 1, 2), "Common Stock"),
+            _listing(self.OTHER, "FB", date(2021, 3, 1), "Common Stock"),
+        )
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 0
+
+    def test_a_tied_first_span_takes_no_lead(self) -> None:
+        # code-review on #983: two securities' FB spans start the same day
+        # (rule 4): `resolve` gives FB to no one, so neither gets a lead.
+        resolver = ListingResolver(
+            [*self._listings(), _listing(self.OTHER, "FB", self.COVER, "Common Stock")],
+            first_sessions={self.META: self.FIRST, self.OTHER: date(2018, 1, 2)},
+        )
+        assert resolver.resolve("FB", self.COVER) is None
+        for session in (date(2014, 1, 2), date(2018, 6, 1)):
+            assert resolver.lead("FB", session) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_an_earlier_non_equity_span_of_the_security_takes_no_lead(self) -> None:
+        resolver = self._resolver(_listing(self.META, "FBN", date(2018, 1, 2), "Notes due 2025"))
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert resolver.report.first_span_leads == 0
+
+    def test_an_earlier_placeholder_span_of_the_security_is_skipped(self) -> None:
+        resolver = self._resolver(_listing(self.META, "N/A", date(2018, 1, 2), "Common Stock"))
+        assert resolver.lead("FB", date(2017, 6, 1)) == self.META
+        assert resolver.lead("FB", date(2018, 6, 1)) == self.META
+        assert resolver.report.first_span_leads == 1
+
+    def test_symbols_cover_the_lead_window(self) -> None:
+        resolver = self._resolver()
+        assert resolver.symbols(self.META, date(2017, 1, 3), date(2017, 12, 29)) == ["FB"]
+        assert resolver.symbols(self.META, date(2011, 1, 3), date(2011, 12, 30)) == []
+
+    def test_holds_a_bar_and_an_action_in_the_window(self) -> None:
+        resolver = self._resolver()
+        day = date(2017, 5, 31)
+        assert resolver.holds(self.META, day)
+        assert resolver.holds(self.META, day, actions=True)
+
+    def test_actions_never_take_the_rename_lead(self) -> None:
+        # TestRenameLead's contested OLD: only the rename lead holds the gap.
+        sid, other = "0000000003", "0000000004"
+        resolver = ListingResolver(
+            [
+                _listing(sid, "OLD", START, "Common Stock"),
+                _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
+                _listing(other, "XO", START, "Common Stock"),
+                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+            ],
+            rename_lead_days=400,
+            first_sessions={sid: self.FIRST, other: self.FIRST},
+        )
+        day = date(2022, 6, 15)  # inside OLD -> NEWT's #843 rename gap
+        assert resolver.holds(sid, day)
+        assert not resolver.holds(sid, day, actions=True)
+        assert resolver.lead("NEWT", day) == sid
+        assert resolver.lead("NEWT", day, actions=True) is None
+        assert not resolver.holds(sid, date(2014, 6, 2))  # OLD is contested: no first-span lead
+
+    def test_a_split_in_the_window_is_parsed_to_the_security(self) -> None:
+        resolver = self._resolver()
+        ex_date = date(2017, 6, 1)
+        parsed = parse_corporate_actions(
+            self._split("FB", ex_date), resolver.resolve, partial(resolver.lead, actions=True)
+        )
+        [split] = parsed.actions
+        assert (split.security_id, split.ex_date, split.ratio_or_amount) == (
+            self.META,
+            ex_date,
+            2.0,
+        )
+        assert split.known_at == action_first_seen_known_at(ex_date)
+        without = parse_corporate_actions(self._split("FB", ex_date), resolver.resolve)
+        assert without.actions == ()
+        assert without.unresolved == (("FB", ex_date),)
+
+    def test_a_split_in_a_rename_gap_is_still_not_parsed(self) -> None:
+        resolver = ListingResolver(TestRenameLead()._listings(), rename_lead_days=400)
+        ex_date = date(2022, 6, 15)
+        parsed = parse_corporate_actions(
+            self._split("META", ex_date), resolver.resolve, partial(resolver.lead, actions=True)
+        )
+        assert parsed.actions == ()
+        assert parsed.unresolved == (("META", ex_date),)
+
+    def test_the_price_source_asks_for_the_led_symbol_and_keeps_bars_and_split(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+
+        def fetch_bars(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(("bars", symbols))
+            return self._payload()
+
+        def fetch_actions(symbols: list[str], start: date, end: date) -> dict[str, Any]:
+            calls.append(("actions", symbols))
+            return self._split("FB", date(2017, 6, 1))
+
+        source = AlpacaPriceSource(
+            self._resolver(),
+            fetch_bars=fetch_bars,
+            fetch_actions=fetch_actions,
+            settings=_settings(),
+        )
+        start, end = date(2017, 1, 3), date(2017, 12, 29)
+        bars = source.bars([self.META], start, end)
+        actions = source.corporate_actions([self.META], start, end)
+        assert calls == [("bars", ["FB"]), ("actions", ["FB"])]
+        assert [b.session for b in bars] == [date(2017, 5, 31), date(2017, 6, 1)]
+        assert [(a.security_id, a.ex_date) for a in actions] == [(self.META, date(2017, 6, 1))]
+        assert "1 securities led by a first-span lead" in source.resolution_summary()
+
+    def test_without_first_sessions_nothing_changes(self) -> None:
+        resolver = self._resolver(first=None)
+        parsed = parse_bars(self._payload(), resolver.resolve, resolver.lead)
+        assert [b.session for b in parsed.bars] == [d for d in self.DAYS if d >= self.COVER]
+        assert resolver.lead("FB", date(2017, 6, 1)) is None
+        assert not resolver.holds(self.META, date(2017, 6, 1))
+        assert resolver.symbols(self.META, date(2017, 1, 3), date(2017, 12, 29)) == []
+        assert resolver.report.first_span_leads == 0
+        assert resolver.report.first_span_refused == 0
+
+
+class TestSuccessorDuplicate:
+    """#874: a repair successor (`<cik>@<date>`, #826) whose row duplicates
+    its predecessor's (same ticker, same `valid_from`) holds the ticker;
+    the pair is not ambiguous, so the ticker never resolves to nobody."""
+
+    OLD_MATCH, IAC, SUCC = "0001575189", "0000891103", "0000891103@2020-08-10"
+
+    def _match(self) -> list[dict[str, object]]:
+        day = date(2020, 8, 10)
+        return [
+            _listing(self.OLD_MATCH, "MTCH", date(2019, 3, 1), "Common Stock"),
+            _listing(self.IAC, "IAC", START, "Common Stock"),
+            _listing(self.IAC, "MTCH", day, "Common Stock"),
+            _listing(self.SUCC, "MTCH", day, "Common Stock"),
+        ]
+
+    def test_the_successor_holds_the_duplicated_ticker(self) -> None:
+        resolver = ListingResolver(self._match())
+        for session in (date(2020, 8, 12), date(2022, 9, 1), date(2026, 9, 1)):
+            assert resolver.resolve("MTCH", session) == self.SUCC, session
+            assert resolver.holds(self.SUCC, session)
+            assert not resolver.holds(self.IAC, session)
+        assert resolver.resolve("IAC", date(2020, 3, 2)) == self.IAC
+        assert resolver.report.ambiguous_spans == 0
+        assert resolver.report.successor_duplicates == 1
+        assert "1 predecessor rows duplicated by a successor" in resolver.report.summary()
+        assert resolver.symbols(self.SUCC, date(2020, 8, 3), date(2020, 8, 31)) == ["MTCH"]
+        assert resolver.symbols(self.IAC, date(2020, 8, 3), date(2020, 8, 31)) == ["IAC"]
+
+    def test_the_successor_id_may_carry_another_day(self) -> None:
+        # CHRD: 0001486159@2021-03-08 duplicates the 2022-08-04 CHRD row.
+        day = date(2022, 8, 4)
+        resolver = ListingResolver(
+            [
+                _listing("0001486159", "OAS", START, "Common Stock"),
+                _listing("0001486159", "CHRD", day, "Common Stock"),
+                _listing("0001486159@2021-03-08", "OAS", date(2021, 3, 8), "Common Stock"),
+                _listing("0001486159@2021-03-08", "CHRD", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("CHRD", date(2024, 1, 2)) == "0001486159@2021-03-08"
+
+    def test_a_class_predecessor_is_succeeded_too(self) -> None:
+        day = date(2021, 8, 5)
+        resolver = ListingResolver(
+            [
+                _listing("0000020520:common-stock", "FYBR", day, "Common Stock"),
+                _listing("0000020520@2021-08-05-2", "FYBR", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FYBR", date(2022, 1, 3)) == "0000020520@2021-08-05-2"
+
+    @pytest.mark.parametrize("second", [False, True])
+    def test_a_successor_of_a_successor_holds_the_ticker(self, second: bool) -> None:
+        # code-review on #886: a second relisting succeeds the first successor.
+        day = date(2022, 1, 3)
+        newer = "0000000001@2021-06-01-2" if second else "0000000001@2022-01-03"
+        older = "0000000001@2021-06-01" if second else "0000000001@2018-01-02"
+        resolver = ListingResolver(
+            [
+                _listing(older, "CCC", day, "Common Stock"),
+                _listing(newer, "CCC", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("CCC", date(2023, 1, 3)) == newer
+        assert resolver.report.successor_duplicates == 1
+
+    @pytest.mark.parametrize("order", [1, -1])
+    def test_a_disputed_predecessor_never_outwaits_its_successor(self, order: int) -> None:
+        # quant-auditor and code-review on #886: both rows claim a live
+        # holder's ticker; once the holder moves on, the successor holds it.
+        holder, pred, succ = "0000000009", "0000000005", "0000000005@2020-08-10"
+        day, moved = date(2020, 8, 10), date(2021, 3, 1)
+        rows = [
+            _listing(holder, "XX", date(2010, 1, 4), "Common Stock"),
+            _listing(holder, "YY", moved, "Common Stock"),
+            _listing(pred, "PP", date(2010, 1, 4), "Common Stock"),
+            *[_listing(sid, "XX", day, "Common Stock") for sid in (pred, succ)[::order]],
+        ]
+        facts = [
+            _shares(holder, date(2022, 6, 30), 100.0, date(2022, 8, 1)),
+            _shares(pred, date(2022, 6, 30), 50.0, date(2022, 8, 1)),
+        ]
+        resolver = ListingResolver(rows, _evidence(facts))
+        assert resolver.resolve("XX", date(2020, 9, 1)) is None  # the holder's wait
+        assert resolver.resolve("XX", date(2022, 1, 3)) == succ
+        assert resolver.report.successor_duplicates == 1
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            "0000000002@2021-08-05",
+            "0000020520:x@2021-08-05",
+            "0000020520@21-08-05",
+            "0000020520@2021-08-05x",
+        ],
+    )
+    def test_anything_else_on_the_same_day_stays_ambiguous(self, other: str) -> None:
+        day = date(2021, 8, 5)
+        resolver = ListingResolver(
+            [
+                _listing("0000020520", "FYBR", day, "Common Stock"),
+                _listing(other, "FYBR", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FYBR", date(2022, 1, 3)) is None
+        assert resolver.report.ambiguous_spans == 2
+        assert resolver.report.successor_duplicates == 0
+
+    def test_the_successor_rule_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: the successor and the duplicate land on one day, and
+        # every session before it keeps its mapping (old Match Group's own
+        # MTCH left out: IAC's rename into MTCH contests it, the documented
+        # exception).
+        rows = self._match()[1:]
+        cut = date(2020, 8, 10)
+        full = ListingResolver(rows)
+        early = ListingResolver([r for r in rows if r["valid_from"] < cut])  # type: ignore[operator]
+        sessions = [date(y, m, 1) for y in range(2016, 2021) for m in range(1, 13)]
+        for ticker in ("MTCH", "IAC"):
+            for session in (s for s in sessions if s < cut):
+                assert full.resolve(ticker, session) == early.resolve(ticker, session)
+
+
+class TestUnreadableTickers:
+    """#844: a cover page that puts junk in the trading-symbol field (an
+    exchange name, a footnote marker) never ends the company's span."""
+
+    VMC = "0001396009"
+
+    def _vmc(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.VMC, "VMC", date(2019, 7, 29), "Common Stock"),
+            _listing(self.VMC, "New York Stock Exchange", date(2020, 11, 6), "Common Stock"),
+            _listing(self.VMC, "VMC", date(2021, 2, 25), "Common Stock"),
+            _listing(self.VMC, "New York Stock Exchange", date(2021, 5, 5), "Common Stock"),
+            _listing(self.VMC, "VMC", date(2022, 2, 25), "Common Stock"),
+        ]
+
+    def test_an_exchange_name_in_the_ticker_field_keeps_the_span(self) -> None:
+        resolver = ListingResolver(self._vmc())
+        for session in (date(2020, 11, 6), date(2020, 12, 1), date(2021, 6, 1), date(2022, 3, 1)):
+            assert resolver.resolve("VMC", session) == self.VMC, session
+            assert resolver.holds(self.VMC, session)
+        assert resolver.resolve("New York Stock Exchange", date(2020, 12, 1)) is None
+        assert resolver.symbols(self.VMC, date(2020, 1, 2), date(2022, 6, 1)) == ["VMC"]
+        assert resolver.report.unreadable == 2
+        assert "2 unreadable-ticker listings ignored" in resolver.report.summary()
+
+    @pytest.mark.parametrize("junk", ["VAL*", "BAX (NYSE)", "LCINQ (1)", "UPH(1)"])
+    def test_a_footnote_marker_is_the_same_ticker(self, junk: str) -> None:
+        held = alpaca_symbol(junk)
+        assert held is not None
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", held, date(2019, 7, 29), "Common Stock"),
+                _listing("0000000001", junk, date(2020, 10, 29), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve(held, date(2021, 1, 4)) == "0000000001"
+        assert resolver.symbols("0000000001", START, date(2021, 1, 4)) == [held]
+        assert resolver.report.unreadable == 0  # read as the symbol, not kept as junk
+
+    def test_a_junk_row_on_a_rename_day_never_costs_the_new_ticker(self) -> None:
+        day = date(2022, 6, 9)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "OLD", START, "Common Stock"),
+                _listing("0000000001", "NEWT", day, "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", day, "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("NEWT", date(2022, 7, 1)) == "0000000001"
+        assert resolver.resolve("OLD", date(2022, 7, 1)) is None
+        assert resolver.report.same_day_securities == 0
+        assert resolver.report.unreadable == 1
+
+    def test_a_junk_row_after_a_placeholder_still_holds_nothing(self) -> None:
+        # Only a readable equity ticker just before is carried on: after a
+        # placeholder row (no ticker listed) the junk row is left as it was.
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "AAA", START, "Common Stock"),
+                _listing("0000000001", "N/A", date(2020, 1, 2), "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", date(2021, 1, 4), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("AAA", date(2021, 6, 1)) is None
+        assert resolver.report.unreadable == 0
+
+    def test_a_security_listing_only_junk_is_known_and_never_sent(self) -> None:
+        resolver = ListingResolver(
+            [_listing("0000000001", "New York Stock Exchange", START, "Common Stock")]
+        )
+        assert resolver.knows("0000000001")
+        assert resolver.report.unreadable == 0
+
+    def test_a_delisted_junk_last_row_still_ends_the_span(self) -> None:
+        # quant-auditor on #863: the Form 25 lands on the junk row's listing,
+        # keyed under the junk string; rule 7 must still cut the span.
+        junk_day = date(2021, 1, 4)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "XYZ", date(2019, 1, 2), "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", junk_day, "Common Stock"),
+            ],
+            _evidence(
+                [],
+                [
+                    _ended(
+                        "0000000001",
+                        "New York Stock Exchange",
+                        "Common Stock",
+                        date(2021, 3, 1),
+                        valid_from=junk_day,
+                    )
+                ],
+            ),
+        )
+        assert resolver.resolve("XYZ", date(2021, 2, 1)) == "0000000001"
+        assert resolver.resolve("XYZ", date(2022, 6, 1)) is None
+        assert resolver.report.ended_spans == 1
+
+    def test_a_junk_row_never_carries_a_same_day_typo_on(self) -> None:
+        # code-review on #863: Ford's typo day lists F and FF; a later junk
+        # row must be read as F, never as FutureFuel's FF.
+        resolver = ListingResolver(
+            [
+                _listing("ff", "FF", date(2019, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 1, 2), "Common Stock"),
+                _listing("ford", "F", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "FF", date(2020, 4, 1), "Common Stock"),
+                _listing("ford", "New York Stock Exchange", date(2020, 7, 1), "Common Stock"),
+            ]
+        )
+        assert resolver.resolve("FF", date(2020, 8, 3)) == "ff"
+        assert resolver.resolve("F", date(2020, 8, 3)) == "ford"
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 1)
+
+    def test_a_dropped_junk_row_is_counted_once(self) -> None:
+        day = date(2022, 6, 9)
+        resolver = ListingResolver(
+            [
+                _listing("0000000001", "OLD", START, "Common Stock"),
+                _listing("0000000001", "NEWT", day, "Common Stock"),
+                _listing("0000000001", "New York Stock Exchange", day, "Common Stock"),
+            ]
+        )
+        assert (resolver.report.unreadable, resolver.report.same_day_typos) == (1, 0)
+
+    def test_a_junk_row_never_changes_an_earlier_mapping(self) -> None:
+        # No look-ahead: a junk row, and every row after it, change nothing
+        # before its day; nor does it hand the ticker to another company.
+        cut = date(2020, 11, 6)
+        rows = [
+            *self._vmc(),
+            _listing("0000000009", "VMC", date(2016, 3, 1), "Common Stock"),
+        ]
+        full = ListingResolver(rows)
+        early = ListingResolver([r for r in rows if r["valid_from"] < cut])  # type: ignore[operator]
+        sessions = [date(y, m, 1) for y in range(2016, 2023) for m in range(1, 13)]
+        for session in (s for s in sessions if s < cut):
+            assert full.resolve("VMC", session) == early.resolve("VMC", session), session
+        for session in (s for s in sessions if s >= date(2019, 7, 29)):
+            assert full.resolve("VMC", session) == self.VMC, session
+
+
 class _Recorded:
     """Fetchers returning the recorded payloads, and remembering the calls."""
 
@@ -565,3 +2538,779 @@ class TestAlpacaPriceSource:
             assert bar.known_at == bar_known_at(bar.session)
         for action in source.corporate_actions(ids, date(2020, 8, 3), date(2020, 9, 30)):
             assert action.known_at == action_first_seen_known_at(action.ex_date)
+
+
+class TestAlpacaSymbols:
+    """#737: a master ticker goes to Alpaca only in Alpaca's symbol form.
+
+    alpaca-py comma-joins every symbol into one `symbols=` parameter of one
+    request and raises `APIError` for the whole call on any error status, so
+    one invalid symbol is taken to fail the whole chunk: such a ticker is
+    never sent. Its security gets no bars under it, never another's."""
+
+    @pytest.mark.parametrize(
+        ("ticker", "symbol"),
+        [
+            ("AAPL", "AAPL"),
+            ("BRK.B", "BRK.B"),
+            ("NKTX ", "NKTX"),
+            ('"""CDTX"""', "CDTX"),
+            ("'XOM'", "XOM"),
+            ("Caap", "CAAP"),
+            ("LEDs", "LEDS"),
+            ("CRD-A", "CRD.A"),
+            ("GEF-B", "GEF.B"),
+            ("BRK/B", "BRK.B"),
+            ("crd-a", "CRD.A"),
+            ("BF.B", "BF.B"),
+            ("bf-b", "BF.B"),
+            # #844: a footnote marker or an exchange in brackets after it.
+            ("VAL*", "VAL"),
+            ("DNR*", "DNR"),
+            ("CVIAQ*", "CVIAQ"),
+            ("BAX (NYSE)", "BAX"),
+            ("UPH(1)", "UPH"),
+            ("LCINQ (1)", "LCINQ"),
+            ("QTEKQ (1) ", "QTEKQ"),
+            ("ABC (Nasdaq GS)", "ABC"),
+            ("ABC (NYSE American)", "ABC"),
+        ],
+    )
+    def test_safe_spellings_become_the_alpaca_symbol(self, ticker: str, symbol: str) -> None:
+        assert alpaca_symbol(ticker) == symbol
+
+    @pytest.mark.parametrize(
+        "ticker",
+        [
+            "New York Stock Exchange",
+            "Trading SymbolSLP",
+            "*",
+            "(NYSE)",
+            # quant-auditor on #863: a bracketed class or series is no footnote.
+            "HEI (A)",
+            "BRK (A)",
+            "GOOG (Class C)",
+            "BAC (Series L)",
+            "XYZ (Pfd)",
+            "F (2029)",  # code-review on #863: a year is no footnote
+            "F&G",
+            "C/28",
+            "CUBI/PC",
+            "AAPL,MSFT",
+            "",
+            "  ",
+            "-",
+            "1234",
+            "BRK..B",
+            "BRK.",
+            ".B",
+            "CRD-A-B",
+            "\ufb01t",  # the ligature 'fi' upper-cases to 'FIT'
+            "\u00c9CO",
+        ],
+    )
+    def test_anything_else_is_not_an_alpaca_symbol(self, ticker: str) -> None:
+        assert alpaca_symbol(ticker) is None
+
+    @pytest.mark.parametrize(
+        "ticker", ["C27C", "PG25", "PCAR26", "DE22B", "PTN1", "CK0000731288", "ABC.B1", "AB1-C"]
+    )
+    def test_a_ticker_with_a_digit_is_not_an_alpaca_symbol(self, ticker: str) -> None:
+        # #792: from 2019-08 cover pages bring 510 tickers with digits (notes
+        # such as Citi's C27C); Alpaca rejected every one alone, none had bars.
+        assert alpaca_symbol(ticker) is None
+
+    def test_a_note_ticker_is_never_sent_and_is_named(self) -> None:
+        listings = [
+            _listing("SEC_AAPL", "AAPL", START),
+            _listing("SEC_C_NOTE", "C27C", START),
+            _listing("SEC_BRK", "BRK.B", START),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"BRK.B": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(
+            ["SEC_AAPL", "SEC_C_NOTE", "SEC_BRK"], date(2020, 8, 3), date(2020, 8, 7)
+        )
+        assert calls == [["AAPL", "BRK.B"]]
+        assert {b.security_id for b in bars} == {"SEC_AAPL", "SEC_BRK"}
+        assert source.last_excluded_symbols == ("C27C",)
+        assert "'C27C'" in source.symbol_summary()
+
+    @staticmethod
+    def _bars_under(symbols: dict[str, str]) -> dict[str, Any]:
+        """The recorded payload with each `{new: recorded}` symbol's rows
+        served under `new` as well."""
+        payload = _json("daily_bars.json")
+        for new, recorded in symbols.items():
+            payload["bars"][new] = copy.deepcopy(payload["bars"][recorded])
+        return payload
+
+    def test_an_invalid_ticker_is_never_sent_and_is_named(self) -> None:
+        listings = [
+            _listing("SEC_AAPL", "AAPL", START),
+            _listing("SEC_CRD", "CRD-A", START),
+            _listing("SEC_FG", "F&G", START),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"CRD.A": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(["SEC_AAPL", "SEC_CRD", "SEC_FG"], date(2020, 8, 3), date(2020, 8, 7))
+        assert calls == [["AAPL", "CRD.A"]]
+        assert {b.security_id for b in bars} == {"SEC_AAPL", "SEC_CRD"}
+        crd = [b for b in bars if b.security_id == "SEC_CRD"]
+        assert len(crd) == 5 and crd[0].close == _json("daily_bars.json")["bars"]["KO"][0]["c"]
+        assert source.last_excluded_symbols == ("F&G",)
+        assert "1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'F&G'" in (
+            source.symbol_summary()
+        )
+
+    def test_only_invalid_tickers_fetch_nothing(self) -> None:
+        recorded = _Recorded()
+        source = AlpacaPriceSource(
+            ListingResolver([_listing("SEC_X", "New York Stock Exchange", START)]),
+            fetch_bars=recorded.bars,
+            fetch_actions=recorded.actions,
+            settings=_settings(),
+        )
+        assert source.bars(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert source.corporate_actions(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert recorded.calls == []
+        assert source.last_excluded_symbols == ("New York Stock Exchange",)
+
+    def test_actions_are_asked_and_resolved_under_the_alpaca_symbol(self) -> None:
+        listings = [_listing("SEC_CRD", "CRD-A", START)]
+        calls: list[list[str]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append(symbols)
+            row = {**_json("corporate_actions.json")["cash_dividends"][0], "symbol": "CRD.A"}
+            return {"cash_dividends": [row]}
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_CRD"], date(2020, 8, 3), date(2020, 8, 31))
+        assert calls == [["CRD.A"]]
+        assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_CRD", date(2020, 8, 7))]
+
+    def test_two_spellings_are_one_ticker_to_the_resolver(self) -> None:
+        # 'CRD-A' and 'CRD.A' are one Alpaca symbol, so one ticker: the
+        # newer listing takes it, as for any reused ticker.
+        listings = [
+            _listing("SEC_OLD", "CRD-A", START),
+            _listing("SEC_NEW", "CRD.A", date(2020, 1, 2)),
+        ]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            return self._bars_under({"CRD.A": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(["SEC_OLD", "SEC_NEW"], date(2020, 8, 3), date(2020, 8, 7))
+        assert {b.security_id for b in bars} == {"SEC_NEW"}
+
+    def test_a_spelling_variant_is_still_contested(self) -> None:
+        # quant-auditor pass 1 on #760: X held 'META ' (trailing space) before
+        # FB renamed into META. Alpaca serves FB's history under META on X's
+        # dates; they must stay unassigned, as they do for X spelled 'META'.
+        for spelling in ("META", "META ", "meta"):
+            listings = [
+                _listing("SEC_X", spelling, START),
+                _listing("SEC_X", "XNEW", date(2020, 9, 1)),
+                _listing("SEC_FB", "FB", START),
+                _listing("SEC_FB", "META", date(2020, 10, 1)),
+            ]
+
+            def fetch(
+                symbols: list[str], start: date, end: date, *, asof: date | None = None
+            ) -> dict[str, Any]:
+                return self._bars_under({"META": "KO"})
+
+            source = AlpacaPriceSource(
+                ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+            )
+            assert source.bars(["SEC_X"], date(2020, 8, 3), date(2020, 8, 7)) == [], spelling
+            assert source.last_bars_report is not None
+            assert ("META", date(2020, 8, 3)) in source.last_bars_report.unresolved
+
+    def test_two_spellings_of_one_security_resolve_to_it(self) -> None:
+        listings = [
+            _listing("SEC_CAAP", "Caap", START),
+            _listing("SEC_CAAP", "CAAP", date(2020, 8, 5)),
+        ]
+        calls: list[list[str]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            calls.append(symbols)
+            return self._bars_under({"CAAP": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        bars = source.bars(["SEC_CAAP"], date(2020, 8, 3), date(2020, 8, 7))
+        assert calls == [["CAAP"]]
+        assert [b.session.day for b in bars] == [3, 4, 5, 6, 7]
+        assert {b.security_id for b in bars} == {"SEC_CAAP"}
+
+    def test_two_spellings_from_one_day_resolve_to_nothing(self) -> None:
+        # code-review on #760: two securities whose spellings are one symbol
+        # from the same day are ambiguous: their rows go to nobody, and the
+        # chunk goes on rather than raising.
+        listings = [_listing("SEC_A", "Caap", START), _listing("SEC_B", "CAAP", START)]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            return self._bars_under({"CAAP": "KO"})
+
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=fetch, settings=_settings()
+        )
+        assert source.bars(["SEC_A", "SEC_B"], date(2020, 8, 3), date(2020, 8, 7)) == []
+        assert source.last_bars_report is not None
+        assert ("CAAP", date(2020, 8, 3)) in source.last_bars_report.unresolved
+
+    def test_a_placeholder_word_never_joins_a_real_symbol(self) -> None:
+        # 'true' is a placeholder (#735) and keeps its spelling: upper-casing
+        # it would make it TrueCar's TRUE.
+        listings = [
+            _listing("SEC_TRUE", "TRUE", START),
+            _listing("SEC_P", "true", date(2020, 1, 2)),
+        ]
+        resolver = ListingResolver(listings)
+        assert resolver.resolve("TRUE", date(2020, 8, 3)) == "SEC_TRUE"
+        assert resolver.symbols("SEC_P", START, date(2020, 8, 7)) == []
+
+    def test_the_run_line_names_the_tickers_not_sent_last(self) -> None:
+        listings = [_listing("SEC_AAPL", "AAPL", START), _listing("SEC_FG", "F&G", START)]
+        source = AlpacaPriceSource(
+            ListingResolver(listings), fetch_bars=_Recorded().bars, settings=_settings()
+        )
+        source.bars(["SEC_AAPL", "SEC_FG"], date(2020, 8, 3), date(2020, 8, 7))
+        assert source.resolution_summary().endswith(
+            "; 1 master ticker(s) not sent to Alpaca, not Alpaca symbols: 'F&G'"
+        )
+
+    def test_a_valid_ticker_alone_names_no_exclusion(self) -> None:
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_bars=_Recorded().bars, settings=_settings()
+        )
+        source.bars(["SEC_AAPL"], date(2020, 8, 3), date(2020, 8, 7))
+        assert source.last_excluded_symbols == ()
+        assert source.symbol_summary() == ""
+
+
+class TestSameDayTypoRule:
+    """#846: the rule `ListingResolver` uses to tell a cover-page typo
+    from a genuine same-day pair, shared with `health._overlapping_listings`
+    so the two can never drift."""
+
+    def test_the_held_ticker_in_the_pair_is_a_typo(self) -> None:
+        assert is_same_day_typo("FF", {"F", "FF"}) is True
+
+    def test_neither_ticker_held_is_a_genuine_pair(self) -> None:
+        assert is_same_day_typo("FF", {"F", "FFX"}) is False
+
+    def test_no_ticker_held_before_is_a_genuine_pair(self) -> None:
+        assert is_same_day_typo(None, {"F", "FF"}) is False
+
+
+class TestSameAlpacaSymbolFold:
+    """#846: MOTV U / MOTV.U is one Alpaca symbol under two filer
+    spellings of a unit's one-letter suffix, the same fold
+    `alpaca_symbol` already does for `-` and `/` (`CRD-A`, `CRD.A`)."""
+
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [
+            ("MOTV U", "MOTV.U"),
+            ("MOTV.U", "MOTV U"),
+            ("BRK B", "BRK.B"),
+            ("crd a", "CRD.A"),
+            ("BAX (NYSE)", "BAX"),  # #844: a bracketed exchange after the symbol
+        ],
+    )
+    def test_a_space_class_suffix_is_the_dot_spelling(self, one: str, other: str) -> None:
+        assert same_alpaca_symbol(one, other) is True
+
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [("HACAR", "HCACR"), ("CLCR", "CLRC"), ("F", "FF"), ("BAX (NYSE)", "BAXX")],
+    )
+    def test_different_tickers_are_not_one_symbol(self, one: str, other: str) -> None:
+        assert same_alpaca_symbol(one, other) is False
+
+
+class TestClassSymbols:
+    """#1219: a NYSE cover page writes a class ticker without the dot (`BFB`),
+    Alpaca serves `BF.B`. `alpaca.class_symbols` names the pairs; nothing is
+    guessed from the spelling (CVNA, UAA and WLYB are real undotted symbols)."""
+
+    BF = "0000014693:class-b-common-stock-nonvoting"
+    DAYS: ClassVar[list[date]] = [date(2024, 6, 3), date(2024, 6, 4)]
+    MAP: ClassVar[dict[str, str]] = {"BFB": "BF.B"}
+
+    def _listing(self, ticker: str = "BFB", exchange: str | None = "NYSE") -> dict[str, object]:
+        row = _listing(self.BF, ticker, date(2019, 8, 28), "Class B Common Stock (nonvoting)")
+        if exchange is not None:
+            row["exchange"] = exchange
+        return row
+
+    def _asked(self, *rows: dict[str, object], class_symbols: dict[str, str] | None) -> list[str]:
+        asked: list[list[str]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            asked.append(symbols)
+            return {"feed": "sip", "bars": {}}
+
+        resolver = ListingResolver(rows, class_symbols=class_symbols)
+        AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings()).bars(
+            [self.BF], self.DAYS[0], self.DAYS[1]
+        )
+        return asked[0]
+
+    def test_the_nyse_class_ticker_is_asked_in_alpaca_form_and_fills(self) -> None:
+        payload = {"feed": "sip", "bars": {"BF.B": [_row(d, 50.0) for d in self.DAYS]}}
+        source = AlpacaPriceSource(
+            ListingResolver([self._listing()], class_symbols=self.MAP),
+            fetch_bars=lambda symbols, start, end: payload,
+            settings=_settings(),
+        )
+        bars = source.bars([self.BF], self.DAYS[0], self.DAYS[1])
+        assert [(b.security_id, b.session) for b in bars] == [(self.BF, d) for d in self.DAYS]
+
+    def test_without_the_map_the_undotted_ticker_is_asked(self) -> None:
+        assert self._asked(self._listing(), class_symbols=None) == ["BFB"]
+        assert self._asked(self._listing(), class_symbols=self.MAP) == ["BF.B"]
+
+    def test_only_a_nyse_listing_takes_the_mapped_symbol(self) -> None:
+        for exchange in ("NASDAQ", "NYSE_AMERICAN", None):
+            assert self._asked(self._listing(exchange=exchange), class_symbols=self.MAP) == ["BFB"]
+
+    def test_an_unlisted_ticker_is_never_dotted(self) -> None:
+        row = _listing("0000000007", "WLYB", date(2019, 8, 28), "Class B Common Stock")
+        row["exchange"] = "NYSE"
+        resolver = ListingResolver([row], class_symbols=self.MAP)
+        assert resolver.symbols("0000000007", date(2024, 1, 2), date(2024, 1, 3)) == ["WLYB"]
+
+    def test_no_bar_before_the_listing_starts(self) -> None:
+        resolver = ListingResolver([self._listing()], class_symbols=self.MAP)
+        assert resolver.resolve("BF.B", date(2019, 8, 27)) is None
+        assert resolver.resolve("BF.B", date(2019, 8, 28)) == self.BF
+
+    def test_a_delisting_is_keyed_to_the_mapped_symbol(self) -> None:
+        end = {**self._listing(), "status": "delisted", "effective_on": date(2024, 6, 4)}
+        end.update(end_session=None, delisting_filed_at=None)
+        evidence = registrant_evidence(
+            [],
+            [end],
+            as_of=date(2024, 6, 1),
+            quiet_after_days=90,
+            transfer_window_sessions=5,
+            class_symbols=self.MAP,
+        )
+        assert evidence.delisted_listings[self.BF] == (
+            (date(2019, 8, 28), "BF.B", date(2024, 6, 4)),
+        )
+
+    def test_the_default_config_names_the_four_known_pairs(self) -> None:
+        assert _settings().alpaca.class_symbols == {
+            "BFA": "BF.A",
+            "BFB": "BF.B",
+            "HVTA": "HVT.A",
+            "WSOB": "WSO.B",
+        }
+
+
+class TestAsofPerSpan:
+    """#1314: without `asof`, Alpaca maps a symbol to today's holder, so a
+    reused ticker serves the later company's history on the old company's
+    dates (VAL: Valspar's 2017 sessions priced as Valaris). Each security
+    whose span is not the ticker's latest, open span is asked with an
+    `asof` inside its own span; a symbol Alpaca names for no company then
+    falls back to a request without one."""
+
+    OLD = "0000000001"  # Valspar, VAL until the ticker passed on
+    NEW = "0000000002"  # Valaris, VAL from 2018
+    SPAN = date(2016, 1, 4)
+    TAKEN = date(2018, 1, 2)
+    DAYS: ClassVar[list[date]] = [date(2017, 6, 5), date(2017, 6, 6), date(2017, 6, 7)]
+    LATER: ClassVar[list[date]] = [date(2018, 6, 4), date(2018, 6, 5)]
+    LISTINGS: ClassVar[list[dict[str, object]]] = [
+        _listing(OLD, "VAL", SPAN),
+        _listing(NEW, "VAL", TAKEN),
+        _listing("SEC_AAPL", "AAPL", START),
+    ]
+
+    class _Alpaca:
+        """A fake Alpaca: `holders` maps (symbol, asof or None) to the
+        company it names; `prices` that company's closes by session."""
+
+        def __init__(
+            self,
+            holders: dict[tuple[str, date | None], str],
+            prices: dict[str, dict[date, float]],
+        ) -> None:
+            self.holders = holders
+            self.prices = prices
+            self.calls: list[tuple[list[str], date, date, date | None]] = []
+
+        def __call__(
+            self, symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            self.calls.append((symbols, start, end, asof))
+            bars: dict[str, list[dict[str, object]]] = {}
+            for symbol in symbols:
+                key = (symbol, None if asof is None else asof)
+                company = self.holders.get(key)
+                if company is None and asof is not None:
+                    company = next(
+                        (
+                            c
+                            for (s, a), c in self.holders.items()
+                            if s == symbol and a and a <= asof
+                        ),
+                        None,
+                    )
+                if company is None:
+                    continue
+                rows = [
+                    _row(day, close)
+                    for day, close in sorted(self.prices[company].items())
+                    if start <= day <= end
+                ]
+                if rows:
+                    bars[symbol] = rows
+            return {"feed": "sip", "bars": bars}
+
+    def _alpaca(self) -> TestAsofPerSpan._Alpaca:
+        old = {d: 110.0 for d in self.DAYS}
+        new = {d: 6.0 for d in [*self.DAYS, *self.LATER]}  # history copied back (#104)
+        return self._Alpaca(
+            {("VAL", None): "valaris", ("VAL", self.SPAN): "valspar", ("AAPL", None): "apple"},
+            {"valspar": old, "valaris": new, "apple": {d: 300.0 for d in self.DAYS}},
+        )
+
+    def _source(self, fetch: Any, listings: list[dict[str, object]] | None = None) -> Any:
+        return AlpacaPriceSource(
+            ListingResolver(self.LISTINGS if listings is None else listings),
+            fetch_bars=fetch,
+            settings=_settings(),
+        )
+
+    def test_a_reused_ticker_gets_the_old_company_bars_with_asof(self) -> None:
+        alpaca = self._alpaca()
+        bars = self._source(alpaca).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [(b.security_id, b.session, b.close) for b in bars] == [
+            (self.OLD, d, 110.0) for d in self.DAYS
+        ]
+        asof = self.SPAN + timedelta(days=7)  # alpaca.asof_offset_days after the span starts
+        assert alpaca.calls == [(["VAL"], self.DAYS[0], self.DAYS[-1], asof)]
+
+    def test_the_known_at_is_still_the_session_close(self) -> None:
+        bars = self._source(self._alpaca()).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [b.known_at for b in bars] == [bar_known_at(d) for d in self.DAYS]
+
+    def test_today_holder_rows_on_the_old_dates_are_dropped(self) -> None:
+        alpaca = self._alpaca()
+        bars = self._source(alpaca).bars(
+            [self.OLD, self.NEW, "SEC_AAPL"], self.DAYS[0], self.LATER[-1]
+        )
+        closes = {(b.security_id, b.session): b.close for b in bars}
+        assert closes == {
+            **{(self.OLD, d): 110.0 for d in self.DAYS},
+            **{(self.NEW, d): 6.0 for d in self.LATER},
+            **{("SEC_AAPL", d): 300.0 for d in self.DAYS},
+        }
+        # Today's holders share one request without asof, as before.
+        assert [c for c in alpaca.calls if c[3] is None] == [
+            (["AAPL", "VAL"], self.DAYS[0], self.LATER[-1], None)
+        ]
+
+    def test_an_ended_span_is_asked_with_asof_though_no_store_listing_took_it(self) -> None:
+        # The security renamed away from WTRE; an issuer the store never saw
+        # holds WTRE today (Watford, #1314).
+        listings = [_listing(self.OLD, "WTRE", self.SPAN), _listing(self.OLD, "WTX", self.TAKEN)]
+        alpaca = self._Alpaca(
+            {("WTRE", None): "later", ("WTRE", self.SPAN): "watford"},
+            {"later": {d: 9.0 for d in self.DAYS}, "watford": {d: 30.0 for d in self.DAYS}},
+        )
+        bars = self._source(alpaca, listings).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert {b.close for b in bars} == {30.0}
+
+    def test_a_symbol_asof_names_no_company_falls_back_to_no_asof(self) -> None:
+        # DAVE, AMCI, MBC, STRN, SMLR (#1314, #1311): asof returns nothing.
+        alpaca = self._alpaca()
+        del alpaca.holders[("VAL", self.SPAN)]
+        alpaca.prices["valaris"] = {d: 110.0 for d in self.DAYS}
+        source = self._source(alpaca)
+        bars = source.bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [(b.security_id, b.close) for b in bars] == [(self.OLD, 110.0)] * 3
+        asof = self.SPAN + timedelta(days=7)
+        assert alpaca.calls == [
+            (["VAL"], self.DAYS[0], self.DAYS[-1], asof),
+            (["VAL"], self.SPAN, self.DAYS[-1], asof),  # does Alpaca know it at all?
+            (["VAL"], self.DAYS[0], self.DAYS[-1], None),
+        ]
+        assert all(call[2] <= self.DAYS[-1] for call in alpaca.calls)  # never past the window
+        assert "1 symbol(s) asked without asof" in source.resolution_summary()
+
+    def test_an_empty_window_of_a_known_company_does_not_fall_back(self) -> None:
+        # Span lag (TOPW, #1314): the company stopped trading before its span
+        # ended; a window after its last bar must not take today's holder.
+        alpaca = self._alpaca()
+        source = self._source(alpaca)
+        late = [date(2017, 8, 14), date(2017, 8, 15)]
+        alpaca.prices["valaris"].update({d: 6.0 for d in late})
+        assert source.bars([self.OLD], late[0], late[-1]) == []
+        assert all(call[3] is not None for call in alpaca.calls)
+        assert source.bars([self.OLD], late[0], late[-1]) == []  # served once: no new probe
+        assert len(alpaca.calls) == 3
+
+    def test_the_resolver_names_no_asof_for_the_latest_open_span(self) -> None:
+        resolver = ListingResolver(self.LISTINGS)
+        assert resolver.asof(self.NEW, "VAL", 7) is None
+        assert resolver.asof("SEC_AAPL", "AAPL", 7) is None
+        assert resolver.asof(self.OLD, "VAL", 7) == self.SPAN + timedelta(days=7)
+
+    def test_the_asof_stays_inside_a_short_span(self) -> None:
+        listings = [
+            _listing(self.OLD, "VAL", self.SPAN),
+            _listing(self.NEW, "VAL", date(2016, 1, 7)),
+        ]
+        assert ListingResolver(listings).asof(self.OLD, "VAL", 7) == date(2016, 1, 6)
+
+
+class TestRule8Handover:
+    """Rule 8 (#1314 item 2, spec acceptance "Span lag"): S's span of T ends
+    on the session after its last bar L when another company's span of T
+    starts on D more than `master.transfer_window_sessions` sessions later;
+    T resolves to nobody from there, or to the new issuer's first-span lead."""
+
+    S = "0000000011"  # Top Win, TOPW from 2020-01-02
+    N = "0000000022"  # the later TOPW holder, its first cover page on D
+    START = date(2020, 1, 2)
+    D = date(2020, 6, 1)
+    L = date(2020, 4, 1)  # S's last bar
+    H = date(2020, 4, 2)
+
+    def _resolver(
+        self,
+        last: date | None = L,
+        *,
+        listings: list[dict[str, object]] | None = None,
+        evidence: RegistrantEvidence | None = None,
+        first_sessions: dict[str, date] | None = None,
+    ) -> ListingResolver:
+        asked: list[tuple[str, date, date]] = []
+
+        def last_bar(security_id: str, start: date, before: date) -> date | None:
+            asked.append((security_id, start, before))
+            return last if security_id != self.N else None
+
+        rows = listings or [_listing(self.S, "TOPW", self.START), _listing(self.N, "TOPW", self.D)]
+        resolver = ListingResolver(
+            rows,
+            evidence,
+            first_sessions=first_sessions,
+            last_bar=last_bar,
+            handover_sessions=5,
+        )
+        self.asked = asked
+        return resolver
+
+    def test_a_ended_on_the_session_after_the_last_bar(self) -> None:
+        resolver = self._resolver()
+        assert resolver.resolve("TOPW", self.L) == self.S
+        assert resolver.resolve("TOPW", self.H) is None
+        assert resolver.resolve("TOPW", date(2020, 5, 29)) is None
+        assert resolver.resolve("TOPW", self.D) == self.N
+        assert [(h.ticker, h.start, h.end) for h in resolver.handovers(self.S)] == [
+            ("TOPW", self.H, self.D)
+        ]
+        assert self.asked == [(self.S, self.START, self.D)]
+        assert resolver.report.handover_spans == 1
+        assert "1 spans ended where another issuer took the ticker" in resolver.report.summary()
+
+    def test_a_the_new_issuers_first_span_lead_fills_from_the_hand_over(self) -> None:
+        first = {self.N: date(2020, 1, 15)}  # its S-1, before H
+        resolver = self._resolver(first_sessions=first)
+        assert resolver.lead("TOPW", date(2020, 4, 15)) == self.N
+        assert resolver.lead("TOPW", self.L) is None  # S's session
+        assert resolver.report.first_span_clipped == 1
+        assert resolver.report.first_span_refused == 0
+        # Without rule 8 the lead is refused whole: S's span covers its window.
+        plain = ListingResolver(
+            [_listing(self.S, "TOPW", self.START), _listing(self.N, "TOPW", self.D)],
+            first_sessions=first,
+        )
+        assert plain.lead("TOPW", date(2020, 4, 15)) is None
+        assert plain.report.first_span_refused == 1
+
+    @pytest.mark.parametrize(
+        "last",
+        [date(2020, 5, 22), date(2020, 5, 29), None],  # 4 sessions between; bars to D; none
+    )
+    def test_b_a_short_gap_bars_to_d_or_no_bar_change_nothing(self, last: date | None) -> None:
+        resolver = self._resolver(last)
+        assert resolver.resolve("TOPW", date(2020, 5, 28)) == self.S
+        assert resolver.handovers(self.S) == ()
+        assert resolver.report.handover_spans == 0
+
+    @pytest.mark.parametrize("later", ["0000000011:class-b", "0000000011@2020-06-01"])
+    def test_b_a_later_span_of_the_same_company_changes_nothing(self, later: str) -> None:
+        resolver = self._resolver(
+            listings=[_listing(self.S, "TOPW", self.START), _listing(later, "TOPW", self.D)]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert self.asked == []
+
+    def test_c_a_span_already_ended_before_d_is_unchanged(self) -> None:
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(self.S, "TOPX", date(2020, 3, 2)),  # its own next row
+                _listing(self.N, "TOPW", self.D),
+            ]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert resolver.resolve("TOPW", date(2020, 2, 28)) == self.S
+        assert resolver.resolve("TOPW", date(2020, 3, 2)) is None
+
+    def test_d_a_co_registrant_claim_on_s_changes_nothing(self) -> None:
+        resolver = ListingResolver(
+            AEP_LISTINGS,
+            _evidence(AEP_FACTS),
+            last_bar=lambda sid, start, before: date(2026, 6, 1),
+            handover_sessions=5,
+        )
+        assert resolver.handovers(AEP) == ()
+        assert resolver.resolve("AEP", date(2026, 9, 15)) == AEP
+
+    def test_d_a_disputed_claim_on_s_changes_nothing(self) -> None:
+        resolver = ListingResolver(
+            MGEE_LISTINGS,
+            _evidence(MGEE_FACTS),
+            last_bar=lambda sid, start, before: date(2025, 6, 2),
+            handover_sessions=5,
+        )
+        assert resolver.handovers(MGEE) == ()
+        assert resolver.report.disputed_spans == 1
+
+    def test_fill_resolve_lands_the_window_on_s_never_on_a_lead(self) -> None:
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        day = date(2020, 4, 15)
+        assert resolver.fill_resolve("TOPW", day) == self.S
+        assert resolver.fill_resolve("TOPW", self.D) == self.N
+        assert resolver.symbols(self.S, day, day) == []
+        assert resolver.symbols(self.S, day, day, handovers=True) == ["TOPW"]
+
+    def test_a_fill_source_stores_s_bars_in_its_window_and_a_plain_one_does_not(self) -> None:
+        days = [date(2020, 4, 14), date(2020, 4, 15)]
+        asof_seen: list[date | None] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            asof_seen.append(asof)
+            return {"feed": "sip", "bars": {"TOPW": [_row(d, 7.0) for d in days]}}
+
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        bars = fill.bars([self.S], days[0], days[-1])
+        assert [(b.security_id, b.session) for b in bars] == [(self.S, d) for d in days]
+        assert [b.known_at for b in bars] == [bar_known_at(d) for d in days]
+        assert asof_seen[0] is not None  # S's own asof request
+        plain = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        assert plain.bars([self.S], days[0], days[-1]) == []
+        led = plain.bars([self.N], days[0], days[-1])  # the new issuer's lead
+        assert {b.security_id for b in led} == {self.N}
+
+    def test_b_a_successor_of_s_inside_its_span_keeps_it_whole(self) -> None:
+        successor = "0000000011@2020-03-02"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(successor, "TOPW", date(2020, 3, 2)),
+                _listing(self.N, "TOPW", self.D),
+            ]
+        )
+        assert resolver.handovers(self.S) == ()
+        assert resolver.fill_resolve("TOPW", date(2020, 4, 15)) == successor
+
+    def _alpaca(self, *, asof_known: bool) -> Any:
+        days = [date(2020, 4, 14), date(2020, 4, 15)]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            if asof is not None and not asof_known:
+                return {"feed": "sip", "bars": {}}
+            close = 7.0 if asof is not None else 99.0  # S's own, or today's holder N's
+            return {"feed": "sip", "bars": {"TOPW": [_row(d, close) for d in days]}}
+
+        return days, fetch
+
+    def test_a_fill_never_lands_todays_holders_fallback_rows_on_s(self) -> None:
+        days, fetch = self._alpaca(asof_known=False)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        assert fill.bars([self.S], days[0], days[-1]) == []
+        assert fill.last_asof_fallbacks == ("TOPW",)
+
+    def test_a_fill_lands_the_new_issuers_lead_rows_on_it(self) -> None:
+        days, fetch = self._alpaca(asof_known=True)
+        resolver = self._resolver(first_sessions={self.N: date(2020, 1, 15)})
+        fill = AlpacaPriceSource(
+            resolver, fetch_bars=fetch, settings=_settings(), fill_handovers=True
+        )
+        led = fill.bars([self.N], days[0], days[-1])
+        assert [(b.security_id, b.close) for b in led] == [(self.N, 99.0)] * 2
+        both = fill.bars([self.S, self.N], days[0], days[-1])
+        assert {(b.security_id, b.close) for b in both} == {(self.S, 7.0)}  # S's own first
+
+    def test_a_clipped_lead_refused_by_a_third_span_counts_once(self) -> None:
+        third = "0000000033"
+        resolver = self._resolver(
+            listings=[
+                _listing(self.S, "TOPW", self.START),
+                _listing(third, "TOPW", date(2020, 5, 1), "Warrants"),
+                _listing(self.N, "TOPW", self.D),
+            ],
+            first_sessions={self.N: date(2020, 1, 15)},
+        )
+        assert (resolver.report.first_span_clipped, resolver.report.first_span_refused) == (0, 1)
+
+    def test_last_bar_needs_the_configured_window(self) -> None:
+        with pytest.raises(ValueError, match="handover_sessions"):
+            ListingResolver([], last_bar=lambda sid, start, before: None)

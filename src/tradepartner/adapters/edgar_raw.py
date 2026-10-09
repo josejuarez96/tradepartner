@@ -8,16 +8,44 @@ iXBRL, never here.
 
 SEC requires every request to declare a `User-Agent` with a name and
 contact ("Verify before the Phase 2 plan", ADR 0003) and rate-limits to
-roughly `edgar.requests_per_second` (default 10) requests/second.
+roughly `edgar.requests_per_second` (default 9) requests/second.
 `_RateLimiter` enforces that floor between requests made through this
 module's shared client (a simple token/timestamp limiter, `threading.Lock`
 -guarded: it remembers the last request time and sleeps off the remainder
-of the interval); `_get` retries once, after a backoff (`Retry-After` if
-the response sends one and it's a finite, non-negative number no larger
-than `edgar.max_retry_after_seconds` -- else `edgar.retry_backoff_seconds`
--- a response naming `nan`, `inf`, or an absurdly large value raises
-instead of sleeping for it), on `403`/`429`/`503` (SEC uses `403` for
-rate limiting too, alongside the more standard `429`/`503`).
+of the interval).
+
+Retry policy (#554, research #572 pitfalls P1/P2/P10), decided in one
+place, `_RetryPolicy`, which every request consults: `_execute_with_retry`
+(`_get`, `fsn_validators`'s `HEAD`) and `_stream_to_with_headers`'s
+streamed `GET`, each attempt and retry still behind `_RateLimiter`:
+- **`429`/`503`, and a transport error** (a dropped connection, a timeout,
+  or any other `httpx.TransportError`): capped exponential backoff,
+  `edgar.retry_backoff_seconds * 2 ** attempt` up to
+  `edgar.retry_backoff_cap_seconds`, up to `edgar.retry_max_attempts` tries
+  in total. A `429` still there once those tries are used up is treated as
+  SEC's rate-limit block (research #572 P2: SEC may signal it with a `429`
+  too) and gets the `403` wait below (#761). A `429`/`503` response's own
+  `Retry-After` is honoured instead of the computed backoff when the
+  response sends one and it's a finite, non-negative number no larger
+  than `edgar.max_retry_after_seconds` -- a response naming `nan`, `inf`,
+  or an absurdly large value raises instead of sleeping for it.
+- **`403`** (SEC uses it for its rate-limit block too, alongside the more
+  standard `429`/`503`; the block lifts only once the request rate has
+  stayed under the threshold for a while): one wait of
+  `edgar.rate_limit_wait_seconds` (default 10 minutes), then one retry;
+  a second `403` fails outright rather than waiting again. The block is
+  remembered process-wide (`_RATE_LIMIT_BLOCK`, #761): once a block has
+  been waited out and no request has succeeded since, a later request's
+  `403` (or `429` past its backoff) fails at once instead of waiting
+  another 10 minutes, so a block that persists (e.g. a refused
+  `User-Agent`) costs one wait per run, not one per request. Any success
+  clears it.
+- **A corrupt or truncated bulk zip** (one that won't open, a member whose
+  deflate data won't inflate or ends early, or `testzip()` naming a CRC
+  mismatch): `_stream_to_with_headers` re-downloads it once more; a zip
+  still corrupt after that raises `zipfile.BadZipFile`. Each download is
+  checked in its temp file before it replaces the cached zip, so a corrupt
+  one never overwrites the previous good copy (#761).
 
 Every public function takes an optional `client: httpx.Client` so tests
 can inject an `httpx.MockTransport`-backed client without any real
@@ -33,6 +61,9 @@ import re
 import tempfile
 import threading
 import time
+import zipfile
+import zlib
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +72,15 @@ from pydantic import SecretStr
 
 from tradepartner.config import Settings, get_settings
 
-_RETRY_STATUS_CODES = frozenset({403, 429, 503})
+#: `429`/`503`: SEC's standard "back off" statuses, retried with capped
+#: exponential backoff (see module docstring).
+_TRANSIENT_STATUS_CODES = frozenset({429, 503})
+#: SEC's rate-limit block, which it also signals with a plain `403`: waited
+#: out once (`edgar.rate_limit_wait_seconds`), never retried a second time.
+_RATE_LIMIT_STATUS_CODE = 403
+#: A `429` still returned once the backoff attempts are used up is SEC's
+#: block too (research #572 P2), and is waited out like a `403` (#761).
+_BLOCK_429_STATUS_CODE = 429
 # `.fullmatch()`, so no anchors needed: a partial/embedded match (or a
 # trailing-newline edge case `^...$` can admit) can never slip through.
 _ACCESSION_PATTERN = re.compile(r"\d{10}-\d{2}-\d{6}")
@@ -139,27 +178,26 @@ def _user_agent(settings: Settings) -> str:
     return value
 
 
-def _retry_backoff_seconds(response: httpx.Response, settings: Settings) -> float:
-    """`Retry-After` if the response sent one (seconds, integer per RFC 9110's
-    common case), else `edgar.retry_backoff_seconds`.
+def _retry_after_seconds(response: httpx.Response, settings: Settings) -> float | None:
+    """`Retry-After`, parsed and validated, or `None` if the response sent
+    none or it doesn't parse as a number (e.g. RFC 9110's HTTP-date form):
+    the caller then falls back to its own computed backoff.
 
-    Raises `RetryAfterTooLargeError` -- rather than sleeping for it -- if
-    the header names a non-finite value (`nan`/`inf`; `math.isfinite`) or
-    a finite one larger than `edgar.max_retry_after_seconds`: an SEC
-    response is not a trustworthy source for "sleep for however long it
-    says", and a value like `1e9` would otherwise hang this process for
-    over 31 years. A header that doesn't parse as a number at all (e.g.
-    the RFC 9110 HTTP-date form) is treated as absent, falling back to
-    `edgar.retry_backoff_seconds`.
+    Raises `RetryAfterTooLargeError` -- rather than returning it for the
+    caller to sleep on -- if the header names a non-finite value
+    (`nan`/`inf`; `math.isfinite`) or a finite one larger than
+    `edgar.max_retry_after_seconds`: an SEC response is not a trustworthy
+    source for "sleep for however long it says", and a value like `1e9`
+    would otherwise hang this process for over 31 years.
     """
     retry_after = response.headers.get("Retry-After")
     if retry_after is None:
-        return settings.edgar.retry_backoff_seconds
+        return None
 
     try:
         seconds = float(retry_after)
     except ValueError:
-        return settings.edgar.retry_backoff_seconds
+        return None
 
     if not math.isfinite(seconds):
         raise RetryAfterTooLargeError(
@@ -173,6 +211,142 @@ def _retry_backoff_seconds(response: httpx.Response, settings: Settings) -> floa
     return max(seconds, 0.0)
 
 
+class _RateLimitBlock:
+    """Process-wide memory of SEC's rate-limit block (#761): set when a
+    request waits a block out, cleared by any successful response. While
+    set, a block status fails at once rather than waiting again (module
+    docstring). `threading.Lock`-guarded, like `_RateLimiter`."""
+
+    def __init__(self) -> None:
+        self._waited_since_last_success = False
+        self._lock = threading.Lock()
+
+    def is_set(self) -> bool:
+        with self._lock:
+            return self._waited_since_last_success
+
+    def set(self) -> None:
+        with self._lock:
+            self._waited_since_last_success = True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._waited_since_last_success = False
+
+
+# Module-level and process-wide on purpose, like `_LIMITER`: SEC blocks the
+# client, not one request.
+_RATE_LIMIT_BLOCK = _RateLimitBlock()
+
+
+def _backoff_seconds(
+    attempt_index: int, settings: Settings, response: httpx.Response | None
+) -> float:
+    """How long to sleep before the next attempt: `response`'s own
+    `Retry-After` when it sends a usable one, else capped exponential
+    backoff, `edgar.retry_backoff_seconds * 2 ** attempt_index` up to
+    `edgar.retry_backoff_cap_seconds`. `response` is `None` for a transport
+    error (a dropped connection, a timeout, ...), which never carries a
+    `Retry-After`.
+    """
+    if response is not None:
+        retry_after = _retry_after_seconds(response, settings)
+        if retry_after is not None:
+            return retry_after
+    return min(
+        settings.edgar.retry_backoff_seconds * (2.0**attempt_index),
+        settings.edgar.retry_backoff_cap_seconds,
+    )
+
+
+class _RetryPolicy:
+    """One request's retry state and decisions (see the module docstring),
+    shared by `_execute_with_retry` and the streamed `GET` in
+    `_stream_to_with_headers`, so both follow the same policy.
+
+    `429`/`503` responses and transport errors share one attempt counter,
+    capped at `edgar.retry_max_attempts`; a `403`, or a `429` once that
+    counter is used up, is waited out once per request (and not at all
+    while `_RATE_LIMIT_BLOCK` is set) and never advances that counter.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._attempt = 0
+        self._rate_limit_waited = False
+
+    def retry_after_transport_error(self) -> bool:
+        """After an `httpx.TransportError`: sleep the backoff and return
+        `True` to retry, or `False` (no sleep) when the attempts are used up,
+        and the caller re-raises the error."""
+        if self._attempt + 1 >= self._settings.edgar.retry_max_attempts:
+            return False
+        time.sleep(_backoff_seconds(self._attempt, self._settings, None))
+        self._attempt += 1
+        return True
+
+    def retry_after_response(self, response: httpx.Response) -> bool:
+        """After a response: sleep and return `True` to retry a `429`/`503`
+        (until the attempts are used up) or a block (`_wait_out_block`);
+        return `False` for a success, which also clears
+        `_RATE_LIMIT_BLOCK`; otherwise raise `httpx.HTTPStatusError`
+        (`response.raise_for_status()`: a block not waited out again, a
+        last `503`, or any status this policy doesn't retry). Reads only the
+        status and headers, never the body, so a streamed response is not
+        consumed."""
+        status = response.status_code
+        if status == _RATE_LIMIT_STATUS_CODE:
+            return self._wait_out_block(response)
+        if status in _TRANSIENT_STATUS_CODES:
+            if self._attempt + 1 < self._settings.edgar.retry_max_attempts:
+                time.sleep(_backoff_seconds(self._attempt, self._settings, response))
+                self._attempt += 1
+                return True
+            if status == _BLOCK_429_STATUS_CODE:
+                return self._wait_out_block(response)
+        response.raise_for_status()
+        _RATE_LIMIT_BLOCK.clear()
+        return False
+
+    def _wait_out_block(self, response: httpx.Response) -> bool:
+        """SEC's rate-limit block: sleep `edgar.rate_limit_wait_seconds` and
+        return `True` to retry, once per request; raise instead if this
+        request already waited, or if an earlier request's wait has not
+        been followed by any success (`_RATE_LIMIT_BLOCK`)."""
+        if self._rate_limit_waited or _RATE_LIMIT_BLOCK.is_set():
+            response.raise_for_status()
+        self._rate_limit_waited = True
+        _RATE_LIMIT_BLOCK.set()
+        time.sleep(self._settings.edgar.rate_limit_wait_seconds)
+        return True
+
+
+def _execute_with_retry(
+    make_request: Callable[[], httpx.Response],
+    *,
+    settings: Settings,
+    min_interval_seconds: float,
+) -> httpx.Response:
+    """Call `make_request()` (behind `_LIMITER`, which also spaces out every
+    retry) until it succeeds or `_RetryPolicy` gives up. Raises
+    `httpx.TransportError` (a transport error on the last allowed attempt)
+    or `httpx.HTTPStatusError` (a second `403`, a last `429`/`503`, or any
+    status the policy doesn't retry) on final failure.
+    """
+    policy = _RetryPolicy(settings)
+    while True:
+        _LIMITER.wait(min_interval_seconds)
+        try:
+            response = make_request()
+        except httpx.TransportError:
+            if policy.retry_after_transport_error():
+                continue
+            raise
+        if policy.retry_after_response(response):
+            continue
+        return response
+
+
 def _get(
     url: str,
     *,
@@ -180,23 +354,20 @@ def _get(
     extra_headers: dict[str, str] | None = None,
     client: httpx.Client | None = None,
 ) -> httpx.Response:
-    """`GET url` behind the throttle, with the declared `User-Agent` and one retry."""
+    """`GET url` behind the throttle, with the declared `User-Agent` and the
+    module's retry policy (see module docstring)."""
     headers = {"User-Agent": _user_agent(settings), **(extra_headers or {})}
     http_client = (
         client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
     )
+    timeout = settings.edgar.request_timeout_seconds
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
 
-    _LIMITER.wait(min_interval_seconds)
-    response = http_client.get(url, headers=headers, timeout=settings.edgar.request_timeout_seconds)
-    if response.status_code in _RETRY_STATUS_CODES:
-        time.sleep(_retry_backoff_seconds(response, settings))
-        _LIMITER.wait(min_interval_seconds)
-        response = http_client.get(
-            url, headers=headers, timeout=settings.edgar.request_timeout_seconds
-        )
-    response.raise_for_status()
-    return response
+    return _execute_with_retry(
+        lambda: http_client.get(url, headers=headers, timeout=timeout),
+        settings=settings,
+        min_interval_seconds=min_interval_seconds,
+    )
 
 
 def _padded_cik(cik: str) -> str:
@@ -420,41 +591,101 @@ def download_filing_file(
 
 
 def _stream_to(url: str, dest: Path, *, settings: Settings, client: httpx.Client | None) -> Path:
-    """Stream `url` to `dest` behind the throttle and `User-Agent`, one retry
-    on a rate-limit status as `_get` does, through a temp file and `os.replace`."""
+    """Stream `url` to `dest` behind the throttle and `User-Agent`, the
+    module's retry policy, and one re-download if it arrives corrupt, through
+    a temp file and `os.replace`."""
     return _stream_to_with_headers(url, dest, settings=settings, client=client)[0]
+
+
+def _write_stream_to_temp(dest: Path, chunks: Iterable[bytes]) -> Path:
+    """Write `chunks` to a new temp file beside `dest` and return its path,
+    leaving `dest` untouched; the caller checks it and then `os.replace`s it
+    over `dest` or deletes it (`_replace_if_valid_zip`). A mid-stream
+    failure deletes the temp file before re-raising."""
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as file:
+            for chunk in chunks:
+                file.write(chunk)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return Path(tmp)
+
+
+def _replace_if_valid_zip(tmp: Path, dest: Path) -> bool:
+    """Move `tmp` over `dest` if it is a sound zip and return `True`; else
+    delete it and return `False`, leaving any previous `dest` in place
+    (#761: the check runs before `os.replace`, never after). `tmp` is gone
+    either way, including on an error."""
+    try:
+        if _zip_is_corrupt(tmp):
+            return False
+        os.replace(tmp, dest)
+        return True
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _zip_is_corrupt(path: Path) -> bool:
+    """Whether `path` is a truncated or corrupted download (research #572
+    P10): it fails to open as a zip (`BadZipFile`), a member's deflate data
+    won't inflate (`zlib.error`) or ends early (`EOFError`), or its own CRC
+    check (`testzip()`) names a bad member. `testzip()` itself catches only
+    `BadZipFile`, so the other two would otherwise escape as raw errors
+    instead of triggering the re-download (#554 quant-auditor pass 1)."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is not None
+    except (zipfile.BadZipFile, zlib.error, EOFError):
+        return True
 
 
 def _stream_to_with_headers(
     url: str, dest: Path, *, settings: Settings, client: httpx.Client | None
 ) -> tuple[Path, httpx.Headers]:
     """As `_stream_to`, but also returns the response headers (T11c: `Last-
-    Modified`, `ETag` and `Content-Length` go into the FSN period manifest)."""
+    Modified`, `ETag` and `Content-Length` go into the FSN period manifest).
+
+    Every destination streamed through this function is a zip
+    (`bulk_submissions`, `bulk_company_facts`, `fsn_zip`): once a response
+    streams cleanly to a temp file beside `dest`, the temp file is opened
+    and CRC-checked (`_zip_is_corrupt`) and only a sound one replaces
+    `dest`; a corrupt or truncated result is re-downloaded once more, and a
+    second corrupt result raises `zipfile.BadZipFile` with the previous
+    `dest` (if any) untouched (#761). The
+    status and transport-error decisions are `_RetryPolicy`'s, the same as
+    every other request here.
+    """
     headers = {"User-Agent": _user_agent(settings)}
     http_client = (
         client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
     )
+    timeout = settings.edgar.request_timeout_seconds
+    min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     dest.parent.mkdir(parents=True, exist_ok=True)
-    for attempt in range(2):
-        _LIMITER.wait(1.0 / settings.edgar.requests_per_second)
-        timeout = settings.edgar.request_timeout_seconds
-        with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
-            if response.status_code in _RETRY_STATUS_CODES and attempt == 0:
-                time.sleep(_retry_backoff_seconds(response, settings))
+
+    policy = _RetryPolicy(settings)
+    zip_redownloaded = False
+    while True:
+        _LIMITER.wait(min_interval_seconds)
+        try:
+            with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                if policy.retry_after_response(response):
+                    continue
+                response_headers = response.headers
+                tmp = _write_stream_to_temp(dest, response.iter_bytes())
+        except httpx.TransportError:
+            if policy.retry_after_transport_error():
                 continue
-            response.raise_for_status()
-            response_headers = response.headers
-            fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as file:
-                    for chunk in response.iter_bytes():
-                        file.write(chunk)
-                os.replace(tmp, dest)
-            except BaseException:
-                Path(tmp).unlink(missing_ok=True)
-                raise
-            return dest, response_headers
-    raise AssertionError("unreachable")  # pragma: no cover
+            raise
+
+        if not _replace_if_valid_zip(tmp, dest):
+            if zip_redownloaded:
+                raise zipfile.BadZipFile(f"{dest} still corrupt after one re-download")
+            zip_redownloaded = True
+            continue
+        return dest, response_headers
 
 
 # --- SEC Financial Statement and Notes data sets (T11c) ---------------------
@@ -555,13 +786,11 @@ def fsn_validators(
     min_interval_seconds = 1.0 / settings.edgar.requests_per_second
     timeout = settings.edgar.request_timeout_seconds
 
-    _LIMITER.wait(min_interval_seconds)
-    response = http_client.request("HEAD", url, headers=headers, timeout=timeout)
-    if response.status_code in _RETRY_STATUS_CODES:
-        time.sleep(_retry_backoff_seconds(response, settings))
-        _LIMITER.wait(min_interval_seconds)
-        response = http_client.request("HEAD", url, headers=headers, timeout=timeout)
-    response.raise_for_status()
+    response = _execute_with_retry(
+        lambda: http_client.request("HEAD", url, headers=headers, timeout=timeout),
+        settings=settings,
+        min_interval_seconds=min_interval_seconds,
+    )
     return response.headers
 
 
@@ -580,13 +809,31 @@ def bulk_submissions(
 
 
 def bulk_company_facts(
-    *, settings: Settings | None = None, client: httpx.Client | None = None
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+    reuse_cached: bool = False,
 ) -> Path:
-    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`."""
+    """The nightly `companyfacts.zip`, streamed to `edgar.cache_dir/bulk/companyfacts.zip`.
+
+    With `reuse_cached` (`ingest --bulk-from-cache`, #660) the file already
+    there is returned as it stands with no request, provided it opens as a
+    zip; a missing file or one that does not open raises `BadZipFile`
+    rather than falling back to a download."""
     settings = settings or get_settings()
+    dest = Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip"
+    if reuse_cached:
+        try:
+            with zipfile.ZipFile(dest):
+                pass
+        except (OSError, zipfile.BadZipFile) as error:
+            raise zipfile.BadZipFile(
+                f"{dest}: reuse_cached needs a companyfacts.zip that opens as a zip: {error}"
+            ) from error
+        return dest
     return _stream_to(
         "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
-        Path(settings.edgar.cache_dir) / "bulk" / "companyfacts.zip",
+        dest,
         settings=settings,
         client=client,
     )

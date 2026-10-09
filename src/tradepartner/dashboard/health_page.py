@@ -6,8 +6,11 @@ updated" and a stale chip; a KPI row (coverage, interior gaps, delisted
 names, last update); the hero chart of each session's missing share against
 `ingest.max_missing_share`; supporting cards (bars per session, integrity
 checks as status chips, per-source ingest status, survivorship gap,
-unclassifiable and `snapshot_static` reliance, settings); and the gap,
-delisted and missing-name tables. Read-only.
+unclassifiable and `snapshot_static` reliance, settings, statement facts
+(issue 660, T77c: the switch's state, coverage and derived share while it
+is on, the last EDGAR run's `statement_*` counts and a warning badge while
+`statement_vintage_late > 0`)); and the gap, delisted and missing-name
+tables. Read-only.
 
 Two layers, like the other pages: `load_health_view` reads everything
 through the connection it is given (the shell's single read-only
@@ -30,6 +33,12 @@ fact table at or before `t`; "last updated" the latest finish of an `ok`
 ingest run of any source; "stale" the number of sessions after the last
 bar session up to the last completed session, shown as a warning chip when
 positive.
+
+**Sources.** The "latest run" chip is green for `ok`, orange (a caution,
+not a failure) for a maintenance run's own status (`repair-resolution`'s
+`repaired`, `ingest --fill-holes`'s `filled`, issue 833: deliberately never
+`ok`, so neither counts as a fresh ingest for "last ok" or the staleness
+check above) or when the source has never run, and red for anything else.
 """
 
 from __future__ import annotations
@@ -44,16 +53,26 @@ import duckdb
 import polars as pl
 import streamlit as st
 
+from tradepartner.backfill import FILLED
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.health import HealthReport, health_report
+from tradepartner.repair import REPAIRED
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
 from tradepartner.store.master import securities_as_of
 
 #: Sessions the window control starts with (a view default, not a threshold).
 DEFAULT_WINDOW_SESSIONS: Final = 60
+
+#: Statuses a maintenance run (`repair-resolution`, `ingest --fill-holes`)
+#: writes on success (issue 833): never `ok` (that stays the only "fresh"
+#: status, ingest's own staleness check, module docstring), but not a
+#: failure either, so the "Sources" card shows them as a caution, not an
+#: alarm. Shared from `repair`/`backfill`, never copied, so a renamed
+#: status can't drift silently out of this set.
+_MAINTENANCE_STATUSES: Final[frozenset[str]] = frozenset({REPAIRED, FILLED})
 
 _SERIES_SCHEMA: Final[dict[str, Any]] = {
     "session": pl.Date,
@@ -279,6 +298,10 @@ def _sources_card(report: HealthReport) -> None:
                 theme.status_badge("never run", "warning")
             elif ingest.latest_status == "ok":
                 theme.status_badge("latest run: ok", "good")
+            elif ingest.latest_status in _MAINTENANCE_STATUSES:
+                # A successful repair or hole-fill (issue 833): not a fresh
+                # ingest, but not a failure either.
+                theme.status_badge(f"latest run: {ingest.latest_status}", "warning")
             else:
                 theme.status_badge(f"latest run: {ingest.latest_status}", "critical")
             if ingest.latest_message:
@@ -297,7 +320,8 @@ def _survivorship_card(report: HealthReport) -> None:
         st.markdown(
             f"Side categories: unclassifiable {len(gap.unclassifiable)} · "
             f"truncated history {len(gap.truncated_history)} · "
-            f"stale shares {len(gap.stale_shares)}"
+            f"stale shares {len(gap.stale_shares)} · "
+            f"stale listings {gap.stale_listings.height}"
         )
 
 
@@ -316,6 +340,32 @@ def _data_card(report: HealthReport) -> None:
         st.markdown(f"Liquidity rule: {rule} · Fill price: {report.settings['fill_price']}")
 
 
+def _statement_card(report: HealthReport) -> None:
+    statement = report.statement
+    with st.container(border=True):
+        st.subheader("Statement facts")
+        state = "on" if statement.enabled else "off"
+        st.markdown(f"Switch (`edgar.statement_facts_enabled`): **{state}**")
+        if statement.coverage is None:
+            st.caption("Switch is off: nothing to report.")
+        else:
+            cov = statement.coverage
+            st.markdown(
+                f"Coverage: {cov.fresh} of {cov.total} universe names "
+                f"({cov.share:.1%}) have a fresh revenue and total assets row "
+                "(rule 7's `universe.max_shares_age_days` bound)"
+            )
+            gross_profit = cov.derived + cov.reported
+            st.markdown(
+                f"Derived gross profit: {cov.derived} of {gross_profit} ({cov.derived_share:.1%})"
+            )
+        if statement.counts:
+            counts = ", ".join(f"{k} {v}" for k, v in sorted(statement.counts.items()))
+            st.caption(f"Last EDGAR run: {counts}")
+        if statement.vintage_late > 0:
+            theme.status_badge(f"statement_vintage_late: {statement.vintage_late}", "warning")
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -326,6 +376,8 @@ def _tables(report: HealthReport) -> None:
     st.dataframe(pl.DataFrame({"security_id": list(missing)}), hide_index=True)
     st.subheader(f"Survivorship missing ({report.survivorship.missing.height})")
     st.dataframe(report.survivorship.missing, hide_index=True)
+    st.subheader(f"Stale listings, out of the gap ({report.survivorship.stale_listings.height})")
+    st.dataframe(report.survivorship.stale_listings, hide_index=True)
 
 
 def render(conn: duckdb.DuckDBPyConnection) -> None:
@@ -353,4 +405,5 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     with right:
         _sources_card(view.report)
         _survivorship_card(view.report)
+        _statement_card(view.report)
     _tables(view.report)

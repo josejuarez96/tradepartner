@@ -24,7 +24,7 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
   3. SPEC     (what and why, acceptance criteria)→ docs/specs/<feature>.md
   4. PLAN     (how: ordered tasks, 1 task = 1 PR)→ docs/plans/<feature>.md
   5. BUILD    (branch, tests first, PR)         → code + tests
-  6. REVIEW   (CI + specialist agents + owner)  → merged PR
+  6. REVIEW   (CI + specialist agents + the owner for class B)  → merged PR; each agent's full report is a PR comment, its return a ten-line summary
   7. RECORD   (STATUS, CHANGELOG, plan ticks)   → docs/STATUS.md
                               │
   per phase:                  ▼
@@ -38,11 +38,11 @@ This process fixes both. **Research serves decisions, decisions feed specs, and 
 | Research → Decide | The report answers the brief's question, with evidence grades and a disconfirmation section | Owner |
 | Decide → Spec | ADR status is `Accepted` | Owner |
 | Spec → Plan | Acceptance criteria are testable, out-of-scope is listed, `spec-critic` has run | Owner |
-| Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines | Owner (can be delegated for size M) |
-| Build → Merge | CI is green, PR checklist is complete, specialist reviews are done | Owner merges, or explicitly tells the main session to |
+| Plan → Build | Each task names its files, tests and dependencies. No task over about 400 lines. The plan passes the "Plan shape" list below | Owner (can be delegated for size M) |
+| Build → Merge | CI is green on the PR, the PR checklist is complete, specialist reviews are done, and CI is green on the batch's train run for a prefix that contains the PR (the full batch run or a green probe; `merge_train.py build`, [git-workflow.md](git-workflow.md#the-merge-train)), or, for a hand merge of one PR, CI green on that PR's head | [git-workflow rule 7](git-workflow.md#the-rules-in-one-screen): a class-A PR (only `src/`, `tests/`, research, retros, runbooks, fragments) by the orchestrator after a trial merge; every other PR is class B (specs, plans, ADRs, ways-of-working, `.claude/`, `.github/`, `CLAUDE.md`, the process scripts, deps, anything else, or labelled `hold`) and lands on the owner's word for that PR; a train on his "merge train `<batch id>`" |
 | Phase → next phase | Phase exit criteria are met, retro is written, release is tagged | Owner |
 
-The owner approves by merging the PR that contains the artifact, or by explicitly telling the main session to merge it. Specs, plans and ADRs all land through PRs like code does, so **the approval is recorded in git history.**
+The owner's word is required for every class-B PR (rule 7): he merges it, tells a window to merge that specific PR, or names it in a "merge train `<batch id>`", which lands exactly the PRs the train's record names. A class-A PR is landed by the orchestrator under the written rule. Specs, plans and ADRs are class B, and they land through PRs like code does, so **the approval is recorded in git history.**
 
 ## Right-size the ceremony
 
@@ -55,6 +55,19 @@ Not every change needs every document. Size is set on the issue.
 | **L** (multi-PR feature or phase) | Backtester, broker integration, LLM layer | Spec + plan docs, and an ADR for any hard-to-reverse choice |
 
 **Always requires an ADR, whatever the size:** choosing a vendor, data source, broker, model, storage format or library that would be painful to swap, plus any change to risk rules or LLM authority.
+
+## Plan shape (many windows, one plan)
+
+Added 2026-09-30 (#388) after the Phase 4 plan serialised eight windows behind a twelve-PR chain: five tasks edited `wrapper.py` in sequence, six edited `run.py`, an owner recording gated twelve tasks transitively, and merges fell from 83 a day to 3. A plan or plan amendment is approved only when it passes this list. `spec-critic` checks it (check 5) and `uv run python scripts/team.py graph` (#389) prints the numbers it needs.
+
+1. **Slice by file, not by step.** A module that would be built in slices is split into pure modules over explicit inputs, each its own task and file, plus one driver task that composes them last. A sequence of tasks that edit one file is allowed only as a declared chain of at most three (the driver and its wiring), named in the plan's lanes paragraph.
+2. **Depth bound.** No chain of open tasks longer than six PRs without a sentence in the approach section saying why.
+3. **File bound.** No file named by more than two unticked tasks unless the lanes paragraph lists those tasks as one chain, in order, or the plan states that they touch disjoint parts (config keys, dated amendment notes) and that whichever lands later merges main first.
+4. **Owner tasks gate the edge, never the middle.** An owner task (keys, the real store, market hours) gates only the task that consumes its artifact: an adapter, a start, a close. A build task that would otherwise wait on it declares the stub on its line: the one call site, the test that names it, and that the follow-up lands by amendment or a size-S issue.
+5. **Handoffs amend the line.** When a PR learns something a later task needs, it edits that task's line in the same PR. A docstring, a PR body or a review comment is not a handoff (#374, #375).
+6. **Fixes on an unbuilt consumer's input go to its line, or one issue per module.** Review findings on a merged module that an unbuilt task consumes are folded into that task's line, or batched as one `size:S` issue per PR, per module. Never one issue per finding on one file: each becomes a PR that conflicts with the others. Only real defects and owner decisions are filed at all; nits are dropped ([agents.md](agents.md#review-passes) rule 6, #1123).
+7. **Owner items carry what they unblock.** The plan lists them in one place, ordered by what they block, earliest first, so the owner's single-threaded time goes to the earliest gate.
+8. **Numbers in the approach.** The approach section states the longest open chain, the tasks at depth 1 and 2, and the files shared by open tasks, from `team.py graph`, before and after any amendment.
 
 ## Definition of Ready (before BUILD starts)
 
@@ -70,7 +83,7 @@ Not every change needs every document. Size is set on the issue.
 - [ ] There are tests for new behavior. A bug fix starts with a failing test.
 - [ ] CI is green: lint, format, types, tests, hygiene.
 - [ ] There are no TODOs without a linked issue.
-- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, one STATUS "Done" line and one CHANGELOG bullet as **fragments** (`uv run python scripts/fragments.py add <issue> ...`, never an edit to `STATUS.md` or `CHANGELOG.md` themselves; #70), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
+- [ ] Docs are updated **inside this PR, written as if it has already merged**: plan checkbox ticked, one STATUS "Recently done" line (at most 240 characters) and the CHANGELOG bullets in **one fragment file** (`uv run python scripts/fragments.py add <issue> --slug <slug> --status "..." --added "..."`, never an edit to `STATUS.md` or `CHANGELOG.md` themselves; #70, #351), ADR status `Accepted`, and `.env.example` if config changed. No follow-up PR exists just to record a merge. (Phase 1 retro.)
 - [ ] The PR was marked ready by `/ready-pr` (`scripts/ready_pr.py`), which ran the checks, verified the template and the specialist reviews, and waited for CI on the merged commit.
 - [ ] Data code: every stored fact has `known_at`, and `quant-auditor` has passed.
 - [ ] Execution, LLM or secrets code: `safety-reviewer` has passed.
@@ -91,14 +104,14 @@ These come straight from the research handoff. They are process rules, not just 
 ## Session protocol (human or agent)
 
 **Start of session:**
-1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the Done entries not folded in yet.
-2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md)). No claim, no branch (spikes excepted).
-3. Branch from `origin/main` as the claim output prints (`git fetch origin && git switch -c <branch> origin/main`).
+1. Read `docs/STATUS.md`, then `uv run python scripts/fragments.py show` for the recently done entries not folded in yet.
+2. `uv run python scripts/team.py status`, then `claim` the next ready plan task or unclaimed issue ([teams.md](teams.md); every command on its [command card](teams.md#command-card)). No claim, no branch (spikes excepted).
+3. Branch from `origin/main` as the claim output prints (`git fetch origin && git switch -c <branch> origin/main`). The claim also prints the task's plan line and its dependencies' lines: that is what the implementer reads, plus the spec sections the line cites, never the whole plan or spec (`team.py show <Tn>` reprints it; #352).
 
 **End of session:**
 1. Commit and push.
 2. Update the draft PR description with the current state.
-3. Record what changed: your Done line and CHANGELOG bullet as fragments (`scripts/fragments.py add`); a new blocker or decision needed as a line under STATUS "Blocked" or "Decisions needed" (those short lists rarely collide). Never edit "Next up" or the frontier snapshot to reserve work.
+3. Record what changed: your STATUS line and CHANGELOG bullets in one fragment (`scripts/fragments.py add`, one call per PR); a new blocker or decision needed as a line under STATUS "Blocked" or "Decisions needed" (those short lists rarely collide). Never edit "Next up" or the frontier snapshot to reserve work.
 4. Stopping for good on an item: `uv run python scripts/team.py release` it, with a handoff comment on the issue.
 
 `STATUS.md` replaces ad-hoc handoff documents. It always tells you where things stand in two minutes of reading.

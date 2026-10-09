@@ -9,20 +9,23 @@ Run this when the work on your claimed issue is complete and the draft PR descri
 
 ## Before you run it
 
-1. Bookkeeping goes in **fragments, not the shared files**. If you have not done so:
+1. Bookkeeping goes in **one fragment file, not the shared files**. If you have not done so:
    ```bash
    uv run python scripts/fragments.py add <issue> --slug <short-slug> \
-     --status "<one Done line, with the PR number>" \
+     --status "<one Recently done line, at most 240 characters, with the PR number>" \
      --added "<one CHANGELOG bullet>"      # or --changed / --fixed
    ```
    Do not edit `docs/STATUS.md` or `CHANGELOG.md` yourself. Tick only your plan checkbox.
 2. Run the specialist reviews the touched paths require (the plan task's `Review:` field):
    `quant-auditor` for data, store, signals, backtests; `safety-reviewer` for broker, orders,
-   secrets, config, LLM inputs. Address the findings, then post **a PR comment** whose first
-   line is the verdict: `quant-auditor: PASS` or `quant-auditor: PASS WITH FIXES`, followed by
-   the findings and what you did. Only the **first line** of a comment counts, the latest
-   verdict per agent wins, and `FAIL` blocks. The PR body does not count because the template
-   already names both agents.
+   secrets, config, LLM inputs. Give the agent the PR number: it posts its full report as **a
+   PR comment** whose first line is the verdict (`quant-auditor: PASS` or `quant-auditor: PASS
+   WITH FIXES`) and returns a ten-line summary; if it says it could not post, post the file it
+   wrote with `gh pr comment <n> --body-file <path>`. Address the findings and re-run it for a
+   fresh verdict. Only the **first line** of a comment counts, the latest verdict per agent
+   wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` both block until a re-review
+   after the fixes posts `PASS` (#356). The PR body does not count because the template already names
+   both agents. (#352)
 3. Fill in the PR template. Tick every box, or replace an inapplicable one with `n/a` and why.
    The body must say `Closes #<issue>`.
 
@@ -44,12 +47,19 @@ What runs locally:
 
 | Check | When |
 |---|---|
-| ruff check, ruff format --check, mypy, fragment check | always |
-| pytest | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version` |
+| ruff check, ruff format --check, mypy, fragment check, `tests/test_docs_budget.py` | always |
+| pytest, targeted | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`; then only the test files the diff maps to |
 
-A docs, fragment or process PR skips the local pytest run (the command prints a note), and CI
-skips it on that PR too, by the same rule (`ready_pr.py --tests-needed`). Every push to main
-still runs the full suite. `--tests` forces the local run; `--no-tests` skips it.
+The mapping (#456): a changed test file runs itself; a `src/` module runs the test files that
+import it by name plus the static checks over its subtree (all of `src/`, and the backtest
+import scan for `backtest/`); a file under `scripts/` or `.github/` runs the tests that name
+it. The full suite runs instead when the mapping is unclear: a `conftest.py`, `pyproject.toml`,
+`uv.lock` or `.python-version`, a fixture or helper under `tests/`, a package `__init__`, a
+deleted or moved module, or a module or script no test names. The command prints which it chose. A test that
+reaches a module only through another one is not run locally, so CI, which runs the full
+suite on every such PR (`ready_pr.py --tests-needed`) and every push to main, catches it
+later. A docs, fragment or process PR skips local pytest, and CI skips it on that PR too.
+`--full-tests` runs the full suite locally; `--tests` forces the local run; `--no-tests` skips it.
 
 ## When it says NOT READY
 
@@ -69,6 +79,6 @@ Each message names one fix. Do that fix, commit, and run the command again:
 ## Never
 
 - Pass `--allow-shared-files` unless your PR is a fold host the owner asked for (doc-keeper folding fragments and refreshing the STATUS snapshot sections) or a process change that must edit those files.
-- Merge the PR. The owner merges, or tells the main session to.
+- Merge the PR. PRs land through the merge train, and only on the owner's "merge train `<batch id>`"; a single PR is merged by hand only when the owner says to merge that specific PR, never with `--admin`; subagents never merge ([git-workflow rule 7](../../../docs/ways-of-working/git-workflow.md)).
 - Force-push. The command does not need it and neither do you.
 - Run it in another team's directory or the main checkout.

@@ -11,6 +11,10 @@ safety-reviewer MUST FIX).
 
 from __future__ import annotations
 
+import io
+import random
+import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -21,6 +25,24 @@ from tradepartner.adapters import edgar_raw
 from tradepartner.config import Settings
 
 _Handler = Callable[[httpx.Request], httpx.Response]
+
+
+def _valid_zip_bytes(member: str = "a.txt", content: bytes = b"hi") -> bytes:
+    """A real, openable zip (unlike a bare `b"PK ..."` placeholder), so tests
+    that aren't about zip-corruption detection don't trip it by accident.
+
+    A fixed `date_time` makes two calls byte-identical regardless of when each
+    runs: `ZipInfo` otherwise stamps "now" (2-second resolution) at construction,
+    so a caller that builds one copy to write to a cache and a second to compare
+    against it (as `test_reuse_cached_returns_the_cached_companyfacts_zip_with_no_
+    request` below does) would intermittently see different bytes for identical
+    content whenever those two calls straddled a clock tick — observed failing
+    under a full, loaded `-n auto` run and passing every time in isolation (#1126).
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(zipfile.ZipInfo(member, date_time=(2020, 1, 1, 0, 0, 0)), content)
+    return buffer.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -37,10 +59,16 @@ def _settings(
     cache_dir: Path | None = None,
     **edgar_kwargs: object,
 ) -> Settings:
-    edgar_overrides: dict[str, object] = {"requests_per_second": 1000.0, **edgar_kwargs}
+    edgar_overrides: dict[str, object] = dict(edgar_kwargs)
     if cache_dir is not None:
         edgar_overrides["cache_dir"] = str(cache_dir)
-    return Settings(_env_file=None, sec_edgar_user_agent=user_agent, edgar=edgar_overrides)
+    settings = Settings(_env_file=None, sec_edgar_user_agent=user_agent, edgar=edgar_overrides)
+    # 1000 req/s (no real sleeps) is past the config's `le=10` (#1108): set it past
+    # validation unless the test asks for its own rate.
+    if "requests_per_second" in edgar_kwargs:
+        return settings
+    fast = settings.edgar.model_copy(update={"requests_per_second": 1000.0})
+    return settings.model_copy(update={"edgar": fast})
 
 
 def _mock_client(handler: _Handler) -> httpx.Client:
@@ -158,14 +186,137 @@ def test_retryable_status_then_success_retries_once(
     assert served == [first_status, 200]
 
 
-def test_503_then_503_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_503_then_503_raises_once_retry_max_attempts_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
     handler, served = _status_sequence_handler([503, 503])
 
     with pytest.raises(httpx.HTTPStatusError):
-        edgar_raw.company_tickers(settings=_settings(), client=_mock_client(handler))
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=2), client=_mock_client(handler)
+        )
 
     assert served == [503, 503]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_capped_exponential_backoff_across_several_attempts(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Each retry's sleep doubles (`retry_backoff_seconds * 2 ** attempt`)
+    until `retry_backoff_cap_seconds` caps it, and the request is retried up
+    to `retry_max_attempts` times in total before the status is raised."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([status, status, status, status, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(
+            retry_backoff_seconds=1.0,
+            retry_backoff_cap_seconds=3.0,
+            retry_max_attempts=5,
+        ),
+        client=_mock_client(handler),
+    )
+
+    assert payload == {"status": 200}
+    assert served == [status, status, status, status, 200]
+    # `time.sleep` also picks up the rate limiter's own (sub-millisecond,
+    # real-clock) waits between requests; only the backoff sleeps matter here.
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(3.0),
+        pytest.approx(3.0),
+    ]
+
+
+def test_503_fails_after_retry_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    handler, served = _status_sequence_handler([503] * 10)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=3), client=_mock_client(handler)
+        )
+
+    assert served == [503, 503, 503]
+
+
+def test_403_waits_the_configured_rate_limit_wait_then_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(rate_limit_wait_seconds=600.0), client=_mock_client(handler)
+    )
+
+    assert payload == {"status": 200}
+    assert served == [403, 200]
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [pytest.approx(600.0)]
+
+
+def test_403_then_403_fails_without_a_second_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second `403` after the one wait-and-retry fails outright: SEC's
+    block lifts only after the rate has stayed below the threshold for a
+    while, so a second immediate retry cannot succeed and would only extend
+    the block (research #572 P2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(rate_limit_wait_seconds=600.0, retry_max_attempts=10),
+            client=_mock_client(handler),
+        )
+
+    assert served == [403, 403]
+    backoff_sleeps = [s for s in slept if s > 0.5]
+    assert backoff_sleeps == [pytest.approx(600.0)]
+
+
+def test_a_transport_error_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped connection (or any other `httpx.TransportError`, e.g. a
+    timeout) is retried through the same capped-exponential-backoff policy
+    as `429`/`503` (research #572 P1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"status": 200})
+
+    payload = edgar_raw.company_tickers(settings=_settings(), client=_mock_client(handler))
+
+    assert payload == {"status": 200}
+    assert calls["n"] == 2
+
+
+def test_a_transport_error_raises_after_retry_max_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        edgar_raw.company_tickers(
+            settings=_settings(retry_max_attempts=3), client=_mock_client(handler)
+        )
+
+    assert calls["n"] == 3
 
 
 def test_retry_after_header_honored_over_configured_backoff(
@@ -478,19 +629,20 @@ def test_bulk_zips_stream_into_the_cache_dir_after_one_retry(
     tmp_path: Path, fetch: Callable[..., Path], url_tail: str, name: str
 ) -> None:
     served: list[str] = []
+    zip_bytes = _valid_zip_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         served.append(str(request.url))
         assert request.headers["User-Agent"] == "TradePartner test-agent"
         if len(served) == 1:
             return httpx.Response(503)
-        return httpx.Response(200, content=b"PK zip bytes")
+        return httpx.Response(200, content=zip_bytes)
 
     path = fetch(
         settings=_settings(cache_dir=tmp_path, retry_backoff_seconds=0.001),
         client=_mock_client(handler),
     )
-    assert path == tmp_path / "bulk" / name and path.read_bytes() == b"PK zip bytes"
+    assert path == tmp_path / "bulk" / name and path.read_bytes() == zip_bytes
     assert len(served) == 2 and served[0].endswith(url_tail)
     assert [p.name for p in path.parent.iterdir()] == [name]
 
@@ -511,15 +663,204 @@ class _BrokenStream(httpx.SyncByteStream):
 
 
 def test_a_bulk_download_failing_mid_stream_keeps_the_previous_zip(tmp_path: Path) -> None:
+    """`retry_max_attempts=1` disables the (unrelated) transport-error
+    retry, so this stays a test of atomicity: a failure mid-write must
+    never touch the previously cached zip."""
     previous = tmp_path / "bulk" / "submissions.zip"
     previous.parent.mkdir()
     previous.write_bytes(b"yesterday's zip")
     with pytest.raises(httpx.ReadError):
         edgar_raw.bulk_submissions(
-            settings=_settings(cache_dir=tmp_path),
+            settings=_settings(cache_dir=tmp_path, retry_max_attempts=1),
             client=_mock_client(lambda request: httpx.Response(200, stream=_BrokenStream())),
         )
     assert previous.read_bytes() == b"yesterday's zip"
+    assert list(previous.parent.iterdir()) == [previous]
+
+
+def test_a_corrupt_zip_is_redownloaded_once_then_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated/corrupt zip (one that fails to open) is re-downloaded
+    once automatically, without the caller seeing an error (research #572
+    P10)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+    good_zip = _valid_zip_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"not actually a zip" if len(served) == 0 else good_zip
+        served.append(body)
+        return httpx.Response(200, content=body)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert len(served) == 2
+    assert path.read_bytes() == good_zip
+
+
+def test_a_zip_still_corrupt_after_one_redownload_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second corrupt download is not retried again, and is not handed
+    back to the caller either: it raises `BadZipFile` naming the file
+    (research #572 P10, "re-download once, then fail"), rather than this
+    client looping forever against a source that keeps failing or a later
+    caller consuming a damaged file (#554 quant-auditor NIT)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b"not a zip, attempt 1" if len(served) == 0 else b"not a zip, attempt 2"
+        served.append(body)
+        return httpx.Response(200, content=body)
+
+    with pytest.raises(zipfile.BadZipFile, match="still corrupt after one re-download"):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+        )
+
+    assert len(served) == 2
+
+
+_MEMBER = "a.txt"
+# `ZipFile.writestr` writes a 30-byte local header plus the member's name
+# before its data (no extra field), so the member's data starts here.
+_MEMBER_DATA_OFFSET = 30 + len(_MEMBER)
+
+
+def _deflated_zip_with_damaged_compressed_data() -> bytes:
+    """A real `ZIP_DEFLATED` zip (as SEC's bulk and FSN zips are) with an
+    intact central directory but 40 flipped bytes in the middle of its
+    member's compressed data: opening succeeds, and reading the member
+    raises `zlib.error` (not `BadZipFile`), which `testzip()` does not
+    catch (#554 quant-auditor pass 1, SHOULD FIX)."""
+    rng = random.Random(0)
+    content = " ".join(f"w{rng.randint(0, 500)}" for _ in range(4000)).encode()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(_MEMBER, content)
+    damaged = bytearray(buffer.getvalue())
+    compress_size = zipfile.ZipFile(io.BytesIO(bytes(damaged))).getinfo(_MEMBER).compress_size
+    middle = _MEMBER_DATA_OFFSET + compress_size // 2
+    for i in range(middle, middle + 40):
+        damaged[i] ^= 0xFF
+    return bytes(damaged)
+
+
+def _stored_zip_failing_its_crc() -> bytes:
+    """A `ZIP_STORED` zip whose member's bytes were changed after writing
+    (same length, central directory intact): it opens and reads, and only
+    the CRC check (`testzip()` naming the member) catches it."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(_MEMBER, b"hello world" * 10)
+    damaged = bytearray(buffer.getvalue())
+    damaged[_MEMBER_DATA_OFFSET + 3] ^= 0xFF
+    return bytes(damaged)
+
+
+def test_damaged_deflate_data_raises_zlib_error_not_bad_zip_file() -> None:
+    """Guards the fixture: the deflate case must reach the `zlib.error`
+    branch, not the `BadZipFile` one the other corrupt-zip tests cover."""
+    archive = zipfile.ZipFile(io.BytesIO(_deflated_zip_with_damaged_compressed_data()))
+    with pytest.raises(zlib.error):
+        archive.testzip()
+    stored = zipfile.ZipFile(io.BytesIO(_stored_zip_failing_its_crc()))
+    assert stored.testzip() == _MEMBER
+
+
+@pytest.mark.parametrize(
+    "corrupt_body",
+    [_deflated_zip_with_damaged_compressed_data(), _stored_zip_failing_its_crc()],
+    ids=["deflate-stream-damaged", "stored-member-crc-mismatch"],
+)
+def test_a_zip_damaged_mid_body_is_redownloaded_once_then_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt_body: bytes
+) -> None:
+    """A zip that opens but whose member data is damaged (a deflate error
+    or a CRC mismatch) is re-downloaded once, like one that fails to open."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    served: list[bytes] = []
+    good_zip = _valid_zip_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = corrupt_body if len(served) == 0 else good_zip
+        served.append(body)
+        return httpx.Response(200, content=body)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert len(served) == 2
+    assert path.read_bytes() == good_zip
+
+
+# --- the stream path's retry policy (#554 quant-auditor pass 1) ----------
+
+
+def test_a_bulk_download_403_then_403_waits_once_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(
+                cache_dir=tmp_path, rate_limit_wait_seconds=600.0, retry_max_attempts=10
+            ),
+            client=_mock_client(handler),
+        )
+
+    assert served == [403, 403]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+    assert list((tmp_path / "bulk").iterdir()) == []
+
+
+def test_a_bulk_download_503_raises_after_retry_max_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    handler, served = _status_sequence_handler([503])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path, retry_max_attempts=3),
+            client=_mock_client(handler),
+        )
+
+    assert served == [503, 503, 503]
+
+
+def test_a_bulk_download_dropped_mid_stream_is_retried_and_replaces_the_previous_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `ReadError` mid-body is retried; the previous zip is replaced only
+    by the complete download, and no temp file is left behind."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    previous.write_bytes(b"yesterday's zip")
+    good_zip = _valid_zip_bytes()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, stream=_BrokenStream())
+        return httpx.Response(200, content=good_zip)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert calls["n"] == 2
+    assert path == previous and path.read_bytes() == good_zip
     assert list(previous.parent.iterdir()) == [previous]
 
 
@@ -551,18 +892,20 @@ def test_fsn_periods_raises_when_page_has_no_matches() -> None:
 
 
 def test_fsn_zip_streams_into_the_fsn_cache_dir_and_returns_headers(tmp_path: Path) -> None:
+    zip_bytes = _valid_zip_bytes()
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url).endswith("2025_10_notes.zip")
         assert request.headers["User-Agent"] == "TradePartner test-agent"
         return httpx.Response(
-            200, content=b"PK fsn zip bytes", headers={"ETag": '"abc"', "Content-Length": "17"}
+            200, content=zip_bytes, headers={"ETag": '"abc"', "Content-Length": str(len(zip_bytes))}
         )
 
     path, headers = edgar_raw.fsn_zip(
         "2025_10", settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
     )
     assert path == tmp_path / "fsn" / "2025_10_notes.zip"
-    assert path.read_bytes() == b"PK fsn zip bytes"
+    assert path.read_bytes() == zip_bytes
     assert headers["ETag"] == '"abc"'
 
 
@@ -631,3 +974,211 @@ def test_fsn_validators_retries_once_on_a_rate_limit_status() -> None:
     )
     assert len(served) == 2
     assert headers["ETag"] == '"x"'
+
+
+# --- #761: zip checked before it replaces the cache; per-run block; 429 block ---
+
+
+def test_a_zip_still_corrupt_after_one_redownload_keeps_the_previous_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each streamed zip is checked in its temp file, before `os.replace`:
+    two corrupt downloads raise `BadZipFile` and leave the previous good
+    zip in place, with no temp file behind (#761 item 1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    previous = tmp_path / "bulk" / "submissions.zip"
+    previous.parent.mkdir()
+    yesterdays_zip = _valid_zip_bytes(content=b"yesterday")
+    previous.write_bytes(yesterdays_zip)
+
+    with pytest.raises(zipfile.BadZipFile, match="still corrupt after one re-download"):
+        edgar_raw.bulk_submissions(
+            settings=_settings(cache_dir=tmp_path),
+            client=_mock_client(lambda request: httpx.Response(200, content=b"not a zip")),
+        )
+
+    assert previous.read_bytes() == yesterdays_zip
+    assert list(previous.parent.iterdir()) == [previous]
+
+
+def test_a_corrupt_zip_never_replaces_the_previous_zip_even_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the good second download is moved over `dest`: the corrupt first
+    one is never `os.replace`d onto it (#761 item 1)."""
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda _seconds: None)
+    replaced_with: list[bytes] = []
+    real_replace = edgar_raw.os.replace
+
+    def recording_replace(src: str | Path, dst: str | Path) -> None:
+        replaced_with.append(Path(src).read_bytes())
+        real_replace(src, dst)
+
+    monkeypatch.setattr(edgar_raw.os, "replace", recording_replace)
+    good_zip = _valid_zip_bytes()
+    served: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(1)
+        return httpx.Response(200, content=b"not a zip" if len(served) == 1 else good_zip)
+
+    path = edgar_raw.bulk_submissions(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+
+    assert replaced_with == [good_zip]
+    assert path.read_bytes() == good_zip
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_a_persistent_403_is_waited_out_once_per_run_not_once_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `403` that outlasts its one wait (e.g. a refused User-Agent) makes
+    every later `403` in the process fail at once, without another
+    `edgar.rate_limit_wait_seconds` wait: `fsn_validators` over many cached
+    periods would otherwise wait 10 minutes per period (#761 item 2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403])
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    client = _mock_client(handler)
+
+    for period in ("2025_08", "2025_09", "2025_10"):
+        with pytest.raises(httpx.HTTPStatusError):
+            edgar_raw.fsn_validators(period, settings=settings, client=client)
+
+    assert served == [403, 403, 403, 403]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0)]
+
+
+def test_a_success_ends_the_block_so_a_later_403_is_waited_out_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-fast lasts only while the block does: once any request
+    succeeds, a later `403` gets its own wait again (#761 item 2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([403, 403, 200, 403, 200])
+    settings = _settings(rate_limit_wait_seconds=600.0)
+    client = _mock_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(settings=settings, client=client)
+    assert edgar_raw.company_tickers(settings=settings, client=client) == {"status": 200}
+    assert edgar_raw.company_tickers(settings=settings, client=client) == {"status": 200}
+
+    assert served == [403, 403, 200, 403, 200]
+    assert [s for s in slept if s > 0.5] == [pytest.approx(600.0), pytest.approx(600.0)]
+
+
+def test_a_429_past_its_backoff_is_waited_out_as_a_block_then_retried_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC may signal its block with a `429` (research #572 P2): once the
+    backoff attempts are used up, a `429` gets the same one
+    `edgar.rate_limit_wait_seconds` wait and one retry as a `403` (#761
+    item 3)."""
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([429, 429, 429, 200])
+
+    payload = edgar_raw.company_tickers(
+        settings=_settings(
+            retry_max_attempts=3, retry_backoff_seconds=1.0, rate_limit_wait_seconds=600.0
+        ),
+        client=_mock_client(handler),
+    )
+
+    assert payload == {"status": 200}
+    assert served == [429, 429, 429, 200]
+    assert [s for s in slept if s > 0.5] == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(600.0),
+    ]
+
+
+def test_a_429_that_outlasts_the_block_wait_fails_without_a_second_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(edgar_raw.time, "sleep", slept.append)
+    handler, served = _status_sequence_handler([429] * 10)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.company_tickers(
+            settings=_settings(
+                retry_max_attempts=3, retry_backoff_seconds=1.0, rate_limit_wait_seconds=600.0
+            ),
+            client=_mock_client(handler),
+        )
+
+    assert served == [429, 429, 429, 429]
+    assert [s for s in slept if s > 0.5] == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(600.0),
+    ]
+
+
+def test_valid_zip_bytes_is_byte_identical_across_separate_calls() -> None:
+    """Regression (#1126): two calls with the same args must be byte-identical
+    regardless of wall-clock time, or any test comparing their output (like the one
+    below) is flaky by construction. Fails before the `date_time` fix whenever the
+    two calls straddle a 2-second clock tick; a fixed `date_time` makes that
+    impossible to observe either way."""
+    assert _valid_zip_bytes("CIK0000000001.json", b"{}") == _valid_zip_bytes(
+        "CIK0000000001.json", b"{}"
+    )
+
+
+# --- reuse_cached (#660, T77a) ------------------------------------------------
+
+
+def _refuse(request: httpx.Request) -> httpx.Response:
+    pytest.fail(f"no request expected, got {request.url}")
+
+
+def test_reuse_cached_returns_the_cached_companyfacts_zip_with_no_request(
+    tmp_path: Path,
+) -> None:
+    cached = tmp_path / "bulk" / "companyfacts.zip"
+    cached.parent.mkdir()
+    cached.write_bytes(_valid_zip_bytes("CIK0000000001.json", b"{}"))
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(_refuse), reuse_cached=True
+    )
+    assert path == cached and path.read_bytes() == _valid_zip_bytes("CIK0000000001.json", b"{}")
+
+
+@pytest.mark.parametrize("body", [b"not a zip", None])
+def test_reuse_cached_raises_on_a_file_that_does_not_open_as_a_zip(
+    tmp_path: Path, body: bytes | None
+) -> None:
+    """A damaged file, or none at all, raises: never a silent download."""
+    if body is not None:
+        (tmp_path / "bulk").mkdir()
+        (tmp_path / "bulk" / "companyfacts.zip").write_bytes(body)
+    with pytest.raises(zipfile.BadZipFile, match="reuse_cached"):
+        edgar_raw.bulk_company_facts(
+            settings=_settings(cache_dir=tmp_path), client=_mock_client(_refuse), reuse_cached=True
+        )
+
+
+def test_without_reuse_cached_the_bulk_file_is_requested_over_a_cached_one(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "bulk").mkdir()
+    (tmp_path / "bulk" / "companyfacts.zip").write_bytes(_valid_zip_bytes("old.json"))
+    served: list[str] = []
+    fresh = _valid_zip_bytes("new.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        served.append(str(request.url))
+        return httpx.Response(200, content=fresh)
+
+    path = edgar_raw.bulk_company_facts(
+        settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
+    )
+    assert len(served) == 1 and path.read_bytes() == fresh

@@ -28,7 +28,71 @@ page is read as a new class: a documented limit, not a guess.
 (ticker, exchange) pair it did not show on its previous cover page, so a
 ticker change or an exchange transfer adds a row and a repeated cover page
 does not. `valid_from` is the XNYS session on or after the acceptance's
-New York date; `known_at` is the acceptance.
+New York date; `known_at` is the acceptance. A class shows a pair once per
+page: when a page lists one class's pair under two titles (a filer's
+duplicate, e.g. an ADS and its underlying shares, or two notes given one
+ticker), the row takes the first item's title.
+
+**Relistings** (#820, spec req 4). A Form 25 (`source.delistings()`, any
+of `DELISTING_FORMS`) is matched to a class known before it, as
+`store.delistings` resolves it (`_form25_classes`): the one class listed
+on its exchange whose title matches up to the first comma, else, for a
+plain common-equity title, the one plain-common class on that exchange; a
+title naming several classes ("Common stock and warrants", #1163) is
+matched through the common classes it names. The next cover page
+accepted after it that lists that class on that exchange opens a new row
+even for an unchanged pair (a holding-company reorganisation, a change of
+domicile, an LP or REIT conversion: CMPR, CG, WELL, FCFS, KIM), with
+`known_at` that cover page's acceptance and `valid_from` no earlier than
+the session after the filing session. A cover page before the delisting
+takes effect (the effective day: the filing's, else filing day + 10) only
+shows shares still trading and relists nothing (a Form 25 ends the latest listing
+starting on or before that session). An amendment (`/A`) does not re-arm
+a class and exchange that already had one, so a late 25-NSE/A never
+splits the listing it amends. A cover page that shows the class only on
+another exchange (and not on the Form 25's) settles it as a transfer: a later move back is
+an ordinary new row, never a relisting.
+
+**New equity after a Form 25 is a new security** (owner decision on
+#820): when the CIK filed an 8-A12B (a new 12(b) registration) between
+`master.transfer_window_sessions` sessions before the filing session and
+that cover page, the relisted shares are a successor, not the old class:
+post-bankruptcy equity (CRC, OAS, DBD, GPOR, MNK, WW, WOLF all filed one,
+none of the five reorganisations above did). The successor gets the id
+`<cik>@<valid_from>`, its own `securities` row known at the cover page,
+the old class's titles, and a row starting no earlier than the session
+after the Form 25's effective day (that cover page may precede it).
+The old class takes no later cover-page item, so no listing joins the two
+and no return spans the gap. A Form 15 (15-12B or 15-12G) within
+`master.reorganisation_window_sessions` sessions of the Form 25 vetoes
+it: the old class was exchanged in a reorganisation or merger, so the
+8-A12B registers the same holders' shares (WSC's merger, #834; every
+reorganisation above filed one, no bankruptcy did). `MasterBuild.successions` records each pair.
+The id has no `<cik>:` prefix on purpose: the price resolver treats it as
+its own company, so its listing takes the ticker from the old holder,
+which has left by then. Limit: an 8-A12B for another class (new notes) in
+that window also makes a successor; the error is a split history, never
+a return across a bankruptcy.
+
+**Listing evidence without a cover page** (#834). Two other records
+relist a class a Form 25 left pending, for its last pairs on that
+exchange, from the session after the Form 25 took effect: an 8-K12B (a
+successor issuer's 12(b) registration under Rule 12g-3) accepted after
+the class's last cover page, with no 8-A12B near the Form 25 (that
+registers another exchange or new equity, which a cover page settles:
+CTO's transfer), known at the later of it and the Form 25
+(FRT, whose later cover pages parse with no listing; OKE before its next
+cover page); else the earliest companies snapshot fetched after the Form
+25 that still names the ticker on that exchange, `provenance =
+snapshot`, known at the fetch (SA). The 8-K12B must fall inside
+`master.reorganisation_window_sessions` sessions of the Form 25's filing
+session (so an old Form 25 is never revived years later), and the fetch
+must come `master.snapshot_relisting_lag_days` after the effective day
+with no Form 15 from that window's start to the fetch (so a fetch before
+SEC drops a delisted or acquired name's ticker never relists it). Fetches are judged in time
+order with the cover pages, against what was known at the fetch. The same new-equity test applies. A
+company acquired into another CIK (GORO, STRR) has neither, and stays
+delisted: its ticker's later bars belong to the other CIK.
 
 **Snapshot listings** (pre-~2019 names have no cover page). A companies
 snapshot entry attaches to the class trading under its ticker on the cover
@@ -57,13 +121,25 @@ the snapshot entry with that ticker, `known_at` its fetch time. Their
 static listing starts at `calendar.start` (nominal; bars decide what
 exists). A benchmark absent from the snapshot is returned in
 `missing_benchmarks`.
+
+**Instrument ids** (ADR 0015 seam 6). Every `security_id` column in the
+journal and the backtest is read as an *instrument id*; for a share the
+instrument id equals the security id, so today's rows need no change. A
+future `instruments` table issues ids in the same namespace with a type
+prefix and `INSTRUMENT_ID_SEPARATOR` (`:`), as `BENCHMARK_PREFIX` (`BENCH`)
+already does for benchmarks; `securities` stays the equity master. The
+master's own id derivation — `primary_security_id` and the `{base}-{n}`
+class ids — refuses an input holding the separator, so it can never mint an
+id whose prefix is an instrument type. The one `:` a derived class id may
+hold is the class separator between its CIK and its title slug; the token
+before it is always a CIK, never a type.
 """
 
 from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -75,10 +151,11 @@ from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
     CoverPage,
+    DelistingFiling,
     FilingIndexEntry,
     FilingSource,
 )
-from tradepartner.calendar import is_session, next_session
+from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.store.asof import _EXCHANGE_TZ, _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
@@ -86,7 +163,22 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
 _CONFIG = "config"
+#: The separator between an instrument id's type prefix and the rest
+#: (ADR 0015 seam 6), as `BENCH:<ticker>` has used since T8.
+INSTRUMENT_ID_SEPARATOR = ":"
+#: The type prefix of a benchmark's instrument id.
+BENCHMARK_PREFIX = "BENCH"
 _STATIC_LISTING_COLUMNS = frozenset({"ticker", "exchange"})
+#: A new 12(b) registration: near a Form 25, it marks the relisted shares as new equity.
+_NEW_REGISTRATION_FORMS = frozenset({"8-A12B"})
+#: A deregistration: near a Form 25, the old class was exchanged in a reorganisation
+#: or merger, so an 8-A12B there registers the same holders' shares, not new equity (#834).
+_DEREGISTRATION_FORMS = frozenset({"15-12B", "15-12G"})
+#: A successor issuer's 12(b) registration (Rule 12g-3): the class is listed again (#834).
+_SUCCESSOR_ISSUER_FORMS = frozenset({"8-K12B"})
+_MARKER_FORMS = _NEW_REGISTRATION_FORMS | _DEREGISTRATION_FORMS | _SUCCESSOR_ISSUER_FORMS
+#: Days from filing to effect when a Form 25 states none (Rule 12d2-2), as in `store.delistings`.
+_DEFAULT_EFFECTIVE_DAYS = 10
 
 Row = dict[str, Any]
 
@@ -100,6 +192,91 @@ class MasterBuild:
     unmatched_snapshot: tuple[CompanySnapshotEntry, ...]
     missing_benchmarks: tuple[str, ...]
     unlisted_securities: tuple[str, ...] = ()
+    successions: tuple[Succession, ...] = ()
+    class_titles: tuple[ClassTitle, ...] = ()
+    shown: tuple[ShownSpan, ...] = ()
+
+
+@dataclass(frozen=True)
+class ShownSpan:
+    """A run of a CIK's consecutive cover pages that all show one class,
+    from `first_at` to `last_at` (the first and last page's acceptance; a
+    page listing nothing is skipped, never a break). A class missing from a
+    page starts a new span when it shows again. Lets a reader tell, at any
+    `t`, whether a class was shown on a page known at `t` after another
+    class first appeared (#1165: a de-SPAC's old common class never is)."""
+
+    security_id: str
+    first_at: datetime
+    last_at: datetime
+
+
+@dataclass(frozen=True)
+class ClassTitle:
+    """A title a class showed on a cover page, known from `known_at` (that
+    page's acceptance), once per class and title. A listing row keeps only
+    the title of the page that first showed its pair; a later retitling
+    ("Common Stock" to "Class A Common Stock" for one pair) is here (#1166)."""
+
+    security_id: str
+    title: str
+    known_at: datetime
+
+
+@dataclass(frozen=True)
+class Succession:
+    """New equity listed after a Form 25 (#820): `security_id` succeeds
+    `predecessor_id`, known from `known_at` (the relisting cover page)."""
+
+    predecessor_id: str
+    security_id: str
+    known_at: datetime
+
+
+@dataclass(frozen=True)
+class _Stop:
+    """A Form 25 that ended a class's listing on one exchange."""
+
+    after: date  # the first session a later row of the class may start
+    effective_after: date  # the first session after the delisting took effect
+    window_start: date  # the earliest session of an 8-A12B that marks new equity
+    filed_at: datetime  # the Form 25's acceptance
+    since: datetime | None  # the last cover page showing the class before it
+    effective_on: date  # the day the delisting took effect
+    reorg_start: date  # sessions of an 8-K12B or Form 15 that belong to it
+    reorg_end: date
+
+
+#: Acceptances per marker form (`_MARKER_FORMS`) of one CIK.
+_Marks = Mapping[str, Sequence[datetime]]
+
+
+def _registered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """An 8-A12B accepted from `stop.window_start` to `until`."""
+    return any(
+        stop.window_start <= _session_of(at) and at <= until
+        for form in _NEW_REGISTRATION_FORMS
+        for at in marks.get(form, ())
+    )
+
+
+def _deregistered(stop: _Stop, until: datetime, marks: _Marks, *, windowed: bool = True) -> bool:
+    """A Form 15 accepted by `until` inside the stop's reorganisation window
+    (or, with `windowed=False`, any time from the window's start)."""
+    return any(
+        stop.reorg_start <= _session_of(at)
+        and (not windowed or _session_of(at) <= stop.reorg_end)
+        and at <= until
+        for form in _DEREGISTRATION_FORMS
+        for at in marks.get(form, ())
+    )
+
+
+def _new_equity(stop: _Stop, until: datetime, marks: _Marks) -> bool:
+    """True when the shares listed again after `stop` (evidence accepted at
+    `until`) are new equity: an 8-A12B from `stop.window_start` to `until`
+    and no Form 15 in the reorganisation window (#820, #834)."""
+    return _registered(stop, until, marks) and not _deregistered(stop, until, marks)
 
 
 _Pairs = frozenset[tuple[str, str]]
@@ -114,6 +291,11 @@ class _Class:
     history: list[tuple[datetime, _Pairs]] = field(default_factory=list)
     first_listing: tuple[str, str, date, datetime] | None = None  # + the row's known_at
     static_ticker: str | None = None  # ticker of the static span, once written
+    exchanges: set[str] = field(default_factory=set)  # exchanges of its cover-page rows
+    pair_titles: dict[tuple[str, str], str] = field(default_factory=dict)  # latest title per pair
+    delisted_on: set[str] = field(default_factory=set)  # exchanges a Form 25 named
+    ended: dict[str, _Stop] = field(default_factory=dict)  # Form 25s no cover page followed yet
+    retired: bool = False  # succeeded by new equity: takes no later cover-page item
 
     def pairs_at(self, t: datetime) -> _Pairs:
         """The pairs this class showed on the latest cover page known at `t`."""
@@ -129,9 +311,36 @@ class _Class:
         return self.first_listing[:3]
 
 
+def _refuse_separator(value: str, what: str) -> None:
+    """Refuse an input that would put the instrument-id separator into a
+    derived id, so the master's own derivation can never mint a prefixed id."""
+    if INSTRUMENT_ID_SEPARATOR in value:
+        raise ValueError(
+            f"{what} {value!r} holds the instrument-id separator {INSTRUMENT_ID_SEPARATOR!r}"
+        )
+
+
 def primary_security_id(cik: str) -> str:
-    """The `security_id` of a CIK's first class."""
+    """The `security_id` of a CIK's first class.
+
+    Raises `ValueError` when the CIK holds the separator: the derived id
+    would then read as a prefixed instrument id.
+    """
+    _refuse_separator(cik, "cik")
     return cik
+
+
+def _numbered_id(base: str, taken: Collection[str]) -> str:
+    """`base`, then `{base}-{n}` for the first `n` whose id is free.
+
+    The caller refuses the separator on the parts that name the id, so a
+    derived id can never carry an instrument-type prefix.
+    """
+    security_id, n = base, 1
+    while security_id in taken:
+        n += 1
+        security_id = f"{base}-{n}"
+    return security_id
 
 
 #: Title words that mark a common-equity class, preferred as a CIK's primary.
@@ -171,6 +380,136 @@ def _session_of(instant: datetime) -> date:
     return _session_on_or_after(instant.astimezone(_EXCHANGE_TZ).date())
 
 
+#: Words that make a title mentioning common stock something else; mirrors
+#: `store.delistings` (which imports this module, so it cannot be imported here).
+_NOT_COMMON_WORDS = ("warrant", "right", "unit", "preferred", "depositary", "note", "debenture")
+
+
+def _is_plain_common(title: str) -> bool:
+    norm = _norm_title(title)
+    return _is_common(title) and not any(word in norm for word in _NOT_COMMON_WORDS)
+
+
+#: Separators between the classes one Form 25 title names (#1163): "Common
+#: stock and warrants", "Class A Common Stock; Units, each consisting of ...".
+_TITLE_PARTS = re.compile(r"[;,]|\s+(?:and|&)\s+")
+#: Words that, before a part's first common word, make it a description of
+#: another class ("each consisting of one share of Class A common stock",
+#: "exercisable for one-half of one share of Common Stock"), not a class name.
+_DESCRIPTION_WORDS = frozenset({"each", "one", "of", "for", "into", "to"})
+
+
+def _named_common_titles(title: str) -> tuple[str, ...]:
+    """The normalised plain-common class names `title` lists (#1163), in
+    order: each part between `;`, `,`, "and" or "&", parentheses dropped,
+    that is plain common and no description of another class."""
+    names: list[str] = []
+    for part in _TITLE_PARTS.split(re.sub(r"\([^)]*\)", " ", title)):
+        norm = _norm_title(part)
+        if not norm or not _is_plain_common(norm):
+            continue
+        first = min(norm.find(word) for word in _COMMON_WORDS if word in norm)
+        if _DESCRIPTION_WORDS.isdisjoint(norm[:first].split()) and norm not in names:
+            names.append(norm)
+    return tuple(names)
+
+
+def _form25_classes[K](title: str, classes: Mapping[K, Collection[str | None]]) -> tuple[K, ...]:
+    """The keys of `classes` (each class listed on the Form 25's exchange,
+    with its titles there; `None` is an untitled row) that a Form 25
+    titled `title` delists, or `()` if that is not certain. Shared by
+    `_delisted_classes` and `store.delistings`, so a Form 25 ends the
+    class it re-arms for relisting (#820).
+
+    1. A title naming two or more common classes (#1163: "Class A Common
+       Stock and Class B Common Stock") delists each if every one matches
+       exactly one class by title up to the first comma.
+    2. A title that is not itself plain common but names one common class
+       among others ("Units, Class A Common Stock and Warrants") resolves
+       through that name first: the class with that title, else the one
+       class whose titles are all plain common.
+    3. Otherwise the one class with the whole title up to the first comma
+       (so a filing whose named classes do not all resolve keeps what an
+       exact title match gives, never a guessed class); failing that, for a
+       plain-common title naming at most one class, the one class whose
+       titles are all plain common.
+    Anything else is `()`: never a guess."""
+
+    def by_title(name: str) -> list[K]:
+        return [
+            key
+            for key, titles in classes.items()
+            if any(t is not None and _norm_title(t) == name for t in titles)
+        ]
+
+    def only_common() -> list[K]:
+        common = [
+            key
+            for key, titles in classes.items()
+            if all(t is None or _is_plain_common(t) for t in titles)
+        ]
+        return common if len(common) == 1 else []
+
+    named = _named_common_titles(title)
+    plain = _is_plain_common(title)
+    if len(named) > 1:
+        found = [by_title(name) for name in named]
+        if all(len(keys) == 1 for keys in found):
+            return tuple(dict.fromkeys(keys[0] for keys in found))
+    elif named and not plain:
+        exact = by_title(named[0])
+        if len(exact) == 1:
+            return (exact[0],)
+        if not exact and (common := only_common()):
+            return (common[0],)
+    exact = by_title(_norm_title(title))
+    if len(exact) == 1:
+        return (exact[0],)
+    if exact or not plain or len(named) > 1:
+        return ()
+    common = only_common()
+    return (common[0],) if common else ()
+
+
+def _delisted_classes(classes: Sequence[_Class], filing: DelistingFiling) -> list[_Class]:
+    """The live classes `filing` delists (`_form25_classes`), only among
+    classes already listed on its exchange; empty if not certain."""
+    on_exchange = [c for c in classes if not c.retired and filing.exchange in c.exchanges]
+    keys = _form25_classes(filing.class_title, dict(enumerate(c.titles for c in on_exchange)))
+    return [on_exchange[key] for key in keys]
+
+
+def _sessions_around(session: date, sessions: int) -> tuple[date, date]:
+    low = high = session
+    for _ in range(sessions):
+        low, high = previous_session(low), next_session(high)
+    return low, high
+
+
+def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -> _Stop:
+    session = _session_of(filing.accepted_at)
+    filed_on = filing.accepted_at.astimezone(_EXCHANGE_TZ).date()
+    effective = filing.effective_on or filed_on + timedelta(days=_DEFAULT_EFFECTIVE_DAYS)
+    window_start, _ = _sessions_around(session, settings.master.transfer_window_sessions)
+    reorg_start, reorg_end = _sessions_around(
+        session, settings.master.reorganisation_window_sessions
+    )
+    return _Stop(
+        next_session(session),
+        next_session(effective),
+        window_start,
+        filing.accepted_at,
+        since,
+        effective,
+        reorg_start,
+        reorg_end,
+    )
+
+
+#: One dated record in a CIK's timeline: a Form 25, an 8-K12B, a snapshot fetch.
+_Event = tuple[datetime, int, str, "DelistingFiling | CompanySnapshotEntry | None"]
+
+
 def _row(known_at: datetime, ingested_at: datetime, source: str, provenance: str) -> Row:
     if known_at > ingested_at:
         raise ValueError(f"known_at {known_at.isoformat()} is after ingested_at")
@@ -190,6 +529,9 @@ class _Builder:
         self.securities: list[Row] = []
         self.listings: list[Row] = []
         self.unmatched: list[CompanySnapshotEntry] = []
+        self.successions: list[Succession] = []
+        self.class_titles: dict[tuple[str, str], ClassTitle] = {}  # first per (id, title)
+        self.shown: list[ShownSpan] = []
 
     def security(
         self,
@@ -230,36 +572,217 @@ class _Builder:
             | _row(known_at, self.ingested_at, source, provenance)
         )
 
-    def cover_pages(self, first: FilingIndexEntry, pages: Sequence[CoverPage]) -> list[_Class]:
+    def cover_pages(
+        self,
+        first: FilingIndexEntry,
+        pages: Sequence[CoverPage],
+        delistings: Sequence[DelistingFiling] = (),
+        marks: _Marks | None = None,
+        fetches: Sequence[CompanySnapshotEntry] = (),
+    ) -> list[_Class]:
+        """Classes and their cover-page listings for one CIK; `delistings`
+        are its Form 25s, `marks` its marker filings (`_MARKER_FORMS`) and
+        `fetches` its companies-snapshot entries (every fetch)."""
         cik = first.cik
+        marks = marks or {}
         classes: list[_Class] = []
+        open_spans: dict[str, int] = {}  # security_id -> its span on the previous page
+        # Form 25s, 8-K12Bs and snapshot fetches in time order (in that order on a tie).
+        events: list[_Event] = [(f.accepted_at, 0, f.accession, f) for f in delistings]
+        events += [
+            (at, 1, "", None) for form in _SUCCESSOR_ISSUER_FORMS for at in marks.get(form, ())
+        ]
+        events += [(e.fetched_at, 2, e.ticker, e) for e in fetches]
+        events.sort(key=lambda e: e[:3])
         for page in sorted(pages, key=lambda p: (p.accepted_at, p.accession)):
+            while events and events[0][0] < page.accepted_at:
+                self._event(first, classes, events.pop(0), marks)
             known_at = max(page.accepted_at, first.accepted_at)
             valid_from = _session_of(page.accepted_at)
             shown: dict[str, set[tuple[str, str]]] = defaultdict(set)
             claimed: dict[str, str] = {}  # security_id -> ticker it took on this page
+            starts: dict[tuple[str, str], date] = {}  # (security_id, exchange) -> row start
             items = list(page.listings)
             if not classes:  # the primary is the first common class, else the first
                 items.sort(key=lambda item: not _is_common(item.title))
             for item in items:
-                cls = _match(classes, item, claimed)
+                live = [c for c in classes if not c.retired]
+                cls = _match(live, item, claimed)
                 if cls is None:
                     cls = self._new_class(first, item, classes, known_at)
+                relisted = False
+                stop = cls.ended.get(item.exchange)
+                if stop is not None and (cls.security_id, item.exchange) not in starts:
+                    new_equity = _new_equity(stop, page.accepted_at, marks)
+                    # Before the delisting takes effect the old shares still
+                    # trade, so the page relists only new equity (whose row
+                    # starts after the effective day anyway).
+                    if new_equity or valid_from >= stop.effective_after:
+                        relisted = True
+                        del cls.ended[item.exchange]
+                        start = max(valid_from, stop.after)
+                        if new_equity:
+                            start = max(start, stop.effective_after)
+                            cls = self._successor(first, cls, start, classes, known_at)
+                        starts[(cls.security_id, item.exchange)] = start
+                start = starts.get((cls.security_id, item.exchange), valid_from)
                 claimed[cls.security_id] = item.ticker
                 cls.titles.add(_norm_title(item.title))
+                key = (cls.security_id, item.title)
+                if key not in self.class_titles:
+                    self.class_titles[key] = ClassTitle(cls.security_id, item.title, known_at)
                 pair = (item.ticker, item.exchange)
+                shown_already = pair in shown[cls.security_id]
                 shown[cls.security_id].add(pair)
-                if pair not in cls.pairs:
-                    self.listing(cls.security_id, *pair, item.title, valid_from, known_at)
+                if not shown_already:
+                    cls.pair_titles[pair] = item.title
+                if (relisted or pair not in cls.pairs) and not shown_already:
+                    self.listing(cls.security_id, *pair, item.title, start, known_at)
+                    cls.exchanges.add(item.exchange)
                     if cls.first_listing is None:
-                        cls.first_listing = (item.ticker, item.exchange, valid_from, known_at)
+                        cls.first_listing = (item.ticker, item.exchange, start, known_at)
             for cls in classes:
                 if cls.security_id in shown:
                     cls.pairs = frozenset(shown[cls.security_id])
                     cls.history.append((known_at, cls.pairs))
+                    # A Form 25 on an exchange the page no longer lists for the
+                    # class was a move (a transfer), not a pause before a relisting.
+                    listed_on = {exchange for _, exchange in cls.pairs}
+                    for exchange in [e for e in cls.ended if e not in listed_on]:
+                        del cls.ended[exchange]
+            if shown:
+                self._spans(classes, shown, open_spans, known_at)
+        for event in events:  # after the last cover page
+            self._event(first, classes, event, marks)
         if not classes:
             classes.append(_Class(primary_security_id(cik), first.accepted_at))
         return classes
+
+    def _spans(
+        self,
+        classes: list[_Class],
+        shown: Mapping[str, object],
+        open_spans: dict[str, int],
+        known_at: datetime,
+    ) -> None:
+        """Extend the span of each class `shown` on this page (known at
+        `known_at`) that was shown on the previous page, else open one;
+        close the span of every class the page leaves out."""
+        for cls in classes:
+            sid = cls.security_id
+            if sid not in shown:
+                open_spans.pop(sid, None)
+            elif sid in open_spans:
+                i = open_spans[sid]
+                self.shown[i] = ShownSpan(sid, self.shown[i].first_at, known_at)
+            else:
+                open_spans[sid] = len(self.shown)
+                self.shown.append(ShownSpan(sid, known_at, known_at))
+
+    def _event(
+        self, first: FilingIndexEntry, classes: list[_Class], event: _Event, marks: _Marks
+    ) -> None:
+        """A Form 25 (recorded, and relisted at once if an 8-K12B since the
+        class's last cover page and inside its reorganisation window precedes
+        it), an 8-K12B inside a pending Form 25's window (relists it), or a
+        snapshot fetch (relists a pending Form 25's ticker; see the module
+        docstring). Never an 8-K12B with an 8-A12B near the Form 25: that
+        registers another exchange (a transfer) or new equity, which only a
+        cover page settles (CTO, #834)."""
+        at, _, _, record = event
+        if isinstance(record, DelistingFiling):
+            for cls, stop in self._delisting(classes, record):
+                successor_issuer = any(
+                    (stop.since is None or a > stop.since)
+                    and a <= at
+                    and stop.reorg_start <= _session_of(a)
+                    for form in _SUCCESSOR_ISSUER_FORMS
+                    for a in marks.get(form, ())
+                )
+                if successor_issuer and not _registered(stop, at, marks):
+                    self._relist(first, classes, cls, record.exchange, at, "filing", marks)
+            return
+        lag = timedelta(days=self.settings.master.snapshot_relisting_lag_days)
+        for cls in [c for c in classes if not c.retired]:
+            for exchange, stop in list(cls.ended.items()):
+                if stop.filed_at >= at:
+                    continue
+                if record is None:  # an 8-K12B
+                    if _session_of(at) <= stop.reorg_end and not _registered(stop, at, marks):
+                        self._relist(first, classes, cls, exchange, at, "filing", marks)
+                    continue
+                tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
+                if (
+                    record.exchange == exchange
+                    and record.ticker in tickers
+                    and at.astimezone(_EXCHANGE_TZ).date() >= stop.effective_on + lag
+                    and not _deregistered(stop, at, marks, windowed=False)
+                ):
+                    self._relist(first, classes, cls, exchange, at, "snapshot", marks)
+
+    def _relist(
+        self,
+        first: FilingIndexEntry,
+        classes: list[_Class],
+        cls: _Class,
+        exchange: str,
+        known_at: datetime,
+        provenance: str,
+        marks: _Marks,
+    ) -> None:
+        """List `cls`'s last pairs on `exchange` again, known at `known_at`,
+        from the session after its Form 25 took effect (#834): evidence
+        other than a cover page (an 8-K12B, a companies snapshot)."""
+        stop = cls.ended.pop(exchange)
+        pairs = sorted(pair for pair in cls.pairs if pair[1] == exchange)
+        if not pairs:
+            return
+        start = max(stop.after, stop.effective_after)
+        target = cls
+        if _new_equity(stop, known_at, marks):
+            target = self._successor(first, cls, start, classes, known_at)
+            target.pairs = frozenset(pairs)
+            target.history.append((known_at, target.pairs))
+            target.first_listing = (*pairs[0], start, known_at)
+        for pair in pairs:
+            title = None if provenance == "snapshot" else cls.pair_titles.get(pair)
+            self.listing(target.security_id, *pair, title, start, known_at, provenance=provenance)
+            target.exchanges.add(exchange)
+
+    def _delisting(
+        self, classes: list[_Class], filing: DelistingFiling
+    ) -> list[tuple[_Class, _Stop]]:
+        """Record `filing` on each class it delists, if they are certain."""
+        stopped: list[tuple[_Class, _Stop]] = []
+        for cls in _delisted_classes(classes, filing):
+            if filing.form.endswith("/A") and filing.exchange in cls.delisted_on:
+                continue  # amends a Form 25 already counted
+            cls.delisted_on.add(filing.exchange)
+            since = cls.history[-1][0] if cls.history else None
+            stop = _stop(filing, self.settings, since)
+            cls.ended[filing.exchange] = stop
+            stopped.append((cls, stop))
+        return stopped
+
+    def _successor(
+        self,
+        first: FilingIndexEntry,
+        old: _Class,
+        start: date,
+        classes: list[_Class],
+        known_at: datetime,
+    ) -> _Class:
+        """New equity succeeding `old` from `start` (its own security)."""
+        base = f"{first.cik}@{start.isoformat()}"
+        _refuse_separator(base, "successor base")
+        taken = {c.security_id for c in classes}
+        security_id = _numbered_id(base, taken)
+        cls = _Class(security_id, known_at, titles=set(old.titles))
+        old.retired = True
+        self.security(security_id, first.cik, first.company_name, known_at)
+        self.successions.append(Succession(old.security_id, security_id, known_at))
+        classes.append(cls)
+        return cls
 
     def _new_class(
         self, first: FilingIndexEntry, item: CoverListing, classes: list[_Class], known_at: datetime
@@ -268,12 +791,10 @@ class _Builder:
             cls = _Class(primary_security_id(first.cik), first.accepted_at)
         else:
             slug = re.sub(r"[^a-z0-9]+", "-", _norm_title(item.title).replace("%", "pct"))
-            base = f"{first.cik}:{slug.strip('-')}"
+            _refuse_separator(slug, "class slug")
+            base = f"{primary_security_id(first.cik)}{INSTRUMENT_ID_SEPARATOR}{slug.strip('-')}"
             taken = {c.security_id for c in classes}
-            security_id, n = base, 1
-            while security_id in taken:
-                n += 1
-                security_id = f"{base}-{n}"
+            security_id = _numbered_id(base, taken)
             cls = _Class(security_id, known_at)
             self.security(security_id, first.cik, first.company_name, known_at)
         classes.append(cls)
@@ -329,7 +850,7 @@ class _Builder:
         )
 
     def benchmark(self, entry: CompanySnapshotEntry) -> None:
-        security_id = f"BENCH:{entry.ticker}"
+        security_id = f"{BENCHMARK_PREFIX}{INSTRUMENT_ID_SEPARATOR}{entry.ticker}"
         static_name = "name" in self.settings.master.static_columns
         name_prov = "snapshot_static" if static_name else "snapshot"
         self.security(
@@ -390,7 +911,10 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     issuer_forms = set(settings.master.issuer_forms)
     first: dict[str, FilingIndexEntry] = {}
+    marks: dict[str, dict[str, list[datetime]]] = defaultdict(lambda: defaultdict(list))
     for entry in source.filing_index():  # full history, never `since` (spec req 3)
+        if entry.form in _MARKER_FORMS:
+            marks[entry.cik][entry.form].append(entry.accepted_at)
         if entry.form not in issuer_forms:
             continue
         seen = first.get(entry.cik)
@@ -399,7 +923,9 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
             first[entry.cik] = entry
 
     snapshot: dict[tuple[str, str, str], CompanySnapshotEntry] = {}
+    fetches: dict[str, list[CompanySnapshotEntry]] = defaultdict(list)  # every fetch, per CIK
     for snap in source.companies_snapshot():  # earliest fetch wins per (cik, ticker, exchange)
+        fetches[snap.cik].append(snap)
         key = (snap.cik, snap.ticker, snap.exchange)
         if key not in snapshot or snap.fetched_at < snapshot[key].fetched_at:
             snapshot[key] = snap
@@ -409,11 +935,18 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         if snap.ticker not in benchmarks:
             by_cik[snap.cik].append(snap)
 
+    delistings: dict[str, list[DelistingFiling]] = defaultdict(list)
+    for filing in source.delistings():  # full history, like the index
+        delistings[filing.cik].append(filing)
+
     builder = _Builder(settings, ingested_at)
     for cik in sorted(first):
         entry = first[cik]
         builder.security(primary_security_id(cik), cik, entry.company_name, entry.accepted_at)
-        classes = builder.cover_pages(entry, source.cover_pages(cik))
+        cik_marks = marks.get(cik, {})
+        classes = builder.cover_pages(
+            entry, source.cover_pages(cik), delistings.get(cik, ()), cik_marks, fetches.get(cik, ())
+        )
         builder.snapshot(classes, by_cik.pop(cik, []))
     for entries in by_cik.values():  # snapshot names with no issuer filing
         builder.unmatched.extend(entries)
@@ -437,6 +970,9 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         unlisted_securities=tuple(
             row["security_id"] for row in builder.securities if row["security_id"] not in listed
         ),
+        successions=tuple(builder.successions),
+        class_titles=tuple(builder.class_titles.values()),
+        shown=tuple(builder.shown),
     )
 
 

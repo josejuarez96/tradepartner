@@ -1,7 +1,7 @@
 """The paper-trading journal: row types, the one writer and the fills accessor
 (Phase 4 spec "Data / interfaces"; plan T49b).
 
-The journal tables (`schema.JOURNAL_TABLE_NAMES`, schema version 5) are append-only:
+The journal tables (`schema.JOURNAL_TABLE_NAMES`, schema version 5 on) are append-only:
 this module inserts and reads, and never updates or deletes, as `store.registry`
 does for the registry. A later fact is a new row, never an edit: an order's next
 state is an `order_events` row, and a real fill arriving after the synthetic
@@ -22,7 +22,11 @@ pointer).
   moment the system learned or decided the fact (spec "Definitions"): this module
   never derives it from a broker field such as `filled_at` or `event_at`.
   `ingested_at` must come from the same clock or later, or the check refuses the
-  row.
+  row. A `fills` row must also be stamped strictly after every `reconciliations`
+  row's `known_at` (any window): `execution.ledger` treats a fill tied with its
+  base reconciliation as inside that reconciliation's `broker_cash`, so a later
+  fill on the same clock reading would silently drop out of the ledger's cash
+  (#650). A tie needs a frozen or coarse clock; the writer refuses it.
 - **`fills_for(conn, ...)`**: the **single** reader of `fills`. It hides every
   superseded row (`superseded_by IS NULL`) and joins each fill to its `orders` row
   for `side` and `security_id` (`fills.quantity` is unsigned). A live fill with no
@@ -32,6 +36,13 @@ pointer).
 - **`JournalNotInitialised`**: raised by `append`, `fills_for` and `all_fill_ids`
   when the journal tables are absent (a version-4 store no write has migrated;
   read-only connections never migrate), for the pages' "not initialised" state.
+- **`SchemaVersionError`**: raised by `require_journal` when the journal
+  predates schema version 17: a read-only connection to a version-16 store has
+  every journal table but none of them carries `book_id` (ADR 0015 seams 1 to
+  3, plan T132; read-only connections never migrate). The message names the
+  fix (open the store for writing once). `_select` selects every row-type
+  field, so without this guard every read of the eight expanded tables, the
+  ops page and `open_window` included, would fail with a binder error.
 
 Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 `insert_row` quotes every column.
@@ -48,12 +59,20 @@ from typing import Any, ClassVar, Protocol
 import duckdb
 
 from tradepartner.store.db import ensure_tz_aware, insert_row
-from tradepartner.store.schema import JOURNAL_TABLE_NAMES
+from tradepartner.store.schema import (
+    DEFAULT_BOOK_ID,
+    ENGAGE_KILL_SWITCH_KIND,
+    JOURNAL_TABLE_NAMES,
+    LATER_JOURNAL_TABLE_NAMES,
+    LONG,
+    ORDER_SHAPE_DEFAULTS,
+    SchemaVersionError,
+)
 
 
 class JournalNotInitialised(RuntimeError):
     """The store has no journal tables: a version-4 store that no write connection
-    has migrated to version 5 yet. Any writing command's `init_schema` migrates it."""
+    has migrated to the current version yet. Any writing command's `init_schema` migrates it."""
 
 
 class JournalIntegrityError(RuntimeError):
@@ -65,8 +84,13 @@ class JournalRow(Protocol):
 
     TABLE: ClassVar[str]
     ID_COLUMN: ClassVar[str | None]
-    known_at: datetime
-    ingested_at: datetime
+
+    # Read-only members, so a frozen row type satisfies the protocol.
+    @property
+    def known_at(self) -> datetime: ...
+
+    @property
+    def ingested_at(self) -> datetime: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -86,6 +110,7 @@ class PaperWindowRow:
     started_at: datetime
     frozen_json: str
     frozen_sha256: str
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -229,6 +254,8 @@ class DecisionRow:
     decision: str
     reason: str | None = None
     override_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -267,6 +294,16 @@ class OrderRow:
     side: str
     notional: float | None = None
     quantity: float | None = None
+    position_side: str = LONG
+    order_type: str = ORDER_SHAPE_DEFAULTS["order_type"]
+    time_in_force: str = ORDER_SHAPE_DEFAULTS["time_in_force"]
+    limit_price: float | None = None
+    stop_price: float | None = None
+    asset_class: str = ORDER_SHAPE_DEFAULTS["asset_class"]
+    order_class: str = ORDER_SHAPE_DEFAULTS["order_class"]
+    multiplier: float = ORDER_SHAPE_DEFAULTS["multiplier"]
+    parent_order_id: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     sells_in_flight_at_submit: bool
     known_at: datetime
     ingested_at: datetime
@@ -336,6 +373,22 @@ class ResumeInvocationRow:
     at: datetime
     reason: str
     accept_broker_fills: bool
+    accept_rejections: bool
+    known_at: datetime
+    ingested_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResumeAcceptanceRow:
+    """One `resume_acceptances` row: the rejection-cap verdicts a resume given
+    `--accept-rejections` accepted, as a JSON list (`[]` for none; #472). Not a
+    release: that is the `kill_switch` `released` row citing the `resume_id`."""
+
+    TABLE: ClassVar[str] = "resume_acceptances"
+    ID_COLUMN: ClassVar[str | None] = None
+
+    resume_id: int
+    accepted_json: str
     known_at: datetime
     ingested_at: datetime
 
@@ -372,6 +425,8 @@ class PositionDailyRow:
     value: float | None = None
     cash: float | None = None
     tradable: bool | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -393,6 +448,7 @@ class AdjustmentRow:
     quantity: float | None = None
     cash: float | None = None
     explanation_json: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -411,6 +467,7 @@ class ReconciliationRow:
     status: str
     broker_cash: float | None = None
     mismatches_json: str | None = None
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -440,7 +497,8 @@ class KillSwitchRow:
 
 @dataclass(frozen=True, kw_only=True)
 class OverrideRow:
-    """One `overrides` row."""
+    """One `overrides` row. `client_order_id` is set exactly for a `settle_order`
+    row, the order `paper settle` settled (schema version 9, spec req 17, #571)."""
 
     TABLE: ClassVar[str] = "overrides"
     ID_COLUMN: ClassVar[str | None] = "override_id"
@@ -450,6 +508,7 @@ class OverrideRow:
     made_at: datetime
     rebalance_session: date | None = None
     security_id: str | None = None
+    client_order_id: str | None = None
     kind: str
     reason: str
     known_at: datetime
@@ -508,6 +567,8 @@ class LotRow:
     quantity: float
     cost_basis: float
     fill_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -529,6 +590,8 @@ class DisposalRow:
     realised_pnl: float
     tax_year: int
     fill_id: int | None = None
+    position_side: str = LONG
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -570,6 +633,7 @@ ROW_TYPES: Mapping[str, type[Any]] = MappingProxyType(
             FillRow,
             FillCursorRow,
             ResumeInvocationRow,
+            ResumeAcceptanceRow,
             OutcomeRow,
             PositionDailyRow,
             AdjustmentRow,
@@ -598,19 +662,65 @@ class OrderedFill:
     window_id: int
 
 
+#: The tables `require_journal` asks for: every journal table but those a
+#: read-only connection to an older journal store may lack (#472).
+_REQUIRED_TABLES = tuple(t for t in JOURNAL_TABLE_NAMES if t not in LATER_JOURNAL_TABLE_NAMES)
+
+#: The eight journal tables ADR 0015 seams 1 to 3 expand at schema version 17
+#: (plan T132); a read-only connection to a version-16 store has every one of
+#: them but none carries `book_id`.
+_EXPANSION_SEAM_TABLES = (
+    "paper_windows",
+    "decisions",
+    "orders",
+    "positions_daily",
+    "lots",
+    "disposals",
+    "adjustments",
+    "reconciliations",
+)
+
+
+def _require_expansion_seams(conn: duckdb.DuckDBPyConnection) -> None:
+    """Raise `SchemaVersionError` naming the fix when any of the eight journal
+    tables ADR 0015 seams 1 to 3 expand lacks `book_id`: a read-only connection
+    to a version-16 store, where `_select` would otherwise fail with a binder
+    error selecting a row-type field the table has no column for. The caller
+    (`require_journal`) has already ensured every table exists, so a missing
+    table cannot reach here."""
+    (with_book_id,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND column_name = 'book_id' AND table_name IN "
+        f"({', '.join('?' for _ in _EXPANSION_SEAM_TABLES)})",
+        list(_EXPANSION_SEAM_TABLES),
+    ).fetchone()
+    if with_book_id != len(_EXPANSION_SEAM_TABLES):
+        raise SchemaVersionError(
+            "the store's paper-trading journal predates schema version 17 "
+            "(a journal table has no book_id column); open it for writing once "
+            "with a command that migrates it (for example `ingest`) to read the journal"
+        )
+
+
 def require_journal(conn: duckdb.DuckDBPyConnection) -> None:
-    """Raise `JournalNotInitialised` unless every journal table exists."""
+    """Raise `JournalNotInitialised` unless every journal table exists, those in
+    `schema.LATER_JOURNAL_TABLE_NAMES` aside (a read-only connection to a
+    version-7 store lacks them; a write connection has migrated). Raise
+    `SchemaVersionError` when the tables exist but predate schema version 17
+    (no `book_id`; a read-only connection to a version-16 store), naming the
+    fix: open the store for writing once."""
     (present,) = conn.execute(  # type: ignore[misc]
         "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() "
         "AND schema_name = current_schema() AND table_name IN "
-        f"({', '.join('?' for _ in JOURNAL_TABLE_NAMES)})",
-        list(JOURNAL_TABLE_NAMES),
+        f"({', '.join('?' for _ in _REQUIRED_TABLES)})",
+        list(_REQUIRED_TABLES),
     ).fetchone()
-    if present != len(JOURNAL_TABLE_NAMES):
+    if present != len(_REQUIRED_TABLES):
         raise JournalNotInitialised(
-            "the store has no paper-trading journal (schema version 4); any writing "
-            "command migrates it to version 5"
+            "the store has no paper-trading journal (a journal table is missing); "
+            "any writing command migrates it to the current version"
         )
+    _require_expansion_seams(conn)
 
 
 def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:
@@ -619,12 +729,27 @@ def _next_id(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> int:
     return int(row[0])
 
 
+def _require_after_reconciliations(conn: duckdb.DuckDBPyConnection, known_at: datetime) -> None:
+    """Refuse a fill stamped at or before the latest reconciliation (#650): a
+    ledger counts a fill's cash only when its `known_at` is strictly after its
+    base reconciliation's, so a tied stamp would drop the fill from every later
+    ledger's cash."""
+    row = conn.execute("SELECT MAX(known_at) FROM reconciliations").fetchone()
+    floor = None if row is None else row[0]
+    if floor is not None and known_at <= floor:
+        raise ValueError(
+            f"fills: known_at {known_at.isoformat()} is not after the latest reconciliation's "
+            f"{floor.isoformat()}; the clock did not advance past it"
+        )
+
+
 def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
     """Insert `row` into its table and return its own id (assigned when None), or
-    None for a table without one. Raises `ValueError` for a naive timestamp or
-    `known_at` after `ingested_at`, `JournalNotInitialised` on a store without the
-    journal, and DuckDB's constraint errors for anything the schema refuses. Runs in
-    the caller's transaction."""
+    None for a table without one. Raises `ValueError` for a naive timestamp,
+    `known_at` after `ingested_at`, or a fill not stamped after every
+    reconciliation; `JournalNotInitialised` on a store without the journal; and
+    DuckDB's constraint errors for anything the schema refuses. Runs in the
+    caller's transaction."""
     if type(row) not in ROW_TYPES.values():
         raise TypeError(f"not a journal row type: {type(row).__name__}")
     table, id_column = type(row).TABLE, type(row).ID_COLUMN
@@ -636,6 +761,8 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
             f"{ingested_at.isoformat()}"
         )
     require_journal(conn)
+    if isinstance(row, FillRow):
+        _require_after_reconciliations(conn, known_at)
     values = {f.name: getattr(row, f.name) for f in fields(row)}  # type: ignore[arg-type]
     row_id = None
     if id_column is not None:
@@ -649,11 +776,33 @@ def append(conn: duckdb.DuckDBPyConnection, row: JournalRow) -> int | None:
 _FILL_COLUMNS = tuple(f.name for f in fields(FillRow))
 
 
+def _ids(client_order_ids: Iterable[str] | None) -> list[str] | None:
+    """`client_order_ids` as a sorted SQL list parameter, None for "every order"."""
+    if isinstance(client_order_ids, str):
+        raise TypeError("client_order_ids must be a collection of ids, not one string")
+    return None if client_order_ids is None else sorted(set(client_order_ids))
+
+
+def _check_limit(limit: int | None) -> None:
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+
+
+def _orphan_fill_error(
+    fill_id: int | None, broker_fill_id: str, client_order_id: str, side: str | None, run_id: Any
+) -> JournalIntegrityError:
+    missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
+    return JournalIntegrityError(
+        f"fill {fill_id} ({broker_fill_id}) of {client_order_id!r} has no {missing}"
+    )
+
+
 def fills_for(
     conn: duckdb.DuckDBPyConnection,
     *,
     window_id: int | None = None,
     client_order_ids: Iterable[str] | None = None,
+    limit: int | None = None,
 ) -> list[OrderedFill]:
     """Every live fill (superseded rows hidden), in `fill_id` order, each with
     its order's side and security; optionally only a window's (through the order's
@@ -663,15 +812,19 @@ def fills_for(
     earlier `filled_at`): anything order-sensitive, such as FIFO lots, sorts by
     `(filled.filled_at, fill_id)` itself.
 
+    `limit` (#435, for a page's bounded read; every other caller leaves it None
+    and reads everything) keeps only the `limit` newest live fills in scope, by
+    `fill_id`, bounded in SQL, and returns them newest first (`fill_id` descending).
+
     Fails closed: raises `JournalIntegrityError` when any superseded row points at
     something other than a live `broker_status` fill of its own order (so no fill is
     hidden by a bad pointer), and when a live fill in scope has no `orders` row or
     its order no `paper_runs` row (a fill whose window cannot be told is never
-    filtered out of a window's ledger)."""
+    filtered out of a window's ledger). Both checks cover the whole scope, not
+    only the `limit` rows returned."""
     require_journal(conn)
-    if isinstance(client_order_ids, str):
-        raise TypeError("client_order_ids must be a collection of ids, not one string")
-    ids = None if client_order_ids is None else sorted(set(client_order_ids))
+    ids = _ids(client_order_ids)
+    _check_limit(limit)
     bad = conn.execute(
         "SELECT f.fill_id, f.superseded_by FROM fills f "
         "LEFT JOIN fills s ON s.fill_id = f.superseded_by "
@@ -685,17 +838,30 @@ def fills_for(
             f"fills superseded by something other than a live broker_status fill of "
             f"their own order: {pairs}"
         )
-    selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
-    rows = conn.execute(
-        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
-        "r.window_id "
+    in_scope = (
         "FROM fills f LEFT JOIN orders o USING (client_order_id) "
         "LEFT JOIN paper_runs r ON r.run_id = o.run_id "
         "WHERE f.superseded_by IS NULL "
         "AND (? IS NULL OR r.run_id IS NULL OR r.window_id = ?) "
         "AND (? IS NULL OR list_contains(?, f.client_order_id)) "
-        "ORDER BY f.fill_id",
-        [window_id, window_id, ids, ids],
+    )
+    scope = [window_id, window_id, ids, ids]
+    if limit is not None:
+        # The rows past the limit are never fetched, so check them in SQL first.
+        orphan = conn.execute(
+            "SELECT f.fill_id, f.broker_fill_id, f.client_order_id, o.side, o.run_id "
+            f"{in_scope}AND (o.side IS NULL OR r.run_id IS NULL) "
+            "ORDER BY f.fill_id LIMIT 1",
+            scope,
+        ).fetchone()
+        if orphan is not None:
+            raise _orphan_fill_error(*orphan)
+    selected = ", ".join(f"f.{name}" for name in _FILL_COLUMNS)
+    order = "ORDER BY f.fill_id" if limit is None else "ORDER BY f.fill_id DESC LIMIT ?"
+    rows = conn.execute(
+        f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
+        f"r.window_id {in_scope}{order}",
+        scope if limit is None else [*scope, limit],
     ).fetchall()
     width = len(_FILL_COLUMNS)
     result: list[OrderedFill] = []
@@ -703,10 +869,8 @@ def fills_for(
         fill = FillRow(**dict(zip(_FILL_COLUMNS, row[:width], strict=True)))
         side, security_id, symbol, run_id, known_run, fill_window = row[width:]
         if side is None or known_run is None:
-            missing = "orders row" if side is None else f"paper_runs row for run {run_id}"
-            raise JournalIntegrityError(
-                f"fill {fill.fill_id} ({fill.broker_fill_id}) of "
-                f"{fill.client_order_id!r} has no {missing}"
+            raise _orphan_fill_error(
+                fill.fill_id, fill.broker_fill_id, fill.client_order_id, side, run_id
             )
         result.append(OrderedFill(fill, side, security_id, symbol, run_id, fill_window))
     return result
@@ -717,3 +881,450 @@ def all_fill_ids(conn: duckdb.DuckDBPyConnection) -> frozenset[str]:
     insert-or-ignore check, so a fill is never journaled twice."""
     require_journal(conn)
     return frozenset(row[0] for row in conn.execute("SELECT broker_fill_id FROM fills").fetchall())
+
+
+# --- Readers (plan T49c) -------------------------------------------------------------
+#
+# Reads only. Every reader calls `require_journal` first, so a version-4 store
+# raises `JournalNotInitialised`. A row tied to a window through a column
+# (`window_id`) or through its run (`run_id -> paper_runs.window_id`, or an order's
+# run for `order_events` and `outcomes`) is read per window; later tasks never add a
+# reader here, they query in their own module. Rows come back in `known_at` order,
+# ties broken by `ingested_at` and then insertion order (DuckDB's `rowid`), or in id
+# order for a table with its own id; "latest" always means latest by that order,
+# never by a broker instant. No reader applies a `known_at` cutoff: a caller that
+# needs state as of an instant (the ledger at close(S-1), say) filters itself.
+# The one amendment (#435, ADR 0011's bounded page reads): `orders_for` takes an
+# optional `limit` and `order_events_for` and `outcomes_for` an optional
+# `client_order_ids`, so a page reads its capped rows in SQL; left at their
+# defaults, every reader reads everything as before.
+
+#: `order_events` statuses that end an order. Terminal is absorbing: an order with
+#: any of these rows is terminal whatever rows follow it in `known_at` order.
+TERMINAL_ORDER_STATUSES: tuple[str, ...] = ("filled", "expired", "rejected", "cancelled")
+#: Statuses that show the broker has the order; an order with none of them and no
+#: journaled fill is `pending` (spec req 4, "Unknown state"), whatever `cancel_*`
+#: rows follow.
+ACKNOWLEDGED_ORDER_STATUSES: tuple[str, ...] = ("accepted", "replay", *TERMINAL_ORDER_STATUSES)
+#: `paper_window_stops` states that close a window (`requested` leaves it open).
+CLOSING_STOP_STATES: tuple[str, ...] = ("closed", "abandoned")
+
+_ORDER = "t.known_at, t.ingested_at, t.rowid"
+_RUN_IN_WINDOW = "t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)"
+_ORDER_IN_WINDOW = (
+    "(? IS NULL OR t.client_order_id IN (SELECT o.client_order_id FROM orders o "
+    "JOIN paper_runs r ON r.run_id = o.run_id WHERE r.window_id = ?))"
+)
+_ORDER_IN_LIST = "(? IS NULL OR list_contains(?, t.client_order_id))"
+#: `orders_for(limit=...)`'s order: newest first, ties by `client_order_id`.
+_NEWEST_ORDER_FIRST = "t.known_at DESC, t.client_order_id DESC"
+
+
+@dataclass(frozen=True)
+class RunWithResult:
+    """A `paper_runs` row and its `paper_run_results` row, None while unfinished."""
+
+    run: PaperRunRow
+    result: PaperRunResultRow | None
+
+
+@dataclass(frozen=True)
+class DecisionWithEvents:
+    """A decision and its `decision_events` rows in `known_at` order."""
+
+    decision: DecisionRow
+    events: tuple[DecisionEventRow, ...]
+
+
+@dataclass(frozen=True)
+class OverrideWithConsumption:
+    """An override and what consumed it: the decisions citing it (`exclude_name`,
+    `keep_name`) or the `engaged` `kill_switch` rows citing it (`engage_kill_switch`)."""
+
+    override: OverrideRow
+    decision_ids: tuple[int, ...]
+    kill_switch_event_ids: tuple[int, ...]
+
+    @property
+    def consumed(self) -> bool:
+        """True once what its kind consumes cites it: an `engaged` `kill_switch` row
+        for `engage_kill_switch`, a decision for the name kinds."""
+        if self.override.kind == ENGAGE_KILL_SWITCH_KIND:
+            return bool(self.kill_switch_event_ids)
+        return bool(self.decision_ids)
+
+
+def _select[R](
+    conn: duckdb.DuckDBPyConnection,
+    row_type: type[R],
+    where: str = "TRUE",
+    params: Iterable[Any] = (),
+    order: str = _ORDER,
+    limit: int | None = None,
+) -> list[R]:
+    """Rows of `row_type`'s table (aliased `t`) matching `where`, as row objects,
+    at most `limit` of them (in `order`) when given. Never `fills`: that table is
+    read only through `fills_for`."""
+    if row_type is FillRow:
+        raise TypeError("fills is read only through fills_for")
+    require_journal(conn)
+    _check_limit(limit)
+    names = [f.name for f in fields(row_type)]  # type: ignore[arg-type]
+    columns = ", ".join(f't."{name}"' for name in names)
+    table = row_type.TABLE  # type: ignore[attr-defined]
+    sql = f"SELECT {columns} FROM {table} t WHERE {where} ORDER BY {order}"
+    values = list(params)
+    if limit is not None:
+        sql += " LIMIT ?"
+        values.append(limit)
+    rows = conn.execute(sql, values).fetchall()
+    return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
+
+
+def _open_windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
+    return _select(
+        conn,
+        PaperWindowRow,
+        "t.window_id NOT IN (SELECT window_id FROM paper_window_stops "
+        "WHERE list_contains(?, state))",
+        [list(CLOSING_STOP_STATES)],
+        order="t.window_id",
+    )
+
+
+def open_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
+    """The open window (no `closed` or `abandoned` stop row), or None. Fails closed
+    with `JournalIntegrityError` when more than one window is open."""
+    windows = _open_windows(conn)
+    if len(windows) > 1:
+        ids = ", ".join(str(w.window_id) for w in windows)
+        raise JournalIntegrityError(f"more than one open paper window: {ids}")
+    return windows[0] if windows else None
+
+
+def latest_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
+    """The window with the highest id, open or closed (what `paper check` and
+    `paper report` target), or None before the first `paper start`."""
+    windows = _select(conn, PaperWindowRow, order="t.window_id DESC")
+    return windows[0] if windows else None
+
+
+def window_stops_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperWindowStopRow]:
+    """The window's `paper_window_stops` rows."""
+    return _select(conn, PaperWindowStopRow, "t.window_id = ?", [window_id])
+
+
+def runs_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[RunWithResult]:
+    """The window's runs in `run_id` order, each with its result (None while
+    unfinished)."""
+    runs = _select(conn, PaperRunRow, "t.window_id = ?", [window_id], order="t.run_id")
+    results = {
+        r.run_id: r
+        for r in _select(
+            conn,
+            PaperRunResultRow,
+            "t.run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?)",
+            [window_id],
+        )
+    }
+    return [RunWithResult(run, results.get(run.run_id)) for run in runs]  # type: ignore[arg-type]
+
+
+def _require_orders_have_runs(conn: duckdb.DuckDBPyConnection) -> None:
+    """Fail closed, as `fills_for` does: an order whose run has no `paper_runs` row
+    would drop out of every per-window order read (and so out of the halt path's
+    and reconciliation's view) instead of being seen."""
+    require_journal(conn)
+    orphans = conn.execute(
+        "SELECT o.client_order_id FROM orders o LEFT JOIN paper_runs r "
+        "ON r.run_id = o.run_id WHERE r.run_id IS NULL ORDER BY o.client_order_id"
+    ).fetchall()
+    if orphans:
+        ids = ", ".join(repr(row[0]) for row in orphans)
+        raise JournalIntegrityError(f"orders with no paper_runs row: {ids}")
+
+
+def orders_for(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None, limit: int | None = None
+) -> list[OrderRow]:
+    """The window's orders (through their run), or every order when `window_id` is
+    None (the collectors read own orders account-wide). Raises
+    `JournalIntegrityError` when any order has no run (every order reader does).
+
+    `limit` (#435, for a page's bounded read; every other caller leaves it None)
+    keeps only the `limit` newest orders, bounded in SQL, and returns them newest
+    first: `known_at` descending, ties by `client_order_id` descending."""
+    _require_orders_have_runs(conn)
+    if limit is None:
+        return _select(conn, OrderRow, _ORDER_IN_WINDOW, [window_id, window_id])
+    return _select(
+        conn,
+        OrderRow,
+        _ORDER_IN_WINDOW,
+        [window_id, window_id],
+        order=_NEWEST_ORDER_FIRST,
+        limit=limit,
+    )
+
+
+def order_events_for(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_id: int | None,
+    client_order_ids: Iterable[str] | None = None,
+) -> list[OrderEventRow]:
+    """Every `order_events` row of the window's orders (or of every order), or,
+    given `client_order_ids` (#435), only those orders' rows within that scope."""
+    _require_orders_have_runs(conn)
+    ids = _ids(client_order_ids)
+    return _select(
+        conn,
+        OrderEventRow,
+        f"{_ORDER_IN_WINDOW} AND {_ORDER_IN_LIST}",
+        [window_id, window_id, ids, ids],
+    )
+
+
+def latest_order_events(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+) -> dict[str, OrderEventRow]:
+    """Each order's latest event by `known_at` (not insertion order, not the
+    broker's `event_at`), keyed by `client_order_id`; an order with no event is
+    absent. Not an order's state: a `cancel_noop` journaled after `expired` is the
+    latest row of a terminal order. State comes from `non_terminal_orders` and
+    `pending_orders`."""
+    return {e.client_order_id: e for e in order_events_for(conn, window_id=window_id)}
+
+
+def _orders_where(
+    conn: duckdb.DuckDBPyConnection, window_id: int | None, statuses: tuple[str, ...]
+) -> list[OrderRow]:
+    _require_orders_have_runs(conn)
+    return _select(
+        conn,
+        OrderRow,
+        f"{_ORDER_IN_WINDOW} AND t.client_order_id NOT IN (SELECT client_order_id "
+        "FROM order_events WHERE list_contains(?, status))",
+        [window_id, window_id, list(statuses)],
+    )
+
+
+def non_terminal_orders(
+    conn: duckdb.DuckDBPyConnection, *, window_id: int | None
+) -> list[OrderRow]:
+    """Orders with no terminal event (`pending` ones included), for the window or,
+    with None, account-wide."""
+    return _orders_where(conn, window_id, TERMINAL_ORDER_STATUSES)
+
+
+def pending_orders(conn: duckdb.DuckDBPyConnection, *, window_id: int | None) -> list[OrderRow]:
+    """Orders with no broker-acknowledged event (`accepted`, `replay` or terminal)
+    and no journaled fill (read through `fills_for`), whatever `cancel_*` rows
+    follow: settled only by `paper resume`."""
+    candidates = _orders_where(conn, window_id, ACKNOWLEDGED_ORDER_STATUSES)
+    if not candidates:
+        return []
+    filled = {
+        f.fill.client_order_id
+        for f in fills_for(conn, client_order_ids=[o.client_order_id for o in candidates])
+    }
+    return [o for o in candidates if o.client_order_id not in filled]
+
+
+def orders_on_session(
+    conn: duckdb.DuckDBPyConnection, session: date, security_id: str, side: str
+) -> list[OrderRow]:
+    """Every order on `session` for (`security_id`, `side`), across decisions and
+    windows: the attempt count behind `client_order_id`. Not filtered by window,
+    because ids are unique store-wide and a window filter could re-issue one."""
+    return _select(
+        conn,
+        OrderRow,
+        "t.session = ? AND t.security_id = ? AND t.side = ?",
+        [session, security_id, side],
+    )
+
+
+def decisions_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, rebalance_session: date | None = None
+) -> list[DecisionWithEvents]:
+    """The window's decisions in `decision_id` order, each with its events; only
+    one rebalance's when `rebalance_session` is given (forced exits, which have
+    none, are then left out)."""
+    where = _RUN_IN_WINDOW
+    params: list[Any] = [window_id]
+    if rebalance_session is not None:
+        where += " AND t.rebalance_session = ?"
+        params.append(rebalance_session)
+    decisions = _select(conn, DecisionRow, where, params, order="t.decision_id")
+    events: dict[int, list[DecisionEventRow]] = {}
+    for event in _select(
+        conn,
+        DecisionEventRow,
+        f"t.decision_id IN (SELECT decision_id FROM decisions t WHERE {_RUN_IN_WINDOW})",
+        [window_id],
+    ):
+        events.setdefault(event.decision_id, []).append(event)
+    return [
+        DecisionWithEvents(d, tuple(events.get(d.decision_id, ())))  # type: ignore[arg-type]
+        for d in decisions
+    ]
+
+
+def fill_cursors(conn: duckdb.DuckDBPyConnection) -> list[FillCursorRow]:
+    """Every `fill_cursors` row (account-wide: collectors read `fills(since)` for
+    the whole account)."""
+    return _select(conn, FillCursorRow)
+
+
+def latest_collected_through(conn: duckdb.DuckDBPyConnection) -> datetime | None:
+    """The latest `collected_through` across every `fill_cursors` row, or None."""
+    through = [c.collected_through for c in fill_cursors(conn)]
+    return max(through) if through else None
+
+
+def kill_switch_events_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[KillSwitchRow]:
+    """The window's `kill_switch` rows in `known_at` order (then insertion order).
+    Rows written on the halt path after a `ClockError` carry `utc_now()` stamps,
+    so the caller deriving the state must not trust `known_at` order alone there
+    (`event_id` is write order)."""
+    return _select(conn, KillSwitchRow, "t.window_id = ?", [window_id])
+
+
+def positions_daily_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, after: date | None = None
+) -> list[PositionDailyRow]:
+    """The window's marks (through their run) in session order, only those after
+    `after` when given."""
+    return _select(
+        conn,
+        PositionDailyRow,
+        f"{_RUN_IN_WINDOW} AND (? IS NULL OR t.session > ?)",
+        [window_id, after, after],
+        order=f"t.session, {_ORDER}",
+    )
+
+
+def last_marked_session(conn: duckdb.DuckDBPyConnection, window_id: int) -> date | None:
+    """The latest session the window has a mark for, or None: the mark step
+    writes every session after it through S-1."""
+    marks = positions_daily_for(conn, window_id)
+    return marks[-1].session if marks else None
+
+
+def adjustments_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int, *, through_session: date | None = None
+) -> list[AdjustmentRow]:
+    """The window's `adjustments` rows, only those on or before `through_session`
+    when given."""
+    return _select(
+        conn,
+        AdjustmentRow,
+        "t.window_id = ? AND (? IS NULL OR t.session <= ?)",
+        [window_id, through_session, through_session],
+    )
+
+
+def reconciliations_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconciliationRow]:
+    """The window's `reconciliations` rows."""
+    return _select(conn, ReconciliationRow, "t.window_id = ?", [window_id])
+
+
+def last_ok_reconciliation(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> ReconciliationRow | None:
+    """The window's latest `ok` reconciliation (the ledger's cash base), or None."""
+    rows = _select(conn, ReconciliationRow, "t.window_id = ? AND t.status = 'ok'", [window_id])
+    return rows[-1] if rows else None
+
+
+def rebalance_events_for(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> list[RebalanceEventRow]:
+    """The window's `rebalance_events` rows (through their run)."""
+    return _select(conn, RebalanceEventRow, _RUN_IN_WINDOW, [window_id])
+
+
+def plans_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperPlanRow]:
+    """The window's `paper_plans` rows (through their run)."""
+    return _select(conn, PaperPlanRow, _RUN_IN_WINDOW, [window_id])
+
+
+def signals_for(conn: duckdb.DuckDBPyConnection, run_id: int) -> list[SignalRow]:
+    """One planning run's `signals` rows."""
+    return _select(conn, SignalRow, "t.run_id = ?", [run_id])
+
+
+def overrides_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[OverrideWithConsumption]:
+    """The window's overrides in `override_id` order, each with the decisions and
+    `engaged` `kill_switch` rows citing it (consumption is visible only through
+    those; a `released` row citing it consumes nothing)."""
+    overrides = _select(conn, OverrideRow, "t.window_id = ?", [window_id], order="t.override_id")
+    cited = "t.override_id IN (SELECT override_id FROM overrides WHERE window_id = ?)"
+    decisions: dict[int, list[int]] = {}
+    for d in _select(conn, DecisionRow, cited, [window_id], order="t.decision_id"):
+        decisions.setdefault(d.override_id, []).append(d.decision_id)  # type: ignore[arg-type]
+    engaged: dict[int, list[int]] = {}
+    engaged_rows = f"{cited} AND t.state = 'engaged' AND t.window_id = ?"
+    for k in _select(conn, KillSwitchRow, engaged_rows, [window_id, window_id], order="t.event_id"):
+        engaged.setdefault(k.override_id, []).append(k.event_id)  # type: ignore[arg-type]
+    return [
+        OverrideWithConsumption(
+            o,
+            tuple(decisions.get(o.override_id, ())),  # type: ignore[arg-type]
+            tuple(engaged.get(o.override_id, ())),  # type: ignore[arg-type]
+        )
+        for o in overrides
+    ]
+
+
+def unconsumed_kill_switch_overrides(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> list[OverrideRow]:
+    """The window's `engage_kill_switch` overrides no `kill_switch` row cites yet:
+    they count as engaged until a run or phase boundary appends that row."""
+    return [
+        o.override
+        for o in overrides_for(conn, window_id)
+        if o.override.kind == ENGAGE_KILL_SWITCH_KIND and not o.kill_switch_event_ids
+    ]
+
+
+def paper_reports_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[PaperReportRow]:
+    """The window's `paper_reports` rows."""
+    return _select(conn, PaperReportRow, "t.window_id = ?", [window_id])
+
+
+def resume_invocations(conn: duckdb.DuckDBPyConnection) -> list[ResumeInvocationRow]:
+    """Every `resume_invocations` row in `resume_id` order (the table has no
+    window; its outcome is the `kill_switch` row carrying the `resume_id`)."""
+    return _select(conn, ResumeInvocationRow, order="t.resume_id")
+
+
+def resume_acceptances(conn: duckdb.DuckDBPyConnection) -> list[ResumeAcceptanceRow]:
+    """Every `resume_acceptances` row in `resume_id` order (#472)."""
+    return _select(conn, ResumeAcceptanceRow, order="t.resume_id")
+
+
+def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> list[AlertRow]:
+    """The alerts under one dedupe key (`kind`, `alerts.session`)."""
+    return _select(
+        conn, AlertRow, "t.kind = ? AND t.session = ?", [kind, session], order="t.alert_id"
+    )
+
+
+def outcomes_for(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    *,
+    client_order_ids: Iterable[str] | None = None,
+) -> list[OutcomeRow]:
+    """The window's `outcomes` rows (through their order's run), or, given
+    `client_order_ids` (#435), only those orders' rows of the window."""
+    ids = _ids(client_order_ids)
+    return _select(
+        conn,
+        OutcomeRow,
+        f"{_ORDER_IN_WINDOW} AND {_ORDER_IN_LIST}",
+        [window_id, window_id, ids, ids],
+    )

@@ -9,6 +9,7 @@ message.
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -96,6 +97,44 @@ def test_configured_secrets_excludes_blank_values() -> None:
     assert secrets == ["TradePartner test@example.com"]
 
 
+def test_configured_secrets_finds_a_new_secret_field_by_type() -> None:
+    """A `SecretStr` field added to `Settings` later is scrubbed from CLI output
+    and fixtures without editing a list, as `ingest._clean` already does (#342)."""
+    from pydantic import SecretStr
+
+    class _MoreSettings(Settings):
+        future_token: SecretStr | None = None
+
+    settings = _MoreSettings(_env_file=None, future_token="fake-future-token-342")
+    assert "fake-future-token-342" in cli_record._configured_secrets(settings)
+
+
+@pytest.mark.parametrize("error_name", ["AlpacaPaperCredentialsError", "AlpacaPaperGuardError"])
+def test_paper_construction_errors_are_scrubbed(
+    error_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`main paper` prints the adapter's construction errors through `scrub_text`,
+    the same rule as every other recorder error (#342)."""
+    from tradepartner.adapters import alpaca_trading_raw
+
+    paper_key = "PKFAKEPAPER342ABCDEFG"  # gitleaks:allow
+    settings = _settings(alpaca_paper_api_key=paper_key)
+    monkeypatch.setattr(cli_record, "get_settings", lambda: settings)
+    error = getattr(alpaca_trading_raw, error_name)
+
+    def refuse(_settings: Settings) -> AlpacaTradingRaw:
+        raise error(f"refused for {paper_key}")
+
+    monkeypatch.setattr(cli_record, "AlpacaTradingRaw", refuse)
+
+    assert cli_record.main(["paper", "XYZ"]) == 1
+    captured = capsys.readouterr()
+    assert paper_key not in captured.err
+    assert "cli_record: refused for" in captured.err
+
+
 # --- filing-document helpers (MUST FIX #2) ----------------------------------
 
 
@@ -140,6 +179,23 @@ def test_trim_company_facts_keeps_dei_and_share_concepts_only() -> None:
     assert "ffd" not in out["facts"]
     assert payload["facts"]["us-gaap"].get("Revenues")  # input untouched
     assert cli_record.trim_company_facts({"no": "facts"}) == {"no": "facts"}
+
+
+def test_trim_company_facts_keeps_the_configured_statement_tags_only() -> None:
+    """#660 (T77a): a configured `taxonomy:tag` survives, an unlisted
+    concept and a same-named concept in another taxonomy do not."""
+    payload = {
+        "cik": 1,
+        "facts": {
+            "us-gaap": {"Revenues": {"units": {}}, "InventoryNet": {"units": {}}},
+            "ifrs-full": {"Revenues": {"units": {}}},
+        },
+    }
+    tags = Settings(_env_file=None).edgar.statement_tags
+    out = cli_record.trim_company_facts(payload, itertools.chain(*tags.values()))
+    assert "us-gaap:Revenues" in tags["revenue"]
+    assert set(out["facts"]["us-gaap"]) == {"Revenues"}
+    assert "ifrs-full" not in out["facts"]
 
 
 def test_trim_company_tickers_keeps_sample_and_recorded_rows() -> None:
@@ -429,3 +485,49 @@ def test_paper_script_reports_not_flat_when_a_flattening_sell_is_refused(
     )
     assert f"NOT FLAT: {NON_FRACTIONABLE}" in capsys.readouterr().err
     assert not paper_dir.exists()
+
+
+# --- #320: the Phase 4 alert secrets are scrubbed too ------------------------
+
+_ALERT_SECRETS = {
+    "alert_smtp_user": "relay-login-gamma",
+    "alert_smtp_password": "correct horse battery staple 99",
+    "alert_email_to": "owner.alerts@example.org",
+}
+
+
+@pytest.mark.parametrize("field", sorted(_ALERT_SECRETS))
+def test_alert_secrets_are_configured_and_scrubbed(field: str) -> None:
+    from tradepartner import cli
+
+    value = _ALERT_SECRETS[field]
+    settings = Settings(_env_file=None, **{field: value})
+    assert value in cli_record._configured_secrets(settings)
+
+    message = f"sent alert via {value} ok"
+    try:
+        raise RuntimeError(f"SMTP login failed for {value!r}: 535 rejected")
+    except RuntimeError as exc:
+        exception_text = f"{type(exc).__name__}: {exc}"
+    for text in (message, exception_text):
+        scrubbed, count = cli_record.scrub_text(
+            text, secrets=cli_record._configured_secrets(settings)
+        )
+        assert value not in scrubbed
+        assert count >= 1
+        assert value not in cli._scrubbed(text, settings)
+
+
+def test_blank_alert_secrets_are_not_configured() -> None:
+    settings = Settings(
+        _env_file=None,
+        alert_smtp_user="  ",
+        alert_smtp_password="",
+        alert_email_to=None,
+        alpaca_api_key=None,
+        alpaca_api_secret=None,
+        alpaca_paper_api_key=None,
+        alpaca_paper_api_secret=None,
+        sec_edgar_user_agent=None,
+    )
+    assert cli_record._configured_secrets(settings) == []

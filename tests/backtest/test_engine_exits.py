@@ -133,7 +133,7 @@ def _run(
     end: date = T2,
     levels: Sequence[float] = (LEVEL,),
 ) -> dict[float, BacktestResult]:
-    return run(params, provider, T0, end, _handle(), levels)
+    return run(params, provider, T0, end, _handle(), levels, family="momentum")
 
 
 def _strategy(result: BacktestResult) -> dict[date, tuple[float, float | None]]:
@@ -222,9 +222,6 @@ class TestDelistingExit:
         for session in _steps(T0, T1):
             assert _strategy(exiting)[session][0] == pytest.approx(_strategy(twin)[session][0])
 
-    def test_status_constant_matches_the_store(self) -> None:
-        assert engine._LISTED == delistings.LISTED
-
     def test_after_a_ticker_change_the_current_listing_decides(self) -> None:
         # The pre-change listing is never ended by the filing and stays `listed`.
         skip = [("X", s) for s in SESSIONS if s > self.END]
@@ -285,6 +282,65 @@ class TestTransfer:
         bought = [w for w in moved.weights if w.fill_session == F1 and w.security_id == "X"]
         assert bought and bought[0].shares is not None and bought[0].shares > 0
         assert _value(moved, "X", T2) > 0
+
+    def test_a_transfer_known_ahead_of_its_effective_date_is_held_through(self) -> None:
+        # The successor listing is already known (filed/announced) before the T1 read,
+        # but its own `valid_from` is still in the future, so the current row stays the
+        # old exchange's: status `transferred`, not yet `listed` (issue #557, same bug
+        # #555 fixed in planning; owner decision 2026-10-02: a transfer never ends a
+        # listing, known ahead or not).
+        far_future = date(2024, 6, 1)
+        listing = [
+            ("X", self.OLD, delistings.TRANSFERRED, date(2024, 2, 15), date(2024, 2, 20)),
+            ("X", far_future, delistings.LISTED, None, date(2024, 2, 20)),
+        ]
+        moved = _run(_provider(listing_rows=listing), _no_stale())[LEVEL]
+        plain = _run(_provider(), _no_stale())[LEVEL]
+        assert _strategy(moved) == _strategy(plain)
+        assert [r.n_delisting_exits for r in moved.rebalances] == [0, 0]
+
+    def test_an_advance_transfer_known_only_after_the_decision_date_has_no_effect_at_that_date(
+        self,
+    ) -> None:
+        # Filed and known only after the T0 step's read (close T1): at that read
+        # nothing is known yet, so it must match plain exactly (no look-ahead). Once
+        # known, before the T1 step's read (close T2), the transfer is held through
+        # like any other, with no retroactive exit charged for the window it was
+        # unknown.
+        far_future = date(2024, 6, 1)
+        known_on = date(2024, 3, 5)  # after close(T1), before close(T2)
+        listing = [
+            ("X", self.OLD, delistings.TRANSFERRED, date(2024, 2, 15), known_on),
+            ("X", far_future, delistings.LISTED, None, known_on),
+        ]
+        moved = _run(_provider(listing_rows=listing), _no_stale())[LEVEL]
+        plain = _run(_provider(), _no_stale())[LEVEL]
+        assert _strategy(moved) == _strategy(plain)
+        assert [r.n_delisting_exits for r in moved.rebalances] == [0, 0]
+
+
+class TestEndedDirect:
+    """Direct, unit-level coverage of `engine._ended` (mirrors #559's planning tests),
+    independent of the full run harness above."""
+
+    OLD, NEW = date(2010, 1, 4), date(2024, 2, 16)
+
+    def test_a_transfer_known_ahead_of_its_effective_date_does_not_end_the_listing(self) -> None:
+        far_future = date(2024, 6, 1)
+        frame = _listing_rows(
+            [
+                ("X", self.OLD, delistings.TRANSFERRED, date(2024, 2, 15), date(2024, 2, 20)),
+                ("X", far_future, delistings.LISTED, None, date(2024, 2, 20)),
+            ]
+        )
+        # Sanity: `far_future` has not arrived at T1, so the current row is still the
+        # old, `transferred` one -- otherwise this would not exercise the bug.
+        assert engine._ended(frame, T1) == {}
+
+    def test_a_genuine_delisting_with_no_successor_still_ends(self) -> None:
+        end = date(2024, 2, 15)
+        frame = _listing_rows([("X", self.OLD, delistings.DELISTED, end, date(2024, 2, 20))])
+        assert engine._ended(frame, T1) == {"X": end}
 
 
 class TestStaleExit:
@@ -379,7 +435,7 @@ class TestBenchmarks:
     @pytest.mark.parametrize("fill_price", ["close", "open"])
     def test_equal_hand_computed_total_return(self, fill_price: str) -> None:
         params = _params(execution={"fill_price": fill_price})
-        results = run(params, self._provider(), T0, T3, _handle(), [0.0, LEVEL])
+        results = run(params, self._provider(), T0, T3, _handle(), [0.0, LEVEL], family="momentum")
         for level, result in results.items():
             for series, sid in self.BENCHMARKS.items():
                 rows = [row for row in result.equity if row.series == series]
@@ -391,7 +447,9 @@ class TestBenchmarks:
                     assert got[session] == pytest.approx(value, rel=1e-9), (series, session)
 
     def test_one_initial_cost_only(self) -> None:
-        results = run(_params(), self._provider(), T0, T3, _handle(), [0.0, LEVEL])
+        results = run(
+            _params(), self._provider(), T0, T3, _handle(), [0.0, LEVEL], family="momentum"
+        )
         for series in self.BENCHMARKS:
             free = {r.session: r.equity for r in results[0.0].equity if r.series == series}
             paid = {r.session: r.equity for r in results[LEVEL].equity if r.series == series}
@@ -401,7 +459,7 @@ class TestBenchmarks:
 
     def test_benchmarks_are_read_once_and_marked_with_the_held_names(self) -> None:
         provider = self._provider()
-        result = run(_params(), provider, T0, T3, _handle(), [LEVEL])[LEVEL]
+        result = run(_params(), provider, T0, T3, _handle(), [LEVEL], family="momentum")[LEVEL]
         reads = [call for call in provider.calls if call.method == "benchmark_ids"]
         assert [call.t for call in reads] == [read_time(T0)]
         stitched = result.stitched_returns()
@@ -413,11 +471,15 @@ class TestBenchmarks:
             ~((pl.col("security_id") == "M") & (pl.col("session") == F0))
         )
         with pytest.raises(ValueError, match="MTUM"):
-            run(_params(), provider, T0, T3, _handle(), [LEVEL])
+            run(_params(), provider, T0, T3, _handle(), [LEVEL], family="momentum")
 
     def test_prefix_invariance_holds_with_benchmarks(self) -> None:
-        short = run(_params(), self._provider(), T0, T2, _handle(), [LEVEL])[LEVEL]
-        long = run(_params(), self._provider(), T0, T3, _handle(), [LEVEL])[LEVEL]
+        short = run(_params(), self._provider(), T0, T2, _handle(), [LEVEL], family="momentum")[
+            LEVEL
+        ]
+        long = run(_params(), self._provider(), T0, T3, _handle(), [LEVEL], family="momentum")[
+            LEVEL
+        ]
         assert short.equity == tuple(row for row in long.equity if row.session <= T2)
 
 

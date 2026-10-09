@@ -38,7 +38,7 @@ from pydantic import SecretStr
 from tradepartner import calendar
 from tradepartner.adapters import alpaca_raw, alpaca_trading_raw, edgar_raw
 from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError, AlpacaTradingRaw
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import Settings, get_settings, secret_values
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 ALPACA_FIXTURES_DIR = FIXTURES_ROOT / "alpaca"
@@ -226,23 +226,47 @@ def _non_blank_secret(secret: SecretStr | None) -> str | None:
 def _configured_secrets(settings: Settings) -> list[str]:
     """Every real secret value to scrub as a substring, plus derived forms.
 
-    Includes the HTTP Basic `base64("key:secret")` form of the Alpaca
-    credential pair, in case a payload ever carries an `Authorization:
-    Basic ...` value built from them (T2 review round 2, safety-reviewer
-    MUST FIX) -- on top of the `Authorization`-header-name scrub in
-    `scrub_json`, which catches it regardless of content.
-    """
-    api_key = _non_blank_secret(settings.alpaca_api_key)
-    api_secret = _non_blank_secret(settings.alpaca_api_secret)
-    user_agent = _non_blank_secret(settings.sec_edgar_user_agent)
-    paper_key = _non_blank_secret(settings.alpaca_paper_api_key)
-    paper_secret = _non_blank_secret(settings.alpaca_paper_api_secret)
+    Starts from `config.secret_values`, every `SecretStr` field found by type,
+    so a secret added to `Settings` later is scrubbed from CLI output and
+    fixtures without editing this function (#342), as `ingest._clean` does
+    for run rows (#334). An SMTP password is neither email- nor key-shaped,
+    so no pattern would catch it otherwise (#320).
 
-    values = [v for v in (api_key, api_secret, user_agent, paper_key, paper_secret) if v]
-    for key, secret in ((api_key, api_secret), (paper_key, paper_secret)):
+    On top: the HTTP Basic `base64("key:secret")` form of each Alpaca
+    credential pair, in case a payload ever carries an `Authorization: Basic
+    ...` value built from them (T2 review round 2, safety-reviewer MUST FIX),
+    on top of the `Authorization`-header-name scrub in `scrub_json`, which
+    catches it regardless of content; and the SMTP AUTH forms.
+    """
+    values = secret_values(settings)
+    pairs = (
+        (settings.alpaca_api_key, settings.alpaca_api_secret),
+        (settings.alpaca_paper_api_key, settings.alpaca_paper_api_secret),
+    )
+    for key_field, secret_field in pairs:
+        key = _non_blank_secret(key_field)
+        secret = _non_blank_secret(secret_field)
         if key is not None and secret is not None:
             values.append(base64.b64encode(f"{key}:{secret}".encode()).decode())
+    values.extend(_smtp_login_forms(settings))
     return values
+
+
+def _smtp_login_forms(settings: Settings) -> list[str]:
+    """The base64 forms SMTP AUTH sends for the alert credentials (#334):
+    `AUTH PLAIN` carries base64("\\0user\\0password"), and `AUTH LOGIN` sends
+    base64(user) and base64(password) on their own. A raw-value scrub would
+    miss them in a transcript or an exception, so they are scrubbed too. The
+    alert delivery path must never enable `smtplib` debug output regardless, and
+    must pass `smtplib.login` the same raw (unstripped) values these forms are
+    built from. CRAM-MD5 (tried first when a server offers it) sends
+    base64("user hmac"), which exposes the user name only and is not covered."""
+    user = _non_blank_secret(settings.alert_smtp_user)
+    password = _non_blank_secret(settings.alert_smtp_password)
+    forms = [base64.b64encode(v.encode()).decode() for v in (user, password) if v]
+    if user is not None and password is not None:
+        forms.append(base64.b64encode(f"\0{user}\0{password}".encode()).decode())
+    return forms
 
 
 def _missing_secret_names(settings: Settings) -> list[str]:
@@ -320,12 +344,16 @@ def trim_submissions_page(page: Any, *, accessions: Iterable[str]) -> Any:
     }
 
 
-def trim_company_facts(payload: Any) -> Any:
-    """Keep `dei` whole and only share-count concepts elsewhere; other keys untouched.
+def trim_company_facts(payload: Any, statement_tags: Iterable[str] = ()) -> Any:
+    """Keep `dei` whole, share-count concepts and the `taxonomy:tag` names in
+    `statement_tags` (#660: `edgar.statement_tags`' fallbacks) elsewhere;
+    other keys untouched.
 
-    Pure. Drops nothing the master/universe code reads (spec master table); the full
+    Pure. Drops nothing the master/universe code or the statement-facts
+    parser reads (spec master table, amendment 2026-10-03); the full
     payload is 2-8 MB per filer, the trimmed one under ~200 KB.
     """
+    keep_tags = frozenset(statement_tags)
     if not isinstance(payload, dict) or not isinstance(payload.get("facts"), dict):
         return payload
     facts: dict[str, Any] = {}
@@ -339,6 +367,7 @@ def trim_company_facts(payload: Any) -> Any:
             name: value
             for name, value in concepts.items()
             if any(s in name for s in COMPANY_FACTS_KEEP_CONCEPT_SUBSTRINGS)
+            or f"{namespace}:{name}" in keep_tags
         }
         if kept:
             facts[namespace] = kept
@@ -493,7 +522,8 @@ def _record_edgar(settings: Settings, secrets: list[str]) -> None:
         submissions = edgar_raw.submissions(cik, settings=settings)
         _write_json(EDGAR_FIXTURES_DIR / f"submissions_{label}.json", submissions, secrets=secrets)
 
-        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings))
+        statement_tags = itertools.chain.from_iterable(settings.edgar.statement_tags.values())
+        facts = trim_company_facts(edgar_raw.company_facts(cik, settings=settings), statement_tags)
         _write_json(EDGAR_FIXTURES_DIR / f"company_facts_{label}.json", facts, secrets=secrets)
 
         # Older filings (and their acceptance times) live in paged files; keep only the
@@ -772,7 +802,8 @@ def _paper_finish(
         out["positions_after"] = raw.list_positions()
         out["open_orders_after"] = raw.list_open_orders()
     except (AlpacaTradingError, PaperRecordingError) as error:
-        print(f"cli_record: NOT FLAT? flattening failed ({error}); check it", file=sys.stderr)
+        message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+        print(f"cli_record: NOT FLAT? flattening failed ({message}); check it", file=sys.stderr)
         raise
     residue = [str(p.get("symbol")) for p in out["positions_after"]] + [
         str(o.get("client_order_id")) for o in out["open_orders_after"]
@@ -874,7 +905,9 @@ def _run_paper(
     try:
         recordings = _record_paper(raw, settings, non_fractionable, now or datetime.now(UTC))
     except (PaperRecordingError, AlpacaTradingError) as error:
-        print(f"cli_record: {error}", file=sys.stderr)
+        # An adapter error can echo a response body; scrub it like a fixture (#334).
+        message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+        print(f"cli_record: {message}", file=sys.stderr)
         return 1
     account = recordings["account_before"]
     secrets = _configured_secrets(settings) + [
@@ -917,7 +950,9 @@ def main(argv: Sequence[str] = ()) -> int:
             alpaca_trading_raw.AlpacaPaperCredentialsError,
             alpaca_trading_raw.AlpacaPaperGuardError,
         ) as error:
-            print(f"cli_record: {error}", file=sys.stderr)
+            # Fixed text today; scrubbed anyway so every recorder error has one rule (#342).
+            message = scrub_text(str(error), secrets=_configured_secrets(settings))[0]
+            print(f"cli_record: {message}", file=sys.stderr)
             return 1
         return _run_paper(raw, settings, argv[1].upper())
 

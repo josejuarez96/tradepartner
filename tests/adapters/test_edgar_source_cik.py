@@ -20,12 +20,14 @@ and `parse_sgml_header` run for real rather than being stubbed.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gzip
 import io
 import json
 import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -34,7 +36,8 @@ from test_edgar_fsn import FSN_PAGE_URL, _fsn_zip_bytes, _fsn_zip_url, _num, _su
 from test_edgar_source import EXCHANGE_LINE, KLX, KLX_25NSE, KLX_LINE, MISSING_LINE, SUBMISSIONS_URL
 from test_edgar_source import _payload as _index_payload
 
-from tradepartner.adapters import edgar_raw
+from tradepartner.adapters import edgar_raw, edgar_source
+from tradepartner.adapters.edgar import CoverPageParse
 from tradepartner.adapters.edgar_source import (
     COVER_VERSION,
     DELISTING_VERSION,
@@ -232,6 +235,68 @@ def test_a_lag_window_filing_absent_from_fsn_is_fetched_once_and_cached(tmp_path
     [again] = source.cover_pages(APPLE)
     assert again == page
     assert router.urls[before:] == []
+
+
+def test_a_lag_window_parse_carries_its_incomplete_listings_into_cache_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#612: a per-document parse's skipped listings (no title or exchange,
+    #609) are written to its cover cache entry and counted once on
+    `.cover_incomplete_listings`, as FSN's are on `.fsn_incomplete_listings`;
+    a cache hit (the `facts` pass, a later run) re-counts nothing."""
+    real_parse = edgar_source.parse_cover_page
+
+    def parse_with_two_skipped(
+        document: bytes, *, accession: str, accepted_at: datetime
+    ) -> CoverPageParse:
+        parsed = real_parse(document, accession=accession, accepted_at=accepted_at)
+        return dataclasses.replace(parsed, incomplete_listings=2)
+
+    monkeypatch.setattr(edgar_source, "parse_cover_page", parse_with_two_skipped)
+    settings = _settings(tmp_path)
+    router = _router()
+    accession = "0000320193-26-000050"
+    router.add(_download_url(APPLE, accession, "lagwin.htm"), _COVER_DOCUMENT)
+    source = _source(settings, router)
+    stamps = {accession: _record(accession, "10-K", INSIDE_LAG, primary_document="lagwin.htm")}
+    _seed_stamps(source, APPLE, stamps)
+    assert source.cover_incomplete_listings == 0
+    source.cover_pages(APPLE)
+    source.cover_pages(APPLE)  # served from the cache: not counted again
+    assert source.cover_incomplete_listings == 2
+    cache_path = (
+        Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{accession}.json"
+    )
+    assert json.loads(cache_path.read_text())["incomplete_listings"] == 2
+
+    later = _source(settings, router)  # a later run over the same cache
+    _seed_stamps(later, APPLE, stamps)
+    later.cover_pages(APPLE)
+    assert later.cover_incomplete_listings == 0
+
+
+def test_a_cover_cache_entry_written_before_612_still_loads(tmp_path: Path) -> None:
+    """#612 adds `incomplete_listings` to the cover cache entry without a
+    `COVER_VERSION` bump: an entry with no such key is still a cache hit."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _router())
+    _seed_stamps(source, APPLE, {APPLE_ACCESSION: _record(APPLE_ACCESSION, "10-K", APPLE_ACCEPTED)})
+    entry = {
+        "version": COVER_VERSION,
+        "accession": APPLE_ACCESSION,
+        "cik": APPLE,
+        "entity_cik": APPLE,
+        "listings": [["Old Title", "OLD", "NYSE"]],
+        "facts": [],
+    }
+    cache_path = (
+        Path(settings.edgar.cache_dir) / "cover" / f"v{COVER_VERSION}" / f"{APPLE_ACCESSION}.json"
+    )
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps(entry))
+    [page] = source.cover_pages(APPLE)
+    assert [item.ticker for item in page.listings] == ["OLD"]
+    assert source.cover_incomplete_listings == 0
 
 
 def test_an_older_accession_absent_from_fsn_is_not_fetched_and_is_counted(tmp_path: Path) -> None:
@@ -470,15 +535,19 @@ def test_an_sgml_header_is_served_at_the_submissions_acceptance(tmp_path: Path) 
     assert header.accepted_at == forged_stamp
 
 
-def test_a_header_naming_another_accession_raises(tmp_path: Path) -> None:
+def test_a_header_naming_another_accession_skips_and_records(tmp_path: Path) -> None:
+    """T11h: `_ranged_header`'s own accession-mismatch `ValueError` is one of
+    the failure policy's skipped-not-raised kinds, recorded on
+    `.failed_filings`, the run left `ok`."""
     settings = _settings(tmp_path)
     router = _router()
     accession = "0000320193-26-000080"
     router.add(_header_url(APPLE, accession), _synthetic_header("0000320193-26-999999"))
     source = _source(settings, router)
     _seed_stamps(source, APPLE, {accession: _record(accession, "10-K", INSIDE_LAG)})
-    with pytest.raises(ValueError, match="names accession"):
-        source.filing_headers(APPLE, ["10-K"])
+    headers = source.filing_headers(APPLE, ["10-K"])
+    assert accession not in {h.accession for h in headers}
+    assert source.failed_filings == 1
 
 
 def test_an_http_error_on_a_ranged_header_propagates(tmp_path: Path) -> None:
@@ -928,7 +997,9 @@ def test_an_http_error_on_a_delisting_document_propagates(tmp_path: Path) -> Non
         source.delistings()
 
 
-def test_a_delisting_parse_error_propagates(tmp_path: Path) -> None:
+def test_a_delisting_parse_error_skips_and_records(tmp_path: Path) -> None:
+    """T11h: a `parse_delisting` `ValueError` skips that accession, records
+    it and leaves the run `ok`, instead of raising."""
     accession = "0005555557-26-000001"
     line = index_line("25", "Bad Corp 2", 5555557, "2026-09-01", accession)
     router = _delisting_router(line)
@@ -939,8 +1010,9 @@ def test_a_delisting_parse_error_propagates(tmp_path: Path) -> None:
     )
     router.add(_download_url("0005555557", accession, "primary_doc.xml"), b"<not-a-delisting/>")
     source = _delisting_source(router, tmp_path)
-    with pytest.raises(ValueError, match="has no"):
-        source.delistings()
+    results = source.delistings()
+    assert accession not in {d.accession for d in results}
+    assert source.failed_filings == 1
 
 
 @pytest.mark.parametrize(
@@ -1134,6 +1206,40 @@ def test_an_fsn_only_month_end_after_acceptance_is_capped_at_the_eastern_date(
     assert record.value == 14_000_000_000.0 and record.accepted_at == accepted
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_shares_at_several_ddates_serve_the_latest_never_after_acceptance(
+    tmp_path: Path, reverse: bool
+) -> None:
+    """#609 F1, no look-ahead: an FSN-only 10-Q reporting the share count at
+    two ddates (the shape of 0001104659-26-008700) is served once, with the
+    latest ddate's value, dated no later than the filing's acceptance in New
+    York even though that month end (2026-03-31) falls after it."""
+    accession = "0000320193-26-000300"
+    rows = [
+        _num(accession, SHARES, "13900000000.0000", "20251231"),
+        _num(accession, SHARES, "14000000000.0000", "20260331"),
+    ]
+    zip_bytes = _fsn_zip_bytes(
+        [_sub(BLANK_SIC_ACCESSION, "320193", "8-K", sic=""), _sub(accession, "320193", "10-Q")],
+        rows[::-1] if reverse else rows,
+        [
+            _txt(BLANK_SIC_ACCESSION, "Security12bTitle", "Common Stock"),
+            _txt(BLANK_SIC_ACCESSION, "TradingSymbol", "AAPL"),
+            _txt(BLANK_SIC_ACCESSION, "SecurityExchangeName", "Nasdaq Stock Market LLC"),
+        ],
+        [],
+    )
+    router = _facts_router()
+    router.add(_fsn_zip_url("2026_03"), zip_bytes)
+    source = _source(_settings(tmp_path), router)
+    accepted = datetime(2026, 3, 21, 0, 30, tzinfo=UTC)  # 2026-03-20 in New York
+    _seed_apple(source, _record(accession, "10-Q", accepted))
+    [record] = [f for f in _shares(source, APPLE) if f.accession == accession]
+    assert record.value == 14_000_000_000.0
+    assert record.as_of_date <= accepted.astimezone(ZoneInfo("America/New_York")).date()
+    assert record.as_of_date == date(2026, 3, 20)
+
+
 def test_a_lag_window_accession_keeps_its_own_cover_date(tmp_path: Path) -> None:
     """An accession absent from FSN inside the lag window: its shares come from
     the per-document parse (the recorded Apple document, cover date
@@ -1199,10 +1305,10 @@ def test_an_unstamped_fsn_accession_shares_are_absent_then_present(tmp_path: Pat
     assert record.accession == APPLE_ACCESSION and record.accepted_at == APPLE_ACCEPTED
 
 
-def test_a_forged_collision_raises_and_serves_neither_value(tmp_path: Path) -> None:
-    """A per-document cache entry for the FSN-covered accession whose share
-    count differs from company facts: `facts` raises (T11f's policy replaces
-    this) rather than picking one."""
+def test_a_forged_collision_skips_that_key_and_records(tmp_path: Path) -> None:
+    """T11h: a per-document cache entry for the FSN-covered accession whose
+    share count differs from company facts withholds that key (skip, not
+    raise), records it and leaves the run `ok`."""
     settings = _settings(tmp_path)
     source = _source(settings, _facts_router())
     _seed_apple(source)
@@ -1219,8 +1325,75 @@ def test_a_forged_collision_raises_and_serves_neither_value(tmp_path: Path) -> N
     )
     cache_path.parent.mkdir(parents=True)
     cache_path.write_text(json.dumps(forged))
-    with pytest.raises(ValueError, match=APPLE_ACCESSION):
-        _shares(source, APPLE)
+    assert _shares(source, APPLE) == []
+    assert source.failed_filings == 1
+
+
+def test_a_forged_collision_withholds_only_that_class_serves_the_rest(tmp_path: Path) -> None:
+    """T11h: a collision on one (accession, fact name, class member) key
+    withholds only that key; the accession's other classes are still
+    served."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router())
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    forged = {
+        "version": COVER_VERSION,
+        "accession": ALPHABET_ACCESSION,
+        "cik": ALPHABET,
+        "entity_cik": ALPHABET,
+        "listings": [],
+        "facts": [
+            # the same source, same date, two values for CommonClassA: a collision
+            [SHARES, "2026-01-31", "CommonClassA", 1.0],
+            [SHARES, "2026-01-31", "CommonClassA", 2.0],
+            [SHARES, "2026-01-31", "CommonClassB", 837_000_000.0],
+            [SHARES, "2026-01-31", "CapitalClassC", 5_438_000_000.0],
+        ],
+    }
+    cache_path = (
+        Path(settings.edgar.cache_dir)
+        / "cover"
+        / f"v{COVER_VERSION}"
+        / f"{ALPHABET_ACCESSION}.json"
+    )
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps(forged))
+    records = _shares(source, ALPHABET)
+    assert {f.class_member: f.value for f in records} == {
+        "CommonClassB": 837_000_000.0,
+        "CapitalClassC": 5_438_000_000.0,
+    }
+    assert source.failed_filings == 1
+
+
+def test_a_company_facts_404_counts_missing_not_a_failure(tmp_path: Path) -> None:
+    """T11h/T11e's leftover: a company-facts 404 (an issuer with no XBRL
+    facts) is counted on `.facts_missing`, never `.failed_filings` or
+    `failed_filings.json`; the FSN share still stands (only the company-facts
+    source is missing), and the empty company-facts result is cached under
+    the facts key so a new cover-form accession refetches it."""
+    settings = _settings(tmp_path)
+    router = _facts_router(**{APPLE: 404})
+    source = _source(settings, router)
+    _seed_apple(source)
+    records = _shares(source, APPLE)
+    assert [r.accession for r in records] == [APPLE_ACCESSION]  # FSN's row still served
+    assert source.facts_missing == 1
+    assert source.failed_filings == 0
+    assert not (Path(settings.edgar.cache_dir) / "failed_filings.json").exists()
+    # cached: a second facts() call for the same CIK makes no new request
+    before = router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE))
+    assert _shares(source, APPLE) == records
+    assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == before
+    # a new cover-form accession changes the facts-cache key: refetches
+    _seed_apple(source, _record(APPLE_10Q, "10-Q", APPLE_10Q_ACCEPTED))
+    _shares(source, APPLE)
+    assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == before + 1
+    assert source.facts_missing == 2
 
 
 def test_a_second_facts_call_for_an_unchanged_cik_makes_no_request(tmp_path: Path) -> None:
@@ -1416,18 +1589,21 @@ def test_a_lag_window_cover_date_wins_over_a_differing_company_facts_end(tmp_pat
     assert [(f.as_of_date, f.value) for f in records] == [(date(2025, 10, 17), 14_776_353_000.0)]
 
 
-def test_a_same_date_disagreement_raises_even_when_another_value_matches(tmp_path: Path) -> None:
-    """Company facts {V1 on D1, V9 on D2} against FSN's V1 dated D2 (the FSN
-    share takes the latest company-facts end): the values on D2 differ, so
-    an overlapping value elsewhere does not excuse the clash."""
+def test_a_same_date_disagreement_skips_that_key_even_when_another_value_matches(
+    tmp_path: Path,
+) -> None:
+    """T11h: company facts {V1 on D1, V9 on D2} against FSN's V1 dated D2 (the
+    FSN share takes the latest company-facts end): the values on D2 differ,
+    so an overlapping value elsewhere does not excuse the clash; the key is
+    skipped and recorded instead of raising."""
     payload = _apple_entries(
         _entry(APPLE_ACCESSION, "2025-09-27", 14_776_353_000),
         _entry(APPLE_ACCESSION, "2025-10-17", 99),
     )
     source = _source(_settings(tmp_path), _facts_router(**{APPLE: payload}))
     _seed_apple(source)
-    with pytest.raises(ValueError, match="2025-10-17"):
-        _shares(source, APPLE)
+    assert _shares(source, APPLE) == []
+    assert source.failed_filings == 1
 
 
 def test_a_company_facts_end_after_acceptance_is_capped(tmp_path: Path) -> None:
@@ -1462,7 +1638,8 @@ def test_a_malformed_cik_is_refused_before_any_io(tmp_path: Path) -> None:
     assert router.urls == []
 
 
-def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
+def test_a_bulk_payload_for_another_cik_is_recorded_and_absent(tmp_path: Path) -> None:
+    """#578: still never served, now recorded for the gate instead of raised."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as bulk:
         bulk.write(FIXTURES / "company_facts_dual_class.json", f"CIK{APPLE}.json")
@@ -1476,8 +1653,292 @@ def test_a_bulk_payload_for_another_cik_raises(tmp_path: Path) -> None:
         ALPHABET,
         {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
     )
-    with pytest.raises(ValueError, match="served for"):
-        _shares(source, APPLE)
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "served for")
+
+
+def _assert_member_recorded_and_absent(
+    source: EdgarFilingSource, router: EdgarRouter, records: list[FactRecord], error: str
+) -> None:
+    """#578: Apple's zip member is recorded once on the validation collector
+    and is absent for the run: no company facts (FSN's share alone, dated
+    min(ddate, acceptance)), no per-CIK API call (its answer would likely
+    share the shape, #599) and no facts cache written."""
+    [failure] = source.validation_failures
+    assert (failure.input, failure.key) == ("companyfacts.zip member", f"CIK{APPLE}.json")
+    assert error in failure.error
+    assert COMPANY_FACTS_URL.format(cik=APPLE) not in router.urls
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    cache = Path(source._settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}"
+    assert not (cache / f"{APPLE}.json").exists()
+    assert (source.facts_bulk_empty, source.facts_bulk_keyless, source.facts_missing) == (0, 0, 0)
+    _shares(source, APPLE)  # asked again in the same run: memoised, not recorded twice
+    assert len(source.validation_failures) == 1
+
+
+# --- an empty or keyless companyfacts.zip member (#566) -------------------------
+
+
+def _bulk_zip_members(members: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        for cik, body in members.items():
+            bulk.writestr(f"CIK{cik}.json", body)
+    return buffer.getvalue()
+
+
+def _bulk_facts_source(
+    tmp_path: Path, zip_bytes: bytes, **api: object
+) -> tuple[EdgarFilingSource, EdgarRouter]:
+    """A source on the bulk path (threshold 1, two stale CIKs) with the
+    per-CIK API overridable per CIK (`_facts_router`)."""
+    settings = _settings(tmp_path, bulk_stamp_threshold_ciks=1)
+    router = _facts_router(**api)
+    router.add(BULK_FACTS_URL, zip_bytes)
+    source = _source(settings, router)
+    _seed_apple(source)
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    return source, router
+
+
+def test_an_empty_bulk_member_falls_back_to_the_api_and_a_404_is_missing(tmp_path: Path) -> None:
+    """#566: SEC's zip has `{}` members. One is treated as absent from the zip:
+    the per-CIK API is asked, and its 404 is the ordinary `facts_missing`
+    path, never "no facts" without asking."""
+    zip_bytes = _bulk_zip_members({APPLE: b"{}"})
+    source, router = _bulk_facts_source(tmp_path, zip_bytes, **{APPLE: 404})
+    records = _shares(source, APPLE)
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+    assert (source.facts_bulk_empty, source.facts_missing, source.failed_filings) == (1, 1, 0)
+    assert source.facts_api_empty == 0  # #576: a 404 is not an empty 200
+    # nothing from company facts: FSN's share alone, dated min(ddate, acceptance)
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+
+
+def test_an_empty_bulk_member_falls_back_to_the_api_and_a_200_is_used(tmp_path: Path) -> None:
+    """#566: the API's payload is served exactly as for a CIK the zip lacks."""
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}))
+    records = _shares(source, APPLE)
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+    assert (source.facts_bulk_empty, source.facts_missing) == (1, 0)
+    absent, _ = _bulk_facts_source(tmp_path / "absent", _bulk_zip_members({}))
+    assert records == _shares(absent, APPLE)
+    # company facts came from the API: dated by their `end`, not FSN's month end
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 17)]
+
+
+def test_a_good_bulk_member_is_unchanged_by_an_empty_neighbour(tmp_path: Path) -> None:
+    """#566, no look-ahead: a CIK with a good member is served from the zip
+    exactly as before, with no API call, whatever other members hold."""
+    good = json.dumps(_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 5.0))).encode()
+    alone, alone_router = _bulk_facts_source(tmp_path / "alone", _bulk_zip_members({APPLE: good}))
+    mixed, mixed_router = _bulk_facts_source(
+        tmp_path / "mixed", _bulk_zip_members({APPLE: good, ALPHABET: b"{}"})
+    )
+    assert _shares(mixed, APPLE) == _shares(alone, APPLE)
+    api = COMPANY_FACTS_URL.format(cik=APPLE)
+    assert api not in mixed_router.urls and api not in alone_router.urls
+    assert mixed.facts_bulk_empty == 0  # counted only when that CIK is asked for
+
+
+def test_a_bulk_member_that_is_not_json_is_recorded_and_absent(tmp_path: Path) -> None:
+    """Fail closed (#578): only an empty or `cik`-less object counts as
+    absent without a record; a member that is not JSON is recorded for the
+    gate, which fails the run before any store write."""
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"not json"}))
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "JSONDecodeError")
+
+
+def test_a_bulk_member_whose_facts_do_not_parse_is_recorded_and_absent(tmp_path: Path) -> None:
+    """#578: a member that holds the latest filing but whose entry
+    `parse_company_facts` refuses (an impossible `end`) is recorded under
+    the member, never cached, and the API is not asked."""
+    bad = json.dumps(_apple_entries(_entry(APPLE_ACCESSION, "2025-13-45", 5.0))).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: bad}))
+    records = _shares(source, APPLE)
+    _assert_member_recorded_and_absent(source, router, records, "ValueError")
+
+
+# --- a per-CIK companyfacts API 200 `{}` (#576) --------------------------------
+
+
+@pytest.mark.parametrize("bulk", [True, False], ids=["bulk-empty-member", "per-cik"])
+def test_an_empty_api_payload_is_missing_like_a_404_and_cached(tmp_path: Path, bulk: bool) -> None:
+    """#576: SEC's API answers 200 `{}` for the CIKs whose zip member is `{}`.
+    That is SEC's "no XBRL facts", handled exactly like a 404: missing,
+    counted, its empty result cached, and the run goes on."""
+    if bulk:
+        source, router = _bulk_facts_source(
+            tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: {}}
+        )
+        expected_bulk_empty = 1
+    else:
+        settings = _settings(tmp_path)
+        router = _facts_router(**{APPLE: {}})
+        source = _source(settings, router)
+        _seed_apple(source)
+        expected_bulk_empty = 0
+    records = _shares(source, APPLE)
+    counts = (source.facts_bulk_empty, source.facts_api_empty, source.facts_missing)
+    assert counts == (expected_bulk_empty, 1, 1)
+    assert source.failed_filings == 0
+    # exactly what a 404 gives: FSN's share alone, dated min(ddate, acceptance)
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    # cached: a later run on the same cache does not ask the API again
+    again = _source(source._settings, router)
+    assert _shares(again, APPLE) == records
+    assert router.urls.count(COMPANY_FACTS_URL.format(cik=APPLE)) == 1
+
+
+def _assert_api_recorded_and_absent(
+    source: EdgarFilingSource, records: list[FactRecord], error: str
+) -> None:
+    """#578 part 3: Apple's API payload is recorded once and is absent for
+    the run: no company facts (FSN's share alone), nothing cached, and not
+    counted as empty, keyless or missing."""
+    [failure] = source.validation_failures
+    assert (failure.input, failure.key) == ("companyfacts API", f"CIK{APPLE}.json")
+    assert error in failure.error
+    assert [r.as_of_date for r in records if r.accession == APPLE_ACCESSION] == [date(2025, 10, 31)]
+    cache = Path(source._settings.edgar.cache_dir) / "facts" / f"v{PARSER_VERSION}"
+    assert not (cache / f"{APPLE}.json").exists()
+    counts = (source.facts_api_empty, source.facts_api_keyless, source.facts_missing)
+    assert counts == (0, 0, 0)
+    _shares(source, APPLE)  # memoised: asked and recorded once per run
+    assert len(source.validation_failures) == 1
+
+
+def test_a_non_empty_api_payload_without_facts_is_recorded(tmp_path: Path) -> None:
+    """Fail closed (#576, #599, #578): only an empty object is "no facts",
+    and only a payload with `facts` is identified by its requested CIK; a
+    non-empty payload missing `facts` is recorded for the gate."""
+    payload = {"cik": 320193}
+    source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: payload})
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "KeyError")
+
+
+def test_an_api_payload_that_is_not_an_object_is_recorded(tmp_path: Path) -> None:
+    """Fail closed (#576, #578): an empty list is not an empty object."""
+    source, _ = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: b"{}"}), **{APPLE: b"[]"})
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "TypeError")
+
+
+def test_an_api_payload_for_another_cik_is_recorded(tmp_path: Path) -> None:
+    """#578 part 3: another CIK's facts are never served; recorded, not raised."""
+    settings = _settings(tmp_path)
+    router = _facts_router(**{APPLE: load("company_facts_dual_class.json")})
+    source = _source(settings, router)
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "served for")
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (b"<html>busy</html>", "JSONDecodeError"),
+        (b'{"cik": 320193, "facts": []}', "ValueError: company facts: malformed"),
+    ],
+    ids=["not-json", "facts-a-list"],
+)
+def test_an_api_body_that_is_not_json_or_has_the_wrong_shape_is_recorded(
+    tmp_path: Path, body: bytes, error: str
+) -> None:
+    """Reviewers on #881: a non-JSON body and a `facts` list (an
+    `AttributeError` in `_holds_accession`) are recorded, never a crash."""
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router(**{APPLE: body}))
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), error)
+
+
+def test_an_api_payload_whose_facts_do_not_parse_is_recorded(tmp_path: Path) -> None:
+    """#578 part 3: `parse_company_facts` refusing an API payload (an
+    impossible `end`) is recorded under the API, never cached."""
+    bad = _apple_entries(_entry(APPLE_ACCESSION, "2025-13-45", 5.0))
+    settings = _settings(tmp_path)
+    source = _source(settings, _facts_router(**{APPLE: bad}))
+    _seed_apple(source)
+    _assert_api_recorded_and_absent(source, _shares(source, APPLE), "ValueError")
+
+
+# --- a keyless companyfacts payload with facts (#599) --------------------------
+
+
+def _keyless_apple_entries(*entries: dict[str, object]) -> dict[str, object]:
+    """`_apple_entries`, with no `cik` field (SEC ships this shape for a
+    handful of CIKs, identically from the zip and the API, #599)."""
+    return {"entityName": "x", "facts": {"dei": {SHARES: {"units": {"shares": list(entries)}}}}}
+
+
+def test_a_keyless_bulk_member_with_facts_is_used_for_its_cik(tmp_path: Path) -> None:
+    """#599: a zip member with `entityName`/`facts` and no `cik` is served
+    under the CIK it was requested under (the zip member name), counted on
+    `facts_bulk_keyless`, and never asked of the API since it already holds
+    the latest accession."""
+    member = json.dumps(
+        _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    ).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: member}))
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert (record.cik, record.value, record.as_of_date) == (
+        APPLE,
+        14_776_353_000.0,
+        date(2025, 10, 17),
+    )
+    assert source.facts_bulk_keyless == 1
+    assert source.facts_bulk_empty == 0
+    assert COMPANY_FACTS_URL.format(cik=APPLE) not in router.urls
+
+
+def test_a_keyless_api_payload_with_facts_is_used_for_its_cik(tmp_path: Path) -> None:
+    """#599: the same shape from the per-CIK API (the zip has no member for
+    the CIK), identified by the API URL it was requested under and counted
+    on `facts_api_keyless`."""
+    payload = _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({}), **{APPLE: payload})
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert (record.cik, record.value, record.as_of_date) == (
+        APPLE,
+        14_776_353_000.0,
+        date(2025, 10, 17),
+    )
+    assert source.facts_api_keyless == 1
+    assert source.facts_api_empty == 0
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+
+
+def test_a_keyless_bulk_member_incomplete_falls_back_to_the_api(tmp_path: Path) -> None:
+    """A keyless bulk member that does not yet hold the latest accession (the
+    zip trails the day's filings, as for a normal member) still falls back to
+    the per-CIK API, which here answers with the same keyless shape."""
+    bulk_member = json.dumps(_keyless_apple_entries()).encode()  # holds nothing yet
+    payload = _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    source, router = _bulk_facts_source(
+        tmp_path, _bulk_zip_members({APPLE: bulk_member}), **{APPLE: payload}
+    )
+    [record] = [f for f in _shares(source, APPLE) if f.accession == APPLE_ACCESSION]
+    assert record.cik == APPLE
+    assert (source.facts_bulk_keyless, source.facts_api_keyless) == (1, 1)
+    assert COMPANY_FACTS_URL.format(cik=APPLE) in router.urls
+
+
+def test_a_keyless_payload_is_cached_under_the_requested_cik(tmp_path: Path) -> None:
+    """The facts cache written for a keyless bulk payload is keyed and
+    readable by the requested CIK: a second source over the same cache
+    directory serves the same records without reading the zip again."""
+    member = json.dumps(
+        _keyless_apple_entries(_entry(APPLE_ACCESSION, "2025-10-17", 14_776_353_000))
+    ).encode()
+    source, router = _bulk_facts_source(tmp_path, _bulk_zip_members({APPLE: member}))
+    records = _shares(source, APPLE)
+    again = _source(source._settings, _facts_router())
+    assert _shares(again, APPLE) == records
+    assert router.urls.count(BULK_FACTS_URL) == 1
 
 
 # --- review fixes (#262) -----------------------------------------------------
@@ -1562,3 +2023,48 @@ def test_a_pre_xml_form_25_under_two_ciks_is_counted_once(tmp_path: Path) -> Non
     source = _delisting_source(router, tmp_path)
     source.delistings()
     assert source.pre_xml_delistings == 1
+
+
+def _bulk_zip(*ciks: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        for cik in ciks:
+            bulk.writestr(f"CIK{cik}.json", json.dumps(_apple_entries()))
+    return buffer.getvalue()
+
+
+def _bulk_source(tmp_path: Path, zip_bytes: bytes) -> tuple[EdgarFilingSource, EdgarRouter]:
+    settings = _settings(tmp_path, bulk_stamp_threshold_ciks=1)
+    router = _facts_router(**{APPLE: 404})
+    router.add(BULK_FACTS_URL, zip_bytes)
+    source = _source(settings, router)
+    _seed_apple(source)
+    _seed_stamps(
+        source,
+        ALPHABET,
+        {ALPHABET_ACCESSION: _record(ALPHABET_ACCESSION, "10-K", ALPHABET_ACCEPTED)},
+    )
+    return source, router
+
+
+def test_a_cik_absent_from_the_bulk_zip_and_404_counts_missing(tmp_path: Path) -> None:
+    """Plan T11h: a CIK absent from `companyfacts.zip` (then 404 from the API)
+    is counted on `.facts_missing`, not a filing failure."""
+    source, _router = _bulk_source(tmp_path, _bulk_zip(ALPHABET))
+    _shares(source, APPLE)
+    assert (source.facts_missing, source.failed_filings) == (1, 0)
+
+
+def test_a_bulk_payload_is_kept_when_the_api_404s(tmp_path: Path) -> None:
+    """The zip holds the CIK but trails its latest filing and the API 404s:
+    the zip's facts are served, not replaced by an empty cached result, and
+    the result is not cached as complete, so the next run asks again."""
+    source, router = _bulk_source(tmp_path, _bulk_zip(APPLE))
+    first = _shares(source, APPLE)
+    assert source.facts_missing == 0
+    assert any(f.accession == APPLE_ACCESSION for f in first)
+    api = COMPANY_FACTS_URL.format(cik=APPLE)
+    before = router.urls.count(api)
+    fresh = _source(source._settings, router)
+    _shares(fresh, APPLE)
+    assert router.urls.count(api) == before + 1  # not cached as complete

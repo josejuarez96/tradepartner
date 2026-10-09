@@ -21,10 +21,12 @@ import polars as pl
 import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 
+from tradepartner.adapters.alpaca_prices import ListingResolver, registrant_evidence
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
     CoverPage,
+    DelistingFiling,
     FilingIndexEntry,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
@@ -32,8 +34,15 @@ from tradepartner.config import Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import configure_connection
+from tradepartner.store.delistings import DELISTED, LISTED, build_delistings, derive_listing_ends
 from tradepartner.store.master import (
+    BENCHMARK_PREFIX,
+    INSTRUMENT_ID_SEPARATOR,
+    ClassTitle,
     MasterBuild,
+    ShownSpan,
+    Succession,
+    _refuse_separator,
     build_master,
     primary_security_id,
     securities_as_of,
@@ -57,6 +66,7 @@ PREF = "0000000011"  # earliest cover page lists the preferred before the common
 MULTI = "0000000012"  # one class listed on two exchanges
 EARLY = "0000000013"  # snapshot fetched before a cover page that changes the ticker
 BANK = "0000000014"  # two depositary series with titles equal up to the comma
+REORG = "0000000015"  # Form 25 on a redomicile, then the same pair on a later cover page
 EARLY_FETCH = datetime(2018, 6, 1, 14, 0, tzinfo=UTC)
 SPY_TRUST = "0000884394"
 ISHARES = "0001100663"
@@ -80,6 +90,12 @@ def _cover(cik: str, accepted_at: datetime, *listings: tuple[str, str, str]) -> 
         accepted_at,
         tuple(CoverListing(title, ticker, exchange) for title, ticker, exchange in listings),
     )
+
+
+def _form25(
+    cik: str, title: str, exchange: str, accepted_at: datetime, form: str = "25-NSE"
+) -> DelistingFiling:
+    return DelistingFiling(cik, form, title, exchange, f"{cik}-{next(_counter):06d}", accepted_at)
 
 
 def _snap(
@@ -110,6 +126,7 @@ def _source() -> FixtureFilingSource:
             _filing(MULTI, "Multi Corp", "10-K", _at(2018, 2, 5)),
             _filing(EARLY, "Early Corp", "10-K", _at(2017, 3, 1)),
             _filing(BANK, "Bank Corp", "10-K", _at(2018, 2, 6)),
+            _filing(REORG, "Reorg Ltd", "10-K", _at(2018, 2, 7)),
         ],
         cover_pages=[
             _cover(TICK, _at(2019, 3, 1), ("Common Stock, par value $0.01", "TCKA", "NYSE")),
@@ -170,7 +187,12 @@ def _source() -> FixtureFilingSource:
                 ("Depositary Shares, each 1/1000th of a Series B Preferred", "BK-PB", "NYSE"),
                 ("Depositary Shares, each 1/1000th of a Series A Preferred", "BK-PA", "NYSE"),
             ),
+            _cover(REORG, _at(2019, 8, 9), ("Ordinary Shares, par value 0.01", "RORG", "NASDAQ")),
+            _cover(
+                REORG, _at(2019, 12, 16), ("Ordinary Shares, nominal value 0.01", "RORG", "NASDAQ")
+            ),
         ],
+        delistings=[_form25(REORG, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))],
         snapshot=[
             _snap(ACME, "ACME CORP", "ACME", "NYSE"),
             _snap(TICK, "TICK CO", "TCKB", "NYSE"),
@@ -446,6 +468,116 @@ class TestBenchmarks:
         assert ISHARES not in ids
 
 
+#: The fixture master's ids, pinned byte-identical: ADR 0015 seam 6 reserves
+#: the instrument-id namespace but changes no bytes (T138).
+_FIXTURE_SECURITY_IDS = (
+    "0000000001",
+    "0000000003",
+    "0000000004",
+    "0000000005",
+    "0000000006",
+    "0000000007",
+    "0000000007:class-c-capital-stock",
+    "0000000007:6pct-preferred-stock",
+    "0000000008",
+    "0000000009",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000011",
+    "0000000011:depositary-shares",
+    "0000000012",
+    "0000000013",
+    "0000000014",
+    "0000000014:depositary-shares",
+    "0000000014:depositary-shares-2",
+    "0000000015",
+    "BENCH:SPY",
+    "BENCH:MTUM",
+)
+_FIXTURE_LISTING_IDS = (
+    "0000000001",
+    "0000000004",
+    "0000000004",
+    "0000000005",
+    "0000000006",
+    "0000000007",
+    "0000000007:class-c-capital-stock",
+    "0000000007:6pct-preferred-stock",
+    "0000000007",
+    "0000000008",
+    "0000000009",
+    "0000000009",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000010",
+    "0000000010:class-b-common-stock",
+    "0000000011",
+    "0000000011:depositary-shares",
+    "0000000012",
+    "0000000012",
+    "0000000013",
+    "0000000013",
+    "0000000014",
+    "0000000014:depositary-shares",
+    "0000000014:depositary-shares-2",
+    "0000000015",
+    "0000000015",
+    "BENCH:SPY",
+    "BENCH:MTUM",
+)
+
+
+class TestInstrumentIdRule:
+    """ADR 0015 seam 6: every `security_id` is read as an *instrument id*; a
+    typed id carries a prefix and the separator (`BENCH:` today, the only
+    prefixed ids the master writes), and the master's own derivation can
+    never mint one. A derived class id's one `:` is its class separator,
+    whose token before it is a CIK, never an instrument type."""
+
+    def test_fixture_ids_are_byte_identical(self, built: MasterBuild) -> None:
+        assert tuple(row["security_id"] for row in built.securities) == _FIXTURE_SECURITY_IDS
+        assert tuple(row["security_id"] for row in built.listings) == _FIXTURE_LISTING_IDS
+
+    def test_no_derived_id_carries_an_instrument_type_prefix(self, built: MasterBuild) -> None:
+        ciks = {row["cik"] for row in built.securities if not row["benchmark"]}
+        derived = [row["security_id"] for row in built.securities if not row["benchmark"]]
+        assert derived
+        for security_id in derived:
+            prefix = security_id.partition(INSTRUMENT_ID_SEPARATOR)[0]
+            assert prefix in ciks, security_id
+
+    def test_primary_ids_carry_no_separator(self, built: MasterBuild) -> None:
+        ciks = {row["cik"] for row in built.securities if not row["benchmark"]}
+        assert all(INSTRUMENT_ID_SEPARATOR not in primary_security_id(cik) for cik in ciks)
+
+    def test_equity_derived_ids_carry_no_separator(self) -> None:
+        # A master whose only classes are the CIKs themselves: every id it
+        # derives for a share is a CIK, with no separator (the benchmarks are
+        # the only prefixed ids, checked separately).
+        source = FixtureFilingSource(
+            index=[_filing(ACME, "Acme Corp", "10-K", _at(2005, 3, 1))],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        equity_ids = [row["security_id"] for row in build.securities if not row["benchmark"]]
+        assert equity_ids == [ACME]
+        assert all(INSTRUMENT_ID_SEPARATOR not in sid for sid in equity_ids)
+
+    def test_every_benchmark_id_starts_with_the_prefix(self, built: MasterBuild) -> None:
+        benchmarks = [row["security_id"] for row in built.securities if row["benchmark"]]
+        assert benchmarks
+        prefix = f"{BENCHMARK_PREFIX}{INSTRUMENT_ID_SEPARATOR}"
+        assert all(security_id.startswith(prefix) for security_id in benchmarks)
+
+    def test_a_cik_holding_the_separator_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="separator"):
+            primary_security_id(f"{ACME}{INSTRUMENT_ID_SEPARATOR}x")
+
+    def test_a_base_holding_the_separator_is_refused(self) -> None:
+        base = f"{ACME}@2020-11-05{INSTRUMENT_ID_SEPARATOR}x"
+        with pytest.raises(ValueError, match="separator"):
+            _refuse_separator(base, "base")
+
+
 class TestWriteAndRead:
     def test_known_at_after_ingested_at_raises(self) -> None:
         with pytest.raises(ValueError, match="ingested_at"):
@@ -495,3 +627,997 @@ class TestNoLookAhead:
             for read in (securities_as_of, listings_as_of):
                 assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
             partial.close()
+
+
+class TestClassTitles:
+    """#1166: a later cover page that retitles a class under the same pair
+    adds no listing row, but its title is kept, known at that page."""
+
+    CIK = "0000000077"
+
+    def _source(self) -> FixtureFilingSource:
+        return FixtureFilingSource(
+            index=[_filing(self.CIK, "Beer Co", "10-K", _at(2018, 2, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2019, 7, 25), ("Common Stock", "SAM", "NYSE")),
+                _cover(self.CIK, _at(2019, 10, 24), ("Class A Common Stock", "SAM", "NYSE")),
+                _cover(self.CIK, _at(2020, 2, 20), ("Class A Common Stock", "SAM", "NYSE")),
+            ],
+        )
+
+    def test_a_retitled_class_keeps_each_title_at_its_first_page(self) -> None:
+        build = build_master(self._source(), _settings(), ingested_at=INGESTED_AT)
+        assert [r["class_title"] for r in build.listings] == ["Common Stock"]
+        assert build.class_titles == (
+            ClassTitle(self.CIK, "Common Stock", _at(2019, 7, 25)),
+            ClassTitle(self.CIK, "Class A Common Stock", _at(2019, 10, 24)),
+        )
+
+    def test_titles_built_from_pages_known_at_t_agree(self) -> None:
+        source = self._source()
+        full = build_master(source, _settings(), ingested_at=INGESTED_AT).class_titles
+        for t in sorted(k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)):
+            partial = build_master(source.known_by(t), _settings(), ingested_at=INGESTED_AT)
+            assert partial.class_titles == tuple(c for c in full if c.known_at <= t), f"T={t!r}"
+
+
+class TestShownSpans:
+    """#1165: each run of consecutive cover pages showing a class, so a
+    reader can tell whether a class was shown after another first appeared."""
+
+    CIK = "0000000078"
+    NEW = f"{CIK}:common-stock"
+
+    def _source(self) -> FixtureFilingSource:
+        spac = ("Class A ordinary shares", "SPAC", "NYSE")
+        new = ("Common Stock", "NEWC", "NYSE")
+        return FixtureFilingSource(
+            index=[_filing(self.CIK, "Spac Co", "10-K", _at(2019, 2, 1))],
+            cover_pages=[
+                _cover(self.CIK, _at(2019, 3, 1), spac),
+                _cover(self.CIK, _at(2019, 5, 1), spac),
+                _cover(self.CIK, _at(2019, 8, 1)),  # lists nothing: no break
+                _cover(self.CIK, _at(2019, 11, 1), spac),
+                _cover(self.CIK, _at(2020, 5, 1), new),  # the de-SPAC
+                _cover(self.CIK, _at(2020, 8, 1), new),
+                _cover(self.CIK, _at(2020, 11, 1), spac, new),  # shown again
+            ],
+        )
+
+    def test_spans_run_over_consecutive_pages_showing_the_class(self) -> None:
+        build = build_master(self._source(), _settings(), ingested_at=INGESTED_AT)
+        assert sorted(build.shown, key=lambda s: (s.security_id, s.first_at)) == [
+            ShownSpan(self.CIK, _at(2019, 3, 1), _at(2019, 11, 1)),
+            ShownSpan(self.CIK, _at(2020, 11, 1), _at(2020, 11, 1)),
+            ShownSpan(self.NEW, _at(2020, 5, 1), _at(2020, 11, 1)),
+        ]
+
+    def test_spans_built_from_pages_known_at_t_agree(self) -> None:
+        # No look-ahead: the spans known at t are the full build's spans
+        # cut at t (a span ending later ends at the last page known at t).
+        source = self._source()
+        full = build_master(source, _settings(), ingested_at=INGESTED_AT).shown
+        ticker = {self.CIK: "SPAC", self.NEW: "NEWC"}
+        pages = {
+            sid: [p.accepted_at for p in source.cover_pages(self.CIK) if tk in str(p.listings)]
+            for sid, tk in ticker.items()
+        }
+        for t in sorted(k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)):
+            partial = build_master(source.known_by(t), _settings(), ingested_at=INGESTED_AT)
+            cut = {
+                ShownSpan(
+                    s.security_id,
+                    s.first_at,
+                    max(p for p in pages[s.security_id] if p <= min(s.last_at, t)),
+                )
+                for s in full
+                if s.first_at <= t
+            }
+            assert set(partial.shown) == cut, f"T={t!r}"
+
+
+class TestDuplicatePairPerPage:
+    """#687: a cover page that lists one class's (ticker, exchange) pair
+    under two titles (a filer's duplicate) must build and insert exactly
+    one `listings` row for that pair, not two rows that collide on the
+    store's UNIQUE (security_id, ticker, exchange, valid_from, known_at)
+    key. Real shapes: Honda (CIK 0000864270) 10-Q accepted 2021-11-09, two
+    0.750% medium-term notes both tagged HMC/26A; Moatable (CIK 0001509223)
+    10-Q accepted 2023-08-14, Class A ordinary shares and their ADS both
+    retickered to MTBL."""
+
+    NOTES_CIK = "0000900001"
+    ADS_CIK = "0000900002"
+
+    def _keys(self, build: MasterBuild) -> list[tuple[object, ...]]:
+        return [
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"], row["known_at"])
+            for row in build.listings
+        ]
+
+    def test_two_notes_typo_the_same_ticker_on_one_page(self) -> None:
+        # The 0.750% Nov-2026 note is new on the bug page (first time this
+        # class shows any pair at all): its pair is not yet in `cls.pairs`,
+        # so the typo'd Jan-2024 note matching the same class and the same
+        # (ticker, exchange) is the within-page duplicate #687 is about.
+        cik = self.NOTES_CIK
+        source = FixtureFilingSource(
+            index=[_filing(cik, "Honda-like Co", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(
+                    cik,
+                    _at(2021, 3, 1),
+                    ("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                ),
+                _cover(
+                    cik,
+                    datetime(2021, 11, 9, 17, 59, 52, tzinfo=UTC),
+                    ("Common Stock, par value $0.50 per share", "HMC", "NYSE"),
+                    (
+                        "0.750% Medium-Term Notes, Series ADue November 25, 2026",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    (
+                        "0.750% Medium-Term Notes, Series ADue January 17, 2024",
+                        "HMC/26A",
+                        "NYSE",
+                    ),
+                    (
+                        "1.100% Medium-Term Notes, Series BDue October 1, 2025",
+                        "HMC/25B",
+                        "NYSE",
+                    ),
+                ),
+            ],
+        )
+        ingested_at = datetime(2021, 11, 10, tzinfo=UTC)
+        build = build_master(source, _settings(), ingested_at=ingested_at)
+        keys = self._keys(build)
+        assert len(keys) == len(set(keys))
+        conn = _new_store()
+        write_master(conn, build)  # must not raise duckdb.ConstraintException
+        conn.close()
+
+    def test_ads_and_underlying_typo_the_same_ticker_on_one_page(self) -> None:
+        cik = self.ADS_CIK
+        ads_title = "American depositary shares, each representing 45 Class A ordinary shares"
+        class_a_title = "Class A ordinary shares, par value $0.001 per share*"
+        source = FixtureFilingSource(
+            index=[_filing(cik, "Moatable-like Inc", "10-K", _at(2015, 3, 1))],
+            cover_pages=[
+                _cover(cik, _at(2020, 3, 1), (ads_title, "RENN", "NYSE")),
+                _cover(
+                    cik,
+                    _at(2023, 3, 31),
+                    (class_a_title, "RENN", "NYSE"),
+                    (ads_title, "RENN", "NYSE"),
+                ),
+                _cover(
+                    cik,
+                    datetime(2023, 8, 14, 20, 56, 14, tzinfo=UTC),
+                    (class_a_title, "MTBL", "NYSE"),
+                    (ads_title, "MTBL", "NYSE"),
+                ),
+            ],
+        )
+        ingested_at = datetime(2023, 8, 15, tzinfo=UTC)
+        build = build_master(source, _settings(), ingested_at=ingested_at)
+        keys = self._keys(build)
+        assert len(keys) == len(set(keys))
+        mtbl_rows = [row for row in build.listings if row["ticker"] == "MTBL"]
+        assert len(mtbl_rows) == 1
+        assert mtbl_rows[0]["class_title"] == class_a_title
+        assert mtbl_rows[0]["security_id"] == primary_security_id(cik)
+        conn = _new_store()
+        write_master(conn, build)  # must not raise duckdb.ConstraintException
+        conn.close()
+
+
+class TestRelistingAfterForm25:
+    """#820 (spec req 4): a cover page accepted after a Form 25 that still
+    names the same (ticker, exchange) for the class opens a new listing row
+    from its own session, `known_at` = that cover page's acceptance. Real
+    shapes: CMPR redomicile (Form 25 2019-12-03), KIM holding-company
+    reorganisation (2023-01-03), CRC new equity after bankruptcy (Form 25
+    2020-07-31, trading again 2020-10-28)."""
+
+    CIK = "0000900003"
+    ORD = "Ordinary Shares, par value 0.01"
+
+    def _build(
+        self,
+        covers: list[CoverPage],
+        filings: list[DelistingFiling],
+        *,
+        cik: str = CIK,
+        registered: tuple[datetime, ...] = (),
+    ) -> MasterBuild:
+        source = FixtureFilingSource(
+            index=[
+                _filing(cik, "Relist Co", "10-K", _at(2018, 3, 1)),
+                *(_filing(cik, "Relist Co", "8-A12B", at) for at in registered),
+            ],
+            cover_pages=covers,
+            delistings=filings,
+        )
+        return build_master(source, _settings(), ingested_at=INGESTED_AT)
+
+    def _rows(self, build: MasterBuild) -> list[tuple[object, ...]]:
+        return sorted(
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"], row["known_at"])
+            for row in build.listings
+        )
+
+    def test_redomicile_opens_a_row_at_the_next_cover_page(self) -> None:
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 16), ("Ordinary Shares, nominal value", "RLC", "NASDAQ")),
+            ],
+            [_form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))],
+        )
+        assert self._rows(build) == [
+            (cik, "RLC", "NASDAQ", date(2019, 8, 9), _at(2019, 8, 9)),
+            (cik, "RLC", "NASDAQ", date(2019, 12, 16), _at(2019, 12, 16)),
+        ]
+        assert [row["provenance"] for row in build.listings] == ["filing", "filing"]
+
+    def test_without_a_form_25_a_repeated_pair_adds_no_row(self) -> None:
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 16), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [],
+        )
+        assert len(build.listings) == 1
+
+    def test_a_cover_page_before_the_form_25_adds_no_row(self) -> None:
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 2), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [_form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))],
+        )
+        assert len(build.listings) == 1
+
+    def test_a_cover_page_before_the_delisting_takes_effect_relists_nothing(self) -> None:
+        # code-review on #826: an acquisition target's 10-K filed between its
+        # Form 25 and the effective day still names the pair; the shares are
+        # still trading, so it opens no row, and the Form 25 ends the listing.
+        cik = self.CIK
+        filing = _form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 6), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [filing],
+        )
+        assert [row["valid_from"] for row in build.listings] == [date(2019, 8, 9)]
+        delistings = build_delistings([filing], build, ingested_at=INGESTED_AT)
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik], "session": [date(2019, 12, 12)]}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("status", "end_session").rows() == [(DELISTED, date(2019, 12, 12))]
+
+    def test_the_first_cover_page_after_the_effective_day_relists(self) -> None:
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 6), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2020, 1, 29), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [_form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3))],
+        )
+        assert self._rows(build)[-1] == (cik, "RLC", "NASDAQ", date(2020, 1, 29), _at(2020, 1, 29))
+
+    def test_form_25_on_the_preferred_leaves_the_common_alone(self) -> None:
+        cik = self.CIK
+        pref = ("6% Series A Preferred Stock", "RLC-PA", "NYSE")
+        common = ("Common Stock", "RLC", "NYSE")
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 3, 1), common, pref),
+                _cover(cik, _at(2020, 3, 2), common),
+            ],
+            [_form25(cik, "6% Series A Preferred Stock", "NYSE", _at(2019, 12, 3))],
+        )
+        assert [row["ticker"] for row in build.listings] == ["RLC", "RLC-PA"]
+
+    def test_plain_common_form_25_reaches_a_differently_worded_class(self) -> None:
+        # KIM: "(OLD) Kimco Realty Corporation Common Stock, 5.125% Class L
+        # Preferred ..." names no class title; it is plain common up to the
+        # comma, and the common is the one common-only class on the exchange.
+        cik = self.CIK
+        common = ("Common Stock", "RLC", "NYSE")
+        pref = ("5.125% Class L Cumulative Redeemable, Preferred Stock", "RLCprL", "NYSE")
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 7, 26), common, pref),
+                _cover(cik, _at(2023, 2, 2), common, pref),
+            ],
+            [
+                _form25(
+                    cik,
+                    "(OLD) Relist Co Common Stock, 5.125% Class L Preferred Stock",
+                    "NYSE",
+                    _at(2023, 1, 3),
+                )
+            ],
+        )
+        relisted = [row for row in build.listings if row["known_at"] == _at(2023, 2, 2)]
+        assert [(row["security_id"], row["ticker"]) for row in relisted] == [(cik, "RLC")]
+
+    def test_a_compound_title_form_25_rearms_the_common_class(self) -> None:
+        # #1163: master resolves a "Common stock and warrants" Form 25 as
+        # `store.delistings` does, so the next cover page still relists.
+        cik = self.CIK
+        common = ("Common Stock, par value $0.0001", "RLC", "NASDAQ")
+        warrant = ("Warrants, each exercisable for one share", "RLCW", "NASDAQ")
+        build = self._build(
+            [_cover(cik, _at(2019, 8, 9), common, warrant), _cover(cik, _at(2020, 1, 29), common)],
+            [_form25(cik, "Common stock and warrants", "NASDAQ", _at(2019, 12, 3))],
+        )
+        relisted = [row for row in build.listings if row["known_at"] == _at(2020, 1, 29)]
+        assert [(row["security_id"], row["ticker"]) for row in relisted] == [(cik, "RLC")]
+
+    def test_a_form_25_naming_two_classes_rearms_both(self) -> None:
+        cik = self.CIK
+        a = ("Class A Common Stock", "RLCA", "NASDAQ")
+        b = ("Class B Common Stock", "RLCB", "NASDAQ")
+        build = self._build(
+            [_cover(cik, _at(2019, 8, 9), a, b), _cover(cik, _at(2020, 1, 29), a, b)],
+            [
+                _form25(
+                    cik,
+                    "Class A Common Stock and Class B Common Stock",
+                    "NASDAQ",
+                    _at(2019, 12, 3),
+                )
+            ],
+        )
+        relisted = [row["ticker"] for row in build.listings if row["known_at"] == _at(2020, 1, 29)]
+        assert sorted(relisted) == ["RLCA", "RLCB"]
+
+    def test_an_amendment_after_the_relisting_opens_no_second_row(self) -> None:
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 9), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2019, 12, 16), (self.ORD, "RLC", "NASDAQ")),
+                _cover(cik, _at(2020, 3, 2), (self.ORD, "RLC", "NASDAQ")),
+            ],
+            [
+                _form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3)),
+                _form25(cik, "Ordinary Shares", "NASDAQ", _at(2020, 1, 6), form="25-NSE/A"),
+            ],
+        )
+        assert [row["valid_from"] for row in build.listings] == [
+            date(2019, 8, 9),
+            date(2019, 12, 16),
+        ]
+        # Read side (code-review on #826): the late amendment never ends the
+        # relisting row it postdates.
+        filings = [
+            _form25(cik, "Ordinary Shares", "NASDAQ", _at(2019, 12, 3)),
+            _form25(cik, "Ordinary Shares", "NASDAQ", _at(2020, 1, 6), form="25-NSE/A"),
+        ]
+        delistings = build_delistings(filings, build, ingested_at=INGESTED_AT)
+        # The relisting trades after the Form 25's effective day (12-13): a
+        # real relisting, which the #1163 Form 25 close leaves listed.
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame(
+                {"security_id": [cik, cik], "session": [date(2019, 12, 13), date(2019, 12, 17)]}
+            ),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("valid_from", "status").rows() == [
+            (date(2019, 8, 9), DELISTED),
+            (date(2019, 12, 16), LISTED),
+        ]
+
+    def test_an_amendment_alone_still_counts(self) -> None:
+        # CG's only stored filing is a 25-NSE/A (original missing).
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 7, 31), ("Common units", "RLC", "NASDAQ")),
+                _cover(cik, _at(2020, 2, 3), ("Common Stock", "RLC", "NASDAQ")),
+            ],
+            [_form25(cik, "Common units", "NASDAQ", _at(2020, 1, 3), form="25-NSE/A")],
+        )
+        assert [row["valid_from"] for row in build.listings] == [
+            date(2019, 7, 31),
+            date(2020, 2, 3),
+        ]
+
+    def test_relisting_after_a_gap_without_a_registration_keeps_the_security(self) -> None:
+        # A Form 25, a cover page with nothing listed, then the same ticker
+        # again with no 8-A12B: a relisting of the same security.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "RLC", "NYSE")),
+                _cover(cik, _at(2020, 8, 10)),
+                _cover(cik, _at(2020, 11, 5), ("Common Stock, par value $0.01", "RLC", "NYSE")),
+            ],
+            [_form25(cik, "Common Stock", "NYSE", _at(2020, 7, 31))],
+        )
+        assert self._rows(build) == [
+            (cik, "RLC", "NYSE", date(2019, 8, 1), _at(2019, 8, 1)),
+            (cik, "RLC", "NYSE", date(2020, 11, 5), _at(2020, 11, 5)),
+        ]
+        # Read side (spec req 4): the old listing is delisted and ends at its
+        # last bar before the gap; the new one is listed.
+        filings = [_form25(cik, "Common Stock", "NYSE", _at(2020, 7, 31))]
+        delistings = build_delistings(filings, build, ingested_at=INGESTED_AT)
+        bars = pl.DataFrame(
+            {
+                "security_id": [cik] * 4,
+                "session": [
+                    date(2020, 7, 29),
+                    date(2020, 7, 30),
+                    date(2020, 11, 5),
+                    date(2020, 11, 6),
+                ],
+            }
+        )
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)).sort("valid_from"),
+            pl.DataFrame(list(delistings.delistings)),
+            bars,
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("valid_from", "status", "end_session").rows() == [
+            (date(2019, 8, 1), DELISTED, date(2020, 7, 30)),
+            (date(2020, 11, 5), LISTED, None),
+        ]
+
+    def test_relisted_row_exists_only_from_its_cover_page(
+        self, store: duckdb.DuckDBPyConnection
+    ) -> None:
+        relisted_at = _at(2019, 12, 16)
+        before = listings_as_of(store, relisted_at - PROBE_EPSILON, security_ids=[REORG])
+        after = listings_as_of(store, relisted_at, security_ids=[REORG])
+        assert before["valid_from"].to_list() == [date(2019, 8, 9)]
+        assert sorted(after["valid_from"].to_list()) == [date(2019, 8, 9), date(2019, 12, 16)]
+
+
+class TestNewEquityAfterForm25:
+    """Owner decision on #820: post-bankruptcy equity under the same CIK and
+    ticker is a new security, so no return spans the gap. Marker: an 8-A12B
+    from `master.transfer_window_sessions` sessions before the Form 25 up to
+    the relisting cover page (CRC, OAS, DBD, GPOR, MNK, WW and WOLF filed
+    one; CMPR, CG, WELL, FCFS and KIM did not)."""
+
+    CIK = "0000900004"
+
+    def _source(self, *, registered: datetime | None) -> FixtureFilingSource:
+        cik = self.CIK
+        return FixtureFilingSource(
+            index=[
+                _filing(cik, "Crc Co", "10-K", _at(2018, 3, 1)),
+                *([_filing(cik, "Crc Co", "8-A12B", registered)] if registered else []),
+            ],
+            cover_pages=[
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "CRC", "NYSE")),
+                _cover(cik, _at(2020, 8, 6)),  # in bankruptcy: nothing listed
+                _cover(cik, _at(2020, 11, 5), ("Common Stock, par value $0.01", "CRC", "NYSE")),
+                _cover(cik, _at(2021, 3, 1), ("Common Stock, par value $0.01", "CRC", "NYSE")),
+            ],
+            delistings=[self._form25()],
+        )
+
+    def _form25(self) -> DelistingFiling:
+        return DelistingFiling(
+            self.CIK,
+            "25-NSE",
+            "Common Stock",
+            "NYSE",
+            "25-crc",
+            _at(2020, 7, 31),
+            date(2020, 8, 10),
+        )
+
+    def test_a_registration_makes_the_relisted_shares_a_new_security(self) -> None:
+        cik = self.CIK
+        build = build_master(
+            self._source(registered=_at(2020, 10, 27)), _settings(), ingested_at=INGESTED_AT
+        )
+        successor = f"{cik}@2020-11-05"
+        assert build.successions == (Succession(cik, successor, _at(2020, 11, 5)),)
+        assert [(r["security_id"], r["known_at"]) for r in build.securities] == [
+            (cik, _at(2018, 3, 1)),
+            (successor, _at(2020, 11, 5)),
+        ]
+        assert [(r["security_id"], r["valid_from"]) for r in build.listings] == [
+            (cik, date(2019, 8, 1)),
+            (successor, date(2020, 11, 5)),
+        ]
+        # The Form 25 still ends the old security: a successor known after
+        # the filing is never its candidate.
+        delistings = build_delistings([self._form25()], build, ingested_at=INGESTED_AT)
+        assert [r["security_id"] for r in delistings.delistings] == [cik]
+
+    def test_no_return_spans_the_bankruptcy(self) -> None:
+        cik = self.CIK
+        build = build_master(
+            self._source(registered=_at(2020, 10, 27)), _settings(), ingested_at=INGESTED_AT
+        )
+        resolver = ListingResolver(build.listings)
+        assert resolver.resolve("CRC", date(2020, 7, 30)) == cik
+        assert resolver.resolve("CRC", date(2020, 11, 5)) == f"{cik}@2020-11-05"
+        assert resolver.resolve("CRC", date(2021, 6, 1)) == f"{cik}@2020-11-05"
+        # Each security's bars sit on one side of the gap only, so a return
+        # (close over the security's previous close) never spans it.
+        sessions = [date(2020, 7, 29), date(2020, 7, 30), date(2020, 11, 5), date(2020, 11, 6)]
+        owners = [resolver.resolve("CRC", day) for day in sessions]
+        assert owners == [cik, cik, f"{cik}@2020-11-05", f"{cik}@2020-11-05"]
+
+    def test_a_registration_just_before_the_form_25_counts(self) -> None:
+        # WOLF: 8-A12B 2025-09-26, Form 25 2025-09-29 effective 2025-10-09,
+        # a cover page the next day; the successor starts after the old
+        # shares' last day.
+        cik = self.CIK
+        source = FixtureFilingSource(
+            index=[
+                _filing(cik, "Wolf Co", "10-K", _at(2018, 3, 1)),
+                _filing(cik, "Wolf Co", "8-A12B", _at(2025, 9, 26)),
+            ],
+            cover_pages=[
+                _cover(cik, _at(2025, 8, 26), ("Common Stock", "WLF", "NYSE")),
+                _cover(cik, _at(2025, 9, 30), ("Common Stock", "WLF", "NYSE")),
+            ],
+            delistings=[
+                DelistingFiling(
+                    cik,
+                    "25-NSE",
+                    "Common Stock",
+                    "NYSE",
+                    "25-wlf",
+                    _at(2025, 9, 29),
+                    date(2025, 10, 9),
+                )
+            ],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        assert [(r["security_id"], r["valid_from"], r["known_at"]) for r in build.listings] == [
+            (cik, date(2025, 8, 26), _at(2025, 8, 26)),
+            (f"{cik}@2025-10-10", date(2025, 10, 10), _at(2025, 9, 30)),
+        ]
+
+    def test_a_registration_outside_the_window_keeps_the_security(self) -> None:
+        cik = self.CIK
+        build = build_master(
+            self._source(registered=_at(2020, 5, 1)), _settings(), ingested_at=INGESTED_AT
+        )
+        assert build.successions == ()
+        assert [(r["security_id"], r["valid_from"]) for r in build.listings] == [
+            (cik, date(2019, 8, 1)),
+            (cik, date(2020, 11, 5)),
+        ]
+
+    def test_the_successor_is_known_only_from_its_cover_page(self) -> None:
+        source = self._source(registered=_at(2020, 10, 27))
+        settings = _settings()
+        full = _new_store()
+        write_master(full, build_master(source, settings, ingested_at=INGESTED_AT))
+        probes = sorted(
+            {k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)}
+        )
+        for t in probes:
+            partial = _new_store()
+            write_master(
+                partial, build_master(source.known_by(t), settings, ingested_at=INGESTED_AT)
+            )
+            for read in (securities_as_of, listings_as_of):
+                assert read(full, t).equals(read(partial, t)), f"{read.__name__} T={t!r}"
+            partial.close()
+        before = securities_as_of(full, _at(2020, 11, 5) - PROBE_EPSILON)
+        assert f"{self.CIK}@2020-11-05" not in _ids(before)
+        full.close()
+
+    def test_a_delisted_successor_is_ended_by_its_own_form_25(self) -> None:
+        # quant-auditor on #826: the successor's later Form 25 names the same
+        # title as the old class; it must resolve to the successor.
+        cik = self.CIK
+        first = self._form25()
+        second = DelistingFiling(
+            cik, "25-NSE", "Common Stock", "NYSE", "25-crc-2", _at(2023, 6, 1), date(2023, 6, 12)
+        )
+        source = self._source(registered=_at(2020, 10, 27))
+        source = FixtureFilingSource(
+            index=source.filing_index(),
+            cover_pages=source.cover_pages(cik),
+            delistings=[first, second],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        delistings = build_delistings([first, second], build, ingested_at=INGESTED_AT)
+        assert [r["security_id"] for r in delistings.delistings] == [cik, f"{cik}@2020-11-05"]
+        assert delistings.unmatched == ()
+
+    @pytest.mark.parametrize("registered_back", [True, False])
+    def test_a_transfer_and_a_move_back_make_no_successor(self, registered_back: bool) -> None:
+        # quant-auditor on #826: NYSE -> NASDAQ (Form 25 on NYSE, 8-A12B for
+        # NASDAQ), later NASDAQ -> NYSE. A move, never new equity.
+        cik = self.CIK
+        index = [
+            _filing(cik, "Move Co", "10-K", _at(2018, 3, 1)),
+            _filing(cik, "Move Co", "8-A12B", _at(2020, 2, 27)),
+        ]
+        if registered_back:
+            index.append(_filing(cik, "Move Co", "8-A12B", _at(2023, 2, 27)))
+        source = FixtureFilingSource(
+            index=index,
+            cover_pages=[
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "XYZ", "NYSE")),
+                _cover(cik, _at(2020, 5, 1), ("Common Stock", "XYZ", "NASDAQ")),
+                _cover(cik, _at(2023, 5, 1), ("Common Stock", "XYZ", "NYSE")),
+            ],
+            delistings=[
+                _form25(cik, "Common Stock", "NYSE", _at(2020, 3, 2)),
+                _form25(cik, "Common Stock", "NASDAQ", _at(2023, 3, 1)),
+            ],
+        )
+        build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+        assert build.successions == ()
+        assert [(r["security_id"], r["exchange"], r["valid_from"]) for r in build.listings] == [
+            (cik, "NYSE", date(2019, 8, 1)),
+            (cik, "NASDAQ", date(2020, 5, 1)),
+            (cik, "NYSE", date(2023, 5, 1)),
+        ]
+
+    def test_a_late_amendment_never_delists_the_successor(self) -> None:
+        # quant-auditor pass 2 on #826: a 25-NSE/A amending the old class's
+        # Form 25, filed after the successor is known, amends the old class.
+        cik = self.CIK
+        amendment = DelistingFiling(
+            cik, "25-NSE/A", "Common Stock", "NYSE", "25-crc-a", _at(2020, 12, 1), date(2020, 8, 10)
+        )
+        build = build_master(
+            self._source(registered=_at(2020, 10, 27)), _settings(), ingested_at=INGESTED_AT
+        )
+        delistings = build_delistings([self._form25(), amendment], build, ingested_at=INGESTED_AT)
+        assert [r["security_id"] for r in delistings.delistings] == [cik, cik]
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik], "session": [date(2020, 7, 30)]}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        assert ends.select("security_id", "status").rows() == [
+            (cik, DELISTED),
+            (f"{cik}@2020-11-05", LISTED),
+        ]
+
+
+class TestListingEvidenceAfterForm25:
+    """#834: reorganised securities that #826 still left delisted on the
+    owner's store. Real shapes: WSC (merger: 8-A12B and 15-12B, the same
+    shares reclassified), FRT (8-K12B the day of the Form 25, then cover
+    pages that parse with no listing), OKE (8-K12B before the Form 25, no
+    cover page since), SA (no filing; the companies snapshot still lists
+    it), and GORO (acquired: 15-12G, no ticker left) which stays delisted."""
+
+    CIK = "0000900005"
+    INGESTED = datetime(2026, 10, 5, tzinfo=UTC)
+
+    def _build(
+        self,
+        covers: list[CoverPage],
+        filing: DelistingFiling,
+        *,
+        forms: tuple[tuple[str, datetime], ...] = (),
+        snapshot: tuple[CompanySnapshotEntry, ...] = (),
+    ) -> MasterBuild:
+        return build_master(
+            self._source(covers, filing, forms, snapshot), _settings(), ingested_at=self.INGESTED
+        )
+
+    def _source(
+        self,
+        covers: list[CoverPage],
+        filing: DelistingFiling,
+        forms: tuple[tuple[str, datetime], ...],
+        snapshot: tuple[CompanySnapshotEntry, ...],
+    ) -> FixtureFilingSource:
+        cik = self.CIK
+        return FixtureFilingSource(
+            index=[
+                _filing(cik, "Reorg Co", "10-K", _at(2018, 3, 1)),
+                *(_filing(cik, "Reorg Co", form, at) for form, at in forms),
+            ],
+            cover_pages=covers,
+            delistings=[filing],
+            snapshot=snapshot,
+        )
+
+    def _rows(self, build: MasterBuild) -> list[tuple[object, ...]]:
+        return [
+            (r["security_id"], r["ticker"], r["valid_from"], r["known_at"], r["provenance"])
+            for r in build.listings
+            if r["provenance"] != "snapshot_static"
+        ]
+
+    def test_a_merger_with_a_form_15_is_not_new_equity(self) -> None:
+        # WSC: 8-A12B 2020-07-01, Form 25 the same day, 15-12B 2020-07-13.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2020, 5, 6), ("Class A common stock, par value", "WSC", "NASDAQ")),
+                _cover(cik, _at(2020, 8, 10), ("Common Stock, par value $0.0001", "WSC", "NASDAQ")),
+            ],
+            DelistingFiling(
+                cik, "25-NSE", "Class A Common Stock", "NASDAQ", "25-wsc", _at(2020, 7, 1, 15, 0)
+            ),
+            forms=(("8-A12B", _at(2020, 7, 1, 14, 0)), ("15-12B", _at(2020, 7, 13))),
+        )
+        assert build.successions == ()
+        assert self._rows(build) == [
+            (cik, "WSC", date(2020, 5, 6), _at(2020, 5, 6), "filing"),
+            (cik, "WSC", date(2020, 8, 10), _at(2020, 8, 10), "filing"),
+        ]
+
+    def test_an_8k12b_relists_without_a_cover_page(self) -> None:
+        # FRT: 8-K12B and Form 25 on 2022-01-03 (effective 2022-01-13); every
+        # later cover page parses with no listing.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(
+                    cik, _at(2021, 11, 4), ("Common Shares of Beneficial Interest", "FRT", "NYSE")
+                ),
+                _cover(cik, _at(2022, 2, 10)),
+                _cover(cik, _at(2022, 5, 5)),
+            ],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Shares of Beneficial Interest",
+                "NYSE",
+                "25-frt",
+                _at(2022, 1, 3, 21, 0),
+                date(2022, 1, 13),
+            ),
+            forms=(("8-K12B", _at(2022, 1, 3, 13, 30)),),
+        )
+        assert self._rows(build) == [
+            (cik, "FRT", date(2021, 11, 4), _at(2021, 11, 4), "filing"),
+            (cik, "FRT", date(2022, 1, 14), _at(2022, 1, 3, 21, 0), "filing"),
+        ]
+
+    def _oke(self) -> FixtureFilingSource:
+        cik = self.CIK
+        return self._source(
+            [_cover(cik, _at(2026, 8, 4), ("Common stock, par value of $0.01", "OKE", "NYSE"))],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Stock",
+                "NYSE",
+                "25-oke",
+                _at(2026, 9, 18, 13, 35),
+                date(2026, 9, 28),
+            ),
+            (("8-K12B", _at(2026, 9, 10, 20, 47)), ("15-12G", _at(2026, 9, 28, 21, 9))),
+            (),
+        )
+
+    def test_an_8k12b_before_the_form_25_relists_at_the_form_25(self) -> None:
+        cik = self.CIK
+        build = build_master(self._oke(), _settings(), ingested_at=self.INGESTED)
+        assert self._rows(build) == [
+            (cik, "OKE", date(2026, 8, 4), _at(2026, 8, 4), "filing"),
+            (cik, "OKE", date(2026, 9, 29), _at(2026, 9, 18, 13, 35), "filing"),
+        ]
+
+    def test_the_resolver_keeps_a_relisted_security_trading(self) -> None:
+        # End to end with #830's own-delisting rule: OKE's bars after the
+        # Form 25's effective day stay on OKE.
+        cik = self.CIK
+        source = self._oke()
+        build = build_master(source, _settings(), ingested_at=self.INGESTED)
+        delistings = build_delistings(source.delistings(), build, ingested_at=self.INGESTED)
+        bars = [date(2026, 9, 25), date(2026, 9, 28), date(2026, 9, 30), date(2026, 10, 2)]
+        ends = derive_listing_ends(
+            pl.DataFrame(list(build.listings)),
+            pl.DataFrame(list(delistings.delistings)),
+            pl.DataFrame({"security_id": [cik] * len(bars), "session": bars}),
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        evidence = registrant_evidence(
+            [],
+            ends.to_dicts(),
+            as_of=date(2026, 10, 4),
+            quiet_after_days=180,
+            transfer_window_sessions=_settings().master.transfer_window_sessions,
+        )
+        resolver = ListingResolver(build.listings, evidence)
+        assert [resolver.resolve("OKE", day) for day in bars] == [cik] * len(bars)
+
+    def _sa(self, *, fetched_at: datetime | None) -> FixtureFilingSource:
+        cik = self.CIK
+        snapshot = (
+            () if fetched_at is None else (_snap(cik, "SEABRIDGE", "SA", "NYSE", fetched_at),)
+        )
+        return self._source(
+            [_cover(cik, _at(2026, 3, 27), ("Common Shares", "SA", "NYSE"))],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Shares",
+                "NYSE",
+                "25-sa",
+                _at(2026, 6, 5, 16, 47),
+                date(2026, 6, 15),
+            ),
+            (),
+            snapshot,
+        )
+
+    def test_a_snapshot_after_the_form_25_relists(self) -> None:
+        cik = self.CIK
+        build = build_master(
+            self._sa(fetched_at=_at(2026, 10, 4)), _settings(), ingested_at=self.INGESTED
+        )
+        assert self._rows(build)[-1] == (cik, "SA", date(2026, 6, 16), _at(2026, 10, 4), "snapshot")
+
+    def test_without_evidence_the_form_25_stands(self) -> None:
+        build = build_master(self._sa(fetched_at=None), _settings(), ingested_at=self.INGESTED)
+        assert [r["valid_from"] for r in build.listings] == [date(2026, 3, 27)]
+
+    def test_a_snapshot_before_the_form_25_relists_nothing(self) -> None:
+        build = build_master(
+            self._sa(fetched_at=_at(2026, 6, 1)), _settings(), ingested_at=self.INGESTED
+        )
+        assert [
+            r["provenance"] for r in build.listings if r["valid_from"] > date(2026, 3, 27)
+        ] == []
+
+    def test_an_acquired_company_stays_delisted(self) -> None:
+        # GORO: Form 25, 8-K (2.01), 15-12G; the ticker left the CIK.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 7, 30, 20, 1)),),
+        )
+        assert [r["valid_from"] for r in build.listings] == [date(2026, 5, 7)]
+
+    @pytest.mark.parametrize("case", ["oke", "sa"])
+    def test_the_relisting_is_known_only_from_its_evidence(self, case: str) -> None:
+        source = self._oke() if case == "oke" else self._sa(fetched_at=_at(2026, 10, 4))
+        settings = _settings()
+        full = _new_store()
+        write_master(full, build_master(source, settings, ingested_at=self.INGESTED))
+        probes = sorted(
+            {k + d for k in source.known_ats() for d in (-PROBE_EPSILON, PROBE_EPSILON)}
+        )
+        for t in probes:
+            partial = _new_store()
+            write_master(
+                partial, build_master(source.known_by(t), settings, ingested_at=self.INGESTED)
+            )
+            assert listings_as_of(full, t).equals(listings_as_of(partial, t)), f"T={t!r}"
+            partial.close()
+        full.close()
+
+    def test_an_8k12b_with_a_transfer_waits_for_a_cover_page(self) -> None:
+        # CTO (REIT conversion and NYSE American -> NYSE, 2021): 8-A12B
+        # 2021-01-28 (the NYSE registration), 25-NSE and 8-K12B 2021-02-01,
+        # 15-12B 2021-02-12, a 10-K cover page on NYSE 2021-03-05. The 8-K12B
+        # must not relist the old exchange (nor make new equity): a transfer.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(
+                    cik, _at(2020, 11, 5), ("COMMON STOCK, $1 PAR VALUE", "CTO", "NYSE_AMERICAN")
+                ),
+                _cover(
+                    cik, _at(2021, 3, 5), ("Common Stock, $0.01 par value per share", "CTO", "NYSE")
+                ),
+            ],
+            DelistingFiling(
+                cik,
+                "25-NSE",
+                "Common Stock",
+                "NYSE_AMERICAN",
+                "25-cto",
+                _at(2021, 2, 1, 18, 10),
+                date(2021, 2, 11),
+            ),
+            forms=(
+                ("8-A12B", _at(2021, 1, 28)),
+                ("8-K12B", _at(2021, 2, 1, 21, 0)),
+                ("15-12B", _at(2021, 2, 12)),
+            ),
+        )
+        assert build.successions == ()
+        assert self._rows(build) == [
+            (cik, "CTO", date(2020, 11, 5), _at(2020, 11, 5), "filing"),
+            (cik, "CTO", date(2021, 3, 5), _at(2021, 3, 5), "filing"),
+        ]
+
+    @pytest.mark.parametrize(
+        "fetched_at",
+        [_at(2026, 6, 10), _at(2026, 6, 15), _at(2026, 6, 16), _at(2026, 7, 14)],
+        ids=["before-effective", "effective-day", "day-after-effective", "inside-lag"],
+    )
+    def test_a_snapshot_inside_the_lag_relists_nothing(self, fetched_at: datetime) -> None:
+        # safety-reviewer and quant-auditor on #835: a daily fetch before SEC
+        # drops a delisted ticker must not relist it (effective 2026-06-15,
+        # lag 30 days: first eligible fetch 2026-07-15).
+        build = build_master(
+            self._sa(fetched_at=fetched_at), _settings(), ingested_at=self.INGESTED
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 3, 27)]
+
+    def test_a_snapshot_after_a_form_15_relists_nothing(self) -> None:
+        # An acquired company deregisters; a fetch that still shows its
+        # ticker is no listing evidence.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 7, 30, 20, 1)),),
+            snapshot=(_snap(cik, "GOLD RESOURCE", "GORO", "NYSE_AMERICAN", _at(2026, 10, 4)),),
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 5, 7)]
+
+    def test_a_snapshot_after_a_late_form_15_relists_nothing(self) -> None:
+        # Pass-2 fix on #835: a Form 15 filed after the reorganisation window
+        # but before the fetch still vetoes the snapshot (the company left
+        # the registry; a stale ticker file is no listing evidence).
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2026, 5, 7), ("Common Stock", "GORO", "NYSE_AMERICAN"))],
+            DelistingFiling(
+                cik, "25-NSE", "Common stock", "NYSE_AMERICAN", "25-goro", _at(2026, 7, 20, 14, 56)
+            ),
+            forms=(("15-12G", _at(2026, 8, 31, 20, 1)),),
+            snapshot=(_snap(cik, "GOLD RESOURCE", "GORO", "NYSE_AMERICAN", _at(2026, 10, 4)),),
+        )
+        assert [r[2] for r in self._rows(build)] == [date(2026, 5, 7)]
+
+    def test_an_8k12b_years_after_the_form_25_relists_nothing(self) -> None:
+        # safety-reviewer and quant-auditor on #835: an unrelated 8-K12B long
+        # after an old Form 25 (a redeemed class) must not revive it.
+        cik = self.CIK
+        build = self._build(
+            [_cover(cik, _at(2015, 3, 2), ("Common Stock", "OLD", "NYSE"))],
+            DelistingFiling(cik, "25-NSE", "Common Stock", "NYSE", "25-old", _at(2015, 6, 1)),
+            forms=(("8-K12B", _at(2020, 6, 1)),),
+        )
+        assert [r["valid_from"] for r in build.listings] == [date(2015, 3, 2)]
+
+    def test_a_late_form_15_never_vetoes_new_equity(self) -> None:
+        # quant-auditor on #835: a bankruptcy whose Form 15 comes months after
+        # the Form 25 (outside the reorganisation window) is still new equity.
+        cik = self.CIK
+        build = self._build(
+            [
+                _cover(cik, _at(2019, 8, 1), ("Common Stock", "CRC", "NYSE")),
+                _cover(cik, _at(2020, 11, 5), ("Common Stock", "CRC", "NYSE")),
+            ],
+            DelistingFiling(
+                cik, "25-NSE", "Common Stock", "NYSE", "25-crc", _at(2020, 7, 31), date(2020, 8, 10)
+            ),
+            forms=(("15-12B", _at(2020, 10, 1)), ("8-A12B", _at(2020, 10, 27))),
+        )
+        assert [s.security_id for s in build.successions] == [f"{cik}@2020-11-05"]

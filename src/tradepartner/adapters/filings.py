@@ -42,6 +42,16 @@ def _utc(record: object, field_name: str) -> None:
     object.__setattr__(record, field_name, ensure_tz_aware_utc(value, field_name=field_name))
 
 
+def _utc_optional(record: object, field_name: str) -> None:
+    """As `_utc`, but `None` passes through unchanged (#660:
+    `StatementFactRecord.accepted_at` is `None` for an accession with no
+    stamp record yet; anything else must still be a tz-aware datetime)."""
+    value = getattr(record, field_name)
+    if value is None:
+        return
+    _utc(record, field_name)
+
+
 @dataclass(frozen=True)
 class FilingIndexEntry:
     """One row of EDGAR's full-history filing index."""
@@ -146,6 +156,70 @@ class DelistingFiling:
         _utc(self, "accepted_at")
 
 
+@dataclass(frozen=True)
+class StatementFactRecord:
+    """One as-filed statement-fact entry (amendment 2026-10-03, #660):
+    revenue, cost of revenue, gross profit, total assets or operating
+    cash flow, as the companyfacts payload carries it for one tag and
+    period. **Reported values only** — the parser never derives a
+    missing `gross_profit`; that is the ingest's job (T77b), working
+    from the stored `revenue` and `cost_of_revenue` rows, so this record
+    carries no `basis`.
+
+    `period_start` is `None` for an instant fact (`total_assets`;
+    `period_days` is then `0`); for a duration it is the entry's own
+    period start, never `None`, and `period_end` must be strictly after
+    it (never equal — an instant is `period_start=None`, not a one-day
+    duration). `period_days` is computed, not stored, since the spec's
+    `StatementFactRecord` field list has no such field — the table
+    column of the same name is `(period_end - period_start).days`, or
+    `0` for an instant.
+
+    `accepted_at` is the filing's SEC acceptance instant (submissions
+    UTC) — `None` when the accession has no stamp record yet (the
+    ingest's hold rule, T77b, holds the key rather than writing it).
+    Unlike every other record in this module, a `None` is valid, so
+    `accepted_at` is tz-checked **only when set** (`_utc_optional`).
+
+    `filed` is the companyfacts entry's own `filed` date — read only by
+    the ingest's hold rule to compare against an unstamped carrier's
+    date, and **never stored**: `statement_facts` has no `filed` column
+    (spec "Data / interfaces" > Amendment 2026-10-03, "Interfaces").
+    """
+
+    cik: str
+    fact_name: str
+    xbrl_tag: str
+    period_start: date | None
+    period_end: date
+    value: float
+    unit: str
+    form: str
+    accession: str
+    accepted_at: datetime | None
+    filed: date
+    comparative: bool
+
+    def __post_init__(self) -> None:
+        _check_cik(self.cik)
+        _utc_optional(self, "accepted_at")
+        if self.period_start is not None and self.period_end <= self.period_start:
+            raise ValueError(
+                "period_end must be strictly after period_start for a duration fact "
+                f"(got period_start={self.period_start!r}, period_end={self.period_end!r}); "
+                "an instant fact (period_days = 0) uses period_start=None instead"
+            )
+
+    @property
+    def period_days(self) -> int:
+        """`0` for an instant fact (`period_start is None`), else the
+        duration in days — the `statement_facts.period_days` column's
+        value, computed here rather than stored on the record."""
+        if self.period_start is None:
+            return 0
+        return (self.period_end - self.period_start).days
+
+
 class FilingSource(abc.ABC):
     """Filing data, as parsed records (spec "Interfaces").
 
@@ -184,3 +258,13 @@ class FilingSource(abc.ABC):
     @abc.abstractmethod
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         """Every Form 25 and 25-NSE."""
+
+    @abc.abstractmethod
+    def statement_facts(self, cik: str) -> list[StatementFactRecord]:
+        """As-filed statement facts (amendment 2026-10-03, #660) for
+        `cik`: one entry per tag occurrence the companyfacts payload
+        carries for the configured statement names, reported values
+        only. The ingest (T77b) keeps the first vintage of each key,
+        applies the hold rule on an unstamped carrier, and derives a
+        missing `gross_profit` from the stored `revenue` and
+        `cost_of_revenue` rows; none of that lives here."""

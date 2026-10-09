@@ -1,7 +1,7 @@
 """Tests for the paper-trading journal tables (Phase 4 plan T49, schema version 5).
 
 The journal tables exist after `init_schema` on a fresh store and after a write
-connection opens a version-4 store, which gets one appended version-5 row and no
+connection opens a version-4 store, which gets appended version-5 to version-10 rows and no
 other change: fact and registry DDL are pinned by hash and every fact and registry
 table is byte-identical after the migration. A read-only open of a version-4 store
 (`conftest.version_4_store`) still passes the schema check and serves fact and
@@ -25,9 +25,10 @@ import duckdb
 import pytest
 from conftest import version_4_store
 
-from tradepartner.store import registry, schema
+from tradepartner.store import lab_schema, registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row
+from tradepartner.store.journal import _EXPANSION_SEAM_TABLES, fills_for, latest_window
 
 _EXPECTED_JOURNAL_TABLES = {
     "paper_windows",
@@ -45,6 +46,7 @@ _EXPECTED_JOURNAL_TABLES = {
     "fills",
     "fill_cursors",
     "resume_invocations",
+    "resume_acceptances",
     "outcomes",
     "positions_daily",
     "adjustments",
@@ -59,7 +61,11 @@ _EXPECTED_JOURNAL_TABLES = {
 }
 
 #: SHA-256 of `"".join(schema._TABLE_DDL)` and `"".join(schema._REGISTRY_TABLE_DDL)`
-#: at version 4, which version 5 must leave as they are.
+#: at version 4, which version 5 must leave as they are -- frozen forever by
+#: design (quant-auditor review of #660/T76, PR #729): `statement_facts`
+#: (version 10) is additive to the *store*, not to this tuple, which is why it
+#: lives in its own `_STATEMENT_FACTS_TABLE_DDL` with its own pin
+#: (`test_schema.py`) instead of changing the hash below.
 _V4_FACT_DDL_SHA256 = "0815559c58066e74829be4956dea3f252eeddb03ab612cb3485b588c6f44b54a"
 _V4_REGISTRY_DDL_SHA256 = "d8152e9e8bd289b606b7de2e976da4ff9b679648a28f4735d54216bca50cd1db"
 
@@ -141,13 +147,24 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_5() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 5
+def test_current_schema_version_is_18() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 18
+    assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
+
+
+def test_the_expansion_seam_table_lists_agree() -> None:
+    """`journal.require_journal`'s guard and `schema._migrate_expansion_seams`
+    must name the same eight tables (plan T132)."""
+    assert tuple(schema._EXPANSION_SEAM_TABLE_DDL) == _EXPANSION_SEAM_TABLES
 
 
 def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
-    """Version 5 adds tables only. A fact or registry change goes to version 6 with
-    its own migration, never an edit of this DDL."""
+    """Version 5 adds journal tables only. `statement_facts` (version 10, #660,
+    T76) is a new fact table but lives outside `_TABLE_DDL`
+    (`_STATEMENT_FACTS_TABLE_DDL`, pinned separately in `test_schema.py`), so
+    this pin never has to move for it either. Any other fact or registry
+    change goes to the next version with its own migration, never an edit of
+    this DDL."""
     assert _sha256(schema._TABLE_DDL) == _V4_FACT_DDL_SHA256
     assert _sha256(schema._REGISTRY_TABLE_DDL) == _V4_REGISTRY_DDL_SHA256
 
@@ -155,16 +172,35 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 # --- fresh store and migration --------------------------------------------------------
 
 
-def test_fresh_init_creates_the_journal_at_version_5(journal: duckdb.DuckDBPyConnection) -> None:
+def test_fresh_init_creates_the_journal_at_version_17(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [5]
+    assert _versions(journal) == [18]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     v4_path: Path,
 ) -> None:
     kept = schema.TABLE_NAMES + schema.REGISTRY_TABLE_NAMES
-    kept_without_versions = tuple(name for name in kept if name != "schema_version")
+    # Version 11 (#859) rebuilds the retractable master tables, every row kept
+    # (`tests/store/test_retraction_schema.py`); version 12 (#926) adds
+    # `trial_results.n_research` (`tests/store/test_research_schema.py`);
+    # version 13 (#720, #1033, T85d) adds `trial_rebalances`'s six
+    # `PROFITABILITY_REBALANCE_COLUMNS` (`tests/store/test_schema.py`);
+    # version 14 (#1153, T127) makes its `n_excluded_no_history` nullable and
+    # adds `trial_rebalance_counts`; version 15 (#1179, T97) adds `trials`'
+    # vintage and detail columns (`tests/store/test_schema_period.py`);
+    # version 16 (#1195, T113) creates the lab tables and rebuilds
+    # `owner_decisions` with every row kept (`tests/store/test_lab_migration.py`);
+    # version 17 (#1258, T132) rebuilds the eight expanded journal tables with
+    # their new defaulted columns (every row kept, `_version_16_store` below).
+    kept_without_versions = tuple(
+        name
+        for name in kept
+        if name
+        not in ("schema_version", "trial_results", "trial_rebalances", "trials", "owner_decisions")
+        and name not in schema.RETRACTABLE_TABLES
+        and name not in lab_schema.LAB_TABLE_NAMES
+    )
     conn = duckdb.connect(str(v4_path))
     try:
         assert _table_names(conn).isdisjoint(schema.JOURNAL_TABLE_NAMES)
@@ -179,8 +215,11 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5]
-    assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES)
+    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
+    assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
+        schema.MASTER_CHECK_TABLE_NAMES
+    ) | set(schema.RESEARCH_TABLE_NAMES) | {schema.REBALANCE_COUNTS_TABLE_NAME, "store_markers"}
 
 
 def test_migrated_journal_matches_a_fresh_store(
@@ -202,18 +241,344 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5]
+        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 
 
-def test_unknown_version_6_is_refused(tmp_path: Path) -> None:
-    path = tmp_path / "store_v6.duckdb"
+# --- version 17 (#1258, T132): the ADR 0015 expansion seams --------------------------
+
+
+#: The columns schema version 17 adds, by table (ADR 0015 seams 1 to 3, plan
+#: T132): `_version_16_store`'s table is the version-17 one without them.
+_V17_ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "paper_windows": ("book_id",),
+    "decisions": ("position_side", "book_id"),
+    "orders": (
+        "position_side",
+        "order_type",
+        "time_in_force",
+        "limit_price",
+        "stop_price",
+        "asset_class",
+        "order_class",
+        "multiplier",
+        "parent_order_id",
+        "book_id",
+    ),
+    "positions_daily": ("position_side", "book_id"),
+    "lots": ("position_side", "book_id"),
+    "disposals": ("position_side", "book_id"),
+    "adjustments": ("book_id",),
+    "reconciliations": ("book_id",),
+}
+
+
+def _version_16_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 16 left it: the eight tables ADR 0015 seams 1 to 3
+    expand, each holding one row, without the version-17 columns and with a
+    version-16 `schema_version` row (`tests/store/test_lab_migration.py`'s
+    `_version_15_store`, adapted: the version-17 delta is *removed from* the
+    current tables rather than never created, because version 17 deletes
+    nothing and every other table is byte-identical either way)."""
+    schema.init_schema(conn)
+    session = _NOW.date()
+    conn.execute(
+        "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+        "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+        "frozen_sha256, known_at, ingested_at) VALUES (1, 1, ?, 'acct', 100.0, 100.0, "
+        "'v1', ?, '{}', 'sha', ?, ?)",
+        [session, _NOW, _NOW, _NOW],
+    )
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) VALUES (3, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=3), _NOW.replace(second=3)],
+    )
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) VALUES (1, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=1), _NOW.replace(second=1)],
+    )
+    conn.execute("DELETE FROM decisions WHERE decision_id = 1")
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) VALUES (2, 1, 'SEC_A', true, 'trade', ?, ?)",
+        [_NOW.replace(second=2), _NOW.replace(second=2)],
+    )
+    for client_order_id, second in (("tp-3", 3), ("tp-1", 1)):
+        conn.execute(
+            "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+            "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) "
+            "VALUES (?, 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', true, ?, ?)",
+            [client_order_id, session, _NOW.replace(second=second), _NOW.replace(second=second)],
+        )
+    conn.execute("DELETE FROM orders WHERE client_order_id = 'tp-1'")
+    conn.execute(
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) "
+        "VALUES ('tp-2', 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', true, ?, ?)",
+        [session, _NOW.replace(second=2), _NOW.replace(second=2)],
+    )
+    conn.execute(
+        "INSERT INTO positions_daily (run_id, session, security_id, quantity, known_at, "
+        "ingested_at) VALUES (1, ?, 'SEC_A', 2.0, ?, ?)",
+        [session, _NOW, _NOW],
+    )
+    conn.execute(
+        "INSERT INTO lots (lot_id, account_id, account_type, account_owner, security_id, "
+        "symbol, trade_at, trade_date_local, quantity, cost_basis, known_at, ingested_at) "
+        "VALUES (1, 'acct', 'individual', 'owner', 'SEC_A', 'SEC_A', ?, ?, 2.0, 10.0, ?, ?)",
+        [_NOW, session, _NOW, _NOW],
+    )
+    conn.execute(
+        "INSERT INTO disposals (disposal_id, lot_id, account_id, trade_at, trade_date_local, "
+        "quantity, proceeds, realised_pnl, tax_year, known_at, ingested_at) "
+        "VALUES (1, 1, 'acct', ?, ?, 1.0, 12.0, 2.0, 2026, ?, ?)",
+        [_NOW, session, _NOW, _NOW],
+    )
+    conn.execute(
+        "INSERT INTO adjustments (adjustment_id, window_id, session, kind, known_at, "
+        "ingested_at) VALUES (1, 1, ?, 'dividend_cash', ?, ?)",
+        [session, _NOW, _NOW],
+    )
+    conn.execute(
+        'INSERT INTO reconciliations (reconciliation_id, window_id, "at", status, known_at, '
+        "ingested_at) VALUES (1, 1, ?, 'ok', ?, ?)",
+        [_NOW, _NOW, _NOW],
+    )
+    conn.execute("UPDATE schema_version SET version = 16")
+    for table, columns in _V17_ADDED_COLUMNS.items():
+        for column in columns:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+
+@pytest.fixture
+def v16_path(tmp_path: Path) -> Path:
+    path = tmp_path / "store_v16.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        _version_16_store(conn)
+    finally:
+        conn.close()
+    return path
+
+
+def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns() -> None:
+    """The spec's "Migration identity" for version 17: every row of the eight
+    expanded tables is kept in insertion order (not key order: `decisions` and
+    `orders` hold two rows inserted out of key order, with one deleted in
+    between), each pre-version-17 column — `known_at` and `ingested_at`
+    included — unchanged, and its new columns at their defaults
+    (`book_id = 'main'`, `position_side = 'long'`, the `orders` shape from
+    `ORDER_SHAPE_DEFAULTS`)."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_16_store(conn)
+        old_columns = {table: _column_order(conn, table) for table in _V17_ADDED_COLUMNS}
+        for table in _V17_ADDED_COLUMNS:
+            assert "book_id" not in old_columns[table]
+        before = {
+            table: conn.execute(
+                f"SELECT {', '.join(f'"{c}"' for c in columns)} FROM {table} ORDER BY rowid"
+            ).fetchall()
+            for table, columns in old_columns.items()
+        }
+        schema.init_schema(conn)
+        assert _versions(conn) == [16, 17, 18]
+        assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
+            (1, "main")
+        ]
+        assert conn.execute(
+            "SELECT decision_id, position_side, book_id FROM decisions ORDER BY rowid"
+        ).fetchall() == [(3, "long", "main"), (2, "long", "main")]
+        assert conn.execute(
+            "SELECT client_order_id, position_side, order_type, time_in_force, limit_price, "
+            "stop_price, asset_class, order_class, multiplier, parent_order_id, book_id "
+            "FROM orders ORDER BY rowid"
+        ).fetchall() == [
+            ("tp-3", "long", "market", "day", None, None, "us_equity", "simple", 1.0, None, "main"),
+            ("tp-2", "long", "market", "day", None, None, "us_equity", "simple", 1.0, None, "main"),
+        ]
+        assert conn.execute(
+            "SELECT run_id, position_side, book_id FROM positions_daily"
+        ).fetchall() == [(1, "long", "main")]
+        assert conn.execute("SELECT lot_id, position_side, book_id FROM lots").fetchall() == [
+            (1, "long", "main")
+        ]
+        assert conn.execute(
+            "SELECT disposal_id, position_side, book_id FROM disposals"
+        ).fetchall() == [(1, "long", "main")]
+        assert conn.execute("SELECT adjustment_id, book_id FROM adjustments").fetchall() == [
+            (1, "main")
+        ]
+        assert conn.execute(
+            "SELECT reconciliation_id, book_id FROM reconciliations"
+        ).fetchall() == [(1, "main")]
+        # Every pre-version-17 column of every row, `known_at` and `ingested_at`
+        # included, is identical in rowid order: the rebuild neither restamps
+        # nor reorders (quant-auditor finding on pass 1).
+        for table, columns in old_columns.items():
+            after = conn.execute(
+                f"SELECT {', '.join(f'"{c}"' for c in columns)} FROM {table} ORDER BY rowid"
+            ).fetchall()
+            assert after == before[table], table
+            assert _column_order(conn, table)[-2:] == ["known_at", "ingested_at"], table
+        assert [row[0] for row in before["decisions"]] == [3, 2]
+        assert [row[0] for row in before["orders"]] == ["tp-3", "tp-2"]
+    finally:
+        conn.close()
+
+
+def test_the_version_16_migration_leaves_every_other_table_byte_identical() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_16_store(conn)
+        others = tuple(
+            table
+            for table in sorted(_table_names(conn))
+            if table not in _V17_ADDED_COLUMNS and table != "schema_version"
+        )
+        before = _snapshot(conn, others)
+        schema.init_schema(conn)
+        assert _snapshot(conn, others) == before
+    finally:
+        conn.close()
+
+
+def test_a_version_16_store_gets_no_new_version_row_on_a_second_open() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_16_store(conn)
+        schema.init_schema(conn)
+        first = _snapshot(conn, tuple(sorted(_table_names(conn))))
+        schema.init_schema(conn)
+        assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
+        assert _versions(conn) == [16, 17, 18]
+    finally:
+        conn.close()
+
+
+def test_a_version_4_store_gets_the_version_17_journal_directly(v4_path: Path) -> None:
+    conn = duckdb.connect(str(v4_path))
+    try:
+        schema.init_schema(conn)
+        assert "book_id" in _columns(conn, "orders")
+        assert "position_side" in _columns(conn, "positions_daily")
+        assert "multiplier" in _columns(conn, "orders")
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_16_store_serves_fact_and_registry_reads(
+    v16_path: Path,
+) -> None:
+    with duckdb.connect(str(v16_path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [16]
+        assert registry.list_trials(conn) == []
+        assert prices_as_of(conn, datetime(2019, 6, 28, 20, 0, tzinfo=UTC)).height == 0
+
+
+def test_read_only_open_of_a_version_16_store_raises_schema_version_error_for_journal_reads(
+    v16_path: Path,
+) -> None:
+    """#1261: a read-only view of a version-16 store renders the fix, not a
+    traceback. Every read of the eight expanded tables goes through
+    `require_journal`, whose message names the fix (open it for writing once)."""
+    with duckdb.connect(str(v16_path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert conn.execute("SELECT COUNT(*) FROM prices_daily").fetchone() is not None
+        with pytest.raises(schema.SchemaVersionError, match="book_id"):
+            fills_for(conn)
+        with pytest.raises(schema.SchemaVersionError, match="open it for writing once"):
+            latest_window(conn)
+
+
+def test_default_book_id_is_a_nonempty_word() -> None:
+    assert re.fullmatch(r"[A-Za-z0-9]+", schema.DEFAULT_BOOK_ID)
+
+
+@pytest.mark.parametrize(
+    "table",
+    sorted(table for table, columns in _V17_ADDED_COLUMNS.items() if "position_side" in columns),
+)
+def test_a_position_side_outside_the_set_is_refused_on_each_expanded_table(
+    journal: duckdb.DuckDBPyConnection, table: str
+) -> None:
+    """ADR 0015 seam 2: `position_side` is a closed set on the five tables that
+    carry it."""
+    assert schema.JOURNAL_ENUMS[table, "position_side"] == schema.POSITION_SIDES
+    assert schema.LONG in schema.POSITION_SIDES
+    with pytest.raises(duckdb.ConstraintException):
+        _insert(journal, table, {**_minimal_v17_row(table), "position_side": "sideways"})
+
+
+def _minimal_v17_row(table: str) -> dict[str, object]:
+    """A minimal valid row for each table that carries `position_side` (its old
+    columns, since a fresh version-17 store fills the new ones by default)."""
+    session = _NOW.date()
+    base: dict[str, dict[str, object]] = {
+        "decisions": {
+            "decision_id": 1,
+            "run_id": 1,
+            "security_id": "SEC_A",
+            "whole_share": True,
+            "decision": "trade",
+        },
+        "orders": {
+            "client_order_id": "tp-1",
+            "decision_id": 1,
+            "run_id": 1,
+            "session": session,
+            "attempt": 1,
+            "phase": "buy",
+            "security_id": "SEC_A",
+            "symbol": "SEC_A",
+            "side": "buy",
+            "sells_in_flight_at_submit": True,
+        },
+        "positions_daily": {
+            "run_id": 1,
+            "session": session,
+            "security_id": "SEC_A",
+            "quantity": 2.0,
+        },
+        "lots": {
+            "lot_id": 1,
+            "account_id": "acct",
+            "account_type": "individual",
+            "account_owner": "owner",
+            "security_id": "SEC_A",
+            "symbol": "SEC_A",
+            "trade_at": _NOW,
+            "trade_date_local": session,
+            "quantity": 2.0,
+            "cost_basis": 10.0,
+        },
+        "disposals": {
+            "disposal_id": 1,
+            "lot_id": 1,
+            "account_id": "acct",
+            "trade_at": _NOW,
+            "trade_date_local": session,
+            "quantity": 1.0,
+            "proceeds": 12.0,
+            "realised_pnl": 2.0,
+            "tax_year": 2026,
+        },
+    }
+    return {**base[table], "known_at": _NOW, "ingested_at": _NOW}
+
+
+def test_an_unknown_later_version_is_refused(tmp_path: Path) -> None:
+    later = schema.CURRENT_SCHEMA_VERSION + 1
+    path = tmp_path / f"store_v{later}.duckdb"
     with duckdb.connect(str(path)) as conn:
         schema.init_schema(conn)
-        conn.execute("INSERT INTO schema_version VALUES (6, ?)", [_NOW])
+        conn.execute("INSERT INTO schema_version VALUES (?, ?)", [later, _NOW])
     for read_only in (False, True):
         with (
             duckdb.connect(str(path), read_only=read_only) as conn,
-            pytest.raises(schema.SchemaVersionError, match="6"),
+            pytest.raises(schema.SchemaVersionError, match=str(later)),
         ):
             schema.init_schema(conn)
 
@@ -258,6 +623,18 @@ def _columns(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, bool]:
         [table],
     ).fetchall()
     return {name: nullable == "YES" for name, nullable in rows}
+
+
+def _column_order(conn: duckdb.DuckDBPyConnection, table: str) -> list[str]:
+    """The table's column names in ordinal order."""
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ? "
+            "ORDER BY ordinal_position",
+            [table],
+        ).fetchall()
+    ]
 
 
 @pytest.mark.parametrize("table", sorted(_EXPECTED_JOURNAL_TABLES))
@@ -313,6 +690,12 @@ def _row(table: str, **values: object) -> dict[str, object]:
             "kind": "no_window",
             "message": "m",
             "at": _NOW,
+        },
+        "signals": {
+            "run_id": 1,
+            "rebalance_session": _NOW.date(),
+            "security_id": "SEC_A",
+            "reason": "selected",
         },
     }
     return {**base[table], "known_at": _NOW, "ingested_at": _NOW, **values}
@@ -442,6 +825,21 @@ def test_window_stop_states_include_abandoned(journal: duckdb.DuckDBPyConnection
         _insert(journal, "paper_window_stops", _row("paper_window_stops", state=state))
     with pytest.raises(duckdb.ConstraintException):
         _insert(journal, "paper_window_stops", _row("paper_window_stops", state="paused"))
+
+
+def test_signal_reasons_are_checked_by_prefix_not_by_closed_set(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    """`signals.reason` is no closed enum since version 14 (#1153, T127; ADR 0014
+    point 3): its own `CHECK` accepts `selected`, `below_cut` and any
+    `excluded_<reason>`, refuses anything else and NULL."""
+    assert ("signals", "reason") not in schema.JOURNAL_ENUMS
+    assert schema.SIGNAL_REASONS == ("selected", "below_cut")
+    for reason in ("selected", "below_cut", "excluded_no_history", "excluded_sector"):
+        _insert(journal, "signals", _row("signals", reason=reason))
+    for reason in ("foo", "excluded", "Excluded_sector", None):
+        with pytest.raises(duckdb.ConstraintException):
+            _insert(journal, "signals", _row("signals", reason=reason))
 
 
 @pytest.mark.parametrize(("table", "column"), sorted(schema.JOURNAL_ENUMS))

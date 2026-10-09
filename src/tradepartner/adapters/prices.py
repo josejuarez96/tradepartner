@@ -385,3 +385,9 @@ class PriceSource(abc.ABC):
         self, security_ids: Sequence[str], start: date, end: date
     ) -> list[CorporateAction]:
         """Splits and dividends for `security_ids` with `start <= ex_date <= end`."""
+
+    def resolution_summary(self) -> str:
+        """What the source left unassigned while mapping its rows to
+        securities, as one line for the run row's message; `""` when it
+        maps nothing (the default)."""
+        return ""

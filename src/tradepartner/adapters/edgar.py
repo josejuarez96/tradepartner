@@ -47,13 +47,14 @@ Fact names are the XBRL concept's local name
 from __future__ import annotations
 
 import functools
+import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import lxml.etree  # type: ignore[import-untyped]
@@ -67,6 +68,7 @@ from tradepartner.adapters.filings import (
     FactRecord,
     FilingHeader,
     FilingIndexEntry,
+    StatementFactRecord,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -75,6 +77,7 @@ _DELISTING_FORMS = frozenset({"25", "25-NSE"})
 _SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 _CLASS_AXIS = "us-gaap:StatementClassOfStockAxis"
 _CIK_SCHEME = "http://www.sec.gov/CIK"
+_CIK_CONCEPT = "EntityCentralIndexKey"
 _COVER_CONCEPTS = frozenset(
     {"Security12bTitle", "TradingSymbol", "SecurityExchangeName", _SHARES_CONCEPT}
 )
@@ -205,13 +208,18 @@ def _filing_columns(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 @_fail_closed
 def acceptance_times(*payloads: Mapping[str, Any]) -> dict[str, datetime]:
     """Accession -> acceptance instant (UTC) from submissions payloads and
-    their older pages (`submissions_page`), in any mix."""
+    their older pages (`submissions_page`), in any mix. A row with a blank
+    `acceptanceDateTime` is skipped rather than stamped, so one malformed row
+    does not abort the whole payload; its accession simply stays unstamped
+    for the caller, as a row with no entry at all already does."""
     times: dict[str, datetime] = {}
     for payload in payloads:
         columns = _filing_columns(payload)
         for accession, stamp in zip(
             columns["accessionNumber"], columns["acceptanceDateTime"], strict=True
         ):
+            if not stamp:
+                continue
             times[accession] = _parse_utc(stamp)
     return times
 
@@ -255,23 +263,34 @@ _INDEX_ROW = re.compile(
     r"^(?P<form>\S(?:.*?\S)?)\s{2,}(?P<name>\S.*?)\s+(?P<cik>\d+)\s+"
     r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
 )
+# A row whose company-name column is blank (EDGAR has such rows, e.g. a 1997 SC 13D). Tried
+# only when `_INDEX_ROW` fails, so a one-character form can never absorb the name. The form
+# is capped at 16 characters (the form column is 17 wide, the name column 62) and the gap
+# must be at least 40 spaces, so a form and a name separated by one space, whatever the form
+# length, never pass as a long form with a blank name (#358).
+_INDEX_ROW_BLANK_NAME = re.compile(
+    r"^(?P<form>\S(?:.{0,14}\S)?)\s{40,}(?P<cik>\d+)\s+"
+    r"(?P<filed>\d{4}-\d{2}-\d{2})\s+edgar/data/\d+/(?P<accession>\d{10}-\d{2}-\d{6})\.txt\s*$"
+)
 
 
 @_fail_closed
 def parse_filing_index(text: str, acceptance: Mapping[str, datetime]) -> FilingIndexParse:
     """Rows of a quarterly `form.idx`, stamped from `acceptance`
     (`acceptance_times`); rows with no acceptance time go to `unstamped`.
-    A data row (one naming `edgar/data/`) that does not parse raises."""
+    A data row (one naming `edgar/data/`) that does not parse raises. A row whose
+    company-name column is blank (EDGAR has such rows, e.g. a 1997 SC 13D) parses with
+    an empty name (#358)."""
     entries: list[FilingIndexEntry] = []
     unstamped: list[UnstampedFiling] = []
     for line in text.splitlines():
-        match = _INDEX_ROW.match(line)
+        match = _INDEX_ROW.match(line) or _INDEX_ROW_BLANK_NAME.match(line)
         if match is None:
             if "edgar/data/" in line:
                 raise ValueError(f"form.idx row does not parse: {line.strip()!r}")
             continue
         cik, accession = _cik(match["cik"]), match["accession"]
-        form, name = match["form"], match["name"]
+        form, name = match["form"], match.groupdict().get("name") or ""
         accepted_at = acceptance.get(accession)
         if accepted_at is None:
             filed_on = date.fromisoformat(match["filed"])
@@ -367,6 +386,210 @@ def parse_company_facts(
     return CompanyFactsParse(tuple(facts), tuple(unstamped))
 
 
+# --- statement facts (#660) -------------------------------------------------------
+
+#: Entry keys that would name a dimension. The companyfacts API carries no
+#: segment facts by construction, so one of these is schema drift (pitfall P9).
+_DIMENSION_KEYS = frozenset({"segment", "segments", "dimension", "dimensions"})
+
+
+class SubmissionStamp(Protocol):
+    """What `parse_statement_facts` reads from a submissions record (the
+    stamps file's `SubmissionRecord` satisfies it): the filing's form and
+    its acceptance, `None` for an accession settled as unstampable."""
+
+    @property
+    def form(self) -> str: ...
+
+    @property
+    def accepted_at(self) -> datetime | None: ...
+
+
+@dataclass(frozen=True)
+class StatementConflict:
+    """A key one filing carries with two values for its winning tag in one
+    unit (pitfall P13): withheld from that filing, never raised, so a later
+    filing's clean value can be the vintage. `values` are sorted."""
+
+    accession: str
+    fact_name: str
+    period_start: date | None
+    period_end: date
+    values: tuple[float, ...]
+
+    @property
+    def period_days(self) -> int:
+        """`0` for an instant, else the duration in days (the key's)."""
+        return 0 if self.period_start is None else (self.period_end - self.period_start).days
+
+
+@dataclass(frozen=True)
+class StatementFactsParse:
+    """`parse_statement_facts`' result: one record per (accession, fact,
+    period) the filing carries cleanly, the conflicts it withheld, and the
+    counts of (filing, fact) pairs skipped for their unit (`non_unit`: the
+    filing carries the fact only in units that are not read) and of
+    entries withheld as malformed (`malformed`)."""
+
+    records: tuple[StatementFactRecord, ...]
+    conflicts: tuple[StatementConflict, ...]
+    non_unit: int
+    malformed: int
+
+
+_StatementKey = tuple[str, str, date | None, date]  # accession, fact, start, end
+
+
+def _statement_period(
+    entry: Mapping[str, Any], stamp: SubmissionStamp | None
+) -> tuple[date | None, date, float] | None:
+    """An entry's `(start, end, value)`, or `None` when it is malformed: a
+    value that is not a finite number, a start on or after its end (a
+    zero-day duration is not an instant), or an end after the filing's
+    acceptance date in New York (checked only when the stamp is known)."""
+    raw = entry["val"]
+    end = date.fromisoformat(entry["end"])
+    start = date.fromisoformat(entry["start"]) if "start" in entry else None
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
+        return None
+    if start is not None and start >= end:
+        return None
+    accepted_at = None if stamp is None else stamp.accepted_at
+    if accepted_at is not None and end > accepted_at.astimezone(_EASTERN).date():
+        return None
+    return start, end, float(raw)
+
+
+@_fail_closed
+def parse_statement_facts(
+    payload: Mapping[str, Any],
+    tags: Mapping[str, Sequence[str]],
+    forms: Iterable[str],
+    units: Sequence[str],
+    acceptance: Mapping[str, SubmissionStamp],
+) -> StatementFactsParse:
+    """As-filed statement-fact entries from a companyfacts payload (spec
+    amendment 2026-10-03, #660; plan T77). Pure: reported values only, no
+    derivation, no first-vintage choice (the ingest's, T77b).
+
+    `tags` maps each canonical fact name to its ordered `taxonomy:tag`
+    fallbacks (`edgar.statement_tags`). Per filing, fact and period:
+
+    - **Period** is the entry's own `(start, end)`; `fy`, `fp` and `frame`
+      are never read. No `start` is an instant (`period_start = None`).
+    - **Form** is the submissions record's (`acceptance[accn].form`), never
+      the entry's; a form outside `forms` drops the entry. An accession with
+      no record yet is emitted with `accepted_at = None` and `form = ""`
+      (unknown until submissions names it), unfiltered, so the ingest's hold
+      rule sees it; a record with `accepted_at = None` (settled unstampable)
+      keeps its form and filter and is emitted unstamped too.
+    - **Units**: only `units` are read, first listed first; entries in any
+      other unit are skipped; a filing that carries a fact only in unread
+      units, under every tag it uses for it, counts once on `non_unit`.
+    - **Malformed** entries (see `_statement_period`) are withheld and
+      counted; they are no value for the key and set no latest period.
+    - **Precedence**: the first listed tag the filing carries (read unit,
+      well formed) wins and is recorded in `xbrl_tag`. Two values for that
+      tag in that unit withhold the key from this filing as a
+      `StatementConflict` (never raised, and never a fall-back to the next
+      tag); identical duplicates collapse.
+    - **comparative** is TRUE when the period ends before the latest
+      `period_end` the filing carries for the same fact and `period_days`.
+
+    An entry naming a dimension raises `ValueError` (schema drift, P9), as
+    does any malformed payload structure (a missing key)."""
+    cik = _cik(payload["cik"])
+    allowed_forms = frozenset(forms)
+    unit_rank = {unit: rank for rank, unit in enumerate(units)}
+    facts: Mapping[str, Any] = payload["facts"]
+    # key -> (tag rank, unit rank) -> values; the filing's `filed` per key.
+    values: dict[_StatementKey, dict[tuple[int, int], set[float]]] = {}
+    filed: dict[_StatementKey, date] = {}
+    malformed = 0
+    # (accession, fact) pairs seen in an unread unit, and in a read one.
+    unread: set[tuple[str, str]] = set()
+    read: set[tuple[str, str]] = set()
+    for fact_name, fallbacks in tags.items():
+        for tag_rank, tag in enumerate(fallbacks):
+            taxonomy, _, local = tag.partition(":")
+            concept = facts.get(taxonomy, {}).get(local)
+            if concept is None:
+                continue
+            for unit, entries in concept["units"].items():
+                for entry in entries:
+                    if _DIMENSION_KEYS & entry.keys():
+                        raise ValueError(
+                            f"{tag} entry for {entry.get('accn')!r} names a dimension: {entry!r}"
+                        )
+                    accession = entry["accn"]
+                    stamp = acceptance.get(accession)
+                    if stamp is not None and stamp.form not in allowed_forms:
+                        continue
+                    if unit not in unit_rank:
+                        unread.add((accession, fact_name))
+                        continue
+                    read.add((accession, fact_name))
+                    period = _statement_period(entry, stamp)
+                    if period is None:
+                        malformed += 1
+                        continue
+                    start, end, value = period
+                    key = (accession, fact_name, start, end)
+                    values.setdefault(key, {}).setdefault((tag_rank, unit_rank[unit]), set()).add(
+                        value
+                    )
+                    entry_filed = date.fromisoformat(entry["filed"])
+                    filed[key] = min(filed.get(key, entry_filed), entry_filed)
+
+    non_unit = len(unread - read)
+    latest: dict[tuple[str, str, int], date] = {}
+    for accession, fact_name, start, end in values:
+        days = 0 if start is None else (end - start).days
+        group = (accession, fact_name, days)
+        if group not in latest or end > latest[group]:
+            latest[group] = end
+
+    records: list[StatementFactRecord] = []
+    conflicts: list[StatementConflict] = []
+    for key, candidates in values.items():
+        accession, fact_name, start, end = key
+        tag_rank, rank_of_unit = min(candidates)
+        found = sorted(candidates[(tag_rank, rank_of_unit)])
+        if len(found) > 1:
+            conflicts.append(StatementConflict(accession, fact_name, start, end, tuple(found)))
+            continue
+        stamp = acceptance.get(accession)
+        days = 0 if start is None else (end - start).days
+        records.append(
+            StatementFactRecord(
+                cik=cik,
+                fact_name=fact_name,
+                xbrl_tag=tags[fact_name][tag_rank],
+                period_start=start,
+                period_end=end,
+                value=found[0],
+                unit=units[rank_of_unit],
+                form="" if stamp is None else stamp.form,
+                accession=accession,
+                accepted_at=None if stamp is None else stamp.accepted_at,
+                filed=filed[key],
+                comparative=end < latest[(accession, fact_name, days)],
+            )
+        )
+    records.sort(
+        key=lambda r: (
+            r.accepted_at is None,
+            r.accepted_at or datetime.min.replace(tzinfo=UTC),
+            r.accession,
+            r.fact_name,
+            r.period_end,
+            r.period_days,
+        )
+    )
+    conflicts.sort(key=lambda c: (c.accession, c.fact_name, c.period_end, c.period_days))
+    return StatementFactsParse(tuple(records), tuple(conflicts), non_unit, malformed)
+
+
 # --- SGML header ---------------------------------------------------------------
 
 _HEADER_FIELD = re.compile(r"^\s*(?P<key>[A-Z][A-Z0-9 -]*?):\s*(?P<value>.*?)\s*$")
@@ -450,14 +673,37 @@ class CoverPageParse:
     #: Contexts dimensioned by anything but the class axis (a co-registrant's
     #: `dei:LegalEntityAxis`): reported, never read as the filer's own.
     other_contexts: tuple[str, ...] = ()
+    #: Listings with a trading symbol but no title or exchange, skipped and
+    #: counted (owner decision #224, as `FsnFiling.incomplete_listings`;
+    #: #609 C1): the filing's shares and complete listings are kept.
+    incomplete_listings: int = 0
 
 
-def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str, Any]]]:
+def _is_nil(element: Any) -> bool:
+    """Whether an iXBRL fact element carries `xsi:nil="true"` (any prefix:
+    filers write `xs:nil` too): a fact that reports no value."""
+    return any(
+        str(key).rsplit(":", 1)[-1].lower() == "nil" and str(value).strip().lower() == "true"
+        for key, value in element.attrib.items()
+    )
+
+
+@dataclass(frozen=True)
+class _DeiFacts:
+    #: (local name, value, context) of each cover concept, in document order.
+    cover: list[tuple[str, str, dict[str, Any]]]
+    #: The `dei:EntityCentralIndexKey` values, read only to name the filer
+    #: of a cover that carries no cover concept (#609 C3).
+    ciks: set[str]
+
+
+def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
     """(local name, value, context) of each cover-page `dei:` fact this
     module reads, in document order. A repeated fact (same concept, context
     and value) is kept once; the same concept and context with two values,
     or a value whose iXBRL format did not apply, raises: either would give
-    a silently wrong record."""
+    a silently wrong record. A nil fact (`xsi:nil="true"`, #609 C2) reports
+    nothing and is skipped; a nil fact that also has text raises (#615)."""
     # Imported here: loading `edgar` pulls in the whole package, which only
     # cover-page parsing needs.
     from edgar.documents.strategies.xbrl_extraction import XBRLExtractor
@@ -466,12 +712,21 @@ def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str
     extractor = XBRLExtractor()  # type: ignore[no-untyped-call]
     seen: dict[tuple[str, str], str] = {}
     out: list[tuple[str, str, dict[str, Any]]] = []
+    ciks: set[str] = set()
     for element in tree.iter():
         fact = extractor.extract_fact(element)
         if fact is None or not fact.concept.startswith("dei:"):
             continue
         name = fact.concept.removeprefix("dei:")
+        if name == _CIK_CONCEPT:
+            ciks.add(str(fact.value).strip())
+            continue
         if name not in _COVER_CONCEPTS:
+            continue
+        if _is_nil(element):
+            text = "".join(element.itertext()).strip()
+            if text:  # #615: an XBRL inconsistency, never a silent skip
+                raise ValueError(f"{accession}: dei:{name} is nil but has text {text[:40]!r}")
             continue
         issue = (fact.metadata or {}).get("format_issue")
         if issue:
@@ -484,7 +739,7 @@ def _dei_facts(document: bytes, accession: str) -> list[tuple[str, str, dict[str
             continue
         seen[key] = fact.value
         out.append((name, fact.value, context))
-    return out
+    return _DeiFacts(out, ciks)
 
 
 @_fail_closed
@@ -498,12 +753,26 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     Each class is one context holding one title, one symbol and one
     exchange; a class listed on a second exchange is a second context. A
     title with no symbol (notes with `NoTradingSymbolFlag`) is not a
-    listing; a symbol with no title or no exchange, or a fact with no
-    context, raises. A context dimensioned by any axis other than the class
-    axis (a co-registrant in a combined filing) is skipped and returned in
-    `other_contexts`: its shares and listings are not the filer's."""
+    listing; a symbol with no title or no exchange is skipped and counted
+    in `incomplete_listings` (owner decision #224, as the FSN path); a fact
+    with no context raises. A nil fact (`xsi:nil="true"`) is skipped, and
+    one that also has text raises (#615). A context dimensioned by any axis
+    other than the class axis (a co-registrant in a combined filing) is
+    skipped and returned in `other_contexts`: its shares and listings are
+    not the filer's.
+
+    A cover with no listing, shares or title fact at all (a registrant
+    with no listed class that reports no share count) is an empty parse for
+    the one CIK its `dei:EntityCentralIndexKey` names; with no such CIK it
+    raises."""
     accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
-    facts = _dei_facts(document, accession)
+    dei = _dei_facts(document, accession)
+    facts = dei.cover
+    if not facts and len(dei.ciks) == 1:  # nothing to list or count (#609 C3)
+        [raw_cik] = dei.ciks
+        if not re.fullmatch(r"[0-9]{1,10}", raw_cik):  # ASCII only: it names cache files
+            raise ValueError(f"{accession}: cover-page EntityCentralIndexKey is not a CIK")
+        return CoverPageParse(CoverPage(_cik(raw_cik), accession, accepted_at, ()), ())
     entities = {(context.get("scheme"), context.get("entity")) for _, _, context in facts}
     if len(entities) != 1:
         raise ValueError(f"{accession}: cover page names {len(entities)} entities")
@@ -538,18 +807,21 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
             )
 
     listings: list[CoverListing] = []
-    for context_id, group in classes.items():
+    incomplete = 0
+    for group in classes.values():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if symbol is None:
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
-            raise ValueError(
-                f"{accession}: symbol {symbol!r} ({context_id}) lacks a title or exchange"
-            )
+            incomplete += 1  # skipped and counted, not a failure (owner, #224; #609 C1)
+            continue
         listings.append(CoverListing(title, symbol, normalize_exchange(exchange)))
     return CoverPageParse(
-        CoverPage(cik, accession, accepted_at, tuple(listings)), tuple(shares), tuple(sorted(other))
+        CoverPage(cik, accession, accepted_at, tuple(listings)),
+        tuple(shares),
+        tuple(sorted(other)),
+        incomplete,
     )
 
 
@@ -577,10 +849,20 @@ def parse_delisting(
             raise ValueError(f"{accession}: {form} has no {path}")
         return found.strip()
 
+    class_title = (root.findtext("descriptionClassSecurity") or "").strip()
+    if not class_title:
+        # Owner 2026-10-02 (#609 D1): which class is removed is never
+        # guessed (ACCO Brands' 25-NSE names none while the issuer stays
+        # listed), so the notice stays a failure for the owner to accept.
+        raise ValueError(
+            f"{accession}: {form} names no class of security (descriptionClassSecurity is "
+            "missing or blank); the class is not guessed, so the notice is not recorded"
+        )
+
     return DelistingFiling(
         cik=_cik(text("issuer/cik")),
         form=form,
-        class_title=text("descriptionClassSecurity"),
+        class_title=class_title,
         exchange=normalize_exchange(text("exchange/entityName")),
         accession=accession,
         accepted_at=accepted_at,
@@ -609,7 +891,10 @@ class FsnShare:
     end**: Alphabet's cover date 2026-01-28 arrives as 2026-01-31, Apple's
     2025-10-17 as 2025-10-31 (recorded fixtures, #224). It is not the cover's
     own date, it can fall after the filing's acceptance, and it is never a
-    `known_at`; T11e decides how FSN shares are dated and de-duplicated."""
+    `known_at`; T11e decides how FSN shares are dated and de-duplicated.
+    When a filing reports a member's count at several ddates, only the
+    latest is kept (#609 F1); `facts()` still caps it at the acceptance
+    date."""
 
     class_member: str
     value: float
@@ -665,6 +950,23 @@ def restore_class_letter_space(title: str) -> str:
     return _CLASS_LETTER_NO_SPACE.sub(r"Class \1", title)
 
 
+def _fsn_title_key(title: str) -> str:
+    """`title` with the class-letter space restored and all whitespace
+    removed: two FSN copies of one title that differ only by a dropped
+    non-breaking space ("ClassA" / "Class A", "No ParValue" / "No Par
+    Value", #609 F4) have the same key."""
+    return "".join(restore_class_letter_space(title).split())
+
+
+def _fsn_spaced_title(first: str, second: str) -> str:
+    """Of two titles with the same `_fsn_title_key`, the one that kept its
+    spaces (the longer once whitespace runs are collapsed), whatever their
+    order; a tie keeps the larger string, so the result never depends on
+    row order."""
+    candidates = (" ".join(restore_class_letter_space(t).split()) for t in (first, second))
+    return max(candidates, key=lambda t: (len(t), t))
+
+
 def _fsn_segments(raw: str) -> dict[str, str] | None:
     """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
     member}`, or `None` if it names any axis other than `ClassOfStock`."""
@@ -701,6 +1003,14 @@ def _fsn_class_member(row: Mapping[str, str], dim_segments: Mapping[str, str]) -
     segments_raw = dim_segments.get((row.get("dimh") or "").strip())
     if segments_raw is None:
         return None
+    # An invalid byte or a tab `_fsn_rows` replaced (#498), anywhere in a
+    # ClassOfStock segment: beside the axis key it would read as another
+    # axis and drop the class silently, so the accession fails instead.
+    if "\ufffd" in segments_raw and _FSN_CLASS_AXIS in segments_raw:
+        raise ValueError(
+            f"{row.get('adsh', '')}: undecodable byte or embedded tab in "
+            f"segments {segments_raw[:60]!r}"
+        )
     segments = _fsn_segments(segments_raw)
     if segments is None:
         return None
@@ -732,8 +1042,16 @@ def _parse_one_fsn_filing(
         if member is None:
             continue
         group, value = groups.setdefault(member, {}), row.get("value") or ""
-        if group.get(tag, value) != value:  # fail closed, as parse_cover_page does
-            raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+        if "\ufffd" in value:  # an invalid byte or a tab `_fsn_rows` replaced (#455, #498)
+            raise ValueError(
+                f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
+            )
+        held = group.get(tag, value)
+        if held != value:
+            if tag != "Security12bTitle" or _fsn_title_key(held) != _fsn_title_key(value):
+                # fail closed, as parse_cover_page does
+                raise ValueError(f"{accession}: two values for {tag} ({member or 'no class'})")
+            value = _fsn_spaced_title(held, value)  # FSN dropped a space in one copy (#609 F4)
         group[tag] = value
 
     listings: list[CoverListing] = []
@@ -750,19 +1068,28 @@ def _parse_one_fsn_filing(
             CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
         )
 
-    shares: dict[str, FsnShare] = {}
+    # member -> ddate -> value. A filing may report its share count at several
+    # ddates (a prior year-end beside the cover date, #609 F1): every ddate is
+    # checked, and the latest is kept per member.
+    dated: dict[str, dict[date, float]] = {}
     for row in num_rows:
         if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
             continue
         member = _fsn_class_member(row, dim_segments)
         if member is None:
             continue
-        share = FsnShare(member, float(Decimal(row["value"])), _fsn_ddate(row["ddate"]))
-        if shares.get(member, share) != share:  # fail closed, as for listing tags
-            raise ValueError(f"{accession}: two share values for {member or 'no class'}")
-        shares[member] = share
+        raw_value = row.get("value")
+        if raw_value is None or not str(raw_value).strip():
+            continue  # FSN's NULL: an `xsi:nil` fact reports no count (#609 F3)
+        ddate, count = _fsn_ddate(row["ddate"]), float(Decimal(raw_value))
+        # Fail closed: nothing in the rows read picks one of two counts (#609 F2).
+        if dated.setdefault(member, {}).setdefault(ddate, count) != count:
+            raise ValueError(
+                f"{accession}: two share values for {member or 'no class'} on {ddate.isoformat()}"
+            )
+    shares = tuple(FsnShare(m, values[max(values)], max(values)) for m, values in dated.items())
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), tuple(shares.values()), incomplete)
+    return FsnFiling(accession, cik, form, sic, tuple(listings), shares, incomplete)
 
 
 def parse_fsn(

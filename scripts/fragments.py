@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """Per-PR bookkeeping fragments, so parallel PRs never edit the same shared lines.
 
-Every PR used to append one line to ``docs/STATUS.md`` ("Done") and one to
-``CHANGELOG.md`` ("[Unreleased]") at the same anchor. Git cannot merge two insertions at
-one spot, so every merge to ``main`` conflicted every other open PR. Instead, a PR now adds
-**new files**::
+A PR records its bookkeeping in **one new file**, never in the shared files::
 
-    docs/status.d/<issue>-<slug>.md      one or more "- ..." bullets for STATUS "Done"
-    changelog.d/<issue>-<slug>.md        "### Added|Changed|Fixed|Removed" headings + bullets
+    changelog.d/<issue>-<slug>.md
 
-New files never conflict. ``fold`` moves every fragment into the shared files in issue
-order and deletes it; it runs inside a PR that already edits those files for another
-reason (doc-keeper, a plan amendment, the phase-close PR), never in a PR of its own.
+    - <one STATUS "Recently done" line, optional, at most 240 characters>
+    ### Added
+    - <CHANGELOG [Unreleased] bullet>
+    ### Fixed
+    - ...
+
+A bullet before any heading is the STATUS line; the ``### Added|Changed|Deprecated|
+Removed|Fixed`` headings carry the CHANGELOG bullets. New files never conflict. ``fold``
+appends the CHANGELOG bullets under ``[Unreleased]`` in issue order, appends the STATUS lines
+to ``## Recently done`` and keeps only the last ``STATUS_RECENT_N`` there (older lines are
+dropped: CHANGELOG and git history keep them), then deletes the fragments. It runs inside a
+PR that already edits those files (doc-keeper, a plan amendment, the phase-close PR).
+
+Transition (#351): ``docs/status.d/<issue>-<slug>.md`` files (bullets only), the old layout
+beside ``changelog.d/``, are still read, checked, shown and folded, so PRs opened before
+the change keep working. A STATUS line without a ``#<number>`` gets ``(#<issue>)``, and one
+longer than the limit is cut at a word boundary, when it is folded.
 
 Usage::
 
@@ -31,24 +41,34 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STATUS_DIR = Path("docs/status.d")
-CHANGELOG_DIR = Path("changelog.d")
+FRAGMENT_DIR = Path("changelog.d")
+LEGACY_STATUS_DIR = Path("docs/status.d")
 STATUS_FILE = Path("docs/STATUS.md")
 CHANGELOG_FILE = Path("CHANGELOG.md")
-STATUS_SECTION = "## Done"
+STATUS_SECTION = "## Recently done"
+#: How many "Recently done" lines STATUS keeps after a fold (#351).
+STATUS_RECENT_N = 10
+#: A new STATUS line's length limit; longer legacy lines are cut when folded (#351).
+STATUS_LINE_MAX = 240
 CHANGELOG_SECTION = "## [Unreleased]"
 CHANGELOG_HEADINGS = ("### Added", "### Changed", "### Deprecated", "### Removed", "### Fixed")
 FRAGMENT_NAME_RE = re.compile(r"^(?P<issue>\d+)-(?P<slug>[a-z0-9][a-z0-9-]*)\.md$")
 BULLET_RE = re.compile(r"^- \S")
+LINK_RE = re.compile(r"#\d+")
 SKIP_NAMES = frozenset({"README.md", ".gitkeep"})
+
+# Old names, kept so tools written against the two-directory layout still import.
+STATUS_DIR = LEGACY_STATUS_DIR
+CHANGELOG_DIR = FRAGMENT_DIR
 
 
 @dataclass(frozen=True)
 class Fragment:
-    """One fragment file, parsed. ``sections`` maps a heading ("" for STATUS) to bullets."""
+    """One fragment file, parsed: its STATUS lines and its CHANGELOG sections."""
 
     path: Path
     issue: int
+    status: list[str] = field(default_factory=list)
     sections: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -59,16 +79,12 @@ class FragmentError(ValueError):
 # ── parsing (pure) ──────────────────────────────────────────────────────────────
 
 
-def parse_status_fragment(path: Path, text: str) -> Fragment:
-    """A STATUS fragment is bullets only, at least one."""
+def parse_fragment(path: Path, text: str) -> Fragment:
+    """A fragment: at most one STATUS bullet before any heading (at most
+    ``STATUS_LINE_MAX`` characters), then Keep-a-Changelog headings with bullets.
+    It needs a STATUS line, a CHANGELOG bullet, or both."""
     issue = _issue_from_name(path)
-    bullets = _bullets_only(path, text.strip().splitlines())
-    return Fragment(path, issue, {"": bullets})
-
-
-def parse_changelog_fragment(path: Path, text: str) -> Fragment:
-    """A CHANGELOG fragment is one or more Keep-a-Changelog headings, each with bullets."""
-    issue = _issue_from_name(path)
+    status: list[str] = []
     sections: dict[str, list[str]] = {}
     heading: str | None = None
     for raw in text.strip().splitlines():
@@ -81,17 +97,40 @@ def parse_changelog_fragment(path: Path, text: str) -> Fragment:
             heading = line
             sections.setdefault(heading, [])
             continue
-        if heading is None:
-            raise FragmentError(f"{path}: bullets must follow a '### Added'-style heading")
         if not BULLET_RE.match(line):
             raise FragmentError(f"{path}: expected a '- ...' bullet, got {line!r}")
-        sections[heading].append(line)
-    if not sections:
-        raise FragmentError(f"{path}: empty fragment")
-    for heading, bullets in sections.items():
+        if heading is None:
+            status.append(line)
+        else:
+            sections[heading].append(line)
+    if len(status) > 1:
+        raise FragmentError(f"{path}: one STATUS line per fragment, got {len(status)}")
+    if status and len(status[0]) > STATUS_LINE_MAX:
+        raise FragmentError(
+            f"{path}: the STATUS line is {len(status[0])} characters; keep it to "
+            f"{STATUS_LINE_MAX} and put the detail in the CHANGELOG bullet or the PR"
+        )
+    for name, bullets in sections.items():
         if not bullets:
-            raise FragmentError(f"{path}: heading {heading!r} has no bullets")
-    return Fragment(path, issue, sections)
+            raise FragmentError(f"{path}: heading {name!r} has no bullets")
+    if not status and not sections:
+        raise FragmentError(f"{path}: empty fragment")
+    return Fragment(path, issue, status, sections)
+
+
+def parse_legacy_status_fragment(path: Path, text: str) -> Fragment:
+    """An old-layout ``docs/status.d`` fragment: bullets only, at least one."""
+    issue = _issue_from_name(path)
+    return Fragment(path, issue, _bullets_only(path, text.strip().splitlines()), {})
+
+
+# The pre-#351 names, for callers and tests of the old layout.
+parse_status_fragment = parse_legacy_status_fragment
+
+
+def parse_changelog_fragment(path: Path, text: str) -> Fragment:
+    """An old-layout CHANGELOG fragment (no STATUS line); the new parser accepts it."""
+    return parse_fragment(path, text)
 
 
 def _issue_from_name(path: Path) -> int:
@@ -109,6 +148,19 @@ def _bullets_only(path: Path, lines: Sequence[str]) -> list[str]:
         if not BULLET_RE.match(ln):
             raise FragmentError(f"{path}: expected a '- ...' bullet, got {ln!r}")
     return bullets
+
+
+def recent_line(line: str, issue: int) -> str:
+    """A STATUS line as it enters "Recently done": linked to its issue (``(#<issue>)``
+    appended when it names no ``#<number>``) and cut to ``STATUS_LINE_MAX`` characters
+    at a word boundary, the link kept."""
+    link = "" if LINK_RE.search(line) else f" (#{issue})"
+    if len(line) + len(link) <= STATUS_LINE_MAX:
+        return line + link
+    tail = link or f" (#{issue})"
+    room = STATUS_LINE_MAX - len(tail) - 1
+    cut = line[:room].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return f"{cut}…{tail}"
 
 
 # ── folding (pure) ──────────────────────────────────────────────────────────────
@@ -145,21 +197,41 @@ def _last_bullet_index(lines: Sequence[str], start: int, end: int) -> int:
     return last
 
 
-def fold_status(text: str, fragments: Sequence[Fragment]) -> str:
-    """Append every fragment's bullets after the last bullet of the "## Done" list."""
-    if not fragments:
-        return text
+def _bullet_blocks(lines: Sequence[str]) -> list[list[str]]:
+    """``lines`` (a list's bullets) grouped as bullet plus indented continuation lines."""
+    blocks: list[list[str]] = []
+    for ln in lines:
+        if BULLET_RE.match(ln):
+            blocks.append([ln])
+        elif blocks and ln[:1] in (" ", "\t") and ln.strip():
+            blocks[-1].append(ln)
+    return blocks
+
+
+def fold_status(text: str, fragments: Sequence[Fragment], keep: int = STATUS_RECENT_N) -> str:
+    """Append every fragment's STATUS lines (issue order, linked and cut by
+    ``recent_line``) to "## Recently done", then keep only the last ``keep`` bullets
+    there. Lines before the first bullet (a note) and every other section are kept."""
+    new = [
+        recent_line(line, f.issue)
+        for f in sorted(fragments, key=lambda f: f.issue)
+        for line in f.status
+    ]
     lines = text.splitlines()
     start, end = _section_bounds(lines, STATUS_SECTION)
-    at = _last_bullet_index(lines, start, end)
-    new = [b for f in sorted(fragments, key=lambda f: f.issue) for b in f.sections[""]]
-    lines[at:at] = new
+    first = next((i for i in range(start, end) if BULLET_RE.match(lines[i])), None)
+    last = _last_bullet_index(lines, start, end)
+    if first is None:
+        first = last = start + _trim_trailing_blank(lines[start:end])
+    blocks = _bullet_blocks(lines[first:last]) + [[b] for b in new]
+    kept = [ln for block in blocks[-keep:] for ln in block] if keep > 0 else []
+    lines[first:last] = kept
     return "\n".join(lines) + "\n"
 
 
 def fold_changelog(text: str, fragments: Sequence[Fragment]) -> str:
     """Append bullets under the matching ``### `` heading of "[Unreleased]", creating it."""
-    if not fragments:
+    if not any(f.sections for f in fragments):
         return text
     lines = text.splitlines()
     for heading in CHANGELOG_HEADINGS:
@@ -201,22 +273,15 @@ def _fragment_files(root: Path, directory: Path) -> list[Path]:
     return sorted(p for p in d.iterdir() if p.is_file() and p.name not in SKIP_NAMES)
 
 
-def load_fragments(root: Path) -> tuple[list[Fragment], list[Fragment]]:
-    """Parse every fragment under ``root``; raises ``FragmentError`` on the first bad one."""
-    status = [parse_status_fragment(p, p.read_text()) for p in _fragment_files(root, STATUS_DIR)]
-    changelog = [
-        parse_changelog_fragment(p, p.read_text()) for p in _fragment_files(root, CHANGELOG_DIR)
+def load_fragments(root: Path) -> list[Fragment]:
+    """Every fragment under ``root``, new and legacy layout, in issue order;
+    raises ``FragmentError`` on the first bad one."""
+    found = [parse_fragment(p, p.read_text()) for p in _fragment_files(root, FRAGMENT_DIR)]
+    found += [
+        parse_legacy_status_fragment(p, p.read_text())
+        for p in _fragment_files(root, LEGACY_STATUS_DIR)
     ]
-    return status, changelog
-
-
-def write_fragment(root: Path, directory: Path, issue: int, slug: str, body: str) -> Path:
-    path = root / directory / f"{issue}-{slug}.md"
-    if path.exists():
-        raise FragmentError(f"{path} exists; edit it instead of adding another")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body.rstrip("\n") + "\n")
-    return path
+    return sorted(found, key=lambda f: (f.issue, str(f.path)))
 
 
 def cmd_add(
@@ -224,7 +289,7 @@ def cmd_add(
     issue: int,
     slug: str,
     *,
-    status: Sequence[str],
+    status: str | None,
     added: Sequence[str],
     changed: Sequence[str],
     fixed: Sequence[str],
@@ -233,12 +298,9 @@ def cmd_add(
     if not slug or not FRAGMENT_NAME_RE.match(f"{issue}-{slug}.md"):
         raise SystemExit("--slug must be lowercase letters, digits and dashes")
     name = f"{issue}-{slug}.md"
-    plan: list[tuple[Path, str]] = []
-    if status:
-        body = "\n".join(_as_bullet(s) for s in status)
-        parse_status_fragment(STATUS_DIR / name, body)  # validate before writing anything
-        plan.append((STATUS_DIR, body))
     parts: list[str] = []
+    if status is not None:
+        parts.append(_as_bullet(status))
     for heading, items in (
         ("### Added", added),
         ("### Changed", changed),
@@ -248,17 +310,17 @@ def cmd_add(
         if items:
             parts.append(heading)
             parts.extend(_as_bullet(s) for s in items)
-    if parts:
-        body = "\n".join(parts)
-        parse_changelog_fragment(CHANGELOG_DIR / name, body)
-        plan.append((CHANGELOG_DIR, body))
-    if not plan:
+    if not parts:
         raise SystemExit("nothing to add: pass --status and/or --added/--changed/--fixed/--removed")
-    for directory, _ in plan:
+    body = "\n".join(parts)
+    parse_fragment(FRAGMENT_DIR / name, body)  # validate before writing anything
+    for directory in (FRAGMENT_DIR, LEGACY_STATUS_DIR):
         if (root / directory / name).exists():
             raise FragmentError(f"{directory / name} exists; edit it instead of adding another")
-    for directory, body in plan:
-        print(f"wrote {write_fragment(root, directory, issue, slug, body).relative_to(root)}")
+    path = root / FRAGMENT_DIR / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body + "\n")
+    print(f"wrote {path.relative_to(root)}")
     return 0
 
 
@@ -271,31 +333,28 @@ def _as_bullet(text: str) -> str:
 
 def cmd_check(root: Path) -> int:
     try:
-        status, changelog = load_fragments(root)
+        found = load_fragments(root)
     except FragmentError as exc:
         print(f"fragment check FAILED: {exc}")
         return 1
-    print(f"fragments ok: {len(status)} status, {len(changelog)} changelog")
+    legacy = sum(1 for f in found if f.path.parent.name == LEGACY_STATUS_DIR.name)
+    print(f"fragments ok: {len(found)} ({legacy} in the old {LEGACY_STATUS_DIR}/ layout)")
     return 0
 
 
 def cmd_show(root: Path) -> int:
-    status, changelog = load_fragments(root)
-    if not status and not changelog:
+    found = load_fragments(root)
+    if not found:
         print("no pending fragments")
         return 0
+    status = [recent_line(line, f.issue) for f in found for line in f.status]
     if status:
-        print(f"{STATUS_SECTION} (pending, from {STATUS_DIR}/)")
-        for f in sorted(status, key=lambda f: f.issue):
-            print("\n".join(f.sections[""]))
-    if changelog:
-        print(f"\n{CHANGELOG_SECTION} (pending, from {CHANGELOG_DIR}/)")
+        print(f"{STATUS_SECTION} (pending, from {FRAGMENT_DIR}/)")
+        print("\n".join(status))
+    if any(f.sections for f in found):
+        print(f"\n{CHANGELOG_SECTION} (pending, from {FRAGMENT_DIR}/)")
         for heading in CHANGELOG_HEADINGS:
-            items = [
-                b
-                for f in sorted(changelog, key=lambda f: f.issue)
-                for b in f.sections.get(heading, [])
-            ]
+            items = [b for f in found for b in f.sections.get(heading, [])]
             if items:
                 print(heading)
                 print("\n".join(items))
@@ -303,20 +362,21 @@ def cmd_show(root: Path) -> int:
 
 
 def cmd_fold(root: Path, *, keep: bool = False) -> int:
-    status, changelog = load_fragments(root)
-    if not status and not changelog:
+    found = load_fragments(root)
+    if not found:
         print("no pending fragments")
         return 0
     status_path = root / STATUS_FILE
     changelog_path = root / CHANGELOG_FILE
-    status_path.write_text(fold_status(status_path.read_text(), status))
-    changelog_path.write_text(fold_changelog(changelog_path.read_text(), changelog))
+    status_path.write_text(fold_status(status_path.read_text(), found))
+    changelog_path.write_text(fold_changelog(changelog_path.read_text(), found))
     if not keep:
-        for f in [*status, *changelog]:
+        for f in found:
             f.path.unlink()
+    lines = sum(len(f.status) for f in found)
     print(
-        f"folded {len(status)} status and {len(changelog)} changelog fragments into "
-        f"{STATUS_FILE} and {CHANGELOG_FILE}" + (" (fragments kept)" if keep else "")
+        f"folded {len(found)} fragments ({lines} STATUS lines, the last {STATUS_RECENT_N} kept) "
+        f"into {STATUS_FILE} and {CHANGELOG_FILE}" + (" (fragments kept)" if keep else "")
     )
     return 0
 
@@ -332,10 +392,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--root", type=Path, default=None, help="repo root (default: cwd)")
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("add", help="write this PR's fragment file(s)")
+    p = sub.add_parser("add", help="write this PR's fragment file")
     p.add_argument("issue", type=int)
     p.add_argument("--slug", required=True, help="short lowercase slug for the file name")
-    p.add_argument("--status", action="append", default=[], help="STATUS Done bullet (repeatable)")
+    p.add_argument(
+        "--status",
+        default=None,
+        help=f'the one STATUS "Recently done" line (at most {STATUS_LINE_MAX} characters)',
+    )
     p.add_argument("--added", action="append", default=[], help="CHANGELOG Added bullet")
     p.add_argument("--changed", action="append", default=[], help="CHANGELOG Changed bullet")
     p.add_argument("--fixed", action="append", default=[], help="CHANGELOG Fixed bullet")

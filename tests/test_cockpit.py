@@ -60,6 +60,13 @@ def test_parse_chains_keeps_only_rows_with_task_ids() -> None:
     assert chains == [{"name": "universe", "tasks": ["T5", "T6"], "starts": "T4 merged"}]
 
 
+def test_critical_path_ids_lists_only_open_tasks_in_dependency_order() -> None:
+    tasks = team.parse_plan(PLAN, "p")
+    # T4 is done, so the longest open chain is T5 then T6; the owner task T3 stands alone.
+    assert cockpit.critical_path_ids(tasks) == ["task:T5", "task:T6"]
+    assert cockpit.critical_path_ids([t for t in tasks if t.done]) == []
+
+
 def test_task_state_by_plan_and_holders() -> None:
     tasks = team.parse_plan(PLAN, "p")
     by_id = {t.id: t for t in tasks}

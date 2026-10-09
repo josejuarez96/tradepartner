@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -78,6 +80,10 @@ class FakeClient:
     def get_order_by_client_id(self, client_id: str) -> Any:
         self._hit("get_order_by_client_id", client_id)
         return {"client_order_id": client_id}
+
+    def get_order_by_id(self, order_id: str) -> Any:
+        self._hit("get_order_by_id", order_id)
+        return {"id": order_id}
 
     def get_orders(self, filter: Any = None) -> Any:
         self._hit("get_orders", filter)
@@ -226,9 +232,18 @@ def test_a_timeout_is_retried_max_retries_times_then_raised() -> None:
     assert PAPER_KEY not in repr(vars(err.value)) and PAPER_KEY not in str(err.value)
 
 
-def _api_error(status: int) -> APIError:
+def _api_error(status: int, body: str = '{"code": 1, "message": "refused"}') -> APIError:
     http_error = SimpleNamespace(response=SimpleNamespace(status_code=status))
-    return APIError('{"code": 1, "message": "refused"}', http_error)
+    return APIError(body, http_error)
+
+
+PAPER = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca" / "paper"
+
+
+def _recorded_duplicate() -> APIError:
+    """Alpaca's recorded duplicate refusal (T48b): 422, code 40010001."""
+    error = json.loads((PAPER / "duplicate_client_order_id.json").read_text())["error"]
+    return _api_error(error["status_code"], error["body"])
 
 
 def test_a_429_is_retried_and_a_403_is_not() -> None:
@@ -290,7 +305,7 @@ def _request() -> Any:
 
 
 def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> None:
-    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422)])
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _recorded_duplicate()])
     assert _raw(client=client).submit_order(_request()) == {"client_order_id": "rec-1"}
     assert [name for name, _ in client.calls] == [
         "submit_order",
@@ -299,8 +314,33 @@ def test_a_submit_refused_as_duplicate_on_retry_returns_the_landed_order() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"code": 40010000, "message": "qty must be > 0"}',
+        '{"code": "40010001", "message": "client_order_id must be unique"}',
+        '{"message": "client_order_id must be unique"}',
+        '[{"code": 40010001}]',
+        "client_order_id must be unique",
+        "",
+    ],
+    ids=["other-code", "code-as-string", "no-code", "non-object", "not-json", "empty"],
+)
+def test_a_retried_submit_refused_422_for_anything_but_a_duplicate_is_raised(
+    body: str,
+) -> None:
+    """#1300: only Alpaca's duplicate code 40010001 means the first attempt landed;
+    any other 422, or a body that does not parse to that code, is the refusal."""
+    client = FakeClient(fail_with=[requests.ReadTimeout("slow"), _api_error(422, body)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).submit_order(_request())
+    assert err.value.status_code == 422 and err.value.retried
+    assert err.value.body == body
+    assert [name for name, _ in client.calls] == ["submit_order", "submit_order"]
+
+
 def test_a_duplicate_on_the_first_submit_attempt_is_raised() -> None:
-    client = FakeClient(fail_with=[_api_error(422)])
+    client = FakeClient(fail_with=[_recorded_duplicate()])
     with pytest.raises(AlpacaTradingError) as err:
         _raw(client=client).submit_order(_request())
     assert err.value.status_code == 422 and len(client.calls) == 1
@@ -368,3 +408,31 @@ def test_fill_activities_raise_when_paging_does_not_advance() -> None:
 def test_fill_activities_refuse_a_naive_instant() -> None:
     with pytest.raises(ValueError):
         _raw().list_fill_activities(datetime(2026, 9, 28, 13, 30))  # noqa: DTZ001
+
+
+def test_get_order_by_id_is_paced_and_retried_like_every_call() -> None:
+    clock = FakeClock()
+    client = FakeClient(fail_with=[requests.Timeout("slow")])
+    raw = AlpacaTradingRaw(_settings(trading_requests_per_minute=30), client=client, clock=clock)
+
+    assert raw.get_order_by_id("o9") == {"id": "o9"}
+    assert client.calls == [("get_order_by_id", ("o9",))] * 2
+    assert clock.sleeps == [pytest.approx(2.0)]
+
+
+@pytest.mark.parametrize(
+    ("side", "notional", "qty"), [("buy", 5.0, None), ("sell", None, 0.557436865)]
+)
+def test_market_day_order_builds_the_one_shape_the_adapter_sends(
+    side: str, notional: float | None, qty: float | None
+) -> None:
+    request = raw_mod.market_day_order("KO", side, "rec-1", notional=notional, qty=qty)
+    fields = request.to_request_fields()
+    assert fields.pop("side") == side
+    assert fields == {
+        "symbol": "KO",
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": "rec-1",
+        **({"notional": notional} if notional is not None else {"qty": qty}),
+    }
