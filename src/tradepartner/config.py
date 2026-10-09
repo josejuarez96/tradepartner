@@ -1347,9 +1347,11 @@ class PaperConfig(BaseModel):
 
     `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys. The six
     timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
-    `accept_wait_seconds`, `fill_read_overlap_seconds`) are the spec's placeholders until
-    Probe 3 (#182) sets them (T70), which also switches `tracking_rule` to `residual`
-    (#247 Q4). `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
+    `accept_wait_seconds`, `fill_read_overlap_seconds`) were checked against Probe 3's
+    measured paper fill latency and all kept (#182, T70, the ADR 0006 amendment of
+    2026-10-09), which also switched `tracking_rule` to `residual` (#247 Q4, the
+    ADR 0005 amendment of the same date).
+    `poll_interval_seconds` never exceeds `accept_wait_seconds` (req 3(f)), or
     the acknowledgement poll could never run before its own deadline. `order_id_prefix`
     is one token with no whitespace, since it heads every `client_order_id`.
     `book_id` names the book whose rows this window writes and whose token sits in
@@ -1366,7 +1368,7 @@ class PaperConfig(BaseModel):
     book_id: str = Field(default="main", min_length=1, pattern=r"^[A-Za-z0-9]+$")
     min_rebalances: int = Field(default=6, gt=0)
     tracking_k: float = Field(default=2.0, ge=0)
-    tracking_rule: Literal["raw", "residual"] = "raw"
+    tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
     submit_window_before_open_minutes: int = Field(default=90, ge=0)
     submit_window_after_open_minutes: int = Field(default=30, ge=0)
