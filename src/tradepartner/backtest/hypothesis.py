@@ -39,12 +39,13 @@ overlay (a drift the table does not cover), rather than letting a live value in
 silently.
 
 **Registration after the lab** (strategy-lab spec reqs 1, 4 and 5; plan task T104c).
-In every state `register` returns the existing record for an unchanged slug, doc hash
-and canonical frozen set, newest first (never calling `registry.register_hypothesis`,
+In every state `register` returns the existing record for an unchanged slug, family, doc
+hash and canonical frozen set, newest first (never calling `registry.register_hypothesis`,
 so a registration from before a `FROZEN_KEY_DEFAULTS` key landed is still the record)
-and refuses a prose-only edit (the slug's latest canonical frozen set, hence its
+and refuses a prose-only edit (the slug's latest canonical frozen set and family, hence its
 fingerprint, under a new doc hash; a change to a frozen key outside the fingerprint is
-a new frozen set, which a lab store refuses as a standalone file anyway). **When
+a new frozen set, which a lab store refuses as a standalone file anyway, and a file whose
+family changed is a new hypothesis that the registry refuses as a slug moving family). **When
 `lab_schema.is_lab_initialised`** it refuses every other standalone file unless the
 caller registers it as a promoted file (`promotion_of`, the variant it promotes,
 which `sweep promote` names in the `promotion` decision it appends next): a new
@@ -473,11 +474,12 @@ def register(
 ) -> registry.HypothesisRecord:
     """Register the hypothesis in `path` through `store.registry` and return its record.
 
-    In every state: an unchanged file (same slug and doc hash) whose canonical frozen
-    set equals a stored registration's returns that record without writing, newest
-    first; a prose-only edit (the slug's latest frozen set, so its fingerprint, with a
-    new doc hash) raises `ProseOnlyEditError`; a changed frozen set is a new
-    hypothesis. A family outside `hypotheses.families` is refused (`RegistryError`).
+    In every state: an unchanged file (same slug, family and doc hash) whose canonical
+    frozen set equals a stored registration's returns that record without writing, newest
+    first; a prose-only edit (the slug's latest frozen set and family, so its fingerprint,
+    with a new doc hash) raises `ProseOnlyEditError`; a changed frozen set, or a file whose
+    family changed, is a new hypothesis, and a slug may not move family (`RegistryError`).
+    A family outside `hypotheses.families` is refused (`RegistryError`).
     Refuses a file whose record is not the slug's latest registration, since
     `load_frozen` would run the latest one instead. When the lab is initialised, a new
     registration must be a promoted file: `promotion_of` names the sweep variant it
@@ -499,12 +501,16 @@ def register(
 
     def same_set(existing: registry.HypothesisRecord) -> bool:
         return (
-            existing.in_sample_start,
-            existing.holdout_start,
-            existing.holdout_end,
-        ) == window and frozen.canonical_frozen_set(
-            frozen.frozen_values(existing), existing.family
-        ) == canonical
+            existing.family == parsed.family
+            and (
+                existing.in_sample_start,
+                existing.holdout_start,
+                existing.holdout_end,
+            )
+            == window
+            and frozen.canonical_frozen_set(frozen.frozen_values(existing), existing.family)
+            == canonical
+        )
 
     # Newest first: a file stored twice (before and after a table key landed) is its
     # latest registration, the one runs use.
