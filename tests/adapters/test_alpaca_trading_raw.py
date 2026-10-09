@@ -575,3 +575,17 @@ def test_the_recorder_builds_the_raw_client_on_mains_pair() -> None:
     assert calls
     assert all(kw.arg != "book_id" for call in calls for kw in call.keywords)
     assert inspect.signature(AlpacaTradingRaw).parameters["book_id"].default == "main"
+
+
+def test_an_unread_main_books_entry_never_refuses_another_book(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ALPACA_PAPER_BOOKS__MAIN__*` is never read, so it is never a clash either
+    (code-review on #1373: the refusal would name variables holding other values)."""
+    built = _record_built(monkeypatch)
+    settings = _book_settings(
+        main={"api_key": B_KEY, "api_secret": "leftoverFake"},
+        b={"api_key": B_KEY, "api_secret": B_SECRET},
+    )
+    AlpacaTradingRaw(settings, book_id="b", clock=FakeClock())
+    assert built[0]["api_key"] == B_KEY

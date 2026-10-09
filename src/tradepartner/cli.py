@@ -304,7 +304,7 @@ from tradepartner.backtest.hypothesis import HypothesisFileError, register
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import MAIN_BOOK_ID, Settings, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
@@ -1076,11 +1076,12 @@ def _settle_review(session: review.ReviewSession, settings: Settings, *, recover
 BrokerFactory = Callable[[Settings, Clock], Broker]
 
 
-def _configured_book_broker(settings: Settings, clock: Clock) -> Broker:
-    """`build_broker` for the configured book, `paper.book_id` (`main` by default,
-    so H1's commands read `main`'s pair exactly as before T153); `--book` (T155b)
-    replaces this."""
-    return build_broker(settings, clock, settings.paper.book_id)
+def _main_book_broker(settings: Settings, clock: Clock) -> Broker:
+    """`build_broker` for book `main`, H1's (`main`'s pair exactly as before T153).
+    Not the live `paper.book_id`: until `--book` (T155b) picks the book from the
+    command and its window, a config edit must never point `main`'s window at
+    another book's account."""
+    return build_broker(settings, clock, MAIN_BOOK_ID)
 
 
 #: The `paper` commands' refusal exit codes besides `paper run`'s (module docstring).
@@ -1289,7 +1290,7 @@ def make_app(
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
-    broker: BrokerFactory = _configured_book_broker,
+    broker: BrokerFactory = _main_book_broker,
     model_client: job.ClientFactory = job.CLIENT_FACTORY,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""

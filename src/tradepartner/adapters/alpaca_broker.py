@@ -4,7 +4,9 @@
 **Paper only.** Every request goes through T48's raw client
 (`adapters/alpaca_trading_raw.py`), which builds its `TradingClient` with the
 literal `paper=True`, refuses to start unless `alpaca.paper` is `True`, and reads
-only `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET`. This adapter checks the
+only the adapter's book's own paper pair (`ALPACA_PAPER_API_KEY` / `..._SECRET` for
+`main`, `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` / `..._API_SECRET` for every other
+book; ADR 0017 B.1, T153). This adapter checks the
 guard again and refuses to construct while `alpaca.quantity_decimals` or
 `alpaca.client_order_id_max_length` is unset (T48b's broker facts).
 

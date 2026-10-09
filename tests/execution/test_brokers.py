@@ -115,15 +115,16 @@ def test_the_book_never_lifts_the_paper_guard(monkeypatch: pytest.MonkeyPatch) -
             build_broker(bypassed, _clock, book)
 
 
-def test_the_cli_default_factory_builds_the_configured_book_main_by_default() -> None:
-    """Until `--book` (T155b), the `paper` commands build `paper.book_id`'s broker,
-    `main` by default, so H1's commands read `main`'s pair exactly as before T153."""
+def test_the_cli_default_factory_builds_main_whatever_paper_book_id_says() -> None:
+    """Until `--book` (T155b), the `paper` commands build book `main`'s broker on
+    `main`'s pair, exactly as before T153, even when the live `paper.book_id` names
+    another book (code-review on #1373: a config edit must not move `main`'s window
+    onto another account)."""
     from tradepartner import cli
 
     settings = _settings(b={"api_key": B_KEY, "api_secret": B_SECRET})
-    main_broker: Any = cli._configured_book_broker(settings, _clock)
-    assert main_broker.book_id == "main"
-    assert main_broker._raw._client._api_key == PAPER_KEY
     as_b = settings.model_copy(update={"paper": settings.paper.model_copy(update={"book_id": "b"})})
-    b_broker: Any = cli._configured_book_broker(as_b, _clock)
-    assert b_broker._raw._client._api_key == B_KEY
+    for s in (settings, as_b):
+        broker: Any = cli._main_book_broker(s, _clock)
+        assert broker.book_id == "main"
+        assert broker._raw._client._api_key == PAPER_KEY

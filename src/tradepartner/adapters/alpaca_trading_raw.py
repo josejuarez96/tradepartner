@@ -196,7 +196,7 @@ def _shared_with(settings: Settings, book_id: str, values: set[str]) -> str | No
     others += [
         ("/".join(paper_key_variable_names(other)), pair.api_key, pair.api_secret)
         for other, pair in sorted(settings.alpaca_paper_books.items())
-        if other != book_id
+        if other not in (book_id, MAIN_BOOK_ID)  # a `main` entry is never read
     ]
     for names, other_key, other_secret in others:
         if values & {v for v in (_non_blank(other_key), _non_blank(other_secret)) if v}:
