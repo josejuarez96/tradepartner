@@ -94,6 +94,14 @@ family's `in_sample_start` (`BoundaryRefused`). `open_trial` records the boundar
 in force on every trial (`trials.development_boundary`, NULL when there is none).
 `family_registered_on` is the day a family was first registered, from which a
 holdout is forward (`holdout.is_forward`).
+
+**The shakedown decisions** (ADR 0017 part E; paper-trading plan T157; schema
+version 20). The owner opens the shakedown span with a `shakedown_span` row whose
+`values_json` holds the two thresholds, `sessions` (N) and `order_sessions` (M),
+so the bar is read from the row, never from live settings; a new row restarts the
+span, and `shakedown_span` reads the newest by `made_at` (then by id). A
+`shakedown_note` row names one existing `alerts` row (`alert_id`) the owner has
+explained. Both go through `record_decision`, which checks their values.
 """
 
 from __future__ import annotations
@@ -140,10 +148,17 @@ UNFINISHED: Final = "unfinished"
 TrialKind = Literal["in_sample", "holdout", "tracking"]
 
 #: `owner_decisions.kind` values `record_decision` writes: the Phase 3 three, then
-#: version 18's two (#1319, T140b; `lab_schema.RELEASE_DECISION_KINDS`). The lab's
+#: version 18's two (#1319, T140b; `lab_schema.RELEASE_DECISION_KINDS`) and version
+#: 20's two (#1388, T157; `lab_schema.SHAKEDOWN_DECISION_KINDS`). The lab's
 #: `promotion` and `sweep_retired` are written by `store.lab_registry`.
 DecisionKind = Literal[
-    "gap_signoff", "gap_override", "holdout_spend", "data_release", "development_boundary"
+    "gap_signoff",
+    "gap_override",
+    "holdout_spend",
+    "data_release",
+    "development_boundary",
+    "shakedown_span",
+    "shakedown_note",
 ]
 Basis = Literal["raw", "excess_spy"]
 
@@ -1114,11 +1129,19 @@ def record_decision(
     A `data_release` row is refused here: the release writers below are its only
     writers, so every such row has the shape `data_vintage` reads. So is a
     `development_boundary` row: `write_development_boundary` is its one writer, so
-    every boundary passes ADR 0016 point 6's refusals."""
+    every boundary passes ADR 0016 point 6's refusals. A `shakedown_span` row's
+    `values` must be exactly `sessions` and `order_sessions`, whole numbers with
+    1 <= order_sessions <= sessions (`ValueError` otherwise); a `shakedown_note`
+    row's exactly `alert_id`, naming an existing `alerts` row
+    (`ShakedownRefused` for an unknown one; ADR 0017 part E)."""
     if kind == DATA_RELEASE_KIND:
         raise ValueError("a data_release row is written by the release writers only")
     if kind == DEVELOPMENT_BOUNDARY_KIND:
         raise ValueError("a development_boundary row is written by write_development_boundary only")
+    if kind == SHAKEDOWN_SPAN_KIND:
+        _check_span_values(values)
+    if kind == SHAKEDOWN_NOTE_KIND:
+        _check_note_values(conn, values)
     return _insert_decision(
         conn,
         kind=kind,
@@ -1398,6 +1421,86 @@ def boundary_date(conn: duckdb.DuckDBPyConnection) -> date | None:
     """The newest development boundary's date (`development_boundary`), or None."""
     found = development_boundary(conn)
     return found.boundary if found is not None else None
+
+
+# --- the shakedown decisions (#1388, paper-trading plan T157; ADR 0017 part E) ---
+
+SHAKEDOWN_SPAN_KIND: Final = "shakedown_span"
+SHAKEDOWN_NOTE_KIND: Final = "shakedown_note"
+_SPAN_KEYS: Final = ("sessions", "order_sessions")
+_NOTE_KEYS: Final = ("alert_id",)
+
+
+class ShakedownRefused(RegistryError):
+    """A shakedown decision that names something the store does not hold (an
+    unknown alert); nothing was written."""
+
+
+@dataclass(frozen=True)
+class ShakedownSpan:
+    """The newest `shakedown_span` row: when the span opened and the two
+    thresholds it froze (ADR 0017 part E, "The span")."""
+
+    decision_id: int
+    made_at: datetime
+    sessions: int
+    order_sessions: int
+    reason: str
+
+
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_keys(kind: str, values: Mapping[str, Any], keys: tuple[str, ...]) -> None:
+    if set(values) != set(keys):
+        raise ValueError(f"a {kind} row's values are exactly {list(keys)}, got {sorted(values)}")
+
+
+def _check_span_values(values: Mapping[str, Any]) -> None:
+    _check_keys(SHAKEDOWN_SPAN_KIND, values, _SPAN_KEYS)
+    sessions, order_sessions = values["sessions"], values["order_sessions"]
+    if not (_whole(sessions) and _whole(order_sessions)):
+        raise ValueError("sessions and order_sessions are whole numbers")
+    if not 1 <= order_sessions <= sessions:
+        raise ValueError(
+            f"order_sessions must be at least 1 and at most sessions "
+            f"(got sessions={sessions}, order_sessions={order_sessions})"
+        )
+
+
+def _check_note_values(conn: duckdb.DuckDBPyConnection, values: Mapping[str, Any]) -> None:
+    _check_keys(SHAKEDOWN_NOTE_KIND, values, _NOTE_KEYS)
+    alert_id = values["alert_id"]
+    if not _whole(alert_id):
+        raise ValueError("alert_id is a whole number")
+    if (
+        not _has_table(conn, "alerts")
+        or conn.execute("SELECT 1 FROM alerts WHERE alert_id = ?", [alert_id]).fetchone() is None
+    ):
+        raise ShakedownRefused(f"alert {alert_id} does not exist")
+
+
+def shakedown_span(conn: duckdb.DuckDBPyConnection) -> ShakedownSpan | None:
+    """The newest `shakedown_span` row by `made_at` (then by id), or None. The
+    thresholds come from the row, never from settings (ADR 0017 part E)."""
+    if not _has_table(conn, "owner_decisions"):
+        return None
+    row = conn.execute(
+        "SELECT decision_id, made_at, values_json, reason FROM owner_decisions "
+        "WHERE kind = ? ORDER BY made_at DESC, decision_id DESC LIMIT 1",
+        [SHAKEDOWN_SPAN_KIND],
+    ).fetchone()
+    if row is None:
+        return None
+    values = json.loads(row[2])
+    return ShakedownSpan(
+        decision_id=int(row[0]),
+        made_at=row[1],
+        sessions=int(values["sessions"]),
+        order_sessions=int(values["order_sessions"]),
+        reason=str(row[3]),
+    )
 
 
 class Unread:

@@ -26,7 +26,7 @@ from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, N
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
-from tradepartner.store import registry
+from tradepartner.store import journal, registry
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
 
@@ -1000,6 +1000,116 @@ def test_development_boundary_usage_errors_write_nothing(tmp_path: Path) -> None
     assert _set_boundary(settings, "2023-12-29", " ").exit_code == 2
     assert _set_boundary(settings, "2023-12-1").exit_code == 2
     assert _boundary_rows(settings) == 0
+
+
+# --- decision shakedown-span / shakedown-note (#1388, paper-trading plan T157) --------
+
+
+_SPAN = ("decision", "shakedown-span")
+
+
+def _shakedown_store(settings: Settings) -> int:
+    """A migrated store with one `missed_run` alert on book `main`; its id."""
+    at = datetime(2026, 10, 12, 21, 0, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        alert_id = journal.append(
+            conn,
+            journal.AlertRow(
+                session=date(2026, 10, 12),
+                kind="missed_run",
+                message="no run",
+                at=at,
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+    assert alert_id is not None
+    return alert_id
+
+
+def _shakedown_rows(settings: Settings) -> list[tuple[Any, ...]]:
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        return conn.execute(
+            "SELECT kind, values_json, reason FROM owner_decisions "
+            "WHERE kind LIKE 'shakedown%' ORDER BY decision_id"
+        ).fetchall()
+
+
+def test_shakedown_span_writes_both_thresholds_and_a_new_row_restarts(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _shakedown_store(settings)
+    args = [*_SPAN, "--sessions", "10", "--order-sessions", "5"]
+    first = _invoke(settings, [*args, "--reason", "H1 goes live first"])
+    assert first.exit_code == 0, first.output
+    assert "shakedown_span (sessions 10, order sessions 5)" in first.output
+    second = _invoke(
+        settings,
+        [*_SPAN, "--sessions", "20", "--order-sessions", "10", "--reason", "restart after"],
+    )
+    assert second.exit_code == 0, second.output
+    assert _shakedown_rows(settings) == [
+        ("shakedown_span", '{"order_sessions":5,"sessions":10}', "H1 goes live first"),
+        ("shakedown_span", '{"order_sessions":10,"sessions":20}', "restart after"),
+    ]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        span = registry.shakedown_span(conn)
+    assert span is not None and (span.sessions, span.order_sessions) == (20, 10)
+
+
+@pytest.mark.parametrize(
+    ("sessions", "order_sessions", "reason"),
+    [("10", "5", " "), ("10", "11", "r"), ("10", "0", "r"), ("0", "0", "r"), ("ten", "5", "r")],
+    ids=["blank-reason", "m-over-n", "m-zero", "n-zero", "not-a-number"],
+)
+def test_shakedown_span_usage_errors_write_nothing(
+    tmp_path: Path, sessions: str, order_sessions: str, reason: str
+) -> None:
+    settings = _settings(tmp_path)
+    _shakedown_store(settings)
+    result = _invoke(
+        settings,
+        [*_SPAN, "--sessions", sessions, "--order-sessions", order_sessions, "--reason", reason],
+    )
+    assert result.exit_code == 2, result.output
+    assert _shakedown_rows(settings) == []
+
+
+def test_shakedown_note_names_an_existing_alert_and_refuses_an_unknown_one(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    alert_id = _shakedown_store(settings)
+    unknown = _invoke(
+        settings,
+        ["decision", "shakedown-note", "--alert", str(alert_id + 1), "--reason", "late"],
+    )
+    assert unknown.exit_code == 1, unknown.output
+    assert f"shakedown refused: alert {alert_id + 1} does not exist" in unknown.output
+    blank = _invoke(
+        settings, ["decision", "shakedown-note", "--alert", str(alert_id), "--reason", " "]
+    )
+    assert blank.exit_code == 2, blank.output
+    assert _shakedown_rows(settings) == []
+    ok = _invoke(
+        settings,
+        ["decision", "shakedown-note", "--alert", str(alert_id), "--reason", "feed late"],
+    )
+    assert ok.exit_code == 0, ok.output
+    assert f"shakedown_note for alert {alert_id}" in ok.output
+    assert _shakedown_rows(settings) == [
+        ("shakedown_note", f'{{"alert_id":{alert_id}}}', "feed late")
+    ]
+
+
+def test_shakedown_commands_without_a_store_write_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    result = _invoke(
+        settings,
+        [*_SPAN, "--sessions", "10", "--order-sessions", "5", "--reason", "r"],
+    )
+    assert result.exit_code != 0
+    assert not Path(settings.store.path).exists()
 
 
 # --- decision data-release (#1319, data-foundation plan T140b) ------------------------

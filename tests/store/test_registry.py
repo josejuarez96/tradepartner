@@ -27,7 +27,7 @@ import duckdb
 import pytest
 
 from tradepartner.config import Cadence, Settings
-from tradepartner.store import registry, schema
+from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import insert_row
 
 _T0 = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
@@ -1784,3 +1784,128 @@ def test_a_registration_with_an_empty_default_window_is_refused(
         _family(conn, settings, "momentum", start, (date(2024, 1, 1), date(2026, 9, 30)))
     assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
     _family(conn, settings, "momentum", date(2023, 11, 30), (date(2024, 1, 1), date(2026, 9, 30)))
+
+
+# --- the shakedown decisions (#1388, paper-trading plan T157; ADR 0017 part E) -------
+
+
+def _alert(conn: duckdb.DuckDBPyConnection, *, book_id: str = "main") -> int:
+    at = datetime(2026, 10, 12, 21, 0, tzinfo=UTC)
+    alert_id = journal.append(
+        conn,
+        journal.AlertRow(
+            session=date(2026, 10, 12),
+            kind="missed_run",
+            message="no run",
+            at=at,
+            book_id=book_id,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    assert alert_id is not None
+    return alert_id
+
+
+def _decision_count(conn: duckdb.DuckDBPyConnection) -> int:
+    (n,) = conn.execute("SELECT COUNT(*) FROM owner_decisions").fetchone()  # type: ignore[misc]
+    return int(n)
+
+
+def test_a_shakedown_span_row_records_both_thresholds(conn: duckdb.DuckDBPyConnection) -> None:
+    assert registry.shakedown_span(conn) is None
+    decision_id = registry.record_decision(
+        conn,
+        kind="shakedown_span",
+        reason="H1 goes live first (ADR 0017 open question 8)",
+        values={"sessions": 10, "order_sessions": 5},
+    )
+    row = conn.execute(
+        "SELECT kind, hypothesis_id, trial_id, values_json FROM owner_decisions "
+        "WHERE decision_id = ?",
+        [decision_id],
+    ).fetchone()
+    assert row == ("shakedown_span", None, None, '{"order_sessions":5,"sessions":10}')
+    span = registry.shakedown_span(conn)
+    assert span is not None
+    assert (span.decision_id, span.sessions, span.order_sessions) == (decision_id, 10, 5)
+    assert span.reason == "H1 goes live first (ADR 0017 open question 8)"
+    assert span.made_at.tzinfo is not None
+
+
+def test_the_newest_shakedown_span_wins_by_made_at_not_by_id(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A new row restarts the span (ADR 0017 part E): the newest by `made_at`, so a
+    row with a higher id but an earlier `made_at` does not win."""
+    first = registry.record_decision(
+        conn, kind="shakedown_span", reason="first", values={"sessions": 10, "order_sessions": 5}
+    )
+    second = registry.record_decision(
+        conn, kind="shakedown_span", reason="second", values={"sessions": 20, "order_sessions": 10}
+    )
+    span = registry.shakedown_span(conn)
+    assert span is not None and (span.decision_id, span.sessions) == (second, 20)
+    conn.execute(
+        "UPDATE owner_decisions SET made_at = made_at - INTERVAL 1 DAY WHERE decision_id = ?",
+        [second],
+    )
+    span = registry.shakedown_span(conn)
+    assert span is not None
+    assert (span.decision_id, span.sessions, span.order_sessions, span.reason) == (
+        first,
+        10,
+        5,
+        "first",
+    )
+    # A tie on `made_at` goes to the higher id.
+    conn.execute("UPDATE owner_decisions SET made_at = TIMESTAMPTZ '2026-10-09 20:00:00+00'")
+    span = registry.shakedown_span(conn)
+    assert span is not None and span.decision_id == second
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"sessions": 10},
+        {"sessions": 10, "order_sessions": 5, "extra": 1},
+        {"sessions": 10, "order_sessions": 0},
+        {"sessions": 10, "order_sessions": 11},
+        {"sessions": 0, "order_sessions": 0},
+        {"sessions": 10.0, "order_sessions": 5},
+        {"sessions": True, "order_sessions": True},
+        {"sessions": "10", "order_sessions": "5"},
+    ],
+    ids=["missing", "extra", "m-zero", "m-over-n", "n-zero", "float", "bool", "str"],
+)
+def test_a_malformed_shakedown_span_is_refused_and_writes_nothing(
+    conn: duckdb.DuckDBPyConnection, values: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError):
+        registry.record_decision(conn, kind="shakedown_span", reason="r", values=values)
+    assert _decision_count(conn) == 0
+    assert registry.shakedown_span(conn) is None
+
+
+def test_a_shakedown_note_names_an_existing_alert(conn: duckdb.DuckDBPyConnection) -> None:
+    alert_id = _alert(conn, book_id="daily")
+    decision_id = registry.record_decision(
+        conn, kind="shakedown_note", reason="feed late", values={"alert_id": alert_id}
+    )
+    row = conn.execute(
+        "SELECT kind, values_json, reason FROM owner_decisions WHERE decision_id = ?",
+        [decision_id],
+    ).fetchone()
+    assert row == ("shakedown_note", f'{{"alert_id":{alert_id}}}', "feed late")
+
+
+def test_a_shakedown_note_refuses_an_unknown_alert(conn: duckdb.DuckDBPyConnection) -> None:
+    alert_id = _alert(conn)
+    with pytest.raises(registry.ShakedownRefused, match=f"alert {alert_id + 1} does not exist"):
+        registry.record_decision(
+            conn, kind="shakedown_note", reason="r", values={"alert_id": alert_id + 1}
+        )
+    for values in ({}, {"alert_id": str(alert_id)}, {"alert_id": alert_id, "book": "main"}):
+        with pytest.raises(ValueError):
+            registry.record_decision(conn, kind="shakedown_note", reason="r", values=values)
+    assert _decision_count(conn) == 0

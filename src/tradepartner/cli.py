@@ -103,6 +103,15 @@ Phase 3 (T42):
   forward) or on or before any such family's `in_sample_start`. The boundary moves
   only by a new row. Exit 0 when written, 1 on a refusal or a busy store, 2 on a
   usage error.
+- `tradepartner decision shakedown-span --sessions N --order-sessions M --reason`
+  writes a `shakedown_span` row (ADR 0017 part E; paper-trading plan T157): the
+  span opens at the session after it, and its two thresholds are the row's,
+  never settings; a new row restarts the span. `tradepartner decision
+  shakedown-note --alert <id> --reason` writes a `shakedown_note` row naming an
+  existing alert, refusing an unknown one. Both write through
+  `registry.record_decision`. Exit 0 when written, 1 on a refusal or a busy
+  store, 2 on a usage error (a blank reason, `--order-sessions` below 1 or above
+  `--sessions`).
 
 Research registry (research-registry spec req 11 and req 14; plan T83):
 
@@ -2005,6 +2014,56 @@ def make_app(
         except registry.BoundaryRefused as exc:
             raise _fail(f"boundary refused: {exc}", 1) from None
         typer.echo(f"decision {decision_id}: development_boundary {day}")
+
+    def _shakedown_write(
+        kind: registry.DecisionKind, values: Mapping[str, Any], reason: str
+    ) -> int:
+        """Write one shakedown decision on a migrated store (ADR 0017 part E)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                return registry.record_decision(conn, kind=kind, reason=reason, values=values)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except registry.ShakedownRefused as exc:
+            raise _fail(f"shakedown refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(str(exc), USAGE_ERROR) from None
+
+    @decision_app.command("shakedown-span")
+    def shakedown_span(
+        sessions: Annotated[int, typer.Option(help="N: the sessions the span needs")],
+        order_sessions: Annotated[
+            int, typer.Option(help="M: the sessions with a live fill it needs (1 to N)")
+        ],
+        reason: Annotated[str, typer.Option(help="why, naming the strategy that goes live first")],
+    ) -> None:
+        """Open (or restart) the shakedown span with its two thresholds (ADR 0017 E)."""
+        decision_id = _shakedown_write(
+            "shakedown_span",
+            {"sessions": sessions, "order_sessions": order_sessions},
+            reason,
+        )
+        typer.echo(
+            f"decision {decision_id}: shakedown_span (sessions {sessions}, "
+            f"order sessions {order_sessions}); the span starts at the next session"
+        )
+
+    @decision_app.command("shakedown-note")
+    def shakedown_note(
+        alert: Annotated[int, typer.Option(help="the alert id the note explains")],
+        reason: Annotated[str, typer.Option(help="what happened and why it is accepted")],
+    ) -> None:
+        """Note an alert inside the shakedown span (ADR 0017 E.1 and E.7)."""
+        decision_id = _shakedown_write("shakedown_note", {"alert_id": alert}, reason)
+        typer.echo(f"decision {decision_id}: shakedown_note for alert {alert}")
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")
