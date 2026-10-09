@@ -658,7 +658,12 @@ class TestPublicPlan:
         assert public.n_excluded_no_history == len(public.excluded_no_history)
         assert set(public.targets) <= set(public.scores)
         # The generic fields (#1153, T127) agree with the momentum-named ones.
-        assert public.exclusions == {"no_history": public.excluded_no_history}
+        # Every declared reason has an entry (#1358: `no_turnover` is empty and its counts
+        # unreported at the default `strategy.turnover_top_fraction = 1.0`).
+        assert public.exclusions == {
+            "no_history": public.excluded_no_history,
+            "no_turnover": (),
+        }
         assert public.counts == {"n_excluded_no_history": public.n_excluded_no_history}
 
     def test_the_new_fields_leave_the_run_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -923,3 +928,135 @@ def test_a_run_at_cadence_on_the_fixture_store_completes(
             row.fill_session == t_next
             for row, t_next in zip(results[0.0].rebalances, sessions[1:], strict=True)
         )
+
+
+# --- literal pins of the H1 twin's run, taken on `main`'s code (#1358, T165) ----------
+
+TWIN_FILE = Path(__file__).parents[1] / "fixtures" / "hypotheses" / "fixture-momentum.md"
+
+
+def _twin_settings() -> Settings:
+    """The momentum fixture twin's (H1's) signal, cost and gap keys over the defaults,
+    as its registration freezes them; the holdout is the defaults', outside this run."""
+    from tradepartner.backtest import hypothesis
+
+    parsed = hypothesis.parse_file(TWIN_FILE)
+    nested: dict[str, dict[str, Any]] = {}
+    for key, value in parsed.file_params.items():
+        section, _, name = key.partition(".")
+        if section != "holdout":
+            nested.setdefault(section, {})[name] = value
+    return Settings(_env_file=None, **nested)  # type: ignore[arg-type]
+
+
+def _rounded(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 9)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(k): _rounded(v) for k, v in sorted(value.items())}
+    if isinstance(value, tuple | list):
+        return [_rounded(v) for v in value]
+    return value
+
+
+def _run_digest(result: BacktestResult) -> str:
+    import hashlib
+    import json
+
+    payload = {
+        "equity": [_rounded(dataclasses.astuple(row)) for row in result.equity],
+        "rebalances": [
+            _rounded({**row.columns(), "counts": row.counts}) for row in result.rebalances
+        ],
+        "weights": [_rounded(dataclasses.astuple(row)) for row in result.weights],
+        "targets": _rounded({d.isoformat(): t for d, t in result.targets.items()}),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _call_log(provider: FakeProvider) -> list[tuple[Any, ...]]:
+    return [
+        (
+            call.method,
+            call.t.isoformat(),
+            call.ids,
+            call.include_dividends,
+            None if call.t_prev is None else call.t_prev.isoformat(),
+            None if call.sessions_from is None else call.sessions_from.isoformat(),
+        )
+        for call in provider.calls
+    ]
+
+
+def test_h1_twin_run_on_the_fake_provider_is_pinned() -> None:
+    """The H1 twin's fake-provider call log and `in_sample` run, by literal on `main`'s
+    code before `strategy.turnover_top_fraction` existed (T165): the key at its default
+    1.0 must read nothing new and change nothing (T165c keeps this green)."""
+    import hashlib
+    import json
+
+    settings = _twin_settings()
+    provider = _provider()
+    levels = tuple(settings.costs.sensitivity_per_side_bps)
+    results = run(settings, provider, T0, T4, _handle(), levels, family="momentum")
+    log = _call_log(provider)
+    assert {call.method for call in provider.calls} == TWIN_CALL_METHODS
+    assert len(log) == TWIN_N_CALLS
+    assert hashlib.sha256(json.dumps(log).encode()).hexdigest() == TWIN_CALL_LOG_SHA256
+    assert {level: _run_digest(result) for level, result in results.items()} == TWIN_RUN_DIGESTS
+    finals = {level: result.equity[-1].equity for level, result in results.items()}
+    assert finals == pytest.approx(TWIN_FINAL_EQUITY, rel=1e-12)
+
+
+def test_the_twin_pin_fails_if_the_screen_reads_or_runs_at_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pin above has teeth (T165c): with the screen forced on at 1.0, the twin's run
+    makes a turnover read and reports the screen's counts, so its log and digests move."""
+    import hashlib
+    import json
+
+    from tradepartner.backtest import strategies
+
+    monkeypatch.setattr(strategies, "_screens", lambda params: True)
+    settings = _twin_settings()
+    assert settings.strategy.turnover_top_fraction == 1.0
+    provider = _provider()
+    provider.raw = provider.prices.with_columns(pl.lit(1000.0).alias("volume"))
+    results = run(settings, provider, T0, T4, _handle(), (0.0,), family="momentum")
+    assert "turnover_inputs" in {call.method for call in provider.calls}
+    log = _call_log(provider)
+    assert hashlib.sha256(json.dumps(log).encode()).hexdigest() != TWIN_CALL_LOG_SHA256
+    assert _run_digest(results[0.0]) != TWIN_RUN_DIGESTS[0.0]
+
+
+#: The provider methods the twin's run calls: no turnover read.
+TWIN_CALL_METHODS = {
+    "universe",
+    "adjusted_prices",
+    "raw_prices",
+    "static_listing_count",
+    "survivorship_gap",
+    "benchmark_ids",
+    "listing_ends",
+    "dropped_dividends",
+    "late_dividends",
+}
+TWIN_N_CALLS = 37
+TWIN_CALL_LOG_SHA256 = "a67e79433a68e158dacc4838930cc8dc787b6ca0db80d0938c0d8e135a49d341"
+#: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
+#: target rows, floats rounded to nine places.
+TWIN_RUN_DIGESTS = {
+    0.0: "cc8ef92465dd2de9751bb299f14ec3c8bfb091a9b787f7f26ed7da80fd228eeb",
+    30.0: "8580101aaa32339c8321c4bede06f244dbfe84d16d11423abfb77871b8ea3212",
+    60.0: "284267f52861c0bc8254a6c66b29cc8b0bbaac615c61e35105f669c4ac249883",
+    100.0: "6444e18ce51e309a3a27691a639c36eac4917a627f4d320335b80fea667c3c7e",
+}
+TWIN_FINAL_EQUITY = {
+    0.0: 115350.9398460223,
+    30.0: 114317.95046215717,
+    60.0: 113295.2130230013,
+    100.0: 111947.28992016679,
+}

@@ -15,9 +15,10 @@ so a registration is never re-registered when a key lands.
 
 **The canonical frozen set** leaves out every table key whose value is its default (in
 the same JSON form, so `True`, `1` and `1.0` differ), except the keys of the family's
-own signal section, which are always kept; **the fingerprint** hashes the keys that
-decide what a run computes through that set, so a table entry added later changes
-neither.
+own signal section, which are always kept unless the key is a
+`POST_REGISTRATION_OWN_KEYS` member (backtest spec amendment #1358, item 3); **the
+fingerprint** hashes the keys that decide what a run computes through that set, so a
+table entry added later changes neither.
 """
 
 from __future__ import annotations
@@ -53,7 +54,20 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # table entries already exist above.
     ("combined.top_fraction", 0.10, 16),
     ("combined.weighting", "equal", 16),
+    # B10's share-turnover screen (backtest spec amendment #1358, T165): 1.0 is no screen.
+    # A post-registration own-section key, so it is in `POST_REGISTRATION_OWN_KEYS` below.
+    ("strategy.turnover_top_fraction", 1.0, 19),
 )
+
+#: Keys added to a family's own listed section **after** that family's first
+#: registration (backtest spec amendment #1358, item 3; decision 13 amended). Unlike the
+#: keys a family registered with, each is left out of the canonical set and the
+#: fingerprint at its `FROZEN_KEY_DEFAULTS` default even in an own section, and is not a
+#: required key of a file or a sweep's fixed block, so no stored fingerprint moves when
+#: it lands. A key enters in the same PR as its table entry. Append-only: removing a
+#: member would put the key back into every stored set at its default; pinned by value
+#: in `tests/backtest/test_frozen_defaults.py`.
+POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset({"strategy.turnover_top_fraction"})
 
 #: The frozen key set before the lab (`frozen_keys()` on 2026-10-05, schema version 12).
 #: Every frozen key outside it needs a `FROZEN_KEY_DEFAULTS` entry.
@@ -179,16 +193,22 @@ def inert_sections(family: str) -> frozenset[str]:
 
 def canonical_frozen_set(params: Mapping[str, Any], family: str) -> dict[str, Any]:
     """`params` read through the defaults, with every table key at its default left out,
-    except the keys of `family`'s own listed sections, which are always kept, and with
+    except the keys of `family`'s own listed sections, which are always kept (but a
+    `POST_REGISTRATION_OWN_KEYS` member at its default is left out there too), and with
     the sections `family` does not list left out whole."""
     own = _own_sections(family)
     inert = _all_sections() - own
     defaults = _defaults()
+
+    def dropped(key: str, value: Any) -> bool:
+        if key not in defaults or not is_default(value, defaults[key]):
+            return False
+        return _section(key) not in own or key in POST_REGISTRATION_OWN_KEYS
+
     return {
         key: value
         for key, value in _overlay_defaults(params, family).items()
-        if _section(key) not in inert
-        and not (key in defaults and _section(key) not in own and is_default(value, defaults[key]))
+        if _section(key) not in inert and not dropped(key, value)
     }
 
 

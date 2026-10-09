@@ -55,15 +55,32 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 
 import duckdb
 
+from tradepartner.backtest import hypothesis
 from tradepartner.store import schema
 from tradepartner.store.db import configure_connection
 
 #: The gap used on each side of a `known_at` to build a probe timestamp.
 PROBE_EPSILON: Final[timedelta] = timedelta(microseconds=1)
+
+#: The turnover-screened momentum twin (backtest spec amendment #1358, T165c): the two
+#: backtest look-ahead suites' screened case freezes its `strategy` block.
+SCREENED_FIXTURE: Final[Path] = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hypotheses" / "fixture-momentum-turnover.md"
+)
+
+
+def screened_strategy() -> dict[str, Any]:
+    """`SCREENED_FIXTURE`'s `strategy.*` keys by name, for `Settings(strategy=...)`."""
+    params = hypothesis.parse_file(SCREENED_FIXTURE).file_params
+    return {
+        key.partition(".")[2]: value for key, value in params.items() if key.startswith("strategy.")
+    }
+
 
 #: Fact tables in the store: every table `known_at <= T` filtering applies
 #: to. Excludes `ingestion_runs` (job status, no `known_at`) and
