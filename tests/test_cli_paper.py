@@ -510,6 +510,7 @@ PAPER_OPTIONS = {
     "settle": {"--order", "--reason"},
     "override": {"--kind", "--session", "--name", "--reason"},
     "lots-reconcile": {"--export", "--tax-year"},
+    "shakedown": set(),
 }
 
 
