@@ -17,7 +17,7 @@ The script is `scripts/probe_open_fills.py` on branch `spike/106-probes` (commit
 - **W:** `qty=1`, `time_in_force=DAY`.
 - **O:** `qty=1`, `time_in_force=OPG` (the control; the protocol's optional order, included on both sessions).
 
-**Sessions** (the owner chose two, not the protocol's five): Monday 2026-10-05 (`submit --opg` at 09:01:20 ET, `collect` at 09:54 ET) and Friday 2026-10-09 (`submit --opg` at 09:05:06 ET, `collect` at 09:50 ET). Both are full XNYS sessions (the script's guard). Neither name reported earnings on either date to the author's knowledge; this was not checked against a filing. The probe's positions were flattened afterwards so the account is flat before T71.
+**Sessions** (the owner chose two, not the protocol's five): Monday 2026-10-05 (`submit --opg` at 09:01:20 ET, `collect` at 09:54 ET) and Friday 2026-10-09 (`submit --opg` at 09:05:06 ET, `collect` at 09:50 ET). Both are full XNYS sessions (the script's guard). Neither name reported earnings on either date to the author's knowledge; this was not checked against a filing. The 2026-10-09 session's positions are still open at writing (the 2026-10-05 session's are unverified); the account must be flat before T71 (owner action).
 
 **Collected**, after 09:46 ET so the free plan's 15-minute SIP delay is respected: each order's final state (`status`, `submitted_at`, `filled_at`, `filled_qty`, `filled_avg_price`); the SIP daily bar's `o` (the bar open); SIP trades 09:29:50-09:31:00 ET, from which the **official open** is the listing exchange's print with condition `O` and its condition `Q` duplicate (NYSE `N` for KO, Nasdaq `Q` for AAPL; the two prints agree in every case); and SIP quotes around each order's submit and fill times, for the pre-open NBBO and the NBBO at fill.
 
