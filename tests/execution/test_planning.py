@@ -630,6 +630,39 @@ def test_a_re_registered_hypothesis_is_a_plan_trial_error(env: Env) -> None:
     assert env.counts() == counts
 
 
+#: A forward holdout's shape for the planning tests (ADR 0016 point 4, plan T142c):
+#: the stored `holdout.end` moved past T_i, so T_i sits inside the holdout.
+FORWARD_HOLDOUT_END = date(2019, 12, 31)
+
+
+def _move_holdout_end(env: Env, first_registered: datetime) -> None:
+    env.conn.execute(
+        "UPDATE hypotheses SET holdout_end = ? WHERE hypothesis_id = ?",
+        [FORWARD_HOLDOUT_END, env.hypothesis_id],
+    )
+    env.conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE family = 'momentum'", [first_registered]
+    )
+
+
+def test_a_forward_holdout_plans_inside_its_holdout(env: Env) -> None:
+    """The family first registered before `holdout.start`: the holdout is forward and
+    the tracking trial at T_i, inside it, is accepted (the paper book is the exam)."""
+    _move_holdout_end(env, datetime(2018, 6, 1, 12, tzinfo=UTC))
+    outcome = env.plan()
+    assert (outcome.status, outcome.rebalance_session) == ("planned", T_I)
+
+
+def test_a_historical_holdout_still_refuses_a_tracking_trial_inside_it(env: Env) -> None:
+    """The same dates with the family first registered after `holdout.start`: the
+    tracking rule refuses T_i, before `holdout.end`, as before T142c."""
+    _move_holdout_end(env, datetime(2018, 7, 3, 12, tzinfo=UTC))
+    counts = env.counts()
+    with pytest.raises(PlanTrialError, match=r"after holdout\.end 2019-12-31"):
+        env.plan()
+    assert env.counts() == counts
+
+
 def test_profitability_is_refused_by_the_paper_family_gate(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

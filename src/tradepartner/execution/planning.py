@@ -19,7 +19,10 @@ else None. **`due_rebalance`** returns the same with its T_i.
    `assets` read, for the held names.
 2. **One write transaction** on `conn`, committed or rolled back as a whole:
    the plan trial (`registry.open_trial`, `kind=tracking`, window [T_i, T_i],
-   data cutoff read_time(T_i)) is opened first, because `StoreProvider` reads
+   data cutoff read_time(T_i), checked by the tracking-window rule with the
+   family's first registration day, `registry.family_registered_on`, so a
+   forward holdout's window may sit inside its holdout, ADR 0016 point 4) is
+   opened first, because `StoreProvider` reads
    only under an open trial (Definitions > Plan trial: every engine read sits
    under a trial); `engine.plan` reads at close(T_i) over a `StoreProvider` on
    the same connection, so it sees the uncommitted trial row; the second
@@ -520,7 +523,10 @@ def _open_trial(
     window = Window(t_i, t_i)
     verdict = decide(
         window,
-        Frozen.from_hypothesis(reads.hypothesis),
+        Frozen.from_hypothesis(
+            reads.hypothesis,
+            registered_on=registry.family_registered_on(conn, reads.hypothesis.family),
+        ),
         Flags(),
         Reasons(),
         None,

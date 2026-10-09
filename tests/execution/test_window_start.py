@@ -78,6 +78,7 @@ def _register(
     holdout_end: date,
     params: dict[str, Any] | None = None,
     family: str = "momentum",
+    holdout_start: date = date(2023, 1, 3),
 ) -> registry.HypothesisRecord:
     return registry.register_hypothesis(
         conn,
@@ -88,7 +89,7 @@ def _register(
         doc_sha256="d" * 64,
         params=_params() if params is None else params,
         in_sample_start=date(2016, 1, 29),
-        holdout_start=date(2023, 1, 3),
+        holdout_start=holdout_start,
         holdout_end=holdout_end,
         registered_by="owner",
         settings=settings,
@@ -1224,3 +1225,208 @@ def test_start_refuses_schema_version_on_a_version_16_store(
 
     assert refused.value.reason == window.SCHEMA_VERSION
     assert "open it for writing once" in str(refused.value)
+
+
+# --- a forward holdout (ADR 0016 point 4, plan T142c) -------------------------
+
+#: A forward holdout: it starts after the family's first registration day, so the
+#: paper book inside it is the exam of record. At the conftest clock (2026-10-01,
+#: 10:00 ET) `holdout.start` has passed and `holdout.end` lies a year ahead.
+FORWARD_START = date(2026, 9, 1)
+FORWARD_END = date(2027, 8, 31)
+FIRST_REGISTERED = datetime(2026, 8, 14, 15, 0, tzinfo=UTC)
+#: The tracking rule's frozen gap threshold, which `holdout.Frozen` requires.
+GAP_KEY = "gap.count_share_threshold"
+#: The first month-end session strictly after the clock's date (2026-10-31 is a Saturday).
+NEXT_MONTH_END = date(2026, 10, 30)
+
+
+def _register_forward(
+    settings: Settings,
+    tmp_path: Path,
+    *,
+    holdout_start: date = FORWARD_START,
+    first_registered: datetime = FIRST_REGISTERED,
+    family: str = "momentum",
+    params: dict[str, Any] | None = None,
+    sign_off: bool = True,
+) -> registry.HypothesisRecord:
+    """Register `h1` with a holdout of [`holdout_start`, `FORWARD_END`] and date the
+    family's every registration at `first_registered` (`registered_at` is the wall
+    clock at registration, which a test cannot choose)."""
+    with open_for_write(settings) as conn:
+        hyp = _register(
+            conn,
+            settings,
+            "h1",
+            FORWARD_END,
+            params=_params(**{GAP_KEY: 0.05}) if params is None else params,
+            family=family,
+            holdout_start=holdout_start,
+        )
+        if sign_off:
+            _sign_off(conn, settings, hyp, tmp_path)
+        conn.execute(
+            "UPDATE hypotheses SET registered_at = ? WHERE family = ?", [first_registered, family]
+        )
+        assert registry.family_registered_on(conn, family) == first_registered.date()
+    return hyp
+
+
+def test_forward_holdout_starts_inside_the_holdout(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """`holdout.end` is a year away (today's rule refuses `holdout_not_complete`), but
+    the holdout is forward and its start has passed: the window opens, its T_0 the
+    first month-end on or after `holdout.start` and after today, inside the holdout."""
+    hyp = _register_forward(journal_settings, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+    assert result.window.hypothesis_id == hyp.hypothesis_id
+    assert result.window.first_rebalance_session == NEXT_MONTH_END
+    assert FORWARD_START <= NEXT_MONTH_END < FORWARD_END
+
+
+def test_forward_holdout_starting_today_is_accepted(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """On `holdout.start`'s own day (New York) the start has passed; T_0 is the first
+    month-end on or after it."""
+    _register_forward(journal_settings, tmp_path, holdout_start=date(2026, 10, 1))
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.first_rebalance_session == NEXT_MONTH_END
+
+
+def test_forward_holdout_is_refused_before_its_start(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A forward holdout that starts tomorrow is refused `holdout_not_complete`, before
+    any broker call or write."""
+    _register_forward(journal_settings, tmp_path, holdout_start=date(2026, 10, 2))
+    broker = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "holdout_not_complete"
+    assert "forward holdout.start (2026-10-02) has not passed" in str(exc.value)
+    assert broker.calls == ()
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_a_holdout_registered_after_its_start_keeps_the_holdout_end_rule(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The same dates with the family first registered after `holdout.start` is a
+    historical holdout: refused on the incomplete `holdout.end`, as before T142c."""
+    _register_forward(
+        journal_settings, tmp_path, first_registered=datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    )
+    broker = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "holdout_not_complete"
+    assert str(exc.value) == ("'h1''s frozen holdout.end (2027-08-31) is not a completed month-end")
+    assert broker.calls == ()
+
+
+def test_a_historical_holdout_s_first_session_is_unchanged(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """A historical holdout (registered long after its start) still starts at the first
+    month-end strictly after both `holdout.end` and today."""
+    with open_for_write(journal_settings) as conn:
+        first = registry.family_registered_on(conn, "momentum")
+    assert first is not None and first > ready_hypothesis.holdout_start
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.first_rebalance_session == NEXT_MONTH_END
+
+
+def test_forward_holdout_still_needs_a_gap_signoff(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path, sign_off=False)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        )
+    assert exc.value.reason == "gap_signoff"
+
+
+def test_forward_holdout_still_needs_a_paper_family(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path, family="profitability")
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        )
+    assert exc.value.reason == "family_not_runnable"
+
+
+def test_forward_holdout_still_needs_month_end_cadence(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(
+        journal_settings,
+        tmp_path,
+        params=_params(**{"schedule.rebalance_cadence": "week_end", GAP_KEY: 0.05}),
+    )
+    broker = _fake(fixed_clock)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert exc.value.reason == "refused_cadence"
+    assert broker.calls == ()
+
+
+def test_forward_holdout_still_allows_one_open_window(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        )
+    assert exc.value.reason == "window_open"
+
+
+def test_forward_holdout_still_needs_a_flat_account(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    _register_forward(journal_settings, tmp_path)
+    fake = _fake(fixed_clock)
+    fake.submit(OrderRequest(client_order_id="o1", symbol="SPY", side=Side.BUY, quantity=1))
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "open_orders"
+    held = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    held.extra_quantity["SPY"] = 1.0
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), held, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
+
+
+def test_forward_holdout_without_a_frozen_gap_threshold_raises_before_any_call(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """A forward registration the daily run's tracking rule could not read is stopped
+    at `paper start`, before any broker call or write."""
+    _register_forward(journal_settings, tmp_path, params=_params())
+    broker = _fake(fixed_clock)
+    with pytest.raises(ValueError, match=r"gap\.count_share_threshold"):
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
+    assert broker.calls == ()
+    with open_for_write(journal_settings) as conn:
+        assert latest_window(conn) is None
