@@ -658,7 +658,12 @@ class TestPublicPlan:
         assert public.n_excluded_no_history == len(public.excluded_no_history)
         assert set(public.targets) <= set(public.scores)
         # The generic fields (#1153, T127) agree with the momentum-named ones.
-        assert public.exclusions == {"no_history": public.excluded_no_history}
+        # Every declared reason has an entry (#1358: `no_turnover` is empty and its counts
+        # unreported at the default `strategy.turnover_top_fraction = 1.0`).
+        assert public.exclusions == {
+            "no_history": public.excluded_no_history,
+            "no_turnover": (),
+        }
         assert public.counts == {"n_excluded_no_history": public.n_excluded_no_history}
 
     def test_the_new_fields_leave_the_run_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -766,7 +766,12 @@ class StrategyConfig(BaseModel):
     """12-1 momentum signal and portfolio rules (spec req 3; handoff H1).
 
     `formation_months` must exceed `skip_months`, or the formation window is empty.
-    `top_fraction` is a share of ranked names in (0, 1].
+    `top_fraction` is a share of ranked names in (0, 1]. `turnover_top_fraction` is the
+    share of members kept by B10's share-turnover screen before the rank, in (0, 1];
+    the default 1.0 is no screen (backtest spec amendment #1358). It is a `momentum`
+    rule and a post-registration own-section key (`backtest/frozen.py`
+    `POST_REGISTRATION_OWN_KEYS`): a file that leaves it out freezes 1.0, never the live
+    value.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -776,6 +781,7 @@ class StrategyConfig(BaseModel):
     top_fraction: float = Field(default=0.10, gt=0, le=1)
     weighting: Literal["equal"] = "equal"
     signal_total_return: bool = True
+    turnover_top_fraction: float = Field(default=1.0, gt=0, le=1)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -881,8 +887,10 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         parent=None,
         engine_ready=True,
         paper_ready=True,
-        exclusion_reasons=("no_history",),
-        count_names=("n_excluded_no_history",),
+        # `no_turnover` and its two counts are B10's screen, reported only when
+        # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
+        exclusion_reasons=("no_history", "no_turnover"),
+        count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
         benchmark="MTUM",
         sweepable_keys=(
             "strategy.formation_months",
@@ -890,6 +898,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "strategy.top_fraction",
             "strategy.weighting",
             "strategy.signal_total_return",
+            "strategy.turnover_top_fraction",
         ),
     ),
     "oracle": FamilySpec(

@@ -9,10 +9,13 @@ file wants to pin). Every other part of the file is prose, but it is hashed too.
 
 **The file must name** `in_sample_start`, `holdout.start`, `holdout.end`, every
 `costs.*` key and every key of its family's signal section (`strategy.*` for
-`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`), or it is
-refused; the holdout never comes from live `Settings`. A key outside the frozen list
-below is refused rather than ignored, and so is a key of another family's signal
-section (`frozen.inert_sections`).
+`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`) except
+the `frozen.POST_REGISTRATION_OWN_KEYS` members, or it is refused; the holdout never
+comes from live `Settings`, and neither does a post-registration member the file leaves
+out: it is frozen at its `FROZEN_KEY_DEFAULTS` default (backtest spec amendment #1358).
+A `FAMILY_ONLY_KEYS` key off its default is refused for any other family. A key outside
+the frozen list below is refused rather than ignored, and so is a key of another
+family's signal section (`frozen.inert_sections`).
 
 **The frozen set** is every key of `strategy`, `profitability`, `schedule`, `universe`,
 `costs`, `backtest`, `adjust`, `master`, `gap`, `holdout` and `metrics`, plus
@@ -173,13 +176,34 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
 
 def required_keys(family: str) -> frozenset[str]:
     """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
-    every key of its listed sections (`FAMILIES[family].sections`) plus every `costs.*`
-    key. Raises `KeyError` for an unlisted family (ADR 0014 point 2: the momentum
-    fallback goes)."""
+    every key of its listed sections (`FAMILIES[family].sections`) not in
+    `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key. Raises `KeyError` for
+    an unlisted family (ADR 0014 point 2: the momentum fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
     for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
         keys.update(_section_keys(section))
-    return frozenset(keys)
+    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS)
+
+
+#: Keys that are one family's rule although other families list their section
+#: (backtest spec amendment #1358, item 1): `oracle` and `combined` read `strategy.*`,
+#: but B10's turnover screen is `momentum`'s alone, so any other family's frozen value
+#: must be the table default (1.0, no screen).
+FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": "momentum"}
+
+
+def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
+    """Why `params` (a `family` registration's frozen values, JSON form) may not be
+    registered, or None: a `FAMILY_ONLY_KEYS` key of another family whose value is not
+    its `FROZEN_KEY_DEFAULTS` default. The message names the key."""
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key, owner in FAMILY_ONLY_KEYS.items():
+        if family != owner and key in params and not frozen.is_default(params[key], defaults[key]):
+            return (
+                f"{key} is a {owner!r} rule; a {family!r} registration must freeze its "
+                f"default {defaults[key]!r}, got {params[key]!r}"
+            )
+    return None
 
 
 def _flatten(table: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -333,8 +357,25 @@ def frozen_hash_matches(settings: Settings, stored_sha256: str, *, family: str) 
 
 
 def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
-    """The frozen set: the file's values over `settings` for every frozen key."""
-    return frozen_params_of(_overlay(settings, parsed.file_params), family=parsed.family)
+    """The frozen set: the file's values over `settings` for every frozen key, except
+    that a `frozen.POST_REGISTRATION_OWN_KEYS` member the file leaves out is frozen at
+    its table default, never from `settings` (backtest spec amendment #1358, item 3(ii):
+    a signal key never reaches a registration from `.env`). Raises
+    `HypothesisFileError` when `family_only_refusal` refuses the set."""
+    inert = frozen.inert_sections(parsed.family)
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    fixed = {
+        key: defaults[key]
+        for key in sorted(frozen.POST_REGISTRATION_OWN_KEYS)
+        if key not in parsed.file_params and key.partition(".")[0] not in inert
+    }
+    params = frozen_params_of(
+        _overlay(settings, {**fixed, **parsed.file_params}), family=parsed.family
+    )
+    refusal = family_only_refusal(parsed.family, params)
+    if refusal is not None:
+        raise HypothesisFileError(f"{parsed.path}: {refusal}")
+    return params
 
 
 def _check_latest(

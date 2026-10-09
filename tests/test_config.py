@@ -868,6 +868,7 @@ def test_lab_defaults() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     ]
@@ -1104,6 +1105,7 @@ def test_default_sweepable_keys_derives_at_today_s_value() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     )
@@ -1120,8 +1122,9 @@ def test_momentum_family_spec() -> None:
     assert spec.parent is None
     assert spec.engine_ready is True
     assert spec.paper_ready is True
-    assert spec.exclusion_reasons == ("no_history",)
-    assert spec.count_names == ("n_excluded_no_history",)
+    # B10's screen (#1358): its reason and counts, reported only below 1.0.
+    assert spec.exclusion_reasons == ("no_history", "no_turnover")
+    assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
         "strategy.formation_months",
@@ -1129,7 +1132,17 @@ def test_momentum_family_spec() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
     )
+
+
+def test_turnover_top_fraction_defaults_to_no_screen() -> None:
+    """B10's key (backtest spec amendment #1358): 1.0 by default, in (0, 1]."""
+    assert StrategyConfig().turnover_top_fraction == 1.0
+    assert StrategyConfig(turnover_top_fraction=0.2).turnover_top_fraction == 0.2
+    for bad in (0, 1.5, -0.1):
+        with pytest.raises(ValidationError):
+            StrategyConfig(turnover_top_fraction=bad)
 
 
 def test_oracle_family_spec_reads_momentum_s_section() -> None:

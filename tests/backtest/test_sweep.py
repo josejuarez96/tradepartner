@@ -560,3 +560,89 @@ def test_fixed_block_validated_whole_outside_axis_sections(
 ) -> None:
     with pytest.raises(SweepFileError, match=match):
         parse_sweep_file(_rewrite(tmp_path, SWEEP, old, new), _settings())
+
+
+# ── the turnover key (backtest spec amendment #1358, T165) ──────────────────────
+
+TURNOVER_KEY = "strategy.turnover_top_fraction"
+_COMBINED_SECTIONS = """[combined]
+top_fraction = 0.2
+weighting = "equal"
+
+[profitability]
+basis = "gross"
+annual_period_days = [350, 380]
+max_fact_age_days = 548
+exclude_sic_ranges = [[6000, 6999]]
+include_derived = true
+top_fraction = 0.10
+weighting = "equal"
+
+[strategy]
+"""
+
+
+def _turnover_sweep(
+    tmp_path: Path, *, family: str = "momentum", fixed: str = "", grid: str | None = None
+) -> Path:
+    """The fixture sweep as `family`, with `fixed` lines added to `[strategy]` and, when
+    `grid` is given, the turnover key as the one grid axis beside `strategy.top_fraction`
+    fixed at 0.10 (so the variants differ only in the screen)."""
+    text = SWEEP.read_text().replace('slug = "fixture-sweep"', 'slug = "turnover"')
+    text = text.replace('family = "momentum"', f'family = "{family}"')
+    head = _COMBINED_SECTIONS if family == "combined" else "[strategy]\n"
+    text = text.replace("[strategy]\n", head + fixed, 1)
+    if grid is not None:
+        text = text.replace(
+            '"strategy.top_fraction" = [0.05, 0.20]\n"schedule.rebalance_cadence" = '
+            '["month_end", "week_end"]',
+            f'"{TURNOVER_KEY}" = {grid}',
+        )
+        text = text.replace("[schedule]\n", '[schedule]\nrebalance_cadence = "month_end"\n')
+        text = text.replace("[strategy]\n", "[strategy]\ntop_fraction = 0.10\n", 1)
+    path = tmp_path / "turnover.md"
+    path.write_text(text)
+    return path
+
+
+def test_a_momentum_fixed_block_without_the_key_parses_and_freezes_the_default(
+    tmp_path: Path,
+) -> None:
+    live = _settings(strategy={"turnover_top_fraction": 0.5})
+    parsed = parse_sweep_file(_turnover_sweep(tmp_path), live)
+    assert TURNOVER_KEY not in parsed.fixed_params
+    assert TURNOVER_KEY not in hypothesis.required_keys("momentum")
+    for variant in expand_grid(parsed, live):
+        assert variant.frozen_set[TURNOVER_KEY] == 1.0
+
+
+def test_a_momentum_sweep_grids_the_screen_and_its_control(tmp_path: Path) -> None:
+    settings = _settings()
+    assert TURNOVER_KEY in settings.lab.sweepable_keys
+    parsed = parse_sweep_file(_turnover_sweep(tmp_path, grid="[0.20, 1.0]"), settings)
+    assert parsed.grid == {TURNOVER_KEY: (0.2, 1.0)}
+    variants = expand_grid(parsed, settings)
+    assert sorted(v.values[TURNOVER_KEY] for v in variants) == [0.2, 1.0]
+    assert len({v.fingerprint for v in variants}) == 2
+    (control,) = [v for v in variants if v.values[TURNOVER_KEY] == 1.0]
+    assert TURNOVER_KEY not in frozen.canonical_frozen_set(control.frozen_set, "momentum")
+
+
+def test_a_combined_sweep_gridding_the_key_is_refused(tmp_path: Path) -> None:
+    path = _turnover_sweep(tmp_path, family="combined", grid="[0.20, 1.0]")
+    with pytest.raises(AxisNotSweepableError, match=re.escape(TURNOVER_KEY)):
+        parse_sweep_file(path, _settings())
+
+
+def test_a_combined_fixed_block_naming_a_screen_is_refused(tmp_path: Path) -> None:
+    path = _turnover_sweep(tmp_path, family="combined", fixed="turnover_top_fraction = 0.5\n")
+    with pytest.raises(SweepFileError, match=re.escape(TURNOVER_KEY)):
+        parse_sweep_file(path, _settings())
+
+
+def test_a_combined_fixed_block_at_the_default_is_accepted(tmp_path: Path) -> None:
+    for fixed in ("turnover_top_fraction = 1\n", ""):
+        path = _turnover_sweep(tmp_path, family="combined", fixed=fixed)
+        parsed = parse_sweep_file(path, _settings(strategy={"turnover_top_fraction": 0.5}))
+        variants = expand_grid(parsed, _settings(strategy={"turnover_top_fraction": 0.5}))
+        assert all(v.frozen_set[TURNOVER_KEY] == 1.0 for v in variants)
