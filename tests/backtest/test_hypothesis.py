@@ -107,7 +107,9 @@ def test_fixture_file_names_every_required_key() -> None:
     parsed = hypothesis.parse_file(FIXTURE)
     required = hypothesis.required_keys("momentum")
     assert {"holdout.start", "holdout.end"} <= required
-    assert {k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))} <= required
+    assert {
+        k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))
+    } - frozen.POST_REGISTRATION_OWN_KEYS <= required
     assert required <= set(parsed.file_params)
 
 
@@ -592,7 +594,7 @@ def test_combined_file_names_and_freezes_both_sub_signal_keys(
         k
         for k in _spec_frozen_keys()
         if k.startswith(("combined.", "strategy.", "profitability.", "costs."))
-    } <= required
+    } - frozen.POST_REGISTRATION_OWN_KEYS <= required
     assert required <= set(parsed.file_params)
     assert frozen.inert_sections("combined") == frozenset()
     record = _register(conn, COMBINED_FIXTURE, settings)
@@ -615,8 +617,17 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
 
 @pytest.mark.parametrize(
     "dropped",
-    # The pre-lab twin also predates `gap.stale_listing_sessions` (#1199), as H1 does.
-    [("profitability.",), ("schedule.", "profitability.", "gap.stale_listing_sessions")],
+    # The pre-lab twin also predates `gap.stale_listing_sessions` (#1199) and
+    # `strategy.turnover_top_fraction` (#1358), as H1 does.
+    [
+        ("profitability.",),
+        (
+            "schedule.",
+            "profitability.",
+            "gap.stale_listing_sessions",
+            "strategy.turnover_top_fraction",
+        ),
+    ],
     ids=["today", "pre-lab"],
 )
 def test_h1_twin_registered_before_t85_still_loads_and_verifies(
@@ -730,9 +741,9 @@ def test_required_keys_unchanged_for_momentum_and_profitability(settings: Settin
     """The derived `required_keys` returns today's sets for both families."""
     momentum_required = hypothesis.required_keys("momentum")
     assert {"holdout.start", "holdout.end"} <= momentum_required
-    assert {k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))} <= (
-        momentum_required
-    )
+    assert {
+        k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))
+    } - frozen.POST_REGISTRATION_OWN_KEYS <= momentum_required
     assert not any(k.startswith("profitability.") for k in momentum_required)
     profitability_required = hypothesis.required_keys("profitability")
     assert {"holdout.start", "holdout.end"} <= profitability_required
@@ -1174,3 +1185,146 @@ def test_without_the_lab_a_frozen_key_outside_the_fingerprint_is_a_new_hypothesi
     )
     second = _register(conn, path, settings)
     assert second.hypothesis_id > first.hypothesis_id
+
+
+# --- the turnover key: required-keys carve-out and family refusals (#1358, T165) -----
+
+TURNOVER_KEY = "strategy.turnover_top_fraction"
+H1_FILE = Path(__file__).resolve().parents[2] / "docs" / "hypotheses" / "h1-momentum-12-1.md"
+
+
+def _with_turnover(tmp_path: Path, source: Path, slug: str, value: str) -> Path:
+    """`source` with `turnover_top_fraction = <value>` added to its `[strategy]` table."""
+    text = source.read_text()
+    assert "\n[strategy]\n" in text
+    text = text.replace("\n[strategy]\n", f"\n[strategy]\nturnover_top_fraction = {value}\n", 1)
+    path = tmp_path / "hypotheses" / f"{slug}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize("family", ["momentum", "oracle", "combined"])
+def test_required_keys_leave_out_the_post_registration_key(family: str) -> None:
+    assert TURNOVER_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
+    assert TURNOVER_KEY not in hypothesis.required_keys(family)
+    assert "strategy.top_fraction" in hypothesis.required_keys(family)
+
+
+@pytest.mark.parametrize("path", [H1_FILE, FIXTURE])
+def test_h1_and_the_twin_parse_unchanged_without_the_key(path: Path) -> None:
+    parsed = hypothesis.parse_file(path)
+    assert TURNOVER_KEY not in parsed.file_params
+    assert hypothesis.required_keys("momentum") <= set(parsed.file_params)
+
+
+def test_a_file_without_the_key_freezes_the_default_not_the_live_value(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"turnover_top_fraction": 0.5})}
+    )
+    assert live.strategy.turnover_top_fraction == 0.5
+    record = _register(conn, FIXTURE, live)
+    assert record.params[TURNOVER_KEY] == 1.0
+    assert hypothesis.load_frozen(conn, SLUG, settings=live).strategy.turnover_top_fraction == 1.0
+
+
+def test_a_momentum_file_naming_the_key_freezes_its_value(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
+    assert record.params[TURNOVER_KEY] == 0.2
+
+
+@pytest.mark.parametrize("value", ["0", "1.5"])
+def test_a_value_outside_zero_one_is_refused(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings, value: str
+) -> None:
+    with pytest.raises(HypothesisFileError, match=r"fail validation.*turnover_top_fraction"):
+        _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, value), settings)
+
+
+@pytest.mark.parametrize(
+    ("source", "slug", "family"),
+    [(COMBINED_FIXTURE, COMBINED_SLUG, "combined"), (FIXTURE, SLUG, "oracle")],
+)
+def test_another_family_naming_a_screen_is_refused_naming_the_key(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    source: Path,
+    slug: str,
+    family: str,
+) -> None:
+    path = _with_turnover(tmp_path, source, slug, "0.5")
+    path.write_text(path.read_text().replace('family = "momentum"', f'family = "{family}"'))
+    with pytest.raises(HypothesisFileError, match=f"{TURNOVER_KEY} is a 'momentum' rule"):
+        _register(conn, path, settings)
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (0,)
+
+
+def test_a_combined_file_at_the_default_or_without_the_key_stores_the_default(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"turnover_top_fraction": 0.5})}
+    )
+    assert _register(conn, COMBINED_FIXTURE, live).params[TURNOVER_KEY] == 1.0
+    named = _with_turnover(tmp_path, COMBINED_FIXTURE, COMBINED_SLUG, "1.0")
+    assert hypothesis.frozen_params(hypothesis.parse_file(named), live)[TURNOVER_KEY] == 1.0
+
+
+def test_a_profitability_file_naming_the_key_is_refused_as_inert(tmp_path: Path) -> None:
+    text = PROF_FIXTURE.read_text().replace(
+        "\n[costs]\n", "\n[strategy]\nturnover_top_fraction = 1.0\n\n[costs]\n", 1
+    )
+    path = tmp_path / "hypotheses" / f"{PROF_SLUG}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    with pytest.raises(HypothesisFileError, match="another family"):
+        hypothesis.parse_file(path)
+
+
+def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """H1's case: stored without the key. `frozen_hash_matches` holds on its loaded
+    settings, and `hypothesis register` on the unchanged file writes nothing."""
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = {
+        k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k != TURNOVER_KEY
+    }
+    record = registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=FIXTURE.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=params,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+    live = settings.model_copy(
+        update={"strategy": settings.strategy.model_copy(update={"turnover_top_fraction": 0.5})}
+    )
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
+    assert loaded.strategy.turnover_top_fraction == 1.0
+    assert hypothesis.frozen_hash_matches(loaded, record.params_sha256, family="momentum")
+    assert _register(conn, FIXTURE, live).hypothesis_id == record.hypothesis_id
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+
+
+def test_a_screened_registration_cannot_run_until_the_screen_exists(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """quant-auditor on #1387: until T165c applies the key, a run or paper plan of a
+    registration at 0.20 would record unscreened results under a screened label."""
+    assert frozenset({TURNOVER_KEY}) == hypothesis.NOT_YET_APPLIED_KEYS
+    _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
+    with pytest.raises(HypothesisFileError, match=f"{TURNOVER_KEY} is registered off"):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)
