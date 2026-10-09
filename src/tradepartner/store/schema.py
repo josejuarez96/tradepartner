@@ -288,7 +288,21 @@ registry; #83 took version 2 first, so the registry is version 3):
   open it for writing once): `journal._select` selects every row-type field,
   so every read of the eight tables, the ops page and `open_window` included,
   would otherwise fail with a binder error.
-- **A later DDL change goes to version 18**, with its own migration and a
+- **Version 18** (#1319, data-foundation plan T140b; ADR 0016 point 6): named
+  data releases and the development boundary. `owner_decisions.kind` gains
+  `data_release` and `development_boundary` (`lab_schema.RELEASE_DECISION_KINDS`,
+  also the tail of `LAB_DECISION_KINDS`), the `CHECK` rebuilt by
+  `lab_schema.widen_enum` as the lab migration rebuilt it (every row kept in
+  insertion order, byte-identical, every kind kept), and `trials` gains a
+  nullable `development_boundary DATE` by `ALTER TABLE` (NULL on every existing
+  row). `_migrate_release_kinds` runs on every fresh or migrating writable
+  store (a fresh one too, since `_REGISTRY_TABLE_DDL` keeps its version-4
+  pin), never on one already at 18; it is idempotent. No fact, journal,
+  research or lab table changes, and nothing writes the `development_boundary`
+  kind or column until T142b. A read-only connection accepts a version-17
+  store: every read works but the new column, which nothing reads before
+  T142b.
+- **A later DDL change goes to version 19**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -496,9 +510,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   in insertion order with the new columns at their defaults
 #:   (`_migrate_expansion_seams`), after `_migrate_lab` (module docstring,
 #:   "Schema versions").
-#: - A later DDL change goes to version 18, with its own migration and a
+#: - 18 (#1319, data-foundation plan T140b): `owner_decisions.kind` widened with
+#:   `data_release` and `development_boundary`, every row kept, and the nullable
+#:   `trials.development_boundary` (`_migrate_release_kinds`, on every store;
+#:   module docstring, "Schema versions").
+#: - A later DDL change goes to version 19, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -569,6 +587,11 @@ _PRE_LAB_VERSION = 15
 #: a journal read raises `SchemaVersionError` (`store.journal.require_journal`),
 #: since the eight expanded tables lack `book_id`.
 _PRE_EXPANSION_SEAMS_VERSION = 16
+
+#: The last version without the release decision kinds and
+#: `trials.development_boundary` (#1319, T140b, version 18): read-only
+#: connections serve every read (nothing reads the new column before T142b).
+_PRE_RELEASE_VERSION = 17
 
 
 class SchemaVersionError(RuntimeError):
@@ -2239,6 +2262,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PERIOD_KEYS_VERSION,
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
+        _PRE_RELEASE_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2255,7 +2279,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # raises `LabNotInitialised`); version 16 serves fact, registry and lab
         # reads, but every journal read raises `SchemaVersionError`
         # (`store.journal.require_journal`, naming the fix): the eight expanded
-        # tables lack `book_id`.
+        # tables lack `book_id`; version 17 serves every read (a data-release
+        # row cannot exist there, and nothing reads `trials.development_boundary`
+        # before T142b).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2796,9 +2822,31 @@ def _migrate_expansion_seams(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
 
 
+#: The column version 18 adds to `trials` (ADR 0016 point 6).
+_DEVELOPMENT_BOUNDARY_COLUMN: Final = "development_boundary"
+
+
+def _migrate_release_kinds(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 18 (module docstring, "Schema versions"): widen
+    `owner_decisions.kind` with `lab_schema.RELEASE_DECISION_KINDS` by
+    `lab_schema.widen_enum` (a no-op once present; every row kept in insertion
+    order) and add the nullable `trials.development_boundary DATE` where missing
+    (NULL on every existing row). Idempotent; runs on a fresh or migrating
+    writable store (never one already at 18), inside `init_schema`'s transaction, after
+    `_migrate_expansion_seams`. `lab_schema` imports this module, so it is
+    imported here, at call time."""
+    from tradepartner.store import lab_schema
+
+    lab_schema.widen_enum(conn, "owner_decisions", "kind", lab_schema.RELEASE_DECISION_KINDS)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('trials')").fetchall()}
+    if _DEVELOPMENT_BOUNDARY_COLUMN not in columns:
+        conn.execute(f"ALTER TABLE trials ADD COLUMN {_DEVELOPMENT_BOUNDARY_COLUMN} DATE")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 16 store to version 17.
+    version-2 to 17 store to version 18.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2810,7 +2858,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; a version-16 or earlier store
+    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `owner_decisions.kind` widened with `data_release` and
+    `development_boundary` (every row kept) and the nullable
+    `trials.development_boundary`, and a version-17 store a version-18 row
+    (#1319, T140b); a version-16 or earlier store
     gets each of the eight journal tables ADR 0015 seams 1 to 3 expand
     rebuilt with the version-17 DDL where it lacks `book_id` (every row kept
     in insertion order, the new columns at their defaults; #1258, T132);
@@ -2851,7 +2903,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-17 store passes, and a
+    On a read-only connection no DDL runs: a version-18 or 17 store passes, and a
     version-16 store serves fact, registry and lab reads while every journal
     read raises `SchemaVersionError` (`store.journal.require_journal`, naming
     the fix); 15 (every read but
@@ -2897,6 +2949,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PERIOD_KEYS_VERSION,
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
+        _PRE_RELEASE_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2949,6 +3002,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_lab(conn)
         if max_version is not None and max_version <= _PRE_EXPANSION_SEAMS_VERSION:
             _migrate_expansion_seams(conn)
+        if max_version is None or max_version <= _PRE_RELEASE_VERSION:
+            _migrate_release_kinds(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

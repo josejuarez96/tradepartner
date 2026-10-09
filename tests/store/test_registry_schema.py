@@ -213,11 +213,11 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) & set(schema.TABLE_NAMES) == set()
 
 
-def test_current_schema_version_is_17() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 17
+def test_current_schema_version_is_18() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 18
 
 
-def test_fresh_init_creates_every_table_at_version_17() -> None:
+def test_fresh_init_creates_every_table_at_version_18() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     assert _table_names(conn) == (
@@ -228,14 +228,14 @@ def test_fresh_init_creates_every_table_at_version_17() -> None:
         | set(schema.RESEARCH_TABLE_NAMES)
         | {schema.REBALANCE_COUNTS_TABLE_NAME}
     )
-    assert [version for version, _ in _versions(conn)] == [17]
+    assert [version for version, _ in _versions(conn)] == [18]
 
 
 def test_fresh_init_twice_keeps_one_version_row() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     schema.init_schema(conn)
-    assert [version for version, _ in _versions(conn)] == [17]
+    assert [version for version, _ in _versions(conn)] == [18]
 
 
 def test_registry_tables_carry_no_fact_columns() -> None:
@@ -255,7 +255,7 @@ def test_registry_tables_carry_no_fact_columns() -> None:
         assert columns.isdisjoint({"known_at", "ingested_at", "provenance"}), table
 
 
-def test_write_open_of_version_2_store_migrates_to_version_17(version_2_store: Path) -> None:
+def test_write_open_of_version_2_store_migrates_to_version_18(version_2_store: Path) -> None:
     conn = duckdb.connect(str(version_2_store))
     try:
         assert _table_names(conn).isdisjoint(_PHASE3_REGISTRY)
@@ -281,13 +281,14 @@ def test_write_open_of_version_2_store_migrates_to_version_17(version_2_store: P
         15,
         16,
         17,
+        18,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
     assert versions[3][1] == versions[2][1] == versions[1][1]
 
 
-def test_write_open_of_version_3_store_migrates_to_version_17(version_3_store: Path) -> None:
+def test_write_open_of_version_3_store_migrates_to_version_18(version_3_store: Path) -> None:
     conn = duckdb.connect(str(version_3_store))
     try:
         # Version 12 (#926) adds `trial_results.n_research`; version 13
@@ -324,6 +325,7 @@ def test_write_open_of_version_3_store_migrates_to_version_17(version_3_store: P
         15,
         16,
         17,
+        18,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
@@ -477,15 +479,15 @@ def test_read_only_open_of_version_3_store_raises_and_changes_nothing(
         conn.close()
 
 
-def test_read_only_open_of_version_17_store_passes(tmp_path: Path) -> None:
-    path = tmp_path / "store_v17.duckdb"
+def test_read_only_open_of_version_18_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "store_v18.duckdb"
     conn = duckdb.connect(str(path))
     schema.init_schema(conn)
     conn.close()
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == [17]
+        assert [version for version, _ in _versions(conn)] == [18]
     finally:
         conn.close()
 
@@ -628,3 +630,173 @@ def _insert(conn: duckdb.DuckDBPyConnection, table: str, row: dict[str, Any]) ->
     columns = ", ".join(row)
     placeholders = ", ".join("?" for _ in row)
     conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", list(row.values()))
+
+
+# --- version 18 (#1319, data-foundation plan T140b): the release kinds ---------------
+
+#: `owner_decisions.kind` as version 17 left it on a store the lab migration
+#: reached (the owner's) and on one it did not (a fresh version-16/17 store).
+_V17_LAB_KINDS = ("gap_signoff", "gap_override", "holdout_spend", "promotion", "sweep_retired")
+_V17_PLAIN_KINDS = _V17_LAB_KINDS[:3]
+
+
+def _version_17_store(path: Path, *, lab: bool) -> None:
+    """A store as version 17 left it, the fixture universe loaded (every fact
+    table populated), one trial and one `owner_decisions` row of every kind the
+    store allowed: the version-18 delta (the widened `kind` CHECK and
+    `trials.development_boundary`) is removed from a current store, as
+    `tests/store/test_journal_schema.py`'s `_version_16_store` does, and
+    `owner_decisions` is rebuilt from the version-3 DDL (widened by the lab's two
+    kinds when `lab`)."""
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
+        if lab:
+            lab_schema.apply_lab_schema(conn)
+        conn.execute("DROP TABLE owner_decisions")
+        conn.execute(schema._CREATE_OWNER_DECISIONS)
+        if lab:
+            lab_schema.widen_enum(conn, "owner_decisions", "kind", ("promotion", "sweep_retired"))
+        conn.execute("ALTER TABLE trials DROP COLUMN development_boundary")
+        conn.execute(
+            "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+            "end_session, data_cutoff, code_version, synthetic, run_by) VALUES "
+            "(4, 1, 'holdout', ?, '2023-12-29', '2026-09-30', ?, 'abc', false, 'owner')",
+            [_NOW, _NOW],
+        )
+        kinds = _V17_LAB_KINDS if lab else _V17_PLAIN_KINDS
+        # Inserted out of id order, one deleted between, so "insertion order" is
+        # not "id order".
+        for decision_id, kind in zip((3, 1, 5, 2, 4), kinds, strict=False):
+            conn.execute(
+                "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, 4, ?, ?)",
+                [decision_id, _NOW, kind, f'{{"k": {decision_id}}}', f"reason {kind}"],
+            )
+        conn.execute("DELETE FROM owner_decisions WHERE decision_id = 1")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (17, ?)", [_OLD_APPLIED_AT])
+    finally:
+        conn.close()
+
+
+def _every_row(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
+    """Every table's rows in insertion order, `trials` without the version-18
+    column, `schema_version` left out."""
+    out = {}
+    for table in sorted(_table_names(conn) - {"schema_version"}):
+        exclude = " EXCLUDE (development_boundary)" if table == "trials" else ""
+        columns = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+        if "development_boundary" not in columns:
+            exclude = ""
+        out[table] = conn.execute(f"SELECT *{exclude} FROM {table} ORDER BY rowid").fetchall()
+    return out
+
+
+def _kind_check(conn: duckdb.DuckDBPyConnection) -> str:
+    (sql,) = conn.execute(  # type: ignore[misc]
+        "SELECT sql FROM duckdb_tables() WHERE table_name = 'owner_decisions'"
+    ).fetchone()
+    return str(sql)
+
+
+@pytest.mark.parametrize("lab", [True, False])
+def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool) -> None:
+    """No row of any table changes, fact tables included (so no as-of read and no
+    look-ahead moves); every decision keeps its kind; only the `kind` CHECK widens
+    and `trials` gains the NULL `development_boundary`."""
+    path = tmp_path / "v17.duckdb"
+    _version_17_store(path, lab=lab)
+    with duckdb.connect(str(path)) as conn:
+        configure_connection(conn)
+        before = _every_row(conn)
+        kinds_before = conn.execute(
+            "SELECT decision_id, kind FROM owner_decisions ORDER BY rowid"
+        ).fetchall()
+        check_before = _kind_check(conn)
+        schema.init_schema(conn)
+        assert _every_row(conn) == before
+        assert before["prices_daily"] and before["securities"]  # facts were there
+        assert (
+            conn.execute("SELECT decision_id, kind FROM owner_decisions ORDER BY rowid").fetchall()
+            == kinds_before
+        )
+        added = ", ".join(f"'{k}'" for k in lab_schema.RELEASE_DECISION_KINDS)
+        assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
+        assert conn.execute("SELECT development_boundary FROM trials").fetchall() == [(None,)]
+        assert [v for v, _ in _versions(conn)] == [17, 18]
+        for decision_id, kind in enumerate(lab_schema.RELEASE_DECISION_KINDS, start=10):
+            conn.execute(
+                "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
+                [decision_id, _NOW, kind],
+            )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO owner_decisions VALUES (20, ?, 'made_up', NULL, NULL, '{}', 'r')",
+                [_NOW],
+            )
+        with pytest.raises(duckdb.ConstraintException):  # the primary key survives
+            conn.execute(
+                "INSERT INTO owner_decisions VALUES (3, ?, 'data_release', NULL, NULL, '{}', 'r')",
+                [_NOW],
+            )
+        assert lab_schema.is_lab_initialised(conn) == lab
+        # A second open changes nothing more.
+        rows, check = _every_row(conn), _kind_check(conn)
+        schema.init_schema(conn)
+        assert (_every_row(conn), _kind_check(conn)) == (rows, check)
+        assert [v for v, _ in _versions(conn)] == [17, 18]
+
+
+def test_a_failed_version_18_migration_leaves_the_store_at_17(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "v17.duckdb"
+    _version_17_store(path, lab=True)
+
+    widen = lab_schema.widen_enum
+
+    def boom(*args: Any) -> None:
+        widen(*args)  # the rebuild happens, then the migration fails
+        raise RuntimeError("injected")
+
+    with duckdb.connect(str(path)) as conn:
+        configure_connection(conn)
+        before, check = _every_row(conn), _kind_check(conn)
+        monkeypatch.setattr(lab_schema, "widen_enum", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            schema.init_schema(conn)
+        assert (_every_row(conn), _kind_check(conn)) == (before, check)
+        assert [v for v, _ in _versions(conn)] == [17]
+
+
+def test_a_fresh_store_allows_the_version_18_kinds() -> None:
+    conn = duckdb.connect(":memory:")
+    schema.init_schema(conn)
+    for decision_id, kind in enumerate(lab_schema.RELEASE_DECISION_KINDS, start=1):
+        conn.execute(
+            "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
+            [decision_id, _NOW, kind],
+        )
+    with pytest.raises(duckdb.ConstraintException):  # still no lab kind without the lab
+        conn.execute(
+            "INSERT INTO owner_decisions VALUES (9, ?, 'promotion', NULL, NULL, '{}', 'r')",
+            [_NOW],
+        )
+    assert "development_boundary" in {
+        r[1] for r in conn.execute("PRAGMA table_info('trials')").fetchall()
+    }
+
+
+def test_read_only_open_of_a_version_17_store_passes_and_changes_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "v17.duckdb"
+    _version_17_store(path, lab=True)
+    with duckdb.connect(str(path), read_only=True) as conn:
+        before = _every_row(conn)
+        schema.init_schema(conn)
+        assert _every_row(conn) == before
+        assert [v for v, _ in _versions(conn)] == [17]
+        assert "development_boundary" not in {
+            r[1] for r in conn.execute("PRAGMA table_info('trials')").fetchall()
+        }

@@ -73,6 +73,18 @@ Phase 3 (T42):
 - `tradepartner decision gap-signoff --trial <id> --reason` appends a
   `gap_signoff` owner decision for an `ok` trial, with its gap maxima and the
   frozen threshold (spec req 12, ADR 0003 rule 8).
+- `tradepartner decision data-release open --name --backup --reason`, `close
+  --name --from <session> --to <session> [--reason]`, `record --name --backup
+  --trial <id> --reason` and `import-file <path>` write the named data releases of
+  `docs/runbooks/data-releases.md` (#1319, data-foundation plan T140b) through
+  `store.registry`'s release writers: `open` the `before` row (the backup, read
+  read-only, must hold the store's latest `ingested_at`), `close` the open
+  release's `after` row with the sessions touched, `record` a closed row for the
+  backup that holds a trial's state (its vintage at the trial's cutoff, whether
+  it equals the trial's, and the repair runs since), and `import-file` the
+  hand-written `data/releases.toml` once, every entry checked before anything is
+  written, then one transaction per release. Exit 0 when written, 1 on a
+  refusal or a busy store, 2 on a usage error.
 
 Research registry (research-registry spec req 11 and req 14; plan T83):
 
@@ -268,7 +280,12 @@ from tradepartner.store import (
     research,
     schema,
 )
-from tradepartner.store.db import StoreLockedError, open_for_write, open_read_only, utc_now
+from tradepartner.store.db import (
+    StoreLockedError,
+    open_for_write,
+    open_read_only,
+    utc_now,
+)
 from tradepartner.store.lab_schema import LabNotInitialised
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -1516,6 +1533,136 @@ def make_app(
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         typer.echo(f"decision {decision_id}: gap_signoff for trial {trial} ({record.slug})")
+
+    release_app = typer.Typer(no_args_is_help=True, help="Record a named data release.")
+    decision_app.add_typer(release_app, name="data-release")
+
+    def _backup(path: Path, s: Settings) -> duckdb.DuckDBPyConnection:
+        try:
+            return registry.open_backup(path, Path(s.store.path))
+        except registry.BackupRefused as exc:
+            raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
+
+    def _importer(
+        group: Sequence[Mapping[str, Any]],
+    ) -> Callable[[duckdb.DuckDBPyConnection], list[int]]:
+        return lambda conn: registry.import_release(conn, group)
+
+    def _release_write[T](write: Callable[[duckdb.DuckDBPyConnection], T], s: Settings) -> T:
+        """Run one release write in its own committed chunk on a migrated store."""
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                return write(conn)
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except schema.SchemaVersionError as exc:
+            raise _fail(str(exc), 1) from None
+        except registry.ReleaseRefused as exc:
+            raise _fail(f"release refused: {_scrubbed(str(exc), s)}", 1) from None
+
+    @release_app.command("open")
+    def release_open(
+        name: Annotated[str, typer.Option(help="the release name (lowercase, digits, hyphens)")],
+        backup: Annotated[Path, typer.Option(help="the backup file taken just before")],
+        reason: Annotated[str, typer.Option(help="why, and the issue number")],
+    ) -> None:
+        """Open a release: write its `before` row (runbook steps 3 and 4)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        copy = _backup(backup, s)
+        try:
+            decision_id = _release_write(
+                lambda conn: registry.open_data_release(
+                    conn, copy, name=name, backup_path=str(backup), reason=reason
+                ),
+                s,
+            )
+        finally:
+            copy.close()
+        typer.echo(f"decision {decision_id}: data_release {name} before (open)")
+
+    @release_app.command("close")
+    def release_close(
+        name: Annotated[str, typer.Option(help="the open release's name")],
+        from_: Annotated[str, typer.Option("--from", help="the first session the repair touched")],
+        to: Annotated[str, typer.Option(help="the last session the repair touched")],
+        reason: Annotated[
+            str | None, typer.Option(help="what differs from the plan (default: open's)")
+        ] = None,
+    ) -> None:
+        """Close the open release: write its `after` row with the sessions touched."""
+        if reason is not None and not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        first = _parse_day("--from", from_)
+        last = _parse_day("--to", to)
+        assert first is not None and last is not None
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        decision_id = _release_write(
+            lambda conn: registry.close_data_release(
+                conn, name=name, sessions_from=first, sessions_to=last, reason=reason
+            ),
+            s,
+        )
+        typer.echo(f"decision {decision_id}: data_release {name} after ({first}..{last})")
+
+    @release_app.command("record")
+    def release_record(
+        name: Annotated[str, typer.Option(help="the record's name")],
+        backup: Annotated[Path, typer.Option(help="the backup that holds the trial's state")],
+        trial: Annotated[int, typer.Option(help="the trial whose state the backup holds")],
+        reason: Annotated[str, typer.Option(help="why, and the issue number")],
+    ) -> None:
+        """Record which backup holds the store state a trial read (a closed row)."""
+        if not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+
+        def _record(conn: duckdb.DuckDBPyConnection) -> registry.DataRelease:
+            decision_id = registry.record_trial_state(
+                conn, copy, name=name, backup_path=str(backup), trial_id=trial, reason=reason
+            )
+            (row,) = [r for r in registry.data_releases(conn) if r.decision_id == decision_id]
+            return row
+
+        copy = _backup(backup, s)
+        try:
+            row = _release_write(_record, s)
+        finally:
+            copy.close()
+        equal = row.values["vintage_equals_trial"]
+        runs = len(row.values["repair_runs"])
+        typer.echo(
+            f"decision {row.decision_id}: data_release {name} record for trial {trial}: "
+            f"data_vintage {_fmt(row.data_vintage)} "
+            f"{'equals' if equal else 'DIFFERS FROM'} the trial's "
+            f"{row.values.get('trial_data_vintage', '-')}; {runs} repair run(s) since the trial"
+        )
+
+    @release_app.command("import-file")
+    def release_import(
+        path: Annotated[Path, typer.Argument(help="the hand-written data/releases.toml")],
+    ) -> None:
+        """Import the hand-written release record once, one release per transaction."""
+        try:
+            entries = registry.read_release_file(path)
+        except registry.ReleaseFileError as exc:
+            raise _fail(str(exc), USAGE_ERROR) from None
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        groups = _release_write(lambda conn: registry.plan_release_import(conn, entries), s)
+        for group in groups:
+            ids = _release_write(_importer(group), s)
+            stages = ", ".join(str(e["stage"]) for e in group)
+            typer.echo(f"{group[0]['name']}: imported {stages} (decisions {ids})")
 
     sweep_app = typer.Typer(no_args_is_help=True, help="Register, run and judge sweeps.")
     app.add_typer(sweep_app, name="sweep")
