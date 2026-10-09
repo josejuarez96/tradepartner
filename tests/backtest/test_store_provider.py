@@ -281,6 +281,32 @@ def test_gap_equals_survivorship_gap(store: Store) -> None:
     assert got == GapReading(count_share=want.count_share, size_share=want.size_share)
 
 
+def test_a_step_builds_its_universe_once(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1305: the gap counts the universe's missing-data exclusions; within one step
+    # (one connection, one t) it reuses the universe the step built instead of
+    # building it a second time. A new step builds its own.
+    built: list[datetime] = []
+
+    def counting(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> Any:
+        built.append(t)
+        return universe_as_of(conn, t, settings)
+
+    monkeypatch.setattr(store_provider_module, "universe_as_of", counting)
+    monkeypatch.setattr(gap_module, "universe_as_of", counting)
+    with store.provider() as provider:
+        universe = provider.universe(T_WINDOW_DELIST)
+        gap = provider.survivorship_gap(T_WINDOW_DELIST)
+        assert provider.universe(T_WINDOW_DELIST) is universe
+        assert built == [T_WINDOW_DELIST]
+        gap_first = provider.survivorship_gap(T_AFTER_DELIST)  # a new step, gap first
+        provider.universe(T_AFTER_DELIST)
+        assert built == [T_WINDOW_DELIST, T_AFTER_DELIST]
+    with store.direct() as conn:
+        for t, got in ((T_WINDOW_DELIST, gap), (T_AFTER_DELIST, gap_first)):
+            want = gap_module.survivorship_gap(conn, t, store.settings)
+            assert got == GapReading(count_share=want.count_share, size_share=want.size_share)
+
+
 @pytest.mark.parametrize("include_dividends", [False, True])
 def test_adjusted_prices_equal_the_as_of_read(store: Store, include_dividends: bool) -> None:
     ids = ["SEC_SPLIT_BETWEEN", "SEC_DIV_REVISED", "SEC_SPY"]
