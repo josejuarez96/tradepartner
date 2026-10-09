@@ -4,6 +4,7 @@ queries against the latest `paper_windows` row, through `check.check`."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -334,16 +335,16 @@ def test_week_end_window_counts_and_compares_per_iso_week(settings: Settings) ->
     assert lines["rebalance_count"].detail.startswith(
         "2 scheduler-executed rebalance session(s) [2026-11-27, 2026-12-04], need >= 2"
     )
-    assert lines["tracking"].detail.startswith("2 compared non-excluded month(s), need >= 2")
+    assert lines["tracking"].detail.startswith("2 compared non-excluded week(s), need >= 2")
 
 
 def test_week_end_trial_months_are_iso_week_ends(settings: Settings) -> None:
-    """`_trial_months` reads the trial's sessions at the window's cadence (#1286)."""
+    """`_trial_periods` reads the trial's sessions at the window's cadence (#1286)."""
     with open_for_write(settings) as conn:
         _insert_hypothesis(conn, "week_end")
         _insert_trial(conn, sessions=(W0, W1, W2))
     with open_read_only(settings) as conn:
-        trial = check_module._trial_months(conn, TRIAL_ID, "week_end")
+        trial = check_module._trial_periods(conn, TRIAL_ID, "week_end")
     assert tuple(trial.sessions) == (W0, W1, W2)
     assert trial.cadence == "week_end"
 
@@ -692,7 +693,7 @@ def test_chain_due_threshold_follows_order_phase_for_a_forced_exit_in_a_rebalanc
                 ingested_at=_utc(forced_exit_session),
             ),
         )
-        # A bar for SEC_B on the fill session: `compare_months`'s fill-timing
+        # A bar for SEC_B on the fill session: `compare_periods`'s fill-timing
         # term (the tracking check, exercised regardless of this test's own
         # concern) needs one for any fill inside a compared month.
         conn.execute(
@@ -831,3 +832,41 @@ def test_check_stop_session_is_plan_stop_session(requested_at: datetime, expecte
         )
     ]
     assert check_module._stop_session_of(stops) == stop_session(requested_at) == expected
+
+
+# --- per book (ADR 0017 B.7; plan T156) -------------------------------------------
+
+
+def _other_book_window(conn: duckdb.DuckDBPyConnection, book_id: str = "b") -> None:
+    """A second book's open window, newer than `main`'s, with no run, report or
+    override of its own."""
+    append(conn, replace(_window(), window_id=WINDOW_ID + 1, book_id=book_id))
+
+
+def test_check_reads_only_the_named_books_latest_window(settings: Settings) -> None:
+    """`paper check --book b` checks `b`'s window, never `main`'s; with no book it
+    checks `paper.book_id`'s (`main`), even though `b`'s window is the newer one."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+        _other_book_window(conn)
+    with open_read_only(settings) as conn:
+        default = {line.name: line for line in check(conn, settings)}
+        main = {line.name: line for line in check(conn, settings, "main")}
+        other = {line.name: line for line in check(conn, settings, "b")}
+    assert all(line.passed for line in default.values()), default
+    assert main == default
+    assert not other["rebalance_count"].passed
+    assert other["rebalance_count"].detail.startswith("0 scheduler-executed")
+    assert other["tracking"].detail == "no paper_reports row yet"
+
+
+def test_check_for_a_book_with_no_window_fails_and_a_bad_token_is_refused(
+    settings: Settings,
+) -> None:
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn)
+    with open_read_only(settings) as conn:
+        with pytest.raises(ValueError, match="no paper window"):
+            check(conn, settings, "b")
+        with pytest.raises(ValueError, match="book_id must match"):
+            check(conn, settings, "b-1")

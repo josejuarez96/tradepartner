@@ -12,10 +12,16 @@ KPI row (positions, open orders, today's signals, the kill-switch state as a
 status chip); the ranking hero (the latest plan's targets in the accent,
 everything else muted, in/out reasons on hover and in the table below);
 fills; the chain detail view, one order at a time; alerts; reconciliation
-status. Two states short-circuit the rest, each its own panel rather than a
-traceback (the T43/T44 "registry not initialised" pattern): a store with
-no paper-trading journal yet (`journal_not_initialised`), and a
-migrated store with no `paper start` yet (`window is None`).
+status. **Books** (ADR 0017 B.7, plan T156; spec req 12 as amended
+2026-10-09): above the per-book sections, a one-row-per-book summary
+(`ops.book_summaries`: window, open or closed, positions, open orders, switch
+state, last run status, next rebalance session at the book's cadence) and,
+when more than one book has a window, a book selector (`BOOK_KEY`, default
+`paper.book_id`) that picks the book every section below is drawn for
+(`ops.page_data(conn, settings, book)`). Two states short-circuit the
+rest, each its own panel rather than a traceback (the T43/T44 "registry not
+initialised" pattern): a store with no paper-trading journal yet
+(`journal_not_initialised`), and a migrated store with no `paper start` yet (`window is None`).
 """
 
 from __future__ import annotations
@@ -31,6 +37,10 @@ from tradepartner.execution import ops
 from tradepartner.execution.ops import OpsData, OrderChain, RankedSignal
 from tradepartner.execution.switch import SwitchState
 from tradepartner.store.journal import AlertRow, ReconciliationRow
+from tradepartner.store.schema import SchemaVersionError
+
+#: The book selector's widget key (session state).
+BOOK_KEY = "ops_book"
 
 #: Severity per `execution.reconcile` status (module docstring there, "Status"):
 #: `mismatch` is the only real error (the caller raises `ReconciliationError` on
@@ -43,6 +53,16 @@ _RECONCILIATION_STATUS: dict[str, theme.Status] = {
     "mismatch": "critical",
 }
 
+_SUMMARY_SCHEMA: dict[str, pl.DataType] = {
+    "book": pl.Utf8(),
+    "window": pl.Int64(),
+    "open": pl.Boolean(),
+    "positions": pl.Int64(),
+    "open_orders": pl.Int64(),
+    "kill_switch": pl.Utf8(),
+    "last_run": pl.Utf8(),
+    "next_rebalance": pl.Date(),
+}
 _RANKING_SCHEMA: dict[str, pl.DataType] = {
     "security_id": pl.Utf8(),
     "rank": pl.Int64(),
@@ -97,6 +117,59 @@ def _switch_badge(state: SwitchState) -> None:
         theme.status_badge("kill switch: run in progress", "warning")
     else:
         theme.status_badge("kill switch: ok", "good")
+
+
+def _switch_text(state: SwitchState) -> str:
+    if state.engaged:
+        return "engaged"
+    return "run in progress" if state.run_in_progress else "ok"
+
+
+def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "book": row.book_id,
+                "window": row.window.window_id,
+                "open": row.is_open,
+                "positions": row.positions_count,
+                "open_orders": row.open_orders_count,
+                "kill_switch": _switch_text(row.switch_state),
+                "last_run": row.last_run_status,
+                "next_rebalance": row.next_rebalance_session,
+            }
+            for row in summaries
+        ],
+        schema=_SUMMARY_SCHEMA,
+    )
+
+
+def _book_summaries(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> tuple[ops.BookSummary, ...]:
+    """The summary rows, or none on a journal too old to read (the outdated
+    panel below names it)."""
+    try:
+        return ops.book_summaries(conn, settings)
+    except SchemaVersionError:
+        return ()
+
+
+def _selected_book(summaries: tuple[ops.BookSummary, ...], default: str) -> str:
+    """The book the sections are drawn for: the selector's pick when more than
+    one book has a window, else `default` (`paper.book_id`)."""
+    books = [row.book_id for row in summaries]
+    if len(books) < 2:
+        return books[0] if books else default
+    index = books.index(default) if default in books else 0
+    picked = st.selectbox("Book", books, index=index, key=BOOK_KEY)
+    return str(picked)
+
+
+def _summary_card(summaries: tuple[ops.BookSummary, ...]) -> None:
+    with st.container(border=True):
+        st.subheader("Books")
+        st.dataframe(_summary_table(summaries), hide_index=True)
 
 
 def _kpis(data: OpsData) -> None:
@@ -254,7 +327,11 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         settings = get_settings()
 
     st.header("Operations")
-    data = ops.page_data(conn, settings)
+    summaries = _book_summaries(conn, settings)
+    if summaries:
+        _summary_card(summaries)
+    book = _selected_book(summaries, settings.paper.book_id)
+    data = ops.page_data(conn, settings, book)
 
     if data.journal_not_initialised:
         _render_journal_not_initialised()

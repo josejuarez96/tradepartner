@@ -1,6 +1,20 @@
-"""Operations data: `page_data(conn, settings) -> OpsData` (Phase 4 spec req 12;
+"""Operations data: `page_data(conn, settings, book_id) -> OpsData` and
+`book_summaries(conn, settings) -> tuple[BookSummary, ...]` (Phase 4 spec req 12;
 plan T66b; split out of T66 on 2026-09-30, #388, so the operations page and
 `paper status` (T67) can start before the window and report chains finish).
+
+**Per book** (ADR 0017 B.7, plan T156; spec req 12 as amended 2026-10-09).
+`page_data` reads one book's latest window (`journal.latest_window(conn,
+book)`; `book_id` defaults to `paper.book_id`, the spec's `--book` default), so
+another book's window, runs, orders or alerts never reach it. A run-scoped alert
+belongs to the window through its run; a `locked` alert (no run) belongs to the
+book it names (`alerts.book_id`, schema version 19; on a read-only version-18
+store, which has no such column, every alert is `main`'s, the one book there
+was). `book_summaries` is the page's one-row-per-book summary and `paper status
+--all`: for every book with a window, in token order, its latest window, whether
+it is open, its positions and open orders, its kill-switch state, its last run's
+status and its next rebalance session at the window's cadence. With one book,
+`main`, `page_data` reads exactly what it read before books existed.
 
 Pure over a read-only connection: every number the operations page and
 `paper status` show comes from here, never recomputed by the page itself
@@ -92,13 +106,16 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from tradepartner.calendar import previous_session
+from tradepartner.backtest.schedule import rebalance_sessions
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.execution import lock
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
-from tradepartner.store import journal
+from tradepartner.execution.window import window_cadence
+from tradepartner.store import journal, registry
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import (
+    CLOSING_STOP_STATES,
     TERMINAL_ORDER_STATUSES,
     AlertRow,
     DecisionRow,
@@ -116,11 +133,24 @@ from tradepartner.store.journal import (
     RunWithResult,
     SignalRow,
 )
-from tradepartner.store.schema import SchemaVersionError
+from tradepartner.store.schema import DEFAULT_BOOK_ID, SchemaVersionError
 
-__all__ = ["ChainStep", "OpsData", "OrderChain", "RankedSignal", "page_data"]
+__all__ = [
+    "BookSummary",
+    "ChainStep",
+    "OpsData",
+    "OrderChain",
+    "RankedSignal",
+    "book_ids",
+    "book_summaries",
+    "page_data",
+]
 
 _NEW_YORK = ZoneInfo("America/New_York")
+
+#: How far ahead `_next_rebalance_session` looks: the slowest cadence, `month_end`,
+#: has a rebalance session within two calendar months of any day.
+_REBALANCE_SEARCH = timedelta(days=62)
 
 #: Deterministic tie-break for steps sharing a `known_at` in one order's chain.
 _STEP_ORDER: dict[str, int] = {"order": 0, "order_event": 1, "fill": 2, "outcome": 3}
@@ -183,6 +213,8 @@ class OpsData:
     once over a read-only connection."""
 
     journal_not_initialised: bool = False
+    #: The book this was read for (`page_data`'s `book_id`, or `paper.book_id`).
+    book_id: str = DEFAULT_BOOK_ID
     #: `require_journal`'s message when the journal predates schema version 17
     #: (the eight expanded tables lack `book_id`; plan T132). Set instead of
     #: `journal_not_initialised`, so the page shows the migrate-first message
@@ -207,10 +239,45 @@ class OpsData:
     reconciliation: ReconciliationRow | None = None
 
 
+@dataclass(frozen=True)
+class BookSummary:
+    """One book's row in the operations page's summary and `paper status --all`
+    (spec req 12 as amended 2026-10-09; ADR 0017 B.7): the book's latest window,
+    open or not, read with the same helpers `page_data` uses."""
+
+    book_id: str
+    window: PaperWindowRow
+    #: False once the window has a `closed` or `abandoned` stop row.
+    is_open: bool
+    positions_count: int
+    open_orders_count: int
+    switch_state: SwitchState
+    #: The latest run's result status, `"unfinished"` while it has none, None
+    #: before the window's first run.
+    last_run_status: str | None
+    #: The first rebalance session at the window's cadence whose close is after
+    #: now, never before the window's first rebalance; None for a window that is
+    #: no longer open or whose cadence cannot be read.
+    next_rebalance_session: date | None
+
+
 def _latest(plans: list[PaperPlanRow]) -> PaperPlanRow | None:
     if not plans:
         return None
     return max(plans, key=lambda p: (p.rebalance_session, p.run_id))
+
+
+def _alerts_have_book(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Whether `alerts` has its version-19 `book_id` column: a read-only
+    connection serves a version-18 store, whose alerts are all `main`'s (module
+    docstring)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = current_schema() AND table_name = 'alerts' "
+        "AND column_name = 'book_id'"
+    ).fetchone()
+    assert row is not None
+    return bool(row[0])
 
 
 def _alerts_for_window(
@@ -225,14 +292,22 @@ def _alerts_for_window(
     (kind, session) instead; it is this window's when its session is on or
     after the window's first rebalance, since there is no run to join it to.
     `no_window` alone has no window to belong to: it fires before the first
-    `paper start`, and this function is never called before one exists."""
+    `paper start`, and this function is never called before one exists.
+    A `locked` alert is also the window's book's only (`alerts.book_id`, ADR
+    0017 B.6 and B.7): another book's run lock is another book's alert. A
+    version-18 store's alerts have no book and are all `main`'s."""
     journal.require_journal(conn)
+    book_params: list[str] = []
+    if _alerts_have_book(conn):
+        book_filter, book_params = "book_id = ?", [window.book_id]
+    else:
+        book_filter = "TRUE" if window.book_id == DEFAULT_BOOK_ID else "FALSE"
     rows = conn.execute(
         'SELECT alert_id, run_id, session, kind, message, "at", known_at, ingested_at '
         "FROM alerts WHERE run_id IN (SELECT run_id FROM paper_runs WHERE window_id = ?) "
-        "OR (run_id IS NULL AND kind = 'locked' AND session >= ?) "
+        f"OR (run_id IS NULL AND kind = 'locked' AND session >= ? AND {book_filter}) "
         "ORDER BY alert_id DESC LIMIT ?",
-        [window.window_id, window.first_rebalance_session, limit + 1],
+        [window.window_id, window.first_rebalance_session, *book_params, limit + 1],
     ).fetchall()
     capped = len(rows) > limit
     kept = rows[:limit]
@@ -674,21 +749,60 @@ def _bounded_known_at(conn: duckdb.DuckDBPyConnection, window_id: int) -> dateti
     return latest
 
 
-def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
-    """Everything the operations page and `paper status` (T67) show, read once
-    through `conn` (the shell's read-only connection). Never writes to the
-    store, never takes the run lock and never engages or releases the switch
-    (module docstring)."""
+def _book_of(settings: Settings, book_id: str | None) -> str:
+    """The book read: `book_id`, or `paper.book_id` when none is given (the
+    spec's `--book` default); `ValueError` outside the token grammar."""
+    book = settings.paper.book_id if book_id is None else book_id
+    journal.check_book_id(book)
+    return book
+
+
+def _lock_free(settings: Settings, book: str) -> bool:
+    """Whether no process holds the book's run lock (`lock.is_held`, a
+    non-blocking check), for `switch.derive`'s in-progress rule."""
+    del book  # the run lock is one per store until the per-book lock (T155)
+    return not lock.is_held(settings)
+
+
+def _positions(conn: duckdb.DuckDBPyConnection, window_id: int) -> tuple[int, float]:
+    """(count, value) of the non-zero marks at the window's latest marked
+    session (module docstring, item 1)."""
+    last_session = _last_marked_session(conn, window_id)
+    if last_session is None:
+        return 0, 0.0
+    # `after` is exclusive and `last_session` is the maximum session
+    # (`_last_marked_session`), so `after=last_session - timedelta(days=1)`
+    # reads exactly `session == last_session`, with no dependency on
+    # which dates the trading calendar schedules as sessions (#652).
+    marks = [
+        m
+        for m in journal.positions_daily_for(
+            conn, window_id, after=last_session - timedelta(days=1)
+        )
+        if m.security_id is not None and m.quantity != 0
+    ]
+    return len(marks), sum(m.value or 0.0 for m in marks)
+
+
+def page_data(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book_id: str | None = None
+) -> OpsData:
+    """Everything the operations page and `paper status` (T67) show for one book
+    (`book_id`, default `paper.book_id`; ADR 0017 B.7), read once through `conn`
+    (the shell's read-only connection). Never writes to the store, never takes
+    the run lock and never engages or releases the switch (module docstring).
+    `ValueError` for a book outside the token grammar."""
     limit = settings.dashboard.page_row_limit
+    book = _book_of(settings, book_id)
     try:
-        window = journal.latest_window(conn)
+        window = journal.latest_window(conn, book)
     except JournalNotInitialised:
-        return OpsData(journal_not_initialised=True)
+        return OpsData(journal_not_initialised=True, book_id=book)
     except SchemaVersionError as exc:
-        return OpsData(journal_outdated=str(exc))
+        return OpsData(journal_outdated=str(exc), book_id=book)
 
     if window is None:
-        return OpsData()
+        return OpsData(book_id=book)
 
     window_id = window.window_id
     assert window_id is not None
@@ -714,23 +828,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
     s_minus_1 = _required_run_session(utc_now())
     stale, last_updated = _stale_and_last_updated(conn, window_id, s_minus_1)
 
-    last_session = _last_marked_session(conn, window_id)
-    positions_count = 0
-    positions_value = 0.0
-    if last_session is not None:
-        # `after` is exclusive and `last_session` is the maximum session
-        # (`_last_marked_session`), so `after=last_session - timedelta(days=1)`
-        # reads exactly `session == last_session`, with no dependency on
-        # which dates the trading calendar schedules as sessions (#652).
-        marks = [
-            m
-            for m in journal.positions_daily_for(
-                conn, window_id, after=last_session - timedelta(days=1)
-            )
-            if m.security_id is not None
-        ]
-        positions_count = sum(1 for m in marks if m.quantity != 0)
-        positions_value = sum(m.value or 0.0 for m in marks if m.quantity != 0)
+    positions_count, positions_value = _positions(conn, window_id)
 
     open_orders_count = _open_orders_count(conn, window_id)
 
@@ -744,7 +842,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         runs,
         results,
         reading_run=None,
-        lock_free=not lock.is_held(settings),
+        lock_free=_lock_free(settings, book),
     )
 
     chains, chains_capped = _build_chains(orders, order_events, chain_fills, outcomes, limit=limit)
@@ -765,6 +863,7 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
 
     return OpsData(
         journal_not_initialised=False,
+        book_id=book,
         window=window,
         as_of=as_of,
         last_updated=last_updated,
@@ -783,6 +882,88 @@ def page_data(conn: duckdb.DuckDBPyConnection, settings: Settings) -> OpsData:
         alerts_capped=alerts_capped,
         reconciliation=reconciliation,
     )
+
+
+def book_ids(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
+    """Every book with at least one window, in token order. Raises
+    `JournalNotInitialised` or `SchemaVersionError` as every journal read does."""
+    journal.require_journal(conn)
+    rows = conn.execute("SELECT DISTINCT book_id FROM paper_windows ORDER BY book_id").fetchall()
+    return tuple(str(r[0]) for r in rows)
+
+
+def _is_open(conn: duckdb.DuckDBPyConnection, window_id: int) -> bool:
+    """No `closed` or `abandoned` stop row (`journal.open_window`'s rule)."""
+    return not any(
+        stop.state in CLOSING_STOP_STATES for stop in journal.window_stops_for(conn, window_id)
+    )
+
+
+def _next_rebalance_session(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, now: datetime
+) -> date | None:
+    """The first rebalance session at the window's cadence, on or after its first
+    rebalance, whose close is after `now`; None when the cadence cannot be read
+    (an unknown hypothesis or a cadence outside `Cadence`), so the summary shows
+    "n/a" rather than failing the page."""
+    try:
+        cadence = window_cadence(conn, window)
+    except (registry.UnknownHypothesis, ValueError):
+        return None
+    start = max(now.astimezone(_NEW_YORK).date(), window.first_rebalance_session)
+    sessions = rebalance_sessions(start, start + _REBALANCE_SEARCH, cadence)
+    return next((t for t in sessions if session_close(t) > now), None)
+
+
+def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> BookSummary | None:
+    window = journal.latest_window(conn, book)
+    if window is None or window.window_id is None:
+        return None
+    window_id = window.window_id
+    kill_switch_rows = _kill_switch_rows_for(conn, window_id)
+    released_at = max((r.at for r in kill_switch_rows if r.state == "released"), default=None)
+    runs_with_results = _runs_for_switch(conn, window_id, released_at=released_at)
+    switch_state = derive(
+        window,
+        kill_switch_rows,
+        [rw.run for rw in runs_with_results],
+        [rw.result for rw in runs_with_results if rw.result is not None],
+        reading_run=None,
+        lock_free=_lock_free(settings, book),
+    )
+    latest_run = max(runs_with_results, key=lambda rw: rw.run.run_id or 0, default=None)
+    last_run_status = (
+        None
+        if latest_run is None
+        else ("unfinished" if latest_run.result is None else latest_run.result.status)
+    )
+    is_open = _is_open(conn, window_id)
+    positions_count, _ = _positions(conn, window_id)
+    return BookSummary(
+        book_id=book,
+        window=window,
+        is_open=is_open,
+        positions_count=positions_count,
+        open_orders_count=_open_orders_count(conn, window_id),
+        switch_state=switch_state,
+        last_run_status=last_run_status,
+        next_rebalance_session=(
+            _next_rebalance_session(conn, window, utc_now()) if is_open else None
+        ),
+    )
+
+
+def book_summaries(conn: duckdb.DuckDBPyConnection, settings: Settings) -> tuple[BookSummary, ...]:
+    """The one-row-per-book summary (module docstring), every book with a window
+    in token order; empty before the first `paper start` and on a store with no
+    journal. A journal too old to read raises `SchemaVersionError` (its message
+    names the fix). Reads only, like `page_data`."""
+    try:
+        books = book_ids(conn)
+    except JournalNotInitialised:
+        return ()
+    summaries = (_summary(conn, settings, book) for book in books)
+    return tuple(summary for summary in summaries if summary is not None)
 
 
 def _capped_fills(
