@@ -13,7 +13,9 @@ than the charter default, including an environment override, so it cannot
 be silently loosened; changing it is a charter amendment, not a config edit.
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
-Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, the `ALERT_SMTP_*`
+Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (book `main`'s pair; every
+other book's is `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY`/`..._API_SECRET`, ADR 0017
+B.1, plan T153), the `ALERT_SMTP_*`
 credentials and the research vendor's `TYPESAFE_API_KEY`) are `SecretStr` so
 their values never appear in `repr()`/`str()` of `Settings`, including
 `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
@@ -1309,6 +1311,37 @@ def _is_set(value: str | SecretStr | None) -> bool:
     return bool(text.strip())
 
 
+#: The book whose paper key pair is `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`
+#: (ADR 0017 B.1): H1's book, `store.schema.DEFAULT_BOOK_ID` and `paper.book_id`'s default.
+MAIN_BOOK_ID = "main"
+#: The settings field holding every other book's pair, and so the head of its variables.
+_BOOK_PAIRS_FIELD = "alpaca_paper_books"
+
+
+class AlpacaPaperKeyPair(BaseModel):
+    """One book's Alpaca paper key pair (ADR 0017 B.1, plan T153), read from
+    `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` / `ALPACA_PAPER_BOOKS__<TOKEN>__API_SECRET`.
+    Both halves are optional here so a half-set pair never stops `Settings` loading
+    (and with it every other book's run); the adapter refuses such a book alone
+    (`no_credentials`). A mistyped half is ignored the same way, never echoed."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
+
+    api_key: SecretStr | None = None
+    api_secret: SecretStr | None = None
+
+
+def paper_key_variable_names(book_id: str) -> tuple[str, str]:
+    """The environment variables holding `book_id`'s paper key pair (ADR 0017 B.1,
+    plan T153): `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` for book `main`
+    (unchanged), and `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY`/`..._API_SECRET` for every
+    other book, `<TOKEN>` the book token upper-cased. Names only, never a value."""
+    if book_id == MAIN_BOOK_ID:
+        return "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET"
+    head = f"{_BOOK_PAIRS_FIELD.upper()}__{book_id.upper()}__"
+    return f"{head}API_KEY", f"{head}API_SECRET"
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -1583,6 +1616,11 @@ class Settings(BaseSettings):
     # fall back to the data keys, so a live-capable key is never in the order path.
     alpaca_paper_api_key: SecretStr | None = Field(default=None)
     alpaca_paper_api_secret: SecretStr | None = Field(default=None)
+    # ADR 0017 B.1 (plan T153): every book but `main` has its own pair, keyed by its
+    # token (`paper_key_variable_names`). Never a fallback to `main`'s pair or the
+    # data keys: a book with no entry has no pair. Environment names are
+    # case-insensitive, so the keys arrive lower-cased.
+    alpaca_paper_books: dict[str, AlpacaPaperKeyPair] = Field(default_factory=dict)
     # Phase 4 (spec req 11): the optional `email` alert channel. Top-level like the other
     # env-named secrets, because the nested delimiter is `__` and the spec names these
     # variables `ALERT_SMTP_HOST` etc.
@@ -1707,12 +1745,19 @@ def secret_values(settings: Settings) -> list[str]:
     """The value of every `SecretStr` field on `settings`, found by type, so a
     secret added to `Settings` later is redacted without editing a list (#334,
     #342). Blank values are left out; values are stripped; longest first, so a
-    secret that contains another is redacted whole."""
+    secret that contains another is redacted whole. The per-book paper pairs
+    (T153) sit one level down, in `alpaca_paper_books`, and are included."""
     values = []
     for name in type(settings).model_fields:
-        secret = getattr(settings, name)
-        if isinstance(secret, SecretStr):
-            value = secret.get_secret_value().strip()
-            if value:
-                values.append(value)
+        field = getattr(settings, name)
+        candidates = [field]
+        if name == _BOOK_PAIRS_FIELD:
+            candidates += [
+                half for pair in field.values() for half in (pair.api_key, pair.api_secret)
+            ]
+        for secret in candidates:
+            if isinstance(secret, SecretStr):
+                value = secret.get_secret_value().strip()
+                if value:
+                    values.append(value)
     return sorted(set(values), key=len, reverse=True)

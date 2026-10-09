@@ -201,6 +201,129 @@ def test_data_keys_are_never_a_fallback_for_paper_keys() -> None:
         AlpacaTradingRaw(settings, client=FakeClient(), clock=FakeClock())
 
 
+# --- one pair per book (ADR 0017 B.1 and B.2, plan T153) ----------------------
+
+B_KEY = "PKBOOKBFAKE0987654321"  # gitleaks:allow
+B_SECRET = "bookBSecretFake0987654321zyxwvutsrq"  # gitleaks:allow
+C_KEY = "PKBOOKCFAKE1122334455"  # gitleaks:allow
+C_SECRET = "bookCSecretFake1122334455mnopqrstuv"  # gitleaks:allow
+
+
+def _book_settings(**books: dict[str, Any]) -> Settings:
+    return _settings({"alpaca_paper_books": books})
+
+
+def _record_built(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    built: list[dict[str, Any]] = []
+
+    class RecordingTradingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(kwargs)
+            self._retry = 3
+            self._session = requests.Session()
+
+    monkeypatch.setattr(raw_mod, "TradingClient", RecordingTradingClient)
+    return built
+
+
+def test_book_b_is_built_on_its_own_pair_and_never_mains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built = _record_built(monkeypatch)
+    settings = _book_settings(
+        b={"api_key": B_KEY, "api_secret": B_SECRET}, c={"api_key": C_KEY, "api_secret": C_SECRET}
+    )
+    raw = AlpacaTradingRaw(settings, book_id="b", clock=FakeClock())
+
+    assert raw.book_id == "b"
+    assert built == [{"api_key": B_KEY, "secret_key": B_SECRET, "paper": True, "raw_data": True}]
+
+
+def test_book_main_keeps_the_paper_pair_and_ignores_a_main_books_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H1's book reads `ALPACA_PAPER_API_KEY/SECRET` exactly as before T153, by
+    default (the recorder's call) and by name, never an `alpaca_paper_books` entry."""
+    built = _record_built(monkeypatch)
+    settings = _book_settings(
+        main={"api_key": B_KEY, "api_secret": B_SECRET},
+        c={"api_key": C_KEY, "api_secret": C_SECRET},
+    )
+    AlpacaTradingRaw(settings, clock=FakeClock())
+    AlpacaTradingRaw(settings, book_id="main", clock=FakeClock())
+
+    expected = {"api_key": PAPER_KEY, "secret_key": PAPER_SECRET, "paper": True, "raw_data": True}
+    assert built == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    ("books", "missing"),
+    [
+        ({}, "ALPACA_PAPER_BOOKS__B__API_KEY and ALPACA_PAPER_BOOKS__B__API_SECRET"),
+        ({"b": {"api_key": B_KEY}}, "ALPACA_PAPER_BOOKS__B__API_SECRET"),
+        ({"b": {"api_key": "  ", "api_secret": B_SECRET}}, "ALPACA_PAPER_BOOKS__B__API_KEY"),
+        ({"c": {"api_key": C_KEY, "api_secret": C_SECRET}}, "ALPACA_PAPER_BOOKS__B__API_KEY"),
+    ],
+)
+def test_a_book_with_no_pair_fails_before_any_client_is_built(
+    monkeypatch: pytest.MonkeyPatch, books: dict[str, Any], missing: str
+) -> None:
+    """`no_credentials`: never `main`'s pair, another book's or the data keys as a
+    fallback, and no client (real or injected) is touched."""
+    built = _record_built(monkeypatch)
+    client = FakeClient()
+    with pytest.raises(AlpacaPaperCredentialsError) as err:
+        AlpacaTradingRaw(_book_settings(**books), book_id="b", client=client, clock=FakeClock())
+    text = str(err.value)
+    assert missing in text and "'b'" in text
+    for secret in (PAPER_KEY, PAPER_SECRET, DATA_KEY, B_KEY, B_SECRET, C_KEY, C_SECRET):
+        assert secret not in text
+    assert built == [] and client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("pair", "clash"),
+    [
+        ({"api_key": PAPER_KEY, "api_secret": B_SECRET}, "ALPACA_PAPER_API_KEY"),
+        ({"api_key": B_KEY, "api_secret": PAPER_SECRET}, "ALPACA_PAPER_API_KEY"),
+        ({"api_key": DATA_KEY, "api_secret": B_SECRET}, "ALPACA_API_KEY"),
+        ({"api_key": C_KEY, "api_secret": B_SECRET}, "ALPACA_PAPER_BOOKS__C__API_KEY"),
+    ],
+)
+def test_a_book_pair_repeating_another_pair_is_refused(
+    monkeypatch: pytest.MonkeyPatch, pair: dict[str, str], clash: str
+) -> None:
+    """One pair per book, never the data keys, never `main`'s or another book's."""
+    built = _record_built(monkeypatch)
+    settings = _book_settings(b=pair, c={"api_key": C_KEY, "api_secret": C_SECRET})
+    with pytest.raises(AlpacaPaperCredentialsError) as err:
+        AlpacaTradingRaw(settings, book_id="b", clock=FakeClock())
+    text = str(err.value)
+    assert clash in text
+    for secret in (PAPER_KEY, PAPER_SECRET, DATA_KEY, B_KEY, B_SECRET, C_KEY, C_SECRET):
+        assert secret not in text
+    assert built == []
+
+
+def test_a_mixed_case_token_has_no_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Environment names are case-insensitive, so `B` and `b` would share a pair."""
+    built = _record_built(monkeypatch)
+    settings = _settings({"alpaca_paper_books": {"B": {"api_key": B_KEY, "api_secret": B_SECRET}}})
+    with pytest.raises(AlpacaPaperCredentialsError, match="lower-case"):
+        AlpacaTradingRaw(settings, book_id="B", clock=FakeClock())
+    assert built == []
+
+
+def test_the_book_pair_guard_does_not_lift_the_paper_guard() -> None:
+    """`alpaca.paper` is still refused first, whatever book is named."""
+    settings = _book_settings(b={"api_key": B_KEY, "api_secret": B_SECRET})
+    bypassed = settings.model_copy(
+        update={"alpaca": settings.alpaca.model_copy(update={"paper": False})}
+    )
+    with pytest.raises(AlpacaPaperGuardError):
+        AlpacaTradingRaw(bypassed, book_id="b", client=FakeClient(), clock=FakeClock())
+
+
 # --- pacing, timeout, retries -----------------------------------------------
 
 
@@ -436,3 +559,19 @@ def test_market_day_order_builds_the_one_shape_the_adapter_sends(
         "client_order_id": "rec-1",
         **({"notional": notional} if notional is not None else {"qty": qty}),
     }
+
+
+def test_the_recorder_builds_the_raw_client_on_mains_pair() -> None:
+    """`cli_record paper` (T48) names no book, so it stays on `main`'s pair."""
+    from tradepartner import cli_record
+
+    calls = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(cli_record)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "AlpacaTradingRaw"
+    ]
+    assert calls
+    assert all(kw.arg != "book_id" for call in calls for kw in call.keywords)
+    assert inspect.signature(AlpacaTradingRaw).parameters["book_id"].default == "main"

@@ -8,11 +8,13 @@ does no interpretation: the status table, symbol mapping and deduplication live 
 Paper only, on every path (spec req 2): the `TradingClient` is built with the literal
 `paper=True`, never `settings.alpaca.paper` forwarded, because `model_copy` and
 `model_construct` bypass that field's guard; construction also refuses to start when
-`settings.alpaca.paper is not True`. Credentials come from `ALPACA_PAPER_API_KEY` /
-`ALPACA_PAPER_API_SECRET` only, never the data keys, so a live-capable key is never in
-the order path. A failed request is re-raised as `AlpacaTradingError`, holding only
-the status code and response body, raised outside the SDK's exception so no
-`__context__` keeps its request (whose headers carry the keys).
+`settings.alpaca.paper is not True`. Credentials are the book's own pair (ADR 0017
+B.1, plan T153): `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET` for book `main`,
+`ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` / `..._API_SECRET` for every other book, never
+the data keys and never another book's, so a live-capable key is never in the order
+path and a book can only reach its own account. A failed request is re-raised as
+`AlpacaTradingError`, holding only the status code and response body, raised outside
+the SDK's exception so no `__context__` keeps its request (whose headers carry the keys).
 
 The EDGAR client pattern: requests are paced at `alpaca.trading_requests_per_minute`,
 time out after `alpaca.trading_request_timeout_seconds`, and a timeout (or a 429/504,
@@ -43,7 +45,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, OrderR
 from pydantic import SecretStr
 from requests.adapters import HTTPAdapter
 
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import MAIN_BOOK_ID, Settings, get_settings, paper_key_variable_names
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 # API maxima, not tunables: `GET /v2/orders` returns at most 500 orders and
@@ -56,7 +58,8 @@ _DUPLICATE_ERROR_CODE = 40010001  # "client_order_id must be unique" (recorded, 
 
 
 class AlpacaPaperCredentialsError(RuntimeError):
-    """`ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_API_SECRET` missing or blank."""
+    """The book's paper key pair is missing, blank, or not its own (`no_credentials`,
+    raised before any client is built; the text names variables, never a value)."""
 
 
 class AlpacaPaperGuardError(RuntimeError):
@@ -139,20 +142,66 @@ def _non_blank(secret: SecretStr | None) -> str | None:
     return value if value.strip() else None
 
 
-def _paper_credentials(settings: Settings) -> tuple[str, str]:
-    key = _non_blank(settings.alpaca_paper_api_key)
-    secret = _non_blank(settings.alpaca_paper_api_secret)
-    missing = [
-        name
-        for name, value in (("ALPACA_PAPER_API_KEY", key), ("ALPACA_PAPER_API_SECRET", secret))
-        if value is None
-    ]
+def _paper_credentials(settings: Settings, book_id: str) -> tuple[str, str]:
+    """`book_id`'s own paper `(key, secret)` (ADR 0017 B.1 and B.2, plan T153):
+    `main` reads `ALPACA_PAPER_API_KEY`/`..._SECRET` exactly as before; every other
+    book reads its `alpaca_paper_books` entry and nothing else. Raises
+    `AlpacaPaperCredentialsError` when the pair is missing or blank, when a
+    non-`main` token has upper-case letters (environment names are case-insensitive,
+    so `B` and `b` would share one pair), or when a non-`main` book's key or secret is
+    the data pair's, `main`'s or another book's. Messages name variables only."""
+    key_name, secret_name = paper_key_variable_names(book_id)
+    if book_id == MAIN_BOOK_ID:
+        key = _non_blank(settings.alpaca_paper_api_key)
+        secret = _non_blank(settings.alpaca_paper_api_secret)
+    else:
+        if book_id != book_id.lower():
+            raise AlpacaPaperCredentialsError(
+                f"book {book_id!r} has no paper key pair: a book with its own pair needs "
+                "a lower-case token, because environment variable names are "
+                "case-insensitive and two tokens differing in case would share one pair."
+            )
+        pair = settings.alpaca_paper_books.get(book_id)
+        key = _non_blank(pair.api_key) if pair is not None else None
+        secret = _non_blank(pair.api_secret) if pair is not None else None
+    missing = [name for name, value in ((key_name, key), (secret_name, secret)) if value is None]
     if key is None or secret is None:
         raise AlpacaPaperCredentialsError(
-            f"{' and '.join(missing)} must be set (see .env.example) before any paper "
-            "trading call; the data keys are never used for trading."
+            f"book {book_id!r} has no paper key pair: {' and '.join(missing)} must be set "
+            "(see .env.example) before any paper trading call; the data keys and other "
+            "books' keys are never used."
         )
+    if book_id != MAIN_BOOK_ID:
+        clash = _shared_with(settings, book_id, {key, secret})
+        if clash is not None:
+            raise AlpacaPaperCredentialsError(
+                f"book {book_id!r}'s {key_name}/{secret_name} repeat a value of {clash}: "
+                "every book has its own paper account and pair, never the data keys or "
+                "another book's."
+            )
     return key, secret
+
+
+def _shared_with(settings: Settings, book_id: str, values: set[str]) -> str | None:
+    """The variable pair (names only) other than `book_id`'s that holds any of
+    `values`, or `None`: the data pair, `main`'s pair, then the other books' pairs."""
+    others: list[tuple[str, SecretStr | None, SecretStr | None]] = [
+        ("ALPACA_API_KEY/ALPACA_API_SECRET", settings.alpaca_api_key, settings.alpaca_api_secret),
+        (
+            "/".join(paper_key_variable_names(MAIN_BOOK_ID)),
+            settings.alpaca_paper_api_key,
+            settings.alpaca_paper_api_secret,
+        ),
+    ]
+    others += [
+        ("/".join(paper_key_variable_names(other)), pair.api_key, pair.api_secret)
+        for other, pair in sorted(settings.alpaca_paper_books.items())
+        if other != book_id
+    ]
+    for names, other_key, other_secret in others:
+        if values & {v for v in (_non_blank(other_key), _non_blank(other_secret)) if v}:
+            return names
+    return None
 
 
 def _build_client(key: str, secret: str, timeout_seconds: float) -> TradingClient:
@@ -220,18 +269,22 @@ class AlpacaTradingRaw:
         self,
         settings: Settings | None = None,
         *,
+        book_id: str = MAIN_BOOK_ID,
         client: TradingClientLike | None = None,
         clock: PacingClock | None = None,
     ) -> None:
-        """Refuse unless `alpaca.paper` is `True` and both paper keys are set, then
-        build the paper `TradingClient` (or use the injected `client`)."""
+        """Refuse unless `alpaca.paper` is `True` and `book_id`'s own paper pair is
+        set, then build the paper `TradingClient` on that pair (or use the injected
+        `client`). `book_id` defaults to `main`, the owner-run recorder's book
+        (`cli_record paper`); the order path always names it (`build_broker`)."""
         settings = settings or get_settings()
         if settings.alpaca.paper is not True:
             raise AlpacaPaperGuardError(
                 "alpaca.paper is not true; the trading client runs against paper only "
                 "(guarded setting, changed only by ADR)."
             )
-        key, secret = _paper_credentials(settings)
+        key, secret = _paper_credentials(settings, book_id)
+        self.book_id = book_id
         alpaca = settings.alpaca
         if isinstance(client, TradingClient) and client._base_url != BaseURL.TRADING_PAPER:
             raise AlpacaPaperGuardError("the injected TradingClient is not on the paper URL")

@@ -1074,6 +1074,15 @@ def _settle_review(session: review.ReviewSession, settings: Settings, *, recover
 # --- Phase 4: the paper commands (plan T67) ---------------------------------------
 
 BrokerFactory = Callable[[Settings, Clock], Broker]
+
+
+def _configured_book_broker(settings: Settings, clock: Clock) -> Broker:
+    """`build_broker` for the configured book, `paper.book_id` (`main` by default,
+    so H1's commands read `main`'s pair exactly as before T153); `--book` (T155b)
+    replaces this."""
+    return build_broker(settings, clock, settings.paper.book_id)
+
+
 #: The `paper` commands' refusal exit codes besides `paper run`'s (module docstring).
 PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
     {"refused": 4, "locked": 5, "no_window": 6}
@@ -1280,7 +1289,7 @@ def make_app(
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
-    broker: BrokerFactory = build_broker,
+    broker: BrokerFactory = _configured_book_broker,
     model_client: job.ClientFactory = job.CLIENT_FACTORY,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""

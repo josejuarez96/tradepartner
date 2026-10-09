@@ -261,9 +261,13 @@ class AlpacaBroker(Broker):
         settings: Settings,
         clock: Callable[[], datetime],
         client: AlpacaTradingRaw | None = None,
+        *,
+        book_id: str,
     ) -> None:
         """Refuse unless `alpaca.paper` is `True` and both broker facts are set,
-        then use `client` (T48's raw client) or build one from `settings`."""
+        then use `client` (T48's raw client) or build one from `settings` on
+        `book_id`'s own paper pair (ADR 0017 B.2, plan T153). An injected `client`
+        built for another book is refused, so a book never trades on another's pair."""
         alpaca = settings.alpaca
         if alpaca.paper is not True:
             raise AlpacaPaperGuardError("alpaca.paper is not true; the adapter is paper only")
@@ -281,8 +285,13 @@ class AlpacaBroker(Broker):
         assert alpaca.client_order_id_max_length is not None
         self._quantity_decimals: int = alpaca.quantity_decimals
         self._max_id_length: int = alpaca.client_order_id_max_length
+        if client is not None and client.book_id != book_id:
+            raise AlpacaPaperGuardError(
+                f"the injected raw client is book {client.book_id!r}'s, not book {book_id!r}'s"
+            )
         self.clock = clock
-        self._raw = client if client is not None else AlpacaTradingRaw(settings)
+        self.book_id = book_id
+        self._raw = client if client is not None else AlpacaTradingRaw(settings, book_id=book_id)
 
     # --- Broker -----------------------------------------------------------
 
