@@ -16,7 +16,7 @@ import polars as pl
 import pytest
 
 from tradepartner import universe as universe_module
-from tradepartner.calendar import all_sessions, last_completed_session, sessions_in_month_window
+from tradepartner.calendar import last_completed_session, sessions_in_month_window
 from tradepartner.config import Settings
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row
@@ -437,9 +437,8 @@ def _first_needed_session(t: datetime, settings: Settings) -> date:
     the liquidity window's, whichever is earlier."""
     session = last_completed_session(t)
     history = sessions_in_month_window(session, settings.universe.min_history_months)
-    sessions = all_sessions()
-    liquidity_first = sessions[sessions.index(session) - settings.universe.liquidity_window + 1]
-    return min(history[0], liquidity_first)
+    liquidity = universe_module._last_sessions(session, settings.universe.liquidity_window)
+    return min(history[0], min(liquidity))
 
 
 @pytest.mark.parametrize("t", [T_SPLIT_BETWEEN, T_LATE, T_STALE])

@@ -229,8 +229,9 @@ class StoreProvider:
 
     def survivorship_gap(self, t: datetime) -> GapReading:
         t = check_t(t)
-        universe = self._step_universe(t)
-        reading = gap_module.survivorship_gap(self._at(t), t, self.settings, universe=universe)
+        universe = self._step_universe(t)  # opens the step's connection at `t`
+        conn = self._at(t)
+        reading = gap_module.survivorship_gap(conn, t, self.settings, universe=universe)
         return GapReading(count_share=reading.count_share, size_share=reading.size_share)
 
     def dropped_dividends(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:

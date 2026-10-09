@@ -269,10 +269,11 @@ def survivorship_gap(
     source of every `gap.*` and `universe.*` value, also passed to
     `listing_ends_as_of` and `universe_as_of`. `previous_rebalance`, when
     given, must be a session before `t`'s. `universe`, when given, is
-    `universe_as_of(conn, t, settings)` already built by the caller on the
-    same connection (the backtest provider's step, #1305), used for the side
-    categories instead of building it again; one at another `t` or with
-    other `universe` settings raises `ValueError`. A bare date raises
+    `universe_as_of(conn, t, settings)` already built by the caller with the
+    same `settings` on the same connection (the backtest provider's step,
+    #1305), used for the side categories instead of building it again. That
+    is the caller's precondition; only a universe at another `t` or with
+    other `universe` settings is detected, and raises `ValueError`. A bare date raises
     `TypeError`, a naive datetime `ValueError`."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()

@@ -494,7 +494,7 @@ def universe_as_of(
         _last_sessions(session, cfg.liquidity_window) if cfg.liquidity_rule_enabled else frozenset()
     )
     history = sessions_in_month_window(session, cfg.min_history_months)
-    first = min(session, *history, *window)
+    first = min(history[0], min(window, default=session))
     bars: dict[str, dict[date, tuple[float, int]]] = defaultdict(dict)
     frame = prices_as_of(conn, t, alive, traded_only=True, sessions_from=first)
     for sid, day, close_, volume in frame.select(
