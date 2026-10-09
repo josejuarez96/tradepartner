@@ -693,13 +693,10 @@ def test_the_fixture_store_holds_the_three_filing_events(
 
 def _version_20_store(conn: duckdb.DuckDBPyConnection) -> None:
     """A store as version 20 left it: today's schema without `filing_events`
-    and a single version-20 row, holding the fixture universe's other rows
-    and a registry row."""
+    and a single version-20 row, holding a `prices_daily` and a
+    `statement_facts` row."""
     configure_connection(conn)
     schema.init_schema(conn)
-    for ddl in schema._TABLE_DDL:
-        if "CREATE TABLE IF NOT EXISTS facts " in ddl:
-            break
     conn.execute(
         "INSERT INTO prices_daily VALUES ('S1', DATE '2020-01-02', 1, 1, 1, 1, 1, "
         "TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
