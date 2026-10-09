@@ -265,8 +265,8 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 # --- constants and names -----------------------------------------------------------
 
 
-def test_current_schema_version_is_20() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 20
+def test_current_schema_version_is_21() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 21
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -351,7 +351,7 @@ def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [20]
+    assert _versions(conn) == [21]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
@@ -360,7 +360,7 @@ def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [20]
+    assert _versions(conn) == [21]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -641,7 +641,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         schema.init_schema(c)
         ddl_after = _ddl(c)
         rows_after = _snapshot(c)
-        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        assert _versions(c) == [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
         assert n_research.fetchall() == [(1, None), (2, None)]
@@ -671,7 +671,8 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
         c not in ddl_before["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS
     )
     assert all(c in ddl_after["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS)
-    assert rows_after == rows_before
+    # Version 21 (#1358) adds `filing_events`, empty; nothing else gains a table.
+    assert rows_after == {**rows_before, "filing_events": []}
     # And the migrated store is shaped exactly as a fresh one.
     # (A fresh store gets version 18's and version 20's two kinds before the lab's
     # two, a migrating one after them: the same set of kinds, in another order.)
