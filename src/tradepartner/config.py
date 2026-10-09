@@ -499,6 +499,12 @@ class AlpacaConfig(BaseModel):
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
     symbols_per_request: int = Field(default=1000, gt=0)
+    # #1356: the free plan serves SIP only when a request's `end` is at least this many
+    # minutes old ("the `end` parameter must be at least 15 minutes old to query SIP data
+    # without a subscription", Alpaca FAQ, docs/research/2026-09-25-free-data-terms.md
+    # claim 2b, S1). `alpaca_raw.daily_bars` caps a SIP request's end at now minus this;
+    # 0 turns the cap off (a paid SIP subscription).
+    sip_delay_minutes: int = Field(default=15, ge=0)
     #: Security ids (`<cik>`, `<cik>:<class>` or a #820 successor `<cik>@<day>`)
     #: the owner accepted as genuine long-gap relistings (#943: MiMedx, Nasdaq
     #: 2019-03 to OTC to Nasdaq 2020-11): `ListingResolver` does not apply rule 7's
