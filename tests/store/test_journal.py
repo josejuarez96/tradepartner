@@ -27,6 +27,7 @@ from conftest import version_4_store
 from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
     ROW_TYPES,
+    AlertRow,
     DecisionRow,
     FillRow,
     JournalIntegrityError,
@@ -227,6 +228,20 @@ def test_the_expansion_seam_fields_default_to_their_column_defaults(table: str) 
     if table == "orders":
         for key, value in schema.ORDER_SHAPE_DEFAULTS.items():
             assert defaults[key] == value
+
+
+def test_the_alert_row_books_main_by_default_and_round_trips_another_book(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """ADR 0017 B.6 (plan T154, schema version 19): `AlertRow.book_id` defaults to
+    the column default, so every writer that passes no book still writes `main`."""
+    assert {f.name: f.default for f in fields(AlertRow)}["book_id"] == schema.DEFAULT_BOOK_ID
+    append(conn, _sample(AlertRow))
+    append(conn, _sample(AlertRow, book_id="b"))
+    assert conn.execute("SELECT book_id FROM alerts ORDER BY alert_id").fetchall() == [
+        ("main",),
+        ("b",),
+    ]
 
 
 def test_an_order_appends_with_the_expansion_defaults(conn: duckdb.DuckDBPyConnection) -> None:

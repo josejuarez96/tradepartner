@@ -302,7 +302,21 @@ registry; #83 took version 2 first, so the registry is version 3):
   kind or column until T142b. A read-only connection accepts a version-17
   store: every read works but the new column, which nothing reads before
   T142b.
-- **A later DDL change goes to version 19**, with its own migration and a
+- **Version 19** (#1370, paper-trading plan T154; ADR 0017 B.6): `alerts`
+  gains `book_id VARCHAR NOT NULL DEFAULT 'main'` (`DEFAULT_BOOK_ID`), so the
+  session-scoped kinds (`no_window`, `locked`) dedupe per (book, kind,
+  session) and a page can filter by book. Additive: DuckDB cannot add a NOT
+  NULL column in place, so `_migrate_alert_books`, run by `init_schema` after
+  `_migrate_release_kinds` on a migrating writable store, rebuilds `alerts`
+  with the version-19 DDL where it lacks `book_id`, every row kept in
+  insertion order with `book_id = 'main'` (every alert before version 19 is
+  book `main`'s, the one book there was) and every other column unchanged.
+  No other table changes; `paper_windows` and the seven other expanded tables
+  already carry `book_id` (version 17). A read-only connection accepts a
+  version-18 store: every read works but `store.journal.alerts_for`, which
+  only the writing `execution.alerts.Alerter` calls, and a writer migrates
+  first. T157 takes version 20, chained after this.
+- **A later DDL change goes to version 20**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -514,9 +528,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `data_release` and `development_boundary`, every row kept, and the nullable
 #:   `trials.development_boundary` (`_migrate_release_kinds`, on every store;
 #:   module docstring, "Schema versions").
-#: - A later DDL change goes to version 19, with its own migration and a
+#: - 19 (#1370, paper-trading plan T154; ADR 0017 B.6): `alerts.book_id`,
+#:   defaulted `main`; `alerts` rebuilt with every row kept where it lacks the
+#:   column (`_migrate_alert_books`; module docstring, "Schema versions").
+#: - A later DDL change goes to version 20, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -592,6 +609,11 @@ _PRE_EXPANSION_SEAMS_VERSION = 16
 #: `trials.development_boundary` (#1319, T140b, version 18): read-only
 #: connections serve every read (nothing reads the new column before T142b).
 _PRE_RELEASE_VERSION = 17
+
+#: The last version without `alerts.book_id` (#1370, T154, version 19):
+#: read-only connections serve every read but `store.journal.alerts_for`
+#: (which only the writing `Alerter` calls; a writer migrates first).
+_PRE_ALERT_BOOKS_VERSION = 18
 
 
 class SchemaVersionError(RuntimeError):
@@ -1754,7 +1776,9 @@ CREATE TABLE IF NOT EXISTS overrides (
 
 # run_id is NULL for an alert raised outside a run (`locked`, `no_window`).
 # session is the run's S, or the calendar session containing `at` (the next
-# one on a non-session day): always set, since alerts dedupe on it.
+# one on a non-session day): always set, since alerts dedupe on it. book_id
+# (version 19, ADR 0017 B.6): the book whose run or entry raised it, so the
+# session-scoped kinds dedupe per (book, kind, session).
 _CREATE_ALERTS = f"""
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id BIGINT NOT NULL PRIMARY KEY,
@@ -1763,6 +1787,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     kind VARCHAR NOT NULL,
     message VARCHAR NOT NULL,
     "at" TIMESTAMPTZ NOT NULL,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS}
 )
 """
@@ -2263,6 +2288,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
         _PRE_RELEASE_VERSION,
+        _PRE_ALERT_BOOKS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2281,7 +2307,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (`store.journal.require_journal`, naming the fix): the eight expanded
         # tables lack `book_id`; version 17 serves every read (a data-release
         # row cannot exist there, and nothing reads `trials.development_boundary`
-        # before T142b).
+        # before T142b); version 18 every read but `journal.alerts_for` (no
+        # `alerts.book_id`), which only the writing `Alerter` calls.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2844,9 +2871,32 @@ def _migrate_release_kinds(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _migrate_alert_books(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 19 (module docstring, "Schema versions"): rebuild `alerts` with
+    its version-19 DDL where it lacks `book_id`, every row kept in insertion
+    order with `book_id = DEFAULT_BOOK_ID` (no alert before version 19 can
+    belong to another book) and every other column, `known_at` and
+    `ingested_at` included, unchanged. Idempotent: an `alerts` that already
+    has `book_id` (a version-4 store's, created from the current DDL in the
+    same open) is left alone. Runs inside `init_schema`'s transaction, after
+    `_migrate_release_kinds`."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('alerts')").fetchall()}
+    if "book_id" in columns:
+        return
+    conn.execute(
+        _CREATE_ALERTS.replace(
+            "CREATE TABLE IF NOT EXISTS alerts (", "CREATE TABLE alerts_v19 (", 1
+        )
+    )
+    conn.execute("INSERT INTO alerts_v19 BY NAME SELECT * FROM alerts ORDER BY rowid")
+    conn.execute("DROP TABLE alerts")
+    conn.execute("ALTER TABLE alerts_v19 RENAME TO alerts")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 17 store to version 18.
+    version-2 to 18 store to version 19.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2858,7 +2908,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `CURRENT_SCHEMA_VERSION` and no lab table; a version-18 or earlier store
+    gets `alerts` rebuilt with `book_id` where it lacks it (every row kept in
+    insertion order, `book_id = 'main'`; #1370, T154) and a version-19 row;
+    every store gets
     `owner_decisions.kind` widened with `data_release` and
     `development_boundary` (every row kept) and the nullable
     `trials.development_boundary`, and a version-17 store a version-18 row
@@ -2903,7 +2956,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-18 or 17 store passes, and a
+    On a read-only connection no DDL runs: a version-19, 18 (every read but
+    `journal.alerts_for`, which only a writer calls) or 17 store passes, and a
     version-16 store serves fact, registry and lab reads while every journal
     read raises `SchemaVersionError` (`store.journal.require_journal`, naming
     the fix); 15 (every read but
@@ -2950,6 +3004,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
         _PRE_RELEASE_VERSION,
+        _PRE_ALERT_BOOKS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3004,6 +3059,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_expansion_seams(conn)
         if max_version is None or max_version <= _PRE_RELEASE_VERSION:
             _migrate_release_kinds(conn)
+        if max_version is not None and max_version <= _PRE_ALERT_BOOKS_VERSION:
+            _migrate_alert_books(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

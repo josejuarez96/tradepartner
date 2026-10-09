@@ -1728,7 +1728,7 @@ def plan_release_import(
     if problems:
         raise ReleaseRefused("; ".join(problems))
     migrated = conn.execute(
-        "SELECT MIN(applied_at) FROM schema_version WHERE version = 18"
+        "SELECT MIN(applied_at) FROM schema_version WHERE version >= 18"
     ).fetchone()
     since = migrated[0] if migrated is not None else None
     for entry in entries:
