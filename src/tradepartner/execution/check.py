@@ -175,9 +175,9 @@ def _price_of(
     return price
 
 
-def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths:
-    """`TrialMonths` for `trial_id`'s base cost level (`report._trial_months`,
-    duplicated locally)."""
+def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Cadence) -> TrialMonths:
+    """`TrialMonths` for `trial_id`'s base cost level at the window's `cadence`
+    (`report._trial_months`, duplicated locally; #1286)."""
     found = conn.execute(
         "SELECT hypothesis_id, start_session, end_session FROM trials WHERE trial_id = ?",
         [trial_id],
@@ -187,7 +187,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
     hypothesis_id, start_session, end_session = found
     hypothesis = registry.get_hypothesis_by_id(conn, hypothesis_id)
     base_level = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
-    sessions = tuple(rebalance_sessions(start_session, end_session))
+    sessions = tuple(rebalance_sessions(start_session, end_session, cadence))
     equity_rows = conn.execute(
         "SELECT session, equity FROM trial_equity "
         "WHERE trial_id = ? AND series = 'strategy' AND cost_per_side_bps = ?",
@@ -205,6 +205,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
         equity={session: equity[session] for session in sessions if session in equity},
         cost_paid=cost_paid,
         trial_id=trial_id,
+        cadence=cadence,
     )
 
 
@@ -275,6 +276,7 @@ def _tracking_line(
     frozen: dict[str, Any],
     last_t: date,
     stop_session: date | None,
+    cadence: Cadence,
 ) -> CheckLine:
     query = (
         "req 10 tracking check (report.compare_months) over the window's "
@@ -299,7 +301,7 @@ def _tracking_line(
         )
 
     fill_price_key = _frozen_fill_price(window)
-    trial = _trial_months(conn, latest_report.trial_id)
+    trial = _trial_months(conn, latest_report.trial_id, cadence)
     journal = _journal_for(conn, window_id)
     actions = conn.execute("SELECT * FROM corporate_actions").pl()
     prices = _price_of(conn, fill_price_key)
@@ -435,7 +437,7 @@ def check(conn: duckdb.DuckDBPyConnection, settings: Settings) -> list[CheckLine
 
     return [
         _rebalance_count_line(conn, window, window_id, frozen),
-        _tracking_line(conn, window, window_id, frozen, last_t, stop_session),
+        _tracking_line(conn, window, window_id, frozen, last_t, stop_session, cadence),
         _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),
     ]

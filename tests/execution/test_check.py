@@ -70,8 +70,11 @@ def _frozen_json() -> str:
     )
 
 
-def _insert_hypothesis(conn: duckdb.DuckDBPyConnection) -> None:
-    params = json.dumps({"costs.per_side_bps": 5.0})
+def _insert_hypothesis(conn: duckdb.DuckDBPyConnection, cadence: str | None = None) -> None:
+    values: dict[str, object] = {"costs.per_side_bps": 5.0}
+    if cadence is not None:
+        values["schedule.rebalance_cadence"] = cadence
+    params = json.dumps(values)
     conn.execute(
         "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
         "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
@@ -87,20 +90,22 @@ def _insert_trial(
     *,
     equity_t1: float = 100_000.0,
     cost_paid_t0: float = 0.0,
+    sessions: tuple[date, date, date] = (T0, T1, T2),
 ) -> None:
+    t0, t1, t2 = sessions
     conn.execute(
         "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
         "end_session, code_version, synthetic, run_by) VALUES "
         "(?, ?, 'tracking', ?, ?, ?, 'test', FALSE, 'test')",
-        [TRIAL_ID, HYPOTHESIS_ID, _utc(T0), T0, T2],
+        [TRIAL_ID, HYPOTHESIS_ID, _utc(t0), t0, t2],
     )
-    for session, equity in ((T0, 100_000.0), (T1, equity_t1), (T2, 100_000.0)):
+    for session, equity in ((t0, 100_000.0), (t1, equity_t1), (t2, 100_000.0)):
         conn.execute(
             "INSERT INTO trial_equity (trial_id, series, cost_per_side_bps, session, equity) "
             "VALUES (?, 'strategy', 5.0, ?, ?)",
             [TRIAL_ID, session, equity],
         )
-    for session, cost_paid in ((T0, cost_paid_t0), (T1, 0.0)):
+    for session, cost_paid in ((t0, cost_paid_t0), (t1, 0.0)):
         conn.execute(
             "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, fill_session, "
             "n_universe, n_static_listings, n_targets, turnover, cost_paid, n_missing_fill, "
@@ -110,11 +115,11 @@ def _insert_trial(
         )
 
 
-def _window(*, started: datetime = _T0_UTC) -> PaperWindowRow:
+def _window(*, started: datetime = _T0_UTC, first: date = T0) -> PaperWindowRow:
     return PaperWindowRow(
         window_id=WINDOW_ID,
         hypothesis_id=HYPOTHESIS_ID,
-        first_rebalance_session=T0,
+        first_rebalance_session=first,
         account_id="PA1",
         starting_cash=100_000.0,
         starting_equity=100_000.0,
@@ -169,41 +174,48 @@ def _insert_decision(
     )
 
 
-def _insert_complete_order(conn: duckdb.DuckDBPyConnection, *, with_outcome: bool = True) -> None:
-    """One order at T0: decision 1 -> order 'o1' -> filled -> a position_return
-    outcome, the chain check's passing baseline."""
+def _insert_complete_order(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    with_outcome: bool = True,
+    session: date = T0,
+    through: date = T1,
+) -> None:
+    """One order at T0 (`session`): decision 1 -> order 'o1' -> filled -> a
+    position_return outcome through T1 (`through`), the chain check's passing
+    baseline."""
     coid = "o1"
     conn.execute(
         "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
         "security_id, symbol, side, notional, sells_in_flight_at_submit, known_at, "
         "ingested_at) VALUES (?, 1, 1, ?, 1, 'buy', 'SEC_A', 'SEC_A', 'buy', 1000.0, FALSE, "
         "?, ?)",
-        [coid, T0, _utc(T0), _utc(T0)],
+        [coid, session, _utc(session), _utc(session)],
     )
     conn.execute(
         "INSERT INTO order_events (client_order_id, event_at, status, known_at, ingested_at) "
         "VALUES (?, ?, 'filled', ?, ?)",
-        [coid, _utc(T0), _utc(T0), _utc(T0)],
+        [coid, _utc(session), _utc(session), _utc(session)],
     )
     append(
         conn,
         FillRow(
             client_order_id=coid,
-            filled_at=_utc(T0),
+            filled_at=_utc(session),
             quantity=10.0,
             price=100.0,
             price_implied=False,
             broker_fill_id="f1",
             source="broker_feed",
-            known_at=_utc(T0),
-            ingested_at=_utc(T0),
+            known_at=_utc(session),
+            ingested_at=_utc(session),
         ),
     )
     if with_outcome:
         conn.execute(
             "INSERT INTO outcomes (client_order_id, through_session, kind, value, "
             "known_at, ingested_at) VALUES (?, ?, 'position_return', 1.0, ?, ?)",
-            [coid, T1, _utc(T1), _utc(T1)],
+            [coid, through, _utc(through), _utc(through)],
         )
 
 
@@ -243,7 +255,7 @@ def _build_passing_fixture(
     conn: duckdb.DuckDBPyConnection,
     *,
     equity_t1: float = 100_000.0,
-    report_through: date = T2,
+    report_through: date | None = None,
     t0_executed_by: str = "scheduler",
     t1_executed_by: str | None = "scheduler",
     extra_no_trade_run: bool = False,
@@ -251,36 +263,42 @@ def _build_passing_fixture(
     t0_missed: bool = False,
     chain_outcome: bool = True,
     override_reason: str = "a sufficiently long documented reason",
+    sessions: tuple[date, date, date] = (T0, T1, T2),
+    cadence: str | None = None,
 ) -> None:
-    _insert_hypothesis(conn)
-    _insert_trial(conn, equity_t1=equity_t1)
-    window = _window()
+    """The passing fixture over three rebalance sessions `sessions` (T0, T1, T2 at
+    `month_end` by default; `cadence` is stored on the hypothesis when given;
+    `report_through` defaults to T2)."""
+    t0, t1, t2 = sessions
+    _insert_hypothesis(conn, cadence)
+    _insert_trial(conn, equity_t1=equity_t1, sessions=sessions)
+    window = _window(started=_utc(t0), first=t0)
     append(conn, window)
-    _insert_run(conn, 1, T0, invoked_by=t0_executed_by)
-    _insert_run(conn, 2, T1, invoked_by=t1_executed_by or "scheduler")
-    _insert_run(conn, 3, T2, invoked_by="scheduler")
+    _insert_run(conn, 1, t0, invoked_by=t0_executed_by)
+    _insert_run(conn, 2, t1, invoked_by=t1_executed_by or "scheduler")
+    _insert_run(conn, 3, t2, invoked_by="scheduler")
     if duplicate_t0_run:
-        _insert_run(conn, 11, T0, invoked_by="scheduler", kind="catch_up")
-        _insert_rebalance_event(conn, T0, 11)
+        _insert_run(conn, 11, t0, invoked_by="scheduler", kind="catch_up")
+        _insert_rebalance_event(conn, t0, 11)
     if extra_no_trade_run:
-        _insert_run(conn, 12, T1, invoked_by="scheduler", kind="catch_up")
+        _insert_run(conn, 12, t1, invoked_by="scheduler", kind="catch_up")
     if t0_missed:
         conn.execute(
             "INSERT INTO rebalance_events (rebalance_session, run_id, status, known_at, "
             "ingested_at) VALUES (?, 1, 'missed', ?, ?)",
-            [T0, _utc(T0), _utc(T0)],
+            [t0, _utc(t0), _utc(t0)],
         )
     else:
-        _insert_rebalance_event(conn, T0, 1)
+        _insert_rebalance_event(conn, t0, 1)
     if t1_executed_by is not None:
-        _insert_rebalance_event(conn, T1, 2)
-    _insert_cash_mark(conn, 1, T0)
-    _insert_cash_mark(conn, 2, T1)
-    _insert_cash_mark(conn, 3, T2)
-    _insert_decision(conn, 1, 1, T0)
-    _insert_complete_order(conn, with_outcome=chain_outcome)
+        _insert_rebalance_event(conn, t1, 2)
+    _insert_cash_mark(conn, 1, t0)
+    _insert_cash_mark(conn, 2, t1)
+    _insert_cash_mark(conn, 3, t2)
+    _insert_decision(conn, 1, 1, t0)
+    _insert_complete_order(conn, with_outcome=chain_outcome, session=t0, through=t1)
     _insert_override(conn, override_reason)
-    _insert_paper_report(conn, report_through)
+    _insert_paper_report(conn, t2 if report_through is None else report_through)
 
 
 def test_passes_on_a_fixture_meeting_every_req_15_criterion(settings: Settings) -> None:
@@ -295,6 +313,39 @@ def test_passes_on_a_fixture_meeting_every_req_15_criterion(settings: Settings) 
         "override_reason",
     }
     assert all(line.passed for line in lines), lines
+
+
+#: Three consecutive ISO-week ends (Fridays); the frozen clock, Tuesday 2026-12-15, is
+#: after close(W2) and before the next week-end, so W2 is the last completed one. At
+#: `month_end` these dates hold one rebalance session (2026-11-30) and no period.
+W0, W1, W2 = date(2026, 11, 27), date(2026, 12, 4), date(2026, 12, 11)
+
+
+def test_week_end_window_counts_and_compares_per_iso_week(settings: Settings) -> None:
+    """ADR 0017 part C, #1286: at `week_end` `paper check` counts the scheduler-executed
+    week-ends (W0, W1) against the frozen minimum and the tracking line compares one
+    period per ISO week of the window's cadence, never per month (a `month_end`
+    fallback reads no compared period here and fails the line)."""
+    with open_for_write(settings) as conn:
+        _build_passing_fixture(conn, sessions=(W0, W1, W2), cadence="week_end")
+    with open_read_only(settings) as conn:
+        lines = {line.name: line for line in check(conn, settings)}
+    assert all(line.passed for line in lines.values()), lines
+    assert lines["rebalance_count"].detail.startswith(
+        "2 scheduler-executed rebalance session(s) [2026-11-27, 2026-12-04], need >= 2"
+    )
+    assert lines["tracking"].detail.startswith("2 compared non-excluded month(s), need >= 2")
+
+
+def test_week_end_trial_months_are_iso_week_ends(settings: Settings) -> None:
+    """`_trial_months` reads the trial's sessions at the window's cadence (#1286)."""
+    with open_for_write(settings) as conn:
+        _insert_hypothesis(conn, "week_end")
+        _insert_trial(conn, sessions=(W0, W1, W2))
+    with open_read_only(settings) as conn:
+        trial = check_module._trial_months(conn, TRIAL_ID, "week_end")
+    assert tuple(trial.sessions) == (W0, W1, W2)
+    assert trial.cadence == "week_end"
 
 
 def test_rebalance_count_fails_one_short_when_a_rebalance_is_tty_executed(

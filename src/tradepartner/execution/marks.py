@@ -526,7 +526,14 @@ def lapses(
     lapsed once `session` is past T_i's catch-up boundary (F_i advanced by
     the frozen `paper.max_catch_up_sessions` sessions): `session <= boundary`
     is still within the catch-up window and is never reported here ("each
-    lapse computed at its boundary session and not one earlier"). The reason
+    lapse computed at its boundary session and not one earlier"). The
+    boundary is never later than the session before the next rebalance's
+    fill session F_{i+1}, because from F_{i+1} on `planning.due_rebalance`
+    plans T_{i+1}, never T_i (ADR 0017 section 2): at `daily` a T_i left
+    pending lapses on F_{i+1}, in the run that plans T_{i+1}. At `month_end`
+    F_{i+1} is about twenty sessions after F_i, beyond any catch-up window
+    the frozen key allows in practice, so the boundary there is F_i plus the
+    key as before. The reason
     is `kill_switch` when the switch was engaged at any point overlapping
     T_i's fill session `F_i` through the boundary, inclusive (`#366 Q19(b)`:
     naming the cause even when the switch was released again before
@@ -547,13 +554,19 @@ def lapses(
     max_catch_up_sessions = _frozen_int(frozen, _PAPER_MAX_CATCH_UP)
     windows = _run_windows(runs)
     missed: list[Missed] = []
-    for rebalance_session in rebalance_sessions(window.first_rebalance_session, session, cadence):
+    due = rebalance_sessions(window.first_rebalance_session, session, cadence)
+    for index, rebalance_session in enumerate(due):
         fill = fill_session(rebalance_session, cadence)
         if fill > session:
             continue
         if not _is_pending(rebalance_session, rebalance_events, windows, window.window_id):
             continue
         boundary = _catch_up_boundary(rebalance_session, max_catch_up_sessions, cadence)
+        if index + 1 < len(due):
+            next_fill = fill_session(due[index + 1], cadence)
+            if next_fill <= session:
+                # T_{i+1} is due on and after F_{i+1}: T_i is never planned again.
+                boundary = min(boundary, previous_session(next_fill))
         if session <= boundary:
             continue
         period = _period_sessions(fill, boundary)

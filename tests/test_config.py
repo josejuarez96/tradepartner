@@ -1569,7 +1569,10 @@ def test_risk_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> 
 
 def test_paper_defaults() -> None:
     p = _settings().paper
-    assert p.min_rebalances == 6
+    # ADR 0017 part C, open question 2: six months, a quarter of weeks, a quarter of
+    # sessions; `paper start` freezes the window's cadence's entry as a scalar.
+    assert p.min_rebalances == {"month_end": 6, "week_end": 13, "daily": 63}
+    # One k at every cadence (ADR 0017 open question 6): a scalar, never a table.
     assert p.tracking_k == pytest.approx(2.0)
     assert p.tracking_rule == "residual"  # T70, ADR 0005 amendment 2026-10-09 (#247 Q4)
     assert p.max_catch_up_sessions == 5
@@ -1608,6 +1611,10 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
     "override",
     [
         {"min_rebalances": 0},
+        {"min_rebalances": 6},
+        {"min_rebalances": {"month_end": 6, "week_end": 13}},
+        {"min_rebalances": {"month_end": 6, "week_end": 13, "daily": 0}},
+        {"min_rebalances": {"month_end": 6, "week_end": 13, "daily": 63, "quarter_end": 2}},
         {"tracking_k": -1.0},
         {"max_catch_up_sessions": -1},
         {"submit_window_before_open_minutes": -1},
@@ -1630,6 +1637,15 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
 def test_paper_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper=override)
+
+
+def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
+    """The table is the config key (ADR 0017 part C); an override restates every
+    cadence, and the validator names a missing one."""
+    table = {"month_end": 6, "week_end": 10, "daily": 63}
+    assert Settings(_env_file=None, paper={"min_rebalances": table}).paper.min_rebalances == table
+    with pytest.raises(ValidationError, match="missing an entry for"):
+        Settings(_env_file=None, paper={"min_rebalances": {"month_end": 6, "week_end": 13}})
 
 
 def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
