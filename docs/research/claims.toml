@@ -2729,3 +2729,129 @@ scope = "KO and AAPL, 2026-10-05 and 2026-10-09; confirms FDT S20's one example"
 source = "docs/research/2026-10-09-probe3-preopen-fills.md"
 section = "Evidence"
 bears_on = ["spec:backtest"]
+
+# ===== 2026-10-09-short-horizon-candidates.md =====
+# CZ = the team's own read-only computation on the Chen & Zimmermann open-source portfolio
+# returns (release downloaded 2026-10-09); gross, long-short as published; unverified by a second party.
+
+[[claim]]
+id = "SH-1"
+statement = "Plain one-month (and weekly) short-term reversal has no post-publication edge in large or value-weighted US stocks: the largest-500 low-turnover reversal earns 2 bp/month (1963-2018), post-decimalization reversal 0.18%/month (t 0.62), and CZ value-weighted reversal -0.05%/month (t -0.11) after 1990."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Large-cap or value-weighted US equities, monthly sorts, gross, long-short; post-publication"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Refines QI-17 (MIXED, generic short-horizon) for our universe. Counter: De Groot, Huij & Zhou (2012) report 30-50 bp/week net in large caps to 2009, long-short."
+
+[[claim]]
+id = "SH-2"
+statement = "Trading costs exceed the gross spread of high-turnover short-horizon strategies: value-weighted short-run reversal nets -1.28%/month, one-month industry momentum -0.29%/month and industry-relative reversal -0.80%/month (1963-2013), and the average anomaly earns about 4 bp/month net, post-publication, in the modern era."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Long-short, institutional effective-spread cost models (upward-biased after 2003); not our long-only, commission-free scale"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Novy-Marx & Velikov (RFS 2016), Chen & Velikov (JFQA 2023), Blitz et al. (FAJ 2023: break-even costs below 25 bp at 1,300-2,000% turnover). Consistent with QI-21 and G4-8."
+
+[[claim]]
+id = "SH-3"
+statement = "One-month industry momentum has disappeared since decimalization: 0.09%/month (t 0.34) value-weighted long-short over 2001-2021 against 0.68%/month (t 3.57) over 1973-2021."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "US, Fama-French 49 industries, value-weighted, gross, long-short"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Dai, Medhat, Novy-Marx & Rizova (2023 WP); CZ IndMom (6-month signal) post-publication 0.06%/month (t 0.18)."
+
+[[claim]]
+id = "SH-4"
+statement = "Announcement-adjusted, industry-relative one-month reversal earned 0.58%/month (t 3.29) value-weighted long-short gross after decimalization (2001-2021), but its best published net version (low-volatility industry-relative reversal) earns an insignificant 0.19%/month (t 1.41)."
+kind = "empirical"
+grade = "MIXED"
+scope = "US, monthly, long-short; gross post-2001 vs net to 2013; long-only leg not reported"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Dai et al. (2023 WP) vs Novy-Marx & Velikov (2016). Needs earnings-release dates (SH-12) and SIC (held). Large-cap price pressure half-life about 0.54 days (Hendershott & Menkveld via Medhat & Schmeling), so daily/weekly versions are out of reach at next-open fills."
+
+[[claim]]
+id = "SH-5"
+statement = "Analyst-surprise PEAD has not existed in all-but-microcap US stocks since 2006, and random-walk earnings surprises predicted drift there only before 1990."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "US non-microcap, 60-day post-announcement drift, 1984-2019"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+bears_on = ["adr:0006"]
+note = "Martineau (CFR 2022); CZ EarningsSurprise post-publication -0.06%/month (t -0.52). Confirms HO-4; Hirshleifer, Peng & Wang (RFS 2025) find weaker drift where news spreads faster, not a revival."
+
+[[claim]]
+id = "SH-6"
+statement = "Drift after the three-day earnings-announcement return (EAR) persists after publication at reduced size: CZ value-weighted long-short 0.99%/month (t 4.47) post-1996 and 0.81%/month (t 3.12) in 2010-2024, Dai et al. 0.36%/month (t 2.09) in 2001-2021, and Novy-Marx & Velikov a significant 0.34%/month net to 2013; the long leg alone is +0.07 to +0.32%/month gross over the average portfolio in 2010-2024."
+kind = "empirical"
+grade = "MIXED"
+scope = "US, monthly hold after the announcement window, long-short; size-screened CZ version 0.25%/month (t 2.15) in 2010-2024; 2019-2023 alone insignificant in both files; long-only net at 15 bp/side about zero"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Rank 1 of the report. Needs the earnings-release time (SH-12); a 10-Q-keyed version is a different, untested event (ER-6). CZ figures are the team's own computation."
+
+[[claim]]
+id = "SH-7"
+statement = "Revenue-surprise drift alone is weak after publication: CZ value-weighted long-short 0.34%/month (t 1.68) after 2006 and -0.29%/month (t -0.68) in 2019-2023."
+kind = "empirical"
+grade = "MIXED"
+scope = "US, monthly, gross, long-short; CZ computation"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "The one earnings-surprise signal our XBRL `revenue` fact supports without new data; not recommended alone."
+
+[[claim]]
+id = "SH-8"
+statement = "The US earnings-announcement premium (buying expected announcers) has disappeared since the 2004 8-K disclosure regulation: the value-weighted weekly premium fell from 32.6 bp to an insignificant 8.7 bp."
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "US, weekly announcer vs non-announcer portfolios, gross; one Tier 1 working paper"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Heitz, Narayanamoorthy & Zekhnini (2020 WP); the premium persists internationally, not in the US."
+
+[[claim]]
+id = "SH-9"
+statement = "Last month's winners among high-turnover stocks keep winning (short-term momentum): the largest-500 long-short earns 0.42%/month (t 4.91) gross and the full-sample strategy 1.00%/month net of half-spreads, 1963-2018, with about 90% one-sided monthly turnover."
+kind = "empirical"
+grade = "MIXED"
+scope = "US large caps, monthly, long-short; one Tier 1 source with in-paper international out-of-sample; no post-2018 US test found; long-only leg not reported"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Medhat & Schmeling (RFS 2022). Against: no short-term momentum in China (abstract). Data held (bars' volume, shares outstanding). Rank 2 of the report."
+
+[[claim]]
+id = "SH-10"
+statement = "The dividend-month premium (holding stocks in months they are predicted to pay a dividend) is not visible after publication: CZ DivSeason long-short 0.01%/month (t 0.21) over 2014-2024 against 0.26%/month (t 11.76) in sample."
+kind = "empirical"
+grade = "MIXED"
+scope = "US, size-screened CZ portfolios, gross; conflicts with Ainsworth et al. (75 bp/month four-factor alpha, 1993-2013)"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "Original: Hartzmark & Solomon (JFE 2013), 53 and 37 bp/month. Data would be held (corporate-action ex-dates) but the post-publication null argues against."
+
+[[claim]]
+id = "SH-11"
+statement = "Price drift after 10-K filings is a 12-month effect in a pre-2005 sample (good-news stocks +1.49% at 3 months, +4.25% at 12 months), present only for complex 10-Ks."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "US 10-K filings, pre-2005, gross; one source; not a days-to-weeks horizon"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+note = "You & Zhang (RAS 2009). Not a candidate for fast paper feedback."
+
+[[claim]]
+id = "SH-12"
+statement = "The free EDGAR submissions payload carries each filing's acceptanceDateTime and, for 8-Ks, the item codes, so the earnings-release time (Item 2.02) is available point-in-time; for Apple the 8-K 2.02 was accepted 2026-07-31T00:30:28Z and the 10-Q about 13.5 hours later."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Primary source, one issuer checked; universe coverage and release-to-10-Q lags not measured"
+source = "docs/research/2026-10-09-short-horizon-candidates.md"
+section = "Evidence"
+bears_on = ["spec:data-foundation"]
+note = "Our EDGAR adapter reads the submissions payload (form, accession, acceptanceDateTime) but does not keep `items`; the store has no filings table."
