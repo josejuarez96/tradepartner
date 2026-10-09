@@ -47,6 +47,17 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   with a digest, changing nothing; with `--apply` and the dry run's count and
   digest it retracts them (refused, writing nothing, on another set, or on a
   traded name without `--allow-traded`). Needs the EDGAR user agent.
+  `--apply` also needs `--release <name>`, the open data release.
+- `tradepartner repair-resolution [--dry-run | --expect-bar-rows N
+  --expect-action-rows M --release <name>]` runs `repair.repair_resolution`
+  (#819), and `tradepartner repair-bars --security <id> --from <session> --to
+  <session> --release <name> [--dry-run | --expect-bar-rows N
+  --expect-action-rows M]` runs `repair.delete_bars` (#1319, data-foundation
+  plan T140c): one security's Alpaca bars and actions on those sessions, every
+  revision. Both list the row counts on a dry run; a real run deletes only
+  those counts, only inside the open data release named by `--release`
+  (`docs/runbooks/data-releases.md`), and exits 1 on a refusal, 2 on a usage
+  error.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -251,7 +262,7 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
-from tradepartner.repair import RepairRefused, repair_resolution, store_resolver
+from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
 from tradepartner.research import EVERY_ROW_SPLITS
 from tradepartner.research.experiment import (
     SPLITS,
@@ -587,6 +598,26 @@ def _parse_day(flag: str, value: str | None) -> date | None:
 
 def _blank_text(value: str | None) -> bool:
     return value is None or not value.strip()
+
+
+def _repair_expect(
+    dry_run: bool, bar_rows: int | None, action_rows: int | None, release: str | None
+) -> tuple[int, int] | None:
+    """A real repair's `expect` from the dry run's counts, or a usage error when a
+    count or the release name is missing (#819; data-foundation plan T140c)."""
+    if dry_run:
+        return None
+    if bar_rows is None or action_rows is None:
+        raise _fail(
+            "run --dry-run first, then pass its counts as --expect-bar-rows and "
+            "--expect-action-rows",
+            USAGE_ERROR,
+        )
+    if _blank_text(release):
+        raise _fail(
+            "a repair writes only inside a data release: pass --release <name>", USAGE_ERROR
+        )
+    return (bar_rows, action_rows)
 
 
 def _row(conn: duckdb.DuckDBPyConnection, table: str, trial_id: int) -> dict[str, Any] | None:
@@ -1214,22 +1245,19 @@ def make_app(
         expect_action_rows: Annotated[
             int | None, typer.Option(help="the dry run's action row count (required to delete)")
         ] = None,
+        release: Annotated[
+            str | None, typer.Option(help="the open data release (required to delete)")
+        ] = None,
     ) -> None:
         """Delete Alpaca bars and actions the resolver no longer assigns to their security."""
-        expect = None
-        if not dry_run:
-            if expect_bar_rows is None or expect_action_rows is None:
-                raise _fail(
-                    "run --dry-run first, then pass its counts as --expect-bar-rows and "
-                    "--expect-action-rows",
-                    USAGE_ERROR,
-                )
-            expect = (expect_bar_rows, expect_action_rows)
+        expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
         try:
-            result = repair_resolution(s, clock=clock, dry_run=dry_run, expect=expect)
+            result = repair_resolution(
+                s, clock=clock, dry_run=dry_run, expect=expect, release=release
+            )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except RepairRefused as exc:
@@ -1237,6 +1265,49 @@ def make_app(
         typer.echo(result.summary())
         for line in result.lines():
             typer.echo(line)
+
+    @app.command("repair-bars")
+    def repair_bars(
+        security: Annotated[str, typer.Option(help="the security id whose bars to delete")],
+        from_: Annotated[str, typer.Option("--from", help="the first session to delete")],
+        to: Annotated[str, typer.Option(help="the last session to delete")],
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        dry_run: Annotated[
+            bool, typer.Option(help="count what would be deleted and change nothing")
+        ] = False,
+        expect_bar_rows: Annotated[
+            int | None, typer.Option(help="the dry run's bar row count (required to delete)")
+        ] = None,
+        expect_action_rows: Annotated[
+            int | None, typer.Option(help="the dry run's action row count (required to delete)")
+        ] = None,
+    ) -> None:
+        """Delete one security's Alpaca bars and actions, every revision, on a session range."""
+        first = _parse_day("--from", from_)
+        last = _parse_day("--to", to)
+        assert first is not None and last is not None
+        expect = _repair_expect(dry_run, expect_bar_rows, expect_action_rows, release)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = delete_bars(
+                s,
+                security_id=security,
+                sessions_from=first,
+                sessions_to=last,
+                clock=clock,
+                dry_run=dry_run,
+                expect=expect,
+                release=release,
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
 
     @app.command("master-retract")
     def master_retract_(
@@ -1253,6 +1324,9 @@ def make_app(
             bool,
             typer.Option("--allow-traded", help="with --apply: retract rows of traded names"),
         ] = False,
+        release: Annotated[
+            str | None, typer.Option(help="the open data release (required with --apply)")
+        ] = None,
     ) -> None:
         """Retract stored master rows the current rules no longer derive (#859)."""
         expect: tuple[int, str] | None = None
@@ -1261,6 +1335,11 @@ def make_app(
                 raise _fail(
                     "run without --apply first, then pass its count and digest as "
                     "--expect-rows and --expect-digest",
+                    USAGE_ERROR,
+                )
+            if _blank_text(release):
+                raise _fail(
+                    "--apply writes only inside a data release: pass --release <name>",
                     USAGE_ERROR,
                 )
             expect = (expect_rows, expect_digest)
@@ -1287,6 +1366,7 @@ def make_app(
                 dry_run=not apply,
                 expect=expect,
                 allow_traded=allow_traded,
+                release=release,
             )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None

@@ -27,6 +27,11 @@ whose key that build does not derive (`store.retraction.underived`).
   `retracted`, never `ok`, so it never reads as a fresh ingest), and the
   rows it retracted in `master_underived` under that run, so health's
   `underived_master_rows` shows none still live.
+- **Inside a named release** (#1319, data-foundation plan T140c; runbook
+  `docs/runbooks/data-releases.md`). `--apply` takes the name of the open
+  data release (`--release`) and refuses, writing nothing, when no release
+  of that name is open (`repair.release_refusal`); the run row's message
+  names it.
 - **Owner-kept successors (#922).** A row of a security on
   `master.keep_successors` (an owner-accepted successor the rules no longer
   derive, MTCH's `0000891103@2020-08-10` on #828) is never proposed: it is
@@ -75,6 +80,7 @@ from tradepartner.ingest import (
     _unjudged_ciks,
     _write_run,
 )
+from tradepartner.repair import release_refusal
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.master import build_master
 from tradepartner.store.retraction import (
@@ -205,15 +211,19 @@ def master_retract(
     dry_run: bool = True,
     expect: tuple[int, str] | None = None,
     allow_traded: bool = False,
+    release: str | None = None,
 ) -> RetractResult:
     """Find the stored master rows the current build no longer derives and,
     unless `dry_run`, retract them and record the run (module docstring). A
     real run requires `expect`, the dry run's `(rows, digest)`, and raises
     `RetractRefused` before writing on any other, or on a traded row without
-    `allow_traded`. Raises `StoreLockedError` like ingest when the store
-    stays locked."""
+    `allow_traded`, or outside the open data release `release`
+    (`repair.release_refusal`). Raises `StoreLockedError` like ingest when
+    the store stays locked."""
     if not dry_run and expect is None:
         raise ValueError("an apply retracts only the set of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("an apply writes only inside a named data release: pass release")
     started = ensure_tz_aware_utc(clock(), field_name="clock()")
     recorded = _Recorded(filings)
     try:
@@ -250,6 +260,8 @@ def master_retract(
             )
         if not dry_run:
             init_schema(conn)
+            if release is not None and (why := release_refusal(conn, release)):
+                raise RetractRefused(f"{why}; nothing retracted")
         at = ensure_tz_aware_utc(clock(), field_name="clock()")  # under the lock
         if at < built_at:
             raise RetractRefused(f"the clock went back from {built_at} to {at}; nothing judged")
@@ -284,7 +296,7 @@ def master_retract(
             write_retractions(conn, found, at)
             run_id = uuid.uuid4().hex
             record_underived(conn, run_id, at, found)
-            message = clean_message(result.summary(), settings)
+            message = clean_message(f"{result.summary()}; release {release}", settings)
             run = SourceRun(EDGAR, RETRACTED, result.rows, "", message)
             _write_run(conn, run_id, started, clock(), run, RETRACT)
     return result

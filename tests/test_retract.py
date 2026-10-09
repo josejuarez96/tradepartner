@@ -31,6 +31,7 @@ from tradepartner.config import Settings
 from tradepartner.health import UNDERIVED_MASTER_ROWS, integrity_checks, last_ingests
 from tradepartner.ingest import ingest_session
 from tradepartner.retract import RetractRefused, RetractResult, master_retract
+from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import securities_as_of
@@ -44,6 +45,8 @@ INGEST = datetime(2019, 6, 29, 2, 0, tzinfo=UTC)
 CHECK = datetime(2019, 7, 2, 2, 0, tzinfo=UTC)
 RETRACT_AT = datetime(2019, 7, 3, 2, 0, tzinfo=UTC)
 AFTER = datetime(2019, 7, 4, 2, 0, tzinfo=UTC)
+#: The data release every apply in the `store` fixture runs inside (T140c).
+REL = "retract-test"
 
 
 def _at(year: int, month: int, day: int) -> datetime:
@@ -112,6 +115,7 @@ def store(settings: Settings) -> Settings:
         init_schema(conn)
         insert_row(conn, "securities", security)
         insert_row(conn, "listings", listing)
+        registry.open_data_release(conn, conn, name=REL, backup_path="b.duckdb", reason="#1319")
     return settings
 
 
@@ -146,7 +150,7 @@ def _apply(settings: Settings, at: datetime, **kwargs: Any) -> RetractResult:
         clock=lambda: at,
         dry_run=False,
         expect=(dry.rows, dry.digest),
-        **kwargs,
+        **({"release": REL} | kwargs),
     )
 
 
@@ -201,7 +205,7 @@ def test_the_apply_is_recorded_and_never_reads_as_a_fresh_ingest(store: Settings
         ).fetchall()
     assert (source, status, rows) == ("edgar", RETRACTED, 2)
     assert status != "ok" and mode == RETRACT
-    assert message == result.summary()
+    assert message == f"{result.summary()}; release {REL}"
     assert recorded == [(run_id, RETRACT_AT, "listings"), (run_id, RETRACT_AT, "securities")]
 
 
@@ -210,11 +214,34 @@ def test_the_apply_refuses_another_set_and_writes_nothing(store: Settings) -> No
     for expect in ((1, dry.digest), (2, "000000000000")):
         with pytest.raises(RetractRefused, match="found 2 rows"):
             master_retract(
-                store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False, expect=expect
+                store,
+                filings=_filings(),
+                clock=lambda: RETRACT_AT,
+                dry_run=False,
+                expect=expect,
+                release=REL,
             )
     assert FALSE_ID in _listed(store, AFTER)
     with pytest.raises(ValueError, match="dry run"):
         master_retract(store, filings=_filings(), clock=lambda: RETRACT_AT, dry_run=False)
+
+
+def test_the_apply_writes_only_inside_the_open_release_of_its_name(store: Settings) -> None:
+    with pytest.raises(ValueError, match="named data release"):
+        _apply(store, RETRACT_AT, release=None)
+    with pytest.raises(RetractRefused, match=f"'other' \\(release {REL!r} is open\\)"):
+        _apply(store, RETRACT_AT, release="other")
+    with open_for_write(store) as conn:
+        registry.close_data_release(
+            conn, name=REL, sessions_from=date(2019, 7, 1), sessions_to=date(2019, 7, 2)
+        )
+    with pytest.raises(RetractRefused, match="no release is open"):
+        _apply(store, RETRACT_AT)
+    assert FALSE_ID in _listed(store, AFTER)
+    with _read(store) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE mode = ?", [RETRACT]
+        ).fetchone() == (0,)
 
 
 def test_the_digest_names_the_set_not_the_count() -> None:
@@ -313,6 +340,7 @@ def test_the_retraction_is_stamped_after_the_lock(store: Settings) -> None:
         clock=lambda: next(ticks),
         dry_run=False,
         expect=(dry.rows, dry.digest),
+        release=REL,
     )
     assert result.at == RETRACT_AT
     assert FALSE_ID in _listed(store, RETRACT_AT.replace(minute=59, hour=1))
@@ -391,14 +419,18 @@ def test_the_command_dry_run_then_apply(store: Settings, monkeypatch: pytest.Mon
     for alone in (["--expect-rows", "2"], ["--allow-traded"]):
         assert runner.invoke(app, ["master-retract", *alone]).exit_code == cli.USAGE_ERROR
     digest = dry.output.split("digest ")[1].split(",")[0]
-    wrong = runner.invoke(
-        app, ["master-retract", "--apply", "--expect-rows", "3", "--expect-digest", digest]
-    )
+    apply = ["master-retract", "--apply", "--expect-digest", digest]
+    unreleased = runner.invoke(app, [*apply, "--expect-rows", "2"])
+    assert unreleased.exit_code == cli.USAGE_ERROR
+    assert "--release" in unreleased.output
+    other = runner.invoke(app, [*apply, "--expect-rows", "2", "--release", "other"])
+    assert other.exit_code == 1
+    assert "retract refused: no open data release named 'other'" in other.output
+    assert FALSE_ID in _listed(store, AFTER)
+    wrong = runner.invoke(app, [*apply, "--expect-rows", "3", "--release", REL])
     assert wrong.exit_code == 1
     assert "retract refused" in wrong.output
-    done = runner.invoke(
-        app, ["master-retract", "--apply", "--expect-rows", "2", "--expect-digest", digest]
-    )
+    done = runner.invoke(app, [*apply, "--expect-rows", "2", "--release", REL])
     assert done.exit_code == 0, done.output
     assert done.output.startswith("retracted 2 rows")
     assert FALSE_ID not in _listed(store, AFTER)
