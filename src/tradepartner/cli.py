@@ -127,6 +127,54 @@ Research registry (research-registry spec req 11 and req 14; plan T83):
   export, checks the declared span against the event column and every sealed
   split's rows against the sealed periods, and records the version.
 
+Research labeling (research-labeling spec C12 and req 18, amendment 2026-10-08
+#1330; plan T124). Each command calls its own module, `store.db`'s connections
+and `store.registry.code_version`, and prints through the `cli_record` scrub:
+
+- `tradepartner corpus fetch departure-reason [--since] [--until] [--cik]...
+  [--limit]` runs `corpus.departure_fetch.fetch_departure_corpus` through the
+  paced EDGAR client and prints the corpus path and its count identity.
+- `tradepartner research frame build departure-reason --corpus <path> --as-of
+  <t> [--register]` runs `research.labeling.frame.build_frame` at `t` (an ISO
+  datetime with its UTC offset) and either registers the frame
+  (`frame.register`, on an `open_for_write` connection) or prints the `dataset
+  register` line that would.
+- `tradepartner research gold [--frame <id> --seed <s> [--n 150] --exclude
+  <csv>] [--lock]` builds the gold session (`gold.build_gold_session`, the
+  frame's export read at its content address in the research store and checked
+  against the row's SHA-256) or, with no flags, resumes
+  it (`gold.open_gold_session`, which refuses flags that differ from the
+  session); `--lock` alone locks an existing complete session and launches
+  nothing.
+- `tradepartner research review --run <id> [--finish]` builds or resumes the
+  review session of an unfinished batch run (`review.build_review_session`, on
+  a read-only connection); `--finish` alone finishes a fully decided session
+  and launches nothing.
+- Both page commands close every connection they opened, then launch `streamlit
+  run` on `REVIEW_PAGE` through the same launcher as `dashboard`, with
+  `--server.address localhost --browser.gatherUsageStats false` before `--` and
+  `--session <path>` after it (`research review` also passes `--code-version
+  <commit>[+dirty]`). The page writes no store. Once the launcher returns (the
+  page's own stop, Ctrl-C or any exit status) the command reads the session: a
+  complete one is locked (`gold.lock_gold`) or finished (`review.finish`) on an
+  `open_for_write` connection and its count and hash are printed (exit 0); a
+  partial one prints how many cases or items are open and stays unlocked (exit
+  0); a busy store prints "store busy" and exits 1 with nothing written to the
+  store. Nothing of a case's content (labels, passages, answers) is printed.
+- `tradepartner research label <slug> --dataset <id> --split <split> --model
+  <jev-X.Y.Z> [--configurations 1] [--accepted-from] [--accepted-to] [--limit]
+  [--drift-gold <id> --drift-baseline-run <id>] [--spend-holdout
+  --holdout-reason]` runs one batch (`job.run_batch`) on a non-synthetic run;
+  a frame split needs the two drift flags (the drift probe of C5). With
+  `--dry-run` it prints `job.dry_run`'s estimate, spend sums and headroom on a
+  read-only connection, opens no run and calls nothing. Exit 0 for `ok` or
+  `unfinished` (a batch awaiting review), 1 for `failed`, 2 for a refusal.
+
+There is no `research probe`, `research spend` or `research record-fixtures`
+command and no `--out` flag (C12). The model client is `make_app`'s
+`model_client` edge (`job.CLIENT_FACTORY`, which builds the disabled client
+unless both spend ceilings and the key are set in the owner's environment).
+
 Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
 2026-10-04):
 
@@ -218,18 +266,20 @@ value.
 
 `make_app` takes every edge a test replaces (settings, clock, the EDGAR HTTP
 client, the price source, the dashboard launcher, the broker export parser,
-the `paper` broker factory); `main` is the console script over the real ones.
+the `paper` broker factory, the research model client); `main` is the console
+script over the real ones.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any
@@ -255,6 +305,7 @@ from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
 from tradepartner.config import Settings, get_settings
+from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
 from tradepartner.execution import report as paper_report
@@ -270,7 +321,7 @@ from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CO
 from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
 from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
-from tradepartner.research import EVERY_ROW_SPLITS
+from tradepartner.research import EVERY_ROW_SPLITS, DatasetChanged, datafiles
 from tradepartner.research.experiment import (
     SPLITS,
     ExperimentFileError,
@@ -288,6 +339,8 @@ from tradepartner.research.experiment import (
 )
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
+from tradepartner.research.labeling import frame as labeling_frame
+from tradepartner.research.labeling import gold, job, review
 from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import (
     journal,
@@ -309,6 +362,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 USAGE_ERROR = 2
 DASHBOARD_APP = Path(__file__).resolve().parent / "dashboard" / "app.py"
+#: The review page (C10) `research gold` and `research review` launch: a path, never
+#: an import, since importing a Streamlit script runs it.
+REVIEW_PAGE = Path(__file__).resolve().parent / "research" / "labeling" / "review_page.py"
 #: Relative path-shaped settings resolve against the project root (config.py).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -854,6 +910,167 @@ def _flag_names(run: research.RunSummary) -> str:
     return ",".join(flags) or "-"
 
 
+# --- Research labeling: corpus, frame, gold, label, review (plan T124) -------------
+
+#: The frame's registered dataset name (C7; `research.labeling.frame.register`).
+FRAME_DATASET = "departure-reason-frame"
+#: The gold sample's size when `--n` is not given (req 10, owner decision 3).
+GOLD_N_DEFAULT = 150
+#: The exit code of a command the owner stopped with Ctrl-C (128 + SIGINT).
+INTERRUPTED_EXIT = 130
+#: Errors a labeling command reports as a refusal (exit 2): the research refusals,
+#: an export it cannot read, a changed export, a records file the spend sum refuses,
+#: and another labeling run holding the research store's run lock.
+_LABELING_REFUSALS = (
+    *_DATASET_REFUSALS,
+    DatasetChanged,
+    job.RunInProgress,
+    job.UnexpectedInferenceFile,
+)
+
+
+def _export_path(settings: Settings, record: research.DatasetRecord) -> Path:
+    """Where the research store keeps a frame or gold export, by its content address
+    (spec "Research store layout"): the caller checks the file against the row's
+    SHA-256, and a dataset row's own `path` is read only by `research.load_dataset`."""
+    if record.name == FRAME_DATASET:
+        return datafiles.frame_path(settings, record.sha256)
+    if record.name == gold.DATASET_NAME:
+        return datafiles.gold_path(settings, record.sha256)
+    raise ExperimentFileError(
+        f"dataset {record.dataset_id} is {record.name!r}: neither "
+        f"{FRAME_DATASET} nor {gold.DATASET_NAME}"
+    )
+
+
+def _latest_run_id(conn: duckdb.DuckDBPyConnection) -> int:
+    """The newest research run id (0 when none), to tell a refusal before any run
+    opened from a failure after one did."""
+    return max((r.run_id for r in research.list_runs(conn, include_synthetic=True)), default=0)
+
+
+def _close_open_runs(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, after: int, why: str
+) -> list[int]:
+    """The run ids above `after` (the ones this command opened), each still-open one
+    closed `failed` with `why`; the caller commits them."""
+    runs = [r for r in research.list_runs(conn, include_synthetic=True) if r.run_id > after]
+    for run in runs:
+        if run.outcome == research.UNFINISHED:
+            handle = research.attach_run(conn, run.run_id, settings=settings)
+            research.close_run(conn, handle, "failed", _scrubbed(f"interrupted: {why}", settings))
+    return sorted(r.run_id for r in runs)
+
+
+def _page_argv(session: Path, *page_args: str) -> list[str]:
+    """`streamlit run` on the review page, bound to localhost with usage stats off
+    (ADR 0011 point 3), the page's own arguments after `--` (C10, #1330)."""
+    return [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(REVIEW_PAGE),
+        "--server.address",
+        "localhost",
+        "--browser.gatherUsageStats",
+        "false",
+        "--",
+        "--session",
+        str(session),
+        *page_args,
+    ]
+
+
+def _launch(launcher: Launcher, argv: list[str]) -> int:
+    """Run the page and return its exit status; Ctrl-C ends it like any other exit
+    (#1330 point 3: the command then checks the session either way)."""
+    try:
+        return launcher(argv)
+    except KeyboardInterrupt:
+        return INTERRUPTED_EXIT
+
+
+def _code_version_text() -> str:
+    """`<commit>` or `<commit>+dirty` from `store.registry.code_version` (#1330 point 4)."""
+    commit, dirty = registry.code_version()
+    return f"{commit}+dirty" if dirty else commit
+
+
+def _parse_as_of(value: str) -> datetime:
+    """`--as-of`: an ISO datetime carrying its UTC offset, returned in UTC."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _fail(f"--as-of {value!r} is not an ISO datetime", USAGE_ERROR) from None
+    if parsed.tzinfo is None:
+        raise _fail(
+            f"--as-of {value!r} has no UTC offset; give one, e.g. 2026-10-09T00:00:00+00:00",
+            USAGE_ERROR,
+        )
+    return parsed.astimezone(UTC)
+
+
+def _gold_open_count(session: gold.GoldSession) -> int:
+    """Cases with no final answer (open or skipped): a partial session is never locked."""
+    status, _, _ = gold._states(session)
+    return sum(1 for s in status.values() if s in ("open", "skipped"))
+
+
+def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: bool) -> None:
+    """After the page (or for `--lock`): lock a complete session on an
+    `open_for_write` connection and print the scorable `pilot` count and the export's
+    hash; a partial one prints its open count and stays unlocked (#1330 point 3)."""
+    open_count = _gold_open_count(session)
+    if open_count:
+        message = (
+            f"gold session: {open_count} of {len(session.cases)} cases open; "
+            "left unlocked (run `tradepartner research gold` to resume)"
+        )
+        if recovery:
+            raise _fail(f"refused: {message}", USAGE_ERROR)
+        typer.echo(message)
+        return
+    result = gold.lock_gold(session, lambda: open_for_write(settings))
+    if result.state == "busy":
+        raise _fail(_scrubbed(result.message or "store busy", settings), 1)
+    typer.echo(
+        f"gold session locked: dataset {result.dataset_id}, scorable pilot count "
+        f"{result.scorable_pilot}, sha256 {result.sha256}"
+    )
+
+
+def _review_open_count(session: review.ReviewSession) -> int:
+    """Items with no final decision: a partial session is never finished."""
+    return sum(1 for line in review.final_lines(session).values() if line is None)
+
+
+def _settle_review(session: review.ReviewSession, settings: Settings, *, recovery: bool) -> None:
+    """After the page (or for `--finish`): finish a fully decided session on an
+    `open_for_write` connection and print `n_reviewed` and the review file's hash; a
+    partial one prints its open count and stays unfinished (#1330 point 3)."""
+    open_count = _review_open_count(session)
+    if open_count:
+        message = (
+            f"review session: {open_count} of {len(session.items)} items open; "
+            f"left unfinished (run `tradepartner research review --run {session.run_id}` "
+            "to resume)"
+        )
+        if recovery:
+            raise _fail(f"refused: {message}", USAGE_ERROR)
+        typer.echo(message)
+        return
+    writable = dataclasses.replace(session, connect=lambda: open_for_write(settings))
+    try:
+        result = review.finish(writable)
+    except StoreLockedError as exc:
+        raise _fail(_scrubbed(f"store busy: {exc}", settings), 1) from None
+    typer.echo(
+        f"review finished: run {session.run_id} {result.outcome}, n_reviewed "
+        f"{result.metrics['n_reviewed']}, dataset {result.dataset_id}, sha256 {result.sha256}"
+    )
+
+
 # --- Phase 4: the paper commands (plan T67) ---------------------------------------
 
 BrokerFactory = Callable[[Settings, Clock], Broker]
@@ -1064,6 +1281,7 @@ def make_app(
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
     broker: BrokerFactory = build_broker,
+    model_client: job.ClientFactory = job.CLIENT_FACTORY,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""
     app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
@@ -2271,6 +2489,384 @@ def make_app(
             + (", ".join(f"{a} to {b}" for a, b in record.sealed_periods) or "-")
         )
         typer.echo(f"  locked {_fmt(record.locked)}, seed {_fmt(record.seed)}")
+
+    # --- Research labeling (research-labeling spec C12, #1330; plan T124) -------------
+
+    corpus_app = typer.Typer(no_args_is_help=True, help="Fetch research corpora from EDGAR.")
+    app.add_typer(corpus_app, name="corpus")
+    corpus_fetch_app = typer.Typer(no_args_is_help=True, help="Fetch one corpus.")
+    corpus_app.add_typer(corpus_fetch_app, name="fetch")
+
+    @corpus_fetch_app.command("departure-reason")
+    def corpus_fetch_departure_reason(
+        since: Annotated[
+            str, typer.Option(help="first Form 25 filing date, YYYY-MM-DD")
+        ] = departure_fetch.POPULATION_START.isoformat(),
+        until: Annotated[
+            str | None, typer.Option(help="last Form 25 filing date (default: today, UTC)")
+        ] = None,
+        cik: Annotated[
+            list[str] | None, typer.Option("--cik", help="only this issuer CIK (repeatable)")
+        ] = None,
+        limit: Annotated[
+            int | None, typer.Option(help="only the first n accessions by filing date")
+        ] = None,
+    ) -> None:
+        """Fetch the departure-reason corpus (Form 25s, notices, one 8-K each)."""
+        start = _parse_day("--since", since)
+        assert start is not None
+        end = _parse_day("--until", until)
+        if limit is not None and limit < 1:
+            raise _fail("--limit must be at least 1", USAGE_ERROR)
+        ciks = tuple(c.strip() for c in cik or ())
+        bad = [c for c in ciks if not (c.isascii() and c.isdigit())]
+        if bad:
+            raise _fail(f"--cik must be digits: {', '.join(bad)}", USAGE_ERROR)
+        s = settings()
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(f"missing required secret(s): {', '.join(missing)}", USAGE_ERROR)
+        now = ensure_tz_aware_utc(clock(), field_name="clock()")
+        last = end if end is not None else now.date()
+        if last < start:
+            what = f"--until {last}" if end is not None else f"today ({last}, the default --until)"
+            raise _fail(f"--since {start} is after {what}", USAGE_ERROR)
+        try:
+            result = departure_fetch.fetch_departure_corpus(
+                since=start,
+                until=last,
+                ciks=ciks,
+                limit=limit,
+                settings=s,
+                client=edgar_client,
+                now=now,
+            )
+        except (httpx.HTTPError, OSError, ValueError, RuntimeError) as exc:
+            raise _fail(_scrubbed(f"corpus fetch failed: {_describe(exc)}", s), 1) from None
+        counts = result.counts.as_json()
+        _echo_scrubbed(f"corpus {result.corpus_path}", s)
+        _echo_scrubbed(f"  counts {result.counts_path}", s)
+        typer.echo("  " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+
+    research_app = typer.Typer(
+        no_args_is_help=True, help="Research labeling under ADR 0013 (run by the owner)."
+    )
+    app.add_typer(research_app, name="research")
+    frame_app = typer.Typer(no_args_is_help=True, help="Build research frames.")
+    research_app.add_typer(frame_app, name="frame")
+    frame_build_app = typer.Typer(no_args_is_help=True, help="Build one frame.")
+    frame_app.add_typer(frame_build_app, name="build")
+
+    @frame_build_app.command("departure-reason")
+    def frame_build_departure_reason(
+        corpus: Annotated[Path, typer.Option(help="the corpus file (corpus.jsonl)")],
+        as_of: Annotated[str, typer.Option(help="t, an ISO datetime with its UTC offset")],
+        register_: Annotated[
+            bool, typer.Option("--register", help="register the frame as a dataset version")
+        ] = False,
+    ) -> None:
+        """Build the departure-reason frame: the rule answer of every listing end at t."""
+        t = _parse_as_of(as_of)
+        s = settings()
+        if t > ensure_tz_aware_utc(clock(), field_name="clock()"):
+            raise _fail(f"--as-of {t.isoformat()} is in the future", USAGE_ERROR)
+        if not corpus.is_file():
+            raise _fail(f"no corpus file at {corpus}", USAGE_ERROR)
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = labeling_frame.build_frame(corpus, t, s)
+            record = None
+            if register_:
+                with open_for_write(s) as conn:
+                    schema.init_schema(conn)
+                    record = labeling_frame.register(conn, result)
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except (*_LABELING_REFUSALS, KeyError) as exc:
+            raise _refusal(exc, s) from None
+        _echo_scrubbed(f"frame {result.frame_path}", s)
+        typer.echo(
+            f"  sha256 {result.sha256}, {result.n_rows} rows, events {result.event_start} "
+            f"to {result.event_end}, as of {t.isoformat()}"
+        )
+        typer.echo("  " + ", ".join(f"{k} {v}" for k, v in result.counts.as_json().items()))
+        for label, rows in (
+            ("delistings ending no listing", result.delistings_ending_no_listing),
+            ("unmatched delistings", result.unmatched_delistings),
+        ):
+            ids = sorted({r.security_id for r in rows})
+            typer.echo(f"  {label}: {len(rows)}" + (f" ({', '.join(ids)})" if ids else ""))
+        if record is not None:
+            typer.echo(f"dataset {record.dataset_id}: {record.name} {record.version}")
+            return
+        _echo_scrubbed(
+            f"register it with: tradepartner dataset register --name {FRAME_DATASET} "
+            f"--version {result.sha256[:12]} --path {result.frame_path} --event-start "
+            f"{result.event_start} --event-end {result.event_end} "
+            "--event-column form25_accepted_at",
+            s,
+        )
+
+    @research_app.command("gold")
+    def research_gold(
+        frame: Annotated[
+            int | None, typer.Option(help="the departure-reason-frame dataset id (new session)")
+        ] = None,
+        seed: Annotated[int | None, typer.Option(help="the registered seed (new session)")] = None,
+        n: Annotated[
+            int | None,
+            typer.Option("--n", help=f"cases to draw (new session; default {GOLD_N_DEFAULT})"),
+        ] = None,
+        exclude: Annotated[
+            Path | None, typer.Option(help="the exclusion CSV (new session)")
+        ] = None,
+        lock: Annotated[
+            bool, typer.Option("--lock", help="lock a complete session; opens no page")
+        ] = False,
+    ) -> None:
+        """Label the gold sample on the local review page: build the session, or resume
+        it with no flags; the session is locked once every case is answered."""
+        s = settings()
+        given = any(v is not None for v in (frame, seed, n, exclude))
+        if lock and given:
+            raise _fail("--lock runs alone, on the existing session", USAGE_ERROR)
+        path = gold.session_path(s)
+        try:
+            if path.exists():
+                session = gold.open_gold_session(
+                    path, gold.GoldFlags(frame, seed, n, exclude), settings=s
+                )
+            elif lock:
+                raise _fail(f"no gold session at {path} to lock", USAGE_ERROR)
+            else:
+                if frame is None or seed is None or exclude is None:
+                    raise _fail(
+                        "a new gold session needs --frame, --seed and --exclude", USAGE_ERROR
+                    )
+                if (missing := _store_missing(s)) is not None:
+                    raise missing
+                with open_read_only(s) as conn:
+                    row = research.get_dataset(conn, frame)
+                if row.name != FRAME_DATASET:
+                    raise ExperimentFileError(
+                        f"dataset {frame} is {row.name!r}, not a {FRAME_DATASET}"
+                    )
+                built = gold.build_gold_session(
+                    gold.FrameExport(frame, _export_path(s, row), row.sha256),
+                    seed,
+                    GOLD_N_DEFAULT if n is None else n,
+                    exclude,
+                    settings=s,
+                )
+                session = built.session
+                x = built.exclusion
+                typer.echo(
+                    f"exclusion: {x.accessions_matched} accessions matched, {x.ciks} issuer "
+                    f"CIKs, {x.rows_removed} rows removed, sha256 {x.sha256}"
+                )
+                if x.unmatched:
+                    typer.echo(f"  accessions matching no frame row: {', '.join(x.unmatched)}")
+            if lock:
+                _settle_gold(session, s, recovery=True)
+                return
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except _LABELING_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        splits = [c.split for c in session.cases]
+        typer.echo(
+            f"gold session: {len(session.cases)} cases ({splits.count('dev')} dev, "
+            f"{splits.count('pilot')} pilot), {_gold_open_count(session)} open"
+        )
+        _launch(launcher, _page_argv(session.session_file))
+        try:  # the session's state is its working file, read again by every step
+            _settle_gold(session, s, recovery=False)
+        except _LABELING_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+
+    @research_app.command("review")
+    def research_review(
+        run: Annotated[int, typer.Option("--run", help="the unfinished batch run to review")],
+        finish: Annotated[
+            bool, typer.Option("--finish", help="finish a fully decided session; opens no page")
+        ] = False,
+    ) -> None:
+        """Review a batch's shortlist on the local review page; the run is finished once
+        every item is decided."""
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        version = _code_version_text()
+        try:
+            session = review.build_review_session(
+                run, settings=s, connect=lambda: open_read_only(s), code_version=version
+            )
+            if finish:
+                _settle_review(session, s, recovery=True)
+                return
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except _LABELING_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+        open_count = _review_open_count(session)
+        typer.echo(f"review session: run {run}, {len(session.items)} items, {open_count} open")
+        _launch(launcher, _page_argv(session.review_path, "--code-version", version))
+        try:
+            _settle_review(session, s, recovery=False)
+        except _LABELING_REFUSALS as exc:
+            raise _refusal(exc, s) from None
+
+    @research_app.command("label")
+    def research_label(
+        slug: Annotated[str, typer.Argument(help="the registered experiment slug")],
+        dataset: Annotated[int, typer.Option(help="the dataset version id to bind")],
+        split: Annotated[str, typer.Option(help="the split to bind")],
+        model: Annotated[
+            str | None, typer.Option(help="the pinned model id, jev-X.Y.Z (never an alias)")
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option("--dry-run", help="print the estimate; open nothing, call nothing")
+        ] = False,
+        configurations: Annotated[
+            int, typer.Option(help="configurations this run will evaluate")
+        ] = 1,
+        accepted_from: Annotated[
+            str | None, typer.Option(help="first Form 25 acceptance day, YYYY-MM-DD")
+        ] = None,
+        accepted_to: Annotated[
+            str | None, typer.Option(help="last Form 25 acceptance day, YYYY-MM-DD")
+        ] = None,
+        limit: Annotated[int | None, typer.Option(help="only the first n rows")] = None,
+        drift_gold: Annotated[
+            int | None, typer.Option(help="a batch: the gold dataset holding the drift set")
+        ] = None,
+        drift_baseline_run: Annotated[
+            int | None, typer.Option(help="a batch: the frozen configuration's dev run")
+        ] = None,
+        spend_holdout: Annotated[
+            bool, typer.Option(help="score the sealed pilot period (needs a reason)")
+        ] = False,
+        holdout_reason: Annotated[str | None, typer.Option(help="why the period is spent")] = None,
+    ) -> None:
+        """Label one batch with the pinned model (or, with --dry-run, estimate it)."""
+        start = _parse_day("--accepted-from", accepted_from)
+        end = _parse_day("--accepted-to", accepted_to)
+        if limit is not None and limit < 1:
+            raise _fail("--limit must be at least 1", USAGE_ERROR)
+        if configurations < 1:
+            raise _fail("--configurations must be at least 1", USAGE_ERROR)
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        if dry_run:
+            try:
+                with open_read_only(s) as conn:
+                    row = research.get_dataset(conn, dataset)
+                    report = job.dry_run(
+                        conn,
+                        s,
+                        dataset,
+                        _export_path(s, row),
+                        accepted_from=start,
+                        accepted_to=end,
+                        limit=limit,
+                        now=ensure_tz_aware_utc(clock(), field_name="clock()"),
+                    )
+            except StoreLockedError as exc:
+                raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+            except _LABELING_REFUSALS as exc:
+                raise _refusal(exc, s) from None
+            for line in report.lines():
+                typer.echo(line)
+            typer.echo(
+                "dry run: no run opened, no call made; the estimate covers every row of "
+                "the export, an upper bound for the split"
+            )
+            return
+        if model is None:
+            raise _fail("--model is required (a pinned jev-X.Y.Z id)", USAGE_ERROR)
+        if spend_holdout and _blank_text(holdout_reason):
+            raise _fail("--spend-holdout needs a non-blank --holdout-reason", USAGE_ERROR)
+        if holdout_reason is not None and not spend_holdout:
+            raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
+        drift_flags = (drift_gold, drift_baseline_run)
+        drift: job.DriftProbe | None = None
+        if split in job.FRAME_SPLITS:
+            if drift_gold is None or drift_baseline_run is None:
+                raise _fail(
+                    f"a {split!r} batch runs the drift probe first: give --drift-gold and "
+                    "--drift-baseline-run",
+                    USAGE_ERROR,
+                )
+            drift = job.DriftProbe(dataset_id=drift_gold, baseline_run_id=drift_baseline_run)
+        elif any(v is not None for v in drift_flags):
+            raise _fail("--drift-gold and --drift-baseline-run go with a batch split", USAGE_ERROR)
+        failure: BaseException | None = None
+        result: job.BatchResult | None = None
+        opened: list[int] = []
+        try:
+            with open_for_write(s) as conn:
+                schema.init_schema(conn)
+                before = _latest_run_id(conn)
+                try:
+                    result = job.run_batch(
+                        conn,
+                        s,
+                        model_client,
+                        slug,
+                        dataset,
+                        split,
+                        model=model,
+                        drift=drift,
+                        flags=ResearchFlags(spend_holdout=spend_holdout),
+                        reasons=ResearchReasons(holdout_reason=holdout_reason),
+                        configurations=configurations,
+                        accepted_from=start,
+                        accepted_to=end,
+                        limit=limit,
+                        run_by=_REGISTERED_BY,
+                    )
+                except (Exception, KeyboardInterrupt) as exc:
+                    # Commit what the job wrote (its run rows, a `failed` close) rather
+                    # than roll it back: the run's records file already exists. A run
+                    # the job left open (Ctrl-C reaches no `close_run`) is closed here.
+                    failure = exc
+                    opened = _close_open_runs(conn, s, before, _describe(exc))
+        except StoreLockedError as exc:
+            raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
+        except Exception as exc:
+            raise _fail(_scrubbed(f"failed: {_describe(exc)}", s), 1) from None
+        if failure is not None:
+            if isinstance(failure, KeyboardInterrupt):
+                runs = ", ".join(str(r) for r in opened) or "none"
+                raise _fail(
+                    f"interrupted: run(s) opened and closed failed: {runs}", INTERRUPTED_EXIT
+                )
+            if opened:
+                # A run opened: whatever went wrong after it is a failure, never a refusal.
+                runs = ", ".join(str(r) for r in opened)
+                raise _fail(_scrubbed(f"failed (run {runs}): {_describe(failure)}", s), 1)
+            if isinstance(failure, _LABELING_REFUSALS):
+                raise _refusal(failure, s)
+            raise _fail(_scrubbed(f"failed: {_describe(failure)}", s), 1)
+        assert result is not None
+        typer.echo(f"run {result.run_id}: {result.outcome}")
+        if result.message:
+            typer.echo(f"  {_scrubbed(result.message, s)}")
+        if result.inferences_dataset_id is not None:
+            typer.echo(f"  inference records: dataset {result.inferences_dataset_id}")
+        if result.packets_refused:
+            typer.echo(f"  packets refused (over the token cap): {len(result.packets_refused)}")
+        if result.shortlist is not None:
+            active = len(result.shortlist.items) - result.shortlist.n_deferred
+            typer.echo(
+                f"  shortlist: {active} items to review, {result.shortlist.n_deferred} deferred; "
+                f"review with `tradepartner research review --run {result.run_id}`"
+            )
+        if result.outcome in ("ok", "unfinished"):
+            return
+        raise typer.Exit(1 if result.outcome == "failed" else USAGE_ERROR)
 
     paper_app = typer.Typer(no_args_is_help=True, help="Paper trading (Phase 4).")
     app.add_typer(paper_app, name="paper")

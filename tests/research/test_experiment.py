@@ -429,3 +429,105 @@ def test_check_sealed_split_has_period() -> None:
         check_sealed_split_has_period("test", [date(2021, 1, 1)], [period])
     with pytest.raises(ExperimentFileError, match="sealed split without period"):
         check_sealed_split_has_period("test", [date(2020, 6, 1)], [])
+
+
+# --------------------------------------------------------------------------------
+# The three departure-reason experiment files (research-labeling spec C7, req 10;
+# plan T124): the fixtures are the docs files byte for byte, they parse and register
+# against the fixture claims file, and the pilot is refused as confirmatory.
+# --------------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+LABELING_FIXTURES = ROOT / "tests" / "fixtures" / "research" / "experiments"
+LABELING_SLUGS = (
+    "departure-reason-pilot",
+    "departure-reason-batches",
+    "departure-reason-drift",
+)
+
+
+def _labeling_tree(tmp_path: Path) -> Path:
+    """`<tmp>/experiments` holding the three fixtures, with the fixture claims file as
+    its sibling `research/claims.toml`."""
+    experiments_dir = tmp_path / "experiments"
+    experiments_dir.mkdir()
+    (tmp_path / "research").mkdir()
+    claims = ROOT / "tests" / "fixtures" / "research" / "claims.toml"
+    (tmp_path / "research" / "claims.toml").write_bytes(claims.read_bytes())
+    for slug in LABELING_SLUGS:
+        name = f"{slug}.md"
+        (experiments_dir / name).write_bytes((LABELING_FIXTURES / name).read_bytes())
+    return experiments_dir
+
+
+@pytest.mark.parametrize("slug", LABELING_SLUGS)
+def test_the_labeling_fixtures_are_the_docs_files(slug: str) -> None:
+    name = f"{slug}.md"
+    docs = ROOT / "docs" / "experiments" / name
+    assert (LABELING_FIXTURES / name).read_bytes() == docs.read_bytes()
+
+
+def test_the_three_labeling_files_parse_and_register(tmp_path: Path, settings: Settings) -> None:
+    import duckdb
+
+    from tradepartner.store import research, schema
+
+    experiments_dir = _labeling_tree(tmp_path)
+    parsed = {
+        slug: parse_experiment_file(
+            experiments_dir / f"{slug}.md", experiments_dir, settings=settings
+        )
+        for slug in LABELING_SLUGS
+    }
+    pilot = parsed["departure-reason-pilot"]
+    assert (pilot.kind, pilot.provenance, pilot.confirmatory) == (
+        "benchmark",
+        "model_historical",
+        False,
+    )
+    assert (pilot.dataset_name, pilot.splits) == ("departure-reason-gold", ("dev", "pilot"))
+    assert (pilot.primary_metric, pilot.primary_threshold, pilot.primary_min_clusters) == (
+        "class_accuracy",
+        0.80,
+        90,
+    )
+    assert (pilot.budget_runs, pilot.budget_configurations) == (6, 2)
+    batches = parsed["departure-reason-batches"]
+    assert (batches.dataset_name, batches.splits, batches.primary_metric) == (
+        "departure-reason-frame",
+        ("full",),
+        "yield",
+    )
+    assert batches.primary_threshold is None
+    drift = parsed["departure-reason-drift"]
+    assert (drift.kind, drift.dataset_name, drift.splits) == (
+        "robustness",
+        "departure-reason-gold",
+        ("dev",),
+    )
+    assert (drift.primary_metric, drift.primary_direction, drift.primary_threshold) == (
+        "flip_rate",
+        "less",
+        0.10,
+    )
+    assert {p.claims for p in parsed.values()} == {("ER-14", "ER-15")}
+    assert len({p.seed for p in parsed.values()}) == 3
+
+    with duckdb.connect(str(tmp_path / "registry.duckdb")) as conn:
+        schema.init_schema(conn)
+        for slug in LABELING_SLUGS:
+            record = research.register_experiment(conn, parsed[slug], "owner")
+            assert (record.slug, record.confirmatory) == (slug, False)
+
+
+def test_the_labeling_pilot_is_refused_as_confirmatory(tmp_path: Path, settings: Settings) -> None:
+    experiments_dir = _labeling_tree(tmp_path)
+    path = experiments_dir / "departure-reason-pilot.md"
+    text = path.read_text(encoding="utf-8")
+    assert "\nconfirmatory = false\n" in text
+    # ER-15 is UNGRADED, which is its own refusal on a confirmatory file; drop it so
+    # the refusal under test is the provenance one.
+    text = text.replace('claims = ["ER-14", "ER-15"]', 'claims = ["ER-14"]')
+    path.write_text(text.replace("\nconfirmatory = false\n", "\nconfirmatory = true\n"))
+    with pytest.raises(ExperimentFileError, match="model_historical"):
+        parse_experiment_file(path, experiments_dir, settings=settings)
