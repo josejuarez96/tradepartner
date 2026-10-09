@@ -888,6 +888,7 @@ scope = "Tier 1 paper-trading doc plus Tier 2 staff answers"
 source = "docs/research/2026-09-25-alpaca-open-and-depth.md"
 section = "Answer"
 bears_on = ["spec:paper-trading"]
+note = "The OPG part conflicts with P3-3 (2026-10-09): on paper, OPG orders expired unfilled in 4 of 4 cases; the NBBO and omissions parts stand (P3-1 found fractional fills at the opening print, not the NBBO)."
 
 [[claim]]
 id = "AO-4"
@@ -2674,3 +2675,57 @@ source = "docs/research/2026-10-05-gdelt-news-metadata.md"
 section = "Alternative evaluated: Alpaca News API (Benzinga)"
 bears_on = ["spec:event-data", "adr:0008"]
 note = "See FT-1 for the Alpaca terms."
+
+# ===== 2026-10-09-probe3-preopen-fills.md =====
+[[claim]]
+id = "P3-1"
+statement = "On Alpaca paper, a $5 notional fractional market DAY buy queued at 09:01-09:05 ET filled at the listing exchange's official opening print, to the cent, 0.9 to 2.0 s after 09:30:00 ET, in 4 of 4 cases (KO and AAPL, 2026-10-05 and 2026-10-09)."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Paper simulator only; two sessions, two liquid names, four orders; the mechanism (last-trade pricing on release) is inferred, not documented; nothing transfers to live"
+source = "docs/research/2026-10-09-probe3-preopen-fills.md"
+section = "Evidence"
+bears_on = ["adr:0005", "adr:0006", "spec:paper-trading"]
+note = "The protocol's reading table expected the first NBBO after the open (its row 1); the fill was the opening print instead. Magnitudes are INSUFFICIENT as a distribution (n = 4)."
+
+[[claim]]
+id = "P3-2"
+statement = "On Alpaca paper, a 1-share market DAY buy queued at 09:01-09:05 ET filled at the NBBO ask at fill time, to the cent, 17 to 118 s after the open (median 53 s), -9.3 to +34.7 bps from the official open (median +6.2 bps), in 4 of 4 cases."
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "Paper simulator only; two sessions, two liquid names, four orders; the worst latency and gap are the largest of four, not a tail estimate"
+source = "docs/research/2026-10-09-probe3-preopen-fills.md"
+section = "Evidence"
+bears_on = ["adr:0005", "adr:0006", "spec:paper-trading"]
+note = "Reading-table rows 1 and 4: first NBBO after the open, with a release delay; two of four were not filled by 09:31. Sets paper.sell_wait_seconds and the other timing keys (T70, #294)."
+
+[[claim]]
+id = "P3-3"
+statement = "On Alpaca paper, a 1-share OPG order submitted at 09:01-09:05 ET expired unfilled 52 to 168 s after the open in 4 of 4 cases; paper does not simulate OPG as a market order."
+kind = "fact"
+grade = "SUPPORTED"
+scope = "Paper simulator, 2026-10-05 and 2026-10-09, KO and AAPL; contradicts the 2024 staff statement S26 in the #86 report"
+source = "docs/research/2026-10-09-probe3-preopen-fills.md"
+section = "Evidence"
+bears_on = ["adr:0006"]
+note = "Conflicts with AO-3 (paper simulates OPG as a market order, from 2024 staff answers); the probe is newer and OPG expired on both sessions."
+
+[[claim]]
+id = "P3-4"
+statement = "Alpaca paper restamps a queued fractional order's submitted_at to a fixed pre-open release time (09:23:01 ET on both sessions, 18 to 22 minutes after creation), while whole-share orders keep a submitted_at within 15 ms of creation; the fill cursor must rest on the journal's own known_at, never on the broker's submitted_at."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Observed on two sessions; the release mechanism is inferred from timestamps"
+source = "docs/research/2026-10-09-probe3-preopen-fills.md"
+section = "Evidence"
+bears_on = ["spec:paper-trading"]
+
+[[claim]]
+id = "P3-5"
+statement = "The SIP daily bar open differs from the listing exchange's official opening print by -4.4 to +19.8 bps on the four name-sessions probed, so an open fill convention in a backtest is measured against the first eligible SIP trade, not the auction."
+kind = "fact"
+grade = "UNGRADED"
+scope = "KO and AAPL, 2026-10-05 and 2026-10-09; confirms FDT S20's one example"
+source = "docs/research/2026-10-09-probe3-preopen-fills.md"
+section = "Evidence"
+bears_on = ["spec:backtest"]
