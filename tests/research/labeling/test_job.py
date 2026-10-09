@@ -749,6 +749,52 @@ def test_a_second_run_is_refused_while_one_holds_the_lock(world: World) -> None:
     ]
 
 
+def test_process_loss_after_first_record_preserves_run_and_never_reuses_file(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class HardKill(BaseException):
+        pass
+
+    gold_id = world.gold(_dev(1), _pilot(1))
+    world.conn.commit()
+    original_append = datafiles.append_jsonl
+
+    def kill_after_append(path: Path, records: Any) -> None:
+        original_append(path, records)
+        raise HardKill
+
+    monkeypatch.setattr(datafiles, "append_jsonl", kill_after_append)
+    world.conn.begin()
+    with pytest.raises(HardKill):
+        world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev")
+    world.conn.close()  # process death discards any transaction still open
+    first_file = datafiles.inference_path(world.settings, 1)
+    first_bytes = first_file.read_bytes()
+    world.conn = duckdb.connect(str(world.tmp / "scratch.duckdb"))
+    assert world.conn.execute("SELECT run_id FROM research_runs").fetchall() == [(1,)]
+
+    monkeypatch.setattr(datafiles, "append_jsonl", original_append)
+    second = world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev")
+    assert second.run_id != 1
+    assert first_file.read_bytes() == first_bytes
+    assert datafiles.inference_path(world.settings, second.run_id).is_file()
+
+
+def test_existing_records_file_refuses_open_without_writing(world: World) -> None:
+    gold_id = world.gold(_dev(1), _pilot(1))
+    path = datafiles.inference_path(world.settings, 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"previous record\n")
+    client = ScriptedModelClient([Answer(MERGER)])
+
+    with pytest.raises(ValueError, match=r"records file.*1\.jsonl.*exists"):
+        world.run(client, gold_id, "dev")
+
+    assert path.read_bytes() == b"previous record\n"
+    assert client.requests == []
+    assert world.conn.execute("SELECT count(*) FROM research_runs").fetchone() == (0,)
+
+
 def test_a_record_in_a_new_month_starts_that_months_sum() -> None:
     october = job.SpendSums(5.0, 2.0, (2026, 10))
     november = october.plus(0.5, datetime(2026, 11, 1, 0, 1, tzinfo=UTC))

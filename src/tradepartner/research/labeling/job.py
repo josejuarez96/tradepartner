@@ -688,6 +688,23 @@ def _file_sha256(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
 
+def _begin_run_transaction(conn: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Refuse an orphaned records path before allocating its run id."""
+    next_id = conn.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM research_runs").fetchone()
+    assert next_id is not None
+    path = datafiles.inference_path(settings, int(next_id[0]))
+    if path.exists():
+        raise ValueError(f"records file {path} already exists; refusing to open run")
+    conn.commit()
+    conn.begin()
+
+
+def _commit_open_run(conn: duckdb.DuckDBPyConnection) -> None:
+    """Make the run row durable before any model call or records append."""
+    conn.commit()
+    conn.begin()
+
+
 # --- the drift probe (C5) ----------------------------------------------------------------
 
 
@@ -734,6 +751,7 @@ def _run_drift(
         "baseline_run_id": probe.baseline_run_id,
         "probe_size": probe.size,
     }
+    _begin_run_transaction(conn, settings)
     handle = open_run(
         conn,
         DRIFT_SLUG,
@@ -744,6 +762,7 @@ def _run_drift(
         synthetic=synthetic,
         settings=settings,
     )
+    _commit_open_run(conn)
     if handle.refusal is not None:
         return None
     try:
@@ -918,6 +937,7 @@ def run_batch(
         "drift": dataclasses.asdict(drift) if drift else None,
     }
     with _run_lock(settings):
+        _begin_run_transaction(conn, settings)
         handle = open_run(
             conn,
             slug,
@@ -931,6 +951,7 @@ def run_batch(
             configurations=configurations,
             settings=settings,
         )
+        _commit_open_run(conn)
         if handle.refusal is not None:
             return BatchResult(handle.run_id, handle.refusal, handle.message)
         caller_args = {
