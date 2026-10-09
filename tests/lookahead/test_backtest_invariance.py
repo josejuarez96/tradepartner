@@ -611,8 +611,15 @@ def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
 
 def test_a_run_under_the_boundary_reads_nothing_after_it(fixture: Fixture) -> None:
     """Module docstring, "The development boundary". The boundary is the Saturday after
-    the walk's middle rebalance, so the window's end and the truncation differ."""
-    middle = fixture.sessions[len(fixture.sessions) // 2]
+    the walk's middle rebalance (and its first month end), so the window's end and the
+    truncation differ."""
+    # Past the first month end too: the fixture hypothesis freezes the default
+    # `month_end` cadence, which the boundary writer checks (the daily case's walk is a
+    # month and a half long).
+    middle = max(
+        fixture.sessions[len(fixture.sessions) // 2],
+        rebalance_sessions(fixture.case.start, fixture.case.end, "month_end")[0],
+    )
     boundary = middle + timedelta(days=(5 - middle.weekday()) % 7 or 7)
     assert not is_session(boundary)
     conn = fixture.conn
