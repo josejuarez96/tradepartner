@@ -281,7 +281,7 @@ from tradepartner.store.journal import (
     runs_for,
     window_stops_for,
 )
-from tradepartner.store.schema import WINDOW_STOP_REASON
+from tradepartner.store.schema import DEFAULT_BOOK_ID, WINDOW_STOP_REASON
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -826,11 +826,14 @@ class _ChunkAlerter(Alerter):
         message: str,
         *,
         clock_fault: bool = False,
+        book_id: str = DEFAULT_BOOK_ID,
     ) -> int:
         """`Alerter.write` in a write chunk of its own."""
         with self._chunk() as conn:
             alerter = Alerter(self._chunk_settings, conn, self._chunk_clock)
-            return alerter.write(kind, run_id, session, message, clock_fault=clock_fault)
+            return alerter.write(
+                kind, run_id, session, message, clock_fault=clock_fault, book_id=book_id
+            )
 
     def scrub(self, text: str) -> str:
         """`text` with every configured secret masked: the `Alerter`'s own

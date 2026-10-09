@@ -269,21 +269,44 @@ def test_refuses_without_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
-def test_refuses_a_family_paper_cannot_run(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+def test_refuses_a_family_outside_paper_families(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A `profitability` hypothesis remains outside `PAPER_FAMILIES`, before any
-    broker call or write, although the backtest engine can now run it."""
+    """The gate itself, with `PAPER_FAMILIES` narrowed back to momentum's pair: a
+    family outside it is refused `family_not_runnable`, before any write."""
+    monkeypatch.setattr(window, "PAPER_FAMILIES", ("momentum", "oracle"))
     with open_for_write(journal_settings) as conn:
         hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
         _sign_off(conn, journal_settings, hyp, tmp_path)
-    broker = _fake(fixed_clock)
     with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "b3")
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "b3"
+        )
     assert exc.value.reason == "family_not_runnable"
     assert "profitability" in str(exc.value)
     with open_for_write(journal_settings) as conn:
         assert latest_window(conn) is None
+
+
+@pytest.mark.parametrize("family", ["profitability", "combined"])
+def test_accepts_a_family_paper_now_runs(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, family: str
+) -> None:
+    """`profitability` and `combined` are in `PAPER_FAMILIES` (ADR 0017 part D, T152):
+    a signed-off hypothesis of either starts a window on its own registration."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family=family)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "b3"
+    )
+    assert result.window.hypothesis_id == hyp.hypothesis_id
+    with open_for_write(journal_settings) as conn:
+        opened = latest_window(conn)
+        assert opened is not None and opened.window_id == result.window.window_id
 
 
 @pytest.mark.parametrize("cadence", ["week_end", "daily"])
@@ -1360,15 +1383,18 @@ def test_forward_holdout_still_needs_a_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
-def test_forward_holdout_still_needs_a_paper_family(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+@pytest.mark.parametrize("family", ["profitability", "combined"])
+def test_forward_holdout_starts_for_a_paper_family(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, family: str
 ) -> None:
-    _register_forward(journal_settings, tmp_path, family="profitability")
-    with pytest.raises(window.StartRefusedError) as exc:
-        window.start(
-            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
-        )
-    assert exc.value.reason == "family_not_runnable"
+    """B4 (`combined`) is a forward exam (ADR 0016 point 5): a forward holdout of either
+    newly paper-ready family opens inside its holdout, as momentum's does (T152)."""
+    hyp = _register_forward(journal_settings, tmp_path, family=family)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.hypothesis_id == hyp.hypothesis_id
+    assert result.window.first_rebalance_session == NEXT_MONTH_END
 
 
 def test_forward_holdout_still_needs_month_end_cadence(

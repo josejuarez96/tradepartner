@@ -1621,7 +1621,7 @@ def test_the_import_refuses_an_after_made_since_the_version_18_migration(
     """quant-auditor pass 2 on #1336: once the store has the commands, a hand-written
     `after` would hide a delete-only repair from the vintage; only `close` records it."""
     (migrated,) = conn.execute(  # type: ignore[misc]
-        "SELECT applied_at FROM schema_version WHERE version = 18"
+        "SELECT MIN(applied_at) FROM schema_version WHERE version >= 18"
     ).fetchone()
     late = {**_AFTER, "made_at": migrated + (_AFTER["made_at"] - _BEFORE["made_at"])}
     with pytest.raises(registry.ReleaseRefused, match="gained the release commands"):
