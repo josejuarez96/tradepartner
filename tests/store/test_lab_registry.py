@@ -577,6 +577,22 @@ def test_family_ready_for_sweep_reads_only_the_latest_registration_of_a_slug(
     assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
 
 
+def test_family_ready_for_sweep_reads_the_default_window_under_the_boundary(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """ADR 0016 point 2 (plan T142b): the twin's default window ends at the development
+    boundary, read from the store unless the caller passes it."""
+    twin = _register(lab_store, settings)
+    _trial(lab_store, settings, tmp_path, twin.hypothesis_id)
+    assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
+    moved = date(2022, 12, 30)
+    registry.write_development_boundary(lab_store, boundary=moved, reason="test")
+    assert not lab_registry.family_ready_for_sweep(lab_store, "momentum")
+    assert lab_registry.family_ready_for_sweep(lab_store, "momentum", None)
+    _trial(lab_store, settings, tmp_path, twin.hypothesis_id, window=(IN_SAMPLE_START, moved))
+    assert lab_registry.family_ready_for_sweep(lab_store, "momentum")
+
+
 def test_is_pre_lab_by_the_marker_only(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:

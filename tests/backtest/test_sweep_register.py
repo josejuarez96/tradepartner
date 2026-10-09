@@ -32,6 +32,7 @@ from tradepartner.backtest import frozen, hypothesis, results, sweep
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.sweep import (
     AnchorInfeasibleError,
+    DevelopmentBoundaryError,
     FamilyLatticeError,
     FamilyNotReadyError,
     FamilyRuleError,
@@ -93,9 +94,10 @@ def _run_ok(
     record: registry.HypothesisRecord,
     *,
     synthetic: bool = False,
+    boundary: date | None = None,
 ) -> None:
-    """An `ok` in-sample trial of `record` over its default window."""
-    window = default_in_sample_window(Frozen.from_hypothesis(record), "month_end")
+    """An `ok` in-sample trial of `record` over its default window (under `boundary`)."""
+    window = default_in_sample_window(Frozen.from_hypothesis(record), "month_end", boundary)
     handle = registry.open_trial(
         conn,
         hypothesis_id=record.hypothesis_id,
@@ -513,6 +515,36 @@ def test_readiness_refuses_before_the_twins_first_ok_trial_and_accepts_after(
     _run_ok(lab_store, settings, tmp_path, twin)
 
     assert register(lab_store, path, settings, registered_by="test").created
+
+
+def test_readiness_reads_the_twins_default_window_under_the_boundary(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """ADR 0016 point 2 (plan T142b): with a boundary that moves the twin's default
+    window, its run over the old window is no reading of it."""
+    moved = date(2021, 6, 30)
+    registry.write_development_boundary(ready, boundary=moved, reason="test")
+    path = _copy(tmp_path, SWEEP_SOURCE)
+    _refused(ready, path, settings, FamilyNotReadyError, "'fixture-momentum'")
+    _run_ok(
+        ready,
+        settings,
+        tmp_path,
+        registry.get_hypothesis(ready, "fixture-momentum"),
+        boundary=moved,
+    )
+    assert register(ready, path, settings, registered_by="test").created
+
+
+@pytest.mark.parametrize("start", ["2021-06-30", "2022-01-31"])
+def test_an_in_sample_start_on_or_after_the_boundary_is_refused(
+    ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path, start: str
+) -> None:
+    """ADR 0016 point 2: no registration's default window is ever empty. The refusal
+    comes before the family rules' (the file's `in_sample_start` differs from them)."""
+    registry.write_development_boundary(ready, boundary=date(2021, 6, 30), reason="test")
+    path = _copy(tmp_path, SWEEP_SOURCE, (IN_SAMPLE_START, f"in_sample_start = {start}"))
+    _refused(ready, path, settings, DevelopmentBoundaryError, "development boundary 2021-06-30")
 
 
 def test_an_unrun_promoted_hypothesis_blocks_the_next_sweep(

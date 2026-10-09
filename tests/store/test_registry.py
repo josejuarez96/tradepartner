@@ -1331,15 +1331,19 @@ def _open_release(conn: duckdb.DuckDBPyConnection, name: str = "repair-a") -> in
     )
 
 
-def test_the_version_18_kinds_are_recorded_by_record_decision(
+def test_the_version_18_kinds_are_recorded_by_their_writers(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
-    decision_id = registry.record_decision(
-        conn, kind="development_boundary", reason="r", values={"date": "2023-12-29"}
-    )
+    decision_id = registry.write_development_boundary(conn, boundary=date(2023, 12, 29), reason="r")
     assert conn.execute(
         "SELECT kind FROM owner_decisions WHERE decision_id = ?", [decision_id]
     ).fetchone() == ("development_boundary",)
+    # A development_boundary row has one writer, so every boundary passes its refusals
+    # (T142b).
+    with pytest.raises(ValueError, match="write_development_boundary only"):
+        registry.record_decision(
+            conn, kind="development_boundary", reason="r", values={"date": "2023-12-29"}
+        )
     # A data_release row has one writer per stage, so `data_vintage` can parse it.
     with pytest.raises(ValueError, match="release writers only"):
         registry.record_decision(conn, kind="data_release", reason="r", values={})
@@ -1593,10 +1597,8 @@ def test_the_import_refuses_a_second_open_release_beside_the_stores(
 
 def test_development_boundary_is_the_newest_row(conn: duckdb.DuckDBPyConnection) -> None:
     assert registry.development_boundary(conn) is None
-    for day in ("2023-12-29", "2022-12-30"):
-        registry.record_decision(
-            conn, kind="development_boundary", reason=f"set {day}", values={"date": day}
-        )
+    for day in (date(2023, 12, 29), date(2022, 12, 30)):
+        registry.write_development_boundary(conn, boundary=day, reason=f"set {day}")
     boundary = registry.development_boundary(conn)
     assert boundary is not None
     assert (boundary.boundary, boundary.reason) == (date(2022, 12, 30), "set 2022-12-30")
@@ -1625,3 +1627,135 @@ def test_the_import_refuses_an_after_made_since_the_version_18_migration(
     with pytest.raises(registry.ReleaseRefused, match="gained the release commands"):
         registry.plan_release_import(conn, [_BEFORE, late])
     assert registry.data_releases(conn) == []
+
+
+# --- the development boundary (ADR 0016 points 1, 2 and 6; plan T142b) -------------
+
+
+def _family(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    family: str,
+    in_sample_start: date,
+    holdout: tuple[date, date],
+) -> registry.HypothesisRecord:
+    return registry.register_hypothesis(
+        conn,
+        slug=f"{family}-h",
+        family=family,
+        title=family,
+        doc_path=f"docs/hypotheses/{family}-h.md",
+        doc_sha256="d" * 64,
+        params=_params(),
+        in_sample_start=in_sample_start,
+        holdout_start=holdout[0],
+        holdout_end=holdout[1],
+        registered_by="owner",
+        settings=settings,
+    )
+
+
+@pytest.fixture
+def families(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> duckdb.DuckDBPyConnection:
+    """Today's families: momentum's spent holdout, profitability's unspent one on the
+    same months, and a forward one (combined, registered before its holdout starts)."""
+    _family(conn, settings, "momentum", date(2020, 8, 31), (date(2024, 1, 1), date(2026, 9, 30)))
+    spend = _open(conn, settings, tmp_path, "momentum-h", kind="holdout")
+    registry.close_trial(conn, spend, "failed", "spent")
+    _family(
+        conn, settings, "profitability", date(2020, 8, 31), (date(2024, 1, 1), date(2026, 9, 30))
+    )
+    _family(conn, settings, "combined", date(2021, 1, 29), (date(2099, 1, 1), date(2099, 6, 30)))
+    return conn
+
+
+def _boundaries(conn: duckdb.DuckDBPyConnection) -> int:
+    (n,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM owner_decisions WHERE kind = 'development_boundary'"
+    ).fetchone()
+    return int(n)
+
+
+@pytest.mark.parametrize(
+    ("day", "named"),
+    [
+        # Momentum's spent holdout.start and profitability's unspent one (#1333).
+        (date(2024, 1, 1), "momentum (2024-01-01), profitability (2024-01-01)"),
+        (date(2025, 6, 30), "momentum (2024-01-01), profitability (2024-01-01)"),
+        # A date past every historical exam still reaches the forward one.
+        (date(2099, 1, 1), "combined (2099-01-01), momentum"),
+    ],
+)
+def test_a_boundary_on_or_after_any_holdout_start_is_refused(
+    families: duckdb.DuckDBPyConnection, day: date, named: str
+) -> None:
+    with pytest.raises(registry.BoundaryRefused, match=re.escape(named)):
+        registry.write_development_boundary(families, boundary=day, reason="r")
+    assert _boundaries(families) == 0
+
+
+@pytest.mark.parametrize(
+    ("day", "named"),
+    [
+        (date(2019, 12, 31), "combined (2021-01-29), momentum (2020-08-31), profitability"),
+        (date(2020, 8, 31), "combined (2021-01-29), momentum (2020-08-31), profitability"),
+        # The orchestrator's reading on #1343: before ANY family's in_sample_start, not
+        # every family's. A family starting later than the others decides alone.
+        (date(2020, 12, 31), "of combined (2021-01-29):"),
+        (date(2021, 1, 29), "of combined (2021-01-29):"),
+    ],
+)
+def test_a_boundary_on_or_before_any_in_sample_start_is_refused(
+    families: duckdb.DuckDBPyConnection, day: date, named: str
+) -> None:
+    with pytest.raises(registry.BoundaryRefused, match=re.escape(named)):
+        registry.write_development_boundary(families, boundary=day, reason="r")
+    assert _boundaries(families) == 0
+
+
+def test_the_recommended_boundary_is_written_and_oracle_is_not_read(
+    families: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _family(
+        families, settings, "oracle", date(2023, 12, 1), (date(2023, 12, 4), date(2023, 12, 29))
+    )
+    decision_id = registry.write_development_boundary(
+        families, boundary=date(2023, 12, 29), reason="ADR 0016"
+    )
+    found = registry.development_boundary(families)
+    assert found is not None
+    assert (found.decision_id, found.boundary, found.reason) == (
+        decision_id,
+        date(2023, 12, 29),
+        "ADR 0016",
+    )
+    with pytest.raises(ValueError, match="needs a reason"):
+        registry.write_development_boundary(families, boundary=date(2023, 6, 30), reason=" ")
+
+
+def test_open_trial_records_the_boundary_in_force(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    before = _open(conn, settings, tmp_path)
+    registry.write_development_boundary(conn, boundary=date(2022, 12, 30), reason="r")
+    after = _open(conn, settings, tmp_path)
+    rows = conn.execute(
+        "SELECT trial_id, development_boundary FROM trials ORDER BY trial_id"
+    ).fetchall()
+    assert rows == [(before.trial_id, None), (after.trial_id, date(2022, 12, 30))]
+
+
+def test_family_registered_on_is_the_first_registration_day(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert registry.family_registered_on(conn, "momentum") is None
+    first = _register(conn, settings)
+    _register(conn, settings, slug="h2", params=_params(20.0))
+    conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE hypothesis_id = ?",
+        [datetime(2026, 9, 1, 23, 30, tzinfo=UTC), first.hypothesis_id],
+    )
+    assert registry.family_registered_on(conn, "momentum") == date(2026, 9, 1)

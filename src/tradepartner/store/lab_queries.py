@@ -39,6 +39,18 @@ already restarted, and after a data-vintage change it can take one more
 identical failure before a variant reads terminal-failed: never fewer, so no
 variant leaves the argmax earlier than req 2 allows, and failures never enter N.
 
+**The development boundary** (ADR 0016 points 2 and 6; data-foundation plan T142b).
+A variant's default window ends at the development boundary
+(`registry.development_boundary`, read once per call and passed to
+`holdout.default_in_sample_window`); with no boundary row it is as before. Beside the
+vintage test, the window test: a variant whose latest `ok` trial ran over a window
+that is not its default window under the current boundary (same start, another end,
+because the boundary moved) is **stale**, never current, and the next plain run
+reruns it; with no boundary row the test is not applied, so nothing changes.
+Writing a first boundary that leaves every default window as it was (2023-12-29 for
+H1 and B3) stales nothing, and a trial with a `NULL` recorded boundary stays current
+while its window fits (#1333).
+
 **Synthetic runs** (#1218). `run_sweep(..., store_path=...)` opens every trial
 `synthetic=True` on a marked fixture store. The planning reads take
 `synthetic`: with it true they read only synthetic trials, with it false (the
@@ -79,6 +91,9 @@ from tradepartner.store.lab_registry import (
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
     STORE_CHANGED_MESSAGE,
+    UNREAD,
+    Unread,
+    boundary_date,
     canonical_params_json,
     code_tree_sha256,
     data_vintage,
@@ -194,14 +209,22 @@ def _max_failures_per_variant(conn: duckdb.DuckDBPyConnection, sweep_id: int) ->
     return int(row[0])
 
 
-def default_window(conn: duckdb.DuckDBPyConnection, hypothesis_id: int, sweep_id: int) -> Window:
+def default_window(
+    conn: duckdb.DuckDBPyConnection,
+    hypothesis_id: int,
+    sweep_id: int,
+    boundary: date | Unread | None = UNREAD,
+) -> Window:
     """The variant's default in-sample window: `holdout.default_in_sample_window`
     at its own frozen cadence over the sweep registration's copied window (spec
-    req 2), so a cadence-axis sweep's variants each key the window their own
-    rebalances resolve to. The window `counted_trial` reads and the runner (T107)
-    opens every variant's trial over. Raises `LabRegistryError` for an unknown
-    sweep."""
+    req 2), under the development `boundary` (module docstring; read from the store
+    unless the caller already read it), so a cadence-axis sweep's variants each key
+    the window their own rebalances resolve to. The window `counted_trial` reads and
+    the runner (T107) opens every variant's trial over. Raises `LabRegistryError` for
+    an unknown sweep."""
     require_lab(conn)
+    if isinstance(boundary, Unread):
+        boundary = boundary_date(conn)
     record = get_hypothesis_by_id(conn, hypothesis_id)
     in_sample_start, holdout_start, holdout_end = _sweep_window(conn, sweep_id)
     frozen = replace(
@@ -211,7 +234,7 @@ def default_window(conn: duckdb.DuckDBPyConnection, hypothesis_id: int, sweep_id
         holdout_end=holdout_end,
     )
     cadence = frozen_values(record)[CADENCE_KEY]
-    return default_in_sample_window(frozen, cadence)
+    return default_in_sample_window(frozen, cadence, boundary)
 
 
 def _counted_trial(
@@ -359,6 +382,7 @@ def terminal_failed(
         {},
         rerun_epoch(conn, sweep.sweep_id),
         synthetic,
+        boundary=boundary_date(conn),
     )
     return state.state == "terminal_failed"
 
@@ -491,6 +515,7 @@ def plan_run(
             f"sweep {sweep_id} is not complete; --rerun reruns only a complete current sweep"
         )
     epoch = rerun_epoch(conn, sweep_id)
+    boundary = boundary_date(conn)
     vintages: dict[datetime, datetime | None] = {}
     planned: list[PlannedVariant] = []
     for group_index, group in enumerate(_read_groups(conn, variants), start=1):
@@ -504,6 +529,7 @@ def plan_run(
                 vintages,
                 epoch,
                 synthetic,
+                boundary=boundary,
             ):
                 continue
             cadence = frozen_values(get_hypothesis_by_id(conn, variant.hypothesis_id))[CADENCE_KEY]
@@ -539,16 +565,20 @@ def _variant_state(
     epoch: int | None,
     synthetic: bool,
     variant: SweepVariant | None = None,
+    *,
+    boundary: date | None,
 ) -> VariantState:
     """One variant's state under req 2 (`sweep_state`'s docstring): a variant
-    awaiting a stopped `--rerun` is stale whatever its earlier trial."""
+    awaiting a stopped `--rerun` is stale whatever its earlier trial, and so is one
+    whose latest `ok` trial ran over another window than its default window under
+    the development `boundary` (module docstring, the window test)."""
     if variant is None:
         variant = next(
             v
             for v in lab_registry.sweep_variants(conn, sweep_id)
             if v.hypothesis_id == hypothesis_id
         )
-    window = default_window(conn, hypothesis_id, sweep_id)
+    window = default_window(conn, hypothesis_id, sweep_id, boundary)
     counted = _counted_trial(conn, hypothesis_id, window, code_vintage, vintages, synthetic)
     awaiting = _awaiting_rerun(conn, hypothesis_id, sweep_id, epoch, synthetic)
     if not awaiting and counted is not None and _is_current(conn, counted, code_vintage, vintages):
@@ -569,9 +599,28 @@ def _variant_state(
     )
     if message is not None:
         return VariantState(variant, "terminal_failed", None, message)
+    if counted is None and boundary is not None:
+        counted = _other_window_trial(conn, hypothesis_id, window, synthetic)
     if counted is not None:
         return VariantState(variant, "stale", counted, None)
     return VariantState(variant, "unrun", None, None)
+
+
+def _other_window_trial(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, window: Window, synthetic: bool
+) -> TrialRow | None:
+    """The window test (module docstring): the latest `ok`, in-sample trial of the
+    variant (of the run's kind of store) that started at `window.start` but ended
+    elsewhere, so it ran under another development boundary; None when there is
+    none. Such a trial counts in N (`registry.family_sharpes` reads every `ok`
+    trial) and never selects: it is not over the default window."""
+    row = conn.execute(
+        _TRIAL_SELECT + "WHERE t.hypothesis_id = ? AND t.kind = 'in_sample' AND t.synthetic = ? "
+        "AND r.status = 'ok' AND t.start_session = ? AND t.end_session <> ? "
+        "ORDER BY t.trial_id DESC LIMIT 1",
+        [hypothesis_id, synthetic, window.start, window.end],
+    ).fetchone()
+    return None if row is None else TrialRow(*row)
 
 
 def _variant_done(
@@ -583,6 +632,8 @@ def _variant_done(
     vintages: dict[datetime, datetime | None],
     epoch: int | None,
     synthetic: bool,
+    *,
+    boundary: date | None,
 ) -> bool:
     """Whether a plain run skips the variant: current or terminal-failed."""
     state = _variant_state(
@@ -595,6 +646,7 @@ def _variant_done(
         epoch,
         synthetic,
         variant,
+        boundary=boundary,
     )
     return state.state in ("current", "terminal_failed")
 
@@ -614,6 +666,7 @@ def variant_states(
     max_failures = _max_failures_per_variant(conn, sweep_id)
     vintage = code_vintage if code_vintage is not None else code_tree_sha256()
     epoch = rerun_epoch(conn, sweep_id)
+    boundary = boundary_date(conn)
     vintages: dict[datetime, datetime | None] = {}
     return tuple(
         _variant_state(
@@ -626,6 +679,7 @@ def variant_states(
             epoch,
             synthetic,
             variant,
+            boundary=boundary,
         )
         for variant in lab_registry.sweep_variants(conn, sweep_id)
     )

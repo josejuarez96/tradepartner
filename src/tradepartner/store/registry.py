@@ -83,8 +83,17 @@ used once. `data_vintage` also takes the `made_at` of every command-written
 `after` row whose `sessions_from` is on or before the cutoff, so a release that
 only deletes rows stales the trials whose window it touched. `plan_release_import`
 and `import_release` read the hand-written `data/releases.toml` once; imported
-`after` rows move no vintage (`_release_vintage`). `development_boundary` reads
-the newest `development_boundary` row (ADR 0016), which nothing writes yet.
+`after` rows move no vintage (`_release_vintage`).
+
+**The development boundary** (ADR 0016 points 1, 2 and 6; data-foundation plan
+T142b). `development_boundary` reads the newest `development_boundary` row by
+`made_at`; `write_development_boundary` is its one writer (`record_decision`
+refuses the kind), and refuses a date on or after the `holdout.start` of any
+registered non-oracle family (spent, unspent or forward) or on or before any such
+family's `in_sample_start` (`BoundaryRefused`). `open_trial` records the boundary
+in force on every trial (`trials.development_boundary`, NULL when there is none).
+`family_registered_on` is the day a family was first registered, from which a
+holdout is forward (`holdout.is_forward`).
 """
 
 from __future__ import annotations
@@ -487,8 +496,11 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
 
 
 #: The columns schema version 15 adds (`schema._PERIOD_COLUMNS`), by table.
+#: `development_boundary` is version 18's (#1319, T140b), absent on the same stores.
 _VERSION_15_COLUMNS: Final[dict[str, frozenset[str]]] = {
-    "trials": frozenset({"detail_level", "data_vintage", "code_tree_sha256"}),
+    "trials": frozenset(
+        {"detail_level", "data_vintage", "code_tree_sha256", "development_boundary"}
+    ),
     "trial_results": frozenset({"sharpe_unit"}),
 }
 
@@ -789,8 +801,9 @@ def open_trial(
     and the data vintage at `data_cutoff`, and records `detail_level`
     (`full` by default; a sweep variant's is the sweep's level, which
     `backtest.results.write_results` then must write; module docstring,
-    "Vintages"). Refuses an unknown detail level and
-    `synthetic=True` on the real store. Commit it in its own write chunk
+    "Vintages"), and the development boundary in force (`development_boundary`,
+    NULL when none; module docstring, "The development boundary"). Refuses an
+    unknown detail level and `synthetic=True` on the real store. Commit it in its own write chunk
     (module docstring, "Trial handle").
     """
     if detail_level not in DETAIL_LEVELS:
@@ -802,6 +815,7 @@ def open_trial(
     version, dirty = code_version(repo_dir)
     max_ingested = store_max_ingested_at(conn)
     vintage = data_vintage(conn, data_cutoff) if data_cutoff is not None else None
+    boundary = development_boundary(conn)
     trial_id = max(
         _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
     )
@@ -832,6 +846,7 @@ def open_trial(
                 "detail_level": detail_level,
                 "data_vintage": vintage,
                 "code_tree_sha256": code_tree_sha256(repo_dir),
+                "development_boundary": boundary.boundary if boundary is not None else None,
             },
         ),
     )
@@ -1073,11 +1088,14 @@ def record_decision(
     """Append an `owner_decisions` row (spec req 12) and return its id.
     `values` (the gap values at the time, say) are stored as canonical JSON.
     Refuses a blank reason and a trial or hypothesis id that does not exist.
-    `development_boundary` needs a version-18 store. A `data_release` row is
-    refused here: the release writers below are its only writers, so every such
-    row has the shape `data_vintage` reads."""
+    A `data_release` row is refused here: the release writers below are its only
+    writers, so every such row has the shape `data_vintage` reads. So is a
+    `development_boundary` row: `write_development_boundary` is its one writer, so
+    every boundary passes ADR 0016 point 6's refusals."""
     if kind == DATA_RELEASE_KIND:
         raise ValueError("a data_release row is written by the release writers only")
+    if kind == DEVELOPMENT_BOUNDARY_KIND:
+        raise ValueError("a development_boundary row is written by write_development_boundary only")
     return _insert_decision(
         conn,
         kind=kind,
@@ -1328,9 +1346,14 @@ def open_release(conn: duckdb.DuckDBPyConnection) -> DataRelease | None:
     return found[0] if found else None
 
 
+class BoundaryRefused(RegistryError):
+    """A development boundary ADR 0016 point 6 refuses: on or after a registered
+    non-oracle family's `holdout.start`, or on or before its `in_sample_start`."""
+
+
 def development_boundary(conn: duckdb.DuckDBPyConnection) -> DevelopmentBoundary | None:
-    """The newest `development_boundary` row by `made_at` (then by id), or None.
-    Nothing writes one until ADR 0016 is accepted and T142b lands."""
+    """The newest `development_boundary` row by `made_at` (then by id), or None
+    (`write_development_boundary` writes them)."""
     if not _has_table(conn, "owner_decisions"):
         return None
     row = conn.execute(
@@ -1346,6 +1369,73 @@ def development_boundary(conn: duckdb.DuckDBPyConnection) -> DevelopmentBoundary
         boundary=date.fromisoformat(json.loads(row[2])["date"]),
         reason=str(row[3]),
     )
+
+
+def boundary_date(conn: duckdb.DuckDBPyConnection) -> date | None:
+    """The newest development boundary's date (`development_boundary`), or None."""
+    found = development_boundary(conn)
+    return found.boundary if found is not None else None
+
+
+class Unread:
+    """The default of a caller's `boundary` argument it did not read from the store:
+    the callee reads `boundary_date` itself."""
+
+
+#: The one `Unread` value.
+UNREAD: Final = Unread()
+
+
+def write_development_boundary(
+    conn: duckdb.DuckDBPyConnection, *, boundary: date, reason: str
+) -> int:
+    """Append a `development_boundary` row (ADR 0016 points 1 and 6) and return its id.
+
+    A new row is the only way the boundary moves; it never edits an older one. Refuses
+    (`BoundaryRefused`, nothing written) a boundary on or after the `holdout.start` of
+    any registered non-oracle family, spent, unspent or forward, so no exam month can
+    become a development month, and a boundary on or before any such family's
+    `in_sample_start`, so every family keeps an in-sample session (the same line
+    `backtest.sweep.register` holds for a new registration). A blank reason is refused
+    as for every owner decision. Families are read from `hypotheses`, so a store
+    without the lab tables is checked too."""
+    rows = conn.execute(
+        "SELECT family, MIN(holdout_start), MAX(in_sample_start) FROM hypotheses "
+        "WHERE family <> ? GROUP BY family ORDER BY family",
+        [ORACLE_FAMILY],
+    ).fetchall()
+    exams = [f"{family} ({start})" for family, start, _ in rows if boundary >= start]
+    if exams:
+        raise BoundaryRefused(
+            f"development boundary {boundary} is on or after the holdout.start of "
+            f"{', '.join(exams)}: exam months never become development months"
+        )
+    early = [f"{family} ({start})" for family, _, start in rows if boundary <= start]
+    if early:
+        raise BoundaryRefused(
+            f"development boundary {boundary} is on or before the in_sample_start of "
+            f"{', '.join(early)}: no in-sample session would remain"
+        )
+    return _insert_decision(
+        conn,
+        kind=DEVELOPMENT_BOUNDARY_KIND,
+        reason=reason,
+        values={"date": boundary.isoformat()},
+        hypothesis_id=None,
+        trial_id=None,
+        made_at=utc_now(),
+    )
+
+
+def family_registered_on(conn: duckdb.DuckDBPyConnection, family: str) -> date | None:
+    """The UTC day `family` was first registered (its earliest `hypotheses` row), or
+    None for a family with no registration: the day a holdout is forward from (ADR
+    0016 point 4, `holdout.Frozen.registered_on`)."""
+    row = conn.execute(
+        "SELECT MIN(registered_at) FROM hypotheses WHERE family = ?", [family]
+    ).fetchone()
+    first = row[0] if row is not None else None
+    return None if first is None else first.astimezone(UTC).date()
 
 
 def _release_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:

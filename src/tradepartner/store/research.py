@@ -37,6 +37,15 @@ reasons are recorded only on a run that opens. Commit `open_run` in its own writ
 chunk before any other work. `synthetic=True` is refused on `settings.store.path`
 (file identity, `store.registry`'s check).
 
+**The development boundary** (ADR 0016 point 2; data-foundation plan T142b). For a
+registration that names a backtest family, `open_run` reads
+`store.registry.development_boundary` once and treats it as one more protected edge,
+checked right after the window gate: a registration window that reads a session after
+the boundary outside every one of the family's holdouts (a dead month, or a session
+past the last `holdout.end`) is `refused_window`, with no flag to override it. A
+window past the boundary inside a holdout is the holdout gate's, as before (it needs
+`--spend-holdout`). With no boundary row, or no family, nothing changes.
+
 **Results** (reqs 6, 8). `close_run` records any non-`ok` outcome; `write_result`
 records `ok` with a verdict computed from the interval, or `failed` when more
 configurations were evaluated than declared, the export's hash moved, or the
@@ -51,13 +60,14 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final, Literal
 
 import duckdb
 
+from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, get_settings
 from tradepartner.research import (
     EVERY_ROW_SPLITS,
@@ -72,6 +82,7 @@ from tradepartner.research.gates import (
     PriorSpend,
     Reasons,
     Span,
+    WindowDecision,
     check_budget,
     check_confirmatory,
     check_holdout,
@@ -87,6 +98,7 @@ from tradepartner.store.registry import (
     _database_path,
     _is_real_store,
     _next_id,
+    boundary_date,
     canonical_params_json,
     code_version,
     store_max_ingested_at,
@@ -614,6 +626,35 @@ def _family_holdouts(conn: duckdb.DuckDBPyConnection, family: str | None) -> tup
     return tuple(Span(start, end) for start, end in rows)
 
 
+def _boundary_decision(
+    window: Span, family_holdouts: Sequence[Span], boundary: date | None
+) -> WindowDecision:
+    """The development boundary as a protected edge (module docstring): `refused_window`
+    when `window` reads a session after `boundary` that no family holdout covers. A day
+    past the calendar's last session counts as a session, so a window beyond the
+    configured calendar is refused rather than let through."""
+    if boundary is None or window.end <= boundary:
+        return WindowDecision("ok", "no session after the development boundary")
+    sessions = frozenset(all_sessions())
+    last = max(sessions)
+    day = max(window.start, boundary + timedelta(days=1))
+    dead: list[date] = []
+    while day <= window.end:
+        if (day in sessions or day > last) and not any(
+            h.start <= day <= h.end for h in family_holdouts
+        ):
+            dead.append(day)
+        day += timedelta(days=1)
+    if not dead:
+        return WindowDecision("ok", "sessions after the development boundary are holdout")
+    return WindowDecision(
+        "refused_window",
+        f"window [{window.start}, {window.end}] reads sessions after the development "
+        f"boundary {boundary} outside the family's holdouts ({dead[0]}..{dead[-1]}); "
+        "no flag reads them",
+    )
+
+
 def _prior_spends(
     conn: duckdb.DuckDBPyConnection, family: str | None, dataset_name: str, split: str
 ) -> tuple[tuple[PriorSpend, ...], bool]:
@@ -742,6 +783,8 @@ def open_run(
     )
 
     window_decision = check_window(dataset_span, window, as_of)
+    if window_decision.outcome == "ok" and registration.family is not None:
+        window_decision = _boundary_decision(window, family_holdouts, boundary_date(conn))
     split_decision = check_split(split, registration.splits)
     holdout = check_holdout(
         window,
