@@ -2736,13 +2736,13 @@ bears_on = ["spec:backtest"]
 
 [[claim]]
 id = "SH-1"
-statement = "Plain one-month (and weekly) short-term reversal has no post-publication edge in large or value-weighted US stocks: the largest-500 low-turnover reversal earns 2 bp/month (1963-2018), post-decimalization reversal 0.18%/month (t 0.62), and CZ value-weighted reversal -0.05%/month (t -0.11) after 1990."
+statement = "Plain one-month short-term reversal has no post-publication edge in large or value-weighted US stocks: the largest-500 low-turnover reversal earns 2 bp/month (1963-2018), post-decimalization reversal 0.18%/month (t 0.62), and CZ value-weighted reversal -0.05%/month (t -0.11) after 1990."
 kind = "empirical"
 grade = "NOT SUPPORTED"
 scope = "Large-cap or value-weighted US equities, monthly sorts, gross, long-short; post-publication"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
-note = "Refines QI-17 (MIXED, generic short-horizon) for our universe. Counter: De Groot, Huij & Zhou (2012) report 30-50 bp/week net in large caps to 2009, long-short."
+note = "Refines QI-17 (MIXED, generic short-horizon) for our universe; weekly reversal is not tested post-2009. Counter: De Groot, Huij & Zhou (2012) report 30-50 bp/week net in large caps to 2009, long-short."
 
 [[claim]]
 id = "SH-2"
@@ -2752,14 +2752,14 @@ grade = "SUPPORTED"
 scope = "Long-short, institutional effective-spread cost models (upward-biased after 2003); not our long-only, commission-free scale"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
-note = "Novy-Marx & Velikov (RFS 2016), Chen & Velikov (JFQA 2023), Blitz et al. (FAJ 2023: break-even costs below 25 bp at 1,300-2,000% turnover). Consistent with QI-21 and G4-8."
+note = "Novy-Marx & Velikov (RFS 2016), Chen & Velikov (JFQA 2023), Blitz et al. (FAJ 2023: break-even costs below 25 bp at 1,300-2,000% turnover). Consistent with QI-21 and G4-8. Counter: De Groot, Huij & Zhou (2012) 30-50 bp/week net in large caps to 2009; Blitz et al. find positive net alpha only by combining short-term signals with efficient trading rules."
 
 [[claim]]
 id = "SH-3"
-statement = "One-month industry momentum has disappeared since decimalization: 0.09%/month (t 0.34) value-weighted long-short over 2001-2021 against 0.68%/month (t 3.57) over 1973-2021."
+statement = "Industry momentum has no post-publication edge: one-month industry momentum earned 0.09%/month (t 0.34) value-weighted long-short over 2001-2021 against 0.68%/month (t 3.57) over 1973-2021, and the six-month industry signal 0.06%/month (t 0.18) after 1999."
 kind = "empirical"
 grade = "NOT SUPPORTED"
-scope = "US, Fama-French 49 industries, value-weighted, gross, long-short"
+scope = "US, value-weighted, gross, long-short; one-month (Fama-French 49 industries) and six-month (two-digit industries, CZ) signals"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
 note = "Dai, Medhat, Novy-Marx & Rizova (2023 WP); CZ IndMom (6-month signal) post-publication 0.06%/month (t 0.18)."
@@ -2790,10 +2790,10 @@ id = "SH-6"
 statement = "Drift after the three-day earnings-announcement return (EAR) persists after publication at reduced size: CZ value-weighted long-short 0.99%/month (t 4.47) post-1996 and 0.81%/month (t 3.12) in 2010-2024, Dai et al. 0.36%/month (t 2.09) in 2001-2021, and Novy-Marx & Velikov a significant 0.34%/month net to 2013; the long leg alone is +0.07 to +0.32%/month gross over the average portfolio in 2010-2024."
 kind = "empirical"
 grade = "MIXED"
-scope = "US, monthly hold after the announcement window, long-short; size-screened CZ version 0.25%/month (t 2.15) in 2010-2024; 2019-2023 alone insignificant in both files; long-only net at 15 bp/side about zero"
+scope = "US, monthly hold after the announcement window, long-short; size-screened CZ version 0.25%/month (t 2.15) in 2010-2024; 2019-2023 alone insignificant in both files; long-only net at 15 bp/side about 0 to -0.2%/month"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
-note = "Rank 1 of the report. Needs the earnings-release time (SH-12); a 10-Q-keyed version is a different, untested event (ER-6). CZ figures are the team's own computation."
+note = "Rank 1 of the report. Needs the earnings-release time (SH-12), with breakpoints only from windows closed before entry and day 0 the first session opening after the 8-K acceptance; a 10-Q-keyed version is a different, untested event (ER-6). CZ figures are the team's own computation."
 
 [[claim]]
 id = "SH-7"
@@ -2809,21 +2809,21 @@ note = "The one earnings-surprise signal our XBRL `revenue` fact supports withou
 id = "SH-8"
 statement = "The US earnings-announcement premium (buying expected announcers) has disappeared since the 2004 8-K disclosure regulation: the value-weighted weekly premium fell from 32.6 bp to an insignificant 8.7 bp."
 kind = "empirical"
-grade = "NOT SUPPORTED"
+grade = "INSUFFICIENT"
 scope = "US, weekly announcer vs non-announcer portfolios, gross; one Tier 1 working paper"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
-note = "Heitz, Narayanamoorthy & Zekhnini (2020 WP); the premium persists internationally, not in the US."
+note = "INSUFFICIENT: one Tier 1 working paper (auditor regrade from NOT SUPPORTED before merge). Heitz, Narayanamoorthy & Zekhnini (2020 WP); the premium persists internationally, not in the US."
 
 [[claim]]
 id = "SH-9"
 statement = "Last month's winners among high-turnover stocks keep winning (short-term momentum): the largest-500 long-short earns 0.42%/month (t 4.91) gross and the full-sample strategy 1.00%/month net of half-spreads, 1963-2018, with about 90% one-sided monthly turnover."
 kind = "empirical"
-grade = "MIXED"
+grade = "INSUFFICIENT"
 scope = "US large caps, monthly, long-short; one Tier 1 source with in-paper international out-of-sample; no post-2018 US test found; long-only leg not reported"
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
-note = "Medhat & Schmeling (RFS 2022). Against: no short-term momentum in China (abstract). Data held (bars' volume, shares outstanding). Rank 2 of the report."
+note = "INSUFFICIENT: one qualifying source (auditor regrade from MIXED before merge). Medhat & Schmeling (RFS 2022). Against: no short-term momentum in China (abstract). Data held (bars' volume, shares outstanding). Rank 2 of the report."
 
 [[claim]]
 id = "SH-10"
