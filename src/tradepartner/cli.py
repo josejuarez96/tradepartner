@@ -400,7 +400,7 @@ class StorePriceSource(PriceSource):
         self._fill_handovers = fill_handovers  # #1314: `--fill-holes` lands rule-8 bars
         self._fetch_bars = fetch_bars or (
             lambda symbols, start, end, *, asof=None: alpaca_raw.daily_bars(
-                symbols, start, end, asof=asof, settings=settings
+                symbols, start, end, asof=asof, settings=settings, clock=clock
             )
         )
         self._fetch_actions = fetch_actions or (
