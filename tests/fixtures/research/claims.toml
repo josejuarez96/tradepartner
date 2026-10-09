@@ -58,3 +58,19 @@ kind = "empirical"
 grade = "UNGRADED"
 scope = "fixture"
 source = "fixture"
+
+[[claim]]
+id = "ER-14"
+statement = "Fixture claim mirroring the real ER-14 (typed decision models classify disclosures), for the departure-reason experiment fixtures."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "fixture"
+source = "fixture"
+
+[[claim]]
+id = "ER-15"
+statement = "Fixture claim mirroring the real ER-15 (a decision head follows the option name), for the departure-reason experiment fixtures."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "fixture"
+source = "fixture"
