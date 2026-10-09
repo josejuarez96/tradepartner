@@ -481,6 +481,31 @@ def test_label_scores_a_gold_split_on_a_non_synthetic_run(s: Settings) -> None:
     assert datafiles.inference_path(s, 1).is_file()
 
 
+def test_label_reversed_order_pass_uses_drift_registration(s: Settings) -> None:
+    gold_id, baseline = _baseline(s)
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-drift",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        "--reversed-order-baseline-run",
+        str(baseline),
+        client=lambda _s, _h: client,
+    )
+    assert result.exit_code == 0, result.output
+    assert "run 2: ok" in result.output
+    assert "flip_rate: 0.000; unresolved share: 0.000" in result.output
+    assert len(client.requests) == 1
+    assert next(iter(client.requests[0].criteria)) == "unresolved"
+
+
 def test_label_runs_a_frame_batch_after_the_drift_probe(s: Settings) -> None:
     run_id = _batch(s)
     assert _count(s, "SELECT count(*) FROM research_results WHERE run_id = ?", run_id) == 0

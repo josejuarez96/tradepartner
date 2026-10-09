@@ -58,6 +58,14 @@ def test_hash_changes_on_reorder() -> None:
     assert base.hash != reordered.hash
 
 
+def test_reversed_option_set_keeps_ids_and_descriptions() -> None:
+    reversed_set = questions.REVERSED_OPTION_SET
+    assert reversed_set.options == tuple(reversed(questions.DEFAULT_OPTION_SET.options))
+    assert reversed_set.instructions == questions.DEFAULT_OPTION_SET.instructions
+    assert reversed_set.hash != questions.DEFAULT_OPTION_SET.hash
+    assert set(reversed_set.criteria) == set(questions.DEFAULT_OPTION_SET.criteria)
+
+
 def test_hash_changes_on_a_description_edit() -> None:
     base = questions.OptionSet(version="1", instructions="i", options=questions.DEFAULT_OPTIONS)
     name, description = questions.DEFAULT_OPTIONS[0]

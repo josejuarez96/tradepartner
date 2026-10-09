@@ -341,6 +341,7 @@ from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
 from tradepartner.research.labeling import frame as labeling_frame
 from tradepartner.research.labeling import gold, job, review
+from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
 from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import (
     journal,
@@ -2744,6 +2745,10 @@ def make_app(
         drift_baseline_run: Annotated[
             int | None, typer.Option(help="a batch: the frozen configuration's dev run")
         ] = None,
+        reversed_order_baseline_run: Annotated[
+            int | None,
+            typer.Option(help="reversed dev pass: baseline pilot dev run to compare"),
+        ] = None,
         spend_holdout: Annotated[
             bool, typer.Option(help="score the sealed pilot period (needs a reason)")
         ] = False,
@@ -2790,6 +2795,14 @@ def make_app(
             raise _fail("--spend-holdout needs a non-blank --holdout-reason", USAGE_ERROR)
         if holdout_reason is not None and not spend_holdout:
             raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
+        if reversed_order_baseline_run is not None and (
+            slug != job.DRIFT_SLUG or split != "dev" or reversed_order_baseline_run < 1
+        ):
+            raise _fail(
+                "--reversed-order-baseline-run needs departure-reason-drift on dev "
+                "and a positive baseline run id",
+                USAGE_ERROR,
+            )
         drift_flags = (drift_gold, drift_baseline_run)
         drift: job.DriftProbe | None = None
         if split in job.FRAME_SPLITS:
@@ -2818,7 +2831,13 @@ def make_app(
                         dataset,
                         split,
                         model=model,
+                        option_set=(
+                            REVERSED_OPTION_SET
+                            if reversed_order_baseline_run is not None
+                            else DEFAULT_OPTION_SET
+                        ),
                         drift=drift,
+                        reversed_baseline_run_id=reversed_order_baseline_run,
                         flags=ResearchFlags(spend_holdout=spend_holdout),
                         reasons=ResearchReasons(holdout_reason=holdout_reason),
                         configurations=configurations,
@@ -2856,6 +2875,11 @@ def make_app(
             typer.echo(f"  {_scrubbed(result.message, s)}")
         if result.inferences_dataset_id is not None:
             typer.echo(f"  inference records: dataset {result.inferences_dataset_id}")
+        if result.flip_rate is not None and result.unresolved_share is not None:
+            typer.echo(
+                f"  flip_rate: {result.flip_rate:.3f}; "
+                f"unresolved share: {result.unresolved_share:.3f}"
+            )
         if result.packets_refused:
             typer.echo(f"  packets refused (over the token cap): {len(result.packets_refused)}")
         if result.shortlist is not None:
