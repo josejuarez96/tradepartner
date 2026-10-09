@@ -326,6 +326,28 @@ def test_checks_state_needs_the_exact_commit_and_completed_runs() -> None:
     assert ready_pr.checks_state(hc("abc", twice), "abc") == "failure"
 
 
+def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> None:
+    """#1254: a draft run cancelled by the labelled `ci:full` run leaves its matrix job as
+    the bare ``pytest-shard`` (cancelled), while the full run reports its shards as
+    ``pytest-shard (N)``. The stale cancel is superseded, not a failure, so the head is
+    green once the full run's ``checks`` succeeds -- ready_pr must not report CI failure."""
+    hc = ready_pr.HeadChecks
+    cr = ready_pr.CheckRun
+    cancelled_draft = (
+        cr("checks-fast", "COMPLETED", "CANCELLED"),
+        cr("claims", "COMPLETED", "CANCELLED"),
+        cr("checks (draft, no shards)", "COMPLETED", "FAILURE"),
+        cr("pytest-shard", "COMPLETED", "CANCELLED"),
+    )
+    full_run = (
+        cr("checks-fast", "COMPLETED", "SUCCESS"),
+        cr("claims", "COMPLETED", "SUCCESS"),
+        *[cr(f"pytest-shard ({i})", "COMPLETED", "SUCCESS") for i in range(8)],
+        cr("checks", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", (*cancelled_draft, *full_run)), "abc") == "success"
+
+
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
 
 

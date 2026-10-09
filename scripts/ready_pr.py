@@ -79,6 +79,7 @@ VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
+MATRIX_SUFFIX_RE = re.compile(r" \(\d+\)$")
 STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
@@ -324,6 +325,18 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     return sorted(r for r in required if latest.get(r) != "pass")
 
 
+def matrix_base(name: str) -> str:
+    """A matrix job's bare name: ``pytest-shard (3)`` -> ``pytest-shard``.
+
+    GitHub reports a matrix job both as the base name (when the whole matrix is skipped or
+    cancelled before it fans out) and as ``<base> (<index>)`` for each child. Comparing the
+    base names lets a cancelled ``pytest-shard`` match the full run's ``pytest-shard (N)``
+    children, so the superseded cancel does not read as a failure (#1254). A plain name is
+    returned unchanged.
+    """
+    return MATRIX_SUFFIX_RE.sub("", name)
+
+
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
@@ -339,21 +352,25 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     aggregator is ``checks (draft, no shards)``, which gates nothing and is ignored here,
     so a draft's head stays pending until a full run reports ``checks``. That full run
     (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
-    a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
-    the superseded run does not read as a failure. A lone ``CANCELLED`` ``checks`` with
-    every run on the head completed is ``cancelled`` (#1201): the caller may re-trigger
-    once, and it is never green. Any other lone ``CANCELLED`` still fails.
+    a ``CANCELLED`` run is ignored when another run of the same (matrix base) name is on
+    the head, so the superseded run does not read as a failure -- including a cancelled
+    ``pytest-shard`` whose full run reported ``pytest-shard (N)`` (#1254). A lone
+    ``CANCELLED`` ``checks`` with every run on the head completed is ``cancelled`` (#1201):
+    the caller may re-trigger once, and it is never green. Any other lone ``CANCELLED``
+    still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
     live = [r for r in checks.runs if r.name != DRAFT_CHECKS]
     not_cancelled = {
-        r.name
+        matrix_base(r.name)
         for r in live
         if r.conclusion.upper() != "CANCELLED" or r.status.upper() != "COMPLETED"
     }
     runs = [
-        r for r in live if not (r.conclusion.upper() == "CANCELLED" and r.name in not_cancelled)
+        r
+        for r in live
+        if not (r.conclusion.upper() == "CANCELLED" and matrix_base(r.name) in not_cancelled)
     ]
     if not any(r.name == "checks" for r in runs):
         return "pending"
