@@ -2828,9 +2828,9 @@ def make_app(
                         run_by=_REGISTERED_BY,
                     )
                 except (Exception, KeyboardInterrupt) as exc:
-                    # Commit what the job wrote (its run rows, a `failed` close) rather
-                    # than roll it back: the run's records file already exists. A run
-                    # the job left open (Ctrl-C reaches no `close_run`) is closed here.
+                    # The job already committed each run row before calls. Close a
+                    # run left open by Ctrl-C or another failure, then commit that
+                    # close on exit from open_for_write.
                     failure = exc
                     opened = _close_open_runs(conn, s, before, _describe(exc))
         except StoreLockedError as exc:
