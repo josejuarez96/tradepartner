@@ -506,6 +506,33 @@ def test_label_reversed_order_pass_uses_drift_registration(s: Settings) -> None:
     assert next(iter(client.requests[0].criteria)) == "unresolved"
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [("--limit", "1"), ("--accepted-from", "2016-01-01"), ("--accepted-to", "2016-12-31")],
+)
+def test_reversed_pass_refuses_filters_before_open(s: Settings, extra: tuple[str, str]) -> None:
+    gold_id, baseline = _baseline(s)
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-drift",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        "--reversed-order-baseline-run",
+        str(baseline),
+        *extra,
+        client=lambda _s, _h: ScriptedModelClient([]),
+    )
+    assert result.exit_code == 2
+    assert "--reversed-order-baseline-run cannot use" in result.output
+    assert _count(s, "SELECT count(*) FROM research_runs") == 1
+
+
 def test_label_runs_a_frame_batch_after_the_drift_probe(s: Settings) -> None:
     run_id = _batch(s)
     assert _count(s, "SELECT count(*) FROM research_results WHERE run_id = ?", run_id) == 0

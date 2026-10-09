@@ -2803,6 +2803,14 @@ def make_app(
                 "and a positive baseline run id",
                 USAGE_ERROR,
             )
+        if reversed_order_baseline_run is not None and (
+            limit is not None or start is not None or end is not None
+        ):
+            raise _fail(
+                "--reversed-order-baseline-run cannot use --limit, --accepted-from "
+                "or --accepted-to",
+                USAGE_ERROR,
+            )
         drift_flags = (drift_gold, drift_baseline_run)
         drift: job.DriftProbe | None = None
         if split in job.FRAME_SPLITS:

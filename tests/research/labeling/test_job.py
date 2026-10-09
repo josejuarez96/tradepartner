@@ -756,6 +756,56 @@ def test_reversed_dev_pass_reports_flip_and_unresolved_against_baseline(world: W
     )
 
 
+def test_reversed_pass_skips_non_ok_baseline_before_open(world: World) -> None:
+    gold_id = world.gold(_dev(2), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER), Timeout()]), gold_id, "dev")
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+    assert result.outcome == "ok"
+    assert len(client.requests) == 1
+    assert json.loads(world.result(result.run_id)["exploratory"])["skipped_baseline"] == ["D01"]
+
+
+def test_reversed_pass_uses_only_limited_baseline_items(world: World) -> None:
+    gold_id = world.gold(_dev(2), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev", limit=1)
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+    assert result.outcome == "ok"
+    assert len(client.requests) == 1
+    assert json.loads(world.result(result.run_id)["exploratory"])["skipped_baseline"] == ["D01"]
+
+
+def test_reversed_pass_with_no_ok_baseline_opens_nothing(world: World) -> None:
+    gold_id = world.gold(_dev(1), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Timeout()]), gold_id, "dev")
+    before = world.conn.execute("SELECT count(*) FROM research_runs").fetchone()
+    with pytest.raises(ValueError, match="no comparable baseline"):
+        world.run(
+            ScriptedModelClient([]),
+            gold_id,
+            "dev",
+            slug=job.DRIFT_SLUG,
+            option_set=questions.REVERSED_OPTION_SET,
+            reversed_baseline_run_id=baseline.run_id,
+        )
+    assert world.conn.execute("SELECT count(*) FROM research_runs").fetchone() == before
+
+
 # --- review fixes: the run lock, the month rollover, billed refusals, the estimate --------
 
 
