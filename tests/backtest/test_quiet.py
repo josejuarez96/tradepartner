@@ -119,7 +119,7 @@ def test_paper_interval_on_a_session() -> None:
     interval = paper_interval(MONDAY, _settings(), True, _session_open(MONDAY))
     assert interval is not None
     assert interval.start == _ny(MONDAY, 7, 30)
-    assert interval.end == _ny(MONDAY, 10, 15)
+    assert interval.end == _ny(MONDAY, 10, 5)  # 09:30 + 30 + 5 (T70: sell wait 300 s)
 
 
 def test_paper_interval_moves_with_the_paper_keys() -> None:
@@ -141,7 +141,7 @@ def test_paper_interval_on_a_weekday_holiday_uses_the_regular_open() -> None:
     interval = paper_interval(THANKSGIVING, _settings(), True, None)
     assert interval is not None
     assert interval.start == _ny(THANKSGIVING, 7, 30)
-    assert interval.end == _ny(THANKSGIVING, 10, 15)
+    assert interval.end == _ny(THANKSGIVING, 10, 5)
 
 
 def test_no_paper_interval_without_an_open_window_or_off_the_quiet_weekdays() -> None:
@@ -174,7 +174,7 @@ def test_overlapping_intervals_merge() -> None:
     monday = [i for i in intervals if i.start.astimezone(NY).date() == MONDAY]
     assert len(monday) == 1
     assert monday[0].start == _ny(MONDAY, 7)
-    assert monday[0].end == _ny(MONDAY, 10, 15)
+    assert monday[0].end == _ny(MONDAY, 10, 5)
 
 
 def test_next_quiet_interval_and_in_quiet_interval() -> None:

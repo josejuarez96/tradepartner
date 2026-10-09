@@ -79,32 +79,27 @@ Until this is verified, the claim that the universe is reproducible at any histo
 - Reversibility: cheap for thresholds (config, subject to the pre-registration guard); moderate for the universe definition, because every registered trial depends on it. Changing the definition after trials exist means new trials, not edited ones.
 - Revisit if: the survivorship gap or the unclassifiable count concentrates near the cap cut; paper fills diverge from the cost model at month end; the strategy spec needs a different formation window; or the Phase 3 strategy spec finds that ~$100 across the chosen position count falls below Alpaca's fractional minimum per order.
 
-## Amendment draft — 2026-09-27: Phase 4 paper execution (T70, #294)
+## Amendment 2026-10-09: Phase 4 paper execution (T70, #294)
 
-**Status: Proposed; blocked on Probe 3's report (#182).** This is the execution
-half of the [ADR 0005 amendment](0005-objective-benchmark-stop-criteria.md#amendment-draft--2026-09-27-phase-4-residual-tracking-t70-294),
-under the owner's [#247 Q4/Q14 decision](https://github.com/josejuarez96/tradepartner/issues/247#issuecomment-5851267262).
-Both halves and the measured timing defaults must merge before `paper start`.
+**Status: Accepted by the owner's merge of PR #297 (#247 Q4 and Q14; drafted 2026-09-27, completed 2026-10-09 once Probe 3 reported).** This is the execution half of the [ADR 0005 amendment](0005-objective-benchmark-stop-criteria.md#amendment-2026-10-09-phase-4-residual-tracking-t70-294); both halves merge before `paper start` (T71).
 
-For Phase 4, this supersedes the cadence paragraph's requirement for the same
-T+1 close in both backtest and paper ("never a mix"). H1's registered
-`execution.fill_price = close` remains frozen: its backtest and benchmarks keep
-the frozen close convention. Paper executes market DAY orders in two phases at
-the NBBO after the open: sells first, then buys after every sell is terminal or
-`paper.sell_wait_seconds` has elapsed since the open, sized from the account's
-then-current cash as specified in paper-trading requirement 2. Paper fills are
-not opening-auction fills or fills at the backtest's close. Signals still use
-only information known at the preceding rebalance cutoff.
+**Paper executes at the NBBO after the open; the backtest fills at the frozen close.** For Phase 4 this supersedes the cadence paragraph's "T+1 close for both backtest and paper, never a mix". H1's registered `execution.fill_price = close` stays frozen: its backtest and benchmarks keep the close convention. Paper executes market DAY orders in two phases: sells, by quantity, submitted before the open inside the submit window; then buys, by notional, submitted after every sell is terminal or `paper.sell_wait_seconds` has elapsed since the open, sized from the account's then-current cash (paper-trading requirement 3). Paper fills are not opening-auction fills and not the backtest's close; the ADR 0005 residual check accounts for the difference while always showing the raw series. Signals still use only information known at the preceding rebalance cutoff. Nothing here changes H1's registration, the monthly cadence or the universe.
 
-[#86's report](../research/2026-09-25-alpaca-open-and-depth.md) documents the
-simulator's NBBO matching and lack of dividends. The ADR 0005 residual check
-accounts for the dividend and fill-timing differences while always showing the
-raw series; missed and override months are excluded and listed under that rule.
-This does not change H1's registration, monthly cadence, universe, or frozen
-backtest fill convention.
+**What Probe 3 found about the paper simulator** ([report](../research/2026-10-09-probe3-preopen-fills.md), #182; the protocol is in [#86's report](../research/2026-09-25-alpaca-open-and-depth.md)):
+- a fractional (notional) order queued before the open is released at a fixed pre-open time and filled at the official opening print, within 2 s of 09:30 ET (4 of 4);
+- a whole-share order queued before the open fills at the NBBO ask 17 to 118 s after the open (median 53 s), −9 to +35 bps from the official open (4 of 4);
+- an OPG order expires unfilled on paper (4 of 4), so OPG is not a usable order type for the paper stage and the two-phase NBBO design above stands;
+- every order is acknowledged within milliseconds of submission; the T48b recording ([alpaca-paper-facts](../research/2026-10-08-alpaca-paper-facts.md)) shows during-hours market orders filled at the first poll, which is the case the buys phase meets.
 
-[Probe 3 (#182)](https://github.com/josejuarez96/tradepartner/issues/182) must supply
-the measured latency and fill-price gaps before the six runtime timing keys in
-the [spec's Config keys note](../specs/paper-trading.md#t70-amendment-draft--2026-09-27)
-are finalized. No latency has been measured in this draft; the existing values
-remain placeholders and do not establish readiness for T71.
+**The six timing keys (#247 Q14), set from that evidence.** All six are run-time keys (not frozen into the window), so a value the first paper window proves wrong is changed in config with a dated note in the spec, not by a new amendment. The values and the reasoning:
+
+| Key | Was | Now | Why |
+|---|---|---|---|
+| `paper.submit_window_before_open_minutes` | 90 | **90** (kept) | Probe 3 submitted 25 to 29 minutes before the open and the orders were accepted and held until 09:30; it did not test an earlier submission, so nothing measured moves this edge. The scheduling runbook's 08:05 ET job and `lab.paper_run_lead_minutes` rest on it. |
+| `paper.submit_window_after_open_minutes` | 30 | **30** (kept) | Unmeasured: the probe submitted before the open only. A run that starts late but inside 30 minutes trades at the then-current NBBO (the T48b during-hours case) and pays intraday drift, not a missed session; a tighter edge would turn a late wake into a `pending` rebalance for no measured gain. |
+| `paper.sell_wait_seconds` | 900 | **300** | The slowest of the four whole-share fills was 118.5 s after the open and the slowest fractional 2.0 s. 300 s is about two and a half times the worst observed and keeps the buys phase inside the first five minutes, where the fill-timing term is smallest. The wait ends as soon as every sell is terminal, so the key binds only on a sell that has not filled by 09:35; buys are then sized from the cash on hand and the shortfall shows as unspent cash (`risk.max_unspent_cash_fraction`). **Sells were not probed**: this rests on four buy fills from two sessions, used as a proxy. |
+| `paper.poll_interval_seconds` | 15 | **5** | Fills landed 17 s after the open at the earliest for a whole share and 1 s for a fraction; a 15 s poll could add up to 15 s between the last sell's fill and the buys, a 5 s poll at most 5 s plus one paced sweep of the open sells (`alpaca.trading_requests_per_minute`, 0.4 s per read). The pacer, not this key, bounds the request rate. It stays at most `paper.accept_wait_seconds` (req 3(f)). |
+| `paper.accept_wait_seconds` | 30 | **30** (kept) | Every probe order's acknowledgement stamp was 5 to 14 ms after creation, and T48b saw fills at the first poll 3 to 4 ms after submit. The deadline binds only on a fault, where 30 s is already a thousand times the measured latency; shortening it buys nothing and risks a false halt on a slow broker response. |
+| `paper.fill_read_overlap_seconds` | 60 | **60** (kept) | Probe 3 did not read `fills(since)`. The overlap guards the skew between the journal's `known_at` and the broker's fill stamps, which `risk.max_broker_clock_skew_seconds = 60` already bounds and the run pre-checks; the measured fill stamps sat 25 to 29 minutes after their submits, far outside any overlap. Probe 3 did show that Alpaca restamps a queued fractional order's `submitted_at` to its pre-open release time (09:23 ET on both sessions), which confirms that the cursor rests on the journal's own `known_at`, never on the broker's `submitted_at`. |
+
+**How two sessions limit this.** The two changed values rest on four buy fills on two sessions in two liquid large-cap names, on paper. They bound nothing: the worst case observed is the largest of four, not a tail. The four kept values rest on the probe not contradicting them, not on a measurement that supports them. `paper.sell_wait_seconds = 300` is the one value a thin sample could make wrong in a way that costs money (a buys phase sized before a slow sell fills); it is a run-time key, and the first fill session's `orders` and `fills` rows are the check: a sell still open at 09:35 on a normal session is a reason to raise it with a dated note in the spec, no amendment needed.
