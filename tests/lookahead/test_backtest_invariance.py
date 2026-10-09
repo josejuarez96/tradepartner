@@ -446,7 +446,8 @@ def test_the_run_is_not_vacuous(fixture: Fixture, longest: Results) -> None:
     assert len(fixture.sessions) >= 30
     # The frozen cadence reached the engine: it rebalanced on exactly the case's sessions.
     assert [row.session for row in result.rebalances] == list(fixture.sessions[:-1])
-    assert max(row.n_targets for row in result.rebalances) >= 3
+    # The screened case ranks at most three screened names, so it targets at most two.
+    assert max(row.n_targets for row in result.rebalances) >= (2 if fixture.case.screened else 3)
     assert sum(row.turnover > 0 for row in result.rebalances) >= 10
     # The walk crosses seeded revisions on held names: at most seeded T_k a seeded
     # name is held at the close whose bar is revised, and late dividends are counted.
