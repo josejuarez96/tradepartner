@@ -123,3 +123,11 @@ def test_below_one_the_plan_screens_before_the_rank_and_reports_the_counts() -> 
     assert plan.exclusions == {"no_history": ("C",), "no_turnover": ("B", "D", "E")}
     assert list(plan.scores) == ["A"]
     assert set(plan.targets) == {"A"}
+
+
+def test_oracle_never_screens_even_below_one() -> None:
+    """The key is `momentum`'s rule: `oracle` shares its signal but not the screen."""
+    provider = _screen_provider()
+    plan = engine.plan(provider, _screen_params(0.5), T_SESSION, "oracle")
+    assert "turnover_inputs" not in {call.method for call in provider.calls}
+    assert plan.counts == {"n_excluded_no_history": 1}

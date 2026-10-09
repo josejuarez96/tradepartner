@@ -34,6 +34,7 @@ class SignalResult:
 class _MomentumRead:
     frame: pl.DataFrame
     turnover: TurnoverInputs | None = None
+    formation: tuple[date, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,22 @@ def _momentum_read(
     if not _screens(params):
         return _MomentumRead(frame)
     formation = formation_sessions(session, schedule.rebalance_cadence)
-    return _MomentumRead(frame, provider.turnover_inputs(t, members, formation[0]))
+    return _MomentumRead(frame, provider.turnover_inputs(t, members, formation[0]), formation)
+
+
+def _oracle_read(
+    provider: DataProvider,
+    params: Settings,
+    session: date,
+    t: datetime,
+    members: Sequence[str],
+) -> _Read:
+    """Momentum's price read without the screen: B10's key is `momentum`'s alone
+    (registration refuses `oracle` off 1.0), so `oracle` never screens or reports it."""
+    unscreened = params.model_copy(
+        update={"strategy": params.strategy.model_copy(update={"turnover_top_fraction": 1.0})}
+    )
+    return _momentum_read(provider, unscreened, session, t, members)
 
 
 def _momentum_signal(
@@ -110,7 +126,7 @@ def _momentum_signal(
     if read.turnover is not None:
         screen = turnover_screen(
             read.turnover,
-            formation_sessions(session, schedule.rebalance_cadence),
+            read.formation,
             session,
             strategy.turnover_top_fraction,
             security_ids=members,
@@ -241,7 +257,7 @@ def _combined_signal(
 # `Plan.exclusions` and `Plan.counts` carry exactly the names each family declares.
 _FAMILY_IO: Mapping[HypothesisFamily, tuple[tuple[str, ...], _Reader, _Signal]] = {
     "momentum": (("adjusted_prices",), _momentum_read, _momentum_signal),
-    "oracle": (("adjusted_prices",), _momentum_read, _momentum_signal),
+    "oracle": (("adjusted_prices",), _oracle_read, _momentum_signal),
     "profitability": (("statement_facts", "sics"), _profitability_read, _profitability_signal),
     "combined": (("adjusted_prices", "statement_facts", "sics"), _combined_read, _combined_signal),
 }
