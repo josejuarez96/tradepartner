@@ -45,7 +45,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
-from tradepartner.config import Settings
+from tradepartner.config import Settings, secret_values
 from tradepartner.health import statement_counts
 from tradepartner.ingest import (
     DARK,
@@ -2380,8 +2380,18 @@ def _secret_offenders(model: type[Any]) -> list[str]:
 def test_secrets_live_only_in_top_level_secretstr_fields() -> None:
     """`config.secret_values` finds secrets among `Settings`' own fields by type;
     a secret nested in a sub-model, a container or `SecretBytes` would be missed,
-    so this pins that none exists (#334 review)."""
-    assert _secret_offenders(Settings) == []
+    so this pins that none exists (#334 review), except the per-book paper pairs
+    (ADR 0017 B.1, T153), which `secret_values` walks by name; that walk is pinned
+    here too, so a second nested secret still fails this test."""
+    assert sorted(_secret_offenders(Settings)) == [
+        "alpaca_paper_books.api_key",
+        "alpaca_paper_books.api_secret",
+    ]
+    settings = Settings(
+        _env_file=None,
+        alpaca_paper_books={"b": {"api_key": "pk-nested-1", "api_secret": "ps-nested-2"}},
+    )
+    assert {"pk-nested-1", "ps-nested-2"} <= set(secret_values(settings))
 
 
 def test_the_secret_guard_flags_what_the_scrub_would_miss() -> None:
