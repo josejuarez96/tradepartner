@@ -12,7 +12,9 @@ floors. The rest of the file is prose, hashed with the block.
 `parse_sweep_file` applies every **file-level** refusal of req 1, each as its own
 `SweepFileError` subclass: a family signal-section or `costs.*` key, or
 `schedule.rebalance_cadence`, neither fixed nor gridded; a key both fixed and gridded; an
-axis outside `lab.sweepable_keys` (or under `FORBIDDEN_AXIS_PREFIXES`); a `[lab]` block
+axis outside `lab.sweepable_keys` (or under `FORBIDDEN_AXIS_PREFIXES`); a
+`hypothesis.FAMILY_ONLY_KEYS` key gridded, or fixed off its default, in another family's
+sweep (backtest spec amendment #1358); a `[lab]` block
 missing a field, with `promote_at_least` below `lab.promotion_min_dsr_excess`, or with
 `retire_below >= promote_at_least` under `dsr_excess`; `dsr_excess` with a cadence axis;
 a grid value off its `lab.axis_lattice` step; two grid values that validate (or fall on
@@ -462,6 +464,18 @@ def parse_sweep_file(path: Path, settings: Settings | None = None) -> SweepFile:
                 f"{path}: grid axis {axis} is not in lab.sweepable_keys "
                 f"({', '.join(settings.lab.sweepable_keys)})"
             )
+    for axis in grid_lists:
+        owner = hypothesis.FAMILY_ONLY_KEYS.get(axis)
+        if owner is not None and owner != family:
+            raise AxisNotSweepableError(
+                f"{path}: grid axis {axis} is a {owner!r} rule; a {family!r} sweep may not grid it"
+            )
+    named = {key: fixed[key] for key in hypothesis.FAMILY_ONLY_KEYS if key in fixed}
+    refusal = hypothesis.family_only_refusal(
+        family, {key: _validated(path, key, value) for key, value in named.items()}
+    )
+    if refusal is not None:
+        raise SweepFileError(f"{path}: the fixed block's {refusal}")
     both = sorted(set(grid_lists) & set(fixed))
     if both:
         raise FixedAndGriddedError(

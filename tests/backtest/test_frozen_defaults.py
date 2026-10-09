@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis
 from tradepartner.config import Settings
 
@@ -315,13 +316,19 @@ PROFITABILITY_DEFAULTS = (
 )
 
 #: The `combined` fixture twin's frozen values (T130), computed on this branch over
-#: `Settings(_env_file=None)`.
+#: `Settings(_env_file=None)`. `COMBINED_LATER_KEYS` landed after: the params hash is
+#: over the set without them (a `combined` registration stored before #1358).
 COMBINED_FINGERPRINT = "810686f134111c9bddfc9194050de71ed65a497ba0acf7c4fd43052e26a3b9d2"
 COMBINED_PARAMS_SHA256 = "239dd0b6cfbc1fc1ef21e48831dfdae80b6d67a3688ab3d172a9bcb290163094"
 COMBINED_DEFAULTS = (
     ("combined.top_fraction", 0.10, 16),
     ("combined.weighting", "equal", 16),
 )
+COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction",)
+
+
+def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {k: v for k, v in params.items() if k not in keys}
 
 
 def _defaults_settings() -> Settings:
@@ -346,7 +353,7 @@ def test_stale_listing_entry_is_pinned_by_value() -> None:
 
 #: Frozen keys that landed after the twin hashes were pinned: a registration made
 #: before them stores none, so the pinned hashes are over the set without them.
-LATER_KEYS = ("gap.stale_listing_sessions",)
+LATER_KEYS = ("gap.stale_listing_sessions", "strategy.turnover_top_fraction")
 
 
 def test_h1_twin_canonical_set_fingerprint_and_hash_unchanged() -> None:
@@ -434,8 +441,9 @@ def test_combined_twin_frozen_set_and_fingerprint_pinned() -> None:
 
     settings = _combined_defaults_settings()
     params = _combined_params(settings)
-    assert registry.params_sha256(params) == COMBINED_PARAMS_SHA256
-    assert frozen.fingerprint("combined", params, date(2017, 1, 31)) == COMBINED_FINGERPRINT
+    assert registry.params_sha256(_before(params, COMBINED_LATER_KEYS)) == COMBINED_PARAMS_SHA256
+    for stored in (params, _before(params, COMBINED_LATER_KEYS)):
+        assert frozen.fingerprint("combined", stored, date(2017, 1, 31)) == COMBINED_FINGERPRINT
     canonical = frozen.canonical_frozen_set(params, "combined")
     # Its listed sections are kept whole: both sub-signals' keys, default-valued ones too.
     assert {k for k in canonical if k.startswith("combined.")} == {
@@ -464,7 +472,7 @@ def test_combined_twin_ignores_live_sub_signal_keys() -> None:
     )
     moved = _combined_params(live)
     assert moved == base
-    assert registry.params_sha256(moved) == COMBINED_PARAMS_SHA256
+    assert registry.params_sha256(_before(moved, COMBINED_LATER_KEYS)) == COMBINED_PARAMS_SHA256
     assert frozen.fingerprint("combined", moved, date(2017, 1, 31)) == COMBINED_FINGERPRINT
     assert frozen.canonical_frozen_set(moved, "combined") == frozen.canonical_frozen_set(
         base, "combined"
@@ -501,3 +509,122 @@ def test_no_module_reads_record_params_outside_the_accessor() -> None:
     allowed = {"backtest/frozen.py", "backtest/hypothesis.py"}
     assert readers - allowed - NOT_A_RECORD <= PARAMS_READERS_ALLOWLIST
     assert "store/registry.py" not in readers
+
+
+# --- literal pins taken on `main`'s code before the turnover key (#1358, T165) -------
+
+#: B3 (the profitability fixture twin and the real B3 file) and `oracle` (the momentum
+#: fixture twin read as `oracle`), computed on `main` at 3de454d7 over
+#: `Settings(_env_file=None)`, before `strategy.turnover_top_fraction` existed. Canonical
+#: sets are pinned by `registry.params_sha256` of the set.
+B3_TWIN_FINGERPRINT = "0d4670860b79d1591c1d00ad34ba98c34ba5451745d3257ec3b42c5a1d9caf1c"
+B3_TWIN_CANONICAL_SHA256 = "6059282b4af951d4ac6088150a8eacc3c7e6877410660bcc1f3e169843869642"
+B3_TWIN_PARAMS_SHA256 = "7e72f97a0594055f002d33de2dde181a1fda8341e2a67117a57f50b7bed643f0"
+B3_FILE_FINGERPRINT = "0ef4ebf725560b73ccc8157e4d477f07facc16116bea44016bbef4f06ec9ae83"
+B3_FILE_CANONICAL_SHA256 = "ada9a26f7a0172abbc27419bf6adca29443be3d64032847c024951df0f398a2c"
+B3_FILE_PARAMS_SHA256 = "c1b7e7002cf6160828210c3fbc72483113622740b9c21b526762d8d63d72f1d4"
+ORACLE_TWIN_FINGERPRINT = "2fc196fad5d1fbe618d51a1adc7d8e02f664fae55b32d3cbfef90d011ca17ae5"
+ORACLE_TWIN_CANONICAL_SHA256 = "22fedb1cf5f53d68ecf69f9e6d5ec912cb573aee07ba2932728dcab3c178403d"
+B3_FILE = H1_FILE.with_name("b3-gross-profitability.md")
+
+
+@pytest.mark.parametrize(
+    ("path", "fingerprint", "canonical_sha256", "params_sha256"),
+    [
+        (PROF_FIXTURE, B3_TWIN_FINGERPRINT, B3_TWIN_CANONICAL_SHA256, B3_TWIN_PARAMS_SHA256),
+        (B3_FILE, B3_FILE_FINGERPRINT, B3_FILE_CANONICAL_SHA256, B3_FILE_PARAMS_SHA256),
+    ],
+)
+def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
+    path: Path, fingerprint: str, canonical_sha256: str, params_sha256: str
+) -> None:
+    from tradepartner.store import registry
+
+    parsed = hypothesis.parse_file(path)
+    params = hypothesis.frozen_params(parsed, _defaults_settings())
+    assert registry.params_sha256(params) == params_sha256
+    assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
+    canonical = frozen.canonical_frozen_set(params, parsed.family)
+    assert registry.params_sha256(canonical) == canonical_sha256
+    # B3's seven keys stay in its canonical set (decision 13 holds for them).
+    assert {key for key, _default, _version in PROFITABILITY_DEFAULTS} <= set(canonical)
+
+
+def test_oracle_fingerprint_and_canonical_set_are_pinned() -> None:
+    from tradepartner.store import registry
+
+    parsed = hypothesis.parse_file(FIXTURE)
+    params = hypothesis.frozen_params(parsed, _defaults_settings())
+    assert frozen.fingerprint("oracle", params, parsed.in_sample_start) == ORACLE_TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(params, "oracle")
+    assert registry.params_sha256(canonical) == ORACLE_TWIN_CANONICAL_SHA256
+
+
+# --- the turnover key and decision 13's carve-out (#1358, T165) ----------------------
+
+TURNOVER_KEY = "strategy.turnover_top_fraction"
+
+
+def test_turnover_entry_is_last_and_pinned_by_value() -> None:
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[12:], ((TURNOVER_KEY, 1.0, 19),))
+
+
+def test_post_registration_own_keys_pinned_and_each_a_listed_table_key() -> None:
+    """Append-only (removing a member moves every stored own-section fingerprint)."""
+    assert frozenset({TURNOVER_KEY}) == frozen.POST_REGISTRATION_OWN_KEYS
+    table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    listed = {section for spec in config.FAMILIES.values() for section in spec.sections}
+    for key in frozen.POST_REGISTRATION_OWN_KEYS:
+        assert key in table
+        assert key.partition(".")[0] in listed
+
+
+def test_a_post_registration_key_at_its_default_is_left_out_of_every_own_section() -> None:
+    settings = _defaults_settings()
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("oracle", _new_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        assert params[TURNOVER_KEY] == 1.0  # stored at its default
+        assert TURNOVER_KEY not in frozen.canonical_frozen_set(params, family)
+        # A key the family registered with stays in at its default (decision 13).
+        assert "strategy.top_fraction" in frozen.canonical_frozen_set(
+            {**params, "strategy.top_fraction": 0.10}, family
+        )
+
+
+def _twin_with(tmp_path: Path, line: str | None) -> Path:
+    text = FIXTURE.read_text()
+    if line is not None:
+        text = text.replace(
+            "signal_total_return = true\n", f"signal_total_return = true\n{line}\n", 1
+        )
+    path = tmp_path / FIXTURE.name
+    path.write_text(text)
+    return path
+
+
+def test_a_momentum_file_naming_the_default_is_the_twin_and_another_value_is_not(
+    tmp_path: Path,
+) -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    twin_canonical = frozen.canonical_frozen_set(twin, "momentum")
+    explicit = hypothesis.frozen_params(
+        hypothesis.parse_file(_twin_with(tmp_path, "turnover_top_fraction = 1.0")), settings
+    )
+    assert explicit == twin
+    assert frozen.fingerprint("momentum", explicit, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    assert frozen.canonical_frozen_set(explicit, "momentum") == twin_canonical
+    assert registry.params_sha256(twin_canonical) == TWIN_PRE_LAB_PARAMS_SHA256
+    screened = hypothesis.frozen_params(
+        hypothesis.parse_file(_twin_with(tmp_path, "turnover_top_fraction = 0.20")), settings
+    )
+    assert screened[TURNOVER_KEY] == 0.2
+    assert frozen.fingerprint("momentum", screened, date(2017, 1, 31)) != TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(screened, "momentum")
+    assert canonical[TURNOVER_KEY] == 0.2
+    assert {k: v for k, v in canonical.items() if k != TURNOVER_KEY} == twin_canonical
