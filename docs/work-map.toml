@@ -964,3 +964,28 @@ why = "The first live order goes through the same wrapper and journal as paper; 
 [task.T163c]
 what = "A settled-cash read for the buys phase of a cash account, so the live book never buys with unsettled sale proceeds."
 why = "The live account is a taxable cash account (#813) while paper is margin; buying on unsettled proceeds is a good-faith violation the paper book can never show."
+
+
+[task.T164]
+what = "The data-foundation spec amendment for filing_events (the EDGAR 8-K items field with its acceptance time) and the read-only coverage count of 2.02 8-Ks across the universe."
+why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; the count says how many issuers the rule reaches before anything is built."
+
+[task.T164b]
+what = "The filing_events table, the FilingEvent record, the FilingSource question and three fixture 8-K rows (a same-day-filed 2.02, an after-hours 2.02, a 5.02)."
+why = "The table and the fixture are what every later task and the look-ahead tests read."
+
+[task.T164c]
+what = "The EDGAR adapter keeps the submissions items field in its stamps cache under a new layout constant, with a test that no existing stamp changes."
+why = "The adapter already reads the field and drops it; keeping it must not move a single known_at, so the stamps are diffed rather than trusted."
+
+[task.T164d]
+what = "The as-of read filing_events_as_of and its look-ahead cases: an 8-K accepted after the close is invisible at that close, and the filed date is never the event's time."
+why = "The event signal is only as point-in-time as this read; the filed-date trap would move day 0 a session early."
+
+[task.T164e]
+what = "The ingest write, the config switch and keys, the health count, and the first real-store run under a named data release."
+why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
+
+[issue.1358]
+what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
+why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."
