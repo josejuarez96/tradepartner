@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -313,8 +314,10 @@ def test_every_command_and_option_exists(s: Settings) -> None:
     ):
         result = _cli(s, *args, "--help")
         assert result.exit_code == 0, result.output
+        # CI forces colour, and Rich's help styles each option: compare the plain text.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         for option in options:
-            assert option in result.output, (args, option)
+            assert option in plain, (args, option)
 
 
 # --- corpus fetch and frame build -------------------------------------------------
