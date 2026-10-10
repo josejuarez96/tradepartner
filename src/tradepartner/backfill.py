@@ -188,7 +188,7 @@ from tradepartner.store.benchmarks import (
 from tradepartner.store.classify import EQUITY, classifications_as_of, listing_kind
 from tradepartner.store.db import StoreLockedError, insert_row, open_for_write, utc_now
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
-from tradepartner.store.master import _first_session, securities_as_of
+from tradepartner.store.master import first_session, securities_as_of
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -1031,7 +1031,7 @@ def backfill_benchmark(
     if isinstance(since, datetime) or not isinstance(since, date):
         raise TypeError(f"since must be a date, got {since!r}")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    if since < _first_session(settings):
+    if since < first_session(settings):
         raise ValueError(f"since {since} is before the calendar's first session")
     windows = month_windows(since, expected_session(now, settings))
     if not windows:
@@ -1068,7 +1068,7 @@ def _seed_benchmark(
             f"benchmark {symbol} is not in the store; give its cik, name and exchange to seed it"
         )
     security_id = f"BENCH:{symbol}"
-    start = _first_session(settings)
+    start = first_session(settings)
     holders = ticker_holders(conn, symbol, start=start, through=None)
     taken = conn.execute(
         "SELECT count(*) FROM securities WHERE security_id = ?", [security_id]

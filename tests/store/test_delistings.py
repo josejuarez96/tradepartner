@@ -32,6 +32,7 @@ from tradepartner.store.delistings import (
     DelistingBuild,
     build_delistings,
     delistings_as_of,
+    derive_listing_ends,
     listing_ends_as_of,
     write_delistings,
 )
@@ -1212,3 +1213,30 @@ class TestNoLookAhead:
                 assert full.equals(listing_ends_as_of(truncated.at(t), t, settings)), f"T={t!r}"
         finally:
             truncated.close()
+
+
+def test_derive_listing_ends_skips_amendment_after_counted_form_25() -> None:
+    sid = "RELISTED"
+    listings = pl.DataFrame(
+        [
+            _listing(sid, "RLC", "NASDAQ", date(2019, 8, 9), _at(2019, 8, 9)),
+            _listing(sid, "RLC", "NASDAQ", date(2019, 12, 16), _at(2019, 12, 16)),
+        ]
+    )
+    original = _delisting(sid, "NASDAQ", _at(2019, 12, 3))
+    amendment = {
+        **_delisting(sid, "NASDAQ", _at(2020, 1, 6)),
+        "form": "25-NSE/A",
+    }
+    bars = pl.DataFrame(
+        {"security_id": [sid, sid], "session": [date(2019, 12, 2), date(2019, 12, 20)]}
+    )
+
+    ends = derive_listing_ends(
+        listings, pl.DataFrame([original, amendment]), bars, transfer_window_sessions=10
+    )
+
+    assert ends.select("valid_from", "status", "end_session", "delisting_form").rows() == [
+        (date(2019, 8, 9), "delisted", date(2019, 12, 2), "25"),
+        (date(2019, 12, 16), "listed", None, None),
+    ]
