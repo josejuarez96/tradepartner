@@ -272,6 +272,7 @@ script over the real ones.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import re
@@ -947,6 +948,16 @@ def _latest_run_id(conn: duckdb.DuckDBPyConnection) -> int:
     """The newest research run id (0 when none), to tell a refusal before any run
     opened from a failure after one did."""
     return max((r.run_id for r in research.list_runs(conn, include_synthetic=True)), default=0)
+
+
+def _fresh_transaction(conn: duckdb.DuckDBPyConnection) -> None:
+    """Roll back whatever transaction is open (none is fine) and begin a new one, so
+    `open_for_write`'s rollback on the way out has one to end and the error that got
+    us here is the one raised (#1351). `begin` is not a probe: inside an open
+    transaction it fails and aborts that transaction."""
+    with contextlib.suppress(duckdb.TransactionException):
+        conn.rollback()
+    conn.begin()
 
 
 def _close_open_runs(
@@ -2830,9 +2841,15 @@ def make_app(
                 except (Exception, KeyboardInterrupt) as exc:
                     # The job already committed each run row before calls. Close a
                     # run left open by Ctrl-C or another failure, then commit that
-                    # close on exit from open_for_write.
+                    # close on exit from open_for_write. run_batch usually returns
+                    # with no transaction open; a close that raises then needs a
+                    # fresh one, or open_for_write's rollback hides its error.
                     failure = exc
-                    opened = _close_open_runs(conn, s, before, _describe(exc))
+                    try:
+                        opened = _close_open_runs(conn, s, before, _describe(exc))
+                    except BaseException:
+                        _fresh_transaction(conn)
+                        raise
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except Exception as exc:

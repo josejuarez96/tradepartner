@@ -11,9 +11,8 @@ This is the one module that imports `tradepartner.research.models` (ADR 0013 poi
 refuses an existing records or shortlist file for the allocated id, rolling
 back that run row first. A `pilot` split bound to the sealed period opens only
 with the holdout flags, and is then a spend; a refused open reads nothing and
-returns. On a frame
-batch (`full`, `prospective`) it first runs the **drift probe** of C5 under its own
-`robustness` run (`departure-reason-drift`) and closes the batch `failed` with
+returns. On a frame batch (`full`, `prospective`) it first runs the **drift probe** of
+C5 under its own `robustness` run (`departure-reason-drift`) and closes the batch `failed` with
 `drift probe not passed` before its first call unless that run's verdict is `pass`.
 It then loads the bound rows through `research.load_dataset`, builds every first
 packet, and runs **`spend_check`** over every inference record in the research store
