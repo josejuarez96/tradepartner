@@ -394,6 +394,16 @@ class _Submissions:
     empty: bool = False
 
 
+def _filing_date_or_none(value: Any) -> date | None:
+    """A bad optional filing date disables only the clock comparison for its row."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, SubmissionRecord], list[str]]:
     """Accession -> reduced record for a submissions payload or an older page,
     and the names of the older pages it lists. A malformed payload raises
@@ -409,7 +419,15 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
         items = columns.get("items")
         if items is None:
             items = [None] * len(accessions)
-        filing_dates = columns.get("filingDate", [None] * len(accessions))
+        raw_dates = columns.get("filingDate")
+        filing_dates = [
+            _filing_date_or_none(raw_dates[i])
+            if isinstance(raw_dates, Sequence)
+            and not isinstance(raw_dates, (str, bytes))
+            and i < len(raw_dates)
+            else None
+            for i in range(len(accessions))
+        ]
         records = {
             accession: SubmissionRecord(
                 accession,
@@ -418,7 +436,7 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
                 bool(ixbrl),
                 times[accession],
                 None if item is None else str(item),
-                date.fromisoformat(filed) if filed else None,
+                filed,
             )
             for accession, form, doc, ixbrl, item, filed in zip(
                 accessions,
