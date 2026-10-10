@@ -2042,11 +2042,8 @@ def _rebalance_kind(
     session: date,
     cadence: Cadence,
 ) -> planning.RebalanceKind | None:
-    """`planning.rebalance_kind` with the window's frozen catch-up bound and cadence; None
-    before the window's first rebalance session, a session that function
-    refuses (its schedule needs a start on or before the session)."""
-    if session < window.first_rebalance_session:
-        return None
+    """`planning.rebalance_kind` with the window's frozen catch-up bound and cadence (None
+    before the window's first rebalance session, #649)."""
     return planning.rebalance_kind(
         window,
         runs,

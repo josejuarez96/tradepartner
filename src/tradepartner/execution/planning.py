@@ -5,7 +5,8 @@ Plan trial; plan T63c).
 when S is the fill session F_i of a rebalance T_i of the window, `catch_up`
 while T_i is pending (no `executed` or `missed` event of the window's runs)
 and S is at most the frozen `paper.max_catch_up_sessions` sessions after F_i,
-else None. **`due_rebalance`** returns the same with its T_i.
+else None (also before the window's first rebalance session, #649).
+**`due_rebalance`** returns the same with its T_i.
 
 **`plan_rebalance`** plans T_i once:
 
@@ -192,7 +193,9 @@ def _sessions_after(first: date, last: date) -> int:
 
 def _latest_due(window: PaperWindowRow, session: date, cadence: Cadence) -> date | None:
     """The latest rebalance T_i at `cadence` of the window whose fill session is on or
-    before S."""
+    before S; None before the window's first rebalance session (#649)."""
+    if session < window.first_rebalance_session:
+        return None
     due = [
         t
         for t in rebalance_sessions(window.first_rebalance_session, session, cadence)
