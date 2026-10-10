@@ -739,9 +739,9 @@ why = "One monthly strategy at a time made the Phase 4 exit a six-month wait tha
 unblocks = ["plan:paper-trading", "issue:1352"]
 
 [adr.0018]
-what = "The end-user app: a local FastAPI read API in this repo over the CLI's own read functions (books, equity vs benchmark, positions vs targets, orders and fills, runs, alerts, strategies), a React + TypeScript front end in webapp/ served by the same loopback process, two writes only (stop and resume a book through paper kill and paper resume's code paths), phone access over the owner's Tailscale network with identity checks and no secret in the browser, Streamlit retired page by page at parity, and a spike before any plan task."
+what = "The end-user app: a local FastAPI read API in this repo over the CLI's own read functions (books, equity vs benchmark, positions vs targets, orders and fills, runs, alerts, strategies), a React + TypeScript front end in webapp/ served by the same loopback process, the only writes a book's kill switch engaged or released by running the CLI's own paper kill and paper resume as subprocesses, phone access over the owner's Tailscale network with identity checks and no secret in the browser, Streamlit retired page by page at parity, and a spike before any plan task."
 why = "The owner wants a product-quality surface at his desk and on his phone that answers how he is doing, what each book holds and why, what is wrong or waiting on him, and lets him stop or resume a book safely; ADR 0011's Streamlit-only rule cannot give that, and the change to the roadmap's no-separate-API rule is hard to reverse, so it is recorded first."
-unblocks = ["issue:1410"]
+unblocks = ["plan:webapp"]
 
 [issue.1352]
 what = "Turn ADR 0017 into the spec amendments (paper spec, strategy-lab req 11, the ADR pointers) and the Phase 4 plan tasks T151 to T163c: cadence lift, the family flip, one account per book, the multi-book run, the per-book surfaces, paper shakedown, the runbook, the owner's accounts, hypotheses, starts and span, and the Phase 6 live book."
