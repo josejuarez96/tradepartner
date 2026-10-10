@@ -2,6 +2,8 @@
 
 **Status:** spike (`spike/design-ui`), prototype under [`web/`](../../../web/). **Date:** 2026-10-10 · **Direction:** v4, built on [shadcn/ui](https://github.com/shadcn-ui/ui) (the stack Base44 apps use: React, Vite, Tailwind, Radix, lucide)
 
+**What to avoid:** [ai-tells.md](ai-tells.md), the checklist of AI design tells, our four versions mapped onto it, and an audit of the current build.
+
 The app is for the owner as a *user*, not its developer. Screens built: **Overview** and **Research**. Next: Book detail (holdings vs targets, orders, why, stop/resume).
 
 ## How we got here
