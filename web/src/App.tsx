@@ -11,8 +11,9 @@ import { SampleA } from "@/samples/SampleA";
 import { SampleB } from "@/samples/SampleB";
 import { SampleC } from "@/samples/SampleC";
 import { SampleD } from "@/samples/SampleD";
+import { SampleE } from "@/samples/SampleE";
 
-const SAMPLES: Record<string, () => React.JSX.Element> = { "sample-a": SampleA, "sample-b": SampleB, "sample-c": SampleC, "sample-d": SampleD };
+const SAMPLES: Record<string, () => React.JSX.Element> = { "sample-a": SampleA, "sample-b": SampleB, "sample-c": SampleC, "sample-d": SampleD, "sample-e": SampleE };
 
 type Load = { kind: "loading" } | { kind: "error"; retrying: boolean } | { kind: "ready"; data: AppData };
 

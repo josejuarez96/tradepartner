@@ -1,0 +1,56 @@
+.sE { --bg:#0c0e12; --raised:#12151b; --line:#20252e; --ink:#e6e8eb; --mut:#8b929c; --gain:#3ecf8e; --loss:#f2645a; --att:#f0b03f; --bench:#6b727c; --c:var(--gain);
+  min-height:100vh; background:var(--bg); color:var(--ink); font-family:"IBM Plex Sans",sans-serif; font-size:14px; }
+.sE-loss{--c:var(--loss)}
+.sE .num{font-family:"IBM Plex Mono",monospace; letter-spacing:-.01em}
+.sE .gain{color:var(--gain)} .sE .loss{color:var(--loss)} .sE .flat{color:var(--mut)} .sE .att{color:var(--att)}
+.sE a{color:inherit; text-decoration:none; cursor:pointer}
+.sE-top{display:flex; align-items:center; gap:28px; height:56px; padding:0 28px; border-bottom:1px solid var(--line)}
+.sE-brand{font-weight:600; font-size:15px}
+.sE-top nav{display:flex; gap:22px; color:var(--mut)} .sE-top nav a.on{color:var(--ink)} .sE-top nav b{color:var(--att); font-weight:500; margin-left:4px}
+.sE-acct{margin-left:auto; color:var(--mut); font-size:13px}
+.sE-wrap{display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:48px; max-width:1180px; margin:0 auto; padding:28px 28px 64px}
+.sE-label{color:var(--mut); margin:0}
+.sE-total{font-size:40px; font-weight:500; margin:2px 0 0; letter-spacing:-.03em}
+.sE-day{margin:2px 0 0} .sE-day span{color:var(--mut); font-family:"IBM Plex Sans",sans-serif}
+.sE-chart{position:relative; margin-top:28px}
+.sE-chart svg{width:100%; height:300px; display:block; overflow:visible}
+.sE-chart .you{fill:none; stroke:var(--c); stroke-width:2; vector-effect:non-scaling-stroke; stroke-linejoin:round}
+.sE-chart .spy{fill:none; stroke:var(--bench); stroke-width:1.25; stroke-dasharray:3 4; vector-effect:non-scaling-stroke}
+.sE-chart .band{fill:color-mix(in srgb,var(--ink) 6%,transparent)}
+.sE-chart .tick{stroke:var(--mut); vector-effect:non-scaling-stroke}
+.sE-marks{position:relative; height:18px; margin-top:4px; font-size:11px; color:var(--mut)}
+.sE-marks span{position:absolute; transform:translateX(-50%); white-space:nowrap}
+.sE-marks span:last-child{transform:translateX(-100%)}
+.sE-legend{display:flex; flex-wrap:wrap; gap:18px; font-size:12px; color:var(--mut); margin-top:10px}
+.sE-legend .you{color:var(--c)} .sE-legend .ticks{display:none} .sE-legend .band::before{content:""; display:inline-block; width:14px; height:8px; margin-right:6px; background:color-mix(in srgb,var(--ink) 12%,transparent)}
+.sE-ranges{display:flex; gap:4px; margin-top:14px; padding-bottom:16px; border-bottom:1px solid var(--line)}
+.sE-ranges button{font:inherit; font-size:13px; font-weight:500; border:0; background:none; color:var(--mut); padding:6px 12px; border-radius:999px}
+.sE-ranges button.on{color:var(--c); background:color-mix(in srgb,var(--c) 14%,transparent)} .sE-ranges button:disabled{opacity:.35}
+.sE-sec{margin-top:32px}
+.sE-sec h2{font-size:18px; font-weight:500; margin:0 0 14px; display:flex; align-items:baseline; gap:10px}
+.sE-sec h2 span{font-size:13px; color:var(--mut); font-weight:400}
+.sE-stats{display:grid; grid-template-columns:repeat(4,1fr); gap:0; margin:0; border-top:1px solid var(--line)}
+.sE-stats>div{padding:12px 0; border-bottom:1px solid var(--line)}
+.sE-stats dt{font-family:"IBM Plex Sans",sans-serif; color:var(--mut); font-size:12.5px}
+.sE-stats dd{margin:4px 0 0; font-size:16px} .sE-stats small{font-family:"IBM Plex Sans",sans-serif; color:var(--mut); font-size:12px; margin-left:4px}
+.sE-note{color:var(--mut); font-size:12px; line-height:1.5; margin:12px 0 0; max-width:70ch}
+.sE-card{display:flex; align-items:center; gap:16px; padding:14px 16px; border:1px solid var(--line); border-radius:8px; background:var(--raised)}
+.sE-card>span:first-child{flex:1} .sE-card b{display:block; font-weight:500} .sE-card small{display:block; color:var(--mut); margin-top:2px}
+.sE .chev{color:var(--mut); font-size:20px}
+.sE-more{display:inline-block; margin-top:10px; color:var(--mut); font-size:13px}
+.sE-rail{border-left:1px solid var(--line); padding-left:28px}
+.sE-rail section+section{margin-top:28px}
+.sE-rail h2{font-size:13px; font-weight:500; color:var(--mut); margin:0 0 4px}
+.sE-row{display:flex; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid var(--line)}
+.sE-row .n{flex:1; min-width:0} .sE-row b{display:block; font-weight:500} .sE-row small{display:block; color:var(--mut); font-size:12px}
+.sE-row .spark{width:64px; height:24px} .sE-row .spark path{fill:none; stroke:currentColor; stroke-width:1.4; vector-effect:non-scaling-stroke}
+.sE-row .young{width:64px; text-align:center}
+.sE-row .pill{min-width:72px; text-align:center; padding:5px 8px; border-radius:6px; font-size:13px}
+.sE-row .pill.gain{background:color-mix(in srgb,var(--gain) 18%,transparent)} .sE-row .pill.loss{background:color-mix(in srgb,var(--loss) 18%,transparent)} .sE-row .pill.flat{background:var(--raised); color:var(--mut)}
+.sE-row .luck{text-align:right; font-size:15px} .sE-row .luck small{font-family:"IBM Plex Sans",sans-serif}
+@media (max-width:900px){
+  .sE-wrap{grid-template-columns:1fr; gap:8px; padding:20px 16px 48px} .sE-rail{border-left:0; padding-left:0}
+  .sE-top{padding:0 16px; gap:16px} .sE-top nav{display:none}
+  .sE-total{font-size:34px} .sE-chart svg{height:220px} .sE-stats{grid-template-columns:repeat(2,1fr)}
+  .sE-marks{display:none} .sE-legend .ticks{display:inline}
+}
