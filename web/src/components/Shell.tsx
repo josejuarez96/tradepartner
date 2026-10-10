@@ -1,13 +1,12 @@
 import type { ReactNode } from "react";
-import { Icon, type IconName } from "./Icon";
 import { ThemeSwitch } from "./ThemeSwitch";
 import "./Shell.css";
 
 export type Screen = "overview" | "books" | "strategies";
-const NAV: { key: Screen; label: string; icon: IconName }[] = [
-  { key: "overview", label: "Overview", icon: "overview" },
-  { key: "books", label: "Books", icon: "books" },
-  { key: "strategies", label: "Strategies", icon: "strategies" },
+const NAV: { key: Screen; label: string }[] = [
+  { key: "overview", label: "overview" },
+  { key: "books", label: "books" },
+  { key: "strategies", label: "strategies" },
 ];
 
 interface Props {
@@ -19,47 +18,30 @@ interface Props {
   footer?: ReactNode;
 }
 
-/** Top bar on desktop, top bar + bottom tabs on phone. Mode is always visible: paper money vs real money. */
+/** A plain masthead: name, three words of navigation, and which money this is. Text tabs on phone. */
 export function Shell({ screen, mode, sample, attention, children, footer }: Props) {
+  const link = (n: (typeof NAV)[number], cls: string) => (
+    <a key={n.key} href={`#${n.key}`} className={cls} aria-current={n.key === screen ? "page" : undefined}>
+      {n.label}
+      {n.key === "overview" && attention > 0 && <span className="navcount" aria-label={`, ${attention} need you`}>{attention}</span>}
+    </a>
+  );
   return (
     <div className="shell">
-      <header className="topbar">
-        <div className="topbar__inner">
-          <a className="brand" href="#overview" aria-label="TradePartner, overview">
-            <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden>
-              <rect width="32" height="32" rx="8" fill="var(--ink)" />
-              <path d="M8 21l5-6 4 3 7-8" fill="none" stroke="var(--ink-inverse)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            <span>TradePartner</span>
-          </a>
-          <nav className="topnav" aria-label="Main">
-            {NAV.map((n) => (
-              <a key={n.key} href={`#${n.key}`} className="topnav__link" aria-current={n.key === screen ? "page" : undefined}>
-                {n.label}
-                {n.key === "overview" && attention > 0 && <span className="dot" aria-label={`${attention} need you`} />}
-              </a>
-            ))}
-          </nav>
-          <div className="topbar__tags">
-            {sample && <span className="tag tag--sample" title="Every number on this page is made up">Sample data</span>}
-            <span className={`tag tag--${mode}`}>{mode === "paper" ? "Paper money" : "Real money"}</span>
-            <ThemeSwitch />
-          </div>
+      <header className="mast">
+        <div className="mast__inner">
+          <a className="wordmark" href="#overview">tradepartner</a>
+          <nav className="mast__nav" aria-label="Main">{NAV.map((n) => link(n, "mast__link"))}</nav>
+          <p className="mast__mode">
+            <span>{mode === "paper" ? "paper account" : "live account"}</span>
+            {sample && <span className="mast__sample" title="Every number on this page is made up">sample data</span>}
+          </p>
+          <ThemeSwitch />
         </div>
       </header>
       <main className="page">{children}</main>
       {footer && <footer className="pagefoot">{footer}</footer>}
-      <nav className="tabbar" aria-label="Main">
-        {NAV.map((n) => (
-          <a key={n.key} href={`#${n.key}`} className="tabbar__link" aria-current={n.key === screen ? "page" : undefined}>
-            <span className="tabbar__icon">
-              <Icon name={n.icon} size={20} />
-              {n.key === "overview" && attention > 0 && <span className="dot dot--tab" aria-label={`${attention} need you`} />}
-            </span>
-            {n.label}
-          </a>
-        ))}
-      </nav>
+      <nav className="tabbar" aria-label="Main">{NAV.map((n) => link(n, "tabbar__link"))}</nav>
     </div>
   );
 }

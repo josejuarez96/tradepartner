@@ -1,88 +1,79 @@
 /*
- * TradePartner design tokens. The only place a raw colour, size or duration
- * may appear. Components use var(--…) and nothing else; charts read the same
- * variables at runtime (src/lib/tokens.ts), so a chart and a number never
- * disagree.
+ * TradePartner design tokens: the "ledger" direction.
+ *
+ * The only place a raw colour, size or duration may appear. Components use
+ * var(--…) and nothing else; charts read the same variables at runtime
+ * (src/lib/tokens.ts).
+ *
+ * The idea: a private statement, not a SaaS dashboard. Warm paper and ink,
+ * rules instead of cards, a sentence in a serif that answers "how am I
+ * doing?", and every number in a monospace so columns line up like a ledger.
  *
  * Colour carries meaning, and only three things get one:
- *   gain      money made, a number above the benchmark
- *   loss      money lost, a number below it
- *   attention something waiting on you (alerts, a stopped book)
- * Everything else is ink. The benchmark is a quieter ink. Your line takes
- * gain or loss by how the shown period ended. Contrast pairs are listed in
- * docs/research/ui/README.md.
+ *   gain       money made (moss)
+ *   loss       money lost (rust)
+ *   attention  something waiting on you: not a hue but inverted ink, the
+ *              loudest thing the page can do without adding a colour
+ * Contrast pairs are listed in docs/research/ui/README.md.
  *
- * Dark is the primary design; light is its own set of steps, chosen with
- * data-theme="light" (the theme switch in the top bar).
+ * Dark is the default; data-theme="light" selects paper.
  */
 
 :root {
   color-scheme: dark;
 
-  /* ── Surfaces ─────────────────────────────────────────── */
-  --bg: #09090b;             /* page: near-black */
-  --surface: #111215;        /* panels */
-  --surface-raised: #191a1e; /* selected tile, hovered row */
-  --surface-sunken: #1a1b1f; /* tracks, skeletons */
-  --hairline: #1f2125;       /* 1px dividers and panel edges */
-  --hairline-strong: #2c2f34;
-
-  /* ── Ink ──────────────────────────────────────────────── */
-  --ink: #f4f4f5;
-  --ink-2: #a3a7ae;
-  --ink-3: #848991;
-  --ink-inverse: #09090b;
+  /* ── Paper and ink ────────────────────────────────────── */
+  --bg: #13120f;             /* warm black, not blue-black */
+  --bg-raised: #1b1a16;      /* hover rows, skeletons */
+  --rule: #2b2924;           /* 1px rules between sections and rows */
+  --rule-strong: #3d3a33;
+  --ink: #ece7dc;            /* bone */
+  --ink-2: #b3ad9f;
+  --ink-3: #928d81;
+  --ink-inverse: #13120f;
 
   /* ── Meaning ──────────────────────────────────────────── */
-  --gain: #2fd480;
-  --gain-soft: #0e2619;
-  --gain-fill: rgba(47, 212, 128, 0.20);
-  --loss: #f8636a;
-  --loss-soft: #2c1215;
-  --loss-fill: rgba(248, 99, 106, 0.20);
-  --attention: #f5a524;
-  --attention-soft: #241a08;
-  --attention-edge: #5e4312;
+  --gain: #a3c48f;           /* moss */
+  --loss: #e8906f;           /* rust */
+  --attention-bg: var(--ink);
+  --attention-ink: var(--ink-inverse);
 
   /* ── Chart ────────────────────────────────────────────── */
-  --chart-benchmark: #6f747c;  /* decorative; its value is always printed in text */
-  --chart-grid: #17181c;
-  --chart-dot: rgba(255, 255, 255, 0.055);
-  --chart-crosshair: #4a4e55;
-  --chart-tag-ink: #09090b;
+  --chart-you: var(--ink);
+  --chart-you-fill: rgba(236, 231, 220, 0.07);
+  --chart-bench: #6f6b62;    /* decorative; its value is always printed in text */
+  --chart-crosshair: #57534a;
 
-  /* ── Focus and states ─────────────────────────────────── */
-  --focus-ring: #7ea2ff;     /* the one non-meaning hue: keyboard focus only */
-  --hover-wash: rgba(255, 255, 255, 0.03);
-  --press-wash: rgba(255, 255, 255, 0.06);
-  --skeleton-shine: rgba(255, 255, 255, 0.04);
-  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 16px 40px rgba(0, 0, 0, 0.6);
+  /* ── States ───────────────────────────────────────────── */
+  --focus-ring: #e8d9a8;     /* a pale brass, only for keyboard focus */
+  --hover-wash: rgba(236, 231, 220, 0.035);
+  --press-wash: rgba(236, 231, 220, 0.07);
+  --skeleton-shine: rgba(236, 231, 220, 0.04);
 
   /* ── Type ─────────────────────────────────────────────── */
-  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-num-features: "tnum" 1, "cv11" 1, "ss01" 1; /* tabular figures: digits never shift */
+  --font-serif: "Newsreader Variable", "Newsreader", ui-serif, Georgia, serif;   /* the sentence */
+  --font-sans: "Geist Variable", "Geist", ui-sans-serif, system-ui, sans-serif;  /* prose */
+  --font-mono: "Geist Mono Variable", "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace; /* numbers, labels, chrome */
 
-  --text-2xs: 0.6875rem;/* 11  tab labels */
-  --text-xs: 0.75rem;   /* 12  meta, axis */
-  --text-sm: 0.8125rem; /* 13  labels, secondary */
-  --text-md: 0.9375rem; /* 15  body */
-  --text-lg: 1.0625rem; /* 17  row titles */
-  --text-xl: 1.375rem;  /* 22  section numbers */
-  --text-2xl: 2rem;     /* 32  hero on phone */
-  --text-3xl: 2.75rem;  /* 44  hero on desktop */
+  --text-2xs: 0.6875rem; /* 11 */
+  --text-xs: 0.75rem;    /* 12 */
+  --text-sm: 0.8125rem;  /* 13 */
+  --text-md: 0.9375rem;  /* 15 */
+  --text-lg: 1.125rem;   /* 18 */
+  --text-xl: 1.5rem;     /* 24 */
+  --text-2xl: 1.875rem;  /* 30  the sentence on phone */
+  --text-3xl: 2.625rem;  /* 42  the sentence on desktop */
 
-  --leading-tight: 1.1;
+  --leading-tight: 1.12;
   --leading-snug: 1.3;
   --leading-body: 1.5;
 
-  --weight-regular: 420;
-  --weight-medium: 520;
+  --weight-regular: 400;
+  --weight-medium: 500;
   --weight-semibold: 600;
 
-  --tracking-display: -0.025em;
-  --tracking-tight: -0.011em;
-  --tracking-label: 0.04em;
-  --tracking-micro: 0.07em;  /* uppercase column labels */
+  --tracking-serif: -0.015em;
+  --tracking-mono: -0.01em;
 
   /* ── Space (4px base) ─────────────────────────────────── */
   --space-1: 4px;
@@ -96,15 +87,13 @@
   --space-12: 48px;
   --space-16: 64px;
 
-  /* ── Shape ────────────────────────────────────────────── */
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-pill: 999px;
+  /* ── Shape: almost square. Only the alert and buttons round a little. ── */
+  --radius-sm: 3px;
+  --radius-md: 6px;
 
   /* ── Layout ───────────────────────────────────────────── */
-  --page-max: 1080px;
-  --gutter: var(--space-4);      /* phone */
+  --page-max: 1120px;
+  --gutter: var(--space-4);
   --touch-min: 44px;
 
   /* ── Motion ───────────────────────────────────────────── */
@@ -115,39 +104,27 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f3f3f1;
-  --surface: #ffffff;
-  --surface-raised: #f7f7f5;
-  --surface-sunken: #ececea;
-  --hairline: #e4e4e0;
-  --hairline-strong: #d0d0cb;
-  --ink: #0e0f11;
-  --ink-2: #555a62;
-  --ink-3: #62676f;
-  --ink-inverse: #ffffff;
-  --gain: #0d7a46;
-  --gain-soft: #e2f2e9;
-  --gain-fill: rgba(13, 122, 70, 0.14);
-  --loss: #c0322e;
-  --loss-soft: #fae4e2;
-  --loss-fill: rgba(192, 50, 46, 0.13);
-  --attention: #965000;
-  --attention-soft: #fcf0dd;
-  --attention-edge: #e7b061;
-  --chart-benchmark: #8d9199;
-  --chart-grid: #f0f0ed;
-  --chart-dot: rgba(14, 15, 17, 0.07);
-  --chart-crosshair: #b5b5af;
-  --chart-tag-ink: #ffffff;
-  --focus-ring: #2d5bd7;
-  --hover-wash: rgba(14, 15, 17, 0.03);
-  --press-wash: rgba(14, 15, 17, 0.06);
-  --skeleton-shine: rgba(255, 255, 255, 0.7);
-  --shadow-pop: 0 1px 2px rgba(14, 15, 17, 0.06), 0 12px 32px rgba(14, 15, 17, 0.12);
+  --bg: #f4f0e7;
+  --bg-raised: #ebe6da;
+  --rule: #ddd7ca;
+  --rule-strong: #c9c2b2;
+  --ink: #1c1a16;
+  --ink-2: #55514a;
+  --ink-3: #68645a;
+  --ink-inverse: #f4f0e7;
+  --gain: #3b6a2a;
+  --loss: #a5442a;
+  --chart-you-fill: rgba(28, 26, 22, 0.06);
+  --chart-bench: #a29c8e;
+  --chart-crosshair: #bdb6a6;
+  --focus-ring: #7a5a12;
+  --hover-wash: rgba(28, 26, 22, 0.03);
+  --press-wash: rgba(28, 26, 22, 0.06);
+  --skeleton-shine: rgba(255, 255, 255, 0.5);
 }
 
 @media (min-width: 768px) {
-  :root { --gutter: var(--space-8); }
+  :root { --gutter: var(--space-10); }
 }
 
 @media (prefers-reduced-motion: reduce) {

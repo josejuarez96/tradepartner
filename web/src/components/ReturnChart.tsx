@@ -10,8 +10,6 @@ import "./ReturnChart.css";
 interface Props {
   you: Point[];
   spy: Point[];
-  /** Colour of your line: how the shown period ended. */
-  tone: "gain" | "loss" | "flat";
   label: string;
   /** Called with the hovered date, or null when the pointer leaves. */
   onScrub?: (date: string | null) => void;
@@ -23,19 +21,17 @@ const dayLabel = (t: Time) =>
 
 /**
  * Your return against the benchmark, both from 0% at the start of the range.
- * Your line takes the gain or loss colour; the benchmark stays a quiet grey.
- * Each line ends in a tag on the axis; the crosshair carries a date tag.
+ * Your line is ink with a faint wash under it; the benchmark is a thin quiet
+ * line. No tags on the lines: the legend above the chart prints both values
+ * and follows the pointer.
  */
-export function ReturnChart({ you, spy, tone, label, onScrub }: Props) {
+export function ReturnChart({ you, spy, label, onScrub }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const youS = useRef<ISeriesApi<"Area"> | null>(null);
   const spyS = useRef<ISeriesApi<"Line"> | null>(null);
-  const toneRef = useRef(tone);
-  const paintRef = useRef<() => void>(() => {});
   const scrub = useRef(onScrub);
   scrub.current = onScrub;
-  toneRef.current = tone;
 
   useEffect(() => {
     const c = createChart(host.current!, {
@@ -50,35 +46,32 @@ export function ReturnChart({ you, spy, tone, label, onScrub }: Props) {
       localization: { priceFormatter: pctLabel, timeFormatter: dayLabel },
     });
     spyS.current = c.addSeries(LineSeries, {
-      lineWidth: 1, priceLineVisible: false, lastValueVisible: true, title: "S&P", crosshairMarkerRadius: 3,
+      lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerRadius: 3,
     });
     youS.current = c.addSeries(AreaSeries, {
-      lineWidth: 2, priceLineVisible: false, lastValueVisible: true, title: "You", crosshairMarkerRadius: 4,
+      lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerRadius: 4,
       crosshairMarkerBorderWidth: 2,
     });
     const zero = youS.current.createPriceLine({ price: 0, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false });
 
     const paint = () => {
-      const t = toneRef.current;
-      const line = token(t === "loss" ? "loss" : t === "gain" ? "gain" : "ink-2");
-      const fill = t === "loss" ? token("loss-fill") : t === "gain" ? token("gain-fill") : token("hover-wash");
+      const line = token("chart-you");
       c.applyOptions({
-        layout: { textColor: token("ink-3"), fontFamily: token("font-sans") },
+        layout: { textColor: token("ink-3"), fontFamily: token("font-mono") },
         crosshair: {
           vertLine: { color: token("chart-crosshair"), width: 1, style: LineStyle.Dashed, labelBackgroundColor: token("ink") },
         },
       });
       youS.current!.applyOptions({
-        lineColor: line, topColor: fill, bottomColor: "rgba(0,0,0,0)",
-        crosshairMarkerBorderColor: token("surface"), crosshairMarkerBackgroundColor: line,
+        lineColor: line, topColor: token("chart-you-fill"), bottomColor: "rgba(0,0,0,0)",
+        crosshairMarkerBorderColor: token("bg"), crosshairMarkerBackgroundColor: line,
       });
       spyS.current!.applyOptions({
-        color: token("chart-benchmark"), crosshairMarkerBackgroundColor: token("chart-benchmark"),
-        crosshairMarkerBorderColor: token("surface"),
+        color: token("chart-bench"), crosshairMarkerBackgroundColor: token("chart-bench"),
+        crosshairMarkerBorderColor: token("bg"),
       });
-      zero.applyOptions({ color: token("hairline-strong") });
+      zero.applyOptions({ color: token("rule-strong") });
     };
-    paintRef.current = paint;
     paint();
     const off = onSchemeChange(paint);
     const move = (p: MouseEventParams<Time>) => scrub.current?.(p.time ? String(p.time) : null);
@@ -86,8 +79,6 @@ export function ReturnChart({ you, spy, tone, label, onScrub }: Props) {
     chart.current = c;
     return () => { off(); c.unsubscribeCrosshairMove(move); c.remove(); chart.current = null; };
   }, []);
-
-  useEffect(() => { paintRef.current(); }, [tone]);
 
   useEffect(() => {
     youS.current?.setData(you.map((p) => ({ time: p.date as Time, value: p.value })));

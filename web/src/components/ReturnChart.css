@@ -1,13 +1,3 @@
-/* The dotted field sits behind the transparent canvas, inside the plot area only:
-   texture, not grid lines. Insets leave the price and time axes clean. */
-.rchart { position: relative; height: 300px; }
-.rchart::before {
-  content: "";
-  position: absolute;
-  inset: 0 64px 28px 0;
-  background-image: radial-gradient(circle, var(--chart-dot) 1px, transparent 1.3px);
-  background-size: 14px 14px;
-  pointer-events: none;
-}
+.rchart { position: relative; height: 320px; }
 .rchart__plot { position: absolute; inset: 0; }
-@media (max-width: 640px) { .rchart { height: 228px; } }
+@media (max-width: 640px) { .rchart { height: 220px; } }

@@ -1,32 +1,24 @@
 import { Skeleton } from "../components/Skeleton";
-import { Icon } from "../components/Icon";
 import "./Overview.css";
-import "../components/PeriodTiles.css";
 import "./OverviewStates.css";
 
 /** Loading: the page's real shape in grey, so nothing jumps when numbers arrive. */
 export function OverviewLoading() {
   return (
     <div className="overview" aria-busy="true" aria-label="Loading your books">
-      <section className="hero">
-        <div className="hero__main">
-          <Skeleton w={72} h={12} />
-          <div style={{ marginTop: "var(--space-3)" }}><Skeleton w={300} h={40} /></div>
-          <div style={{ marginTop: "var(--space-2)" }}><Skeleton w={180} h={16} /></div>
-        </div>
+      <section className="lede">
+        <Skeleton w="92%" h={40} />
+        <div style={{ marginTop: "var(--space-2)" }}><Skeleton w="60%" h={40} /></div>
+        <div style={{ marginTop: "var(--space-5)" }}><Skeleton w={260} h={18} /></div>
       </section>
-      <section className="card perf">
-        <div className="perf__head">
-          <Skeleton w={150} h={18} />
-          <div className="ptiles">{[0, 1, 2, 3].map((i) => <Skeleton key={i} w="100%" h={44} r="var(--radius-md)" />)}</div>
-        </div>
-        <div className="perf__stats"><Skeleton w={72} h={40} /><Skeleton w={72} h={40} /></div>
-        <Skeleton w="100%" h={260} r="var(--radius-md)" />
+      <section className="section">
+        <div className="chart__bar"><Skeleton w={300} h={16} /><Skeleton w={150} h={20} /></div>
+        <Skeleton w="100%" h={300} />
       </section>
-      <section className="card books">
-        <div className="books__head"><Skeleton w={60} h={18} /></div>
+      <section className="section">
+        <div className="section__head"><Skeleton w={80} h={24} /></div>
         {[0, 1, 2].map((i) => (
-          <div key={i} className="state-row"><Skeleton w="30%" h={16} /><Skeleton w={96} h={16} /></div>
+          <div key={i} className="state-row"><Skeleton w="28%" h={16} /><Skeleton w={110} h={16} /></div>
         ))}
       </section>
     </div>
@@ -36,16 +28,16 @@ export function OverviewLoading() {
 /** Error: what happened in plain words, what still holds, one thing to do. */
 export function LoadError({ onRetry, retrying }: { onRetry: () => void; retrying: boolean }) {
   return (
-    <div className="state card" role="alert">
-      <span className="state__icon state__icon--attention"><Icon name="alert" size={20} /></span>
-      <h1 className="state__title">Can't reach TradePartner on this computer</h1>
+    <div className="state" role="alert">
+      <p className="state__kicker mono">can't load</p>
+      <h1 className="state__title serif">This page can't reach TradePartner on your computer.</h1>
       <p className="state__body">
-        The app couldn't load your books. Your strategies keep running on their schedule; this only affects what you see here.
+        Your strategies keep running on their schedule. Only this view is affected. If it keeps happening, the
+        computer running TradePartner may be asleep or offline.
       </p>
-      <button className="btn btn--primary" onClick={onRetry} disabled={retrying} aria-live="polite">
-        <Icon name="refresh" size={14} /> {retrying ? "Trying again…" : "Try again"}
+      <button className="btn btn--solid" onClick={onRetry} disabled={retrying} aria-live="polite">
+        {retrying ? "trying again…" : "try again"}
       </button>
-      <p className="state__hint">If this keeps happening, the computer running TradePartner may be asleep or offline.</p>
     </div>
   );
 }
@@ -53,13 +45,13 @@ export function LoadError({ onRetry, retrying }: { onRetry: () => void; retrying
 /** Empty: first run, before any book exists. */
 export function NoBooks() {
   return (
-    <div className="state card">
-      <span className="state__icon"><Icon name="books" size={20} /></span>
-      <h1 className="state__title">No books running yet</h1>
+    <div className="state">
+      <p className="state__kicker mono">no books yet</p>
+      <h1 className="state__title serif">Nothing is trading yet.</h1>
       <p className="state__body">
-        Once a strategy starts trading on paper, its value and how it compares with the S&amp;P 500 show up here.
+        When a strategy starts trading on paper, this page will tell you how it's doing against the S&amp;P 500.
       </p>
-      <a className="btn btn--quiet" href="#strategies">See strategies</a>
+      <a className="btn" href="#strategies">see strategies</a>
     </div>
   );
 }

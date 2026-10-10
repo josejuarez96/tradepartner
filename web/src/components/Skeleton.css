@@ -2,7 +2,7 @@
   display: block;
   position: relative;
   overflow: hidden;
-  background: var(--surface-sunken);
+  background: var(--bg-raised);
 }
 .skel::after {
   content: "";
