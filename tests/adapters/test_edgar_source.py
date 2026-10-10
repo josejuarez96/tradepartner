@@ -611,7 +611,9 @@ def test_the_refresh_writes_items_only_once_per_cik(settings: Settings) -> None:
     router = _router(overrides=SETTLED)
     source = _source(settings, router)
     events = source.filing_events(APPLE)
-    assert _submission_urls(router) == ["CIK0000320193.json", "CIK0000320193-submissions-001.json"]
+    # One read; the older page is not needed (every wanted accession is in the
+    # main payload, and the sentinel is never wanted).
+    assert _submission_urls(router) == ["CIK0000320193.json"]
     _assert_old_stamps_unchanged(settings, old)
     data = _file(settings, APPLE)
     assert data["items_refreshed"] is True
@@ -708,3 +710,82 @@ def test_event_forms_are_configurable_and_never_empty(settings: Settings) -> Non
     assert {e.form for e in source.filing_events(APPLE)} == {"10-Q"}
     with pytest.raises(ValueError, match="event_forms"):
         EdgarFilingSource(settings, client=_router().client(), event_forms=[])
+
+
+def _bulk_zip(settings: Settings, *members: tuple[str, bytes]) -> None:
+    bulk = Path(settings.edgar.cache_dir) / "bulk" / "submissions.zip"
+    bulk.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bulk, "w") as archive:
+        for name, body in members:
+            archive.writestr(name, body)
+
+
+def test_a_stale_cached_zip_fills_what_it_has_and_leaves_the_cik_unrefreshed(
+    settings: Settings,
+) -> None:
+    old = _old_cache(settings)
+    stale = load(SUBMISSIONS[APPLE][0])
+    columns = stale["filings"]["recent"]
+    keep = [i for i, a in enumerate(columns["accessionNumber"]) if a != APPLE_202]
+    for key, values in columns.items():
+        columns[key] = [values[i] for i in keep]
+    stale["filings"]["files"] = []
+    _bulk_zip(settings, (f"CIK{APPLE}.json", json.dumps(stale).encode()))
+    router = _router(overrides=SETTLED)
+    source = EdgarFilingSource(
+        settings, client=router.client(), clock=lambda: CLOCK, reuse_cached=True
+    )
+    events = source.filing_events(APPLE)
+    assert router.urls == []
+    assert APPLE_202 not in {e.accession for e in events}
+    assert {e.accession for e in events} == {APPLE_507}
+    assert source.filing_events_items_missing == 0  # not terminal: not refreshed
+    data = _file(settings, APPLE)
+    assert data["items_refreshed"] is False
+    assert data["records"][APPLE_202][4] is None
+    _assert_old_stamps_unchanged(settings, old)
+    # A later per-CIK refresh completes it and marks it refreshed.
+    later = _source(settings, _router(overrides=SETTLED))
+    assert {e.accession for e in later.filing_events(APPLE)} == {APPLE_202, APPLE_507}
+    assert _file(settings, APPLE)["items_refreshed"] is True
+    _assert_old_stamps_unchanged(settings, old)
+
+
+def test_an_empty_zip_page_is_counted_not_recorded_and_marks_nothing(settings: Settings) -> None:
+    old = _old_cache(settings)
+    path = _stamps_files(settings)[APPLE]
+    data = json.loads(path.read_bytes())
+    data["records"]["0000320193-15-000001"] = ["8-K", "doc.htm", False, "2015-01-27T21:30:00+00:00"]
+    path.write_bytes(json.dumps(data).encode("utf-8"))  # wanted only on the older page
+    main, _ = SUBMISSIONS[APPLE]
+    _bulk_zip(
+        settings,
+        (f"CIK{APPLE}.json", (FIXTURES / main).read_bytes()),
+        (f"CIK{APPLE}-submissions-001.json", b"{}"),
+    )
+    source = EdgarFilingSource(
+        settings, client=_router().client(), clock=lambda: CLOCK, reuse_cached=True
+    )
+    source.filing_events(APPLE)
+    assert source.submissions_bulk_empty == 1
+    assert not source.validation_failures
+    assert _file(settings, APPLE)["items_refreshed"] is False
+    _assert_old_stamps_unchanged(settings, old)
+
+
+def test_the_missing_count_waits_for_the_refresh_that_succeeds(settings: Settings) -> None:
+    _old_cache(settings)
+    router = _router(overrides=SETTLED)
+    payload = load(SUBMISSIONS[APPLE][0])
+    del payload["filings"]["recent"]["items"]
+    answers = iter([{}, payload])
+    router.add(
+        SUBMISSIONS_URL + "CIK0000320193.json",
+        lambda request: httpx.Response(200, json=next(answers)),
+    )
+    source = _source(settings, router)
+    assert source.filing_events(APPLE) == []  # `{}`: not refreshed, nothing counted
+    assert source.filing_events_items_missing == 0
+    source._submissions.clear()  # a later run's fresh memo
+    assert source.filing_events(APPLE) == []
+    assert source.filing_events_items_missing == 2  # both 8-Ks terminal, counted once

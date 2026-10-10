@@ -894,7 +894,7 @@ class EdgarFilingSource(FilingSource):
         Counts: `.filing_events_unstamped` (event-form sentinels with no
         acceptance) and `.filing_events_items_missing` (stamped event-form
         accessions whose `items` is still unknown after the refresh, a
-        terminal state), each CIK counted once per instance."""
+        terminal state), each CIK counted once per instance, once refreshed."""
         _validate_cik(cik)
         stamps = self._load_stamps(cik)
         if stamps and not self._items_refreshed.get(cik, True):
@@ -915,7 +915,7 @@ class EdgarFilingSource(FilingSource):
                         cik, record.accession, record.form, record.items, record.accepted_at
                     )
                 )
-        if cik not in self._events_counted:
+        if refreshed and cik not in self._events_counted:
             self._events_counted.add(cik)
             self.filing_events_unstamped += unstamped
             self.filing_events_items_missing += missing
@@ -926,29 +926,39 @@ class EdgarFilingSource(FilingSource):
         self, cik: str, stamps: dict[str, SubmissionRecord]
     ) -> dict[str, SubmissionRecord]:
         """Fill `items` for `cik`'s stamped accessions from one re-read of its
-        submissions, touching nothing else, and mark the file refreshed. A
-        read that fails or answers nothing leaves the file as it is (the
-        refresh is tried again on a later ask)."""
-        payload = self._items_source(cik, set(stamps))
-        if payload is None:
-            return stamps
+        submissions, touching nothing else, and mark the file refreshed once
+        the read is complete (module docstring). A read that fails or answers
+        nothing leaves the file as it is; a cached zip that lacks a wanted
+        accession (it trails the stamps) fills what it has and leaves the
+        flag `false`, so the refresh is tried again on a later ask."""
+        wanted = {a for a, r in stamps.items() if r.items is None and r.accepted_at is not None}
+        if wanted:
+            read = self._items_source(cik, wanted)
+            if read is None:
+                return stamps
+            payload, complete = read
+        else:
+            payload, complete = {}, True  # only sentinels: nothing to read
         filled = dict(stamps)
-        for accession, record in stamps.items():
-            if record.items is not None:
-                continue
+        for accession in wanted:
             fresh = payload.get(accession)
             if fresh is not None and fresh.items is not None:
-                filled[accession] = replace(record, items=fresh.items)
-        self._save_stamps(cik, filled, items_refreshed=True)
+                filled[accession] = replace(stamps[accession], items=fresh.items)
+        if complete or filled != stamps:
+            self._save_stamps(cik, filled, items_refreshed=complete)
         return filled
 
-    def _items_source(self, cik: str, wanted: set[str]) -> dict[str, SubmissionRecord] | None:
-        """`cik`'s submission records for the refresh, or `None` when nothing
-        usable was read: the cached `submissions.zip` member and its pages
-        under `reuse_cached` (no request), otherwise the per-CIK API."""
+    def _items_source(
+        self, cik: str, wanted: set[str]
+    ) -> tuple[dict[str, SubmissionRecord], bool] | None:
+        """`cik`'s submission records for the refresh and whether the read is
+        complete, or `None` when nothing usable was read. Under `reuse_cached`
+        the cached `submissions.zip` member and its older pages (no request),
+        complete only when every one of `wanted` is found; otherwise the
+        per-CIK API, complete once every page it needed was read."""
         if not self._reuse_cached:
             submissions = self._fetch_submissions(cik, wanted)
-            return None if submissions.empty else submissions.records
+            return None if submissions.empty else (submissions.records, True)
         path = self._cache / "bulk" / "submissions.zip"
         try:
             bulk = zipfile.ZipFile(path)
@@ -959,26 +969,38 @@ class EdgarFilingSource(FilingSource):
         with bulk:
             names = set(bulk.namelist())
 
-            def member(name: str) -> tuple[dict[str, SubmissionRecord], list[str]] | None:
-                def parse() -> tuple[dict[str, SubmissionRecord], list[str]] | None:
-                    payload = json.loads(bulk.read(name))
-                    return None if _keyless_member(payload) else reduce_submissions(payload)
+            def member(
+                name: str, absent: Callable[[Any], bool]
+            ) -> tuple[dict[str, SubmissionRecord], list[str]] | bool:
+                """As `_stamp_bulk`'s: `True` when `absent(payload)` (#566),
+                `False` once recorded as unparsed (#578)."""
 
-                return self.validation_failures.collect("submissions.zip member", name, parse)
+                def parse() -> tuple[dict[str, SubmissionRecord], list[str]] | bool:
+                    payload = json.loads(bulk.read(name))
+                    return True if absent(payload) else reduce_submissions(payload)
+
+                parsed = self.validation_failures.collect("submissions.zip member", name, parse)
+                return False if parsed is None else parsed
 
             name = f"CIK{cik}.json"
-            main = member(name) if name in names else None
-            if main is None:
+            if name not in names:
+                return None
+            main = member(name, _keyless_member)
+            if main is True:
+                self.submissions_bulk_empty += 1
+            if isinstance(main, bool):
                 return None
             records, pages = main
             for page in pages:
                 if wanted <= records.keys() or page not in names:
                     break
-                older = member(page)
-                if older is None:
+                older = member(page, _empty_object)
+                if older is True:
+                    self.submissions_bulk_empty += 1
+                if isinstance(older, bool):
                     break
                 records.update(older[0])
-            return records
+            return records, wanted <= records.keys()
 
     # --- the companies snapshot ---------------------------------------------
 
