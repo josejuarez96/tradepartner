@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-10 · **Branch:** `spike/design-ui` (pushed; no PR, the owner hasn't asked for one) · **Owner:** Jose
 
-Read this first, then [engine-first.md](engine-first.md) (the step back: what the engine does, how other platforms show theirs, the proposed structure and the owner's open decisions), [DESIGN.md](DESIGN.md) (the design contract) and [ai-tells.md](ai-tells.md) (what to avoid). Older history is in [README.md](README.md).
+Read this first, then [workflow.md](workflow.md) (a strategy's life, the owner's routine and the app structure that follows; **this now leads the design**), [engine-first.md](engine-first.md) (the step back: what the engine does, how other platforms show theirs, the proposed structure and the owner's open decisions), [DESIGN.md](DESIGN.md) (the design contract) and [ai-tells.md](ai-tells.md) (what to avoid). Older history is in [README.md](README.md).
 
 ## The brief, in one paragraph
 Design the end-user app for TradePartner for the owner as a *user*, not a developer, at his desk and on his phone. It answers: how am I doing (overall, per book, vs SPY); what each book holds and does, and why; is anything wrong or waiting on me (quiet when nothing is); stop/resume a book safely (reason required, clear confirm); and research (what am I testing, did it work, could it be luck, what's waiting on me). Plain language, every element earns its place, phone first-class, WCAG AA, finished states (hover/focus/loading/empty/error). Prototype as React + TypeScript + Vite under `web/`, fed by `web/sample/app-data.json`; no backend. Notes under `docs/research/ui/`. Don't touch `src/`, `tests/` or other `docs/`. Don't read `data/*.duckdb` or `.env`.
