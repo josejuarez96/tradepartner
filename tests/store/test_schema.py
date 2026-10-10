@@ -588,7 +588,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (21,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (22,)
     finally:
         conn.close()
 
@@ -598,7 +598,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
 _V21_FILING_EVENTS_DDL_SHA256 = "aff98d8eecb42c4ffb6cf47d75d6e1976ff8d0ceb01f26becb1dee0de3f8730d"
 
 
-def test_filing_events_ddl_is_pinned_at_version_21() -> None:
+def test_filing_events_ddl_is_pinned_at_version_22() -> None:
     digest = hashlib.sha256("".join(schema._FILING_EVENTS_TABLE_DDL).encode()).hexdigest()
     assert digest == _V21_FILING_EVENTS_DDL_SHA256, (
         "filing_events DDL changed: bump the schema version and add a "
@@ -737,9 +737,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21]
+        assert _versions(conn) == [20, 21, 22]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21]
+        assert _versions(conn) == [20, 21, 22]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -872,7 +872,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (21,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (22,)
     finally:
         conn.close()
 
@@ -994,7 +994,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -1491,7 +1491,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `signals.reason` prefix `CHECK` (#1153, T127) is version 14; the period keys
     (#1179, T97) are version 15; the lab migration (#1195, T113) is version 16;
     the ADR 0015 expansion seams (#1258, T132) are version 17."""
-    assert schema.CURRENT_SCHEMA_VERSION == 21
+    assert schema.CURRENT_SCHEMA_VERSION == 22
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

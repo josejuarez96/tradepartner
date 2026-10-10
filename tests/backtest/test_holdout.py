@@ -686,6 +686,42 @@ def test_a_variant_is_refused_before_any_other_rule(window: Window, tracking: bo
     assert "sweep run" in decision.message
 
 
+def test_an_operations_book_is_unpromoted_so_its_spend_is_refused_and_tracking_runs(
+    lab_store: Any, settings: Settings, tmp_path: Path
+) -> None:
+    """Paper plan T160b: an operations file (strategy-lab spec req 1, amendment
+    2026-10-10) is no variant, not pre-lab and not promoted, as `run._lab_state` reads
+    it from the store: `decide` refuses its holdout spend (req 5(b)) and lets its
+    tracking window through (no `refused_variant`)."""
+    from backtest.test_promotion import CODE, Lab
+
+    root = tmp_path / "files"
+    root.mkdir()
+    lab = Lab(lab_store, settings, root)
+    lab.trial(lab.twin(), 0.3)
+    _sweep, (_v1, v2) = lab.sweep([0.15, 0.25])
+    lab.trial(_v1, 1.5)
+    lab.trial(v2, 0.4)
+    outcome = hypothesis_module.register_operations_book(
+        lab_store,
+        lab.file("ops-book", 0.25),
+        v2.slug,
+        "machine test",
+        registered_by="owner",
+        settings=settings,
+        code_vintage=CODE,
+    )
+    state = run_module._lab_state(lab_store, outcome.registered, settings)
+    assert state is not None
+    assert (state.is_variant, state.is_pre_lab, state.promoted) == (False, False, False)
+    spend = _decide_lab(HOLDOUT, state)
+    assert (spend.outcome, spend.kind) == ("refused_holdout", None)
+    assert "pre-lab or promoted" in spend.message
+    assert _decide_lab(HOLDOUT, state, NO_FLAGS, NO_REASONS, tracking=True).outcome != (
+        "refused_variant"
+    )
+
+
 def test_without_lab_state_a_not_pre_lab_spend_runs_as_in_phase_3() -> None:
     """`lab=None` (a store without the lab tables) is the Phase 3 decision exactly."""
     for spends in [(), (_spend(HYPOTHESIS_ID + 1), _spend(HYPOTHESIS_ID + 2, trial_id=2))]:
