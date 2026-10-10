@@ -926,10 +926,14 @@ class TestRefusals:
         `load_frozen` and its results are recorded (strategy-lab T96)."""
         settings = _settings(tmp_path)
         all_params = frozen_params_of(settings, family="momentum")
+        # Also before `gap.stale_listing_sessions` (#1199) and
+        # `strategy.turnover_top_fraction` (#1358) landed.
         params = {
             k: v
             for k, v in all_params.items()
-            if not k.startswith(("schedule.", "gap.stale_listing_sessions"))
+            if not k.startswith(
+                ("schedule.", "gap.stale_listing_sessions", "strategy.turnover_top_fraction")
+            )
         }
         registry.register_hypothesis(
             conn,

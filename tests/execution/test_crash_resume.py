@@ -921,7 +921,7 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     # other test's catch-up-session behavior.
     assert window.window_id is not None
     frozen_values = json.loads(window.frozen_json)
-    frozen_values["paper.min_rebalances"] = PaperConfig().min_rebalances
+    frozen_values["paper.min_rebalances"] = PaperConfig().min_rebalances["month_end"]
     with env.connect() as conn:
         conn.execute(
             "UPDATE paper_windows SET frozen_json = ? WHERE window_id = ?",

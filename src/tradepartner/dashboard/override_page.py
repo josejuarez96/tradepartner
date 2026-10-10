@@ -56,6 +56,15 @@ What the page draws comes from the shell's read-only connection: whether a
 window is open, so the owner sees before submitting that the writer would
 refuse with `no_window`. The form renders whatever else the store holds or
 lacks; no other table is read.
+
+**The book** (ADR 0017 B.7, plan T156). When a book other than
+`paper.book_id` has a window (`execution.ops.book_ids`), a book selector
+(`BOOK_KEY`, outside the form, so the window state below it follows the pick;
+default `paper.book_id`) names the book the override is written to: `on_submit`
+hands it to the writer (`window.override(..., book_id=)`), which appends to
+that book's open window only, and the duplicate guard's signature includes it.
+With only `main` there is no selector and the writer takes `paper.book_id`,
+exactly as before.
 """
 
 from __future__ import annotations
@@ -69,7 +78,7 @@ import duckdb
 import streamlit as st
 
 from tradepartner.config import Settings, get_settings
-from tradepartner.execution import window
+from tradepartner.execution import ops, window
 from tradepartner.store.db import StoreLockedError, utc_now
 from tradepartner.store.journal import JournalIntegrityError, JournalNotInitialised, open_window
 from tradepartner.store.schema import (
@@ -86,6 +95,8 @@ KINDS: tuple[str, ...] = tuple(
     kind for kind in JOURNAL_ENUMS[("overrides", "kind")] if kind != SETTLE_ORDER_KIND
 )
 
+#: The book selector's widget key (module docstring, "The book").
+BOOK_KEY = "override_book"
 FORM_KEY = "override_form"
 KIND_KEY = "override_kind"
 SESSION_KEY = "override_rebalance_session"
@@ -93,7 +104,7 @@ NAME_KEY = "override_name"
 REASON_KEY = "override_reason"
 SUBMIT_KEY = "override_submit"
 OUTCOME_KEY = "override_outcome"
-#: The trimmed `(kind, rebalance_session, name, reason)` last written this
+#: The `(book, kind, rebalance_session, name, reason)` (trimmed) last written this
 #: session (module docstring, "A fast double-click"); `None` until the first
 #: write. Changes only when a *different* submit is itself written — never
 #: on a field edit alone — so an exact resubmit of it stays refused until
@@ -136,17 +147,19 @@ def submit(
     name: str | None,
     reason: str | None,
     clock: Callable[[], datetime] = utc_now,
+    book_id: str | None = None,
 ) -> Outcome:
     """Call T64b's `override` writer once with what the form holds and map its
     answer to an `Outcome`. A blank name is no name (`engage_kill_switch`
     takes none); the reason goes to the writer untrimmed, which trims it and
     checks it. Any other exception (a clock fault, a window whose
     `frozen_json` lacks the minimum) propagates: it is not an answer to
-    show, it is a fault."""
+    show, it is a fault. `book_id` names the book whose open window the row is
+    written to (default `paper.book_id`)."""
     security_id = (name or "").strip() or None
     try:
         override_id = window.override(
-            settings, clock, kind, rebalance_session, security_id, reason or ""
+            settings, clock, kind, rebalance_session, security_id, reason or "", book_id=book_id
         )
     except window.WindowCommandRefused as exc:
         return Outcome(OutcomeStatus.REFUSED, str(exc), refusal=exc.reason)
@@ -182,7 +195,8 @@ def on_submit(settings: Settings) -> None:
         state[NAME_KEY],
         state[REASON_KEY],
     )
-    signature = (kind, rebalance_session, (name or "").strip(), (reason or "").strip())
+    book = state.get(BOOK_KEY) or settings.paper.book_id  # no selector: `paper.book_id`
+    signature = (book, kind, rebalance_session, (name or "").strip(), (reason or "").strip())
     if kind not in _DUPLICATE_GUARD_EXEMPT_KINDS and signature == state.get(LAST_WRITTEN_KEY):
         state[OUTCOME_KEY] = Outcome(
             OutcomeStatus.DUPLICATE,
@@ -190,7 +204,7 @@ def on_submit(settings: Settings) -> None:
             "was written. Change a field to submit again.",
         )
         return
-    outcome = submit(settings, kind, rebalance_session, name, reason)
+    outcome = submit(settings, kind, rebalance_session, name, reason, book_id=book)
     if outcome.status is OutcomeStatus.WRITTEN:
         state[LAST_WRITTEN_KEY] = signature
         state[REASON_KEY] = ""
@@ -218,9 +232,22 @@ def show_outcome(settings: Settings) -> None:
         st.error(f"Refused ({outcome.refusal}): {outcome.message}. Nothing was written.")
 
 
-def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
+def _render_book_selector(conn: duckdb.DuckDBPyConnection, default: str) -> str:
+    """The book selector when more than one book has a window (module docstring,
+    "The book"); returns the book the window state is shown for."""
     try:
-        current = open_window(conn)
+        books = list(ops.book_ids(conn))
+    except (JournalNotInitialised, SchemaVersionError):
+        books = []
+    if books in ([], [default]):
+        return default
+    index = books.index(default) if default in books else 0
+    return str(st.selectbox("Book", books, index=index, key=BOOK_KEY))
+
+
+def _render_window_state(conn: duckdb.DuckDBPyConnection, book: str) -> None:
+    try:
+        current = open_window(conn, book)
     except JournalNotInitialised:
         current = None
     except SchemaVersionError as exc:
@@ -232,7 +259,10 @@ def _render_window_state(conn: duckdb.DuckDBPyConnection) -> None:
         st.error(f"{exc}; the writer refuses every override until this is resolved.")
         return
     if current is None:
-        st.info("No paper window is open: the writer refuses an override with `no_window`.")
+        st.info(
+            f"No paper window is open for book `{book}`: the writer refuses an override "
+            "with `no_window`."
+        )
 
 
 def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) -> None:
@@ -251,7 +281,7 @@ def render(conn: duckdb.DuckDBPyConnection, settings: Settings | None = None) ->
         "once trimmed."
     )
 
-    _render_window_state(conn)
+    _render_window_state(conn, _render_book_selector(conn, settings.paper.book_id))
 
     with st.form(FORM_KEY):
         st.selectbox("Kind", KINDS, key=KIND_KEY)

@@ -78,7 +78,7 @@ import polars as pl
 import pytest
 from conftest import load_universe_fixtures
 
-from lookahead.harness import _FACT_TABLES, _SOURCE_SCHEMA, TruncatedStore
+from lookahead.harness import _FACT_TABLES, _SOURCE_SCHEMA, TruncatedStore, screened_strategy
 from tradepartner.backtest import engine
 from tradepartner.backtest.engine import BacktestResult, run
 from tradepartner.backtest.provider import DataProvider
@@ -143,10 +143,14 @@ class Case:
     teeth: date
     family: HypothesisFamily = "momentum"
     accepted: tuple[Accepted, ...] = ()
+    screened: bool = False
 
     @property
     def id(self) -> str:
-        """The pytest id: the cadence for a momentum case (ids unchanged), else the family."""
+        """The pytest id: the cadence for a momentum case (ids unchanged), else the family;
+        the turnover-screened momentum case is `momentum-turnover`."""
+        if self.screened:
+            return "momentum-turnover"
         return self.cadence if self.family == "momentum" else self.family
 
 
@@ -223,16 +227,22 @@ CASES: dict[str, Case] = {
             family="combined",
             accepted=(*ACCEPTED[:1], *ACCEPTED[3:]),
         ),
+        # B10's turnover screen (#1358, T165c): the screened twin's `strategy` block, so
+        # each plan also reads the formation month's volume, the shares facts and the
+        # splits, and the compared reads carry `no_turnover` and the screen's counts.
+        Case("month_end", date(2018, 1, 2), FIXTURE_END, teeth=date(2019, 1, 31), screened=True),
     )
 }
-assert tuple(c.cadence for c in CASES.values() if c.family == "momentum") == get_args(Cadence)
+assert tuple(
+    c.cadence for c in CASES.values() if c.family == "momentum" and not c.screened
+) == get_args(Cadence)
 
 Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 Results = Mapping[float, BacktestResult]
 PlanView = dict[float, tuple[dict[str, float], tuple[Any, ...]]]
 Planned = tuple[Results, Mapping[date, engine.Plan]]
 #: The `Plan` fields `decisions_from` reads (T53b), compared like the row's plan fields.
-PLAN_READS = ("members", "scores", "excluded_no_history", "exclusions")
+PLAN_READS = ("members", "scores", "excluded_no_history", "exclusions", "counts")
 
 
 @pytest.fixture(autouse=True)
@@ -242,7 +252,7 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
 
 
-def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
+def _frozen(cadence: Cadence, family: HypothesisFamily, *, screened: bool = False) -> Settings:
     extra: dict[str, dict[str, float]] = {}
     if family in ("profitability", "combined"):
         extra["profitability"] = {"top_fraction": 0.5}
@@ -250,7 +260,7 @@ def _frozen(cadence: Cadence, family: HypothesisFamily) -> Settings:
         extra["combined"] = {"top_fraction": 0.5}
     return Settings(
         _env_file=None,
-        strategy={"top_fraction": 0.5},
+        strategy=screened_strategy() if screened else {"top_fraction": 0.5},
         schedule={"rebalance_cadence": cadence},
         **extra,
     )
@@ -394,7 +404,7 @@ class Fixture:
 def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
     case: Case = request.param
     conn = _store()
-    settings = _frozen(case.cadence, case.family)
+    settings = _frozen(case.cadence, case.family, screened=case.screened)
     try:
         yield Fixture(
             case=case,
@@ -571,7 +581,8 @@ def _late_signal_plan(fixture: Fixture) -> Callable[..., engine._Plan]:
 def test_a_late_signal_read_fails_the_check_and_the_engine_passes_it(
     fixture: Fixture, baseline: dict[date, PlanView], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if fixture.case.family != "momentum":
+    if fixture.case.family != "momentum" or fixture.case.screened:
+        # The screened case's teeth are the shares revision in the invariance suite.
         pytest.skip("revises a momentum anchor bar; the profitability teeth are `Accepted`")
     t_k = fixture.case.teeth
     k = fixture.sessions.index(t_k)

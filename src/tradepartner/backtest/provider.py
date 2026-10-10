@@ -14,6 +14,11 @@ The two statement reads (`statement_facts`, `sics`; backtest spec amendment #720
 T85c) serve the `profitability` family: a statement fact is visible at `t` from its
 filing's acceptance (`known_at <= t`), and the engine passes `t = session_close(T)`, so a
 10-K accepted after the close of a rebalance session is first read at the next one.
+
+The turnover read (`turnover_inputs`; backtest spec amendment #1358, plan T165b) serves
+the `momentum` family's turnover screen: the formation sessions' raw `traded_only` bars,
+rule 7's raw shares pick and the splits known at `t`, each read with `known_at <= t`. It
+is raw on purpose: the screen moves volume and shares into `t`'s share units itself.
 """
 
 from __future__ import annotations
@@ -31,6 +36,38 @@ from tradepartner.universe import Universe
 #: The `statement_facts` names `DataProvider.statement_facts` returns: the `profitability`
 #: family's numerator and denominator (`operating_cash_flow` joins with B3b).
 STATEMENT_FACT_NAMES: Final[tuple[str, ...]] = ("gross_profit", "total_assets")
+
+
+@dataclass(frozen=True)
+class TurnoverInputs:
+    """`DataProvider.turnover_inputs`'s one record, every part as known at `t`.
+
+    `bars`: the raw `traded_only` bars of the ids from `sessions_from` through `t`'s
+    session (`security_id`, `session`, `volume`, `known_at`, sorted by id and session);
+    a session with no traded bar is a missing row, never a zero. `shares`: per id with a
+    pick, rule 7's raw shares fact `(as_of_date, value)` (`universe.shares_as_of`, not
+    split-moved); an id with none is absent. `splits`: per id with any, `(ex_date,
+    ratio)` of every split known at `t` with `ex_date` at or before `t`'s session, one
+    per action identity (a re-dated split counts once, a cancelled one not at all, #108),
+    sorted by `ex_date`.
+    """
+
+    t: datetime
+    bars: pl.DataFrame
+    shares: Mapping[str, tuple[date, float]]
+    splits: Mapping[str, tuple[tuple[date, float], ...]]
+
+
+#: `TurnoverInputs.bars`' columns, in order.
+TURNOVER_BAR_COLUMNS: Final[tuple[str, ...]] = ("security_id", "session", "volume", "known_at")
+
+
+def check_sessions_from(sessions_from: date) -> date:
+    """`sessions_from` as a session date; a datetime (or anything else) raises
+    `TypeError`, as the store's bounded reads refuse it."""
+    if isinstance(sessions_from, datetime) or not isinstance(sessions_from, date):
+        raise TypeError(f"sessions_from must be a session date, not {sessions_from!r}")
+    return sessions_from
 
 
 @dataclass(frozen=True)
@@ -128,4 +165,14 @@ class DataProvider(Protocol):
         """Each of `ids` mapped to the `sic` of its latest `classifications` row known at
         `t` (`classifications_as_of(t, ids)`); `None` when it has no such row or the row
         carries no SIC."""
+        ...
+
+    def turnover_inputs(
+        self, t: datetime, ids: Sequence[str], sessions_from: date
+    ) -> TurnoverInputs:
+        """The `momentum` turnover screen's inputs at `t` for `ids` (`TurnoverInputs`):
+        `prices_as_of(t, ids, traded_only=True)` from `sessions_from` through `t`'s
+        session, `universe.shares_as_of(t, ids)`'s raw picks with their `as_of_date`, and
+        the splits of `live_actions_as_of(t, ids)` with `ex_date` at or before `t`'s
+        session. Only rows with `known_at <= t` are read."""
         ...

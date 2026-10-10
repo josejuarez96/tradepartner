@@ -1,0 +1,3 @@
+- T164 (#1371): data-foundation spec amendment for filing_events (8-K items with acceptance, known_at = stamp) and the coverage count: 98-99% of universe CIKs file a 2.02 8-K a quarter (TP-1); SEC acceptance-clock defect found (TP-2).
+### Added
+- Data-foundation spec amendment #1358: the filing_events table (cik, accession, form, verbatim items, accepted_at; known_at = accepted_at), its as-of read, health count, edgar.event_forms and edgar.filing_events_enabled; claims TP-1 (2.02 8-K coverage and the lag to the 10-Q/10-K) and TP-2 (the submissions acceptance clock moved by the New York offset).

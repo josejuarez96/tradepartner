@@ -12,6 +12,14 @@ The statement reads (T85c) work the same way over `statement_rows` (keyed by
 `security_id`, as `statement_facts_as_of` returns them after its `cik` join) and
 `classification_rows` (`security_id`, `sic`, `known_at`). `statement_rows` holds first
 vintages only, as the table does, so two rows for one key are refused.
+
+The turnover read (T165b) works over `raw` (or `prices`; it needs a `volume` column)
+for the `traded_only` bars, `shares_rows` (`security_id`, `as_of_date`, `value`,
+`known_at`; the pick is the latest `as_of_date` among the rows known at `t`, its latest
+revision, with none of rule 7's class or plausibility handling) and `split_rows`
+(`security_id`, `action_id`, `ex_date`, `ratio`, `cancelled`, `known_at`; the latest
+revision per `(security_id, action_id)` known at `t`, dropped when cancelled, so a
+re-dated split counts once).
 """
 
 from __future__ import annotations
@@ -23,7 +31,14 @@ from typing import Any
 
 import polars as pl
 
-from tradepartner.backtest.provider import STATEMENT_FACT_NAMES, GapReading, check_t
+from tradepartner.backtest.provider import (
+    STATEMENT_FACT_NAMES,
+    TURNOVER_BAR_COLUMNS,
+    GapReading,
+    TurnoverInputs,
+    check_sessions_from,
+    check_t,
+)
 from tradepartner.calendar import last_completed_session
 from tradepartner.universe import _EXCLUSION_SCHEMA, _MEMBER_SCHEMA, Universe
 
@@ -54,6 +69,22 @@ _STATEMENT_KEY = ["security_id", "fact_name", "period_end", "period_days"]
 _CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "sic": pl.Int32,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+_SHARES_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "as_of_date": pl.Date,
+    "value": pl.Float64,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+_SPLIT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "action_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "ratio": pl.Float64,
+    "cancelled": pl.Boolean,
     "known_at": pl.Datetime("us", "UTC"),
 }
 
@@ -114,6 +145,8 @@ class FakeProvider:
     classification_rows: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(schema=_CLASSIFICATION_SCHEMA)
     )
+    shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
+    split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -232,3 +265,35 @@ class FakeProvider:
         rows = _latest(_for_ids(_known(self.classification_rows, t), ids), ["security_id"])
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in ids}
+
+    def turnover_inputs(
+        self, t: datetime, ids: Sequence[str], sessions_from: date
+    ) -> TurnoverInputs:
+        sessions_from = check_sessions_from(sessions_from)
+        t = self._record("turnover_inputs", t, ids=ids, sessions_from=sessions_from)
+        session = last_completed_session(t)
+        source = self.raw if self.raw is not None else self.prices
+        bars = (
+            _latest(_for_ids(_known(source, t), ids), ["security_id", "session"])
+            .filter(pl.col("volume") > 0)
+            .filter(pl.col("session").is_between(sessions_from, session))
+            .select(TURNOVER_BAR_COLUMNS)
+            .sort("security_id", "session")
+        )
+        facts = _latest(_for_ids(_known(self.shares_rows, t), ids), ["security_id", "as_of_date"])
+        picks = facts.sort("security_id", "as_of_date").unique(subset="security_id", keep="last")
+        shares = {
+            sid: (as_of, value)
+            for sid, as_of, value in picks.select("security_id", "as_of_date", "value").iter_rows()
+        }
+        actions = _latest(_for_ids(_known(self.split_rows, t), ids), ["security_id", "action_id"])
+        live = actions.filter(~pl.col("cancelled") & (pl.col("ex_date") <= session))
+        splits: dict[str, list[tuple[date, float]]] = {}
+        for sid, ex_date, ratio in live.select("security_id", "ex_date", "ratio").iter_rows():
+            splits.setdefault(sid, []).append((ex_date, ratio))
+        return TurnoverInputs(
+            t=t,
+            bars=bars,
+            shares={sid: shares[sid] for sid in ids if sid in shares},
+            splits={sid: tuple(sorted(splits[sid])) for sid in ids if sid in splits},
+        )

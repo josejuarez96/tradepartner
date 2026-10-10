@@ -12,6 +12,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -23,9 +24,11 @@ from tradepartner.execution.plan import stop_session
 from tradepartner.execution.report import (
     Journal,
     PriceOf,
-    TrialMonths,
-    compare_months,
+    TrialPeriods,
+    compare_periods,
+    compare_targets,
 )
+from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionEventRow,
@@ -84,8 +87,8 @@ def _trial(
     equity: Mapping[date, float],
     cost_paid: Mapping[date, float],
     sessions: Sequence[date] = (T0, T1),
-) -> TrialMonths:
-    return TrialMonths(sessions=sessions, equity=equity, cost_paid=cost_paid)
+) -> TrialPeriods:
+    return TrialPeriods(sessions=sessions, equity=equity, cost_paid=cost_paid)
 
 
 def _cash_mark(session: date, cash: float, *, run_id: int = 1) -> PositionDailyRow:
@@ -255,11 +258,11 @@ def test_equal_returns_both_rules_pass() -> None:
     trial = _trial(equity, {T0: 100.0})
     journal = _journal(positions_daily=_flat_marks(equity))
     for rule in ("raw", "residual"):
-        result = compare_months(
+        result = compare_periods(
             _window(tracking_rule=rule), trial, journal, _no_actions(), _no_price, _no_price, None
         )
-        assert result.passed, result.months
-        assert result.months[0].raw == pytest.approx(0.0)
+        assert result.passed, result.periods
+        assert result.periods[0].raw == pytest.approx(0.0)
 
 
 def test_modelled_cost_uses_trial_equity_not_paper_equity() -> None:
@@ -271,7 +274,7 @@ def test_modelled_cost_uses_trial_equity_not_paper_equity() -> None:
     trial_equity = {T0: 100_000.0, T1: 101_000.0}  # trial return = 0.01
     trial = _trial(trial_equity, {T0: 1_000.0})  # modelled cost = 1_000/100_000 = 0.01
     journal = _journal(positions_daily=_flat_marks(paper_equity))
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw", tracking_k=1.0),
         trial,
         journal,
@@ -280,8 +283,8 @@ def test_modelled_cost_uses_trial_equity_not_paper_equity() -> None:
         _no_price,
         None,
     )
-    assert result.months[0].modelled_cost == pytest.approx(0.01)
-    assert result.months[0].raw == pytest.approx(0.0)  # both returns are 0.01
+    assert result.periods[0].modelled_cost == pytest.approx(0.01)
+    assert result.periods[0].raw == pytest.approx(0.0)  # both returns are 0.01
     assert result.passed
     # Had the cost instead divided by paper's equity (10_000), the modelled
     # cost would be 0.1, ten times too loose: the check would still pass
@@ -328,14 +331,14 @@ def test_action_identity_matches_store_asof_source_action_id() -> None:
     )
     actions = pl.concat([original, revised])
     journal = _journal(positions_daily=marks)
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="residual"), trial, journal, actions, _no_price, _no_price, None
     )
     # The correction moved the dividend out of this month entirely: the
     # correct identity (by source_action_id) leaves nothing to count here.
     # A wrong identity (keeping the original's in-month row alive too) would
     # report 0.5*100/100_000 = 0.0005 instead.
-    assert result.months[0].dividend_term == pytest.approx(0.0)
+    assert result.periods[0].dividend_term == pytest.approx(0.0)
 
 
 def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None:
@@ -364,16 +367,16 @@ def test_dividend_credit_known_only_after_month_end_does_not_zero_term() -> None
             )
         ],
     )
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="residual"), trial, late_credit, dividends, _no_price, _no_price, None
     )
     expected = (0.5 * 100.0) / 100_000.0
-    assert result.months[0].dividend_term == pytest.approx(expected)
+    assert result.periods[0].dividend_term == pytest.approx(expected)
 
 
 def test_raw_boundary_exact_passes_one_above_fails() -> None:
     # Every number below is a dyadic fraction (an exact power-of-two divisor)
-    # so the arithmetic `compare_months` does is bit-exact, and the "exactly
+    # so the arithmetic `compare_periods` does is bit-exact, and the "exactly
     # at the threshold" case is not a coin flip of float rounding.
     equity_i = 100_000.0
     cost = {T0: 48.828125}  # modelled cost = 48.828125 / 100_000 = 0.00048828125 (2^-11)
@@ -385,7 +388,7 @@ def test_raw_boundary_exact_passes_one_above_fails() -> None:
     boundary_next = equity_i * (1 + target_paper_return)  # 101_660.15625
 
     boundary = _journal(positions_daily=_flat_marks({T0: equity_i, T1: boundary_next}))
-    ok = compare_months(
+    ok = compare_periods(
         _window(tracking_rule="raw", tracking_k=tracking_k),
         _trial(trial_equity, cost),
         boundary,
@@ -394,12 +397,12 @@ def test_raw_boundary_exact_passes_one_above_fails() -> None:
         _no_price,
         None,
     )
-    assert ok.months[0].raw == threshold  # bit-exact, not merely approx
+    assert ok.periods[0].raw == threshold  # bit-exact, not merely approx
     assert ok.passed
 
     # Comfortably over (far beyond any float noise) fails, naming T0.
     over = _journal(positions_daily=_flat_marks({T0: equity_i, T1: boundary_next + 1.0}))
-    bad = compare_months(
+    bad = compare_periods(
         _window(tracking_rule="raw", tracking_k=tracking_k),
         _trial(trial_equity, cost),
         over,
@@ -409,8 +412,8 @@ def test_raw_boundary_exact_passes_one_above_fails() -> None:
         None,
     )
     assert not bad.passed
-    assert bad.failing_month == T0
-    assert not bad.months[0].passed
+    assert bad.failing_period == T0
+    assert not bad.periods[0].passed
 
 
 def test_dividend_term_and_dividend_cash_zero() -> None:
@@ -427,7 +430,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
     dividends = _action(A, "dividend", ex_date, 0.5, _utc(T1))  # amount 0.5/share
 
     with_dividend = _journal(positions_daily=marks)
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="residual"),
         trial,
         with_dividend,
@@ -437,7 +440,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
         None,
     )
     expected_term = (0.5 * 100.0) / 100_000.0
-    month = result.months[0]
+    month = result.periods[0]
     assert month.dividend_term == pytest.approx(expected_term)
     # raw is negative (paper ahead by less than expected, forcing the base case below);
     # build a case where raw alone fails but the dividend term rescues the residual.
@@ -449,7 +452,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
             _position_mark(record_date, A, 100.0, 50.0),
         ]
     )
-    raw_result = compare_months(
+    raw_result = compare_periods(
         _window(tracking_rule="raw"),
         raw_fail_trial,
         raw_fail_journal,
@@ -459,7 +462,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
         None,
     )
     assert not raw_result.passed  # raw alone, tracking_k=2, cost=0 -> any nonzero raw fails
-    residual_result = compare_months(
+    residual_result = compare_periods(
         _window(tracking_rule="residual"),
         raw_fail_trial,
         raw_fail_journal,
@@ -471,7 +474,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
     # dividend term = 0.5*100/100_000 = 0.0005, nowhere near rescuing -0.01, so use a
     # dividend sized to exactly offset raw: amount such that dividend_term == 0.01.
     big_dividend = _action(A, "dividend", ex_date, 10.0, _utc(T1))  # 10*100/100_000 = 0.01
-    rescued = compare_months(
+    rescued = compare_periods(
         _window(tracking_rule="residual"),
         raw_fail_trial,
         raw_fail_journal,
@@ -480,7 +483,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
         _no_price,
         None,
     )
-    assert rescued.months[0].residual == pytest.approx(0.0)
+    assert rescued.periods[0].residual == pytest.approx(0.0)
     assert rescued.passed
     assert not residual_result.passed  # sanity: the small dividend does not rescue it
 
@@ -502,10 +505,10 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
             )
         ],
     )
-    credited_result = compare_months(
+    credited_result = compare_periods(
         _window(tracking_rule="residual"), trial, credited, dividends, _no_price, _no_price, None
     )
-    assert credited_result.months[0].dividend_term == pytest.approx(0.0)
+    assert credited_result.periods[0].dividend_term == pytest.approx(0.0)
 
     # ...or, as `reconcile_run._dividends` actually stamps it, several
     # sessions later at the pay date: a session-equality match would miss
@@ -527,7 +530,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
             )
         ],
     )
-    credited_lagged_result = compare_months(
+    credited_lagged_result = compare_periods(
         _window(tracking_rule="residual"),
         trial,
         credited_lagged,
@@ -536,7 +539,7 @@ def test_dividend_term_and_dividend_cash_zero() -> None:
         _no_price,
         None,
     )
-    assert credited_lagged_result.months[0].dividend_term == pytest.approx(0.0)
+    assert credited_lagged_result.periods[0].dividend_term == pytest.approx(0.0)
 
 
 def test_fill_timing_term_positive_for_costly_buy_and_sell() -> None:
@@ -551,27 +554,27 @@ def test_fill_timing_term_positive_for_costly_buy_and_sell() -> None:
         positions_daily=_flat_marks(equity),
         fills=[_fill("buy-1", "buy", A, _utc(fill_day), 10.0, close + 1.0)],
     )
-    buy_result = compare_months(
+    buy_result = compare_periods(
         _window(tracking_rule="raw"), trial, buy, _no_actions(), closes, _no_price, None
     )
     expected_buy = (10.0 * 1.0) / 100_000.0
-    assert buy_result.months[0].fill_timing_term == pytest.approx(expected_buy)
-    assert buy_result.months[0].fill_timing_term > 0
+    assert buy_result.periods[0].fill_timing_term == pytest.approx(expected_buy)
+    assert buy_result.periods[0].fill_timing_term > 0
 
     # A sell filled below the close: also positive.
     sell = _journal(
         positions_daily=_flat_marks(equity),
         fills=[_fill("sell-1", "sell", A, _utc(fill_day), 10.0, close - 1.0)],
     )
-    sell_result = compare_months(
+    sell_result = compare_periods(
         _window(tracking_rule="raw"), trial, sell, _no_actions(), closes, _no_price, None
     )
     expected_sell = (10.0 * 1.0) / 100_000.0
-    assert sell_result.months[0].fill_timing_term == pytest.approx(expected_sell)
-    assert sell_result.months[0].fill_timing_term > 0
+    assert sell_result.periods[0].fill_timing_term == pytest.approx(expected_sell)
+    assert sell_result.periods[0].fill_timing_term > 0
 
     # Residual equals the hand-computed value (raw=0, dividend=0, fill_timing=expected).
-    assert sell_result.months[0].residual == pytest.approx(expected_sell)
+    assert sell_result.periods[0].residual == pytest.approx(expected_sell)
 
 
 def test_residue_term_hand_computed_and_split_adjusted() -> None:
@@ -603,12 +606,12 @@ def test_residue_term_hand_computed_and_split_adjusted() -> None:
         )
     ]
     journal = _journal(positions_daily=marks, adjustments=adjustments)
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), _no_price, closes, None
     )
     expected = 10.0 * (close_next - close_i) / 100_000.0
-    assert result.months[0].residue_term == pytest.approx(expected)
-    assert result.months[0].residual == pytest.approx(0.0)  # never folded into the residual
+    assert result.periods[0].residue_term == pytest.approx(expected)
+    assert result.periods[0].residual == pytest.approx(0.0)  # never folded into the residual
 
     # A realistic forward 2:1 split inside the month: the observed market
     # close roughly HALVES (one pre-split share becomes two post-split
@@ -622,10 +625,10 @@ def test_residue_term_hand_computed_and_split_adjusted() -> None:
     split_close_next = close_next / 2.0  # the actual post-split observed close
     split_closes = _prices({(A, T0): close_i, (A, T1): split_close_next})
     split_actions = _action(A, "split", date(2026, 10, 15), 2.0, _utc(T1))
-    split_result = compare_months(
+    split_result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, split_actions, _no_price, split_closes, None
     )
-    assert split_result.months[0].residue_term == pytest.approx(expected)
+    assert split_result.periods[0].residue_term == pytest.approx(expected)
 
 
 def test_residue_term_no_look_ahead_on_later_decision() -> None:
@@ -673,12 +676,12 @@ def test_residue_term_no_look_ahead_on_later_decision() -> None:
         decision_events=decision_events,
         runs=(_run(1, T0), _run(2, T1)),
     )
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), _no_price, closes, None
     )
     # Month 0 (T0 -> T1): the dust decision is dated at T1, not known at
     # close(T0), so it must not make T0's residue term nonzero.
-    assert result.months[0].residue_term == pytest.approx(0.0)
+    assert result.periods[0].residue_term == pytest.approx(0.0)
 
 
 def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
@@ -723,7 +726,7 @@ def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
         )
     ]
     journal = _journal(positions_daily=marks, adjustments=adjustments)
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw", fill_price="open"),
         trial,
         journal,
@@ -733,7 +736,7 @@ def test_residue_term_uses_close_even_when_fill_price_is_open() -> None:
         None,
     )
     expected = 10.0 * (close_next - close_i) / 100_000.0
-    assert result.months[0].residue_term == pytest.approx(expected)
+    assert result.periods[0].residue_term == pytest.approx(expected)
 
 
 def test_raw_rule_excludes_missed_lists_override() -> None:
@@ -753,12 +756,12 @@ def test_raw_rule_excludes_missed_lists_override() -> None:
             )
         ],
     )
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), _no_price, _no_price, None
     )
     assert result.passed  # excluded from the check
-    assert result.months[0].missed
-    assert result.months[0].excluded
+    assert result.periods[0].missed
+    assert result.periods[0].excluded
 
     # An override month: listed, but NOT excluded under raw.
     override_journal = _journal(
@@ -776,7 +779,7 @@ def test_raw_rule_excludes_missed_lists_override() -> None:
             )
         ],
     )
-    override_result = compare_months(
+    override_result = compare_periods(
         _window(tracking_rule="raw"),
         trial,
         override_journal,
@@ -785,8 +788,8 @@ def test_raw_rule_excludes_missed_lists_override() -> None:
         _no_price,
         None,
     )
-    assert override_result.months[0].override
-    assert not override_result.months[0].excluded
+    assert override_result.periods[0].override
+    assert not override_result.periods[0].excluded
     assert not override_result.passed  # the large raw diff still fails the check
 
 
@@ -808,7 +811,7 @@ def test_residual_rule_excludes_missed_and_override() -> None:
             )
         ],
     )
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="residual"),
         trial,
         override_journal,
@@ -817,8 +820,8 @@ def test_residual_rule_excludes_missed_and_override() -> None:
         _no_price,
         None,
     )
-    assert result.months[0].override
-    assert result.months[0].excluded
+    assert result.periods[0].override
+    assert result.periods[0].excluded
     assert result.passed
 
 
@@ -840,11 +843,11 @@ def test_skip_decision_listed_not_excluded() -> None:
             )
         ],
     )
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), _no_price, _no_price, None
     )
-    assert result.months[0].skip_names == (B,)
-    assert not result.months[0].excluded
+    assert result.periods[0].skip_names == (B,)
+    assert not result.periods[0].excluded
     assert result.passed
 
 
@@ -856,7 +859,7 @@ def test_frozen_rule_not_live_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 100.0})
     journal = _journal(positions_daily=_flat_marks(equity))
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), _no_price, _no_price, None
     )
     assert result.tracking_rule == "raw"  # the window's frozen value, not the live default
@@ -872,11 +875,11 @@ def test_superseded_fill_counted_once() -> None:
     replacement = _fill("buy-1", "buy", A, _utc(fill_day), 10.0, close + 1.0, fill_id=2)
     superseded_marked = replace(superseded, fill=replace(superseded.fill, superseded_by=2))
     journal = _journal(positions_daily=_flat_marks(equity), fills=[superseded_marked, replacement])
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, _no_actions(), closes, _no_price, None
     )
     expected = (10.0 * 1.0) / 100_000.0
-    assert result.months[0].fill_timing_term == pytest.approx(expected)
+    assert result.periods[0].fill_timing_term == pytest.approx(expected)
 
 
 def test_no_look_ahead_late_dividend_not_counted() -> None:
@@ -888,24 +891,24 @@ def test_no_look_ahead_late_dividend_not_counted() -> None:
     # Known only AFTER close(T1): must not affect month 0's dividend term.
     late = _action(A, "dividend", ex_date, 5.0, session_close(T1) + timedelta(seconds=1))
     journal = _journal(positions_daily=marks)
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, late, _no_price, _no_price, None
     )
-    assert result.months[0].dividend_term == pytest.approx(0.0)
+    assert result.periods[0].dividend_term == pytest.approx(0.0)
 
     # The same dividend, known just in time (at close(T1)): counted.
     on_time = _action(A, "dividend", ex_date, 5.0, session_close(T1))
-    on_time_result = compare_months(
+    on_time_result = compare_periods(
         _window(tracking_rule="raw"), trial, journal, on_time, _no_price, _no_price, None
     )
-    assert on_time_result.months[0].dividend_term == pytest.approx((5.0 * 100.0) / 100_000.0)
+    assert on_time_result.periods[0].dividend_term == pytest.approx((5.0 * 100.0) / 100_000.0)
 
 
 def test_month_uncompared_at_or_after_stop_session() -> None:
     equity = {T0: 100_000.0, T1: 101_000.0}
     trial = _trial(equity, {T0: 100.0})
     journal = _journal(positions_daily=_flat_marks(equity))
-    result = compare_months(
+    result = compare_periods(
         _window(tracking_rule="raw"),
         trial,
         journal,
@@ -915,7 +918,7 @@ def test_month_uncompared_at_or_after_stop_session() -> None:
         # A stop requested after close(T1) still falls in T1 (plan.stop_session).
         stop_session=stop_session(_utc(T1, hour=22)),
     )
-    assert result.months == ()
+    assert result.periods == ()
     assert result.passed  # vacuously, nothing to compare
 
 
@@ -940,3 +943,95 @@ def test_report_stop_session_is_plan_stop_session(requested_at: datetime, expect
     ]
     assert report_module._stop_session_of(stops) == stop_session(requested_at) == expected
     assert report_module._stop_session_of([_stop_row(requested_at, "closed")]) is None
+
+
+# --- the window's cadence (ADR 0017 part C, #1286) -----------------------------------
+
+#: Three consecutive ISO-week ends (Fridays); at `month_end` these dates hold one
+#: rebalance session (2026-11-30) and no compared period.
+W0, W1, W2 = date(2026, 11, 27), date(2026, 12, 4), date(2026, 12, 11)
+WEEK_TRIAL_ID = 1
+
+
+def _week_end_trial_store(settings: Settings) -> None:
+    """A `week_end` hypothesis and its tracking trial over [W0, W2] on the fixture
+    store: base-level equity at each week-end, a modelled cost at W0 and W1."""
+    params = json.dumps({"costs.per_side_bps": 5.0, "schedule.rebalance_cadence": "week_end"})
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
+            "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
+            "registered_at, registered_by) VALUES (1, 'h-week', 'momentum', 'week', "
+            "'docs/hypotheses/h-week.md', repeat('0', 64), ?, repeat('0', 64), ?, ?, ?, ?, "
+            "'test')",
+            [params, W0, W0, W0, _utc(W0)],
+        )
+        conn.execute(
+            "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+            "end_session, code_version, synthetic, run_by) VALUES "
+            "(?, 1, 'tracking', ?, ?, ?, 'test', FALSE, 'test')",
+            [WEEK_TRIAL_ID, _utc(W0), W0, W2],
+        )
+        for session, equity in ((W0, 100_000.0), (W1, 100_500.0), (W2, 101_000.0)):
+            conn.execute(
+                "INSERT INTO trial_equity (trial_id, series, cost_per_side_bps, session, equity) "
+                "VALUES (?, 'strategy', 5.0, ?, ?)",
+                [WEEK_TRIAL_ID, session, equity],
+            )
+        for session, cost_paid in ((W0, 50.0), (W1, 25.0)):
+            conn.execute(
+                "INSERT INTO trial_rebalances (trial_id, cost_per_side_bps, session, "
+                "fill_session, n_universe, n_static_listings, n_targets, turnover, cost_paid, "
+                "n_missing_fill, n_delisting_exits, n_stale_exits, n_excluded_no_history, "
+                "n_dropped_dividends, n_late_dividends) "
+                "VALUES (?, 5.0, ?, ?, 1, 1, 1, 0.0, ?, 0, 0, 0, 0, 0, 0)",
+                [WEEK_TRIAL_ID, session, session, cost_paid],
+            )
+
+
+@pytest.fixture
+def week_settings(fixture_store_path: Path) -> Settings:
+    return Settings(_env_file=None, store={"path": str(fixture_store_path)})
+
+
+def test_week_end_report_compares_per_iso_week(week_settings: Settings) -> None:
+    """At `week_end` the report's trial periods are the ISO weeks of the window's
+    cadence: `_trial_periods` reads [W0, W1, W2] (a `month_end` read finds no period
+    here), and `compare_periods` compares (W0, W1) and (W1, W2), each against its own
+    week's modelled cost."""
+    _week_end_trial_store(week_settings)
+    with open_read_only(week_settings) as conn:
+        trial = report_module._trial_periods(conn, WEEK_TRIAL_ID, "week_end")
+    assert tuple(trial.sessions) == (W0, W1, W2)
+    assert trial.cadence == "week_end"
+    assert dict(trial.equity) == {W0: 100_000.0, W1: 100_500.0, W2: 101_000.0}
+
+    equity = {W0: 100_000.0, W1: 100_500.0, W2: 101_000.0}
+    window = replace(_window(), first_rebalance_session=W0)
+    result = compare_periods(
+        window,
+        trial,
+        _journal(positions_daily=_flat_marks(equity), runs=()),
+        _no_actions(),
+        _no_price,
+        _no_price,
+        None,
+    )
+    assert [(m.rebalance_session, m.next_session) for m in result.periods] == [(W0, W1), (W1, W2)]
+    assert [m.modelled_cost for m in result.periods] == [
+        pytest.approx(50.0 / 100_000.0),
+        pytest.approx(25.0 / 100_500.0),
+    ]
+
+
+def test_week_end_target_comparison_reads_fill_sessions_at_the_window_cadence(
+    week_settings: Settings,
+) -> None:
+    """`compare_targets` passes the trial's cadence to `fill_session` (#1286): a week-end
+    T_i is not a `month_end` rebalance session, so the `month_end` fallback raised here;
+    with no decision and no trial weight there is nothing to report."""
+    _week_end_trial_store(week_settings)
+    with open_read_only(week_settings) as conn:
+        trial = report_module._trial_periods(conn, WEEK_TRIAL_ID, "week_end")
+        result = compare_targets(_window(), trial, _journal(runs=()), conn)
+    assert result.rows == ()
