@@ -542,12 +542,16 @@ def version_4_store(path: Path) -> Path:
     below loads every fixture CSV generically, `statement_facts.csv`
     included, so the table must exist for that call to succeed — the same
     simplification this function already makes for every other fact
-    table's shape."""
+    table's shape. `schema._FILING_EVENTS_TABLE_DDL` (version 21, #1358) is
+    there for the same reason (`filing_events.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
         for ddl in (
-            schema._TABLE_DDL + schema._REGISTRY_TABLE_DDL + schema._STATEMENT_FACTS_TABLE_DDL
+            schema._TABLE_DDL
+            + schema._REGISTRY_TABLE_DDL
+            + schema._STATEMENT_FACTS_TABLE_DDL
+            + schema._FILING_EVENTS_TABLE_DDL
         ):
             conn.execute(ddl)
         conn.execute(
