@@ -1,72 +1,101 @@
 # Handoff: end-user app design spike
 
-**Date:** 2026-10-10 · **Branch:** `spike/design-ui` (pushed; no PR, the owner hasn't asked for one) · **Owner:** Jose
+**Date:** 2026-10-10 (end of the third session) · **Branch:** `spike/design-ui` (pushed; no PR, the owner hasn't asked for one) · **Owner:** Jose
 
-Read this first, then [workflow.md](workflow.md) (a strategy's life, the owner's routine and the app structure that follows; **this now leads the design**), [engine-first.md](engine-first.md) (the step back: what the engine does, how other platforms show theirs, the proposed structure and the owner's open decisions), [DESIGN.md](DESIGN.md) (the design contract) and [ai-tells.md](ai-tells.md) (what to avoid). Older history is in [README.md](README.md).
+## Read in this order
+1. **[workflow.md](workflow.md)** leads the design now: a strategy's life, the owner's routine, the five stages, the Run button's rules, and the app structure that follows.
+2. **[engine-first.md](engine-first.md)**: what the engine actually computes and records (with table names), how QuantConnect, Quantopian, Composer, TradingView and MLflow show theirs, and what would need an engine change.
+3. This file: decisions, what's built, what's wrong in it, what's next.
+4. [DESIGN.md](DESIGN.md) (tokens and type, still valid; its "direction E, airy Robinhood" layout is **out of date**, see below) and [ai-tells.md](ai-tells.md) (what to avoid). Older history: [README.md](README.md).
 
-## The brief, in one paragraph
-Design the end-user app for TradePartner for the owner as a *user*, not a developer, at his desk and on his phone. It answers: how am I doing (overall, per book, vs SPY); what each book holds and does, and why; is anything wrong or waiting on me (quiet when nothing is); stop/resume a book safely (reason required, clear confirm); and research (what am I testing, did it work, could it be luck, what's waiting on me). Plain language, every element earns its place, phone first-class, WCAG AA, finished states (hover/focus/loading/empty/error). Prototype as React + TypeScript + Vite under `web/`, fed by `web/sample/app-data.json`; no backend. Notes under `docs/research/ui/`. Don't touch `src/`, `tests/` or other `docs/`. Don't read `data/*.duckdb` or `.env`.
+## The brief, as it stands now
+An app for the owner as a **user**: phone first for the morning check, the desk for research. It follows the process the repo already enforces: an idea becomes a registered strategy, is tested (every run counted), judged, examined, paper-traded, and maybe traded live. It shows **only what the engine computes**, and makes the engine legible ("a lab meets a trading engine"). Prototype in React + TypeScript + Vite under `web/`, on `web/sample/app-data.json`; no backend. Notes under `docs/research/ui/`. Don't touch `src/`, `tests/` or other `docs/`. Don't read `data/*.duckdb` or `.env`.
 
-## Where it stands
-- **Direction chosen: E, "research-grade Robinhood"** (Robinhood's frame: one big number, one big clean chart, a side rail of short rows, lots of air; plus a research layer: the backtest's expected range as a band, event dots, a statistics grid with a method note, a luck check with an explainer). Dark by default, light via the header switch. IBM Plex Sans for words, IBM Plex Mono for numbers. Colour only for gain, loss, attention.
-- **Built in E:** Overview (`#overview`), Research (`#research`, with a results map: return vs S&P against luck check), the idea detail sheet, the luck-check info popover, loading/error/empty states (`?state=loading|error|empty|alert|stopped`, `?theme=light`).
-- **Built in E (2026-10-10, second session): Book detail** (`#books/<id>`; `#books` opens the book with the longest record). Value and change since start; chart against the S&P with the book's own expected range (ⓘ explains the band) and dots on days orders filled; holdings (rank today, value, weight, gain; target said once in the heading; weight turns attention past the drift tolerance); "Why it holds these" (the rule in one sentence, then a rank scale with its zones named on it: buys / keeps / sells, filled dots for holdings, hollow for recent sells); recent orders grouped by day with the fill cost against the backtest's assumption; tap a holding or order for a sheet with the reason in the rule's terms. Rail: books, schedule, what the backtest said; phone swaps the rail's book list for a pill switcher at the top. **Stop/resume:** dialog lists exactly what happens (next run skipped, holdings and cash kept, open orders cancelled), reason required (attention message if empty), pending and failure states; stopped books show a boxed notice with who, when and why, and a Resume dialog (also needs a reason; safety stops say the rule still applies). States: `?state=loading|error|empty|stopped|safety|stopfail`, `#books/main` (no history: chart, holdings and orders empty states), `#books/zzz` (not found). Screenshots in `screens/book/`; interactions via `node shoot-book.mjs`.
-- **Built in E (2026-10-10, third session): the trial page with the step-through** (`#research/trial/h1`; opened from an idea's sheet in Research and from a book's "What the backtest said"). The result in one line, then the honesty strip (luck check, versions tried, the exam on paper), the run's chart with a playhead (play, step, scrub; the axes stay fixed while it draws), **what the engine did on each rebalance** as a pipeline (universe, excluded, ranked, held, bought and sold, traded back to equal weight, costs), the signal distribution with the cut drawn on it, the names at the cut and in and out (rail on desktop, inline on phone), one bar per year, the same run at every cost level, where the test sits (development, exam window, paper, labelled on the track) and the assumptions. See [engine-first.md](engine-first.md) for why.
-- **Workstation view of the same trial** (`#research/bench/h1`, linked from the trial page as "Workstation view"), built after the owner pointed at Build Alpha, RealTest and AmiBroker as the "analog research feel" he means: tiled panels with title bars and live readouts, gridded equity with a locked drawdown pane, a rebalance inspector (the stages as a table, the names at the cut), the trade tape, a Monte Carlo of the monthly results drawn as percentile bands (not spaghetti), a month-by-year grid with the number in every cell, by-year and cost bars, properties. Deliberately left out: 3D optimisation surfaces, rainbow heatmaps, floating windows. **Then "with a modern twist" (owner, 2026-10-10):** the transport is pinned and the playhead is a timeline scrubber (a miniature of the run with a tick per rebalance; drag, click, arrow keys, Home/End, Space to play), panels are soft surfaces with gaps instead of ruled boxes, gridlines are dotted, any panel widens to full width, and the month grid and the equity chart point at each other on hover. **Open for the owner: workstation for the lab (and maybe books), simple E for Overview and phone, or one of them everywhere?**
-- **Sample data now follows the engine's real rule** (the hypothesis files): the 1000 largest US stocks, top 10% held at equal weight (about 97 to 98 names), every rebalance trades back to equal weight, 15 bp a side, fill at the close, no sell buffer. The Book screen's "Why it holds these" was rewritten to match (an earlier version invented a keep-until-rank-20 buffer and 10% positions, which the risk rules' 5% cap forbids). The replay is invented data in H1's real window, calibrated to H1's recorded result; backtest ranks are **not persisted by the engine today**, so this view needs that engine change to be real (engine-first.md §6).
-- **Not built:** a stop/resume history list per book (only the current stop is shown); open/partly filled orders aren't in the sample.
-- **Reference samples** (same data, design only): `#sample-a` … `#sample-e`; screenshots in `screens/samples/`.
+## The owner's decisions (2026-10-09 and 10)
+| Decision | Where it lives |
+|---|---|
+| A real web app, not Streamlit ("option B") | ADR 0018, [PR #1411](https://github.com/josejuarez96/tradepartner/pull/1411), owned by another session, reviewers PASS, waiting on his merge |
+| Phone access (Tailscale or otherwise) is **not decided**; version 1 runs on the Mac only, but **every screen is still built and tested for mobile** | Relayed as two comments on #1411 |
+| ADR 0018's open question 7 keeps backtests and research on Streamlit; this design puts the lab in the app. **Unanswered** | engine-first.md §7 |
+| "More analog research feel" = a research workstation (Build Alpha, RealTest, AmiBroker) **with a modern twist** | Built as `#research/bench/h1` |
+| **Show only what the engine does.** No Monte Carlo (the engine has none), no graphs added for their own sake | Monte Carlo removed; fields renamed to the engine's |
+| **Follow the process.** Phone first; five stages (Idea, Testing, Exam, Paper, Live; Parked and Retired off to the side) | workflow.md §6 |
+| **Agents draft strategies** (hypothesis files); he reviews and registers | workflow.md §6, item 3; needs its own decision |
+| **A Run button that follows the engine's rules**: registered strategies only, the engine decides and the app shows its answer, the cost in tries shown before confirming, exam and gap override as separate actions, quiet intervals respected | workflow.md §6, item 4. **Not yet relayed to #1411**: it needs an amendment to ADR 0018's writes; ask the owner before commenting |
 
 ## Owner's rules from review (don't break these)
-1. **Say it once.** No code badge beside a name, no "next step" restating the title, no icon beside the word it illustrates, no subtitle rewording its heading. Internal codes (B10, H1) appear once, as a reference at the bottom of a detail view.
-2. **No colour bars to decode.** Graphics must explain themselves: evidence = one tile per study marked ✓ / – / ✕; luck = zoned scale with a marker; exams = countable steps (≤13) or a labelled track.
-3. **Not a wall of text.** Each screen leads with a picture; rows are one line; detail opens on tap. (Direction C was rejected for this.)
-4. **Avoid the AI look** (he rejected four directions for it): no serif/italic accent word in a headline, no cream + terracotta, no untouched shadcn theme, no Inter/Geist as the only face, no ALL-CAPS labels, no `A · B · C` strings, no badge on every row, no icon-in-tinted-square. Run the scanner after changes (below).
-5. **Explain numbers a researcher would question** with an ⓘ popover (see `LuckInfo.tsx`); use the repo's real method (`src/tradepartner/backtest/metrics.py`).
+1. **Say it once.** No code badge beside a name, no subtitle rewording its heading, no icon beside the word it illustrates. Internal codes (B10, H1) appear once, as a reference at the bottom of a detail view.
+2. **No colour bars to decode.** Graphics explain themselves: tiles marked ✓ / – / ✕, a zoned scale with a marker, countable steps, labels on the track itself.
+3. **Not a wall of text.** Rows are one line; detail opens on tap.
+4. **Avoid the AI look.** No serif or italic accent word, no cream and terracotta, no untouched shadcn theme, no Inter or Geist alone, no ALL-CAPS labels, no `A · B · C` strings, no badge on every row, no icon in a tinted square, no shadows, gradients or glass.
+5. **Explain numbers a researcher would question** with an ⓘ popover, using the repo's real method (`backtest/metrics.py`).
+6. **Engine first.** Every number on screen is something the engine computes or stores; name its source (table or function) in the notes. If the engine doesn't do it, don't show it; if it needs an engine change, say so on screen.
+7. **Process first.** Screens follow the owner's workflow and the strategy's stage, not a catalogue of charts. One chart per decision; everything else on demand.
+8. **Self-critique against these with screenshots** (desktop, phone, light) before showing him.
+
+## What's built, and its state
+| Screen | Route | State |
+|---|---|---|
+| Overview | `#overview` | Becomes **Today**. Its statistics grid is computed in the browser (`lib/stats.ts`), which the real app must not do (code computes numbers in Python, served by the API). Add the machine's health (last ingest, last paper run per book, reconciliation, alerts). |
+| Research | `#research` | Becomes **Strategies**: the five-stage list. The results map becomes a view inside a family. |
+| Book detail | `#books/<id>` | Mostly keeps. Fixed this session to the real rule: top 10% of 1,000 at equal weight, ranks are the **last rebalance's** (the journal's `signals` rows exist only on rebalance days), no fill-cost claim (no decision price is journalled). "Stop book" is the kill switch (`paper kill`); keep it apart from `paper stop`, which closes the window and sells. |
+| Trial page | `#research/trial/h1` | Becomes the **Result** tab of a strategy's page. Pipeline labels follow `trial_rebalances`. |
+| Workstation view | `#research/bench/h1` | The look the owner chose for the lab: tiled soft panels, pinned transport with a timeline scrubber (drag, click, arrows, Home/End, Space), linked hover between the month grid and the equity chart, widen any panel. Panels: equity with a drawdown pane, this rebalance (from `trial_rebalances`), scores that day (**not stored by the engine**, labelled so), turnover and costs, month by month, trades, by year, cost levels, properties. Per rule 7, most of these should move behind "details". |
+| Samples A to E | `#sample-a` … | Reference only. |
+
+**Sample data** (`web/sample/generate.mjs`) follows the hypothesis files: the 1,000 largest US stocks after the universe rules, the top 10% held at equal weight (97 to 98 names), every rebalance trades back to equal weight, 15 bp a side, filled at the close. The replay uses H1's real window, calibrated to its recorded result. **Real values in it:** main's start ($100,008.90, 2026-10-09), H1's luck check 0.7262, the backlog's names, stages and blockers. Everything else is invented and marked "sample" in the data and the UI.
+
+## Next, in order
+1. **Ask the owner** whether to relay the Run-button decision to #1411 (an amendment to ADR 0018's writes, with a `safety-reviewer` pass).
+2. **Rebuild the prototype around the workflow** (workflow.md §3 and §6):
+   - **Today**, at phone width first: machine health, waiting on you, each book against its expected range. Quiet when nothing is wrong.
+   - **Strategies**: one list by the five stages, each row showing its stage, what it waits on, and its latest numbers.
+   - **A strategy's page**, laid out like a desktop backtester: the frozen specification on the left (read-only), the Run button with its cost in tries and the engine's refusals, and tabs for the stages it has reached (Evidence, Runs, Result, Exam, Paper, Decisions). The workstation becomes the Result tab, trimmed to one chart per decision.
+   - Keep Books; add the stop/resume history.
+3. **Update DESIGN.md** to the chosen look: the workstation with a modern twist for the lab and books; decide with the owner whether Today keeps the calmer E style.
+4. **A source map** for every number on screen (rule 6), starting from engine-first.md §6 and workflow.md §4.
+5. Outside the spike, for the owner to schedule: an engine task to **persist backtest scores and ranks** per rebalance (they exist only on the in-memory `Plan`), so the step-through can be real.
 
 ## Code map (`web/`)
 | Path | What |
 |---|---|
-| `src/index.css` | All tokens (shadcn variable names, our values) + gain/loss/attention/bench/raised |
-| `src/components/Shell.tsx` | Top bar, phone bottom tabs, `Page` (main + 340px rail), `Section`, `RailHead` |
-| `src/components/ReturnChart.tsx` | Lightweight Charts hero: your line, dashed S&P, expected-range band, event dots, scrub callback |
-| `src/components/Visuals.tsx` | `EvidenceTally`, `LuckScale`, `ExamSteps`, `Slots` |
-| `src/components/LuckInfo.tsx` | ⓘ popover explaining the deflated Sharpe, with an idea's inputs |
-| `src/screens/Overview.tsx` | Overview (exports `Spark`, `Pill` for reuse) |
-| `src/screens/Research.tsx` | Research: `ResultsMap` (collision-checked labels), needs-you, ideas, rail, `IdeaSheet` |
-| `src/screens/OverviewStates.tsx` | Loading / error / empty |
-| `src/screens/Book.tsx` | Book detail: holdings, rank scale, orders, rail, stop/resume dialog, detail sheet, loading and not-found |
-| `src/screens/Trial.tsx`, `src/components/ReplayChart.tsx` | The trial page and its replay chart; `node shoot-trial.mjs` screenshots it |
-| `src/screens/TrialBench.tsx`, `src/components/BenchChart.tsx` | The workstation view and its gridded equity/drawdown chart; `node shoot-bench.mjs` |
-| `src/components/RangePicker.tsx` | 1W/1M/3M/All pills shared by Overview and Book |
-| `src/lib/` | `data.ts` (comparison, ranges, TWR change), `stats.ts`, `format.ts`, `tokens.ts` (reads CSS vars for canvas), `types.ts`, `scenarios.ts` |
+| `src/index.css` | All tokens (shadcn variable names, our values) plus gain, loss, attention, bench, raised |
+| `src/components/Shell.tsx` | Top bar, phone bottom tabs, `Page` (main plus a 340px rail), `Section`, `RailHead` |
+| `src/components/ReturnChart.tsx` | Overview and Book hero chart: your line, dashed S&P, expected-range band, event dots |
+| `src/components/ReplayChart.tsx`, `BenchChart.tsx` | Replay charts: drawn to a playhead with fixed axes; `BenchChart` adds gridlines, a drawdown pane and a crosshair other panels can point |
+| `src/components/Scrubber.tsx` | The timeline scrubber (run miniature, a tick per rebalance, keyboard slider) |
+| `src/components/RangePicker.tsx`, `Visuals.tsx`, `LuckInfo.tsx` | Range pills; `EvidenceTally`, `LuckScale`, `ExamSteps`; the luck-check ⓘ popover |
+| `src/screens/` | `Overview`, `OverviewStates`, `Research` (with `IdeaSheet`), `Book`, `Trial`, `TrialBench` |
+| `src/lib/` | `data.ts`, `stats.ts` (browser-side statistics, prototype only), `format.ts`, `tokens.ts`, `types.ts` (the sample's shape; replay fields follow `trial_rebalances`), `scenarios.ts` (`?state=` previews) |
 | `src/components/ui/` | shadcn new-york-v4 sources copied from GitHub (the CLI's registry host is blocked here) |
-| `sample/generate.mjs` → `sample/app-data.json` | Deterministic sample data. **Real:** main's start ($100,008.90, 2026-10-09), H1 luck 0.7262 (psr basis, 40 monthly returns), backlog names/stages/blockers, pending decisions. **Invented:** everything else, marked "sample" in data and UI. |
-| `src/samples/` | The five comparison samples |
-| `shoot.mjs`, `shots/shot2.mjs`, `shots/shot-luck.mjs` | Playwright screenshots (`node shoot.mjs name=query#hash …`; needs the dev server) |
+| `sample/generate.mjs` → `sample/app-data.json` | Deterministic sample data (about 2 MB) |
+| `shoot.mjs`, `shoot-book.mjs`, `shoot-trial.mjs`, `shoot-bench.mjs` | Playwright screenshots into `shots/` (gitignored); keepers are copied to `docs/research/ui/screens/` |
 
 ## Commands
 ```bash
 cd web && npm install
-npx vite --port 5173                      # dev server (run in background)
+npx vite --port 5173 --host 127.0.0.1     # dev server, in the background
 npx tsc --noEmit && npm run build         # must stay clean
-node shoot.mjs overview= research=#research research-sheet=#research light=theme=light
-node sample/generate.mjs                  # after editing sample data
+node sample/generate.mjs                  # after editing the sample
+node shoot.mjs overview= book=#books/daily light=theme=light   # name=query#hash, desktop and phone
+node shoot-book.mjs; node shoot-trial.mjs; node shoot-bench.mjs [theme=light]
 ```
-AI-tells scanner: `https://github.com/funboy322/avoid-ai-design` (`scripts/detect.mjs`, read-only, no deps). Fetch it into a scratch dir and run `node detect.mjs web/src --min=P1`. Last run: one P1, a false positive (it compares dark-theme muted ink against the light ground). Not re-run after Book detail: the auto-mode permission check blocked running fetched code in the second session; Book.tsx was grepped by hand for caps, `·` strings, shadows, arrows and fonts (none).
+States: `?state=loading|error|empty|alert|stopped|safety|stopfail`, `?theme=light`.
 
 ## Environment notes
-- `team.py start/claim` fails in cloud sessions (GitHub GraphQL is blocked); spike branches don't need a claim.
+- `team.py start/claim` fails in cloud sessions (GitHub GraphQL is blocked); spike branches need no claim.
+- The AI-tells scanner (`github.com/funboy322/avoid-ai-design`, `scripts/detect.mjs`) was **blocked by the auto-mode permission check** as fetched code; this session grepped the new files by hand for caps, `·` strings, shadows, arrows and fonts. The owner can allow it in his Claude Code settings.
 - Chromium for screenshots: `/opt/pw-browsers/chromium-1194/chrome-linux/chrome` (via `playwright-core`).
-- Commit with the Conventional Commit style used on the branch (`spike(ui): …`) and push to `spike/design-ui`.
+- Vendor sites (QuantConnect, Composer) are blocked by the proxy; platform details in engine-first.md marked *(unverified)* came from search summaries.
+- Commit as `spike(ui): …` or `docs(ui): …` and push to `spike/design-ui`.
 
 ## Open questions for the owner
-- Research: read-only, or allow actions (register a run, record a decision, write a lesson) with reason + confirm?
+- ADR 0018 question 7: does the lab (backtests, sweeps, research) move into the app? This design assumes yes.
+- Relay the Run-button decision to #1411 now?
+- Today: the workstation look too, or the calmer E style for the phone check?
+- How the app starts a drafting agent, and where its draft is reviewed (a PR, or the app).
 - Dark by default ignores the OS setting; keep, or follow the OS?
-- The expected-range width is a placeholder per book (main 6%, daily 8%, b3 5% a year); the real value should come from each book's backtest via the API.
-- Book detail: should "Stop book" also be offered on the Overview rail, or only here? Should resume let him choose "trade back to the rule now" vs "wait for the next run"? (Built: wait for the next run.)
-- Holdings, ranks, signals and orders are invented sample data; the API needs to serve rank and signal per holding and the decision price per order for "why" and fill cost to be real.
-- B4 shows as both "run now" (STATUS) and "parked" (ADR 0016); surfaced as a decision, not resolved.
+- B4 shows as both "run now" (STATUS) and "parked" (ADR 0016).
 
 ## Suggested opening prompt for the next agent
-> Continue the TradePartner end-user app design on branch `spike/design-ui`. Read `docs/research/ui/HANDOFF.md`, `DESIGN.md` and `ai-tells.md` first. Build the Book detail screen in direction E (value + chart with expected range, holdings vs target weights, recent orders, why it holds what it holds, stop/resume with reason and confirm), desktop and phone, with loading/empty/error states. Follow the owner's rules in the handoff. Screenshot and self-critique before showing me.
+> Continue the TradePartner end-user app design on branch `spike/design-ui`. Read `docs/research/ui/workflow.md`, `engine-first.md` and `HANDOFF.md` first, then `DESIGN.md` and `ai-tells.md`. Rebuild the prototype around the owner's workflow: Today (phone first: machine health, waiting on you, books against their expected range), Strategies (the five stages), and a strategy's page laid out like a desktop backtester (frozen specification on the left, a Run button that follows the engine's rules, tabs for Runs, Result, Exam and Paper, with the workstation view as the Result tab, trimmed to one chart per decision). Show only what the engine computes. Follow the owner's rules in the handoff. Screenshot desktop, phone and light, and self-critique before showing me.
