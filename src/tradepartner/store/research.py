@@ -28,7 +28,9 @@ periods holding its event span (`full` and `none` against the whole declared
 `none`; #1149). The two span endpoints can hide a row in a gap between two sealed
 periods, so when the periods do not cover the whole span the store also checks
 the split's per-row event dates (`split_row_dates`, every row for `full`/`none`,
-the same rows the CLI already reads); #1174.
+the same rows the CLI already reads); #1174. It can only check the rows it is
+given: for `full`/`none` their count must equal `n_rows`, while a labelled
+split's completeness stays the CLI's `check_sealed_split_has_period`.
 
 **Runs** (reqs 3 to 7). `open_run` and `attach_run` are the only constructors of
 `RunHandle`. `open_run` reads the rows the gates need, asks `research.gates` in
@@ -543,9 +545,11 @@ def register_dataset(
     event column and the split file; without a split file the one split `full`
     spans `[event_start, event_end]`. `test` in `split_spans` seals `test` by
     implication. `split_row_dates` maps a split to the event dates of its rows
-    (`full` and `none` are every row); when the sealed periods do not cover a
-    sealed split's whole span, the store checks every one of those rows, since the
-    two endpoints can hide a row between them (#1174). Refuses `split without event
+    (`full` and `none` are every row, `n_rows` of them when given); both span
+    endpoints must lie in a sealed period, and when the periods do not cover a
+    sealed split's whole span the store also requires a non-empty list and checks
+    every one of those rows is inside the span and a period, since the two
+    endpoints can hide a row between them (#1174). Refuses `split without event
     column`, `sealed split without period`, `sealed set shrinks` and a split file
     labelling rows `full` or `none`; returns the existing row for the same `(name,
     sha256, split_sha256)` and sealed set when the path, split path, `locked` and
@@ -583,17 +587,36 @@ def register_dataset(
         # (with or without a split file). Check the dataset's whole declared
         # event span instead (#1149).
         span = (event_start, event_end) if split in EVERY_ROW_SPLITS else spans.get(split)
-        if span is None or _covers_span(span, periods):
+        if span is None:
+            continue
+        if not all(any(start <= day <= end for start, end in periods) for day in span):
+            raise ResearchError(
+                f"sealed split without period: {split!r} spans [{span[0]}, {span[1]}], "
+                f"outside the sealed periods {periods}"
+            )
+        if _covers_span(span, periods):
             continue
         # The span's two endpoints can each sit in a different sealed period while a row
         # between them is held by none (#1174). Where the periods do not cover the whole
-        # span, only the split's row dates can show it, so require and check them.
+        # span, only the split's row dates can show it, so require and check them. An
+        # empty list cannot stand in for the rows.
         rows = row_dates.get(split)
-        if rows is None or (rows and (min(rows), max(rows)) != span):
+        if not rows:
             raise ResearchError(
                 f"sealed split without period: {split!r} spans [{span[0]}, {span[1]}], which "
                 f"the sealed periods {periods} do not cover; sealing it needs split_row_dates "
                 f"for {split!r} to check every row"
+            )
+        if split in EVERY_ROW_SPLITS and n_rows is not None and len(rows) != n_rows:
+            raise ResearchError(
+                f"sealed split without period: {split!r} has {len(rows)} row dates for "
+                f"n_rows {n_rows}; every row is needed to check the gaps between periods"
+            )
+        outside_span = [day for day in rows if not span[0] <= day <= span[1]]
+        if outside_span:
+            raise ResearchError(
+                f"sealed split without period: {split!r} row with event date "
+                f"{outside_span[0]} is outside the declared span [{span[0]}, {span[1]}]"
             )
         uncovered = [day for day in rows if not any(start <= day <= end for start, end in periods)]
         if uncovered:
