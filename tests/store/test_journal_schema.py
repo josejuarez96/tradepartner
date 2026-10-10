@@ -28,7 +28,19 @@ from conftest import version_4_store
 from tradepartner.store import lab_schema, registry, schema
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row
-from tradepartner.store.journal import _EXPANSION_SEAM_TABLES, fills_for, latest_window
+from tradepartner.store.journal import (
+    _EXPANSION_SEAM_TABLES,
+    AlertDeliveryRow,
+    AlertRow,
+    PaperRunResultRow,
+    PaperRunRow,
+    PaperWindowRow,
+    alerts_for,
+    append,
+    fills_for,
+    latest_window,
+    open_window,
+)
 
 _EXPECTED_JOURNAL_TABLES = {
     "paper_windows",
@@ -147,8 +159,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_18() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 18
+def test_current_schema_version_is_21() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 21
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
 
 
@@ -174,7 +186,7 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 
 def test_fresh_init_creates_the_journal_at_version_17(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [18]
+    assert _versions(journal) == [21]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -215,7 +227,26 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         conn.close()
     assert after == before
     assert versions[:1] == applied_before
-    assert [row[0] for row in versions] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    assert [row[0] for row in versions] == [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+    ]
     # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
         schema.MASTER_CHECK_TABLE_NAMES
@@ -241,7 +272,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
         conn.close()
     with duckdb.connect(str(v4_path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        assert _versions(conn) == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 
 
 # --- version 17 (#1258, T132): the ADR 0015 expansion seams --------------------------
@@ -383,7 +414,7 @@ def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns(
             for table, columns in old_columns.items()
         }
         schema.init_schema(conn)
-        assert _versions(conn) == [16, 17, 18]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21]
         assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
             (1, "main")
         ]
@@ -452,7 +483,7 @@ def test_a_version_16_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [16, 17, 18]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21]
     finally:
         conn.close()
 
@@ -491,6 +522,224 @@ def test_read_only_open_of_a_version_16_store_raises_schema_version_error_for_jo
             fills_for(conn)
         with pytest.raises(schema.SchemaVersionError, match="open it for writing once"):
             latest_window(conn)
+
+
+# --- version 19 (#1370, T154; ADR 0017 B.6): `alerts.book_id` -------------------------
+
+
+def _version_18_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 18 left it, shaped like the owner's store while H1's
+    window is open: book `main`'s window 1, open (no stop row), with a run and its
+    result, and `alerts` without `book_id` holding a run-scoped alert, the two
+    session-scoped kinds (`no_window` from before the window, `locked`) and their
+    delivery rows, inserted out of key order with one deleted in between, so
+    insertion order is not key order. The version-19 delta is removed from the
+    current table, as `_version_16_store` does for version 17."""
+    schema.init_schema(conn)
+    session = _NOW.date()
+    append(
+        conn,
+        PaperWindowRow(
+            window_id=1,
+            hypothesis_id=1,
+            first_rebalance_session=session,
+            account_id="PA_H1",
+            starting_cash=100_000.0,
+            starting_equity=100_000.0,
+            code_version="v1",
+            started_at=_NOW,
+            frozen_json='{"cadence": "month_end"}',
+            frozen_sha256="0" * 64,
+            known_at=_NOW,
+            ingested_at=_NOW,
+        ),
+    )
+    append(
+        conn,
+        PaperRunRow(
+            run_id=1,
+            window_id=1,
+            session=session,
+            kind="rebalance",
+            started_at=_NOW,
+            invoked_by="scheduler",
+            code_version="v1",
+            known_at=_NOW,
+            ingested_at=_NOW,
+        ),
+    )
+    append(
+        conn,
+        PaperRunResultRow(
+            run_id=1,
+            finished_at=_NOW,
+            status="ok",
+            clock_fault=False,
+            known_at=_NOW,
+            ingested_at=_NOW,
+        ),
+    )
+    for alert_id, run_id, kind, second in (
+        (3, 1, "stale_data", 3),
+        (1, None, "no_window", 1),
+        (2, None, "locked", 2),
+        (4, None, "locked", 4),
+    ):
+        stamp = _NOW.replace(second=second)
+        append(
+            conn,
+            AlertRow(
+                alert_id=alert_id,
+                run_id=run_id,
+                session=session,
+                kind=kind,
+                message=f"{kind} {alert_id}",
+                at=stamp,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+        append(
+            conn,
+            AlertDeliveryRow(
+                alert_id=alert_id,
+                channel="store",
+                at=stamp,
+                ok=True,
+                known_at=stamp,
+                ingested_at=stamp,
+            ),
+        )
+    conn.execute("DELETE FROM alerts WHERE alert_id = 2")
+    conn.execute("DELETE FROM alert_deliveries WHERE alert_id = 2")
+    conn.execute("UPDATE schema_version SET version = 18")
+    conn.execute("ALTER TABLE alerts DROP COLUMN book_id")
+
+
+@pytest.fixture
+def v18_path(tmp_path: Path) -> Path:
+    path = tmp_path / "store_v18.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        _version_18_store(conn)
+    finally:
+        conn.close()
+    return path
+
+
+def test_migrating_a_version_18_store_keeps_every_alert_and_books_it_main() -> None:
+    """Every `alerts` row is kept in insertion order, each pre-version-19 column,
+    `known_at` and `ingested_at` included, unchanged, and `book_id = 'main'`; the
+    column sits before the two timestamps, as on a fresh store."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_18_store(conn)
+        old_columns = _column_order(conn, "alerts")
+        assert "book_id" not in old_columns
+        select = f"SELECT {', '.join(f'"{c}"' for c in old_columns)} FROM alerts ORDER BY rowid"
+        before = conn.execute(select).fetchall()
+        assert [row[0] for row in before] == [3, 1, 4]
+        schema.init_schema(conn)
+        assert _versions(conn) == [18, 19, 20, 21]
+        assert conn.execute(select).fetchall() == before
+        assert conn.execute("SELECT alert_id, book_id FROM alerts ORDER BY rowid").fetchall() == [
+            (3, "main"),
+            (1, "main"),
+            (4, "main"),
+        ]
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        assert _column_order(conn, "alerts") == _column_order(fresh, "alerts")
+        assert _column_order(conn, "alerts")[-3:] == ["book_id", "known_at", "ingested_at"]
+        fresh.close()
+        with pytest.raises(duckdb.ConstraintException):  # the primary key survives
+            conn.execute(
+                'INSERT INTO alerts (alert_id, session, kind, message, "at", known_at, '
+                "ingested_at) VALUES (1, ?, 'locked', 'm', ?, ?, ?)",
+                [_NOW.date(), _NOW, _NOW, _NOW],
+            )
+    finally:
+        conn.close()
+
+
+def test_the_version_19_migration_leaves_mains_open_window_and_other_tables_unchanged() -> None:
+    """H1's window is open on the owner's store when version 19 lands: the
+    migration changes no row outside `alerts`, `main`'s open window reads the same
+    before and after, and the alert dedupe for `main` finds the same rows."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_18_store(conn)
+        others = tuple(
+            table
+            for table in sorted(_table_names(conn))
+            if table not in ("alerts", "schema_version")
+        )
+        before = _snapshot(conn, others)
+        window_before = open_window(conn, "main")
+        assert window_before is not None and window_before.window_id == 1
+        schema.init_schema(conn)
+        assert _snapshot(conn, others) == before
+        assert open_window(conn, "main") == window_before == open_window(conn)
+        assert latest_window(conn, "main") == window_before
+        assert open_window(conn, "b") is None
+        assert [a.alert_id for a in alerts_for(conn, kind="locked", session=_NOW.date())] == [4]
+        assert alerts_for(conn, kind="locked", session=_NOW.date(), book_id="b") == []
+    finally:
+        conn.close()
+
+
+def test_a_version_18_store_gets_no_new_version_row_on_a_second_open() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_18_store(conn)
+        schema.init_schema(conn)
+        first = _snapshot(conn, tuple(sorted(_table_names(conn))))
+        schema.init_schema(conn)
+        assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
+        assert _versions(conn) == [18, 19, 20, 21]
+    finally:
+        conn.close()
+
+
+def test_a_failed_version_19_migration_leaves_the_store_at_18(
+    v18_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rebuild = schema._migrate_alert_books
+
+    def boom(conn: duckdb.DuckDBPyConnection) -> None:
+        rebuild(conn)  # the rebuild happens, then the migration fails
+        raise RuntimeError("injected")
+
+    with duckdb.connect(str(v18_path)) as conn:
+        everything = tuple(sorted(_table_names(conn)))
+        before = _snapshot(conn, everything)
+        monkeypatch.setattr(schema, "_migrate_alert_books", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            schema.init_schema(conn)
+        assert _snapshot(conn, everything) == before
+        assert _versions(conn) == [18]
+        assert "book_id" not in _column_order(conn, "alerts")
+
+
+def test_read_only_open_of_a_version_18_store_serves_the_window_reads(v18_path: Path) -> None:
+    """A read-only view (the ops page, `paper status`) of the owner's version-18
+    store before any writer has migrated it: the version check passes, nothing
+    changes, and `main`'s window reads as before."""
+    with duckdb.connect(str(v18_path), read_only=True) as conn:
+        everything = tuple(sorted(_table_names(conn)))
+        before = _snapshot(conn, everything)
+        schema.init_schema(conn)
+        assert _versions(conn) == [18]
+        assert (window := open_window(conn, "main")) is not None and window.window_id == 1
+        assert latest_window(conn) == window
+        assert _snapshot(conn, everything) == before
+
+
+def test_a_version_4_store_gets_alerts_book_id_directly(v4_path: Path) -> None:
+    with duckdb.connect(str(v4_path)) as conn:
+        schema.init_schema(conn)
+        assert _columns(conn, "alerts")["book_id"] is False  # NOT NULL
+        assert _versions(conn)[-1] == 21
 
 
 def test_default_book_id_is_a_nonempty_word() -> None:

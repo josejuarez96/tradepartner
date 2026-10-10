@@ -65,3 +65,13 @@ Maps every statement-facts fixture case (`statement_facts.csv`) to its cik, the 
 
 - `statement_facts` is keyed by **cik**, not `security_id` (spec decision (c)): most cases above reuse an existing req 13 case's cik from `securities.csv` rather than inventing a bare one, so a later as-of/join test (T76b) has a security to join against.
 - `basis='derived'` and a restated key's single surviving row are authored directly as the (future) ingest's expected output, not computed by this generator or verified against a parser here (T77/T77b's job).
+
+## Filing events (#1358)
+
+Three 8-K rows (`filing_events.csv`) for cik `CIK0001000011` (`SEC_SPLIT_PLAIN`), for T164c-T164e authors. `known_at` = `accepted_at`; the submissions record's filing date is not stored and is listed here so a `filed`-keyed read can be shown failing.
+
+| Case | Accession | items | accepted_at | filed | Notes |
+|---|---|---|---|---|---|
+| After-close 2.02 whose filed date is its session (the filed-date trap) | 0001000011-20-000101 | `2.02,9.01` | 2020-04-30T20:05:00+00:00 (16:05 New York) | 2020-04-30 | invisible at session_close 2020-04-30T20:00:00+00:00, first visible at 2020-05-01; a filed-keyed read sees it at 2020-04-30 |
+| Evening 2.02 filed the next day (the lag case) | 0001000011-20-000102 | `2.02,9.01` | 2020-05-06T00:30:00+00:00 (20:30 New York) | 2020-05-06 | first visible at 2020-05-06; a filed-keyed read passes by accident |
+| Pre-open 5.02 (not a 2.02) | 0001000011-20-000103 | `5.02` | 2020-05-12T13:00:00+00:00 (09:00 New York) | 2020-05-12 | visible at session_close 2020-05-12T20:00:00+00:00; an items filter on 2.02 drops it |

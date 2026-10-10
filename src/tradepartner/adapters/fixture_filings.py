@@ -18,6 +18,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
@@ -45,6 +46,7 @@ class FixtureFilingSource(FilingSource):
         cover_pages: Iterable[CoverPage] = (),
         delistings: Iterable[DelistingFiling] = (),
         statement_facts: Iterable[StatementFactRecord] = (),
+        filing_events: Iterable[FilingEvent] = (),
     ) -> None:
         self._index = sorted(index, key=lambda e: (e.accepted_at, e.accession, e.cik))
         self._snapshot = sorted(snapshot, key=lambda e: (e.fetched_at, e.cik, e.ticker))
@@ -52,6 +54,9 @@ class FixtureFilingSource(FilingSource):
         self._headers = sorted(headers, key=lambda e: (e.accepted_at, e.accession))
         self._cover_pages = sorted(cover_pages, key=lambda e: (e.accepted_at, e.accession))
         self._delistings = sorted(delistings, key=lambda e: (e.accepted_at, e.accession))
+        self._filing_events = sorted(
+            filing_events, key=lambda e: (e.accepted_at, e.accession, e.cik)
+        )
         # Not filtered by `known_by`/`known_ats` below: those two methods
         # exist for the master's write-path look-ahead tests (module
         # docstring), which never touch statement facts — their own
@@ -97,6 +102,7 @@ class FixtureFilingSource(FilingSource):
             headers=[e for e in self._headers if e.accepted_at <= t],
             cover_pages=[e for e in self._cover_pages if e.accepted_at <= t],
             delistings=[e for e in self._delistings if e.accepted_at <= t],
+            filing_events=[e for e in self._filing_events if e.accepted_at <= t],
         )
 
     def known_ats(self) -> list[datetime]:
@@ -107,6 +113,7 @@ class FixtureFilingSource(FilingSource):
         stamps |= {e.accepted_at for e in self._headers}
         stamps |= {e.accepted_at for e in self._cover_pages}
         stamps |= {e.accepted_at for e in self._delistings}
+        stamps |= {e.accepted_at for e in self._filing_events}
         return sorted(stamps)
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
@@ -129,3 +136,6 @@ class FixtureFilingSource(FilingSource):
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         return [e for e in self._statement_facts if e.cik == cik]
+
+    def filing_events(self, cik: str) -> list[FilingEvent]:
+        return [e for e in self._filing_events if e.cik == cik]

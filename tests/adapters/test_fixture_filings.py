@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import UTC, date, datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -12,6 +15,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
@@ -320,3 +324,95 @@ def test_statement_facts_sorted_with_unstamped_entries_first() -> None:
     )
     source = FixtureFilingSource(statement_facts=[stamped, unstamped])
     assert source.statement_facts(CIK) == [unstamped, stamped]
+
+
+# --- filing events (#1358, T164b) ------------------------------------------
+
+_UNIVERSE = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _fixture_events() -> list[FilingEvent]:
+    """The three `filing_events.csv` rows as records: the store's fixture cik
+    convention (`CIK` + 10 digits) stripped to EDGAR's 10 digits."""
+    with (_UNIVERSE / "filing_events.csv").open(newline="") as fh:
+        return [
+            FilingEvent(
+                row["cik"].removeprefix("CIK"),
+                row["accession"],
+                row["form"],
+                row["items"],
+                datetime.fromisoformat(row["accepted_at"]),
+            )
+            for row in csv.DictReader(fh)
+        ]
+
+
+def test_filing_event_refuses_a_naive_datetime() -> None:
+    with pytest.raises(ValueError):
+        FilingEvent(CIK, "e1", "8-K", "2.02,9.01", datetime(2020, 4, 30, 20, 5))  # noqa: DTZ001
+
+
+def test_filing_event_refuses_a_date_and_a_bad_cik() -> None:
+    with pytest.raises(TypeError):
+        FilingEvent(CIK, "e1", "8-K", "2.02", date(2020, 4, 30))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        FilingEvent("320193", "e1", "8-K", "2.02", T1)
+
+
+def test_filing_event_items_is_a_string_never_none() -> None:
+    """`items` is the payload's string verbatim, `""` for none: an unknown
+    `items` is never a record (spec, Amendment 2026-10-09)."""
+    assert FilingEvent(CIK, "e1", "8-K", "", T1).items == ""
+    with pytest.raises(TypeError):
+        FilingEvent(CIK, "e1", "8-K", None, T1)  # type: ignore[arg-type]
+
+
+def test_filing_event_normalizes_to_utc() -> None:
+    est = timezone(timedelta(hours=-4))
+    event = FilingEvent(CIK, "e1", "8-K", "2.02", datetime(2020, 4, 30, 16, 5, tzinfo=est))
+    assert event.accepted_at == datetime(2020, 4, 30, 20, 5, tzinfo=UTC)
+    assert event.accepted_at.tzinfo is UTC
+
+
+def test_the_fixture_source_answers_filing_events_with_the_three_rows() -> None:
+    events = _fixture_events()
+    source = FixtureFilingSource(
+        filing_events=[*reversed(events), FilingEvent(OTHER, "x1", "8-K", "2.02", T1)]
+    )
+    answer = source.filing_events("0001000011")
+    assert answer == sorted(events, key=lambda e: (e.accepted_at, e.accession))
+    assert [(e.form, e.items) for e in answer] == [
+        ("8-K", "2.02,9.01"),
+        ("8-K", "2.02,9.01"),
+        ("8-K", "5.02"),
+    ]
+    # The 16:00-17:30 row (its filing date is its own session) and the 20:30
+    # row (filed the next day), in New York wall time.
+    local = [e.accepted_at.astimezone(_NEW_YORK) for e in answer]
+    assert (local[0].hour, local[0].minute) == (16, 5)
+    assert (local[1].hour, local[1].minute) == (20, 30)
+    assert source.filing_events(CIK) == []
+    assert [e.accession for e in source.filing_events(OTHER)] == ["x1"]
+
+
+def test_known_by_keeps_only_filing_events_knowable_at_t() -> None:
+    events = _fixture_events()
+    source = FixtureFilingSource(filing_events=events)
+    first = min(e.accepted_at for e in events)
+    assert source.known_by(first - timedelta(microseconds=1)).filing_events("0001000011") == []
+    assert [e.accession for e in source.known_by(first).filing_events("0001000011")] == [
+        events[0].accession
+    ]
+    assert set(source.known_ats()) == {e.accepted_at for e in events}
+
+
+def test_an_adapter_without_an_answer_refuses_filing_events() -> None:
+    """The question is not abstract (the EDGAR answer is T164c's): an adapter
+    that does not answer it raises rather than answering an empty list."""
+
+    class _Bare(FixtureFilingSource):
+        filing_events = FilingSource.filing_events
+
+    with pytest.raises(NotImplementedError, match="filing_events"):
+        _Bare().filing_events(CIK)

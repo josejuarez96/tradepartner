@@ -38,14 +38,17 @@ Seam 3 (T135b): after the same run every `orders` row reads the default shape,
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import pytest
 
+import execution.test_run_trade as run_trade
 from execution.test_run_trade import F_0, Clock, Env, at, bought
 from tradepartner.config import Settings
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
+from tradepartner.execution.run import tracking_run
 from tradepartner.store.db import open_for_write
 from tradepartner.store.schema import LONG, ORDER_SHAPE_DEFAULTS
 
@@ -77,8 +80,10 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def fx_env(fixture_store_path: Path) -> Env:
-    """The scripted fake's `Env` with a non-default window book."""
+def fx_env(fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    """The scripted fake's `Env` with a non-default window book, its runs made for
+    that book (`paper run --book fx`, T155b) whatever the live `paper.book_id` says."""
+    monkeypatch.setattr(run_trade, "tracking_run", partial(tracking_run, book_id=BOOK))
     settings = Settings(
         _env_file=None,
         store={"path": str(fixture_store_path)},
