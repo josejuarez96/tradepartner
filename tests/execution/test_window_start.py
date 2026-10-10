@@ -263,6 +263,28 @@ def _write_closed_window(
 # --- refusals ---------------------------------------------------------------
 
 
+def test_refuses_sweep_variant_before_broker_call(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    from tradepartner.store import lab_schema
+
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "variant", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        lab_schema.apply_lab_schema(conn)
+        conn.execute(
+            "INSERT INTO sweep_variants VALUES (1, 1, ?, 'fingerprint', '{}')",
+            [hyp.hypothesis_id],
+        )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "variant"
+        )
+    assert exc.value.reason == "sweep_variant"
+    with open_read_only(journal_settings) as conn:
+        assert conn.execute("SELECT count(*) FROM paper_windows").fetchone() == (0,)
+
+
 def test_refuses_without_gap_signoff(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:

@@ -51,7 +51,7 @@ from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import expected_max_sharpe
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
 from tradepartner.store.db import insert_row, utc_now
-from tradepartner.store.lab_schema import require_lab
+from tradepartner.store.lab_schema import is_lab_initialised, require_lab
 from tradepartner.store.registry import (
     BASE_COST_KEY,
     UNREAD,
@@ -416,6 +416,18 @@ def sweep_by_slug(conn: duckdb.DuckDBPyConnection, slug: str) -> SweepRecord | N
         [slug],
     )
     return found[0] if found else None
+
+
+def is_sweep_variant(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
+    """Whether a hypothesis is a sweep variant, including on a pre-lab store."""
+    if not is_lab_initialised(conn):
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM sweep_variants WHERE hypothesis_id = ? LIMIT 1", [hypothesis_id]
+        ).fetchone()
+        is not None
+    )
 
 
 def sweep_variants(conn: duckdb.DuckDBPyConnection, sweep_id: int) -> list[SweepVariant]:

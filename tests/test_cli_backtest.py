@@ -475,6 +475,23 @@ def test_gap_signoff_appends_an_owner_decision_with_the_gap_values(
     _assert_scrubbed(out)
 
 
+def test_gap_signoff_refuses_sweep_variant(registered: Path, read: Any) -> None:
+    from tradepartner.store import lab_schema
+
+    trial_id = _trial_id(_cli("backtest", SLUG))
+    with open_for_write(get_settings()) as conn:
+        hypothesis_id = registry.get_hypothesis(conn, SLUG).hypothesis_id
+        lab_schema.apply_lab_schema(conn)
+        conn.execute(
+            "INSERT INTO sweep_variants VALUES (1, 1, ?, 'fingerprint', '{}')",
+            [hypothesis_id],
+        )
+    out = _cli("decision", "gap-signoff", "--trial", str(trial_id), "--reason", "gap accepted")
+    assert out.exit_code == 2, out.output
+    assert "sweep variant" in out.output.lower()
+    assert read().execute("SELECT count(*) FROM owner_decisions").fetchone() == (0,)
+
+
 def test_a_second_signoff_appends_another_row(registered: Path, read: Any) -> None:
     trial_id = _trial_id(_cli("backtest", SLUG))
     for reason in ("first", "second"):

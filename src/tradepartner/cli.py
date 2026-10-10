@@ -1976,6 +1976,11 @@ def make_app(
                     status = "unfinished" if result is None else result["status"]
                     raise _fail(f"trial {trial} is {status}; only an ok trial", USAGE_ERROR)
                 record = registry.get_hypothesis_by_id(conn, int(trial_row["hypothesis_id"]))
+                if lab_registry.is_sweep_variant(conn, record.hypothesis_id):
+                    raise _fail(
+                        f"{record.slug!r} is a sweep variant; promote it before gap signoff",
+                        USAGE_ERROR,
+                    )
                 decision_id = registry.record_decision(
                     conn,
                     kind="gap_signoff",
