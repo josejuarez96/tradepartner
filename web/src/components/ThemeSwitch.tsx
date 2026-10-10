@@ -23,6 +23,7 @@ export function ThemeSwitch() {
     <Button
       variant="ghost"
       size="icon"
+      className="text-muted-foreground size-8 max-sm:size-11"
       aria-label={`Switch to ${next} theme`}
       onClick={() => {
         applyTheme(next);

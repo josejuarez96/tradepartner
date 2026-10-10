@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { sample } from "@/lib/data";
 import type { AppData } from "@/lib/types";
 import { scenario } from "@/lib/scenarios";
-import { AppShell, type Screen } from "@/components/AppShell";
+import { Shell, type Screen } from "@/components/Shell";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Overview } from "@/screens/Overview";
 import { Research } from "@/screens/Research";
@@ -17,7 +17,6 @@ const SAMPLES: Record<string, () => React.JSX.Element> = { "sample-a": SampleA, 
 type Load = { kind: "loading" } | { kind: "error"; retrying: boolean } | { kind: "ready"; data: AppData };
 
 const state = new URLSearchParams(location.search).get("state");
-const TITLES: Record<Screen, string> = { overview: "Overview", books: "Books", research: "Research" };
 
 function useScreen(): Screen {
   const read = (): Screen => {
@@ -51,9 +50,8 @@ export function App() {
   if (Sample) return <Sample />;
   return (
     <TooltipProvider>
-      <AppShell
+      <Shell
         screen={screen}
-        title={TITLES[screen]}
         mode={data?.account_mode ?? "paper"}
         sample={data?.sample ?? true}
         counts={{ overview: data?.alerts.length, research: data?.research.waiting.length }}
@@ -67,8 +65,8 @@ export function App() {
         )}
         {data && screen === "research" && <Research data={data} />}
         {data && screen === "overview" && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
-        {data && screen === "books" && <p className="text-muted-foreground p-6 text-sm">Book detail is the next screen to design.</p>}
-      </AppShell>
+        {data && screen === "books" && <p className="text-muted-foreground p-4">Book detail is the next screen to build.</p>}
+      </Shell>
     </TooltipProvider>
   );
 }

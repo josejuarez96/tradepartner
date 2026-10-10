@@ -1,30 +1,25 @@
 /*
- * TradePartner tokens, on shadcn/ui's theme (new-york v4, neutral).
+ * TradePartner tokens: direction C, "terminal" (docs/research/ui/DESIGN.md).
  *
- * This file is the only place a colour, font or radius is defined. Components
- * use Tailwind classes that resolve to these variables (bg-card, text-muted-
- * foreground, text-gain …); charts read the same variables at runtime
- * (src/lib/tokens.ts). The shadcn variables are kept as shipped so upstream
- * components drop in unchanged; TradePartner adds only three meanings:
- *
- *   gain       money made
- *   loss       money lost
- *   attention  something waiting on you
- *
- * Dark is the default (class "dark" on <html>); removing it gives light.
- * Contrast pairs are listed in docs/research/ui/README.md.
+ * The only place a colour, font or radius is defined. shadcn/ui's variable
+ * names are kept so its components (Sheet, Tabs, Tooltip, Table) work, but
+ * every value is ours. TradePartner adds three meanings: gain, loss,
+ * attention. Dark is the default (class "dark" on <html>).
  */
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
-@import "@fontsource-variable/geist-mono";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -62,81 +57,75 @@
   --color-loss: var(--loss);
   --color-attention: var(--attention);
   --color-attention-soft: var(--attention-soft);
+  --color-raised: var(--raised);
+  --color-bench: var(--bench);
 }
 
 :root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.52 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.205 0 0);        /* your line */
-  --chart-2: oklch(0.708 0 0);        /* the benchmark */
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.95 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
-  --gain: #047857;          /* emerald-700, 5.5:1 on white */
-  --loss: #dc2626;          /* red-600, 4.8:1 */
-  --attention: #b45309;     /* amber-700, 5.0:1 */
-  --attention-soft: #fffbeb;
+  --radius: 0.25rem;
+  --background: #f6f7f9;
+  --raised: #ffffff;
+  --foreground: #14171c;
+  --card: #f6f7f9;
+  --card-foreground: #14171c;
+  --popover: #ffffff;
+  --popover-foreground: #14171c;
+  --primary: #14171c;
+  --primary-foreground: #ffffff;
+  --secondary: #eceef2;
+  --secondary-foreground: #14171c;
+  --muted: #eceef2;
+  --muted-foreground: #5b6470;
+  --accent: #eceef2;
+  --accent-foreground: #14171c;
+  --destructive: #c2362c;
+  --border: #e2e5ea;
+  --input: #d5d9e0;
+  --ring: #6b7380;
+  --chart-1: #14171c;
+  --chart-2: #9aa1ab;
+  --bench: #9aa1ab;
+  --gain: #137a48;          /* 5.3:1 on ground */
+  --loss: #c2362c;          /* 5.2:1 */
+  --attention: #955800;     /* 5.6:1 */
+  --attention-soft: #fdf3e1;
+  --sidebar: #ffffff; --sidebar-foreground: #14171c; --sidebar-primary: #14171c; --sidebar-primary-foreground: #fff;
+  --sidebar-accent: #eceef2; --sidebar-accent-foreground: #14171c; --sidebar-border: #e2e5ea; --sidebar-ring: #6b7380;
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.185 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.922 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --sidebar: oklch(0.175 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.922 0 0);
-  --sidebar-primary-foreground: oklch(0.205 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
-  --gain: #34d399;          /* emerald-400 */
-  --loss: #f87171;          /* red-400 */
-  --attention: #fbbf24;     /* amber-400 */
-  --attention-soft: rgb(251 191 36 / 0.08);
+  --background: #0c0e12;
+  --raised: #12151b;
+  --foreground: #e6e8eb;
+  --card: #0c0e12;
+  --card-foreground: #e6e8eb;
+  --popover: #12151b;
+  --popover-foreground: #e6e8eb;
+  --primary: #e6e8eb;
+  --primary-foreground: #0c0e12;
+  --secondary: #1a1f27;
+  --secondary-foreground: #e6e8eb;
+  --muted: #1a1f27;
+  --muted-foreground: #8b929c;   /* 6.2:1 on ground */
+  --accent: #1a1f27;
+  --accent-foreground: #e6e8eb;
+  --destructive: #f2645a;
+  --border: #20252e;
+  --input: #2a303a;
+  --ring: #5d6570;
+  --chart-1: #3ecf8e;
+  --chart-2: #5d6570;
+  --bench: #5d6570;
+  --gain: #3ecf8e;
+  --loss: #f2645a;
+  --attention: #f0b03f;
+  --attention-soft: #241c0c;
+  --sidebar: #12151b; --sidebar-foreground: #e6e8eb; --sidebar-primary: #e6e8eb; --sidebar-primary-foreground: #0c0e12;
+  --sidebar-accent: #1a1f27; --sidebar-accent-foreground: #e6e8eb; --sidebar-border: #20252e; --sidebar-ring: #5d6570;
 }
 
 @layer base {
   * { @apply border-border outline-ring/50; }
-  body { @apply bg-background text-foreground antialiased; font-synthesis-weight: none; }
-  .num { font-variant-numeric: tabular-nums; }
+  body { @apply bg-background text-foreground antialiased; font-size: 12.5px; line-height: 1.45; font-synthesis-weight: none; }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 }

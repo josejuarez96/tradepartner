@@ -1,30 +1,36 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, Pause } from "lucide-react";
+import { AlertTriangle, ChevronRight, Pause } from "lucide-react";
 import type { AppData, Book } from "@/lib/types";
 import { RANGES, comparison, lastChange, rangeStart, type RangeKey } from "@/lib/data";
 import { clock, money, pct, pts, shortDate, signedMoney, tone, weekdayDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { Panel } from "@/components/Shell";
 import { ReturnChart } from "@/components/ReturnChart";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
-import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
+const signedPts = (g: number) => `${g >= 0 ? "+" : "−"}${pts(g)}`;
 
-/** Screen 1, "How am I doing?". shadcn dashboard pattern: summary cards, one chart, one table. */
+/** One labelled figure in the quote strip. */
+function Quote({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="bg-background flex flex-col gap-0.5 px-4 py-2.5 sm:flex-row sm:items-baseline sm:gap-2">
+      <span className="text-muted-foreground text-xs">{label}</span>
+      <span className="num text-[13px]">{children}</span>
+    </div>
+  );
+}
+
+/** Overview, "How am I doing?": a quote strip, the chart as the hero, books and anything waiting beside it. */
 export function Overview({ data }: { data: AppData }) {
   const [range, setRange] = useState<RangeKey>("ALL");
   const [hover, setHover] = useState<string | null>(null);
 
   const port = data.portfolio.equity;
-  const today = lastChange(port);
+  const today = lastChange(port)!;
   const total = port.at(-1)!.value;
   const lastDate = port.at(-1)!.date;
   const own = useMemo(() => port.map((p) => ({ date: p.date, v: p.index })), [port]);
   const available = (k: RangeKey) => { const f = rangeStart(lastDate, k); return !f || f >= own[0].date; };
-
   const all = useMemo(() => comparison(own, data.benchmark.closes, null), [own, data.benchmark.closes]);
   const cmp = useMemo(() => comparison(own, data.benchmark.closes, rangeStart(lastDate, range)), [own, data.benchmark.closes, lastDate, range]);
   const at = hover ? cmp.you.findIndex((p) => p.date === hover) : -1;
@@ -32,139 +38,109 @@ export function Overview({ data }: { data: AppData }) {
   const spyAt = at >= 0 ? cmp.spy[at].value : cmp.spyRet;
   const from = cmp.you[0]?.date ?? lastDate;
   const to = at >= 0 ? cmp.you[at].date : lastDate;
-
   const running = data.books.filter((b) => b.status.state === "running").sort((a, b) => a.next_run.at.localeCompare(b.next_run.at));
-  const next = running[0];
-  const waiting = data.alerts.length;
-  const gapAll = all.youRet - all.spyRet;
+  const research = data.research.waiting;
+  const needs = data.alerts.length + research.length;
 
   return (
-    <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
+    <div className="flex min-h-[calc(100dvh-2.75rem)] flex-col">
       {data.alerts.map((a) => {
         const book = data.books.find((b) => b.id === a.book_id);
         return (
-          <div key={a.id} className="px-4 lg:px-6">
-            <Alert className="border-attention/40 bg-attention-soft [&>svg]:text-attention">
-              <AlertTriangle />
-              <AlertTitle>{a.title}</AlertTitle>
-              <AlertDescription>
-                <p>{a.detail}</p>
-                <p><span className="text-foreground font-medium">What to do:</span> {a.todo}</p>
-                {book && (
-                  <Button asChild size="sm" variant="outline" className="mt-2">
-                    <a href={`#books/${book.id}`}>Open {book.name}</a>
-                  </Button>
-                )}
-              </AlertDescription>
-            </Alert>
+          <div key={a.id} role="status" className="bg-attention-soft flex flex-wrap items-start gap-x-4 gap-y-1 border-b px-4 py-3">
+            <AlertTriangle className="text-attention mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="text-attention font-medium">{a.title}</p>
+              <p className="text-muted-foreground mt-0.5">{a.detail} <span className="text-foreground">{a.todo}</span></p>
+            </div>
+            {book && <a href={`#books/${book.id}`} className="text-foreground inline-flex items-center gap-1 underline-offset-4 hover:underline">Open {book.name}<ChevronRight className="size-3.5" /></a>}
           </div>
         );
       })}
 
-      <div className="grid grid-cols-1 gap-4 px-4 lg:px-6 @xl/main:grid-cols-2 @6xl/main:grid-cols-4 *:data-[slot=card]:shadow-xs">
-        <Card className="@container/card">
-          <CardHeader>
-            <CardDescription>Total value</CardDescription>
-            <CardTitle className="num text-2xl font-semibold @[250px]/card:text-3xl">{money(total)}</CardTitle>
-          </CardHeader>
-          <CardFooter className="flex-col items-start gap-1 text-sm">
-            {today && <div className={cn("num font-medium", toneText[tone(today.rel)])}>{signedMoney(today.abs)} ({pct(today.rel)}) on {weekdayDate(lastDate)}</div>}
-            <div className="text-muted-foreground">All {data.books.length} books, new money not counted as gain</div>
-          </CardFooter>
-        </Card>
-
-        <Card className="@container/card">
-          <CardHeader>
-            <CardDescription>Return since {shortDate(own[0].date)}</CardDescription>
-            <CardTitle className={cn("num text-2xl font-semibold @[250px]/card:text-3xl", toneText[tone(all.youRet)])}>{pct(all.youRet)}</CardTitle>
-          </CardHeader>
-          <CardFooter className="flex-col items-start gap-1 text-sm">
-            <div className="font-medium">{tone(gapAll) === "flat" ? "Level with the S&P 500" : `${pts(gapAll).replace(" pts", " points")} ${gapAll > 0 ? "ahead of" : "behind"} the S&P 500`}</div>
-            <div className="text-muted-foreground num">S&amp;P 500 {pct(all.spyRet)} over the same days</div>
-          </CardFooter>
-        </Card>
-
-        <Card className="@container/card">
-          <CardHeader>
-            <CardDescription>Needs you</CardDescription>
-            <CardTitle className={cn("text-2xl font-semibold @[250px]/card:text-3xl", waiting && "text-attention")}>
-              {waiting ? `${waiting} ${waiting === 1 ? "thing" : "things"}` : "Nothing"}
-            </CardTitle>
-          </CardHeader>
-          <CardFooter className="flex-col items-start gap-1 text-sm">
-            <div className="font-medium">{waiting ? data.alerts[0].title : "Every book ran as planned"}</div>
-            <div className="text-muted-foreground">Prices as of {weekdayDate(data.as_of).split(",")[0]}'s close</div>
-          </CardFooter>
-        </Card>
-
-        <Card className="@container/card">
-          <CardHeader>
-            <CardDescription>Next run</CardDescription>
-            <CardTitle className="num text-2xl font-semibold @[250px]/card:text-3xl">
-              {next ? `${weekdayDate(next.next_run.at).split(",")[0]} ${clock(next.next_run.at)}` : "None"}
-            </CardTitle>
-          </CardHeader>
-          <CardFooter className="flex-col items-start gap-1 text-sm">
-            {next && <div className="font-medium">{next.next_run.what} for {next.name}</div>}
-            {running[1] && <div className="text-muted-foreground">Then {running.slice(1).map((b) => b.name).join(" and ")}</div>}
-          </CardFooter>
-        </Card>
+      <div className="bg-border grid grid-cols-2 gap-px border-b sm:flex sm:[&>*]:flex-none">
+        <Quote label="Total">{money(total)} <span className={toneText[tone(today.rel)]}>{pct(today.rel)}</span></Quote>
+        <Quote label={`Since ${shortDate(own[0].date)}`}><span className={toneText[tone(all.youRet)]}>{pct(all.youRet)}</span></Quote>
+        <Quote label="S&P 500"><span className={toneText[tone(all.spyRet)]}>{pct(all.spyRet)}</span></Quote>
+        <Quote label="Needs you"><span className={needs ? "text-attention" : ""}>{needs}</span></Quote>
+        <div className="bg-background hidden sm:block sm:flex-1!" />
       </div>
 
-      <div className="px-4 lg:px-6">
-        <Card className="@container/card shadow-xs">
-          <CardHeader>
-            <CardTitle>Return vs the S&amp;P 500</CardTitle>
-            <CardDescription className="num">
-              <span className="inline-flex items-center gap-1.5"><i className="inline-block h-0.5 w-3 rounded bg-chart-1" />You <b className={cn("font-medium", toneText[tone(youAt)])}>{pct(youAt)}</b></span>
-              <span className="mx-3 inline-flex items-center gap-1.5"><i className="inline-block h-px w-3 bg-chart-2" />S&amp;P 500 <b className="text-foreground font-medium">{pct(spyAt)}</b></span>
-              <span>{shortDate(from)} – {shortDate(to)}</span>
-            </CardDescription>
-            <CardAction>
-              <ToggleGroup type="single" value={range} onValueChange={(v) => v && setRange(v as RangeKey)} variant="outline" className="*:data-[slot=toggle-group-item]:px-3!">
-                {RANGES.map((r) => (
-                  <ToggleGroupItem key={r.key} value={r.key} disabled={!available(r.key)} title={available(r.key) ? undefined : "Not enough history yet"}>
+      <div className="bg-border grid flex-1 gap-px lg:grid-cols-[minmax(0,1.7fr)_minmax(340px,1fr)] lg:grid-rows-[auto_1fr]">
+        <Panel
+          className="lg:row-span-2"
+          title="Return vs S&P 500"
+          aside={
+            <div role="radiogroup" aria-label="Time range" className="flex gap-0.5">
+              {RANGES.map((r) => {
+                const ok = available(r.key);
+                return (
+                  <button
+                    key={r.key}
+                    role="radio"
+                    aria-checked={r.key === range}
+                    disabled={!ok}
+                    title={ok ? undefined : "Not enough history yet"}
+                    onClick={() => setRange(r.key)}
+                    className={cn(
+                      "num h-7 min-w-9 rounded px-2 text-xs transition-colors max-sm:h-10 max-sm:min-w-11",
+                      r.key === range ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground",
+                      !ok && "opacity-35",
+                    )}
+                  >
                     {r.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            </CardAction>
-          </CardHeader>
-          <CardContent className="px-2 pt-2 sm:px-6">
-            <ReturnChart
-              you={cmp.you}
-              spy={cmp.spy}
-              onScrub={setHover}
-              label={`Your return ${pct(cmp.youRet)} against the S&P 500 ${pct(cmp.spyRet)}, ${shortDate(from)} to ${shortDate(lastDate)}.`}
-            />
-          </CardContent>
-        </Card>
-      </div>
+                  </button>
+                );
+              })}
+            </div>
+          }
+        >
+          <ReturnChart
+            you={cmp.you}
+            spy={cmp.spy}
+            tone={tone(cmp.youRet)}
+            onScrub={setHover}
+            height={typeof window !== "undefined" && window.innerWidth < 640 ? 300 : 460}
+            label={`Your return ${pct(cmp.youRet)} against the S&P 500 ${pct(cmp.spyRet)}, ${shortDate(from)} to ${shortDate(lastDate)}.`}
+          />
+          <p className="num text-muted-foreground mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs">
+            <span className={toneText[tone(youAt)]}>You {pct(youAt)}</span>
+            <span>S&amp;P 500 {pct(spyAt)}</span>
+            <span>{tone(youAt - spyAt) === "flat" ? "level" : `${pts(youAt - spyAt)} ${youAt > spyAt ? "ahead" : "behind"}`}</span>
+            <span>{shortDate(from)} – {shortDate(to)}</span>
+            <span className={toneText[tone(today.rel)]}>{signedMoney(today.abs)} {weekdayDate(lastDate).split(",")[0]}</span>
+          </p>
+        </Panel>
 
-      <div className="px-4 lg:px-6">
-        <Card className="shadow-xs">
-          <CardHeader>
-            <CardTitle>Books</CardTitle>
-            <CardDescription>{running.length} running{data.books.length - running.length ? `, ${data.books.length - running.length} stopped` : ""}</CardDescription>
-          </CardHeader>
-          <CardContent className="px-0">
-            <Table>
-              <TableHeader className="bg-muted/50">
-                <TableRow>
-                  <TableHead className="pl-6">Book</TableHead>
-                  <TableHead className="hidden md:table-cell">Status</TableHead>
-                  <TableHead className="text-right">Value</TableHead>
-                  <TableHead className="text-right">Since start</TableHead>
-                  <TableHead className="hidden text-right sm:table-cell">vs S&amp;P 500</TableHead>
-                  <TableHead className="hidden pr-6 lg:table-cell">Next run</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.books.map((b) => <BookRow key={b.id} book={b} data={data} />)}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
+        <Panel title="Books" aside={`${running.length} running`}>
+          <table className="w-full">
+            <thead className="text-muted-foreground text-xs">
+              <tr className="border-b">
+                <th className="py-1.5 text-left font-normal">Book</th>
+                <th className="py-1.5 text-right font-normal">Value</th>
+                <th className="py-1.5 text-right font-normal">Return</th>
+                <th className="py-1.5 text-right font-normal">vs S&amp;P</th>
+              </tr>
+            </thead>
+            <tbody>{data.books.map((b) => <BookRow key={b.id} book={b} data={data} />)}</tbody>
+          </table>
+        </Panel>
+
+        <Panel title="Needs you" aside={needs ? <span className="num text-attention">{needs}</span> : undefined}>
+          {data.alerts.length === 0 && <p className="text-muted-foreground border-b pb-2">Books: every run went as planned. Next: {running[0]?.name}, {weekdayDate(running[0]?.next_run.at ?? data.as_of).split(",")[0]} {running[0] && clock(running[0].next_run.at)}.</p>}
+          {research.length > 0 && <p className="text-muted-foreground pt-2 text-xs">Research decisions</p>}
+          <ul>
+            {research.slice(0, 4).map((w) => (
+              <li key={w.id} className="border-b last:border-0">
+                <a href="#research" className="hover:bg-raised -mx-2 flex items-baseline justify-between gap-3 rounded px-2 py-2">
+                  <span>{w.title}</span>
+                  <span className="text-muted-foreground shrink-0 text-xs">{w.effort}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+          {research.length > 4 && <a href="#research" className="text-muted-foreground hover:text-foreground mt-1 inline-block text-xs">{research.length - 4} more in Research</a>}
+        </Panel>
       </div>
     </div>
   );
@@ -178,31 +154,18 @@ function BookRow({ book, data }: { book: Book; data: AppData }) {
   const flagged = data.alerts.some((a) => a.book_id === book.id);
   const stopped = book.status.state === "stopped";
   return (
-    <TableRow className="cursor-pointer" onClick={() => (location.hash = `books/${book.id}`)}>
-      <TableCell className="pl-6">
+    <tr className="hover:bg-raised cursor-pointer border-b last:border-0" onClick={() => (location.hash = `books/${book.id}`)}>
+      <td className="py-2 pr-2 align-top">
         <a href={`#books/${book.id}`} className="font-medium hover:underline">{book.name}</a>
-        <div className="text-muted-foreground text-xs">{strat?.name}</div>
-      </TableCell>
-      <TableCell className="hidden md:table-cell">
-        {stopped ? (
-          <span className="text-attention inline-flex items-center gap-1.5 font-medium"><Pause className="size-3.5" />Stopped by you at {clock(book.status.at!)}</span>
-        ) : flagged ? (
-          <span className="text-attention inline-flex items-center gap-1.5 font-medium"><AlertTriangle className="size-3.5" />Needs you</span>
-        ) : (
-          <span className="text-muted-foreground">Running</span>
-        )}
-      </TableCell>
-      <TableCell className="num text-right">{money(book.equity.at(-1)!.value)}</TableCell>
-      <TableCell className={cn("num text-right", toneText[tone(cmp.youRet)])}>
-        {pct(cmp.youRet)}
-        <div className="text-muted-foreground text-xs">{young ? `day ${book.equity.length}` : `since ${shortDate(book.started_on)}`}</div>
-      </TableCell>
-      <TableCell className={cn("num hidden text-right sm:table-cell", young ? "text-muted-foreground" : toneText[tone(gap)])}>
-        {young ? "—" : `${gap >= 0 ? "+" : "−"}${pts(gap)}`}
-      </TableCell>
-      <TableCell className="text-muted-foreground hidden pr-6 lg:table-cell">
-        {book.next_run.what}, {shortDate(book.next_run.at)}
-      </TableCell>
-    </TableRow>
+        <div className="text-muted-foreground text-[11px]">
+          {stopped ? <span className="text-attention inline-flex items-center gap-1"><Pause className="size-3" />Stopped by you {clock(book.status.at!)}</span>
+            : flagged ? <span className="text-attention inline-flex items-center gap-1"><AlertTriangle className="size-3" />Needs you</span>
+            : strat?.name}
+        </div>
+      </td>
+      <td className="num py-2 text-right align-top">{money(book.equity.at(-1)!.value)}</td>
+      <td className={cn("num py-2 text-right align-top", toneText[tone(cmp.youRet)])}>{pct(cmp.youRet)}</td>
+      <td className={cn("num py-2 text-right align-top", young ? "text-muted-foreground" : toneText[tone(gap)])}>{young ? `day ${book.equity.length}` : signedPts(gap)}</td>
+    </tr>
   );
 }

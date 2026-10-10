@@ -1,4 +1,3 @@
-import { Check, Minus, X } from "lucide-react";
 import type { Idea } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -9,10 +8,12 @@ import { cn } from "@/lib/utils";
 
 type Ev = NonNullable<Idea["evidence"]>;
 
+/** Three drawn marks, one per kind of study: a tick, a level dash, a cross. */
+const MARK = { for: "M2.5 6.5 5 9l4.5-6", mixed: "M2.5 6h7", against: "M3 3l6 6M9 3 3 9" } as const;
 const KIND = {
-  for: { icon: Check, cls: "bg-gain/15 text-gain", label: "supports it" },
-  mixed: { icon: Minus, cls: "bg-attention/15 text-attention", label: "mixed" },
-  against: { icon: X, cls: "bg-loss/15 text-loss", label: "against it" },
+  for: { cls: "bg-gain/15 text-gain", label: "supports it" },
+  mixed: { cls: "bg-attention/15 text-attention", label: "mixed" },
+  against: { cls: "bg-loss/15 text-loss", label: "against it" },
 } as const;
 
 export function evidenceVerdict(e: Ev) {
@@ -37,10 +38,11 @@ export function EvidenceTally({ e, showVerdict = true }: { e: Ev; showVerdict?: 
       {tiles.length ? (
         <span className="flex gap-1">
           {tiles.map((k, i) => {
-            const { icon: Icon, cls } = KIND[k];
             return (
-              <span key={i} className={cn("grid size-5 place-items-center rounded", cls)}>
-                <Icon className="size-3" strokeWidth={3} />
+              <span key={i} className={cn("grid size-5 place-items-center rounded", KIND[k].cls)}>
+                <svg viewBox="0 0 12 12" className="size-3" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d={MARK[k]} />
+                </svg>
               </span>
             );
           })}
@@ -48,7 +50,7 @@ export function EvidenceTally({ e, showVerdict = true }: { e: Ev; showVerdict?: 
       ) : (
         <span className="text-muted-foreground grid size-5 place-items-center rounded border border-dashed text-[10px]">?</span>
       )}
-      {showVerdict && <span className={cn("text-sm font-medium", v.cls)}>{v.text}</span>}
+      {showVerdict && <span className={cn("font-medium whitespace-nowrap", v.cls)}>{v.text}</span>}
     </div>
   );
 }
