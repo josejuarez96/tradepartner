@@ -1,3 +1,0 @@
-- T142: holdout.py takes the development boundary (ADR 0016): default window ends at the earlier of holdout.start's eve and the boundary, in-sample past it and spends outside the holdout refused, forward tracking start; None unchanged.
-### Added
-- The development boundary in the window rules (`backtest/holdout.py`, ADR 0016 points 2 and 4): `default_in_sample_window` and `decide` take `boundary`; an in-sample window past it and a spend window starting before `holdout.start` are `refused_window`; `Frozen.registered_on`, `is_forward` and `tracking_start` let a forward holdout's tracking window start at its first rebalance on or after `holdout.start`. With no boundary nothing changes (T142, #1340).

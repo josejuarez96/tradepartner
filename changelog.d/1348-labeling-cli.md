@@ -1,3 +1,0 @@
-- T124 (#1348, PR #1350): the research-labeling CLI (corpus fetch, frame build, gold, label, review; lock and finish after the page), the three experiment files, the paid-vendor terms line, the charter sentence and roadmap item.
-### Added
-- `tradepartner corpus fetch departure-reason`, `research frame build departure-reason`, `research gold`, `research label` and `research review`: the page commands launch the local review page, then lock or finish a complete session on the store (or print "store busy" or the open count); the three departure-reason experiment files, the paid-vendor terms report, ADR 0013 point 9's charter Budget sentence and roadmap item (T124, #1348).
