@@ -39,6 +39,7 @@ from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     facts_as_of,
+    filing_events_as_of,
     listings_as_of,
     prices_as_of,
     statement_facts_as_of,
@@ -1515,3 +1516,180 @@ def test_a_split_and_dividend_on_one_ex_date_read_bit_equal_full_and_cut() -> No
     finally:
         forward.close()
         backward.close()
+
+
+def _filing_event(
+    conn: duckdb.DuckDBPyConnection,
+    cik: str,
+    accession: str,
+    items: str,
+    *,
+    accepted_at: datetime,
+    form: str = "8-K",
+) -> None:
+    """One `filing_events` row (T164d synthetic-store tests): `known_at =
+    accepted_at`, as the table's `CHECK` requires."""
+    insert_row(
+        conn,
+        "filing_events",
+        {
+            "cik": cik,
+            "accession": accession,
+            "form": form,
+            "items": items,
+            "accepted_at": accepted_at,
+            "known_at": accepted_at,
+            "ingested_at": accepted_at,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+class TestFilingEventsAsOf:
+    """T164d (#1358): `filing_events_as_of(t, forms, items)` joins through
+    `securities_as_of(t)` on `cik`, one row per `(security_id, accession)`,
+    filters `form` exactly and `items` by whole code. The fixture's three rows
+    (CIK0001000011, `SEC_SPLIT_PLAIN`) cover the boundary; the filters and the
+    join use a `synthetic_store`. The look-ahead cases are in
+    `tests/lookahead/test_filing_events.py`."""
+
+    _TEETH_KNOWN_AT = datetime(2020, 4, 30, 20, 5, tzinfo=UTC)
+    _AFTER_ALL = datetime(2020, 6, 1, tzinfo=UTC)
+    _CIK = "CIK0007000001"
+    _SECURITY_KNOWN = datetime(2019, 1, 2, tzinfo=UTC)
+
+    def _issuer(self, conn: duckdb.DuckDBPyConnection) -> None:
+        _security(conn, "SEC_EVENTS", self._CIK, known_at=self._SECURITY_KNOWN)
+
+    def test_invisible_before_known_at_visible_at_it(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        before = filing_events_as_of(
+            fixture_store, self._TEETH_KNOWN_AT - timedelta(microseconds=1)
+        )
+        assert before.height == 0
+        at = filing_events_as_of(fixture_store, self._TEETH_KNOWN_AT)
+        assert at["accession"].to_list() == ["0001000011-20-000101"]
+        assert at["security_id"].to_list() == ["SEC_SPLIT_PLAIN"]
+
+    def test_columns_are_security_id_then_the_table_in_schema_order(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = filing_events_as_of(fixture_store, self._AFTER_ALL)
+        table_columns = [r[0] for r in fixture_store.execute("DESCRIBE filing_events").fetchall()]
+        assert rows.columns == ["security_id", *table_columns]
+
+    def test_sorted_by_known_at_then_accession_then_security_id(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._issuer(synthetic_store)
+        _security(synthetic_store, "SEC_EVENTS_B", self._CIK, known_at=self._SECURITY_KNOWN)
+        late = datetime(2020, 3, 2, 21, 0, tzinfo=UTC)
+        early = datetime(2020, 3, 1, 21, 0, tzinfo=UTC)
+        _filing_event(synthetic_store, self._CIK, "A-3", "8.01", accepted_at=late)
+        _filing_event(synthetic_store, self._CIK, "A-2", "8.01", accepted_at=late)
+        _filing_event(synthetic_store, self._CIK, "A-9", "8.01", accepted_at=early)
+        rows = filing_events_as_of(synthetic_store, self._AFTER_ALL)
+        assert list(zip(rows["accession"], rows["security_id"], strict=True)) == [
+            ("A-9", "SEC_EVENTS"),
+            ("A-9", "SEC_EVENTS_B"),
+            ("A-2", "SEC_EVENTS"),
+            ("A-2", "SEC_EVENTS_B"),
+            ("A-3", "SEC_EVENTS"),
+            ("A-3", "SEC_EVENTS_B"),
+        ]
+
+    def test_dual_class_issuer_event_appears_once_per_class(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._issuer(synthetic_store)
+        class_b_known = datetime(2020, 3, 10, tzinfo=UTC)
+        _security(synthetic_store, "SEC_EVENTS_B", self._CIK, known_at=class_b_known)
+        accepted = datetime(2020, 3, 1, 21, 0, tzinfo=UTC)
+        _filing_event(synthetic_store, self._CIK, "A-1", "2.02,9.01", accepted_at=accepted)
+        before_b = filing_events_as_of(synthetic_store, class_b_known - timedelta(seconds=1))
+        assert before_b["security_id"].to_list() == ["SEC_EVENTS"]
+        after_b = filing_events_as_of(synthetic_store, class_b_known)
+        assert sorted(after_b["security_id"]) == ["SEC_EVENTS", "SEC_EVENTS_B"]
+        assert after_b["accession"].unique().to_list() == ["A-1"]
+
+    def test_cik_with_no_securities_row_at_t_is_invisible(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        accepted = datetime(2020, 3, 1, 21, 0, tzinfo=UTC)
+        _filing_event(synthetic_store, self._CIK, "A-1", "2.02", accepted_at=accepted)
+        assert filing_events_as_of(synthetic_store, self._AFTER_ALL).height == 0
+        security_known = datetime(2020, 4, 1, tzinfo=UTC)
+        _security(synthetic_store, "SEC_LATE", self._CIK, known_at=security_known)
+        assert (
+            filing_events_as_of(synthetic_store, security_known - timedelta(seconds=1)).height == 0
+        )
+        assert filing_events_as_of(synthetic_store, security_known).height == 1
+
+    def test_forms_filter_is_exact(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
+        self._issuer(synthetic_store)
+        accepted = datetime(2020, 3, 1, 21, 0, tzinfo=UTC)
+        _filing_event(synthetic_store, self._CIK, "A-1", "2.02", accepted_at=accepted)
+        _filing_event(synthetic_store, self._CIK, "A-2", "2.02", accepted_at=accepted, form="8-K/A")
+
+        def accessions(forms: list[str] | None) -> list[str]:
+            frame = filing_events_as_of(synthetic_store, self._AFTER_ALL, forms=forms)
+            return sorted(frame["accession"])
+
+        assert accessions(["8-K"]) == ["A-1"]
+        assert accessions(["8-K/A"]) == ["A-2"]
+        assert accessions(["8-K", "8-K/A"]) == ["A-1", "A-2"]
+        assert accessions(None) == ["A-1", "A-2"]
+        assert accessions([]) == []
+        assert accessions(["8-k"]) == []
+
+    def test_items_filter_matches_whole_codes_only(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        self._issuer(synthetic_store)
+        accepted = datetime(2020, 3, 1, 21, 0, tzinfo=UTC)
+        _filing_event(synthetic_store, self._CIK, "A-1", "2.02,9.01", accepted_at=accepted)
+        _filing_event(synthetic_store, self._CIK, "A-2", "12.02,2.021", accepted_at=accepted)
+        _filing_event(synthetic_store, self._CIK, "A-3", "5.02", accepted_at=accepted)
+        _filing_event(synthetic_store, self._CIK, "A-4", "", accepted_at=accepted)
+        _filing_event(synthetic_store, self._CIK, "A-5", "9.01, 2.02", accepted_at=accepted)
+
+        def accessions(items: list[str] | None) -> list[str]:
+            frame = filing_events_as_of(synthetic_store, self._AFTER_ALL, items=items)
+            return sorted(frame["accession"])
+
+        assert accessions(["2.02"]) == ["A-1", "A-5"]
+        assert accessions(["5.02", "9.01"]) == ["A-1", "A-3", "A-5"]
+        assert accessions(["2.0"]) == []
+        assert accessions(None) == ["A-1", "A-2", "A-3", "A-4", "A-5"]
+        assert accessions([]) == []
+
+    def test_forms_and_items_combine(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        rows = filing_events_as_of(fixture_store, self._AFTER_ALL, forms=["8-K"], items=["2.02"])
+        assert rows["accession"].to_list() == ["0001000011-20-000101", "0001000011-20-000102"]
+        assert filing_events_as_of(
+            fixture_store, self._AFTER_ALL, forms=["8-K/A"], items=["2.02"]
+        ).is_empty()
+
+    @pytest.mark.parametrize("argument", ["forms", "items"])
+    def test_a_bare_string_filter_raises(
+        self, fixture_store: duckdb.DuckDBPyConnection, argument: str
+    ) -> None:
+        with pytest.raises(TypeError):
+            filing_events_as_of(fixture_store, self._AFTER_ALL, **{argument: "2.02"})
+
+    def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(TypeError):
+            filing_events_as_of(fixture_store, date(2020, 5, 1))  # type: ignore[arg-type]
+
+    def test_naive_datetime_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError):
+            filing_events_as_of(fixture_store, datetime(2020, 5, 1, 21, 0))  # noqa: DTZ001
+
+    def test_view_is_unregistered_after_the_call(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        filing_events_as_of(fixture_store, self._AFTER_ALL)
+        with pytest.raises(duckdb.CatalogException):
+            fixture_store.execute("SELECT * FROM _asof_filing_event_securities")
