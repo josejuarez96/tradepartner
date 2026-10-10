@@ -22,11 +22,11 @@ def _selected_count(n_ranked: int, top_fraction: float) -> int:
     not the 4 that `ceil(0.1 * 30)` gives (0.1 * 30 == 3.0000000000000004). When the
     capped fraction is not the same `float` (1e-7 caps to 0, #1446), the fraction is
     its shortest decimal form instead. A positive fraction of a non-empty set selects
-    at least one name.
+    at least one name; an empty set selects none.
     """
     small = Fraction(top_fraction).limit_denominator()
     fraction = small if float(small) == top_fraction else Fraction(repr(top_fraction))
-    return max(1, math.ceil(fraction * n_ranked))
+    return max(1, math.ceil(fraction * n_ranked)) if n_ranked else 0
 
 
 def _equal_weight(k: int) -> float:

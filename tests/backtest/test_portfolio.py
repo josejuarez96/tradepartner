@@ -6,7 +6,12 @@ import math
 
 import pytest
 
-from tradepartner.backtest.portfolio import drifted_weights, target_weights, trades_from
+from tradepartner.backtest.portfolio import (
+    _selected_count,
+    drifted_weights,
+    target_weights,
+    trades_from,
+)
 
 
 def _scores(n: int) -> dict[str, float]:
@@ -34,6 +39,11 @@ def test_number_selected_is_the_ceiling_without_float_error(
 def test_a_tiny_top_fraction_still_selects_one_name(n: int, fraction: float) -> None:
     """#1446: a valid but tiny fraction used to round to 0 and divide by zero."""
     assert target_weights(_scores(n), fraction, "equal") == {f"S{n - 1:04d}": 1.0}
+
+
+@pytest.mark.parametrize("fraction", [1e-7, 0.1, 1.0])
+def test_an_empty_set_selects_none(fraction: float) -> None:
+    assert _selected_count(0, fraction) == 0
 
 
 @pytest.mark.parametrize(
