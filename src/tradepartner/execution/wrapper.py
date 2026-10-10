@@ -23,7 +23,13 @@ the last `ok` ingestion run's `finished_at` and not later than the close of the
 session `risk.clock_max_sessions_late` sessions after S.
 
 **The halt path** (`halt`, also the run's halt entry point, T63), in the req 4
-order:
+order. A wrapper built with `book_id` first reads the run's window's book: when
+it is another book's (`BookMismatchError`, #1400), the halt is refused before
+step 1, whatever the fault, so it never engages that book's switch, cancels
+its orders through this book's broker, or writes its alert or result row; the
+refusal (chained from the fault) propagates and the run is left as an
+interrupted one for that book's own `paper resume`. A wrapper with no
+`book_id` (H1's) never reads it here:
 
 1. the `kill_switch` `engaged` row (source `fault`, the fault's type, the
    message as its reason) through T59's `switch.engage`, which retries the
@@ -291,6 +297,7 @@ __all__ = [
     "SUBMIT_ALLOWLIST",
     "WRITE_FAILED_EXIT_CODE",
     "BatchOutcome",
+    "BookMismatchError",
     "RiskGatedBroker",
     "TradingCalendar",
     "Verdict",
@@ -385,6 +392,12 @@ _MISSED = "missed"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
 _COSTS_PREFIX = "costs."
+
+
+class BookMismatchError(ValueError):
+    """A wrapper built for one book was handed a run of another book's window
+    (#1400): refused before any broker call, and on the halt path before any
+    write, so the other book's switch, orders and alerts are never touched."""
 
 
 class Verdict(StrEnum):
@@ -1011,6 +1024,12 @@ class RiskGatedBroker:
         the alert write itself then most likely fails too) `main`."""
         if self._book_id is not None:
             return self._book_id
+        book = self._window_book(run)
+        return DEFAULT_BOOK_ID if book is None else book
+
+    def _window_book(self, run: PaperRunRow) -> str | None:
+        """The run's window row's book (cached from a phase's read, else
+        queried), or None when the store does not answer or has no such row."""
         if run.window_id in self._window_books:
             return self._window_books[run.window_id]
         try:
@@ -1019,8 +1038,20 @@ class RiskGatedBroker:
                     "SELECT book_id FROM paper_windows WHERE window_id = ?", [run.window_id]
                 ).fetchone()
         except Exception:
-            return DEFAULT_BOOK_ID
-        return DEFAULT_BOOK_ID if row is None else str(row[0])
+            return None
+        if row is None:
+            return None
+        self._window_books[run.window_id] = str(row[0])
+        return self._window_books[run.window_id]
+
+    def _check_book(self, run: PaperRunRow, book_id: str) -> None:
+        """Raise `BookMismatchError` when this wrapper has a book and the run's
+        window is `book_id`, another one."""
+        if self._book_id is not None and book_id != self._book_id:
+            raise BookMismatchError(
+                f"run {run.run_id}'s window {run.window_id} is book {book_id!r}, "
+                f"not this wrapper's {self._book_id!r}"
+            )
 
     def _read_book(self, run: PaperRunRow, rows: Sequence[DecisionRow]) -> _Book:
         """One read of the journal and the store for a phase (`_Book`)."""
@@ -1034,11 +1065,7 @@ class RiskGatedBroker:
             if window is None:
                 raise ValueError(f"run {run.run_id}'s window {run.window_id} is not the open one")
             self._window_books[run.window_id] = window.book_id
-            if self._book_id is not None and window.book_id != self._book_id:
-                raise ValueError(
-                    f"run {run.run_id}'s window {run.window_id} is book {window.book_id!r}, "
-                    f"not this wrapper's {self._book_id!r}"
-                )
+            self._check_book(run, window.book_id)
             costs = _frozen_costs(window)
             window_id = run.window_id
             actions = live_actions_as_of(conn, cut)
@@ -1363,6 +1390,17 @@ class RiskGatedBroker:
         docstring). `write_offs` is the run's write-off context (T58)."""
         if run.run_id is None:
             raise ValueError("halt needs a journaled run (run_id is None)")
+        if self._book_id is not None:
+            # Another book's run is never halted here (#1400): not its switch,
+            # not its orders, not its alert. An unreadable book halts as before.
+            book = self._window_book(run)
+            if book is not None:
+                if isinstance(fault, BookMismatchError):
+                    raise fault
+                try:
+                    self._check_book(run, book)
+                except BookMismatchError as refused:
+                    raise refused from fault
         stale = isinstance(fault, StaleDataError)
         stamp = _HaltClock(self, fault=isinstance(fault, ClockError))
         fault_type = type(fault).__name__
