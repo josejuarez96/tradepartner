@@ -293,7 +293,6 @@ script over the real ones.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import re
@@ -977,9 +976,12 @@ def _fresh_transaction(conn: duckdb.DuckDBPyConnection) -> None:
     `open_for_write`'s rollback on the way out has one to end and the error that got
     us here is the one raised (#1351). `begin` is not a probe: inside an open
     transaction it fails and aborts that transaction."""
-    with contextlib.suppress(duckdb.TransactionException):
+    try:
         conn.rollback()
-    conn.begin()
+    except duckdb.TransactionException:
+        conn.begin()  # no transaction was open to roll back
+    else:
+        conn.begin()
 
 
 def _close_open_runs(
