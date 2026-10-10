@@ -121,6 +121,37 @@ def test_without_marking_frames_a_group_keeps_none_and_every_other_field_is_equa
         )
 
 
+@pytest.mark.parametrize("window", list(WINDOWS.values()), ids=list(WINDOWS))
+def test_without_detail_a_group_keeps_no_positions_or_weights_and_the_rest_is_equal(
+    window: tuple[Cadence, date, date],
+) -> None:
+    """#1448: `keep_detail=False` keeps no position values and no weight rows at any
+    level, and changes nothing else."""
+    cadence, start, end = window
+    variants = _variants(_params(cadence, top_fraction=0.4), _params(cadence, top_fraction=0.8))
+    kept = run_many(variants, _provider(), start, end, LEVELS, family="momentum")
+    dropped = run_many(
+        variants, _provider(), start, end, LEVELS, family="momentum", keep_detail=False
+    )
+    assert sorted(dropped) == sorted(kept) == [1, 2] and not dropped.failures
+    for trial_id, levels in kept.items():
+        assert all(r.weights and not r.position_values.is_empty() for r in levels.values())
+        for result in dropped[trial_id].values():
+            assert result.weights == ()
+            assert result.position_values.is_empty()
+            assert (
+                result.position_values.schema
+                == levels[result.cost_per_side_bps].position_values.schema
+            )
+        _assert_same(
+            dropped[trial_id],
+            {
+                lv: dataclasses.replace(r, weights=(), position_values=r.position_values.clear())
+                for lv, r in levels.items()
+            },
+        )
+
+
 class TestReadGroups:
     """The spec's "Read groups" criterion."""
 
