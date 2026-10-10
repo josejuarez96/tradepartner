@@ -34,7 +34,9 @@ from tradepartner.store.journal import FillRow, OrderedFill, OrderRow, PaperWind
 S = date(2026, 10, 7)
 PRIOR = date(2026, 10, 6)
 AT = datetime(2026, 10, 7, 13, 0, tzinfo=UTC)
-FROZEN = RiskConfig()  # quantity tolerance 1e-6, cash tolerance 0.01
+# Quantity tolerance 1e-6; cash tolerance 1.26 = 0.005 x 250 orders + 0.01 (ADR 0010
+# amendment 2026-10-10, #1290): the cash cases below step past it by whole dollars.
+FROZEN = RiskConfig()
 PREFIX = "tp"
 SYMBOLS = {"SEC_A": "AAA", "SEC_B": "BBB", "SEC_C": "CCC", "SEC_KID": "KID"}
 WINDOW = PaperWindowRow(
@@ -161,7 +163,7 @@ def test_matching_books_are_ok_and_record_the_broker_cash() -> None:
         (_ledger(SEC_A=10.0), _positions(AAA=10.0, BBB=3.0), 1_000.0, "broker_only_position"),
         (_ledger(SEC_A=10.0, SEC_B=3.0), _positions(AAA=10.0), 1_000.0, "ledger_only_position"),
         (_ledger(SEC_A=10.0), _positions(AAA=10.00001), 1_000.0, "quantity"),
-        (_ledger(SEC_A=10.0), _positions(AAA=10.0), 1_000.02, "cash"),
+        (_ledger(SEC_A=10.0), _positions(AAA=10.0), 1_002.0, "cash"),
         (_ledger(SEC_A=10.0), _positions(AAA=10.0, ZZZ=1.0), 1_000.0, "unknown_symbol"),
     ],
 )
@@ -174,6 +176,16 @@ def test_each_position_and_cash_mismatch(
     assert _kinds(result) == [kind]
     assert result.broker_cash is None  # never a re-base
     assert kind in json.loads(result.mismatches_json)["mismatches"][0]["kind"]
+
+
+@pytest.mark.parametrize(("cash", "status"), [(1_001.25, "ok"), (1_001.27, "mismatch")])
+def test_the_cash_band_is_the_frozen_tolerance(cash: float, status: str) -> None:
+    """#1290: a $1.25 gap is inside the 1.26 default, which absorbs per-fill cent
+    rounding over `risk.max_orders_per_run` fills; $1.27 is outside it."""
+    result = _run(_ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), cash)
+
+    assert result.status == status
+    assert _kinds(result) == ([] if status == "ok" else ["cash"])
 
 
 def test_a_different_account_id_is_a_mismatch() -> None:
@@ -588,7 +600,7 @@ def test_a_pending_quantity_order_counts_at_the_buffered_reference_price() -> No
     pending = _pending("tp-20261007-SEC_B-buy-1", "SEC_B", "buy", quantity=3.0)
     inside = _run(_ledger(1_000.0), _positions(BBB=3.0), 847.0, journal_open=[pending])
     assert inside.status == "pending_unresolved"
-    beyond = _run(_ledger(1_000.0), _positions(BBB=3.0), 846.0, journal_open=[pending])
+    beyond = _run(_ledger(1_000.0), _positions(BBB=3.0), 845.0, journal_open=[pending])
     assert _kinds(beyond) == ["cash"]
 
 
@@ -656,7 +668,7 @@ def test_ended_listing_proceeds_above_the_reference_value_cap_are_a_mismatch() -
     beyond = _run(
         _ledger(1_000.0, SEC_B=4.0),
         {},
-        1_205.0,
+        1_206.0,
         explanations=_explanations(ended=frozenset({"SEC_B"})),
     )
     assert _kinds(beyond) == ["cash"]
@@ -722,7 +734,7 @@ def test_a_spin_off_must_match_its_ratio() -> None:
     in_lieu = _run(
         _ledger(1_000.0, SEC_A=10.0),
         _positions(AAA=10.0, KID=2.0),
-        1_001.0,
+        1_002.0,
         explanations=_explanations(spinoffs={"SEC_KID": ("SEC_A", 0.25)}),
     )
     assert _kinds(in_lieu) == ["cash"]  # the cash in lieu is not explained here
@@ -933,12 +945,12 @@ def test_a_notional_reading_within_its_buffered_notional_still_lags() -> None:
 
 
 def test_a_notional_reading_past_its_buffered_notional_is_a_bad_reading() -> None:
-    """#398: 5.11 shares at $100 is $511, past 500 x 1.02 + the cash tolerance."""
+    """#398: 5.13 shares at $100 is $513, past 500 x 1.02 + the cash tolerance."""
     result = _run(
         _ledger(1_000.0, SEC_A=10.0),
-        _positions(AAA=15.11),
-        489.0,
-        journal_open=[_lagging_buy(5.11, 0.0)],
+        _positions(AAA=15.13),
+        487.0,
+        journal_open=[_lagging_buy(5.13, 0.0)],
     )
 
     assert "bad_reading" in _kinds(result)
@@ -1016,11 +1028,12 @@ def test_cash_beyond_the_proceeds_cap_is_read_as_the_dividend_beside_them() -> N
 
 
 def test_cash_beyond_the_cap_and_the_dividend_is_still_a_mismatch() -> None:
-    """#400: $107.50 is more than the $102 cap plus the $4.50 dividend."""
+    """#400: $108.50 is more than the $102 cap plus the $4.50 dividend and the
+    cash tolerance."""
     result = _run(
         _ledger(1_000.0, SEC_A=10.0, SEC_C=5.0),
         _positions(AAA=10.0),
-        1_107.5,
+        1_108.5,
         explanations=_explanations(ended=frozenset({"SEC_C"}), dividends={"SEC_A": 4.5}),
     )
 
@@ -1044,11 +1057,11 @@ def test_an_ended_listing_whose_cash_excludes_the_dividend_keeps_all_proceeds() 
 
 def test_cash_beyond_the_lag_and_the_dividend_is_still_a_mismatch() -> None:
     """#399: the band runs from the lag's -$300 to the dividend's +$4.50; a
-    dollar above that is a mismatch."""
+    dollar above that plus the cash tolerance is a mismatch."""
     result = _run(
         _ledger(1_000.0, SEC_A=12.0, SEC_B=4.0),
         _positions(AAA=15.0, BBB=4.0),
-        1_005.5,
+        1_006.5,
         journal_open=[_lagging_buy(5.0, 2.0)],
         explanations=_explanations(dividends={"SEC_B": 4.5}),
     )

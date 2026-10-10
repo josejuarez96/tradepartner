@@ -173,7 +173,7 @@ Live trading, a live endpoint, live keys and live sizing (Phase 6; `alpaca.paper
 
 - `alpaca.quantity_decimals=9`: paper accepted and filled 9-decimal quantities.
 - `alpaca.client_order_id_max_length=128`: Alpaca's documented `client_order_id` limit.
-- `risk.min_order_notional=1.0`, `risk.reconcile_quantity_tolerance=1e-6` and `risk.reconcile_cash_tolerance=0.01`: confirmed. The cash tolerance's scaling with fill count is an owner question, [#1290](https://github.com/josejuarez96/tradepartner/issues/1290).
+- `risk.min_order_notional=1.0` and `risk.reconcile_quantity_tolerance=1e-6`: confirmed. `risk.reconcile_cash_tolerance=1.26` (0.005 × `risk.max_orders_per_run` + 0.01, per-fill cent rounding): ADR 0010's amendment of 2026-10-10 ([#1290](https://github.com/josejuarez96/tradepartner/issues/1290)); windows started before it keep the 0.01 they froze.
 
 Req 2's open answers:
 
