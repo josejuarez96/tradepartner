@@ -756,6 +756,30 @@ def test_a_late_stamp_applies_on_the_next_read_with_no_request(tmp_path: Path) -
     assert fresh.statement_facts(CIK) == [after]
     assert fresh.statement_conflict_keys == [] and fresh.statement_conflicts == 0
     assert fresh.statement_unstampable == 0  # an 8-K is filtered, never unstampable
+    assert fresh.statement_malformed == 1  # #1060: the late stamp's drop is counted
+
+
+def test_an_entry_ending_after_a_known_stamp_counts_once_per_run(tmp_path: Path) -> None:
+    """#1060: the end-after-acceptance drop is counted by the read (first
+    call per CIK per instance), never by the parse as well."""
+    body = _company(
+        CIK,
+        {
+            "Revenues": {
+                "USD": [entry(K2022, FY2022, 1), entry(K2022, ("2023-01-01", "2023-03-31"), 2)]
+            }
+        },
+    )
+    settings = _settings(tmp_path)
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, STAMPS)
+    [kept] = source.statement_facts(CIK)
+    assert kept.period_end == date(2022, 12, 31)
+    assert source.statement_malformed == 1
+    source.statement_facts(CIK)
+    assert source.statement_malformed == 1
+    fresh = _adapter(settings, EdgarRouter())  # a cache hit: the read counts it again
+    assert fresh.statement_facts(CIK) == [kept] and fresh.statement_malformed == 1
 
 
 ONE, NONE_TAGGED, UNSTAMPED = "0000000001", "0000000002", "0000000003"
@@ -895,7 +919,17 @@ def test_co_registrant_accessions_contribute_nothing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     body = _company(
         CIK,
-        {"Revenues": {"USD": [entry(K2022, FY2022, 1), entry(Q2022, FY2021, 2)]}},
+        {
+            "Revenues": {
+                "USD": [
+                    entry(K2022, FY2022, 1),
+                    entry(Q2022, FY2021, 2),
+                    entry(K2022, ("2022-12-31", "2022-12-31"), 3),  # malformed
+                    entry(Q2022, ("2022-01-01", "2022-09-30"), 4),  # ends after acceptance
+                ]
+            },
+            "GrossProfit": {"EUR": [entry(K2022, FY2022, 5), entry(Q2022, FY2021, 6)]},
+        },
     )
     source = _adapter(settings, _router(**{f"c{CIK}": body}))
     stamps = {**STAMPS, Q2022: ("10-Q", datetime(2022, 7, 29, 20, 0, tzinfo=UTC))}
@@ -917,6 +951,8 @@ def test_co_registrant_accessions_contribute_nothing(tmp_path: Path) -> None:
     )
     assert source.statement_facts(CIK) == []
     assert source.statement_conflicts == 0
+    # #1060: nor do they count on the parse's or the read's skips.
+    assert (source.statement_malformed, source.statement_non_usd) == (0, 0)
 
 
 # --- bulk reuse (`reuse_cached`, `--bulk-from-cache`) -----------------------------

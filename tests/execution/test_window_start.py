@@ -362,6 +362,57 @@ def test_accepts_a_week_end_and_a_daily_registration(
     assert frozen["paper.tracking_k"] == 2.0
 
 
+def test_accepts_an_operations_book_after_a_signoff_on_its_own_trial(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Paper plan T160b: on a lab store, a `daily` operations file (an
+    `operations_book` decision names it; no promotion row) starts after a gap sign-off
+    on its own `ok` in-sample trial, T_0 and `paper.min_rebalances` at `daily`; and
+    H1's `month_end` window on book `main`, started on the same store, freezes exactly
+    what it freezes on a store without the operations row."""
+    from tradepartner.store import lab_registry, lab_schema
+
+    def h1_frozen() -> tuple[date, str, str]:
+        result = window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+        )
+        opened = result.window
+        with open_for_write(journal_settings) as conn:
+            conn.execute("DELETE FROM paper_windows")
+        return opened.first_rebalance_session, opened.book_id, opened.frozen_json
+
+    with open_for_write(journal_settings) as conn:
+        h1 = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, h1, tmp_path)
+    before = h1_frozen()
+    with open_for_write(journal_settings) as conn:
+        lab_schema.apply_lab_schema(conn)
+        ops = _register(
+            conn,
+            journal_settings,
+            "ops-book",
+            HOLDOUT_END_PAST,
+            params=_params(**{"schedule.rebalance_cadence": "daily"}),
+        )
+        registry.record_decision(
+            conn,
+            kind="operations_book",
+            reason="machine test",
+            values={"variant_hypothesis_id": 99},
+            hypothesis_id=ops.hypothesis_id,
+        )
+        assert lab_registry.promotion_for(conn, ops.hypothesis_id) is None
+        _sign_off(conn, journal_settings, ops, tmp_path)
+    assert h1_frozen() == before
+    assert before[1] == "main"
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "ops-book"
+    )
+    assert result.window.hypothesis_id == ops.hypothesis_id
+    assert result.window.first_rebalance_session == date(2026, 10, 2)
+    assert json.loads(result.window.frozen_json)["paper.min_rebalances"] == 63
+
+
 def test_refuses_a_week_end_registration_whose_holdout_end_is_not_a_week_end(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:

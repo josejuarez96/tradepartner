@@ -626,6 +626,24 @@ def test_promotion_for_by_decision_row(
     assert lab_registry.promotion_for(lab_store, other.hypothesis_id) is None
 
 
+def test_operations_book_for_by_decision_row(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """T160b: the earliest `operations_book` row naming the hypothesis; a promotion
+    row is not one, and an operations row is never a promotion."""
+    ops = _register(lab_store, settings, "ops")
+    _decision(lab_store, "promotion", ops.hypothesis_id, {"sweep_id": 1})
+    assert lab_registry.operations_book_for(lab_store, ops.hypothesis_id) is None
+    lab_store.execute("DELETE FROM owner_decisions")
+    decision_id = _decision(lab_store, "operations_book", ops.hypothesis_id, {"sweep_id": 1})
+    _decision(lab_store, "operations_book", ops.hypothesis_id, {"sweep_id": 2})
+    found = lab_registry.operations_book_for(lab_store, ops.hypothesis_id)
+    assert found is not None
+    assert (found.decision_id, found.values) == (decision_id, {"sweep_id": 1})
+    assert lab_registry.promotion_for(lab_store, ops.hypothesis_id) is None
+    assert lab_registry.operations_book_for(lab_store, 999) is None
+
+
 def test_grandfathered_fingerprints_lists_pre_lab_duplicates_only(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
@@ -764,6 +782,7 @@ _CALLS: dict[str, Callable[[duckdb.DuckDBPyConnection], object]] = {
     "family_ready_for_sweep": lambda c: lab_registry.family_ready_for_sweep(c, "momentum"),
     "is_pre_lab": lambda c: lab_registry.is_pre_lab(c, 1),
     "promotion_for": lambda c: lab_registry.promotion_for(c, 1),
+    "operations_book_for": lambda c: lab_registry.operations_book_for(c, 1),
     "grandfathered_fingerprints": lab_registry.grandfathered_fingerprints,
     "grandfathered_members": lab_registry.grandfathered_members,
     "registry_size_bytes": lab_registry.registry_size_bytes,

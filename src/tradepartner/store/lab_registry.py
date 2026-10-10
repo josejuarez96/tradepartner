@@ -146,6 +146,19 @@ class PromotionDecision:
 
 
 @dataclass(frozen=True)
+class OperationsBookDecision:
+    """An `owner_decisions` row of kind `operations_book` (strategy-lab spec req 1,
+    amendment 2026-10-10); `hypothesis_id` is the registered operations file (the
+    row's `hypothesis_id` column), `values` names the sweep and the variant."""
+
+    decision_id: int
+    made_at: datetime
+    hypothesis_id: int
+    values: dict[str, Any]
+    reason: str
+
+
+@dataclass(frozen=True)
 class GrandfatheredMember:
     """A pre-lab member whose frozen values differ from its family's rules
     (spec req 13); `differences` names each differing rule."""
@@ -646,6 +659,23 @@ def promotion_for(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> Promot
         PromotionDecision,
         "owner_decisions",
         "kind = 'promotion' AND hypothesis_id = ? ORDER BY decision_id LIMIT 1",
+        [hypothesis_id],
+    )
+    return found[0] if found else None
+
+
+def operations_book_for(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int
+) -> OperationsBookDecision | None:
+    """The earliest `operations_book` decision naming `hypothesis_id` as the
+    registered operations file (the row's `hypothesis_id`), or None. Never a
+    promotion: `promotion_for` stays None for it."""
+    require_lab(conn)
+    found = _select(
+        conn,
+        OperationsBookDecision,
+        "owner_decisions",
+        "kind = 'operations_book' AND hypothesis_id = ? ORDER BY decision_id LIMIT 1",
         [hypothesis_id],
     )
     return found[0] if found else None
