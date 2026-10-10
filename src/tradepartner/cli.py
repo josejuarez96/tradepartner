@@ -3055,11 +3055,16 @@ def make_app(
                     _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
                 ) from exc
             for entry in runs:
-                prefix = "paper run" if len(runs) == 1 else f"paper run: book {entry.book_id}"
+                # The line before books for `paper.book_id` alone; any other book is named.
+                alone = len(runs) == 1 and entry.book_id == s.paper.book_id
+                prefix = "paper run" if alone else f"paper run: book {entry.book_id}"
                 if entry.outcome is None:
                     assert entry.error is not None
                     if isinstance(entry.error, SystemExit):
-                        detail = f"exited {entry.exit_code}"
+                        said = entry.error.code
+                        detail = f"exited {entry.exit_code}" + (
+                            f": {said}" if isinstance(said, str) else ""
+                        )
                     else:
                         detail = f"failed: {_describe(entry.error)}"
                     typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)

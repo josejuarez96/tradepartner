@@ -1101,6 +1101,36 @@ def test_a_write_failed_exit_in_any_book_is_the_drivers_exit(
     assert "paper run: book zeta: no_session" in out.output
 
 
+def test_a_single_book_other_than_paper_book_id_is_named_on_its_line(
+    clock: _Clock, books: _BookFactory
+) -> None:
+    assert _paper(clock, books, "stop", "--reason", LONG_REASON).exit_code == 0
+    assert _paper(clock, books, "abandon", "--reason", LONG_REASON).exit_code == 0
+    books.books.clear()
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == 0, out.output
+    assert books.books == ["zeta"]
+    assert "paper run: book zeta: no_session" in out.output
+
+
+def test_a_run_exiting_with_a_message_keeps_it_on_its_line(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: _BookFactory
+) -> None:
+    real = paper_run.tracking_run
+
+    def exiting(*args: Any, **kwargs: Any) -> paper_run.RunOutcome:
+        if kwargs["book_id"] == "main":
+            raise SystemExit("the halt path could not finish")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(paper_run, "tracking_run", exiting)
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == 1
+    assert "paper run: book main: exited 1: the halt path could not finish" in out.output
+
+
 def test_paper_kill_all_engages_every_open_book(clock: _Clock, books: _BookFactory) -> None:
     out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
     assert out.exit_code == 0, out.output
