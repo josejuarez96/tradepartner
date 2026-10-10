@@ -606,7 +606,10 @@ def _operations_refusal(
     from tradepartner.backtest import sweep_report
 
     variant = registry.get_hypothesis_by_id(conn, variant_id)
-    standing = sweep_report.variant_standing(conn, variant_id, code_vintage=code_vintage)
+    try:
+        standing = sweep_report.variant_standing(conn, variant_id, code_vintage=code_vintage)
+    except ValueError as exc:  # a shown trial without a finite base-level metric
+        raise LabRegistrationError(f"{path}: variant {variant.slug}: {exc}") from exc
     # Counted means counted in N: the current `ok` trial, or a stale one (an `ok`
     # trial from an earlier code or data vintage, which N still counts). A rerun to
     # make it current would add trials to N for nothing; the decision records which.

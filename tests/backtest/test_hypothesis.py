@@ -1437,6 +1437,21 @@ def test_an_operations_file_accepts_a_stale_ok_trial_and_records_it(ops: Any) ->
     assert outcome.values["variant_trial_id"] is not None
 
 
+def test_an_operations_file_of_a_trial_missing_a_metric_is_a_clean_refusal(ops: Any) -> None:
+    v2 = ops.variants[1]
+    ops.conn.execute(
+        "DELETE FROM trial_metrics WHERE metric = 'periods_per_year' AND trial_id IN "
+        "(SELECT trial_id FROM trials WHERE hypothesis_id = ?)",
+        [v2.hypothesis_id],
+    )
+    path = ops.file(OPS_SLUG, 0.25)
+    before = _ops_counts(ops.conn)
+    # Both are the CLI's usage refusals (exit 2), never a traceback.
+    with pytest.raises((HypothesisFileError, registry.RegistryError), match="periods_per_year"):
+        _ops_register(ops, path, v2.slug)
+    assert _ops_counts(ops.conn) == before
+
+
 def test_an_operations_file_is_refused_without_the_flag(ops: Any) -> None:
     path = ops.file(OPS_SLUG, 0.25)
     before = _ops_counts(ops.conn)
