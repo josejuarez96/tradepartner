@@ -164,6 +164,7 @@ def test_edgar_filing_source_defaults() -> None:
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
     assert s.edgar.bulk_stamp_threshold_ciks == 500
+    assert s.edgar.bulk_stamps_enabled is False
     assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
 
 

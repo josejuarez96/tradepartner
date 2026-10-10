@@ -15,7 +15,7 @@ import gzip
 import io
 import json
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -292,6 +292,45 @@ def test_a_truncated_cache_file_is_not_served(settings: Settings) -> None:
 # --- the bulk path -------------------------------------------------------------
 
 
+def _moved_early(name: str) -> bytes:
+    """Submissions fixture `name` with every `acceptanceDateTime` moved 5 h
+    earlier, the shape #1382 found in SEC's bulk `submissions.zip`."""
+    payload = load(name)
+    recent = payload["filings"]["recent"] if "filings" in payload else payload
+    recent["acceptanceDateTime"] = [
+        (datetime.fromisoformat(at.replace("Z", "+00:00")) - timedelta(hours=5))
+        .isoformat()
+        .replace("+00:00", ".000Z")
+        for at in recent["acceptanceDateTime"]
+    ]
+    return json.dumps(payload).encode("utf-8")
+
+
+def test_a_moved_bulk_zip_never_writes_a_stamp_by_default(tmp_path: Path) -> None:
+    """#1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved
+    by New York's UTC offset (early for many CIKs, a look-ahead). With
+    `edgar.bulk_stamps_enabled` at its default (`false`), more pending CIKs
+    than `edgar.bulk_stamp_threshold_ciks` are still stamped per CIK from the
+    API: the zip is not even downloaded, and every stamp equals the per-CIK
+    one, never the zip's early value."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as bulk:
+        for cik in (APPLE, ALPHABET):
+            for number, name in enumerate(SUBMISSIONS[cik]):
+                member = f"CIK{cik}.json" if number == 0 else f"CIK{cik}-submissions-001.json"
+                bulk.writestr(member, _moved_early(name))
+    router = _router()
+    router.add(BULK_URL, buffer.getvalue())
+    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    assert settings.edgar.bulk_stamps_enabled is False
+    source = _source(settings, router)
+    entries = source.filing_index()
+    assert BULK_URL not in router.urls
+    assert entries == _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
+    recorded = _recorded_acceptance()
+    assert entries and all(e.accepted_at == recorded[e.accession] for e in entries)
+
+
 def test_the_bulk_zip_stamps_and_the_per_cik_top_up_follows(tmp_path: Path) -> None:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as bulk:  # built before KLX's latest filings
@@ -301,7 +340,9 @@ def test_the_bulk_zip_stamps_and_the_per_cik_top_up_follows(tmp_path: Path) -> N
             bulk.write(FIXTURES / page, f"CIK{cik}-submissions-001.json")
     router = _router()
     router.add(BULK_URL, buffer.getvalue())
-    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    settings = edgar_settings(
+        tmp_path / "cache", bulk_stamp_threshold_ciks=2, bulk_stamps_enabled=True
+    )
     source = _source(settings, router)
     entries = source.filing_index()
     assert entries == _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
@@ -351,7 +392,9 @@ def test_an_empty_bulk_submissions_member_falls_back_to_the_api(tmp_path: Path) 
         bulk.writestr(f"CIK{ALPHABET}.json", "{}")
     router = _router()
     router.add(BULK_URL, buffer.getvalue())
-    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    settings = edgar_settings(
+        tmp_path / "cache", bulk_stamp_threshold_ciks=2, bulk_stamps_enabled=True
+    )
     source = _source(settings, router)
     entries = source.filing_index()
     assert entries == _source(edgar_settings(tmp_path / "per-cik"), _router()).filing_index()
@@ -718,6 +761,28 @@ def _bulk_zip(settings: Settings, *members: tuple[str, bytes]) -> None:
     with zipfile.ZipFile(bulk, "w") as archive:
         for name, body in members:
             archive.writestr(name, body)
+
+
+def test_the_refresh_from_a_moved_zip_never_moves_a_stamp(settings: Settings) -> None:
+    """#1382 guard on T164c's refresh: a cached zip whose `acceptanceDateTime`
+    is moved early fills `items` only; every `accepted_at` stays the stamp
+    already in the file, never the zip's early value."""
+    old = _old_cache(settings)
+    main, page = SUBMISSIONS[APPLE]
+    _bulk_zip(
+        settings,
+        (f"CIK{APPLE}.json", _moved_early(main)),
+        (f"CIK{APPLE}-submissions-001.json", _moved_early(page)),
+    )
+    router = _router(overrides=SETTLED)
+    source = EdgarFilingSource(
+        settings, client=router.client(), clock=lambda: CLOCK, reuse_cached=True
+    )
+    events = source.filing_events(APPLE)
+    recorded = _recorded_acceptance()
+    assert events and all(e.accepted_at == recorded[e.accession] for e in events)
+    assert {e.accession: e.items for e in events}[APPLE_202] == "2.02,9.01"
+    _assert_old_stamps_unchanged(settings, old)
 
 
 def test_a_stale_cached_zip_fills_what_it_has_and_leaves_the_cik_unrefreshed(
