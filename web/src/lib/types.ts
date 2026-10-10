@@ -5,12 +5,29 @@ export interface PortfolioPoint extends Point { index: number }
 export interface BookStatus {
   state: "running" | "stopped";
   by?: "you" | "safety";
+  /** For a safety stop: the rule that tripped. */
+  rule?: string;
   at?: string;
   reason?: string;
 }
 
 export interface Position {
   symbol: string; name: string; weight: number; target_weight: number; value: number; unrealized_pnl: number;
+  shares: number; price: number; avg_cost: number; bought_on: string;
+  /** Rank today on the strategy's own measure (1 is best), and that measure's value. */
+  rank: number; signal: number;
+}
+
+/** expected_price: the price when the order was decided; cost_bp: how much worse the fill was. */
+export interface Order {
+  id: string; placed_at: string; side: "buy" | "sell"; symbol: string; shares: number; filled_shares: number;
+  status: "filled" | "partial" | "open" | "cancelled" | "rejected";
+  expected_price: number; fill_price: number | null; cost_bp: number | null; why: string; note?: string;
+}
+
+/** The strategy's rule in numbers, so the screen can say why it holds what it holds. */
+export interface Rule {
+  universe: number; measure: string; hold: number; sell_below: number; weight: number; tolerance: number; check: string;
 }
 
 export interface Run { at: string; outcome?: "ok" | "failed" | "skipped"; summary?: string; what?: string }
@@ -18,12 +35,15 @@ export interface Run { at: string; outcome?: "ok" | "failed" | "skipped"; summar
 export interface Book {
   id: string; name: string; strategy_id: string; cadence: "daily" | "weekly" | "monthly";
   started_on: string; start_equity: number; status: BookStatus; equity: Point[]; cash: number;
-  positions: Position[]; orders: unknown[]; last_run: Run; next_run: Run;
+  positions: Position[]; orders: Order[]; last_run: Run; next_run: Run;
+  /** SAMPLE: the yearly spread around the S&P this book's backtest expects. */
+  expected_tracking_error: number;
 }
 
 export interface Strategy {
   id: string; name: string; idea: string; on_paper: boolean;
-  backtest: { period: string; annual_return: number; benchmark_annual_return: number; max_drawdown: number; verdict: string };
+  backtest: { period: string; annual_return: number; benchmark_annual_return: number; max_drawdown: number; verdict: string; cost_bp: number };
+  rule: Rule;
 }
 
 export interface Alert {

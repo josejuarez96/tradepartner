@@ -52,9 +52,73 @@ for (const date of sessions) {
   portfolio.push({ date, value: r2(value), index: Math.round(idx * 10000) / 10000 });
 }
 
-const pos = (symbol, name, weight, target, value, pnl) => ({ symbol, name, weight, target_weight: target, value, unrealized_pnl: pnl });
 const last = (s) => s.at(-1).value;
 
+// Holdings, SAMPLE. Each one carries why the rule holds it: its rank today on
+// the strategy's own measure, and that measure's value.
+const pos = (book, symbol, name, weight, target, rank, signal, price, avg_cost, bought_on) => {
+  const value = r2(last(book) * weight);
+  const shares = Math.round(value / price);
+  return { symbol, name, weight, target_weight: target, value, shares, price, avg_cost, bought_on, rank, signal,
+    unrealized_pnl: r2(shares * (price - avg_cost)) };
+};
+const dailyPositions = [
+  pos(daily, "NVDA", "NVIDIA", 0.112, 0.1, 1, 1.42, 191.2, 158.4, "2026-08-03"),
+  pos(daily, "AVGO", "Broadcom", 0.104, 0.1, 2, 1.18, 342.6, 309.9, "2026-08-03"),
+  pos(daily, "PLTR", "Palantir", 0.101, 0.1, 3, 1.05, 171.3, 178.2, "2026-09-14"),
+  pos(daily, "GE", "GE Aerospace", 0.098, 0.1, 4, 0.81, 288.4, 276.1, "2026-08-03"),
+  pos(daily, "META", "Meta Platforms", 0.099, 0.1, 5, 0.74, 742.1, 693.5, "2026-08-21"),
+  pos(daily, "NFLX", "Netflix", 0.097, 0.1, 6, 0.69, 1214.5, 1188.0, "2026-09-02"),
+  pos(daily, "JPM", "JPMorgan Chase", 0.091, 0.1, 7, 0.52, 309.8, 307.1, "2026-10-09"),
+  pos(daily, "ANET", "Arista Networks", 0.096, 0.1, 8, 0.49, 141.7, 137.2, "2026-10-05"),
+  pos(daily, "ORCL", "Oracle", 0.093, 0.1, 11, 0.44, 288.9, 296.3, "2026-09-23"),
+  pos(daily, "TSLA", "Tesla", 0.088, 0.1, 14, 0.38, 433.0, 441.8, "2026-10-06"),
+];
+const b3Names = [
+  ["AAPL", "Apple", 0.47, 254.6, 241.0], ["MSFT", "Microsoft", 0.41, 512.3, 519.8], ["V", "Visa", 0.62, 351.2, 344.0],
+  ["MA", "Mastercard", 0.58, 589.4, 576.2], ["ADBE", "Adobe", 0.55, 352.8, 371.5], ["LLY", "Eli Lilly", 0.51, 812.0, 768.3],
+  ["ABBV", "AbbVie", 0.49, 228.7, 219.4], ["KO", "Coca-Cola", 0.46, 67.9, 69.2], ["PEP", "PepsiCo", 0.45, 142.3, 146.8],
+  ["PG", "Procter & Gamble", 0.44, 154.1, 157.0], ["HD", "Home Depot", 0.43, 401.7, 396.5], ["LOW", "Lowe's", 0.42, 251.9, 249.0],
+  ["TJX", "TJX Companies", 0.42, 144.6, 139.8], ["ORLY", "O'Reilly Automotive", 0.40, 102.5, 98.1], ["AZO", "AutoZone", 0.40, 4120.0, 3995.0],
+  ["MCD", "McDonald's", 0.39, 301.4, 306.2], ["TXN", "Texas Instruments", 0.38, 182.6, 191.0], ["QCOM", "Qualcomm", 0.38, 166.2, 158.9],
+  ["NKE", "Nike", 0.37, 71.3, 74.8], ["COST", "Costco", 0.36, 921.5, 934.0],
+];
+const b3Positions = b3Names
+  .map(([s, n, gpa, price, cost], k) => pos(b3, s, n, r2((0.0494 + ((k * 7) % 5 - 2) * 0.0009) * 1000) / 1000, 0.05, k + 1, gpa, price, cost, "2026-09-01"))
+  .sort((a, b) => a.rank - b.rank);
+
+// Orders, SAMPLE. expected_price is the price when the order was decided (the
+// open); cost_bp is how much worse the fill was, the number the backtest assumed.
+let oid = 0;
+const ord = (placed_at, side, symbol, shares, status, expected_price, fill_price, why, filled = status === "filled" ? shares : 0, note) => ({
+  id: `o${++oid}`, placed_at, side, symbol, shares, filled_shares: filled, status, expected_price, fill_price,
+  cost_bp: fill_price ? Math.round(((side === "buy" ? fill_price - expected_price : expected_price - fill_price) / expected_price) * 1e4 * 10) / 10 : null,
+  why, ...(note ? { note } : {}),
+});
+const dailyOrders = [
+  ord("2026-10-09T13:25:00Z", "buy", "JPM", 31, "filled", 309.4, 309.62, "Entered the top 10 (rank 7)"),
+  ord("2026-10-09T13:25:00Z", "sell", "CRWD", 19, "filled", 488.1, 487.85, "Fell to rank 23, past the sell line at 20"),
+  ord("2026-10-06T13:25:00Z", "buy", "TSLA", 21, "filled", 441.5, 441.8, "Entered the top 10 (rank 9)"),
+  ord("2026-10-06T13:25:00Z", "sell", "UBER", 104, "filled", 92.3, 92.21, "Fell to rank 25, past the sell line at 20"),
+  ord("2026-10-05T13:25:00Z", "buy", "ANET", 72, "filled", 137.0, 137.2, "Second try after Friday's order went unfilled"),
+  ord("2026-10-02T13:25:00Z", "buy", "ANET", 72, "cancelled", 133.9, null, "Entered the top 10 (rank 8)", 0, "Price moved past the limit before it filled; cancelled at the close"),
+  ord("2026-10-02T13:25:00Z", "sell", "COIN", 26, "filled", 351.0, 350.38, "Fell to rank 21, past the sell line at 20"),
+  ord("2026-09-23T13:25:00Z", "buy", "ORCL", 33, "filled", 296.0, 296.3, "Entered the top 10 (rank 10)"),
+  ord("2026-09-23T13:25:00Z", "sell", "SHOP", 62, "filled", 158.6, 158.41, "Fell to rank 22, past the sell line at 20"),
+  ord("2026-09-22T13:25:00Z", "sell", "NVDA", 6, "filled", 172.1, 171.96, "Trim: weight had drifted to 12.3%, over 2 points from 10%"),
+];
+const sep30 = "2026-09-30T13:05:00Z";
+const b3Orders = [
+  ord(sep30, "sell", "GOOGL", 18, "filled", 243.1, 242.83, "Fell to rank 29, out of the top 20"),
+  ord(sep30, "sell", "UNH", 9, "filled", 352.4, 351.9, "Fell to rank 24, out of the top 20"),
+  ord(sep30, "buy", "ORLY", 49, "filled", 98.0, 98.1, "Entered the top 20 (rank 14)"),
+  ord(sep30, "buy", "QCOM", 31, "filled", 158.7, 158.9, "Entered the top 20 (rank 18)"),
+  ...["AAPL", "MSFT", "V", "MA", "LLY", "ABBV", "KO", "HD", "TJX", "COST"].map((sym, k) => {
+    const px = b3Names.find((n) => n[0] === sym)[4];
+    const side = k % 3 ? "sell" : "buy";
+    return ord(sep30, side, sym, 1 + (k % 4), "filled", px, r2(px * (1 + (side === "buy" ? 1 : -1) * (2 + (k % 4)) / 1e4)), "Trim or top up back to 5%");
+  }),
+];
 
 // Research lab, as the owner sees it. Names, stages, blockers and the H1 luck
 // check (DSR 0.7262, psr basis) come from the repo's docs; every other number
@@ -158,35 +222,25 @@ const data = {
   portfolio: { equity: portfolio, expected_tracking_error: 0.06 /* SAMPLE: the yearly spread around the S&P the backtests expect */ },
   strategies: [
     { id: "h1-monthly-momentum", name: "Monthly momentum", idea: "Own the stocks that rose most over the past year, skipping the last month. Reshuffle once a month.",
-      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.141, benchmark_annual_return: 0.112, max_drawdown: -0.187, verdict: "pass" }, on_paper: true },
+      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.141, benchmark_annual_return: 0.112, max_drawdown: -0.187, verdict: "pass", cost_bp: 10 }, on_paper: true,
+      rule: { universe: 500, measure: "past-year return, skipping the last month", hold: 20, sell_below: 30, weight: 0.05, tolerance: 0.01, check: "on the last trading day of each month" } },
     { id: "daily-momentum", name: "Daily momentum", idea: "Same idea as monthly momentum, but rechecked every day before the open.",
-      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.128, benchmark_annual_return: 0.112, max_drawdown: -0.224, verdict: "pass" }, on_paper: true },
+      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.128, benchmark_annual_return: 0.112, max_drawdown: -0.224, verdict: "pass", cost_bp: 10 }, on_paper: true,
+      rule: { universe: 500, measure: "past-year return, skipping the last month", hold: 10, sell_below: 20, weight: 0.1, tolerance: 0.02, check: "every trading day before the open" } },
     { id: "profitability", name: "Profitability", idea: "Own companies that turn the most gross profit per dollar of assets.",
-      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.119, benchmark_annual_return: 0.112, max_drawdown: -0.162, verdict: "pass" }, on_paper: true },
+      backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.119, benchmark_annual_return: 0.112, max_drawdown: -0.162, verdict: "pass", cost_bp: 10 }, on_paper: true,
+      rule: { universe: 500, measure: "gross profit divided by total assets", hold: 20, sell_below: 20, weight: 0.05, tolerance: 0.01, check: "on the last trading day of each month" } },
   ],
   books: [
     { id: "main", name: "main", strategy_id: "h1-monthly-momentum", cadence: "monthly", started_on: "2026-10-09", start_equity: 100008.9,
-      status: { state: "running" }, equity: main, cash: last(main), positions: [], orders: [],
+      status: { state: "running" }, equity: main, cash: last(main), positions: [], orders: [], expected_tracking_error: 0.06,
       last_run: { at: "2026-10-09T13:05:00Z", outcome: "ok", summary: "Opened the book. Holding cash until the first rebalance." },
       next_run: { at: "2026-10-30T13:05:00Z", what: "First rebalance" } },
     { id: "daily", name: "daily", strategy_id: "daily-momentum", cadence: "daily", started_on: "2026-08-03", start_equity: 100000,
-      status: { state: "running" }, equity: daily, cash: r2(last(daily) * 0.021),
-      positions: [
-        pos("NVDA", "NVIDIA", 0.112, 0.1, r2(last(daily) * 0.112), 1840.22),
-        pos("AVGO", "Broadcom", 0.104, 0.1, r2(last(daily) * 0.104), 960.4),
-        pos("PLTR", "Palantir", 0.101, 0.1, r2(last(daily) * 0.101), -412.75),
-        pos("META", "Meta Platforms", 0.099, 0.1, r2(last(daily) * 0.099), 655.1),
-        pos("GE", "GE Aerospace", 0.098, 0.1, r2(last(daily) * 0.098), 233.9),
-      ],
-      orders: [], last_run: { at: "2026-10-09T13:25:00Z", outcome: "ok", summary: "Sold 1, bought 1. 2 orders filled." },
+      status: { state: "running" }, equity: daily, cash: r2(last(daily) * 0.021), positions: dailyPositions, orders: dailyOrders, expected_tracking_error: 0.08, last_run: { at: "2026-10-09T13:25:00Z", outcome: "ok", summary: "Sold 1, bought 1. 2 orders filled." },
       next_run: { at: "2026-10-12T13:25:00Z", what: "Daily check" } },
     { id: "b3", name: "b3", strategy_id: "profitability", cadence: "monthly", started_on: "2026-09-01", start_equity: 100000,
-      status: { state: "running" }, equity: b3, cash: r2(last(b3) * 0.012),
-      positions: [
-        pos("AAPL", "Apple", 0.051, 0.05, r2(last(b3) * 0.051), 210.3),
-        pos("MSFT", "Microsoft", 0.049, 0.05, r2(last(b3) * 0.049), -88.1),
-      ],
-      orders: [], last_run: { at: "2026-09-30T13:05:00Z", outcome: "ok", summary: "Rebalanced 20 names. 14 orders filled." },
+      status: { state: "running" }, equity: b3, cash: r2(last(b3) * 0.012), positions: b3Positions, orders: b3Orders, expected_tracking_error: 0.05, last_run: { at: "2026-09-30T13:05:00Z", outcome: "ok", summary: "Rebalanced 20 names. 14 orders filled." },
       next_run: { at: "2026-10-30T13:05:00Z", what: "Monthly rebalance" } },
   ],
   alerts: [],

@@ -6,6 +6,7 @@ import { Shell, type Screen } from "@/components/Shell";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Overview } from "@/screens/Overview";
 import { Research } from "@/screens/Research";
+import { BookLoading, Books } from "@/screens/Book";
 import { LoadError, NoBooks, OverviewLoading } from "@/screens/OverviewStates";
 import { SampleA } from "@/samples/SampleA";
 import { SampleB } from "@/samples/SampleB";
@@ -33,7 +34,7 @@ function useScreen(): Screen {
   return s;
 }
 
-/** Prototype loader: reads the sample file; ?state= previews loading, error, empty, alert and stopped. */
+/** Prototype loader: reads the sample file; ?state= previews loading, error, empty, alert, stopped, safety and stopfail. */
 export function App() {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
   const screen = useScreen();
@@ -57,7 +58,7 @@ export function App() {
         sample={data?.sample ?? true}
         counts={{ overview: data?.alerts.length, research: data?.research.waiting.length }}
       >
-        {load.kind === "loading" && <OverviewLoading />}
+        {load.kind === "loading" && (screen === "books" ? <BookLoading /> : <OverviewLoading />)}
         {load.kind === "error" && (
           <LoadError
             retrying={load.retrying}
@@ -66,7 +67,7 @@ export function App() {
         )}
         {data && screen === "research" && <Research data={data} />}
         {data && screen === "overview" && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
-        {data && screen === "books" && <p className="text-muted-foreground p-4">Book detail is the next screen to build.</p>}
+        {data && screen === "books" && <Books data={data} />}
       </Shell>
     </TooltipProvider>
   );

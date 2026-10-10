@@ -1,13 +1,14 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, ChevronRight, Pause } from "lucide-react";
 import type { AppData } from "@/lib/types";
-import { RANGES, comparison, lastChange, rangeStart, type RangeKey } from "@/lib/data";
+import { comparison, lastChange, rangeStart, type RangeKey } from "@/lib/data";
 import { stats } from "@/lib/stats";
 import { clock, money, pct, pts, shortDate, signedMoney, tone, weekdayDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Page, RailHead, Section } from "@/components/Shell";
 import { LuckInfo } from "@/components/LuckInfo";
 import { ReturnChart, type ChartEvent } from "@/components/ReturnChart";
+import { RangePicker } from "@/components/RangePicker";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
 
@@ -96,17 +97,7 @@ export function Overview({ data }: { data: AppData }) {
         {event && <span className="text-foreground">{event.label}</span>}
       </p>
 
-      <div role="radiogroup" aria-label="Time range" className="mt-3 flex gap-1 border-b pb-4">
-        {RANGES.map((r) => {
-          const ok = available(r.key), on = r.key === range;
-          return (
-            <button key={r.key} role="radio" aria-checked={on} disabled={!ok} title={ok ? undefined : "Not enough history yet"} onClick={() => setRange(r.key)}
-              className={cn("h-9 min-w-11 rounded-full px-3 text-[13px] font-medium transition-colors", on ? (tone(cmp.youRet) === "loss" ? "bg-loss/15 text-loss" : "bg-gain/15 text-gain") : "text-muted-foreground hover:text-foreground", !ok && "opacity-35")}>
-              {r.label}
-            </button>
-          );
-        })}
-      </div>
+      <RangePicker value={range} onChange={setRange} available={available} tone={tone(cmp.youRet)} />
 
       <Section title="Statistics" note={`${shortDate(cmp.you[0]?.date ?? last.date)} to ${shortDate(last.date)}, ${st.days} trading days`}>
         <dl className="num grid grid-cols-2 border-t sm:grid-cols-4">

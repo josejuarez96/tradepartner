@@ -10,7 +10,8 @@ Design the end-user app for TradePartner for the owner as a *user*, not a develo
 ## Where it stands
 - **Direction chosen: E, "research-grade Robinhood"** (Robinhood's frame: one big number, one big clean chart, a side rail of short rows, lots of air; plus a research layer: the backtest's expected range as a band, event dots, a statistics grid with a method note, a luck check with an explainer). Dark by default, light via the header switch. IBM Plex Sans for words, IBM Plex Mono for numbers. Colour only for gain, loss, attention.
 - **Built in E:** Overview (`#overview`), Research (`#research`, with a results map: return vs S&P against luck check), the idea detail sheet, the luck-check info popover, loading/error/empty states (`?state=loading|error|empty|alert|stopped`, `?theme=light`).
-- **Not built:** Book detail (`#books`, currently a placeholder): one book's value and chart with its expected range, holdings vs target weights, recent orders and fills, why it holds what it holds, and **stop/resume** (typed reason + confirm dialog stating exactly what happens; resume also needs a reason; show who stopped it and when). This is the agreed next screen.
+- **Built in E (2026-10-10, second session): Book detail** (`#books/<id>`; `#books` opens the book with the longest record). Value and change since start; chart against the S&P with the book's own expected range (ⓘ explains the band) and dots on days orders filled; holdings (rank today, value, weight, gain; target said once in the heading; weight turns attention past the drift tolerance); "Why it holds these" (the rule in one sentence, then a rank scale with its zones named on it: buys / keeps / sells, filled dots for holdings, hollow for recent sells); recent orders grouped by day with the fill cost against the backtest's assumption; tap a holding or order for a sheet with the reason in the rule's terms. Rail: books, schedule, what the backtest said; phone swaps the rail's book list for a pill switcher at the top. **Stop/resume:** dialog lists exactly what happens (next run skipped, holdings and cash kept, open orders cancelled), reason required (attention message if empty), pending and failure states; stopped books show a boxed notice with who, when and why, and a Resume dialog (also needs a reason; safety stops say the rule still applies). States: `?state=loading|error|empty|stopped|safety|stopfail`, `#books/main` (no history: chart, holdings and orders empty states), `#books/zzz` (not found). Screenshots in `screens/book/`; interactions via `node shoot-book.mjs`.
+- **Not built:** a stop/resume history list per book (only the current stop is shown); open/partly filled orders aren't in the sample.
 - **Reference samples** (same data, design only): `#sample-a` … `#sample-e`; screenshots in `screens/samples/`.
 
 ## Owner's rules from review (don't break these)
@@ -31,6 +32,8 @@ Design the end-user app for TradePartner for the owner as a *user*, not a develo
 | `src/screens/Overview.tsx` | Overview (exports `Spark`, `Pill` for reuse) |
 | `src/screens/Research.tsx` | Research: `ResultsMap` (collision-checked labels), needs-you, ideas, rail, `IdeaSheet` |
 | `src/screens/OverviewStates.tsx` | Loading / error / empty |
+| `src/screens/Book.tsx` | Book detail: holdings, rank scale, orders, rail, stop/resume dialog, detail sheet, loading and not-found |
+| `src/components/RangePicker.tsx` | 1W/1M/3M/All pills shared by Overview and Book |
 | `src/lib/` | `data.ts` (comparison, ranges, TWR change), `stats.ts`, `format.ts`, `tokens.ts` (reads CSS vars for canvas), `types.ts`, `scenarios.ts` |
 | `src/components/ui/` | shadcn new-york-v4 sources copied from GitHub (the CLI's registry host is blocked here) |
 | `sample/generate.mjs` → `sample/app-data.json` | Deterministic sample data. **Real:** main's start ($100,008.90, 2026-10-09), H1 luck 0.7262 (psr basis, 40 monthly returns), backlog names/stages/blockers, pending decisions. **Invented:** everything else, marked "sample" in data and UI. |
@@ -45,7 +48,7 @@ npx tsc --noEmit && npm run build         # must stay clean
 node shoot.mjs overview= research=#research research-sheet=#research light=theme=light
 node sample/generate.mjs                  # after editing sample data
 ```
-AI-tells scanner: `https://github.com/funboy322/avoid-ai-design` (`scripts/detect.mjs`, read-only, no deps). Fetch it into a scratch dir and run `node detect.mjs web/src --min=P1`. Last run: one P1, a false positive (it compares dark-theme muted ink against the light ground).
+AI-tells scanner: `https://github.com/funboy322/avoid-ai-design` (`scripts/detect.mjs`, read-only, no deps). Fetch it into a scratch dir and run `node detect.mjs web/src --min=P1`. Last run: one P1, a false positive (it compares dark-theme muted ink against the light ground). Not re-run after Book detail: the auto-mode permission check blocked running fetched code in the second session; Book.tsx was grepped by hand for caps, `·` strings, shadows, arrows and fonts (none).
 
 ## Environment notes
 - `team.py start/claim` fails in cloud sessions (GitHub GraphQL is blocked); spike branches don't need a claim.
@@ -55,7 +58,9 @@ AI-tells scanner: `https://github.com/funboy322/avoid-ai-design` (`scripts/detec
 ## Open questions for the owner
 - Research: read-only, or allow actions (register a run, record a decision, write a lesson) with reason + confirm?
 - Dark by default ignores the OS setting; keep, or follow the OS?
-- The expected-range width (6%/yr tracking error) is a placeholder; the real value should come from each book's backtest via the API.
+- The expected-range width is a placeholder per book (main 6%, daily 8%, b3 5% a year); the real value should come from each book's backtest via the API.
+- Book detail: should "Stop book" also be offered on the Overview rail, or only here? Should resume let him choose "trade back to the rule now" vs "wait for the next run"? (Built: wait for the next run.)
+- Holdings, ranks, signals and orders are invented sample data; the API needs to serve rank and signal per holding and the decision price per order for "why" and fill cost to be real.
 - B4 shows as both "run now" (STATUS) and "parked" (ADR 0016); surfaced as a decision, not resolved.
 
 ## Suggested opening prompt for the next agent
