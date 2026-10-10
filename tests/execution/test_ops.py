@@ -10,6 +10,7 @@ import textwrap
 import time
 from collections.abc import Iterator
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +36,7 @@ from tradepartner.store.journal import (
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     PositionDailyRow,
     ReconciliationRow,
     SignalRow,
@@ -1661,3 +1663,151 @@ def test_switch_engages_from_an_unfinished_run_alone(
     assert data.switch_state is not None
     assert data.switch_state.engaged is True
     assert data.switch_state.causes == (f"run {run_id} unfinished",)
+
+
+# --- per book (ADR 0017 B.7; plan T156) -------------------------------------------
+
+
+def _locked_alert(book_id: str, minutes: int) -> AlertRow:
+    return AlertRow(
+        session=_S_MINUS_1,
+        kind="locked",
+        message=f"{book_id}'s run lock was held",
+        at=_at(minutes),
+        book_id=book_id,
+        **_stamp(minutes),
+    )
+
+
+@pytest.fixture
+def two_books(journal_settings: Settings, open_window: PaperWindowRow) -> dict[str, int]:
+    """`main`'s open window (the shared fixture's, first rebalance before S-1) with
+    one `ok` run and a mark, and a newer window for book `b` with one unfinished
+    run, two marked positions and its own `locked` alert; `main` has a `locked`
+    alert of its own too."""
+    main_id = open_window.window_id
+    assert main_id is not None
+    with open_for_write(journal_settings) as conn:
+        main_run = append(conn, _run(main_id, _S_MINUS_1))
+        assert main_run is not None
+        append(conn, _result(main_run, "ok"))
+        append(
+            conn,
+            PositionDailyRow(
+                run_id=main_run,
+                session=_S_MINUS_1,
+                security_id="AAA",
+                quantity=1.0,
+                mark_price=10.0,
+                value=10.0,
+                **_stamp(6),
+            ),
+        )
+        b_id = append(
+            conn,
+            replace(open_window, window_id=None, account_id="PB1", book_id="b"),
+        )
+        assert b_id is not None
+        b_run = append(conn, _run(b_id, _S_MINUS_1, minutes=10))
+        assert b_run is not None
+        for security_id in ("BBB", "CCC"):
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=b_run,
+                    session=_S_MINUS_1,
+                    security_id=security_id,
+                    quantity=2.0,
+                    mark_price=5.0,
+                    value=10.0,
+                    **_stamp(11),
+                ),
+            )
+        append(conn, _locked_alert("main", 20))
+        append(conn, _locked_alert("b", 21))
+    return {"main": main_id, "b": b_id, "main_run": main_run, "b_run": b_run}
+
+
+def test_page_data_reads_only_the_named_books_window(
+    journal_settings: Settings, two_books: dict[str, int]
+) -> None:
+    """With no book `page_data` reads `paper.book_id`'s (`main`'s) window, though
+    `b`'s is newer; with `b` it reads `b`'s; each sees its own `locked` alert only."""
+    with open_read_only(journal_settings) as conn:
+        default = ops.page_data(conn, journal_settings)
+        main = ops.page_data(conn, journal_settings, "main")
+        other = ops.page_data(conn, journal_settings, "b")
+    assert default == main
+    assert main.book_id == "main" and other.book_id == "b"
+    assert main.window is not None and main.window.window_id == two_books["main"]
+    assert other.window is not None and other.window.window_id == two_books["b"]
+    assert [a.message for a in main.alerts] == ["main's run lock was held"]
+    assert [a.message for a in other.alerts] == ["b's run lock was held"]
+    assert (main.positions_count, other.positions_count) == (1, 2)
+
+
+def test_page_data_for_a_book_with_no_window_is_the_no_window_state(
+    journal_settings: Settings, two_books: dict[str, int]
+) -> None:
+    with open_read_only(journal_settings) as conn:
+        data = ops.page_data(conn, journal_settings, "c")
+        with pytest.raises(ValueError, match="book_id must match"):
+            ops.page_data(conn, journal_settings, "b-1")
+    assert data == ops.OpsData(book_id="c")
+
+
+def test_book_summaries_lists_one_row_per_book_in_token_order(
+    journal_settings: Settings, two_books: dict[str, int]
+) -> None:
+    with open_read_only(journal_settings) as conn:
+        rows = ops.book_summaries(conn, journal_settings)
+    assert [(r.book_id, r.window.window_id) for r in rows] == [
+        ("b", two_books["b"]),
+        ("main", two_books["main"]),
+    ]
+    b, main = rows
+    assert (b.positions_count, main.positions_count) == (2, 1)
+    assert (b.last_run_status, main.last_run_status) == ("unfinished", "ok")
+    assert b.is_open and main.is_open
+    assert main.open_orders_count == 0
+    assert not main.switch_state.engaged
+
+
+def test_book_summaries_closed_window_has_no_next_rebalance(
+    journal_settings: Settings, two_books: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A closed book's row says so and names no next rebalance; an open one names
+    the first rebalance session at its window's cadence whose close is after now."""
+    monkeypatch.setattr(ops, "window_cadence", lambda _conn, _window: "month_end")
+    monkeypatch.setattr(ops, "utc_now", lambda: datetime(2026, 10, 9, 18, tzinfo=UTC))
+    with open_for_write(journal_settings) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(window_id=two_books["b"], at=_at(30), state="closed", **_stamp(30)),
+        )
+    with open_read_only(journal_settings) as conn:
+        b, main = ops.book_summaries(conn, journal_settings)
+    assert not b.is_open and b.next_rebalance_session is None
+    assert main.is_open and main.next_rebalance_session == date(2026, 10, 30)
+
+
+def test_book_summaries_is_empty_before_the_first_window(journal_settings: Settings) -> None:
+    with open_read_only(journal_settings) as conn:
+        assert ops.book_summaries(conn, journal_settings) == ()
+
+
+def test_the_switch_reads_the_books_own_run_lock(
+    journal_settings: Settings, two_books: dict[str, int]
+) -> None:
+    """`b`'s held run lock shows `b`'s unfinished run as in progress, and never
+    `main`'s switch (each book has its own lock, ADR 0017 B.3)."""
+    from tradepartner.execution.lock import run_lock
+
+    with run_lock(journal_settings, "b"), open_read_only(journal_settings) as conn:
+        other = ops.page_data(conn, journal_settings, "b")
+        main = ops.page_data(conn, journal_settings, "main")
+        summaries = {r.book_id: r for r in ops.book_summaries(conn, journal_settings)}
+    assert other.switch_state is not None and other.switch_state.run_in_progress
+    assert main.switch_state is not None and not main.switch_state.run_in_progress
+    assert summaries["b"].switch_state.run_in_progress
+    assert not summaries["main"].switch_state.run_in_progress

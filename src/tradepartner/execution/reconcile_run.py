@@ -70,10 +70,12 @@ as_of`:
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
 
-**`reconcile_command`** is `paper reconcile`. It takes the run lock (T59),
-refuses with `NoWindowError` when no window is open (no broker call, no
-write), and runs one `reconcile_now` for the clock's session (the latest
-XNYS session on or before the clock's New York date), with the window's
+**`reconcile_command`** is `paper reconcile --book <book>` (`book_id`, default
+`paper.book_id`; ADR 0017 B.3 to B.5, plan T155). It takes the book's run lock
+(T59), refuses with `NoWindowError` when no window is open for the book (no
+broker call, no write; another book's window is never read), and runs one
+`reconcile_now` for the clock's session (the latest XNYS session on or before
+the clock's New York date), with the window's
 frozen `risk` section. A mismatch is a system fault (spec Definitions), so it
 appends the `engaged` row (source `fault`, fault type
 `ReconciliationError`) before re-raising. It writes no alert: a
@@ -102,7 +104,7 @@ from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import run_lock
+from tradepartner.execution.lock import resolve_book, run_lock
 from tradepartner.execution.plan import current_listings
 from tradepartner.execution.reconcile import (
     MISMATCH,
@@ -559,16 +561,21 @@ def reconcile_command(
     connect: Connect,
     broker: Broker,
     clock: Callable[[], datetime],
+    *,
+    book_id: str | None = None,
 ) -> Reconciliation:
-    """`paper reconcile` (module docstring). Raises `LockHeld` while another
-    process holds the run lock and `NoWindowError` with no open window, both
-    before any broker call or write. On a mismatch, appends the `engaged` row
+    """`paper reconcile --book <book>` (module docstring; `book_id` defaults to
+    `paper.book_id`, `ValueError` outside the token grammar). Raises `LockHeld`
+    while another process holds the book's run lock and `NoWindowError` with no
+    open window for the book, both before any broker call or write. A mismatch
+    engages only the book's window (ADR 0017 B.5). On a mismatch, appends the `engaged` row
     and re-raises `ReconciliationError`; if that row cannot be written (the
     store, or the clock it is stamped with, failing), the error says so and
     still names the mismatch."""
-    with run_lock(settings):
+    book = resolve_book(settings, book_id)
+    with run_lock(settings, book):
         with connect() as conn:
-            window = open_window(conn)
+            window = open_window(conn, book)
         if window is None:
             raise NoWindowError("no_window: no paper window is open")
         frozen = frozen_risk(window)

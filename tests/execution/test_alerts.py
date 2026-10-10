@@ -233,6 +233,49 @@ def test_no_window_and_locked_dedupe_on_kind_and_session(conn: duckdb.DuckDBPyCo
     assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone() == (3,)
 
 
+@pytest.mark.parametrize("kind", ["no_window", "locked"])
+def test_session_scoped_kinds_dedupe_per_book_kind_and_session(
+    conn: duckdb.DuckDBPyConnection, kind: str
+) -> None:
+    """ADR 0017 B.6 (plan T154): one book's `locked` or `no_window` never hides
+    another's on the same session; within a book the dedupe is as before."""
+    runner = FakeRunner()
+    alerter = _alerter(conn, _settings(["store", "macos"]), runner=runner)
+    main = alerter.write(kind, None, _SESSION, "main")
+    other = alerter.write(kind, None, _SESSION, "b", book_id="b")
+    assert other != main
+    assert alerter.write(kind, None, _SESSION, "main again") == main
+    assert alerter.write(kind, None, _SESSION, "main again", book_id="main") == main
+    assert alerter.write(kind, None, _SESSION, "b again", book_id="b") == other
+    assert alerter.write(kind, None, date(2026, 10, 2), "b next", book_id="b") not in (main, other)
+    assert conn.execute(
+        "SELECT alert_id, book_id, message FROM alerts ORDER BY alert_id"
+    ).fetchall() == [(main, "main", "main"), (other, "b", "b"), (other + 1, "b", "b next")]
+    assert len(runner.calls) == 3  # each duplicate is not delivered again
+
+
+def test_a_run_scoped_alert_journals_its_book(conn: duckdb.DuckDBPyConnection) -> None:
+    alerter = _alerter(conn, _settings())
+    main = alerter.write("halted", 7, _SESSION, "a")
+    other = alerter.write("halted", 8, _SESSION, "b", book_id="b")
+    assert conn.execute("SELECT alert_id, book_id FROM alerts ORDER BY alert_id").fetchall() == [
+        (main, "main"),
+        (other, "b"),
+    ]
+
+
+@pytest.mark.parametrize("kind,run_id", [("locked", None), ("halted", 7)])
+def test_a_book_outside_the_token_grammar_is_refused_before_any_row(
+    conn: duckdb.DuckDBPyConnection, kind: str, run_id: int | None
+) -> None:
+    runner = FakeRunner()
+    alerter = _alerter(conn, _settings(["store", "macos"]), runner=runner)
+    with pytest.raises(ValueError, match="book_id"):
+        alerter.write(kind, run_id, _SESSION, "m", book_id="b-1")
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone() == (0,)
+    assert runner.calls == []
+
+
 # --- channels ------------------------------------------------------------------------------
 
 

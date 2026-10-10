@@ -16,6 +16,7 @@ import ast
 import functools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -31,7 +32,7 @@ from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.schedule import fill_session, read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, session_close
-from tradepartner.config import Cadence, RiskConfig, Settings
+from tradepartner.config import Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
 from tradepartner.execution import planning, reconcile_run, wrapper
 from tradepartner.execution import window as window_module
@@ -88,10 +89,17 @@ def _utc(day: date, hour: int) -> datetime:
     return datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
 
 
-def _frozen_settings() -> Settings:
+def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
+    # `profitability` and `combined` take the same top fraction from their own
+    # sections (T152); a momentum registration freezes only `strategy.*`.
+    strategy: dict[str, Any] = {"top_fraction": 0.5}
+    if turnover_top_fraction is not None:
+        strategy["turnover_top_fraction"] = turnover_top_fraction
     return Settings(
         _env_file=None,
-        strategy={"top_fraction": 0.5},
+        strategy=strategy,
+        profitability={"top_fraction": 0.5},
+        combined={"top_fraction": 0.5},
         holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
     )
 
@@ -174,6 +182,22 @@ class Env:
 
 @pytest.fixture
 def env(fixture_store_path: Path, tmp_path: Path) -> Iterator[Env]:
+    with open_env(fixture_store_path, tmp_path) as opened:
+        yield opened
+
+
+@contextmanager
+def open_env(
+    fixture_store_path: Path,
+    tmp_path: Path,
+    family: HypothesisFamily = "momentum",
+    *,
+    drop_keys: Sequence[str] = (),
+    turnover_top_fraction: float | None = None,
+) -> Iterator[Env]:
+    """The module's planning environment for a hypothesis of `family` (T152), its stored
+    params less `drop_keys` (a registration stored before those keys existed, T165),
+    freezing `strategy.turnover_top_fraction` when given (T165d)."""
     conn = duckdb.connect(str(fixture_store_path))
     configure_connection(conn)
     live = Settings(
@@ -181,15 +205,17 @@ def env(fixture_store_path: Path, tmp_path: Path) -> Iterator[Env]:
         store={"path": str(tmp_path / "not-the-fixture.duckdb")},
         paper={"live_capital_reference": LIVE_CAPITAL},
     )
-    params = _frozen_settings()
+    params = _frozen_settings(turnover_top_fraction)
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-paper-plan",
-        family="momentum",
+        family=family,
         title="planning step test",
         doc_path="docs/hypotheses/h-paper-plan.md",
         doc_sha256="0" * 64,
-        params=frozen_params_of(params, family="momentum"),
+        params={
+            k: v for k, v in frozen_params_of(params, family=family).items() if k not in drop_keys
+        },
         in_sample_start=IN_SAMPLE_START,
         holdout_start=HOLDOUT_START,
         holdout_end=HOLDOUT_END,
@@ -428,6 +454,10 @@ class RecordingProvider(StoreProvider):
         self.reads.append(("survivorship_gap", t))
         return super().survivorship_gap(t)
 
+    def turnover_inputs(self, t: datetime, *args: Any, **kwargs: Any) -> Any:
+        self.reads.append(("turnover_inputs", t))
+        return super().turnover_inputs(t, *args, **kwargs)
+
 
 @pytest.mark.parametrize("sessions_late", [0, MAX_CATCH_UP])
 def test_every_provider_read_is_at_close_t_i_on_time_and_on_a_catch_up(
@@ -663,20 +693,41 @@ def test_a_historical_holdout_still_refuses_a_tracking_trial_inside_it(env: Env)
     assert env.counts() == counts
 
 
-def test_profitability_is_refused_by_the_paper_family_gate(
-    env: Env, monkeypatch: pytest.MonkeyPatch
+def test_profitability_passes_the_paper_family_gate(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Profitability is engine-ready but cannot open a paper plan or provider."""
-    env.conn.execute("UPDATE hypotheses SET family = 'profitability'")
-    counts = env.counts()
+    """`profitability` is paper-ready (ADR 0017 part D, T152): its window plans, and
+    the engine is called with the stored family. The full round trip of a
+    `profitability` and a `combined` plan is `test_families_paper.py`."""
+    real_plan = engine.plan
+    seen: list[str] = []
+
+    def record(*args: Any, **kwargs: Any) -> engine.Plan:
+        seen.append(kwargs["family"])
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "plan", record)
+    with open_env(fixture_store_path, tmp_path, "profitability") as env:
+        assert env.plan().status == "planned"
+    assert seen == ["profitability"]
+
+
+def test_a_family_outside_paper_families_is_refused_before_any_read(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planning gate itself, with `PAPER_FAMILIES` narrowed back to momentum's
+    pair: no provider opens and no row is written."""
+    monkeypatch.setattr(planning, "PAPER_FAMILIES", ("momentum", "oracle"))
 
     def provider_used(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("provider must not open for a non-paper family")
 
     monkeypatch.setattr(planning, "StoreProvider", provider_used)
-    with pytest.raises(PlanTrialError, match="cannot run yet"):
-        env.plan()
-    assert env.counts() == counts
+    with open_env(fixture_store_path, tmp_path, "profitability") as env:
+        counts = env.counts()
+        with pytest.raises(PlanTrialError, match="cannot run yet"):
+            env.plan()
+        assert env.counts() == counts
 
 
 def test_momentum_plan_uses_the_windows_stored_family(
@@ -1047,3 +1098,80 @@ def test_current_listings_keeps_the_first_row_on_a_valid_from_tie() -> None:
     assert window_module.current_listings is planning.current_listings
     assert not hasattr(reconcile_run, "_current_listings")
     assert not hasattr(window_module, "_current_tickers")
+
+
+# --- literal pins of H1's paper rows, taken on `main`'s code (#1358, T165) -------------
+
+#: The key H1's registration never stored (T165; T165d keeps the pin green).
+TURNOVER_KEY = "strategy.turnover_top_fraction"
+
+
+def _rows_digest(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[int, str]:
+    import hashlib
+
+    cursor = conn.execute(f"SELECT * FROM {table} ORDER BY ALL")
+    columns = [d[0] for d in cursor.description]
+    rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    payload = json.dumps(rows, sort_keys=True, default=str)
+    return len(rows), hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path) -> None:
+    """H1's registration (no turnover key stored) plans the same `signals`, `decisions`
+    and `paper_plans` rows as on `main`'s code before the key existed (T165)."""
+    with open_env(fixture_store_path, tmp_path, drop_keys=(TURNOVER_KEY,)) as env:
+        stored = registry.get_hypothesis_by_id(env.conn, env.hypothesis_id).params
+        assert TURNOVER_KEY not in stored
+        outcome = env.plan()
+        assert outcome.status == "planned"
+        digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
+    assert digests == H1_PAPER_ROWS
+
+
+def test_h1_paper_plan_reads_no_turnover(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the key absent the planner's provider call log holds no turnover read, and
+    the plan reports none of the screen's counts (T165d)."""
+    RecordingProvider.reads = []
+    monkeypatch.setattr(planning, "StoreProvider", RecordingProvider)
+    with open_env(fixture_store_path, tmp_path, drop_keys=(TURNOVER_KEY,)) as env:
+        env.plan()
+        counts = _plan_on_store(env).counts
+    methods = {name for name, _ in RecordingProvider.reads}
+    assert methods == {"universe", "adjusted_prices", "static_listing_count", "survivorship_gap"}
+    assert "n_screened" not in counts and "n_excluded_no_turnover" not in counts
+
+
+def test_a_screened_momentum_plan_journals_no_turnover_signals_and_counts(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `momentum` registration at 0.20 reads turnover and journals the screen's drops
+    as `excluded_no_turnover` `signals` rows. Its `engine.Plan.counts` carry
+    `n_screened` and `n_excluded_no_turnover`; the paper plan trial writes no
+    `trial_rebalance_counts` rows (#1401)."""
+    RecordingProvider.reads = []
+    monkeypatch.setattr(planning, "StoreProvider", RecordingProvider)
+    with open_env(fixture_store_path, tmp_path, turnover_top_fraction=0.2) as env:
+        stored = registry.get_hypothesis_by_id(env.conn, env.hypothesis_id).params
+        assert stored[TURNOVER_KEY] == 0.2
+        outcome = env.plan()
+        assert outcome.status == "planned"
+        signals = journal.signals_for(env.conn, env.run.run_id)  # type: ignore[arg-type]
+        assert registry.rebalance_counts(env.conn, outcome.plan_trial_id) == {}
+        counts = _plan_on_store(env).counts
+    assert ("turnover_inputs", read_time(T_I)) in RecordingProvider.reads
+    dropped = [s for s in signals if s.reason == "excluded_no_turnover"]
+    assert dropped
+    assert all(s.score is None and s.rank is None for s in dropped)
+    assert counts["n_screened"] + len(dropped) == len(signals)
+    assert counts["n_excluded_no_turnover"] <= len(dropped)
+
+
+#: Row count and SHA-256 of each table's rows (every column, `ORDER BY ALL`, JSON with
+#: `default=str`) after H1's plan at T_i, on `main` at 3de454d7.
+H1_PAPER_ROWS = {
+    "signals": (6, "31f4d58d4188196ec5fe48cde2df02d5f61ce21325a2b6cb641dbfc6dbd29f04"),
+    "decisions": (5, "e2f38d001a59a863c63aedf09d7311c5e1796df3e451b6351b69b649554ae7d4"),
+    "paper_plans": (1, "c6d327ddf9ce1660fac83ba6addca3434d6a9399707bf9d51e3887f78364fc03"),
+}

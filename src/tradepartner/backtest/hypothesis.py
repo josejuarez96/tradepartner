@@ -9,10 +9,13 @@ file wants to pin). Every other part of the file is prose, but it is hashed too.
 
 **The file must name** `in_sample_start`, `holdout.start`, `holdout.end`, every
 `costs.*` key and every key of its family's signal section (`strategy.*` for
-`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`), or it is
-refused; the holdout never comes from live `Settings`. A key outside the frozen list
-below is refused rather than ignored, and so is a key of another family's signal
-section (`frozen.inert_sections`).
+`momentum`, `profitability.*` for `profitability`; `FAMILIES[family].sections`) except
+the `frozen.POST_REGISTRATION_OWN_KEYS` members, or it is refused; the holdout never
+comes from live `Settings`, and neither does a post-registration member the file leaves
+out: it is frozen at its `FROZEN_KEY_DEFAULTS` default (backtest spec amendment #1358).
+A `FAMILY_ONLY_KEYS` key off its default is refused for any other family. A key outside
+the frozen list below is refused rather than ignored, and so is a key of another
+family's signal section (`frozen.inert_sections`).
 
 **The frozen set** is every key of `strategy`, `profitability`, `schedule`, `universe`,
 `costs`, `backtest`, `adjust`, `master`, `gap`, `holdout` and `metrics`, plus
@@ -39,12 +42,13 @@ overlay (a drift the table does not cover), rather than letting a live value in
 silently.
 
 **Registration after the lab** (strategy-lab spec reqs 1, 4 and 5; plan task T104c).
-In every state `register` returns the existing record for an unchanged slug, doc hash
-and canonical frozen set, newest first (never calling `registry.register_hypothesis`,
+In every state `register` returns the existing record for an unchanged slug, family, doc
+hash and canonical frozen set, newest first (never calling `registry.register_hypothesis`,
 so a registration from before a `FROZEN_KEY_DEFAULTS` key landed is still the record)
-and refuses a prose-only edit (the slug's latest canonical frozen set, hence its
+and refuses a prose-only edit (the slug's latest canonical frozen set and family, hence its
 fingerprint, under a new doc hash; a change to a frozen key outside the fingerprint is
-a new frozen set, which a lab store refuses as a standalone file anyway). **When
+a new frozen set, which a lab store refuses as a standalone file anyway, and a file whose
+family changed is a new hypothesis that the registry refuses as a slug moving family). **When
 `lab_schema.is_lab_initialised`** it refuses every other standalone file unless the
 caller registers it as a promoted file (`promotion_of`, the variant it promotes,
 which `sweep promote` names in the `promotion` decision it appends next): a new
@@ -172,13 +176,41 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
 
 def required_keys(family: str) -> frozenset[str]:
     """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
-    every key of its listed sections (`FAMILIES[family].sections`) plus every `costs.*`
-    key. Raises `KeyError` for an unlisted family (ADR 0014 point 2: the momentum
-    fallback goes)."""
+    every key of its listed sections (`FAMILIES[family].sections`) not in
+    `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key. Raises `KeyError` for
+    an unlisted family (ADR 0014 point 2: the momentum fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
     for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
         keys.update(_section_keys(section))
-    return frozenset(keys)
+    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS)
+
+
+#: Keys that are one family's rule although other families list their section
+#: (backtest spec amendment #1358, item 1): `oracle` and `combined` read `strategy.*`,
+#: but B10's turnover screen is `momentum`'s alone, so any other family's frozen value
+#: must be the table default (1.0, no screen).
+FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": "momentum"}
+
+
+#: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
+#: a value other than the table default, so no run or paper plan records results under a
+#: label its signal ignores. Empty since T165c (#1358): `strategies.py` applies
+#: `strategy.turnover_top_fraction`.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
+
+
+def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
+    """Why `params` (a `family` registration's frozen values, JSON form) may not be
+    registered, or None: a `FAMILY_ONLY_KEYS` key of another family whose value is not
+    its `FROZEN_KEY_DEFAULTS` default. The message names the key."""
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key, owner in FAMILY_ONLY_KEYS.items():
+        if family != owner and key in params and not frozen.is_default(params[key], defaults[key]):
+            return (
+                f"{key} is a {owner!r} rule; a {family!r} registration must freeze its "
+                f"default {defaults[key]!r}, got {params[key]!r}"
+            )
+    return None
 
 
 def _flatten(table: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -332,8 +364,25 @@ def frozen_hash_matches(settings: Settings, stored_sha256: str, *, family: str) 
 
 
 def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
-    """The frozen set: the file's values over `settings` for every frozen key."""
-    return frozen_params_of(_overlay(settings, parsed.file_params), family=parsed.family)
+    """The frozen set: the file's values over `settings` for every frozen key, except
+    that a `frozen.POST_REGISTRATION_OWN_KEYS` member the file leaves out is frozen at
+    its table default, never from `settings` (backtest spec amendment #1358, item 3(ii):
+    a signal key never reaches a registration from `.env`). Raises
+    `HypothesisFileError` when `family_only_refusal` refuses the set."""
+    inert = frozen.inert_sections(parsed.family)
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    fixed = {
+        key: defaults[key]
+        for key in sorted(frozen.POST_REGISTRATION_OWN_KEYS)
+        if key not in parsed.file_params and key.partition(".")[0] not in inert
+    }
+    params = frozen_params_of(
+        _overlay(settings, {**fixed, **parsed.file_params}), family=parsed.family
+    )
+    refusal = family_only_refusal(parsed.family, params)
+    if refusal is not None:
+        raise HypothesisFileError(f"{parsed.path}: {refusal}")
+    return params
 
 
 def _check_latest(
@@ -473,11 +522,12 @@ def register(
 ) -> registry.HypothesisRecord:
     """Register the hypothesis in `path` through `store.registry` and return its record.
 
-    In every state: an unchanged file (same slug and doc hash) whose canonical frozen
-    set equals a stored registration's returns that record without writing, newest
-    first; a prose-only edit (the slug's latest frozen set, so its fingerprint, with a
-    new doc hash) raises `ProseOnlyEditError`; a changed frozen set is a new
-    hypothesis. A family outside `hypotheses.families` is refused (`RegistryError`).
+    In every state: an unchanged file (same slug, family and doc hash) whose canonical
+    frozen set equals a stored registration's returns that record without writing, newest
+    first; a prose-only edit (the slug's latest frozen set and family, so its fingerprint,
+    with a new doc hash) raises `ProseOnlyEditError`; a changed frozen set, or a file whose
+    family changed, is a new hypothesis, and a slug may not move family (`RegistryError`).
+    A family outside `hypotheses.families` is refused (`RegistryError`).
     Refuses a file whose record is not the slug's latest registration, since
     `load_frozen` would run the latest one instead. When the lab is initialised, a new
     registration must be a promoted file: `promotion_of` names the sweep variant it
@@ -499,12 +549,16 @@ def register(
 
     def same_set(existing: registry.HypothesisRecord) -> bool:
         return (
-            existing.in_sample_start,
-            existing.holdout_start,
-            existing.holdout_end,
-        ) == window and frozen.canonical_frozen_set(
-            frozen.frozen_values(existing), existing.family
-        ) == canonical
+            existing.family == parsed.family
+            and (
+                existing.in_sample_start,
+                existing.holdout_start,
+                existing.holdout_end,
+            )
+            == window
+            and frozen.canonical_frozen_set(frozen.frozen_values(existing), existing.family)
+            == canonical
+        )
 
     # Newest first: a file stored twice (before and after a table key landed) is its
     # latest registration, the one runs use.
@@ -542,7 +596,8 @@ def load_frozen(
 ) -> Settings:
     """`Settings` for a run of `slug`'s latest registration: its frozen values (read
     through `frozen.frozen_values`) over the live `settings` (default: loaded config)
-    for every other key, the family's inert sections included.
+    for every other key, the family's inert sections included. Refuses a
+    `NOT_YET_APPLIED_KEYS` value other than its default.
     `UnknownHypothesis` for an unregistered slug."""
     record = registry.get_hypothesis(conn, slug)
     if registry.params_sha256(record.params) != record.params_sha256:
@@ -557,6 +612,17 @@ def load_frozen(
         raise HypothesisFileError(
             f"{slug!r}: registered with a different frozen key set ({', '.join(drift)}); "
             "re-register the hypothesis"
+        )
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    pending = sorted(
+        key
+        for key in NOT_YET_APPLIED_KEYS
+        if key in values and not frozen.is_default(values[key], defaults[key])
+    )
+    if pending:
+        raise HypothesisFileError(
+            f"{slug!r}: {', '.join(pending)} is registered off its default but no signal "
+            "applies it yet (backtest plan T165c); it cannot run"
         )
     live = settings if settings is not None else get_settings()
     return _overlay(live, values)

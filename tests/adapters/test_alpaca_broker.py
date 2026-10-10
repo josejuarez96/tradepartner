@@ -31,6 +31,7 @@ from tradepartner.adapters.alpaca_broker import (
 )
 from tradepartner.adapters.alpaca_trading_raw import (
     AlpacaPaperCredentialsError,
+    AlpacaPaperGuardError,
     AlpacaTradingError,
     AlpacaTradingRaw,
 )
@@ -161,7 +162,7 @@ def _broker(
     raw = AlpacaTradingRaw(settings, clock=FakeClock())
     http = Recorded()
     raw._client._session.mount("https://", http)  # type: ignore[attr-defined]
-    return AlpacaBroker(settings, clock, client=raw), http
+    return AlpacaBroker(settings, clock, client=raw, book_id="main"), http
 
 
 def _by_client_id(orders: dict[str, Any]) -> Responder:
@@ -358,7 +359,7 @@ def test_a_transport_timeout_is_retried_max_retries_times_then_raised() -> None:
     settings = _settings(trading_max_retries=2)
     client = CountingClient()
     raw = AlpacaTradingRaw(settings, client=client, clock=FakeClock())  # type: ignore[arg-type]
-    broker = AlpacaBroker(settings, lambda: NOW, client=raw)
+    broker = AlpacaBroker(settings, lambda: NOW, client=raw, book_id="main")
 
     with pytest.raises(AlpacaTradingError) as err:
         broker.account()
@@ -375,7 +376,7 @@ def test_requests_are_paced_at_the_configured_rate_on_a_fake_clock() -> None:
     raw._client._session.mount("https://", http)  # type: ignore[attr-defined]
     http.route("GET", "/v2/account", (200, _load("account_before")))
     http.route("GET", "/v2/positions", (200, _load("positions_held")))
-    broker = AlpacaBroker(settings, lambda: NOW, client=raw)
+    broker = AlpacaBroker(settings, lambda: NOW, client=raw, book_id="main")
 
     broker.account()
     broker.positions()
@@ -427,11 +428,37 @@ def test_the_base_url_of_every_request_is_the_paper_endpoint() -> None:
 def test_a_missing_paper_key_raises_a_credentials_error_with_no_key_in_it() -> None:
     settings = _settings({"alpaca_paper_api_key": None})
     with pytest.raises(AlpacaPaperCredentialsError) as err:
-        AlpacaBroker(settings, lambda: NOW)
+        AlpacaBroker(settings, lambda: NOW, book_id="main")
     text = str(err.value)
     assert "ALPACA_PAPER_API_KEY" in text
     for secret in (PAPER_SECRET, DATA_KEY, DATA_SECRET):
         assert secret not in text
+
+
+def test_the_adapter_builds_its_raw_client_on_the_books_own_pair() -> None:
+    """ADR 0017 B.2 (T153): `AlpacaBroker` for book `b` reads `b`'s pair, never `main`'s."""
+    b_key, b_secret = "PKBOOKBFAKE0987654321", "bookBSecretFake0987654321zyxw"  # gitleaks:allow
+    settings = _settings({"alpaca_paper_books": {"b": {"api_key": b_key, "api_secret": b_secret}}})
+    broker = AlpacaBroker(settings, lambda: NOW, book_id="b")
+    client: Any = broker._raw._client
+    assert broker.book_id == "b" and broker._raw.book_id == "b"
+    assert client._api_key == b_key and client._secret_key == b_secret
+    assert client._base_url == "https://paper-api.alpaca.markets"
+
+
+def test_a_book_with_no_pair_is_refused_before_any_client_is_built() -> None:
+    with pytest.raises(AlpacaPaperCredentialsError) as err:
+        AlpacaBroker(_settings(), lambda: NOW, book_id="b")
+    text = str(err.value)
+    assert "ALPACA_PAPER_BOOKS__B__API_KEY" in text
+    for secret in (PAPER_KEY, PAPER_SECRET, DATA_KEY, DATA_SECRET):
+        assert secret not in text
+
+
+def test_an_injected_raw_client_of_another_book_is_refused() -> None:
+    raw = AlpacaTradingRaw(_settings(), client=CountingClient(), clock=FakeClock())  # type: ignore[arg-type]
+    with pytest.raises(AlpacaPaperGuardError, match="'main'"):
+        AlpacaBroker(_settings(), lambda: NOW, client=raw, book_id="b")
 
 
 @pytest.mark.parametrize("unset", ["quantity_decimals", "client_order_id_max_length"])
@@ -439,9 +466,9 @@ def test_construction_is_refused_while_a_broker_fact_is_unset(unset: str) -> Non
     settings = _settings(**{unset: None})
     raw = AlpacaTradingRaw(_settings(), client=CountingClient(), clock=FakeClock())  # type: ignore[arg-type]
     with pytest.raises(AlpacaBrokerConfigError, match=f"alpaca.{unset}"):
-        AlpacaBroker(settings, lambda: NOW, client=raw)
+        AlpacaBroker(settings, lambda: NOW, client=raw, book_id="main")
     with pytest.raises(AlpacaBrokerConfigError):
-        AlpacaBroker(settings, lambda: NOW)
+        AlpacaBroker(settings, lambda: NOW, book_id="main")
 
 
 def test_the_concrete_class_exposes_its_clock() -> None:
@@ -938,4 +965,4 @@ def test_an_asset_read_answering_fewer_symbols_raises_system_fault() -> None:
     raw = AlpacaTradingRaw(settings, clock=FakeClock())
     raw.get_assets = lambda symbols: []  # type: ignore[method-assign]
     with pytest.raises(SystemFaultError, match="0 of 1"):
-        AlpacaBroker(settings, lambda: NOW, client=raw).assets(["KO"])
+        AlpacaBroker(settings, lambda: NOW, client=raw, book_id="main").assets(["KO"])

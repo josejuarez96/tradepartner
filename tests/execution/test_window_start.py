@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -220,14 +221,19 @@ def _write_closed_window(
     residues: dict[str, tuple[float, str | None]],
     state: str = "closed",
     reason: str | None = None,
+    book_id: str | None = None,
+    account_id: str = ACCOUNT_ID,
 ) -> int:
+    """A previous window of `book_id` (default `settings.paper.book_id`, the book
+    `start` reads) on `account_id`, closed (or `state`) with `residues`."""
     with open_for_write(settings) as conn:
         row_id = append(
             conn,
             PaperWindowRow(
                 hypothesis_id=hyp.hypothesis_id,
                 first_rebalance_session=date(2026, 8, 31),
-                account_id=ACCOUNT_ID,
+                account_id=account_id,
+                book_id=settings.paper.book_id if book_id is None else book_id,
                 starting_cash=100_000.0,
                 starting_equity=100_000.0,
                 code_version="prev",
@@ -269,46 +275,114 @@ def test_refuses_without_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
-def test_refuses_a_family_paper_cannot_run(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+def test_refuses_a_family_outside_paper_families(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A `profitability` hypothesis remains outside `PAPER_FAMILIES`, before any
-    broker call or write, although the backtest engine can now run it."""
+    """The gate itself, with `PAPER_FAMILIES` narrowed back to momentum's pair: a
+    family outside it is refused `family_not_runnable`, before any write."""
+    monkeypatch.setattr(window, "PAPER_FAMILIES", ("momentum", "oracle"))
     with open_for_write(journal_settings) as conn:
         hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
         _sign_off(conn, journal_settings, hyp, tmp_path)
-    broker = _fake(fixed_clock)
     with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "b3")
+        window.start(
+            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "b3"
+        )
     assert exc.value.reason == "family_not_runnable"
     assert "profitability" in str(exc.value)
     with open_for_write(journal_settings) as conn:
         assert latest_window(conn) is None
 
 
-@pytest.mark.parametrize("cadence", ["week_end", "daily"])
-def test_refuses_a_non_monthly_cadence_before_any_broker_call(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, cadence: str
+@pytest.mark.parametrize("family", ["profitability", "combined"])
+def test_accepts_a_family_paper_now_runs(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, family: str
 ) -> None:
-    """Strategy-lab spec req 11 (T100): a hypothesis whose `frozen_values` cadence
-    is not `month_end` is refused `refused_cadence`, before any broker call or write."""
+    """`profitability` and `combined` are in `PAPER_FAMILIES` (ADR 0017 part D, T152):
+    a signed-off hypothesis of either starts a window on its own registration."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family=family)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "b3"
+    )
+    assert result.window.hypothesis_id == hyp.hypothesis_id
+    with open_for_write(journal_settings) as conn:
+        opened = latest_window(conn)
+        assert opened is not None and opened.window_id == result.window.window_id
+
+
+#: The conftest clock (2026-10-01, a Thursday) is mid-week: the first week-end and the
+#: first session strictly after it are both Friday 2026-10-02.
+NEXT_WEEK_END = date(2026, 10, 2)
+#: A completed week-end at the conftest clock (Friday 2026-09-25; 2026-09-30 is not one).
+WEEK_END_PAST = date(2026, 9, 25)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "holdout_end", "t_0", "min_rebalances"),
+    [
+        pytest.param("week_end", WEEK_END_PAST, NEXT_WEEK_END, 13, id="week_end"),
+        pytest.param("daily", HOLDOUT_END_PAST, date(2026, 10, 2), 63, id="daily"),
+    ],
+)
+def test_accepts_a_week_end_and_a_daily_registration(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    cadence: str,
+    holdout_end: date,
+    t_0: date,
+    min_rebalances: int,
+) -> None:
+    """ADR 0017 part C (strategy-lab spec req 11 as amended 2026-10-09): a `week_end`
+    and a `daily` hypothesis start; T_0 is the first rebalance session at that cadence
+    strictly after both `holdout.end` and today, and the window freezes that cadence's
+    `paper.min_rebalances` as a scalar under the same key."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(
+            conn,
+            journal_settings,
+            "h1",
+            holdout_end,
+            params=_params(**{"schedule.rebalance_cadence": cadence}),
+        )
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.window_id is not None
+    assert result.window.first_rebalance_session == t_0
+    frozen = json.loads(result.window.frozen_json)
+    assert frozen["paper.min_rebalances"] == min_rebalances
+    # One k at every cadence (ADR 0017 open question 6).
+    assert frozen["paper.tracking_k"] == 2.0
+
+
+def test_refuses_a_week_end_registration_whose_holdout_end_is_not_a_week_end(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The holdout-end check runs at the hypothesis's cadence: Wednesday 2026-09-30 is a
+    completed month-end but not a week-end, so a `week_end` registration ending there is
+    refused `holdout_not_complete`, before any broker call."""
     with open_for_write(journal_settings) as conn:
         hyp = _register(
             conn,
             journal_settings,
             "h1",
             HOLDOUT_END_PAST,
-            params=_params(**{"schedule.rebalance_cadence": cadence}),
+            params=_params(**{"schedule.rebalance_cadence": "week_end"}),
         )
         _sign_off(conn, journal_settings, hyp, tmp_path)
     broker = _fake(fixed_clock)
     with pytest.raises(window.StartRefusedError) as exc:
         window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
-    assert exc.value.reason == "refused_cadence"
-    assert cadence in str(exc.value)
+    assert exc.value.reason == "holdout_not_complete"
+    assert str(exc.value) == ("'h1''s frozen holdout.end (2026-09-30) is not a completed week-end")
     assert broker.calls == ()
-    with open_for_write(journal_settings) as conn:
-        assert latest_window(conn) is None
 
 
 @pytest.mark.parametrize("stored", [{"schedule.rebalance_cadence": "month_end"}, {}])
@@ -316,7 +390,8 @@ def test_accepts_a_month_end_and_a_pre_lab_registration(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, stored: dict[str, Any]
 ) -> None:
     """A `month_end` registration and one without `schedule.*` keys (a pre-lab
-    registration, read as `month_end` through `frozen_values`) both start."""
+    registration, read as `month_end` through `frozen_values`) both start, at the
+    first month-end, freezing `paper.min_rebalances` 6 as before ADR 0017."""
     with open_for_write(journal_settings) as conn:
         hyp = _register(conn, journal_settings, "h1", HOLDOUT_END_PAST, params=_params(**stored))
         _sign_off(conn, journal_settings, hyp, tmp_path)
@@ -325,6 +400,10 @@ def test_accepts_a_month_end_and_a_pre_lab_registration(
         journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
     )
     assert result.window.window_id is not None
+    assert result.window.first_rebalance_session == date(2026, 10, 30)
+    frozen = json.loads(result.window.frozen_json)
+    assert frozen["paper.min_rebalances"] == 6
+    assert frozen["paper.tracking_k"] == 2.0
 
 
 def test_refuses_on_synthetic_signoff_trial(
@@ -1199,7 +1278,7 @@ def test_window_of_refuses_schema_version_on_a_version_16_store(tmp_path: Path) 
         duckdb.connect(str(path), read_only=True) as conn,
         pytest.raises(window.WindowCommandRefused) as refused,
     ):
-        window._window_of(conn)
+        window._window_of(conn, "main")
     assert refused.value.reason == window.SCHEMA_VERSION
     assert "open it for writing once" in str(refused.value)
 
@@ -1360,30 +1439,35 @@ def test_forward_holdout_still_needs_a_gap_signoff(
     assert exc.value.reason == "gap_signoff"
 
 
-def test_forward_holdout_still_needs_a_paper_family(
-    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+@pytest.mark.parametrize("family", ["profitability", "combined"])
+def test_forward_holdout_starts_for_a_paper_family(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path, family: str
 ) -> None:
-    _register_forward(journal_settings, tmp_path, family="profitability")
-    with pytest.raises(window.StartRefusedError) as exc:
-        window.start(
-            journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
-        )
-    assert exc.value.reason == "family_not_runnable"
+    """B4 (`combined`) is a forward exam (ADR 0016 point 5): a forward holdout of either
+    newly paper-ready family opens inside its holdout, as momentum's does (T152)."""
+    hyp = _register_forward(journal_settings, tmp_path, family=family)
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.hypothesis_id == hyp.hypothesis_id
+    assert result.window.first_rebalance_session == NEXT_MONTH_END
 
 
-def test_forward_holdout_still_needs_month_end_cadence(
+def test_forward_holdout_at_week_end_starts_at_the_first_week_end(
     journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
 ) -> None:
+    """ADR 0017 part C: a forward `week_end` holdout opens at the first week-end on or
+    after `holdout.start` and after today, freezing `paper.min_rebalances` 13."""
     _register_forward(
         journal_settings,
         tmp_path,
         params=_params(**{"schedule.rebalance_cadence": "week_end", GAP_KEY: 0.05}),
     )
-    broker = _fake(fixed_clock)
-    with pytest.raises(window.StartRefusedError) as exc:
-        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "h1")
-    assert exc.value.reason == "refused_cadence"
-    assert broker.calls == ()
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert result.window.first_rebalance_session == NEXT_WEEK_END
+    assert json.loads(result.window.frozen_json)["paper.min_rebalances"] == 13
 
 
 def test_forward_holdout_still_allows_one_open_window(
@@ -1430,3 +1514,207 @@ def test_forward_holdout_without_a_frozen_gap_threshold_raises_before_any_call(
     assert broker.calls == ()
     with open_for_write(journal_settings) as conn:
         assert latest_window(conn) is None
+
+
+# --- books (ADR 0017 B.3 to B.5, plan T155) ------------------------------------------
+
+B_ACCOUNT_ID = "PB1"
+
+
+def _fake_b(clock: FixedClock) -> BookedFake:
+    """Book `b`'s own paper account: another account id than `main`'s."""
+    return BookedFake(
+        clock=clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False, account_id=B_ACCOUNT_ID
+    )
+
+
+def _windows(settings: Settings) -> list[tuple[int | None, str, str]]:
+    with open_read_only(settings) as conn:
+        rows = conn.execute(
+            "SELECT window_id, book_id, account_id FROM paper_windows ORDER BY window_id"
+        ).fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+def test_a_second_book_starts_beside_an_open_main_window_and_a_second_main_is_refused(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """Spec acceptance (ADR 0017): `paper start --book b` beside an open `main`
+    window is accepted, a second `paper start --book main` is refused
+    `window_open`, and so is a second `b`."""
+    connect = _connect(journal_settings)
+    main = window.start(journal_settings, connect, _fake(fixed_clock), fixed_clock, "h1")
+    assert main.window.book_id == "main"
+
+    b = window.start(
+        journal_settings, connect, _fake_b(fixed_clock), fixed_clock, "h1", book_id="b"
+    )
+    assert b.window.book_id == "b"
+    assert b.window.account_id == B_ACCOUNT_ID
+
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, connect, _fake(fixed_clock), fixed_clock, "h1")
+    assert exc.value.reason == "window_open"
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, connect, _fake_b(fixed_clock), fixed_clock, "h1", book_id="b"
+        )
+    assert exc.value.reason == "window_open"
+    assert _windows(journal_settings) == [
+        (main.window.window_id, "main", ACCOUNT_ID),
+        (b.window.window_id, "b", B_ACCOUNT_ID),
+    ]
+
+
+def test_b_s_first_start_is_not_excused_by_main_s_closed_window_residues(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """The fail-open trap: `main`'s closed window lists SPY as a residue, and
+    `b`'s account holds exactly that position. `b` has no previous window, so its
+    account must be strictly flat: refused `not_flat`, nothing written."""
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=fixed_clock() - timedelta(days=1),
+        residues={SPY: (5.0, "dust")},
+        book_id="main",
+    )
+    fake = _fake_b(fixed_clock)
+    fake.extra_quantity["SPY"] = 5.0
+    before = _windows(journal_settings)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), fake, fixed_clock, "h1", book_id="b"
+        )
+    assert exc.value.reason == "not_flat"
+    assert _windows(journal_settings) == before
+
+
+def test_b_carries_its_own_closed_window_s_residues_not_main_s(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """`b`'s previous window is `b`'s, even when `main`'s closed later: its
+    residue is carried, and `main`'s (MTUM) explains nothing on `b`'s account."""
+    stop_at = fixed_clock() - timedelta(days=2)
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at,
+        residues={SPY: (5.0, "dust")},
+        book_id="b",
+        account_id=B_ACCOUNT_ID,
+    )
+    _write_closed_window(
+        journal_settings,
+        ready_hypothesis,
+        at=stop_at + timedelta(days=1),
+        residues={MTUM: (2.0, "dust")},
+        book_id="main",
+    )
+    fake = _fake_b(fixed_clock)
+    fake.extra_quantity["SPY"] = 5.0
+    fake.extra_quantity["MTUM"] = 2.0  # main's residue, on b's account: unexplained
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings, _connect(journal_settings), fake, fixed_clock, "h1", book_id="b"
+        )
+    assert exc.value.reason == "not_flat"
+
+    del fake.extra_quantity["MTUM"]
+    result = window.start(
+        journal_settings, _connect(journal_settings), fake, fixed_clock, "h1", book_id="b"
+    )
+    window_id = result.window.window_id
+    assert window_id is not None
+    with open_read_only(journal_settings) as conn:
+        carried = [a for a in adjustments_for(conn, window_id) if a.kind == "carried_residue"]
+    assert [(a.security_id, a.quantity, a.book_id) for a in carried] == [(SPY, 5.0, "b")]
+
+
+@pytest.mark.parametrize("state", ["open", "closed", "abandoned"])
+def test_a_book_is_refused_another_book_s_account(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    state: str,
+) -> None:
+    """ADR 0017 B.1 and B.4: one account per book. `b`'s broker reporting the
+    account `main`'s window (open, closed or abandoned) was opened on is refused
+    `account_in_use` before any write, the message naming no secret."""
+    connect = _connect(journal_settings)
+    if state == "open":
+        window.start(journal_settings, connect, _fake(fixed_clock), fixed_clock, "h1")
+    else:
+        _write_closed_window(
+            journal_settings,
+            ready_hypothesis,
+            at=fixed_clock() - timedelta(days=1),
+            residues={},
+            state=state,
+            reason="test",
+            book_id="main",
+        )
+    before = _windows(journal_settings)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, connect, _fake(fixed_clock), fixed_clock, "h1", book_id="b")
+    assert exc.value.reason == window.ACCOUNT_IN_USE
+    assert "'main'" in str(exc.value)
+    assert _windows(journal_settings) == before
+
+
+def test_main_s_own_closed_account_is_not_another_book_s(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """The identity check is per book: `main` reopening on its own previous
+    account (H1's case) is accepted, with `b` open on another account."""
+    _write_closed_window(
+        journal_settings, ready_hypothesis, at=fixed_clock() - timedelta(days=1), residues={}
+    )
+    connect = _connect(journal_settings)
+    window.start(journal_settings, connect, _fake_b(fixed_clock), fixed_clock, "h1", book_id="b")
+    result = window.start(journal_settings, connect, _fake(fixed_clock), fixed_clock, "h1")
+    assert (result.window.book_id, result.window.account_id) == ("main", ACCOUNT_ID)
+
+
+def test_the_default_book_is_paper_book_id_and_main_is_unchanged(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+    tmp_path: Path,
+) -> None:
+    """H1 pinned: with no book, `start` is `paper.book_id`'s (`main`) and writes
+    the same row as `book_id="main"`, field for field but the id."""
+    default = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    other = tmp_path / "other.duckdb"
+    other.write_bytes(Path(journal_settings.store.path).read_bytes())
+    settings = Settings(_env_file=None, store={"path": str(other)})
+    with open_for_write(settings) as conn:
+        conn.execute("DELETE FROM paper_windows")
+    named = window.start(
+        settings, _connect(settings), _fake(fixed_clock), fixed_clock, "h1", book_id="main"
+    )
+    assert replace(default.window, window_id=None) == replace(named.window, window_id=None)
+
+
+def test_a_book_outside_the_token_grammar_is_refused_before_anything(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    fake = _fake(fixed_clock)
+    with pytest.raises(ValueError, match="book_id"):
+        window.start(
+            journal_settings, _connect(journal_settings), fake, fixed_clock, "h1", book_id="../x"
+        )
+    assert fake.calls == ()
+    assert _windows(journal_settings) == []
