@@ -467,13 +467,13 @@ With the flag, for each qualifying order `paper resume` journals a synthetic fil
 
 **When `--accept-rejections` is the right call.** Normally omit it. Before it releases, `paper resume` judges the rejections on every run the release would clear (each `halted`, `crashed` or `failed` run of the window that no earlier release cleared, #397/#451) and refuses while any of them breached the rejection cap (all of a run's orders rejected, or more than the frozen `risk.max_rejections_per_run`). The refusal names each run's verdict. Add the flag only when:
 - resume refused with such a verdict on a halted, crashed or failed run, **and**
-- you have found why the broker rejected those orders (symbol halted, account restriction, bad request shape; see `rejection_cap` above), fixed it or confirmed it will not recur, and accept that run's rejections as they stand.
+- for **every** run the refusal names, you have found why the broker rejected its orders (symbol halted, account restriction, bad request shape; see `rejection_cap` above), fixed it or confirmed it will not recur, and accept its rejections as they stand. The flag is all or nothing: it accepts the verdicts on all the runs this release would clear at once, never one run at a time.
 
 ```bash
 uv run tradepartner paper resume --accept-rejections --reason "run <id>: rejected because <cause>; fixed/checked <what>"
 ```
 
-The flag accepts **only those rejection-cap verdicts**, on the runs this release would clear. Resume journals a `resume_acceptances` row naming each accepted verdict (the CLI prints one `accepted ...` line each) before any reconciliation or release, and then every other step still applies: a rejection-cap verdict from this resume's own collection on any other run, the `fills_lagging` bound (that is `--accept-broker-fills`), reconciliation and every release check still refuse. It lifts no other refusal and bypasses no limit; the two flags are independent and may be given together when both apply.
+The flag accepts **only those rejection-cap verdicts**, on the runs this release would clear. Resume journals a `resume_acceptances` row naming each accepted verdict (the CLI prints one `accepted ...` line each) before any reconciliation or release, and then every other step still applies: a rejection-cap verdict from this resume's own collection on any other run, the `fills_lagging` bound (that is `--accept-broker-fills`), reconciliation and every release check still refuse. It lifts no other refusal and bypasses no limit; the two flags are independent and may be given together when both apply. The acceptance does not carry over: if a flagged resume still refuses for another reason, the next `paper resume` needs `--accept-rejections` again.
 
 ### The kill-switch drill (ADR 0017 part E.4)
 
