@@ -1159,3 +1159,35 @@ def test_a_tracking_run_on_the_real_store_needs_no_marker(
         trial = _row(conn, "trials", outcome.trial_id)
         assert (trial["kind"], trial["synthetic"]) == ("tracking", False)
         assert not lab_schema.has_fixture_marker(conn)
+
+
+def test_a_single_run_keeps_no_marking_frames_and_writes_the_same_rows(
+    store: Path, read: Read
+) -> None:
+    """#1417: `run_hypothesis` keeps no step's marking frame (they grow without bound
+    over a long daily run, as the sweep's did in #1414); the results and every written
+    equity and rebalance row equal a run that kept them."""
+    dropped = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=store)
+    kept = run_hypothesis(
+        SLUG, None, None, Flags(), synthetic=True, store_path=store, keep_marking_frames=True
+    )
+    assert (dropped.status, kept.status) == ("ok", "ok")
+    assert dropped.results is not None and kept.results is not None
+    assert set(dropped.results) == set(kept.results) == LEVELS
+    for level, result in kept.results.items():
+        assert result.marking_frames
+        assert dropped.results[level].marking_frames == ()
+        other = dropped.results[level]
+        for field in ("cost_per_side_bps", "equity", "rebalances", "weights", "targets"):
+            assert getattr(other, field) == getattr(result, field), (level, field)
+        assert other.position_values.equals(result.position_values), level
+    conn = read()
+    for table in ("trial_equity", "trial_rebalances"):
+        rows = [
+            conn.execute(
+                f"SELECT * EXCLUDE (trial_id) FROM {table} WHERE trial_id = ? ORDER BY ALL",
+                [trial_id],
+            ).fetchall()
+            for trial_id in (dropped.trial_id, kept.trial_id)
+        ]
+        assert rows[0] and rows[0] == rows[1]
