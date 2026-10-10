@@ -352,6 +352,18 @@ class EdgarConfig(BaseModel):
         min_length=1,
     )
     statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
+    # T164e (#1358, spec amendment 2026-10-09): filing events. While the
+    # switch is off the ingest never asks `filing_events`, so the adapter makes
+    # no request and no cache write for it and no row is added. It stays off
+    # until the real-store run has passed and the owner has closed #1382 (the
+    # stamps clock: an early stamp is a look-ahead for an event read). Only a
+    # form in `event_forms` is ever a row; never empty. Narrowing it later
+    # fails `health --check` on the stored rows of a dropped form until a
+    # rebuild (the amendment's open question 12).
+    filing_events_enabled: bool = False
+    event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["8-K", "8-K/A"], min_length=1
+    )
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
