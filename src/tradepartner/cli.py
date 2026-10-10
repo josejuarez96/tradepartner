@@ -985,6 +985,19 @@ def _latest_run_id(conn: duckdb.DuckDBPyConnection) -> int:
     return max((r.run_id for r in research.list_runs(conn, include_synthetic=True)), default=0)
 
 
+def _fresh_transaction(conn: duckdb.DuckDBPyConnection) -> None:
+    """Roll back whatever transaction is open (none is fine) and begin a new one, so
+    `open_for_write`'s rollback on the way out has one to end and the error that got
+    us here is the one raised (#1351). `begin` is not a probe: inside an open
+    transaction it fails and aborts that transaction."""
+    try:
+        conn.rollback()
+    except duckdb.TransactionException:
+        conn.begin()  # no transaction was open to roll back
+    else:
+        conn.begin()
+
+
 def _close_open_runs(
     conn: duckdb.DuckDBPyConnection, settings: Settings, after: int, why: str
 ) -> list[int]:
@@ -2974,11 +2987,17 @@ def make_app(
                         run_by=_REGISTERED_BY,
                     )
                 except (Exception, KeyboardInterrupt) as exc:
-                    # Commit what the job wrote (its run rows, a `failed` close) rather
-                    # than roll it back: the run's records file already exists. A run
-                    # the job left open (Ctrl-C reaches no `close_run`) is closed here.
+                    # The job already committed each run row before calls. Close a
+                    # run left open by Ctrl-C or another failure, then commit that
+                    # close on exit from open_for_write. run_batch usually returns
+                    # with no transaction open; a close that raises then needs a
+                    # fresh one, or open_for_write's rollback hides its error.
                     failure = exc
-                    opened = _close_open_runs(conn, s, before, _describe(exc))
+                    try:
+                        opened = _close_open_runs(conn, s, before, _describe(exc))
+                    except BaseException:
+                        _fresh_transaction(conn)
+                        raise
         except StoreLockedError as exc:
             raise _fail(_scrubbed(f"store busy: {exc}", s), 1) from None
         except Exception as exc:
