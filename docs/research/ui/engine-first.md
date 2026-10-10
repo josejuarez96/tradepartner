@@ -70,7 +70,7 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 
 ## 5. What the docs constrain (and where the spike is out of line)
 
-- **ADR 0011 (accepted): Streamlit, no separate API, localhost only.** The React spike is not covered by any ADR or spec. Streamlit pages already exist (health, backtest, trials, research, operations, override, per book). Any move to React needs a new ADR, and the data it reads needs a spec.
+- **ADR 0011 (accepted): Streamlit, no separate API, localhost only**, for the Phase 2–3 dashboard; those pages exist (health, backtest, trials, research, operations, override, per book). The roadmap left the next step open on purpose: "Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, is a Phase 4 ADR" (`roadmap.md`). That ADR has not been written. The owner's direction (2026-10-10) is a real app, not Streamlit, so the ADR is the missing piece: React front end, read-only local API, which writes it may make, and how the phone reaches it.
 - **The UI is read-only except one write:** the logged override (`exclude_name`, `keep_name`, `engage_kill_switch`) with a reason. Stop/resume from the UI needs a spec change.
 - **"Stop" is two things.** The spike's "Stop book" (holdings kept, next run skipped) is the **kill switch** (`paper kill`; released only by `paper resume` after a clean reconciliation). `paper stop` **closes the window and sells**. The UI must name them differently.
 - **No contest between books** (ADR 0017 open question): rank books against their own expected range, not against each other.
@@ -88,11 +88,11 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 | Rebalance step-through (universe, trades, costs) | Mostly: `trial_rebalances`, `trial_weights` | UI only |
 | …including the signal and rank at each rebalance | **No**: `Plan.scores` is not persisted | Engine change: persist scores and ranks per rebalance (new table, plan task) |
 | Book run timeline, order chains | Yes: runs, `decisions`, `orders`, `order_events`, `fills`, `outcomes` | UI only |
-| A data source the React app can read | **No** API | Either an ADR to amend 0011 (read-only local API over `ops.page_data` and registry reads) or read `tradepartner export` Parquet files |
+| A data source the React app can read | **No** API | The Phase 4 front-end ADR picks one: a read-only local API over `ops.page_data` and registry reads, or `tradepartner export` Parquet files |
 
 ## 7. Decisions for the owner
 
-1. **Front end:** stay in Streamlit and bring this design to it, or propose an ADR for React behind a read-only local API? (ADR 0011 named React-plus-API as the rejected option; its "revisit if" conditions decide whether this qualifies.)
+1. **The Phase 4 front-end ADR.** Direction set by the owner: a real app (React), not Streamlit. To decide in the ADR: a read-only local API over the existing readers versus reading `tradepartner export` files; which writes the app may make (today only the logged override); whether the Streamlit pages stay as the developer's view; and how the phone reaches a localhost-only system.
 2. **Which machine view first:** the lab's trial page with the rebalance step-through, or a book's run timeline with order chains?
 3. **Engine change:** open a plan task to persist backtest signal scores and ranks, so the step-through can show why each name was chosen?
 4. **Stop/resume from the UI:** keep it as the one override (`engage_kill_switch`) and leave release to `paper resume`, or specify a UI release?
