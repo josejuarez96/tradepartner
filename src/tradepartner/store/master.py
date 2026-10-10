@@ -381,8 +381,9 @@ def session_of(instant: datetime) -> date:
     return _session_on_or_after(instant.astimezone(_EXCHANGE_TZ).date())
 
 
-#: Words that make a title mentioning common stock something else; mirrors
-#: `store.delistings` (which imports this module, so it cannot be imported here).
+#: Words that make a title mentioning common stock something else
+#: ("Warrants to purchase Common Stock", "Units, each of one share ...").
+#: `store.delistings` imports these from here (it already imports this module).
 _NOT_COMMON_WORDS = ("warrant", "right", "unit", "preferred", "depositary", "note", "debenture")
 
 

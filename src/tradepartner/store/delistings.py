@@ -107,7 +107,12 @@ from tradepartner.store.asof import (
     listings_as_of,
 )
 from tradepartner.store.db import insert_row
-from tradepartner.store.master import MasterBuild, _form25_classes, _is_common, _norm_title
+from tradepartner.store.master import (
+    MasterBuild,
+    _form25_classes,
+    _is_plain_common,
+    _norm_title,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 # Amendments too (owner decision 2026-09-26, #262): EDGAR's history has them,
@@ -145,16 +150,6 @@ def _filing_day(filed_at: datetime) -> date:
 def _filing_session(filed_at: datetime) -> date:
     day = _filing_day(filed_at)
     return day if is_session(day) else next_session(day)
-
-
-#: Words that make a title mentioning common stock something else
-#: ("Warrants to purchase Common Stock", "Units, each of one share ...").
-_NOT_COMMON_WORDS = ("warrant", "right", "unit", "preferred", "depositary", "note", "debenture")
-
-
-def _is_plain_common(title: str) -> bool:
-    norm = _norm_title(title)
-    return _is_common(title) and not any(word in norm for word in _NOT_COMMON_WORDS)
 
 
 #: A class or series letter ("Class B Common Stock", "Series B ...").
