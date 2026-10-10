@@ -738,6 +738,11 @@ what = "Fast paper: several paper books at once, one Alpaca paper account per bo
 why = "One monthly strategy at a time made the Phase 4 exit a six-month wait that measured the strategy, not the machine; several books at daily and weekly cadence give the operations evidence in weeks while each strategy's exam of record stays ADR 0016's."
 unblocks = ["plan:paper-trading", "issue:1352"]
 
+[adr.0018]
+what = "The end-user app: a local FastAPI read API in this repo over the CLI's own read functions (books, equity vs benchmark, positions vs targets, orders and fills, runs, alerts, strategies), a React + TypeScript front end in webapp/ served by the same loopback process, the only writes a book's kill switch engaged or released by running the CLI's own paper kill and paper resume as subprocesses, phone access over the owner's Tailscale network with identity checks and no secret in the browser, Streamlit retired page by page at parity, and a spike before any plan task."
+why = "The owner wants a product-quality surface at his desk and on his phone that answers how he is doing, what each book holds and why, what is wrong or waiting on him, and lets him stop or resume a book safely; ADR 0011's Streamlit-only rule cannot give that, and the change to the roadmap's no-separate-API rule is hard to reverse, so it is recorded first."
+unblocks = ["plan:webapp"]
+
 [issue.1352]
 what = "Turn ADR 0017 into the spec amendments (paper spec, strategy-lab req 11, the ADR pointers) and the Phase 4 plan tasks T151 to T163c: cadence lift, the family flip, one account per book, the multi-book run, the per-book surfaces, paper shakedown, the runbook, the owner's accounts, hypotheses, starts and span, and the Phase 6 live book."
 why = "A decision the owner merged is built only from claimable task lines; the lines fix the schema chain, the drill's host book and the counted selection of the daily variant so several teams can build in parallel."
@@ -990,3 +995,8 @@ why = "The B9 engine tasks can be claimed only once the owner's store holds the 
 [issue.1358]
 what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
 why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."
+
+[issue.1410]
+what = "One ADR (0018, Proposed) recording the owner's 2026-10-09 decision to replace the Streamlit pages with a web front end over a small local read API, with the API contract, the two writes, the stack, phone access, coexistence, testing and the validating spike each decided with options and a recommendation."
+why = "The plan and spec for the end-user app can only be written against an accepted record; the ADR also takes 0018 so the Phase 6 live-book ADR (T163) takes 0019."
+unblocks = ["adr:0018"]
