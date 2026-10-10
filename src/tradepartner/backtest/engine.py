@@ -529,11 +529,13 @@ def run(
     cost_levels: Sequence[float],
     *,
     family: HypothesisFamily,
+    keep_marking_frames: bool = True,
 ) -> dict[float, BacktestResult]:
     """Run the strategy over the rebalance sessions in `[start, end]` at the frozen
     `schedule.rebalance_cadence`, at every cost level in `cost_levels` (per-side bps;
     commissions from `params.costs`) from one read set: `run_many` with one variant,
     whose failure, shared read or not, is raised as the error itself.
+    `keep_marking_frames` is `run_many`'s (False keeps no step's marking frame, #1417).
 
     `params` is the trial's frozen `Settings` (`hypothesis.load_frozen`, which reads the
     schedule keys through `frozen.frozen_values`). Raises `TypeError` without a
@@ -544,7 +546,15 @@ def run(
     failure: Exception | None = None
     outcome = RunManyResults()
     try:
-        outcome = run_many([(params, handle)], provider, start, end, cost_levels, family=family)
+        outcome = run_many(
+            [(params, handle)],
+            provider,
+            start,
+            end,
+            cost_levels,
+            family=family,
+            keep_marking_frames=keep_marking_frames,
+        )
     except SharedReadFailed as exc:
         failure = exc.cause
     if failure is None and outcome.failures:
