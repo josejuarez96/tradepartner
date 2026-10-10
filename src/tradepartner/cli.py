@@ -223,6 +223,20 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   `check` with no window are such a failure), 2 on a usage
   error, 3 when `kill` cannot write its row, and `PAPER_REFUSAL_EXIT`'s code for
   `refused` (the reason code is printed), `locked` and `no_window`.
+  **Books** (ADR 0017 B.2 to B.5, plan T155b). `start`, `stop`, `run`,
+  `reconcile`, `kill`, `resume`, `abandon`, `override` and `settle` take `--book
+  <token>` (default `paper.book_id`; a token outside the grammar is a usage
+  error, 2, before the store is opened or any broker built), pass the book to
+  their `execution` function and build the broker with `build_broker(settings,
+  clock, book)`, that book's own paper key pair. `--book` selects a book, never
+  an endpoint: the factory is the paper adapter for every book. `paper run`
+  with no `--book` is `run.every_book_run`: every book with an open window, in
+  token order, each its own run under its own lock, one line per book (as
+  before books when one book runs), a crash in one never stopping the next; it
+  exits `WRITE_FAILED_EXIT_CODE` when any book's did, else 1 when any book's
+  exit was non-zero, else 0. `paper kill --all --reason` engages every open
+  book's switch, one line per book, trying every book even after one fails
+  (`no_window` with no open book; it is a usage error with `--book`).
 - `tradepartner paper shakedown` (ADR 0017 part E; plan T157b) prints
   `execution.shakedown.shakedown`'s seven lines, E.1 to E.7, over every book,
   each with the rows, query and thresholds it read, through
@@ -325,7 +339,7 @@ from tradepartner.backtest.hypothesis import HypothesisFileError, register
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
-from tradepartner.config import MAIN_BOOK_ID, Settings, get_settings
+from tradepartner.config import Settings, get_settings
 from tradepartner.corpus import departure_fetch
 from tradepartner.execution import check as paper_check
 from tradepartner.execution import lots_reconcile, ops, reconcile_run, window
@@ -334,7 +348,7 @@ from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution.brokers import build_broker
-from tradepartner.execution.lock import LockHeld
+from tradepartner.execution.lock import LockHeld, resolve_book
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
 from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
@@ -1095,15 +1109,9 @@ def _settle_review(session: review.ReviewSession, settings: Settings, *, recover
 
 # --- Phase 4: the paper commands (plan T67) ---------------------------------------
 
-BrokerFactory = Callable[[Settings, Clock], Broker]
-
-
-def _main_book_broker(settings: Settings, clock: Clock) -> Broker:
-    """`build_broker` for book `main`, H1's (`main`'s pair exactly as before T153).
-    Not the live `paper.book_id`: until `--book` (T155b) picks the book from the
-    command and its window, a config edit must never point `main`'s window at
-    another book's account."""
-    return build_broker(settings, clock, MAIN_BOOK_ID)
+#: `build_broker`'s shape: the settings, the command's one clock and the book,
+#: whose own paper key pair the broker reads (ADR 0017 B.2, plan T155b).
+BrokerFactory = Callable[[Settings, Clock, str], Broker]
 
 
 #: The `paper` commands' refusal exit codes besides `paper run`'s (module docstring).
@@ -1114,7 +1122,8 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 
 #: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
-#: `--book`, on `report`, `check` and `status` (ADR 0017 B.7, plan T156).
+#: `--book`, on every `paper` command but `shakedown` and `lots-reconcile` (ADR
+#: 0017 B.2 and B.7; plans T155b and T156).
 _BOOK_OPTION = typer.Option(
     "--book", help="the book token (default paper.book_id)", allow_from_autoenv=False
 )
@@ -1129,6 +1138,17 @@ def _checked_book(book: str | None) -> str | None:
         except ValueError as exc:
             raise _fail(f"--book: {exc}", USAGE_ERROR) from exc
     return book
+
+
+def _run_lines(prefix: str, outcome: paper_run.RunOutcome, settings: Settings) -> None:
+    """`paper run`'s line for one run's outcome and its notes, scrubbed."""
+    _echo_scrubbed(
+        f"{prefix}: {outcome.status} (run {_fmt(outcome.run_id)}, session "
+        f"{_fmt(outcome.session)}, kind {_fmt(outcome.kind)})",
+        settings,
+    )
+    for note in outcome.notes:
+        _echo_scrubbed(f"  {note}", settings)
 
 
 def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
@@ -1356,7 +1376,7 @@ def make_app(
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
-    broker: BrokerFactory = _main_book_broker,
+    broker: BrokerFactory = build_broker,
     model_client: job.ClientFactory = job.CLIENT_FACTORY,
 ) -> typer.Typer:
     """The `tradepartner` Typer app over the given edges (module docstring)."""
@@ -3013,12 +3033,17 @@ def make_app(
     @paper_app.command("start")
     def paper_start(
         hypothesis: Annotated[str, typer.Option(help="the registered hypothesis slug")],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
-        """Open a paper window for a signed-off hypothesis (spec req 14)."""
+        """Open a paper window for a signed-off hypothesis in the book (spec req 14)."""
+        chosen = _checked_book(book)
         s = paper_settings()
+        bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
-            lambda: window.start(s, lambda: open_read_only(s), broker(s, clock), clock, hypothesis),
+            lambda: window.start(
+                s, lambda: open_read_only(s), broker(s, clock, bk), clock, hypothesis, book_id=bk
+            ),
         )
         opened = result.window
         _echo_scrubbed(
@@ -3030,11 +3055,18 @@ def make_app(
             _echo_scrubbed(f"after an abandoned window: {result.abandoned_note}", s)
 
     @paper_app.command("stop")
-    def paper_stop(reason: Annotated[str, _REASON_OPTION]) -> None:
-        """Request the window's stop, or close it once the stop run is done (req 14)."""
+    def paper_stop(
+        reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+    ) -> None:
+        """Request the book's window's stop, or close it once the stop run is done
+        (req 14)."""
+        chosen = _checked_book(book)
         s = paper_settings(reason)
+        bk = resolve_book(s, chosen)
         result = _paper_call(
-            s, lambda: window.stop(s, write_chunk(s), broker(s, clock), clock, reason)
+            s,
+            lambda: window.stop(s, write_chunk(s), broker(s, clock, bk), clock, reason, book_id=bk),
         )
         _echo_scrubbed(
             f"paper stop: {result.state}; reconciliation {_fmt(result.reconciliation_id)}; "
@@ -3043,46 +3075,119 @@ def make_app(
         )
 
     @paper_app.command("run")
-    def paper_run_() -> None:
-        """The tracking run on the clock's session (spec req 7; the scheduler's job)."""
+    def paper_run_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+        """The tracking run on the clock's session for the book, or with no `--book`
+        for every book with an open window (spec req 7; the scheduler's job)."""
+        chosen = _checked_book(book)
         s = paper_settings()
+        if chosen is None:
+            try:
+                runs = paper_run.every_book_run(
+                    s, write_chunk(s), lambda b: broker(s, clock, b), clock
+                )
+            except Exception as exc:
+                raise _fail(
+                    _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
+                ) from exc
+            for entry in runs:
+                # The line before books for `paper.book_id` alone; any other book is named.
+                alone = len(runs) == 1 and entry.book_id == s.paper.book_id
+                prefix = "paper run" if alone else f"paper run: book {entry.book_id}"
+                if entry.outcome is None:
+                    assert entry.error is not None
+                    if isinstance(entry.error, SystemExit):
+                        said = entry.error.code
+                        detail = f"exited {entry.exit_code}" + (
+                            f": {said}" if isinstance(said, str) else ""
+                        )
+                    else:
+                        detail = f"failed: {_describe(entry.error)}"
+                    typer.echo(_scrubbed(f"{prefix}: {detail}", s), err=True)
+                    continue
+                _run_lines(prefix, entry.outcome, s)
+            codes = [entry.exit_code for entry in runs]
+            if WRITE_FAILED_EXIT_CODE in codes:
+                raise typer.Exit(WRITE_FAILED_EXIT_CODE)
+            if any(codes):
+                raise typer.Exit(CRASH_EXIT_CODE)
+            return
         try:
-            outcome = paper_run.tracking_run(s, write_chunk(s), broker(s, clock), clock)
+            outcome = paper_run.tracking_run(
+                s, write_chunk(s), broker(s, clock, chosen), clock, book_id=chosen
+            )
         except Exception as exc:
             raise _fail(
                 _scrubbed(f"paper run: failed: {_describe(exc)}", s), CRASH_EXIT_CODE
             ) from exc
-        _echo_scrubbed(
-            f"paper run: {outcome.status} (run {_fmt(outcome.run_id)}, session "
-            f"{_fmt(outcome.session)}, kind {_fmt(outcome.kind)})",
-            s,
-        )
-        for note in outcome.notes:
-            _echo_scrubbed(f"  {note}", s)
+        _run_lines("paper run", outcome, s)
         if outcome.exit_code:
             raise typer.Exit(outcome.exit_code)
 
     @paper_app.command("reconcile")
-    def paper_reconcile() -> None:
-        """Reconcile the journal with the broker now (spec req 6)."""
+    def paper_reconcile(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+        """Reconcile the book's journal with its broker now (spec req 6)."""
+        chosen = _checked_book(book)
         s = paper_settings()
+        bk = resolve_book(s, chosen)
         result = _paper_call(
-            s, lambda: reconcile_run.reconcile_command(s, write_chunk(s), broker(s, clock), clock)
+            s,
+            lambda: reconcile_run.reconcile_command(
+                s, write_chunk(s), broker(s, clock, bk), clock, book_id=bk
+            ),
         )
         _echo_scrubbed(f"paper reconcile: {result.status}; {result.mismatches_json}", s)
         if result.status != RECONCILE_OK:
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("kill")
-    def paper_kill(reason: Annotated[str, _REASON_OPTION]) -> None:
-        """Engage the kill switch (spec req 5); takes no run lock."""
+    def paper_kill(
+        reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        every_book: Annotated[
+            bool,
+            typer.Option("--all", help="every book with an open window", allow_from_autoenv=False),
+        ] = False,
+    ) -> None:
+        """Engage the book's kill switch, or `--all` books' (spec req 5; ADR 0017
+        B.5); takes no run lock."""
+        chosen = _checked_book(book)
+        if every_book and chosen is not None:
+            raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = paper_settings(reason)
-        event_id = _paper_call(s, lambda: window.kill(s, write_chunk(s), clock, reason))
-        _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
+        if not every_book:
+            bk = resolve_book(s, chosen)
+            event_id = _paper_call(
+                s, lambda: window.kill(s, write_chunk(s), clock, reason, book_id=bk)
+            )
+            _echo_scrubbed(f"paper kill: engaged (kill_switch event {event_id})", s)
+            return
+        books = _paper_call(s, lambda: paper_run.open_books(s))
+        if not books:
+            raise _fail(
+                "refused: no_window: no book has an open window", PAPER_REFUSAL_EXIT["no_window"]
+            )
+        codes: list[int] = []
+
+        def kill_book(target: str) -> Callable[[], int]:
+            return lambda: window.kill(s, write_chunk(s), clock, reason, book_id=target)
+
+        for each in books:
+            try:
+                event_id = _paper_call(s, kill_book(each))
+            except typer.Exit as failed:
+                typer.echo(f"paper kill: book {each}: NOT engaged (above)", err=True)
+                codes.append(failed.exit_code)
+                continue
+            _echo_scrubbed(f"paper kill: book {each}: engaged (kill_switch event {event_id})", s)
+        if codes:
+            raise typer.Exit(
+                WRITE_FAILED_EXIT_CODE if WRITE_FAILED_EXIT_CODE in codes else codes[0]
+            )
 
     @paper_app.command("resume")
     def paper_resume_(
         reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
         accept_broker_fills: Annotated[
             bool, typer.Option("--accept-broker-fills", help="settle lagging fills (req 8)")
         ] = False,
@@ -3095,18 +3200,21 @@ def make_app(
             ),
         ] = False,
     ) -> None:
-        """Settle, collect, reconcile and release the kill switch (spec req 5)."""
+        """Settle, collect, reconcile and release the book's kill switch (spec req 5)."""
+        chosen = _checked_book(book)
         s = paper_settings(reason)
+        bk = resolve_book(s, chosen)
         outcome = _paper_call(
             s,
             lambda: paper_resume.resume(
                 s,
                 write_chunk(s),
-                broker(s, clock),
+                broker(s, clock, bk),
                 clock,
                 reason,
                 accept_broker_fills,
                 accept_rejections=accept_rejections_flag,
+                book_id=bk,
             ),
         )
         lines = [
@@ -3234,11 +3342,19 @@ def make_app(
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
 
     @paper_app.command("abandon")
-    def paper_abandon(reason: Annotated[str, _REASON_OPTION]) -> None:
-        """End the window without flattening, owner-only (#247 Q13)."""
+    def paper_abandon(
+        reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+    ) -> None:
+        """End the book's window without flattening, owner-only (#247 Q13)."""
+        chosen = _checked_book(book)
         s = paper_settings(reason)
+        bk = resolve_book(s, chosen)
         result = _paper_call(
-            s, lambda: window.abandon(s, write_chunk(s), broker(s, clock), clock, reason)
+            s,
+            lambda: window.abandon(
+                s, write_chunk(s), broker(s, clock, bk), clock, reason, book_id=bk
+            ),
         )
         _echo_scrubbed(
             f"paper abandon: abandoned; reconciliation {result.reconciliation_id} "
@@ -3254,11 +3370,17 @@ def make_app(
             str | None, typer.Option("--session", help="the rebalance session, YYYY-MM-DD")
         ] = None,
         name: Annotated[str | None, typer.Option(help="the security_id")] = None,
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
-        """Append an override through the override page's writer (spec req 9)."""
+        """Append an override to the book's window through the override page's
+        writer (spec req 9)."""
         day = _parse_day("--session", session)
+        chosen = _checked_book(book)
         s = paper_settings(reason)
-        override_id = _paper_call(s, lambda: window.override(s, clock, kind, day, name, reason))
+        bk = resolve_book(s, chosen)
+        override_id = _paper_call(
+            s, lambda: window.override(s, clock, kind, day, name, reason, book_id=bk)
+        )
         _echo_scrubbed(f"paper override: override {override_id} written ({kind})", s)
 
     @paper_app.command("settle")
@@ -3270,18 +3392,22 @@ def make_app(
             ),
         ],
         reason: Annotated[str, _REASON_OPTION],
+        book: Annotated[str | None, _BOOK_OPTION] = None,
     ) -> None:
-        """Settle one order no collector can close, owner-only (spec req 17)."""
+        """Settle one order of the book's that no collector can close, owner-only
+        (spec req 17)."""
         if len(order) != 1:
             raise _fail("--order is given exactly once", USAGE_ERROR)
         if _blank_text(order[0]):
             raise _fail("--order must be non-blank", USAGE_ERROR)
         (client_order_id,) = order
+        chosen = _checked_book(book)
         s = paper_settings(reason)
+        bk = resolve_book(s, chosen)
         result = _paper_call(
             s,
             lambda: window.settle_order(
-                s, write_chunk(s), broker(s, clock), clock, client_order_id, reason
+                s, write_chunk(s), broker(s, clock, bk), clock, client_order_id, reason, book_id=bk
             ),
         )
         _echo_scrubbed(
