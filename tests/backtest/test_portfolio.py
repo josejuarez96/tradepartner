@@ -6,7 +6,12 @@ import math
 
 import pytest
 
-from tradepartner.backtest.portfolio import drifted_weights, target_weights, trades_from
+from tradepartner.backtest.portfolio import (
+    _selected_count,
+    drifted_weights,
+    target_weights,
+    trades_from,
+)
 
 
 def _scores(n: int) -> dict[str, float]:
@@ -26,6 +31,27 @@ def test_number_selected_is_the_ceiling_without_float_error(
     n: int, fraction: float, k: int
 ) -> None:
     """0.1 * 30 is 3.0000000000000004 in floating point; that must still select 3."""
+    assert len(target_weights(_scores(n), fraction, "equal")) == k
+
+
+@pytest.mark.parametrize("n", [1, 2, 30, 1000])
+@pytest.mark.parametrize("fraction", [1e-7, 5e-7, 1e-12, 5e-324])
+def test_a_tiny_top_fraction_still_selects_one_name(n: int, fraction: float) -> None:
+    """#1446: a valid but tiny fraction used to round to 0 and divide by zero."""
+    assert target_weights(_scores(n), fraction, "equal") == {f"S{n - 1:04d}": 1.0}
+
+
+@pytest.mark.parametrize("fraction", [1e-7, 0.1, 1.0])
+def test_an_empty_set_selects_none(fraction: float) -> None:
+    assert _selected_count(0, fraction) == 0
+
+
+@pytest.mark.parametrize(
+    ("n", "fraction", "k"),
+    [(30, 0.05, 2), (30, 0.10, 3), (30, 0.20, 6), (2000, 0.05, 100), (2000, 0.20, 400)],
+)
+def test_registered_fractions_keep_their_counts(n: int, fraction: float, k: int) -> None:
+    """The registered values (0.05, 0.10, 0.20) select what they selected before #1446."""
     assert len(target_weights(_scores(n), fraction, "equal")) == k
 
 
