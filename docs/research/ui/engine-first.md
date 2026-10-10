@@ -18,9 +18,9 @@ The same pipeline runs in two places: **the lab** (a backtest, over history) and
 | 5. Risk gate | frozen limits per window (position weight .05, order notional, orders per run, drawdown .30 …) | paper: `decisions` (`trade`, `skip_*`, `dust`, `forced_exit`), halts |
 | 6. Orders and fills | sells first, then buys; costs `per_side_bps`; paper orders have a full event chain | backtest: `fill_price`, `shares`, `cost_paid`; paper: `orders` → `order_events` → `fills` → `outcomes` |
 | 7. Portfolio and marks | daily values, cash, exits (delisted, stale) | `trial_equity` per cost level; `positions_daily`, `lots` |
-| 8. Judgement | metrics, luck check (deflated Sharpe with the family's N), red flag, exam rules | `trial_metrics`, `trial_results(n_trials, sr_star, dsr …)`, `owner_decisions` |
+| 8. Judgement | metrics, DSR (deflated Sharpe with the family's N), red flag, holdout rules | `trial_metrics`, `trial_results(n_trials, sr_star, dsr …)`, `owner_decisions` |
 
-Around the machine sit the **registry** (every run is a trial with its frozen settings, `params_sha256`, `code_version`, `data_cutoff`, `store_max_ingested_at`), the **lab** (sweeps with pre-registered `promote_at_least` / `retire_below`), the **exam rules** (development boundary, holdout spent once, forward exam on paper) and, for books, the **daily run** (switch check → stale-data check → collect fills → reconcile → mark → plan → trade) with the kill switch and reconciliation.
+Around the machine sit the **registry** (every run is a trial with its frozen settings, `params_sha256`, `code_version`, `data_cutoff`, `store_max_ingested_at`), the **lab** (sweeps with pre-registered `promote_at_least` / `retire_below`), the **holdout rules** (development boundary, holdout spent once, forward holdout on paper) and, for books, the **daily run** (switch check → stale-data check → collect fills → reconcile → mark → plan → trade) with the kill switch and reconciliation.
 
 This is much richer than what the spike shows. The spike shows outcomes (a value, a chart, a list); the engine records *process*. A lab UI should show the process.
 
@@ -35,7 +35,7 @@ This is much richer than what the spike shows. The spike shows outcomes (a value
 | W&B / MLflow | Runs table, compare runs, parallel coordinates for sweeps, lineage (commit, data, config) | Every backtest as a run with lineage; a diff between two runs | Sweep plots that invite picking the best cell |
 | StrategyQuant / Build Alpha / Numerai | Walk-forward grid, Monte Carlo fans, noise tests *(Build Alpha unverified)*; Numerai leads with consistency across periods | Consistency per period (per year) as a headline; out-of-sample zones shaded on the curve | 3D surfaces |
 
-**The gap nobody fills:** no platform found puts the number of tries and the deflated Sharpe next to the winning result. TradePartner already computes both (`n_trials`, `sr_star`, `dsr`). Making that honesty visible is the product's clearest point of difference.
+**The gap nobody fills:** no platform found puts the number of trials (N) and the deflated Sharpe next to the winning result. TradePartner already computes both (`n_trials`, `sr_star`, `dsr`). Making that honesty visible is the product's clearest point of difference.
 
 ## 3. Proposed structure: an instrument with a lab notebook
 
@@ -43,16 +43,16 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 
 1. **Bench (home).** Is the machine healthy, is anything waiting on the owner, how are the books doing against what was expected. Quiet when nothing is wrong. (Today's Overview, kept.)
 2. **Lab.** Ideas → pre-registration → trials → judgement.
-   - **Run ledger** (MLflow-style): every trial as one row with its family, window, N at the time, luck check, status (`ok`, `refused_*`). Rows open the trial page.
+   - **Run ledger** (MLflow-style): every trial as one row with its family, window, N at the time, DSR, status (`ok`, `refused_*`). Rows open the trial page.
    - **Trial page**, the lab's centre:
      - *Run identity:* hypothesis, frozen settings hash, code version, data cutoff, run date.
-     - *Honesty strip:* versions tried in the family (N), the luck bar SR*, the luck check, exam status (locked / spent / forward), red flag if raised.
+     - *Honesty strip:* N, the number of trials in the family, SR*, the DSR, holdout status (locked / spent / forward), red flag if raised.
      - *Hero:* equity against the S&P with the zones shaded on the timeline (development window, dead months, holdout), event dots on rebalances.
      - *Consistency:* one bar per year, excess over the S&P.
      - *Assumptions panel:* universe rule, cost per side and the cost sensitivity levels (0/15/30/60/100 bp, all already computed), fill price, survivorship gap.
      - *Checks:* pass/fail with values (gap within limit, red flag, enough periods).
    - **Rebalance step-through: the machine view.** Pick a rebalance (or press play) and watch one pass through the pipeline, stage by stage: universe (N in, exclusions by rule), signal (distribution with the cut line), selected names, targets, trades and costs, portfolio after. This is the screen that teaches how the engine works.
-   - **Sweeps:** variants as a small multiple or heatmap (by number of parameters), always beside N and the moving luck bar, with the pre-registered promote/retire lines drawn on.
+   - **Sweeps:** variants as a small multiple or heatmap (by number of parameters), always beside N and the moving SR*, with the pre-registered promote/retire lines drawn on.
 3. **Books.** The same machine, run daily.
    - **Run timeline:** each session's run as its steps (switch check, stale data, fills, reconcile, mark, plan, trade) with a status for each; a failed step says what happened and what holds.
    - **Order chain:** decision → order → broker events → fill → outcome, with the risk check that applied.
@@ -62,7 +62,7 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 ## 4. Aesthetic: scientific instrument, not trading app
 
 - **Figures, not widgets.** Each chart is a numbered figure with a caption that says what it shows and how it was computed (the method note the Overview already has). Axes with ticks and units.
-- **Uncertainty is always drawn.** Bands, intervals, the luck bar. A number a researcher would question carries its ⓘ.
+- **Uncertainty is always drawn.** Bands, intervals, SR*. A number a researcher would question carries its ⓘ.
 - **The pipeline as a schematic.** A small, labelled diagram of the eight stages, reused as navigation in the step-through and in a book's run timeline; the current stage lit.
 - **Identity in mono, prose in sans.** Run IDs, hashes, code versions, dates in IBM Plex Mono; explanation in Plex Sans. (Keeps direction E's tokens.)
 - **Analog where it earns it:** candles and order lines on a holding's chart, tick-marked scales, a replay scrubber. Not as decoration.

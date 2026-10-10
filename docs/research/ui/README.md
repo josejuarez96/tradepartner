@@ -1,5 +1,7 @@
 # End-user app: design notes
 
+> **Terms (2026-10-10):** this is a historical record. Its invented names ("luck check", "luck bar", "versions tried", "tries", "exam", "final exam") are retired; the app uses DSR, SR*, N (number of trials) and holdout, explained with an ⓘ. See [interaction.md](interaction.md) §9 and §10.
+
 **Status:** spike (`spike/design-ui`), prototype under [`web/`](../../../web/). **Date:** 2026-10-10 · **Direction:** v4, built on [shadcn/ui](https://github.com/shadcn-ui/ui) (the stack Base44 apps use: React, Vite, Tailwind, Radix, lucide)
 
 > **Current direction: E, "research-grade Robinhood"**, chosen by the owner on 2026-10-10 after five samples (C rejected as a wall of text). The design contract is [DESIGN.md](DESIGN.md); the samples are in [`screens/samples/`](screens/samples/). Sections below about v4 describe the previous build and are kept for history.

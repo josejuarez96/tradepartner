@@ -60,7 +60,7 @@ Ranked by who notices (P0 anyone, P1 a designer/developer, P2 polish). IDs match
 
 ### Owner's rules (from review, 2026-10-10)
 - [ ] **Say it once.** No label repeated in the same block: not the title, a code badge, the first words of the description and a "Next step" line all naming the same thing. Internal codes (B10, H1) appear once, as a reference, never as a badge beside the name. If two lines mean the same, cut one. This goes for "Ahead" next to a "+2.3 pts" badge, an icon next to the word it illustrates, and a subtitle that rewords its heading.
-- [ ] **No coloured bars to decode.** Segmented or multi-colour horizontal bars (evidence splits, progress strips) need a legend to read. Say it in words with the numbers beside it: "Mostly supported (5 studies: 3 for, 2 mixed)", "73% could be luck", "Exam 48 of 63 trading days".
+- [ ] **No coloured bars to decode.** Segmented or multi-colour horizontal bars (evidence splits, progress strips) need a legend to read. Say it in words with the numbers beside it: "Mostly supported (5 studies: 3 for, 2 mixed)", "DSR 0.73 (could be chance)", "Forward holdout 48 of 63 sessions".
 
 ### Don't over-correct
 - Restraint done on purpose is not "timid". Minimal is fine when it's a decision.
@@ -94,7 +94,7 @@ Conclusion: v4 still sits on the first-order median. **A re-skin won't fix it**;
 
 ## How we avoid it from here
 
-1. **Ground the direction in TradePartner's own world before writing code.** Candidate source material from the repo itself: the trial registry, the pre-registered hypothesis file (prior, stop rule, retire condition), the exam (holdout spent once), the brokerage statement and trade confirm, the plan's task lines. Pick one structural idea from that, not a "look".
+1. **Ground the direction in TradePartner's own world before writing code.** Candidate source material from the repo itself: the trial registry, the pre-registered hypothesis file (prior, stop rule, retire condition), the holdout (spent once), the brokerage statement and trade confirm, the plan's task lines. Pick one structural idea from that, not a "look".
 2. **Write it down once** in a `DESIGN.md` (Google's open format, <https://github.com/google-labs-code/design.md>): 4 to 6 colours with roles, the faces, the layout idea, one signature detail. Every screen is built from it (prevents X1 drift).
 3. **Review the plan against this checklist before building.** For each choice, ask "would I have made this for any similar app?" The owner confirms the plan.
 4. **Re-scan every change.** The scanner exits 2 on any P0/P1, so it can gate the prototype (`node detect.mjs web/src`); the render-only tells get a screenshot check.

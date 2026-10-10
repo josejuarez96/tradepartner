@@ -1,5 +1,7 @@
 # Base44 prompt: TradePartner app
 
+> **Terms (2026-10-10):** this is a historical record. Its invented names ("luck check", "luck bar", "versions tried", "tries", "exam", "final exam") are retired; the app uses DSR, SR*, N (number of trials) and holdout, explained with an ⓘ. See [interaction.md](interaction.md) §9 and §10.
+
 Paste everything below the line into Base44.
 
 ---

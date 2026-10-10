@@ -12,15 +12,15 @@ Every strategy moves through the same stages. Each row is one stage: what the ow
 | **1. Evidence** | Reads what published research says | `docs/research/claims.toml` (282 graded claims) | nothing (files) | The claims an idea rests on and their grades |
 | **2. Idea** | Ranks the backlog; parks or retires ideas | `docs/research/hypothesis-backlog.md` (B1 to B10) | nothing (files) | Prior, evidence, data and engine work needed, cost (S/M/L), kill criterion, value of the information |
 | **3. Specify** | An agent drafts the file; he merges it, then registers | `docs/hypotheses/<slug>.md` or `docs/sweeps/<slug>.md`; `tradepartner hypothesis register`, `sweep register` | `hypotheses` (params, `params_sha256`, holdout window, `registered_at`); lab tables for sweeps | The parameters, exactly as frozen: universe, signal, top fraction, cadence, costs, holdout, the promote and retire lines |
-| **4. Develop** | Runs it, usually overnight | `tradepartner backtest <slug>`, `sweep run` | One **trial** per run (`trials`, `trial_results`, `trial_metrics`, `trial_equity`, `trial_rebalances`, `trial_weights`), N rises | The result and its cost in tries: excess over the S&P, luck check, cost sensitivity, the rebalances |
-| **5. Judge** | Promotes the winner or retires the sweep, against lines set before the run | `sweep report`, `sweep promote` / `retire`, `lab status` | `owner_decisions` (`promotion`, `sweep_retired`) | The variant chosen by the pre-registered statistic, the floor it had to clear, the family's N and luck bar |
-| **6. Exam** | Spends the holdout once, on one finalist, with a reason; or lets the paper book judge it | `backtest --spend-holdout --holdout-reason`; `decision ...` | A `holdout` trial; `owner_decisions` (`holdout_spend`) | That the exam is still unspent, what it would cost to spend it, then the one result |
-| **7. Paper** | Starts a book; checks it each morning; kills or resumes it with a reason; reads the tracking report | `paper start`, then the scheduled `paper run` (launchd); `paper status`, `kill`, `resume`, `report`, `check`, `shakedown` | `paper_windows`, `signals`, `decisions`, `orders`, `order_events`, `fills`, `positions_daily`, `reconciliations`, `alerts`, `kill_switch`, `paper_reports` | Did it run, is it reconciled, what it holds and why, how far it is from its backtest, how far into its forward exam |
+| **4. Develop** | Runs it, usually overnight | `tradepartner backtest <slug>`, `sweep run` | One **trial** per run (`trials`, `trial_results`, `trial_metrics`, `trial_equity`, `trial_rebalances`, `trial_weights`), N rises | The result and its cost in trials (N): excess over the S&P, DSR, cost sensitivity, the rebalances |
+| **5. Judge** | Promotes the winner or retires the sweep, against lines set before the run | `sweep report`, `sweep promote` / `retire`, `lab status` | `owner_decisions` (`promotion`, `sweep_retired`) | The variant chosen by the pre-registered statistic, the floor it had to clear, the family's N and SR* |
+| **6. Holdout** | Spends the holdout once, on one finalist, with a reason; or lets the paper book judge it | `backtest --spend-holdout --holdout-reason`; `decision ...` | A `holdout` trial; `owner_decisions` (`holdout_spend`) | That the holdout is still unspent, what it would cost to spend it, then the one result |
+| **7. Paper** | Starts a book; checks it each morning; kills or resumes it with a reason; reads the tracking report | `paper start`, then the scheduled `paper run` (launchd); `paper status`, `kill`, `resume`, `report`, `check`, `shakedown` | `paper_windows`, `signals`, `decisions`, `orders`, `order_events`, `fills`, `positions_daily`, `reconciliations`, `alerts`, `kill_switch`, `paper_reports` | Did it run, is it reconciled, what it holds and why, how far it is from its backtest, how far into its forward holdout |
 | **8. Live** | One more book on the live endpoint, under its own ADR (Phase 6) | not built | the same journal | The same as paper, plus the live limits |
 | **9. Record** | The result becomes a `TP-` claim, good or bad; the backlog item moves on | `claims.toml`, the backlog | nothing (files) | What was learned, in a sentence, beside the evidence it changes |
 
 Two rules shape the whole flow, and the app must carry them, not work around them:
-- **Every run counts.** A run is a trial and raises the family's N, which raises the luck bar every later result must clear. There is no free rerun.
+- **Every run counts.** A run is a trial and raises the family's N, which raises SR* every later result must clear. There is no free rerun.
 - **Parameters are frozen once registered.** A changed parameter is a new sweep variant, registered and counted, never an edit.
 
 ## 2. The routine
@@ -30,8 +30,8 @@ Two rules shape the whole flow, and the app must carry them, not work around the
 | Every evening, 18:30 ET (launchd) | `tradepartner ingest` brings the store up to the session | Nothing, unless it failed or data is stale |
 | Every session, before the open (launchd) | `paper run` for each book: switch check, stale-data check, collect fills, reconcile, mark, plan, trade | Nothing, unless a run failed, halted, skipped, or reconciliation mismatched |
 | Each morning, a minute or two, often on the phone | He checks | Anything wrong or waiting on me? How are the books doing against what was expected? |
-| When a run finishes (overnight backtest, sweep) | He reads the result | What did it find, could it be luck, what does it cost in tries, what is the decision now |
-| When a decision is due | Promote or retire, spend an exam, start a book, kill or resume, set the boundary | The decision, its consequence, the evidence, and the one action (with a reason) |
+| When a run finishes (overnight backtest, sweep) | He reads the result | What did it find, could it be chance (DSR), what does it cost in trials, what is the decision now |
+| When a decision is due | Promote or retire, spend a holdout, start a book, kill or resume, set the boundary | The decision, its consequence, the evidence, and the one action (with a reason) |
 | Weekly, or when a verdict lands | Reviews the backlog | Ideas by stage, what is blocked on what, what to run next |
 
 ## 3. What this means for the app
@@ -40,15 +40,15 @@ Two rules shape the whole flow, and the app must carry them, not work around the
 
 1. **Today** (home). The routine's first question: is the machine healthy (last ingest, last paper run per book, reconciliation, alerts), what is waiting on me (decisions due, runs to start, questions to answer), how each book is doing against its expected range. Quiet when nothing is wrong. Most mornings this is the only screen opened, often on the phone.
 
-2. **Strategies** (the pipeline). Every idea in one list, grouped by stage: Idea, Specified, In development, Judged, Exam, On paper, Live, Retired. One row per strategy: its stage, what it is waiting on, its latest numbers if it has any. This replaces today's Research screen's mix of a results map, a needs-you list and stage groups.
+2. **Strategies** (the pipeline). Every idea in one list, grouped by stage: Idea, Specified, In development, Judged, Holdout, On paper, Live, Retired. One row per strategy: its stage, what it is waiting on, its latest numbers if it has any. This replaces today's Research screen's mix of a results map, a needs-you list and stage groups.
 
 3. **A strategy's page**, laid out like the backtester because the process is the same shape:
    - **Left: the specification**, the frozen parameters as registered (universe, signal, top fraction, cadence, costs, holdout window, the promote and retire lines, the kill criterion), with its fingerprint and registration date. Read-only, because the file is frozen; the panel says how a change would happen (a new variant, counted).
-   - **Right: tabs that follow the stages it has reached.** *Evidence* (its claims), *Runs* (the trial log: every run, its N at the time, its status, including refusals), *Result* (one run: the equity against the S&P, the rebalances log, the statistics with the luck check; the step-through lives here), *Exam*, *Paper* (its book), *Decisions* (every owner decision on it, with reasons).
-   - **The action is the engine's command.** Under ADR 0011 and ADR 0018 the app writes only the override and kill/resume, so the "Run" control shows the exact command to run, with its consequence stated ("adds trial 3 to the momentum family; the luck bar rises"). This is deliberate, not a stopgap: it is the app being the code, and it teaches the engine. A later ADR can let the app run it.
-   - **No parameter form for tweak-and-rerun.** The backtester's editable parameters are exactly what this system exists to stop: each tweak is a hidden trial. Here a parameter change is a new registered variant, and the page shows its cost in tries before it happens.
+   - **Right: tabs that follow the stages it has reached.** *Evidence* (its claims), *Runs* (the trial log: every run, its N at the time, its status, including refusals), *Result* (one run: the equity against the S&P, the rebalances log, the statistics with the DSR; the step-through lives here), *Holdout*, *Paper* (its book), *Decisions* (every owner decision on it, with reasons).
+   - **The action is the engine's command.** Under ADR 0011 and ADR 0018 the app writes only the override and kill/resume, so the "Run" control shows the exact command to run, with its consequence stated ("adds trial 3 to the momentum family; SR* rises"). This is deliberate, not a stopgap: it is the app being the code, and it teaches the engine. A later ADR can let the app run it.
+   - **No parameter form for tweak-and-rerun.** The backtester's editable parameters are exactly what this system exists to stop: each tweak is a hidden trial. Here a parameter change is a new registered variant, and the page shows its cost in trials (N) before it happens.
 
-4. **Books**, the operations side: one book's runs, holdings and why, orders and their journal chain, tracking against its backtest, the forward exam's progress, kill and resume.
+4. **Books**, the operations side: one book's runs, holdings and why, orders and their journal chain, tracking against its backtest, the forward holdout's progress, kill and resume.
 
 5. **Data**, rarely: the health report, freshness, gaps.
 
@@ -57,8 +57,8 @@ Two rules shape the whole flow, and the app must carry them, not work around the
 | Decision | The one picture that helps | Already in the engine? |
 |---|---|---|
 | Is a book on track? | Its value against the S&P with the backtest's expected range | Yes: equity, benchmark, `tracking_error_spy` |
-| Did the backtest find anything? | Excess over the S&P across the window, with the development and exam windows marked | Yes: `trial_equity` |
-| Could it be luck? | The luck check on its zoned scale | Yes: `trial_results.dsr` |
+| Did the backtest find anything? | Excess over the S&P across the window, with the development and holdout windows marked | Yes: `trial_equity` |
+| Could it be chance? | The DSR on its zoned scale | Yes: `trial_results.dsr` |
 | Does it survive costs? | The result at each cost level | Yes: `trial_metrics` per `cost_per_side_bps` |
 | Which variant does the sweep promote? | Variants against the pre-registered floor, beside N | Yes: lab tables |
 | Why does it hold this stock? | The rank and the cut at the last rebalance | Paper: yes (`signals`); backtest: **no**, scores are not persisted |
@@ -83,7 +83,7 @@ Everything else (month grids, histograms, turnover bars) is a detail opened on d
    |---|---|---|
    | **Idea** | Evidence, backlog item | A hypothesis or sweep file is registered |
    | **Testing** | Specify, develop, judge | A variant is promoted (or the sweep is retired) |
-   | **Exam** | The holdout, or the forward exam's first rebalances | The exam is passed or failed |
+   | **Holdout** | The holdout, or the forward holdout's first rebalances | The holdout is passed or failed |
    | **Paper** | The paper book | The live ADR, or retired |
    | **Live** | A live book | Retired |
 
@@ -91,9 +91,9 @@ Everything else (month grids, histograms, turnover bars) is a detail opened on d
 3. **Writing a hypothesis file: an agent framework.** The owner wants agents to draft strategies, not a form. That fits how the repo already works (agents draft hypothesis files and ADRs; the owner merges and registers) and ADR 0008 (LLM output is advisory and never reaches an order): the agent proposes a file, the owner reviews it, and registration stays the deterministic `hypothesis register`. In the app this would be an action on an idea ("draft this as a hypothesis") that starts the agent and later shows its draft for review. It needs its own decision before it is built: the design standard has "no chat, no AI cards", and ADR 0018 allows only kill and resume as writes. Open: how the app starts an agent, and where the draft is reviewed (a PR, or the app).
 4. **Starting runs from the app: yes, a Run button, and it follows the engine's rules** (owner, 2026-10-10). What that means, from the code:
    - **It runs registered strategies only.** No parameter fields: the only inputs are the ones `tradepartner backtest` takes (a window within the development years, a note). A changed parameter is still a new registered variant.
-   - **It runs the engine's own command**, as ADR 0018 already runs kill and resume (a CLI subprocess), so every rule in `backtest/holdout.decide` applies unchanged. The engine, not the app, decides; the app shows the engine's answer word for word: `run`, `refused_window` (before the start, past the development boundary, into exam months), `refused_holdout`, `refused_gap` (survivorship gap over the limit), `refused_variant`, `needs_gap`.
-   - **Its cost is shown before the confirm:** "this becomes the next trial in the momentum family; every later result must clear a higher luck bar." A refused run is logged but does not count (the family's N counts `ok` in-sample trials only, `results.family_n`).
-   - **The exam and the gap override are separate actions, never options on Run.** Spending a holdout is `--spend-holdout` with a required reason; accepting a gap is `--override-gap` with a required reason. Each has its own confirm stating that it happens once and is recorded as an owner decision.
+   - **It runs the engine's own command**, as ADR 0018 already runs kill and resume (a CLI subprocess), so every rule in `backtest/holdout.decide` applies unchanged. The engine, not the app, decides; the app shows the engine's answer word for word: `run`, `refused_window` (before the start, past the development boundary, into holdout months), `refused_holdout`, `refused_gap` (survivorship gap over the limit), `refused_variant`, `needs_gap`.
+   - **Its cost is shown before the confirm:** "this becomes the next trial in the momentum family; every later result must clear a higher SR*." A refused run is logged but does not count (the family's N counts `ok` in-sample trials only, `results.family_n`).
+   - **The holdout spend and the gap override are separate actions, never options on Run.** Spending a holdout is `--spend-holdout` with a required reason; accepting a gap is `--override-gap` with a required reason. Each has its own confirm stating that it happens once and is recorded as an owner decision.
    - **It never contends with the scheduled jobs.** A backtest writes to the store, so it waits for a quiet interval, as the sweep runner already does (`backtest/quiet.py`: never during the evening ingest or a book's submit window), and one run at a time. A kill is never delayed by it (ADR 0018).
    - **It reports, it does not hide.** Queued, running, finished or refused, with the result page when done and the engine's message when not.
    - **Needs** an amendment to ADR 0018's writes (run backtest and sweep as subprocesses, under these rules) with a `safety-reviewer` pass. Starting a run from the phone waits on the phone-access decision.
