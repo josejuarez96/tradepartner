@@ -36,8 +36,8 @@ DEFAULT_INSTRUCTIONS = (
 )
 
 #: The pilot's nine options, in req 4's fixed order (the model leans toward the
-#: first option it sees; the perturbation probe permutes this order to measure
-#: that bias, never this module). Descriptions avoid every store table name as a
+#: first option it sees; the perturbation pass below reverses this order to
+#: measure that bias). Descriptions avoid every store table name as a
 #: whole token (req 14; test (c)) and name no model field, gold column or review
 #: column.
 DEFAULT_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -144,4 +144,12 @@ DEFAULT_OPTION_SET = OptionSet(
     version="1",
     instructions=DEFAULT_INSTRUCTIONS,
     options=DEFAULT_OPTIONS,
+)
+
+#: C5's one reported order perturbation. The option ids and descriptions are
+#: unchanged; the distinct version and order make its recorded hash unambiguous.
+REVERSED_OPTION_SET = OptionSet(
+    version="1-reversed",
+    instructions=DEFAULT_INSTRUCTIONS,
+    options=tuple(reversed(DEFAULT_OPTIONS)),
 )

@@ -14,6 +14,9 @@ with the holdout flags, and is then a spend; a refused open reads nothing and
 returns. On a frame batch (`full`, `prospective`) it first runs the **drift probe** of
 C5 under its own `robustness` run (`departure-reason-drift`) and closes the batch `failed` with
 `drift probe not passed` before its first call unless that run's verdict is `pass`.
+The reported order perturbation is a separate `departure-reason-drift` `dev` run:
+it sends each baseline item's final passage with the reversed option set and
+records `flip_rate` and the reversed `unresolved` share.
 It then loads the bound rows through `research.load_dataset`, builds every first
 packet, and runs **`spend_check`** over every inference record in the research store
 before the first call; before every call it checks the spend recorded so far plus
@@ -91,7 +94,12 @@ from tradepartner.research.labeling.packets import (
     build_packet,
     next_kind,
 )
-from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, UNRESOLVED, OptionSet
+from tradepartner.research.labeling.questions import (
+    DEFAULT_OPTION_SET,
+    REVERSED_OPTION_SET,
+    UNRESOLVED,
+    OptionSet,
+)
 from tradepartner.research.models import (
     ModelAuthRejected,
     ModelClient,
@@ -120,6 +128,7 @@ QUESTION: Final = "departure_reason"
 INFERENCES_DATASET: Final = "departure-reason-inferences"
 #: C5's drift registration.
 DRIFT_SLUG: Final = "departure-reason-drift"
+PILOT_SLUG: Final = "departure-reason-pilot"
 #: C5: the probe set's size.
 DRIFT_PROBE_SIZE: Final = 20
 #: Splits that bind a frame (a batch); every other split is a gold split, scored.
@@ -753,13 +762,13 @@ class DriftProbe:
     size: int = DRIFT_PROBE_SIZE
 
 
-def _baseline_sha256(conn: duckdb.DuckDBPyConnection, run_id: int) -> str:
+def _baseline_sha256(conn: duckdb.DuckDBPyConnection, run_id: int, *, kind: str = "drift") -> str:
     row = conn.execute(
         "SELECT artifact_sha256 FROM research_results WHERE run_id = ? AND outcome = 'ok'",
         [run_id],
     ).fetchone()
     if row is None or not row[0]:
-        raise _Stop(f"drift baseline run {run_id} has no ok result")
+        raise _Stop(f"{kind} baseline run {run_id} has no ok result")
     return str(row[0])
 
 
@@ -877,6 +886,130 @@ def _run_drift(
     return None if verdict is None else verdict[0]
 
 
+@dataclass(frozen=True)
+class _ReversedBaseline:
+    run_id: int
+    sha256: str
+    records: Mapping[str, Mapping[str, Any]]
+
+
+def _prepare_reversed_baseline(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    dataset_id: int,
+    baseline_run_id: int,
+    model: str,
+) -> _ReversedBaseline:
+    """Verify the baseline and refuse an empty comparison before opening a run."""
+    baseline_run = conn.execute(
+        "SELECT r.dataset_id, r.split, g.slug FROM research_runs r "
+        "JOIN research_registrations g USING (registration_id) WHERE r.run_id = ?",
+        [baseline_run_id],
+    ).fetchone()
+    if baseline_run != (dataset_id, "dev", PILOT_SLUG):
+        raise ValueError(f"reversed baseline run {baseline_run_id} must be this pilot dev dataset")
+    try:
+        expected = _baseline_sha256(conn, baseline_run_id, kind="reversed")
+    except _Stop as stop:
+        raise ValueError(stop.message) from None
+    baseline_path = datafiles.inference_path(settings, baseline_run_id)
+    if not baseline_path.is_file() or _file_sha256(baseline_path) != expected:
+        raise ValueError(f"reversed baseline run {baseline_run_id} records changed")
+    records = final_records(datafiles.read_jsonl(baseline_path))
+    comparable = 0
+    for lid, record in records.items():
+        if record["reason"] != "ok":
+            continue
+        if (
+            record["option_set_hash"] != DEFAULT_OPTION_SET.hash
+            or record["model_id_requested"] != model
+        ):
+            raise ValueError(f"reversed baseline run {baseline_run_id} differs for {lid}")
+        comparable += 1
+    if not comparable:
+        raise ValueError(f"reversed pass has no comparable baseline items in run {baseline_run_id}")
+    return _ReversedBaseline(baseline_run_id, expected, records)
+
+
+def _label_reversed(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    client_factory: ClientFactory,
+    handle: RunHandle,
+    caller_args: Mapping[str, Any],
+    baseline: _ReversedBaseline,
+) -> BatchResult:
+    """Record C5's one reversed-order `dev` pass against the baseline's final calls."""
+    rows = select_rows(load_dataset(handle))
+    option_set: OptionSet = caller_args["option_set"]
+    if option_set.hash != REVERSED_OPTION_SET.hash:
+        raise _Stop("reversed pass needs the reversed option set")
+    limits = packet_limits(settings.research.labeling)
+    packets: list[tuple[str, Packet]] = []
+    comparable_rows: list[dict[str, Any]] = []
+    skipped_baseline: list[str] = []
+    for row in rows:
+        lid = str(row["listing_end_id"])
+        record = baseline.records.get(lid)
+        if record is None or record["reason"] != "ok":
+            skipped_baseline.append(lid)
+            continue
+        packet = build_packet(row, option_set, limits, record["passage_kind"])
+        if packet.sha256 != record["passage_sha256"]:
+            raise _Stop(f"reversed packet {lid} differs from its baseline passage")
+        packets.append((lid, packet))
+        comparable_rows.append(row)
+    if not packets:
+        raise _Stop("reversed pass has no comparable baseline items in the dev dataset")
+    caller = _start_caller(settings, handle, client_factory, caller_args, packets)
+    comparisons: list[scoring.DriftComparison] = []
+    unresolved = 0
+    try:
+        for lid, packet in packets:
+            response = caller.call(lid, packet)
+            option = response.selected_option if response.reason == "ok" else None
+            unresolved += option is None or option == UNRESOLVED
+            comparisons.append(
+                scoring.DriftComparison(lid, option, baseline.records[lid]["selected_option"])
+            )
+    finally:
+        caller.close()
+    path = caller.records_path
+    records = datafiles.read_jsonl(path) if path.is_file() else []
+    inferences_id = (
+        _register_records(conn, handle, path, comparable_rows, len(records)) if records else None
+    )
+    rate = scoring.flip_rate(comparisons)
+    unresolved_share = unresolved / len(comparisons)
+    outcome = write_result(
+        conn,
+        handle,
+        primary_value=rate,
+        primary_ci_low=rate,
+        primary_ci_high=rate,
+        n_observations=len(comparisons),
+        n_clusters=len(comparisons),
+        n_configurations=1,
+        artifact_sha256=_file_sha256(path) if records else "",
+        artifact_path=str(path),
+        exploratory={
+            "baseline_run_id": baseline.run_id,
+            "baseline_sha256": baseline.sha256,
+            "unresolved_share": unresolved_share,
+            "skipped_baseline": skipped_baseline,
+            "flips": [c.listing_end_id for c in comparisons if c.option != c.baseline_option],
+        },
+    )
+    return BatchResult(
+        handle.run_id,
+        outcome,
+        None,
+        inferences_id,
+        flip_rate=rate,
+        unresolved_share=unresolved_share,
+    )
+
+
 def _start_caller(
     settings: Settings,
     handle: RunHandle,
@@ -922,6 +1055,8 @@ class BatchResult:
     inferences_dataset_id: int | None = None
     shortlist: crosswalk.Shortlist | None = None
     packets_refused: tuple[str, ...] = ()
+    flip_rate: float | None = None
+    unresolved_share: float | None = None
 
 
 def run_batch(
@@ -935,6 +1070,7 @@ def run_batch(
     model: str,
     option_set: OptionSet = DEFAULT_OPTION_SET,
     drift: DriftProbe | None = None,
+    reversed_baseline_run_id: int | None = None,
     flags: Flags | None = None,
     reasons: Reasons | None = None,
     configurations: int = 1,
@@ -960,6 +1096,12 @@ def run_batch(
         raise ValueError(
             f"a {split!r} batch runs the drift probe first: pass drift=DriftProbe(...)"
         )
+    if reversed_baseline_run_id is not None and (slug != DRIFT_SLUG or split != "dev"):
+        raise ValueError("the reversed-order pass needs departure-reason-drift on dev")
+    if reversed_baseline_run_id is not None and (
+        accepted_from is not None or accepted_to is not None or limit is not None
+    ):
+        raise ValueError("the reversed-order pass cannot use accepted dates or limit")
     config = {
         "model": model,
         "option_set_version": option_set.version,
@@ -972,8 +1114,14 @@ def run_batch(
         "agreement_sample_size": agreement_sample_size,
         "max_items": max_items,
         "drift": dataclasses.asdict(drift) if drift else None,
+        "reversed_baseline_run_id": reversed_baseline_run_id,
     }
     with _run_lock(settings):
+        reversed_baseline = (
+            _prepare_reversed_baseline(conn, settings, dataset_id, reversed_baseline_run_id, model)
+            if reversed_baseline_run_id is not None
+            else None
+        )
         handle = _open_durable_run(
             conn,
             settings,
@@ -998,6 +1146,12 @@ def run_batch(
             "monotonic": monotonic,
         }
         try:
+            if reversed_baseline is not None:
+                reversed_result = _label_reversed(
+                    conn, settings, client_factory, handle, caller_args, reversed_baseline
+                )
+                conn.commit()
+                return reversed_result
             if drift is not None:
                 verdict = _run_drift(
                     conn,

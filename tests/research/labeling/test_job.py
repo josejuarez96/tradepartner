@@ -28,7 +28,7 @@ from tradepartner.config import Settings
 from tradepartner.research import DatasetChanged, RunHandle, datafiles
 from tradepartner.research.experiment import ParsedExperiment
 from tradepartner.research.gates import Flags, Reasons
-from tradepartner.research.labeling import job
+from tradepartner.research.labeling import job, questions
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET
 from tradepartner.research.models import ModelRequest, ModelResponse
 from tradepartner.store import research, schema
@@ -726,6 +726,84 @@ def test_one_drift_flip_passes_and_the_batch_is_left_unfinished(world: World) ->
         dataset.sha256
         == sha256(datafiles.inference_path(world.settings, result.run_id).read_bytes()).hexdigest()
     )
+
+
+def test_reversed_dev_pass_reports_flip_and_unresolved_against_baseline(world: World) -> None:
+    gold_id = world.gold(_dev(2), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER)] * 2), gold_id, "dev")
+    client = ScriptedModelClient([Answer(BANKRUPTCY), Answer(UNRESOLVED)])
+
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+
+    assert len(client.requests) == 2
+    assert list(client.requests[0].criteria) == [
+        name for name, _ in questions.REVERSED_OPTION_SET.options
+    ]
+    assert result.outcome == "ok"
+    recorded = world.result(result.run_id)
+    assert recorded["primary_value"] == 1.0
+    assert json.loads(recorded["exploratory"])["unresolved_share"] == 0.5
+    records = _records(world.settings, result.run_id)
+    assert all(
+        record["option_set_hash"] == questions.REVERSED_OPTION_SET.hash for record in records
+    )
+
+
+def test_reversed_pass_skips_non_ok_baseline_before_open(world: World) -> None:
+    gold_id = world.gold(_dev(2), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER), Timeout()]), gold_id, "dev")
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+    assert result.outcome == "ok"
+    assert len(client.requests) == 1
+    assert json.loads(world.result(result.run_id)["exploratory"])["skipped_baseline"] == ["D01"]
+
+
+def test_reversed_pass_uses_only_limited_baseline_items(world: World) -> None:
+    gold_id = world.gold(_dev(2), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER)]), gold_id, "dev", limit=1)
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+    assert result.outcome == "ok"
+    assert len(client.requests) == 1
+    assert json.loads(world.result(result.run_id)["exploratory"])["skipped_baseline"] == ["D01"]
+
+
+def test_reversed_pass_with_no_ok_baseline_opens_nothing(world: World) -> None:
+    gold_id = world.gold(_dev(1), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Timeout()]), gold_id, "dev")
+    before = world.conn.execute("SELECT count(*) FROM research_runs").fetchone()
+    with pytest.raises(ValueError, match="no comparable baseline"):
+        world.run(
+            ScriptedModelClient([]),
+            gold_id,
+            "dev",
+            slug=job.DRIFT_SLUG,
+            option_set=questions.REVERSED_OPTION_SET,
+            reversed_baseline_run_id=baseline.run_id,
+        )
+    assert world.conn.execute("SELECT count(*) FROM research_runs").fetchone() == before
 
 
 # --- review fixes: the run lock, the month rollover, billed refusals, the estimate --------
