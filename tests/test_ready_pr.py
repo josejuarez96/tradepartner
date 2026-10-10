@@ -205,6 +205,15 @@ def test_merge_train_paths_require_the_safety_review() -> None:
         assert "safety-reviewer" in ready_pr.required_reviews([path]), path
 
 
+def test_kill_switch_page_requires_the_safety_review() -> None:
+    # the dashboard's kill-switch override page and its test (#773, PR #771's safety review)
+    for path in (
+        "src/tradepartner/dashboard/override_page.py",
+        "tests/dashboard/test_override_page.py",
+    ):
+        assert ready_pr.required_reviews([path]) == {"safety-reviewer"}, path
+
+
 def test_every_review_prefix_exists_on_the_tree_unless_planned() -> None:
     # a rename must not silently disable the gate (#357: exec/ vs execution/)
     for prefix in (*ready_pr.QUANT_PREFIXES, *ready_pr.SAFETY_PREFIXES):
