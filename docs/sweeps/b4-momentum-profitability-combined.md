@@ -9,7 +9,7 @@ docs/sweeps/b4-momentum-profitability-combined.md`, then `tradepartner sweep run
 b4-momentum-profitability-combined`. The file is frozen once registered.
 -->
 
-**Family:** combined (child of `momentum`)  ·  **Author:** team hypfiles (agent draft); window, holdout and kill rule by Jose Juarez on #1292 (2026-10-08, option A) and ADR 0016 point 5  ·  **Date:** 2026-10-10  ·  **Issue:** #1292
+**Family:** combined (child of `momentum`)  ·  **Author:** team hypfiles (agent draft); window and kill rule by Jose Juarez on #1292 (2026-10-08, option A) and ADR 0016 point 5; holdout dates set by the agent from his "forward data from 2026-10-01" (see Parameters), for the owner to confirm at registration  ·  **Date:** 2026-10-10  ·  **Issue:** #1292
 
 ## Why this is a sweep file, not a hypothesis file
 
@@ -49,11 +49,19 @@ Every value is decided before any B4 run, each with its source:
   registration day, and must not overlap any non-oracle family's holdout (`profitability`
   holds the same months as `momentum`). The owner's word on #1292 was "forward data from
   2026-10-01"; October 2026 has already begun, so it can no longer be forward at
-  registration, and the first whole month after this file is 2026-11. Six month-ends
-  (2026-11-30 to 2027-04-30) is `paper.min_rebalances` at `month_end` (ADR 0017's
-  per-cadence default 6). **If the owner registers on or after 2026-11-01, move both
-  dates forward by whole months before registering**; the exam is the paper book, and a
-  holdout whose start has passed at registration is not forward.
+  registration, and the first whole month after this file is 2026-11. Six month-end
+  rebalance sessions (2026-11-30 to 2027-04-30) is `paper.min_rebalances` at
+  `month_end` (ADR 0017's per-cadence default 6, which counts rebalances, so five
+  holding-period returns). **These dates are the agent's, for the owner to confirm.**
+  **B9 queues against them:** B9's file proposes its own forward holdout [2027-01-04,
+  2027-06-30] ([b9-earnings-reaction-drift](../hypotheses/b9-earnings-reaction-drift.md),
+  open question B9-2), which overlaps this one, so the overlap rule refuses whichever of
+  the two registers second. The dates here hold only if B4 takes the earlier slot (B9
+  then moves after 2027-04-30); if B9 registers first, B4 takes the slot after B9's
+  `holdout.end` (for example 2027-07-01 to 2027-12-31). The order is the owner's (B9-2).
+  Likewise, if the owner registers on or after 2026-11-01, both dates move forward by
+  whole months before registering; a holdout whose start has passed at registration is
+  not forward.
 - `[strategy]`: H1's values ([h1-momentum-12-1](../hypotheses/h1-momentum-12-1.md)).
   `top_fraction` and `weighting` there are momentum's own portfolio rules and are not read
   by the combined book; they are frozen because `combined` freezes and hashes the whole
@@ -162,12 +170,14 @@ that trades more than H1 contradicts the prior.
 
 40 monthly returns in sample, as H1's and B3's (the same window and calendar). N for the
 `combined` family starts at 1 with this one variant, but its SR\* high-water mark is
-seeded from `momentum`'s at registration (strategy-lab spec, child families; ADR 0014), so
-B4 clears no lower bar than momentum's two counted trials and the first sweep's six. At
-H1's 8.4% tracking error, each pp/yr of excess is worth about t ≈ 0.30 over the window
-(B3's arithmetic). The kill line below is about −3.3 pp/yr, so a B4 result inside the
-prior clears it by about one standard error; the run cannot show B4 is better than either
-part with confidence, only whether it is clearly worse. That is why its exam is the
+seeded once, from `momentum`'s mark on the day it registers (strategy-lab spec, child
+families; ADR 0014), and not updated after. The first sweep (T114) has not run as of this
+file, so if B4 registers before it, its seed reflects momentum's N = 2 only; if after, it
+also reflects the sweep's six variants. At H1's 8.4% tracking error over 40 monthly
+returns, each pp/yr of excess is worth about t ≈ 0.22 (1 pp/yr ÷ (8.4% ÷ √3.33)). The
+kill line is −3.28 pp/yr: the prior's centre (+0.25) sits about 0.8 standard errors above
+it and the prior's lower end (−2) only about 0.3. The run cannot show B4 is better than
+either part with confidence, only whether it is clearly worse. That is why its exam is the
 forward paper book, not this in-sample run.
 
 ## Prior-evidence disclosure
@@ -177,11 +187,12 @@ Seen before this file was written:
    `excess_cagr_spy` −5.77 pp/yr (#503; the first sweep's disclosure).
 2. **B3's in-sample trial 3**, same window: base-level `excess_cagr_spy` −3.28 pp/yr
    (team b4file's comment on #1292).
-3. **H1's holdout trial 4** (2024-01-01 to 2026-09-30): +4.44 pp/yr over SPY. B4 never
+3. **H1's holdout trial 4** (2023-12-29 to 2026-09-30): +4.44 pp/yr over SPY. B4 never
    reads those months: its practice ends at the boundary and its exam is forward.
 4. Everything H1's and B3's files disclose.
 
-No B4 result has been seen on any store: team b4file's dry runs on #1292 ran
+No result of the first sweep (`momentum-topfrac-cadence`, T114) has been seen: it has
+not run on the owner's store as of this file. No B4 result has been seen on any store: team b4file's dry runs on #1292 ran
 registrations only, no backtest. The two in-sample results above set the kill line, which
 is why that line is fixed here, before any B4 run. Both sub-signals were seen to lose to
 SPY in this window, so a combination of two losers is a priori unlikely to win; that is
@@ -206,7 +217,8 @@ non-synthetic, in-sample trial of B4 over the full default window [2020-08-31,
 ...`, nothing promoted) when that trial's base-level `excess_cagr_spy` is **below
 −3.28 pp/yr** (`retire_below = -0.0328`, in the statistic's own units, a fraction): it
 then does not improve, net, on the better single signal, B3 trial 3 (owner, #1292 option
-A; the backlog's kill). "After counting the combination's trials" is the SR\* mark: a
+A; the backlog's kill). The line is B3 trial 3's value as reported on #1292, rounded to
+two decimals of a pp; `retire_below` is strict, so a B4 equal to the line is not retired. "After counting the combination's trials" is the SR\* mark: a
 promotion also needs `dsr_excess` at or above 0.5 (`promote_at_least`, the spec's
 `lab.promotion_min_dsr_excess` floor) against the `momentum`-seeded mark. A B4 that clears
 the kill line but not the DSR floor is neither retired nor promoted: it waits for its
