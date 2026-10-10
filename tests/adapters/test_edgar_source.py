@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -32,7 +34,11 @@ from edgar_transport import (
 
 from tradepartner.adapters.edgar import acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
-from tradepartner.adapters.edgar_source import EdgarFilingSource, reduce_submissions
+from tradepartner.adapters.edgar_source import (
+    STAMPS_LAYOUT,
+    EdgarFilingSource,
+    reduce_submissions,
+)
 from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
@@ -483,3 +489,222 @@ def test_a_company_seen_only_through_its_delisting_is_kept(settings: Settings) -
     assert [(e.cik, e.form) for e in entries if e.accession == gone] == [("0003333333", "25-NSE")]
     assert "0001354457" not in {e.cik for e in entries}
     assert source.skipped_filers == 3
+
+
+# --- 8-K items and the stamps layout (T164c, #1358) ----------------------------
+
+SETTLED = {(2025, 1): _synthetic(MISSING_LINE), (2026, 3): _synthetic(KLX_LINE)}
+APPLE_202 = "0000320193-24-000005"  # recorded 8-K, items "2.02,9.01"
+APPLE_507 = "0001140361-24-010155"  # recorded 8-K, items "5.07"
+APPLE_10Q = "0000320193-24-000006"  # recorded 10-Q, items ""
+
+
+def _stamps_files(settings: Settings) -> dict[str, Path]:
+    root = Path(settings.edgar.cache_dir) / "stamps"
+    return {p.stem: p for p in root.glob("*/*.json")}
+
+
+def _to_old_layout(path: Path) -> None:
+    """Rewrite a stamps file exactly as the pre-T164c writer did: no `layout`,
+    no `items_refreshed`, four elements per record."""
+    data = json.loads(path.read_bytes())
+    old = {
+        "version": data["version"],
+        "cik": data["cik"],
+        "records": {a: row[:4] for a, row in data["records"].items()},
+    }
+    path.write_bytes(json.dumps(old).encode("utf-8"))
+
+
+def _old_cache(settings: Settings) -> dict[str, dict[str, list[object]]]:
+    """A settled fixture cache (with MISSING as a `None` sentinel) in the old
+    layout; returns each CIK's old records as written."""
+    _source(settings, _router(overrides=SETTLED)).filing_index()
+    old = {}
+    for cik, path in _stamps_files(settings).items():
+        _to_old_layout(path)
+        old[cik] = json.loads(path.read_bytes())["records"]
+    assert old[APPLE][MISSING] == ["8-K", "", False, None]  # the sentinel
+    return old
+
+
+def _file(settings: Settings, cik: str) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(_stamps_files(settings)[cik].read_bytes())
+    return data
+
+
+def _assert_old_stamps_unchanged(
+    settings: Settings, old: dict[str, dict[str, list[object]]]
+) -> None:
+    """Every pre-existing record's form, document, iXBRL flag and acceptance
+    (sentinels included) is byte-identical in the new file."""
+    for cik, records in old.items():
+        new = _file(settings, cik)["records"]
+        assert records.keys() <= new.keys()
+        for accession, row in records.items():
+            assert json.dumps(new[accession][:4]) == json.dumps(row), accession
+
+
+def test_reduce_keeps_items_verbatim_and_a_page_without_the_column_parses() -> None:
+    records, _ = reduce_submissions(load("submissions_plain_issuer.json"))
+    assert records[APPLE_202].items == "2.02,9.01"
+    assert records[APPLE_507].items == "5.07"
+    assert records[APPLE_10Q].items == ""
+    assert (
+        reduce_submissions(load("submissions_plain_issuer.json"))[0]["0001140361-26-035325"].items
+        == "5.02"
+    )
+    with_items = _payload(int(APPLE), ("0000320193-26-000001", "8-K", KLX_AT))
+    with_items["filings"]["recent"]["items"] = [""]  # type: ignore[index]
+    assert reduce_submissions(with_items)[0]["0000320193-26-000001"].items == ""
+    without = _payload(int(APPLE), ("0000320193-26-000001", "8-K", KLX_AT))
+    [record] = reduce_submissions(without)[0].values()
+    assert record.items is None
+    assert record.accepted_at == datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC)
+
+
+def test_the_stamps_cache_round_trips_items_under_the_new_layout(settings: Settings) -> None:
+    _source(settings, _router()).filing_index()
+    data = _file(settings, APPLE)
+    assert (data["layout"], data["items_refreshed"]) == (STAMPS_LAYOUT, True)
+    assert data["records"][APPLE_202][4] == "2.02,9.01"
+    loaded = _source(settings, _router())._load_stamps(APPLE)
+    assert loaded[APPLE_202].items == "2.02,9.01"
+    assert loaded[APPLE_202].accepted_at == _recorded_acceptance()[APPLE_202]
+
+
+def test_an_old_layout_cache_is_read_as_it_is_with_no_request(settings: Settings) -> None:
+    old = _old_cache(settings)
+    before = {cik: p.read_bytes() for cik, p in _stamps_files(settings).items()}
+    router = _router(overrides=SETTLED)
+    source = _source(settings, router)
+    source.filing_index()
+    # The stamping path neither refreshes nor rewrites: no submissions request.
+    assert _submission_urls(router) == []
+    assert {cik: p.read_bytes() for cik, p in _stamps_files(settings).items()} == before
+    assert source._load_stamps(APPLE)[APPLE_202].items is None
+    assert old
+
+
+def test_restamping_an_old_layout_cik_keeps_every_old_stamp_byte_identical(
+    settings: Settings,
+) -> None:
+    old = _old_cache(settings)
+    path = _stamps_files(settings)[APPLE]
+    data = json.loads(path.read_bytes())
+    dropped = data["records"].pop(APPLE_202)
+    path.write_bytes(json.dumps(data).encode("utf-8"))
+    del old[APPLE][APPLE_202]
+    router = _router(overrides=SETTLED)
+    _source(settings, router).filing_index()
+    assert "CIK0000320193.json" in _submission_urls(router)
+    new = _file(settings, APPLE)
+    assert (new["layout"], new["items_refreshed"]) == (STAMPS_LAYOUT, False)
+    assert new["records"][APPLE_202] == [*dropped, "2.02,9.01"]  # the new stamp carries it
+    _assert_old_stamps_unchanged(settings, old)
+    # The old records keep `items` unknown until the refresh.
+    assert all(new["records"][a][4] is None for a in old[APPLE])
+
+
+def test_the_refresh_writes_items_only_once_per_cik(settings: Settings) -> None:
+    old = _old_cache(settings)
+    router = _router(overrides=SETTLED)
+    source = _source(settings, router)
+    events = source.filing_events(APPLE)
+    assert _submission_urls(router) == ["CIK0000320193.json", "CIK0000320193-submissions-001.json"]
+    _assert_old_stamps_unchanged(settings, old)
+    data = _file(settings, APPLE)
+    assert data["items_refreshed"] is True
+    assert data["records"][MISSING] == ["8-K", "", False, None, None]  # sentinel untouched
+    recorded = _recorded_acceptance()
+    by_accession = {e.accession: e for e in events}
+    assert by_accession[APPLE_202].items == "2.02,9.01"
+    assert by_accession[APPLE_202].accepted_at == recorded[APPLE_202]
+    assert by_accession[APPLE_507].items == "5.07"
+    assert MISSING not in by_accession
+    assert set(by_accession) == {APPLE_202, APPLE_507}
+    assert events == sorted(events, key=lambda e: (e.accepted_at, e.accession))
+    assert (source.filing_events_unstamped, source.filing_events_items_missing) == (1, 0)
+    # Asked again, here or by a new instance: no request, the same answer.
+    again_router = _router(overrides=SETTLED)
+    assert _source(settings, again_router).filing_events(APPLE) == events
+    assert source.filing_events(APPLE) == events
+    assert _submission_urls(again_router) == []
+    assert (source.filing_events_unstamped, source.filing_events_items_missing) == (1, 0)
+    # Untouched CIKs stay in the old layout.
+    assert "layout" not in _file(settings, ALPHABET)
+
+
+def test_an_accession_without_items_after_the_refresh_is_terminal_and_counted(
+    settings: Settings,
+) -> None:
+    old = _old_cache(settings)
+    router = _router(overrides=SETTLED)
+    for name in ("CIK0000320193.json", "CIK0000320193-submissions-001.json"):
+        payload = load(SUBMISSIONS[APPLE][0 if name.endswith("0193.json") else 1])
+        columns = payload["filings"]["recent"] if "filings" in payload else payload
+        del columns["items"]
+        router.add(SUBMISSIONS_URL + name, payload)
+    source = _source(settings, router)
+    assert source.filing_events(APPLE) == []
+    eight_ks = sum(
+        1 for row in old[APPLE].values() if row[0] in ("8-K", "8-K/A") and row[3] is not None
+    )
+    assert source.filing_events_items_missing == eight_ks > 0
+    assert _file(settings, APPLE)["items_refreshed"] is True
+    _assert_old_stamps_unchanged(settings, old)
+    again = _router(overrides=SETTLED)
+    assert _source(settings, again).filing_events(APPLE) == []
+    assert _submission_urls(again) == []  # never re-fetched
+
+
+def test_a_failed_refresh_read_marks_nothing_and_is_tried_again(settings: Settings) -> None:
+    old = _old_cache(settings)
+    router = _router(overrides=SETTLED)
+    router.add(SUBMISSIONS_URL + "CIK0000320193.json", {})  # SEC's "nothing here"
+    source = _source(settings, router)
+    assert source.filing_events(APPLE) == []
+    assert source.filing_events_items_missing == 0
+    assert "layout" not in _file(settings, APPLE)
+    assert json.loads(_stamps_files(settings)[APPLE].read_bytes())["records"] == old[APPLE]
+    assert _source(settings, _router(overrides=SETTLED)).filing_events(APPLE)
+
+
+def test_the_refresh_reads_the_cached_zip_with_no_request_under_reuse_cached(
+    settings: Settings,
+) -> None:
+    old = _old_cache(settings)
+    bulk = Path(settings.edgar.cache_dir) / "bulk" / "submissions.zip"
+    bulk.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bulk, "w") as archive:
+        main, page = SUBMISSIONS[APPLE]
+        archive.write(FIXTURES / main, f"CIK{APPLE}.json")
+        archive.write(FIXTURES / page, f"CIK{APPLE}-submissions-001.json")
+    router = _router(overrides=SETTLED)
+    source = EdgarFilingSource(
+        settings, client=router.client(), clock=lambda: CLOCK, reuse_cached=True
+    )
+    events = source.filing_events(APPLE)
+    assert router.urls == []
+    assert events == _source(settings, _router(overrides=SETTLED)).filing_events(APPLE)
+    assert {e.accession: e.items for e in events}[APPLE_202] == "2.02,9.01"
+    _assert_old_stamps_unchanged(settings, old)
+
+
+def test_a_cik_with_no_stamps_file_answers_nothing_and_fetches_nothing(
+    settings: Settings,
+) -> None:
+    router = _router()
+    source = _source(settings, router)
+    assert source.filing_events(APPLE) == []
+    assert router.urls == []
+
+
+def test_event_forms_are_configurable_and_never_empty(settings: Settings) -> None:
+    _source(settings, _router()).filing_index()
+    source = EdgarFilingSource(settings, client=_router().client(), event_forms=["10-Q"])
+    [event] = [e for e in source.filing_events(APPLE) if e.accession == APPLE_10Q]
+    assert (event.form, event.items) == ("10-Q", "")
+    assert {e.form for e in source.filing_events(APPLE)} == {"10-Q"}
+    with pytest.raises(ValueError, match="event_forms"):
+        EdgarFilingSource(settings, client=_router().client(), event_forms=[])

@@ -25,6 +25,25 @@ one reduced record per accession, under a directory named by
 decode (truncated, older version) is ignored and re-fetched. Every write
 goes through a temp file and `os.replace`.
 
+**Stamps layout and `items` (T164c, #1358).** A stamps record carries the
+payload's 8-K `items` string as a fifth element under `STAMPS_LAYOUT`, a
+constant separate from `PARSER_VERSION` (which also keys the facts and
+statement caches, so a bump there would re-stamp every CIK). A file in the
+old four-element layout is read as it is, `items` unknown (`None`) for its
+accessions, and rewritten in the new layout only when the CIK is next
+stamped, every existing record (`form`, document, iXBRL flag,
+`accepted_at`, every `None` sentinel) written back byte-identical. A new
+stamp carries `items` whatever `edgar.filing_events_enabled` says. The only
+thing that fills an old accession's `items` is the **refresh**, run by
+`filing_events(cik)` (asked only while the switch is on): it re-reads the
+CIK's submissions once (the cached `submissions.zip` under `reuse_cached`,
+otherwise the per-CIK API), writes `items` for accessions already stamped
+and touches nothing else, stamps nothing, and sets the file's
+`items_refreshed` flag, the once-per-CIK marker (a file migrated by the
+stamping path keeps it `false`, so it is still refreshed once; a file
+written for a CIK with no earlier file starts `true`). An accession still
+without `items` after the refresh is terminal and counted.
+
 **Stamping.** A row's `known_at` is its SEC acceptance instant from the
 submissions payloads, never its index filing date. Accessions not in the
 cache are stamped from one `submissions.zip` download when they belong to
@@ -256,6 +275,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
@@ -269,6 +289,12 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 #: cache version bump" says how to remove it, #615).
 #: Bumped when a parser change must re-stamp every cached accession.
 PARSER_VERSION = 1
+#: The per-CIK stamps file's record layout (T164c, #1358): 2 adds `items` as
+#: a fifth element and the file's `items_refreshed` flag. Separate from
+#: `PARSER_VERSION`, which also keys the facts and statement caches: a file in
+#: the old layout is read as it is, never re-stamped (module docstring).
+STAMPS_LAYOUT = 2
+_OLD_STAMPS_LAYOUT = 1
 #: Bumped when the layout of the per-CIK statement-facts cache (T77a, #660)
 #: or `parse_statement_facts` changes and every CIK must be re-parsed.
 STATEMENT_VERSION = 1
@@ -336,6 +362,10 @@ class SubmissionRecord:
     primary_document: str
     inline_xbrl: bool
     accepted_at: datetime | None
+    #: The payload's 8-K `items` string verbatim (`""` when it lists none);
+    #: `None` when unknown: a payload or page without the column, or a record
+    #: from the old stamps layout not yet refreshed (T164c, #1358).
+    items: str | None = None
 
 
 @dataclass
@@ -359,13 +389,27 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
         columns = filings["recent"] if isinstance(filings, Mapping) else payload
         pages = [str(f["name"]) for f in filings.get("files", [])] if filings else []
         times = acceptance_times(payload)
+        # T164c (#1358): `items` is optional; without the column it is
+        # unknown (`None`), which is not the empty string.
+        accessions = columns["accessionNumber"]
+        items = columns.get("items")
+        if items is None:
+            items = [None] * len(accessions)
         records = {
-            accession: SubmissionRecord(accession, form, str(doc), bool(ixbrl), times[accession])
-            for accession, form, doc, ixbrl in zip(
-                columns["accessionNumber"],
+            accession: SubmissionRecord(
+                accession,
+                form,
+                str(doc),
+                bool(ixbrl),
+                times[accession],
+                None if item is None else str(item),
+            )
+            for accession, form, doc, ixbrl, item in zip(
+                accessions,
                 columns["form"],
                 columns["primaryDocument"],
                 columns["isInlineXBRL"],
+                items,
                 strict=True,
             )
             # #1138: a blank `acceptanceDateTime` leaves its accession out of
@@ -396,7 +440,10 @@ class EdgarFilingSource(FilingSource):
         clock: Callable[[], datetime] | None = None,
         *,
         reuse_cached: bool = False,
+        event_forms: Sequence[str] = ("8-K", "8-K/A"),
     ) -> None:
+        if not event_forms:
+            raise ValueError("event_forms must name at least one form (spec: never empty)")
         self._settings = settings
         # #660 (`ingest --bulk-from-cache`): company facts always from the
         # cached `companyfacts.zip`, with no request for it.
@@ -410,6 +457,14 @@ class EdgarFilingSource(FilingSource):
         # #578: the fetch pass's parse failures, for `ingest._prefetch`'s gate.
         self.validation_failures = ValidationFailures(self._cache / "validation", self._clock)
         self._submissions: dict[str, _Submissions] = {}
+        # T164c (#1358): CIK -> its stamps file's `items_refreshed` flag, as
+        # last read or written; the forms `filing_events` answers (T164e
+        # passes `edgar.event_forms`); the counts, each CIK counted once.
+        self._items_refreshed: dict[str, bool] = {}
+        self._event_forms = frozenset(event_forms)
+        self._events_counted: set[str] = set()
+        self.filing_events_unstamped = 0
+        self.filing_events_items_missing = 0
         self._open_quarters: dict[Quarter, str] = {}
         # #578: quarters whose form.idx did not parse, recorded once per instance.
         self._unparsed_quarters: set[Quarter] = set()
@@ -756,12 +811,29 @@ class EdgarFilingSource(FilingSource):
         return self._cache / "stamps" / f"v{PARSER_VERSION}" / f"{cik}.json"
 
     def _load_stamps(self, cik: str) -> dict[str, SubmissionRecord]:
+        """`cik`'s stamps in either layout (module docstring, "Stamps layout");
+        `{}` for an absent, truncated or unknown file. Records the file's
+        `items_refreshed` flag for `_save_stamps` (`True` with no file)."""
         try:
             data = json.loads(self._stamps_path(cik).read_bytes())
             if data["version"] != PARSER_VERSION or data["cik"] != cik:
-                return {}
-            return {
-                accession: SubmissionRecord(
+                raise ValueError("another version or CIK")
+            layout = data.get("layout", _OLD_STAMPS_LAYOUT)
+            if layout == _OLD_STAMPS_LAYOUT:
+                rows = [(*row, None) for row in data["records"].values()]
+                refreshed = False
+            elif layout == STAMPS_LAYOUT:
+                rows = list(data["records"].values())
+                refreshed = data["items_refreshed"]
+                if not isinstance(refreshed, bool):
+                    raise TypeError("items_refreshed")
+            else:
+                raise ValueError(f"stamps layout {layout!r}")
+            records = {}
+            for accession, (form, doc, ixbrl, at, items) in zip(data["records"], rows, strict=True):
+                if items is not None and not isinstance(items, str):
+                    raise TypeError("items")
+                records[accession] = SubmissionRecord(
                     accession,
                     form,
                     doc,
@@ -769,27 +841,144 @@ class EdgarFilingSource(FilingSource):
                     ensure_tz_aware_utc(datetime.fromisoformat(at), field_name="stamp")
                     if at
                     else None,
+                    items,
                 )
-                for accession, (form, doc, ixbrl, at) in data["records"].items()
-            }
         except (OSError, ValueError, KeyError, TypeError):
+            self._items_refreshed.pop(cik, None)
             return {}  # absent, truncated or another layout: stamp again
+        self._items_refreshed[cik] = refreshed
+        return records
 
-    def _save_stamps(self, cik: str, records: Mapping[str, SubmissionRecord]) -> None:
+    def _save_stamps(
+        self,
+        cik: str,
+        records: Mapping[str, SubmissionRecord],
+        *,
+        items_refreshed: bool | None = None,
+    ) -> None:
+        """Write `cik`'s stamps in `STAMPS_LAYOUT`. `items_refreshed` defaults
+        to the flag `_load_stamps` last read for the CIK (`True` if none), so
+        a stamping pass never marks an old-layout file refreshed."""
+        if items_refreshed is None:
+            items_refreshed = self._items_refreshed.get(cik, True)
         data = {
             "version": PARSER_VERSION,
+            "layout": STAMPS_LAYOUT,
             "cik": cik,
+            "items_refreshed": items_refreshed,
             "records": {
                 r.accession: [
                     r.form,
                     r.primary_document,
                     r.inline_xbrl,
                     r.accepted_at.isoformat() if r.accepted_at else None,
+                    r.items,
                 ]
                 for r in records.values()
             },
         }
         edgar_raw.write_atomic(self._stamps_path(cik), json.dumps(data).encode("utf-8"))
+        self._items_refreshed[cik] = items_refreshed
+
+    # --- filing events (T164c, #1358) ----------------------------------------
+
+    def filing_events(self, cik: str) -> list[FilingEvent]:
+        """One `FilingEvent` per stamped accession of `cik` whose form is in
+        `event_forms` and whose `items` is known, sorted by `accepted_at`,
+        then accession (module docstring, "Stamps layout and `items`").
+
+        The ingest asks this only while `edgar.filing_events_enabled` is on
+        (T164e). The first ask for a CIK whose stamps are not yet refreshed
+        re-reads its submissions once and writes `items` only; a CIK with no
+        stamps file is never fetched here (only the stamping paths stamp).
+        Counts: `.filing_events_unstamped` (event-form sentinels with no
+        acceptance) and `.filing_events_items_missing` (stamped event-form
+        accessions whose `items` is still unknown after the refresh, a
+        terminal state), each CIK counted once per instance."""
+        _validate_cik(cik)
+        stamps = self._load_stamps(cik)
+        if stamps and not self._items_refreshed.get(cik, True):
+            stamps = self._refresh_items(cik, stamps)
+        refreshed = self._items_refreshed.get(cik, True)
+        events: list[FilingEvent] = []
+        unstamped = missing = 0
+        for record in stamps.values():
+            if record.form not in self._event_forms:
+                continue
+            if record.accepted_at is None:
+                unstamped += 1
+            elif record.items is None:
+                missing += 1 if refreshed else 0
+            else:
+                events.append(
+                    FilingEvent(
+                        cik, record.accession, record.form, record.items, record.accepted_at
+                    )
+                )
+        if cik not in self._events_counted:
+            self._events_counted.add(cik)
+            self.filing_events_unstamped += unstamped
+            self.filing_events_items_missing += missing
+        events.sort(key=lambda e: (e.accepted_at, e.accession))
+        return events
+
+    def _refresh_items(
+        self, cik: str, stamps: dict[str, SubmissionRecord]
+    ) -> dict[str, SubmissionRecord]:
+        """Fill `items` for `cik`'s stamped accessions from one re-read of its
+        submissions, touching nothing else, and mark the file refreshed. A
+        read that fails or answers nothing leaves the file as it is (the
+        refresh is tried again on a later ask)."""
+        payload = self._items_source(cik, set(stamps))
+        if payload is None:
+            return stamps
+        filled = dict(stamps)
+        for accession, record in stamps.items():
+            if record.items is not None:
+                continue
+            fresh = payload.get(accession)
+            if fresh is not None and fresh.items is not None:
+                filled[accession] = replace(record, items=fresh.items)
+        self._save_stamps(cik, filled, items_refreshed=True)
+        return filled
+
+    def _items_source(self, cik: str, wanted: set[str]) -> dict[str, SubmissionRecord] | None:
+        """`cik`'s submission records for the refresh, or `None` when nothing
+        usable was read: the cached `submissions.zip` member and its pages
+        under `reuse_cached` (no request), otherwise the per-CIK API."""
+        if not self._reuse_cached:
+            submissions = self._fetch_submissions(cik, wanted)
+            return None if submissions.empty else submissions.records
+        path = self._cache / "bulk" / "submissions.zip"
+        try:
+            bulk = zipfile.ZipFile(path)
+        except (OSError, zipfile.BadZipFile) as error:
+            raise zipfile.BadZipFile(
+                f"{path}: reuse_cached needs a submissions.zip that opens as a zip: {error}"
+            ) from error
+        with bulk:
+            names = set(bulk.namelist())
+
+            def member(name: str) -> tuple[dict[str, SubmissionRecord], list[str]] | None:
+                def parse() -> tuple[dict[str, SubmissionRecord], list[str]] | None:
+                    payload = json.loads(bulk.read(name))
+                    return None if _keyless_member(payload) else reduce_submissions(payload)
+
+                return self.validation_failures.collect("submissions.zip member", name, parse)
+
+            name = f"CIK{cik}.json"
+            main = member(name) if name in names else None
+            if main is None:
+                return None
+            records, pages = main
+            for page in pages:
+                if wanted <= records.keys() or page not in names:
+                    break
+                older = member(page)
+                if older is None:
+                    break
+                records.update(older[0])
+            return records
 
     # --- the companies snapshot ---------------------------------------------
 
