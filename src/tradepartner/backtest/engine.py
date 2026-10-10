@@ -107,7 +107,9 @@ class BacktestResult:
     """One cost level's run. `targets` is keyed by fill session; `position_values` holds
     each position's dollar value at every session's close; `marking_frames` are the
     per-step frames, shared by every level (req 14 stitches them), empty when the run
-    was asked not to keep them (`run_many(..., keep_marking_frames=False)`)."""
+    was asked not to keep them (`run_many(..., keep_marking_frames=False)`); `weights`
+    and `position_values` are empty when it was asked to keep no detail
+    (`run_many(..., keep_detail=False)`, #1448)."""
 
     cost_per_side_bps: float
     equity: tuple[EquityRow, ...]
@@ -187,6 +189,7 @@ class _Book:
     rebalances: list[RebalanceRow] = field(default_factory=list)
     weights: list[WeightRow] = field(default_factory=list)
     values: list[pl.DataFrame] = field(default_factory=list)
+    keep_detail: bool = True
 
 
 def _check_levels(cost_levels: Sequence[float]) -> list[float]:
@@ -483,15 +486,16 @@ def _step(
         for sid, marked in last.select("security_id", "marked_at").iter_rows()
         if sid in book.positions
     }
-    book.values.append(values.select(list(_POSITION_SCHEMA)))
-    fill_prices = {t.security_id: t.raw_fill_price for t in fill.trades}
-    for sid, weight in sorted(plan.targets.items()):
-        raw_price = fill_prices.get(sid)
-        if raw_price is None and sid not in fill.missing:
-            raw_price = _price_on(raw, sid, plan.fill_session, fill_price)
-        # Shares are the dollar value at the fill (not at the close) over the raw price.
-        shares = None if raw_price is None else fill.positions.get(sid, 0.0) / raw_price
-        book.weights.append(WeightRow(plan.fill_session, sid, weight, raw_price, shares))
+    if book.keep_detail:
+        book.values.append(values.select(list(_POSITION_SCHEMA)))
+        fill_prices = {t.security_id: t.raw_fill_price for t in fill.trades}
+        for sid, weight in sorted(plan.targets.items()):
+            raw_price = fill_prices.get(sid)
+            if raw_price is None and sid not in fill.missing:
+                raw_price = _price_on(raw, sid, plan.fill_session, fill_price)
+            # Shares are the dollar value at the fill (not at the close) over the raw price.
+            shares = None if raw_price is None else fill.positions.get(sid, 0.0) / raw_price
+            book.weights.append(WeightRow(plan.fill_session, sid, weight, raw_price, shares))
     book.rebalances.append(
         RebalanceRow(
             cost_per_side_bps=book.level,
@@ -836,6 +840,7 @@ class _Variant:
     plan: Plan | None = None
     books: list[_Book] = field(default_factory=list)
     keep_frames: bool = True
+    keep_detail: bool = True
     frames: list[StepFrame] = field(default_factory=list)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
 
@@ -910,6 +915,7 @@ def run_many(
     *,
     family: HypothesisFamily,
     keep_marking_frames: bool = True,
+    keep_detail: bool = True,
 ) -> RunManyResults:
     """Run a read group's variants (strategy-lab spec req 2): every variant's frozen
     `Settings` with its own `TrialHandle`, over the rebalance sessions in `[start, end]`
@@ -930,6 +936,10 @@ def run_many(
     group's frames, with the Arrow buffers they pin, grew without bound). Nothing else
     in the results changes; only the `bt` oracle (`BacktestResult.stitched_returns`)
     reads the frames.
+
+    `keep_detail=False` keeps no position values and no weight rows at any level, so
+    each result's `position_values` is empty (with its schema) and its `weights` is
+    `()` (#1448: a summary-level sweep writes neither). Nothing else changes.
     """
     signal_for(family)
     levels = _check_variants(variants, cost_levels)
@@ -940,7 +950,8 @@ def run_many(
 
     out = RunManyResults()
     group = [
-        _Variant(params, handle, keep_frames=keep_marking_frames) for params, handle in variants
+        _Variant(params, handle, keep_frames=keep_marking_frames, keep_detail=keep_detail)
+        for params, handle in variants
     ]
 
     def failed(variant: _Variant, exc: Exception) -> None:
@@ -1000,6 +1011,7 @@ def _run_group(
                 level=level,
                 cash=capital,
                 benchmarks={name: _Holding(sid, capital) for name, sid in benchmarks.items()},
+                keep_detail=variant.keep_detail,
             )
             for level in levels
         ]

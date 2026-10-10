@@ -368,6 +368,30 @@ def test_a_variants_trials_row_records_the_sweep_detail_level(
     assert levels == [("summary",)] and weights == (0,)
 
 
+def test_a_full_detail_sweep_keeps_and_writes_its_weight_rows(
+    store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1448: only a `full` sweep keeps the engine's weight rows, and it writes them."""
+    monkeypatch.setenv("LAB__SWEEP_DETAIL_LEVEL", "full")
+    real_run_many = engine.run_many
+    seen: list[engine.RunManyResults] = []
+
+    def recording(*args: Any, **kwargs: Any) -> engine.RunManyResults:
+        out = real_run_many(*args, **kwargs)
+        seen.append(out)
+        return out
+
+    monkeypatch.setattr(engine, "run_many", recording)
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    ids = [t.trial_id for t in outcome.trials]
+    with _read(store) as conn:
+        weights = conn.execute(
+            "SELECT COUNT(*) FROM trial_weights WHERE trial_id IN (SELECT UNNEST(?))", [ids]
+        ).fetchone()
+    assert outcome.n_ok == 4 and weights is not None and weights[0] > 0
+    assert all(r.weights for out in seen for lv in out.values() for r in lv.values())
+
+
 def test_a_store_path_run_is_synthetic_leaves_n_unchanged_and_completes(
     store: Path, clock: FakeClock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -633,7 +657,8 @@ def test_a_sweep_keeps_no_marking_frames_and_writes_the_same_rows(
     assert dropped.n_ok == 4 and len(seen) == 2
     results = [r for out in seen for levels in out.values() for r in levels.values()]
     assert results and all(r.marking_frames == () for r in results)
-    assert all(not r.position_values.is_empty() for r in results)
+    # #1448: a summary-level sweep keeps no position values and no weight rows either.
+    assert all(r.position_values.is_empty() and r.weights == () for r in results)
 
     kept_store = tmp_path / "kept" / "lab.duckdb"
     kept_store.parent.mkdir()
@@ -642,12 +667,13 @@ def test_a_sweep_keeps_no_marking_frames_and_writes_the_same_rows(
     seen.clear()
 
     def keeping(*args: Any, **kwargs: Any) -> engine.RunManyResults:
-        return recording(*args, **{**kwargs, "keep_marking_frames": True})
+        return recording(*args, **{**kwargs, "keep_marking_frames": True, "keep_detail": True})
 
     monkeypatch.setattr(engine, "run_many", keeping)
     kept = lab.run_sweep(SLUG, clock=FakeClock())
     assert kept.n_ok == 4
-    assert all(r.marking_frames for out in seen for lv in out.values() for r in lv.values())
+    kept_results = [r for out in seen for lv in out.values() for r in lv.values()]
+    assert all(r.marking_frames and r.weights for r in kept_results)
     assert kept.sweep_run_id == dropped.sweep_run_id
     rows = _written(store, dropped.sweep_run_id)
     assert all(rows.values())
