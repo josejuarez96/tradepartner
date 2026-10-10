@@ -74,9 +74,19 @@ Everything else (month grids, histograms, turnover bars) is a detail opened on d
 | Trial page and workstation | The **Result** tab of a strategy's page, under its specification panel; the panels that are not a decision's picture (section 4) move behind "details" |
 | Book | **Books**, unchanged in substance |
 
-## 6. Questions for the owner
+## 6. The owner's answers (2026-10-10)
 
-1. **The morning check:** desk or phone first, and what makes you open the app on a day when nothing is wrong?
-2. **Starting runs:** do you want to start backtests and sweeps from the app (an ADR change), or is "show me the exact command" right for now?
-3. **Who writes a hypothesis file:** do you want to draft one in the app (a form that produces the file for review), or keep it agent-drafted and reviewed in a PR?
-4. **The pipeline:** do the stages in section 1 match how you think of an idea's progress, or would you name or group them differently?
+1. **Morning check: phone first.** Today is designed at phone width first; the desk layout is the same screen with more room.
+2. **Fewer, simpler stages.** The screens use five, with the detail kept inside each strategy's page:
+
+   | Screen stage | Covers the repo's | Leaves it when |
+   |---|---|---|
+   | **Idea** | Evidence, backlog item | A hypothesis or sweep file is registered |
+   | **Testing** | Specify, develop, judge | A variant is promoted (or the sweep is retired) |
+   | **Exam** | The holdout, or the forward exam's first rebalances | The exam is passed or failed |
+   | **Paper** | The paper book | The live ADR, or retired |
+   | **Live** | A live book | Retired |
+
+   Off to the side, not a stage: **Parked** (with its reason) and **Retired** (with what was learned, its `TP-` claim).
+3. **Writing a hypothesis file: an agent framework.** The owner wants agents to draft strategies, not a form. That fits how the repo already works (agents draft hypothesis files and ADRs; the owner merges and registers) and ADR 0008 (LLM output is advisory and never reaches an order): the agent proposes a file, the owner reviews it, and registration stays the deterministic `hypothesis register`. In the app this would be an action on an idea ("draft this as a hypothesis") that starts the agent and later shows its draft for review. It needs its own decision before it is built: the design standard has "no chat, no AI cards", and ADR 0018 allows only kill and resume as writes. Open: how the app starts an agent, and where the draft is reviewed (a PR, or the app).
+4. **Starting runs from the app:** the question was unclear; asked again in plain words.
