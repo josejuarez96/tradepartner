@@ -110,6 +110,23 @@ go in one bulk insert, the frame's timestamps tz-checked once.
 `rebuild_statement_facts` first deletes every `statement_facts` row in the
 same transaction. The counts go into the run message as `statement_<name>:
 N` (`health.statement_counts`).
+
+**Filing events** (amendment 2026-10-09, #1358; plan T164e), only while
+`edgar.filing_events_enabled` is on (off, the default: no call, so no
+request, no cache write and no row). The fetch pass asks `filing_events(cik)`
+for every issuer CIK, full history every run as the filing index is
+(`--since` does not limit it); `_Recorded` keeps only which CIKs were asked,
+never the records. Under the lock the write phase asks again per CIK and
+inserts-or-skips on `(cik, accession)` against the stored keys, one bulk
+insert per CIK, `known_at = accepted_at` (never the index's filing date). A
+form outside `edgar.event_forms` is never a row. A record accepted after the
+run's clock is skipped and counted `filing_events_not_yet_known`, never
+clamped and never fatal: `known_at = accepted_at` and `known_at <=
+ingested_at` cannot both hold for it. `rebuild_filing_events` first deletes
+every row in the same transaction and records the counts before and after.
+The counts go into the run message as `filing_events_<name>: N`
+(`health.filing_event_counts`), with the adapter's `unstamped`,
+`items_missing` and `clock_suspect` counts where the source exposes them.
 """
 
 from __future__ import annotations
@@ -134,6 +151,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
@@ -257,6 +275,7 @@ def ingest_session(
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
     rebuild_statement_facts: bool = False,
+    rebuild_filing_events: bool = False,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
     `all`); see the module docstring. `clock` gives the run's instant, used
@@ -264,13 +283,19 @@ def ingest_session(
     run rolls every chunk back and writes no run row.
     `rebuild_statement_facts` (#660) deletes and re-ingests `statement_facts`
     in the EDGAR chunk's transaction; it needs the switch on and the EDGAR
-    source (`ValueError` otherwise, before anything runs)."""
+    source (`ValueError` otherwise, before anything runs).
+    `rebuild_filing_events` (#1358) does the same for `filing_events`, under
+    the same two conditions on `edgar.filing_events_enabled`."""
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
         raise ValueError(_REBUILD_NEEDS_SWITCH)
     if rebuild_statement_facts and source == "alpaca":
         raise ValueError("rebuild_statement_facts needs the edgar source")
+    if rebuild_filing_events and not settings.edgar.filing_events_enabled:
+        raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
+    if rebuild_filing_events and source == "alpaca":
+        raise ValueError("rebuild_filing_events needs the edgar source")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
@@ -282,6 +307,7 @@ def ingest_session(
             clock,
             run_id,
             rebuild_statement_facts=rebuild_statement_facts,
+            rebuild_filing_events=rebuild_filing_events,
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
@@ -493,6 +519,7 @@ class _Recorded(FilingSource):
         self._source = source
         self._answers: dict[tuple[Any, ...], Any] = {}
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
+        self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
 
     def _ask(self, method: str, *args: Any) -> Any:
@@ -537,6 +564,22 @@ class _Recorded(FilingSource):
             self._statement_filled.add(cik)
             return records
         return self._source.statement_facts(cik)
+
+    def filing_events(self, cik: str) -> list[FilingEvent]:
+        """Not memoized, as `statement_facts` (#1358): the fetch pass's call
+        does the adapter's one refresh for `cik` and this proxy records only
+        that `cik` was asked; the write phase's call under the lock reads the
+        adapter's stamps file again. Once `frozen`, a CIK the pass did not
+        ask raises."""
+        if cik not in self._events_asked:
+            if self.frozen:
+                raise RuntimeError(
+                    f"filing source asked filing_events({cik!r}) after the fetch pass"
+                )
+            records = self._source.filing_events(cik)
+            self._events_asked.add(cik)
+            return records
+        return self._source.filing_events(cik)
 
 
 def _unwrap(filings: FilingSource) -> FilingSource:
@@ -659,6 +702,7 @@ def _ingest_filings(
     run_id: str,
     *,
     rebuild_statement_facts: bool = False,
+    rebuild_filing_events: bool = False,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -696,6 +740,20 @@ def _ingest_filings(
         statements = tally.message(_unwrap(filings))
     elif rebuild_statement_facts:
         raise ValueError(_REBUILD_NEEDS_SWITCH)
+    events = ""
+    if settings.edgar.filing_events_enabled:
+        event_tally = _write_filing_events(
+            conn,
+            recorded,
+            _issuer_ciks(master),
+            now,
+            frozenset(settings.edgar.event_forms),
+            rebuild=rebuild_filing_events,
+        )
+        added += event_tally.added
+        events = event_tally.message(_unwrap(filings))
+    elif rebuild_filing_events:
+        raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
     skip = _unjudged_ciks(recorded).ciks
     keep = frozenset(settings.master.keep_successors)  # owner-accepted (#922)
     derived = frozenset(row["security_id"] for row in master.securities)
@@ -704,7 +762,7 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{_source_counts(filings)}; "
+        f"{statements}{events}{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
@@ -772,7 +830,9 @@ def _build_filings(
     """The builds over `filings`. The fetch pass (`fetch`) also asks
     `statement_facts` for every issuer CIK while the switch is on (#660),
     after `facts`, so one payload read fills both caches; the records are
-    dropped here and read again per CIK under the lock."""
+    dropped here and read again per CIK under the lock. It asks
+    `filing_events` for every issuer CIK while that switch is on (#1358),
+    the same way."""
     master = build_master(filings, settings, ingested_at=ingested_at)
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
@@ -781,6 +841,9 @@ def _build_filings(
     if fetch and settings.edgar.statement_facts_enabled:
         for cik in ciks:
             filings.statement_facts(cik)
+    if fetch and settings.edgar.filing_events_enabled:  # #1358: full history, every run
+        for cik in ciks:
+            filings.filing_events(cik)
     facts, unmatched = fact_rows(
         records,
         master,
@@ -801,6 +864,12 @@ def _issuer_ciks(master: MasterBuild) -> list[str]:
 _REBUILD_NEEDS_SWITCH = (
     "rebuild_statement_facts needs edgar.statement_facts_enabled: with the switch off "
     "it would delete every statement_facts row and re-ingest none"
+)
+
+#: Why a filing-events rebuild is refused while its switch is off (#1358).
+_REBUILD_EVENTS_NEEDS_SWITCH = (
+    "rebuild_filing_events needs edgar.filing_events_enabled: with the switch off "
+    "it would delete every filing_events row and re-ingest none"
 )
 
 #: `statement_facts`' columns, in schema order (the bulk insert's frame).
@@ -1125,6 +1194,144 @@ def insert_statement_frame(conn: duckdb.DuckDBPyConnection, frame: pa.Table) -> 
         conn.execute("INSERT INTO statement_facts BY NAME SELECT * FROM _statement_rows")
     finally:
         conn.unregister("_statement_rows")
+
+
+#: `filing_events`' columns, in schema order (the bulk insert's frame; #1358).
+_EVENT_COLUMNS: tuple[str, ...] = (
+    "cik",
+    "accession",
+    "form",
+    "items",
+    "accepted_at",
+    "known_at",
+    "ingested_at",
+    "source",
+    "provenance",
+)
+
+#: The adapter's own `filing_events_*` counts (spec amendment #1358, "Ingest,
+#: config and health"), read from the unwrapped source after the write, each
+#: only when the source exposes it (a fixture source has none).
+_EVENT_SOURCE_COUNTS: tuple[str, ...] = ("unstamped", "items_missing", "clock_suspect")
+
+
+@dataclass
+class FilingEventCounts:
+    """The ingest's own `filing_events_*` run-row counts (#1358). `before`
+    and `after` (the table's row counts) are set by a rebuild only."""
+
+    added: int = 0
+    not_yet_known: int = 0
+    before: int | None = None
+    after: int | None = None
+
+    def message(self, source: FilingSource) -> str:
+        """`"; filing_events_added: N, ..."` for the run row
+        (`health.filing_event_counts` reads it back), with the adapter's
+        counts `source` exposes."""
+        figures = [("added", self.added), ("not_yet_known", self.not_yet_known)]
+        if self.before is not None and self.after is not None:
+            figures += [("before", self.before), ("after", self.after)]
+        for name in _EVENT_SOURCE_COUNTS:
+            value = getattr(source, f"filing_events_{name}", None)
+            if value is not None:
+                figures.append((name, int(value if isinstance(value, int) else len(value))))
+        return "; " + ", ".join(f"filing_events_{name}: {n}" for name, n in figures)
+
+
+def filing_event_rows(
+    records: Iterable[FilingEvent],
+    stored: Container[str],
+    forms: Container[str],
+    *,
+    ingested_at: datetime,
+) -> tuple[list[Row], int]:
+    """One CIK's new `filing_events` rows and its not-yet-known count
+    (module docstring): a record whose form is outside `forms`, or whose
+    accession is in `stored` (or already taken in this batch), adds
+    nothing; one accepted after `ingested_at` is skipped and counted,
+    never clamped. `known_at` is the record's `accepted_at`."""
+    rows: list[Row] = []
+    taken: set[str] = set()
+    not_yet_known = 0
+    for record in records:
+        if record.form not in forms or record.accession in stored or record.accession in taken:
+            continue
+        if record.accepted_at > ingested_at:
+            not_yet_known += 1
+            continue
+        taken.add(record.accession)
+        rows.append(
+            {
+                "cik": record.cik,
+                "accession": record.accession,
+                "form": record.form,
+                "items": record.items,
+                "accepted_at": record.accepted_at,
+                "known_at": record.accepted_at,
+                "ingested_at": ingested_at,
+                "source": "edgar",
+                "provenance": "filing",
+            }
+        )
+    return rows, not_yet_known
+
+
+def _write_filing_events(
+    conn: duckdb.DuckDBPyConnection,
+    filings: FilingSource,
+    ciks: Sequence[str],
+    ingested_at: datetime,
+    forms: frozenset[str],
+    *,
+    rebuild: bool,
+) -> FilingEventCounts:
+    """The filing-events write (module docstring): with `rebuild`, delete
+    every row first and record the counts before and after; then per CIK,
+    one `filing_events` read, its stored accessions, its new rows, and one
+    bulk insert."""
+    total = FilingEventCounts()
+    if rebuild:
+        total.before = _event_count(conn)
+        conn.execute("DELETE FROM filing_events")
+    for cik in ciks:
+        records = filings.filing_events(cik)
+        if not records:
+            continue
+        stored = {
+            accession
+            for (accession,) in conn.execute(
+                "SELECT accession FROM filing_events WHERE cik = ?", [cik]
+            ).fetchall()
+        }
+        rows, not_yet_known = filing_event_rows(records, stored, forms, ingested_at=ingested_at)
+        total.not_yet_known += not_yet_known
+        if rows:
+            _insert_event_frame(conn, rows)
+            total.added += len(rows)
+    if rebuild:
+        total.after = _event_count(conn)
+    return total
+
+
+def _event_count(conn: duckdb.DuckDBPyConnection) -> int:
+    row = conn.execute("SELECT count(*) FROM filing_events").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _insert_event_frame(conn: duckdb.DuckDBPyConnection, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Insert `rows` into `filing_events` in one statement; a timestamp
+    column without a time zone raises `TypeError` before the insert."""
+    frame = pa.table({column: [row[column] for row in rows] for column in _EVENT_COLUMNS})
+    for column in ("accepted_at", "known_at", "ingested_at"):
+        kind = frame.schema.field(column).type
+        if not pa.types.is_timestamp(kind) or kind.tz is None:
+            raise TypeError(f"filing_events.{column} must be tz-aware timestamps, got {kind}")
+    conn.register("_event_rows", frame)
+    try:
+        conn.execute("INSERT INTO filing_events BY NAME SELECT * FROM _event_rows")
+    finally:
+        conn.unregister("_event_rows")
 
 
 _MEMBER_CLASS = re.compile(r"Class([A-Z])(?![a-z])")

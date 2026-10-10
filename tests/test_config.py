@@ -229,6 +229,28 @@ def test_edgar_statement_facts_defaults() -> None:
     assert s.edgar.statement_units == ["USD"]
 
 
+def test_edgar_filing_events_defaults() -> None:
+    """T164e (#1358): the switch is off and the forms are 8-K and 8-K/A."""
+    s = Settings(_env_file=None)
+    assert s.edgar.filing_events_enabled is False
+    assert s.edgar.event_forms == ["8-K", "8-K/A"]
+
+
+def test_edgar_filing_events_keys_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGAR__FILING_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("EDGAR__EVENT_FORMS", '["8-K"]')
+    s = Settings(_env_file=None)
+    assert s.edgar.filing_events_enabled is True
+    assert s.edgar.event_forms == ["8-K"]
+
+
+@pytest.mark.parametrize("forms", [[], [""], [" "]])
+def test_edgar_event_forms_is_never_empty(forms: list[str]) -> None:
+    """An empty list, or an empty form, would store no event at all."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"event_forms": forms})
+
+
 def test_edgar_statement_tags_default_is_not_shared() -> None:
     """Mutating one instance's default lists never leaks into the next."""
     first = Settings(_env_file=None)
