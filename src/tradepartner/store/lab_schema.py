@@ -93,14 +93,23 @@ RELEASE_DECISION_KINDS: tuple[str, ...] = ("data_release", "development_boundary
 #: `apply_lab_schema` widens with them too.
 SHAKEDOWN_DECISION_KINDS: tuple[str, ...] = ("shakedown_span", "shakedown_note")
 
+#: `owner_decisions.kind` values schema version 22 adds (#1442, paper-trading plan
+#: T160b; strategy-lab spec req 1, amendment 2026-10-10; ADR 0017 part A): the
+#: `operations_book` row `hypothesis register --operations-book-of` appends. As with
+#: version 20, `schema._migrate_operations_kinds` widens every store with it, lab or
+#: not, and `apply_lab_schema` widens with it too.
+OPERATIONS_DECISION_KINDS: tuple[str, ...] = ("operations_book",)
+
 #: `owner_decisions.kind` values the lab adds (spec, Data / interfaces), then the
-#: two version 18 adds (`RELEASE_DECISION_KINDS`) and the two version 20 adds
-#: (`SHAKEDOWN_DECISION_KINDS`).
+#: two version 18 adds (`RELEASE_DECISION_KINDS`), the two version 20 adds
+#: (`SHAKEDOWN_DECISION_KINDS`) and the one version 22 adds
+#: (`OPERATIONS_DECISION_KINDS`).
 LAB_DECISION_KINDS: tuple[str, ...] = (
     "promotion",
     "sweep_retired",
     *RELEASE_DECISION_KINDS,
     *SHAKEDOWN_DECISION_KINDS,
+    *OPERATIONS_DECISION_KINDS,
 )
 
 
@@ -411,7 +420,8 @@ def apply_lab_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every `LAB_TABLE_NAMES` table and widen `trial_results.status`
     (`refused_variant`) and `owner_decisions.kind` (`promotion`,
     `sweep_retired`, version 18's `data_release` and `development_boundary` and
-    version 20's `shakedown_span` and `shakedown_note` where a store lacks them)
+    version 20's `shakedown_span` and `shakedown_note` and version 22's
+    `operations_book` where a store lacks them)
     by the staging rebuild, every row kept byte-identical (module docstring).
     Needs a store `init_schema` has created (the registry tables must exist).
     Idempotent: a second call changes nothing. One transaction (the caller's if

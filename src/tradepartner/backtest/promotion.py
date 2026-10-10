@@ -18,7 +18,8 @@ this order, raising `PromotionRefused` before anything is written:
    family (both copied at registration, so a later config change loosens neither);
 6. a file whose family, `in_sample_start` or canonical frozen set
    (`frozen.canonical_frozen_set`, default-valued table keys left out) differs from the
-   argmax variant's, so no key inside or outside the fingerprint can differ from what
+   argmax variant's (`hypothesis.frozen_set_differences`, the one check an operations
+   file shares), so no key inside or outside the fingerprint can differ from what
    won, and a `FROZEN_KEY_DEFAULTS` entry the file writes out at its default changes
    nothing;
 7. a file without a `## Sweep provenance` section whose `**Sweep:**` line names this
@@ -189,28 +190,6 @@ def _provenance_refusal(text: str, report: SweepReport, argmax: VariantRow) -> s
     return None
 
 
-def _frozen_set_differences(
-    parsed: hypothesis.HypothesisFile, params: dict[str, Any], variant: HypothesisRecord
-) -> list[str]:
-    """Refusal 6: what differs between the file and the argmax variant."""
-    differences: list[str] = []
-    if parsed.family != variant.family:
-        differences.append(f"family ({parsed.family} vs {variant.family})")
-    if parsed.in_sample_start != variant.in_sample_start:
-        differences.append(
-            f"in_sample_start ({parsed.in_sample_start} vs {variant.in_sample_start})"
-        )
-    if differences:
-        return differences
-    mine = frozen.canonical_frozen_set(params, parsed.family)
-    theirs = frozen.canonical_frozen_set(frozen.frozen_values(variant), variant.family)
-    return sorted(
-        f"{key} ({mine.get(key)!r} vs {theirs.get(key)!r})"
-        for key in set(mine) | set(theirs)
-        if key not in mine or key not in theirs or not frozen.is_default(mine[key], theirs[key])
-    )
-
-
 def _statistic(row: VariantRow, statistic: str) -> float:
     value = getattr(row, statistic)
     if not isinstance(value, float):
@@ -286,7 +265,7 @@ def promote(
     variant = registry.get_hypothesis(conn, argmax.slug)
     parsed = hypothesis.parse_file(file)
     params = hypothesis.frozen_params(parsed, settings)
-    differences = _frozen_set_differences(parsed, params, variant)
+    differences = hypothesis.frozen_set_differences(parsed, params, variant)
     if differences:
         raise PromotionRefused(
             f"{file}: its frozen set differs from the argmax {argmax.slug}'s "

@@ -77,7 +77,11 @@ Phase 3 (T42):
   unregistered slug likewise. `--override-gap` without `--gap-reason` is left to
   the run, which records it as `refused_gap`.
 - `tradepartner hypothesis register <file>` registers the file and prints the
-  full frozen set and its hash (spec req 10).
+  full frozen set and its hash (spec req 10). With `--operations-book-of
+  <variant-slug> --reason` (both or neither; strategy-lab spec req 1, amendment
+  2026-10-10, paper plan T160b) it registers an operations file of that sweep
+  variant through `hypothesis.register_operations_book` and also prints the
+  `operations_book` decision's id; it is never a promotion.
 - `tradepartner trials [--hypothesis] [--include-synthetic]` lists trials newest
   first, `unfinished`, failed and refused ones with their message; synthetic
   trials only when asked for.
@@ -335,7 +339,11 @@ from tradepartner.backtest import lab, promotion, sweep_report
 from tradepartner.backtest import sweep as lab_sweep
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import GAP_THRESHOLD_KEY, Flags, Reasons
-from tradepartner.backtest.hypothesis import HypothesisFileError, register
+from tradepartner.backtest.hypothesis import (
+    HypothesisFileError,
+    register,
+    register_operations_book,
+)
 from tradepartner.backtest.metrics import METRIC_KEYS
 from tradepartner.backtest.run import RunOutcome, run_hypothesis
 from tradepartner.cli_record import _configured_secrets, scrub_text
@@ -1848,19 +1856,56 @@ def make_app(
     @hypothesis_app.command("register")
     def hypothesis_register(
         file: Annotated[Path, typer.Argument(help="the hypothesis file (docs/hypotheses/*.md)")],
+        operations_book_of: Annotated[
+            str | None,
+            typer.Option(
+                "--operations-book-of",
+                help="register as an operations file of this sweep variant's slug "
+                "(a paper book's machine test, never a promotion); needs --reason",
+            ),
+        ] = None,
+        reason: Annotated[
+            str | None,
+            typer.Option(help="why the operations book exists (with --operations-book-of)"),
+        ] = None,
     ) -> None:
         """Register a hypothesis file and print its frozen parameters and their hash."""
         s = settings()
+        if (operations_book_of is None) != (reason is None):
+            raise _fail("--operations-book-of and --reason go together", USAGE_ERROR)
+        if reason is not None and not reason.strip():
+            raise _fail("--reason must not be blank", USAGE_ERROR)
         if not file.is_file():
             raise _fail(f"no hypothesis file at {file}", USAGE_ERROR)
+        decision_id: int | None = None
         try:
             with open_for_write(s) as conn:
                 schema.init_schema(conn)
-                record = register(conn, file, registered_by=_REGISTERED_BY, settings=s)
+                if operations_book_of is not None and reason is not None:
+                    outcome = register_operations_book(
+                        conn,
+                        file,
+                        operations_book_of,
+                        reason,
+                        registered_by=_REGISTERED_BY,
+                        settings=s,
+                    )
+                    record, decision_id = outcome.registered, outcome.decision_id
+                else:
+                    record = register(conn, file, registered_by=_REGISTERED_BY, settings=s)
+        except LabNotInitialised as exc:
+            raise _lab_fail(exc, s) from None
         except (HypothesisFileError, registry.RegistryError) as exc:
             raise _fail(_scrubbed(str(exc), s), USAGE_ERROR) from None
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
+        if decision_id is not None:
+            _echo_scrubbed(
+                f"decision {decision_id}: operations_book of {operations_book_of} as "
+                f"hypothesis {record.hypothesis_id} (not a promotion; it never spends the "
+                "holdout)",
+                s,
+            )
         typer.echo(
             f"hypothesis {record.hypothesis_id}: {record.slug} ({record.family}), "
             f"in-sample from {record.in_sample_start}, holdout {record.holdout_start} "
