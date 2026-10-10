@@ -220,6 +220,32 @@ class StatementFactRecord:
         return (self.period_end - self.period_start).days
 
 
+@dataclass(frozen=True)
+class FilingEvent:
+    """One filing-event record (amendment 2026-10-09, #1358): a filing whose
+    form is in `edgar.event_forms` (`8-K`, `8-K/A` by default), with the
+    submissions payload's `items` string kept **verbatim** (`"2.02,9.01"`;
+    `""` when the payload lists none, never `None`) and the filing's stamped
+    SEC acceptance. Every field is set: an accession with no stamp, a
+    settled-unstampable one or one whose `items` is unknown is never a
+    record (the adapter counts it instead). The store row's `known_at` is
+    this `accepted_at`, never the index's filing date."""
+
+    cik: str
+    accession: str
+    form: str
+    items: str
+    accepted_at: datetime
+
+    def __post_init__(self) -> None:
+        _check_cik(self.cik)
+        if not isinstance(self.items, str):
+            raise TypeError(
+                f"items must be the payload's verbatim string ('' for none), got {self.items!r}"
+            )
+        _utc(self, "accepted_at")
+
+
 class FilingSource(abc.ABC):
     """Filing data, as parsed records (spec "Interfaces").
 
@@ -268,3 +294,19 @@ class FilingSource(abc.ABC):
         applies the hold rule on an unstamped carrier, and derives a
         missing `gross_profit` from the stored `revenue` and
         `cost_of_revenue` rows; none of that lives here."""
+
+    def filing_events(self, cik: str) -> list[FilingEvent]:
+        """Filing events (amendment 2026-10-09, #1358) for `cik`: one
+        `FilingEvent` per stamped accession whose form is in
+        `edgar.event_forms` and whose `items` is known, sorted by
+        `accepted_at`, then accession.
+
+        Not abstract, unlike every question above: the EDGAR adapter's
+        answer is T164c's and the ingest's recording proxy is T164e's, and
+        the ingest asks it only while `edgar.filing_events_enabled` is on
+        (default off), so an adapter without an answer refuses loudly here
+        rather than answering an empty list."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not answer filing_events yet (#1358: the EDGAR "
+            "answer is T164c, the ingest proxy T164e)"
+        )
