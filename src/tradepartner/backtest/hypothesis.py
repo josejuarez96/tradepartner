@@ -193,10 +193,10 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": 
 
 
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
-#: a value other than the table default, so no run or paper plan records "screened"
-#: results that are the unscreened signal's. T165c (the screen, #1358) empties this when
-#: `strategies.py` reads the key.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"strategy.turnover_top_fraction"})
+#: a value other than the table default, so no run or paper plan records results under a
+#: label its signal ignores. Empty since T165c (#1358): `strategies.py` applies
+#: `strategy.turnover_top_fraction`.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
 
 
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:

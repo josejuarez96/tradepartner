@@ -22,6 +22,12 @@ is refused here and, at registration, by `check_anchor_feasible`. Which adjustme
 frame carries (splits only, or dividends too per `strategy.signal_total_return`) is the
 caller's choice when it reads the frame.
 
+`turnover_screen` is the `momentum` family's share-turnover screen (backtest spec
+amendment #1358, item 2; B10): before the rank, it keeps the top
+`strategy.turnover_top_fraction` of the members by formation-period turnover (share
+volume over shares outstanding, both moved into T's share units by the splits known at
+`t`). `formation_sessions` gives that period.
+
 `gross_profitability` is the `profitability` family's signal (backtest spec amendment
 #720, rules 0 to 6): annual gross profit over the total assets of the same fiscal year
 end, from a `statement_facts_as_of` frame. Every period length, age and SIC it uses is
@@ -31,7 +37,7 @@ an argument, never a literal here.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Literal
@@ -39,6 +45,8 @@ from typing import Literal
 import polars as pl
 from dateutil.relativedelta import relativedelta
 
+from tradepartner.backtest.portfolio import _selected_count
+from tradepartner.backtest.provider import TurnoverInputs
 from tradepartner.calendar import (
     is_session,
     last_completed_session,
@@ -221,6 +229,140 @@ def momentum_12_1(
         "month_end",
         "month_end",
         security_ids=security_ids,
+    )
+
+
+_PERIOD_KEYS: dict[Cadence, Callable[[date], Hashable]] = {
+    "month_end": lambda s: (s.year, s.month),
+    "week_end": lambda s: s.isocalendar()[:2],
+    "daily": lambda s: s,
+}
+
+
+def formation_sessions(t_session: date, cadence: Cadence) -> tuple[date, ...]:
+    """The turnover screen's formation sessions at rebalance session T (spec amendment
+    #1358, item 2): the sessions after the previous rebalance session at `cadence`,
+    through T, ascending. At `month_end` these are T's calendar month's sessions, at
+    `week_end` its ISO week's, at `daily` T alone. Raises `ValueError` if T is not a
+    rebalance session at `cadence`."""
+    if not _is_rebalance_session(t_session, cadence):
+        raise ValueError(f"t_session {t_session} is not {_PERIOD_NAMES[cadence]}")
+    key = _PERIOD_KEYS[cadence]
+    sessions = [t_session]
+    while key(earlier := previous_session(sessions[-1])) == key(t_session):
+        sessions.append(earlier)
+    return tuple(reversed(sessions))
+
+
+@dataclass(frozen=True)
+class TurnoverScreen:
+    """The turnover screen at one rebalance (spec amendment #1358, item 2).
+
+    `kept`: the screened names, the ones momentum ranks. `excluded`: every other
+    requested name, all under reason `no_turnover` (no usable turnover, or below the
+    cut). `unusable`: the part of `excluded` with no usable turnover (no shares pick, or
+    a formation bar missing), counted as `n_excluded_no_turnover`. Each is ordered by
+    `security_id`. `turnover`: each usable name's turnover in T's share units, by
+    `security_id`. `n_screened` is `len(kept)`.
+    """
+
+    kept: tuple[str, ...]
+    excluded: tuple[str, ...]
+    unusable: tuple[str, ...]
+    turnover: dict[str, float]
+
+    @property
+    def n_screened(self) -> int:
+        """The kept count (`n_screened`)."""
+        return len(self.kept)
+
+    @property
+    def n_excluded_no_turnover(self) -> int:
+        """Members with no usable turnover, the screen's denominator's complement."""
+        return len(self.unusable)
+
+
+def _split_factor(splits: Sequence[tuple[date, float]], after: date, through: date) -> float:
+    """The product of the ratios of the splits with `after < ex_date <= through`."""
+    factor = 1.0
+    for ex_date, ratio in splits:
+        if after < ex_date <= through:
+            factor *= ratio
+    return factor
+
+
+def turnover_screen(
+    inputs: TurnoverInputs,
+    formation_sessions: Sequence[date],
+    t_session: date,
+    fraction: float,
+    *,
+    security_ids: Collection[str],
+) -> TurnoverScreen:
+    """The top `fraction` of `security_ids` (the universe at `inputs.t`) by turnover
+    over `formation_sessions` (which end at `t_session`, `inputs.t`'s session).
+
+    A name's turnover is the sum over the formation sessions of its share volume over
+    its shares outstanding, both in T's share units: the raw shares pick `(as_of_date,
+    value)` times the ratio of every split with `as_of_date < ex_date <= T`, each
+    session's volume times the ratio of every split with `session < ex_date <= T`. Only
+    bars with `known_at <= inputs.t` are read. A name with no positive, finite shares
+    pick, or with no traded bar on any formation session, has no usable turnover: it is
+    excluded (`unusable`), never given a turnover of zero. The kept count is
+    `portfolio`'s count rule (the ceiling of the exact decimal `fraction` times the
+    usable count), by turnover descending, ties by `security_id` ascending.
+
+    Raises `ValueError` for a `fraction` outside (0, 1], formation sessions that are
+    empty, unsorted or do not end at `t_session`, a `t_session` that is not
+    `inputs.t`'s session, a duplicate `(security_id, session)` bar, or a split ratio
+    that is not positive and finite.
+    """
+    if not (0 < fraction <= 1):
+        raise ValueError(f"turnover fraction must be in (0, 1], got {fraction}")
+    sessions = tuple(formation_sessions)
+    if not sessions or sessions[-1] != t_session or list(sessions) != sorted(set(sessions)):
+        raise ValueError(f"formation sessions must be ascending and end at {t_session}")
+    if last_completed_session(inputs.t) != t_session:
+        raise ValueError(f"t_session {t_session} is not the session of t {inputs.t.isoformat()}")
+    names = sorted(set(security_ids))
+    bars = inputs.bars.filter(
+        pl.col("known_at") <= inputs.t,
+        pl.col("security_id").is_in(names),
+        pl.col("session").is_in(sessions),
+    ).select("security_id", "session", "volume")
+    if bars.select(pl.struct("security_id", "session").is_duplicated().any()).item():
+        raise ValueError("turnover bars have a duplicate (security_id, session) bar")
+    volumes: dict[str, dict[date, float]] = {}
+    for sid, session, volume in bars.iter_rows():
+        if volume is not None and math.isfinite(volume) and volume > 0:
+            volumes.setdefault(sid, {})[session] = float(volume)
+    for sid, splits in inputs.splits.items():
+        for ex_date, ratio in splits:
+            if not (math.isfinite(ratio) and ratio > 0):
+                raise ValueError(f"split ratio of {sid} on {ex_date} must be positive: {ratio}")
+
+    turnover: dict[str, float] = {}
+    unusable: list[str] = []
+    for sid in names:
+        pick, by_session = inputs.shares.get(sid), volumes.get(sid, {})
+        if (
+            pick is None
+            or not (math.isfinite(pick[1]) and pick[1] > 0)
+            or any(s not in by_session for s in sessions)
+        ):
+            unusable.append(sid)
+            continue
+        splits = inputs.splits.get(sid, ())
+        shares = pick[1] * _split_factor(splits, pick[0], t_session)
+        volume = math.fsum(by_session[s] * _split_factor(splits, s, t_session) for s in sessions)
+        turnover[sid] = volume / shares
+    ranked = sorted(turnover, key=lambda sid: (-turnover[sid], sid))
+    kept = set(ranked[: _selected_count(len(ranked), fraction)])
+    return TurnoverScreen(
+        kept=tuple(sid for sid in names if sid in kept),
+        excluded=tuple(sid for sid in names if sid not in kept),
+        unusable=tuple(unusable),
+        turnover=turnover,
     )
 
 

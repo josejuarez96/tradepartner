@@ -200,12 +200,12 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
 # --- version 7 and the migrations from versions 6 and 5 ----------------------------------
 
 
-def test_current_schema_version_is_20() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 20
+def test_current_schema_version_is_21() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 21
 
 
 def test_fresh_init_records_version_17(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [20]
+    assert _versions(journal) == [21]
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -229,7 +229,7 @@ def test_write_open_adds_the_check_and_keeps_every_row(
             _decision(conn, "left_target", decision_id=99)
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == list(range(version, 21))
+    assert versions == list(range(version, 22))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -257,7 +257,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        assert _versions(conn) == [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 
 
 @pytest.mark.parametrize("version", [5, 6])
