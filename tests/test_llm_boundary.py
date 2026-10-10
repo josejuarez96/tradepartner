@@ -26,10 +26,13 @@ concatenation (`"typesafe" + ".ai"`) passes them; reviewers read diffs for that.
 from __future__ import annotations
 
 import ast
+import bz2
 import contextlib
 import functools
+import gzip
 import io
 import json
+import lzma
 import re
 import subprocess
 import sys
@@ -76,6 +79,49 @@ def _rel(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+#: Compressed formats the text scan cannot read (#1085), by their leading bytes:
+#: zip, bzip2, xz, zstd, 7z, lz4, Unix compress (`.Z`), lzip and lzma. Any file under
+#: a scanned root that starts with one, whatever its name, fails closed, since a host
+#: inside it would go unseen. Gzip is read decompressed instead (`_read`).
+OPAQUE_MAGICS = (
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    *(b"BZh" + bytes([digit]) for digit in b"123456789"),
+    b"\xfd7zXZ\x00",
+    b"\x28\xb5\x2f\xfd",
+    b"7z\xbc\xaf\x27\x1c",
+    b"\x04\x22\x4d\x18",
+    b"\x1f\x9d",
+    b"LZIP",
+    b"\x5d\x00\x00",
+)
+#: Formats with no reliable leading bytes (brotli), or named as an archive: refused by
+#: name too.
+OPAQUE_SUFFIXES = frozenset({".zip", ".bz2", ".xz", ".zst", ".7z", ".lz4", ".br", ".lzma"})
+
+
+def _decompressed(path: Path) -> bytes:
+    """A file's bytes with every gzip layer removed, detected by content, not by name
+    (#1085): `.GZ`, `.tgz`, a gzip named `.json` and a `.gz.gz` are all unwrapped."""
+    data = path.read_bytes()
+    while data.startswith(GZIP_MAGIC):
+        data = gzip.decompress(data)
+    return data
+
+
+def _read(path: Path) -> str:
+    """A file's text as the scans see it: gzip removed first (#1085), so a gzipped
+    fixture cannot hide the vendor host; undecodable bytes are replaced."""
+    return _decompressed(path).decode("utf-8", errors="replace")
+
+
+def _opaque(path: Path) -> bool:
+    """Whether the scan cannot read `path`: another compressed format, by its leading
+    bytes after any gzip layer or by its name."""
+    return path.suffix.lower() in OPAQUE_SUFFIXES or _decompressed(path).startswith(OPAQUE_MAGICS)
+
+
 def _real_tree(
     suffix: str | None = ".py", roots: tuple[str, ...] = SCANNED_ROOTS
 ) -> dict[str, str]:
@@ -88,7 +134,7 @@ def _real_tree(
                 continue
             if suffix is not None and path.suffix != suffix:
                 continue
-            tree[_rel(path)] = path.read_text(encoding="utf-8", errors="replace")
+            tree[_rel(path)] = _read(path)
     return tree
 
 
@@ -663,6 +709,52 @@ def test_c_fixture_snippets(case: Case) -> None:
         assert case.rule in rules, rules
     else:
         assert rules == set()
+
+
+#: Built from the pattern: this file is scanned and must not name the host.
+_RECORDED_HOST = f'{{"url": "https://api.{_HOST_NAME.pattern.replace(chr(92), "")}/v1"}}'
+
+
+@pytest.mark.parametrize(
+    ("name", "layers"),
+    [("recording.json.gz", 1), ("RECORDING.JSON.GZ", 1), ("recording.json", 1), ("r.gz.gz", 2)],
+)
+def test_c_reads_a_gzipped_fixture_decompressed(tmp_path: Path, name: str, layers: int) -> None:
+    data = _RECORDED_HOST.encode()
+    for _ in range(layers):
+        data = gzip.compress(data)
+    recording = tmp_path / name
+    recording.write_bytes(data)
+    assert not _HOST_NAME.search(data.decode("utf-8", errors="replace"))
+    found = text_violations({f"tests/fixtures/typesafe/{name}": _read(recording)})
+    assert ("host", f"tests/fixtures/typesafe/{name} names the vendor host") in found
+    assert not _opaque(recording)
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        ("recording.json", bz2.compress(_RECORDED_HOST.encode())),
+        ("recording.json", lzma.compress(_RECORDED_HOST.encode())),
+        ("recording.json.gz", gzip.compress(bz2.compress(_RECORDED_HOST.encode()))),
+        ("recording.ZIP", b"anything"),
+        ("recording.br", b"anything"),
+    ],
+)
+def test_c_refuses_a_compressed_file_it_cannot_read(tmp_path: Path, name: str, data: bytes) -> None:
+    path = tmp_path / name
+    path.write_bytes(data)
+    assert _opaque(path)
+
+
+def test_c_no_compressed_file_the_scan_cannot_read() -> None:
+    opaque = [
+        _rel(path)
+        for root in (*SCANNED_ROOTS, TESTS_ROOT)
+        for path in (REPO / root).rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and _opaque(path)
+    ]
+    assert opaque == []
 
 
 def test_c_table_match_is_a_whole_token() -> None:
