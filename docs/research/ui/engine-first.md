@@ -70,7 +70,7 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 
 ## 5. What the docs constrain (and where the spike is out of line)
 
-- **ADR 0011 (accepted): Streamlit, no separate API, localhost only**, for the Phase 2–3 dashboard; those pages exist (health, backtest, trials, research, operations, override, per book). The roadmap left the next step open on purpose: "Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, is a Phase 4 ADR" (`roadmap.md`). That ADR has not been written. The owner's direction (2026-10-10) is a real app, not Streamlit, so the ADR is the missing piece: React front end, read-only local API, which writes it may make, and how the phone reaches it.
+- **ADR 0011 (accepted): Streamlit, no separate API, localhost only**, for the Phase 2–3 dashboard; those pages exist (health, backtest, trials, research, operations, override, per book). The roadmap left the next step open on purpose: "Whether Streamlit with this standard is enough, or a React front end behind a thin read-only API is warranted, is a Phase 4 ADR" (`roadmap.md`). The owner chose a real app on 2026-10-09 ("option B"), and **ADR 0018** records it: [PR #1411](https://github.com/josejuarez96/tradepartner/pull/1411) (Proposed, spec-critic and safety-reviewer PASS), a FastAPI read API on loopback, a React + TypeScript + Vite front end in `webapp/`, kill and resume as the only writes (run as `paper kill` / `paper resume` subprocesses), phone over Tailscale with identity required, Streamlit retired page by page. This note's proposals fit inside it except its open question 7 (see §7).
 - **The UI is read-only except one write:** the logged override (`exclude_name`, `keep_name`, `engage_kill_switch`) with a reason. Stop/resume from the UI needs a spec change.
 - **"Stop" is two things.** The spike's "Stop book" (holdings kept, next run skipped) is the **kill switch** (`paper kill`; released only by `paper resume` after a clean reconciliation). `paper stop` **closes the window and sells**. The UI must name them differently.
 - **No contest between books** (ADR 0017 open question): rank books against their own expected range, not against each other.
@@ -92,7 +92,7 @@ Two kinds of screen, matching the engine's two modes, plus the bench that ties t
 
 ## 7. Decisions for the owner
 
-1. **The Phase 4 front-end ADR.** Direction set by the owner: a real app (React), not Streamlit. To decide in the ADR: a read-only local API over the existing readers versus reading `tradepartner export` files; which writes the app may make (today only the logged override); whether the Streamlit pages stay as the developer's view; and how the phone reaches a localhost-only system.
+1. **ADR 0018's open question 7.** It recommends that the trials, backtest and research pages stay on Streamlit as "research tooling, not the end-user app". This note argues the opposite: the lab (trial page, step-through, sweeps) is where the app shows the engine. Answer 7 decides whether the lab moves to the web app.
 2. **Which machine view first:** the lab's trial page with the rebalance step-through, or a book's run timeline with order chains?
 3. **Engine change:** open a plan task to persist backtest signal scores and ranks, so the step-through can show why each name was chosen?
 4. **Stop/resume from the UI:** keep it as the one override (`engage_kill_switch`) and leave release to `paper resume`, or specify a UI release?
