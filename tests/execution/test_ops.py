@@ -1794,3 +1794,20 @@ def test_book_summaries_closed_window_has_no_next_rebalance(
 def test_book_summaries_is_empty_before_the_first_window(journal_settings: Settings) -> None:
     with open_read_only(journal_settings) as conn:
         assert ops.book_summaries(conn, journal_settings) == ()
+
+
+def test_the_switch_reads_the_books_own_run_lock(
+    journal_settings: Settings, two_books: dict[str, int]
+) -> None:
+    """`b`'s held run lock shows `b`'s unfinished run as in progress, and never
+    `main`'s switch (each book has its own lock, ADR 0017 B.3)."""
+    from tradepartner.execution.lock import run_lock
+
+    with run_lock(journal_settings, "b"), open_read_only(journal_settings) as conn:
+        other = ops.page_data(conn, journal_settings, "b")
+        main = ops.page_data(conn, journal_settings, "main")
+        summaries = {r.book_id: r for r in ops.book_summaries(conn, journal_settings)}
+    assert other.switch_state is not None and other.switch_state.run_in_progress
+    assert main.switch_state is not None and not main.switch_state.run_in_progress
+    assert summaries["b"].switch_state.run_in_progress
+    assert not summaries["main"].switch_state.run_in_progress

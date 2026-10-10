@@ -542,3 +542,87 @@ def test_duplicate_guard_exemption_is_the_shared_kind_constant() -> None:
         set(schema.JOURNAL_ENUMS["overrides", "kind"])
         >= override_page._DUPLICATE_GUARD_EXEMPT_KINDS
     )
+
+
+# --- the book (ADR 0017 B.7; plan T156) -------------------------------------------
+
+
+def _add_book_b(store_path: Path) -> int:
+    """A second open window, book `b` on its own account, on the same hypothesis."""
+    with open_for_write(_settings(store_path)) as conn:
+        main = conn.execute("SELECT hypothesis_id FROM paper_windows").fetchone()
+        assert main is not None
+        window_id = append(
+            conn,
+            PaperWindowRow(
+                hypothesis_id=main[0],
+                first_rebalance_session=_T0,
+                account_id="PB1",
+                starting_cash=50_000.0,
+                starting_equity=50_000.0,
+                code_version="test",
+                started_at=_STARTED,
+                frozen_json=json.dumps({"paper.min_override_reason_chars": _MIN_REASON}),
+                frozen_sha256="0" * 64,
+                book_id="b",
+                known_at=_STARTED,
+                ingested_at=_STARTED,
+            ),
+        )
+    assert window_id is not None
+    return window_id
+
+
+def _override_windows(store_path: Path) -> list[tuple[Any, ...]]:
+    with open_read_only(_settings(store_path)) as conn:
+        return conn.execute("SELECT window_id, kind FROM overrides ORDER BY override_id").fetchall()
+
+
+def test_one_book_shows_no_book_selector(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+    at = _app(monkeypatch, store)
+    assert not at.exception
+    assert all(sb.key != override_page.BOOK_KEY for sb in at.selectbox)
+
+
+def test_an_override_written_from_the_page_attaches_to_the_selected_books_window(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    b_window = _add_book_b(store)
+    at = _app(monkeypatch, store)
+    assert not at.exception
+    selector = at.selectbox(key=override_page.BOOK_KEY)
+    assert selector.options == ["b", "main"]
+    assert selector.value == "main"
+
+    _fill(at, kind="keep_name")
+    _submit(at)
+    assert not at.exception
+    at.selectbox(key=override_page.BOOK_KEY).set_value("b").run()
+    _fill(at, kind="keep_name")  # the same fields, another book: not a duplicate
+    _submit(at)
+    assert not at.exception
+
+    with open_read_only(_settings(store)) as conn:
+        main_window = conn.execute(
+            "SELECT window_id FROM paper_windows WHERE book_id = 'main'"
+        ).fetchone()
+    assert main_window is not None
+    assert _override_windows(store) == [(main_window[0], "keep_name"), (b_window, "keep_name")]
+
+
+def test_the_selected_books_window_state_is_shown(
+    monkeypatch: pytest.MonkeyPatch, store: Path
+) -> None:
+    """A book with no open window shows the `no_window` hint for that book only."""
+    _add_book_b(store)
+    with open_for_write(_settings(store)) as conn:
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, known_at, ingested_at) '
+            "SELECT window_id, ?, 'closed', ?, ? FROM paper_windows WHERE book_id = 'b'",
+            [_STARTED, _STARTED, _STARTED],
+        )
+    at = _app(monkeypatch, store)
+    assert "No paper window is open" not in _text(at)
+    at.selectbox(key=override_page.BOOK_KEY).set_value("b").run()
+    assert not at.exception
+    assert "No paper window is open for book `b`" in _text(at)

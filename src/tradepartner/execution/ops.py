@@ -749,19 +749,10 @@ def _bounded_known_at(conn: duckdb.DuckDBPyConnection, window_id: int) -> dateti
     return latest
 
 
-def _book_of(settings: Settings, book_id: str | None) -> str:
-    """The book read: `book_id`, or `paper.book_id` when none is given (the
-    spec's `--book` default); `ValueError` outside the token grammar."""
-    book = settings.paper.book_id if book_id is None else book_id
-    journal.check_book_id(book)
-    return book
-
-
 def _lock_free(settings: Settings, book: str) -> bool:
-    """Whether no process holds the book's run lock (`lock.is_held`, a
-    non-blocking check), for `switch.derive`'s in-progress rule."""
-    del book  # the run lock is one per store until the per-book lock (T155)
-    return not lock.is_held(settings)
+    """Whether no process holds the book's run lock (`lock.is_held(settings,
+    book)`, a non-blocking check), for `switch.derive`'s in-progress rule."""
+    return not lock.is_held(settings, book)
 
 
 def _positions(conn: duckdb.DuckDBPyConnection, window_id: int) -> tuple[int, float]:
@@ -793,7 +784,7 @@ def page_data(
     the run lock and never engages or releases the switch (module docstring).
     `ValueError` for a book outside the token grammar."""
     limit = settings.dashboard.page_row_limit
-    book = _book_of(settings, book_id)
+    book = lock.resolve_book(settings, book_id)
     try:
         window = journal.latest_window(conn, book)
     except JournalNotInitialised:
