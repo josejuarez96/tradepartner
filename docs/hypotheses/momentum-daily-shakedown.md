@@ -50,12 +50,13 @@ once a month at the `month_end` anchor).
 on most sessions. At `daily` cadence the ranking is monthly but the equal-weight targets
 drift every session, so every session's run has sells and buys to place; at `month_end`
 (H1's book `main`) a run trades on one session a month. Between the two `daily` variants,
-v1 (top 20%) had the shallower drawdown (about −33% against about −47% for v2, the top 5%)
-and about twice the names, so each session's re-weighting is spread over more, smaller
-orders, which is what the order path, the reconciliation and the journal must be shown to
-handle. That is the whole reason. It was decided after the sweep's results were read, and
-it is recorded as such here and in the `operations_book` decision row the registration
-writes.
+v1 (top 20%) holds about twice the names of v2 (top 5%), so each session's re-weighting
+is spread over more, smaller orders, which is more of what the order path, the
+reconciliation and the journal must be shown to handle. That is the whole reason. The two
+variants' returns and drawdowns (disclosed below) played no part in it, and neither
+variant would have been chosen on them. The choice was made after the sweep's results
+were read, and it is recorded as such here and in the `operations_book` decision row the
+registration writes.
 
 ## Parameters
 
@@ -116,7 +117,8 @@ Where each value comes from:
   `fixed_params_json`.
 
 The holdout is the family's **historical, spent** one (H1's trial 4), so under ADR 0016
-point 4 this is not a forward holdout, and `paper start` treats it as a completed one:
+point 4 this is not a forward holdout (an operations file of a forward-holdout family is
+refused, strategy-lab spec req 1 as amended), and `paper start` treats it as a completed one:
 `holdout.end` 2026-09-30 is a completed `daily` rebalance session, and T_0 is the first
 session strictly after the day the book starts. The window's `paper.min_rebalances` is the
 `daily` entry of the per-cadence table (63, ADR 0017 open question 2).
@@ -156,11 +158,12 @@ without losing anything the lab counts.
 What the registration costs the lab: one `ok` in-sample trial of this registration (the
 gap sign-off `paper start` needs references a trial of this hypothesis, so `backtest
 momentum-daily-shakedown` runs once over the default window). It is the same computation
-as v1's counted trial 11 to 16 (same canonical frozen set, same window) and should
-reproduce it to the row. It counts in the momentum family's N like any `ok` in-sample trial
-(N 8 → 9 on the owner's store, SR* moves by the eighth-to-ninth step) and adds no
-(canonical set, window) pair to V (strategy-lab spec req 3: the pair key is the canonical
-set, so this file never doubles v1's pair).
+as v1's counted trial (one of trials 11 to 16; same canonical frozen set, same default
+window) and should reproduce it to the row. It counts in the momentum family's N like any `ok` in-sample trial
+(N 8 → 9 on the owner's store, SR* moves by the eighth-to-ninth step) and, over the
+default window, adds no (canonical set, window) pair to V (strategy-lab spec req 3: the
+pair key is the canonical set, so this file never doubles v1's pair; a run over another
+window would be a new pair, as it would for any hypothesis).
 
 ## Prior-evidence disclosure
 
