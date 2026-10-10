@@ -73,13 +73,15 @@ def _event(order: OrderRow, status: str) -> OrderEventRow:
     )
 
 
-def _fill(order: OrderRow, quantity: float, price: float) -> OrderedFill:
-    stamp = _utc(order.session, 15)
+def _fill(
+    order: OrderRow, quantity: float, price: float, *, filled_at: datetime | None = None
+) -> OrderedFill:
+    stamp = _utc(order.session, 15) if filled_at is None else filled_at
     fill_id = next(_IDS)
     row = FillRow(
         fill_id=fill_id,
         client_order_id=order.client_order_id,
-        filled_at=_utc(order.session, 14),
+        filled_at=_utc(order.session, 14) if filled_at is None else filled_at,
         quantity=quantity,
         price=price,
         price_implied=False,
@@ -165,6 +167,21 @@ def test_a_split_after_the_order_adjusts_its_unfilled_quantity() -> None:
     actions = _splits((A, S2, 2.0, _utc(S1, 22)))
     # 12 x $50 (post-split price) x 1.02 = $612
     assert _reserve([order], [_event(order, "accepted")], fills, actions) == Decimal("612.00")
+
+
+def test_fills_on_both_sides_of_a_split_are_counted_in_post_split_shares() -> None:
+    # #1445: a 10-share buy on S1, 4 filled on S1 (pre-split), a 2:1 split
+    # ex-date S2, 4 more filled on S2 (already post-split shares): 20 - 8 - 4 =
+    # 8 post-split shares remain, 8 x $50 x 1.02 = $408 (not (10 - 8) x 2 = 4)
+    order = _order(S1, quantity=10.0)
+    actions = _splits((A, S2, 2.0, _utc(S1, 22)))
+    events = [_event(order, "partially_filled")]
+    fills = [_fill(order, 4.0, 100.0), _fill(order, 4.0, 50.0, filled_at=_utc(S2, 15))]
+    assert _reserve([order], events, fills, actions) == Decimal("408.00")
+    # a fill after S1's close (18:00 ET) is still on S1, before the ex-date:
+    # pre-split shares, so the same $408
+    late = [_fill(order, 4.0, 100.0, filled_at=_utc(S1, 22)), fills[1]]
+    assert _reserve([order], events, late, actions) == Decimal("408.00")
 
 
 def test_a_split_on_or_before_the_order_session_is_not_applied_again() -> None:
