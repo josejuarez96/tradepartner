@@ -2,57 +2,45 @@ import { useEffect, useState } from "react";
 import { sample } from "@/lib/data";
 import type { AppData } from "@/lib/types";
 import { scenario } from "@/lib/scenarios";
+import { lab, strategy } from "@/lib/lab";
 import { Shell, type Screen } from "@/components/Shell";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Overview } from "@/screens/Overview";
-import { Research } from "@/screens/Research";
+import { Today } from "@/screens/Today";
+import { Strategies } from "@/screens/Strategies";
+import { StrategyPage } from "@/screens/Strategy";
+import { OverrideGapScreen, RegisterScreen, SpendHoldoutScreen } from "@/screens/StrategyActions";
 import { BookLoading, Books } from "@/screens/Book";
-import { Trial } from "@/screens/Trial";
 import { TrialBench } from "@/screens/TrialBench";
 import { LoadError, NoBooks, OverviewLoading } from "@/screens/OverviewStates";
-import { SampleA } from "@/samples/SampleA";
-import { SampleB } from "@/samples/SampleB";
-import { SampleC } from "@/samples/SampleC";
-import { SampleD } from "@/samples/SampleD";
-import { SampleE } from "@/samples/SampleE";
-
-const SAMPLES: Record<string, () => React.JSX.Element> = { "sample-a": SampleA, "sample-b": SampleB, "sample-c": SampleC, "sample-d": SampleD, "sample-e": SampleE };
 
 type Load = { kind: "loading" } | { kind: "error"; retrying: boolean } | { kind: "ready"; data: AppData };
 
 const state = new URLSearchParams(location.search).get("state");
 
-function useScreen(): Screen {
-  const read = (): Screen => {
-    const h = location.hash.replace("#", "").split("/")[0];
-    return h === "research" || h === "books" ? h : "overview";
-  };
-  const [s, setS] = useState<Screen>(read);
+/** `#today`, `#strategies[/<id>[/<tab or action>]]`, `#books/<id>`. */
+interface Route { screen: Screen; id?: string; sub?: string }
+function readRoute(): Route {
+  const [a, b, c] = location.hash.replace("#", "").split("/");
+  if (a === "strategies") return { screen: "strategies", id: b, sub: c };
+  if (a === "books") return { screen: "books", id: b };
+  return { screen: "today" };
+}
+function useRoute(): Route {
+  const [r, setR] = useState<Route>(readRoute);
   useEffect(() => {
-    const on = () => setS(read());
+    const on = () => { const n = readRoute(); setR((p) => { if (p.screen !== n.screen || p.id !== n.id) scrollTo(0, 0); return n; }); };
     addEventListener("hashchange", on);
     return () => removeEventListener("hashchange", on);
   }, []);
-  return s;
+  return r;
 }
 
-/** `#research/trial/<idea>` opens that idea's backtest. */
-function useTrialId(): string | null {
-  const read = () => { const [a, b, c] = location.hash.replace("#", "").split("/"); return a === "research" && (b === "trial" || b === "bench") && c ? `${b}:${c}` : null; };
-  const [id, setId] = useState(read);
-  useEffect(() => {
-    const on = () => { setId(read()); scrollTo(0, 0); };
-    addEventListener("hashchange", on);
-    return () => removeEventListener("hashchange", on);
-  }, []);
-  return id;
-}
+const ACTIONS = new Set(["register", "spend-holdout", "override-gap", "bench", "run"]);
 
-/** Prototype loader: reads the sample file; ?state= previews loading, error, empty, alert, stopped, safety and stopfail. */
+/** Prototype loader: reads the sample files; ?state= previews loading, error, empty, alert, calm, stopped, safety and stopfail. */
 export function App() {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
-  const screen = useScreen();
-  const trialId = useTrialId();
+  const route = useRoute();
 
   useEffect(() => {
     if (state === "loading") return;
@@ -62,27 +50,31 @@ export function App() {
   }, []);
 
   const data = load.kind === "ready" ? load.data : null;
-  // Design samples render on their own, outside the app shell, for comparison.
-  const Sample = SAMPLES[location.hash.slice(1)];
-  if (Sample) return <Sample />;
+  const s = route.id ? strategy(route.id) : undefined;
+  const action = route.sub && ACTIONS.has(route.sub) ? route.sub : undefined;
+  const tab = action ? undefined : route.sub;
+  const replayId = s?.id === "h1-momentum-12-1" ? "h1" : null;
+
   return (
     <TooltipProvider>
-      <Shell
-        screen={screen}
-        mode={data?.account_mode ?? "paper"}
-        sample={data?.sample ?? true}
-        counts={{ overview: data?.alerts.length, research: data?.research.waiting.length }}
-      >
-        {load.kind === "loading" && (screen === "books" ? <BookLoading /> : <OverviewLoading />)}
+      <Shell screen={route.screen} mode={data?.account_mode ?? "paper"} sample={data?.sample ?? true} counts={{ today: lab.waiting.length }}>
+        {load.kind === "loading" && (route.screen === "books" ? <BookLoading /> : <OverviewLoading />)}
         {load.kind === "error" && (
           <LoadError
             retrying={load.retrying}
             onRetry={() => { setLoad({ kind: "error", retrying: true }); setTimeout(() => setLoad({ kind: "error", retrying: false }), 1200); }}
           />
         )}
-        {data && screen === "research" && (trialId ? (trialId.startsWith("bench:") ? <TrialBench data={data} ideaId={trialId.slice(6)} /> : <Trial data={data} ideaId={trialId.slice(6)} />) : <Research data={data} />)}
-        {data && screen === "overview" && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
-        {data && screen === "books" && <Books data={data} />}
+        {data && route.screen === "today" && (data.books.length ? <Today data={data} /> : <NoBooks />)}
+        {data && route.screen === "strategies" && !route.id && <Strategies />}
+        {data && route.screen === "strategies" && route.id && (
+          s && action === "register" ? <RegisterScreen s={s} />
+          : s && action === "spend-holdout" ? <SpendHoldoutScreen s={s} />
+          : s && action === "override-gap" ? <OverrideGapScreen s={s} />
+          : s && action === "bench" && replayId ? <TrialBench data={data} ideaId={replayId} back={`#strategies/${s.id}/result`} />
+          : <StrategyPage data={data} id={route.id} tab={tab} action={action} />
+        )}
+        {data && route.screen === "books" && <Books data={data} />}
       </Shell>
     </TooltipProvider>
   );

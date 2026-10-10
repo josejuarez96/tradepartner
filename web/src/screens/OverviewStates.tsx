@@ -40,7 +40,7 @@ export function LoadError({ onRetry, retrying }: { onRetry: () => void; retrying
 /** Empty: before any book exists. */
 export function NoBooks() {
   return (
-    <Notice title="No books running yet" action={<Button size="sm" variant="outline" asChild><a href="#research">Open research</a></Button>}>
+    <Notice title="No books running yet" action={<Button size="sm" variant="outline" asChild><a href="#strategies">Open strategies</a></Button>}>
       When a strategy starts trading on paper, its value and its return against the S&amp;P 500 show up here.
     </Notice>
   );

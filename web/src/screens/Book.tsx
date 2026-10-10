@@ -13,7 +13,9 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Pill, Spark } from "@/screens/Overview";
+import { Pill, Spark } from "@/components/Marks";
+import { TermInfo } from "@/components/Term";
+import { lab, type KillEvent } from "@/lib/lab";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
 const pctW = (v: number) => `${(v * 100).toFixed(1)}%`;
@@ -38,18 +40,23 @@ export function Books({ data }: { data: AppData }) {
   const id = useBookId();
   // Stops and resumes made here; the real app would post them to the local API.
   const [status, setStatus] = useState<Record<string, BookStatus>>({});
+  const [events, setEvents] = useState<KillEvent[]>([]);
   const fallback = [...data.books].sort((a, b) => b.equity.length - a.equity.length)[0];
   const book = id ? data.books.find((b) => b.id === id) : fallback;
   if (!book) return <BookNotFound id={id ?? ""} first={fallback?.id} />;
   const live = { ...book, status: status[book.id] ?? book.status };
-  return <BookDetail key={book.id} data={data} book={live} onStatus={(s) => setStatus((m) => ({ ...m, [book.id]: s }))} />;
+  const log = [...lab.kill_switch_events, ...events].filter((e) => e.book_id === book.id);
+  return <BookDetail key={book.id} data={data} book={live} log={log} onStatus={(s, reason) => {
+    setStatus((m) => ({ ...m, [book.id]: s }));
+    setEvents((l) => [...l, { book_id: book.id, at: new Date().toISOString(), action: s.state === "stopped" ? "engaged" : "released", by: "you", reason, command: s.state === "stopped" ? `paper kill --book ${book.id}` : `paper resume --book ${book.id}`, ...(s.state === "running" ? { reconciliation: "ok (sample)" } : {}) }]);
+  }} />;
 }
 
 type Open = { kind: "holding"; p: Position } | { kind: "order"; o: Order } | null;
 
-function BookDetail({ data, book, onStatus }: { data: AppData; book: Book; onStatus: (s: BookStatus) => void }) {
+function BookDetail({ data, book, log, onStatus }: { data: AppData; book: Book; log: KillEvent[]; onStatus: (s: BookStatus, reason: string) => void }) {
   const strategy = data.strategies.find((s) => s.id === book.strategy_id)!;
-  const idea = data.research.ideas.find((i) => i.book_id === book.id);
+  const strat = lab.strategies.find((x) => x.book_id === book.id);
   const [range, setRange] = useState<RangeKey>("ALL");
   const [hover, setHover] = useState<string | null>(null);
   const [dialog, setDialog] = useState<"stop" | "resume" | null>(null);
@@ -90,7 +97,7 @@ function BookDetail({ data, book, onStatus }: { data: AppData; book: Book; onSta
             {signedMoney(last.value - book.start_equity)} ({pct(sinceStart)}) <span className="text-muted-foreground font-sans">since {shortDate(book.started_on)}</span>
           </p>
         </div>
-        {!stopped && <Button variant="outline" className="mt-1 h-11 sm:h-9" onClick={() => setDialog("stop")}>Stop book</Button>}
+        {!stopped && <Button variant="outline" className="border-loss/40 text-loss hover:text-loss hover:bg-loss/10 mt-1 h-11 sm:h-9" onClick={() => setDialog("stop")}>Kill switch…</Button>}
       </div>
 
       {stopped && <StoppedNotice book={book} onResume={() => setDialog("resume")} />}
@@ -129,12 +136,13 @@ function BookDetail({ data, book, onStatus }: { data: AppData; book: Book; onSta
       <Holdings book={book} rule={strategy.rule} onOpen={(p) => setOpen({ kind: "holding", p })} />
       <WhyItHolds book={book} rule={strategy.rule} />
       <Orders book={book} onOpen={(o) => setOpen({ kind: "order", o })} />
+      <KillHistory log={log} />
 
       <p className="text-muted-foreground mt-10 border-t pt-4 text-xs">
-        Book id {book.id}, strategy {strategy.id}{idea && <>, research idea {idea.code}</>}. Sample data.
+        Book id {book.id}{strat && <>, strategy {strat.code} <span className="num">{strat.id}</span></>}. Sample data.
       </p>
 
-      <StopResumeDialog book={book} mode={dialog} onClose={() => setDialog(null)} onDone={(s) => { onStatus(s); setDialog(null); }} />
+      <StopResumeDialog book={book} mode={dialog} onClose={() => setDialog(null)} onDone={(s, reason) => { onStatus(s, reason); setDialog(null); }} />
       <DetailSheet open={open} book={book} rule={strategy.rule} onClose={() => setOpen(null)} />
     </Page>
   );
@@ -147,24 +155,24 @@ function BookSwitcher({ data, current }: { data: AppData; current: string }) {
       {data.books.map((b) => (
         <a key={b.id} href={`#books/${b.id}`} aria-current={b.id === current ? "page" : undefined}
           className={cn("inline-flex h-11 min-w-11 items-center rounded-full px-4 text-[13px] font-medium", b.id === current ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground")}>
-          {b.name}{b.status.state === "stopped" && <span className="text-attention ml-1.5 font-normal">stopped</span>}
+          {b.name}{b.status.state === "stopped" && <span className="text-attention ml-1.5 font-normal">{b.status.by === "safety" ? "halted" : "kill switch"}</span>}
         </a>
       ))}
     </nav>
   );
 }
 
-/** The one boxed item on the screen: the book is stopped, by whom, when, why, and the way back. */
+/** The one boxed item on the screen: the kill switch is engaged (or a risk rule halted the book), by whom, when, why, and the way back. */
 function StoppedNotice({ book, onResume }: { book: Book; onResume: () => void }) {
   const s = book.status;
   const who = s.by === "safety" ? `the ${s.rule?.toLowerCase() ?? "safety rule"}` : "you";
   return (
     <div role="status" className="border-attention/40 bg-attention-soft mt-5 flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-start">
       <div className="min-w-0 flex-1">
-        <p className="font-medium"><span className="text-attention">Stopped</span> by {who}, {at(s.at!)}</p>
+        <p className="font-medium"><span className="text-attention">{s.by === "safety" ? "Halted" : "Kill switch engaged"}</span> by {who}, {at(s.at!)}</p>
         {s.reason && <p className="mt-1">{s.by === "safety" ? s.reason : <>“{s.reason}”</>}</p>}
         <p className="text-muted-foreground mt-1 text-[13px]">
-          No orders go out until you resume it. It still holds {book.positions.length ? `its ${book.positions.length} stocks` : "its cash"}, and the value keeps updating.
+          No orders go out until you resume it after a reconciliation with status ok. It still holds {book.positions.length ? `its ${book.positions.length} stocks` : "its cash"}, and the value keeps updating.
         </p>
       </div>
       <Button className="h-11 shrink-0 sm:h-9" onClick={onResume}>Resume…</Button>
@@ -367,7 +375,7 @@ function Orders({ book, onOpen }: { book: Book; onOpen: (o: Order) => void }) {
 function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boolean }) {
   const s = data.strategies.find((x) => x.id === book.strategy_id)!;
   const bt = s.backtest;
-  const idea = data.research.ideas.find((i) => i.book_id === book.id);
+  const strat = lab.strategies.find((x) => x.book_id === book.id);
   return (
     <div className="mt-3 lg:mt-0">
       <div className="hidden lg:block">
@@ -381,7 +389,7 @@ function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boo
             <span className="min-w-0 flex-1">
               <span className="block font-medium">{b.name}</span>
               <span className="text-muted-foreground block truncate text-xs">
-                {(here ? book.status.state : b.status.state) === "stopped" ? <span className="text-attention">Stopped</span> : data.strategies.find((x) => x.id === b.strategy_id)?.name}
+                {(here ? book.status.state : b.status.state) === "stopped" ? <span className="text-attention">Kill switch engaged</span> : data.strategies.find((x) => x.id === b.strategy_id)?.name}
               </span>
             </span>
             {b.equity.length > 4 ? <Spark values={b.equity.map((p) => p.value)} t={tone(c.youRet)} /> : <span className="text-muted-foreground w-16 text-center text-xs">day {b.equity.length}</span>}
@@ -399,7 +407,7 @@ function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boo
         </div>
         <div className="border-b py-3">
           <dt className="text-muted-foreground text-xs">Next run</dt>
-          <dd className="mt-0.5">{stopped ? <span className="text-attention">Skipped while stopped</span> : <>{book.next_run.what}, {at(book.next_run.at!)}</>}</dd>
+          <dd className="mt-0.5">{stopped ? <span className="text-attention">Submits nothing while the kill switch is engaged</span> : <>{book.next_run.what}, {at(book.next_run.at!)}</>}</dd>
         </div>
         <div className="py-3">
           <dt className="text-muted-foreground text-xs">Started</dt>
@@ -415,17 +423,22 @@ function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boo
         ["Trading cost assumed", `${bt.cost_bp} bp`],
       ]} />
       <p className="text-muted-foreground mt-1 text-xs">Tested {yearDate(bt.period.slice(0, 10))} to {yearDate(bt.period.slice(-10))}, after costs.</p>
-      {idea && data.research.replays[idea.id] && (
-        <a href={`#research/trial/${idea.id}`} className="hover:text-foreground text-muted-foreground mt-2 inline-flex h-11 items-center gap-1 text-[13px] sm:h-8">
-          Watch the backtest run<ChevronRight className="size-3.5" />
+      {strat && (
+        <a href={`#strategies/${strat.id}`} className="hover:text-foreground text-muted-foreground mt-2 inline-flex h-11 items-center gap-1 text-[13px] sm:h-8">
+          Its strategy page<ChevronRight className="size-3.5" />
         </a>
       )}
+
+      <RailHead>Kill switch and stop are two things</RailHead>
+      <p className="text-[13px] leading-relaxed">
+        The kill switch keeps the holdings and submits nothing until it is released. Closing the book is <code className="num">paper stop</code> at the desk: it closes the window and sells everything.
+      </p>
     </div>
   );
 }
 
 /** Stop or resume, with what happens spelled out, a required reason and a plain confirm. */
-function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "stop" | "resume" | null; onClose: () => void; onDone: (s: BookStatus) => void }) {
+function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "stop" | "resume" | null; onClose: () => void; onDone: (s: BookStatus, reason: string) => void }) {
   const [reason, setReason] = useState("");
   const [tried, setTried] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -445,7 +458,7 @@ function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "
     setBusy(true); setFailed(false);
     setTimeout(() => {
       if (failOnce.left) { failOnce.left = false; setBusy(false); setFailed(true); return; }
-      onDone(stop ? { state: "stopped", by: "you", at: new Date().toISOString(), reason: reason.trim() } : { state: "running" });
+      onDone(stop ? { state: "stopped", by: "you", at: new Date().toISOString(), reason: reason.trim() } : { state: "running" }, reason.trim());
     }, 700);
   };
 
@@ -453,7 +466,7 @@ function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "
     <Dialog open={!!mode} onOpenChange={(o) => !o && !busy && onClose()}>
       <DialogContent className="bg-raised gap-5 sm:max-w-md">
         <DialogHeader className="text-left">
-          <DialogTitle>{stop ? `Stop ${book.name}?` : `Resume ${book.name}?`}</DialogTitle>
+          <DialogTitle className="flex items-center gap-1">{stop ? `Engage the kill switch on ${book.name}?` : `Resume ${book.name}?`}<TermInfo k="kill_switch" /></DialogTitle>
           <DialogDescription className="sr-only">{stop ? "What stopping does, and a reason to record." : "What resuming does, and a reason to record."}</DialogDescription>
         </DialogHeader>
         <ul className="list-disc space-y-1.5 pl-5 text-[13.5px]">
@@ -462,19 +475,20 @@ function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "
               <li>No orders from the next run, {at(next)}, or any run after it.</li>
               <li>It keeps {book.positions.length ? <>its {book.positions.length} stocks and <span className="num">{money(book.cash)}</span> cash</> : <><span className="num">{money(book.cash)}</span> in cash</>}. Nothing is sold.</li>
               <li>{open ? `${open} open order${open > 1 ? "s are" : " is"} cancelled.` : "No orders are open, so nothing is cancelled."}</li>
-              <li>Its value and chart keep updating. It stays stopped until you resume it.</li>
+              <li>Its value and chart keep updating. It stays this way until you resume it, after a reconciliation with status ok.</li>
             </>
           ) : (
             <>
               <li>Stopped by {s.by === "safety" ? `the ${s.rule?.toLowerCase()}` : "you"}{s.at && <>, {at(s.at)}</>}{s.reason && <>: {s.by === "safety" ? s.reason : `“${s.reason}”`}</>}</li>
+              <li>Needs reconciliations.status = ok first. Last one: ok at {clock(book.last_run.at)}.</li>
               <li>Nothing trades now. The next run is {at(next)}.</li>
-              <li>That run trades back to the rule: it buys what entered the top and sells what fell out while it was stopped.</li>
+              <li>That run trades back to the rule: it buys what entered the top and sells what fell out while the switch was engaged.</li>
               {s.by === "safety" && <li>Resuming doesn't change the {s.rule?.toLowerCase()}; it can stop the book again.</li>}
             </>
           )}
         </ul>
         <div className="flex flex-col gap-1.5">
-          <label htmlFor="reason" className="text-[13px] font-medium">{stop ? "Why are you stopping it?" : "Why resume now?"}</label>
+          <label htmlFor="reason" className="text-[13px] font-medium">{stop ? "Reason" : "Why resume now?"}</label>
           <Textarea id="reason" ref={field} className="aria-invalid:border-attention aria-invalid:ring-attention/25 dark:aria-invalid:ring-attention/30" value={reason} onChange={(e) => setReason(e.target.value)} rows={2} disabled={busy}
             aria-invalid={tried && missing} aria-describedby="reason-help"
             placeholder={stop ? "e.g. earnings week, want to watch first" : "e.g. earnings are out, nothing looks wrong"} />
@@ -484,15 +498,40 @@ function StopResumeDialog({ book, mode, onClose, onDone }: { book: Book; mode: "
         </div>
         {failed && (
           <p role="alert" className="text-attention text-[13px]">
-            Couldn't {stop ? "stop" : "resume"} {book.name}. Nothing changed: it's still {stop ? "running" : "stopped"}. Try again; if it keeps failing, the computer running TradePartner may be offline.
+            {stop ? <>The kill switch is NOT engaged on {book.name}.</> : <>Couldn't resume {book.name}; the kill switch is still engaged.</>} Try again; if it keeps failing, the computer running TradePartner may be offline.
           </p>
         )}
         <DialogFooter className="gap-2">
-          <Button variant="outline" className="h-11 sm:h-9" onClick={onClose} disabled={busy}>{stop ? "Keep it running" : "Leave it stopped"}</Button>
-          <Button className="h-11 sm:h-9" onClick={submit} disabled={busy}>{busy ? (stop ? "Stopping…" : "Resuming…") : failed ? "Try again" : stop ? `Stop ${book.name}` : `Resume ${book.name}`}</Button>
+          <Button variant="outline" className="h-11 sm:h-9" onClick={onClose} disabled={busy}>{stop ? "Keep it running" : "Leave it engaged"}</Button>
+          <Button className="h-11 sm:h-9" onClick={submit} disabled={busy}>{busy ? (stop ? "Engaging…" : "Resuming…") : failed ? "Try again" : stop ? "Engage kill switch" : `Resume ${book.name}`}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Every engage and release on this book, newest first, with its reason: the kill_switch table. */
+function KillHistory({ log }: { log: KillEvent[] }) {
+  const rows = [...log].sort((a, b) => b.at.localeCompare(a.at));
+  return (
+    <Section title={<span className="inline-flex items-center">Kill switch history<TermInfo k="kill_switch" /></span>}>
+      {rows.length === 0 ? (
+        <p className="text-muted-foreground border-t pt-3">Never engaged.</p>
+      ) : (
+        <ul className="border-t">
+          {rows.map((e) => (
+            <li key={e.at + e.action} className="grid grid-cols-[112px_76px_minmax(0,1fr)] items-baseline gap-x-3 border-b py-2.5 text-[13.5px] max-sm:grid-cols-[96px_minmax(0,1fr)]">
+              <span className="num text-muted-foreground text-xs">{shortDate(e.at)}, {clock(e.at)}</span>
+              <span className={cn(e.action === "engaged" ? "text-attention" : "text-foreground")}>{e.action === "engaged" ? "Engaged" : "Released"}</span>
+              <span className="min-w-0 max-sm:col-span-2 max-sm:mt-0.5">
+                “{e.reason}”{e.reconciliation && <span className="text-muted-foreground"> Reconciliation {e.reconciliation}.</span>}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-muted-foreground mt-2 text-xs">Engaged with paper kill, released with paper resume; each row is the kill_switch table's, with the reason typed.</p>
+    </Section>
   );
 }
 
@@ -603,7 +642,7 @@ function BookNotFound({ id, first }: { id: string; first?: string }) {
       <p className="text-muted-foreground">
         {first ? "Check the name in the address, or pick one of your books." : "When a strategy starts trading on paper, its holdings, orders and stop control show up here."}
       </p>
-      <Button size="sm" variant="outline" className="h-11 sm:h-9" asChild><a href={first ? `#books/${first}` : "#research"}>{first ? "Open your books" : "Open research"}</a></Button>
+      <Button size="sm" variant="outline" className="h-11 sm:h-9" asChild><a href={first ? `#books/${first}` : "#strategies"}>{first ? "Open your books" : "Open strategies"}</a></Button>
     </div>
   );
 }

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ChevronLeft, Maximize2, Minimize2, Pause, Play, SkipBack, SkipForward } from "lucide-react";
-import type { AppData, Idea, Replay, ReplayRebalance } from "@/lib/types";
+import type { AppData, Replay, ReplayRebalance } from "@/lib/types";
+import { family, lab, num, type Strategy } from "@/lib/lab";
 import { money, pct, tone } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { BenchChart } from "@/components/BenchChart";
 import { Scrubber } from "@/components/Scrubber";
-import { LuckInfo } from "@/components/LuckInfo";
+import { DsrMaths, TermInfo } from "@/components/Term";
 import { Assumptions, CostBars, SignalPicture, YearBars, p0, pts1, useWidth, yearDate } from "@/screens/Trial";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
@@ -18,14 +19,14 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
  * owner pointed at (Build Alpha, RealTest, AmiBroker), with honest forms:
  * percentile bands instead of spaghetti, numbers in every cell, no 3D.
  */
-export function TrialBench({ data, ideaId }: { data: AppData; ideaId: string }) {
+export function TrialBench({ data, ideaId, back }: { data: AppData; ideaId: string; back: string }) {
   const replay = data.research.replays[ideaId];
-  const idea = data.research.ideas.find((i) => i.id === ideaId);
-  if (!replay || !idea) return <p className="text-muted-foreground p-6">No backtest to show for this idea.</p>;
-  return <Bench replay={replay} idea={idea} />;
+  const idea = lab.strategies.find((s) => s.id === "h1-momentum-12-1");
+  if (!replay || !idea) return <p className="text-muted-foreground p-6">No step-by-step record for this trial.</p>;
+  return <Bench replay={replay} idea={idea} back={back} />;
 }
 
-function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
+function Bench({ replay, idea, back }: { replay: Replay; idea: Strategy; back: string }) {
   const R = replay.rebalances;
   const last = R.length - 1;
   const [at, setAt] = useState(last);
@@ -72,23 +73,23 @@ function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
   const seek = (i: number) => { setPlaying(false); setAt(i); };
   const span = (id: string, normal: string) => (wide === id ? "lg:col-span-12" : normal);
   const toggle = (id: string) => () => setWide(wide === id ? null : id);
-  const luckWord = replay.end.luck >= 0.95 ? "likely real" : replay.end.luck >= 0.5 ? "could be luck" : "probably luck";
+  const fam = family(idea.family);
 
   return (
     <div className="mx-auto max-w-[1440px] px-4 pb-12 sm:px-6">
       <header className="flex flex-wrap items-end gap-x-8 gap-y-3 pt-4 pb-3">
         <div className="min-w-0">
-          <a href={`#research/trial/${idea.id}`} className="text-muted-foreground hover:text-foreground -ml-1 inline-flex h-8 items-center gap-1 text-[12.5px]">
-            <ChevronLeft className="size-3.5" />Simple view
+          <a href={back} className="text-muted-foreground hover:text-foreground -ml-1 inline-flex h-8 items-center gap-1 text-[12.5px]">
+            <ChevronLeft className="size-3.5" />Result
           </a>
-          <h1 className="text-[17px] font-medium tracking-[-0.01em]">{idea.name}, backtest</h1>
+          <h1 className="text-[17px] font-medium tracking-[-0.01em]">{idea.name}, how trial {replay.trial} was computed</h1>
           <p className="text-muted-foreground text-[12.5px]">{yearDate(replay.window.start)} to {yearDate(replay.window.end)}, trial {replay.trial}</p>
         </div>
         <dl className="ml-auto grid grid-cols-2 gap-x-8 gap-y-2 sm:flex sm:gap-x-10">
           <Stat label="A year over the S&P, after costs"><span className={toneText[tone(replay.end.vs_spy)]}>{pts1(replay.end.vs_spy)} pts</span></Stat>
-          <Stat label={<span className="inline-flex items-center gap-1">Luck check <LuckInfo idea={idea} /></span>}>{Math.round(replay.end.luck * 100)}% <span className="text-muted-foreground font-sans text-xs">{luckWord}</span></Stat>
-          <Stat label="Versions tried">{replay.end.tries}</Stat>
-          <Stat label="Exam on paper">{idea.exam?.kind === "paper" ? `${idea.exam.done} of ${idea.exam.of}` : "on hold"}</Stat>
+          <Stat label={<span className="inline-flex items-center">DSR<TermInfo k="dsr"><DsrMaths /></TermInfo></span>}>{num(replay.end.dsr, 4)}</Stat>
+          <Stat label={<span className="inline-flex items-center">N at the run<TermInfo k="n_trials" /></span>}>{replay.end.n_trials}</Stat>
+          <Stat label={<span className="inline-flex items-center">Holdout<TermInfo k="holdout" /></span>}><span className="font-sans text-[15px]">{fam?.holdout.state ?? "unspent"}</span></Stat>
         </dl>
       </header>
 
@@ -149,7 +150,7 @@ function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
         </Panel>
       </div>
       <p className="text-muted-foreground mt-3 text-xs">
-        Trial {replay.trial} of h1-momentum-12-1, {idea.family} family; settings fingerprint and code version {replay.identity.params}; data as known through {yearDate(replay.identity.data_cutoff)}.
+        Trial {replay.trial} of h1-momentum-12-1, {idea.family} family; params_sha256 and code_version {replay.identity.params}; data as known through {yearDate(replay.identity.data_cutoff)}.
         Sample data: H1&apos;s rule and window, invented stocks and prices. Space plays and pauses; arrow keys on the timeline step.
       </p>
     </div>

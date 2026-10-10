@@ -71,30 +71,6 @@ export interface AppData {
   research: Research;
 }
 
-export type Stage = "on_paper" | "ready" | "blocked" | "exploring" | "parked" | "retired";
-
-export interface Idea {
-  id: string; code: string; name: string; family: string; stage: Stage; idea: string; book_id?: string;
-  evidence?: { for: number; mixed: number; against: number; untested?: number; note: string };
-  expected?: string; stop_rule?: string;
-  /** vs_spy: excess return a year over the S&P 500; luck: chance the edge is real after counting every try (DSR). */
-  result?: { status: "done"; window: string; vs_spy: number; luck: number; tries: number; distinct: number; periods: number; period: string; cost_drag: number; sample?: string[] };
-  exam?: { kind: "paper" | "holdout"; label: string; done?: number; of?: number; unit?: string; status?: string; note?: string };
-  blocked_by?: string[]; parked?: string; next?: string; cost: string;
-}
-
-export interface WaitingItem {
-  id: string; idea_id?: string; kind: "run" | "answer" | "decide" | "record";
-  title: string; why: string; effort: string; step: string;
-}
-
-export interface Family {
-  id: string; name: string; tries: number; luck_bar_note?: string;
-  exam: "spent" | "unspent"; exam_date?: string; promotions: [number, number]; sample?: string[];
-}
-
-export interface Lesson { id: string; text: string; grade: "supported" | "mixed" | "against" | "untested"; source: string }
-
 /** A name at a rebalance: its rank and score on the measure (null if it left the universe). */
 export interface Ranked { s: string; r: number | null; sig: number | null }
 
@@ -124,7 +100,7 @@ export interface Replay {
   rebalances: ReplayRebalance[];
   /** The same run's result at every cost level the engine evaluates. */
   cost_levels: { bp: number; vs_spy: number }[]; annual_turnover: number;
-  end: { vs_spy: number; luck: number; tries: number; distinct: number; periods: number };
+  end: { vs_spy: number; dsr: number; n_trials: number; distinct: number; periods: number };
   identity: { params: string; code: string; data_cutoff: string };
   /** Month by month: the strategy's return (s) and the S&P's (b). */
   monthly: { month: string; s: number; b: number }[];
@@ -132,4 +108,5 @@ export interface Replay {
   drawdown: { date: string; s: number; b: number }[];
 }
 
-export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[]; replays: Record<string, Replay> }
+/** Only the replays remain here; the lab lives in sample/lab.json (lib/lab.ts). */
+export interface Research { replays: Record<string, Replay> }

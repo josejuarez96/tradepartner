@@ -2,11 +2,11 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { ThemeSwitch } from "./ThemeSwitch";
 
-export type Screen = "overview" | "books" | "research";
+export type Screen = "today" | "strategies" | "books";
 const NAV: { key: Screen; label: string }[] = [
-  { key: "overview", label: "Overview" },
+  { key: "today", label: "Today" },
+  { key: "strategies", label: "Strategies" },
   { key: "books", label: "Books" },
-  { key: "research", label: "Research" },
 ];
 
 interface Props {
@@ -17,7 +17,7 @@ interface Props {
   children: ReactNode;
 }
 
-/** Direction E shell: a quiet top bar; on phone the navigation moves to a bottom tab bar. */
+/** A quiet top bar; on phone the navigation moves to a bottom tab bar. */
 export function Shell({ screen, mode, sample, counts, children }: Props) {
   const tab = (n: (typeof NAV)[number], phone: boolean) => (
     <a
@@ -37,7 +37,7 @@ export function Shell({ screen, mode, sample, counts, children }: Props) {
   return (
     <div className="flex min-h-dvh flex-col overflow-x-clip">
       <header className="flex h-14 items-center gap-7 border-b px-4 sm:px-7">
-        <a href="#overview" className="text-[15px] font-semibold">TradePartner</a>
+        <a href="#today" className="text-[15px] font-semibold">TradePartner</a>
         <nav className="hidden items-center gap-6 sm:flex" aria-label="Main">{NAV.map((n) => tab(n, false))}</nav>
         <span className="text-muted-foreground ml-auto text-[13px]">{mode === "paper" ? "Paper account" : "Live account"}{sample && ", sample data"}</span>
         <ThemeSwitch />
@@ -50,7 +50,7 @@ export function Shell({ screen, mode, sample, counts, children }: Props) {
   );
 }
 
-/** The E page: a wide main column and, on desktop, a side rail divided by a rule. */
+/** A wide main column and, on desktop, a side rail divided by a rule. */
 export function Page({ children, rail }: { children: ReactNode; rail?: ReactNode }) {
   return (
     <div className="mx-auto grid max-w-[1180px] gap-2 px-4 pt-5 pb-12 sm:px-7 sm:pt-7 lg:grid-cols-[minmax(0,1fr)_340px] lg:gap-12">
@@ -76,4 +76,33 @@ export function Section({ title, note, children, className }: { title: ReactNode
 /** A side-rail list heading. */
 export function RailHead({ children }: { children: ReactNode }) {
   return <h2 className="text-muted-foreground mt-7 mb-1 text-[13px] font-medium first:mt-0">{children}</h2>;
+}
+
+/**
+ * The workstation's soft panel, calmed: one raised surface with a small
+ * heading inside. Used where a group is a unit of attention (waiting on you,
+ * the books, the specification), never around every row.
+ */
+export function Panel({ title, aside, children, className }: { title?: ReactNode; aside?: ReactNode; children: ReactNode; className?: string }) {
+  return (
+    <section className={cn("bg-raised min-w-0 rounded-[10px] border", className)}>
+      {title && (
+        <header className="flex min-h-11 items-baseline gap-3 px-4 pt-3 pb-1">
+          <h2 className="text-[13.5px] font-medium">{title}</h2>
+          {aside && <span className="text-muted-foreground ml-auto text-xs">{aside}</span>}
+        </header>
+      )}
+      {children}
+    </section>
+  );
+}
+
+/** The label every prototype-only write carries: what it would run, and why it can't yet. */
+export function PrototypeWrite({ command, children }: { command: string; children?: ReactNode }) {
+  return (
+    <p className="text-muted-foreground border-t pt-3 text-xs leading-relaxed">
+      Prototype only: this write waits on the ADR 0018 amendment being drafted{children}. Until then it is the command{" "}
+      <code className="num text-foreground [overflow-wrap:anywhere]">{command}</code>, with the same sentence above.
+    </p>
+  );
 }

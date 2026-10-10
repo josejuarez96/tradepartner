@@ -1,0 +1,288 @@
+{
+  "note": "SAMPLE lab data for the prototype, shaped like what the local API would serve from the registry, the lab tables and the paper journal. Real values: the hypothesis files' frozen keys, slugs, holdout dates and thresholds (docs/hypotheses, docs/sweeps on main); H1 trial 2's DSR 0.7262 (psr basis, 40 monthly returns) and its 1.25% cost drag at 15 bp (STATUS.md, T45b); the momentum sweep's six variants and its [lab] values; the momentum family's holdout already spent (hypothesis-backlog B10); main's start of $100,008.90 on 2026-10-09; backlog names, blockers and parked reasons. Everything listed in an object's `sample` array, and every number not named above, is invented.",
+  "as_of": "2026-10-10T12:05:00Z",
+  "development_boundary": "2023-12-29",
+  "health": {
+    "ingest": { "session": "2026-10-09", "finished_at": "2026-10-09T22:42:00Z", "status": "ok" },
+    "runs": [
+      { "book_id": "main", "session": "2026-10-09", "finished_at": "2026-10-09T13:31:00Z", "status": "ok" },
+      { "book_id": "daily", "session": "2026-10-09", "finished_at": "2026-10-09T13:33:00Z", "status": "ok" },
+      { "book_id": "b3", "session": "2026-10-09", "finished_at": "2026-10-09T13:34:00Z", "status": "ok" }
+    ],
+    "reconciliations": [
+      { "book_id": "main", "at": "2026-10-09T13:31:00Z", "status": "ok" },
+      { "book_id": "daily", "at": "2026-10-09T13:33:00Z", "status": "ok" },
+      { "book_id": "b3", "at": "2026-10-09T13:34:00Z", "status": "ok" }
+    ],
+    "alerts": [],
+    "next": { "what": "Evening ingest", "at": "2026-10-12T22:30:00Z" },
+    "sample": ["finished_at", "at"]
+  },
+  "waiting": [
+    { "id": "w1", "kind": "trial_finished", "strategy_id": "momentum-topfrac-cadence", "tab": "result",
+      "text": "Read the momentum sweep's result", "detail": "6 of 6 variants done; the rule says nothing to do" },
+    { "id": "w2", "kind": "decision_due", "strategy_id": "b10-short-term-momentum", "tab": "register",
+      "text": "Register short-term momentum", "detail": "Freezes its parameters and starts its trial count" },
+    { "id": "w3", "kind": "draft_pr", "strategy_id": "b3b-cash-profitability",
+      "text": "Review the cash profitability draft", "detail": "Review it against its claims on GitHub.",
+      "pr": { "number": 1421, "state": "draft", "checks": "passing" }, "sample": ["pr"] }
+  ],
+  "families": [
+    { "id": "momentum", "name": "Momentum", "n_trials": 8, "sr_star": 0.58, "sr_star_next": 0.61, "v": 0.031,
+      "holdout": { "state": "spent", "spends_used": 1, "cap": 3, "spent_at": "2026-10-09T15:12:00Z", "spent_by": "h1-momentum-12-1", "trial_id": 3 },
+      "sample": ["sr_star", "sr_star_next", "v", "spent_at", "trial_id"] },
+    { "id": "profitability", "name": "Profitability", "n_trials": 1, "sr_star": 0.0, "sr_star_next": 0.21, "v": 0.0,
+      "holdout": { "state": "unspent", "spends_used": 0, "cap": 3 },
+      "sample": ["sr_star_next"] }
+  ],
+  "tracking": [
+    { "book_id": "main", "strategy_id": "h1-momentum-12-1", "through_session": "2026-10-09", "paper_return": 0.0, "backtest_return": 0.0, "gap": 0.0, "tolerance": 0.02,
+      "rebalances_done": 0, "min_rebalances": 6, "unit": "monthly rebalances", "first_rebalance": "2026-10-30", "sample": ["tolerance", "min_rebalances"] },
+    { "book_id": "daily", "strategy_id": "h1-daily", "through_session": "2026-10-09", "paper_return": 0.0412, "backtest_return": 0.0366, "gap": 0.0046, "tolerance": 0.015,
+      "rebalances_done": 48, "min_rebalances": 63, "unit": "daily rebalances", "forward": true, "sample": ["paper_return", "backtest_return", "gap", "tolerance", "min_rebalances"] },
+    { "book_id": "b3", "strategy_id": "b3-gross-profitability", "through_session": "2026-10-09", "paper_return": 0.0118, "backtest_return": 0.0189, "gap": -0.0071, "tolerance": 0.02,
+      "rebalances_done": 1, "min_rebalances": 6, "unit": "monthly rebalances", "sample": ["paper_return", "backtest_return", "gap", "tolerance", "min_rebalances"] }
+  ],
+  "kill_switch_events": [
+    { "book_id": "daily", "at": "2026-09-16T13:02:00Z", "action": "engaged", "by": "you", "reason": "Broker maintenance tonight; skip tomorrow's run", "command": "paper kill --book daily" },
+    { "book_id": "daily", "at": "2026-09-17T12:51:00Z", "action": "released", "by": "you", "reason": "Maintenance over; account matches the journal", "reconciliation": "ok at 8:49 am", "command": "paper resume --book daily" },
+    { "book_id": "b3", "at": "2026-09-29T19:40:00Z", "action": "engaged", "by": "you", "reason": "Rebalance day tomorrow, want to read the plan first", "command": "paper kill --book b3" },
+    { "book_id": "b3", "at": "2026-09-30T12:58:00Z", "action": "released", "by": "you", "reason": "Plan read; 9 in, 9 out as expected", "reconciliation": "ok at 8:56 am", "command": "paper resume --book b3" }
+  ],
+  "strategies": [
+    {
+      "id": "b10-short-term-momentum", "code": "B10", "name": "Short-term momentum", "family": "momentum", "stage": "idea",
+      "summary": "Last month's winners among the most-traded large stocks, top 20%, equal weight, monthly.",
+      "waits_on": { "who": "you", "text": "Registration" },
+      "blocked": "The engine needs the key strategy.turnover_top_fraction (a spec amendment).",
+      "prior": "Excess over SPY about zero to slightly negative after costs at 15 bp.",
+      "evidence": [
+        { "id": "SH-9", "grade": "INSUFFICIENT", "text": "Short-term momentum among high-turnover stocks (one study)." },
+        { "id": "SH-1", "grade": "NOT SUPPORTED", "text": "One-month reversal dominates short-horizon returns for most stocks." },
+        { "id": "SH-2", "grade": "NOT SUPPORTED", "text": "Short-horizon effects mostly vanish after realistic costs." }
+      ],
+      "spec": {
+        "kind": "sweep", "doc_path": "docs/sweeps/b10-short-term-momentum.md", "in_sample_start": "2020-08-31",
+        "holdout": { "start": "2024-01-01", "end": "2026-09-30", "kind": "historical, already spent by the family" },
+        "frozen": [
+          ["strategy.formation_months", "1"], ["strategy.skip_months", "0"], ["strategy.top_fraction", "0.20"],
+          ["strategy.turnover_top_fraction", "0.20"], ["strategy.weighting", "equal"], ["schedule.rebalance_cadence", "month_end"],
+          ["costs.per_side_bps", "15.0"], ["costs.sensitivity_per_side_bps", "0, 30, 60, 100"], ["universe.top_n_by_cap", "1000"],
+          ["execution.fill_price", "close"], ["gap.count_share_threshold", "0.05"]
+        ],
+        "thresholds": [
+          { "key": "selection_statistic", "value": "excess_cagr_spy" },
+          { "key": "promote_at_least", "value": "0.5", "on": "dsr_excess" },
+          { "key": "retire_below", "value": "−0.01", "on": "excess_cagr_spy" }
+        ],
+        "kill": "Retire if the one variant's excess_cagr_spy is below −1 pp a year in-sample.",
+        "budget": "1 variant (a one-value sweep), counted in the momentum family's N",
+        "sample": ["promote_at_least", "retire_below"]
+      }
+    },
+    {
+      "id": "b9-earnings-reaction-drift", "code": "B9", "name": "Earnings-reaction drift", "family": "earnings_drift", "stage": "idea",
+      "summary": "Top fifth by the market's reaction around the earnings filing, held 20 sessions, daily.",
+      "waits_on": { "who": "data", "text": "8-K items data (T164c–e)" },
+      "prior": "About zero to negative after costs.",
+      "evidence": [
+        { "id": "SH-6", "grade": "MIXED", "text": "The earnings-announcement return drifts, but much of it has faded since publication." },
+        { "id": "SH-5", "grade": "NOT SUPPORTED", "text": "Short-term earnings reactions mostly do not survive realistic costs." }
+      ]
+    },
+    {
+      "id": "b3b-cash-profitability", "code": "B3b", "name": "Cash profitability", "family": "profitability", "stage": "idea",
+      "summary": "Like profitability, with operating cash flow in place of gross profit.",
+      "waits_on": { "who": "you", "text": "Review draft PR #1421 (sample)" },
+      "evidence": [ { "id": "QI-6", "grade": "SUPPORTED", "text": "Gross profitability predicts returns, in a narrow long-short form; cash flow as a stand-in." } ]
+    },
+    {
+      "id": "b5-filing-changes", "code": "B5", "name": "Filing changes and fundamentals", "family": "new", "stage": "idea",
+      "summary": "When a company quietly rewrites its annual report, do its next results change?",
+      "waits_on": { "who": "data", "text": "Filing text ingest" },
+      "evidence": [ { "id": "ER-4", "grade": "INSUFFICIENT", "text": "Changes in annual-report language and later fundamentals." } ]
+    },
+    {
+      "id": "b7-insider-buying", "code": "B7", "name": "Insider buying", "family": "new", "stage": "idea",
+      "summary": "Follow clusters of executives buying their own company's stock, monthly.",
+      "waits_on": { "who": "data", "text": "Form 4 ingest" },
+      "evidence": [ { "id": "G2-B", "grade": "MIXED", "text": "Opportunistic or clustered insider purchases predict returns; routine ones do not." } ]
+    },
+    {
+      "id": "momentum-topfrac-cadence", "code": "T114", "name": "Momentum: top fraction and cadence", "family": "momentum", "stage": "testing",
+      "summary": "H1's rule at top 5% and 20%, monthly, weekly and daily: six variants.",
+      "waits_on": { "who": "you", "text": "Read the result" },
+      "registered_at": "2026-10-08T21:14:00Z", "params_sha256": "5e0b7c2a91f4d8e36b1a0c9f27d45e81aa30f6c2d9b84e17f5c3a2b9d06e7f14",
+      "latest": { "n_trials": 8, "sr_star": 0.58, "dsr_excess": 0.44, "excess_cagr_spy": 0.009, "label": "argmax" },
+      "prior": "Excess over SPY centred on 0 pp a year; expected range −1 to +1 pp.",
+      "evidence": [
+        { "id": "HO-1", "grade": "SUPPORTED", "text": "12-1 momentum beat the market in long historical studies (Novy-Marx and Velikov 2016: a monthly decile survives costs)." },
+        { "id": "G1-1", "grade": "MIXED", "text": "After 2010, net of costs, momentum's edge is weak and uneven." },
+        { "id": "QI-3", "grade": "MIXED", "text": "Concentrated momentum books carry crash risk (Daniel and Moskowitz 2016)." }
+      ],
+      "spec": {
+        "kind": "sweep", "doc_path": "docs/sweeps/momentum-topfrac-cadence.md", "in_sample_start": "2020-08-31",
+        "holdout": { "start": "2024-01-01", "end": "2026-09-30", "kind": "historical; variants never spend it" },
+        "frozen": [
+          ["strategy.formation_months", "12"], ["strategy.skip_months", "1"], ["strategy.top_fraction", "grid: 0.05, 0.20"],
+          ["schedule.rebalance_cadence", "grid: month_end, week_end, daily"], ["strategy.weighting", "equal"],
+          ["costs.per_side_bps", "15.0"], ["costs.sensitivity_per_side_bps", "0, 30, 60, 100"], ["universe.top_n_by_cap", "1000"],
+          ["execution.fill_price", "close"], ["gap.count_share_threshold", "0.05"]
+        ],
+        "thresholds": [
+          { "key": "selection_statistic", "value": "excess_cagr_spy" },
+          { "key": "expected_range_pp", "value": "−1.0 to +1.0" },
+          { "key": "promote_at_least", "value": "0.5", "on": "dsr_excess" },
+          { "key": "retire_below", "value": "−0.01", "on": "excess_cagr_spy" }
+        ],
+        "kill": "Retire the sweep and promote nothing when its argmax's excess_cagr_spy is below −1 pp a year.",
+        "budget": "6 variants, all counted in the momentum family's N"
+      },
+      "trials": [
+        { "trial_id": 4, "run_at": "2026-10-09T03:41:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.05, month_end", "n_trials": 3, "excess_cagr_spy": 0.009, "dsr_excess": 0.44 },
+        { "trial_id": 5, "run_at": "2026-10-09T03:58:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.20, month_end", "n_trials": 4, "excess_cagr_spy": 0.002, "dsr_excess": 0.31 },
+        { "trial_id": 6, "run_at": "2026-10-09T04:30:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.05, week_end", "n_trials": 5, "excess_cagr_spy": 0.006, "dsr_excess": 0.38 },
+        { "trial_id": 7, "run_at": "2026-10-09T05:02:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.20, week_end", "n_trials": 6, "excess_cagr_spy": -0.001, "dsr_excess": 0.27 },
+        { "trial_id": 8, "run_at": "2026-10-09T06:44:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.05, daily", "n_trials": 7, "excess_cagr_spy": -0.014, "dsr_excess": 0.12 },
+        { "trial_id": 9, "run_at": "2026-10-09T08:21:00Z", "kind": "in_sample", "status": "ok", "label": "top 0.20, daily", "n_trials": 8, "excess_cagr_spy": -0.019, "dsr_excess": 0.08 }
+      ],
+      "result": {
+        "kind": "sweep", "title": "Sweep report, complete", "finished_at": "2026-10-09T08:21:00Z", "n_trials": 8, "sr_star": 0.58, "sr_star_mark": 0.58,
+        "argmax": "top 0.05, month_end",
+        "checks": [
+          { "label": "Retirement line", "term": "retire_below", "value": "argmax excess_cagr_spy +0.9 pp", "against": "retire_below −1 pp", "pass": true, "read": "above the line: not retired" },
+          { "label": "Promotion floor", "term": "promote_at_least", "value": "argmax dsr_excess 0.44", "against": "promote_at_least 0.50", "pass": false, "read": "below the floor: no promotion" },
+          { "label": "Deflated Sharpe ratio", "term": "dsr", "value": "0.44 at N = 8", "against": "SR* 0.58, the family's high-water mark", "pass": null, "read": "the floor above reads it" },
+          { "label": "Expected range", "term": "expected_range_pp", "value": "4 of 6 variants inside", "against": "−1 to +1 pp", "pass": null, "read": "reported, not a gate" },
+          { "label": "Survivorship gap", "term": "gap", "value": "largest count share 0.021", "against": "gap.count_share_threshold 0.05", "pass": true, "read": "within the threshold at every rebalance" },
+          { "label": "Red flag", "term": "red_flag", "value": "0 variants", "against": "metrics.red_flag_excess_cagr_pp", "pass": true, "read": "none raised" }
+        ],
+        "costs": [ { "bp": 0, "excess": 0.021 }, { "bp": 15, "excess": 0.009, "base": true }, { "bp": 30, "excess": -0.003 }, { "bp": 60, "excess": -0.026 }, { "bp": 100, "excess": -0.057 } ],
+        "verdict": { "rule": "nothing", "text": "Nothing to do. The argmax is above retire_below and below promote_at_least, so the sweep neither promotes nor retires.", "then": "It stays in Testing. You can retire it with a reason, or leave it; promote is refused by the engine below the floor." },
+        "variants": [
+          { "label": "top 0.05, month_end", "excess": 0.009, "dsr_excess": 0.44, "argmax": true },
+          { "label": "top 0.20, month_end", "excess": 0.002, "dsr_excess": 0.31 },
+          { "label": "top 0.05, week_end", "excess": 0.006, "dsr_excess": 0.38 },
+          { "label": "top 0.20, week_end", "excess": -0.001, "dsr_excess": 0.27 },
+          { "label": "top 0.05, daily", "excess": -0.014, "dsr_excess": 0.12 },
+          { "label": "top 0.20, daily", "excess": -0.019, "dsr_excess": 0.08 }
+        ],
+        "identity": { "code_version": "a51b5750", "data_cutoff": "2026-10-08", "params_sha256": "5e0b7c2a…7f14" },
+        "sample": ["excess", "dsr_excess", "costs", "gap", "sr_star", "n_trials"]
+      },
+      "decisions": [
+        { "at": "2026-10-08T14:02:00Z", "kind": "sweep axes", "reason": "Half and double H1's 0.10, every cadence ADR 0012 admits; six variants accepted as the cost in N (#1295).", "by": "you" }
+      ]
+    },
+    {
+      "id": "h1-momentum-12-1", "code": "H1", "name": "Monthly momentum", "family": "momentum", "stage": "paper", "book_id": "main",
+      "summary": "Past-year return skipping the last month, top 10% of the 1,000 largest, equal weight, monthly.",
+      "waits_on": { "who": "engine", "text": "First rebalance Oct 30" },
+      "registered_at": "2026-09-30T16:20:00Z", "params_sha256": "c4f19a07e2b85d3f61a0e9c27b4d8f13a5e60c9b2d71f4e83a6c05b9e1d2f7a8",
+      "latest": { "n_trials": 2, "sr_star": 0.0, "dsr": 0.7262, "excess_cagr_spy": 0.011, "label": "trial 2" },
+      "prior": "Net excess over SPY centred on 0 pp a year; mainly a test that the machine works end to end.",
+      "evidence": [
+        { "id": "HO-1", "grade": "SUPPORTED", "text": "12-1 momentum beat the market in long historical studies." },
+        { "id": "G1-1", "grade": "MIXED", "text": "After 2010, net of costs, momentum's edge is weak and uneven." },
+        { "id": "QI-3", "grade": "MIXED", "text": "Long-only momentum keeps less of the published edge." }
+      ],
+      "spec": {
+        "kind": "hypothesis", "doc_path": "docs/hypotheses/h1-momentum-12-1.md", "in_sample_start": "2020-08-31",
+        "holdout": { "start": "2024-01-01", "end": "2026-09-30", "kind": "historical" },
+        "frozen": [
+          ["strategy.formation_months", "12"], ["strategy.skip_months", "1"], ["strategy.top_fraction", "0.10"],
+          ["strategy.weighting", "equal"], ["strategy.signal_total_return", "true"], ["schedule.rebalance_cadence", "month_end"],
+          ["costs.per_side_bps", "15.0"], ["costs.sensitivity_per_side_bps", "0, 30, 60, 100"], ["universe.top_n_by_cap", "1000"],
+          ["execution.fill_price", "close"], ["gap.count_share_threshold", "0.05"]
+        ],
+        "thresholds": [
+          { "key": "retire if excess_cagr_spy <", "value": "−0.01" },
+          { "key": "and dsr_excess <", "value": "0.5" }
+        ],
+        "kill": "Retires as a candidate for live capital when its first full-window in-sample trial is below −1 pp a year and its dsr_excess below 0.5. It stays the paper vehicle either way.",
+        "budget": "1 file, pre-lab; its sweep is counted in the same family"
+      },
+      "trials": [
+        { "trial_id": 1, "run_at": "2026-10-02T02:10:00Z", "kind": "in_sample", "status": "ok", "n_trials": 1, "note": "quant-auditor FAIL on #853, disclosed; it still counts in N", "label": "full window" },
+        { "trial_id": 2, "run_at": "2026-10-03T01:47:00Z", "kind": "in_sample", "status": "ok", "label": "full window", "n_trials": 2, "dsr": 0.7262, "excess_cagr_spy": 0.011 },
+        { "trial_id": 3, "run_at": "2026-10-09T15:12:00Z", "kind": "holdout", "status": "ok", "label": "holdout spend", "excess_cagr_spy": 0.004 },
+        { "trial_id": null, "run_at": "2026-10-09T15:05:00Z", "kind": "holdout", "status": "refused_holdout", "message": "window touches the holdout [2024-01-01, 2026-09-30]; spending it needs --spend-holdout", "label": "full window to 2026-09-30" }
+      ],
+      "result": {
+        "kind": "trial", "title": "Trial 2, in-sample, the full window", "finished_at": "2026-10-03T01:47:00Z", "n_trials": 2, "sr_star": 0.0,
+        "checks": [
+          { "label": "Retirement line, return", "term": "retire_below", "value": "excess_cagr_spy +1.1 pp", "against": "−1 pp a year", "pass": true, "read": "above the line" },
+          { "label": "Retirement line, DSR", "term": "dsr", "value": "dsr 0.7262 at N = 2", "against": "0.5", "pass": true, "read": "above the line" },
+          { "label": "SR*", "term": "sr_star", "value": "0 (one distinct parameter set)", "against": "so DSR is the PSR here", "pass": null, "read": "psr basis" },
+          { "label": "Survivorship gap", "term": "gap", "value": "largest count share 0.018", "against": "gap.count_share_threshold 0.05", "pass": true, "read": "within at every rebalance" },
+          { "label": "Cost drag", "term": "cost_sensitivity", "value": "1.25% a year at 15 bp", "against": "", "pass": null, "read": "reported" }
+        ],
+        "costs": [ { "bp": 0, "excess": 0.0235 }, { "bp": 15, "excess": 0.011, "base": true }, { "bp": 30, "excess": -0.0015 }, { "bp": 60, "excess": -0.0265 }, { "bp": 100, "excess": -0.06 } ],
+        "verdict": { "rule": "stays", "text": "Stays. The rule retires H1 only when both lines are crossed; neither is.", "then": "It stays the paper vehicle either way (ADR 0005)." },
+        "identity": { "code_version": "3f2a9c1", "data_cutoff": "2026-10-02", "params_sha256": "c4f19a07…f7a8" },
+        "sample": ["excess", "costs", "gap", "code_version"]
+      },
+      "holdout_result": { "trial_id": 3, "excess_cagr_spy": 0.004, "reason": "Frozen finalist; the paper book starts on it", "sample": ["excess_cagr_spy", "reason"] },
+      "decisions": [
+        { "at": "2026-10-07T13:20:00Z", "kind": "development_boundary", "reason": "Where the first tests already stop; no in-sample run reads past it.", "by": "you", "detail": "2023-12-29" },
+        { "at": "2026-10-09T15:12:00Z", "kind": "holdout_spend", "reason": "Frozen finalist; the paper book starts on it", "by": "you", "detail": "trial 3" },
+        { "at": "2026-10-09T15:40:00Z", "kind": "paper start", "reason": "First paper book of the momentum family", "by": "you", "detail": "book main, $100,008.90" }
+      ],
+      "sample_decisions": true
+    },
+    {
+      "id": "h1-daily", "code": "S1·d", "name": "Daily momentum", "family": "momentum", "stage": "paper", "book_id": "daily",
+      "summary": "The same momentum rule, rebalanced every session before the open.",
+      "waits_on": { "who": "engine", "text": "Forward holdout, 48 of 63" },
+      "registered_at": "2026-08-02T15:00:00Z", "params_sha256": "8a7d3e19c0b54f26e1d9a83c7f02b6e45d1c9a0f3e78b2d64c15a9e0f7b3d28c",
+      "latest": { "n_trials": 8, "sr_star": 0.58, "dsr": 0.41, "excess_cagr_spy": 0.004, "label": "latest trial" },
+      "evidence": [ { "id": "G1-1", "grade": "MIXED", "text": "Faster versions mostly lose their edge to trading costs." } ],
+      "sample": ["all"]
+    },
+    {
+      "id": "b3-gross-profitability", "code": "B3", "name": "Profitability", "family": "profitability", "stage": "paper", "book_id": "b3",
+      "summary": "Gross profit over total assets, top 10% of the 1,000 largest, equal weight, monthly.",
+      "waits_on": { "who": "you", "text": "Holdout refused on the gap" },
+      "registered_at": "2026-09-30T18:05:00Z", "params_sha256": "2b6e0f9a4c7d13e58f20a6b9c3d7e14f05a8b2c6d9e31f47a0b5c8d2e6f913a4",
+      "latest": { "n_trials": 1, "sr_star": 0.0, "dsr": 0.38, "excess_cagr_spy": -0.006, "label": "trial 1" },
+      "evidence": [
+        { "id": "QI-6", "grade": "SUPPORTED", "text": "Gross profitability predicts returns, in a narrow, long-short form." },
+        { "id": "QI-16", "grade": "MIXED", "text": "Long-only profitability tilts keep a smaller edge." }
+      ],
+      "spec": {
+        "kind": "hypothesis", "doc_path": "docs/hypotheses/b3-gross-profitability.md", "in_sample_start": "2020-08-31",
+        "holdout": { "start": "2024-01-01", "end": "2026-09-30", "kind": "historical" },
+        "frozen": [
+          ["profitability.basis", "gross"], ["profitability.top_fraction", "0.10"], ["profitability.weighting", "equal"],
+          ["profitability.max_fact_age_days", "548"], ["profitability.exclude_sic_ranges", "6000 to 6999"], ["schedule.rebalance_cadence", "month_end"],
+          ["costs.per_side_bps", "15.0"], ["universe.top_n_by_cap", "1000"], ["execution.fill_price", "close"], ["gap.count_share_threshold", "0.05"]
+        ],
+        "thresholds": [ { "key": "retire if excess_cagr_spy <", "value": "−0.01" } ],
+        "kill": "Retire if it trails SPY by more than 1 pp a year in-sample.",
+        "budget": "1 file; the family's first registration"
+      },
+      "trials": [
+        { "trial_id": 1, "run_at": "2026-10-01T02:30:00Z", "kind": "in_sample", "status": "ok", "label": "full window", "n_trials": 1, "dsr": 0.38, "excess_cagr_spy": -0.006 },
+        { "trial_id": null, "run_at": "2026-10-09T16:02:00Z", "kind": "holdout", "status": "refused_gap", "message": "survivorship-gap count share above 0.05 at 2024-03-28 (0.0612), 2024-04-30 (0.0577)", "label": "holdout spend" }
+      ],
+      "holdout_refusal": { "code": "refused_gap", "message": "survivorship-gap count share above 0.05 at 2024-03-28 (0.0612), 2024-04-30 (0.0577)", "breaches": [["2024-03-28", 0.0612], ["2024-04-30", 0.0577]] },
+      "decisions": [
+        { "at": "2026-09-30T18:05:00Z", "kind": "registration", "reason": "Family amendment accepted (#720); coverage spike passed.", "by": "you" },
+        { "at": "2026-10-01T14:10:00Z", "kind": "paper start", "reason": "Fast paper (ADR 0017): run beside H1 while the holdout waits.", "by": "you", "detail": "book b3" }
+      ],
+      "sample": ["dsr", "excess_cagr_spy", "trials", "decisions", "holdout_refusal"]
+    },
+    {
+      "id": "b4-momentum-profitability", "code": "B4", "name": "Momentum and profitability", "family": "combined", "stage": "parked",
+      "summary": "Hold stocks that score well on both momentum and profitability.",
+      "parked_reason": "Waiting for a profitability finalist, so the combined test has something to stand on.",
+      "unpark_when": "Profitability promotes a variant or passes its holdout."
+    },
+    {
+      "id": "b2-trend-filter", "code": "B2", "name": "Trend filter", "family": "momentum", "stage": "parked",
+      "summary": "Sit in cash when the market is below its 10-month average.",
+      "parked_reason": "Lowers risk and return; the goal is beating SPY.",
+      "unpark_when": "The goal changes to drawdown control."
+    }
+  ]
+}
