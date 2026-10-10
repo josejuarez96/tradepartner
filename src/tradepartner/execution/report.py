@@ -1,15 +1,17 @@
-"""Tracking comparison, monthly decomposition (Phase 4 spec req 10, ADR 0005
-check 1; plan T65).
+"""Tracking comparison, per-period decomposition (Phase 4 spec req 10, ADR 0005
+check 1; plan T65; per book and per period, ADR 0017 B.7 and C, plan T156).
 
-`compare_months(window, trial, journal, actions, prices, closes,
-stop_session) -> MonthlyComparison` is pure: no clock, no store, no live
-`Settings` read. Per rebalance month i (consecutive sessions
+`compare_periods(window, trial, journal, actions, prices, closes,
+stop_session) -> PeriodComparison` is pure: no clock, no store, no live
+`Settings` read. Per rebalance period i of the window's cadence (a month at
+`month_end`, an ISO week at `week_end`, a session at `daily`; spec req 10 as
+amended 2026-10-09) (consecutive sessions
 `trial.sessions[i]` = T_i and `trial.sessions[i + 1]` = T_{i+1}) it
 computes:
 
 - the **raw difference**: paper's return (ledger equity at close(T_{i+1})
   over close(T_i), both from `journal.positions_daily`) minus the trial's
-  month return (`trial.equity[T_{i+1}] / trial.equity[T_i] - 1`);
+  period return (`trial.equity[T_{i+1}] / trial.equity[T_i] - 1`);
 - the **dividend term**: over equity at close(T_i), the sum over
   `corporate_actions` dividend rows with `ex_date` in (T_i, T_{i+1}] and
   `known_at <= close(T_{i+1})` of amount x the ledger quantity held on the
@@ -41,13 +43,13 @@ computes:
   not paper's, so the threshold tracks the trial's own scale and is unaffected
   by paper's account size relative to the trial's).
 
-The check applies `window`'s frozen `paper.tracking_k` to that month's
+The check applies `window`'s frozen `paper.tracking_k` to that period's
 modelled cost, against the series the frozen `paper.tracking_rule` names
-(`raw` or `residual`): under `raw` only months with a `missed` rebalance
+(`raw` or `residual`): under `raw` only periods with a `missed` rebalance
 event are excluded from the check (listed separately); under `residual`,
-months with an override are excluded too (a `decisions` row with
-`decision = "override"` at T_i). A month with a `skip_*` decision is listed
-with its names whichever rule applies, never excluded. A month whose
+periods with an override are excluded too (a `decisions` row with
+`decision = "override"` at T_i). A period with a `skip_*` decision is listed
+with its names whichever rule applies, never excluded. A period whose
 T_{i+1} falls on or after `stop_session` is left out of the result
 entirely ("uncompared"): no term is computed for it. `window.frozen_json`
 is read for `paper.tracking_k` and `paper.tracking_rule` only, never live
@@ -77,6 +79,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, Settings
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
@@ -131,12 +134,12 @@ CONVENTIONS: tuple[str, ...] = (
 
 
 @dataclass(frozen=True)
-class TrialMonths:
-    """The tracking trial's base-level series as `compare_months` needs them.
+class TrialPeriods:
+    """The tracking trial's base-level series as `compare_periods` needs them.
 
     `sessions` is every rebalance session the trial covers, T_0 to the last
     completed T, sorted ascending with no gaps; consecutive entries give each
-    month's (T_i, T_{i+1}) pair. `equity` is the base-level strategy equity
+    period's (T_i, T_{i+1}) pair. `equity` is the base-level strategy equity
     (`trial_equity`, the strategy series at the trial's base
     `cost_per_side_bps`) at close of each session in `sessions`. `cost_paid`
     is the base-level modelled cost paid at each rebalance in `sessions`
@@ -150,10 +153,10 @@ class TrialMonths:
     #: The tracking trial's own id (plan T65b): `compare_targets` needs it to read
     #: `trial_weights`, keyed by `fill_session`, not `session`, so it is not one of
     #: this dataclass's other maps. `None` only for a caller (an existing test) that
-    #: never calls `compare_targets`; `compare_months` never reads this field.
+    #: never calls `compare_targets`; `compare_periods` never reads this field.
     trial_id: int | None = None
     #: The cadence `sessions` are rebalance sessions at: the window's frozen cadence
-    #: (`window.window_cadence`, #1286), which `_trial_months` reads `sessions` at and
+    #: (`window.window_cadence`, #1286), which `_trial_periods` reads `sessions` at and
     #: `compare_targets` passes to `fill_session`. The `month_end` default serves only a
     #: hand-built test trial; `paper report` and `paper check` always set it.
     cadence: Cadence = "month_end"
@@ -161,8 +164,8 @@ class TrialMonths:
 
 @dataclass(frozen=True)
 class Journal:
-    """The window's journal rows `compare_months` and `compare_targets` read.
-    `fills` need not be pre-filtered of superseded ones: `compare_months` drops
+    """The window's journal rows `compare_periods` and `compare_targets` read.
+    `fills` need not be pre-filtered of superseded ones: `compare_periods` drops
     `fill.superseded_by is not None` rows itself, so a superseded fill and its
     replacement are counted once, through the live one only."""
 
@@ -180,8 +183,8 @@ class Journal:
 
 
 @dataclass(frozen=True)
-class MonthRow:
-    """One compared month i: T_i, T_{i+1} and every req 10 term."""
+class PeriodRow:
+    """One compared rebalance period i: T_i, T_{i+1} and every req 10 term."""
 
     rebalance_session: date
     next_session: date
@@ -199,14 +202,14 @@ class MonthRow:
 
 
 @dataclass(frozen=True)
-class MonthlyComparison:
-    """The req 10 tracking comparison over every compared month."""
+class PeriodComparison:
+    """The req 10 tracking comparison over every compared rebalance period."""
 
     tracking_rule: str
     tracking_k: float
-    months: tuple[MonthRow, ...]
+    periods: tuple[PeriodRow, ...]
     passed: bool
-    failing_month: date | None
+    failing_period: date | None
     conventions: tuple[str, ...] = CONVENTIONS
 
 
@@ -316,7 +319,7 @@ def _dividend_term(
     #: itself, so the match is "on or after", not "equal to". Only a credit
     #: known by close(T_{i+1}) counts (the same cutoff the dividend term
     #: itself is computed under): a later credit was not knowable when this
-    #: month was last reported and must not retroactively zero its term.
+    #: period was last reported and must not retroactively zero its term.
     cutoff = session_close(t_next)
     credited: dict[str, list[date]] = {}
     for adjustment in adjustments:
@@ -383,9 +386,9 @@ def _residue_term(
     #: `execution.plan.residue` requires its `decisions`, `decision_events`
     #: and `positions_daily` rows to be those known to the run on the ledger's
     #: session (its own docstring), and raises on a row whose run is not among
-    #: `runs`: restrict all four to runs at or before T_i so a later month's
+    #: `runs`: restrict all four to runs at or before T_i so a later period's
     #: decision (e.g. a later `dust` or `untradable` close) can never reach
-    #: back into this month's residue (no look-ahead).
+    #: back into this period's residue (no look-ahead).
     known_runs = tuple(r for r in journal.runs if r.session is not None and r.session <= t_i)
     known_run_ids = {r.run_id for r in known_runs}
     known_decisions = [d for d in journal.decisions if d.run_id in known_run_ids]
@@ -417,22 +420,22 @@ def _residue_term(
     return total
 
 
-def compare_months(
+def compare_periods(
     window: PaperWindowRow,
-    trial: TrialMonths,
+    trial: TrialPeriods,
     journal: Journal,
     actions: pl.DataFrame,
     prices: PriceOf,
     closes: PriceOf,
     stop_session: date | None,
-) -> MonthlyComparison:
-    """The req 10 tracking comparison, every term per month (module docstring).
+) -> PeriodComparison:
+    """The req 10 tracking comparison, every term per period (module docstring).
 
     `actions` is the raw `corporate_actions` rows the window's lifetime could
-    ever need (not pre-cut to one as-of instant): `compare_months` applies its
-    own per-month cutoffs, close(T_i) for the residue term and close(T_{i+1})
+    ever need (not pre-cut to one as-of instant): `compare_periods` applies its
+    own per-period cutoffs, close(T_i) for the residue term and close(T_{i+1})
     for the dividend and split terms, since no single cutoff serves every
-    month. `window.window_id` must be set.
+    period. `window.window_id` must be set.
 
     `prices` serves only the fill-timing term's frozen-bar reads; `closes`
     serves the residue term's close(T_i)/close(T_{i+1}) reads and always
@@ -443,7 +446,7 @@ def compare_months(
         raise ValueError("the window has no window_id")
     tracking_k, tracking_rule = _frozen_paper(window)
     live_fills = [item for item in journal.fills if item.fill.superseded_by is None]
-    months: list[MonthRow] = []
+    periods: list[PeriodRow] = []
     failing: date | None = None
     for t_i, t_next in zip(trial.sessions, trial.sessions[1:], strict=False):
         if stop_session is not None and t_next >= stop_session:
@@ -497,12 +500,12 @@ def compare_months(
         excluded = missed or (tracking_rule == _RESIDUAL and override)
         value = residual if tracking_rule == _RESIDUAL else raw
         threshold = tracking_k * modelled_cost
-        month_passed = excluded or abs(value) <= threshold
-        if not month_passed and failing is None:
+        period_passed = excluded or abs(value) <= threshold
+        if not period_passed and failing is None:
             failing = t_i
 
-        months.append(
-            MonthRow(
+        periods.append(
+            PeriodRow(
                 rebalance_session=t_i,
                 next_session=t_next,
                 raw=raw,
@@ -515,16 +518,16 @@ def compare_months(
                 override=override,
                 skip_names=skip_names,
                 excluded=excluded,
-                passed=month_passed,
+                passed=period_passed,
             )
         )
 
-    return MonthlyComparison(
+    return PeriodComparison(
         tracking_rule=tracking_rule,
         tracking_k=tracking_k,
-        months=tuple(months),
-        passed=all(m.passed for m in months),
-        failing_month=failing,
+        periods=tuple(periods),
+        passed=all(m.passed for m in periods),
+        failing_period=failing,
     )
 
 
@@ -609,7 +612,7 @@ def _late_data(
 
 def compare_targets(
     window: PaperWindowRow,
-    trial: TrialMonths,
+    trial: TrialPeriods,
     journal: Journal,
     store: duckdb.DuckDBPyConnection,
 ) -> TargetComparison:
@@ -634,7 +637,7 @@ def compare_targets(
     `store_max_ingested_at` has no cutoff for the late-data check, so a
     differing name there defaults to `bug` rather than raising.
 
-    `trial.sessions[-1]` is never compared: like `compare_months`'s
+    `trial.sessions[-1]` is never compared: like `compare_periods`'s
     `zip(sessions, sessions[1:])`, the trial's last rebalance session has no
     further session to fill into inside this trial, so the engine never
     planned it (`trial_weights` carries no row at `fill_session(sessions[-1])`)
@@ -702,7 +705,7 @@ class Report:
     """What `report()` computed and wrote: the two req 10 comparisons and the
     `paper_reports` row it appended."""
 
-    monthly: MonthlyComparison
+    comparison: PeriodComparison
     targets: TargetComparison
     paper_report: PaperReportRow
 
@@ -784,8 +787,10 @@ def _journal_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> Journal:
     )
 
 
-def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Cadence) -> TrialMonths:
-    """`TrialMonths` for `trial_id`'s base cost level (backtest spec: "targets are
+def _trial_periods(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Cadence
+) -> TrialPeriods:
+    """`TrialPeriods` for `trial_id`'s base cost level (backtest spec: "targets are
     identical across levels"; `trial_id` carried so `compare_targets` can read
     `trial_weights` itself), at the window's `cadence` (#1286: one period per
     rebalance period of that cadence, an ISO week at `week_end`).
@@ -794,7 +799,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Caden
     window, never every `trial_equity` row: that table carries one row per
     calendar session (the daily equity curve `engine.run` marks through), not
     one per rebalance, so reading its `session` column directly would hand
-    `compare_months` the wrong, far denser set of "months"."""
+    `compare_periods` the wrong, far denser set of periods."""
     found = conn.execute(
         "SELECT hypothesis_id, start_session, end_session FROM trials WHERE trial_id = ?",
         [trial_id],
@@ -817,7 +822,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Caden
         [trial_id, base_level],
     ).fetchall()
     cost_paid = {session: float(value) for session, value in cost_rows}
-    return TrialMonths(
+    return TrialPeriods(
         sessions=sessions,
         equity={session: equity[session] for session in sessions if session in equity},
         cost_paid=cost_paid,
@@ -834,11 +839,16 @@ def _before(session: date, cadence: Cadence) -> date:
     return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
-def report(settings: Settings, connect: Connect) -> Report:
-    """`paper report` (spec req 10): opens a `kind=tracking` trial over
-    `[T_0, last completed T]` on the real store with the hypothesis's frozen
-    parameters (`run.run_hypothesis`, `store_path=settings.store.path`), runs
-    both comparisons and appends a `paper_reports` row.
+def report(settings: Settings, connect: Connect, book_id: str | None = None) -> Report:
+    """`paper report --book <book>` (spec req 10; ADR 0017 B.7): opens a
+    `kind=tracking` trial over `[T_0, last completed T]` on the real store with
+    the frozen parameters of the hypothesis of **the book's** latest window
+    (`run.run_hypothesis`, `store_path=settings.store.path`), runs both
+    comparisons against that window's journal and appends a `paper_reports` row
+    naming that window. `book_id` defaults to `paper.book_id` (the spec's
+    `--book` default; `ValueError` outside the token grammar); another book's
+    window, hypothesis or journal is never read (`store.journal.latest_window`
+    is per book).
 
     `connect` opens one short-lived read-only connection per step, as
     `StoreProvider`'s does (backtest spec "Interfaces"); the write (appending
@@ -859,10 +869,11 @@ def report(settings: Settings, connect: Connect) -> Report:
     #525 — this also keeps `compare_targets` from ever being asked about a
     session the window stopped before planning).
     """
+    book = resolve_book(settings, book_id)
     with connect() as conn:
-        window = store_journal.latest_window(conn)
+        window = store_journal.latest_window(conn, book)
         if window is None:
-            raise ValueError("no paper window is open")
+            raise ValueError(f"no paper window exists for book {book!r}")
         if window.window_id is None:
             raise ValueError("the window has no window_id")
         window_id = window.window_id
@@ -889,7 +900,7 @@ def report(settings: Settings, connect: Connect) -> Report:
         raise ValueError(f"tracking trial {outcome.trial_id} did not run ({outcome.status})")
 
     with connect() as conn:
-        trial = _trial_months(conn, outcome.trial_id, cadence)
+        trial = _trial_periods(conn, outcome.trial_id, cadence)
         journal = _journal_for(conn, window_id)
         actions = conn.execute("SELECT * FROM corporate_actions").pl()
         prices = _price_of(conn, fill_price_key)
@@ -898,7 +909,7 @@ def report(settings: Settings, connect: Connect) -> Report:
         #: from `prices` so a window frozen with `fill_price = "open"` cannot
         #: value a residue at the open.
         closes = _price_of(conn, "close")
-        monthly = compare_months(window, trial, journal, actions, prices, closes, stop_session)
+        comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
         targets = compare_targets(window, trial, journal, conn)
 
     now = utc_now()
@@ -913,4 +924,4 @@ def report(settings: Settings, connect: Connect) -> Report:
     with open_for_write(settings) as write_conn:
         store_journal.append(write_conn, paper_report_row)
 
-    return Report(monthly=monthly, targets=targets, paper_report=paper_report_row)
+    return Report(comparison=comparison, targets=targets, paper_report=paper_report_row)

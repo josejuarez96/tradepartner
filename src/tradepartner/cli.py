@@ -209,6 +209,12 @@ Paper trading (Phase 4 spec req 16; plans T67 and T90; ADR 0010 amendment
   override applies to (spec req 9), never the session a command runs on.
   `--accept-rejections` is spec req 5's owner acceptance of rejection-cap
   verdicts (#472), which lifts no other refusal.
+  `report`, `check` and `status` take `--book <token>` (ADR 0017 B.7, plan
+  T156; default `paper.book_id`; a token outside the grammar is a usage error,
+  2, before the store is opened): each reads only that book's latest window.
+  `status --all` prints `ops.book_summaries`' one line per book instead, and
+  is a usage error with `--book`. `--book` selects a book's window, never an
+  endpoint or a key pair here (these three commands build no broker).
   **Exit codes.** `paper run` keeps the runbook's table: `RunOutcome.exit_code`
   (0 for `ok`, `no_session` and `skipped_kill_switch`, else 1), 1 for a halt or
   failure, `wrapper.WRITE_FAILED_EXIT_CODE` (3) when the halt path cannot write
@@ -1108,6 +1114,21 @@ PAPER_REFUSAL_EXIT: Mapping[str, int] = MappingProxyType(
 
 #: `--reason`, required by `stop`, `kill`, `resume`, `abandon`, `override` and `settle`.
 _REASON_OPTION = typer.Option("--reason", help="why, in words (journaled)")
+#: `--book`, on `report`, `check` and `status` (ADR 0017 B.7, plan T156).
+_BOOK_OPTION = typer.Option(
+    "--book", help="the book token (default paper.book_id)", allow_from_autoenv=False
+)
+
+
+def _checked_book(book: str | None) -> str | None:
+    """`--book`'s value after the token grammar (`journal.check_book_id`); a usage
+    error (2) outside it, before any store is opened."""
+    if book is not None:
+        try:
+            journal.check_book_id(book)
+        except ValueError as exc:
+            raise _fail(f"--book: {exc}", USAGE_ERROR) from exc
+    return book
 
 
 def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
@@ -1132,12 +1153,41 @@ def _paper_call[T](settings: Settings, call: Callable[[], T]) -> T:
     raise _fail(_scrubbed(message, settings), code)
 
 
-def _status_lines(data: ops.OpsData) -> list[str]:
+def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
+    """`paper status --all`: the operations page's one-row-per-book summary (spec
+    req 12 as amended 2026-10-09), one line per book in token order."""
+    if not summaries:
+        return ["paper status: no paper window yet"]
+    lines = []
+    for row in summaries:
+        state = row.switch_state
+        switch_text = (
+            "engaged"
+            if state.engaged
+            else ("run in progress" if state.run_in_progress else "released")
+        )
+        lines.append(
+            f"book {row.book_id}: window {row.window.window_id} "
+            f"{'open' if row.is_open else 'closed'}; positions {row.positions_count}; "
+            f"open orders {row.open_orders_count}; kill switch {switch_text}; "
+            f"last run {_fmt(row.last_run_status)}; "
+            f"next rebalance {_fmt(row.next_rebalance_session)}"
+        )
+    return lines
+
+
+def _for_book(book: str | None) -> str:
+    """` for book 'b'` when `--book` named one, else nothing (H1's output keeps
+    its bytes)."""
+    return "" if book is None else f" for book {book!r}"
+
+
+def _status_lines(data: ops.OpsData, book: str | None = None) -> list[str]:
     """`paper status`: the operations page's numbers (spec req 12), one per line."""
     if data.journal_outdated is not None:
         return [f"paper status: {data.journal_outdated}"]
     if data.window is None:
-        return ["paper status: no paper window yet"]
+        return ["paper status: no paper window yet" + _for_book(book)]
     state = data.switch_state
     switch_text = "n/a" if state is None else ("engaged" if state.engaged else "released")
     causes = "; ".join(state.causes) if state is not None and state.causes else "-"
@@ -3076,22 +3126,23 @@ def make_app(
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
 
     @paper_app.command("report")
-    def paper_report_() -> None:
-        """Open the tracking trial and compare paper with it (spec req 10)."""
+    def paper_report_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+        """Open the book's tracking trial and compare paper with it (spec req 10)."""
+        chosen = _checked_book(book)
         s = paper_settings()
-        result = _paper_call(s, lambda: paper_report.report(s, lambda: open_read_only(s)))
-        monthly, row = result.monthly, result.paper_report
+        result = _paper_call(s, lambda: paper_report.report(s, lambda: open_read_only(s), chosen))
+        comparison, row = result.comparison, result.paper_report
         lines = [
             f"paper report: trial {row.trial_id} through {row.through_session}; rule "
-            f"{monthly.tracking_rule}, k {monthly.tracking_k:g}; "
-            + ("passed" if monthly.passed else f"failed at {monthly.failing_month}"),
+            f"{comparison.tracking_rule}, k {comparison.tracking_k:g}; "
+            + ("passed" if comparison.passed else f"failed at {comparison.failing_period}"),
             *(
                 f"  {m.rebalance_session}: raw {m.raw:.6f} dividend {m.dividend_term:.6f} "
                 f"fill {m.fill_timing_term:.6f} residual {m.residual:.6f} residue "
                 f"{m.residue_term:.6f} cost {m.modelled_cost:.6f}"
                 f"{' excluded' if m.excluded else ''}{' missed' if m.missed else ''}"
                 f"{' override' if m.override else ''} {'pass' if m.passed else 'FAIL'}"
-                for m in monthly.months
+                for m in comparison.periods
             ),
             *(
                 f"  target {t.rebalance_session} {t.security_id}: paper "
@@ -3103,13 +3154,14 @@ def make_app(
             _echo_scrubbed(line, s)
 
     @paper_app.command("check")
-    def paper_check_() -> None:
-        """The four exit-criteria checks; exit 0 only when all pass (spec req 15)."""
+    def paper_check_(book: Annotated[str | None, _BOOK_OPTION] = None) -> None:
+        """The book's four exit-criteria checks; exit 0 only when all pass (req 15)."""
+        chosen = _checked_book(book)
         s = paper_settings()
 
         def run_check() -> list[paper_check.CheckLine]:
             with open_read_only(s) as conn:
-                return paper_check.check(conn, s)
+                return paper_check.check(conn, s, chosen)
 
         lines = _paper_call(s, run_check)
         for line in lines:
@@ -3141,16 +3193,42 @@ def make_app(
             raise typer.Exit(CRASH_EXIT_CODE)
 
     @paper_app.command("status")
-    def paper_status() -> None:
-        """The operations page's numbers (spec req 12); read-only."""
+    def paper_status(
+        book: Annotated[str | None, _BOOK_OPTION] = None,
+        every_book: Annotated[
+            bool,
+            typer.Option("--all", help="one summary line per book", allow_from_autoenv=False),
+        ] = False,
+    ) -> None:
+        """The operations page's numbers (spec req 12) for one book, or `--all`
+        books' summary rows; read-only."""
+        chosen = _checked_book(book)
+        if every_book and chosen is not None:
+            raise _fail("--all and --book cannot be combined", USAGE_ERROR)
         s = paper_settings()
+        if every_book:
+
+            def read_all() -> tuple[ops.BookSummary, ...] | str:
+                with open_read_only(s) as conn:
+                    try:
+                        return ops.book_summaries(conn, s)
+                    except schema.SchemaVersionError as exc:
+                        return str(exc)
+
+            summaries = _paper_call(s, read_all)
+            if isinstance(summaries, str):  # the journal predates version 17
+                _echo_scrubbed(f"paper status: {summaries}", s)
+                raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
+            for line in _summary_lines(summaries):
+                _echo_scrubbed(line, s)
+            return
 
         def read() -> ops.OpsData:
             with open_read_only(s) as conn:
-                return ops.page_data(conn, s)
+                return ops.page_data(conn, s, chosen)
 
         data = _paper_call(s, read)
-        for line in _status_lines(data):
+        for line in _status_lines(data, chosen):
             _echo_scrubbed(line, s)
         if data.journal_outdated is not None:
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
