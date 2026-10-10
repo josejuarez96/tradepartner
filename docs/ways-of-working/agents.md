@@ -86,7 +86,7 @@ A team window may run several subagents at once **inside its own claimed scope**
 | Fixes from a review | One implementer applies them | Never a fixer per finding on one branch |
 
 What stays true regardless of how many agents run:
-- Subagents never claim, release, mark ready or merge. The window does those, through `scripts/team.py` and `/ready-pr`.
+- Subagents never claim, release, mark ready or merge. The window does those, through `scripts/team.py` and `/ready-pr`. A team the orchestrator runs as a background subagent is that window for its own items ([teams.md](teams.md), Vocabulary); the reviewers and helpers it starts still do none of these.
 - Work outside the claim becomes an issue, not an extra agent.
 - New agent types land only through a PR the owner merges (see "Adding or changing an agent"). A window does not invent one mid-task.
 - A subagent cannot spawn subagents; the platform removes that tool from them. Depth is one level, breadth is the window's call within these rows.
