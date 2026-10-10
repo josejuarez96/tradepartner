@@ -287,18 +287,66 @@ def unlabelled_share(items: Sequence[ScoredItem]) -> float:
     return sum(1 for item in items if item.gold_label is None) / len(items)
 
 
-def seeded_recall(items: Sequence[ScoredItem]) -> float:
-    """req 10's `seeded_recall`: the share of the seeded error set that would
-    have been shortlisted under its *pre-fix* rule answer -- a disagreement,
-    or a model `unresolved`/`timeout` (`crosswalk.is_disagreement`'s own
-    rule: unresolved is "neither", but is still always shortlisted, so it
-    counts as caught here). `1.0` when there are no seeds (vacuously true,
-    never a reason to fail the pilot on an empty seed set)."""
-    seeds = [item for item in items if item.is_seed and item.pre_fix_rule_answer is not None]
-    if not seeds:
-        return 1.0
-    caught = sum(1 for item in seeds if _caught_by_pre_fix_rule(item))
-    return caught / len(seeds)
+#: The crosswalk rows whose seeds `seeded_recall` gates (owner decision on #1351,
+#: 2026-10-10, option (a)): a pre-fix answer on row 6 or 7 has an empty consistent
+#: set, so the seed is on the shortlist whatever the model says. A seed on rows 1 to
+#: 5 is reported by `seeded_report`, never gated: a correct label can agree with the
+#: pre-fix rule there, so the gate could fail on a right answer.
+GATED_SEED_ROWS: frozenset[int] = frozenset({6, 7})
+
+
+@dataclass(frozen=True)
+class SeedOutcome:
+    """One seed's line of `seeded_report`: its pre-fix crosswalk row, whether that
+    row is gated (`GATED_SEED_ROWS`), and whether the pre-fix rule answer would have
+    put it on the shortlist."""
+
+    listing_end_id: str
+    pre_fix_row: int
+    gated: bool
+    caught: bool
+
+
+def _seeds(items: Sequence[ScoredItem]) -> list[ScoredItem]:
+    return [item for item in items if item.is_seed and item.pre_fix_rule_answer is not None]
+
+
+def seeded_report(items: Sequence[ScoredItem]) -> tuple[SeedOutcome, ...]:
+    """Every seed with a pre-fix rule answer, gated or not (#1351 option (a): the
+    seeds off rows 6 and 7 are reported here), in `listing_end_id` order."""
+    outcomes = []
+    for item in sorted(_seeds(items), key=lambda i: i.listing_end_id):
+        assert item.pre_fix_rule_answer is not None  # `_seeds` filters on it
+        row = crosswalk.crosswalk_row(item.pre_fix_rule_answer)
+        outcomes.append(
+            SeedOutcome(
+                listing_end_id=item.listing_end_id,
+                pre_fix_row=row,
+                gated=row in GATED_SEED_ROWS,
+                caught=_caught_by_pre_fix_rule(item),
+            )
+        )
+    return tuple(outcomes)
+
+
+def seeded_recall(items: Sequence[ScoredItem]) -> float | None:
+    """req 10's `seeded_recall` as #1351's option (a) amends it: the share of the
+    seeds whose pre-fix rule answer is on crosswalk row 6 or 7 (`GATED_SEED_ROWS`)
+    that would have been shortlisted under it -- a disagreement, or a model
+    `unresolved`/`timeout` (`crosswalk.is_disagreement`'s own rule: unresolved is
+    "neither", but is still always shortlisted, so it counts as caught here).
+    `None` when no seed is on those rows (no claim, never a vacuous `1.0`); the
+    other seeds are in `seeded_report`."""
+    gated = [
+        item
+        for item in _seeds(items)
+        if item.pre_fix_rule_answer is not None
+        and crosswalk.crosswalk_row(item.pre_fix_rule_answer) in GATED_SEED_ROWS
+    ]
+    if not gated:
+        return None
+    caught = sum(1 for item in gated if _caught_by_pre_fix_rule(item))
+    return caught / len(gated)
 
 
 def _caught_by_pre_fix_rule(item: ScoredItem) -> bool:

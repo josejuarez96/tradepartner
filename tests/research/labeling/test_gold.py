@@ -27,6 +27,7 @@ import pytest
 from tradepartner.config import Settings
 from tradepartner.research import datafiles
 from tradepartner.research.labeling import gold
+from tradepartner.research.labeling.crosswalk import RuleAnswer
 from tradepartner.store import schema
 from tradepartner.store.db import StoreLockedError, configure_connection, open_for_write
 from tradepartner.store.research import get_dataset
@@ -163,11 +164,15 @@ def _build(
         N,
         exclude,
         settings=gsettings,
-        seed_cases=seed_cases,
+        seed_cases=[_seed(i) for i in seed_cases],
         n_dev=N_DEV,
         dev_span_min_rows=DEV_ROWS,
     )
     return Built(gsettings, frame, exclude, result)
+
+
+def _seed(listing_end_id: str, status: str = "listed") -> gold.SeedCase:
+    return gold.SeedCase(listing_end_id, RuleAnswer(status=status), "f2b5261", "#921")  # type: ignore[arg-type]
 
 
 def _connect(settings: Settings) -> Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]:
@@ -270,6 +275,76 @@ def test_seed_case_of_an_excluded_cik_stays(gsettings: Settings, tmp_path: Path)
         ("LE030", "pilot", False)
     ]
     assert built.result.seed_cases_missing == ("GONE",)
+
+
+def _seed_file(tmp_path: Path, rows: list[list[str]]) -> Path:
+    path = tmp_path / "seeds.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(gold.SEED_FILE_COLUMNS)
+        writer.writerows(rows)
+    return path
+
+
+def test_read_seed_file_and_the_session_keeps_each_seeds_pre_fix_answer(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    """#1351: the seed file carries each seed's pre-fix rule answer into the session."""
+    path = _seed_file(
+        tmp_path,
+        [
+            ["LE039", "listed", "false", "", "false", "f2b5261", "#921"],
+            ["LE030", "delisted", "false", "", "true", "ca79641", "#943"],
+            ["GONE", "delisted", "false", "", "false", "f2b5261", "#922"],
+        ],
+    )
+    seeds = gold.read_seed_file(path)
+    assert [(c.listing_end_id, c.row) for c in seeds] == [("LE039", 6), ("LE030", 4), ("GONE", 5)]
+    frame = _write_frame(tmp_path, _frame_rows())
+    result = gold.build_gold_session(
+        frame,
+        SEED,
+        N,
+        _exclusion(tmp_path, []),
+        settings=gsettings,
+        seed_cases=seeds,
+        seeds_sha256="abc",
+        n_dev=N_DEV,
+        dev_span_min_rows=DEV_ROWS,
+    )
+    assert result.seed_cases_missing == ("GONE",)
+    resumed = gold.open_gold_session(
+        gold.session_path(gsettings), gold.GoldFlags(), settings=gsettings
+    )
+    assert {i: c.row for i, c in resumed.seed_cases.items()} == {"LE030": 4, "LE039": 6}
+    assert resumed.seed_cases["LE030"].code_version == "ca79641"
+    with pytest.raises(gold.SessionMismatch, match="--seeds"):
+        gold.open_gold_session(
+            gold.session_path(gsettings), gold.GoldFlags(seeds=path), settings=gsettings
+        )
+
+
+@pytest.mark.parametrize(
+    ("row", "match"),
+    [
+        (["LE1", "gone", "false", "", "false", "c", "#1"], "status"),
+        (["LE1", "listed", "yes", "", "false", "c", "#1"], "relisted"),
+        (["LE1", "listed", "false", "", "false", "", "#1"], "code_version"),
+    ],
+)
+def test_read_seed_file_refuses_a_bad_row(tmp_path: Path, row: list[str], match: str) -> None:
+    with pytest.raises(gold.GoldRefused, match=match):
+        gold.read_seed_file(_seed_file(tmp_path, [row]))
+
+
+def test_read_seed_file_refuses_a_repeat_and_a_missing_column(tmp_path: Path) -> None:
+    row = ["LE1", "listed", "false", "", "false", "c", "#1"]
+    with pytest.raises(gold.GoldRefused, match="repeats"):
+        gold.read_seed_file(_seed_file(tmp_path, [row, row]))
+    path = tmp_path / "short.csv"
+    path.write_text("listing_end_id,status\nLE1,listed\n", encoding="utf-8")
+    with pytest.raises(gold.GoldRefused, match="lacks column"):
+        gold.read_seed_file(path)
 
 
 # --- the refusals -----------------------------------------------------------------
@@ -592,6 +667,10 @@ def test_lock_writes_and_registers_the_export(gsettings: Settings, tmp_path: Pat
     assert by_id[plain]["text_states"] == "bankruptcy"  # copied into an empty text_states
     assert by_id[plain]["gold_class"] == "insolvency"
     assert by_id["LE039"]["seed_case"] is True
+    # #1351: the seed's pre-fix rule answer is in the export, bound by its hash
+    assert (by_id["LE039"]["pre_fix_status"], by_id["LE039"]["pre_fix_row"]) == ("listed", 6)
+    assert by_id["LE039"]["pre_fix_code_version"] == "f2b5261"
+    assert by_id[plain]["pre_fix_status"] is None and by_id[plain]["pre_fix_row"] is None
     meta = pl.read_parquet_metadata(export_path)
     assert meta["exclusion_sha256"] == session.exclusion_sha256
 
