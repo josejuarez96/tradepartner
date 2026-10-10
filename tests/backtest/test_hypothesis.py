@@ -9,7 +9,7 @@ environment variable can move a registered hypothesis's holdout or threshold.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -1329,3 +1329,198 @@ def test_a_screened_registration_runs_at_its_frozen_fraction(
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
+
+
+# --- operations files (paper plan T160b; strategy-lab spec req 1, amendment 2026-10-10) --
+
+
+@pytest.fixture
+def ops(lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path) -> Any:
+    """`test_promotion`'s lab family (H1's twin with rules and a counted trial) and a
+    complete two-variant sweep whose argmax is v1; the operations file runs v2."""
+    from backtest.test_promotion import Lab
+
+    root = tmp_path / "ops-files"
+    root.mkdir()
+    built = Lab(lab_store, settings, root)
+    built.trial(built.twin(), 0.3)
+    sweep, variants = built.sweep([0.15, 0.25])
+    for variant, sharpe in zip(variants, (1.5, 0.4), strict=True):
+        built.trial(variant, sharpe)
+    built.sweep_row, built.variants = sweep, variants  # type: ignore[attr-defined]
+    return built
+
+
+OPS_SLUG = "ops-book"
+OPS_REASON = "a machine test for the shakedown, chosen for trading activity"
+_OPS_TABLES = ("hypotheses", "hypothesis_fingerprints", "owner_decisions", "trials")
+
+
+def _ops_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    return {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # type: ignore[index]
+        for table in _OPS_TABLES
+    }
+
+
+def _ops_register(ops: Any, path: Path, variant_slug: str) -> hypothesis.OperationsBookOutcome:
+    from backtest.test_promotion import CODE
+
+    return hypothesis.register_operations_book(
+        ops.conn,
+        path,
+        variant_slug,
+        OPS_REASON,
+        registered_by="owner",
+        settings=ops.settings,
+        code_vintage=CODE,
+    )
+
+
+def _ops_refused(ops: Any, path: Path, variant_slug: str, match: str) -> None:
+    before = _ops_counts(ops.conn)
+    with pytest.raises(LabRegistrationError, match=match):
+        _ops_register(ops, path, variant_slug)
+    assert _ops_counts(ops.conn) == before
+
+
+def test_an_operations_file_registers_with_its_decision_and_n_and_v_unchanged(ops: Any) -> None:
+    from tradepartner.backtest import results
+
+    sweep, (_v1, v2) = ops.sweep_row, ops.variants
+    n_before = results.family_n(ops.conn, "momentum")
+    v_before = registry.family_sharpes(ops.conn, "momentum").variance("excess_spy")
+    trials_before = _ops_counts(ops.conn)["trials"]
+
+    outcome = _ops_register(ops, ops.file(OPS_SLUG, 0.25), v2.slug)
+
+    record = registry.get_hypothesis(ops.conn, OPS_SLUG)
+    assert outcome.registered == record and outcome.variant == v2
+    assert _fingerprint(record) == _fingerprint(v2)
+    (stored,) = ops.conn.execute(  # type: ignore[misc]
+        "SELECT fingerprint FROM hypothesis_fingerprints WHERE hypothesis_id = ?",
+        [record.hypothesis_id],
+    ).fetchone()
+    assert stored == _fingerprint(v2)
+    decision = lab_registry.operations_book_for(ops.conn, record.hypothesis_id)
+    assert decision is not None and decision.decision_id == outcome.decision_id
+    assert decision.reason == OPS_REASON
+    assert decision.values["sweep_id"] == sweep.sweep_id
+    assert decision.values["variant_hypothesis_id"] == v2.hypothesis_id
+    assert decision.values["operations_hypothesis_id"] == record.hypothesis_id
+    assert decision.values["variant_index"] == 2
+    assert decision.values["sharpe_annual_excess_spy"] == pytest.approx(0.4)
+    assert decision.values["family_n"] == n_before
+    assert decision.values["variant_trial_current"] is True
+    # Not a promotion: no promotion row, so every spend, cap and identity rule reads
+    # it as unpromoted; and no trial, so N and V are unchanged.
+    assert lab_registry.promotion_for(ops.conn, record.hypothesis_id) is None
+    assert results.family_n(ops.conn, "momentum") == n_before
+    assert registry.family_sharpes(ops.conn, "momentum").variance("excess_spy") == v_before
+    assert _ops_counts(ops.conn)["trials"] == trials_before
+
+
+def test_an_operations_file_accepts_a_stale_ok_trial_and_records_it(ops: Any) -> None:
+    """A variant whose `ok` trial is from an earlier code vintage (stale, still counted
+    in N) is accepted: a rerun would only add trials to N. The decision says so."""
+    v2 = ops.variants[1]
+    outcome = hypothesis.register_operations_book(
+        ops.conn,
+        ops.file(OPS_SLUG, 0.25),
+        v2.slug,
+        OPS_REASON,
+        registered_by="owner",
+        settings=ops.settings,
+        code_vintage="d" * 64,
+    )
+    assert outcome.values["variant_trial_current"] is False
+    assert outcome.values["variant_trial_id"] is not None
+
+
+def test_an_operations_file_of_a_trial_missing_a_metric_is_a_clean_refusal(ops: Any) -> None:
+    v2 = ops.variants[1]
+    ops.conn.execute(
+        "DELETE FROM trial_metrics WHERE metric = 'periods_per_year' AND trial_id IN "
+        "(SELECT trial_id FROM trials WHERE hypothesis_id = ?)",
+        [v2.hypothesis_id],
+    )
+    path = ops.file(OPS_SLUG, 0.25)
+    before = _ops_counts(ops.conn)
+    # Both are the CLI's usage refusals (exit 2), never a traceback.
+    with pytest.raises((HypothesisFileError, registry.RegistryError), match="periods_per_year"):
+        _ops_register(ops, path, v2.slug)
+    assert _ops_counts(ops.conn) == before
+
+
+def test_an_operations_file_is_refused_without_the_flag(ops: Any) -> None:
+    path = ops.file(OPS_SLUG, 0.25)
+    before = _ops_counts(ops.conn)
+    with pytest.raises(LabRegistrationError, match="operations file"):
+        hypothesis.register(ops.conn, path, registered_by="owner", settings=ops.settings)
+    assert _ops_counts(ops.conn) == before
+
+
+def test_an_operations_file_with_a_changed_non_fingerprint_key_is_refused(ops: Any) -> None:
+    """`gap.count_share_threshold` is outside the fingerprint: the fingerprint check
+    passes and the canonical frozen-set check (`frozen_set_differences`) names it."""
+    v2 = ops.variants[1]
+    path = ops.file(OPS_SLUG, 0.25)
+    text = path.read_text()
+    assert "count_share_threshold = 0.05" in text
+    path.write_text(text.replace("count_share_threshold = 0.05", "count_share_threshold = 0.04"))
+    parsed = hypothesis.parse_file(path)
+    params = hypothesis.frozen_params(parsed, ops.settings)
+    assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == _fingerprint(v2)
+    _ops_refused(ops, path, v2.slug, r"frozen set differs.*gap\.count_share_threshold")
+
+
+def test_an_operations_file_of_a_variant_with_no_ok_trial_is_refused(ops: Any) -> None:
+    _sweep, (v3,) = ops.sweep([0.35], slug="mom-unrun")
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.35), v3.slug, "no counted ok trial")
+
+
+def test_an_operations_file_outside_paper_families_is_refused(
+    ops: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hypothesis, "PAPER_FAMILIES", ("profitability",))
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), ops.variants[1].slug, "PAPER_FAMILIES")
+
+
+def test_an_operations_file_of_a_forward_holdout_family_is_refused(ops: Any) -> None:
+    """ADR 0016 point 4: the family registered before its holdout starts, so the
+    holdout is forward; only the promoted hypothesis's paper book may trade it."""
+    from backtest.test_promotion import HOLDOUT
+
+    ops.conn.execute(
+        "UPDATE hypotheses SET registered_at = ? WHERE family = 'momentum'",
+        [datetime(HOLDOUT[0].year, 1, 2, 12, tzinfo=UTC)],
+    )
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), ops.variants[1].slug, "is forward")
+
+
+def test_an_operations_file_of_a_variant_already_named_is_refused(ops: Any) -> None:
+    v1, v2 = ops.variants
+    _ops_register(ops, ops.file(OPS_SLUG, 0.25), v2.slug)
+    _ops_refused(ops, ops.file("ops-book-2", 0.25), v2.slug, "already named by decision")
+    # A promotion row naming v1 refuses v1 too.
+    registry.record_decision(
+        ops.conn,
+        kind="operations_book",
+        reason="stand-in",
+        values={"variant_hypothesis_id": v1.hypothesis_id},
+    )
+    ops.conn.execute(
+        "UPDATE owner_decisions SET kind = 'promotion' WHERE decision_id = "
+        "(SELECT MAX(decision_id) FROM owner_decisions)"
+    )
+    _ops_refused(ops, ops.file("ops-book-3", 0.15), v1.slug, "already named by decision")
+
+
+def test_an_operations_file_of_a_non_variant_or_registered_slug_is_refused(ops: Any) -> None:
+    v2 = ops.variants[1]
+    _ops_refused(ops, ops.file(OPS_SLUG, 0.25), "h1", "not a sweep variant")
+    _ops_refused(ops, ops.file("h1", 0.25), v2.slug, "already registered")
+    with pytest.raises(ValueError, match="reason"):
+        hypothesis.register_operations_book(
+            ops.conn, ops.file(OPS_SLUG, 0.25), v2.slug, " ", registered_by="owner"
+        )

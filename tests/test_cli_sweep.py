@@ -433,6 +433,80 @@ def test_sweep_promote_registers_the_argmax_file_with_its_decision(
     assert ("promotion",) in kinds
 
 
+def _operations_file(path: Path, directory: Path, variant_slug: str) -> Path:
+    """The momentum fixture at `variant_slug`'s values as the standalone `ops-book`."""
+    with _read(path) as conn:
+        values = frozen.frozen_values(registry.get_hypothesis(conn, variant_slug))
+    text = TWIN_SOURCE.read_text()
+    for old, new in (
+        *WINDOW_EDITS,
+        (f'slug = "{TWIN}"', 'slug = "ops-book"'),
+        ("top_fraction = 0.10", f"top_fraction = {values['strategy.top_fraction']}"),
+        (
+            "[gap]",
+            f'[schedule]\nrebalance_cadence = "{values["schedule.rebalance_cadence"]}"\n'
+            'signal_anchor = "month_end"\n\n[gap]',
+        ),
+    ):
+        assert old in text, old
+        text = text.replace(old, new, 1)
+    directory.mkdir(parents=True, exist_ok=True)
+    out = directory / "ops-book.md"
+    out.write_text(text)
+    return out
+
+
+def test_hypothesis_register_operations_book_of_writes_the_decision(
+    done: Path, tmp_path: Path
+) -> None:
+    """Paper plan T160b: the flag pair registers a non-argmax variant's file as an
+    operations book and prints the decision and hypothesis ids; never a promotion."""
+    with _read(done) as conn:
+        report = sweep_report.sweep_report(conn, SLUG)
+    assert report.verdicts is not None
+    other = next(r for r in report.rows if r.slug != report.verdicts.argmax.slug)
+    file = _operations_file(done, tmp_path / "ops", other.slug)
+    before = _counts(done)
+    plain = _cli("hypothesis", "register", str(file))
+    assert plain.exit_code == 2 and "operations file" in plain.output, plain.output
+    alone = _cli("hypothesis", "register", str(file), "--operations-book-of", other.slug)
+    assert alone.exit_code == 2 and "go together" in alone.output, alone.output
+    reason_only = _cli("hypothesis", "register", str(file), "--reason", "r")
+    assert reason_only.exit_code == 2 and "go together" in reason_only.output
+    blank = _cli(
+        "hypothesis", "register", str(file), "--operations-book-of", other.slug, "--reason", " "
+    )
+    assert blank.exit_code == 2 and "blank" in blank.output, blank.output
+    unknown = _cli(
+        "hypothesis", "register", str(file), "--operations-book-of", "no-such", "--reason", "r"
+    )
+    assert unknown.exit_code == 2, unknown.output
+    assert _counts(done) == before
+
+    out = _cli(
+        "hypothesis",
+        "register",
+        str(file),
+        "--operations-book-of",
+        other.slug,
+        "--reason",
+        "machine test",
+    )
+    assert out.exit_code == 0, out.output
+    with _read(done) as conn:
+        record = registry.get_hypothesis(conn, "ops-book")
+        decision = lab_registry.operations_book_for(conn, record.hypothesis_id)
+        assert decision is not None
+        assert lab_registry.promotion_for(conn, record.hypothesis_id) is None
+    assert f"decision {decision.decision_id}: operations_book of {other.slug}" in out.stdout
+    assert f"hypothesis {record.hypothesis_id}: ops-book" in out.stdout
+    assert _counts(done)["trials"] == before["trials"]
+    again = _cli(
+        "hypothesis", "register", str(file), "--operations-book-of", other.slug, "--reason", "r"
+    )
+    assert again.exit_code == 2 and "already registered" in again.output, again.output
+
+
 def test_sweep_promote_refuses_a_blank_reason_and_a_missing_file(
     done: Path, tmp_path: Path
 ) -> None:

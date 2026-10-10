@@ -88,12 +88,15 @@ from tradepartner.store.schema import REGISTRY_TABLE_NAMES
 __all__ = [
     "DSR_SHARE_THRESHOLD",
     "LabStatus",
+    "OperationsBookLine",
     "SweepReport",
     "VariantRow",
+    "VariantStanding",
     "format_lab_status",
     "format_report",
     "lab_status",
     "sweep_report",
+    "variant_standing",
 ]
 
 VariantStatus = Literal["counted", "terminal_failed", "stale", "failed", "unrun"]
@@ -297,6 +300,30 @@ class SweepRunLine:
 
 
 @dataclass(frozen=True)
+class VariantStanding:
+    """One sweep variant's report row, read for any registration of its sweep (not
+    only the latest), with the sweep it belongs to: what `hypothesis register
+    --operations-book-of` reads (the counted `ok` trial, the base-level statistics)."""
+
+    sweep_id: int
+    sweep_slug: str
+    row: VariantRow
+
+
+@dataclass(frozen=True)
+class OperationsBookLine:
+    """An `operations_book` decision in `lab status` (strategy-lab spec req 1,
+    amendment 2026-10-10): the registered file, the sweep and variant index it runs."""
+
+    hypothesis_id: int
+    slug: str
+    family: str
+    decision_id: int
+    sweep_slug: str
+    variant_index: int
+
+
+@dataclass(frozen=True)
 class LabStatus:
     """`lab status` (spec req 15 and the `lab status` criterion)."""
 
@@ -309,6 +336,7 @@ class LabStatus:
     last_runs: tuple[SweepRunLine, ...]
     timezone_warning: str | None
     development_boundary: registry.DevelopmentBoundary | None = None
+    operations_books: tuple[OperationsBookLine, ...] = ()
 
 
 # --- reads -----------------------------------------------------------------------
@@ -594,6 +622,56 @@ def _verdicts(
 
 def _sr_star(n: int, variance: float | None) -> float | None:
     return expected_max_sharpe(n, variance) if n >= 1 and variance is not None else None
+
+
+def variant_standing(
+    conn: duckdb.DuckDBPyConnection, hypothesis_id: int, *, code_vintage: str | None = None
+) -> VariantStanding | None:
+    """The report row of the sweep variant `hypothesis_id` under the one classifier
+    (module docstring, "Variant states"), with today's N and pair Sharpes for its
+    `dsr_excess`, or None when `hypothesis_id` is no sweep's variant. Reads the
+    variant's own registration of its sweep, whichever registration that is.
+    `code_vintage` is the checkout's `registry.code_tree_sha256()` unless given."""
+    require_lab(conn)
+    found = conn.execute(
+        "SELECT s.sweep_id, s.slug, s.family FROM sweep_variants v JOIN sweeps s "
+        "USING (sweep_id) WHERE v.hypothesis_id = ?",
+        [hypothesis_id],
+    ).fetchone()
+    if found is None:
+        return None
+    sweep_id, sweep_slug, family = int(found[0]), str(found[1]), str(found[2])
+    vintage = code_vintage if code_vintage is not None else registry.code_tree_sha256()
+    states = _family_states(conn, family, vintage).by_sweep.get(sweep_id, [])
+    (state,) = [s for s in states if s.variant.hypothesis_id == hypothesis_id]
+    metrics = None
+    if state.trial is not None:
+        base = float(frozen_values(state.record)[BASE_COST_KEY])
+        metrics = _metrics(conn, [(state.trial.trial_id, base)])[state.trial.trial_id]
+    row = _row(
+        state,
+        metrics,
+        family_n=results.family_n(conn, family),
+        pair_sharpes=registry.family_sharpes(conn, family).excess_spy,
+    )
+    return VariantStanding(sweep_id, sweep_slug, row)
+
+
+def _operations_books(conn: duckdb.DuckDBPyConnection) -> tuple[OperationsBookLine, ...]:
+    """Every `operations_book` decision, oldest first, with the variant index it
+    names (from `sweep_variants`, never from the stored values alone)."""
+    rows = conn.execute(
+        "SELECT d.hypothesis_id, h.slug, h.family, d.decision_id, s.slug, v.variant_index "
+        "FROM owner_decisions d JOIN hypotheses h USING (hypothesis_id) "
+        "JOIN sweep_variants v ON v.hypothesis_id = TRY_CAST(json_extract_string("
+        "d.values_json, '$.variant_hypothesis_id') AS BIGINT) "
+        "JOIN sweeps s ON s.sweep_id = v.sweep_id "
+        "WHERE d.kind = 'operations_book' ORDER BY d.decision_id"
+    ).fetchall()
+    return tuple(
+        OperationsBookLine(int(h), str(slug), str(family), int(d), str(sweep), int(index))
+        for h, slug, family, d, sweep, index in rows
+    )
 
 
 def sweep_report(
@@ -894,6 +972,7 @@ def lab_status(
         open_sweeps=tuple(open_sweeps),
         last_runs=_last_runs(conn),
         development_boundary=registry.development_boundary(conn),
+        operations_books=_operations_books(conn),
         timezone_warning=None
         if matches
         else (
@@ -944,6 +1023,12 @@ def format_lab_status(status: LabStatus) -> str:
     lines += [
         f"  {m.slug} ({m.family}, id {m.hypothesis_id}): {', '.join(m.differences)}"
         for m in status.grandfathered_members
+    ] or ["  none"]
+    lines.append("operations books:")
+    lines += [
+        f"  {o.slug} ({o.family}, id {o.hypothesis_id}, decision {o.decision_id}): "
+        f"operations book of {o.sweep_slug} v{o.variant_index}, not promoted"
+        for o in status.operations_books
     ] or ["  none"]
     lines.append("open sweeps:")
     lines += [
