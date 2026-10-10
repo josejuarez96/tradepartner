@@ -899,7 +899,7 @@ def _next_rebalance_session(
     "n/a" rather than failing the page."""
     try:
         cadence = window_cadence(conn, window)
-    except (registry.UnknownHypothesis, ValueError):
+    except (registry.UnknownHypothesis, ValueError, KeyError, TypeError):
         return None
     start = max(now.astimezone(_NEW_YORK).date(), window.first_rebalance_session)
     sessions = rebalance_sessions(start, start + _REBALANCE_SEARCH, cadence)

@@ -79,6 +79,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, Settings
 from tradepartner.execution.ledger import Ledger
+from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
@@ -868,12 +869,11 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     #525 — this also keeps `compare_targets` from ever being asked about a
     session the window stopped before planning).
     """
-    book = settings.paper.book_id if book_id is None else book_id
-    store_journal.check_book_id(book)
+    book = resolve_book(settings, book_id)
     with connect() as conn:
         window = store_journal.latest_window(conn, book)
         if window is None:
-            raise ValueError("no paper window is open")
+            raise ValueError(f"no paper window exists for book {book!r}")
         if window.window_id is None:
             raise ValueError("the window has no window_id")
         window_id = window.window_id

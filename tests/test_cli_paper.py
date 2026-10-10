@@ -37,7 +37,7 @@ from tradepartner.execution import shakedown as paper_shakedown
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
-from tradepartner.store import journal, registry
+from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     DecisionRow,
@@ -1267,7 +1267,10 @@ def test_status_and_check_for_another_book_read_that_books_window(
     clock: _Clock, factory: _Factory
 ) -> None:
     missing = _paper(clock, factory, "status", "--book", "b")
-    assert (missing.exit_code, missing.output) == (0, "paper status: no paper window yet\n")
+    assert (missing.exit_code, missing.output) == (
+        0,
+        "paper status: no paper window yet for book 'b'\n",
+    )
     no_window = _paper(clock, factory, "check", "--book", "b")
     assert no_window.exit_code == 1
     assert "no paper window" in no_window.output
@@ -1443,3 +1446,15 @@ def test_paper_shakedown_exits_zero_when_every_line_passes_on_a_read_only_store(
     assert out.exit_code == 0, out.output
     assert out.output.count("PASS E.") == 7
     assert seen == [SESSION_CLOCK]
+
+
+def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    def outdated(*_args: Any) -> Any:
+        raise schema.SchemaVersionError("the journal predates schema version 17")
+
+    monkeypatch.setattr(ops, "book_summaries", outdated)
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == REFUSED
+    assert out.output == "paper status: the journal predates schema version 17\n"

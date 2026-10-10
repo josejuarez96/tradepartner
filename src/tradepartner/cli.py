@@ -1176,12 +1176,18 @@ def _summary_lines(summaries: Sequence[ops.BookSummary]) -> list[str]:
     return lines
 
 
-def _status_lines(data: ops.OpsData) -> list[str]:
+def _for_book(book: str | None) -> str:
+    """` for book 'b'` when `--book` named one, else nothing (H1's output keeps
+    its bytes)."""
+    return "" if book is None else f" for book {book!r}"
+
+
+def _status_lines(data: ops.OpsData, book: str | None = None) -> list[str]:
     """`paper status`: the operations page's numbers (spec req 12), one per line."""
     if data.journal_outdated is not None:
         return [f"paper status: {data.journal_outdated}"]
     if data.window is None:
-        return ["paper status: no paper window yet"]
+        return ["paper status: no paper window yet" + _for_book(book)]
     state = data.switch_state
     switch_text = "n/a" if state is None else ("engaged" if state.engaged else "released")
     causes = "; ".join(state.causes) if state is not None and state.causes else "-"
@@ -3202,11 +3208,18 @@ def make_app(
         s = paper_settings()
         if every_book:
 
-            def read_all() -> tuple[ops.BookSummary, ...]:
+            def read_all() -> tuple[ops.BookSummary, ...] | str:
                 with open_read_only(s) as conn:
-                    return ops.book_summaries(conn, s)
+                    try:
+                        return ops.book_summaries(conn, s)
+                    except schema.SchemaVersionError as exc:
+                        return str(exc)
 
-            for line in _summary_lines(_paper_call(s, read_all)):
+            summaries = _paper_call(s, read_all)
+            if isinstance(summaries, str):  # the journal predates version 17
+                _echo_scrubbed(f"paper status: {summaries}", s)
+                raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])
+            for line in _summary_lines(summaries):
                 _echo_scrubbed(line, s)
             return
 
@@ -3215,7 +3228,7 @@ def make_app(
                 return ops.page_data(conn, s, chosen)
 
         data = _paper_call(s, read)
-        for line in _status_lines(data):
+        for line in _status_lines(data, chosen):
             _echo_scrubbed(line, s)
         if data.journal_outdated is not None:
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])

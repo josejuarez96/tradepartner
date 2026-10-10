@@ -67,6 +67,7 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import session_close
 from tradepartner.config import Cadence, Settings
+from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
     POSITION_RETURN,
@@ -437,10 +438,10 @@ def check(
     row, open or closed (`book_id` defaults to `paper.book_id`). Raises
     `ValueError` when the book has no window, for a book outside the token
     grammar, or when the window's `frozen_json` lacks a key a query needs."""
-    book = settings.paper.book_id if book_id is None else book_id
+    book = resolve_book(settings, book_id)
     window = store_journal.latest_window(conn, book)
     if window is None:
-        raise ValueError(f"no paper window exists in {settings.store.path}")
+        raise ValueError(f"no paper window exists for book {book!r} in {settings.store.path}")
     window_id = window.window_id
     if window_id is None:
         raise ValueError(f"the window in {settings.store.path} has no window_id")

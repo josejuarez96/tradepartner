@@ -16,7 +16,7 @@ status. **Books** (ADR 0017 B.7, plan T156; spec req 12 as amended
 2026-10-09): above the per-book sections, a one-row-per-book summary
 (`ops.book_summaries`: window, open or closed, positions, open orders, switch
 state, last run status, next rebalance session at the book's cadence) and,
-when more than one book has a window, a book selector (`BOOK_KEY`, default
+when a book other than `paper.book_id` has a window, a book selector (`BOOK_KEY`, default
 `paper.book_id`) that picks the book every section below is drawn for
 (`ops.page_data(conn, settings, book)`). Two states short-circuit the
 rest, each its own panel rather than a traceback (the T43/T44 "registry not
@@ -122,7 +122,7 @@ def _switch_badge(state: SwitchState) -> None:
 def _switch_text(state: SwitchState) -> str:
     if state.engaged:
         return "engaged"
-    return "run in progress" if state.run_in_progress else "ok"
+    return "run in progress" if state.run_in_progress else "released"
 
 
 def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
@@ -156,11 +156,12 @@ def _book_summaries(
 
 
 def _selected_book(summaries: tuple[ops.BookSummary, ...], default: str) -> str:
-    """The book the sections are drawn for: the selector's pick when more than
-    one book has a window, else `default` (`paper.book_id`)."""
+    """The book the sections are drawn for: the selector's pick when any book
+    other than `default` (`paper.book_id`) has a window, else `default`, as
+    `paper status` and the override page read it."""
     books = [row.book_id for row in summaries]
-    if len(books) < 2:
-        return books[0] if books else default
+    if books in ([], [default]):
+        return default
     index = books.index(default) if default in books else 0
     picked = st.selectbox("Book", books, index=index, key=BOOK_KEY)
     return str(picked)

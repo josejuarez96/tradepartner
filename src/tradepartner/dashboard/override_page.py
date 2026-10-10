@@ -57,13 +57,14 @@ window is open, so the owner sees before submitting that the writer would
 refuse with `no_window`. The form renders whatever else the store holds or
 lacks; no other table is read.
 
-**The book** (ADR 0017 B.7, plan T156). When more than one book has a window
-(`execution.ops.book_ids`), a book selector (`BOOK_KEY`, outside the form, so
-the window state below it follows the pick; default `paper.book_id`) names the
-book the override is written to: `on_submit` hands it to the writer
-(`window.override(..., book_id=)`), which appends to that book's open window
-only, and the duplicate guard's signature includes it. With one book there is
-no selector and the writer takes `paper.book_id`, exactly as before.
+**The book** (ADR 0017 B.7, plan T156). When a book other than
+`paper.book_id` has a window (`execution.ops.book_ids`), a book selector
+(`BOOK_KEY`, outside the form, so the window state below it follows the pick;
+default `paper.book_id`) names the book the override is written to: `on_submit`
+hands it to the writer (`window.override(..., book_id=)`), which appends to
+that book's open window only, and the duplicate guard's signature includes it.
+With only `main` there is no selector and the writer takes `paper.book_id`,
+exactly as before.
 """
 
 from __future__ import annotations
@@ -194,7 +195,7 @@ def on_submit(settings: Settings) -> None:
         state[NAME_KEY],
         state[REASON_KEY],
     )
-    book = state.get(BOOK_KEY)  # None with one book: no selector, `paper.book_id`
+    book = state.get(BOOK_KEY) or settings.paper.book_id  # no selector: `paper.book_id`
     signature = (book, kind, rebalance_session, (name or "").strip(), (reason or "").strip())
     if kind not in _DUPLICATE_GUARD_EXEMPT_KINDS and signature == state.get(LAST_WRITTEN_KEY):
         state[OUTCOME_KEY] = Outcome(
@@ -238,7 +239,7 @@ def _render_book_selector(conn: duckdb.DuckDBPyConnection, default: str) -> str:
         books = list(ops.book_ids(conn))
     except (JournalNotInitialised, SchemaVersionError):
         books = []
-    if len(books) < 2:
+    if books in ([], [default]):
         return default
     index = books.index(default) if default in books else 0
     return str(st.selectbox("Book", books, index=index, key=BOOK_KEY))
