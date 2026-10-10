@@ -269,6 +269,7 @@ from tradepartner.adapters.edgar import (
     StatementFactsParse,
     UnstampedFiling,
     acceptance_times,
+    duration_class,
     parse_company_facts,
     parse_company_tickers,
     parse_cover_page,
@@ -2375,7 +2376,7 @@ class EdgarFilingSource(FilingSource):
         latest: dict[tuple[str, str, int], date] = {}
         items: list[StatementFactRecord | StatementConflict] = [*records, *conflicts]
         for item in items:
-            group = (item.accession, item.fact_name, item.period_days)
+            group = (item.accession, item.fact_name, duration_class(item.period_days))
             latest[group] = max(latest.get(group, item.period_end), item.period_end)
         out: list[StatementFactRecord] = []
         for r in records:
@@ -2385,7 +2386,8 @@ class EdgarFilingSource(FilingSource):
                     r,
                     form="" if stamp is None else stamp.form,
                     accepted_at=None if stamp is None else stamp.accepted_at,
-                    comparative=r.period_end < latest[(r.accession, r.fact_name, r.period_days)],
+                    comparative=r.period_end
+                    < latest[(r.accession, r.fact_name, duration_class(r.period_days))],
                 )
             )
         out.sort(

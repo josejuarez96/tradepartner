@@ -168,13 +168,28 @@ def test_ten_k_with_two_comparative_years_yields_three_keys_on_their_own_dates()
 
 
 def test_comparative_groups_on_exact_period_days_as_the_spec_reads() -> None:
-    """The Periods rule compares within one `period_days`: a leap-year
-    current column (365 days) and its prior year (364) are separate groups,
-    so the prior year is not flagged. Pinned as written; the open question
-    is on the PR."""
+    """#1034 inverts this pin: 365 and 364 days are one annual class."""
     result = parse(payload({"Revenues": [entry(K2020, FY2020, 300), entry(K2020, FY2019, 200)]}))
     flags = {r.period_end: (r.period_days, r.comparative) for r in result.records}
-    assert flags == {date(2020, 12, 31): (365, False), date(2019, 12, 31): (364, False)}
+    assert flags == {date(2020, 12, 31): (365, False), date(2019, 12, 31): (364, True)}
+
+
+def test_53_week_year_and_quarter_ytd_use_separate_duration_classes() -> None:
+    result = parse(
+        payload(
+            {
+                "Revenues": [
+                    entry(K2023, ("2021-12-26", "2022-12-31"), 370, filed="2024-02-23"),
+                    entry(K2023, ("2020-12-31", "2021-12-29"), 363, filed="2024-02-23"),
+                    entry(K2023, ("2023-10-01", "2023-12-31"), 90, filed="2024-02-23"),
+                    entry(K2023, ("2023-04-01", "2023-12-31"), 270, filed="2024-02-23"),
+                ]
+            }
+        )
+    )
+    annual = [r for r in result.records if r.period_days > 300]
+    assert {r.period_days: r.comparative for r in annual} == {370: False, 363: True}
+    assert all(not r.comparative for r in result.records if r.period_days < 300)
 
 
 def test_misleading_fy_and_no_frame_still_land_on_the_entry_dates() -> None:
@@ -669,6 +684,21 @@ def test_switch_off_makes_no_call_no_request_and_no_cache(tmp_path: Path) -> Non
     source.facts(CIK, [SHARES])  # the shares path's payload read fills no statement cache
     assert source.requests == 1
     assert not _cache_dir(settings).exists()
+
+
+def test_cache_hit_recomputes_leap_year_comparative_by_duration_class(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    body = _company(
+        CIK, {"Revenues": {"USD": [entry(K2020, FY2020, 300), entry(K2020, FY2019, 200)]}}
+    )
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, {K2020: ("10-K", ACCEPTANCE[K2020].accepted_at)})
+    source.statement_facts(CIK)
+    cached = _adapter(settings, EdgarRouter())
+    rows = {r.period_end: r for r in cached.statement_facts(CIK)}
+    assert cached.requests == 0
+    assert rows[date(2020, 12, 31)].comparative is False
+    assert rows[date(2019, 12, 31)].comparative is True
 
 
 def _conflicted() -> dict[str, Any]:

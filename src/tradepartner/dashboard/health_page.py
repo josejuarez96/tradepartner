@@ -362,6 +362,8 @@ def _statement_card(report: HealthReport) -> None:
         if statement.counts:
             counts = ", ".join(f"{k} {v}" for k, v in sorted(statement.counts.items()))
             st.caption(f"Last EDGAR run: {counts}")
+            if {"non_usd", "malformed", "none"} & statement.counts.keys():
+                st.caption("non_usd, malformed, none: parsed CIKs only (a cache hit adds zero)")
         if statement.vintage_late > 0:
             theme.status_badge(f"statement_vintage_late: {statement.vintage_late}", "warning")
 

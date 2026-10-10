@@ -460,6 +460,14 @@ def _statement_period(
     return start, end, float(raw)
 
 
+_DAYS_PER_MONTH = 365.25 / 12
+
+
+def duration_class(period_days: int) -> int:
+    """Whole-month duration class for statement comparatives (#1034)."""
+    return math.floor(period_days / _DAYS_PER_MONTH + 0.5)
+
+
 @_fail_closed
 def parse_statement_facts(
     payload: Mapping[str, Any],
@@ -494,7 +502,7 @@ def parse_statement_facts(
       `StatementConflict` (never raised, and never a fall-back to the next
       tag); identical duplicates collapse.
     - **comparative** is TRUE when the period ends before the latest
-      `period_end` the filing carries for the same fact and `period_days`.
+      `period_end` the filing carries for the same fact and duration class.
 
     An entry naming a dimension raises `ValueError` (schema drift, P9), as
     does any malformed payload structure (a missing key)."""
@@ -545,7 +553,7 @@ def parse_statement_facts(
     latest: dict[tuple[str, str, int], date] = {}
     for accession, fact_name, start, end in values:
         days = 0 if start is None else (end - start).days
-        group = (accession, fact_name, days)
+        group = (accession, fact_name, duration_class(days))
         if group not in latest or end > latest[group]:
             latest[group] = end
 
@@ -573,7 +581,7 @@ def parse_statement_facts(
                 accession=accession,
                 accepted_at=None if stamp is None else stamp.accepted_at,
                 filed=filed[key],
-                comparative=end < latest[(accession, fact_name, days)],
+                comparative=end < latest[(accession, fact_name, duration_class(days))],
             )
         )
     records.sort(
