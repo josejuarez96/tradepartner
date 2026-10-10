@@ -164,6 +164,7 @@ def test_edgar_filing_source_defaults() -> None:
     assert s.edgar.index_first_year == 1993
     assert s.edgar.index_settle_days == 3
     assert s.edgar.bulk_stamp_threshold_ciks == 500
+    assert s.edgar.bulk_stamps_enabled is False
     assert s.edgar.cover_page_forms == ["10-K", "10-Q", "20-F", "40-F"]
 
 
@@ -227,6 +228,28 @@ def test_edgar_statement_facts_defaults() -> None:
     }
     assert s.edgar.statement_forms == ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
     assert s.edgar.statement_units == ["USD"]
+
+
+def test_edgar_filing_events_defaults() -> None:
+    """T164e (#1358): the switch is off and the forms are 8-K and 8-K/A."""
+    s = Settings(_env_file=None)
+    assert s.edgar.filing_events_enabled is False
+    assert s.edgar.event_forms == ["8-K", "8-K/A"]
+
+
+def test_edgar_filing_events_keys_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EDGAR__FILING_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("EDGAR__EVENT_FORMS", '["8-K"]')
+    s = Settings(_env_file=None)
+    assert s.edgar.filing_events_enabled is True
+    assert s.edgar.event_forms == ["8-K"]
+
+
+@pytest.mark.parametrize("forms", [[], [""], [" "]])
+def test_edgar_event_forms_is_never_empty(forms: list[str]) -> None:
+    """An empty list, or an empty form, would store no event at all."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"event_forms": forms})
 
 
 def test_edgar_statement_tags_default_is_not_shared() -> None:

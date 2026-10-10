@@ -292,6 +292,12 @@ class EdgarConfig(BaseModel):
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
+    # #1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved by
+    # New York's UTC offset (early for many CIKs, a look-ahead), so stamps never
+    # come from it unless this is turned on; above the threshold, stamping goes
+    # per CIK like below it. Turn on only once the zip is shown to match the
+    # SGML header again (data-foundation plan, the #1382 repair task).
+    bulk_stamps_enabled: bool = False
     cover_page_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"], min_length=1
     )
@@ -346,6 +352,18 @@ class EdgarConfig(BaseModel):
         min_length=1,
     )
     statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
+    # T164e (#1358, spec amendment 2026-10-09): filing events. While the
+    # switch is off the ingest never asks `filing_events`, so the adapter makes
+    # no request and no cache write for it and no row is added. It stays off
+    # until the real-store run has passed and the owner has closed #1382 (the
+    # stamps clock: an early stamp is a look-ahead for an event read). Only a
+    # form in `event_forms` is ever a row; never empty. Narrowing it later
+    # fails `health --check` on the stored rows of a dropped form until a
+    # rebuild (the amendment's open question 12).
+    filing_events_enabled: bool = False
+    event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["8-K", "8-K/A"], min_length=1
+    )
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
