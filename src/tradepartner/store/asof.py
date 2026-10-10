@@ -12,7 +12,8 @@ every T before it.
 
 Five of the eight as-of functions the spec lists live here: `prices_as_of`,
 `adjusted_prices_as_of`, `facts_as_of`, `listings_as_of` and
-`statement_facts_as_of` (#660, T76b), plus `dropped_dividends_as_of`, which
+`statement_facts_as_of` (#660, T76b), plus `filing_events_as_of` (#1358,
+T164d; req 8 lists it after the eight) and `dropped_dividends_as_of`, which
 reports the dividends `adjusted_prices_as_of` leaves unapplied (#72) and is
 not itself one of the spec's eight. The other three live elsewhere, each
 owned by the module that writes its own table: `securities_as_of` in
@@ -254,6 +255,16 @@ _STATEMENT_FACT_KEY: tuple[str, ...] = ("security_id", "fact_name", "period_end"
 #: View name `statement_facts_as_of` registers the `securities_as_of(t)`
 #: frame under, to join `statement_facts` against it by `cik` in SQL.
 _STATEMENT_SECURITIES_VIEW = "_asof_statement_securities"
+
+#: `filing_events_as_of`'s sort order (amendment 2026-10-09, #1358): by
+#: acceptance, then accession, then class -- the spec's order, not the
+#: table's `UNIQUE (cik, accession)`, so events read in the order they became
+#: public.
+_FILING_EVENT_ORDER: tuple[str, ...] = ("known_at", "accession", "security_id")
+
+#: View name `filing_events_as_of` registers the `securities_as_of(t)` frame
+#: under, to join `filing_events` against it by `cik` in SQL.
+_FILING_EVENT_SECURITIES_VIEW = "_asof_filing_event_securities"
 
 #: `PARTITION BY` for an action's identity (#108): the source's id when it
 #: gave one, else `(action_type, ex_date)`. Every reader of
@@ -671,6 +682,83 @@ def statement_facts_as_of(
         return conn.execute(sql, [t]).pl()
     finally:
         conn.unregister(_STATEMENT_SECURITIES_VIEW)
+
+
+def _string_list(value: Sequence[str] | None, *, name: str) -> list[str] | None:
+    """`value` as a list, or `None` for "no filter". A bare `str` is a
+    `Sequence[str]` too, and filtering on its characters would silently
+    match nothing, so it raises `TypeError` instead."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raise TypeError(f"{name} must be a sequence of strings, not a str: {value!r}")
+    return list(value)
+
+
+def filing_events_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    forms: Sequence[str] | None = None,
+    items: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """`filing_events` rows known by `t` (spec "Data / interfaces" >
+    Amendment 2026-10-09, #1358; plan T164d), joined through
+    `securities_as_of(t)` on `cik` as `statement_facts_as_of` is: one row
+    per `(security_id, accession)`, so a dual-class issuer's event appears
+    once per listed class and a CIK with no `securities` row at `t` is
+    invisible at `t`. Sorted by `(known_at, accession, security_id)`.
+    Columns: `security_id` then every `filing_events` column in schema order.
+
+    `known_at` is the filing's stamped acceptance (the table's `CHECK`), never
+    the index's `filed` date, so an 8-K accepted after the close but before
+    EDGAR's 17:30 filing-date cut is invisible at that session's close and
+    first visible at the next session. `filing_events` has no revisions (its
+    `UNIQUE (cik, accession)` excludes `known_at`), so this is a plain
+    `known_at <= t` filter.
+
+    `forms` keeps the rows whose `form` equals one of its entries exactly
+    (`8-K` never matches `8-K/A`). `items` keeps the rows whose verbatim
+    `items` string, split on commas, contains any of its codes as a whole
+    code (`2.02` never matches `12.02`); the store parses no code, so this
+    is the one place a consumer's split happens. `None` means no filter on
+    that column; an empty sequence keeps nothing; a bare `str` raises
+    `TypeError`.
+
+    `t` must be tz-aware (a bare date raises `TypeError`, a naive `datetime`
+    raises `ValueError`). On a store older than schema version 21 the table
+    does not exist and the read raises (`store.schema`'s version-21 note).
+    """
+    t = _validate_t(t)
+    form_list = _string_list(forms, name="forms")
+    item_list = _string_list(items, name="items")
+    # Imported here for the same reason as in `statement_facts_as_of`:
+    # `store.master` imports from this module.
+    from tradepartner.store.master import securities_as_of
+
+    securities = securities_as_of(conn, t).select("security_id", "cik")
+    params: list[Any] = [t]
+    filters = ""
+    if form_list is not None:
+        filters += " AND list_contains(?::VARCHAR[], f.form)"
+        params.append(form_list)
+    if item_list is not None:
+        filters += (
+            " AND list_has_any("
+            "list_transform(string_split(f.items, ','), code -> trim(code)), ?::VARCHAR[])"
+        )
+        params.append(item_list)
+    conn.register(_FILING_EVENT_SECURITIES_VIEW, securities)
+    try:
+        sql = f"""
+            SELECT s.security_id, f.*
+            FROM filing_events f
+            JOIN {_FILING_EVENT_SECURITIES_VIEW} s ON s.cik = f.cik
+            WHERE f.known_at <= ?{filters}
+            ORDER BY {", ".join(_FILING_EVENT_ORDER)}
+        """
+        return conn.execute(sql, params).pl()
+    finally:
+        conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
 
 
 def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> str:
