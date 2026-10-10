@@ -106,7 +106,8 @@ _POSITION_SCHEMA = {"security_id": pl.Utf8, "session": pl.Date, "value": pl.Floa
 class BacktestResult:
     """One cost level's run. `targets` is keyed by fill session; `position_values` holds
     each position's dollar value at every session's close; `marking_frames` are the
-    per-step frames, shared by every level (req 14 stitches them)."""
+    per-step frames, shared by every level (req 14 stitches them), empty when the run
+    was asked not to keep them (`run_many(..., keep_marking_frames=False)`)."""
 
     cost_per_side_bps: float
     equity: tuple[EquityRow, ...]
@@ -824,6 +825,7 @@ class _Variant:
     handle: TrialHandle
     plan: Plan | None = None
     books: list[_Book] = field(default_factory=list)
+    keep_frames: bool = True
     frames: list[StepFrame] = field(default_factory=list)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
 
@@ -897,6 +899,7 @@ def run_many(
     cost_levels: Sequence[float],
     *,
     family: HypothesisFamily,
+    keep_marking_frames: bool = True,
 ) -> RunManyResults:
     """Run a read group's variants (strategy-lab spec req 2): every variant's frozen
     `Settings` with its own `TrialHandle`, over the rebalance sessions in `[start, end]`
@@ -911,6 +914,12 @@ def run_many(
     signal, targets, fills or valuation) is recorded in `failures` against that
     variant only, which is then dropped; a failed provider read raises
     `SharedReadFailed` naming every variant still open.
+
+    `keep_marking_frames=False` keeps no step's marking frame, so each result's
+    `marking_frames` is empty and memory stays flat over a long run (#1414: a daily
+    group's frames, with the Arrow buffers they pin, grew without bound). Nothing else
+    in the results changes; only the `bt` oracle (`BacktestResult.stitched_returns`)
+    reads the frames.
     """
     signal_for(family)
     levels = _check_variants(variants, cost_levels)
@@ -920,7 +929,9 @@ def run_many(
         raise ValueError(f"need at least two rebalance sessions in [{start}, {end}]")
 
     out = RunManyResults()
-    group = [_Variant(params, handle) for params, handle in variants]
+    group = [
+        _Variant(params, handle, keep_frames=keep_marking_frames) for params, handle in variants
+    ]
 
     def failed(variant: _Variant, exc: Exception) -> None:
         out.failures[variant.trial_id] = exc
@@ -1045,7 +1056,8 @@ def _variant_step(
     late = view.late_dividends(t_prev, t, ever_held)
     if next_plan is not None:
         next_plan = _no_benchmark_members(next_plan, benchmarks)
-    variant.frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
+    if variant.keep_frames:
+        variant.frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
     variant.targets[plan.fill_session] = dict(plan.targets)
     for book in variant.books:
         _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)

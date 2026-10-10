@@ -601,6 +601,59 @@ def test_a_one_group_budget_stops_at_the_group_boundary(
         lab.run_sweep(SLUG, rerun=True, clock=clock)
 
 
+def _written(path: Path, sweep_run_id: int) -> dict[str, list[tuple[Any, ...]]]:
+    """Every result row the sweep run wrote, by table, in a fixed order."""
+    trials = "SELECT trial_id FROM sweep_trials WHERE sweep_run_id = ?"
+    with _read(path) as conn:
+        return {
+            table: conn.execute(
+                f"SELECT * EXCLUDE (trial_id), trial_id FROM {table} "
+                f"WHERE trial_id IN ({trials}) ORDER BY ALL",
+                [sweep_run_id],
+            ).fetchall()
+            for table in ("trial_metrics", "trial_equity", "trial_rebalances")
+        }
+
+
+def test_a_sweep_keeps_no_marking_frames_and_writes_the_same_rows(
+    store: Path, template: Path, tmp_path: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1414: the sweep path keeps no step's marking frame (they grew without bound and
+    the OS killed a daily sweep); every written result row equals a run that kept them."""
+    real_run_many = engine.run_many
+    seen: list[engine.RunManyResults] = []
+
+    def recording(*args: Any, **kwargs: Any) -> engine.RunManyResults:
+        out = real_run_many(*args, **kwargs)
+        seen.append(out)
+        return out
+
+    monkeypatch.setattr(engine, "run_many", recording)
+    dropped = lab.run_sweep(SLUG, clock=clock)
+    assert dropped.n_ok == 4 and len(seen) == 2
+    results = [r for out in seen for levels in out.values() for r in levels.values()]
+    assert results and all(r.marking_frames == () for r in results)
+    assert all(not r.position_values.is_empty() for r in results)
+
+    kept_store = tmp_path / "kept" / "lab.duckdb"
+    kept_store.parent.mkdir()
+    shutil.copy(template, kept_store)
+    monkeypatch.setenv("STORE__PATH", str(kept_store))
+    seen.clear()
+
+    def keeping(*args: Any, **kwargs: Any) -> engine.RunManyResults:
+        return recording(*args, **{**kwargs, "keep_marking_frames": True})
+
+    monkeypatch.setattr(engine, "run_many", keeping)
+    kept = lab.run_sweep(SLUG, clock=FakeClock())
+    assert kept.n_ok == 4
+    assert all(r.marking_frames for out in seen for lv in out.values() for r in lv.values())
+    assert kept.sweep_run_id == dropped.sweep_run_id
+    rows = _written(store, dropped.sweep_run_id)
+    assert all(rows.values())
+    assert rows == _written(kept_store, kept.sweep_run_id)
+
+
 # --- vintage and resumption -----------------------------------------------------
 
 

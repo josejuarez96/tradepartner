@@ -100,6 +100,27 @@ WINDOWS: dict[str, tuple[Cadence, date, date]] = {
 }
 
 
+@pytest.mark.parametrize("window", list(WINDOWS.values()), ids=list(WINDOWS))
+def test_without_marking_frames_a_group_keeps_none_and_every_other_field_is_equal(
+    window: tuple[Cadence, date, date],
+) -> None:
+    """#1414: `keep_marking_frames=False` keeps no frame and changes nothing else."""
+    cadence, start, end = window
+    variants = _variants(_params(cadence, top_fraction=0.4), _params(cadence, top_fraction=0.8))
+    kept = run_many(variants, _provider(), start, end, LEVELS, family="momentum")
+    dropped = run_many(
+        variants, _provider(), start, end, LEVELS, family="momentum", keep_marking_frames=False
+    )
+    assert sorted(dropped) == sorted(kept) == [1, 2] and not dropped.failures
+    for trial_id, levels in kept.items():
+        assert all(result.marking_frames for result in levels.values())
+        assert all(result.marking_frames == () for result in dropped[trial_id].values())
+        _assert_same(
+            dropped[trial_id],
+            {lv: dataclasses.replace(r, marking_frames=()) for lv, r in levels.items()},
+        )
+
+
 class TestReadGroups:
     """The spec's "Read groups" criterion."""
 
