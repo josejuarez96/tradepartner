@@ -240,6 +240,7 @@ def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: 
         "Fill price",
         "Gap report",
         "Stale listings, out of the gap",
+        "Listed with no bars after a Form 25",
     ):
         assert label in text, label
     for rule in INTEGRITY_RULES:
@@ -254,6 +255,7 @@ def test_render_shows_every_metric(monkeypatch: pytest.MonkeyPatch, store_path: 
     assert f"snapshot_static reliance: {report.static_reliance.count}" in text
     frames = {tuple(df.value.columns) for df in at.dataframe}
     assert tuple(report.delisted.frame.columns) in frames
+    assert tuple(report.listed_without_bars.frame.columns) in frames
     assert tuple(report.gaps.rows.columns) in frames
 
 
