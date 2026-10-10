@@ -1039,24 +1039,24 @@
     "idea_id": "b10",
     "kind": "run",
     "title": "Run the short-term momentum test",
-    "why": "B10 is written and its code is built. Two versions, one run. It tells you whether last month's busiest winners keep going after costs.",
-    "effort": "about 15 min, then an overnight run",
-    "step": "Register and run B10 as a 2-variant sweep"
+    "why": "Everything is built. One overnight run answers whether last month's busiest winners keep rising after costs.",
+    "effort": "15 min, then overnight",
+    "step": "Register and run as a 2-variant sweep"
    },
    {
     "id": "w2",
     "idea_id": "b9",
     "kind": "answer",
     "title": "Answer 7 questions on earnings-reaction drift",
-    "why": "B9 can't be registered until its open questions are settled (hold length, which filings count, how to treat restatements …).",
-    "effort": "about 30 min",
+    "why": "Hold length, which filings count, how to treat restatements. The test can't be registered until these are settled.",
+    "effort": "30 min",
     "step": "Answer B9-1 to B9-7 in the hypothesis file"
    },
    {
     "id": "w3",
     "kind": "decide",
     "title": "Set the development boundary",
-    "why": "One date that no in-sample test may read past. Recommended: Dec 29, 2023, the end of the in-sample window you already used.",
+    "why": "No backtest will read past this date. Recommended: Dec 29, 2023, where your first tests already stop.",
     "effort": "2 min",
     "step": "Record the boundary with a reason"
    },
@@ -1065,7 +1065,7 @@
     "idea_id": "b4",
     "kind": "decide",
     "title": "Momentum + profitability: test now or wait?",
-    "why": "Your status page says run it now; the newer exam decision says park it until profitability has a finalist. Pick one so it stops showing as both.",
+    "why": "Your notes disagree: one says run it now, the newer decision says wait for a profitability finalist.",
     "effort": "2 min",
     "step": "Keep parked, or register and run in-sample"
    },
@@ -1074,7 +1074,7 @@
     "idea_id": "h1",
     "kind": "record",
     "title": "Write down what monthly momentum taught you",
-    "why": "H1 has been tested and spent its exam, but no lesson is recorded yet, so the evidence list still only shows other people's studies.",
+    "why": "Its test and exam are done, but nothing is recorded, so your evidence still only shows other people's studies.",
     "effort": "10 min",
     "step": "Add a TradePartner claim for H1"
    }
@@ -1209,7 +1209,6 @@
     },
     "expected": "About zero to slightly negative after costs at 15 bp.",
     "stop_rule": "Retire both versions if neither beats the S&P 500 in-sample.",
-    "next": "Waiting on you: register and run.",
     "cost": "S"
    },
    {

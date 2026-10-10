@@ -1,29 +1,17 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleCheck, Pause } from "lucide-react";
+import { AlertTriangle, Pause } from "lucide-react";
 import type { AppData, Book } from "@/lib/types";
 import { RANGES, comparison, lastChange, rangeStart, type RangeKey } from "@/lib/data";
 import { clock, money, pct, pts, shortDate, signedMoney, tone, weekdayDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { ReturnChart } from "@/components/ReturnChart";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
-
-function Delta({ v, children }: { v: number; children: React.ReactNode }) {
-  const t = tone(v);
-  const Icon = t === "loss" ? ArrowDownRight : ArrowUpRight;
-  return (
-    <Badge variant="outline" className={cn("num", toneText[t])}>
-      {t !== "flat" && <Icon />}
-      {children}
-    </Badge>
-  );
-}
 
 /** Screen 1, "How am I doing?". shadcn dashboard pattern: summary cards, one chart, one table. */
 export function Overview({ data }: { data: AppData }) {
@@ -78,10 +66,9 @@ export function Overview({ data }: { data: AppData }) {
           <CardHeader>
             <CardDescription>Total value</CardDescription>
             <CardTitle className="num text-2xl font-semibold @[250px]/card:text-3xl">{money(total)}</CardTitle>
-            {today && <CardAction><Delta v={today.rel}>{pct(today.rel)}</Delta></CardAction>}
           </CardHeader>
           <CardFooter className="flex-col items-start gap-1 text-sm">
-            {today && <div className={cn("num font-medium", toneText[tone(today.rel)])}>{signedMoney(today.abs)} on {weekdayDate(lastDate)}</div>}
+            {today && <div className={cn("num font-medium", toneText[tone(today.rel)])}>{signedMoney(today.abs)} ({pct(today.rel)}) on {weekdayDate(lastDate)}</div>}
             <div className="text-muted-foreground">All {data.books.length} books, new money not counted as gain</div>
           </CardFooter>
         </Card>
@@ -90,10 +77,9 @@ export function Overview({ data }: { data: AppData }) {
           <CardHeader>
             <CardDescription>Return since {shortDate(own[0].date)}</CardDescription>
             <CardTitle className={cn("num text-2xl font-semibold @[250px]/card:text-3xl", toneText[tone(all.youRet)])}>{pct(all.youRet)}</CardTitle>
-            <CardAction><Delta v={gapAll}>{gapAll >= 0 ? "+" : "−"}{pts(gapAll)}</Delta></CardAction>
           </CardHeader>
           <CardFooter className="flex-col items-start gap-1 text-sm">
-            <div className="font-medium">{tone(gapAll) === "flat" ? "Level with" : gapAll > 0 ? "Ahead of" : "Behind"} the S&amp;P 500</div>
+            <div className="font-medium">{tone(gapAll) === "flat" ? "Level with the S&P 500" : `${pts(gapAll).replace(" pts", " points")} ${gapAll > 0 ? "ahead of" : "behind"} the S&P 500`}</div>
             <div className="text-muted-foreground num">S&amp;P 500 {pct(all.spyRet)} over the same days</div>
           </CardFooter>
         </Card>
@@ -104,9 +90,6 @@ export function Overview({ data }: { data: AppData }) {
             <CardTitle className={cn("text-2xl font-semibold @[250px]/card:text-3xl", waiting && "text-attention")}>
               {waiting ? `${waiting} ${waiting === 1 ? "thing" : "things"}` : "Nothing"}
             </CardTitle>
-            <CardAction>
-              {waiting ? <AlertTriangle className="size-5 text-attention" /> : <CircleCheck className="size-5 text-gain" />}
-            </CardAction>
           </CardHeader>
           <CardFooter className="flex-col items-start gap-1 text-sm">
             <div className="font-medium">{waiting ? data.alerts[0].title : "Every book ran as planned"}</div>
@@ -122,7 +105,7 @@ export function Overview({ data }: { data: AppData }) {
             </CardTitle>
           </CardHeader>
           <CardFooter className="flex-col items-start gap-1 text-sm">
-            {next && <div className="font-medium">{next.name} · {(next.next_run.what ?? "run").toLowerCase()}</div>}
+            {next && <div className="font-medium">{next.next_run.what} for {next.name}</div>}
             {running[1] && <div className="text-muted-foreground">Then {running.slice(1).map((b) => b.name).join(" and ")}</div>}
           </CardFooter>
         </Card>
@@ -198,15 +181,15 @@ function BookRow({ book, data }: { book: Book; data: AppData }) {
     <TableRow className="cursor-pointer" onClick={() => (location.hash = `books/${book.id}`)}>
       <TableCell className="pl-6">
         <a href={`#books/${book.id}`} className="font-medium hover:underline">{book.name}</a>
-        <div className="text-muted-foreground text-xs">{strat?.name} · {book.cadence}</div>
+        <div className="text-muted-foreground text-xs">{strat?.name}</div>
       </TableCell>
       <TableCell className="hidden md:table-cell">
         {stopped ? (
-          <Badge variant="outline" className="text-attention"><Pause />Stopped by you {clock(book.status.at!)}</Badge>
+          <span className="text-attention inline-flex items-center gap-1.5 font-medium"><Pause className="size-3.5" />Stopped by you at {clock(book.status.at!)}</span>
         ) : flagged ? (
-          <Badge variant="outline" className="text-attention"><AlertTriangle />Needs you</Badge>
+          <span className="text-attention inline-flex items-center gap-1.5 font-medium"><AlertTriangle className="size-3.5" />Needs you</span>
         ) : (
-          <Badge variant="outline" className="text-muted-foreground"><span className="size-1.5 rounded-full bg-gain" />Running</Badge>
+          <span className="text-muted-foreground">Running</span>
         )}
       </TableCell>
       <TableCell className="num text-right">{money(book.equity.at(-1)!.value)}</TableCell>
@@ -218,7 +201,7 @@ function BookRow({ book, data }: { book: Book; data: AppData }) {
         {young ? "—" : `${gap >= 0 ? "+" : "−"}${pts(gap)}`}
       </TableCell>
       <TableCell className="text-muted-foreground hidden pr-6 lg:table-cell">
-        {book.next_run.what} · {shortDate(book.next_run.at)}
+        {book.next_run.what}, {shortDate(book.next_run.at)}
       </TableCell>
     </TableRow>
   );

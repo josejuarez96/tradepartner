@@ -7,7 +7,6 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -44,29 +43,31 @@ export function Research({ data }: { data: AppData }) {
         <Card className="shadow-xs">
           <CardHeader>
             <CardTitle>Waiting on you</CardTitle>
-            <CardDescription>Only you can do these. Each one unblocks something.</CardDescription>
-            <CardAction><Badge variant="outline" className="text-attention">{r.waiting.length}</Badge></CardAction>
+            <CardAction><span className="text-attention text-sm font-medium">{r.waiting.length}</span></CardAction>
           </CardHeader>
           <CardContent className="px-0">
             <ul className="divide-y border-t">
               {r.waiting.map((w) => {
                 const Icon = KIND_ICON[w.kind];
                 const idea = byId(w.idea_id);
-                return (
-                  <li key={w.id} className="flex items-start gap-3 px-4 py-4 sm:px-6">
-                    <span className="bg-muted text-muted-foreground mt-0.5 hidden size-8 shrink-0 place-items-center rounded-md sm:grid"><Icon className="size-4" /></span>
+                const body = (
+                  <>
+                    <Icon className="text-muted-foreground mt-0.5 size-4 shrink-0" />
                     <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-medium">{w.title}</p>
-                        {idea && <Badge variant="secondary" className="font-mono">{idea.code}</Badge>}
-                      </div>
-                      <p className="text-muted-foreground mt-1 text-sm">{w.why}</p>
-                      <p className="text-muted-foreground mt-1 text-xs">Next step: <span className="text-foreground">{w.step}</span> · {w.effort}</p>
+                      <p className="font-medium">{w.title}</p>
+                      <p className="text-muted-foreground mt-0.5 text-sm">{w.why}</p>
+                      <p className="text-muted-foreground mt-1 text-xs sm:hidden">{w.effort}</p>
                     </div>
-                    {idea && (
-                      <Button variant="ghost" size="sm" className="shrink-0 max-sm:size-9 max-sm:px-0" aria-label={`Open ${idea.name}`} onClick={() => setOpen(idea)}>
-                        <span className="max-sm:sr-only">Open</span> <ChevronRight />
-                      </Button>
+                    <span className="text-muted-foreground hidden shrink-0 text-xs whitespace-nowrap sm:inline">{w.effort}</span>
+                    {idea && <ChevronRight className="text-muted-foreground mt-0.5 size-4 shrink-0" />}
+                  </>
+                );
+                return (
+                  <li key={w.id}>
+                    {idea ? (
+                      <button onClick={() => setOpen(idea)} className="hover:bg-accent/40 focus-visible:ring-ring/50 flex w-full items-start gap-3 px-4 py-3.5 text-left outline-none focus-visible:ring-[3px] sm:px-6">{body}</button>
+                    ) : (
+                      <div className="flex items-start gap-3 px-4 py-3.5 sm:px-6">{body}</div>
                     )}
                   </li>
                 );
@@ -94,10 +95,10 @@ export function Research({ data }: { data: AppData }) {
                   <div className="flex items-baseline gap-2">
                     <h2 className="text-sm font-medium">{s.label}</h2>
                     <span className="text-muted-foreground text-sm">{ideas.length}</span>
-                    <span className="text-muted-foreground hidden text-sm sm:inline">· {s.hint}</span>
+                    <span className="text-muted-foreground ml-2 hidden text-sm sm:inline">{s.hint}</span>
                   </div>
                   <div className="grid grid-cols-1 gap-3 @3xl/main:grid-cols-2 @6xl/main:grid-cols-3">
-                    {ideas.map((i) => <IdeaCard key={i.id} idea={i} onOpen={() => setOpen(i)} />)}
+                    {ideas.map((i) => <IdeaCard key={i.id} idea={i} waiting={r.waiting.some((w) => w.idea_id === i.id)} onOpen={() => setOpen(i)} />)}
                   </div>
                 </section>
               );
@@ -117,7 +118,7 @@ export function Research({ data }: { data: AppData }) {
                       <TableHead className="pl-6">Idea</TableHead>
                       <TableHead className="hidden md:table-cell">Window</TableHead>
                       <TableHead className="text-right">vs S&amp;P / yr</TableHead>
-                      <TableHead className="w-48">Luck check</TableHead>
+                      <TableHead>Luck check</TableHead>
                       <TableHead className="hidden text-right sm:table-cell">Tries</TableHead>
                       <TableHead className="hidden pr-6 lg:table-cell">Exam</TableHead>
                     </TableRow>
@@ -126,7 +127,7 @@ export function Research({ data }: { data: AppData }) {
                     {tested.map((i) => (
                       <TableRow key={i.id} className="cursor-pointer" onClick={() => setOpen(i)}>
                         <TableCell className="pl-6">
-                          <span className="font-medium">{i.name}</span> <span className="text-muted-foreground font-mono text-xs">{i.code}</span>
+                          <span className="font-medium">{i.name}</span>
                         </TableCell>
                         <TableCell className="text-muted-foreground hidden md:table-cell">{i.result!.window}</TableCell>
                         <TableCell className={cn("num text-right", i.result!.vs_spy >= 0 ? "text-gain" : "text-loss")}>
@@ -187,47 +188,41 @@ export function Research({ data }: { data: AppData }) {
   );
 }
 
-function stageBadge(stage: Stage) {
-  const s = STAGES.find((x) => x.key === stage)!;
-  const cls = stage === "on_paper" ? "text-gain" : stage === "ready" ? "text-attention" : "text-muted-foreground";
-  return <Badge variant="outline" className={cls}>{s.label}</Badge>;
+/** Evidence in words: a verdict, then the counts behind it. */
+function evidenceVerdict(e: NonNullable<Idea["evidence"]>) {
+  const known = e.for + e.mixed + e.against;
+  if (!known) return { text: "Not enough evidence yet", cls: "text-muted-foreground" };
+  if (e.for > e.against && e.for >= e.mixed) return { text: "Mostly supported", cls: "text-gain" };
+  if (e.against > e.for && e.against >= e.mixed) return { text: "Mostly against", cls: "text-loss" };
+  return { text: "Mixed", cls: "text-attention" };
 }
 
 function Evidence({ e }: { e: NonNullable<Idea["evidence"]> }) {
-  const total = e.for + e.mixed + e.against + (e.untested ?? 0) || 1;
-  const seg = (n: number, cls: string) => n > 0 && <span className={cls} style={{ width: `${(n / total) * 100}%` }} />;
+  const v = evidenceVerdict(e);
+  const n = e.for + e.mixed + e.against;
+  // One kind of study: just the count. Several kinds: the split.
+  const parts = [e.for && `${e.for} for`, e.mixed && `${e.mixed} mixed`, e.against && `${e.against} against`].filter(Boolean);
+  const detail = !n ? "" : parts.length === 1 ? `${n} ${n === 1 ? "study" : "studies"}` : `${n} studies: ${parts.join(", ")}`;
   return (
-    <div className="flex flex-col gap-1.5">
-      <div className="bg-muted flex h-1.5 w-full gap-0.5 overflow-hidden rounded-full" aria-hidden>
-        {seg(e.for, "bg-gain")}{seg(e.mixed, "bg-attention")}{seg(e.against, "bg-loss")}{seg(e.untested ?? 0, "bg-muted-foreground/40")}
-      </div>
-      <p className="text-muted-foreground text-xs">
-        {e.for} for · {e.mixed} mixed · {e.against} against{e.untested ? ` · ${e.untested} untested` : ""}
-      </p>
-    </div>
+    <p className="text-sm">
+      <span className={cn("font-medium", v.cls)}>{v.text}</span>
+      {detail && <span className="text-muted-foreground"> ({detail})</span>}
+    </p>
   );
 }
 
-function IdeaCard({ idea, onOpen }: { idea: Idea; onOpen: () => void }) {
+function IdeaCard({ idea, waiting, onOpen }: { idea: Idea; waiting: boolean; onOpen: () => void }) {
+  const exam = idea.exam?.kind === "paper" && idea.exam.of ? `Exam ${idea.exam.done} of ${idea.exam.of} ${idea.exam.unit}` : null;
   return (
-    <button onClick={onOpen} className="bg-card hover:bg-accent/40 focus-visible:ring-ring/50 flex flex-col gap-3 rounded-xl border p-4 text-left shadow-xs transition-colors outline-none focus-visible:ring-[3px]">
-      <div className="flex items-center gap-2">
-        <span className="font-medium">{idea.name}</span>
-        <Badge variant="secondary" className="font-mono">{idea.code}</Badge>
-        {idea.cost !== "—" && <span className="text-muted-foreground ml-auto text-xs" title="Effort to test">effort {idea.cost}</span>}
-      </div>
+    <button onClick={onOpen} className="bg-card hover:bg-accent/40 focus-visible:ring-ring/50 flex flex-col gap-2 rounded-xl border p-4 text-left transition-colors outline-none focus-visible:ring-[3px]">
+      <p className="font-medium">{idea.name}</p>
       <p className="text-muted-foreground line-clamp-2 text-sm">{idea.idea}</p>
       {idea.evidence && <Evidence e={idea.evidence} />}
-      {idea.exam?.kind === "paper" && idea.exam.of ? (
-        <div className="flex flex-col gap-1.5">
-          <Progress value={(idea.exam.done! / idea.exam.of) * 100} className="h-1.5" />
-          <p className="text-muted-foreground text-xs num">Exam: {idea.exam.done} of {idea.exam.of} {idea.exam.unit}</p>
-        </div>
-      ) : null}
-      <p className="text-xs">
-        {idea.blocked_by ? <span className="text-muted-foreground"><Lock className="mr-1 inline size-3" />{idea.blocked_by.join(" · ")}</span>
+      <p className="text-sm">
+        {waiting ? <span className="text-attention font-medium">Waiting on you</span>
+          : idea.blocked_by ? <span className="text-muted-foreground">Blocked: {idea.blocked_by[0]}{idea.blocked_by.length > 1 && ` and ${idea.blocked_by.length - 1} more`}</span>
           : idea.parked ? <span className="text-muted-foreground">{idea.parked}</span>
-          : <span>{idea.next}</span>}
+          : <span className="text-muted-foreground num">{exam ?? idea.next}</span>}
       </p>
     </button>
   );
@@ -236,12 +231,10 @@ function IdeaCard({ idea, onOpen }: { idea: Idea; onOpen: () => void }) {
 function Luck({ v, sample }: { v: number; sample?: boolean }) {
   const label = v >= 0.95 ? "likely real" : v >= 0.5 ? "could be luck" : "probably luck";
   return (
-    <div className="flex items-center gap-2" title="Chance the edge is real, after counting every version tried in this family (deflated Sharpe)">
-      <Progress value={v * 100} className="h-1.5 w-16" />
-      <span className="num text-sm">{Math.round(v * 100)}%</span>
-      <span className="text-muted-foreground hidden text-xs xl:inline">{label}</span>
+    <span title="Chance the edge is real, after counting every version tried in this family (deflated Sharpe)">
+      <span className="num">{Math.round(v * 100)}%</span> <span className="text-muted-foreground">{label}</span>
       {sample && <SampleMark />}
-    </div>
+    </span>
   );
 }
 
@@ -256,7 +249,6 @@ function FamilyCard({ family: f }: { family: Family }) {
   return (
     <Card className="shadow-xs">
       <CardHeader>
-        <CardDescription>Family</CardDescription>
         <CardTitle>{f.name}</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-4 text-sm">
@@ -272,12 +264,9 @@ function FamilyCard({ family: f }: { family: Family }) {
           </span>
         </div>
         <Separator />
-        <div className="flex flex-col gap-2">
-          <div className="flex items-baseline justify-between">
-            <span className="text-muted-foreground">Promotions to paper</span>
-            <span className="num font-medium">{f.promotions[0]} of {f.promotions[1]}</span>
-          </div>
-          <Progress value={(f.promotions[0] / f.promotions[1]) * 100} className="h-1.5" />
+        <div className="flex items-baseline justify-between">
+          <span className="text-muted-foreground">Promotions to paper</span>
+          <span className="num font-medium">{f.promotions[0]} of {f.promotions[1]} used</span>
         </div>
         {f.luck_bar_note && <p className="text-muted-foreground text-xs">{f.luck_bar_note}</p>}
       </CardContent>
@@ -320,26 +309,23 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
       <SheetContent className="w-full overflow-y-auto sm:max-w-lg">
         {idea && (
           <>
-            <SheetHeader className="gap-2 border-b">
-              <div className="flex items-center gap-2">
-                <Badge variant="secondary" className="font-mono">{idea.code}</Badge>
-                {stageBadge(idea.stage)}
-              </div>
+            <SheetHeader className="gap-1 border-b">
+              <p className="text-muted-foreground text-sm">{STAGES.find((x) => x.key === idea.stage)?.label}</p>
               <SheetTitle className="text-lg">{idea.name}</SheetTitle>
               <SheetDescription>{idea.idea}</SheetDescription>
             </SheetHeader>
             <div className="flex flex-col gap-6 px-4 pb-8">
               {waiting.map((w) => (
-                <div key={w.id} className="border-attention/40 bg-attention-soft rounded-lg border p-3 text-sm">
-                  <p className="text-attention font-medium">Waiting on you</p>
-                  <p className="mt-1">{w.step}</p>
+                <div key={w.id} className="bg-attention-soft rounded-lg p-3 text-sm">
+                  <p className="text-attention font-medium">Waiting on you: {w.step.charAt(0).toLowerCase() + w.step.slice(1)}</p>
+                  <p className="text-muted-foreground mt-1">{w.effort}</p>
                 </div>
               ))}
 
               {idea.evidence && (
-                <Block title="Why it might work" icon={CircleHelp}>
+                <Block title="Published evidence" icon={CircleHelp}>
                   <Evidence e={idea.evidence} />
-                  <p className="text-muted-foreground mt-2">{idea.evidence.note}</p>
+                  <p className="text-muted-foreground mt-1">{idea.evidence.note}</p>
                 </Block>
               )}
 
@@ -370,10 +356,9 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
               {idea.exam && (
                 <Block title="The exam" icon={Lock}>
                   {idea.exam.kind === "paper" ? (
-                    <div className="flex flex-col gap-2">
-                      <p>{idea.exam.label}: <span className="num">{idea.exam.done} of {idea.exam.of}</span> {idea.exam.unit}</p>
-                      <Progress value={(idea.exam.done! / idea.exam.of!) * 100} className="h-1.5" />
-                      <p className="text-muted-foreground text-xs">A forward exam: the strategy trades on paper with data that didn't exist when it was designed.</p>
+                    <div className="flex flex-col gap-1">
+                      <p>{idea.exam.label}: <span className="num">{idea.exam.done} of {idea.exam.of}</span> {idea.exam.unit} done</p>
+                      <p className="text-muted-foreground text-xs">The strategy trades on paper with data that didn't exist when it was designed.</p>
                     </div>
                   ) : (
                     <p>{idea.exam.label}: <span className="font-medium">{idea.exam.status}</span>{idea.exam.note && <span className="text-muted-foreground"> · {idea.exam.note}</span>}</p>
@@ -381,7 +366,7 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                 </Block>
               )}
 
-              {(idea.blocked_by || idea.parked || idea.next) && (
+              {(idea.blocked_by || idea.parked || (idea.next && !waiting.length)) && (
                 <Block title={idea.blocked_by ? "Blocked by" : idea.parked ? "Parked because" : "What's next"} icon={ChevronRight}>
                   {idea.blocked_by ? (
                     <ul className="list-disc pl-5">{idea.blocked_by.map((b) => <li key={b}>{b}</li>)}</ul>
@@ -390,6 +375,7 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                   )}
                 </Block>
               )}
+              <p className="text-muted-foreground border-t pt-4 text-xs">{idea.code} in the backlog, {idea.family} family</p>
             </div>
           </>
         )}

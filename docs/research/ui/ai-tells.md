@@ -58,6 +58,10 @@ Ranked by who notices (P0 anyone, P1 a designer/developer, P2 polish). IDs match
 - [ ] **CP5 / CP6** Title Case everywhere; "Get started", "Learn more", "Submit".
 - [ ] A subtitle under every heading ("Only you can do these. Each one unblocks something."): Anthropic's skill counts unnecessary labels above or below content among the commonest tells.
 
+### Owner's rules (from review, 2026-10-10)
+- [ ] **Say it once.** No label repeated in the same block: not the title, a code badge, the first words of the description and a "Next step" line all naming the same thing. Internal codes (B10, H1) appear once, as a reference, never as a badge beside the name. If two lines mean the same, cut one. This goes for "Ahead" next to a "+2.3 pts" badge, an icon next to the word it illustrates, and a subtitle that rewords its heading.
+- [ ] **No coloured bars to decode.** Segmented or multi-colour horizontal bars (evidence splits, progress strips) need a legend to read. Say it in words with the numbers beside it: "Mostly supported (5 studies: 3 for, 2 mixed)", "73% could be luck", "Exam 48 of 63 trading days".
+
 ### Don't over-correct
 - Restraint done on purpose is not "timid". Minimal is fine when it's a decision.
 - Glass, bento grids and mesh backgrounds are over-blamed; the tells people actually recognise are shadcn/Tailwind defaults and the indigo gradient.
