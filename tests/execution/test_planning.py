@@ -31,7 +31,7 @@ from tradepartner.backtest import engine
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.backtest.schedule import fill_session, read_time
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.calendar import next_session, session_close
+from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
 from tradepartner.execution import planning, reconcile_run, wrapper
@@ -786,6 +786,14 @@ def test_each_kind_at_its_boundary_session(env: Env) -> None:
     )
     # The next month's fill session is a rebalance again.
     assert kind(env.window, runs, [], fill_session(T_NEXT), MAX_CATCH_UP) == "rebalance"
+
+
+def test_a_session_before_the_first_rebalance_has_no_kind(env: Env) -> None:
+    """#649: before the window's first rebalance session nothing is due, so the
+    kind is None instead of the schedule's start-after-end `ValueError`."""
+    before = previous_session(T_I)
+    assert rebalance_kind(env.window, [env.run], [], before, MAX_CATCH_UP, cadence=CADENCE) is None
+    assert due_rebalance(env.window, [env.run], [], before, MAX_CATCH_UP, cadence=CADENCE) is None
 
 
 @pytest.mark.parametrize("status", ["executed", "missed"])
