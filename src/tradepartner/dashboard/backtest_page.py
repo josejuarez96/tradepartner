@@ -546,6 +546,7 @@ def _render_holdout_spends(view: TrialView) -> None:
             [
                 {
                     "trial_id": s.trial_id,
+                    "source": s.source,
                     "slug": s.slug,
                     "started_at": s.started_at,
                     "status": s.status,
