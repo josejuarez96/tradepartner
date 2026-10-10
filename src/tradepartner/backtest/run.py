@@ -233,6 +233,7 @@ def run_hypothesis(
     note: str | None = None,
     run_by: str = DEFAULT_RUN_BY,
     kind: Literal["tracking"] | None = None,
+    keep_marking_frames: bool = False,
 ) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
     its `RunOutcome` (module docstring).
@@ -253,6 +254,10 @@ def run_hypothesis(
     outside `config.ENGINE_FAMILIES` (#1053), and
     `ValueError` for `kind="tracking"` with a missing `start` or `end`, all before
     any trial exists.
+
+    The results keep no step's marking frame unless `keep_marking_frames` (#1417:
+    nothing written reads them, and over a long daily run they grow without bound);
+    only the `bt` oracle, through `BacktestResult.stitched_returns`, asks for them.
     """
     tracking = kind == "tracking"
     if tracking:
@@ -366,7 +371,14 @@ def run_hypothesis(
                         )
             levels = sorted({params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps})
             results = engine.run(
-                params, provider, window.start, window.end, handle, levels, family=hypothesis.family
+                params,
+                provider,
+                window.start,
+                window.end,
+                handle,
+                levels,
+                family=hypothesis.family,
+                keep_marking_frames=keep_marking_frames,
             )
         with open_for_write(store) as conn:
             status = write_results(conn, handle, results, params)
