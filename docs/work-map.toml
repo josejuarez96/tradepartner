@@ -998,13 +998,18 @@ what = "The ingest write, the config switch and keys, the health count, and the 
 why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
 
 [task.T166]
-what = "A cache-only repair tool for the EDGAR stamps moved by New York's UTC offset: shift the early-class CIKs' bulk-written stamps, classify and re-stamp the rest from the SGML header, audit a sample, with a backup and a manifest."
+what = "The pure rules of the EDGAR stamps repair: New York's offset, the filing-date rule, the per-CIK class from SGML probes, the audit sample and stop rule, the manifest row."
 why = "Stamps written from the 2026-10-01 bulk zip are early for thousands of CIKs, and an early stamp is a look-ahead (#1382); the SGML header is the only per-filing truth."
-unblocks = ["task:T166b"]
+unblocks = ["task:T166a", "task:T166b"]
+
+[task.T166a]
+what = "The driver that applies the repair rules to the stamps cache: frozen inputs, a backup, the SGML reads, the manifest, a dry run first."
+why = "The cache is what every later ingest stamps from, so it is repaired once, resumably, with a record of every change."
+unblocks = ["task:T166c"]
 
 [task.T166b]
-what = "Rebuild the filing-derived tables (securities, listings, classifications, facts, delistings) from a repaired stamps cache in one transaction, security ids unchanged."
-why = "A repaired cache changes nothing in the store until the rows that carry its stamps are rewritten at the new known_at."
+what = "Restamp the store from the repair manifest: only rows whose known_at is a changed stamp move, in one transaction; retractions, revisions and every other row stay as they are, security ids unchanged."
+why = "A repaired cache changes nothing in the store until the rows that carry its stamps move, and a delete-and-reinsert would lose rows the cache cannot reproduce."
 unblocks = ["task:T166c"]
 
 [task.T166c]
