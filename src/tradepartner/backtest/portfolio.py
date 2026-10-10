@@ -15,13 +15,18 @@ Weighting = Literal["equal"]
 
 
 def _selected_count(n_ranked: int, top_fraction: float) -> int:
-    """ceil(top_fraction * n), with the fraction read as the decimal it was written as.
+    """ceil(top_fraction * n), at least 1, with the fraction read as the decimal it
+    was written as.
 
     `Fraction(0.1).limit_denominator()` is exactly 1/10, so 0.1 of 30 names is 3 and
-    not the 4 that `ceil(0.1 * 30)` gives (0.1 * 30 == 3.0000000000000004).
+    not the 4 that `ceil(0.1 * 30)` gives (0.1 * 30 == 3.0000000000000004). When the
+    capped fraction is not the same `float` (1e-7 caps to 0, #1446), the fraction is
+    its shortest decimal form instead. A positive fraction of a non-empty set selects
+    at least one name.
     """
-    exact = Fraction(top_fraction).limit_denominator() * n_ranked
-    return math.ceil(exact)
+    small = Fraction(top_fraction).limit_denominator()
+    fraction = small if float(small) == top_fraction else Fraction(repr(top_fraction))
+    return max(1, math.ceil(fraction * n_ranked))
 
 
 def _equal_weight(k: int) -> float:

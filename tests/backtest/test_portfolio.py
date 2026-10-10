@@ -29,6 +29,22 @@ def test_number_selected_is_the_ceiling_without_float_error(
     assert len(target_weights(_scores(n), fraction, "equal")) == k
 
 
+@pytest.mark.parametrize("n", [1, 2, 30, 1000])
+@pytest.mark.parametrize("fraction", [1e-7, 5e-7, 1e-12, 5e-324])
+def test_a_tiny_top_fraction_still_selects_one_name(n: int, fraction: float) -> None:
+    """#1446: a valid but tiny fraction used to round to 0 and divide by zero."""
+    assert target_weights(_scores(n), fraction, "equal") == {f"S{n - 1:04d}": 1.0}
+
+
+@pytest.mark.parametrize(
+    ("n", "fraction", "k"),
+    [(30, 0.05, 2), (30, 0.10, 3), (30, 0.20, 6), (2000, 0.05, 100), (2000, 0.20, 400)],
+)
+def test_registered_fractions_keep_their_counts(n: int, fraction: float, k: int) -> None:
+    """The registered values (0.05, 0.10, 0.20) select what they selected before #1446."""
+    assert len(target_weights(_scores(n), fraction, "equal")) == k
+
+
 @pytest.mark.parametrize("n", [1, 2, 3, 7, 10, 49, 99, 100, 101, 333, 997, 1000])
 def test_weights_non_negative_equal_and_sum_at_most_one(n: int) -> None:
     w = target_weights(_scores(n), 1.0, "equal")
