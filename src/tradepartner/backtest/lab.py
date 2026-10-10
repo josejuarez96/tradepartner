@@ -570,6 +570,8 @@ def _run_engine(
                 levels,
                 family=cast(HypothesisFamily, sweep.family),
                 keep_marking_frames=False,  # nothing on the sweep path reads them (#1414)
+                # write_results writes weights only at full detail (#1448).
+                keep_detail=first.handle.detail_level == "full",
             )
     except SharedReadFailed as exc:
         error = "".join(traceback.format_exception(exc))
