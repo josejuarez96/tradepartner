@@ -308,7 +308,6 @@ script over the real ones.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import re
 import subprocess
@@ -2813,7 +2812,8 @@ def make_app(
                         "a new gold session needs --frame, --seed, --exclude and --seeds",
                         USAGE_ERROR,
                     )
-                seed_cases = gold.read_seed_file(seeds)
+                seed_file = gold.read_seed_file(seeds)
+                seed_cases = seed_file.seeds
                 if (missing := _store_missing(s)) is not None:
                     raise missing
                 with open_read_only(s) as conn:
@@ -2829,7 +2829,7 @@ def make_app(
                     exclude,
                     settings=s,
                     seed_cases=seed_cases,
-                    seeds_sha256=hashlib.sha256(seeds.read_bytes()).hexdigest(),
+                    seeds_sha256=seed_file.sha256,
                 )
                 session = built.session
                 x = built.exclusion
@@ -2844,6 +2844,8 @@ def make_app(
                     f"seeds: {len(session.seed_cases)} of {len(seed_cases)} in the frame, "
                     f"{len(gated)} gated (row 6 or 7)"
                 )
+                if not gated:
+                    typer.echo("  no gated seed: seeded_recall will be null (no claim)")
                 if built.seed_cases_missing:
                     typer.echo(
                         f"  seeds the frame does not hold (dropped): "

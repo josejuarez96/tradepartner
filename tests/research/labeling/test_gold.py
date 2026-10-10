@@ -298,7 +298,9 @@ def test_read_seed_file_and_the_session_keeps_each_seeds_pre_fix_answer(
             ["GONE", "delisted", "false", "", "false", "f2b5261", "#922"],
         ],
     )
-    seeds = gold.read_seed_file(path)
+    seed_file = gold.read_seed_file(path)
+    assert seed_file.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    seeds = seed_file.seeds
     assert [(c.listing_end_id, c.row) for c in seeds] == [("LE039", 6), ("LE030", 4), ("GONE", 5)]
     frame = _write_frame(tmp_path, _frame_rows())
     result = gold.build_gold_session(
@@ -330,6 +332,8 @@ def test_read_seed_file_and_the_session_keeps_each_seeds_pre_fix_answer(
         (["LE1", "gone", "false", "", "false", "c", "#1"], "status"),
         (["LE1", "listed", "yes", "", "false", "c", "#1"], "relisted"),
         (["LE1", "listed", "false", "", "false", "", "#1"], "code_version"),
+        (["LE1", "listed", "true", "", "false", "c", "#1"], "takes no relisted"),
+        (["LE1", "unmatched", "false", "X@2020", "false", "c", "#1"], "takes no relisted"),
     ],
 )
 def test_read_seed_file_refuses_a_bad_row(tmp_path: Path, row: list[str], match: str) -> None:
@@ -341,6 +345,13 @@ def test_read_seed_file_refuses_a_repeat_and_a_missing_column(tmp_path: Path) ->
     row = ["LE1", "listed", "false", "", "false", "c", "#1"]
     with pytest.raises(gold.GoldRefused, match="repeats"):
         gold.read_seed_file(_seed_file(tmp_path, [row, row]))
+    bom = tmp_path / "bom.csv"
+    bom.write_bytes(
+        b"\xef\xbb\xbf"
+        + ",".join(gold.SEED_FILE_COLUMNS).encode()
+        + b"\nLE1,listed,false,,false,c,#1\n"
+    )
+    assert [c.row for c in gold.read_seed_file(bom).seeds] == [6]
     path = tmp_path / "short.csv"
     path.write_text("listing_end_id,status\nLE1,listed\n", encoding="utf-8")
     with pytest.raises(gold.GoldRefused, match="lacks column"):

@@ -1053,6 +1053,7 @@ def test_gold_builds_launches_and_locks_a_complete_session(s: Settings, tmp_path
     assert "exclusion: 1 accessions matched, 1 issuer CIKs, 1 rows removed" in result.output
     assert "seeds: 0 of 1 in the frame, 0 gated (row 6 or 7)" in result.output
     assert "seeds the frame does not hold (dropped): NO-SUCH-SEED" in result.output
+    assert "no gated seed: seeded_recall will be null (no claim)" in result.output
     assert f"gold session: {GOLD_N} cases (30 dev, 5 pilot), {GOLD_N} open" in result.output
     lock = json.loads((gold.session_path(s).with_name("lock.json")).read_text())
     assert (

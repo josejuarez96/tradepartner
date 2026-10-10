@@ -69,12 +69,12 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 import polars as pl
 
 from tradepartner.research import datafiles
-from tradepartner.research.labeling.crosswalk import RuleAnswer, class_of, crosswalk_row
+from tradepartner.research.labeling.crosswalk import RuleAnswer, RuleStatus, class_of, crosswalk_row
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, OptionSet
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.research import register_dataset
@@ -130,7 +130,7 @@ SEED_FILE_COLUMNS = (
     "code_version",
     "issue",
 )
-_RULE_STATUSES = frozenset({"transferred", "delisted", "listed", "unmatched"})
+_RULE_STATUSES: frozenset[str] = frozenset(get_args(RuleStatus))
 EDGAR_INDEX_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
     "&type=&dateb={dateb}&owner=include&count=100"
@@ -215,6 +215,14 @@ class SeedCase:
     def row(self) -> int:
         """The crosswalk row (1 to 7) of the pre-fix rule answer."""
         return crosswalk_row(self.pre_fix)
+
+
+@dataclass(frozen=True)
+class SeedFile:
+    """`read_seed_file`'s seeds and the SHA-256 of the very bytes it parsed."""
+
+    seeds: tuple[SeedCase, ...]
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -451,41 +459,48 @@ def _bool_cell(value: str, column: str, line: int) -> bool:
     return text == "true"
 
 
-def read_seed_file(path: Path) -> tuple[SeedCase, ...]:
-    """The seeded error set from a CSV with `SEED_FILE_COLUMNS` (#1351). Refuses a
+def read_seed_file(path: Path) -> SeedFile:
+    """The seeded error set from a CSV with `SEED_FILE_COLUMNS` (#1351), parsed and
+    hashed from one read (a BOM is allowed, as for the exclusion file). Refuses a
     missing column, an unknown `status`, a boolean that is not `true`/`false`, an
-    empty `listing_end_id`, `code_version` or `issue`, and a repeated
-    `listing_end_id`."""
-    with path.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        missing = [c for c in SEED_FILE_COLUMNS if c not in (reader.fieldnames or ())]
-        if missing:
-            raise GoldRefused(f"seed file {path} lacks column(s): {', '.join(missing)}")
-        seeds: list[SeedCase] = []
-        seen: set[str] = set()
-        for line, raw in enumerate(reader, start=2):
-            cell = {k: (raw.get(k) or "").strip() for k in SEED_FILE_COLUMNS}
-            for required in ("listing_end_id", "code_version", "issue"):
-                if not cell[required]:
-                    raise GoldRefused(f"seed file line {line}: {required} is empty")
-            if cell["status"] not in _RULE_STATUSES:
-                raise GoldRefused(
-                    f"seed file line {line}: status {cell['status']!r} is not one of "
-                    f"{', '.join(sorted(_RULE_STATUSES))}"
-                )
-            if cell["listing_end_id"] in seen:
-                raise GoldRefused(f"seed file line {line}: {cell['listing_end_id']} repeats")
-            seen.add(cell["listing_end_id"])
-            answer = RuleAnswer(
-                status=cell["status"],  # type: ignore[arg-type]  # checked above
-                relisted=_bool_cell(cell["relisted"], "relisted", line),
-                successor_id=cell["successor_id"] or None,
-                form15_in_window=_bool_cell(cell["form15_in_window"], "form15_in_window", line),
+    empty `listing_end_id`, `code_version` or `issue`, a repeated `listing_end_id`,
+    and a non-`delisted` status with `relisted`, `successor_id` or
+    `form15_in_window` set (fields the crosswalk would silently ignore)."""
+    data = path.read_bytes()
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+    missing = [c for c in SEED_FILE_COLUMNS if c not in (reader.fieldnames or ())]
+    if missing:
+        raise GoldRefused(f"seed file {path} lacks column(s): {', '.join(missing)}")
+    seeds: list[SeedCase] = []
+    seen: set[str] = set()
+    for line, raw in enumerate(reader, start=2):
+        cell = {k: (raw.get(k) or "").strip() for k in SEED_FILE_COLUMNS}
+        for required in ("listing_end_id", "code_version", "issue"):
+            if not cell[required]:
+                raise GoldRefused(f"seed file line {line}: {required} is empty")
+        if cell["status"] not in _RULE_STATUSES:
+            raise GoldRefused(
+                f"seed file line {line}: status {cell['status']!r} is not one of "
+                f"{', '.join(sorted(_RULE_STATUSES))}"
             )
-            seeds.append(
-                SeedCase(cell["listing_end_id"], answer, cell["code_version"], cell["issue"])
+        if cell["listing_end_id"] in seen:
+            raise GoldRefused(f"seed file line {line}: {cell['listing_end_id']} repeats")
+        seen.add(cell["listing_end_id"])
+        answer = RuleAnswer(
+            status=cast(RuleStatus, cell["status"]),
+            relisted=_bool_cell(cell["relisted"], "relisted", line),
+            successor_id=cell["successor_id"] or None,
+            form15_in_window=_bool_cell(cell["form15_in_window"], "form15_in_window", line),
+        )
+        if answer.status != "delisted" and (
+            answer.relisted or answer.successor_id is not None or answer.form15_in_window
+        ):
+            raise GoldRefused(
+                f"seed file line {line}: status {answer.status!r} takes no relisted, "
+                "successor_id or form15_in_window"
             )
-    return tuple(seeds)
+        seeds.append(SeedCase(cell["listing_end_id"], answer, cell["code_version"], cell["issue"]))
+    return SeedFile(tuple(seeds), hashlib.sha256(data).hexdigest())
 
 
 def _seed_doc(seed: SeedCase) -> dict[str, Any]:
@@ -494,7 +509,7 @@ def _seed_doc(seed: SeedCase) -> dict[str, Any]:
         "relisted": seed.pre_fix.relisted,
         "successor_id": seed.pre_fix.successor_id,
         "form15_in_window": seed.pre_fix.form15_in_window,
-        "row": crosswalk_row(seed.pre_fix),
+        "row": seed.row,
         "code_version": seed.code_version,
         "issue": seed.issue,
     }
@@ -893,16 +908,7 @@ def _pre_fix_columns(seed: SeedCase | None) -> dict[str, Any]:
     its crosswalk row, commit and issue, or all null for a case that is no seed."""
     if seed is None:
         return {k: None for k in GOLD_SCHEMA if k.startswith("pre_fix_")}
-    doc = _seed_doc(seed)
-    return {
-        "pre_fix_status": doc["status"],
-        "pre_fix_relisted": doc["relisted"],
-        "pre_fix_successor_id": doc["successor_id"],
-        "pre_fix_form15_in_window": doc["form15_in_window"],
-        "pre_fix_row": doc["row"],
-        "pre_fix_code_version": doc["code_version"],
-        "pre_fix_issue": doc["issue"],
-    }
+    return {f"pre_fix_{k}": v for k, v in _seed_doc(seed).items()}
 
 
 def lock_gold(

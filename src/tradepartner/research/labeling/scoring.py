@@ -337,16 +337,10 @@ def seeded_recall(items: Sequence[ScoredItem]) -> float | None:
     "neither", but is still always shortlisted, so it counts as caught here).
     `None` when no seed is on those rows (no claim, never a vacuous `1.0`); the
     other seeds are in `seeded_report`."""
-    gated = [
-        item
-        for item in _seeds(items)
-        if item.pre_fix_rule_answer is not None
-        and crosswalk.crosswalk_row(item.pre_fix_rule_answer) in GATED_SEED_ROWS
-    ]
+    gated = [outcome for outcome in seeded_report(items) if outcome.gated]
     if not gated:
         return None
-    caught = sum(1 for item in gated if _caught_by_pre_fix_rule(item))
-    return caught / len(gated)
+    return sum(1 for outcome in gated if outcome.caught) / len(gated)
 
 
 def _caught_by_pre_fix_rule(item: ScoredItem) -> bool:
