@@ -4,9 +4,9 @@ import "@fontsource-variable/inter";
 import "./tokens/tokens.css";
 import "./styles/base.css";
 import { App } from "./App";
+import { applyTheme, initialTheme } from "./components/ThemeSwitch";
 
-const theme = new URLSearchParams(location.search).get("theme");
-if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
+applyTheme(initialTheme());
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

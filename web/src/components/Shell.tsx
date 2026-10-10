@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
+import { ThemeSwitch } from "./ThemeSwitch";
 import "./Shell.css";
 
 export type Screen = "overview" | "books" | "strategies";
@@ -42,6 +43,7 @@ export function Shell({ screen, mode, sample, attention, children, footer }: Pro
           <div className="topbar__tags">
             {sample && <span className="tag tag--sample" title="Every number on this page is made up">Sample data</span>}
             <span className={`tag tag--${mode}`}>{mode === "paper" ? "Paper money" : "Real money"}</span>
+            <ThemeSwitch />
           </div>
         </div>
       </header>

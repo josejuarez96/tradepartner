@@ -8,52 +8,55 @@
  *   gain      money made, a number above the benchmark
  *   loss      money lost, a number below it
  *   attention something waiting on you (alerts, a stopped book)
- * Everything else is ink on paper. Your own line is ink; the benchmark is a
- * quieter ink. Contrast pairs are checked in docs/research/ui/tokens.md.
+ * Everything else is ink. The benchmark is a quieter ink. Your line takes
+ * gain or loss by how the shown period ended. Contrast pairs are listed in
+ * docs/research/ui/README.md.
+ *
+ * Dark is the primary design; light is its own set of steps, chosen with
+ * data-theme="light" (the theme switch in the top bar).
  */
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 
   /* ── Surfaces ─────────────────────────────────────────── */
-  --bg: #f6f5f1;            /* page: warm paper, not white */
-  --surface: #ffffff;       /* cards */
-  --surface-sunken: #efede7;/* wells, skeletons, segmented track */
-  --hairline: #e5e2da;      /* 1px dividers and card edges */
-  --hairline-strong: #d3cfc4;
+  --bg: #09090b;             /* page: near-black */
+  --surface: #111215;        /* panels */
+  --surface-raised: #191a1e; /* selected tile, hovered row */
+  --surface-sunken: #1a1b1f; /* tracks, skeletons */
+  --hairline: #1f2125;       /* 1px dividers and panel edges */
+  --hairline-strong: #2c2f34;
 
   /* ── Ink ──────────────────────────────────────────────── */
-  --ink: #16181d;           /* primary text, your line */
-  --ink-2: #565b64;         /* secondary text   6.8:1 on surface */
-  --ink-3: #646972;         /* tertiary, axes   5.5:1 on surface, 5.1:1 on bg */
-  --ink-inverse: #ffffff;
+  --ink: #f4f4f5;
+  --ink-2: #a3a7ae;
+  --ink-3: #848991;
+  --ink-inverse: #09090b;
 
   /* ── Meaning ──────────────────────────────────────────── */
-  --gain: #107a4c;          /* 5.3:1 on surface */
-  --gain-soft: #e3f1e9;
-  --loss: #b8352b;          /* 5.6:1 on surface */
-  --loss-soft: #f8e5e2;
-  --attention: #995200;     /* 5.6:1 on surface */
-  --attention-soft: #fbefdc;
-  --attention-edge: #e9b46a;
+  --gain: #2fd480;
+  --gain-soft: #0e2619;
+  --gain-fill: rgba(47, 212, 128, 0.20);
+  --loss: #f8636a;
+  --loss-soft: #2c1215;
+  --loss-fill: rgba(248, 99, 106, 0.20);
+  --attention: #f5a524;
+  --attention-soft: #241a08;
+  --attention-edge: #5e4312;
 
   /* ── Chart ────────────────────────────────────────────── */
-  --chart-line: var(--ink);
-  --chart-fill-top: rgba(22, 24, 29, 0.09);
-  --chart-fill-bottom: rgba(22, 24, 29, 0);
-  --chart-benchmark: #8c9098;  /* decorative line; values it carries are also in text */
-  --chart-grid: #eeebe4;
-  --chart-crosshair: #b9b5ab;
+  --chart-benchmark: #6f747c;  /* decorative; its value is always printed in text */
+  --chart-grid: #17181c;
+  --chart-dot: rgba(255, 255, 255, 0.055);
+  --chart-crosshair: #4a4e55;
+  --chart-tag-ink: #09090b;
 
   /* ── Focus and states ─────────────────────────────────── */
-  --focus-ring: #2d5bd7;    /* the one non-meaning hue: keyboard focus only */
-  --hover-wash: rgba(22, 24, 29, 0.035);
-  --press-wash: rgba(22, 24, 29, 0.07);
-  --skeleton-shine: rgba(255, 255, 255, 0.6);
-
-  /* ── Elevation ────────────────────────────────────────── */
-  --shadow-card: 0 1px 0 rgba(22, 24, 29, 0.03), 0 1px 2px rgba(22, 24, 29, 0.04);
-  --shadow-pop: 0 1px 2px rgba(22, 24, 29, 0.06), 0 8px 24px rgba(22, 24, 29, 0.10);
+  --focus-ring: #7ea2ff;     /* the one non-meaning hue: keyboard focus only */
+  --hover-wash: rgba(255, 255, 255, 0.03);
+  --press-wash: rgba(255, 255, 255, 0.06);
+  --skeleton-shine: rgba(255, 255, 255, 0.04);
+  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 16px 40px rgba(0, 0, 0, 0.6);
 
   /* ── Type ─────────────────────────────────────────────── */
   --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -79,6 +82,7 @@
   --tracking-display: -0.025em;
   --tracking-tight: -0.011em;
   --tracking-label: 0.04em;
+  --tracking-micro: 0.07em;  /* uppercase column labels */
 
   /* ── Space (4px base) ─────────────────────────────────── */
   --space-1: 4px;
@@ -94,8 +98,8 @@
 
   /* ── Shape ────────────────────────────────────────────── */
   --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 16px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
   --radius-pill: 999px;
 
   /* ── Layout ───────────────────────────────────────────── */
@@ -109,73 +113,41 @@
   --dur-med: 220ms;
 }
 
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f3f1;
+  --surface: #ffffff;
+  --surface-raised: #f7f7f5;
+  --surface-sunken: #ececea;
+  --hairline: #e4e4e0;
+  --hairline-strong: #d0d0cb;
+  --ink: #0e0f11;
+  --ink-2: #555a62;
+  --ink-3: #62676f;
+  --ink-inverse: #ffffff;
+  --gain: #0d7a46;
+  --gain-soft: #e2f2e9;
+  --gain-fill: rgba(13, 122, 70, 0.14);
+  --loss: #c0322e;
+  --loss-soft: #fae4e2;
+  --loss-fill: rgba(192, 50, 46, 0.13);
+  --attention: #965000;
+  --attention-soft: #fcf0dd;
+  --attention-edge: #e7b061;
+  --chart-benchmark: #8d9199;
+  --chart-grid: #f0f0ed;
+  --chart-dot: rgba(14, 15, 17, 0.07);
+  --chart-crosshair: #b5b5af;
+  --chart-tag-ink: #ffffff;
+  --focus-ring: #2d5bd7;
+  --hover-wash: rgba(14, 15, 17, 0.03);
+  --press-wash: rgba(14, 15, 17, 0.06);
+  --skeleton-shine: rgba(255, 255, 255, 0.7);
+  --shadow-pop: 0 1px 2px rgba(14, 15, 17, 0.06), 0 12px 32px rgba(14, 15, 17, 0.12);
+}
+
 @media (min-width: 768px) {
   :root { --gutter: var(--space-8); }
-}
-
-/* Dark: its own steps, not an inversion. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #0d0e10;
-    --surface: #15171a;
-    --surface-sunken: #1c1e22;
-    --hairline: #24272c;
-    --hairline-strong: #33373d;
-    --ink: #ecedee;
-    --ink-2: #a5a9b0;
-    --ink-3: #8b9098;
-    --ink-inverse: #0d0e10;
-    --gain: #3fbf86;
-    --gain-soft: #12271d;
-    --loss: #f0766a;
-    --loss-soft: #2e1714;
-    --attention: #eba54a;
-    --attention-soft: #2a1f10;
-    --attention-edge: #7a5420;
-    --chart-fill-top: rgba(236, 237, 238, 0.10);
-    --chart-fill-bottom: rgba(236, 237, 238, 0);
-    --chart-benchmark: #7a7f87;
-    --chart-grid: #1e2024;
-    --chart-crosshair: #4a4e55;
-    --focus-ring: #7d9cf5;
-    --hover-wash: rgba(255, 255, 255, 0.035);
-    --press-wash: rgba(255, 255, 255, 0.07);
-    --skeleton-shine: rgba(255, 255, 255, 0.05);
-    --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.02);
-    --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 32px rgba(0, 0, 0, 0.5);
-  }
-}
-
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #0d0e10;
-  --surface: #15171a;
-  --surface-sunken: #1c1e22;
-  --hairline: #24272c;
-  --hairline-strong: #33373d;
-  --ink: #ecedee;
-  --ink-2: #a5a9b0;
-  --ink-3: #8b9098;
-  --ink-inverse: #0d0e10;
-  --gain: #3fbf86;
-  --gain-soft: #12271d;
-  --loss: #f0766a;
-  --loss-soft: #2e1714;
-  --attention: #eba54a;
-  --attention-soft: #2a1f10;
-  --attention-edge: #7a5420;
-  --chart-fill-top: rgba(236, 237, 238, 0.10);
-  --chart-fill-bottom: rgba(236, 237, 238, 0);
-  --chart-benchmark: #7a7f87;
-  --chart-grid: #1e2024;
-  --chart-crosshair: #4a4e55;
-  --focus-ring: #7d9cf5;
-  --hover-wash: rgba(255, 255, 255, 0.035);
-  --press-wash: rgba(255, 255, 255, 0.07);
-  --skeleton-shine: rgba(255, 255, 255, 0.05);
-  --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.02);
-  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 32px rgba(0, 0, 0, 0.5);
 }
 
 @media (prefers-reduced-motion: reduce) {

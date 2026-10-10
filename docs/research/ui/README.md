@@ -6,69 +6,82 @@ The app is for the owner as a *user*: four questions, nothing about how the mach
 
 1. How am I doing? (overall, per book, vs SPY): **Overview** (built)
 2. What is each book holding and doing, and why?: Book detail (next)
-3. Is anything wrong or waiting on me?: alerts at the top of Overview; quiet line when nothing is
+3. Is anything wrong or waiting on me?: alerts at the top of Overview; a quiet status line when nothing is
 4. Stop or resume a book, safely: on Book detail (reason required, explicit confirm)
 
-## What makes it feel premium (the bar I designed to)
+## What makes it feel premium (checked against the owner's inspiration images)
 
-- **Restraint.** One hero number, one chart, one list. No KPI tile row, no gauges, no card per metric.
-- **Colour is meaning, not decoration.** Only three hues carry information: gain, loss, attention. Your line is ink; the benchmark is a quieter ink. A fourth hue (blue) exists only as the keyboard focus ring.
-- **Warm paper, not white.** Page `#f6f5f1`, cards white on a 1px hairline plus a barely-there shadow. Dark mode has its own steps (near-black `#0d0e10`, lifted surfaces), not an inversion.
-- **Type does the hierarchy.** Inter with tabular figures everywhere (`tnum`), so digits never shift width when values update. Tight tracking on the hero number, a 7-step scale, three weights.
-- **Chart treatment.** Lightweight Charts, no vertical grid, faint horizontal grid, a stronger 0% baseline, a soft ink gradient under your line, no border, no scroll/zoom (calm, and no fight with page scroll on a phone). Both lines are rebased to 0% at the start of the range, the honest comparison. Hovering scrubs the numbers above the chart to that date instead of popping a tooltip.
-- **Plain language.** "Nothing needs you. Next: daily, Mon 9:25 am." "Stopped by you at 9:41 am." "Ahead by 2.3 pts." "Too early for a trend."
+The references (two dark trading terminals, one light/dark data dashboard) share a mood rather than a layout: near-black, precise, quiet chrome, numbers doing the talking. What I took from them, and what I left out:
+
+| Taken | Left out (fails "every element earns its place") |
+|---|---|
+| Dark first: near-black page `#09090b`, panels one step up, 1px hairline edges, no shadows, 12px corners | Watchlists, order entry, order book, screener, news and "AI insight" cards, gauges |
+| Colour only where it means something: your line and its fill are green or red by how the shown period ended; the benchmark is a quiet grey | Brand colour, coloured icons, logos |
+| Each line ends in a tag on the price axis ("You +0.8%", "S&P −1.6%"); the crosshair carries a date tag | Indicators, drawing tools, zoom and scroll |
+| A faint dot field behind the plot instead of grid lines; one dotted 0% baseline | Vertical grid, chart borders |
+| Period tiles tinted by sign (their "Performance" block), merged into the range control so it does two jobs | A separate KPI row |
+| Uppercase micro labels over right-aligned tabular numbers, hairline rows: a real table for the books | Dense multi-panel layout; the phone gets stacked rows instead |
+| Status top right in small type ("Nothing needs you · Next … · Prices as of …"), like their "Last updated" | Ticker tape |
+
+Other choices:
+
+- **Restraint.** One hero number, one chart, one table. Detail is a click away (Book detail).
+- **Type.** Inter with tabular figures (`tnum`) so digits never shift width. A tight hero, then a quiet scale.
+- **Hover scrubs the numbers.** Moving across the chart updates "You", "S&P 500", the date span and the verdict to that day, instead of a floating tooltip.
+- **Plain language.** "Nothing needs you." "Stopped by you at 9:41 am." "Ahead by 2.3 pts." "Not enough history yet."
+- **Light theme** is its own set of steps (switch in the top bar, remembered per browser), not an inversion.
 
 ## Tokens
 
-Single source: [`web/src/tokens/tokens.css`](../../../web/src/tokens/tokens.css). Components use `var(--…)` only; charts read the same variables at runtime ([`lib/tokens.ts`](../../../web/src/lib/tokens.ts)) and repaint when the scheme flips.
+Single source: [`web/src/tokens/tokens.css`](../../../web/src/tokens/tokens.css). Components use `var(--…)` only; charts read the same variables at runtime ([`lib/tokens.ts`](../../../web/src/lib/tokens.ts)) and repaint when the theme flips.
 
 | Group | Tokens |
 |---|---|
-| Surfaces | `bg`, `surface`, `surface-sunken`, `hairline`, `hairline-strong` |
+| Surfaces | `bg`, `surface`, `surface-raised`, `surface-sunken`, `hairline`, `hairline-strong` |
 | Ink | `ink`, `ink-2`, `ink-3`, `ink-inverse` |
-| Meaning | `gain`, `loss`, `attention` (+ `-soft` backgrounds, `attention-edge`) |
-| Chart | `chart-line`, `chart-fill-top/bottom`, `chart-benchmark`, `chart-grid`, `chart-crosshair` |
-| Type | `text-2xs` 11 to `text-3xl` 44; weights 420/520/600; `font-num-features` |
+| Meaning | `gain`, `loss`, `attention` (+ `-soft` backgrounds, `-fill` chart areas, `attention-edge`) |
+| Chart | `chart-benchmark`, `chart-dot`, `chart-crosshair` (your line uses the meaning tokens) |
+| Type | `text-2xs` 11 to `text-3xl` 44; weights 420/520/600; `font-num-features`; `tracking-micro` for uppercase labels |
 | Space | 4px base: `space-1` 4 … `space-16` 64; `gutter` 16 phone / 32 desktop |
-| Shape | `radius-sm` 6, `radius-md` 10, `radius-lg` 16, `radius-pill` |
+| Shape | `radius-sm` 6, `radius-md` 8, `radius-lg` 12, `radius-pill` |
 | Motion | `dur-fast` 120ms, `dur-med` 220ms, one easing; zeroed under reduced motion |
 
 ### Contrast (WCAG AA, text at 4.5:1 minimum)
 
-| Token | Light on surface / bg | Dark on surface / bg |
+| Token | Dark on panel / page | Light on panel / page |
 |---|---|---|
-| ink | 17.8 / 16.3 | 15.3 / 16.5 |
-| ink-2 | 6.8 / 6.3 | 7.6 / 8.2 |
-| ink-3 | 5.5 / 5.1 | 5.6 / 6.0 |
-| gain | 5.4 / 4.9 | 7.7 / 8.3 |
-| loss | 5.9 / 5.4 | 6.4 / 6.9 |
-| attention | 5.9 / 5.4 | 8.6 / 9.2 |
+| ink | 17.0 / 18.1 | 19.2 / 17.3 |
+| ink-2 | 7.8 / 8.2 | 6.9 / 6.2 |
+| ink-3 | 5.3 / 5.7 | 5.7 / 5.1 |
+| gain | 9.7 / 10.3 | 5.4 / 4.9 |
+| loss | 6.2 / 6.6 | 5.6 / 5.1 |
+| attention | 9.2 / 9.7 | 6.1 / 5.5 |
 
-The benchmark line colour is decorative (its value is always printed in text beside the chart). Touch: tabs 52px tall, buttons and segmented options grow to 44px / 36px under `pointer: coarse`, book rows ≥ 72px.
+Text in these colours also passes on the tinted backgrounds it sits on (period tiles, the alert card, the sample tag): ≥ 4.6:1. The benchmark line colour is decorative (its value is always printed beside the chart). Touch: tabs 52px tall, period tiles 44px, buttons and the theme switch grow to 44px under `pointer: coarse`, book rows ≥ 72px.
 
 ## States (preview with `?state=`)
 
 | State | What you see |
 |---|---|
-| default | Calm: hero, quiet "Nothing needs you" line, chart, books |
-| `alert` | An attention card *above* everything: what happened, what was (not) done, what to do; the affected book row says "Needs a look"; a dot on the Overview tab |
-| `stopped` | The book row reads "Stopped by you at 9:41 am" in attention colour; the count reads "2 running, 1 stopped" |
+| default | Calm: hero, "Nothing needs you" top right, chart, books |
+| `alert` | An attention card *above* everything: what happened, what was (not) done, what to do; the status reads "1 thing needs you"; the book row reads "Needs a look"; a dot on the Overview tab |
+| `stopped` | The book row reads "Stopped by you at 9:41 am" in attention colour; the count reads "2 running · 1 stopped" |
 | `loading` | A grey skeleton of the real layout, so nothing jumps |
 | `error` | "Can't reach TradePartner on this computer" + reassurance that strategies keep running + Try again |
 | `empty` | "No books running yet" + See strategies |
-| a young book | main (day 1): "Too early for a trend", "Day 1" instead of a fake comparison |
+| a young book | main (day 1): "Day 1" and a dash instead of a fake comparison; period tiles longer than your history read "—" and are disabled |
 
-Add `?theme=dark` or `?theme=light` to force a scheme (otherwise it follows the OS).
+Dark is the default; the top-bar switch (or `?theme=light`) picks light.
 
 ## Decisions and open questions for the owner
 
 - **Today's change excludes new money.** main opened on Oct 9 with $100,008.90; that is not a gain. The API should serve a time-weighted index next to the summed value (the sample does: `portfolio.equity[].index`).
 - **Combined line.** "You" on the chart is all books together, time-weighted. Per-book lines vs SPY belong on Book detail.
-- **Inspiration images** were not visible to the agent in this session; the look was worked out from the brief. Re-attach them if the mood should be checked against them.
-- **No theme toggle** in the UI: it follows the OS. Say if you want one.
-- **Error with stale data** (show the last good numbers greyed, labelled with their time) is a better error state than a blank card once the API caches; deferred until the API shape is known.
+- **Dark by default**, ignoring the OS setting, because the references are dark. The switch is there for a bright desk. Say if it should follow the OS instead.
+- **Axis tags can sit on a tick label** (the S&P tag over "−2.0%"). Lightweight Charts draws both; acceptable for now.
+- **Error with stale data** (show the last good numbers dimmed, labelled with their time) is a better error state than a blank card once the API caches; deferred until the API shape is known.
 - **Charts attribution.** Lightweight Charts' logo is off; attribution is a footer link instead (its licence asks for one).
 
 ## Screenshots
 
-[`screens/`](screens/): `overview-desktop`, `overview-phone` (+ `-2` scrolled), `dark-desktop`, `alert-desktop`, `alert-phone`, `states-phone` (stopped, loading, error, empty).
+[`screens/`](screens/): `overview-desktop` (dark), `overview-phone` (+ `-2` scrolled), `light-desktop`, `alert-desktop`, `alert-phone`, `states-phone` (stopped, loading, error, empty).

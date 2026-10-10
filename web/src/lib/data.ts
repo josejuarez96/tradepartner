@@ -3,8 +3,9 @@ import type { AppData, Point, PortfolioPoint } from "./types";
 
 export const sample = raw as AppData;
 
-export type RangeKey = "1M" | "3M" | "ALL";
+export type RangeKey = "1W" | "1M" | "3M" | "ALL";
 export const RANGES: { key: RangeKey; label: string; long: string }[] = [
+  { key: "1W", label: "1W", long: "the past week" },
   { key: "1M", label: "1M", long: "the past month" },
   { key: "3M", label: "3M", long: "the past 3 months" },
   { key: "ALL", label: "All", long: "since you started" },
@@ -14,7 +15,8 @@ export const RANGES: { key: RangeKey; label: string; long: string }[] = [
 export function rangeStart(last: string, key: RangeKey): string | null {
   if (key === "ALL") return null;
   const d = new Date(last + "T00:00:00Z");
-  d.setUTCMonth(d.getUTCMonth() - (key === "1M" ? 1 : 3));
+  if (key === "1W") d.setUTCDate(d.getUTCDate() - 7);
+  else d.setUTCMonth(d.getUTCMonth() - (key === "1M" ? 1 : 3));
   return d.toISOString().slice(0, 10);
 }
 

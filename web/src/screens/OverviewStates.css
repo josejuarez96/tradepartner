@@ -1,5 +1,4 @@
-.state-row { display: flex; justify-content: space-between; align-items: center; min-height: 76px; padding: 0 var(--space-6); }
-.state-row + .state-row { border-top: 1px solid var(--hairline); }
+.state-row { display: flex; justify-content: space-between; align-items: center; min-height: 64px; padding: 0 var(--space-5); border-top: 1px solid var(--hairline); }
 
 .state {
   max-width: 520px;

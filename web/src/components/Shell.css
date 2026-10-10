@@ -4,7 +4,7 @@
   position: sticky;
   top: 0;
   z-index: 10;
-  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
   backdrop-filter: saturate(1.4) blur(12px);
   -webkit-backdrop-filter: saturate(1.4) blur(12px);
   border-bottom: 1px solid var(--hairline);
@@ -42,7 +42,19 @@
 .topnav__link:hover { color: var(--ink); background: var(--hover-wash); }
 .topnav__link:active { background: var(--press-wash); }
 .topnav__link[aria-current="page"] { color: var(--ink); background: var(--surface-sunken); }
-.topbar__tags { margin-left: auto; display: flex; gap: var(--space-2); }
+.topbar__tags { margin-left: auto; display: flex; align-items: center; gap: var(--space-2); }
+.iconbtn {
+  display: inline-grid; place-items: center;
+  width: 32px; height: 32px;
+  border: 0; border-radius: var(--radius-pill);
+  background: transparent; color: var(--ink-2);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.iconbtn:hover { background: var(--hover-wash); color: var(--ink); }
+.iconbtn:active { background: var(--press-wash); }
+.iconbtn:focus-visible { border-radius: var(--radius-pill); }
+@media (pointer: coarse) { .iconbtn { width: var(--touch-min); height: var(--touch-min); margin-right: -6px; } }
 
 .tag {
   display: inline-flex;
