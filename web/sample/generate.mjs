@@ -422,6 +422,25 @@ const replay = {
   end: { vs_spy: 0.011, luck: 0.7262, tries: 2, distinct: 1, periods: 40 },
   identity: { params: "sample", code: "sample", data_cutoff: "2023-12-29" },
 };
+// Workstation extras: month-by-month returns, drawdown from the peak, and a
+// Monte Carlo of the monthly results (the 40 monthly excess returns drawn
+// again with replacement, 1000 times; percentiles of where that leaves you).
+{
+  const days = replay.days;
+  const ends = [...days.filter((d, k) => k === days.length - 1 || days[k + 1].date.slice(0, 7) !== d.date.slice(0, 7))];
+  replay.monthly = ends.slice(1).map((d, k) => ({ month: d.date.slice(0, 7), s: Math.round((d.v / ends[k].v - 1) * 10000) / 10000, b: Math.round((d.b / ends[k].b - 1) * 10000) / 10000 }));
+  let pv = 0, pb = 0;
+  replay.drawdown = days.map((d) => { pv = Math.max(pv, d.v); pb = Math.max(pb, d.b); return { date: d.date, s: Math.round((d.v / pv - 1) * 10000) / 10000, b: Math.round((d.b / pb - 1) * 10000) / 10000 }; });
+  const ex = replay.monthly.map((m) => m.s - m.b);
+  const N = 1000, T = ex.length, paths = [];
+  for (let n = 0; n < N; n++) { let c = 0; const path = []; for (let t = 0; t < T; t++) { c += ex[Math.floor(rand() * T)]; path.push(c); } paths.push(path); }
+  const q = (arr, f) => { const a = [...arr].sort((x, y) => x - y); return Math.round(a[Math.floor(f * (a.length - 1))] * 10000) / 10000; };
+  replay.monte_carlo = {
+    runs: N, actual: ex.reduce((acc, x, t) => { acc.push(Math.round(((acc[t - 1] ?? 0) + x) * 10000) / 10000); return acc; }, []),
+    bands: Array.from({ length: T }, (_, t) => { const col = paths.map((p) => p[t]); return { p5: q(col, 0.05), p25: q(col, 0.25), p50: q(col, 0.5), p75: q(col, 0.75), p95: q(col, 0.95) }; }),
+    below_zero: Math.round((paths.filter((p) => p[T - 1] < 0).length / N) * 1000) / 1000,
+  };
+}
 research.replays = { h1: replay };
 
 const data = {

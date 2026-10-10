@@ -121,6 +121,12 @@ export interface Replay {
   cost_levels: { bp: number; vs_spy: number }[]; annual_turnover: number;
   end: { vs_spy: number; luck: number; tries: number; distinct: number; periods: number };
   identity: { params: string; code: string; data_cutoff: string };
+  /** Month by month: the strategy's return (s) and the S&P's (b). */
+  monthly: { month: string; s: number; b: number }[];
+  /** Fall from the running peak, each day, for the strategy (s) and the S&P (b). */
+  drawdown: { date: string; s: number; b: number }[];
+  /** The monthly excess returns redrawn with replacement: percentiles of the cumulative excess after each month, the actual path, and the share of runs ending below zero. */
+  monte_carlo: { runs: number; actual: number[]; bands: { p5: number; p25: number; p50: number; p75: number; p95: number }[]; below_zero: number };
 }
 
 export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[]; replays: Record<string, Replay> }

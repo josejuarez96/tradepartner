@@ -9,10 +9,10 @@ import { LuckInfo } from "@/components/LuckInfo";
 import { ExamSteps, LuckScale } from "@/components/Visuals";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
-const pts1 = (v: number) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v * 100).toFixed(1)}`;
-const yearDate = (iso: string) => `${shortDate(iso)}, ${iso.slice(0, 4)}`;
+export const pts1 = (v: number) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v * 100).toFixed(1)}`;
+export const yearDate = (iso: string) => `${shortDate(iso)}, ${iso.slice(0, 4)}`;
 /** A whole-percent return with a true minus sign: "+50%", "0%", "−20%". */
-const p0 = (v: number) => { const n = Math.round(v * 100); return `${n > 0 ? "+" : n < 0 ? "−" : ""}${Math.abs(n)}%`; };
+export const p0 = (v: number) => { const n = Math.round(v * 100); return `${n > 0 ? "+" : n < 0 ? "−" : ""}${Math.abs(n)}%`; };
 const narrow = () => typeof window !== "undefined" && window.innerWidth < 640;
 
 /**
@@ -62,6 +62,7 @@ function TrialView({ replay, idea }: { replay: Replay; idea: Idea }) {
       <a href="#research" className="text-muted-foreground hover:text-foreground -ml-1 inline-flex h-11 items-center gap-1 text-[13px] sm:h-8">
         <ChevronLeft className="size-4" />Research
       </a>
+      <a href={`#research/bench/${idea.id}`} className="text-muted-foreground hover:text-foreground float-right inline-flex h-11 items-center text-[13px] sm:h-8">Workstation view</a>
       <h1 className="text-muted-foreground mt-1">{idea.name}, backtest</h1>
       <p className={cn("num mt-0.5 text-[34px] font-medium tracking-[-0.03em] sm:text-[40px]", toneText[finalTone])}>{pts1(replay.end.vs_spy)} pts a year</p>
       <p className="text-muted-foreground">against the S&amp;P 500 after costs, {yearDate(replay.window.start)} to {yearDate(replay.window.end)}</p>
@@ -126,7 +127,7 @@ function TrialView({ replay, idea }: { replay: Replay; idea: Idea }) {
   );
 }
 
-function Controls({ at, total, date, playing, fast, onPlay, onStep, onFast, onSeek }: {
+export function Controls({ at, total, date, playing, fast, onPlay, onStep, onFast, onSeek }: {
   at: number; total: number; date: string; playing: boolean; fast: boolean;
   onPlay: () => void; onStep: (d: number) => void; onFast: () => void; onSeek: (v: number) => void;
 }) {
@@ -181,7 +182,7 @@ function Pipeline({ r, first, measure }: { r: ReplayRebalance; first: boolean; m
   );
 }
 
-function useWidth<T extends HTMLElement>() {
+export function useWidth<T extends HTMLElement>() {
   const ref = useRef<T>(null);
   const [w, setW] = useState(600);
   useLayoutEffect(() => {
@@ -198,7 +199,7 @@ function useWidth<T extends HTMLElement>() {
  * is counted in a bar by its past-year return; bars past the cut are the
  * names held. Labels say which side is which, so there is no legend.
  */
-function SignalPicture({ r, bins }: { r: ReplayRebalance; bins: Replay["bins"] }) {
+export function SignalPicture({ r, bins, caption = true }: { r: ReplayRebalance; bins: Replay["bins"]; caption?: boolean }) {
   const [ref, W] = useWidth<HTMLDivElement>();
   const H = 140;
   const max = Math.max(...r.hist);
@@ -207,8 +208,8 @@ function SignalPicture({ r, bins }: { r: ReplayRebalance; bins: Replay["bins"] }
   const cx = xOf(r.cut);
   const ticks = [-0.5, 0, 0.5, 1, 1.5];
   return (
-    <figure className="mt-7">
-      <figcaption className="mb-2 text-[13px]">
+    <figure className={caption ? "mt-7" : "mt-3"}>
+      <figcaption className={caption ? "mb-2 text-[13px]" : "sr-only"}>
         Every stock scored, by its past-year return. The engine holds everything to the right of the cut, a return of <span className="num">{p0(r.cut)}</span> or more.
       </figcaption>
       <div ref={ref} className="relative" role="img" aria-label={`${r.n_scored} stocks scored; the cut is at ${p0(r.cut)}; ${r.hold} held.`}>
@@ -267,7 +268,7 @@ function Rail({ r, at }: { r: ReplayRebalance; at: number }) {
 }
 
 /** One row per calendar year: the strategy's return minus the S&P's, as a bar from a centre line. */
-function YearBars({ replay }: { replay: Replay }) {
+export function YearBars({ replay }: { replay: Replay }) {
   const rows = useMemo(() => {
     const years = [...new Set(replay.days.map((d) => d.date.slice(0, 4)))];
     return years.map((y) => {
@@ -281,7 +282,7 @@ function YearBars({ replay }: { replay: Replay }) {
   return <Bars rows={rows.map((x) => ({ label: x.y, v: x.excess }))} />;
 }
 
-function CostBars({ replay }: { replay: Replay }) {
+export function CostBars({ replay }: { replay: Replay }) {
   return (
     <>
       <Bars rows={replay.cost_levels.map((c) => ({ label: `${c.bp} bp a side${c.bp === replay.rule.per_side_bps ? ", assumed" : ""}`, v: c.vs_spy, strong: c.bp === replay.rule.per_side_bps }))} />
@@ -293,7 +294,7 @@ function CostBars({ replay }: { replay: Replay }) {
 }
 
 /** Rows of signed values as bars from a centre line, each with its number beside it. */
-function Bars({ rows, unit = "" }: { rows: { label: string; v: number; strong?: boolean }[]; unit?: string }) {
+export function Bars({ rows, unit = "" }: { rows: { label: string; v: number; strong?: boolean }[]; unit?: string }) {
   const m = Math.max(...rows.map((r) => Math.abs(r.v)), 0.001);
   return (
     <ul className="border-t">
@@ -350,7 +351,7 @@ function Timeline({ replay, idea }: { replay: Replay; idea: Idea }) {
   );
 }
 
-function Assumptions({ replay }: { replay: Replay }) {
+export function Assumptions({ replay }: { replay: Replay }) {
   const r = replay.rule;
   const rows: [string, string][] = [
     ["Universe", `The ${r.universe.toLocaleString("en-US")} largest US stocks, rebuilt at every rebalance from data as it was known that day; stocks that later delisted are included`],

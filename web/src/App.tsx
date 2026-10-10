@@ -8,6 +8,7 @@ import { Overview } from "@/screens/Overview";
 import { Research } from "@/screens/Research";
 import { BookLoading, Books } from "@/screens/Book";
 import { Trial } from "@/screens/Trial";
+import { TrialBench } from "@/screens/TrialBench";
 import { LoadError, NoBooks, OverviewLoading } from "@/screens/OverviewStates";
 import { SampleA } from "@/samples/SampleA";
 import { SampleB } from "@/samples/SampleB";
@@ -37,7 +38,7 @@ function useScreen(): Screen {
 
 /** `#research/trial/<idea>` opens that idea's backtest. */
 function useTrialId(): string | null {
-  const read = () => { const [a, b, c] = location.hash.replace("#", "").split("/"); return a === "research" && b === "trial" ? c ?? null : null; };
+  const read = () => { const [a, b, c] = location.hash.replace("#", "").split("/"); return a === "research" && (b === "trial" || b === "bench") && c ? `${b}:${c}` : null; };
   const [id, setId] = useState(read);
   useEffect(() => {
     const on = () => { setId(read()); scrollTo(0, 0); };
@@ -79,7 +80,7 @@ export function App() {
             onRetry={() => { setLoad({ kind: "error", retrying: true }); setTimeout(() => setLoad({ kind: "error", retrying: false }), 1200); }}
           />
         )}
-        {data && screen === "research" && (trialId ? <Trial data={data} ideaId={trialId} /> : <Research data={data} />)}
+        {data && screen === "research" && (trialId ? (trialId.startsWith("bench:") ? <TrialBench data={data} ideaId={trialId.slice(6)} /> : <Trial data={data} ideaId={trialId.slice(6)} />) : <Research data={data} />)}
         {data && screen === "overview" && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
         {data && screen === "books" && <Books data={data} />}
       </Shell>
