@@ -1041,7 +1041,7 @@
     "title": "Run the short-term momentum test",
     "why": "Everything is built. One overnight run answers whether last month's busiest winners keep rising after costs.",
     "effort": "15 min, then overnight",
-    "step": "Register and run as a 2-variant sweep"
+    "step": "Start the overnight run"
    },
    {
     "id": "w2",
@@ -1050,7 +1050,7 @@
     "title": "Answer 7 questions on earnings-reaction drift",
     "why": "Hold length, which filings count, how to treat restatements. The test can't be registered until these are settled.",
     "effort": "30 min",
-    "step": "Answer B9-1 to B9-7 in the hypothesis file"
+    "step": "Answer the 7 open questions"
    },
    {
     "id": "w3",
@@ -1067,7 +1067,7 @@
     "title": "Momentum + profitability: test now or wait?",
     "why": "Your notes disagree: one says run it now, the newer decision says wait for a profitability finalist.",
     "effort": "2 min",
-    "step": "Keep parked, or register and run in-sample"
+    "step": "Keep it parked, or run it now"
    },
    {
     "id": "w5",
@@ -1076,7 +1076,7 @@
     "title": "Write down what monthly momentum taught you",
     "why": "Its test and exam are done, but nothing is recorded, so your evidence still only shows other people's studies.",
     "effort": "10 min",
-    "step": "Add a TradePartner claim for H1"
+    "step": "Record what this test showed"
    }
   ],
   "ideas": [

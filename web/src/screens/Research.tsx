@@ -11,6 +11,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { EvidenceTally, ExamSteps, LuckScale, Slots } from "@/components/Visuals";
 
 const STAGES: { key: Stage; label: string; hint: string }[] = [
   { key: "on_paper", label: "On paper", hint: "Trading with practice money while it takes its exam" },
@@ -133,7 +134,7 @@ export function Research({ data }: { data: AppData }) {
                         <TableCell className={cn("num text-right", i.result!.vs_spy >= 0 ? "text-gain" : "text-loss")}>
                           {pct1(i.result!.vs_spy)} pts{i.result!.sample?.includes("vs_spy") && <SampleMark />}
                         </TableCell>
-                        <TableCell><Luck v={i.result!.luck} sample={i.result!.sample?.includes("luck")} /></TableCell>
+                        <TableCell><LuckScale v={i.result!.luck} compact />{i.result!.sample?.includes("luck") && <SampleMark />}</TableCell>
                         <TableCell className="num hidden text-right sm:table-cell">{i.result!.tries}</TableCell>
                         <TableCell className="text-muted-foreground hidden pr-6 lg:table-cell"><ExamLine idea={i} /></TableCell>
                       </TableRow>
@@ -188,53 +189,21 @@ export function Research({ data }: { data: AppData }) {
   );
 }
 
-/** Evidence in words: a verdict, then the counts behind it. */
-function evidenceVerdict(e: NonNullable<Idea["evidence"]>) {
-  const known = e.for + e.mixed + e.against;
-  if (!known) return { text: "Not enough evidence yet", cls: "text-muted-foreground" };
-  if (e.for > e.against && e.for >= e.mixed) return { text: "Mostly supported", cls: "text-gain" };
-  if (e.against > e.for && e.against >= e.mixed) return { text: "Mostly against", cls: "text-loss" };
-  return { text: "Mixed", cls: "text-attention" };
-}
-
-function Evidence({ e }: { e: NonNullable<Idea["evidence"]> }) {
-  const v = evidenceVerdict(e);
-  const n = e.for + e.mixed + e.against;
-  // One kind of study: just the count. Several kinds: the split.
-  const parts = [e.for && `${e.for} for`, e.mixed && `${e.mixed} mixed`, e.against && `${e.against} against`].filter(Boolean);
-  const detail = !n ? "" : parts.length === 1 ? `${n} ${n === 1 ? "study" : "studies"}` : `${n} studies: ${parts.join(", ")}`;
-  return (
-    <p className="text-sm">
-      <span className={cn("font-medium", v.cls)}>{v.text}</span>
-      {detail && <span className="text-muted-foreground"> ({detail})</span>}
-    </p>
-  );
-}
-
 function IdeaCard({ idea, waiting, onOpen }: { idea: Idea; waiting: boolean; onOpen: () => void }) {
-  const exam = idea.exam?.kind === "paper" && idea.exam.of ? `Exam ${idea.exam.done} of ${idea.exam.of} ${idea.exam.unit}` : null;
+  const paperExam = idea.exam?.kind === "paper" && idea.exam.of ? idea.exam : null;
   return (
     <button onClick={onOpen} className="bg-card hover:bg-accent/40 focus-visible:ring-ring/50 flex flex-col gap-2 rounded-xl border p-4 text-left transition-colors outline-none focus-visible:ring-[3px]">
       <p className="font-medium">{idea.name}</p>
       <p className="text-muted-foreground line-clamp-2 text-sm">{idea.idea}</p>
-      {idea.evidence && <Evidence e={idea.evidence} />}
+      {idea.evidence && <EvidenceTally e={idea.evidence} />}
+      {paperExam && !waiting && <ExamSteps done={paperExam.done!} of={paperExam.of!} unit={paperExam.unit!} />}
       <p className="text-sm">
         {waiting ? <span className="text-attention font-medium">Waiting on you</span>
           : idea.blocked_by ? <span className="text-muted-foreground">Blocked: {idea.blocked_by[0]}{idea.blocked_by.length > 1 && ` and ${idea.blocked_by.length - 1} more`}</span>
           : idea.parked ? <span className="text-muted-foreground">{idea.parked}</span>
-          : <span className="text-muted-foreground num">{exam ?? idea.next}</span>}
+          : !paperExam && <span className="text-muted-foreground">{idea.next}</span>}
       </p>
     </button>
-  );
-}
-
-function Luck({ v, sample }: { v: number; sample?: boolean }) {
-  const label = v >= 0.95 ? "likely real" : v >= 0.5 ? "could be luck" : "probably luck";
-  return (
-    <span title="Chance the edge is real, after counting every version tried in this family (deflated Sharpe)">
-      <span className="num">{Math.round(v * 100)}%</span> <span className="text-muted-foreground">{label}</span>
-      {sample && <SampleMark />}
-    </span>
   );
 }
 
@@ -266,7 +235,7 @@ function FamilyCard({ family: f }: { family: Family }) {
         <Separator />
         <div className="flex items-baseline justify-between">
           <span className="text-muted-foreground">Promotions to paper</span>
-          <span className="num font-medium">{f.promotions[0]} of {f.promotions[1]} used</span>
+          <Slots used={f.promotions[0]} of={f.promotions[1]} label="promotions" />
         </div>
         {f.luck_bar_note && <p className="text-muted-foreground text-xs">{f.luck_bar_note}</p>}
       </CardContent>
@@ -324,7 +293,7 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
 
               {idea.evidence && (
                 <Block title="Published evidence" icon={CircleHelp}>
-                  <Evidence e={idea.evidence} />
+                  <EvidenceTally e={idea.evidence} />
                   <p className="text-muted-foreground mt-1">{idea.evidence.note}</p>
                 </Block>
               )}
@@ -340,12 +309,15 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                 {idea.result ? (
                   <div className="grid grid-cols-2 gap-3">
                     <Stat label="vs S&P 500 a year" value={`${pct1(idea.result.vs_spy)} pts`} cls={idea.result.vs_spy >= 0 ? "text-gain" : "text-loss"} sample={idea.result.sample?.includes("vs_spy")} />
-                    <Stat label="Luck check" value={`${Math.round(idea.result.luck * 100)}%`} sample={idea.result.sample?.includes("luck")} />
                     <Stat label="Versions counted" value={String(idea.result.tries)} />
                     <Stat label="Lost to costs a year" value={`${(idea.result.cost_drag * 100).toFixed(1)}%`} sample={idea.result.sample?.includes("cost_drag")} />
+                    <div className="col-span-2 rounded-lg border p-3">
+                      <p className="text-muted-foreground mb-2 text-xs">Luck check{idea.result.sample?.includes("luck") && <SampleMark />}</p>
+                      <LuckScale v={idea.result.luck} />
+                    </div>
                     <p className="text-muted-foreground col-span-2 text-xs">
                       {idea.result.window}, after costs. The luck check is the chance the edge is real once every version tried in the
-                      {" "}{idea.family} family is counted; above 95% is strong, under 50% is more likely luck than skill.
+                      {" "}{idea.family} family is counted.
                     </p>
                   </div>
                 ) : (
@@ -357,7 +329,8 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                 <Block title="The exam" icon={Lock}>
                   {idea.exam.kind === "paper" ? (
                     <div className="flex flex-col gap-1">
-                      <p>{idea.exam.label}: <span className="num">{idea.exam.done} of {idea.exam.of}</span> {idea.exam.unit} done</p>
+                      <p>{idea.exam.label}</p>
+                      <ExamSteps done={idea.exam.done!} of={idea.exam.of!} unit={idea.exam.unit!} />
                       <p className="text-muted-foreground text-xs">The strategy trades on paper with data that didn't exist when it was designed.</p>
                     </div>
                   ) : (
