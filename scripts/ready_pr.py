@@ -137,6 +137,9 @@ SAFETY_PREFIXES = (
     "src/tradepartner/execution/",
     "src/tradepartner/errors.py",
     "src/tradepartner/llm/",
+    # the kill-switch override page and its test (#773)
+    "src/tradepartner/dashboard/override_page.py",
+    "tests/dashboard/test_override_page.py",
     "scripts/ready_pr.py",
     "tests/test_ready_pr.py",
     "scripts/fragments.py",
