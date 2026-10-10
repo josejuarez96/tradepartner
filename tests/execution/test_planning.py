@@ -89,12 +89,15 @@ def _utc(day: date, hour: int) -> datetime:
     return datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
 
 
-def _frozen_settings() -> Settings:
+def _frozen_settings(turnover_top_fraction: float | None = None) -> Settings:
     # `profitability` and `combined` take the same top fraction from their own
     # sections (T152); a momentum registration freezes only `strategy.*`.
+    strategy: dict[str, Any] = {"top_fraction": 0.5}
+    if turnover_top_fraction is not None:
+        strategy["turnover_top_fraction"] = turnover_top_fraction
     return Settings(
         _env_file=None,
-        strategy={"top_fraction": 0.5},
+        strategy=strategy,
         profitability={"top_fraction": 0.5},
         combined={"top_fraction": 0.5},
         holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
@@ -190,9 +193,11 @@ def open_env(
     family: HypothesisFamily = "momentum",
     *,
     drop_keys: Sequence[str] = (),
+    turnover_top_fraction: float | None = None,
 ) -> Iterator[Env]:
     """The module's planning environment for a hypothesis of `family` (T152), its stored
-    params less `drop_keys` (a registration stored before those keys existed, T165)."""
+    params less `drop_keys` (a registration stored before those keys existed, T165),
+    freezing `strategy.turnover_top_fraction` when given (T165d)."""
     conn = duckdb.connect(str(fixture_store_path))
     configure_connection(conn)
     live = Settings(
@@ -200,7 +205,7 @@ def open_env(
         store={"path": str(tmp_path / "not-the-fixture.duckdb")},
         paper={"live_capital_reference": LIVE_CAPITAL},
     )
-    params = _frozen_settings()
+    params = _frozen_settings(turnover_top_fraction)
     hypothesis = registry.register_hypothesis(
         conn,
         slug="h-paper-plan",
@@ -448,6 +453,10 @@ class RecordingProvider(StoreProvider):
     def survivorship_gap(self, t: datetime) -> Any:
         self.reads.append(("survivorship_gap", t))
         return super().survivorship_gap(t)
+
+    def turnover_inputs(self, t: datetime, *args: Any, **kwargs: Any) -> Any:
+        self.reads.append(("turnover_inputs", t))
+        return super().turnover_inputs(t, *args, **kwargs)
 
 
 @pytest.mark.parametrize("sessions_late", [0, MAX_CATCH_UP])
@@ -1117,6 +1126,46 @@ def test_h1_paper_plan_rows_are_pinned(fixture_store_path: Path, tmp_path: Path)
         assert outcome.status == "planned"
         digests = {t: _rows_digest(env.conn, t) for t in ("signals", "decisions", "paper_plans")}
     assert digests == H1_PAPER_ROWS
+
+
+def test_h1_paper_plan_reads_no_turnover(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the key absent the planner's provider call log holds no turnover read, and
+    the plan reports none of the screen's counts (T165d)."""
+    RecordingProvider.reads = []
+    monkeypatch.setattr(planning, "StoreProvider", RecordingProvider)
+    with open_env(fixture_store_path, tmp_path, drop_keys=(TURNOVER_KEY,)) as env:
+        env.plan()
+        counts = _plan_on_store(env).counts
+    methods = {name for name, _ in RecordingProvider.reads}
+    assert methods == {"universe", "adjusted_prices", "static_listing_count", "survivorship_gap"}
+    assert "n_screened" not in counts and "n_excluded_no_turnover" not in counts
+
+
+def test_a_screened_momentum_plan_journals_no_turnover_signals_and_counts(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `momentum` registration at 0.20 reads turnover and journals the screen's drops
+    as `excluded_no_turnover` `signals` rows. Its `engine.Plan.counts` carry
+    `n_screened` and `n_excluded_no_turnover`; the paper plan trial writes no
+    `trial_rebalance_counts` rows (#1401)."""
+    RecordingProvider.reads = []
+    monkeypatch.setattr(planning, "StoreProvider", RecordingProvider)
+    with open_env(fixture_store_path, tmp_path, turnover_top_fraction=0.2) as env:
+        stored = registry.get_hypothesis_by_id(env.conn, env.hypothesis_id).params
+        assert stored[TURNOVER_KEY] == 0.2
+        outcome = env.plan()
+        assert outcome.status == "planned"
+        signals = journal.signals_for(env.conn, env.run.run_id)  # type: ignore[arg-type]
+        assert registry.rebalance_counts(env.conn, outcome.plan_trial_id) == {}
+        counts = _plan_on_store(env).counts
+    assert ("turnover_inputs", read_time(T_I)) in RecordingProvider.reads
+    dropped = [s for s in signals if s.reason == "excluded_no_turnover"]
+    assert dropped
+    assert all(s.score is None and s.rank is None for s in dropped)
+    assert counts["n_screened"] + len(dropped) == len(signals)
+    assert counts["n_excluded_no_turnover"] <= len(dropped)
 
 
 #: Row count and SHA-256 of each table's rows (every column, `ORDER BY ALL`, JSON with
