@@ -34,7 +34,7 @@ export interface Alert {
 export interface AppData {
   sample: boolean; note: string; as_of: string; updated_at: string; account_mode: "paper" | "live";
   benchmark: { symbol: string; name: string; closes: { date: string; close: number }[] };
-  portfolio: { equity: PortfolioPoint[] };
+  portfolio: { equity: PortfolioPoint[]; expected_tracking_error: number };
   strategies: Strategy[]; books: Book[]; alerts: Alert[];
   research: Research;
 }

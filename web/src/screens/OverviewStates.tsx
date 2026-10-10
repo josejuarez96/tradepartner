@@ -1,21 +1,20 @@
 import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Panel } from "@/components/Shell";
+import { Page } from "@/components/Shell";
 
-/** Loading: the real grid in grey, so nothing jumps when numbers arrive. */
+/** Loading: the real layout in grey, so nothing jumps when numbers arrive. */
 export function OverviewLoading() {
   return (
-    <div className="flex flex-col" aria-busy="true" aria-label="Loading">
-      <div className="bg-border grid grid-cols-2 gap-px border-b sm:flex">
-        {[0, 1, 2, 3].map((i) => <div key={i} className="bg-background px-4 py-3"><Skeleton className="h-4 w-36" /></div>)}
+    <Page rail={<>{[0, 1, 2].map((i) => <Skeleton key={i} className="mb-4 h-10 w-full" />)}</>}>
+      <div aria-busy="true" aria-label="Loading">
+        <Skeleton className="h-4 w-20" />
+        <Skeleton className="mt-2 h-10 w-72" />
+        <Skeleton className="mt-2 h-4 w-48" />
+        <Skeleton className="mt-6 h-[320px] w-full" />
+        <div className="mt-8 grid grid-cols-2 gap-4 sm:grid-cols-4">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-12" />)}</div>
       </div>
-      <div className="bg-border grid gap-px lg:grid-cols-[minmax(0,1.7fr)_minmax(340px,1fr)]">
-        <Panel className="lg:row-span-2"><Skeleton className="mb-3 h-4 w-40" /><Skeleton className="h-[380px] w-full" /></Panel>
-        <Panel>{[0, 1, 2].map((i) => <Skeleton key={i} className="mb-3 h-8 w-full" />)}</Panel>
-        <Panel>{[0, 1, 2].map((i) => <Skeleton key={i} className="mb-3 h-6 w-full" />)}</Panel>
-      </div>
-    </div>
+    </Page>
   );
 }
 

@@ -1,177 +1,260 @@
-import { useState } from "react";
-import { ChevronRight, CircleHelp, FlaskConical, Lock, MessageSquareText, NotebookPen, Play, Scale } from "lucide-react";
-import type { AppData, Idea, Lesson, Stage, WaitingItem } from "@/lib/types";
+import { useLayoutEffect, useRef, useState } from "react";
+import { ChevronRight, CircleHelp, FlaskConical, Lock, NotebookPen } from "lucide-react";
+import type { AppData, Idea, Lesson, Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { shortDate } from "@/lib/format";
-import { Panel } from "@/components/Shell";
+import { Page, RailHead, Section } from "@/components/Shell";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { EvidenceTally, ExamSteps, LuckScale, Slots } from "@/components/Visuals";
 
-const STAGES: { key: Stage; label: string; hint: string }[] = [
-  { key: "on_paper", label: "On paper", hint: "trading practice money while it takes its exam" },
-  { key: "ready", label: "Ready to test", hint: "written and built, waiting for a run" },
-  { key: "blocked", label: "Blocked", hint: "can't move until something else lands" },
-  { key: "exploring", label: "Exploring", hint: "needs data or work first" },
-  { key: "parked", label: "Parked", hint: "set aside on purpose" },
+const STAGES: { key: Stage; label: string }[] = [
+  { key: "on_paper", label: "On paper" },
+  { key: "ready", label: "Ready to test" },
+  { key: "blocked", label: "Blocked" },
+  { key: "exploring", label: "Exploring" },
+  { key: "parked", label: "Parked" },
 ];
-
-const KIND_ICON: Record<WaitingItem["kind"], typeof Play> = { run: Play, answer: MessageSquareText, decide: Scale, record: NotebookPen };
 
 const pct1 = (v: number) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v * 100).toFixed(1)}`;
 const SampleMark = () => <span className="text-muted-foreground ml-1 text-[10px]" title="Sample value">sample</span>;
 
 /**
- * Research, organised around the owner's questions: what's waiting on me,
- * what's on the go, did it work and could it be luck, what have I used up,
- * what have I learned. Each idea opens one story from why to what's next.
+ * Research in direction E: the results as a picture (return vs the S&P
+ * against the luck check), what needs you, the ideas as short rows; detail
+ * opens on tap. A side rail holds the honesty budget and lessons.
  */
 export function Research({ data }: { data: AppData }) {
   const r = data.research;
   const [open, setOpen] = useState<Idea | null>(null);
   const byId = (id?: string) => r.ideas.find((i) => i.id === id) ?? null;
   const waitingIds = new Set(r.waiting.map((w) => w.idea_id));
-  const tested = r.ideas.filter((i) => i.result);
 
   return (
-    <div className="bg-border grid gap-px lg:grid-cols-[minmax(0,1.45fr)_minmax(360px,1fr)]">
-      <div className="bg-border flex flex-col gap-px">
-        <Panel title="Waiting on you" aside={<span className="num text-attention">{r.waiting.length}</span>}>
-          <ul>
-            {r.waiting.map((w) => {
-              const Icon = KIND_ICON[w.kind];
-              const idea = byId(w.idea_id);
-              const body = (
-                <>
-                  <Icon className="text-muted-foreground mt-0.5 size-3.5 shrink-0" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-medium">{w.title}</span>
-                    <span className="text-muted-foreground block">{w.why}</span>
-                    <span className="text-muted-foreground mt-0.5 block text-xs sm:hidden">{w.effort}</span>
-                  </span>
-                  <span className="text-muted-foreground hidden shrink-0 text-xs sm:inline">{w.effort}</span>
-                  {idea && <ChevronRight className="text-muted-foreground mt-0.5 size-3.5 shrink-0" />}
-                </>
-              );
-              return (
-                <li key={w.id} className="border-b last:border-0">
-                  {idea ? (
-                    <button onClick={() => setOpen(idea)} className="hover:bg-raised -mx-2 flex w-[calc(100%+1rem)] items-start gap-2.5 rounded px-2 py-2.5 text-left">{body}</button>
-                  ) : (
-                    <div className="flex items-start gap-2.5 py-2.5">{body}</div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </Panel>
+    <Page rail={<Rail data={data} onOpen={(id) => setOpen(byId(id))} />}>
+      <p className="text-muted-foreground">Tested ideas</p>
+      <p className="mt-0.5 text-[26px] font-medium tracking-[-0.02em] sm:text-[30px]">Could any of it be luck?</p>
+      <ResultsMap ideas={r.ideas.filter((i) => i.result)} onOpen={setOpen} />
 
-        <Panel title="Ideas" aside={`${r.ideas.length} in the backlog`} className="flex-1">
-          <table className="w-full">
-            <thead className="text-muted-foreground text-xs">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">Idea</th>
-                <th className="hidden py-1.5 text-left font-normal md:table-cell">Published evidence</th>
-                <th className="py-1.5 text-left font-normal">Status</th>
-              </tr>
-            </thead>
-            {STAGES.map((s) => {
-              const ideas = r.ideas.filter((i) => i.stage === s.key);
-              if (!ideas.length) return null;
-              return (
-                <tbody key={s.key}>
-                  <tr>
-                    <th colSpan={3} className="pt-3 pb-1 text-left text-xs font-medium">
-                      {s.label} <span className="num text-muted-foreground font-normal">{ideas.length}</span>
-                      <span className="text-muted-foreground font-normal">, {s.hint}</span>
-                    </th>
-                  </tr>
-                  {ideas.map((i) => (
-                    <tr key={i.id} onClick={() => setOpen(i)} className="hover:bg-raised cursor-pointer border-b align-top">
-                      <td className="py-2 pr-3">
-                        <button className="text-left font-medium hover:underline" onClick={(e) => { e.stopPropagation(); setOpen(i); }}>{i.name}</button>
-                        <div className="text-muted-foreground line-clamp-1 text-[11.5px]">{i.idea}</div>
-                      </td>
-                      <td className="hidden py-2 pr-3 md:table-cell">{i.evidence && <EvidenceTally e={i.evidence} />}</td>
-                      <td className="w-[34%] py-2"><Status idea={i} waiting={waitingIds.has(i.id)} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              );
-            })}
-          </table>
-        </Panel>
-      </div>
+      <Section title="Needs you" note={<span className="num text-attention">{r.waiting.length}</span>}>
+        <ul className="border-t">
+          {r.waiting.map((w) => {
+            const idea = byId(w.idea_id);
+            return (
+              <li key={w.id} className="border-b">
+                <button
+                  disabled={!idea}
+                  onClick={() => idea && setOpen(idea)}
+                  className="hover:bg-raised -mx-2 flex w-[calc(100%+1rem)] items-center gap-3 rounded-md px-2 py-3 text-left disabled:cursor-default disabled:hover:bg-transparent"
+                >
+                  <span className="min-w-0 flex-1 font-medium">{w.title}</span>
+                  <span className="text-muted-foreground shrink-0 text-xs">{w.effort}</span>
+                  <ChevronRight className={cn("text-muted-foreground size-4 shrink-0", !idea && "invisible")} />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </Section>
 
-      <div className="bg-border flex flex-col gap-px">
-        <Panel title="Results" aside="in-sample, after costs">
-          <table className="w-full">
-            <thead className="text-muted-foreground text-xs">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">Idea</th>
-                <th className="py-1.5 text-right font-normal">vs S&amp;P / yr</th>
-                <th className="py-1.5 pl-4 text-left font-normal">Luck check</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tested.map((i) => (
-                <tr key={i.id} onClick={() => setOpen(i)} className="hover:bg-raised cursor-pointer border-b last:border-0">
-                  <td className="py-2">{i.name}<div className="text-muted-foreground num text-[11px]">{i.result!.tries} {i.result!.tries === 1 ? "version" : "versions"} counted</div></td>
-                  <td className={cn("num py-2 text-right", i.result!.vs_spy >= 0 ? "text-gain" : "text-loss")}>{pct1(i.result!.vs_spy)} pts</td>
-                  <td className="py-2 pl-4"><LuckScale v={i.result!.luck} compact /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="text-muted-foreground mt-2 text-[11px]">Some values are sample numbers; open an idea to see which.</p>
-        </Panel>
-
-        <Panel title="Honesty budget" aside="per family">
-          <table className="w-full">
-            <thead className="text-muted-foreground text-xs">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">Family</th>
-                <th className="py-1.5 text-right font-normal">Tried</th>
-                <th className="py-1.5 pl-3 text-left font-normal">Final exam</th>
-                <th className="py-1.5 text-left font-normal">Promotions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {r.families.map((f) => (
-                <tr key={f.id} className="border-b last:border-0">
-                  <td className="py-2">{f.name}</td>
-                  <td className="num py-2 text-right">{f.tries}</td>
-                  <td className={cn("py-2 pl-3", f.exam === "unspent" && "text-gain")}>{f.exam === "spent" ? `Used ${shortDate(f.exam_date!)}` : "Unseen"}</td>
-                  <td className="py-2"><Slots used={f.promotions[0]} of={f.promotions[1]} label="promotions" /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="text-muted-foreground mt-2 text-[11px]">Each version tried raises the bar for the next result; each family gets one final exam on unseen data.</p>
-        </Panel>
-
-        <Panel title="Lessons" className="flex-1">
-          <div className="border-b pb-2.5">
-            <p>None of your own recorded yet.</p>
-            <button onClick={() => setOpen(byId("h1"))} className="text-muted-foreground hover:text-foreground mt-0.5 inline-flex items-center gap-1 text-xs">
-              Monthly momentum is ready to write up<ChevronRight className="size-3" />
-            </button>
-          </div>
-          <ul>{r.lessons.map((l) => <LessonRow key={l.id} lesson={l} />)}</ul>
-        </Panel>
-      </div>
+      <Section title="Ideas" note={`${r.ideas.length} in the backlog`}>
+        {STAGES.map((st) => {
+          const ideas = r.ideas.filter((i) => i.stage === st.key);
+          if (!ideas.length) return null;
+          return (
+            <div key={st.key} className="mt-5 first:mt-0">
+              <h3 className="text-muted-foreground mb-1 text-[13px]">{st.label} <span className="num">{ideas.length}</span></h3>
+              <ul className="border-t">
+                {ideas.map((i) => (
+                  <li key={i.id} className="border-b">
+                    <button onClick={() => setOpen(i)} className="hover:bg-raised -mx-2 grid w-[calc(100%+1rem)] grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1.5 rounded-md px-2 py-3 text-left sm:grid-cols-[minmax(0,1fr)_auto_minmax(150px,200px)]">
+                      <span className="font-medium">{i.name}</span>
+                      <span className="col-start-1 row-start-2 sm:col-start-2 sm:row-start-1">{i.evidence ? <EvidenceTally e={i.evidence} showVerdict={false} /> : <span className="text-muted-foreground text-xs">no evidence yet</span>}</span>
+                      <span className="col-start-2 row-span-2 row-start-1 justify-self-end text-right text-[13px] sm:col-start-3 sm:row-span-1 sm:w-full sm:text-left">
+                        <Status idea={i} waiting={waitingIds.has(i.id)} />
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+      </Section>
 
       <IdeaSheet idea={open} data={data} onClose={() => setOpen(null)} />
+    </Page>
+  );
+}
+
+/** The luck check on equal-height zones: under 50%, 50 to 95%, 95% and up. Returns 0..1 from the bottom. */
+function zoneY(v: number) {
+  if (v < 0.5) return v / 0.5 / 3;
+  if (v < 0.95) return 1 / 3 + (v - 0.5) / 0.45 / 3;
+  return 2 / 3 + (v - 0.95) / 0.05 / 3;
+}
+
+/**
+ * Each tested idea as a dot: left to right its yearly return against the
+ * S&P after costs, bottom to top its luck check. The zones get equal height
+ * so "likely real" is readable; labels sit on the side with room and are
+ * nudged apart when two ideas land close together.
+ */
+function ResultsMap({ ideas, onOpen }: { ideas: Idea[]; onOpen: (i: Idea) => void }) {
+  const H = typeof window !== "undefined" && window.innerWidth < 640 ? 240 : 280;
+  const X = 0.02; // the axis runs from −2 to +2 points a year
+  const xOf = (v: number) => ((Math.max(-X, Math.min(X, v)) + X) / (2 * X)) * 100;
+  const plot = useRef<HTMLDivElement>(null);
+  const [W, setW] = useState(600);
+  useLayoutEffect(() => {
+    const el = plot.current!;
+    const ro = new ResizeObserver(() => setW(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const dots = ideas.map((i) => ({ i, x: (xOf(i.result!.vs_spy) / 100) * W, y: H - zoneY(i.result!.luck) * H }));
+  const labels = placeLabels(dots.map((d) => ({ x: d.x, y: d.y, w: (d.i.name.length + 6) * 7.4 + 10 })), W, H);
+  const zones = [
+    { label: "Likely real", sub: "95%+", cls: "bg-gain/10" },
+    { label: "Could be luck", sub: "50–95%", cls: "bg-attention/[0.06]" },
+    { label: "Probably luck", sub: "under 50%", cls: "bg-loss/[0.07]" },
+  ];
+  return (
+    <div className="mt-6">
+      <div className="flex">
+        <div className="text-muted-foreground flex w-[84px] shrink-0 flex-col text-xs sm:w-24" style={{ height: H }} aria-hidden>
+          {zones.map((z) => (
+            <div key={z.label} className="flex flex-1 flex-col justify-center pr-2">
+              <span className="text-foreground/80">{z.label}</span>
+              <span className="num">{z.sub}</span>
+            </div>
+          ))}
+        </div>
+        <div
+          ref={plot}
+          className="relative min-w-0 flex-1"
+          style={{ height: H }}
+          role="img"
+          aria-label={ideas.map((i) => `${i.name}: ${pct1(i.result!.vs_spy)} points a year, luck check ${Math.round(i.result!.luck * 100)}%`).join("; ")}
+        >
+          {zones.map((z, k) => (
+            <div key={z.label} className={cn("absolute inset-x-0 h-1/3", z.cls, k > 0 && "border-t border-dashed")} style={{ top: `${(k * 100) / 3}%` }} />
+          ))}
+          <span className="bg-ring/60 absolute inset-y-0 w-px" style={{ left: "50%" }} aria-hidden />
+          {dots.map((p, k) => {
+            const res = p.i.result!;
+            const l = labels[k];
+            return (
+              <span key={p.i.id}>
+                <button
+                  onClick={() => onOpen(p.i)}
+                  aria-label={`Open ${p.i.name}`}
+                  className={cn("ring-background absolute size-3 rounded-full ring-2", res.vs_spy >= 0 ? "bg-gain" : "bg-loss")}
+                  style={{ left: p.x, top: p.y, transform: "translate(-50%, -50%)" }}
+                />
+                <button
+                  onClick={() => onOpen(p.i)}
+                  className="bg-background/85 absolute -translate-y-1/2 rounded px-1 text-[13px] whitespace-nowrap hover:underline"
+                  style={{ left: l.x, top: l.y }}
+                >
+                  {p.i.name} <span className={cn("num text-xs", res.vs_spy >= 0 ? "text-gain" : "text-loss")}>{pct1(res.vs_spy)}</span>
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      </div>
+      <div className="num text-muted-foreground mt-1.5 ml-[84px] flex justify-between text-xs sm:ml-24">
+        <span>−2 pts</span>
+        <span className="font-sans">vs S&amp;P a year, after costs</span>
+        <span>+2 pts</span>
+      </div>
+      {ideas.some((i) => i.result!.sample?.length) && (
+        <p className="text-muted-foreground mt-2 text-xs">Returns and some luck checks here are sample values; monthly momentum's 73% is real.</p>
+      )}
     </div>
   );
 }
 
-/** One status per idea, in priority order: waiting on you, blocked, parked, exam progress, next. */
+/**
+ * Puts each label beside its dot without covering another label or dot and
+ * without leaving the plot: try right, then left, then step up and down.
+ */
+function placeLabels(dots: { x: number; y: number; w: number }[], W: number, H: number) {
+  const LH = 20, R = 8;
+  const boxes: { x: number; y: number; w: number }[] = [];
+  const hits = (b: { x: number; y: number; w: number }) =>
+    boxes.some((o) => b.x < o.x + o.w && o.x < b.x + b.w && Math.abs(b.y - o.y) < LH) ||
+    dots.some((d) => d.x + R > b.x && d.x - R < b.x + b.w && Math.abs(d.y - b.y) < LH / 2 + R);
+  const order = dots.map((d, k) => ({ d, k })).sort((a, b) => a.d.y - b.d.y);
+  const out: { x: number; y: number }[] = [];
+  for (const { d, k } of order) {
+    let best: { x: number; y: number; w: number } | null = null;
+    for (const dy of [0, -22, 22, -44, 44, -66, 66, -88, 88]) {
+      const centred = Math.max(0, Math.min(W - d.w, d.x - d.w / 2));
+      for (const x of dy === 0 ? [d.x + 10, d.x - 10 - d.w] : [d.x + 10, d.x - 10 - d.w, centred]) {
+        const b = { x, y: d.y + dy, w: d.w };
+        if (x < 0 || x + d.w > W || b.y < LH / 2 || b.y > H - LH / 2 || hits(b)) continue;
+        best = b; break;
+      }
+      if (best) break;
+    }
+    best ??= { x: Math.max(0, Math.min(W - d.w, d.x + 10)), y: d.y, w: d.w };
+    boxes.push(best);
+    out[k] = { x: best.x, y: best.y };
+  }
+  return out;
+}
+
+/** One status per idea, in priority order. */
 function Status({ idea, waiting }: { idea: Idea; waiting: boolean }) {
   if (waiting) return <span className="text-attention font-medium">Waiting on you</span>;
-  if (idea.blocked_by) return <span className="text-muted-foreground"><Lock className="mr-1 inline size-3" />{idea.blocked_by[0]}{idea.blocked_by.length > 1 && ` +${idea.blocked_by.length - 1}`}</span>;
-  if (idea.parked) return <span className="text-muted-foreground line-clamp-2">{idea.parked}</span>;
-  if (idea.exam?.kind === "paper" && idea.exam.of) return <ExamSteps done={idea.exam.done!} of={idea.exam.of} unit={idea.exam.unit!} />;
-  return <span className="text-muted-foreground">{idea.next}</span>;
+  if (idea.blocked_by) return <span className="text-muted-foreground inline-flex items-center gap-1"><Lock className="size-3" />Blocked</span>;
+  if (idea.parked) return <span className="text-muted-foreground">Parked</span>;
+  if (idea.exam?.kind === "paper" && idea.exam.of) return <span className="block w-full min-w-[120px]"><ExamSteps done={idea.exam.done!} of={idea.exam.of} unit={idea.exam.unit!} /></span>;
+  if (idea.exam?.kind === "holdout") return <span className="text-muted-foreground">Exam on hold</span>;
+  return <span className="text-muted-foreground">Later</span>;
+}
+
+function Rail({ data, onOpen }: { data: AppData; onOpen: (id: string) => void }) {
+  const r = data.research;
+  return (
+    <>
+      <RailHead>Honesty budget</RailHead>
+      {r.families.map((f) => (
+        <div key={f.id} className="flex items-center gap-3 border-b py-3 last-of-type:border-0">
+          <span className="min-w-0 flex-1">
+            <span className="block font-medium">{f.name}</span>
+            <span className="num text-muted-foreground block text-xs">{f.tries} tried, exam {f.exam === "spent" ? `used ${shortDate(f.exam_date!)}` : "unseen"}</span>
+          </span>
+          <span className="text-right">
+            <Slots used={f.promotions[0]} of={f.promotions[1]} label="promotions to paper" />
+            <span className="text-muted-foreground mt-1 block text-xs">to paper</span>
+          </span>
+        </div>
+      ))}
+      <p className="text-muted-foreground mt-2 text-xs">Every version tried raises the bar for the next one. Each family gets one final exam on data nobody has seen.</p>
+
+      <RailHead>Lessons</RailHead>
+      <button onClick={() => onOpen("h1")} className="hover:bg-raised -mx-2 flex w-[calc(100%+1rem)] items-center gap-3 rounded-md border-b px-2 py-3 text-left">
+        <span className="min-w-0 flex-1">
+          <span className="block font-medium">None of your own yet</span>
+          <span className="text-muted-foreground block text-xs">Monthly momentum is ready to write up</span>
+        </span>
+        <ChevronRight className="text-muted-foreground size-4" />
+      </button>
+      <ul>{r.lessons.map((l) => <LessonRow key={l.id} lesson={l} />)}</ul>
+    </>
+  );
+}
+
+function LessonRow({ lesson: l }: { lesson: Lesson }) {
+  const g = GRADE[l.grade];
+  return (
+    <li className="border-b py-3 last:border-0">
+      <span className={cn("block text-xs font-medium", g.cls)}>{g.label}</span>
+      <span className="block text-[13px]">{l.text}</span>
+    </li>
+  );
 }
 
 const GRADE: Record<Lesson["grade"], { label: string; cls: string }> = {
@@ -180,16 +263,6 @@ const GRADE: Record<Lesson["grade"], { label: string; cls: string }> = {
   against: { label: "Doesn't hold", cls: "text-loss" },
   untested: { label: "Not enough evidence", cls: "text-muted-foreground" },
 };
-
-function LessonRow({ lesson: l }: { lesson: Lesson }) {
-  const g = GRADE[l.grade];
-  return (
-    <li className="flex items-baseline gap-3 border-b py-2 last:border-0">
-      <span className={cn("w-24 shrink-0 text-xs font-medium", g.cls)}>{g.label}</span>
-      <span className="flex-1">{l.text}</span>
-    </li>
-  );
-}
 
 function Block({ title, icon: Icon, children }: { title: string; icon: typeof FlaskConical; children: React.ReactNode }) {
   return (

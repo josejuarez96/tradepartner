@@ -2,7 +2,7 @@
 
 **Status:** spike (`spike/design-ui`), prototype under [`web/`](../../../web/). **Date:** 2026-10-10 · **Direction:** v4, built on [shadcn/ui](https://github.com/shadcn-ui/ui) (the stack Base44 apps use: React, Vite, Tailwind, Radix, lucide)
 
-> **Current direction: C, "terminal"**, chosen by the owner from four samples on 2026-10-10. The design contract is [DESIGN.md](DESIGN.md); the samples are in [`screens/samples/`](screens/samples/). Sections below about v4 describe the previous build and are kept for history.
+> **Current direction: E, "research-grade Robinhood"**, chosen by the owner on 2026-10-10 after five samples (C rejected as a wall of text). The design contract is [DESIGN.md](DESIGN.md); the samples are in [`screens/samples/`](screens/samples/). Sections below about v4 describe the previous build and are kept for history.
 
 
 **What to avoid:** [ai-tells.md](ai-tells.md), the checklist of AI design tells, our four versions mapped onto it, and an audit of the current build.

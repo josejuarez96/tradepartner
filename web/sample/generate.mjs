@@ -155,7 +155,7 @@ const data = {
   updated_at: "2026-10-09T21:12:00Z",
   account_mode: "paper",
   benchmark: { symbol: "SPY", name: "S&P 500 (SPY)", closes: spyCloses },
-  portfolio: { equity: portfolio },
+  portfolio: { equity: portfolio, expected_tracking_error: 0.06 /* SAMPLE: the yearly spread around the S&P the backtests expect */ },
   strategies: [
     { id: "h1-monthly-momentum", name: "Monthly momentum", idea: "Own the stocks that rose most over the past year, skipping the last month. Reshuffle once a month.",
       backtest: { period: "2020-08-31 to 2023-12-29", annual_return: 0.141, benchmark_annual_return: 0.112, max_drawdown: -0.187, verdict: "pass" }, on_paper: true },

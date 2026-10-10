@@ -22,7 +22,7 @@ for (const job of jobs) {
     const [qs, hash] = q.split("#");
     await page.goto(base + (qs ? `?${qs}` : "") + (hash ? `#${hash}` : ""));
     await page.waitForTimeout(900);
-    if (name.endsWith("-sheet")) { await page.getByRole("button", { name: /short-term momentum test/i }).first().click(); await page.waitForTimeout(500); }
+    if (name.endsWith("-sheet")) { await page.getByRole("button", { name: /Monthly momentum/ }).first().click(); await page.waitForTimeout(500); }
     if (vp === "desktop") await page.screenshot({ path: `shots/${name}-${vp}.png`, fullPage: true });
     else {
       await page.screenshot({ path: `shots/${name}-${vp}.png` });

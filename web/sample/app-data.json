@@ -541,7 +541,8 @@
     "value": 303325.4,
     "index": 100.7874
    }
-  ]
+  ],
+  "expected_tracking_error": 0.06
  },
  "strategies": [
   {
