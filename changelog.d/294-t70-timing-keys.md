@@ -1,3 +1,0 @@
-- T70 done (#294, PR #297): ADR 0005/0006 amended (residual tracking, +1x cost centre stated; paper's T+1 execution under ADR 0012), paper.tracking_rule=residual, six timing keys checked against Probe 3 and kept; T71 unblocked here.
-### Changed
-- ADR 0005 and ADR 0006 amendments of 2026-10-09: paper.tracking_rule=residual with the raw series beside it, missed and override months excluded and listed, the residual's +1x modelled-cost centre stated; paper's T+1 execution recorded under ADR 0012 sentence 2 (sells then buys at the NBBO after the open while the backtest fills at the frozen close); the six timing keys checked against Probe 3's measured fill latency and all kept, with the two-session limit stated (#294).

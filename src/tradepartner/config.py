@@ -146,6 +146,11 @@ class CalendarConfig(_ClosedConfig):
     end: date = date(2035, 12, 31)
 
 
+# A DuckDB memory size (#1418): a number and one of the units DuckDB's
+# `memory_limit` parser accepts (1000^i or 1024^i), any case.
+_DUCKDB_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGT]i?B)", re.IGNORECASE)
+
+
 class StoreConfig(_ClosedConfig):
     """Point-in-time DuckDB store location and single-writer locking.
 
@@ -164,12 +169,36 @@ class StoreConfig(_ClosedConfig):
     never actually grow, or would grow from nothing.
     `lock_retry_seconds` may be zero (a caller that wants "fail
     immediately, no retry" is a legitimate choice) but not negative.
+
+    `memory_limit` and `threads` (#1418) cap DuckDB's memory and worker
+    threads on every store connection (`store.db.configure_connection`).
+    Both default to `None`, which sets nothing and keeps DuckDB's own
+    default (80% of RAM, one thread per core), so behaviour is unchanged
+    unless the owner sets them (`STORE__MEMORY_LIMIT`, `STORE__THREADS`).
+    `memory_limit` is a DuckDB size string, a positive number and one of
+    DuckDB's units (`KB`/`MB`/`GB`/`TB` or `KiB`/`MiB`/`GiB`/`TiB`, any
+    case, e.g. `"6GB"`); `threads` is a positive integer.
     """
 
     path: str = "data/tradepartner.duckdb"
     lock_retry_seconds: int = Field(default=60, ge=0)
     lock_retry_initial_delay_seconds: float = Field(default=0.05, gt=0)
     lock_retry_max_delay_seconds: float = Field(default=1.0, gt=0)
+    memory_limit: str | None = None
+    threads: int | None = Field(default=None, ge=1)
+
+    @field_validator("memory_limit")
+    @classmethod
+    def _validate_memory_limit(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        match = _DUCKDB_SIZE_RE.fullmatch(value.strip())
+        if match is None or float(match.group(1)) <= 0:
+            raise ValueError(
+                "memory_limit must be a positive DuckDB size: a number and one of "
+                "KB, MB, GB, TB, KiB, MiB, GiB, TiB (e.g. '6GB')"
+            )
+        return f"{match.group(1)}{match.group(2)}"
 
     @model_validator(mode="after")
     def _validate_lock_retry_backoff_bounds(self) -> StoreConfig:
