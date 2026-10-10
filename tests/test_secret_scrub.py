@@ -72,3 +72,31 @@ def test_a_failed_flatten_prints_a_scrubbed_error(
     err = capsys.readouterr().err
     assert "NOT FLAT?" in err and "broker echoed" in err
     assert key not in err
+
+
+@pytest.mark.parametrize("source", ["settings", "environment"])
+def test_a_non_main_books_pair_is_scrubbed_raw_and_as_basic_auth(
+    source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1405: a book other than `main` (T153's `ALPACA_PAPER_BOOKS__<TOKEN>__*`)
+    has its pair's raw halves and its HTTP Basic `base64("key:secret")` form
+    scrubbed from a recording, under a field name that is not itself sensitive."""
+    key, secret = "fake-daily-book-key-0001", "fake-daily-book-secret-0002"
+    if source == "environment":
+        monkeypatch.setenv("ALPACA_PAPER_BOOKS__DAILY__API_KEY", key)
+        monkeypatch.setenv("ALPACA_PAPER_BOOKS__DAILY__API_SECRET", secret)
+        settings = Settings(_env_file=None)
+    else:
+        settings = Settings(
+            _env_file=None,
+            alpaca_paper_books={"daily": {"api_key": key, "api_secret": secret}},
+        )
+    assert "daily" in settings.alpaca_paper_books
+    basic = base64.b64encode(f"{key}:{secret}".encode()).decode()
+    secrets = cli_record._configured_secrets(settings)
+    assert basic in secrets
+    payload = {"echo": f"Basic {basic}", "note": f"key {key} secret {secret}"}
+    scrubbed, _ = cli_record.scrub_json(payload, secrets=secrets)
+    text = str(scrubbed)
+    for value in (key, secret, basic):
+        assert value not in text

@@ -706,6 +706,41 @@ def test_label_a_refusal_class_error_after_the_run_opened_is_a_failure(
     assert "failed (run 1)" in result.output
 
 
+def test_label_a_failing_close_keeps_its_own_error(
+    s: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_batch` commits on its way out, so no transaction is open when the CLI
+    closes runs; a close that raises must surface its own error, not the
+    "no transaction is active" of `open_for_write`'s rollback (#1351)."""
+    gold_id = _gold(s, _dev(1), _pilot(1))
+
+    def explode(_s: Settings, _h: RunHandle) -> ScriptedModelClient:
+        raise RuntimeError("client broke")
+
+    def broken_close(*_args: Any) -> list[int]:
+        raise RuntimeError("close broke")
+
+    monkeypatch.setattr(cli, "_close_open_runs", broken_close)
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-pilot",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        client=explode,
+    )
+    assert result.exit_code == 1, result.output
+    assert "close broke" in result.output, result.output
+    assert "no transaction" not in result.output, result.output
+    # The job's own `failed` close was committed before the CLI's close ran.
+    assert _count(s, "SELECT count(*) FROM research_results WHERE outcome = 'failed'") == 1
+
+
 def test_label_ctrl_c_closes_the_open_run_failed(s: Settings) -> None:
     gold_id = _gold(s, _dev(1), _pilot(1))
 
