@@ -139,11 +139,17 @@ its entries counted on `.statement_unstampable`; a stamped entry ending
 after the acceptance date (New York) is dropped (the parser's malformed
 rule, applied once the stamp is known); `comparative` is recomputed over
 what is kept; the co-registrant filters of `_company_facts` apply. The
-first call per CIK per instance counts `.statement_conflicts` and
-`.statement_unstampable` and lists the conflicts once on
-`.statement_conflict_keys`; a parse counts `.statement_non_usd`,
-`.statement_malformed` and `.statement_none` (a payload carrying none of
-the configured tags), so a cross-run cache hit adds zero to those three.
+first call per CIK per instance counts `.statement_conflicts`,
+`.statement_unstampable` and, on `.statement_malformed`, the kept-form
+records and conflicts that end after their acceptance date (so a late
+stamp's drops are counted, #1060), and lists the conflicts once on
+`.statement_conflict_keys`; a parse counts `.statement_non_usd`, the
+stamp-free malformed entries on `.statement_malformed` (a non-finite value,
+a start on or after the end) and `.statement_none` (a payload carrying
+none of the configured tags), so a cross-run cache hit adds zero to those
+parse counts. The parse counts skip the co-registrant accessions the read
+filters drop (as known when parsed) and the stamped forms outside
+`edgar.statement_forms` (#1060).
 Later calls in the run are cache-file reads, never requests, and add
 nothing to the counts. Conflicts are never `_record_failure`d. With
 `reuse_cached` the bulk path is forced from the cached `companyfacts.zip`
@@ -2217,11 +2223,12 @@ class EdgarFilingSource(FilingSource):
         cached = self._statement_cache(cik, stamps)
         if cached is None:
             return []  # no stamped cover-form accession: nothing asked, as `facts`
-        records, conflicts, unstampable = self._stamp_statement(cik, cached, stamps)
+        records, conflicts, unstampable, late = self._stamp_statement(cik, cached, stamps)
         if cik not in self._statement_counted:
             self._statement_counted.add(cik)
             self.statement_conflicts += len(conflicts)
             self.statement_unstampable += unstampable
+            self.statement_malformed += late
         listed = set(self.statement_conflict_keys)
         self.statement_conflict_keys.extend(c for c in conflicts if c not in listed)
         return records
@@ -2272,18 +2279,23 @@ class EdgarFilingSource(FilingSource):
     ) -> StatementFactsParse:
         """Parse `payload` into `cik`'s statement cache and write it, keyed
         by `latest` when the payload holds it, else by the latest stamped
-        cover-form accession it reached; count the parse-time skips. A
-        payload that does not parse is recorded under `origin` and cached
-        empty under a key no run matches."""
+        cover-form accession it reached; count the parse-time skips (module
+        docstring: co-registrant accessions and the end-after-acceptance
+        rule are left to the read). A payload that does not parse is
+        recorded under `origin` and cached empty under a key no run matches."""
         edgar = self._settings.edgar
         tags, forms, units = edgar.statement_tags, edgar.statement_forms, edgar.statement_units
+        # Forms filter the counting parse; the acceptance check is the read's.
+        unaccepted = {a: replace(r, accepted_at=None) for a, r in stamps.items()}
 
         def parse() -> tuple[StatementFactsParse, StatementFactsParse, bool] | None:
             if payload is None:  # no XBRL facts at all, or recorded upstream
                 return None
+            entries = parse_statement_facts(payload, tags, forms, units, {})
+            own = _without_accessions(payload, tags, self._statement_foreign(cik))
             return (
-                parse_statement_facts(payload, tags, forms, units, {}),
-                parse_statement_facts(payload, tags, forms, units, stamps),
+                entries,
+                parse_statement_facts(own, tags, forms, units, unaccepted),
                 _carries_a_tag(payload, tags),
             )
 
@@ -2316,23 +2328,21 @@ class EdgarFilingSource(FilingSource):
 
     def _stamp_statement(
         self, cik: str, cached: StatementFactsParse, stamps: Mapping[str, SubmissionRecord]
-    ) -> tuple[list[StatementFactRecord], list[StatementConflict], int]:
+    ) -> tuple[list[StatementFactRecord], list[StatementConflict], int, int]:
         """Stamp cached entries from `stamps` (module docstring): the kept
-        records, the kept conflicts, and how many records an accession
-        settled as unstampable dropped."""
+        records, the kept conflicts, how many records an accession settled
+        as unstampable dropped, and how many records and conflicts of a
+        kept form were dropped for ending after their acceptance date."""
         forms = frozenset(self._settings.edgar.statement_forms)
-        fsn_cache = self._load_fsn_cache(cik)
-        verdicts: dict[str, bool] = {}
+        foreign = self._statement_foreign(cik)
         unstampable = 0
 
-        def foreign(accession: str) -> bool:
-            """The co-registrant filters of `_company_facts`."""
-            if accession not in verdicts:
-                cover = self._load_cover_cache(accession)
-                verdicts[accession] = (
-                    accession in self._fsn_extracted_accessions and accession not in fsn_cache
-                ) or (cover is not None and cover.entity_cik != cik)
-            return verdicts[accession]
+        def late(accession: str, end: date) -> bool:
+            """A stamped, kept-form, own accession's entry ending after acceptance."""
+            record = stamps.get(accession)
+            if record is None or record.accepted_at is None or record.form not in forms:
+                return False
+            return not foreign(accession) and end > record.accepted_at.astimezone(_EASTERN).date()
 
         def kept(accession: str, end: date) -> bool:
             record = stamps.get(accession)
@@ -2354,6 +2364,9 @@ class EdgarFilingSource(FilingSource):
             if settled and not foreign(r.accession):
                 unstampable += 1
         conflicts = [c for c in cached.conflicts if kept(c.accession, c.period_end)]
+        dropped_late = sum(late(r.accession, r.period_end) for r in cached.records) + sum(
+            late(c.accession, c.period_end) for c in cached.conflicts
+        )
         latest: dict[tuple[str, str, int], date] = {}
         items: list[StatementFactRecord | StatementConflict] = [*records, *conflicts]
         for item in items:
@@ -2380,7 +2393,23 @@ class EdgarFilingSource(FilingSource):
                 r.period_days,
             )
         )
-        return out, conflicts, unstampable
+        return out, conflicts, unstampable, dropped_late
+
+    def _statement_foreign(self, cik: str) -> Callable[[str], bool]:
+        """The co-registrant filters of `_company_facts` for `cik`'s
+        statement entries, as a memoised accession predicate."""
+        fsn_cache = self._load_fsn_cache(cik)
+        verdicts: dict[str, bool] = {}
+
+        def foreign(accession: str) -> bool:
+            if accession not in verdicts:
+                cover = self._load_cover_cache(accession)
+                verdicts[accession] = (
+                    accession in self._fsn_extracted_accessions and accession not in fsn_cache
+                ) or (cover is not None and cover.entity_cik != cik)
+            return verdicts[accession]
+
+        return foreign
 
     def _facts_cache_key(
         self, stamps: Mapping[str, SubmissionRecord], cover_forms: set[str]
@@ -2747,6 +2776,30 @@ def _carries_a_tag(payload: Mapping[str, Any], tags: Mapping[str, Sequence[str]]
         for fallbacks in tags.values()
         for tag in fallbacks
     )
+
+
+def _without_accessions(
+    payload: Mapping[str, Any],
+    tags: Mapping[str, Sequence[str]],
+    drop: Callable[[str], bool],
+) -> dict[str, Any]:
+    """`payload` cut to the configured tags with the entries of every
+    accession `drop` names removed (#1060: the parse counts skip what the
+    read filters drop). Entries are shared, not copied."""
+    facts: Mapping[str, Any] = payload["facts"]
+    kept: dict[str, dict[str, Any]] = {}
+    for fallbacks in tags.values():
+        for tag in fallbacks:
+            taxonomy, _, local = tag.partition(":")
+            concept = facts.get(taxonomy, {}).get(local)
+            if concept is None or local in kept.get(taxonomy, {}):
+                continue
+            units = {
+                unit: [e for e in entries if not drop(e["accn"])]
+                for unit, entries in concept["units"].items()
+            }
+            kept.setdefault(taxonomy, {})[local] = {**concept, "units": units}
+    return {**payload, "facts": kept}
 
 
 def _reached(
