@@ -233,16 +233,19 @@ def _configured_secrets(settings: Settings) -> list[str]:
     so no pattern would catch it otherwise (#320).
 
     On top: the HTTP Basic `base64("key:secret")` form of each Alpaca
-    credential pair, in case a payload ever carries an `Authorization: Basic
-    ...` value built from them (T2 review round 2, safety-reviewer MUST FIX),
-    on top of the `Authorization`-header-name scrub in `scrub_json`, which
-    catches it regardless of content; and the SMTP AUTH forms.
+    credential pair (the data pair, `main`'s paper pair and every other
+    book's pair in `alpaca_paper_books`, read from settings, #1405), in case
+    a payload ever carries an `Authorization: Basic ...` value built from them
+    (T2 review round 2, safety-reviewer MUST FIX), on top of the
+    `Authorization`-header-name scrub in `scrub_json`, which catches it
+    regardless of content; and the SMTP AUTH forms.
     """
     values = secret_values(settings)
-    pairs = (
+    pairs = [
         (settings.alpaca_api_key, settings.alpaca_api_secret),
         (settings.alpaca_paper_api_key, settings.alpaca_paper_api_secret),
-    )
+    ]
+    pairs += [(pair.api_key, pair.api_secret) for pair in settings.alpaca_paper_books.values()]
     for key_field, secret_field in pairs:
         key = _non_blank_secret(key_field)
         secret = _non_blank_secret(secret_field)
