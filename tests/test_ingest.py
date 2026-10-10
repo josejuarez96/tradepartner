@@ -1441,6 +1441,32 @@ def test_a_delisted_name_is_fetched_until_effective_but_never_counted(
     assert "0 of 3 listed names missing" in result.runs[-1].message
 
 
+class _CountedDelistings(FixtureFilingSource):
+    """A fixture source logging every `delistings()` call's `since`."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.delisting_calls: list[datetime | None] = []
+
+    def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
+        self.delisting_calls.append(since)
+        return super().delistings(since)
+
+
+def test_the_edgar_chunk_asks_the_source_for_delistings_exactly_once(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#828 (#826 NIT): `build_master` and `build_delistings` both read the
+    Form 25s, in the fetch pass and again in the write build; the recorded
+    proxy answers every read from one source call, for the full history."""
+    source = _filings(cls=_CountedDelistings, delistings=[_delisting(date(2019, 6, 30))])
+    assert isinstance(source, _CountedDelistings)
+    result = _run(settings, filings=source)
+    assert result.ok, result.runs[-1].message
+    assert source.delisting_calls == [None]
+    assert read("SELECT count(*) FROM delistings") == [(1,)]
+
+
 def test_a_listed_preferred_is_not_in_the_staleness_denominator(settings: Settings) -> None:
     pref = CoverListing("6.00% Series A Preferred Stock", "ACMEP", "NYSE")
     prices = _Prices(missing={f"{ACME}:6-00pct-series-a-preferred-stock"})
