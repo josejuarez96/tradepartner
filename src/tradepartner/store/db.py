@@ -57,7 +57,7 @@ from typing import Any
 
 import duckdb
 
-from tradepartner.config import Settings
+from tradepartner.config import Settings, StoreConfig
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 # Backoff bounds between lock-acquisition attempts (`open_for_write` reads
@@ -105,9 +105,11 @@ def ensure_tz_aware(value: datetime, *, field: str) -> datetime:
     return ensure_tz_aware_utc(value, field_name=field)
 
 
-def configure_connection(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
+def configure_connection(
+    conn: duckdb.DuckDBPyConnection, store: StoreConfig | None = None
+) -> duckdb.DuckDBPyConnection:
     """Pin the session timezone to UTC and disable extension auto-install
-    and auto-load.
+    and auto-load; apply `store.memory_limit`/`store.threads` when set.
 
     `TimeZone='UTC'` is what makes `TIMESTAMPTZ` values round-trip as UTC
     regardless of the host machine's local timezone. The two
@@ -116,10 +118,20 @@ def configure_connection(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConn
     Python's `socket` module — the tests' autouse no-network fixture,
     which patches `socket.socket.connect`/`.connect_ex`, cannot see or
     block it, so this is disabled explicitly instead.
+
+    `store` (#1418) is optional: with none, or with either key unset, that
+    DuckDB setting is left at its default. Both values are validated by
+    `StoreConfig` (a DuckDB size string, a positive int) before they reach
+    the `SET` here.
     """
     conn.execute("SET TimeZone='UTC'")
     conn.execute("SET autoinstall_known_extensions=false")
     conn.execute("SET autoload_known_extensions=false")
+    if store is not None:
+        if store.memory_limit is not None:
+            conn.execute(f"SET memory_limit='{store.memory_limit}'")
+        if store.threads is not None:
+            conn.execute(f"SET threads={int(store.threads)}")
     return conn
 
 
@@ -262,7 +274,7 @@ def open_read_only(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
             ) from exc
         raise
     try:
-        configure_connection(conn)
+        configure_connection(conn, settings.store)
         yield conn
     finally:
         conn.close()
@@ -308,7 +320,7 @@ def open_for_write(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
             delay = min(delay * 2, max_delay)
 
     try:
-        configure_connection(conn)
+        configure_connection(conn, settings.store)
         conn.begin()
         try:
             yield conn
