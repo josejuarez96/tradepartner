@@ -117,8 +117,9 @@ function bookPositions(series, pool, cashFrac, signalOf, bought_on, monthly) {
   const held = pool.slice(0, HOLD);
   // Rank today: a daily book was rebalanced this morning, so it holds exactly
   // the top names; a monthly book has drifted since its last rebalance.
-  const ranks = held.map((_, k) => (monthly ? Math.max(1, Math.round(k + 1 + (k > 70 ? 18 : 6) * gauss())) : k + 1));
-  if (monthly) { ranks.sort((a, b) => a - b); for (let k = 1; k < ranks.length; k++) if (ranks[k] <= ranks[k - 1]) ranks[k] = ranks[k - 1] + 1; }
+  // Rank at the book's last rebalance: the paper journal's signals rows exist
+  // only on rebalance sessions, so a monthly book shows September's ranks.
+  const ranks = held.map((_, k) => k + 1);
   return held.map(([symbol, name], k) => {
     const weight = (1 - cashFrac) / HOLD * (1 + (monthly ? 0.06 : 0.008) * gauss());
     const value = r2(total * weight);
@@ -357,8 +358,8 @@ const rebalances = [];
 const monthlyPort = [];
 for (const m of rebalanceIdx) {
   // Universe: the thousand, minus names without a year of prices or a price on the day (ADR 0006's rules, sample counts).
-  const noHistory = 12 + Math.round(18 * rand()), noPrice = Math.round(3 * rand());
-  const excluded = new Set(); while (excluded.size < noHistory + noPrice) { const i = NAMES.length + Math.floor(rand() * (U - NAMES.length)); excluded.add(i); }
+  const noHistory = 12 + Math.round(18 * rand());
+  const excluded = new Set(); while (excluded.size < noHistory) { const i = NAMES.length + Math.floor(rand() * (U - NAMES.length)); excluded.add(i); }
   const scored = [];
   for (let i = 0; i < U; i++) if (!excluded.has(i)) scored.push({ i, sig: signalAt(i, m) });
   scored.sort((a, b) => b.sig - a.sig);
@@ -383,11 +384,13 @@ for (const m of rebalanceIdx) {
   for (const x of scored) hist[Math.max(0, Math.min(BINS.n - 1, Math.floor(((x.sig - BINS.lo) / (BINS.hi - BINS.lo)) * BINS.n)))]++;
   const row = (x) => ({ s: uname(x.i), r: x.r, sig: x.sig == null ? null : Math.round(x.sig * 1000) / 1000 });
   rebalances.push({
-    date: monthEnds[m], n_universe: U, excluded: [{ rule: "Less than a year of prices", n: noHistory }, { rule: "No price on the day", n: noPrice }],
-    n_scored: scored.length, hold, cut: Math.round(scored[hold - 1].sig * 1000) / 1000, hist,
+    // Field names follow trial_rebalances: n_universe, n_excluded_no_history, n_targets, turnover, cost_paid, the exit counts.
+    date: monthEnds[m], n_universe: U, n_excluded_no_history: noHistory,
+    n_delisting_exits: rand() < 0.15 ? 1 : 0, n_stale_exits: 0, n_missing_fill: rand() < 0.08 ? 1 : 0,
+    n_scored: scored.length, n_targets: hold, cut: Math.round(scored[hold - 1].sig * 1000) / 1000, hist,
     top: scored.slice(0, 8).map(row),
     near: scored.slice(hold - 8, hold + 8).map((x) => ({ ...row(x), held: top.has(x.i) })),
-    entries: entries.map(row), exits: exits.map(row), reweighted, notional: Math.round(notional * 1000) / 1000,
+    entries: entries.map(row), exits: exits.map(row), reweighted, turnover: Math.round(notional * 1000) / 1000,
     held: [...top].map(uname),
   });
 }
@@ -417,29 +420,19 @@ const replay = {
   rule: RULES.momentum, holdout: { start: "2024-01-01", end: "2026-09-30" },
   days: rdays.map((d, j) => ({ date: d, v: r2(100000 * strat[j]), b: r2(100000 * spyR[j]) })),
   bins: BINS,
-  rebalances: rebalances.map((r) => ({ ...r, cost_usd: r2(monthlyPort[rebalances.indexOf(r)].costFrac * 100000 * strat[rdays.indexOf(r.date)]) })),
+  rebalances: rebalances.map((r) => ({ ...r, cost_paid: r2(monthlyPort[rebalances.indexOf(r)].costFrac * 100000 * strat[rdays.indexOf(r.date)]) })),
   cost_levels: costLevels, annual_turnover: Math.round(annualNotional * 100) / 100,
   end: { vs_spy: 0.011, luck: 0.7262, tries: 2, distinct: 1, periods: 40 },
   identity: { params: "sample", code: "sample", data_cutoff: "2023-12-29" },
 };
-// Workstation extras: month-by-month returns, drawdown from the peak, and a
-// Monte Carlo of the monthly results (the 40 monthly excess returns drawn
-// again with replacement, 1000 times; percentiles of where that leaves you).
+// Workstation extras, both derived from the run's daily equity (trial_equity):
+// month-by-month returns and the fall from the running peak.
 {
   const days = replay.days;
   const ends = [...days.filter((d, k) => k === days.length - 1 || days[k + 1].date.slice(0, 7) !== d.date.slice(0, 7))];
   replay.monthly = ends.slice(1).map((d, k) => ({ month: d.date.slice(0, 7), s: Math.round((d.v / ends[k].v - 1) * 10000) / 10000, b: Math.round((d.b / ends[k].b - 1) * 10000) / 10000 }));
   let pv = 0, pb = 0;
   replay.drawdown = days.map((d) => { pv = Math.max(pv, d.v); pb = Math.max(pb, d.b); return { date: d.date, s: Math.round((d.v / pv - 1) * 10000) / 10000, b: Math.round((d.b / pb - 1) * 10000) / 10000 }; });
-  const ex = replay.monthly.map((m) => m.s - m.b);
-  const N = 1000, T = ex.length, paths = [];
-  for (let n = 0; n < N; n++) { let c = 0; const path = []; for (let t = 0; t < T; t++) { c += ex[Math.floor(rand() * T)]; path.push(c); } paths.push(path); }
-  const q = (arr, f) => { const a = [...arr].sort((x, y) => x - y); return Math.round(a[Math.floor(f * (a.length - 1))] * 10000) / 10000; };
-  replay.monte_carlo = {
-    runs: N, actual: ex.reduce((acc, x, t) => { acc.push(Math.round(((acc[t - 1] ?? 0) + x) * 10000) / 10000); return acc; }, []),
-    bands: Array.from({ length: T }, (_, t) => { const col = paths.map((p) => p[t]); return { p5: q(col, 0.05), p25: q(col, 0.25), p50: q(col, 0.5), p75: q(col, 0.75), p95: q(col, 0.95) }; }),
-    below_zero: Math.round((paths.filter((p) => p[T - 1] < 0).length / N) * 1000) / 1000,
-  };
 }
 research.replays = { h1: replay };
 

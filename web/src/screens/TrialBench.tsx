@@ -122,12 +122,12 @@ function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
           <Inspector r={r} first={at === 0} />
         </Panel>
 
-        <Panel className={span("scores", "lg:col-span-4")} title="Scores that day" wide={wide === "scores"} onWide={toggle("scores")} readout={`cut ${p0(r.cut)}, ${r.hold} held`}>
+        <Panel className={span("scores", "lg:col-span-4")} title="Scores that day" wide={wide === "scores"} onWide={toggle("scores")} readout="not stored by the engine yet">
           <div className="px-3 pb-3"><SignalPicture r={r} bins={replay.bins} caption={false} /></div>
         </Panel>
 
-        <Panel className={span("mc", "lg:col-span-4")} title="Monte Carlo" wide={wide === "mc"} onWide={toggle("mc")} readout={`${Math.round(replay.monte_carlo.below_zero * 100)}% of ${replay.monte_carlo.runs.toLocaleString("en-US")} reshuffles end below zero`}>
-          <MonteCarlo mc={replay.monte_carlo} upTo={monthsDone} />
+        <Panel className={span("turnover", "lg:col-span-4")} title="Turnover and costs" wide={wide === "turnover"} onWide={toggle("turnover")} readout={`${Math.round(r.turnover * 100)}% traded, ${money(r.cost_paid)} paid`}>
+          <TurnoverBars replay={replay} at={at} onSeek={seek} />
         </Panel>
 
         <Panel className={span("months", "lg:col-span-8")} title="Month by month" wide={wide === "months"} onWide={toggle("months")} readout="points over the S&P">
@@ -197,16 +197,18 @@ function Panel({ title, readout, className, wide, onWide, children }: { title: s
 
 /** One rebalance, stage by stage, as a table; then the names around the cut. */
 function Inspector({ r, first }: { r: ReplayRebalance; first: boolean }) {
-  const excluded = r.excluded.reduce((a, x) => a + x.n, 0);
   const rows: [string, string][] = [
-    ["1. Universe, largest US stocks", r.n_universe.toLocaleString("en-US")],
-    ...r.excluded.map((x) => [`2. Excluded: ${x.rule.toLowerCase()}`, `−${x.n}`] as [string, string]),
-    ["3. Ranked on past-year return", r.n_scored.toLocaleString("en-US")],
-    ["4. Held, the top 10%", String(r.hold)],
-    ["5. Bought", `+${r.entries.length}`],
-    ...(first ? [] : [["5. Sold", `−${r.exits.length}`] as [string, string]]),
-    ["6. Traded back to equal weight", String(r.reweighted)],
-    ["7. Trading costs", money(r.cost_usd)],
+    ["Universe, the largest after its rules", r.n_universe.toLocaleString("en-US")],
+    ["No year of prices to score", `−${r.n_excluded_no_history}`],
+    ["Ranked on past-year return", r.n_scored.toLocaleString("en-US")],
+    ["Held, the top 10%", String(r.n_targets)],
+    ["Bought", `+${r.entries.length}`],
+    ...(first ? [] : [["Sold", `−${r.exits.length}`] as [string, string]]),
+    ["Traded back to equal weight", String(r.reweighted)],
+    ["Turnover", `${Math.round(r.turnover * 100)}%`],
+    ["Trading costs paid", money(r.cost_paid)],
+    ["Exits: delisted, stale price", `${r.n_delisting_exits}, ${r.n_stale_exits}`],
+    ["Orders with no fill", String(r.n_missing_fill)],
   ];
   return (
     <div className="text-[12.5px]">
@@ -217,7 +219,7 @@ function Inspector({ r, first }: { r: ReplayRebalance; first: boolean }) {
           ))}
         </tbody>
       </table>
-      <p className="text-muted-foreground px-3 pt-3 pb-1 text-[11.5px]">{excluded} excluded names had no score; everything at or above the dashed line is held.</p>
+      <p className="text-muted-foreground px-3 pt-3 pb-1 text-[11.5px]">The names at the cut; everything at or above the dashed line is held. Scores and ranks are not stored by the engine yet.</p>
       <table className="num w-full">
         <thead>
           <tr className="text-muted-foreground border-y font-sans text-[11.5px]">
@@ -263,42 +265,40 @@ function Tape({ r, first }: { r: ReplayRebalance; first: boolean }) {
 }
 
 /**
- * Where the result could have landed: the 40 monthly excess returns drawn
- * again in random order with replacement, a thousand times. Bands are the
- * middle half and the middle 90% of those runs; the line is what happened.
+ * What each rebalance traded and paid, from trial_rebalances: one bar per
+ * rebalance, its height the share of the book traded; the bar in focus is
+ * the playhead's, and a click moves the playhead there.
  */
-function MonteCarlo({ mc, upTo }: { mc: Replay["monte_carlo"]; upTo: number }) {
+function TurnoverBars({ replay, at, onSeek }: { replay: Replay; at: number; onSeek: (i: number) => void }) {
   const [ref, W] = useWidth<HTMLDivElement>();
-  const H = 200, pad = { l: 8, r: 44, t: 10, b: 20 };
-  const T = mc.bands.length;
-  const lo = Math.min(...mc.bands.map((b) => b.p5), ...mc.actual, 0), hi = Math.max(...mc.bands.map((b) => b.p95), ...mc.actual, 0);
-  const x = (t: number) => pad.l + (t / (T - 1)) * (W - pad.l - pad.r);
-  const y = (v: number) => pad.t + (1 - (v - lo) / (hi - lo)) * (H - pad.t - pad.b);
-  const area = (a: "p5" | "p25", b: "p95" | "p75") =>
-    `M${mc.bands.map((v, t) => `${x(t)},${y(v[b])}`).join("L")}L${[...mc.bands].reverse().map((v, t) => `${x(T - 1 - t)},${y(v[a])}`).join("L")}Z`;
-  const ticks = [-0.05, 0, 0.05, 0.1].filter((v) => v >= lo && v <= hi);
-  const actual = mc.actual.slice(0, Math.max(1, upTo));
-  const end = mc.actual.at(-1)!;
+  const R = replay.rebalances.slice(1); // the first rebalance buys everything, 100%, and would flatten the rest
+  const H = 150, pad = { l: 8, r: 40, t: 8, b: 20 };
+  const max = Math.max(...R.map((x) => x.turnover));
+  const bw = (W - pad.l - pad.r) / R.length;
+  const y = (v: number) => pad.t + (1 - v / max) * (H - pad.t - pad.b);
+  const ticks = [0, 0.25, 0.5].filter((v) => v <= max);
   return (
     <div ref={ref} className="px-1 pb-2">
-      <svg width={W} height={H} className="block" role="img" aria-label={`Of ${mc.runs} reshuffled runs, the middle 90% end between ${pts1(mc.bands.at(-1)!.p5)} and ${pts1(mc.bands.at(-1)!.p95)} points; the actual path ends at ${pts1(end)}.`}>
+      <svg width={W} height={H} className="block" role="img" aria-label={`Turnover per rebalance, from ${Math.round(Math.min(...R.map((x) => x.turnover)) * 100)}% to ${Math.round(max * 100)}% of the book.`}>
         {ticks.map((v) => (
           <g key={v}>
-            <line x1={pad.l} x2={W - pad.r} y1={y(v)} y2={y(v)} className={v === 0 ? "stroke-ring" : "stroke-border"} />
-            <text x={W - pad.r + 6} y={y(v) + 3.5} className="fill-muted-foreground font-mono text-[10.5px]">{pts1(v)}</text>
+            <line x1={pad.l} x2={W - pad.r} y1={y(v)} y2={y(v)} className="stroke-border" strokeDasharray={v ? "2 3" : undefined} />
+            <text x={W - pad.r + 6} y={y(v) + 3.5} className="fill-muted-foreground font-mono text-[10.5px]">{Math.round(v * 100)}%</text>
           </g>
         ))}
-        {[0, 9, 19, 29, 39].filter((t) => t < T).map((t) => (
-          <text key={t} x={x(t)} y={H - 5} textAnchor="middle" className="fill-muted-foreground font-mono text-[10.5px]">{t + 1}</text>
+        {R.map((x, i) => (
+          <rect key={x.date} x={pad.l + i * bw + 1} y={y(x.turnover)} width={Math.max(1, bw - 2)} height={H - pad.b - y(x.turnover)} rx={1.5}
+            className={cn("cursor-pointer", i + 1 === at ? "fill-foreground" : "fill-foreground/30 hover:fill-foreground/60")} onClick={() => onSeek(i + 1)}>
+            <title>{`${yearDate(x.date)}: ${Math.round(x.turnover * 100)}% traded, ${money(x.cost_paid)}`}</title>
+          </rect>
         ))}
-        <path d={area("p5", "p95")} className="fill-foreground/[0.08]" />
-        <path d={area("p25", "p75")} className="fill-foreground/[0.14]" />
-        <path d={`M${mc.bands.map((v, t) => `${x(t)},${y(v.p50)}`).join("L")}`} className="stroke-muted-foreground" fill="none" strokeDasharray="3 3" />
-        <path d={`M${actual.map((v, t) => `${x(t)},${y(v)}`).join("L")}`} className={tone(end) === "loss" ? "stroke-loss" : "stroke-gain"} fill="none" strokeWidth={2} />
-        <text x={x(T - 1) - 4} y={y(mc.bands.at(-1)!.p95) + 12} textAnchor="end" className="fill-muted-foreground text-[10.5px]">90% of runs</text>
-        <text x={x(T - 1) - 4} y={y(mc.bands.at(-1)!.p50) - 6} textAnchor="end" className="fill-muted-foreground text-[10.5px]">middle half</text>
+        {[0, 11, 23, 35].filter((i) => i < R.length).map((i) => (
+          <text key={i} x={pad.l + i * bw} y={H - 5} className="fill-muted-foreground font-mono text-[10.5px]">{R[i].date.slice(0, 7)}</text>
+        ))}
       </svg>
-      <p className="text-muted-foreground px-2 text-[11.5px]">Months along the bottom; cumulative points over the S&amp;P up the side. The line is what happened; the dashed line is the middle run.</p>
+      <p className="text-muted-foreground px-2 text-[11.5px]">
+        Share of the book traded at each rebalance after the first, which buys everything. About {Math.round(replay.annual_turnover * 100)}% a year in all; click a bar to go to that rebalance.
+      </p>
     </div>
   );
 }

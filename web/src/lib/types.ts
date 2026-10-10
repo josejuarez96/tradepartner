@@ -98,15 +98,20 @@ export interface Lesson { id: string; text: string; grade: "supported" | "mixed"
 /** A name at a rebalance: its rank and score on the measure (null if it left the universe). */
 export interface Ranked { s: string; r: number | null; sig: number | null }
 
-/** One rebalance of a backtest, as the engine saw it, stage by stage. */
+/**
+ * One rebalance of a backtest, as the engine saw it. The counts follow
+ * `trial_rebalances` (n_universe, n_excluded_no_history, n_targets, turnover,
+ * cost_paid and the exit counts); entries, exits and the trades back to equal
+ * weight are derivable from `trial_weights`. The scores (hist, cut, top,
+ * near, each name's rank) are NOT stored by the engine today: they live on
+ * the in-memory Plan and need an engine change to be shown for real.
+ */
 export interface ReplayRebalance {
   date: string;
-  /** Stage 2, universe: the thousand, the names each rule excluded, the names left with a score. */
-  n_universe: number; excluded: { rule: string; n: number }[]; n_scored: number;
-  /** Stage 3, signal: how the scores spread (counts per bin) and the score of the last name held. */
+  n_universe: number; n_excluded_no_history: number; n_scored: number;
+  n_delisting_exits: number; n_stale_exits: number; n_missing_fill: number;
   hist: number[]; cut: number; top: Ranked[]; near: (Ranked & { held: boolean })[];
-  /** Stages 4 to 6: how many are held, who came in and went out, how many kept names traded back to equal weight. */
-  hold: number; entries: Ranked[]; exits: Ranked[]; reweighted: number; notional: number; cost_usd: number;
+  hold: number; n_targets: number; entries: Ranked[]; exits: Ranked[]; reweighted: number; turnover: number; cost_paid: number;
   held: string[];
 }
 
@@ -125,8 +130,6 @@ export interface Replay {
   monthly: { month: string; s: number; b: number }[];
   /** Fall from the running peak, each day, for the strategy (s) and the S&P (b). */
   drawdown: { date: string; s: number; b: number }[];
-  /** The monthly excess returns redrawn with replacement: percentiles of the cumulative excess after each month, the actual path, and the share of runs ending below zero. */
-  monte_carlo: { runs: number; actual: number[]; bands: { p5: number; p25: number; p50: number; p75: number; p95: number }[]; below_zero: number };
 }
 
 export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[]; replays: Record<string, Replay> }

@@ -159,20 +159,19 @@ export function Controls({ at, total, date, playing, fast, onPlay, onStep, onFas
  * weight, and what it cost.
  */
 function Pipeline({ r, first, measure }: { r: ReplayRebalance; first: boolean; measure: string }) {
-  const excluded = r.excluded.reduce((a, x) => a + x.n, 0);
-  const stages: { n: string; label: string; title?: string }[] = [
-    { n: r.n_universe.toLocaleString("en-US"), label: "largest US stocks" },
-    { n: `−${excluded}`, label: "excluded", title: r.excluded.map((x) => `${x.rule}: ${x.n}`).join("; ") },
+  const stages: { n: string; label: string }[] = [
+    { n: r.n_universe.toLocaleString("en-US"), label: "in the universe, the largest after its rules" },
+    { n: `−${r.n_excluded_no_history}`, label: "without a year of prices to score" },
     { n: r.n_scored.toLocaleString("en-US"), label: `ranked on ${measure}` },
-    { n: String(r.hold), label: "held, the top 10%" },
+    { n: String(r.n_targets), label: "held, the top 10%" },
     { n: first ? `+${r.entries.length}` : `+${r.entries.length} −${r.exits.length}`, label: first ? "bought" : "bought, sold" },
     { n: String(r.reweighted), label: "traded back to equal weight" },
-    { n: money(r.cost_usd).replace(/\.\d\d$/, ""), label: "trading costs" },
+    { n: money(r.cost_paid).replace(/\.\d\d$/, ""), label: "trading costs paid" },
   ];
   return (
     <ol className="relative grid gap-y-2.5 border-l pl-5 sm:grid-cols-7 sm:gap-x-3 sm:border-t sm:border-l-0 sm:pt-4 sm:pl-0" aria-label="The engine's stages for this rebalance">
       {stages.map((s) => (
-        <li key={s.label} className="relative flex items-baseline gap-3 sm:block" title={s.title}>
+        <li key={s.label} className="relative flex items-baseline gap-3 sm:block">
           <span className="bg-foreground ring-background absolute top-2.5 -left-[23.5px] size-2 rounded-full ring-2 sm:-top-[20.5px] sm:left-0" aria-hidden />
           <span className="num block w-20 shrink-0 text-lg leading-tight sm:w-auto">{s.n}</span>
           <span className="text-muted-foreground block text-[12.5px] leading-snug">{s.label}</span>
@@ -210,7 +209,7 @@ export function SignalPicture({ r, bins, caption = true }: { r: ReplayRebalance;
   return (
     <figure className={caption ? "mt-7" : "mt-3"}>
       <figcaption className={caption ? "mb-2 text-[13px]" : "sr-only"}>
-        Every stock scored, by its past-year return. The engine holds everything to the right of the cut, a return of <span className="num">{p0(r.cut)}</span> or more.
+        Every stock scored, by its past-year return. The engine holds everything to the right of the cut, a return of <span className="num">{p0(r.cut)}</span> or more. <span className="text-muted-foreground">Scores are not stored by the engine yet; these are sample.</span>
       </figcaption>
       <div ref={ref} className="relative" role="img" aria-label={`${r.n_scored} stocks scored; the cut is at ${p0(r.cut)}; ${r.hold} held.`}>
         <svg width={W} height={H} className="block">

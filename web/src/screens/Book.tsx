@@ -17,7 +17,6 @@ import { Pill, Spark } from "@/screens/Overview";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
 const pctW = (v: number) => `${(v * 100).toFixed(1)}%`;
-const bp = (v: number) => `${v.toFixed(1)} bp`;
 const yearDate = (iso: string) => `${shortDate(iso)}, ${iso.slice(0, 4)}`;
 const at = (iso: string) => `${weekdayDate(iso)} at ${clock(iso)}`;
 // Prototype only: ?state=stopfail makes the stop and resume calls fail once.
@@ -129,7 +128,7 @@ function BookDetail({ data, book, onStatus }: { data: AppData; book: Book; onSta
 
       <Holdings book={book} rule={strategy.rule} onOpen={(p) => setOpen({ kind: "holding", p })} />
       <WhyItHolds book={book} rule={strategy.rule} />
-      <Orders book={book} assumed={strategy.backtest.cost_bp} onOpen={(o) => setOpen({ kind: "order", o })} />
+      <Orders book={book} onOpen={(o) => setOpen({ kind: "order", o })} />
 
       <p className="text-muted-foreground mt-10 border-t pt-4 text-xs">
         Book id {book.id}, strategy {strategy.id}{idea && <>, research idea {idea.code}</>}. Sample data.
@@ -215,7 +214,7 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
         <>
           <div className={cn(grid, "text-muted-foreground border-b pb-2 text-xs")}>
             <span>Stock</span>
-            <span className="hidden text-right sm:block">Rank today</span>
+            <span className="hidden text-right sm:block" title="Rank at the last rebalance">Rank</span>
             <span className="hidden text-right sm:block">Value</span>
             <span className="text-right">Weight</span>
             <span className="hidden text-right sm:block">Gain</span>
@@ -273,7 +272,7 @@ function WhyItHolds({ book, rule }: { book: Book; rule: Rule }) {
   const sold = book.orders
     .filter((o) => o.side === "sell" && o.status === "filled" && /rank (\d+)/.test(o.why))
     .map((o) => ({ symbol: o.symbol, rank: Number(/rank (\d+)/.exec(o.why)![1]), date: o.placed_at }));
-  const slipped = book.positions.filter((p) => p.rank > cut);
+  const slipped = book.positions.filter((p) => p.rank > cut); // empty by the rule: ranks are the last rebalance's
   const lastRebalance = book.rebalances[0]?.date;
   const share = `${Math.round(rule.top_fraction * 100)}%`;
   return (
@@ -302,8 +301,8 @@ function WhyItHolds({ book, rule }: { book: Book; rule: Rule }) {
       <dl className="mt-4 grid gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2">
         {book.positions.length > 0 && (
           <div>
-            <dt className="text-muted-foreground">{lastRebalance ? `Slipped below rank ${cut} since ${shortDate(lastRebalance)}` : "Below the cut"}</dt>
-            <dd className="num mt-0.5">{slipped.length ? slipped.map((p) => `${p.symbol} ${p.rank}`).join(", ") : "none"}</dd>
+            <dt className="text-muted-foreground">Ranks are from the last rebalance</dt>
+            <dd className="mt-0.5">{lastRebalance ? weekdayDate(lastRebalance) : "none yet"}; the next ranks the stocks again {weekdayDate(book.next_run.at!)}</dd>
           </div>
         )}
         <div>
@@ -311,7 +310,6 @@ function WhyItHolds({ book, rule }: { book: Book; rule: Rule }) {
           <dd className="num mt-0.5">{sold.length ? sold.slice(0, 6).map((s) => `${s.symbol} ${s.rank}`).join(", ") : "none yet"}</dd>
         </div>
       </dl>
-      {slipped.length > 0 && <p className="text-muted-foreground mt-2 text-xs">Marked in amber: these are sold at the next rebalance unless they climb back into the top {cut}.</p>}
     </Section>
   );
 }
@@ -319,11 +317,9 @@ function WhyItHolds({ book, rule }: { book: Book; rule: Rule }) {
 const verb = (o: Order) => (o.filled_shares > 0 ? (o.side === "buy" ? "Bought" : "Sold") : o.side === "buy" ? "Buy" : "Sell");
 const STATUS: Record<Order["status"], string> = { filled: "Filled", partial: "Part filled", open: "Open", cancelled: "Not filled", rejected: "Rejected" };
 
-function Orders({ book, assumed, onOpen }: { book: Book; assumed: number; onOpen: (o: Order) => void }) {
+function Orders({ book, onOpen }: { book: Book; onOpen: (o: Order) => void }) {
   const [all, setAll] = useState(false);
   const shown = all ? book.orders : book.orders.slice(0, 6);
-  const filled = book.orders.filter((o) => o.cost_bp != null);
-  const avg = filled.length ? filled.reduce((a, o) => a + o.cost_bp!, 0) / filled.length : null;
   const days = [...new Set(shown.map((o) => o.placed_at.slice(0, 10)))];
   return (
     <Section title="Recent orders">
@@ -331,20 +327,14 @@ function Orders({ book, assumed, onOpen }: { book: Book; assumed: number; onOpen
         <p className="text-muted-foreground border-t pt-3">No orders yet. The first go out {weekdayDate(book.next_run.at!)} at {clock(book.next_run.at!)}.</p>
       ) : (
         <>
-          {avg != null && (
-            <p className="text-muted-foreground mb-3 max-w-[70ch] text-[13px]">
-              Fills cost <span className="num text-foreground">{bp(avg)}</span> a trade on average against the price when each order was decided. The backtest assumed <span className="num text-foreground">{assumed} bp</span>.
-            </p>
-          )}
           {days.map((d) => (
             <div key={d} className="mt-3 first-of-type:mt-0">
               <h3 className="text-muted-foreground border-b pb-1.5 text-xs">{weekdayDate(d)}</h3>
               {(() => {
                 const rb = book.rebalances.find((x) => x.date === d);
                 return rb ? (
-                  <p className="text-muted-foreground flex min-h-11 items-center justify-between gap-3 border-b py-2 text-[13px]">
+                  <p className="text-muted-foreground flex min-h-11 items-center gap-3 border-b py-2 text-[13px]">
                     <span>Traded {rb.reweighted} holdings back to equal weight{rb.skipped_dust > 0 && <>; skipped {rb.skipped_dust} too small to place</>}</span>
-                    <span className="num shrink-0">{money(rb.cost_usd)} cost</span>
                   </p>
                 ) : null;
               })()}
@@ -537,8 +527,8 @@ function HoldingDetail({ p, book, rule }: { p: Position; book: Book; rule: Rule 
   const cut = holdOf(book, rule);
   const next = `${weekdayDate(book.next_run.at!)}`;
   const why = p.rank <= cut
-    ? `Ranked ${p.rank} of ${rule.universe.toLocaleString("en-US")} today on ${rule.measure} (${signal}), inside the top ${cut} the rule holds.`
-    : `Ranked ${p.rank} today (${signal} on ${rule.measure}), below the top ${cut}. It was in the top ${cut} at the last rebalance; it is sold at the next one, ${next}, unless it climbs back.`;
+    ? `Ranked ${p.rank} of ${rule.universe.toLocaleString("en-US")} on ${rule.measure} (${signal}) at the last rebalance, inside the top ${cut} the rule holds. The next rebalance, ${next}, ranks it again.`
+    : `Ranked ${p.rank} (${signal} on ${rule.measure}), below the top ${cut}.`;
   const trades = book.orders.filter((o) => o.symbol === p.symbol);
   const gainPct = p.price / p.avg_cost - 1;
   return (
@@ -582,13 +572,9 @@ function OrderDetail({ o }: { o: Order }) {
         <Rows rows={[
           ["Status", STATUS[o.status], o.status === "cancelled" || o.status === "rejected" ? "text-attention font-sans" : "font-sans"],
           ["Shares filled", `${o.filled_shares} of ${o.shares}`],
-          ["Price when decided", money(o.expected_price)],
           ["Filled at", o.fill_price != null ? money(o.fill_price) : "—"],
-          ["Cost of the fill", o.cost_bp != null ? bp(o.cost_bp) : "—"],
+          ["Value filled", o.fill_price != null ? money(o.fill_price * o.filled_shares) : "—"],
         ]} />
-        <p className="text-muted-foreground text-xs">
-          Cost is how much worse the fill was than the price when the order was decided, in basis points (1 bp is 0.01%). It is what the backtest's cost assumption stands in for.
-        </p>
       </div>
     </>
   );
