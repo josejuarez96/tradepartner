@@ -188,6 +188,24 @@ def test_the_cash_band_is_the_frozen_tolerance(cash: float, status: str) -> None
     assert _kinds(result) == ([] if status == "ok" else ["cash"])
 
 
+def test_a_window_frozen_at_the_old_tolerance_keeps_it() -> None:
+    """#1290: the band is the window's frozen value, not the default; a window that
+    froze 0.01 (H1's window 1) still finds a $1.25 gap a mismatch."""
+    result = compare(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        (),
+        (),
+        _account(1_001.25),
+        _explanations(),
+        WINDOW,
+        RiskConfig(reconcile_cash_tolerance=0.01),
+        order_id_prefix=PREFIX,
+    )
+
+    assert _kinds(result) == ["cash"]
+
+
 def test_a_different_account_id_is_a_mismatch() -> None:
     result = _run(_ledger(SEC_A=1.0), _positions(AAA=1.0), 1_000.0, account_id="other")
     assert _kinds(result) == ["account_id"]
