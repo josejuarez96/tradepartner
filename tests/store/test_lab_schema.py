@@ -19,7 +19,7 @@ import pytest
 from conftest import mark_pre_lab
 
 from tradepartner.backtest import sweep
-from tradepartner.store import lab_schema, registry, schema
+from tradepartner.store import lab_registry, lab_schema, registry, schema
 from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.journal import (
     AlertRow,
@@ -305,7 +305,7 @@ def test_rebuild_keeps_a_value_another_version_added() -> None:
     conn.execute(
         "CREATE TABLE owner_decisions (decision_id BIGINT PRIMARY KEY, kind VARCHAR NOT "
         "NULL, CHECK (kind IN ('gap_signoff', 'promotion', 'sweep_retired', 'data_release', "
-        "'development_boundary', 'shakedown_span', 'shakedown_note')))"
+        "'development_boundary', 'shakedown_span', 'shakedown_note', 'operations_book')))"
     )
     conn.execute("INSERT INTO trial_results VALUES (1, ?, 'other_plan')", [AT])
     owner_ddl = conn.execute(
@@ -504,9 +504,12 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     schema.init_schema(conn)
     assert _rows_but_versions(conn) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
-    added = ", ".join(f"'{k}'" for k in lab_schema.SHAKEDOWN_DECISION_KINDS)
+    added = ", ".join(
+        f"'{k}'"
+        for k in (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
+    )
     assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
-    assert _versions(conn) == [19, 20, 21]
+    assert _versions(conn) == [19, 20, 21, 22]
     assert lab_schema.is_lab_initialised(conn) == lab
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=20):
         conn.execute(
@@ -528,7 +531,7 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     assert (_rows_but_versions(conn), _kind_check(conn), _versions(conn)) == (
         rows,
         check,
-        [19, 20, 21],
+        [19, 20, 21, 22],
     )
 
 
@@ -578,7 +581,7 @@ def test_read_only_open_of_a_version_19_store_passes_and_has_no_span(tmp_path: P
 
 def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> None:
     conn = _fresh_store()
-    assert schema.CURRENT_SCHEMA_VERSION == 21 and _versions(conn) == [21]
+    assert schema.CURRENT_SCHEMA_VERSION == 22 and _versions(conn) == [22]
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=1):
         conn.execute(
             "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -587,10 +590,121 @@ def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> No
     lab_schema.apply_lab_schema(conn)
     _, values = lab_schema._current_enum(conn, "owner_decisions", "kind")
     assert all(f"'{k}'" in values for k in lab_schema.SHAKEDOWN_DECISION_KINDS)
-    assert lab_schema.LAB_DECISION_KINDS[-2:] == lab_schema.SHAKEDOWN_DECISION_KINDS
+    assert lab_schema.LAB_DECISION_KINDS[-3:-1] == lab_schema.SHAKEDOWN_DECISION_KINDS
     assert [r[2] for r in _rows_in_order(conn, "owner_decisions")] == list(
         lab_schema.SHAKEDOWN_DECISION_KINDS
     )
+
+
+# --- version 22 (#1442, paper-trading plan T160b; strategy-lab spec req 1) -------------
+
+
+def _version_21_store(conn: duckdb.DuckDBPyConnection, *, lab: bool) -> None:
+    """A store as version 21 left it: version 19's shape (H1's window 1 open on book
+    `main`, a decision of every kind the store allowed, insertion order not id order)
+    with version 20's two shakedown kinds allowed and one shakedown row, and
+    `filing_events` present (the DDL pass made it). The version-22 delta (the
+    `operations_book` kind) is absent."""
+    _version_19_store(conn, lab=lab)
+    lab_schema.widen_enum(conn, "owner_decisions", "kind", lab_schema.SHAKEDOWN_DECISION_KINDS)
+    conn.execute(
+        "INSERT INTO owner_decisions VALUES (5, ?, 'shakedown_span', NULL, NULL, ?, 'span')",
+        [AT, '{"order_sessions": 5, "sessions": 10}'],
+    )
+    assert "operations_book" not in _kind_check(conn)
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version VALUES (21, ?)", [AT])
+
+
+def _v21(lab: bool) -> duckdb.DuckDBPyConnection:
+    conn = duckdb.connect(":memory:")
+    _version_21_store(conn, lab=lab)
+    return conn
+
+
+@pytest.mark.parametrize("lab", [True, False], ids=["lab", "plain"])
+def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
+    """The migration from 21 is additive, as version 20's was: every row of every
+    table kept in insertion order and byte-identical, every kind kept; only the
+    `kind` CHECK widens, by exactly `operations_book`."""
+    conn = _v21(lab)
+    before = _rows_but_versions(conn)
+    check_before = _kind_check(conn)
+    columns_before = {t: _columns(conn, t) for t in before}
+    schema.init_schema(conn)
+    assert _rows_but_versions(conn) == before
+    assert {t: _columns(conn, t) for t in before} == columns_before
+    assert _kind_check(conn) == check_before.replace("'))));", "', 'operations_book'))));")
+    assert _versions(conn) == [21, 22]
+    assert lab_schema.is_lab_initialised(conn) == lab
+    conn.execute(
+        "INSERT INTO owner_decisions VALUES (40, ?, 'operations_book', NULL, NULL, '{}', 'r')",
+        [AT],
+    )
+    with pytest.raises(duckdb.ConstraintException):
+        conn.execute(
+            "INSERT INTO owner_decisions VALUES (41, ?, 'made_up', NULL, NULL, '{}', 'r')", [AT]
+        )
+    rows, check = _rows_but_versions(conn), _kind_check(conn)
+    schema.init_schema(conn)
+    assert (_rows_but_versions(conn), _kind_check(conn), _versions(conn)) == (
+        rows,
+        check,
+        [21, 22],
+    )
+
+
+def test_the_version_22_migration_leaves_mains_open_window_unchanged() -> None:
+    conn = _v21(lab=True)
+    journal_before = {t: _rows_in_order(conn, t) for t in schema.JOURNAL_TABLE_NAMES}
+    window = open_window(conn, "main")
+    assert window is not None and window.window_id == 1
+    schema.init_schema(conn)
+    assert open_window(conn, "main") == window == latest_window(conn, "main")
+    assert {t: _rows_in_order(conn, t) for t in schema.JOURNAL_TABLE_NAMES} == journal_before
+
+
+def test_a_failed_version_22_migration_leaves_the_store_at_21(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _v21(lab=True)
+    before, check = _rows_but_versions(conn), _kind_check(conn)
+    widen = lab_schema.widen_enum
+
+    def boom(*args: Any) -> None:
+        widen(*args)
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(lab_schema, "widen_enum", boom)
+    with pytest.raises(RuntimeError, match="injected"):
+        schema.init_schema(conn)
+    assert (_rows_but_versions(conn), _kind_check(conn), _versions(conn)) == (before, check, [21])
+
+
+def test_read_only_open_of_a_version_21_store_passes(tmp_path: Path) -> None:
+    path = tmp_path / "v21.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _version_21_store(conn, lab=True)
+    with duckdb.connect(str(path), read_only=True) as conn:
+        before = _rows_but_versions(conn)
+        schema.init_schema(conn)
+        assert _versions(conn) == [21]
+        assert lab_registry.operations_book_for(conn, 1) is None
+        assert _rows_but_versions(conn) == before
+
+
+def test_a_fresh_store_allows_the_operations_kind_and_the_lab_keeps_it() -> None:
+    conn = _fresh_store()
+    assert _versions(conn) == [schema.CURRENT_SCHEMA_VERSION] == [22]
+    conn.execute(
+        "INSERT INTO owner_decisions VALUES (1, ?, 'operations_book', NULL, NULL, '{}', 'r')",
+        [AT],
+    )
+    lab_schema.apply_lab_schema(conn)
+    _, values = lab_schema._current_enum(conn, "owner_decisions", "kind")
+    assert "'operations_book'" in values
+    assert lab_schema.LAB_DECISION_KINDS[-1:] == lab_schema.OPERATIONS_DECISION_KINDS
+    assert [r[2] for r in _rows_in_order(conn, "owner_decisions")] == ["operations_book"]
 
 
 # --- is_lab_initialised, LabNotInitialised -------------------------------------
