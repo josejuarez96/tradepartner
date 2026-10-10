@@ -212,6 +212,131 @@ const research = {
   ],
 };
 
+// ---- Terminal-chart extras, SAMPLE ----------------------------------------
+// Open/high/low for each book's daily value, so the book chart can draw candles.
+for (const series of books) {
+  for (let k = 0; k < series.length; k++) {
+    const p = series[k], prev = k ? series[k - 1].value : p.value;
+    const o = r2(prev * (1 + 0.0025 * gauss()));
+    const span = Math.abs(p.value - o) + p.value * 0.003 * Math.abs(gauss());
+    p.open = o; p.high = r2(Math.max(o, p.value) + span * 0.5); p.low = r2(Math.min(o, p.value) - span * 0.5);
+  }
+}
+
+// Daily candles and rank history for every holding, ending at today's price
+// and rank; every fill lands inside its day's range.
+function candles(book, position, orders, rule) {
+  const dates = book.map((p) => p.date);
+  const n = dates.length;
+  const closes = new Array(n);
+  closes[n - 1] = position.price;
+  for (let k = n - 2; k >= 0; k--) closes[k] = closes[k + 1] / (1 + 0.004 + 0.018 * gauss());
+  // Pull the path toward the average cost around the purchase date.
+  const buy = dates.indexOf(position.bought_on);
+  if (buy >= 0) {
+    const f = position.avg_cost / closes[buy];
+    for (let k = 0; k <= buy; k++) closes[k] *= f;
+    for (let k = buy + 1; k < n - 1; k++) closes[k] *= 1 + (f - 1) * (1 - (k - buy) / (n - 1 - buy));
+  }
+  const bars = dates.map((date, k) => {
+    const c = closes[k], o = k ? closes[k - 1] * (1 + 0.006 * gauss()) : c * (1 + 0.006 * gauss());
+    const span = Math.abs(c - o) + c * 0.012 * Math.abs(gauss());
+    return { date, open: r2(o), high: r2(Math.max(o, c) + span * 0.4), low: r2(Math.min(o, c) - span * 0.4), close: r2(c),
+      volume: Math.round((8 + 4 * Math.abs(gauss())) * 1e6) };
+  });
+  for (const o of orders.filter((x) => x.symbol === position.symbol && x.fill_price)) {
+    const b = bars.find((x) => x.date === o.placed_at.slice(0, 10));
+    if (b) { b.low = Math.min(b.low, r2(o.fill_price * 0.997)); b.high = Math.max(b.high, r2(o.fill_price * 1.003)); }
+  }
+  // Walk the rank back from today's; while held it never passes the sell line, and on the day it was bought it was inside the top.
+  const ranks = new Array(n);
+  let r = position.rank;
+  for (let k = n - 1; k >= 0; k--) {
+    const cap = dates[k] > position.bought_on ? rule.sell_below : dates[k] === position.bought_on ? rule.hold : rule.sell_below + 10;
+    r = Math.max(1, Math.min(cap, r));
+    ranks[k] = Math.round(r);
+    r += 1.1 * gauss();
+  }
+  return { bars, ranks: dates.map((date, k) => ({ date, rank: ranks[k] })) };
+}
+const dailyRule = { hold: 10, sell_below: 20 }, b3Rule = { hold: 20, sell_below: 20 };
+for (const p of dailyPositions) Object.assign(p, candles(daily, p, dailyOrders, dailyRule));
+for (const p of b3Positions) Object.assign(p, candles(b3, p, b3Orders, b3Rule));
+
+// ---- Backtest replay for monthly momentum (H1), SAMPLE ---------------------
+// The window and rule are H1's; the universe, prices and trades are invented.
+// Rebalances fall on the last NYSE session of each month.
+const nyseHolidays = new Set([
+  "2019-09-02", "2019-11-28", "2019-12-25", "2020-01-01", "2020-01-20", "2020-02-17", "2020-04-10", "2020-05-25", "2020-07-03",
+  "2020-09-07", "2020-11-26", "2020-12-25", "2021-01-01", "2021-01-18", "2021-02-15", "2021-04-02", "2021-05-31", "2021-07-05",
+  "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21", "2022-04-15", "2022-05-30", "2022-06-20", "2022-07-04",
+  "2022-09-05", "2022-11-24", "2022-12-26", "2023-01-02", "2023-01-16", "2023-02-20", "2023-04-07", "2023-05-29", "2023-06-19",
+  "2023-07-04", "2023-09-04", "2023-11-23", "2023-12-25",
+]);
+const rsessions = [];
+for (let d = new Date(Date.UTC(2019, 7, 1)); d <= new Date(Date.UTC(2023, 11, 29)); d.setUTCDate(d.getUTCDate() + 1)) {
+  const iso = d.toISOString().slice(0, 10);
+  if (d.getUTCDay() % 6 !== 0 && !nyseHolidays.has(iso)) rsessions.push(iso);
+}
+const monthEnds = rsessions.filter((d, k) => k === rsessions.length - 1 || rsessions[k + 1].slice(0, 7) !== d.slice(0, 7));
+const universe = ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK.B", "JPM", "V", "UNH", "JNJ", "XOM", "PG", "MA",
+  "HD", "CVX", "LLY", "ABBV", "MRK", "PEP", "KO", "AVGO", "COST", "WMT", "MCD", "CSCO", "TMO", "ACN", "ABT", "ADBE", "CRM",
+  "NFLX", "AMD", "TXN", "NKE", "ORCL", "QCOM", "INTC", "CAT", "DE", "GE", "AMAT", "LRCX", "COP", "SLB", "NOW", "ISRG", "BKNG", "UBER"];
+// Monthly returns: market plus a slowly drifting stock-specific trend, so past winners tend to keep winning a little.
+const months = monthEnds.length;
+const mkt = Array.from({ length: months }, () => 0.009 + 0.045 * gauss());
+const trend = universe.map(() => 0.01 * gauss());
+const mret = universe.map((_, i) => mkt.map((m) => { trend[i] = 0.85 * trend[i] + 0.006 * gauss(); return m * (0.8 + 0.4 * rand()) + trend[i] + 0.06 * gauss(); }));
+const rule = { universe: 500, hold: 20, sell_below: 30, weight: 0.05 };
+const first = monthEnds.indexOf("2020-08-31");
+const rebalanceIdx = []; for (let m = first; m < months - 1; m++) rebalanceIdx.push(m); // Aug 2020 .. Nov 2023: 40
+const signalAt = (i, m) => mret[i].slice(m - 11, m).reduce((a, r) => a * (1 + r), 1) - 1; // months m-11..m-1: past year, skipping the last month
+let held = new Set();
+const rebalances = [];
+const monthlyPort = [];
+for (const m of rebalanceIdx) {
+  const ranked = universe.map((s, i) => ({ s, i, sig: signalAt(i, m) })).sort((a, b) => b.sig - a.sig).map((x, k) => ({ ...x, r: k + 1 }));
+  const rankOf = new Map(ranked.map((x) => [x.s, x.r]));
+  const trades = [];
+  for (const s of [...held]) if (rankOf.get(s) > rule.sell_below) { held.delete(s); trades.push({ side: "sell", s, r: rankOf.get(s), why: `Fell to rank ${rankOf.get(s)}, past the sell line at ${rule.sell_below}` }); }
+  for (const x of ranked) { if (held.size >= rule.hold) break; if (!held.has(x.s)) { held.add(x.s); trades.push({ side: "buy", s: x.s, r: x.r, why: rebalances.length ? `Entered the top ${rule.hold} (rank ${x.r})` : `Starting position (rank ${x.r})` }); } }
+  for (const t of trades) t.cost_bp = Math.round((6 + 8 * rand()) * 10) / 10;
+  const sold = new Set(trades.filter((t) => t.side === "sell").map((t) => t.s)), bought = new Set(trades.filter((t) => t.side === "buy").map((t) => t.s));
+  const ranking = ranked.filter((x) => x.r <= 35 || sold.has(x.s)).map((x) => ({
+    s: x.s, r: x.r, sig: Math.round(x.sig * 1000) / 1000,
+    st: bought.has(x.s) ? "bought" : sold.has(x.s) ? "sold" : held.has(x.s) ? "held" : "out",
+  }));
+  const gross = [...held].reduce((a, s) => a + mret[universe.indexOf(s)][m + 1], 0) / held.size;
+  const costFrac = trades.reduce((a, t) => a + rule.weight * t.cost_bp / 1e4, 0);
+  monthlyPort.push({ m, r: gross - costFrac, costFrac });
+  rebalances.push({ date: monthEnds[m], trades, ranking, cost_frac: costFrac });
+}
+// Daily paths between month ends, then calibrated to H1's recorded result:
+// S&P 11.2% a year, strategy 1.1 points a year ahead after costs.
+const rdays = rsessions.filter((d) => d >= monthEnds[first] && d <= monthEnds[months - 1]);
+function dailyPath(monthly) {
+  const out = []; let v = 1;
+  monthly.forEach((r, j) => {
+    const days = rdays.filter((d) => d > monthEnds[first + j] && d <= monthEnds[first + j + 1]);
+    const noise = days.map(() => 0.009 * gauss()); const mean = noise.reduce((a, x) => a + x, 0) / days.length;
+    const step = Math.log(1 + r) / days.length;
+    days.forEach((d, k) => { v *= Math.exp(step + noise[k] - mean); out.push(v); });
+  });
+  return [1, ...out];
+}
+const stratRaw = dailyPath(monthlyPort.map((x) => x.r));
+const spyRaw = dailyPath(rebalanceIdx.map((m) => mkt[m + 1]));
+const years = (rdays.length - 1) / 252;
+const tilt = (path, annual) => { const k = Math.pow((1 + annual) ** years / path.at(-1), 1 / (path.length - 1)); return path.map((x, j) => x * k ** j); };
+const strat = tilt(stratRaw, 0.112 + 0.011), spyR = tilt(spyRaw, 0.112);
+const replay = {
+  idea_id: "h1", sample: true, window: "Aug 31, 2020 to Dec 29, 2023", start_equity: 100000, cost_bp_assumed: 10, rule,
+  days: rdays.map((d, j) => ({ date: d, v: r2(100000 * strat[j]), b: r2(100000 * spyR[j]) })),
+  rebalances: rebalances.map((r) => ({ ...r, cost_usd: r2(r.cost_frac * 100000 * strat[rdays.indexOf(r.date)]) })).map(({ cost_frac, ...r }) => r),
+  end: { vs_spy: 0.011, luck: 0.7262, tries: 2, trial: "sample trial" },
+};
+research.replays = { h1: replay };
+
 const data = {
   sample: true,
   note: "SAMPLE DATA for the UI prototype. Not real positions, prices or results.",

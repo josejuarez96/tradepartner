@@ -1,5 +1,8 @@
 /** Shape of sample/app-data.json, i.e. what the local API is expected to serve. */
 export interface Point { date: string; value: number }
+/** A book's daily value with its open, high and low, for candles. */
+export interface ValuePoint extends Point { open?: number; high?: number; low?: number }
+export interface Bar { date: string; open: number; high: number; low: number; close: number; volume: number }
 export interface PortfolioPoint extends Point { index: number }
 
 export interface BookStatus {
@@ -16,6 +19,8 @@ export interface Position {
   shares: number; price: number; avg_cost: number; bought_on: string;
   /** Rank today on the strategy's own measure (1 is best), and that measure's value. */
   rank: number; signal: number;
+  /** SAMPLE: daily candles and rank history over the book's life. */
+  bars: Bar[]; ranks: { date: string; rank: number }[];
 }
 
 /** expected_price: the price when the order was decided; cost_bp: how much worse the fill was. */
@@ -34,7 +39,7 @@ export interface Run { at: string; outcome?: "ok" | "failed" | "skipped"; summar
 
 export interface Book {
   id: string; name: string; strategy_id: string; cadence: "daily" | "weekly" | "monthly";
-  started_on: string; start_equity: number; status: BookStatus; equity: Point[]; cash: number;
+  started_on: string; start_equity: number; status: BookStatus; equity: ValuePoint[]; cash: number;
   positions: Position[]; orders: Order[]; last_run: Run; next_run: Run;
   /** SAMPLE: the yearly spread around the S&P this book's backtest expects. */
   expected_tracking_error: number;
@@ -83,4 +88,22 @@ export interface Family {
 
 export interface Lesson { id: string; text: string; grade: "supported" | "mixed" | "against" | "untested"; source: string }
 
-export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[] }
+/** One rebalance of a backtest replay: the ranking that day and the trades it caused. */
+export interface ReplayRebalance {
+  date: string;
+  /** Top of the ranking plus anything sold that day. st: what the rule did with it. */
+  ranking: { s: string; r: number; sig: number; st: "held" | "bought" | "sold" | "out" }[];
+  trades: { side: "buy" | "sell"; s: string; r: number; why: string; cost_bp: number }[];
+  cost_usd: number;
+}
+
+/** A backtest, step by step: daily value of the strategy (v) and the S&P (b), and every rebalance. */
+export interface Replay {
+  idea_id: string; sample: boolean; window: string; start_equity: number; cost_bp_assumed: number;
+  rule: { universe: number; hold: number; sell_below: number; weight: number };
+  days: { date: string; v: number; b: number }[];
+  rebalances: ReplayRebalance[];
+  end: { vs_spy: number; luck: number; tries: number; trial: string };
+}
+
+export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[]; replays: Record<string, Replay> }
