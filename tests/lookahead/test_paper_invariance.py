@@ -932,6 +932,22 @@ def test_the_plan_is_unchanged_on_the_cut(fixture: Fixture, cut: duckdb.DuckDBPy
     assert full.targets  # the comparison covers a plan that trades
 
 
+def test_the_screened_plan_is_unchanged_on_the_cut(
+    fixture: Fixture, cut: duckdb.DuckDBPyConnection
+) -> None:
+    """The paper plan of a registration with the turnover screen on (T165d) reads the
+    same on the cut as on the full store, and the screen is live: it changes the plan."""
+    screened = Settings(
+        _env_file=None, strategy={"top_fraction": 0.5, "turnover_top_fraction": 0.5}
+    )
+    on_full = _plan_at(fixture.full, fixture.full, screened, fixture.handle, T_I)
+    on_cut = _plan_at(cut, fixture.full, screened, fixture.handle, T_I)
+    assert on_full == on_cut
+    assert on_full.targets
+    assert on_full.counts.get("n_screened", 0) > 0
+    assert on_full != _plan(fixture, fixture.full)
+
+
 def test_the_ledger_through_s_minus_1_is_unchanged_on_the_cut(
     fixture: Fixture, cut: duckdb.DuckDBPyConnection
 ) -> None:
