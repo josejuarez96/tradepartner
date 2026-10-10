@@ -160,7 +160,14 @@ def run(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
                 settings=frozen,
             )
         outcome = run_hypothesis(
-            SLUG, None, None, Flags(), synthetic=True, store_path=path, run_by="oracle"
+            SLUG,
+            None,
+            None,
+            Flags(),
+            synthetic=True,
+            store_path=path,
+            run_by="oracle",
+            keep_marking_frames=True,
         )
     assert (outcome.status, outcome.error) == ("ok", None)
     assert outcome.results is not None and set(outcome.results) == {ZERO_COSTS}
