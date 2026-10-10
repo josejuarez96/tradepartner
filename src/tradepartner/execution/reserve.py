@@ -12,14 +12,17 @@ The reserve is the sum, over our own **non-terminal buys from any session**, of
 the unfilled notional:
 
 - a notional buy: its submitted notional minus its journaled filled value;
-- a quantity buy: its unfilled quantity (submitted minus journaled filled),
-  split-adjusted by the splits with ex-date in (its order's session, S], as
-  `plan.remainder` does, times the reference price times
-  (1 + `risk.whole_share_price_buffer`).
+- a quantity buy: its unfilled quantity in post-split shares, times the
+  reference price times (1 + `risk.whole_share_price_buffer`). The submitted
+  quantity is split-adjusted by the splits with ex-date in (its order's
+  session, S], as `plan.remainder` does; each journaled fill by the splits with
+  ex-date in (that fill's day, S], where a fill's day is the New York date of
+  its `filled_at` (never before its order's session), so a fill on or after an
+  ex-date is already in post-split shares and is not adjusted again (#1445).
 
 A buy with no event yet (journaled before its submit) is open. Terminal buys and
 every sell reserve nothing. Each order's unfilled amount is clamped to
-[0, what it was submitted for], so an over-fill never makes the reserve negative.
+[0, what it was submitted for (split-adjusted)], so an over-fill never makes the reserve negative.
 The sum is computed in `Decimal` from each float's shortest repr and rounded
 **up** to the cent, so the reserve never under-reserves.
 
@@ -38,6 +41,7 @@ import math
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from decimal import ROUND_CEILING, Decimal
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -56,6 +60,7 @@ _SPLIT = "split"
 _CENT = Decimal("0.01")
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 def _dec(value: float, what: str, *, positive: bool = False) -> Decimal:
@@ -67,19 +72,23 @@ def _dec(value: float, what: str, *, positive: bool = False) -> Decimal:
     return Decimal(repr(float(value)))
 
 
-def _filled(order: OrderRow, fills: Iterable[OrderedFill]) -> tuple[Decimal, Decimal]:
-    """Filled shares and filled value of one order."""
-    quantity = value = _ZERO
+def _filled(
+    order: OrderRow, fills: Iterable[OrderedFill]
+) -> tuple[list[tuple[Decimal, date]], Decimal]:
+    """Each fill of one order as (shares, the New York date of its `filled_at`),
+    and the order's filled value."""
+    shares: list[tuple[Decimal, date]] = []
+    value = _ZERO
     for fill in fills:
         row = fill.fill
         if row.client_order_id != order.client_order_id:
             continue
         if (fill.side, fill.security_id) != (order.side, order.security_id):
             raise ValueError(f"fill {row.fill_id} disagrees with order {order.client_order_id!r}")
-        shares = _dec(row.quantity, f"fill {row.fill_id} quantity")
-        quantity += shares
-        value += shares * _dec(row.price, f"fill {row.fill_id} price")
-    return quantity, value
+        quantity = _dec(row.quantity, f"fill {row.fill_id} quantity")
+        shares.append((quantity, row.filled_at.astimezone(_NEW_YORK).date()))
+        value += quantity * _dec(row.price, f"fill {row.fill_id} price")
+    return shares, value
 
 
 def _check_actions(actions_as_of: pl.DataFrame, session: date) -> None:
@@ -130,7 +139,17 @@ def _unfilled_notional(
     if order.quantity is not None:
         submitted = _dec(order.quantity, f"order {order.client_order_id!r} quantity")
         factor = _split_factor(actions_as_of, order.security_id, order.session, session)
-        unfilled = min(max(submitted - shares, _ZERO), submitted) * factor
+        # each fill in post-split shares: a fill's day is never taken before its
+        # order's session, so a bad stamp adjusts it by fewer splits, not more
+        filled = sum(
+            (
+                quantity
+                * _split_factor(actions_as_of, order.security_id, max(day, order.session), session)
+                for quantity, day in shares
+            ),
+            _ZERO,
+        )
+        unfilled = min(max(submitted * factor - filled, _ZERO), submitted * factor)
         price = _dec(price_of(order.security_id), f"price of {order.security_id}", positive=True)
         return unfilled * price * (_ONE + buffer)
     if order.notional is not None:
