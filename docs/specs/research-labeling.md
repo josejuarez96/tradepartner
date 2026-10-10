@@ -222,6 +222,8 @@ Pilots C, E and every other row of ADR 0013's table (each is its own registratio
 - **Store locks.** The frame build holds one short read of the owner's store after extraction; runs and the review read no runtime store at all; nothing here contends with ingest or the paper window's run beyond that read.
 - **Registry reading.** A `pilot` run on the sealed period is a flagged holdout spend on a non-`test` split, which research-registry req 5 allows with `--spend-holdout`; it is not the exploratory run on a sealed `test` split that its open question 4 keeps impossible. T81's tests should pin that reading (a follow-up on the registry plan, not this spec).
 
+**Owner decisions 2026-10-10 (#1237).** On review items with a class set and a single class, the owner selects the most specific correct answer supported by the filings; if the single class is correct and belongs to the set, the single class is selected. There is no `both_right` decision. The accepted blinding limit above includes the row 6 and 7 rule phrases, the rule-only "one of" form, and the model-only unresolved phrase. The page still hides attribution and probability until after the decision.
+
 ## Open questions
 
 Each had options and a recommendation; the owner answered all six on 2026-10-05 (the section after this one), so none is open and the plan can be drafted once the owner merges this spec. The questions stand as asked.
