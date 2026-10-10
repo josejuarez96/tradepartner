@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { shortDate } from "@/lib/format";
 import { Page, RailHead, Section } from "@/components/Shell";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { LuckInfo } from "@/components/LuckInfo";
 import { EvidenceTally, ExamSteps, LuckScale, Slots } from "@/components/Visuals";
 
 const STAGES: { key: Stage; label: string }[] = [
@@ -32,7 +33,7 @@ export function Research({ data }: { data: AppData }) {
   return (
     <Page rail={<Rail data={data} onOpen={(id) => setOpen(byId(id))} />}>
       <p className="text-muted-foreground">Tested ideas</p>
-      <p className="mt-0.5 text-[26px] font-medium tracking-[-0.02em] sm:text-[30px]">Could any of it be luck?</p>
+      <p className="mt-0.5 flex items-center gap-3 text-[26px] font-medium tracking-[-0.02em] sm:text-[30px]">Could any of it be luck? <LuckInfo /></p>
       <ResultsMap ideas={r.ideas.filter((i) => i.result)} onOpen={setOpen} />
 
       <Section title="Needs you" note={<span className="num text-attention">{r.waiting.length}</span>}>
@@ -315,7 +316,7 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                     <Stat label="Versions counted" value={String(idea.result.tries)} />
                     <Stat label="Lost to costs a year" value={`${(idea.result.cost_drag * 100).toFixed(1)}%`} sample={idea.result.sample?.includes("cost_drag")} />
                     <div className="col-span-2 rounded-lg border p-3">
-                      <p className="text-muted-foreground mb-2 text-xs">Luck check{idea.result.sample?.includes("luck") && <SampleMark />}</p>
+                      <p className="text-muted-foreground mb-2 flex items-center gap-2 text-xs">Luck check{idea.result.sample?.includes("luck") && <SampleMark />}<LuckInfo idea={idea} /></p>
                       <LuckScale v={idea.result.luck} />
                     </div>
                     <p className="text-muted-foreground col-span-2 text-xs">

@@ -1103,6 +1103,9 @@
      "vs_spy": 0.011,
      "luck": 0.7262,
      "tries": 2,
+     "distinct": 1,
+     "periods": 40,
+     "period": "monthly",
      "cost_drag": 0.0125,
      "sample": [
       "vs_spy"
@@ -1140,6 +1143,9 @@
      "vs_spy": 0.004,
      "luck": 0.41,
      "tries": 8,
+     "distinct": 6,
+     "periods": 846,
+     "period": "daily",
      "cost_drag": 0.041,
      "sample": [
       "vs_spy",
@@ -1179,6 +1185,9 @@
      "vs_spy": -0.006,
      "luck": 0.38,
      "tries": 1,
+     "distinct": 1,
+     "periods": 40,
+     "period": "monthly",
      "cost_drag": 0.006,
      "sample": [
       "vs_spy",

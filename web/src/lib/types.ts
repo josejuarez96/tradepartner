@@ -46,7 +46,7 @@ export interface Idea {
   evidence?: { for: number; mixed: number; against: number; untested?: number; note: string };
   expected?: string; stop_rule?: string;
   /** vs_spy: excess return a year over the S&P 500; luck: chance the edge is real after counting every try (DSR). */
-  result?: { status: "done"; window: string; vs_spy: number; luck: number; tries: number; cost_drag: number; sample?: string[] };
+  result?: { status: "done"; window: string; vs_spy: number; luck: number; tries: number; distinct: number; periods: number; period: string; cost_drag: number; sample?: string[] };
   exam?: { kind: "paper" | "holdout"; label: string; done?: number; of?: number; unit?: string; status?: string; note?: string };
   blocked_by?: string[]; parked?: string; next?: string; cost: string;
 }

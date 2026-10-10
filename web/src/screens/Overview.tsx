@@ -6,6 +6,7 @@ import { stats } from "@/lib/stats";
 import { clock, money, pct, pts, shortDate, signedMoney, tone, weekdayDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Page, RailHead, Section } from "@/components/Shell";
+import { LuckInfo } from "@/components/LuckInfo";
 import { ReturnChart, type ChartEvent } from "@/components/ReturnChart";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
@@ -110,7 +111,7 @@ export function Overview({ data }: { data: AppData }) {
       <Section title="Statistics" note={`${shortDate(cmp.you[0]?.date ?? last.date)} to ${shortDate(last.date)}, ${st.days} trading days`}>
         <dl className="num grid grid-cols-2 border-t sm:grid-cols-4">
           <Stat label="Excess vs S&P"><span className={toneText[tone(gap)]}>{gap >= 0 ? "+" : "−"}{pts(gap)}</span></Stat>
-          <Stat label="Luck check, H1">{h1?.result ? `${Math.round(h1.result.luck * 100)}%` : "—"}</Stat>
+          <Stat label={<span className="inline-flex items-center gap-2">Luck check, H1 <LuckInfo idea={h1} /></span>}>{h1?.result ? `${Math.round(h1.result.luck * 100)}%` : "—"}</Stat>
           <Stat label="Volatility, yearly">{(st.vol * 100).toFixed(1)}%</Stat>
           <Stat label="Max drawdown"><span className="text-loss">{pct(st.maxDD, 1)}</span></Stat>
           <Stat label="Sharpe, yearly">{st.sharpe.toFixed(2)}</Stat>
@@ -139,7 +140,7 @@ export function Overview({ data }: { data: AppData }) {
   );
 }
 
-function Stat({ label, children }: { label: string; children: React.ReactNode }) {
+function Stat({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="border-b py-3">
       <dt className="text-muted-foreground font-sans text-[12.5px]">{label}</dt>
