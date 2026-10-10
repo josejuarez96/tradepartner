@@ -985,3 +985,53 @@ def test_the_estimate_counts_the_fallback_when_the_first_packet_is_over_the_cap(
     limits = dataclasses.replace(job.packet_limits(labeling), max_packet_tokens=cap)
     packets = job._first_packets([row], DEFAULT_OPTION_SET, limits)
     assert [(lid, p.kind) for lid, p in packets] == [("F1", "A")]
+
+
+def test_scored_items_reads_a_seeds_pre_fix_answer_and_gates_rows_6_and_7() -> None:
+    """#1351: `scored_items` sets `pre_fix_rule_answer` from the gold export's
+    `pre_fix_*` columns, so `seeded_recall` is no longer vacuously 1.0; a row-4
+    seed is reported, not gated."""
+    accepted = datetime(2020, 9, 4, 15, tzinfo=UTC)
+    plain = _gold_row("P1", accepted, MERGER)
+    row6 = {
+        **_gold_row("S6", accepted, "bankruptcy"),
+        "seed_case": True,
+        "in_random_draw": False,
+        "pre_fix_status": "listed",
+        "pre_fix_relisted": False,
+        "pre_fix_successor_id": None,
+        "pre_fix_form15_in_window": False,
+    }
+    row4 = {
+        **_gold_row("S4", accepted, "redomicile_or_reorganisation"),
+        "seed_case": True,
+        "in_random_draw": False,
+        "pre_fix_status": "delisted",
+        "pre_fix_relisted": False,
+        "pre_fix_successor_id": None,
+        "pre_fix_form15_in_window": True,
+    }
+    records = [
+        {"listing_end_id": lid, "reason": "ok", "selected_option": option, "probabilities": {}}
+        for lid, option in (
+            ("P1", MERGER),
+            ("S6", "bankruptcy"),
+            ("S4", "redomicile_or_reorganisation"),
+        )
+    ]
+    rows = [{**r, "documents": json.loads(r["documents"])} for r in (plain, row6, row4)]
+    plain = rows[0]
+    items = job.scored_items(rows, records)
+    by_id = {i.listing_end_id: i for i in items}
+    assert by_id["P1"].pre_fix_rule_answer is None
+    assert by_id["S6"].pre_fix_rule_answer is not None
+    assert by_id["S4"].pre_fix_rule_answer is not None
+    assert by_id["S4"].pre_fix_rule_answer.form15_in_window is True
+    _, metrics = job.gold_metrics(items)
+    assert metrics["seeded_recall"] == 1.0
+    assert [(r["listing_end_id"], r["gated"], r["caught"]) for r in metrics["seeded_report"]] == [
+        ("S4", False, False),
+        ("S6", True, True),
+    ]
+    _, no_seeds = job.gold_metrics(job.scored_items([plain], records))
+    assert no_seeds["seeded_recall"] is None
