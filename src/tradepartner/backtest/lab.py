@@ -569,6 +569,7 @@ def _run_engine(
                 first.window.end,
                 levels,
                 family=cast(HypothesisFamily, sweep.family),
+                keep_marking_frames=False,  # nothing on the sweep path reads them (#1414)
             )
     except SharedReadFailed as exc:
         error = "".join(traceback.format_exception(exc))
