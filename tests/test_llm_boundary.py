@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import gzip
 import io
 import json
 import re
@@ -76,6 +77,21 @@ def _rel(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
+#: Compressed files the text scan cannot read (#1085): any of these under a scanned
+#: root fails closed, since a host inside one would go unseen. `.gz` is read
+#: decompressed (`_read`).
+OPAQUE_SUFFIXES = frozenset({".zip", ".bz2", ".xz", ".zst", ".7z", ".lz4", ".br", ".lzma"})
+
+
+def _read(path: Path) -> str:
+    """A file's text as the scans see it: a `.gz` decompressed first (#1085), so a
+    gzipped fixture cannot hide the vendor host; undecodable bytes are replaced."""
+    data = path.read_bytes()
+    if path.suffix == ".gz":
+        data = gzip.decompress(data)
+    return data.decode("utf-8", errors="replace")
+
+
 def _real_tree(
     suffix: str | None = ".py", roots: tuple[str, ...] = SCANNED_ROOTS
 ) -> dict[str, str]:
@@ -88,7 +104,7 @@ def _real_tree(
                 continue
             if suffix is not None and path.suffix != suffix:
                 continue
-            tree[_rel(path)] = path.read_text(encoding="utf-8", errors="replace")
+            tree[_rel(path)] = _read(path)
     return tree
 
 
@@ -663,6 +679,26 @@ def test_c_fixture_snippets(case: Case) -> None:
         assert case.rule in rules, rules
     else:
         assert rules == set()
+
+
+def test_c_reads_a_gzipped_fixture_decompressed(tmp_path: Path) -> None:
+    recording = tmp_path / "recording.json.gz"
+    # Built from the pattern: this file is scanned and must not name the host.
+    host = _HOST_NAME.pattern.replace("\\", "")
+    recording.write_bytes(gzip.compress(f'{{"url": "https://api.{host}/v1"}}'.encode()))
+    assert not _HOST_NAME.search(recording.read_bytes().decode("utf-8", errors="replace"))
+    found = text_violations({"tests/fixtures/typesafe/recording.json.gz": _read(recording)})
+    assert ("host", "tests/fixtures/typesafe/recording.json.gz names the vendor host") in found
+
+
+def test_c_no_compressed_file_the_scan_cannot_read() -> None:
+    opaque = [
+        _rel(path)
+        for root in (*SCANNED_ROOTS, TESTS_ROOT)
+        for path in (REPO / root).rglob("*")
+        if path.is_file() and path.suffix.lower() in OPAQUE_SUFFIXES
+    ]
+    assert opaque == []
 
 
 def test_c_table_match_is_a_whole_token() -> None:
