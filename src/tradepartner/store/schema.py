@@ -302,7 +302,49 @@ registry; #83 took version 2 first, so the registry is version 3):
   kind or column until T142b. A read-only connection accepts a version-17
   store: every read works but the new column, which nothing reads before
   T142b.
-- **A later DDL change goes to version 19**, with its own migration and a
+- **Version 19** (#1370, paper-trading plan T154; ADR 0017 B.6): `alerts`
+  gains `book_id VARCHAR NOT NULL DEFAULT 'main'` (`DEFAULT_BOOK_ID`), so the
+  session-scoped kinds (`no_window`, `locked`) dedupe per (book, kind,
+  session) and a page can filter by book. Additive: DuckDB cannot add a NOT
+  NULL column in place, so `_migrate_alert_books`, run by `init_schema` after
+  `_migrate_release_kinds` on a migrating writable store, rebuilds `alerts`
+  with the version-19 DDL where it lacks `book_id`, every row kept in
+  insertion order with `book_id = 'main'` (every alert before version 19 is
+  book `main`'s, the one book there was) and every other column unchanged.
+  No other table changes; `paper_windows` and the seven other expanded tables
+  already carry `book_id` (version 17). A read-only connection accepts a
+  version-18 store: every read works but `store.journal.alerts_for`, which
+  only the writing `execution.alerts.Alerter` calls, and a writer migrates
+  first. T157 takes version 20, chained after this.
+- **Version 20** (#1388, paper-trading plan T157; ADR 0017 part E): the two
+  shakedown decision kinds. `owner_decisions.kind` gains `shakedown_span` and
+  `shakedown_note` (`lab_schema.SHAKEDOWN_DECISION_KINDS`, also the tail of
+  `LAB_DECISION_KINDS`), the `CHECK` rebuilt by `lab_schema.widen_enum` as
+  version 18 rebuilt it (every row kept in insertion order, byte-identical,
+  every kind kept). `_migrate_shakedown_kinds` runs on every fresh or
+  migrating writable store, never on one already at 20; it is idempotent. No
+  other table changes: no journal row (H1's open window on book `main`
+  included) is touched. A read-only connection accepts a version-19 store:
+  every read works (a shakedown row cannot exist there, so
+  `registry.shakedown_span` reads None).
+- **Version 21** (#1358, data-foundation plan T164b; the spec's "Amendment
+  2026-10-09 (#1358)"): adds `filing_events` (one row per 8-K or 8-K/A of an
+  issuer CIK, the submissions payload's `items` string verbatim, `known_at =
+  accepted_at`). Purely additive, like version 10: the migration from any
+  earlier migratable version just creates the table (`init_schema`'s DDL
+  pass, `_FILING_EVENTS_TABLE_DDL`) and appends a version-21 row; no existing
+  table or row changes. Keyed by `cik`, as `statement_facts` is, with UNIQUE
+  `(cik, accession)` excluding `known_at`: an accession is never reused, so
+  the table has no revisions by construction. It joins `TABLE_NAMES` and
+  `TABLE_PROVENANCE_VALUES` (`filing` only), so the look-ahead harness
+  truncates it and `health`'s common-column rules cover it. Nothing writes it
+  before T164e, behind `edgar.filing_events_enabled` (default off), and no
+  trial reads it until #1382 is closed. A read-only connection accepts a
+  version-20 store: every read works but a `filing_events` read, which fails
+  on the missing table (the per-table loops in `health` and
+  `registry.data_vintage` skip an absent table), and the next writable
+  `init_schema` call migrates the store.
+- **A later DDL change goes to version 22**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -403,6 +445,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "corporate_actions": ("action",),
     "facts": ("filing",),
     "statement_facts": ("filing",),
+    "filing_events": ("filing",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -514,9 +557,19 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `data_release` and `development_boundary`, every row kept, and the nullable
 #:   `trials.development_boundary` (`_migrate_release_kinds`, on every store;
 #:   module docstring, "Schema versions").
-#: - A later DDL change goes to version 19, with its own migration and a
+#: - 19 (#1370, paper-trading plan T154; ADR 0017 B.6): `alerts.book_id`,
+#:   defaulted `main`; `alerts` rebuilt with every row kept where it lacks the
+#:   column (`_migrate_alert_books`; module docstring, "Schema versions").
+#: - 20 (#1388, paper-trading plan T157; ADR 0017 part E): `owner_decisions.kind`
+#:   widened with `shakedown_span` and `shakedown_note`, every row kept
+#:   (`_migrate_shakedown_kinds`, on every store; module docstring, "Schema
+#:   versions").
+#: - 21 (#1358, data-foundation plan T164b): the `filing_events` table, created
+#:   by the DDL pass (`_FILING_EVENTS_TABLE_DDL`); no existing table changes
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 22, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 21
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -592,6 +645,20 @@ _PRE_EXPANSION_SEAMS_VERSION = 16
 #: `trials.development_boundary` (#1319, T140b, version 18): read-only
 #: connections serve every read (nothing reads the new column before T142b).
 _PRE_RELEASE_VERSION = 17
+
+#: The last version without `alerts.book_id` (#1370, T154, version 19):
+#: read-only connections serve every read but `store.journal.alerts_for`
+#: (which only the writing `Alerter` calls; a writer migrates first).
+_PRE_ALERT_BOOKS_VERSION = 18
+
+#: The last version without the shakedown decision kinds (#1388, T157, version
+#: 20): read-only connections serve every read (no shakedown row can exist).
+_PRE_SHAKEDOWN_VERSION = 19
+
+#: The last version without `filing_events` (#1358, T164b, version 21):
+#: read-only connections serve every other read; a `filing_events` read there
+#: fails on the missing table, as a `statement_facts` read did at version 9.
+_PRE_FILING_EVENTS_VERSION = 20
 
 
 class SchemaVersionError(RuntimeError):
@@ -800,6 +867,31 @@ CREATE TABLE IF NOT EXISTS statement_facts (
 )
 """
 
+# Filing events (amendment 2026-10-09, #1358; spec "Data / interfaces" >
+# Amendment 2026-10-09). One row per filing whose form is in
+# `edgar.event_forms` (8-K, 8-K/A by default) of an issuer CIK. Keyed by
+# **cik**, as statement_facts is (a filing is the issuer's; the as-of read
+# resolves through the master). `items` is the submissions payload's string
+# verbatim ('2.02,9.01'; '' when the payload lists none, never NULL), so the
+# store parses no SEC item code. `accepted_at` is the stamped acceptance and
+# known_at equals it, never the index's filing date (an 8-K accepted 16:00 to
+# 17:30 New York carries that session's filing date); the CHECK holds that at
+# the schema level. UNIQUE (cik, accession) excludes known_at: an accession is
+# EDGAR's permanent id of one submission, so the table has no revisions by
+# construction, and an 8-K/A is another accession and another row.
+_CREATE_FILING_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS filing_events (
+    cik VARCHAR NOT NULL,
+    accession VARCHAR NOT NULL,
+    form VARCHAR NOT NULL,
+    items VARCHAR NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["filing_events"])},
+    CHECK (known_at = accepted_at),
+    UNIQUE (cik, accession)
+)
+"""
+
 # Not a fact table (spec "Data / interfaces" > Tables): no known_at,
 # ingested_at, source or provenance columns, and no per-fact provenance
 # concept applies to an ingest job's own status row.
@@ -836,6 +928,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "corporate_actions",
     "facts",
     "statement_facts",
+    "filing_events",
     "ingestion_runs",
     "schema_version",
 )
@@ -867,6 +960,12 @@ _TABLE_DDL: tuple[str, ...] = (
 #: the next schema version with its own migration, exactly as `_TABLE_DDL`
 #: itself is guarded.
 _STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
+
+#: `filing_events` (#1358, T164b), added at version 21: its own tuple, as
+#: `_STATEMENT_FACTS_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
+#: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
+#: schema version with its own migration.
+_FILING_EVENTS_TABLE_DDL: tuple[str, ...] = (_CREATE_FILING_EVENTS,)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -1754,7 +1853,9 @@ CREATE TABLE IF NOT EXISTS overrides (
 
 # run_id is NULL for an alert raised outside a run (`locked`, `no_window`).
 # session is the run's S, or the calendar session containing `at` (the next
-# one on a non-session day): always set, since alerts dedupe on it.
+# one on a non-session day): always set, since alerts dedupe on it. book_id
+# (version 19, ADR 0017 B.6): the book whose run or entry raised it, so the
+# session-scoped kinds dedupe per (book, kind, session).
 _CREATE_ALERTS = f"""
 CREATE TABLE IF NOT EXISTS alerts (
     alert_id BIGINT NOT NULL PRIMARY KEY,
@@ -1763,6 +1864,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     kind VARCHAR NOT NULL,
     message VARCHAR NOT NULL,
     "at" TIMESTAMPTZ NOT NULL,
+    book_id VARCHAR NOT NULL DEFAULT '{DEFAULT_BOOK_ID}',
     {_JOURNAL_TIMESTAMPS}
 )
 """
@@ -2263,6 +2365,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
         _PRE_RELEASE_VERSION,
+        _PRE_ALERT_BOOKS_VERSION,
+        _PRE_SHAKEDOWN_VERSION,
+        _PRE_FILING_EVENTS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2281,7 +2386,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (`store.journal.require_journal`, naming the fix): the eight expanded
         # tables lack `book_id`; version 17 serves every read (a data-release
         # row cannot exist there, and nothing reads `trials.development_boundary`
-        # before T142b).
+        # before T142b); version 18 every read but `journal.alerts_for` (no
+        # `alerts.book_id`), which only the writing `Alerter` calls; version 19
+        # every read (no shakedown row can exist there); version 20 every read
+        # but `filing_events`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2844,9 +2952,46 @@ def _migrate_release_kinds(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _migrate_alert_books(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 19 (module docstring, "Schema versions"): rebuild `alerts` with
+    its version-19 DDL where it lacks `book_id`, every row kept in insertion
+    order with `book_id = DEFAULT_BOOK_ID` (no alert before version 19 can
+    belong to another book) and every other column, `known_at` and
+    `ingested_at` included, unchanged. Idempotent: an `alerts` that already
+    has `book_id` (a version-4 store's, created from the current DDL in the
+    same open) is left alone. Runs inside `init_schema`'s transaction, after
+    `_migrate_release_kinds`."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('alerts')").fetchall()}
+    if "book_id" in columns:
+        return
+    conn.execute(
+        _CREATE_ALERTS.replace(
+            "CREATE TABLE IF NOT EXISTS alerts (", "CREATE TABLE alerts_v19 (", 1
+        )
+    )
+    conn.execute("INSERT INTO alerts_v19 BY NAME SELECT * FROM alerts ORDER BY rowid")
+    conn.execute("DROP TABLE alerts")
+    conn.execute("ALTER TABLE alerts_v19 RENAME TO alerts")
+    forget_column_types(conn)
+
+
+def _migrate_shakedown_kinds(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 20 (module docstring, "Schema versions"): widen
+    `owner_decisions.kind` with `lab_schema.SHAKEDOWN_DECISION_KINDS` by
+    `lab_schema.widen_enum` (a no-op once present; every row kept in insertion
+    order, byte-identical). Idempotent; runs on a fresh or migrating writable
+    store (never one already at 20), inside `init_schema`'s transaction, after
+    `_migrate_alert_books`. `lab_schema` imports this module, so it is imported
+    here, at call time."""
+    from tradepartner.store import lab_schema
+
+    lab_schema.widen_enum(conn, "owner_decisions", "kind", lab_schema.SHAKEDOWN_DECISION_KINDS)
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 17 store to version 18.
+    version-2 to 20 store to version 21.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -2859,6 +3004,14 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `filing_events` created where it lacks it (purely additive; a version-20
+    store gets a version-21 row; #1358, T164b); every store gets
+    `owner_decisions.kind` widened with `shakedown_span` and `shakedown_note`
+    (every row kept), and a version-19 store a version-20 row (#1388, T157);
+    a version-18 or earlier store
+    gets `alerts` rebuilt with `book_id` where it lacks it (every row kept in
+    insertion order, `book_id = 'main'`; #1370, T154) and a version-19 row;
+    every store gets
     `owner_decisions.kind` widened with `data_release` and
     `development_boundary` (every row kept) and the nullable
     `trials.development_boundary`, and a version-17 store a version-18 row
@@ -2903,7 +3056,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-18 or 17 store passes, and a
+    On a read-only connection no DDL runs: a version-21, 20 (every read but
+    `filing_events`, missing there), 19, 18 (every read but
+    `journal.alerts_for`, which only a writer calls) or 17 store passes, and a
     version-16 store serves fact, registry and lab reads while every journal
     read raises `SchemaVersionError` (`store.journal.require_journal`, naming
     the fix); 15 (every read but
@@ -2950,6 +3105,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_LAB_VERSION,
         _PRE_EXPANSION_SEAMS_VERSION,
         _PRE_RELEASE_VERSION,
+        _PRE_ALERT_BOOKS_VERSION,
+        _PRE_SHAKEDOWN_VERSION,
+        _PRE_FILING_EVENTS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -2986,6 +3144,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _MASTER_UNDERIVED_TABLE_DDL
             + _RESEARCH_TABLE_DDL
             + _REBALANCE_COUNTS_TABLE_DDL
+            + _FILING_EVENTS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
@@ -3004,6 +3163,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_expansion_seams(conn)
         if max_version is None or max_version <= _PRE_RELEASE_VERSION:
             _migrate_release_kinds(conn)
+        if max_version is not None and max_version <= _PRE_ALERT_BOOKS_VERSION:
+            _migrate_alert_books(conn)
+        if max_version is None or max_version <= _PRE_SHAKEDOWN_VERSION:
+            _migrate_shakedown_kinds(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

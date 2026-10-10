@@ -13,7 +13,9 @@ than the charter default, including an environment override, so it cannot
 be silently loosened; changing it is a charter amendment, not a config edit.
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
-Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`, the `ALERT_SMTP_*`
+Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (book `main`'s pair; every
+other book's is `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY`/`..._API_SECRET`, ADR 0017
+B.1, plan T153), the `ALERT_SMTP_*`
 credentials and the research vendor's `TYPESAFE_API_KEY`) are `SecretStr` so
 their values never appear in `repr()`/`str()` of `Settings`, including
 `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
@@ -766,7 +768,12 @@ class StrategyConfig(BaseModel):
     """12-1 momentum signal and portfolio rules (spec req 3; handoff H1).
 
     `formation_months` must exceed `skip_months`, or the formation window is empty.
-    `top_fraction` is a share of ranked names in (0, 1].
+    `top_fraction` is a share of ranked names in (0, 1]. `turnover_top_fraction` is the
+    share of members kept by B10's share-turnover screen before the rank, in (0, 1];
+    the default 1.0 is no screen (backtest spec amendment #1358). It is a `momentum`
+    rule and a post-registration own-section key (`backtest/frozen.py`
+    `POST_REGISTRATION_OWN_KEYS`): a file that leaves it out freezes 1.0, never the live
+    value.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -776,6 +783,7 @@ class StrategyConfig(BaseModel):
     top_fraction: float = Field(default=0.10, gt=0, le=1)
     weighting: Literal["equal"] = "equal"
     signal_total_return: bool = True
+    turnover_top_fraction: float = Field(default=1.0, gt=0, le=1)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -881,8 +889,10 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         parent=None,
         engine_ready=True,
         paper_ready=True,
-        exclusion_reasons=("no_history",),
-        count_names=("n_excluded_no_history",),
+        # `no_turnover` and its two counts are B10's screen, reported only when
+        # `strategy.turnover_top_fraction` is below 1.0 (backtest spec amendment #1358).
+        exclusion_reasons=("no_history", "no_turnover"),
+        count_names=("n_excluded_no_history", "n_screened", "n_excluded_no_turnover"),
         benchmark="MTUM",
         sweepable_keys=(
             "strategy.formation_months",
@@ -890,6 +900,7 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
             "strategy.top_fraction",
             "strategy.weighting",
             "strategy.signal_total_return",
+            "strategy.turnover_top_fraction",
         ),
     ),
     "oracle": FamilySpec(
@@ -908,7 +919,8 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         params_model=ProfitabilityConfig,
         parent=None,
         engine_ready=True,
-        paper_ready=False,
+        # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
+        paper_ready=True,
         # The four reasons `gross_profitability` may report (`backtest/signals.py:225`).
         exclusion_reasons=("sector", "no_facts", "stale_facts", "malformed"),
         # The six count names of spec amendment #720 (T85d).
@@ -933,9 +945,8 @@ FAMILIES: dict[HypothesisFamily, FamilySpec] = {
         # `FAMILY_PARENTS` (ADR 0014 open question 2).
         parent="momentum",
         engine_ready=True,
-        # Not paper-ready: `combined` lands through the engine registry only (ADR 0014
-        # point 5), so the paper planner never sees it.
-        paper_ready=False,
+        # Paper-ready by the owner's word in ADR 0017 part D (ADR 0014 point 5, T152).
+        paper_ready=True,
         # Momentum's reason, profitability's four, then the combination's own reason,
         # in the precedence `combined_rank` reports and pairwise disjoint (T130).
         exclusion_reasons=(
@@ -984,9 +995,10 @@ FAMILY_SIGNAL_SECTIONS: dict[HypothesisFamily, str] = {
 }
 
 # The families the engine can run today (#1053, folded into T85 by owner decision
-# 2026-10-06): `backtest run` enforces `ENGINE_FAMILIES`. Paper retains a smaller gate,
-# `PAPER_FAMILIES`, enforced by `paper start` and paper planning, until its journal
-# supports arbitrary signal exclusions (ADR 0014 point 5).
+# 2026-10-06): `backtest run` enforces `ENGINE_FAMILIES`. Paper keeps its own gate,
+# `PAPER_FAMILIES`, enforced by `paper start` and paper planning; a family joins it only
+# by the owner's word (ADR 0014 point 5; `profitability` and `combined` by ADR 0017
+# part D, T152).
 ENGINE_FAMILIES: tuple[HypothesisFamily, ...] = tuple(
     family for family, spec in FAMILIES.items() if spec.engine_ready
 )
@@ -1258,7 +1270,8 @@ class LabConfig(BaseModel):
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
 
 # The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
-# whole `risk.*` section; every other `paper.*` key is read at run time.
+# whole `risk.*` section; every other `paper.*` key is read at run time. `min_rebalances`
+# is frozen as its window's cadence's entry of the per-cadence table (ADR 0017 part C).
 FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "tracking_k",
     "min_rebalances",
@@ -1309,6 +1322,37 @@ def _is_set(value: str | SecretStr | None) -> bool:
     return bool(text.strip())
 
 
+#: The book whose paper key pair is `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET`
+#: (ADR 0017 B.1): H1's book, `store.schema.DEFAULT_BOOK_ID` and `paper.book_id`'s default.
+MAIN_BOOK_ID = "main"
+#: The settings field holding every other book's pair, and so the head of its variables.
+_BOOK_PAIRS_FIELD = "alpaca_paper_books"
+
+
+class AlpacaPaperKeyPair(BaseModel):
+    """One book's Alpaca paper key pair (ADR 0017 B.1, plan T153), read from
+    `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` / `ALPACA_PAPER_BOOKS__<TOKEN>__API_SECRET`.
+    Both halves are optional here so a half-set pair never stops `Settings` loading
+    (and with it every other book's run); the adapter refuses such a book alone
+    (`no_credentials`). A mistyped half is ignored the same way, never echoed."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
+
+    api_key: SecretStr | None = None
+    api_secret: SecretStr | None = None
+
+
+def paper_key_variable_names(book_id: str) -> tuple[str, str]:
+    """The environment variables holding `book_id`'s paper key pair (ADR 0017 B.1,
+    plan T153): `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` for book `main`
+    (unchanged), and `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY`/`..._API_SECRET` for every
+    other book, `<TOKEN>` the book token upper-cased. Names only, never a value."""
+    if book_id == MAIN_BOOK_ID:
+        return "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET"
+    head = f"{_BOOK_PAIRS_FIELD.upper()}__{book_id.upper()}__"
+    return f"{head}API_KEY", f"{head}API_SECRET"
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -1348,6 +1392,17 @@ class RiskConfig(BaseModel):
     reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
 
 
+# `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
+# spec's amendment of 2026-10-09): six months, a quarter of weeks, a quarter of sessions.
+# `paper start` freezes the window's cadence's entry as the scalar `paper.min_rebalances`
+# in `frozen_json`, so every reader of the frozen key reads one number.
+_DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
+    "month_end": 6,
+    "week_end": 13,
+    "daily": 63,
+}
+
+
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
@@ -1367,12 +1422,17 @@ class PaperConfig(BaseModel):
     `^[A-Za-z0-9]+$` (no `-` or `:`, so the prefix and the book parse from the
     left of the id, whose `security_id` may contain a `:`), is not in
     `FROZEN_PAPER_KEYS`, and defaults to `store.schema.DEFAULT_BOOK_ID`'s `"main"`.
+    `min_rebalances` is the per-cadence table (ADR 0017 part C): an entry for every
+    `Cadence`, each above zero; `paper start` freezes the window's cadence's entry as
+    the scalar `paper.min_rebalances` (`execution.window._frozen_params`).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     book_id: str = Field(default="main", min_length=1, pattern=r"^[A-Za-z0-9]+$")
-    min_rebalances: int = Field(default=6, gt=0)
+    min_rebalances: dict[Cadence, int] = Field(
+        default_factory=lambda: dict(_DEFAULT_MIN_REBALANCES)
+    )
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
@@ -1385,6 +1445,17 @@ class PaperConfig(BaseModel):
     order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
     live_capital_reference: float = Field(default=100.0, gt=0)
     min_override_reason_chars: int = Field(default=20, ge=1)
+
+    @field_validator("min_rebalances")
+    @classmethod
+    def _validate_min_rebalances(cls, value: dict[Cadence, int]) -> dict[Cadence, int]:
+        missing = sorted(set(get_args(Cadence)) - set(value))
+        if missing:
+            raise ValueError(f"paper.min_rebalances is missing an entry for {missing}")
+        not_positive = sorted(cadence for cadence, count in value.items() if count <= 0)
+        if not_positive:
+            raise ValueError(f"paper.min_rebalances must be above 0 for {not_positive}")
+        return value
 
     @model_validator(mode="after")
     def _validate_poll_within_accept_wait(self) -> PaperConfig:
@@ -1583,6 +1654,11 @@ class Settings(BaseSettings):
     # fall back to the data keys, so a live-capable key is never in the order path.
     alpaca_paper_api_key: SecretStr | None = Field(default=None)
     alpaca_paper_api_secret: SecretStr | None = Field(default=None)
+    # ADR 0017 B.1 (plan T153): every book but `main` has its own pair, keyed by its
+    # token (`paper_key_variable_names`). Never a fallback to `main`'s pair or the
+    # data keys: a book with no entry has no pair. Environment names are
+    # case-insensitive, so the keys arrive lower-cased.
+    alpaca_paper_books: dict[str, AlpacaPaperKeyPair] = Field(default_factory=dict)
     # Phase 4 (spec req 11): the optional `email` alert channel. Top-level like the other
     # env-named secrets, because the nested delimiter is `__` and the spec names these
     # variables `ALERT_SMTP_HOST` etc.
@@ -1707,12 +1783,19 @@ def secret_values(settings: Settings) -> list[str]:
     """The value of every `SecretStr` field on `settings`, found by type, so a
     secret added to `Settings` later is redacted without editing a list (#334,
     #342). Blank values are left out; values are stripped; longest first, so a
-    secret that contains another is redacted whole."""
+    secret that contains another is redacted whole. The per-book paper pairs
+    (T153) sit one level down, in `alpaca_paper_books`, and are included."""
     values = []
     for name in type(settings).model_fields:
-        secret = getattr(settings, name)
-        if isinstance(secret, SecretStr):
-            value = secret.get_secret_value().strip()
-            if value:
-                values.append(value)
+        field = getattr(settings, name)
+        candidates = [field]
+        if name == _BOOK_PAIRS_FIELD:
+            candidates += [
+                half for pair in field.values() for half in (pair.api_key, pair.api_secret)
+            ]
+        for secret in candidates:
+            if isinstance(secret, SecretStr):
+                value = secret.get_secret_value().strip()
+                if value:
+                    values.append(value)
     return sorted(set(values), key=len, reverse=True)

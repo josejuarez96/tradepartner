@@ -20,8 +20,11 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
   (`execution.outcomes`); added 2026-10-01 by the owner's answer to #366 Q5.
   Run-scoped.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
-  No run id; one alert per (kind, session), `session` being the calendar session
-  containing the instant, or the next one on a non-session day (the caller's).
+  No run id; one alert per (book, kind, session), `session` being the calendar
+  session containing the instant, or the next one on a non-session day (the
+  caller's), and the book the caller's (`alerts.book_id`, schema version 19,
+  ADR 0017 B.6; `main` unless given), so one book's `locked` never hides
+  another's.
 - `kill_switch_write_failed`: the halt path when the `kill_switch` row itself
   could not be written, so the store cannot be trusted. It never touches the
   store: `deliver_without_store` sends it through the other channels only and
@@ -72,6 +75,7 @@ from tradepartner.config import Settings, secret_values
 from tradepartner.store import journal
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import AlertDeliveryRow, AlertRow
+from tradepartner.store.schema import DEFAULT_BOOK_ID
 
 __all__ = [
     "ALERT_KINDS",
@@ -156,6 +160,7 @@ class Alerter:
         message: str,
         *,
         clock_fault: bool = False,
+        book_id: str = DEFAULT_BOOK_ID,
     ) -> int:
         """Append the alert (unless its dedupe key already has one) and deliver it;
         return its `alert_id`, the existing one for a duplicate, which is not
@@ -165,8 +170,11 @@ class Alerter:
         (the caller then falls back to `deliver_without_store`). Never raises for
         a delivery failure. `clock_fault=True` (the halt path after a
         `ClockError`) stamps every row with `store.db.utc_now()` and never reads
-        the clock, which may be returning implausible but well-formed values."""
+        the clock, which may be returning implausible but well-formed values.
+        `book_id` is journaled on the row and, for a session-scoped kind, is part
+        of its dedupe key (`ValueError` outside the book token grammar)."""
         _check_kind(kind)
+        journal.check_book_id(book_id)
         if kind in NON_STORE_KINDS:
             raise ValueError(f"{kind} never touches the store: use deliver_without_store")
         if kind in SESSION_SCOPED_KINDS and run_id is not None:
@@ -174,7 +182,7 @@ class Alerter:
         if kind not in SESSION_SCOPED_KINDS and run_id is None:
             raise ValueError(f"{kind} is run-scoped and needs a run id")
         message = self._scrub(message)
-        existing = self._existing(kind, run_id, session)
+        existing = self._existing(kind, run_id, session, book_id)
         if existing is not None:
             return existing
         now = self._now(clock_fault)
@@ -186,6 +194,7 @@ class Alerter:
                 kind=kind,
                 message=message,
                 at=now,
+                book_id=book_id,
                 known_at=now,
                 ingested_at=now,
             ),
@@ -223,9 +232,9 @@ class Alerter:
 
     # --- internals ---------------------------------------------------------------------
 
-    def _existing(self, kind: str, run_id: int | None, session: date) -> int | None:
+    def _existing(self, kind: str, run_id: int | None, session: date, book_id: str) -> int | None:
         if run_id is None:
-            rows = journal.alerts_for(self._conn, kind=kind, session=session)
+            rows = journal.alerts_for(self._conn, kind=kind, session=session, book_id=book_id)
             return rows[0].alert_id if rows else None
         journal.require_journal(self._conn)
         row = self._conn.execute(

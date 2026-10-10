@@ -89,3 +89,13 @@ def test_h1_power_arithmetic_counts() -> None:
     assert len(schedule.rebalance_sessions(parsed.holdout_start, parsed.holdout_end)) == 33
     assert len(schedule.rebalance_sessions(LAST_IN_SAMPLE_REBALANCE, parsed.holdout_end)) == 34
     assert parsed.holdout_end == last_session_of_month(2026, 9)
+
+
+def test_h1_file_does_not_name_the_turnover_key_and_freezes_no_screen() -> None:
+    """B10's key (backtest spec amendment #1358) is not required, so H1's unchanged file
+    parses, and its frozen set reads 1.0 (no screen) whatever the live value."""
+    parsed = hypothesis.parse_file(H1_PATH)
+    assert "strategy.turnover_top_fraction" not in parsed.file_params
+    assert "strategy.turnover_top_fraction" not in hypothesis.required_keys("momentum")
+    live = Settings(_env_file=None, strategy={"turnover_top_fraction": 0.5})  # type: ignore[call-arg]
+    assert hypothesis.frozen_params(parsed, live)["strategy.turnover_top_fraction"] == 1.0

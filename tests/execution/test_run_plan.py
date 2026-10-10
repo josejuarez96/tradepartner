@@ -85,6 +85,8 @@ class Env:
     clock: Clock
     prices: dict[str, float] = field(default_factory=dict)
     window: PaperWindowRow | None = None
+    #: The names the fake prices at the closes of S-1 (`SYMBOLS` by default).
+    symbols: dict[str, str] = field(default_factory=lambda: dict(SYMBOLS))
     fake: FakeBroker = field(init=False)
 
     def __post_init__(self) -> None:
@@ -114,7 +116,7 @@ class Env:
             [previous_session(session)],
         )
         closes = dict(rows)
-        for sid, symbol in SYMBOLS.items():
+        for sid, symbol in self.symbols.items():
             if sid in closes:
                 self.prices[symbol] = float(closes[sid])
         self.clock.now = now
@@ -135,12 +137,14 @@ class Env:
         with open_for_write(self.settings) as conn:
             return [append(conn, row) for row in rows]  # type: ignore[arg-type]
 
-    def open_window(self, tmp_path: Path) -> PaperWindowRow:
-        """The window on a registered hypothesis (as `test_planning.py`)."""
+    def open_window(self, tmp_path: Path, cadence: str = "month_end") -> PaperWindowRow:
+        """The window on a registered hypothesis (as `test_planning.py`) rebalancing at
+        `cadence`."""
         params = Settings(
             _env_file=None,
             strategy={"top_fraction": 0.5},
             holdout={"start": HOLDOUT_START.isoformat(), "end": HOLDOUT_END.isoformat()},
+            schedule={"rebalance_cadence": cadence},
         )
         elsewhere = Settings(_env_file=None, store={"path": str(tmp_path / "elsewhere.duckdb")})
         with open_for_write(self.settings) as conn:
@@ -626,3 +630,43 @@ def test_a_lagging_fill_leaves_the_rebalance_pending_with_no_plan(
     )
     assert statuses == [("fills_lagging",), ("fills_lagging",)]
     assert any("fills_lagging" in note for note in outcome.notes)
+
+
+# --- the daily lapse (ADR 0017 part C, section 2) ---------------------------------------
+
+
+@pytest.fixture
+def daily_env(fixture_store_path: Path, tmp_path: Path) -> Env:
+    """`env` with the hypothesis registered at `daily`: every session is a rebalance
+    session, so T_1 = F_0 = 2019-05-01 and F_1 = 2019-05-02."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(fixture_store_path)},
+        alpaca={"quantity_decimals": 6, "client_order_id_max_length": 48},
+    )
+    env = Env(settings, Clock(at(F_0)))
+    #: The plan at close(T_1) also buys WNDX, which the plan at close(T_0) does not.
+    env.symbols["SEC_WINDOW_DELIST"] = "WNDX"
+    env.open_window(tmp_path, cadence="daily")
+    return env
+
+
+def test_at_daily_a_pending_rebalance_lapses_on_the_next_fill_session_which_plans_the_next(
+    daily_env: Env,
+) -> None:
+    """ADR 0017 section 2: at `daily` the next rebalance's fill session follows F_i at
+    once, so T_0, left pending by a missing F_0 run, lapses `missed`
+    (`catch_up_lapsed`) on F_1 although `paper.max_catch_up_sessions` (2) has not run
+    out, and the same run plans and executes T_1: `due_rebalance` plans only the latest
+    due rebalance, and a rebalance it can no longer plan is never left pending."""
+    t_1, f_1 = F_0, F_0_PLUS_1
+    outcome = daily_env.run(at(f_1))
+    assert outcome.status == "ok", daily_env.result(outcome.run_id)
+    assert outcome.kind == "rebalance"
+    assert daily_env.rebalance_events() == [
+        (T_0, "missed", "catch_up_lapsed", outcome.run_id),
+        (t_1, "executed", None, outcome.run_id),
+    ]
+    ((planned,),) = daily_env.query("SELECT rebalance_session FROM paper_plans")
+    assert planned == t_1
+    assert daily_env.query("SELECT DISTINCT session FROM orders") == [(f_1,)]
