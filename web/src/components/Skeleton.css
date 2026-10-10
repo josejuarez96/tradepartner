@@ -1,0 +1,16 @@
+.skel {
+  display: block;
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-sunken);
+}
+.skel::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--skeleton-shine), transparent);
+  animation: skel 1.4s var(--ease) infinite;
+}
+@keyframes skel { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .skel::after { animation: none; } }

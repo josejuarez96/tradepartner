@@ -1,0 +1,1035 @@
+{
+ "sample": true,
+ "note": "SAMPLE DATA for the UI prototype. Not real positions, prices or results.",
+ "as_of": "2026-10-09T20:00:00Z",
+ "updated_at": "2026-10-09T21:12:00Z",
+ "account_mode": "paper",
+ "benchmark": {
+  "symbol": "SPY",
+  "name": "S&P 500 (SPY)",
+  "closes": [
+   {
+    "date": "2026-07-01",
+    "close": 612.4
+   },
+   {
+    "date": "2026-07-02",
+    "close": 611.84
+   },
+   {
+    "date": "2026-07-06",
+    "close": 614.34
+   },
+   {
+    "date": "2026-07-07",
+    "close": 615.86
+   },
+   {
+    "date": "2026-07-08",
+    "close": 617.92
+   },
+   {
+    "date": "2026-07-09",
+    "close": 622.23
+   },
+   {
+    "date": "2026-07-10",
+    "close": 622.4
+   },
+   {
+    "date": "2026-07-13",
+    "close": 612.86
+   },
+   {
+    "date": "2026-07-14",
+    "close": 616.91
+   },
+   {
+    "date": "2026-07-15",
+    "close": 622.79
+   },
+   {
+    "date": "2026-07-16",
+    "close": 623.22
+   },
+   {
+    "date": "2026-07-17",
+    "close": 619.17
+   },
+   {
+    "date": "2026-07-20",
+    "close": 624.38
+   },
+   {
+    "date": "2026-07-21",
+    "close": 616.43
+   },
+   {
+    "date": "2026-07-22",
+    "close": 616.97
+   },
+   {
+    "date": "2026-07-23",
+    "close": 613.75
+   },
+   {
+    "date": "2026-07-24",
+    "close": 615.37
+   },
+   {
+    "date": "2026-07-27",
+    "close": 613.65
+   },
+   {
+    "date": "2026-07-28",
+    "close": 617.13
+   },
+   {
+    "date": "2026-07-29",
+    "close": 614.07
+   },
+   {
+    "date": "2026-07-30",
+    "close": 618.93
+   },
+   {
+    "date": "2026-07-31",
+    "close": 621.91
+   },
+   {
+    "date": "2026-08-03",
+    "close": 617.4
+   },
+   {
+    "date": "2026-08-04",
+    "close": 615.47
+   },
+   {
+    "date": "2026-08-05",
+    "close": 616.52
+   },
+   {
+    "date": "2026-08-06",
+    "close": 611.74
+   },
+   {
+    "date": "2026-08-07",
+    "close": 613.31
+   },
+   {
+    "date": "2026-08-10",
+    "close": 611.88
+   },
+   {
+    "date": "2026-08-11",
+    "close": 617.41
+   },
+   {
+    "date": "2026-08-12",
+    "close": 613.24
+   },
+   {
+    "date": "2026-08-13",
+    "close": 618.71
+   },
+   {
+    "date": "2026-08-14",
+    "close": 619.77
+   },
+   {
+    "date": "2026-08-17",
+    "close": 613.12
+   },
+   {
+    "date": "2026-08-18",
+    "close": 612.69
+   },
+   {
+    "date": "2026-08-19",
+    "close": 611.95
+   },
+   {
+    "date": "2026-08-20",
+    "close": 601.77
+   },
+   {
+    "date": "2026-08-21",
+    "close": 598.77
+   },
+   {
+    "date": "2026-08-24",
+    "close": 602.77
+   },
+   {
+    "date": "2026-08-25",
+    "close": 608.53
+   },
+   {
+    "date": "2026-08-26",
+    "close": 609.4
+   },
+   {
+    "date": "2026-08-27",
+    "close": 607.24
+   },
+   {
+    "date": "2026-08-28",
+    "close": 605.9
+   },
+   {
+    "date": "2026-08-31",
+    "close": 602.13
+   },
+   {
+    "date": "2026-09-01",
+    "close": 601.2
+   },
+   {
+    "date": "2026-09-02",
+    "close": 600.58
+   },
+   {
+    "date": "2026-09-03",
+    "close": 598.59
+   },
+   {
+    "date": "2026-09-04",
+    "close": 592.76
+   },
+   {
+    "date": "2026-09-08",
+    "close": 585.33
+   },
+   {
+    "date": "2026-09-09",
+    "close": 582.16
+   },
+   {
+    "date": "2026-09-10",
+    "close": 582.31
+   },
+   {
+    "date": "2026-09-11",
+    "close": 589.29
+   },
+   {
+    "date": "2026-09-14",
+    "close": 592.5
+   },
+   {
+    "date": "2026-09-15",
+    "close": 593.56
+   },
+   {
+    "date": "2026-09-16",
+    "close": 587.87
+   },
+   {
+    "date": "2026-09-17",
+    "close": 583.17
+   },
+   {
+    "date": "2026-09-18",
+    "close": 576.37
+   },
+   {
+    "date": "2026-09-21",
+    "close": 585.35
+   },
+   {
+    "date": "2026-09-22",
+    "close": 582.39
+   },
+   {
+    "date": "2026-09-23",
+    "close": 578.85
+   },
+   {
+    "date": "2026-09-24",
+    "close": 579.44
+   },
+   {
+    "date": "2026-09-25",
+    "close": 583.5
+   },
+   {
+    "date": "2026-09-28",
+    "close": 581.18
+   },
+   {
+    "date": "2026-09-29",
+    "close": 581
+   },
+   {
+    "date": "2026-09-30",
+    "close": 583.28
+   },
+   {
+    "date": "2026-10-01",
+    "close": 589.16
+   },
+   {
+    "date": "2026-10-02",
+    "close": 590.3
+   },
+   {
+    "date": "2026-10-05",
+    "close": 598.3
+   },
+   {
+    "date": "2026-10-06",
+    "close": 596.58
+   },
+   {
+    "date": "2026-10-07",
+    "close": 592.48
+   },
+   {
+    "date": "2026-10-08",
+    "close": 598.34
+   },
+   {
+    "date": "2026-10-09",
+    "close": 607.76
+   }
+  ]
+ },
+ "portfolio": {
+  "equity": [
+   {
+    "date": "2026-08-03",
+    "value": 100000,
+    "index": 100
+   },
+   {
+    "date": "2026-08-04",
+    "value": 99201.74,
+    "index": 99.2017
+   },
+   {
+    "date": "2026-08-05",
+    "value": 99741.53,
+    "index": 99.7415
+   },
+   {
+    "date": "2026-08-06",
+    "value": 98673.19,
+    "index": 98.6732
+   },
+   {
+    "date": "2026-08-07",
+    "value": 98461,
+    "index": 98.461
+   },
+   {
+    "date": "2026-08-10",
+    "value": 98264.75,
+    "index": 98.2647
+   },
+   {
+    "date": "2026-08-11",
+    "value": 99553.45,
+    "index": 99.5534
+   },
+   {
+    "date": "2026-08-12",
+    "value": 97835.18,
+    "index": 97.8352
+   },
+   {
+    "date": "2026-08-13",
+    "value": 99395.35,
+    "index": 99.3953
+   },
+   {
+    "date": "2026-08-14",
+    "value": 99961.35,
+    "index": 99.9614
+   },
+   {
+    "date": "2026-08-17",
+    "value": 99368.33,
+    "index": 99.3683
+   },
+   {
+    "date": "2026-08-18",
+    "value": 100435.66,
+    "index": 100.4357
+   },
+   {
+    "date": "2026-08-19",
+    "value": 100829.46,
+    "index": 100.8295
+   },
+   {
+    "date": "2026-08-20",
+    "value": 98845.32,
+    "index": 98.8453
+   },
+   {
+    "date": "2026-08-21",
+    "value": 99455.98,
+    "index": 99.456
+   },
+   {
+    "date": "2026-08-24",
+    "value": 100442.89,
+    "index": 100.4429
+   },
+   {
+    "date": "2026-08-25",
+    "value": 100730.79,
+    "index": 100.7308
+   },
+   {
+    "date": "2026-08-26",
+    "value": 100252.3,
+    "index": 100.2523
+   },
+   {
+    "date": "2026-08-27",
+    "value": 99287.73,
+    "index": 99.2877
+   },
+   {
+    "date": "2026-08-28",
+    "value": 100276.78,
+    "index": 100.2768
+   },
+   {
+    "date": "2026-08-31",
+    "value": 98911.68,
+    "index": 98.9117
+   },
+   {
+    "date": "2026-09-01",
+    "value": 198301.22,
+    "index": 98.3012
+   },
+   {
+    "date": "2026-09-02",
+    "value": 198477.39,
+    "index": 98.3886
+   },
+   {
+    "date": "2026-09-03",
+    "value": 197399.15,
+    "index": 97.854
+   },
+   {
+    "date": "2026-09-04",
+    "value": 195472.18,
+    "index": 96.8988
+   },
+   {
+    "date": "2026-09-08",
+    "value": 192613.55,
+    "index": 95.4817
+   },
+   {
+    "date": "2026-09-09",
+    "value": 190734.6,
+    "index": 94.5503
+   },
+   {
+    "date": "2026-09-10",
+    "value": 191008.38,
+    "index": 94.686
+   },
+   {
+    "date": "2026-09-11",
+    "value": 192658.05,
+    "index": 95.5038
+   },
+   {
+    "date": "2026-09-14",
+    "value": 195318.65,
+    "index": 96.8227
+   },
+   {
+    "date": "2026-09-15",
+    "value": 196801.63,
+    "index": 97.5578
+   },
+   {
+    "date": "2026-09-16",
+    "value": 195535.39,
+    "index": 96.9302
+   },
+   {
+    "date": "2026-09-17",
+    "value": 193116.09,
+    "index": 95.7309
+   },
+   {
+    "date": "2026-09-18",
+    "value": 191561.67,
+    "index": 94.9603
+   },
+   {
+    "date": "2026-09-21",
+    "value": 193656.4,
+    "index": 95.9987
+   },
+   {
+    "date": "2026-09-22",
+    "value": 191281.89,
+    "index": 94.8216
+   },
+   {
+    "date": "2026-09-23",
+    "value": 191060.48,
+    "index": 94.7119
+   },
+   {
+    "date": "2026-09-24",
+    "value": 191639.5,
+    "index": 94.9989
+   },
+   {
+    "date": "2026-09-25",
+    "value": 193392.44,
+    "index": 95.8679
+   },
+   {
+    "date": "2026-09-28",
+    "value": 192744.4,
+    "index": 95.5466
+   },
+   {
+    "date": "2026-09-29",
+    "value": 193324.89,
+    "index": 95.8344
+   },
+   {
+    "date": "2026-09-30",
+    "value": 194695.17,
+    "index": 96.5136
+   },
+   {
+    "date": "2026-10-01",
+    "value": 196609.88,
+    "index": 97.4628
+   },
+   {
+    "date": "2026-10-02",
+    "value": 197996.41,
+    "index": 98.1501
+   },
+   {
+    "date": "2026-10-05",
+    "value": 200755.23,
+    "index": 99.5177
+   },
+   {
+    "date": "2026-10-06",
+    "value": 199849.67,
+    "index": 99.0688
+   },
+   {
+    "date": "2026-10-07",
+    "value": 199417.74,
+    "index": 98.8547
+   },
+   {
+    "date": "2026-10-08",
+    "value": 200842.76,
+    "index": 99.5611
+   },
+   {
+    "date": "2026-10-09",
+    "value": 303325.4,
+    "index": 100.7874
+   }
+  ]
+ },
+ "strategies": [
+  {
+   "id": "h1-monthly-momentum",
+   "name": "Monthly momentum",
+   "idea": "Own the stocks that rose most over the past year, skipping the last month. Reshuffle once a month.",
+   "backtest": {
+    "period": "2020-08-31 to 2023-12-29",
+    "annual_return": 0.141,
+    "benchmark_annual_return": 0.112,
+    "max_drawdown": -0.187,
+    "verdict": "pass"
+   },
+   "on_paper": true
+  },
+  {
+   "id": "daily-momentum",
+   "name": "Daily momentum",
+   "idea": "Same idea as monthly momentum, but rechecked every day before the open.",
+   "backtest": {
+    "period": "2020-08-31 to 2023-12-29",
+    "annual_return": 0.128,
+    "benchmark_annual_return": 0.112,
+    "max_drawdown": -0.224,
+    "verdict": "pass"
+   },
+   "on_paper": true
+  },
+  {
+   "id": "profitability",
+   "name": "Profitability",
+   "idea": "Own companies that turn the most gross profit per dollar of assets.",
+   "backtest": {
+    "period": "2020-08-31 to 2023-12-29",
+    "annual_return": 0.119,
+    "benchmark_annual_return": 0.112,
+    "max_drawdown": -0.162,
+    "verdict": "pass"
+   },
+   "on_paper": true
+  }
+ ],
+ "books": [
+  {
+   "id": "main",
+   "name": "main",
+   "strategy_id": "h1-monthly-momentum",
+   "cadence": "monthly",
+   "started_on": "2026-10-09",
+   "start_equity": 100008.9,
+   "status": {
+    "state": "running"
+   },
+   "equity": [
+    {
+     "date": "2026-10-09",
+     "value": 100008.9
+    }
+   ],
+   "cash": 100008.9,
+   "positions": [],
+   "orders": [],
+   "last_run": {
+    "at": "2026-10-09T13:05:00Z",
+    "outcome": "ok",
+    "summary": "Opened the book. Holding cash until the first rebalance."
+   },
+   "next_run": {
+    "at": "2026-10-30T13:05:00Z",
+    "what": "First rebalance"
+   }
+  },
+  {
+   "id": "daily",
+   "name": "daily",
+   "strategy_id": "daily-momentum",
+   "cadence": "daily",
+   "started_on": "2026-08-03",
+   "start_equity": 100000,
+   "status": {
+    "state": "running"
+   },
+   "equity": [
+    {
+     "date": "2026-08-03",
+     "value": 100000
+    },
+    {
+     "date": "2026-08-04",
+     "value": 99201.74
+    },
+    {
+     "date": "2026-08-05",
+     "value": 99741.53
+    },
+    {
+     "date": "2026-08-06",
+     "value": 98673.19
+    },
+    {
+     "date": "2026-08-07",
+     "value": 98461
+    },
+    {
+     "date": "2026-08-10",
+     "value": 98264.75
+    },
+    {
+     "date": "2026-08-11",
+     "value": 99553.45
+    },
+    {
+     "date": "2026-08-12",
+     "value": 97835.18
+    },
+    {
+     "date": "2026-08-13",
+     "value": 99395.35
+    },
+    {
+     "date": "2026-08-14",
+     "value": 99961.35
+    },
+    {
+     "date": "2026-08-17",
+     "value": 99368.33
+    },
+    {
+     "date": "2026-08-18",
+     "value": 100435.66
+    },
+    {
+     "date": "2026-08-19",
+     "value": 100829.46
+    },
+    {
+     "date": "2026-08-20",
+     "value": 98845.32
+    },
+    {
+     "date": "2026-08-21",
+     "value": 99455.98
+    },
+    {
+     "date": "2026-08-24",
+     "value": 100442.89
+    },
+    {
+     "date": "2026-08-25",
+     "value": 100730.79
+    },
+    {
+     "date": "2026-08-26",
+     "value": 100252.3
+    },
+    {
+     "date": "2026-08-27",
+     "value": 99287.73
+    },
+    {
+     "date": "2026-08-28",
+     "value": 100276.78
+    },
+    {
+     "date": "2026-08-31",
+     "value": 98911.68
+    },
+    {
+     "date": "2026-09-01",
+     "value": 98301.22
+    },
+    {
+     "date": "2026-09-02",
+     "value": 98612.56
+    },
+    {
+     "date": "2026-09-03",
+     "value": 98155.39
+    },
+    {
+     "date": "2026-09-04",
+     "value": 96905.46
+    },
+    {
+     "date": "2026-09-08",
+     "value": 95668.39
+    },
+    {
+     "date": "2026-09-09",
+     "value": 94701.34
+    },
+    {
+     "date": "2026-09-10",
+     "value": 94941.79
+    },
+    {
+     "date": "2026-09-11",
+     "value": 95435.97
+    },
+    {
+     "date": "2026-09-14",
+     "value": 97401.74
+    },
+    {
+     "date": "2026-09-15",
+     "value": 98636.76
+    },
+    {
+     "date": "2026-09-16",
+     "value": 97989.78
+    },
+    {
+     "date": "2026-09-17",
+     "value": 96917.18
+    },
+    {
+     "date": "2026-09-18",
+     "value": 95936.12
+    },
+    {
+     "date": "2026-09-21",
+     "value": 97249.3
+    },
+    {
+     "date": "2026-09-22",
+     "value": 96375.52
+    },
+    {
+     "date": "2026-09-23",
+     "value": 96388.5
+    },
+    {
+     "date": "2026-09-24",
+     "value": 96636.84
+    },
+    {
+     "date": "2026-09-25",
+     "value": 97221.56
+    },
+    {
+     "date": "2026-09-28",
+     "value": 96691.54
+    },
+    {
+     "date": "2026-09-29",
+     "value": 97316.12
+    },
+    {
+     "date": "2026-09-30",
+     "value": 98714.59
+    },
+    {
+     "date": "2026-10-01",
+     "value": 100134.63
+    },
+    {
+     "date": "2026-10-02",
+     "value": 101131.53
+    },
+    {
+     "date": "2026-10-05",
+     "value": 103131.35
+    },
+    {
+     "date": "2026-10-06",
+     "value": 102510.39
+    },
+    {
+     "date": "2026-10-07",
+     "value": 102742.27
+    },
+    {
+     "date": "2026-10-08",
+     "value": 103264.2
+    },
+    {
+     "date": "2026-10-09",
+     "value": 104377.96
+    }
+   ],
+   "cash": 2191.94,
+   "positions": [
+    {
+     "symbol": "NVDA",
+     "name": "NVIDIA",
+     "weight": 0.112,
+     "target_weight": 0.1,
+     "value": 11690.33,
+     "unrealized_pnl": 1840.22
+    },
+    {
+     "symbol": "AVGO",
+     "name": "Broadcom",
+     "weight": 0.104,
+     "target_weight": 0.1,
+     "value": 10855.31,
+     "unrealized_pnl": 960.4
+    },
+    {
+     "symbol": "PLTR",
+     "name": "Palantir",
+     "weight": 0.101,
+     "target_weight": 0.1,
+     "value": 10542.17,
+     "unrealized_pnl": -412.75
+    },
+    {
+     "symbol": "META",
+     "name": "Meta Platforms",
+     "weight": 0.099,
+     "target_weight": 0.1,
+     "value": 10333.42,
+     "unrealized_pnl": 655.1
+    },
+    {
+     "symbol": "GE",
+     "name": "GE Aerospace",
+     "weight": 0.098,
+     "target_weight": 0.1,
+     "value": 10229.04,
+     "unrealized_pnl": 233.9
+    }
+   ],
+   "orders": [],
+   "last_run": {
+    "at": "2026-10-09T13:25:00Z",
+    "outcome": "ok",
+    "summary": "Sold 1, bought 1. 2 orders filled."
+   },
+   "next_run": {
+    "at": "2026-10-12T13:25:00Z",
+    "what": "Daily check"
+   }
+  },
+  {
+   "id": "b3",
+   "name": "b3",
+   "strategy_id": "profitability",
+   "cadence": "monthly",
+   "started_on": "2026-09-01",
+   "start_equity": 100000,
+   "status": {
+    "state": "running"
+   },
+   "equity": [
+    {
+     "date": "2026-09-01",
+     "value": 100000
+    },
+    {
+     "date": "2026-09-02",
+     "value": 99864.83
+    },
+    {
+     "date": "2026-09-03",
+     "value": 99243.76
+    },
+    {
+     "date": "2026-09-04",
+     "value": 98566.72
+    },
+    {
+     "date": "2026-09-08",
+     "value": 96945.16
+    },
+    {
+     "date": "2026-09-09",
+     "value": 96033.26
+    },
+    {
+     "date": "2026-09-10",
+     "value": 96066.59
+    },
+    {
+     "date": "2026-09-11",
+     "value": 97222.08
+    },
+    {
+     "date": "2026-09-14",
+     "value": 97916.91
+    },
+    {
+     "date": "2026-09-15",
+     "value": 98164.87
+    },
+    {
+     "date": "2026-09-16",
+     "value": 97545.61
+    },
+    {
+     "date": "2026-09-17",
+     "value": 96198.91
+    },
+    {
+     "date": "2026-09-18",
+     "value": 95625.55
+    },
+    {
+     "date": "2026-09-21",
+     "value": 96407.1
+    },
+    {
+     "date": "2026-09-22",
+     "value": 94906.37
+    },
+    {
+     "date": "2026-09-23",
+     "value": 94671.98
+    },
+    {
+     "date": "2026-09-24",
+     "value": 95002.66
+    },
+    {
+     "date": "2026-09-25",
+     "value": 96170.88
+    },
+    {
+     "date": "2026-09-28",
+     "value": 96052.86
+    },
+    {
+     "date": "2026-09-29",
+     "value": 96008.77
+    },
+    {
+     "date": "2026-09-30",
+     "value": 95980.58
+    },
+    {
+     "date": "2026-10-01",
+     "value": 96475.25
+    },
+    {
+     "date": "2026-10-02",
+     "value": 96864.88
+    },
+    {
+     "date": "2026-10-05",
+     "value": 97623.88
+    },
+    {
+     "date": "2026-10-06",
+     "value": 97339.28
+    },
+    {
+     "date": "2026-10-07",
+     "value": 96675.47
+    },
+    {
+     "date": "2026-10-08",
+     "value": 97578.56
+    },
+    {
+     "date": "2026-10-09",
+     "value": 98938.54
+    }
+   ],
+   "cash": 1187.26,
+   "positions": [
+    {
+     "symbol": "AAPL",
+     "name": "Apple",
+     "weight": 0.051,
+     "target_weight": 0.05,
+     "value": 5045.87,
+     "unrealized_pnl": 210.3
+    },
+    {
+     "symbol": "MSFT",
+     "name": "Microsoft",
+     "weight": 0.049,
+     "target_weight": 0.05,
+     "value": 4847.99,
+     "unrealized_pnl": -88.1
+    }
+   ],
+   "orders": [],
+   "last_run": {
+    "at": "2026-09-30T13:05:00Z",
+    "outcome": "ok",
+    "summary": "Rebalanced 20 names. 14 orders filled."
+   },
+   "next_run": {
+    "at": "2026-10-30T13:05:00Z",
+    "what": "Monthly rebalance"
+   }
+  }
+ ],
+ "alerts": []
+}

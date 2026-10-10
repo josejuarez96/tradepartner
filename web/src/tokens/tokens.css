@@ -1,0 +1,183 @@
+/*
+ * TradePartner design tokens. The only place a raw colour, size or duration
+ * may appear. Components use var(--…) and nothing else; charts read the same
+ * variables at runtime (src/lib/tokens.ts), so a chart and a number never
+ * disagree.
+ *
+ * Colour carries meaning, and only three things get one:
+ *   gain      money made, a number above the benchmark
+ *   loss      money lost, a number below it
+ *   attention something waiting on you (alerts, a stopped book)
+ * Everything else is ink on paper. Your own line is ink; the benchmark is a
+ * quieter ink. Contrast pairs are checked in docs/research/ui/tokens.md.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* ── Surfaces ─────────────────────────────────────────── */
+  --bg: #f6f5f1;            /* page: warm paper, not white */
+  --surface: #ffffff;       /* cards */
+  --surface-sunken: #efede7;/* wells, skeletons, segmented track */
+  --hairline: #e5e2da;      /* 1px dividers and card edges */
+  --hairline-strong: #d3cfc4;
+
+  /* ── Ink ──────────────────────────────────────────────── */
+  --ink: #16181d;           /* primary text, your line */
+  --ink-2: #565b64;         /* secondary text   6.8:1 on surface */
+  --ink-3: #646972;         /* tertiary, axes   5.5:1 on surface, 5.1:1 on bg */
+  --ink-inverse: #ffffff;
+
+  /* ── Meaning ──────────────────────────────────────────── */
+  --gain: #107a4c;          /* 5.3:1 on surface */
+  --gain-soft: #e3f1e9;
+  --loss: #b8352b;          /* 5.6:1 on surface */
+  --loss-soft: #f8e5e2;
+  --attention: #995200;     /* 5.6:1 on surface */
+  --attention-soft: #fbefdc;
+  --attention-edge: #e9b46a;
+
+  /* ── Chart ────────────────────────────────────────────── */
+  --chart-line: var(--ink);
+  --chart-fill-top: rgba(22, 24, 29, 0.09);
+  --chart-fill-bottom: rgba(22, 24, 29, 0);
+  --chart-benchmark: #8c9098;  /* decorative line; values it carries are also in text */
+  --chart-grid: #eeebe4;
+  --chart-crosshair: #b9b5ab;
+
+  /* ── Focus and states ─────────────────────────────────── */
+  --focus-ring: #2d5bd7;    /* the one non-meaning hue: keyboard focus only */
+  --hover-wash: rgba(22, 24, 29, 0.035);
+  --press-wash: rgba(22, 24, 29, 0.07);
+  --skeleton-shine: rgba(255, 255, 255, 0.6);
+
+  /* ── Elevation ────────────────────────────────────────── */
+  --shadow-card: 0 1px 0 rgba(22, 24, 29, 0.03), 0 1px 2px rgba(22, 24, 29, 0.04);
+  --shadow-pop: 0 1px 2px rgba(22, 24, 29, 0.06), 0 8px 24px rgba(22, 24, 29, 0.10);
+
+  /* ── Type ─────────────────────────────────────────────── */
+  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-num-features: "tnum" 1, "cv11" 1, "ss01" 1; /* tabular figures: digits never shift */
+
+  --text-2xs: 0.6875rem;/* 11  tab labels */
+  --text-xs: 0.75rem;   /* 12  meta, axis */
+  --text-sm: 0.8125rem; /* 13  labels, secondary */
+  --text-md: 0.9375rem; /* 15  body */
+  --text-lg: 1.0625rem; /* 17  row titles */
+  --text-xl: 1.375rem;  /* 22  section numbers */
+  --text-2xl: 2rem;     /* 32  hero on phone */
+  --text-3xl: 2.75rem;  /* 44  hero on desktop */
+
+  --leading-tight: 1.1;
+  --leading-snug: 1.3;
+  --leading-body: 1.5;
+
+  --weight-regular: 420;
+  --weight-medium: 520;
+  --weight-semibold: 600;
+
+  --tracking-display: -0.025em;
+  --tracking-tight: -0.011em;
+  --tracking-label: 0.04em;
+
+  /* ── Space (4px base) ─────────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ── Shape ────────────────────────────────────────────── */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  /* ── Layout ───────────────────────────────────────────── */
+  --page-max: 1080px;
+  --gutter: var(--space-4);      /* phone */
+  --touch-min: 44px;
+
+  /* ── Motion ───────────────────────────────────────────── */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 120ms;
+  --dur-med: 220ms;
+}
+
+@media (min-width: 768px) {
+  :root { --gutter: var(--space-8); }
+}
+
+/* Dark: its own steps, not an inversion. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0d0e10;
+    --surface: #15171a;
+    --surface-sunken: #1c1e22;
+    --hairline: #24272c;
+    --hairline-strong: #33373d;
+    --ink: #ecedee;
+    --ink-2: #a5a9b0;
+    --ink-3: #8b9098;
+    --ink-inverse: #0d0e10;
+    --gain: #3fbf86;
+    --gain-soft: #12271d;
+    --loss: #f0766a;
+    --loss-soft: #2e1714;
+    --attention: #eba54a;
+    --attention-soft: #2a1f10;
+    --attention-edge: #7a5420;
+    --chart-fill-top: rgba(236, 237, 238, 0.10);
+    --chart-fill-bottom: rgba(236, 237, 238, 0);
+    --chart-benchmark: #7a7f87;
+    --chart-grid: #1e2024;
+    --chart-crosshair: #4a4e55;
+    --focus-ring: #7d9cf5;
+    --hover-wash: rgba(255, 255, 255, 0.035);
+    --press-wash: rgba(255, 255, 255, 0.07);
+    --skeleton-shine: rgba(255, 255, 255, 0.05);
+    --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.02);
+    --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 32px rgba(0, 0, 0, 0.5);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d0e10;
+  --surface: #15171a;
+  --surface-sunken: #1c1e22;
+  --hairline: #24272c;
+  --hairline-strong: #33373d;
+  --ink: #ecedee;
+  --ink-2: #a5a9b0;
+  --ink-3: #8b9098;
+  --ink-inverse: #0d0e10;
+  --gain: #3fbf86;
+  --gain-soft: #12271d;
+  --loss: #f0766a;
+  --loss-soft: #2e1714;
+  --attention: #eba54a;
+  --attention-soft: #2a1f10;
+  --attention-edge: #7a5420;
+  --chart-fill-top: rgba(236, 237, 238, 0.10);
+  --chart-fill-bottom: rgba(236, 237, 238, 0);
+  --chart-benchmark: #7a7f87;
+  --chart-grid: #1e2024;
+  --chart-crosshair: #4a4e55;
+  --focus-ring: #7d9cf5;
+  --hover-wash: rgba(255, 255, 255, 0.035);
+  --press-wash: rgba(255, 255, 255, 0.07);
+  --skeleton-shine: rgba(255, 255, 255, 0.05);
+  --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.02);
+  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur-med: 0ms; }
+}
