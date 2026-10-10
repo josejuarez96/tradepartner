@@ -1,3 +1,0 @@
-.rchart { position: relative; height: 320px; }
-.rchart__plot { position: absolute; inset: 0; }
-@media (max-width: 640px) { .rchart { height: 220px; } }

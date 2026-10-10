@@ -1,7 +1,0 @@
-.state-row { display: flex; justify-content: space-between; align-items: center; min-height: 60px; border-top: 1px solid var(--rule); }
-
-.state { max-width: 34em; display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-4); }
-.state__kicker { color: var(--ink-3); font-size: var(--text-xs); }
-.state__title { font-size: var(--text-3xl); font-weight: var(--weight-regular); line-height: var(--leading-tight); text-wrap: balance; }
-.state__body { color: var(--ink-2); max-width: 52ch; margin-bottom: var(--space-2); }
-@media (max-width: 640px) { .state__title { font-size: var(--text-2xl); } }

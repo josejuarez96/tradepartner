@@ -1,57 +1,53 @@
-import { Skeleton } from "../components/Skeleton";
-import "./Overview.css";
-import "./OverviewStates.css";
+import { AlertTriangle, BookOpen, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 
-/** Loading: the page's real shape in grey, so nothing jumps when numbers arrive. */
+/** Loading: the page's real shape, so nothing jumps when numbers arrive. */
 export function OverviewLoading() {
   return (
-    <div className="overview" aria-busy="true" aria-label="Loading your books">
-      <section className="lede">
-        <Skeleton w="92%" h={40} />
-        <div style={{ marginTop: "var(--space-2)" }}><Skeleton w="60%" h={40} /></div>
-        <div style={{ marginTop: "var(--space-5)" }}><Skeleton w={260} h={18} /></div>
-      </section>
-      <section className="section">
-        <div className="chart__bar"><Skeleton w={300} h={16} /><Skeleton w={150} h={20} /></div>
-        <Skeleton w="100%" h={300} />
-      </section>
-      <section className="section">
-        <div className="section__head"><Skeleton w={80} h={24} /></div>
-        {[0, 1, 2].map((i) => (
-          <div key={i} className="state-row"><Skeleton w="28%" h={16} /><Skeleton w={110} h={16} /></div>
+    <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6" aria-busy="true" aria-label="Loading">
+      <div className="grid grid-cols-1 gap-4 px-4 lg:px-6 @xl/main:grid-cols-2 @6xl/main:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => (
+          <Card key={i} className="shadow-xs">
+            <CardHeader className="gap-3"><Skeleton className="h-4 w-24" /><Skeleton className="h-8 w-36" /></CardHeader>
+            <CardContent><Skeleton className="h-4 w-44" /></CardContent>
+          </Card>
         ))}
-      </section>
+      </div>
+      <div className="px-4 lg:px-6"><Skeleton className="h-[360px] w-full rounded-xl" /></div>
+      <div className="px-4 lg:px-6"><Skeleton className="h-56 w-full rounded-xl" /></div>
     </div>
   );
+}
+
+function Centered({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-1 items-center justify-center p-6"><div className="flex max-w-md flex-col items-center gap-3 text-center">{children}</div></div>;
 }
 
 /** Error: what happened in plain words, what still holds, one thing to do. */
 export function LoadError({ onRetry, retrying }: { onRetry: () => void; retrying: boolean }) {
   return (
-    <div className="state" role="alert">
-      <p className="state__kicker mono">can't load</p>
-      <h1 className="state__title serif">This page can't reach TradePartner on your computer.</h1>
-      <p className="state__body">
-        Your strategies keep running on their schedule. Only this view is affected. If it keeps happening, the
-        computer running TradePartner may be asleep or offline.
+    <Centered>
+      <span className="bg-attention-soft text-attention grid size-10 place-items-center rounded-full"><AlertTriangle className="size-5" /></span>
+      <h2 className="text-lg font-semibold">Can't reach TradePartner</h2>
+      <p className="text-muted-foreground text-sm">
+        This screen couldn't load. Your strategies keep running on their schedule; only this view is affected.
+        If it keeps happening, the computer running TradePartner may be asleep or offline.
       </p>
-      <button className="btn btn--solid" onClick={onRetry} disabled={retrying} aria-live="polite">
-        {retrying ? "trying again…" : "try again"}
-      </button>
-    </div>
+      <Button onClick={onRetry} disabled={retrying}><RefreshCw className={retrying ? "animate-spin" : ""} />{retrying ? "Trying again…" : "Try again"}</Button>
+    </Centered>
   );
 }
 
-/** Empty: first run, before any book exists. */
+/** Empty: before any book exists. */
 export function NoBooks() {
   return (
-    <div className="state">
-      <p className="state__kicker mono">no books yet</p>
-      <h1 className="state__title serif">Nothing is trading yet.</h1>
-      <p className="state__body">
-        When a strategy starts trading on paper, this page will tell you how it's doing against the S&amp;P 500.
-      </p>
-      <a className="btn" href="#strategies">see strategies</a>
-    </div>
+    <Centered>
+      <span className="bg-muted text-muted-foreground grid size-10 place-items-center rounded-full"><BookOpen className="size-5" /></span>
+      <h2 className="text-lg font-semibold">No books running yet</h2>
+      <p className="text-muted-foreground text-sm">When a strategy starts trading on paper, its value and how it compares with the S&amp;P 500 show up here.</p>
+      <Button variant="outline" asChild><a href="#research">See research</a></Button>
+    </Centered>
   );
 }

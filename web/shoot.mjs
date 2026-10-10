@@ -18,8 +18,11 @@ for (const job of jobs) {
     const ctx = await browser.newContext(opts);
     const page = await ctx.newPage();
     page.on("console", (m) => m.type() === "error" && console.log("console:", m.text()));
-    await page.goto(base + (q ? `?${q}` : ""));
+    // q is "query" or "query#hash" or "#hash"; a name ending in "-sheet" opens the first idea.
+    const [qs, hash] = q.split("#");
+    await page.goto(base + (qs ? `?${qs}` : "") + (hash ? `#${hash}` : ""));
     await page.waitForTimeout(900);
+    if (name.endsWith("-sheet")) { await page.getByRole("button", { name: /^Open/ }).first().click(); await page.waitForTimeout(500); }
     if (vp === "desktop") await page.screenshot({ path: `shots/${name}-${vp}.png`, fullPage: true });
     else {
       await page.screenshot({ path: `shots/${name}-${vp}.png` });

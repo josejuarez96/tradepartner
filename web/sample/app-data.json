@@ -1031,5 +1031,348 @@
    }
   }
  ],
- "alerts": []
+ "alerts": [],
+ "research": {
+  "waiting": [
+   {
+    "id": "w1",
+    "idea_id": "b10",
+    "kind": "run",
+    "title": "Run the short-term momentum test",
+    "why": "B10 is written and its code is built. Two versions, one run. It tells you whether last month's busiest winners keep going after costs.",
+    "effort": "about 15 min, then an overnight run",
+    "step": "Register and run B10 as a 2-variant sweep"
+   },
+   {
+    "id": "w2",
+    "idea_id": "b9",
+    "kind": "answer",
+    "title": "Answer 7 questions on earnings-reaction drift",
+    "why": "B9 can't be registered until its open questions are settled (hold length, which filings count, how to treat restatements …).",
+    "effort": "about 30 min",
+    "step": "Answer B9-1 to B9-7 in the hypothesis file"
+   },
+   {
+    "id": "w3",
+    "kind": "decide",
+    "title": "Set the development boundary",
+    "why": "One date that no in-sample test may read past. Recommended: Dec 29, 2023, the end of the in-sample window you already used.",
+    "effort": "2 min",
+    "step": "Record the boundary with a reason"
+   },
+   {
+    "id": "w4",
+    "idea_id": "b4",
+    "kind": "decide",
+    "title": "Momentum + profitability: test now or wait?",
+    "why": "Your status page says run it now; the newer exam decision says park it until profitability has a finalist. Pick one so it stops showing as both.",
+    "effort": "2 min",
+    "step": "Keep parked, or register and run in-sample"
+   },
+   {
+    "id": "w5",
+    "idea_id": "h1",
+    "kind": "record",
+    "title": "Write down what monthly momentum taught you",
+    "why": "H1 has been tested and spent its exam, but no lesson is recorded yet, so the evidence list still only shows other people's studies.",
+    "effort": "10 min",
+    "step": "Add a TradePartner claim for H1"
+   }
+  ],
+  "ideas": [
+   {
+    "id": "h1",
+    "code": "H1",
+    "name": "Monthly momentum",
+    "family": "momentum",
+    "stage": "on_paper",
+    "book_id": "main",
+    "idea": "Own the stocks that rose most over the past year, skipping the last month. Reshuffle monthly.",
+    "evidence": {
+     "for": 3,
+     "mixed": 2,
+     "against": 0,
+     "note": "Strong in older studies; weaker after 2010 once costs are counted."
+    },
+    "expected": "About level with the S&P 500 after costs. Mainly a test that the machine works end to end.",
+    "stop_rule": "Retire if it trails the S&P 500 by more than 1 point a year and the luck check is under 50%.",
+    "result": {
+     "status": "done",
+     "window": "Aug 2020 – Dec 2023",
+     "vs_spy": 0.011,
+     "luck": 0.7262,
+     "tries": 2,
+     "cost_drag": 0.0125,
+     "sample": [
+      "vs_spy"
+     ]
+    },
+    "exam": {
+     "kind": "paper",
+     "label": "Paper book main",
+     "done": 0,
+     "of": 6,
+     "unit": "monthly rebalances"
+    },
+    "next": "First rebalance Fri, Oct 30.",
+    "cost": "—"
+   },
+   {
+    "id": "dm",
+    "code": "S1·d",
+    "name": "Daily momentum",
+    "family": "momentum",
+    "stage": "on_paper",
+    "book_id": "daily",
+    "idea": "The same momentum idea, rechecked every day before the open.",
+    "evidence": {
+     "for": 1,
+     "mixed": 2,
+     "against": 1,
+     "note": "Faster versions mostly lose their edge to trading costs."
+    },
+    "expected": "Below monthly after costs; worth seeing on paper because the backtest can't model daily fills well.",
+    "stop_rule": "Stop if paper tracking drifts more than the agreed tolerance from its backtest.",
+    "result": {
+     "status": "done",
+     "window": "Aug 2020 – Dec 2023",
+     "vs_spy": 0.004,
+     "luck": 0.41,
+     "tries": 8,
+     "cost_drag": 0.041,
+     "sample": [
+      "vs_spy",
+      "luck",
+      "cost_drag"
+     ]
+    },
+    "exam": {
+     "kind": "paper",
+     "label": "Paper book daily",
+     "done": 48,
+     "of": 63,
+     "unit": "trading days"
+    },
+    "next": "Exam ends around Oct 30.",
+    "cost": "—"
+   },
+   {
+    "id": "b3",
+    "code": "B3",
+    "name": "Profitability",
+    "family": "profitability",
+    "stage": "on_paper",
+    "book_id": "b3",
+    "idea": "Own companies that turn the most gross profit per dollar of assets. Reshuffle monthly.",
+    "evidence": {
+     "for": 2,
+     "mixed": 1,
+     "against": 0,
+     "note": "Well supported, but in a narrow form; long-only results are weaker."
+    },
+    "expected": "A small edge over the S&P 500, smaller than published.",
+    "stop_rule": "Retire if it trails the S&P 500 by more than 1 point a year in-sample.",
+    "result": {
+     "status": "done",
+     "window": "Aug 2020 – Dec 2023",
+     "vs_spy": -0.006,
+     "luck": 0.38,
+     "tries": 1,
+     "cost_drag": 0.006,
+     "sample": [
+      "vs_spy",
+      "luck",
+      "cost_drag"
+     ]
+    },
+    "exam": {
+     "kind": "holdout",
+     "label": "Final exam (2024 – Sep 2026)",
+     "status": "unspent",
+     "note": "On hold until profitability has a finalist."
+    },
+    "next": "Paper book running; exam on hold.",
+    "cost": "—"
+   },
+   {
+    "id": "b10",
+    "code": "B10",
+    "name": "Short-term momentum",
+    "family": "momentum",
+    "stage": "ready",
+    "idea": "Last month's winners among the most-traded stocks. Reshuffle monthly.",
+    "evidence": {
+     "for": 0,
+     "mixed": 0,
+     "against": 2,
+     "note": "One study says yes; two independent checks say it's about zero after costs."
+    },
+    "expected": "About zero to slightly negative after costs at 15 bp.",
+    "stop_rule": "Retire both versions if neither beats the S&P 500 in-sample.",
+    "next": "Waiting on you: register and run.",
+    "cost": "S"
+   },
+   {
+    "id": "b9",
+    "code": "B9",
+    "name": "Earnings-reaction drift",
+    "family": "new",
+    "stage": "blocked",
+    "idea": "Buy stocks the market cheered most around their earnings release, hold for 20 days.",
+    "evidence": {
+     "for": 0,
+     "mixed": 1,
+     "against": 1,
+     "note": "Mixed: the effect exists but much of it has faded since publication."
+    },
+    "expected": "About zero to negative after costs.",
+    "stop_rule": "Written once its questions are answered.",
+    "blocked_by": [
+     "Filing-events data (T164c–e)",
+     "Filing clock defect #1382",
+     "7 open questions for you"
+    ],
+    "next": "Unblocks when the filing data lands.",
+    "cost": "M"
+   },
+   {
+    "id": "b3b",
+    "code": "B3b",
+    "name": "Cash profitability",
+    "family": "profitability",
+    "stage": "exploring",
+    "idea": "Like profitability, but using operating cash flow instead of gross profit.",
+    "evidence": {
+     "for": 1,
+     "mixed": 0,
+     "against": 0,
+     "note": "Supported as a stand-in; the exact measure isn't graded yet."
+    },
+    "next": "After profitability's exam.",
+    "cost": "S"
+   },
+   {
+    "id": "b5",
+    "code": "B5",
+    "name": "Filing changes → fundamentals",
+    "family": "new",
+    "stage": "exploring",
+    "idea": "When a company quietly rewrites its annual report, do its next results change?",
+    "evidence": {
+     "for": 0,
+     "mixed": 0,
+     "against": 0,
+     "untested": 3,
+     "note": "Not enough evidence either way yet."
+    },
+    "blocked_by": [
+     "Filing text ingest"
+    ],
+    "next": "Needs filing text first.",
+    "cost": "L"
+   },
+   {
+    "id": "b7",
+    "code": "B7",
+    "name": "Insider buying",
+    "family": "new",
+    "stage": "exploring",
+    "idea": "Follow clusters of executives buying their own company's stock.",
+    "evidence": {
+     "for": 0,
+     "mixed": 1,
+     "against": 1,
+     "note": "Routine insider buys don't predict much; clustered, opportunistic ones might."
+    },
+    "blocked_by": [
+     "Form 4 data (+3 years)"
+    ],
+    "next": "Needs insider-filing data.",
+    "cost": "L"
+   },
+   {
+    "id": "b4",
+    "code": "B4",
+    "name": "Momentum + profitability",
+    "family": "combined",
+    "stage": "parked",
+    "idea": "Hold stocks that score well on both momentum and profitability.",
+    "parked": "Waiting for a profitability finalist, so the combined test has something to stand on.",
+    "cost": "S"
+   },
+   {
+    "id": "b2",
+    "code": "B2",
+    "name": "Trend filter",
+    "family": "momentum",
+    "stage": "parked",
+    "idea": "Sit in cash when the market is below its 10-month average.",
+    "parked": "Lowers risk but also return. Your goal is beating the S&P 500, so it's off the list.",
+    "cost": "S"
+   }
+  ],
+  "families": [
+   {
+    "id": "momentum",
+    "name": "Momentum",
+    "tries": 9,
+    "luck_bar_note": "Each new try raises the bar the next result has to clear.",
+    "exam": "spent",
+    "exam_date": "2026-10-06",
+    "promotions": [
+     1,
+     2
+    ],
+    "sample": [
+     "tries"
+    ]
+   },
+   {
+    "id": "profitability",
+    "name": "Profitability",
+    "tries": 1,
+    "exam": "unspent",
+    "promotions": [
+     0,
+     2
+    ]
+   },
+   {
+    "id": "combined",
+    "name": "Momentum + profitability",
+    "tries": 0,
+    "exam": "unspent",
+    "promotions": [
+     0,
+     2
+    ]
+   }
+  ],
+  "lessons": [
+   {
+    "id": "HO-1",
+    "text": "12-1 momentum beat the market in long historical studies.",
+    "grade": "supported",
+    "source": "Research handoff"
+   },
+   {
+    "id": "G1-1",
+    "text": "After 2010, net of costs, momentum's edge is weak and uneven.",
+    "grade": "mixed",
+    "source": "Momentum after 2010 review"
+   },
+   {
+    "id": "QI-6",
+    "text": "Gross profitability predicts returns, in a narrow, long-short form.",
+    "grade": "supported",
+    "source": "Quant investing brief"
+   },
+   {
+    "id": "SH-5",
+    "text": "Short-term earnings reactions mostly don't survive realistic costs.",
+    "grade": "against",
+    "source": "Short-horizon candidates"
+   }
+  ]
+ }
 }

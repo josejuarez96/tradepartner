@@ -1,94 +1,68 @@
 # End-user app: design notes
 
-**Status:** spike (`spike/design-ui`), prototype under [`web/`](../../../web/). Screen 1 of N. **Date:** 2026-10-10 · **Direction:** v3 "ledger" (v2 "terminal" screenshots kept in [`screens/previous/`](screens/previous/))
+**Status:** spike (`spike/design-ui`), prototype under [`web/`](../../../web/). **Date:** 2026-10-10 · **Direction:** v4, built on [shadcn/ui](https://github.com/shadcn-ui/ui) (the stack Base44 apps use: React, Vite, Tailwind, Radix, lucide)
 
-The app is for the owner as a *user*: four questions, nothing about how the machine works.
+The app is for the owner as a *user*, not its developer. Screens built: **Overview** and **Research**. Next: Book detail (holdings vs targets, orders, why, stop/resume).
 
-1. How am I doing? (overall, per book, vs SPY): **Overview** (built)
-2. What is each book holding and doing, and why?: Book detail (next)
-3. Is anything wrong or waiting on me?: a "needs you" block at the top of Overview; one quiet sentence when nothing is
-4. Stop or resume a book, safely: on Book detail (reason required, explicit confirm)
+## How we got here
 
-## Why v3: v2 still read as AI-made
-
-The owner's verdict on v2 was "something about it feels AI still". Two kinds of evidence on why:
-
-**What similar open-source apps do** (screenshots pulled from each repo's README):
-
-| Project | What it is | What it looks like | Takeaway |
+| Version | What it was | Owner's verdict | Lesson |
 |---|---|---|---|
-| [Wealthfolio](https://github.com/afadil/wealthfolio) | Local, private portfolio tracker (desktop) | The whole UI in a monospace (`font-mono` on `<body>`, JetBrains Mono), Merriweather serif for headings, warm cream and warm-black themes, olive and burnt-orange instead of neon green and red | The one that feels *made by a person*. It commits to a voice: a private ledger, not a SaaS dashboard |
-| [Ghostfolio](https://github.com/ghostfolio/ghostfolio) | Self-hosted wealth tracker (web) | White, Material-style cards, one teal area chart | Clean but stock; nothing you'd recognise it by |
-| [Sure](https://github.com/we-promise/sure) (Maybe fork) | Personal finance | Dark rounded cards, "Welcome back, Jack", donut and Sankey, AI chat panel | The template look: greeting header, card grid, chart-per-card |
-| [FreqUI](https://github.com/freqtrade/frequi) | Web UI for the Freqtrade bot | Bootstrap trading terminal, candles, indicators, tooltip dumps | Developer tool; what this app must *not* become |
+| v1 | Light, warm paper, Inter, cards | "Feels AI" | Generic defaults |
+| v2 | Dark trading terminal after the owner's inspiration images | "Still AI" | Inter, bordered cards, status dots, pill tags, neon green, glyph logo: the catalogue of AI tells |
+| v3 | "Ledger": serif sentence headline, mono numbers, warm cream | "Even more AI"; the serif hero and italics are a tell | A serif headline on warm cream is close to Claude's own house style |
+| **v4** | **shadcn/ui as shipped**, with TradePartner's three meanings added | — | Use a real, maintained design system instead of inventing a look |
 
-**What design writers name as "AI tells"** (blog posts, informed opinion, not measurements): Inter by default; centred stacks of bordered cards; accent colour on everything; decorative status dots; uppercase spaced-out micro labels; pill badges; a greeting or subtitle under every heading; happy-path only. v2 had most of these: Inter everywhere, three bordered cards, a green-dot "Nothing needs you", pill tags for "Sample data" and "Paper money", uppercase column labels, neon green on blue-black, a chart-line logo in a rounded square.
-
-## The v3 direction: a private ledger
-
-| Choice | Instead of (v2) | Why |
-|---|---|---|
-| **The answer is a sentence**, set in a serif (Newsreader): "Since Aug 3 you're *up 0.79%*, 2.3 points ahead of the S&P 500." It changes with the range | A big dollar number plus a stats row | Question 1 answered in words, the way a person would say it. The dollar total sits under it in mono |
-| **Every number in a monospace** (Geist Mono): totals, the legend, axis, the books ledger, the masthead | Inter with tabular figures | Columns line up like a statement, and the page gets a voice (Wealthfolio's move) |
-| **Prose in a plain sans** (Geist) | Inter | Only for sentences: alerts, the quiet line |
-| **Rules, not cards.** Sections are separated by 1px lines on the page itself; corners almost square (3 to 6px) | Bordered rounded cards | Reads like paper; nothing floats |
-| **Warm paper and ink.** Warm black `#13120f` with bone ink `#ece7dc`; light is paper `#f4f0e7` with near-black ink | Blue-black and white | Warmth is what keeps a dark page from looking like every trading template |
-| **Moss for gains, rust for losses**, used only on numbers and the one italic phrase | Neon `#2fd480` / `#f8636a`, tinted tiles, coloured lines | Muted, natural; still unmistakable, and signs (+/−) are always printed |
-| **"Needs you" is inverted ink**, not a colour: the alert is a bone block with dark text; a book row gets a small inverted "needs you" mark; the nav shows a count | An amber card, amber text, dots | The loudest thing the page can do without adding a hue, so attention never competes with gain/loss |
-| **Your line is ink**, a faint wash under it; the S&P is a thin grey line; no axis tags | Line coloured by result, tags on the axis | The legend above the chart prints both values and follows the pointer |
-| **A lowercase wordmark** `tradepartner`, text navigation, text tabs on phone | Logo glyph, icon tab bar | Fewer borrowed symbols |
-| **Plain words for state**: "paper account · sample data", "‖ stopped by you, 9:41 am", "day 1", "not enough history yet" | Pills, dots | |
+Reference apps reviewed for v3 (from their READMEs): Wealthfolio, Ghostfolio, Sure (Maybe fork), FreqUI. The v4 layout follows shadcn's own `dashboard-01` block: inset sidebar, slim header, summary cards, one interactive chart card, a data table.
 
 ## Tokens
 
-Single source: [`web/src/tokens/tokens.css`](../../../web/src/tokens/tokens.css). Components use `var(--…)` only; charts read the same variables at runtime ([`lib/tokens.ts`](../../../web/src/lib/tokens.ts)) and repaint when the theme flips.
+One file: [`web/src/index.css`](../../../web/src/index.css). shadcn's theme variables are kept exactly as shipped (neutral, `--radius: 0.625rem`, Geist and Geist Mono) so upstream components drop in unchanged. TradePartner adds only three meanings, exposed as Tailwind colours (`text-gain`, `text-loss`, `text-attention`, `bg-attention-soft`):
 
-| Group | Tokens |
+| Token | Light | Dark | Means |
+|---|---|---|---|
+| `gain` | `#047857` (5.5:1 on white) | `#34d399` | money made, ahead of the S&P |
+| `loss` | `#dc2626` (4.8:1) | `#f87171` | money lost, behind the S&P |
+| `attention` | `#b45309` (5.0:1) | `#fbbf24` | waiting on you |
+
+`chart-1` (your line) and `chart-2` (the S&P) are neutral. Charts read every colour at runtime ([`lib/tokens.ts`](../../../web/src/lib/tokens.ts), which normalises oklch to rgba for the canvas) and repaint on theme change. Dark is the default; the header switch picks light.
+
+Components come from shadcn's registry source on GitHub (`apps/v4/registry/new-york-v4/ui`), copied into `web/src/components/ui/` (the CLI's registry host is blocked from this environment, so they were added by hand, unmodified except import paths).
+
+## Overview ("How am I doing?")
+
+- Four summary cards: total value (with the day's change; new money not counted as gain), return since start vs the S&P, **Needs you** (Nothing / n things), next run.
+- One chart card: your return vs the S&P 500 from 0%, 1W/1M/3M/All (ranges longer than your history are disabled), hover updates the legend values.
+- Books table: status (Running / Needs you / Stopped by you 9:41 am), value, since start, vs S&P, next run.
+- An alert appears above the cards when something waits on you.
+
+## Research: a human-centred interface to the lab
+
+The lab is rigorous (claims register, ranked backlog, frozen hypotheses, sweeps, a trial count behind the deflated Sharpe, single-use holdouts, forward exams on paper, owner decisions), but today it is spread over the CLI, three Streamlit pages and GitHub issues. The Research screen organises it around the **owner's questions**, not the pipeline:
+
+| Question | Where it's answered |
 |---|---|
-| Paper and ink | `bg`, `bg-raised`, `rule`, `rule-strong`, `ink`, `ink-2`, `ink-3`, `ink-inverse` |
-| Meaning | `gain` (moss), `loss` (rust), `attention-bg` / `attention-ink` (inverted ink) |
-| Chart | `chart-you`, `chart-you-fill`, `chart-bench`, `chart-crosshair` |
-| Type | `font-serif` (Newsreader), `font-sans` (Geist), `font-mono` (Geist Mono); `text-2xs` 11 to `text-3xl` 42 |
-| Space | 4px base: `space-1` 4 … `space-16` 64; `gutter` 16 phone / 40 desktop |
-| Shape | `radius-sm` 3, `radius-md` 6 |
-| Motion | `dur-fast` 120ms, `dur-med` 220ms, one easing; zeroed under reduced motion |
+| What's waiting on me? | **Waiting on you** list at the top (count in the sidebar): what, why it matters, the exact next step, how long it takes |
+| What's on the go, and what's stuck? | **Ideas** tab, grouped by stage: On paper · Ready to test · Blocked · Exploring · Parked (with the reason) |
+| Did it work? Could it be luck? | **Results** tab: return vs the S&P a year after costs; a **luck check** (the deflated Sharpe as "chance the edge is real after counting every version tried"), tries counted, exam status |
+| What have I used up? | **Honesty budget** tab, per family: versions tried, final exam still unseen or used (date), promotions to paper used |
+| What have I learned? | **Lessons** tab: your own recorded lessons (empty today, with the first one to write), then the published findings your ideas lean on, graded in words ("Holds up", "Mixed", "Doesn't hold") |
 
-### Contrast (WCAG AA, text at 4.5:1 minimum)
+Every idea opens the same **story** in a side panel, in the order a person asks: why it might work (evidence bar and note) → what you said before testing (expected result, stop rule) → what happened (or "not tested yet") → the exam (paper progress or holdout status) → blocked by / parked because / what's next. If the idea is waiting on you, that comes first.
 
-| Token | Dark on page / raised | Light on page / raised |
-|---|---|---|
-| ink | 15.2 / 14.1 | 15.3 / 14.0 |
-| ink-2 | 8.4 / 7.8 | 6.9 / 6.3 |
-| ink-3 | 5.7 / 5.3 | 5.2 / 4.7 |
-| gain | 9.7 / 9.0 | 5.6 / 5.1 |
-| loss | 7.7 / 7.2 | 5.3 / 4.9 |
-| inverted "needs you" | 15.2 | 15.3 |
+Plain-language mapping kept consistent everywhere: DSR → "luck check"; N → "versions tried"; holdout → "final exam"; forward exam → "exam on paper"; claim grades → Holds up / Mixed / Doesn't hold / Not enough evidence.
 
-The benchmark line colour is decorative (its value is always printed in the legend). Touch: text tabs 52px tall, range options and buttons 44px under `pointer: coarse`, ledger rows ≥ 64px.
+**Sample data.** Names, stages, blockers and pending decisions come from the repo's docs (backlog B1 to B10, STATUS, ADRs 0016 and 0017). H1's luck check (DSR 0.7262, psr basis) is real; numbers the docs don't give (e.g. excess returns) are invented and tagged "sample" in the UI.
 
-## States (preview with `?state=`)
+**Open questions for the owner**
+- Read-only, or should Research let you act (register a run, record a decision, write a lesson) with a reason and a confirm, like stop/resume?
+- B4 shows as both "run in-sample" (STATUS) and "parked" (ADR 0016); the screen surfaces this as a decision rather than picking.
+- Dark by default; say if it should follow the OS.
 
-| State | What you see |
-|---|---|
-| default | The sentence, the total, "Nothing needs you. Next run: daily, Mon 9:25 am. Prices as of Fri's close." Then the chart and the books ledger |
-| `alert` | An inverted block above everything: "needs you · fri 9:25 am", what happened, what was (not) done, what to do, "open daily →"; the book row carries the "needs you" mark; the nav shows "overview 1" |
-| `stopped` | "‖ stopped by you, 9:41 am" in the book's Next column; the count reads "2 running, 1 stopped" |
-| `loading` | Grey bars in the real layout, so nothing jumps |
-| `error` | "This page can't reach TradePartner on your computer." Strategies keep running; only the view is affected; try again |
-| `empty` | "Nothing is trading yet." + see strategies |
-| a young book | main: "day 1" and a dash instead of a fake comparison; ranges longer than your history (3m) are disabled with "Not enough history yet" |
+## States (`?state=`)
 
-Dark is the default; the masthead switch (or `?theme=light`) picks paper.
-
-## Decisions and open questions for the owner
-
-- **Today's change excludes new money.** main opened on Oct 9 with $100,008.90; that is not a gain. The API should serve a time-weighted index next to the summed value (the sample does: `portfolio.equity[].index`).
-- **Combined line.** "You" is all books together, time-weighted. Per-book lines vs SPY belong on Book detail.
-- **Research has no home yet.** Proposed: Strategies becomes Research, ideas grouped by stage (on paper, tested, up next, parked), with research decisions joining "needs you". Waiting on the owner: read-only or approvals, and order relative to Book detail.
-- **Dark by default**, ignoring the OS setting. Say if it should follow the OS instead.
-- **Error with stale data** (show the last good numbers dimmed, labelled with their time) is a better error state once the API caches; deferred until the API shape is known.
-- **Charts attribution.** Lightweight Charts' logo is off; attribution is a footer link (its licence asks for one).
+`alert`, `stopped`, `loading` (skeletons in the real layout), `error` ("Can't reach TradePartner"; strategies keep running), `empty` ("No books running yet"). `?theme=light` forces light.
 
 ## Screenshots
 
-[`screens/`](screens/): `overview-desktop`, `overview-phone` (+ `-2` scrolled), `light-desktop`, `light-phone`, `alert-desktop`, `alert-phone`, `states-phone` (stopped, loading, error, empty). v2 for comparison: [`screens/previous/`](screens/previous/).
+[`screens/`](screens/): `overview-desktop`, `overview-phone`, `research-desktop`, `research-phone`, `research-sheet-desktop`, `light-desktop`, `alert-desktop`, `loading-desktop`, `error-phone`. v2 for comparison in [`screens/previous/`](screens/previous/).

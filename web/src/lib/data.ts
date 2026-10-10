@@ -1,7 +1,7 @@
 import raw from "../../sample/app-data.json";
 import type { AppData, Point, PortfolioPoint } from "./types";
 
-export const sample = raw as AppData;
+export const sample = raw as unknown as AppData;
 
 export type RangeKey = "1W" | "1M" | "3M" | "ALL";
 export const RANGES: { key: RangeKey; label: string; long: string }[] = [

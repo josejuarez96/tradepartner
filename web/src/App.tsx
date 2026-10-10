@@ -1,52 +1,65 @@
 import { useEffect, useState } from "react";
-import { sample } from "./lib/data";
-import type { AppData } from "./lib/types";
-import { Shell, type Screen } from "./components/Shell";
-import { Overview } from "./screens/Overview";
-import { OverviewLoading, LoadError, NoBooks } from "./screens/OverviewStates";
-import { scenario } from "./lib/scenarios";
+import { sample } from "@/lib/data";
+import type { AppData } from "@/lib/types";
+import { scenario } from "@/lib/scenarios";
+import { AppShell, type Screen } from "@/components/AppShell";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Overview } from "@/screens/Overview";
+import { Research } from "@/screens/Research";
+import { LoadError, NoBooks, OverviewLoading } from "@/screens/OverviewStates";
 
 type Load = { kind: "loading" } | { kind: "error"; retrying: boolean } | { kind: "ready"; data: AppData };
 
-const params = new URLSearchParams(location.search);
-const state = params.get("state");
+const state = new URLSearchParams(location.search).get("state");
+const TITLES: Record<Screen, string> = { overview: "Overview", books: "Books", research: "Research" };
+
+function useScreen(): Screen {
+  const read = (): Screen => {
+    const h = location.hash.replace("#", "").split("/")[0];
+    return h === "research" || h === "books" ? h : "overview";
+  };
+  const [s, setS] = useState<Screen>(read);
+  useEffect(() => {
+    const on = () => setS(read());
+    addEventListener("hashchange", on);
+    return () => removeEventListener("hashchange", on);
+  }, []);
+  return s;
+}
 
 /** Prototype loader: reads the sample file; ?state= previews loading, error, empty, alert and stopped. */
 export function App() {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
-  const screen: Screen = "overview";
+  const screen = useScreen();
 
   useEffect(() => {
     if (state === "loading") return;
     if (state === "error") { setLoad({ kind: "error", retrying: false }); return; }
-    const t = setTimeout(() => setLoad({ kind: "ready", data: scenario(sample, state) }), 250);
+    const t = setTimeout(() => setLoad({ kind: "ready", data: scenario(sample, state) }), 200);
     return () => clearTimeout(t);
   }, []);
 
   const data = load.kind === "ready" ? load.data : null;
   return (
-    <Shell
-      screen={screen}
-      mode={data?.account_mode ?? "paper"}
-      sample={data?.sample ?? true}
-      attention={data?.alerts.length ?? 0}
-      footer={
-        <p>
-          Sample data for design only. Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">TradingView</a> Lightweight Charts.
-        </p>
-      }
-    >
-      {load.kind === "loading" && <OverviewLoading />}
-      {load.kind === "error" && (
-        <LoadError
-          retrying={load.retrying}
-          onRetry={() => {
-            setLoad({ kind: "error", retrying: true });
-            setTimeout(() => setLoad({ kind: "error", retrying: false }), 1200);
-          }}
-        />
-      )}
-      {data && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
-    </Shell>
+    <TooltipProvider>
+      <AppShell
+        screen={screen}
+        title={TITLES[screen]}
+        mode={data?.account_mode ?? "paper"}
+        sample={data?.sample ?? true}
+        counts={{ overview: data?.alerts.length, research: data?.research.waiting.length }}
+      >
+        {load.kind === "loading" && <OverviewLoading />}
+        {load.kind === "error" && (
+          <LoadError
+            retrying={load.retrying}
+            onRetry={() => { setLoad({ kind: "error", retrying: true }); setTimeout(() => setLoad({ kind: "error", retrying: false }), 1200); }}
+          />
+        )}
+        {data && screen === "research" && <Research data={data} />}
+        {data && screen === "overview" && (data.books.length ? <Overview data={data} /> : <NoBooks />)}
+        {data && screen === "books" && <p className="text-muted-foreground p-6 text-sm">Book detail is the next screen to design.</p>}
+      </AppShell>
+    </TooltipProvider>
   );
 }
