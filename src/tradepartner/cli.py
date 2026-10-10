@@ -595,6 +595,13 @@ def _print_report(report: HealthReport) -> None:
     echo(f"delisted names: {report.delisted.count}")
     for row in report.delisted.frame.iter_rows(named=True):
         echo(f"  {row['security_id']} {row['ticker']} {row['exchange']} ended {row['end_session']}")
+    reopened = report.listed_without_bars
+    echo(f"listed with no bars after a Form 25: {reopened.count}")
+    for row in reopened.frame.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']} {row['ticker']} {row['exchange']} from {row['valid_from']} "
+            f"(form {row['delisting_form']} effective {row['delisting_effective_on']})"
+        )
     jumps = report.price_jumps
     shown = "" if jumps.before is None else f" before {jumps.before.isoformat()}"
     echo(f"price jumps{shown}: {jumps.pending.height} to review, {jumps.frame.height} in all")
