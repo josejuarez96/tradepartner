@@ -292,6 +292,12 @@ class EdgarConfig(BaseModel):
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
+    # #1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved by
+    # New York's UTC offset (early for many CIKs, a look-ahead), so stamps never
+    # come from it unless this is turned on; above the threshold, stamping goes
+    # per CIK like below it. Turn on only once the zip is shown to match the
+    # SGML header again (data-foundation plan, the #1382 repair task).
+    bulk_stamps_enabled: bool = False
     cover_page_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"], min_length=1
     )
