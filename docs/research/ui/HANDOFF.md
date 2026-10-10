@@ -46,7 +46,7 @@ An app for the owner as a **user**: phone first for the morning check, the desk 
 **Sample data** (`web/sample/generate.mjs`) follows the hypothesis files: the 1,000 largest US stocks after the universe rules, the top 10% held at equal weight (97 to 98 names), every rebalance trades back to equal weight, 15 bp a side, filled at the close. The replay uses H1's real window, calibrated to its recorded result. **Real values in it:** main's start ($100,008.90, 2026-10-09), H1's luck check 0.7262, the backlog's names, stages and blockers. Everything else is invented and marked "sample" in the data and the UI.
 
 ## Next, in order
-1. **Ask the owner** whether to relay the Run-button decision to #1411 (an amendment to ADR 0018's writes, with a `safety-reviewer` pass).
+1. **Decided (owner, 2026-10-10):** #1411 merges as it is. After it lands, one follow-up amendment PR to ADR 0018 covers lab reading in the app (question 7), the Run button and registration in the app, with a `spec-critic` and a `safety-reviewer` pass. The other decisions of that day are in [interaction.md](interaction.md) §8.
 2. **Rebuild the prototype around the workflow** (workflow.md §3 and §6):
    - **Today**, at phone width first: machine health, waiting on you, each book against its expected range. Quiet when nothing is wrong.
    - **Strategies**: one list by the five stages, each row showing its stage, what it waits on, and its latest numbers.
