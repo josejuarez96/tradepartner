@@ -21,7 +21,12 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from pydantic import ValidationError
 
-from tradepartner.calendar import all_sessions, last_session_of_month, session_close
+from tradepartner.calendar import (
+    all_sessions,
+    last_completed_session,
+    last_session_of_month,
+    session_close,
+)
 from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
@@ -571,15 +576,15 @@ def test_reopened_row_with_a_bar_since_is_not_counted(
 ) -> None:
     _reopen(fixture_store)
     bar_day = date(2019, 3, 4)
-    insert_row(fixture_store, "prices_daily", _bar("SEC_25NSE", bar_day))
+    # A late bar: known 12 hours after its session's close.
+    known = session_close(bar_day) + timedelta(hours=12)
+    insert_row(fixture_store, "prices_daily", _bar("SEC_25NSE", bar_day, known=known))
     assert listed_without_bars(fixture_store, T_END, settings).count == 0
-    # The bar counts only from its own known_at.
-    assert (
-        listed_without_bars(
-            fixture_store, session_close(bar_day) - timedelta(hours=1), settings
-        ).count
-        == 1
-    )
+    # The bar counts only from its own known_at, not from its session.
+    early = session_close(bar_day) + timedelta(hours=1)
+    assert last_completed_session(early) == bar_day
+    assert listed_without_bars(fixture_store, early, settings).count == 1
+    assert listed_without_bars(fixture_store, known, settings).count == 0
 
 
 @pytest.mark.parametrize("exchange", ["NONE", "OTC"])
