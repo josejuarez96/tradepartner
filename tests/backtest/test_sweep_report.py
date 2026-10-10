@@ -924,3 +924,46 @@ def test_report_over_ten_thousand_trials_reads_trial_metrics_a_fixed_number_of_t
 def test_report_module_has_no_destructive_statement() -> None:
     text = Path(sweep_report.__file__).read_text()
     assert re.search(r"\b(DROP|DELETE|TRUNCATE|VACUUM)\b", text, re.IGNORECASE) is None
+
+
+def test_lab_status_lists_an_operations_book_as_not_promoted(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Paper plan T160b: `lab status` prints "operations book of <sweep> v<n>, not
+    promoted" for each `operations_book` decision, and "none" without one."""
+    from backtest.test_promotion import Lab
+    from tradepartner.backtest import hypothesis
+
+    root = tmp_path / "files"
+    root.mkdir()
+    lab = Lab(lab_store, settings, root)
+    lab.trial(lab.twin(), 0.3)
+    sweep, (v1, v2) = lab.sweep([0.15, 0.25])
+    lab.trial(v1, 1.5)
+    lab.trial(v2, 0.4)
+
+    def text() -> str:
+        status = sweep_report.lab_status(
+            lab_store, settings, system_tz=ZoneInfo("America/New_York"), code_vintage=CODE
+        )
+        return sweep_report.format_lab_status(status)
+
+    assert "operations books:\n  none\n" in text()
+    standing = sweep_report.variant_standing(lab_store, v2.hypothesis_id, code_vintage=CODE)
+    assert standing is not None and standing.sweep_slug == sweep.slug
+    assert (standing.row.variant_index, standing.row.status) == (2, "counted")
+    assert sweep_report.variant_standing(lab_store, 999, code_vintage=CODE) is None
+    outcome = hypothesis.register_operations_book(
+        lab_store,
+        lab.file("ops-book", 0.25),
+        v2.slug,
+        "machine test",
+        registered_by="owner",
+        settings=settings,
+        code_vintage=CODE,
+    )
+    record = outcome.registered
+    assert (
+        f"operations books:\n  ops-book (momentum, id {record.hypothesis_id}, decision "
+        f"{outcome.decision_id}): operations book of {sweep.slug} v2, not promoted\n"
+    ) in text()

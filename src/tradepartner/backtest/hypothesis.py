@@ -58,6 +58,24 @@ fingerprint, its family must have family rules (a new family's rules are written
 signal anchor must be feasible against the store's first session. **When the lab is
 not initialised** none of those lab refusals applies: the Phase 3 rules, so H1 and B3
 register on a pre-lab store as before.
+
+**Operations files** (strategy-lab spec req 1, amendment 2026-10-10; ADR 0017 part A;
+paper plan T160b). `register_operations_book` (`hypothesis register <file>
+--operations-book-of <variant-slug> --reason`) registers a standalone file whose
+canonical frozen set equals one sweep variant's, so a paper book can run it as an
+operations test when its sweep could not promote it. `register(..., operations_of=<the
+variant's id>)` applies a promoted file's checks (the variant's fingerprint, the family
+rules, the anchor) and the canonical frozen-set equality `sweep promote` makes
+(`frozen_set_differences`, one function for both), plus its own: a slug not yet
+registered, the variant's `ok` in-sample trial counted in N, current or stale
+(`sweep_report.variant_standing`), its
+family in `PAPER_FAMILIES`, the family's holdout **not forward** (`holdout.is_forward`
+with `registry.family_registered_on`; ADR 0016 point 4) and no `promotion` or
+`operations_book` row naming the variant already. The registration, its
+`hypothesis_fingerprints` row (the variant's fingerprint) and the `operations_book`
+decision are one transaction. It is not a promotion: `lab_registry.promotion_for` stays
+None, so `holdout.decide` refuses any spend by it (req 5(b)); it writes no trial, so N
+and V are unchanged.
 """
 
 from __future__ import annotations
@@ -75,17 +93,29 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 
 from tradepartner.backtest import frozen
+from tradepartner.backtest.holdout import Frozen, is_forward
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.backtest.signals import check_anchor_feasible
 from tradepartner.config import (
     FAMILIES,
     FORBIDDEN_AXIS_PREFIXES,
+    PAPER_FAMILIES,
     Settings,
     get_settings,
     render_validation_errors,
 )
 from tradepartner.store import lab_registry, registry
-from tradepartner.store.lab_schema import is_lab_initialised
+from tradepartner.store.lab_schema import is_lab_initialised, require_lab
+from tradepartner.store.schema import atomic
+
+#: The `owner_decisions.kind` an operations file's registration appends
+#: (`lab_schema.OPERATIONS_DECISION_KINDS`, schema version 22).
+OPERATIONS_BOOK_KIND: Final = "operations_book"
+
+#: The variant states (`sweep_report.VariantRow.status`) whose shown trial is an `ok`
+#: in-sample trial counted in N: current (`counted`) or from an earlier vintage
+#: (`stale`).
+_OPERATIONS_TRIAL_STATES: Final = ("counted", "stale")
 
 
 def _family_frozen_sections() -> tuple[str, ...]:
@@ -472,6 +502,32 @@ def _anchor_refusal(
     )
 
 
+def frozen_set_differences(
+    parsed: HypothesisFile, params: Mapping[str, Any], variant: registry.HypothesisRecord
+) -> list[str]:
+    """What differs between a file (`parsed`, frozen set `params`) and a sweep
+    variant: its family, its `in_sample_start`, or any key of the canonical frozen
+    sets (`frozen.canonical_frozen_set`, default-valued table keys left out), so no
+    key inside or outside the fingerprint can differ. `sweep promote`'s refusal 6
+    and an operations file's check (module docstring) are this one function."""
+    differences: list[str] = []
+    if parsed.family != variant.family:
+        differences.append(f"family ({parsed.family} vs {variant.family})")
+    if parsed.in_sample_start != variant.in_sample_start:
+        differences.append(
+            f"in_sample_start ({parsed.in_sample_start} vs {variant.in_sample_start})"
+        )
+    if differences:
+        return differences
+    mine = frozen.canonical_frozen_set(params, parsed.family)
+    theirs = frozen.canonical_frozen_set(frozen.frozen_values(variant), variant.family)
+    return sorted(
+        f"{key} ({mine.get(key)!r} vs {theirs.get(key)!r})"
+        for key in set(mine) | set(theirs)
+        if key not in mine or key not in theirs or not frozen.is_default(mine[key], theirs[key])
+    )
+
+
 def _lab_refusal(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
@@ -479,23 +535,39 @@ def _lab_refusal(
     params: Mapping[str, Any],
     fingerprint: str,
     promotion_of: int | None,
+    operations_of: int | None = None,
 ) -> None:
-    """Every lab refusal of a new standalone registration (module docstring)."""
-    if promotion_of is None:
+    """Every lab refusal of a new standalone registration (module docstring): a
+    promoted file's (`promotion_of`) or an operations file's (`operations_of`, which
+    adds the canonical frozen-set equality before the family rules)."""
+    variant_id = promotion_of if promotion_of is not None else operations_of
+    if variant_id is None:
         raise LabRegistrationError(
             f"{path}: after the strategy lab a standalone file is registered only as a "
-            "promoted file (`sweep promote`); write it as a one-value sweep "
+            "promoted file (`sweep promote`) or an operations file "
+            "(`hypothesis register --operations-book-of`); write it as a one-value sweep "
             "(docs/templates/sweep.md), run it and promote it"
         )
+    role = "promotes" if promotion_of is not None else "runs as an operations book"
+    name = "promotion_of" if promotion_of is not None else "operations_of"
     row = conn.execute(
-        "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [promotion_of]
+        "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?", [variant_id]
     ).fetchone()
     if row is None:
-        raise LabRegistrationError(f"{path}: promotion_of {promotion_of} is not a sweep variant")
+        raise LabRegistrationError(f"{path}: {name} {variant_id} is not a sweep variant")
     if row[0] != fingerprint:
         raise LabRegistrationError(
-            f"{path}: its fingerprint differs from variant {promotion_of}'s, which it promotes"
+            f"{path}: its fingerprint differs from variant {variant_id}'s, which it {role}"
         )
+    if operations_of is not None:
+        variant = registry.get_hypothesis_by_id(conn, operations_of)
+        differences = frozen_set_differences(parsed, params, variant)
+        if differences:
+            raise LabRegistrationError(
+                f"{path}: its frozen set differs from variant {variant.slug}'s "
+                f"({'; '.join(differences)}); an operations file is the variant's frozen "
+                "set exactly"
+            )
     rules = lab_registry.family_rules(conn, parsed.family)
     if rules is None:
         raise LabRegistrationError(
@@ -512,6 +584,66 @@ def _lab_refusal(
         raise LabRegistrationError(f"{path}: {reason}")
 
 
+def _variant_named(conn: duckdb.DuckDBPyConnection, variant_id: int) -> int | None:
+    """The first `promotion` or `operations_book` decision whose values name
+    `variant_id` as `variant_hypothesis_id`, or None."""
+    row = conn.execute(
+        "SELECT decision_id FROM owner_decisions WHERE kind IN ('promotion', ?) AND "
+        "TRY_CAST(json_extract_string(values_json, '$.variant_hypothesis_id') AS BIGINT) = ? "
+        "ORDER BY decision_id LIMIT 1",
+        [OPERATIONS_BOOK_KIND, variant_id],
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def _operations_refusal(
+    conn: duckdb.DuckDBPyConnection, path: Path, variant_id: int, code_vintage: str | None
+) -> None:
+    """An operations file's own refusals (module docstring), after the promoted
+    file's checks: the variant's counted `ok` trial, its family in `PAPER_FAMILIES`,
+    a family holdout that is not forward, and no decision naming the variant."""
+    # `sweep_report` reads `results`, which imports this module: imported at call time.
+    from tradepartner.backtest import sweep_report
+
+    variant = registry.get_hypothesis_by_id(conn, variant_id)
+    try:
+        standing = sweep_report.variant_standing(conn, variant_id, code_vintage=code_vintage)
+    except ValueError as exc:  # a shown trial without a finite base-level metric
+        raise LabRegistrationError(f"{path}: variant {variant.slug}: {exc}") from exc
+    # Counted means counted in N: the current `ok` trial, or a stale one (an `ok`
+    # trial from an earlier code or data vintage, which N still counts). A rerun to
+    # make it current would add trials to N for nothing; the decision records which.
+    if (
+        standing is None
+        or standing.row.status not in _OPERATIONS_TRIAL_STATES
+        or standing.row.trial_id is None
+    ):
+        state = "not a sweep variant" if standing is None else standing.row.status
+        raise LabRegistrationError(
+            f"{path}: variant {variant.slug} has no counted ok trial ({state}); run its "
+            "sweep (`sweep run`) first"
+        )
+    if variant.family not in PAPER_FAMILIES:
+        raise LabRegistrationError(
+            f"{path}: family {variant.family!r} is not in PAPER_FAMILIES {PAPER_FAMILIES}; "
+            "an operations file is a road to a paper book only"
+        )
+    registered_on = registry.family_registered_on(conn, variant.family)
+    if is_forward(Frozen.from_hypothesis(variant, registered_on=registered_on)):
+        raise LabRegistrationError(
+            f"{path}: family {variant.family!r}'s holdout ({variant.holdout_start} to "
+            f"{variant.holdout_end}) is forward (it starts after the family's first "
+            f"registration day {registered_on}); its exam is the promoted hypothesis's "
+            "paper book alone (ADR 0016 point 4)"
+        )
+    named = _variant_named(conn, variant_id)
+    if named is not None:
+        raise LabRegistrationError(
+            f"{path}: variant {variant.slug} is already named by decision {named} (a "
+            "promotion or an operations book); one standalone registration per variant"
+        )
+
+
 def register(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
@@ -519,6 +651,8 @@ def register(
     registered_by: str,
     settings: Settings | None = None,
     promotion_of: int | None = None,
+    operations_of: int | None = None,
+    code_vintage: str | None = None,
 ) -> registry.HypothesisRecord:
     """Register the hypothesis in `path` through `store.registry` and return its record.
 
@@ -534,8 +668,14 @@ def register(
     promotes (`sweep promote` passes it and appends the `promotion` decision naming
     the returned record); otherwise, or when it breaks a lab rule,
     `LabRegistrationError` (module docstring). `promotion_of` is ignored on a store
-    without the lab tables.
+    without the lab tables. `operations_of` names the sweep variant an operations file
+    runs (`register_operations_book` passes it): it needs the lab (`LabNotInitialised`
+    otherwise), a slug not yet registered, and every operations refusal (module
+    docstring); `code_vintage` is the checkout's for its counted-trial check (a test
+    passes one). Passing both `promotion_of` and `operations_of` is a `ValueError`.
     """
+    if promotion_of is not None and operations_of is not None:
+        raise ValueError("a file is a promoted file or an operations file, never both")
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
     params = frozen_params(parsed, settings)
@@ -563,6 +703,14 @@ def register(
     # Newest first: a file stored twice (before and after a table key landed) is its
     # latest registration, the one runs use.
     registrations = _slug_registrations(conn, parsed.slug)[::-1]
+    if operations_of is not None:
+        require_lab(conn)
+        if registrations:
+            raise LabRegistrationError(
+                f"{path}: slug {parsed.slug!r} is already registered (hypothesis "
+                f"{registrations[0].hypothesis_id}); an operations file is a new "
+                "registration under its own slug"
+            )
     for existing in registrations:
         if existing.doc_sha256 == parsed.doc_sha256 and same_set(existing):
             return _check_latest(conn, path, existing)
@@ -573,7 +721,9 @@ def register(
             "the registered file is the record"
         )
     if is_lab_initialised(conn):
-        _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of)
+        _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of, operations_of)
+        if operations_of is not None:
+            _operations_refusal(conn, path, operations_of, code_vintage)
     record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
@@ -626,3 +776,88 @@ def load_frozen(
         )
     live = settings if settings is not None else get_settings()
     return _overlay(live, values)
+
+
+@dataclass(frozen=True)
+class OperationsBookOutcome:
+    """An operations file's registration: the registered hypothesis, the
+    `operations_book` decision's id, the variant it runs and the decision's values."""
+
+    registered: registry.HypothesisRecord
+    decision_id: int
+    variant: registry.HypothesisRecord
+    values: dict[str, Any]
+
+
+def register_operations_book(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    variant_slug: str,
+    reason: str,
+    *,
+    registered_by: str,
+    settings: Settings | None = None,
+    code_vintage: str | None = None,
+) -> OperationsBookOutcome:
+    """`hypothesis register <path> --operations-book-of <variant_slug> --reason
+    <reason>` (module docstring, "Operations files"): register `path` with
+    `operations_of` the variant's id, write its `hypothesis_fingerprints` row
+    (the variant's fingerprint) and append the `operations_book` decision (sweep,
+    variant, registered id, the variant's base-level in-sample statistics; the
+    owner's reason), in one transaction (the caller's if open). Writes no trial.
+
+    Raises `LabNotInitialised` on a store without the lab tables, `ValueError` for a
+    blank reason, `UnknownHypothesis` for an unknown variant slug and
+    `LabRegistrationError` for every refusal; nothing is written on any of them."""
+    # `sweep_report` reads `results`, which imports this module: imported at call time.
+    from tradepartner.backtest import results, sweep_report
+
+    require_lab(conn)
+    if not reason.strip():
+        raise ValueError("an operations book needs a reason")
+    variant = registry.get_hypothesis(conn, variant_slug)
+    with atomic(conn):
+        record = register(
+            conn,
+            path,
+            registered_by=registered_by,
+            settings=settings,
+            operations_of=variant.hypothesis_id,
+            code_vintage=code_vintage,
+        )
+        standing = sweep_report.variant_standing(
+            conn, variant.hypothesis_id, code_vintage=code_vintage
+        )
+        if standing is None:  # `_operations_refusal` refused a non-variant already
+            raise LabRegistrationError(f"{path}: {variant_slug} is not a sweep variant")
+        (fingerprint,) = conn.execute(  # type: ignore[misc]
+            "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?",
+            [variant.hypothesis_id],
+        ).fetchone()
+        lab_registry.write_fingerprint(conn, record.hypothesis_id, str(fingerprint))
+        row = standing.row
+        values: dict[str, Any] = {
+            "sweep_id": standing.sweep_id,
+            "sweep_slug": standing.sweep_slug,
+            "variant_hypothesis_id": variant.hypothesis_id,
+            "variant_slug": variant.slug,
+            "variant_index": row.variant_index,
+            "operations_hypothesis_id": record.hypothesis_id,
+            "variant_trial_id": row.trial_id,
+            "variant_trial_current": row.status == "counted",
+            "family_n": results.family_n(conn, variant.family),
+            "excess_cagr_spy": row.excess_cagr_spy,
+            "sharpe_annual_excess_spy": row.sharpe_annual_excess_spy,
+            "dsr_excess": row.dsr_excess,
+            "cost_drag": row.cost_drag,
+            "turnover_annual": row.turnover_annual,
+            "max_drawdown": row.max_drawdown,
+        }
+        decision_id = registry.record_decision(
+            conn,
+            kind=OPERATIONS_BOOK_KIND,
+            reason=reason,
+            values=values,
+            hypothesis_id=record.hypothesis_id,
+        )
+    return OperationsBookOutcome(record, decision_id, variant, values)

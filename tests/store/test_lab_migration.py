@@ -182,7 +182,7 @@ def _hypothesis_ids(conn: duckdb.DuckDBPyConnection) -> list[int]:
 
 
 def test_version_is_17_and_16_is_the_pre_expansion_seams_version() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 21
+    assert schema.CURRENT_SCHEMA_VERSION == 22
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
     assert schema._PRE_LAB_VERSION == 15
 
@@ -222,7 +222,7 @@ def test_migration_identity(v15: tuple[duckdb.DuckDBPyConnection, dict[str, int]
     pre_lab = conn.execute("SELECT hypothesis_id FROM pre_lab_hypotheses ORDER BY 1").fetchall()
     assert [i for (i,) in pre_lab] == hypotheses_before
     versions = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-    assert versions == [(15,), (16,), (17,), (18,), (19,), (20,), (21,)]
+    assert versions == [(15,), (16,), (17,), (18,), (19,), (20,), (21,), (22,)]
     assert _tables(conn) == before_tables | set(lab_schema.LAB_TABLE_NAMES)
     # Only the three populated lab tables have rows.
     for table in lab_schema.LAB_TABLE_NAMES:
@@ -361,7 +361,7 @@ def test_a_fresh_store_stays_without_the_lab_tables() -> None:
     try:
         schema.init_schema(conn)
         assert not lab_schema.is_lab_initialised(conn)
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(21,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(22,)]
     finally:
         conn.close()
 
