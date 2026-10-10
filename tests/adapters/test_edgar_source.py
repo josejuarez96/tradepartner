@@ -15,7 +15,7 @@ import gzip
 import io
 import json
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
     STAMPS_LAYOUT,
     EdgarFilingSource,
+    SubmissionRecord,
     reduce_submissions,
 )
 from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
@@ -753,6 +754,26 @@ def test_event_forms_are_configurable_and_never_empty(settings: Settings) -> Non
     assert {e.form for e in source.filing_events(APPLE)} == {"10-Q"}
     with pytest.raises(ValueError, match="event_forms"):
         EdgarFilingSource(settings, client=_router().client(), event_forms=[])
+
+
+def test_clock_detector_reports_refresh_and_new_stamps_once(settings: Settings) -> None:
+    source = _source(settings, _router())
+    early = SubmissionRecord("early", "8-K", "doc.htm", False, datetime(2024, 1, 2, 20, tzinfo=UTC))
+    late = SubmissionRecord("late", "8-K", "doc.htm", False, datetime(2024, 1, 3, 21, tzinfo=UTC))
+    source._items_source = lambda cik, wanted: (  # type: ignore[method-assign]
+        {
+            "early": SubmissionRecord(
+                "early", "8-K", "doc.htm", False, early.accepted_at, "2.02", date(2024, 1, 3)
+            ),
+            "late": SubmissionRecord(
+                "late", "8-K", "doc.htm", False, late.accepted_at, "2.02", date(2024, 1, 2)
+            ),
+        },
+        True,
+    )
+    source._refresh_items(APPLE, {"early": early, "late": late})
+    assert source.filing_events_clock_suspect == 2
+    assert source.filing_events_clock_suspect_accessions == ["early", "late"]
 
 
 def _bulk_zip(settings: Settings, *members: tuple[str, bytes]) -> None:

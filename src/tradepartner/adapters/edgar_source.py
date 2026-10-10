@@ -292,6 +292,7 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.config import Settings, clean_message
+from tradepartner.health import clock_suspect
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The cache versions below each name a directory under `edgar.cache_dir`;
@@ -376,6 +377,9 @@ class SubmissionRecord:
     #: `None` when unknown: a payload or page without the column, or a record
     #: from the old stamps layout not yet refreshed (T164c, #1358).
     items: str | None = None
+    #: Present only on a freshly reduced submissions record; the stamps cache
+    #: keeps its five-element layout and never persists this comparison input.
+    filing_date: date | None = None
 
 
 @dataclass
@@ -405,6 +409,7 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
         items = columns.get("items")
         if items is None:
             items = [None] * len(accessions)
+        filing_dates = columns.get("filingDate", [None] * len(accessions))
         records = {
             accession: SubmissionRecord(
                 accession,
@@ -413,13 +418,15 @@ def reduce_submissions(payload: Mapping[str, Any]) -> tuple[dict[str, Submission
                 bool(ixbrl),
                 times[accession],
                 None if item is None else str(item),
+                date.fromisoformat(filed) if filed else None,
             )
-            for accession, form, doc, ixbrl, item in zip(
+            for accession, form, doc, ixbrl, item, filed in zip(
                 accessions,
                 columns["form"],
                 columns["primaryDocument"],
                 columns["isInlineXBRL"],
                 items,
+                filing_dates,
                 strict=True,
             )
             # #1138: a blank `acceptanceDateTime` leaves its accession out of
@@ -475,6 +482,9 @@ class EdgarFilingSource(FilingSource):
         self._events_counted: set[str] = set()
         self.filing_events_unstamped = 0
         self.filing_events_items_missing = 0
+        self.filing_events_clock_suspect = 0
+        self.filing_events_clock_suspect_accessions: list[str] = []
+        self._clock_suspect_seen: set[tuple[str, str]] = set()
         self._open_quarters: dict[Quarter, str] = {}
         # #578: quarters whose form.idx did not parse, recorded once per instance.
         self._unparsed_quarters: set[Quarter] = set()
@@ -700,6 +710,8 @@ class EdgarFilingSource(FilingSource):
                 if self._settled(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
             if new:
+                for record in new.values():
+                    self._check_event_clock(cik, record)
                 stamps[cik].update(new)
                 self._save_stamps(cik, stamps[cik])
         return stamps
@@ -814,6 +826,8 @@ class EdgarFilingSource(FilingSource):
                     continue
                 new = {a: records[a] for a in wanted if a in records}
                 if new:
+                    for record in new.values():
+                        self._check_event_clock(cik, record)
                     stamps[cik].update(new)
                     self._save_stamps(cik, stamps[cik])
         return unparsed
@@ -893,6 +907,19 @@ class EdgarFilingSource(FilingSource):
 
     # --- filing events (T164c, #1358) ----------------------------------------
 
+    def _check_event_clock(self, cik: str, record: SubmissionRecord) -> None:
+        key = (cik, record.accession)
+        if (
+            record.form in self._event_forms
+            and record.accepted_at is not None
+            and record.filing_date is not None
+            and key not in self._clock_suspect_seen
+            and clock_suspect(record.accepted_at, record.filing_date)
+        ):
+            self._clock_suspect_seen.add(key)
+            self.filing_events_clock_suspect += 1
+            self.filing_events_clock_suspect_accessions.append(record.accession)
+
     def filing_events(self, cik: str) -> list[FilingEvent]:
         """One `FilingEvent` per stamped accession of `cik` whose form is in
         `event_forms` and whose `items` is known, sorted by `accepted_at`,
@@ -951,6 +978,10 @@ class EdgarFilingSource(FilingSource):
         else:
             payload, complete = {}, True  # only sentinels: nothing to read
         filled = dict(stamps)
+        for accession, new_record in payload.items():
+            stamped = stamps.get(accession)
+            if stamped is not None:
+                self._check_event_clock(cik, replace(stamped, filing_date=new_record.filing_date))
         for accession in wanted:
             fresh = payload.get(accession)
             if fresh is not None and fresh.items is not None:

@@ -1442,6 +1442,13 @@ def make_app(
                 help="delete and re-ingest statement_facts in the EDGAR chunk (#660)",
             ),
         ] = False,
+        rebuild_filing_events: Annotated[
+            bool,
+            typer.Option(
+                "--rebuild-filing-events",
+                help="delete and re-ingest filing_events in the EDGAR chunk (#1458)",
+            ),
+        ] = False,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -1459,6 +1466,7 @@ def make_app(
         for flag, given in (
             ("--bulk-from-cache", bulk_from_cache),
             ("--rebuild-statement-facts", rebuild_statement_facts),
+            ("--rebuild-filing-events", rebuild_filing_events),
         ):
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
@@ -1480,6 +1488,8 @@ def make_app(
             raise _fail(
                 "--rebuild-statement-facts needs edgar.statement_facts_enabled", USAGE_ERROR
             )
+        if rebuild_filing_events and not s.edgar.filing_events_enabled:
+            raise _fail("--rebuild-filing-events needs edgar.filing_events_enabled", USAGE_ERROR)
         if fill_holes_ and start is not None:
             if (absent := _store_missing(s)) is not None:
                 raise absent
@@ -1502,7 +1512,11 @@ def make_app(
                 USAGE_ERROR,
             )
         filings = EdgarFilingSource(
-            s, client=edgar_client, clock=clock, reuse_cached=bulk_from_cache
+            s,
+            client=edgar_client,
+            clock=clock,
+            reuse_cached=bulk_from_cache,
+            event_forms=s.edgar.event_forms,
         )
         prices = (
             price_source(s)
@@ -1526,6 +1540,7 @@ def make_app(
                 clock=clock,
                 dry_run=dry_run,
                 rebuild_statement_facts=rebuild_statement_facts,
+                rebuild_filing_events=rebuild_filing_events,
             )
         _print_result(result)
         raise typer.Exit(result.exit_code)
