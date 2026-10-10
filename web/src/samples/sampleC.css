@@ -1,0 +1,29 @@
+.sC { --bg:#0c0e12; --panel:#12151b; --line:#20252e; --ink:#e6e8eb; --mut:#8b929c; --gain:#3ecf8e; --loss:#f2645a; --att:#f0b03f;
+  min-height:100vh; background:var(--bg); color:var(--ink); font-family:"IBM Plex Sans",sans-serif; font-size:12.5px; }
+.sC .n,.sC-axis,.sC-r,.sC-foot{font-family:"IBM Plex Mono",monospace; font-size:12px}
+.sC .gain{color:var(--gain)} .sC .loss{color:var(--loss)} .sC .flat,.sC .m{color:var(--mut)} .sC .att{color:var(--att)}
+.sC-bar{display:flex; align-items:center; gap:24px; height:44px; padding:0 16px; border-bottom:1px solid var(--line); background:var(--panel); overflow-x:auto; white-space:nowrap}
+.sC-brand{font-weight:600}
+.sC-q{display:flex; gap:8px; align-items:baseline} .sC-q .l{color:var(--mut)}
+.sC-tag{margin-left:auto; color:var(--mut)}
+.sC-grid{display:grid; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); grid-template-rows:auto 1fr; gap:1px; background:var(--line); min-height:calc(100vh - 44px)}
+.sC-panel{background:var(--bg); padding:12px 14px}
+.sC-chartp{grid-row:span 2}
+.sC-ph{display:flex; justify-content:space-between; align-items:center; color:var(--mut); margin-bottom:10px}
+.sC-ph>span:first-child{color:var(--ink); font-weight:500}
+.sC-r{display:flex; gap:2px} .sC-r b{font-weight:400; padding:2px 8px; border-radius:3px; color:var(--mut)} .sC-r b.on{background:#232a35; color:var(--ink)} .sC-r b.off{opacity:.35}
+.sC-chartwrap{position:relative; padding-right:56px}
+.sC-chart{width:100%; height:420px; display:block}
+.sC-chart .grid{stroke:var(--line); vector-effect:non-scaling-stroke}
+.sC-chart .area{fill:color-mix(in srgb,var(--gain) 10%,transparent)}
+.sC-chart .you{fill:none; stroke:var(--gain); stroke-width:1.75; vector-effect:non-scaling-stroke}
+.sC-chart .spy{fill:none; stroke:#5d6570; stroke-width:1.25; vector-effect:non-scaling-stroke}
+.sC-axis{position:absolute; right:0; top:0; bottom:0; width:52px; color:var(--mut)} .sC-axis span{position:absolute; right:0; transform:translateY(-50%)}
+.sC-foot{display:flex; flex-wrap:wrap; gap:18px; color:var(--mut); margin:10px 0 0} .sC-foot .you{color:var(--gain)}
+.sC-t{width:100%; border-collapse:collapse}
+.sC-t th{color:var(--mut); font-weight:400; text-align:left; padding:4px 0; border-bottom:1px solid var(--line)}
+.sC-t td{padding:7px 0; border-bottom:1px solid var(--line); vertical-align:top} .sC-t .r{text-align:right}
+.sC-t small{display:block; color:var(--mut); font-size:11px}
+.sC-l{list-style:none; margin:0; padding:0}
+.sC-l li{display:flex; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid var(--line)}
+@media (max-width:900px){ .sC-grid{grid-template-columns:1fr} .sC-chartp{grid-row:auto} .sC-chart{height:240px} .sC-bar{gap:16px} }

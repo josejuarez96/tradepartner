@@ -1,0 +1,26 @@
+.sB { --bg:#fff; --ink:#111; --mut:#6a6d72; --line:#eeeeef; --gain:#0a8a4a; --loss:#d33a2c; --line-c:var(--gain);
+  min-height:100vh; background:var(--bg); color:var(--ink); font-family:"Figtree Variable",sans-serif; font-size:15px; font-feature-settings:"tnum"; }
+.sB-loss{--line-c:var(--loss)}
+.sB .gain{color:var(--gain)} .sB .loss{color:var(--loss)} .sB .flat{color:var(--mut)}
+.sB-top{display:flex; justify-content:space-between; align-items:center; max-width:720px; margin:0 auto; padding:18px 20px}
+.sB-brand{font-weight:700; font-size:16px} .sB-tag{color:var(--mut); font-size:13px}
+.sB-main{max-width:720px; margin:0 auto; padding:12px 20px 60px}
+.sB-total{font-size:44px; font-weight:600; letter-spacing:-.02em; margin:12px 0 2px}
+.sB-today{margin:0; font-weight:600} .sB-today span{color:var(--mut); font-weight:400}
+.sB-chart{width:100%; height:260px; margin:28px 0 8px; display:block; overflow:visible}
+.sB-chart .you{fill:none; stroke:var(--line-c); stroke-width:2.25; vector-effect:non-scaling-stroke; stroke-linejoin:round}
+.sB-chart .spy{fill:none; stroke:#c4c6ca; stroke-width:1.5; stroke-dasharray:2 4; vector-effect:non-scaling-stroke}
+.sB-ranges{display:flex; gap:4px; border-bottom:1px solid var(--line); padding-bottom:12px}
+.sB-ranges button{font:inherit; font-weight:600; font-size:13px; border:0; background:none; padding:6px 12px; border-radius:999px; color:var(--mut)}
+.sB-ranges button.on{color:var(--line-c); background:color-mix(in srgb,var(--line-c) 12%,transparent)} .sB-ranges button:disabled{opacity:.35}
+.sB-vs{color:var(--mut); margin:16px 0}
+.sB-ok{padding:14px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); font-weight:600}
+.sB h2{font-size:20px; margin:36px 0 8px}
+.sB-list{list-style:none; margin:0; padding:0}
+.sB-list li{display:flex; align-items:center; gap:16px; padding:14px 0; border-bottom:1px solid var(--line)}
+.sB-list li>div{flex:1} .sB-list p{margin:0} .sB-list .n{font-weight:600} .sB-list .s{color:var(--mut); font-size:13px}
+.sB-spark{width:80px; height:28px} .sB-spark path{fill:none; stroke:currentColor; stroke-width:1.5}
+.sB-pill{min-width:76px; text-align:center; padding:6px 10px; border-radius:6px; color:#fff; font-weight:600; font-size:14px}
+.sB-pill.gain{background:var(--gain); color:#fff} .sB-pill.loss{background:var(--loss); color:#fff} .sB-pill.flat{background:#eceded; color:var(--ink)}
+.sB .chev{color:var(--mut); font-size:22px}
+@media (max-width:640px){ .sB-total{font-size:36px} .sB-chart{height:200px} .sB-spark{display:none} }

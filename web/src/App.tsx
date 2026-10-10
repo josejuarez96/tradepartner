@@ -7,6 +7,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Overview } from "@/screens/Overview";
 import { Research } from "@/screens/Research";
 import { LoadError, NoBooks, OverviewLoading } from "@/screens/OverviewStates";
+import { SampleA } from "@/samples/SampleA";
+import { SampleB } from "@/samples/SampleB";
+import { SampleC } from "@/samples/SampleC";
+import { SampleD } from "@/samples/SampleD";
+
+const SAMPLES: Record<string, () => React.JSX.Element> = { "sample-a": SampleA, "sample-b": SampleB, "sample-c": SampleC, "sample-d": SampleD };
 
 type Load = { kind: "loading" } | { kind: "error"; retrying: boolean } | { kind: "ready"; data: AppData };
 
@@ -40,6 +46,9 @@ export function App() {
   }, []);
 
   const data = load.kind === "ready" ? load.data : null;
+  // Design samples render on their own, outside the app shell, for comparison.
+  const Sample = SAMPLES[location.hash.slice(1)];
+  if (Sample) return <Sample />;
   return (
     <TooltipProvider>
       <AppShell
