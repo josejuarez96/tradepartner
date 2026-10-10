@@ -1411,12 +1411,30 @@ def test_an_operations_file_registers_with_its_decision_and_n_and_v_unchanged(op
     assert decision.values["variant_index"] == 2
     assert decision.values["sharpe_annual_excess_spy"] == pytest.approx(0.4)
     assert decision.values["family_n"] == n_before
+    assert decision.values["variant_trial_current"] is True
     # Not a promotion: no promotion row, so every spend, cap and identity rule reads
     # it as unpromoted; and no trial, so N and V are unchanged.
     assert lab_registry.promotion_for(ops.conn, record.hypothesis_id) is None
     assert results.family_n(ops.conn, "momentum") == n_before
     assert registry.family_sharpes(ops.conn, "momentum").variance("excess_spy") == v_before
     assert _ops_counts(ops.conn)["trials"] == trials_before
+
+
+def test_an_operations_file_accepts_a_stale_ok_trial_and_records_it(ops: Any) -> None:
+    """A variant whose `ok` trial is from an earlier code vintage (stale, still counted
+    in N) is accepted: a rerun would only add trials to N. The decision says so."""
+    v2 = ops.variants[1]
+    outcome = hypothesis.register_operations_book(
+        ops.conn,
+        ops.file(OPS_SLUG, 0.25),
+        v2.slug,
+        OPS_REASON,
+        registered_by="owner",
+        settings=ops.settings,
+        code_vintage="d" * 64,
+    )
+    assert outcome.values["variant_trial_current"] is False
+    assert outcome.values["variant_trial_id"] is not None
 
 
 def test_an_operations_file_is_refused_without_the_flag(ops: Any) -> None:

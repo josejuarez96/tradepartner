@@ -67,7 +67,8 @@ operations test when its sweep could not promote it. `register(..., operations_o
 variant's id>)` applies a promoted file's checks (the variant's fingerprint, the family
 rules, the anchor) and the canonical frozen-set equality `sweep promote` makes
 (`frozen_set_differences`, one function for both), plus its own: a slug not yet
-registered, the variant's counted `ok` trial (`sweep_report.variant_standing`), its
+registered, the variant's `ok` in-sample trial counted in N, current or stale
+(`sweep_report.variant_standing`), its
 family in `PAPER_FAMILIES`, the family's holdout **not forward** (`holdout.is_forward`
 with `registry.family_registered_on`; ADR 0016 point 4) and no `promotion` or
 `operations_book` row naming the variant already. The registration, its
@@ -110,6 +111,11 @@ from tradepartner.store.schema import atomic
 #: The `owner_decisions.kind` an operations file's registration appends
 #: (`lab_schema.OPERATIONS_DECISION_KINDS`, schema version 22).
 OPERATIONS_BOOK_KIND: Final = "operations_book"
+
+#: The variant states (`sweep_report.VariantRow.status`) whose shown trial is an `ok`
+#: in-sample trial counted in N: current (`counted`) or from an earlier vintage
+#: (`stale`).
+_OPERATIONS_TRIAL_STATES: Final = ("counted", "stale")
 
 
 def _family_frozen_sections() -> tuple[str, ...]:
@@ -601,7 +607,14 @@ def _operations_refusal(
 
     variant = registry.get_hypothesis_by_id(conn, variant_id)
     standing = sweep_report.variant_standing(conn, variant_id, code_vintage=code_vintage)
-    if standing is None or standing.row.status != "counted" or standing.row.trial_id is None:
+    # Counted means counted in N: the current `ok` trial, or a stale one (an `ok`
+    # trial from an earlier code or data vintage, which N still counts). A rerun to
+    # make it current would add trials to N for nothing; the decision records which.
+    if (
+        standing is None
+        or standing.row.status not in _OPERATIONS_TRIAL_STATES
+        or standing.row.trial_id is None
+    ):
         state = "not a sweep variant" if standing is None else standing.row.status
         raise LabRegistrationError(
             f"{path}: variant {variant.slug} has no counted ok trial ({state}); run its "
@@ -812,7 +825,8 @@ def register_operations_book(
         standing = sweep_report.variant_standing(
             conn, variant.hypothesis_id, code_vintage=code_vintage
         )
-        assert standing is not None  # `_operations_refusal` refused a non-variant
+        if standing is None:  # `_operations_refusal` refused a non-variant already
+            raise LabRegistrationError(f"{path}: {variant_slug} is not a sweep variant")
         (fingerprint,) = conn.execute(  # type: ignore[misc]
             "SELECT fingerprint FROM sweep_variants WHERE hypothesis_id = ?",
             [variant.hypothesis_id],
@@ -827,6 +841,7 @@ def register_operations_book(
             "variant_index": row.variant_index,
             "operations_hypothesis_id": record.hypothesis_id,
             "variant_trial_id": row.trial_id,
+            "variant_trial_current": row.status == "counted",
             "family_n": results.family_n(conn, variant.family),
             "excess_cagr_spy": row.excess_cagr_spy,
             "sharpe_annual_excess_spy": row.sharpe_annual_excess_spy,
