@@ -346,6 +346,49 @@ tail -n 40 ~/Library/Logs/tradepartner/paper.log ~/Library/Logs/tradepartner/pap
 
 As above, a `kickstart` run **counts as `scheduler`-invoked**, the same as a real scheduled run, and ("What the job does" above) can submit real paper orders on a fill session, a catch-up session, or for forced exits — on any session, inside the submit window. Prefer `uv run tradepartner paper status` **(built by T67)** to check state without placing anything; reserve `kickstart` for a time **outside the submit window**, or for when you deliberately want a scheduler-attributed run.
 
+### Several books: one plist, each book's run time, `--book`
+
+([ADR 0017](../decisions/0017-fast-paper-and-machine-readiness-gate.md) part B; plan T155b.) A **book** is a token (default `paper.book_id`, `main` for H1) with its own Alpaca paper account, key pair, run lock and at most one open window. The plist above needs no change for a second book: `tradepartner paper run` with **no `--book`** runs every book that has an open window, **in token order**, each its own run under its own lock and its own `paper_runs` row. A crash in one book's run is that book's `crashed` entry and never stops the next one. With one open book (`main`) it is exactly the run described above. A `paper run` with no open book at all is `paper.book_id`'s run alone and writes its `no_window` alert as before.
+
+The job's exit code is the worst of the books': 3 (`WRITE_FAILED_EXIT_CODE`) if any book's halt path could not write its switch, else 1 if any book's run exited non-zero, else 0. One line per book is printed, so read `paper.log` per book, not only `last exit code`. A `locked` book (another `paper run`, `resume`, `reconcile` or `stop` holding that book's lock) is that book's line and exit; the other books still run.
+
+**Every book's run time against the submit window.** The books run one after another under one job, so a later book starts after the earlier ones finish, and a run that waits for its sells (`sell_wait_seconds`, up to 900 s with today's defaults) pushes every later book toward the close of the window (`submit_window_after_open_minutes`). **From the first week with two or more books, record each book's run time** from the journal and compare it with the window. This is a read-only query on the real store, run by the owner (never on a copy an agent made, never while a run is in flight):
+
+```bash
+uv run python - <<'PY'
+import duckdb
+from tradepartner.config import get_settings
+
+con = duckdb.connect(str(get_settings().store.path), read_only=True)
+print(con.sql("""
+    SELECT w.book_id, r.session, r.kind, r.started_at, x.finished_at, x.status
+    FROM paper_runs r
+    JOIN paper_windows w USING (window_id)
+    LEFT JOIN paper_run_results x USING (run_id)
+    WHERE r.session IS NOT NULL
+    ORDER BY r.session DESC, r.started_at
+    LIMIT 40
+"""))
+PY
+```
+
+Convert `started_at` to New York time and read it against `[open(S) - paper.submit_window_before_open_minutes, open(S) + paper.submit_window_after_open_minutes]`. A fill session is the one that matters: a book whose `started_at` falls after the window closed leaves its rebalance `pending` for catch-up with nothing submitted ("What the job does" above). Keep the table for the Phase 4 retro.
+
+**The fallback: one plist per book, staggered.** Only once a book has been seen to miss the window (its `started_at` outside it, or a `missed_run` alert, or a catch-up for a rebalance that should have traded on its session), split the job. For each book, copy the paper plist to `com.tradepartner.paper.<book>.plist` and change three things: the `Label` (`com.tradepartner.paper.<book>`), the arguments (add `<string>--book</string>` and `<string>BOOK</string>` after `<string>run</string>`), and the log names (`paper.<book>.log`, `paper.<book>.err.log`). Give each a different `StartCalendarInterval` Minute, a few minutes apart and all inside the window with room for the earlier book's sells (for example `main` at 08:05 and the next book at 08:20), and **remove the all-books job** (`launchctl bootout gui/$(id -u)/com.tradepartner.paper`) so no book is run twice. Install, test and pause each as above. The run lock is per book, so the staggered jobs cannot step on each other; two jobs for the same book would just produce a `locked` alert.
+
+**`--book` on every command.** Every `paper` command except `shakedown` takes `--book <token>`, default `paper.book_id` (`main`): `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `report`, `check`, `status`, `abandon`, `override` and `settle`. A token outside the grammar is a usage error (exit 2) before the store is opened. `--book` picks a book's paper key pair, never an endpoint. Examples:
+
+```bash
+uv run tradepartner paper status --all              # one summary line per book
+uv run tradepartner paper status --book <token>     # one book in full
+uv run tradepartner paper kill --book <token> --reason "why"
+uv run tradepartner paper kill --all --reason "why"  # every book with an open window
+uv run tradepartner paper resume --book <token> --reason "root cause and what you checked"
+uv run tradepartner paper check --book <token>
+```
+
+A kill is per book (the switch is derived per window); `--all` is the owner's all-books stop. Resume is always per book and always reconciles first. Every other procedure on this page (alerts, exit codes, resume, `abandon`) applies to a book with `--book <token>` added.
+
 ### Checking a run
 
 After a scheduled run, before moving on with your day:
@@ -387,7 +430,7 @@ Every alert is a row in the `alerts` table first (the source of truth), delivere
 | `missed_rebalance` | A rebalance event was logged `missed`, reason one of `catch_up_lapsed`, `kill_switch`, `limit_breach`, `skip_cap` or `window_stop`. | Read the reason in the alert message; it names which of the above stopped this rebalance from trading. |
 | `drawdown` | Ledger equity fell more than `risk.max_drawdown` below the window's peak. | This engages the kill switch automatically (a risk rule, not a judgment call). `paper stop` is refused while the switch is engaged, so you cannot go straight to stopping: `paper resume --reason "..."` first (which also resets the drawdown peak to the ledger equity at the last mark — a further drop from the *new*, lower peak can trip it again), and only then decide whether to let trading continue or `paper stop --reason "..."` right away. |
 | `unspent_cash` | After buys executed, leftover cash exceeded `risk.max_unspent_cash_fraction` of equity. | Informational; check the plan's sizing on `paper status`. Does not engage the switch. |
-| `locked` | A second instance found the run lock (`<store.path>.paper.lock`) held — by another `paper run`, or by a `resume`, `reconcile` or `stop` in progress. Ingest uses a separate store lock and is not a cause of this one. | No `paper_runs` row was written for this attempt; the lock holder's own run proceeds normally. If this was the day's only scheduled attempt, expect `missed_run` for S−1 on the next run, and on a fill session the rebalance falls to catch-up. If it recurs, check for a stuck process holding the paper lock, and avoid running `resume`/`reconcile`/`stop` right at the scheduled start time. |
+| `locked` | A second instance found the run lock (`<store.path>.paper.<book>.lock`, per book; book `main` also takes the pre-book `<store.path>.paper.lock`) held — by another `paper run`, or by a `resume`, `reconcile` or `stop` in progress. Ingest uses a separate store lock and is not a cause of this one. | No `paper_runs` row was written for this attempt; the lock holder's own run proceeds normally. If this was the day's only scheduled attempt, expect `missed_run` for S−1 on the next run, and on a fill session the rebalance falls to catch-up. If it recurs, check for a stuck process holding the paper lock, and avoid running `resume`/`reconcile`/`stop` right at the scheduled start time. |
 | `no_window` | `paper run` ran with no open window; `kill`, `resume`, `reconcile`, `abandon` and `override` are refused the same way but write no alert of their own. | Normal before the first `paper start` or after `paper stop`. If you expected a window to be open, check `paper status`. Once the final window has closed for good, `launchctl bootout` the paper job so it stops alerting daily. |
 
 ### Kill switch: engage, and the resume procedure
@@ -421,6 +464,68 @@ uv run tradepartner paper resume --accept-broker-fills --reason "order <id>: bro
 ```
 
 With the flag, for each qualifying order `paper resume` journals a synthetic fill for the residual quantity only (broker's `filled_quantity` minus what's already journaled), priced from the implied residual and flagged `price_implied`. **The synthetic fill is the one that stands**: if a real fill for that order arrives later anyway, it is journaled `superseded_by` the synthetic one and every reader filters it out — the implied price is not retroactively corrected to the real one. Without the flag, resume refuses outright while any such order exists; this is the owner's considered decision to trust the broker's number over a missing feed message, not something to reach for reflexively because resume is otherwise refusing.
+
+### The kill-switch drill (ADR 0017 part E.4)
+
+The drill proves, on the real store, that an engaged switch stops a scheduled run from submitting anything. It is one of the seven shakedown lines (E.4) and is run **once, on book `main`, on an H1 fill session** inside the shakedown span (the first session after a month-end; not H1's first fill session, which is the evidence run and must trade). `main` hosts it because it is the fastest book that is not a forward exam: the drill costs H1 at most one rebalance (delayed to a catch-up run, or `missed` with reason `kill_switch` if the catch-up lapses), reported by `paper report` and never an exam result. The owner times it.
+
+1. **Before the scheduled run, on the fill session** (after the previous session's ingest, before the job's start, 08:05 ET with today's plist), engage the switch yourself:
+   ```bash
+   uv run tradepartner paper kill --book main --reason "drill"
+   ```
+   The `--reason` is journaled; the `kill_switch` row it writes has `state = engaged` and `source = owner`, which is what E.4 reads. Confirm with `uv run tradepartner paper status --book main` that the switch shows engaged. Engage it **only** for `main`: `--all` would drill every book and cost each its rebalance.
+2. **Let the scheduled run skip.** Do not start the run yourself and do not `kickstart` it: the line needs a run with `invoked_by = 'scheduler'` (and a kickstart inside the window can trade if the switch is not engaged). The job still collects, reconciles and marks, and submits nothing; `main`'s result is `skipped_kill_switch` (exit 0) with **no `orders` row**. Check it in `paper status --book main` after the run. Any other book with an open window runs normally in the same job.
+3. **Resume the same day**, once the run has finished (never before it, or the run trades):
+   ```bash
+   uv run tradepartner paper resume --book main --reason "drill complete: <what you checked>"
+   ```
+   Resume settles, collects, reconciles and appends the `released` row, exactly as in "Kill switch" above; if reconciliation fails it refuses and the switch stays engaged, so find out why before trying again. The `released` row is the third thing E.4 reads. The drilled rebalance trades on a later catch-up run if the catch-up window allows it, else it is logged `missed` (reason `kill_switch`).
+
+Nothing in the drill bypasses a risk check or releases the switch without a reconciliation. If the drilled session shows an `orders` row for `main`, or the run's result is anything but `skipped_kill_switch`, stop and treat it as an incident: that is a kill-switch defect, not a drill result.
+
+### The shakedown: the span, notes and `paper shakedown`
+
+The Phase 4 exit is [ADR 0017](../decisions/0017-fast-paper-and-machine-readiness-gate.md) part E: `tradepartner paper shakedown` exits 0 on the real store with all seven lines passed over every book, and the Phase 4 retro records the output.
+
+**Open the span** with one owner decision:
+
+```bash
+uv run tradepartner decision shakedown-span --sessions 10 --order-sessions 5 --reason "..."
+```
+
+`--sessions N` is how many sessions the span needs and `--order-sessions M` how many of them need a live fill (decided: N = 10, M = 5; a longer span keeps one order session per two sessions). The `--reason` names the strategy that goes live first, from its exam of record (ADR 0017 open question 8). The span is every XNYS session from the session after the row's time through the last completed session. The thresholds are read from that row, never from `config.py` or `.env`, so the bar cannot move after a failing span. A new `shakedown-span` row restarts the span, and the rerun is recorded. Open it so that an H1 fill session lies inside the ten (the drill needs one).
+
+**A `mismatch` reconciliation or a real halt inside the span restarts it**: the span then starts at the session after the `released` kill-switch row that followed it. Fix the cause and resume; open a new `shakedown-span` row only if you want the count to start later.
+
+**Annotate an alert** that the span would otherwise fail on, by the alert's id as `paper status` lists it (a `stale_data` or `missed_run` alert):
+
+```bash
+uv run tradepartner decision shakedown-note --alert <alert id> --reason "what happened and why it is accepted"
+```
+
+A note counts for E.1 (a `stale` run, or a session with no run row, passes with a note on its alert; the line prints how many passed by note) and for E.7 (a `stale_data` alert needs one). An unknown alert id is refused. A note excuses late data only; it does not excuse a mismatch or a halt.
+
+**Run the gate** (read-only, writes nothing; exits 0 only when every line passes, and 1 when any fails or no `shakedown-span` row exists):
+
+```bash
+uv run tradepartner paper shakedown
+```
+
+It prints one line per criterion with the rows it read, its query, the thresholds and what it found. The seven lines (ADR 0017 part E, criteria 1 to 7):
+
+| Line | What passing means |
+|---|---|
+| E.1 sessions | For every session of the span and every book whose window was open, a scheduler-invoked run ended `ok`, or `skipped_kill_switch` during the drill, or `stale` with a note (a session with no run passes only with a note on its `missed_run` alert); and on at least M sessions, across all books, a scheduler-invoked run submitted an order with a live fill. The span must also hold at least N completed sessions. |
+| E.2 reconciliation | No `mismatch` reconciliation in any book; `pending_unresolved` and `fills_lagging` only when that book's next reconciliation is `ok`. |
+| E.3 orders | No decision whose live fills exceed its planned quantity or notional plus the frozen tolerance, no order whose fills exceed its own size plus the tolerance, and no run that ended in a `LimitBreachError`. |
+| E.4 kill-switch drill | In at least one book: an owner `engaged` row, then a scheduler run of kind `rebalance` or `catch_up` that ended `skipped_kill_switch` and wrote no `orders` row, then a `released` row (the drill above). A real halt in the span is printed beside it but restarts the span once resumed. |
+| E.5 journal | `paper check`'s `chain` and `override_reason` lines pass for every book: every due chain is complete and no live fill is known after its terminal event. |
+| E.6 alerts | At least one `alert_deliveries` row with `ok = TRUE` in the span for every non-store channel in `alerts.channels` (`macos`, `email`). |
+| E.7 data | Every `stale_data` alert in the span has a note, and `tradepartner health` passes on the day the command runs. |
+
+A failing line is not a reason to edit a threshold: fix the cause, note the alert, or restart the span.
+
+**Where the evidence is kept.** Paste the seven lines of the passing run on #1352 and copy them into the Phase 4 retro (under `docs/retros/`, written at the phase close), together with the per-book run-time table from "Several books" above and the span's `shakedown-span` and `shakedown-note` decisions. The existing live gates (ADR 0017 part F: employer compliance, the written stop criteria, the taxable cash account, a `safety-reviewer` pass on the live path) stay beside it; a passing `paper shakedown` does not by itself start Phase 6.
 
 ### `abandon`: the last resort, and the strictly-flat rule after it
 

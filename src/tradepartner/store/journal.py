@@ -43,6 +43,13 @@ pointer).
   fix (open the store for writing once). `_select` selects every row-type
   field, so without this guard every read of the eight expanded tables, the
   ops page and `open_window` included, would fail with a binder error.
+- **Per book** (ADR 0017 B.2 and B.6; plan T154, schema version 19):
+  `open_window(conn, book_id)` and `latest_window(conn, book_id)` read only that
+  book's windows (`open_window` still fails closed on two open windows of one
+  book), and `alerts_for` keys the session-scoped dedupe on (book, kind,
+  session). Called without a book (every caller until T155 and T155b pass one),
+  each reads every book exactly as before version 19, `open_window` still failing
+  closed on two open windows of any books.
 
 Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 `insert_row` quotes every column.
@@ -50,6 +57,7 @@ Column `at` is a DuckDB keyword: SQL naming it must quote it (`"at"`);
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
 from datetime import date, datetime
@@ -528,6 +536,7 @@ class AlertRow:
     kind: str
     message: str
     at: datetime
+    book_id: str = DEFAULT_BOOK_ID
     known_at: datetime
     ingested_at: datetime
 
@@ -981,31 +990,74 @@ def _select[R](
     return [row_type(**dict(zip(names, row, strict=True))) for row in rows]
 
 
-def _open_windows(conn: duckdb.DuckDBPyConnection) -> list[PaperWindowRow]:
+#: The book token's grammar (ADR 0015 seam 1, `execution.ids`; `paper.book_id`'s
+#: pattern in `config.py`): the per-book readers refuse anything else rather
+#: than read an empty book.
+_BOOK_ID_PATTERN = re.compile(r"[A-Za-z0-9]+")
+
+
+def check_book_id(book_id: str) -> None:
+    """Raise `ValueError` unless `book_id` is a book token (`^[A-Za-z0-9]+$`)."""
+    if not isinstance(book_id, str) or _BOOK_ID_PATTERN.fullmatch(book_id) is None:
+        raise ValueError(f"book_id must match ^[A-Za-z0-9]+$, got {book_id!r}")
+
+
+#: `t.book_id`'s filter for the per-book readers: a NULL parameter reads every
+#: book (the call without a book), anything else only that book.
+_BOOK_FILTER = "(CAST(? AS VARCHAR) IS NULL OR t.book_id = ?)"
+
+
+def _book_params(book_id: str | None) -> list[str | None]:
+    """`_BOOK_FILTER`'s two parameters, after `check_book_id` on a given book."""
+    if book_id is not None:
+        check_book_id(book_id)
+    return [book_id, book_id]
+
+
+def _open_windows(conn: duckdb.DuckDBPyConnection, book_id: str | None) -> list[PaperWindowRow]:
     return _select(
         conn,
         PaperWindowRow,
-        "t.window_id NOT IN (SELECT window_id FROM paper_window_stops "
+        f"{_BOOK_FILTER} AND t.window_id NOT IN (SELECT window_id FROM paper_window_stops "
         "WHERE list_contains(?, state))",
-        [list(CLOSING_STOP_STATES)],
+        [*_book_params(book_id), list(CLOSING_STOP_STATES)],
         order="t.window_id",
     )
 
 
-def open_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
-    """The open window (no `closed` or `abandoned` stop row), or None. Fails closed
-    with `JournalIntegrityError` when more than one window is open."""
-    windows = _open_windows(conn)
+def open_window(
+    conn: duckdb.DuckDBPyConnection, book_id: str | None = None
+) -> PaperWindowRow | None:
+    """Book `book_id`'s open window (no `closed` or `abandoned` stop row), or None;
+    another book's windows are never read (ADR 0017 B.2). Fails closed with
+    `JournalIntegrityError` when more than one of the book's windows is open, and
+    with `ValueError` on a `book_id` outside the token grammar. With no book (every
+    caller until T155 passes its own) it reads every book, as before version 19,
+    and so fails closed on two open windows of any books."""
+    windows = _open_windows(conn, book_id)
     if len(windows) > 1:
         ids = ", ".join(str(w.window_id) for w in windows)
-        raise JournalIntegrityError(f"more than one open paper window: {ids}")
+        scope = "" if book_id is None else f" for book {book_id!r}"
+        raise JournalIntegrityError(f"more than one open paper window{scope}: {ids}")
     return windows[0] if windows else None
 
 
-def latest_window(conn: duckdb.DuckDBPyConnection) -> PaperWindowRow | None:
-    """The window with the highest id, open or closed (what `paper check` and
-    `paper report` target), or None before the first `paper start`."""
-    windows = _select(conn, PaperWindowRow, order="t.window_id DESC")
+def latest_window(
+    conn: duckdb.DuckDBPyConnection, book_id: str | None = None
+) -> PaperWindowRow | None:
+    """Book `book_id`'s window with the highest id, open or closed (what `paper
+    check` and `paper report` target), or None before the book's first `paper
+    start`; another book's windows are never read (ADR 0017 B.2). `ValueError` on a
+    `book_id` outside the token grammar. With no book it reads every book, as
+    before version 19."""
+    windows = _select(
+        conn,
+        PaperWindowRow,
+        _BOOK_FILTER,
+        _book_params(book_id),
+        order="t.window_id DESC",
+        limit=1,
+    )
     return windows[0] if windows else None
 
 
@@ -1306,10 +1358,23 @@ def resume_acceptances(conn: duckdb.DuckDBPyConnection) -> list[ResumeAcceptance
     return _select(conn, ResumeAcceptanceRow, order="t.resume_id")
 
 
-def alerts_for(conn: duckdb.DuckDBPyConnection, *, kind: str, session: date) -> list[AlertRow]:
-    """The alerts under one dedupe key (`kind`, `alerts.session`)."""
+def alerts_for(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    kind: str,
+    session: date,
+    book_id: str | None = None,
+) -> list[AlertRow]:
+    """The alerts under one session-scoped dedupe key (`alerts.book_id`, `kind`,
+    `alerts.session`; ADR 0017 B.6, schema version 19), or, with no book, every
+    book's under (`kind`, `session`). `ValueError` on a `book_id` outside the
+    token grammar. `execution.alerts.Alerter` always passes its book."""
     return _select(
-        conn, AlertRow, "t.kind = ? AND t.session = ?", [kind, session], order="t.alert_id"
+        conn,
+        AlertRow,
+        f"{_BOOK_FILTER} AND t.kind = ? AND t.session = ?",
+        [*_book_params(book_id), kind, session],
+        order="t.alert_id",
     )
 
 

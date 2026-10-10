@@ -62,7 +62,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 MAIN_REF = "origin/main"
 SHARED_FILES = ("docs/STATUS.md", "CHANGELOG.md")
@@ -79,6 +79,13 @@ VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
+#: The jobs that fan out over a matrix (`.github/workflows/ci.yml`'s `pytest-shard`).
+#: Only these carry a ` (<index>)` suffix GitHub may strip; a non-matrix job named
+#: `foo (2)` is a job of its own, never a child of `foo`.
+MATRIX_JOBS: Final = frozenset({"pytest-shard"})
+#: A matrix child's index as GitHub renders it (`pytest-shard (3)`). Wider than a single
+#: integer so a second matrix key or a string shard name still strips.
+MATRIX_SUFFIX_RE = re.compile(r" \([^)]*\)$")
 STATUS_LIST = "## Recently done"
 CHANGELOG_LIST = "## [Unreleased]"
 FRAGMENT_DIRS = ("docs/status.d/", "changelog.d/")
@@ -324,6 +331,27 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     return sorted(r for r in required if latest.get(r) != "pass")
 
 
+def matrix_base(name: str) -> str:
+    """The bare name of a known matrix job's child: ``pytest-shard (3)`` -> ``pytest-shard``.
+
+    GitHub reports a matrix job both as the bare name (when the whole matrix is skipped or
+    cancelled before it fans out) and as ``<base> (<index>)`` for each child. Only a known
+    matrix job (``MATRIX_JOBS``) is stripped, so a non-matrix job whose name ends in a
+    parenthesised token keeps its own name and never pairs with its stem. A name that is
+    already bare, or is not a known matrix child, is returned unchanged.
+    """
+    if name in MATRIX_JOBS:
+        return name
+    base = MATRIX_SUFFIX_RE.sub("", name)
+    return base if base in MATRIX_JOBS else name
+
+
+def is_cancelled(run: CheckRun) -> bool:
+    """A run GitHub concluded ``CANCELLED`` once it finished. A cancelled job is
+    ``COMPLETED`` (an in-progress run has no conclusion yet)."""
+    return run.conclusion.upper() == "CANCELLED" and run.status.upper() == "COMPLETED"
+
+
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
@@ -338,23 +366,29 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     Since #1192 a draft's run (no ``ci:full`` label) never reports ``checks``: its
     aggregator is ``checks (draft, no shards)``, which gates nothing and is ignored here,
     so a draft's head stays pending until a full run reports ``checks``. That full run
-    (``ready_pr`` labels the draft) can cancel a draft run still going on the same head;
-    a ``CANCELLED`` run is ignored when another run of the same name is on the head, so
-    the superseded run does not read as a failure. A lone ``CANCELLED`` ``checks`` with
-    every run on the head completed is ``cancelled`` (#1201): the caller may re-trigger
-    once, and it is never green. Any other lone ``CANCELLED`` still fails.
+    (``ready_pr`` labels the draft) can cancel a draft run still going on the same head; a
+    ``CANCELLED`` run is ignored when a non-cancelled run of the same exact name is on the
+    head. A non-cancelled matrix child also excuses its cancelled bare parent -- the full
+    run's ``pytest-shard (N)`` excuses a cancelled ``pytest-shard`` cancelled before it
+    fanned out -- but never a cancelled sibling child: a cancelled ``pytest-shard (3)``
+    needs its own ``pytest-shard (3)`` success (#1254). A lone ``CANCELLED`` ``checks``
+    with every run on the head completed is ``cancelled`` (#1201): the caller may
+    re-trigger once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
-    live = [r for r in checks.runs if r.name != DRAFT_CHECKS]
-    not_cancelled = {
-        r.name
-        for r in live
-        if r.conclusion.upper() != "CANCELLED" or r.status.upper() != "COMPLETED"
-    }
-    runs = [
-        r for r in live if not (r.conclusion.upper() == "CANCELLED" and r.name in not_cancelled)
+    live = [
+        (run, matrix_base(run.name), is_cancelled(run))
+        for run in checks.runs
+        if run.name != DRAFT_CHECKS
     ]
+    # The exact names and bare matrix names a finished, non-cancelled run excuses.
+    finished: set[str] = set()
+    for run, base, cancelled in live:
+        if not cancelled:
+            finished.add(run.name)
+            finished.add(base)
+    runs = [run for run, _base, cancelled in live if not (cancelled and run.name in finished)]
     if not any(r.name == "checks" for r in runs):
         return "pending"
     if any(r.status.upper() != "COMPLETED" for r in runs):

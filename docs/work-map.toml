@@ -968,7 +968,8 @@ why = "The live account is a taxable cash account (#813) while paper is margin; 
 
 [task.T164]
 what = "The data-foundation spec amendment for filing_events (the EDGAR 8-K items field with its acceptance time) and the read-only coverage count of 2.02 8-Ks across the universe."
-why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; the count says how many issuers the rule reaches before anything is built."
+why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; the count says how many issuers the rule reaches before anything is built (98 to 99% of the universe each quarter, claim TP-1; it also found the stamps-clock defect, TP-2)."
+unblocks = ["task:T164b"]
 
 [task.T164b]
 what = "The filing_events table, the FilingEvent record, the FilingSource question and three fixture 8-K rows (a same-day-filed 2.02, an after-hours 2.02, a 5.02)."

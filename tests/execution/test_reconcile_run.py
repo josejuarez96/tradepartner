@@ -1141,3 +1141,106 @@ def test_an_as_of_after_the_clock_reading_is_refused_before_any_broker_call(
     with pytest.raises(ClockError, match="after the clock reading"):
         _reconcile(journal_settings, fake, open_window, fixed_clock, as_of=later)
     assert _rows(journal_settings, open_window) == []
+
+
+# --- books (ADR 0017 B.4 and B.5, plan T155) ------------------------------------------
+
+
+@pytest.fixture
+def b_frozen_window(journal_settings: Settings, frozen_window: PaperWindowRow) -> PaperWindowRow:
+    """Book `b`'s open window on its own account (PB1), beside `main`'s."""
+    row = replace(frozen_window, window_id=None, book_id="b", account_id="PB1")
+    (window_id,) = _append(journal_settings, row)
+    return replace(row, window_id=window_id)
+
+
+def _b_fake(clock: FixedClock) -> BookedFake:
+    return BookedFake(clock=clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1")
+
+
+def test_a_reconciliation_fault_halts_only_its_book(
+    journal_settings: Settings,
+    frozen_window: PaperWindowRow,
+    b_frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Spec acceptance (ADR 0017 B.5): a mismatch on `b`'s account writes `b`'s
+    row and engages `b`'s switch; `main` gets no row and no engagement."""
+    b_fake = _b_fake(fixed_clock)
+    b_fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))  # foreign, open
+
+    with pytest.raises(ReconciliationError, match="foreign_order"):
+        reconcile_command(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            b_fake,
+            fixed_clock,
+            book_id="b",
+        )
+
+    (row,) = _rows(journal_settings, b_frozen_window)
+    assert (row.status, row.book_id) == (MISMATCH, "b")
+    assert _rows(journal_settings, frozen_window) == []
+    with open_read_only(journal_settings) as conn:
+        (event,) = kill_switch_events_for(conn, b_frozen_window.window_id)  # type: ignore[arg-type]
+        assert kill_switch_events_for(conn, frozen_window.window_id) == []  # type: ignore[arg-type]
+    assert (event.state, event.source) == ("engaged", "fault")
+
+
+def test_main_s_reconcile_reads_main_s_window_beside_b_s(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    b_frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """With no book, `paper reconcile` is `main`'s (`paper.book_id`): `b`'s open
+    window is not a second open window, and `main`'s row is `main`'s."""
+    result = _command(journal_settings, fake, fixed_clock)
+    assert result.status == "ok"
+    (row,) = _rows(journal_settings, frozen_window)
+    assert row.book_id == "main"
+    assert _rows(journal_settings, b_frozen_window) == []
+
+
+def test_b_s_reconcile_runs_while_main_s_lock_is_held(
+    journal_settings: Settings,
+    frozen_window: PaperWindowRow,
+    b_frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    b_fake = _b_fake(fixed_clock)
+    with run_lock(journal_settings, "main"):
+        result = reconcile_command(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            b_fake,
+            fixed_clock,
+            book_id="b",
+        )
+        with run_lock(journal_settings, "b"), pytest.raises(LockHeld):
+            reconcile_command(
+                journal_settings,
+                lambda: open_for_write(journal_settings),
+                b_fake,
+                fixed_clock,
+                book_id="b",
+            )
+    assert result.status == "ok"
+
+
+def test_reconcile_for_a_book_with_no_window_is_no_window(
+    journal_settings: Settings,
+    fake: BookedFake,
+    frozen_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    with pytest.raises(NoWindowError, match="no_window"):
+        reconcile_command(
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            fake,
+            fixed_clock,
+            book_id="b",
+        )
+    assert fake.calls == ()

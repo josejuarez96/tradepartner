@@ -154,6 +154,18 @@ def _dataset(
 ) -> research.DatasetRecord:
     dates = dates if dates is not None else [date(2021, 1, 4), date(2022, 6, 30)]
     csv, split_file = _export(tmp_path, stem or name, dates, splits)
+    row_dates = (
+        {
+            s: (
+                list(dates)
+                if s in research.EVERY_ROW_SPLITS
+                else [d for d, x in zip(dates, splits or (), strict=False) if x == s]
+            )
+            for s in sealed
+        }
+        if sealed
+        else None
+    )
     return research.register_dataset(
         conn,
         name=name,
@@ -169,6 +181,7 @@ def _dataset(
         split_spans=split_event_spans(dates, splits) if splits else None,
         sealed_splits=sealed,
         sealed_periods=periods,
+        split_row_dates=row_dates,
         locked=locked,
         seed=seed,
         repo_dir=tmp_path,
@@ -521,6 +534,159 @@ def test_register_dataset_checks_a_sealed_none_against_the_whole_event_span(
             dates=_DEV_TEST,
             sealed=("none",),
             periods=_TEST_PERIOD,
+        )
+
+
+def test_register_dataset_refuses_a_sealed_row_that_falls_between_two_periods(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174: the sealed-span check tested only the split's two endpoints, so a row
+    sitting in the gap between two disjoint sealed periods passed, though no period
+    holds it. With the per-split row dates the store refuses it, extending #1149 from
+    the endpoints to every row."""
+    periods = (
+        (date(2020, 1, 1), date(2020, 12, 31)),
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    with pytest.raises(research.ResearchError, match="sealed split without period"):
+        _dataset(
+            conn,
+            tmp_path,
+            dates=[date(2020, 1, 2), date(2022, 6, 1), date(2024, 1, 2)],
+            sealed=("full",),
+            periods=periods,
+        )
+
+
+def test_register_dataset_accepts_a_sealed_split_confined_to_disjoint_periods(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174: disjoint sealed periods are refused only when a row falls in the gap
+    between them; a rowless gap is fine, so the store must not require the merged
+    periods to cover the whole span."""
+    periods = (
+        (date(2020, 1, 1), date(2020, 12, 31)),
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    record = _dataset(
+        conn,
+        tmp_path,
+        dates=[date(2020, 1, 2), date(2024, 1, 2)],
+        sealed=("full",),
+        periods=periods,
+    )
+    assert record.sealed_splits == ("full",)
+    assert record.sealed_periods == periods
+
+
+_GAPPED = (
+    (date(2020, 1, 1), date(2020, 12, 31)),
+    (date(2024, 1, 1), date(2024, 12, 31)),
+)
+
+
+def _seal_full(
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    *,
+    event_start: date,
+    event_end: date,
+    row_dates: list[date] | None,
+    n_rows: int | None,
+    periods: tuple[tuple[date, date], ...] = _GAPPED,
+) -> research.DatasetRecord:
+    """A sealed `full` registration with the declared span, row dates and row count
+    given separately, as a direct API caller can pass them (#1174 review)."""
+    csv, _ = _export(tmp_path, "panel", [date(2020, 1, 2), date(2024, 1, 2)])
+    return research.register_dataset(
+        conn,
+        name="panel",
+        version="v1",
+        path=str(csv),
+        sha256=hash_file(csv),
+        event_start=event_start,
+        event_end=event_end,
+        n_rows=n_rows,
+        event_column="event_date",
+        sealed_splits=("full",),
+        sealed_periods=periods,
+        split_row_dates={"full": row_dates} if row_dates is not None else None,
+        repo_dir=tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "periods",
+    [
+        pytest.param(((date(2020, 1, 1), date(2020, 12, 31)),), id="span-end-outside"),
+        pytest.param(_GAPPED, id="endpoints-inside-gap-between"),
+    ],
+)
+def test_register_dataset_refuses_an_empty_row_list_for_an_uncovered_span(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path, periods: tuple[tuple[date, date], ...]
+) -> None:
+    """#1174 review: `split_row_dates={"full": []}` must not skip the check when the
+    sealed periods do not cover the span; the endpoint check runs first, and an
+    empty row list cannot stand in for the rows."""
+    with pytest.raises(research.ResearchError, match="sealed split without period"):
+        _seal_full(
+            conn,
+            tmp_path,
+            event_start=date(2020, 1, 2),
+            event_end=date(2024, 1, 2),
+            row_dates=[],
+            n_rows=None,
+            periods=periods,
+        )
+    assert conn.execute("SELECT count(*) FROM research_datasets").fetchone() == (0,)
+
+
+def test_register_dataset_accepts_a_declared_span_wider_than_its_sealed_rows(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174 review: the declared `[event_start, event_end]` may be wider than the
+    rows (`check_declared_event_span`); with both endpoints and every row inside a
+    sealed period it registers, as it did before #1174."""
+    record = _seal_full(
+        conn,
+        tmp_path,
+        event_start=date(2020, 1, 1),
+        event_end=date(2024, 12, 31),
+        row_dates=[date(2020, 1, 2), date(2024, 1, 2)],
+        n_rows=2,
+    )
+    assert record.sealed_splits == ("full",)
+
+
+def test_register_dataset_refuses_a_sealed_row_outside_the_declared_span(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """A row date outside the declared span is refused even when a period holds it."""
+    with pytest.raises(research.ResearchError, match="outside the declared span"):
+        _seal_full(
+            conn,
+            tmp_path,
+            event_start=date(2020, 1, 2),
+            event_end=date(2024, 1, 2),
+            row_dates=[date(2020, 1, 2), date(2024, 6, 1)],
+            n_rows=2,
+        )
+
+
+def test_register_dataset_refuses_full_row_dates_short_of_n_rows(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """#1174 review: for `full`/`none` every row's date is needed; passing only the two
+    endpoint dates for a three-row dataset would hide the gap row, so the count must
+    match `n_rows`."""
+    with pytest.raises(research.ResearchError, match="n_rows"):
+        _seal_full(
+            conn,
+            tmp_path,
+            event_start=date(2020, 1, 2),
+            event_end=date(2024, 1, 2),
+            row_dates=[date(2020, 1, 2), date(2024, 1, 2)],
+            n_rows=3,
         )
 
 

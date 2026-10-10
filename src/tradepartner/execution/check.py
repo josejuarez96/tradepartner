@@ -1,12 +1,13 @@
 """Exit-criteria check (Phase 4 spec req 15; plan T66).
 
-`check(conn, settings) -> list[CheckLine]` runs, over a single read
-connection to the real store, the four req 15 queries against the
-**latest** `paper_windows` row (`store.journal.latest_window`), open or
-closed (a closed window is checked through its last completed rebalance
-session strictly before its stop session, `report()`'s own "last completed
-T" rule, spec req 15 and req 10). Every threshold it compares against comes
-from the window's `frozen_json` (Definitions, "Paper window": "runs and
+`check(conn, settings, book_id) -> list[CheckLine]` runs, over a single read
+connection to the real store, the four req 15 queries against **the book's
+latest** `paper_windows` row (`store.journal.latest_window(conn, book)`; the
+book defaults to `paper.book_id`, ADR 0017 B.7, plan T156; another book's
+windows are never read), open or closed (a closed window is checked through
+its last completed rebalance session strictly before its stop session,
+`report()`'s own "last completed T" rule, spec req 15 and req 10). Every threshold it compares
+against comes from the window's `frozen_json` (Definitions, "Paper window": "runs and
 checks read the frozen values, never live `Settings`"); `settings` is taken
 only so a setup failure can name the store it looked in, never for a
 threshold. `check` never reads the lot ledger or its wash-sale flags (spec
@@ -24,10 +25,11 @@ The four `CheckLine`s, in order:
    named in the detail text but never counted. Passes at `paper.min_rebalances`
    or more.
 2. **`tracking`**: the req 10 check, replayed from the window's latest
-   `paper_reports` row's trial (`report.compare_months`, the same pure
+   `paper_reports` row's trial (`report.compare_periods`, the same pure
    function `paper report` calls) over at least `paper.min_rebalances`
-   compared, non-excluded months; fails as `report stale` unless that row's
-   `through_session` is the window's last completed rebalance session.
+   compared, non-excluded rebalance periods of the window's cadence; fails as
+   `report stale` unless that row's `through_session` is the window's last
+   completed rebalance session.
 3. **`chain`**: no order whose chain (signal -> decision -> order ->
    terminal event -> outcome, ADR 0005) is incomplete once its outcome is
    due: at the first run after close(T_{i+1}) for an order of rebalance i,
@@ -51,9 +53,10 @@ ran without reading this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -64,6 +67,7 @@ from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import session_close
 from tradepartner.config import Cadence, Settings
+from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.outcomes import (
     NOT_EXECUTED,
     POSITION_RETURN,
@@ -71,7 +75,7 @@ from tradepartner.execution.outcomes import (
     outcome_horizon,
 )
 from tradepartner.execution.plan import stop_session as stop_session_of_request
-from tradepartner.execution.report import Journal, PriceOf, TrialMonths, compare_months
+from tradepartner.execution.report import Journal, PriceOf, TrialPeriods, compare_periods
 from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -80,6 +84,12 @@ from tradepartner.store.db import utc_now
 from tradepartner.store.journal import PaperWindowRow
 
 _NEW_YORK = ZoneInfo("America/New_York")
+#: The rebalance period's name per cadence in `tracking`'s detail (spec req 10 as
+#: amended 2026-10-09: "month" becomes "rebalance period"; `month_end` keeps "month",
+#: so H1's output is unchanged).
+_PERIOD_NOUN: Mapping[Cadence, str] = MappingProxyType(
+    {"month_end": "month", "week_end": "week", "daily": "session"}
+)
 #: How far back the rebalance-session searches look: the slowest cadence, `month_end`,
 #: has a rebalance session within two calendar months of any day.
 _REBALANCE_SEARCH = timedelta(days=62)
@@ -175,9 +185,11 @@ def _price_of(
     return price
 
 
-def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths:
-    """`TrialMonths` for `trial_id`'s base cost level (`report._trial_months`,
-    duplicated locally)."""
+def _trial_periods(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, cadence: Cadence
+) -> TrialPeriods:
+    """`TrialPeriods` for `trial_id`'s base cost level at the window's `cadence`
+    (`report._trial_periods`, duplicated locally; #1286)."""
     found = conn.execute(
         "SELECT hypothesis_id, start_session, end_session FROM trials WHERE trial_id = ?",
         [trial_id],
@@ -187,7 +199,7 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
     hypothesis_id, start_session, end_session = found
     hypothesis = registry.get_hypothesis_by_id(conn, hypothesis_id)
     base_level = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
-    sessions = tuple(rebalance_sessions(start_session, end_session))
+    sessions = tuple(rebalance_sessions(start_session, end_session, cadence))
     equity_rows = conn.execute(
         "SELECT session, equity FROM trial_equity "
         "WHERE trial_id = ? AND series = 'strategy' AND cost_per_side_bps = ?",
@@ -200,11 +212,12 @@ def _trial_months(conn: duckdb.DuckDBPyConnection, trial_id: int) -> TrialMonths
         [trial_id, base_level],
     ).fetchall()
     cost_paid = {session: float(value) for session, value in cost_rows}
-    return TrialMonths(
+    return TrialPeriods(
         sessions=sessions,
         equity={session: equity[session] for session in sessions if session in equity},
         cost_paid=cost_paid,
         trial_id=trial_id,
+        cadence=cadence,
     )
 
 
@@ -275,7 +288,11 @@ def _tracking_line(
     frozen: dict[str, Any],
     last_t: date,
     stop_session: date | None,
+    cadence: Cadence,
 ) -> CheckLine:
+    # The query text keeps `compare_periods`'s pre-T156 name, `compare_months`, so
+    # `paper check`'s output for H1's `month_end` book `main` stays byte-identical
+    # (ADR 0017 B.7, plan T156; pinned by tests/test_cli_paper.py).
     query = (
         "req 10 tracking check (report.compare_months) over the window's "
         "latest paper_reports row's trial"
@@ -299,7 +316,7 @@ def _tracking_line(
         )
 
     fill_price_key = _frozen_fill_price(window)
-    trial = _trial_months(conn, latest_report.trial_id)
+    trial = _trial_periods(conn, latest_report.trial_id, cadence)
     journal = _journal_for(conn, window_id)
     actions = conn.execute("SELECT * FROM corporate_actions").pl()
     prices = _price_of(conn, fill_price_key)
@@ -307,14 +324,15 @@ def _tracking_line(
     #: frozen `execution.fill_price` bar (#606): bound separately from
     #: `prices`, same as `report.report`'s own binding.
     closes = _price_of(conn, "close")
-    comparison = compare_months(window, trial, journal, actions, prices, closes, stop_session)
-    compared = [m for m in comparison.months if not m.excluded]
+    comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
+    compared = [m for m in comparison.periods if not m.excluded]
     enough = len(compared) >= min_rebalances
     passed = comparison.passed and enough
-    detail = f"{len(compared)} compared non-excluded month(s), need >= {min_rebalances}; " + (
+    noun = _PERIOD_NOUN[cadence]
+    detail = f"{len(compared)} compared non-excluded {noun}(s), need >= {min_rebalances}; " + (
         "tracking check passed"
         if comparison.passed
-        else f"tracking check failed at {comparison.failing_month}"
+        else f"tracking check failed at {comparison.failing_period}"
     )
     return CheckLine(name="tracking", passed=passed, query=query, detail=detail)
 
@@ -412,14 +430,18 @@ def _override_line(
     return CheckLine(name="override_reason", passed=passed, query=query, detail=detail)
 
 
-def check(conn: duckdb.DuckDBPyConnection, settings: Settings) -> list[CheckLine]:
-    """`paper check` (spec req 15): the four exit-criteria `CheckLine`s against
-    the **latest** `paper_windows` row, open or closed. Raises `ValueError`
-    when no window exists or the window's `frozen_json` lacks a key a query
-    needs."""
-    window = store_journal.latest_window(conn)
+def check(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book_id: str | None = None
+) -> list[CheckLine]:
+    """`paper check --book <book>` (spec req 15; ADR 0017 B.7): the four
+    exit-criteria `CheckLine`s against the book's **latest** `paper_windows`
+    row, open or closed (`book_id` defaults to `paper.book_id`). Raises
+    `ValueError` when the book has no window, for a book outside the token
+    grammar, or when the window's `frozen_json` lacks a key a query needs."""
+    book = resolve_book(settings, book_id)
+    window = store_journal.latest_window(conn, book)
     if window is None:
-        raise ValueError(f"no paper window exists in {settings.store.path}")
+        raise ValueError(f"no paper window exists for book {book!r} in {settings.store.path}")
     window_id = window.window_id
     if window_id is None:
         raise ValueError(f"the window in {settings.store.path} has no window_id")
@@ -435,7 +457,7 @@ def check(conn: duckdb.DuckDBPyConnection, settings: Settings) -> list[CheckLine
 
     return [
         _rebalance_count_line(conn, window, window_id, frozen),
-        _tracking_line(conn, window, window_id, frozen, last_t, stop_session),
+        _tracking_line(conn, window, window_id, frozen, last_t, stop_session, cadence),
         _chain_line(conn, window_id, cadence),
         _override_line(conn, window, window_id, frozen),
     ]

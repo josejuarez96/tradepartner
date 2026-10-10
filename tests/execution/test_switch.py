@@ -9,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -27,11 +28,13 @@ from tradepartner.execution.switch import (
     engage,
     engage_from_overrides,
     faulted_runs,
+    open_window_of,
     release,
 )
 from tradepartner.store import schema
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
+    JournalIntegrityError,
     KillSwitchRow,
     OverrideRow,
     PaperRunResultRow,
@@ -961,3 +964,64 @@ def test_release_refuses_a_negative_seen_event_id(store: Settings) -> None:
     resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok")
     with pytest.raises(ReleaseRefused, match="seen_event_id"):
         _release(store, resume_id, reconciliation_id, seen=-1)
+
+
+# --- books (ADR 0017 B.2 and B.5, plan T155) -------------------------------------------
+
+_B_WINDOW = 2
+
+
+def _b_window() -> PaperWindowRow:
+    return replace(_window(_B_WINDOW), book_id="b", account_id="PB1")
+
+
+def test_a_release_on_b_releases_b_alone_beside_main_s_open_window(store: Settings) -> None:
+    """`b`'s open window is never a second open window for `main`'s release, nor
+    the reverse: each release reads its own book's open window (B.5)."""
+    with open_for_write(store) as conn:
+        append(conn, _b_window())
+    engage(store, _Clock(), window_id=_WINDOW, source="owner", reason="paper kill")
+    engage(store, _Clock(), window_id=_B_WINDOW, source="owner", reason="paper kill --book b")
+    resume_id, reconciliation_id = _resume_and_reconciliation(store, "ok", _B_WINDOW)
+
+    event_id = release(
+        store,
+        _Clock(300),
+        window_id=_B_WINDOW,
+        resume_id=resume_id,
+        reconciliation_id=reconciliation_id,
+        peak_equity=900.0,
+        seen_event_id=_seen(store, _B_WINDOW),
+    )
+
+    with open_read_only(store) as conn:
+        b_rows = kill_switch_events_for(conn, _B_WINDOW)
+    assert b_rows[-1].event_id == event_id
+    assert not derive(_b_window(), b_rows, [], [], reading_run=None, lock_free=True).engaged
+    assert derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
+
+    resume_id, reconciliation_id = _resume_and_reconciliation(
+        store, "ok", resume_at=250, reconciled_at=251
+    )
+    _release(store, resume_id, reconciliation_id)
+    assert not derive(_window(), _rows(store), [], [], reading_run=None, lock_free=True).engaged
+
+
+def test_open_window_of_reads_only_the_window_s_own_book(store: Settings) -> None:
+    with open_for_write(store) as conn:
+        append(conn, _b_window())
+    with open_read_only(store) as conn:
+        main, b = open_window_of(conn, _WINDOW), open_window_of(conn, _B_WINDOW)
+        assert main is not None and (main.window_id, main.book_id) == (_WINDOW, "main")
+        assert b is not None and (b.window_id, b.book_id) == (_B_WINDOW, "b")
+        assert open_window_of(conn, 99) is None
+    with open_for_write(store) as conn:
+        append(
+            conn,
+            PaperWindowStopRow(window_id=_B_WINDOW, at=_at(80), state="closed", **_stamp(80)),
+        )
+        append(conn, replace(_window(3), window_id=None))
+    with open_read_only(store) as conn:
+        assert open_window_of(conn, _B_WINDOW) is None
+        with pytest.raises(JournalIntegrityError, match="book 'main'"):
+            open_window_of(conn, _WINDOW)

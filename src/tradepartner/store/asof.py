@@ -315,6 +315,8 @@ def _latest_as_of(
     key_columns: Sequence[str],
     t: datetime,
     security_ids: Sequence[str] | None,
+    *,
+    sessions_from: date | None = None,
 ) -> pl.DataFrame:
     """The latest-revision-as-of-`t` rows of `table`, as a `polars.
     DataFrame` sorted by `key_columns`: one row per distinct `key_columns`
@@ -328,10 +330,23 @@ def _latest_as_of(
     (an empty sequence restricts to none, returning an empty frame with
     the right schema -- see `_security_filter`); every table this is
     called for has a `security_id` column.
+
+    `sessions_from`, when given, keeps only keys with `session >=
+    sessions_from`. It is applied before choosing the latest revision, which
+    gives the same rows as filtering after it because `session` must be a
+    key column: every revision of a key shares its session (#1305).
     """
     partition = ", ".join(key_columns)
     params: list[Any] = [t]
     security_filter = _security_filter(security_ids, params)
+    session_filter = ""
+    if sessions_from is not None:
+        if "session" not in key_columns:
+            raise ValueError(f"sessions_from needs `session` in the key of {table}")
+        if isinstance(sessions_from, datetime):
+            raise TypeError(f"sessions_from must be a session date, not {sessions_from!r}")
+        params.append(sessions_from)
+        session_filter = "AND session >= ?"
     # A retraction (#859) is the latest revision of its key, so the filter
     # applies after choosing it, as `cancelled` does for actions: the key is
     # withdrawn from the retraction's `known_at` on, never before.
@@ -348,6 +363,7 @@ def _latest_as_of(
             FROM {table}
             WHERE known_at <= ?
             {security_filter}
+            {session_filter}
         )
         WHERE _rn = 1 {live}
         ORDER BY {partition}
@@ -393,6 +409,7 @@ def prices_as_of(
     security_ids: Sequence[str] | None = None,
     *,
     traded_only: bool = False,
+    sessions_from: date | None = None,
 ) -> pl.DataFrame:
     """Raw `prices_daily` rows known by `t`: one per `(security_id,
     session)`, the latest revision as of `t` (spec acceptance: "A bar
@@ -405,9 +422,16 @@ def prices_as_of(
     (#787): a session nobody traded is missing, not a price. The universe and
     the backtest provider read with it; a later revision with volume brings
     the bar back.
+
+    `sessions_from` leaves out bars before that session, inside the query
+    (`_latest_as_of`), so a reader that needs only a recent window does not
+    read and convert the whole history (#1305). The bars it keeps are exactly
+    the unbounded read's bars from that session on.
     """
     t = _validate_t(t)
-    frame = _latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids)
+    frame = _latest_as_of(
+        conn, "prices_daily", _PRICE_KEY, t, security_ids, sessions_from=sessions_from
+    )
     return _traded(frame) if traded_only else frame
 
 

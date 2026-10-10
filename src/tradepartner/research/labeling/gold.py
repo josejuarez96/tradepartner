@@ -865,6 +865,7 @@ def lock_gold(
                 split_spans={s: _span(v) for s, v in days.items() if v},
                 sealed_splits=("pilot",),
                 sealed_periods=(session.pilot_period,),
+                split_row_dates={s: v for s, v in days.items() if v},
                 locked=True,
                 seed=session.seed,
                 note=f"exclusion sha256 {session.exclusion_sha256}",

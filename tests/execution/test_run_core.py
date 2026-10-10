@@ -19,7 +19,9 @@ beyond the two smoke cases are T63i's.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -40,8 +42,15 @@ from tradepartner.errors import (
 )
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
-from tradepartner.execution.lock import run_lock
-from tradepartner.execution.run import RunOutcome, invoked_by, tracking_run
+from tradepartner.execution.lock import is_held, legacy_lock_path, lock_path, run_lock
+from tradepartner.execution.run import (
+    BookRun,
+    RunOutcome,
+    every_book_run,
+    invoked_by,
+    open_books,
+    tracking_run,
+)
 from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -134,9 +143,9 @@ class Env:
     def connect(self) -> Any:
         return open_for_write(self.settings)
 
-    def run(self, at: datetime) -> RunOutcome:
+    def run(self, at: datetime, *, book_id: str | None = None) -> RunOutcome:
         self.clock.now = at
-        return tracking_run(self.settings, self.connect, self.fake, self.clock)
+        return tracking_run(self.settings, self.connect, self.fake, self.clock, book_id=book_id)
 
     def append(self, *rows: object) -> list[int | None]:
         with open_for_write(self.settings) as conn:
@@ -171,13 +180,14 @@ class Env:
         hypothesis_id: int | None = None,
         starting_equity: float = FAKE_CASH,
         book_id: str = "main",
+        account_id: str = "PA1",
     ) -> PaperWindowRow:
         if hypothesis_id is None:
             hypothesis_id = registered_hypothesis(self.settings)
         row = PaperWindowRow(
             hypothesis_id=hypothesis_id,
             first_rebalance_session=first,
-            account_id="PA1",
+            account_id=account_id,
             starting_cash=FAKE_CASH,
             starting_equity=starting_equity,
             code_version="test",
@@ -803,9 +813,9 @@ def test_the_lag_bound_mismatch_row_carries_a_non_default_book(env: Env) -> None
         )
     )
     with pytest.raises(ReconciliationError, match="tp-lag"):
-        env.run(_at(TUE))
+        env.run(_at(TUE), book_id="fx")
     env.ingest(_at(TUE, 21))
-    second = env.run(_at(WED))
+    second = env.run(_at(WED), book_id="fx")
     assert second.status == "skipped_kill_switch"
     assert env.query(
         "SELECT DISTINCT book_id FROM reconciliations WHERE run_id = ?", [second.run_id]
@@ -1557,3 +1567,267 @@ def test_an_orphan_order_fails_the_run_with_an_alert_not_before_its_run_row(
     assert env.query("SELECT session FROM paper_runs WHERE run_id = ?", [run_id]) == [(TUE,)]
     assert env.results()[run_id][:2] == ("failed", "JournalIntegrityError")
     assert ("run_failed", run_id, TUE) in env.alerts()
+
+
+# --- books: the run per book and the multi-book driver (ADR 0017 B.3; plan T155b) ------------
+
+
+def _book_fakes(env: Env, *accounts: str) -> dict[str, FakeBroker]:
+    """One scripted fake per account, on the env's clock (each book its own account)."""
+    return {
+        account: FakeBroker(
+            clock=env.clock,
+            price_of=lambda _s: PRICE,
+            auto_fill=False,
+            cash=FAKE_CASH,
+            account_id=account,
+        )
+        for account in accounts
+    }
+
+
+def _two_books(env: Env) -> dict[str, FakeBroker]:
+    """Book `beta` opened first (window 1), then `alpha` (window 2), each on its own
+    account, with the ingest covering Monday: token order is not window order."""
+    beta = env.window(book_id="beta", account_id="PB")
+    env.window(book_id="alpha", account_id="PA", hypothesis_id=beta.hypothesis_id)
+    env.ingest(_at(MON, 21))
+    fakes = _book_fakes(env, "PA", "PB")
+    return {"alpha": fakes["PA"], "beta": fakes["PB"]}
+
+
+def _recording_locks(
+    monkeypatch: pytest.MonkeyPatch, env: Env
+) -> list[tuple[str | None, bool, bool]]:
+    """`run.run_lock` wrapped to record, per lock taken, its book and whether the
+    other book's lock and the legacy lock are held while it is."""
+    seen: list[tuple[str | None, bool, bool]] = []
+    real = run_module.run_lock
+
+    @contextmanager
+    def recording(settings: Settings, book_id: str | None = None) -> Iterator[None]:
+        with real(settings, book_id):
+            other = "beta" if book_id == "alpha" else "alpha"
+            seen.append((book_id, is_held(settings, other), is_held(settings, "main")))
+            yield
+
+    monkeypatch.setattr(run_module, "run_lock", recording)
+    return seen
+
+
+def test_open_books_lists_the_books_with_an_open_window_in_token_order(env: Env) -> None:
+    assert open_books(env.settings) == ()
+    _two_books(env)
+    closed = env.window(book_id="gamma", account_id="PC", hypothesis_id=1)
+    at = _at(MON)
+    env.append(
+        PaperWindowStopRow(
+            window_id=closed.window_id,  # type: ignore[arg-type]
+            state="closed",
+            at=at,
+            reason="done",
+            known_at=at,
+            ingested_at=at,
+        )
+    )
+    assert open_books(env.settings) == ("alpha", "beta")
+
+
+def test_two_open_books_run_each_under_its_own_lock_in_token_order(
+    monkeypatch: pytest.MonkeyPatch, env: Env, exits_done: list[object]
+) -> None:
+    fakes = _two_books(env)
+    locks = _recording_locks(monkeypatch, env)
+    built: list[str] = []
+
+    def broker_for(book: str) -> FakeBroker:
+        built.append(book)
+        return fakes[book]
+
+    env.clock.now = _at(TUE)
+    runs = every_book_run(env.settings, env.connect, broker_for, env.clock)
+
+    assert [(r.book_id, r.status, r.exit_code) for r in runs] == [
+        ("alpha", "ok", 0),
+        ("beta", "ok", 0),
+    ]
+    assert built == ["alpha", "beta"]
+    assert locks == [("alpha", False, False), ("beta", False, False)]
+    rows = env.query(
+        "SELECT r.run_id, w.book_id, s.status FROM paper_runs r JOIN paper_windows w "
+        "USING (window_id) JOIN paper_run_results s USING (run_id) ORDER BY r.run_id"
+    )
+    assert [(book, status) for _, book, status in rows] == [("alpha", "ok"), ("beta", "ok")]
+    assert [r.outcome.run_id for r in runs if r.outcome] == [row[0] for row in rows]
+    # each book read its own account only
+    assert fakes["alpha"].calls and fakes["beta"].calls
+    assert env.query(
+        "SELECT w.book_id, count(*) FROM reconciliations c JOIN paper_windows w "
+        "USING (window_id) WHERE c.book_id = w.book_id GROUP BY w.book_id ORDER BY 1"
+    ) == [("alpha", 2), ("beta", 2)]
+
+
+def test_a_crash_in_the_first_book_leaves_it_crashed_and_the_second_ok(
+    monkeypatch: pytest.MonkeyPatch, env: Env, exits_done: list[object]
+) -> None:
+    fakes = _two_books(env)
+    real_execute = run_module._Run.execute
+
+    def scripted(self: Any) -> RunOutcome:
+        if self.window.book_id == "alpha":
+            raise RuntimeError("scripted crash: the process dies after its run row")
+        return real_execute(self)
+
+    monkeypatch.setattr(run_module._Run, "execute", scripted)
+    env.clock.now = _at(TUE)
+    runs = every_book_run(env.settings, env.connect, fakes.__getitem__, env.clock)
+
+    alpha, beta = runs
+    assert (alpha.book_id, alpha.status, alpha.exit_code) == ("alpha", "crashed", 1)
+    assert alpha.outcome is None and isinstance(alpha.error, RuntimeError)
+    assert (beta.book_id, beta.status, beta.exit_code) == ("beta", "ok", 0)
+    assert not is_held(env.settings, "alpha")  # the crashed book's lock is released
+
+    # The crashed run's row stays unfinished until the book's next run closes it
+    # `crashed`, as for one book (spec req 7 step 1).
+    monkeypatch.setattr(run_module._Run, "execute", real_execute)
+    env.ingest(_at(TUE, 21))
+    env.clock.now = _at(WED)
+    every_book_run(env.settings, env.connect, fakes.__getitem__, env.clock)
+    statuses = env.query(
+        "SELECT w.book_id, r.session, s.status FROM paper_runs r JOIN paper_windows w "
+        "USING (window_id) JOIN paper_run_results s USING (run_id) ORDER BY w.book_id, r.session"
+    )
+    assert [(book, day, status) for book, day, status in statuses if day == TUE] == [
+        ("alpha", TUE, "crashed"),
+        ("beta", TUE, "ok"),
+    ]
+
+
+@pytest.mark.parametrize("fault", ["broker", "exit"])
+def test_a_book_whose_broker_fails_or_whose_run_exits_does_not_stop_the_next(
+    monkeypatch: pytest.MonkeyPatch, env: Env, exits_done: list[object], fault: str
+) -> None:
+    fakes = _two_books(env)
+    real_run = run_module.tracking_run
+
+    def broker_for(book: str) -> FakeBroker:
+        if book == "alpha" and fault == "broker":
+            raise RuntimeError("no key pair for book alpha")
+        return fakes[book]
+
+    def exiting(*args: Any, **kwargs: Any) -> RunOutcome:
+        if kwargs["book_id"] == "alpha":
+            raise SystemExit(run_module.WRITE_FAILED_EXIT_CODE)
+        return real_run(*args, **kwargs)
+
+    if fault == "exit":
+        monkeypatch.setattr(run_module, "tracking_run", exiting)
+    env.clock.now = _at(TUE)
+    alpha, beta = every_book_run(env.settings, env.connect, broker_for, env.clock)
+
+    code = 1 if fault == "broker" else run_module.WRITE_FAILED_EXIT_CODE
+    assert (alpha.status, alpha.exit_code, alpha.outcome) == ("crashed", code, None)
+    assert (beta.status, beta.exit_code) == ("ok", 0)
+
+
+def test_locked_and_no_window_alerts_carry_the_book(env: Env) -> None:
+    fakes = _two_books(env)
+    env.clock.now = _at(TUE)
+    with run_lock(env.settings, "beta"):
+        locked = tracking_run(env.settings, env.connect, fakes["beta"], env.clock, book_id="beta")
+        # another book's lock does not hold this book back
+        assert not is_held(env.settings, "alpha")
+    assert locked.status == "locked"
+    none = tracking_run(env.settings, env.connect, fakes["alpha"], env.clock, book_id="nobook")
+    assert none.status == "no_window"
+    assert env.query("SELECT kind, run_id, session, book_id FROM alerts ORDER BY alert_id") == [
+        ("locked", None, TUE, "beta"),
+        ("no_window", None, TUE, "nobook"),
+    ]
+    assert fakes["beta"].calls == ()
+
+
+def test_a_book_outside_the_token_grammar_is_refused_before_any_lock(env: Env) -> None:
+    with pytest.raises(ValueError, match="book"):
+        tracking_run(env.settings, env.connect, env.fake, env.clock, book_id="../x")
+    assert env.count("alerts") == 0
+
+
+def test_a_run_alert_in_a_book_carries_the_windows_book(env: Env, step_fails: None) -> None:
+    """`missed_run` (`_alert`) and `run_failed` (`_fail`) carry the window's book."""
+    window = env.window(book_id="beta")
+    env.ingest(_at(MON, 21))
+    with pytest.raises(RuntimeError, match="the step failed"):
+        env.run(_at(TUE), book_id="beta")
+    run_id = env.latest_run()
+    assert env.query("SELECT kind, run_id, book_id FROM alerts ORDER BY alert_id") == [
+        ("missed_run", run_id, "beta"),
+        ("run_failed", run_id, "beta"),
+    ]
+    assert window.book_id == "beta"
+
+
+# H1 pin: with one book, `main`, `paper run`'s driver is the run before books, row
+# for row, on a second copy of the same fixture store.
+
+_PIN_TABLES = (
+    "paper_runs",
+    "paper_run_results",
+    "reconciliations",
+    "alerts",
+    "positions_daily",
+    "kill_switch",
+    "orders",
+    "decisions",
+)
+
+
+def _snapshot(settings: Settings) -> dict[str, list[tuple[Any, ...]]]:
+    with open_read_only(settings) as conn:
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
+            for table in _PIN_TABLES
+        }
+
+
+@pytest.mark.parametrize("scenario", ["mark", "no_window", "crashed_earlier"])
+def test_one_book_main_runs_exactly_as_before_books(
+    journal_settings: Settings, exits_done: list[object], scenario: str
+) -> None:
+    twin_path = Path(journal_settings.store.path).with_name("twin.duckdb")
+    shutil.copy(journal_settings.store.path, twin_path)
+    twin_settings = Settings(_env_file=None, store={"path": str(twin_path)})
+    envs: list[Env] = []
+    for settings in (journal_settings, twin_settings):
+        clock = Clock(_at(TUE))
+        fake = FakeBroker(
+            clock=clock,
+            price_of=lambda _s: PRICE,
+            auto_fill=False,
+            cash=FAKE_CASH,
+            account_id="PA1",
+        )
+        envs.append(Env(settings, clock, fake))
+    for env in envs:
+        if scenario != "no_window":
+            window = _marked(env)
+            if scenario == "crashed_earlier":
+                env.past_run(window, _at(MON), status=None)
+        env.clock.now = _at(TUE)
+    before, driven = envs
+    built: list[str] = []
+
+    def broker_for(book: str) -> FakeBroker:
+        built.append(book)
+        return driven.fake
+
+    outcome = tracking_run(before.settings, before.connect, before.fake, before.clock)
+    (entry,) = every_book_run(driven.settings, driven.connect, broker_for, driven.clock)
+
+    assert entry == BookRun("main", outcome.status, outcome, exit_code=outcome.exit_code)
+    assert built == ["main"]
+    assert driven.fake.calls == before.fake.calls
+    assert _snapshot(driven.settings) == _snapshot(before.settings)
+    assert legacy_lock_path(driven.settings).exists()
+    assert lock_path(driven.settings, "main").exists()
