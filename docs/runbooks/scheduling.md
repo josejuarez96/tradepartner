@@ -465,6 +465,16 @@ uv run tradepartner paper resume --accept-broker-fills --reason "order <id>: bro
 
 With the flag, for each qualifying order `paper resume` journals a synthetic fill for the residual quantity only (broker's `filled_quantity` minus what's already journaled), priced from the implied residual and flagged `price_implied`. **The synthetic fill is the one that stands**: if a real fill for that order arrives later anyway, it is journaled `superseded_by` the synthetic one and every reader filters it out — the implied price is not retroactively corrected to the real one. Without the flag, resume refuses outright while any such order exists; this is the owner's considered decision to trust the broker's number over a missing feed message, not something to reach for reflexively because resume is otherwise refusing.
 
+**When `--accept-rejections` is the right call.** Normally omit it. Before it releases, `paper resume` judges the rejections on every run the release would clear (each `halted`, `crashed` or `failed` run of the window that no earlier release cleared, #397/#451) and refuses while any of them breached the rejection cap (all of a run's orders rejected, or more than the frozen `risk.max_rejections_per_run`). The refusal names each run's verdict. Add the flag only when:
+- resume refused with such a verdict on a halted, crashed or failed run, **and**
+- you have found why the broker rejected those orders (symbol halted, account restriction, bad request shape; see `rejection_cap` above), fixed it or confirmed it will not recur, and accept that run's rejections as they stand.
+
+```bash
+uv run tradepartner paper resume --accept-rejections --reason "run <id>: rejected because <cause>; fixed/checked <what>"
+```
+
+The flag accepts **only those rejection-cap verdicts**, on the runs this release would clear. Resume journals a `resume_acceptances` row naming each accepted verdict (the CLI prints one `accepted ...` line each) before any reconciliation or release, and then every other step still applies: a rejection-cap verdict from this resume's own collection on any other run, the `fills_lagging` bound (that is `--accept-broker-fills`), reconciliation and every release check still refuse. It lifts no other refusal and bypasses no limit; the two flags are independent and may be given together when both apply.
+
 ### The kill-switch drill (ADR 0017 part E.4)
 
 The drill proves, on the real store, that an engaged switch stops a scheduled run from submitting anything. It is one of the seven shakedown lines (E.4) and is run **once, on book `main`, on an H1 fill session** inside the shakedown span (the first session after a month-end; not H1's first fill session, which is the evidence run and must trade). `main` hosts it because it is the fastest book that is not a forward exam: the drill costs H1 at most one rebalance (delayed to a catch-up run, or `missed` with reason `kill_switch` if the catch-up lapses), reported by `paper report` and never an exam result. The owner times it.
