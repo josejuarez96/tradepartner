@@ -69,6 +69,8 @@ The store's registry (`hypotheses`, `trials`, `trial_results`, schema version 3)
 
 15. **Page.** A read-only **research view** on the dashboard, inside the shell's single read-only connection: registrations with their block fields, budgets used against declared along the chain, amendments; per hypothesis family the research run and configuration sums beside the family's backtest N (req 6); runs newest first with outcome, verdict, confirmatory and its basis, provenance, split, holdout spent and repeat, synthetic hidden by default, failed, refused, abandoned and unfinished rows visible with their message; datasets with sealed splits and periods and their spends; decisions. The backtest page's N shows the research count (req 9). "Research registry not initialised" on a store before the migration. No run button: runs are CLI only.
 
+**Amendment 2026-10-10 (#1408, owner decisions on #1011).** In req 6, a refused run still uses a run slot but adds zero to the configuration budget; accepted and failed runs use their declared configurations. In req 9, a failed return run also raises N by its declared configurations because its returns may already have been examined; `ok` runs use their evaluated count. Synthetic and holdout-spending runs remain excluded. In req 7, a `holdout_repeat` cannot claim `sealed_split` as a confirmatory basis: a registration that predates the first dataset version retains `predates_dataset`, while a repeat that only qualifies through sealing is `refused_split`. Research and backtest spends apply the same repeat flag rule to a later backtest in the family (#1408 item 4).
+
 ## Acceptance criteria (testable)
 
 Schema and append-only

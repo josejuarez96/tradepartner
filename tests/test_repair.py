@@ -690,6 +690,17 @@ def test_the_floor_is_the_earliest_securities_row_known_at_the_run(led: Settings
     assert resolver.lead("FB", date(2011, 12, 28)) is None
 
 
+def test_first_session_skips_retracted_securities_rows(led: Settings) -> None:
+    sid = "0000000999"
+    old = datetime(2011, 12, 29, 22, tzinfo=UTC)
+    live = datetime(2012, 3, 1, 22, tzinfo=UTC)
+    with open_for_write(led) as conn:
+        insert_row(conn, "securities", _security(sid, old, "wrong") | {"retracted": True})
+        insert_row(conn, "securities", _security(sid, live, "right"))
+    with duckdb.connect(led.store.path, read_only=True) as conn:
+        assert repair.first_sessions(conn, RUN, led)[sid] == date(2012, 3, 1)
+
+
 def test_the_switch_off_lists_the_lead_bars_and_split(led: Settings) -> None:
     result = repair_resolution(_without_lead(led), clock=lambda: RUN, dry_run=True)
     assert sorted(result.found.bars) == [(META, date(2017, 5, 31)), (META, date(2018, 7, 2))]

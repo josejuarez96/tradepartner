@@ -504,6 +504,20 @@ def test_sealed_split_basis_when_registration_is_not_first_but_split_is_sealed()
     assert decision.basis == "sealed_split"
 
 
+def test_holdout_repeat_cannot_claim_sealed_split_confirmatory_basis() -> None:
+    decision = check_confirmatory(
+        kind="benchmark",
+        confirmatory=True,
+        registration_known_at=LATER,
+        dataset_first_known_at=REGISTERED,
+        bound_split_sealed=True,
+        dataset_locked=False,
+        holdout_repeat=True,
+    )
+    assert decision.outcome == "refused_split"
+    assert decision.basis == "none"
+
+
 def test_predates_dataset_preferred_over_sealed_split_when_both_hold() -> None:
     decision = check_confirmatory(
         kind="benchmark",

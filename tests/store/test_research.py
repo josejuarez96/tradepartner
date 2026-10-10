@@ -1002,10 +1002,27 @@ def test_budgets_count_refusals_but_not_synthetic_runs(
     synthetic = _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", synthetic=True)
     assert synthetic.refusal is None
     over = _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", configurations=3)
-    assert (over.refusal, "configurations" in str(over.message)) == ("refused_budget", True)
-    # Two non-synthetic rows now (the refused split and the refused budget).
+    assert over.refusal is None  # the refused split used no configurations
+    # Two non-synthetic rows now (the refused split and the accepted run).
     assert _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot").refusal == (
         "refused_budget"
+    )
+
+
+def test_refusal_uses_a_run_slot_but_no_configuration_budget(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    research.register_experiment(
+        conn,
+        _variant(e1h, "b", confirmatory=False, budget_runs=3, budget_configurations=2),
+        "owner",
+    )
+    ds = _dataset(conn, tmp_path, name=e1h.dataset_name, splits=["pilot", "pilot"])
+    assert _open(conn, settings, tmp_path, "b", ds.dataset_id, "cal", configurations=1000).refusal
+    assert research._chain_usage(conn, "b") == (1, 0)
+    assert (
+        _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", configurations=2).refusal
+        is None
     )
 
 
@@ -1225,11 +1242,11 @@ def test_load_dataset_checks_hashes_before_parsing(
 # --- family_run_count -------------------------------------------------------------------
 
 
-def test_family_run_count_sums_ok_return_configurations_outside_holdout_spends(
+def test_family_run_count_sums_ok_and_failed_return_configurations_outside_holdout_spends(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:
-    """Counted: an `ok`, non-synthetic return run's configurations. Not counted: a
-    synthetic run, a `benchmark` run, a failed run, a holdout-spending run."""
+    """A failed return run counts its declaration; synthetic, benchmark and
+    holdout-spending runs do not count."""
     _gated(conn, settings, e1h)
     before_holdout = date(2023, 12, 31)
     for parsed in (
@@ -1256,7 +1273,7 @@ def test_family_run_count_sums_ok_return_configurations_outside_holdout_spends(
     spend = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
     assert spend.refusal is None
     _ok(conn, spend)
-    assert research.family_run_count(conn, "momentum") == 3
+    assert research.family_run_count(conn, "momentum") == 4
     listed = research.list_runs(conn, family="momentum")
     assert [r.run_id for r in listed] == sorted((r.run_id for r in listed), reverse=True)
     assert all(not r.synthetic for r in listed)
@@ -1485,7 +1502,8 @@ def test_a_research_spend_marks_a_later_backtest_holdout_run_a_repeat(
         None,
         [spend],
     )
-    assert (decision.outcome, decision.holdout_repeat) == ("needs_gap", True)
+    assert decision.outcome == "refused_holdout"
+    assert "--holdout-repeat" in decision.message
 
 
 @pytest.mark.parametrize(

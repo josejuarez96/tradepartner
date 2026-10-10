@@ -354,6 +354,7 @@ def check_confirmatory(
     dataset_first_known_at: datetime,
     bound_split_sealed: bool,
     dataset_locked: bool,
+    holdout_repeat: bool = False,
 ) -> ConfirmatoryDecision:
     """Req 7: an exploratory registration (`confirmatory=False`) always opens
     with basis `none`. A confirmatory `agreement` run needs its bound
@@ -376,6 +377,8 @@ def check_confirmatory(
             "registration predates the bound dataset name's first version",
             basis="predates_dataset",
         )
+    if bound_split_sealed and holdout_repeat:
+        return ConfirmatoryDecision("refused_split", "holdout repeat cannot claim sealed_split")
     if bound_split_sealed:
         return ConfirmatoryDecision(
             "ok",

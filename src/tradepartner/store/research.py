@@ -759,11 +759,12 @@ def _prior_spends(
 
 
 def _chain_usage(conn: duckdb.DuckDBPyConnection, slug: str) -> tuple[int, int]:
-    """`(runs, configurations declared)` over every non-synthetic run of `slug`'s
-    amendment chain, whatever its outcome (req 6)."""
+    """Runs include refusals; configuration budget excludes them (#1408)."""
     row = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(r.n_configurations_declared), 0) FROM research_runs r "
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN x.outcome LIKE 'refused_%' THEN 0 "
+        "ELSE r.n_configurations_declared END), 0) FROM research_runs r "
         "JOIN research_registrations g USING (registration_id) "
+        "LEFT JOIN research_results x USING (run_id) "
         "WHERE g.slug = ? AND NOT r.synthetic",
         [slug],
     ).fetchone()
@@ -881,6 +882,7 @@ def open_run(
         first_known[0],
         binds_sealed and dataset.seed == registration.seed,
         dataset.locked,
+        holdout.holdout_repeat,
     )
     refusal: str | None = None
     message: str | None = None
@@ -1151,15 +1153,18 @@ def record_decision(
 
 
 def family_run_count(conn: duckdb.DuckDBPyConnection, family: str) -> int:
-    """Σ `n_configurations` over `ok`, non-synthetic, non-holdout-spending runs
+    """Σ evaluated or declared configurations over `ok`/`failed`, non-synthetic,
+    non-holdout-spending runs
     of `family` whose registration touches returns, exploratory included: the
     research share of the family's N (req 9)."""
     require_research(conn)
     row = conn.execute(
-        "SELECT COALESCE(SUM(x.n_configurations), 0) FROM research_results x "
+        "SELECT COALESCE(SUM(CASE WHEN x.outcome = 'failed' "
+        "THEN r.n_configurations_declared ELSE x.n_configurations END), 0) "
+        "FROM research_results x "
         "JOIN research_runs r USING (run_id) "
         "JOIN research_registrations g ON g.registration_id = r.registration_id "
-        "WHERE x.outcome = 'ok' AND NOT r.synthetic AND NOT r.holdout_spent "
+        "WHERE x.outcome IN ('ok', 'failed') AND NOT r.synthetic AND NOT r.holdout_spent "
         "AND g.touches_returns AND g.family = ?",
         [family],
     ).fetchone()

@@ -154,14 +154,15 @@ def first_sessions(
     acceptance, mapped to a session as `store.master` maps one (the session
     of its New York day, else the next). A direct read of the table, never
     `securities_as_of`, whose latest revision is stamped at an ingest clock
-    (a renamed, or retracted and restored, row would move the floor past
+    (a renamed or restored row would move the floor past
     the first span and take the lead away). A `known_at` before the
     calendar's first session maps to that session (the calendar raises
     before it, `store.master.first_session`)."""
     at = ensure_tz_aware_utc(at, field_name="at")
     floor = datetime.combine(first_session(settings), time(12), tzinfo=UTC)
     rows = conn.execute(
-        "SELECT security_id, min(known_at) FROM securities WHERE known_at <= ? GROUP BY ALL",
+        "SELECT security_id, min(known_at) FROM securities "
+        "WHERE known_at <= ? AND NOT retracted GROUP BY ALL",
         [at],
     ).fetchall()
     return {
