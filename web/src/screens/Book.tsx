@@ -120,8 +120,8 @@ function BookDetail({ data, book, onStatus }: { data: AppData; book: Book; onSta
             <span className={toneText[tone(youAt)]}>{book.name} {pct(youAt)}</span>
             <span>S&amp;P 500 {pct(spyAt)}</span>
             <span className="inline-flex items-center gap-1.5">{where} the expected range <RangeInfo te={te} period={strategy.backtest.period} /></span>
-            <span>{shortDate(cmp.you[0].date)} – {shortDate(cmp.you[i].date)}</span>
-            {event && <span className="text-foreground">{event.label}</span>}
+            {hover && <span>{shortDate(cmp.you[i].date)}</span>}
+            {hover && event && <span className="text-foreground">{event.label}</span>}
           </p>
           <RangePicker value={range} onChange={setRange} available={available} tone={tone(cmp.youRet)} />
         </>
@@ -197,6 +197,8 @@ function RangeInfo({ te, period }: { te: number; period: string }) {
 }
 
 const ROWS = 10;
+/** How many names the rule holds: the top fraction of the names scored. A book with holdings shows its own count. */
+const holdOf = (book: Book, rule: Rule) => book.positions.length || Math.round(rule.universe * rule.top_fraction);
 
 function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: Position) => void }) {
   const [all, setAll] = useState(false);
@@ -204,7 +206,7 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
   const shown = all ? book.positions : book.positions.slice(0, ROWS);
   const grid = "grid grid-cols-[minmax(0,1fr)_64px_16px] sm:grid-cols-[minmax(0,1fr)_88px_110px_72px_96px_16px] items-center gap-x-3";
   return (
-    <Section title="Holdings" note={book.positions.length ? `${book.positions.length} stocks and cash, target ${pctW(rule.weight)} each` : undefined}>
+    <Section title="Holdings" note={book.positions.length ? `${book.positions.length} stocks at equal weight, and cash` : undefined}>
       {book.positions.length === 0 ? (
         <p className="text-muted-foreground border-t pt-3">
           Nothing yet; all {money(book.cash)} is in cash. {book.next_run.what} {weekdayDate(book.next_run.at!)} at {clock(book.next_run.at!)}.
@@ -221,8 +223,6 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
           </div>
           <ul>
             {shown.map((p) => {
-              const drift = p.weight - p.target_weight;
-              const over = Math.abs(drift) > rule.tolerance;
               return (
                 <li key={p.symbol} className="border-b">
                   <button onClick={() => onOpen(p)} className={cn(grid, "hover:bg-raised focus-visible:ring-ring/50 -mx-2 min-h-12 w-[calc(100%+1rem)] rounded-md px-2 py-2 text-left outline-none focus-visible:ring-2")}>
@@ -230,9 +230,9 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
                       <span className="num w-12 shrink-0 font-medium">{p.symbol}</span>
                       <span className="text-muted-foreground truncate text-[13px]">{p.name}</span>
                     </span>
-                    <span className={cn("num hidden text-right sm:block", p.rank > rule.hold && "text-muted-foreground")}>{p.rank}</span>
+                    <span className={cn("num hidden text-right sm:block", p.rank > holdOf(book, rule) && "text-attention")}>{p.rank}</span>
                     <span className="num hidden text-right sm:block">{money(p.value)}</span>
-                    <span className={cn("num text-right", over && "text-attention")}>{pctW(p.weight)}</span>
+                    <span className="num text-right">{pctW(p.weight)}</span>
                     <span className={cn("num hidden text-right sm:block", toneText[tone(p.unrealized_pnl)])}>{signedMoney(Math.round(p.unrealized_pnl)).replace(".00", "")}</span>
                     <ChevronRight className="text-muted-foreground size-4" />
                   </button>
@@ -248,11 +248,11 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
           </ul>
           {book.positions.length > ROWS && (
             <button onClick={() => setAll(!all)} className="text-muted-foreground hover:text-foreground mt-2 h-11 text-[13px]">
-              {all ? "Show the top 10" : `Show all ${book.positions.length}`}
+              {all ? `Show the top ${ROWS}` : `Show all ${book.positions.length}`}
             </button>
           )}
           <p className="text-muted-foreground mt-2 max-w-[70ch] text-xs">
-            A weight is trimmed back to {pctW(rule.weight)} once it drifts more than {Math.round(rule.tolerance * 100)} point{rule.tolerance > 0.01 ? "s" : ""} away; until then the book leaves it alone to save costs.
+            Weights drift as prices move; every rebalance trades each holding back to an equal share.
           </p>
         </>
       )}
@@ -261,66 +261,57 @@ function Holdings({ book, rule, onOpen }: { book: Book; rule: Rule; onOpen: (p: 
 }
 
 /**
- * Why it holds what it holds: the rule in one sentence, then every holding
- * as a dot on a rank scale whose zones are named on the scale itself
- * (buys, keeps, sells). Recently sold stocks show as hollow dots where they
- * fell to.
+ * Why it holds what it holds, as the engine decides it: rank the universe on
+ * the measure, hold the top fraction at equal weight. The picture is a rank
+ * scale with the cut drawn on it: a tick per holding at its rank today, a
+ * hollow mark for each recent sale at the rank it had fallen to.
  */
 function WhyItHolds({ book, rule }: { book: Book; rule: Rule }) {
-  const max = rule.sell_below + 10;
+  const cut = holdOf(book, rule);
+  const max = Math.round(cut * 1.5);
   const x = (rank: number) => ((Math.min(rank, max) - 0.5) / max) * 100;
   const sold = book.orders
     .filter((o) => o.side === "sell" && o.status === "filled" && /rank (\d+)/.test(o.why))
     .map((o) => ({ symbol: o.symbol, rank: Number(/rank (\d+)/.exec(o.why)![1]), date: o.placed_at }));
-  const top = book.positions.filter((p) => p.rank <= rule.hold);
-  const kept = book.positions.filter((p) => p.rank > rule.hold);
-  const keepZone = rule.sell_below > rule.hold;
-  const zones = [
-    { from: 0, to: rule.hold, label: `Buys: top ${rule.hold}`, cls: "bg-foreground/[0.07]" },
-    ...(keepZone ? [{ from: rule.hold, to: rule.sell_below, label: `Keeps: ${rule.hold + 1}–${rule.sell_below}`, cls: "bg-foreground/[0.035]" }] : []),
-    { from: rule.sell_below, to: max, label: `Sells: below ${rule.sell_below}`, cls: "" },
-  ];
-  const sentence = `${rule.check.charAt(0).toUpperCase()}${rule.check.slice(1)}, it ranks the ${rule.universe} largest US stocks by ${rule.measure}. It buys what reaches the top ${rule.hold}${keepZone ? ` and sells only what falls below rank ${rule.sell_below}, so stocks near the line don't trade back and forth` : ` and sells what drops out`}. Each holding is ${pctW(rule.weight)}.`;
-
+  const slipped = book.positions.filter((p) => p.rank > cut);
+  const lastRebalance = book.rebalances[0]?.date;
+  const share = `${Math.round(rule.top_fraction * 100)}%`;
   return (
     <Section title={book.positions.length ? "Why it holds these" : "How it will choose"}>
-      <p className="max-w-[70ch]">{sentence}</p>
+      <p className="max-w-[70ch]">
+        {rule.check.charAt(0).toUpperCase() + rule.check.slice(1)}, it ranks the {rule.universe.toLocaleString("en-US")} largest US stocks by {rule.measure} and
+        holds the top {share}, about {cut} names, at equal weight. A name that drops out of the top {share} is sold at the next rebalance; one that enters is bought.
+      </p>
 
-      <div className="mt-5" role="img" aria-label={`Ranks today: ${book.positions.map((p) => `${p.symbol} ${p.rank}`).join(", ") || "nothing held"}. Recently sold: ${sold.map((s) => `${s.symbol} at rank ${s.rank}`).join(", ") || "none"}.`}>
-        <div className="relative h-7 overflow-hidden rounded-md border">
-          {zones.map((z) => (
-            <div key={z.label} className={cn("absolute inset-y-0 border-r last:border-r-0", z.cls)} style={{ left: `${(z.from / max) * 100}%`, width: `${((z.to - z.from) / max) * 100}%` }} />
+      <div className="mt-5" role="img" aria-label={`Rank scale: ${book.positions.length} holdings, ${slipped.length} below the cut at rank ${cut}. Recently sold: ${sold.map((s) => `${s.symbol} at rank ${s.rank}`).join(", ") || "none"}.`}>
+        <div className="relative h-8 overflow-hidden rounded-md border">
+          <div className="bg-foreground/[0.06] absolute inset-y-0 left-0 border-r" style={{ width: `${(cut / max) * 100}%` }} />
+          {book.positions.map((p) => (
+            <span key={p.symbol} title={`${p.symbol}, rank ${p.rank}`} className={cn("absolute inset-y-1.5 w-px", p.rank > cut ? "bg-attention" : "bg-foreground/70")} style={{ left: `${x(p.rank)}%` }} />
           ))}
           {sold.map((s) => (
             <span key={s.symbol + s.date} title={`${s.symbol}, sold at rank ${s.rank}`} className="border-muted-foreground absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-[1.5px]" style={{ left: `${x(s.rank)}%` }} />
           ))}
-          {book.positions.map((p) => (
-            <span key={p.symbol} title={`${p.symbol}, rank ${p.rank}`} className="bg-foreground ring-background absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-1" style={{ left: `${x(p.rank)}%` }} />
-          ))}
         </div>
-        <div className="relative mt-1.5 h-4 text-[11px]">
-          {zones.map((z) => (
-            <span key={z.label} className="text-muted-foreground absolute truncate pr-1" style={{ left: `${(z.from / max) * 100}%`, width: `${((z.to - z.from) / max) * 100}%` }}>{z.label}</span>
-          ))}
+        <div className="text-muted-foreground relative mt-1.5 h-4 text-[11px]">
+          <span className="absolute left-0">Held: rank 1 to {cut}</span>
+          <span className="absolute pl-1.5" style={{ left: `${(cut / max) * 100}%` }}>Not held</span>
         </div>
       </div>
 
-      <dl className="mt-4 grid gap-x-8 gap-y-3 text-[13px] sm:grid-cols-3">
-        <div>
-          <dt className="text-muted-foreground">Held, in the top {rule.hold}</dt>
-          <dd className="num mt-0.5">{top.length ? top.map((p) => p.symbol).join(" ") : "none yet"}</dd>
-        </div>
-        {keepZone && (
+      <dl className="mt-4 grid gap-x-8 gap-y-3 text-[13px] sm:grid-cols-2">
+        {book.positions.length > 0 && (
           <div>
-            <dt className="text-muted-foreground">Held, slipped but above {rule.sell_below}</dt>
-            <dd className="num mt-0.5">{kept.length ? kept.map((p) => `${p.symbol} ${p.rank}`).join(", ") : "none"}</dd>
+            <dt className="text-muted-foreground">{lastRebalance ? `Slipped below rank ${cut} since ${shortDate(lastRebalance)}` : "Below the cut"}</dt>
+            <dd className="num mt-0.5">{slipped.length ? slipped.map((p) => `${p.symbol} ${p.rank}`).join(", ") : "none"}</dd>
           </div>
         )}
         <div>
           <dt className="text-muted-foreground">Sold lately, at rank</dt>
-          <dd className="num mt-0.5">{sold.length ? sold.slice(0, 5).map((s) => `${s.symbol} ${s.rank}`).join(", ") : "none"}</dd>
+          <dd className="num mt-0.5">{sold.length ? sold.slice(0, 6).map((s) => `${s.symbol} ${s.rank}`).join(", ") : "none yet"}</dd>
         </div>
       </dl>
+      {slipped.length > 0 && <p className="text-muted-foreground mt-2 text-xs">Marked in amber: these are sold at the next rebalance unless they climb back into the top {cut}.</p>}
     </Section>
   );
 }
@@ -348,6 +339,15 @@ function Orders({ book, assumed, onOpen }: { book: Book; assumed: number; onOpen
           {days.map((d) => (
             <div key={d} className="mt-3 first-of-type:mt-0">
               <h3 className="text-muted-foreground border-b pb-1.5 text-xs">{weekdayDate(d)}</h3>
+              {(() => {
+                const rb = book.rebalances.find((x) => x.date === d);
+                return rb ? (
+                  <p className="text-muted-foreground flex min-h-11 items-center justify-between gap-3 border-b py-2 text-[13px]">
+                    <span>Traded {rb.reweighted} holdings back to equal weight{rb.skipped_dust > 0 && <>; skipped {rb.skipped_dust} too small to place</>}</span>
+                    <span className="num shrink-0">{money(rb.cost_usd)} cost</span>
+                  </p>
+                ) : null;
+              })()}
               <ul>
                 {shown.filter((o) => o.placed_at.startsWith(d)).map((o) => {
                   const bad = o.status === "cancelled" || o.status === "rejected";
@@ -377,6 +377,7 @@ function Orders({ book, assumed, onOpen }: { book: Book; assumed: number; onOpen
 function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boolean }) {
   const s = data.strategies.find((x) => x.id === book.strategy_id)!;
   const bt = s.backtest;
+  const idea = data.research.ideas.find((i) => i.book_id === book.id);
   return (
     <div className="mt-3 lg:mt-0">
       <div className="hidden lg:block">
@@ -424,6 +425,11 @@ function Rail({ data, book, stopped }: { data: AppData; book: Book; stopped: boo
         ["Trading cost assumed", `${bt.cost_bp} bp`],
       ]} />
       <p className="text-muted-foreground mt-1 text-xs">Tested {yearDate(bt.period.slice(0, 10))} to {yearDate(bt.period.slice(-10))}, after costs.</p>
+      {idea && data.research.replays[idea.id] && (
+        <a href={`#research/trial/${idea.id}`} className="hover:text-foreground text-muted-foreground mt-2 inline-flex h-11 items-center gap-1 text-[13px] sm:h-8">
+          Watch the backtest run<ChevronRight className="size-3.5" />
+        </a>
+      )}
     </div>
   );
 }
@@ -528,9 +534,11 @@ function Rows({ rows }: { rows: [string, React.ReactNode, string?][] }) {
 function HoldingDetail({ p, book, rule }: { p: Position; book: Book; rule: Rule }) {
   const isReturn = /return/.test(rule.measure);
   const signal = isReturn ? pct(p.signal, 0) : p.signal.toFixed(2);
-  const why = p.rank <= rule.hold
-    ? `Ranked ${p.rank} of ${rule.universe} today on ${rule.measure} (${signal}), inside the top ${rule.hold} it buys from. It stays while it ranks ${rule.sell_below} or better.`
-    : `Ranked ${p.rank} today (${signal} on ${rule.measure}), below the top ${rule.hold}. It stays because the rule only sells below rank ${rule.sell_below}; selling at the line would trade it back and forth.`;
+  const cut = holdOf(book, rule);
+  const next = `${weekdayDate(book.next_run.at!)}`;
+  const why = p.rank <= cut
+    ? `Ranked ${p.rank} of ${rule.universe.toLocaleString("en-US")} today on ${rule.measure} (${signal}), inside the top ${cut} the rule holds.`
+    : `Ranked ${p.rank} today (${signal} on ${rule.measure}), below the top ${cut}. It was in the top ${cut} at the last rebalance; it is sold at the next one, ${next}, unless it climbs back.`;
   const trades = book.orders.filter((o) => o.symbol === p.symbol);
   const gainPct = p.price / p.avg_cost - 1;
   return (

@@ -30,17 +30,24 @@ export interface Order {
   expected_price: number; fill_price: number | null; cost_bp: number | null; why: string; note?: string;
 }
 
-/** The strategy's rule in numbers, so the screen can say why it holds what it holds. */
+/**
+ * The strategy's rule as the engine runs it (the hypothesis file's fields):
+ * rank the largest `universe` stocks on `measure`, hold the top `top_fraction`
+ * at equal weight, trade every holding back to equal weight at each rebalance.
+ */
 export interface Rule {
-  universe: number; measure: string; hold: number; sell_below: number; weight: number; tolerance: number; check: string;
+  universe: number; measure: string; top_fraction: number; per_side_bps: number; fill_price: "close" | "open"; check: string;
 }
+
+/** One rebalance of a book: names in and out, and the small trades back to equal weight. */
+export interface BookRebalance { date: string; entries: number; exits: number; reweighted: number; skipped_dust: number; cost_usd: number }
 
 export interface Run { at: string; outcome?: "ok" | "failed" | "skipped"; summary?: string; what?: string }
 
 export interface Book {
   id: string; name: string; strategy_id: string; cadence: "daily" | "weekly" | "monthly";
   started_on: string; start_equity: number; status: BookStatus; equity: ValuePoint[]; cash: number;
-  positions: Position[]; orders: Order[]; last_run: Run; next_run: Run;
+  positions: Position[]; orders: Order[]; rebalances: BookRebalance[]; last_run: Run; next_run: Run;
   /** SAMPLE: the yearly spread around the S&P this book's backtest expects. */
   expected_tracking_error: number;
 }
@@ -88,22 +95,32 @@ export interface Family {
 
 export interface Lesson { id: string; text: string; grade: "supported" | "mixed" | "against" | "untested"; source: string }
 
-/** One rebalance of a backtest replay: the ranking that day and the trades it caused. */
+/** A name at a rebalance: its rank and score on the measure (null if it left the universe). */
+export interface Ranked { s: string; r: number | null; sig: number | null }
+
+/** One rebalance of a backtest, as the engine saw it, stage by stage. */
 export interface ReplayRebalance {
   date: string;
-  /** Top of the ranking plus anything sold that day. st: what the rule did with it. */
-  ranking: { s: string; r: number; sig: number; st: "held" | "bought" | "sold" | "out" }[];
-  trades: { side: "buy" | "sell"; s: string; r: number; why: string; cost_bp: number }[];
-  cost_usd: number;
+  /** Stage 2, universe: the thousand, the names each rule excluded, the names left with a score. */
+  n_universe: number; excluded: { rule: string; n: number }[]; n_scored: number;
+  /** Stage 3, signal: how the scores spread (counts per bin) and the score of the last name held. */
+  hist: number[]; cut: number; top: Ranked[]; near: (Ranked & { held: boolean })[];
+  /** Stages 4 to 6: how many are held, who came in and went out, how many kept names traded back to equal weight. */
+  hold: number; entries: Ranked[]; exits: Ranked[]; reweighted: number; notional: number; cost_usd: number;
+  held: string[];
 }
 
-/** A backtest, step by step: daily value of the strategy (v) and the S&P (b), and every rebalance. */
+/** A backtest, step by step: the daily value of the strategy (v) and the S&P (b), and every rebalance. */
 export interface Replay {
-  idea_id: string; sample: boolean; window: string; start_equity: number; cost_bp_assumed: number;
-  rule: { universe: number; hold: number; sell_below: number; weight: number };
+  idea_id: string; sample: boolean; trial: number;
+  window: { start: string; end: string }; holdout: { start: string; end: string }; start_equity: number;
+  rule: Omit<Rule, "check">; bins: { lo: number; hi: number; n: number };
   days: { date: string; v: number; b: number }[];
   rebalances: ReplayRebalance[];
-  end: { vs_spy: number; luck: number; tries: number; trial: string };
+  /** The same run's result at every cost level the engine evaluates. */
+  cost_levels: { bp: number; vs_spy: number }[]; annual_turnover: number;
+  end: { vs_spy: number; luck: number; tries: number; distinct: number; periods: number };
+  identity: { params: string; code: string; data_cutoff: string };
 }
 
 export interface Research { waiting: WaitingItem[]; ideas: Idea[]; families: Family[]; lessons: Lesson[]; replays: Record<string, Replay> }

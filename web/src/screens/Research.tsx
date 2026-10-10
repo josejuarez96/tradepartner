@@ -319,6 +319,11 @@ function IdeaSheet({ idea, data, onClose }: { idea: Idea | null; data: AppData; 
                       <p className="text-muted-foreground mb-2 flex items-center gap-2 text-xs">Luck check{idea.result.sample?.includes("luck") && <SampleMark />}<LuckInfo idea={idea} /></p>
                       <LuckScale v={idea.result.luck} />
                     </div>
+                    {data.research.replays[idea.id] && (
+                      <a href={`#research/trial/${idea.id}`} className="bg-secondary hover:bg-accent col-span-2 inline-flex h-11 items-center justify-center gap-2 rounded-md text-sm font-medium">
+                        Open the backtest and watch it run
+                      </a>
+                    )}
                     <p className="text-muted-foreground col-span-2 text-xs">
                       {idea.result.window}, after costs. The luck check is the chance the edge is real once every version tried in the
                       {" "}{idea.family} family is counted.
