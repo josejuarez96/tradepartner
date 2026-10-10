@@ -739,9 +739,14 @@ why = "One monthly strategy at a time made the Phase 4 exit a six-month wait tha
 unblocks = ["plan:paper-trading", "issue:1352"]
 
 [adr.0018]
-what = "The end-user app: a local FastAPI read API in this repo over the CLI's own read functions (books, equity vs benchmark, positions vs targets, orders and fills, runs, alerts, strategies), a React + TypeScript front end in webapp/ served by the same loopback process, the only writes a book's kill switch engaged or released by running the CLI's own paper kill and paper resume as subprocesses, phone access over the owner's Tailscale network with identity checks and no secret in the browser, Streamlit retired page by page at parity, and a spike before any plan task."
+what = "The end-user app: a local FastAPI read API in this repo over the CLI's own read functions (books, equity vs benchmark, positions vs targets, orders and fills, runs, alerts, strategies, and since the 2026-10-10 amendment the lab: trial registry, result page, sweep report), a React + TypeScript front end in webapp/ served by the same loopback process, every write a CLI command run as a subprocess (kill, resume; since the amendment run a counted trial, spend a holdout, override the survivorship gap, register a hypothesis or sweep), reachable on the Mac only in version 1 with phone access left to a later ADR while every screen is built at phone width, Streamlit retired page by page at parity, and a spike before any plan task."
 why = "The owner wants a product-quality surface at his desk and on his phone that answers how he is doing, what each book holds and why, what is wrong or waiting on him, and lets him stop or resume a book safely; ADR 0011's Streamlit-only rule cannot give that, and the change to the roadmap's no-separate-API rule is hard to reverse, so it is recorded first."
 unblocks = ["plan:webapp"]
+
+[issue.1412]
+what = "The 2026-10-10 amendment to ADR 0018: the lab's reading side (trial registry, result page, sweep report) moves into the app; a Run button, holdout spend, gap override and registration become writes that run the engine's own CLI commands as subprocesses under holdout.decide's rules; the Tailscale decision is withdrawn, version 1 is Mac-only on the network, mobile stays a version 1 design requirement."
+why = "The owner decided these on spike/design-ui; the webapp spec and plan cannot be written against a record that still decides Tailscale and forbids the writes the design needs."
+unblocks = ["adr:0018", "plan:webapp"]
 
 [issue.1352]
 what = "Turn ADR 0017 into the spec amendments (paper spec, strategy-lab req 11, the ADR pointers) and the Phase 4 plan tasks T151 to T163c: cadence lift, the family flip, one account per book, the multi-book run, the per-book surfaces, paper shakedown, the runbook, the owner's accounts, hypotheses, starts and span, and the Phase 6 live book."
