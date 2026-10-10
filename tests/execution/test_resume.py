@@ -236,6 +236,7 @@ def _resume(
     *,
     accept: bool = False,
     accept_rejections: bool = False,
+    book_id: str | None = None,
 ) -> Any:
     # A real clock moves between reads; the release must be stamped after the
     # crashed close for `switch.derive` to clear the crashed run.
@@ -248,6 +249,7 @@ def _resume(
         "owner checked",
         accept,
         accept_rejections=accept_rejections,
+        book_id=book_id,
     )
 
 
@@ -2160,3 +2162,46 @@ def test_observe_leaves_the_floor_alone_on_a_reading_without_a_utc_offset() -> N
 
     assert stamps.observe(lambda: odd)() is odd
     assert stamps._floor == DAY1
+
+
+# --- books (ADR 0017 B.3 and B.5, plan T155) -------------------------------------------
+
+
+def test_b_s_resume_releases_b_alone_under_its_own_lock(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """`paper resume --book b` takes `b`'s lock (`main`'s may be held by a run),
+    reconciles `b`'s account and releases `b`'s switch; `main`'s engagement
+    stays, and `main`'s own resume is still refused `LockHeld`."""
+    b_window = replace(window, window_id=None, book_id="b", account_id="PB1")
+    (b_id,) = _append(journal_settings, b_window)
+    b_window = replace(b_window, window_id=b_id)
+    _engage(journal_settings, window, fixed_clock)
+    _engage(journal_settings, b_window, fixed_clock)
+    b_fake = SkewedFake(
+        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1"
+    )
+
+    with run_lock(journal_settings, "main"):
+        with pytest.raises(LockHeld):
+            _resume(journal_settings, b_fake, fixed_clock)
+        outcome = _resume(journal_settings, b_fake, fixed_clock, book_id="b")
+
+    assert outcome.status == RELEASED, outcome.reasons
+    assert not _engaged(journal_settings, b_window)
+    assert _engaged(journal_settings, window)
+    with open_read_only(journal_settings) as conn:
+        (reconciliation,) = reconciliations_for(conn, b_id)
+        assert reconciliations_for(conn, window.window_id) == []  # type: ignore[arg-type]
+    assert reconciliation.book_id == "b"
+
+
+def test_resume_for_a_book_with_no_window_is_no_window_beside_main(
+    journal_settings: Settings, fake: SkewedFake, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    outcome = _resume(journal_settings, fake, fixed_clock, book_id="b")
+    assert outcome.status == NO_WINDOW
+    assert fake.calls == ()
+    assert _count(journal_settings, "resume_invocations") == 0

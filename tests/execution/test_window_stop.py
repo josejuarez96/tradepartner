@@ -107,12 +107,18 @@ def _frozen_json() -> str:
 
 
 def _new_window(
-    settings: Settings, started: datetime, *, starting_cash: float = 100_000.0
+    settings: Settings,
+    started: datetime,
+    *,
+    starting_cash: float = 100_000.0,
+    book_id: str = "main",
+    account_id: str = "PA1",
 ) -> PaperWindowRow:
     row = PaperWindowRow(
         hypothesis_id=registered_hypothesis(settings),
         first_rebalance_session=date(2026, 9, 30),
-        account_id="PA1",
+        account_id=account_id,
+        book_id=book_id,
         starting_cash=starting_cash,
         starting_equity=100_000.0,
         code_version="test",
@@ -1612,3 +1618,155 @@ def test_override_refuses_schema_version_on_a_version_16_store(
     assert reason == window_module.SCHEMA_VERSION
     assert "open it for writing once" in message
     assert _count(journal_settings, "overrides") == 0
+
+
+# --- books (ADR 0017 B.3 to B.5, plan T155) ------------------------------------------
+
+
+@pytest.fixture
+def b_window(journal_settings: Settings, window: PaperWindowRow) -> PaperWindowRow:
+    """Book `b`'s open window on its own account, beside `main`'s (`window`)."""
+    return _new_window(
+        journal_settings, datetime(2026, 9, 29, 13, 0, tzinfo=UTC), book_id="b", account_id="PB1"
+    )
+
+
+@pytest.fixture
+def b_fake(fixed_clock: FixedClock) -> FakeBroker:
+    return FakeBroker(
+        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1"
+    )
+
+
+def test_paper_kill_on_b_leaves_main_running(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    b_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Spec acceptance (ADR 0017 B.5): `paper kill --book b` engages `b`'s switch
+    only; `main`'s stays released, and the reverse."""
+    event_id = kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE, book_id="b")
+
+    with open_read_only(journal_settings) as conn:
+        (event,) = kill_switch_events_for(conn, b_window.window_id)  # type: ignore[arg-type]
+        assert kill_switch_events_for(conn, window.window_id) == []  # type: ignore[arg-type]
+    assert (event.event_id, event.window_id) == (event_id, b_window.window_id)
+    assert _engaged(journal_settings, b_window)
+    assert not _engaged(journal_settings, window)
+
+    kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)  # the default: main
+    assert _engaged(journal_settings, window)
+
+
+def test_another_book_s_open_window_is_not_a_second_open_window(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    b_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """`multiple_open_windows` is per book: `b`'s open window never refuses
+    `main`'s commands, while a second open `main` window still does."""
+    override_id = override(
+        journal_settings, fixed_clock, "engage_kill_switch", None, None, OVERRIDE_REASON
+    )
+    b_override_id = override(
+        journal_settings,
+        fixed_clock,
+        "engage_kill_switch",
+        None,
+        None,
+        OVERRIDE_REASON,
+        book_id="b",
+    )
+    with open_read_only(journal_settings) as conn:
+        assert [o.override.override_id for o in overrides_for(conn, window.window_id)] == [
+            override_id
+        ]  # type: ignore[arg-type]
+        assert [o.override.override_id for o in overrides_for(conn, b_window.window_id)] == [  # type: ignore[arg-type]
+            b_override_id
+        ]
+
+    _new_window(journal_settings, datetime(2026, 9, 29, 14, 0, tzinfo=UTC))
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE)
+    assert excinfo.value.reason == MULTIPLE_OPEN_WINDOWS
+    kill(journal_settings, _connect(journal_settings), fixed_clock, NOTE, book_id="b")
+
+
+def test_every_command_on_a_book_with_no_window_is_no_window_beside_main(
+    journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """With only `main` open, every command for book `b` refuses `no_window` and
+    writes nothing, and never reaches the broker."""
+    connect = _connect(journal_settings)
+    calls = [
+        lambda: stop(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b"),
+        lambda: abandon(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b"),
+        lambda: kill(journal_settings, connect, fixed_clock, NOTE, book_id="b"),
+        lambda: override(
+            journal_settings,
+            fixed_clock,
+            "engage_kill_switch",
+            None,
+            None,
+            OVERRIDE_REASON,
+            book_id="b",
+        ),
+    ]
+    for call in calls:
+        with pytest.raises(WindowCommandRefused) as excinfo:
+            call()
+        assert excinfo.value.reason == NO_WINDOW
+    assert fake.calls == ()
+    for table in ("paper_window_stops", "kill_switch", "overrides", "reconciliations"):
+        assert _count(journal_settings, table) == 0
+
+
+def test_b_stops_under_its_own_lock_while_main_s_is_held_and_main_stays_open(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    b_window: PaperWindowRow,
+    b_fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """Two locks: `main`'s run lock held (a `main` run in progress) never blocks
+    `b`'s stop, which closes `b`'s window on `b`'s account; `main`'s stop is
+    still refused `LockHeld`, and `main`'s window stays open."""
+    connect = _connect(journal_settings)
+    with run_lock(journal_settings, "main"):
+        with pytest.raises(LockHeld):
+            stop(journal_settings, connect, b_fake, fixed_clock, NOTE)
+        assert stop(journal_settings, connect, b_fake, fixed_clock, NOTE, book_id="b").state == (
+            "requested"
+        )
+        fixed_clock.advance(minutes=1)
+        closed = stop(journal_settings, connect, b_fake, fixed_clock, NOTE, book_id="b")
+    assert closed.state == "closed"
+    assert _stops(journal_settings, window) == []
+    with open_read_only(journal_settings) as conn:
+        assert open_window(conn, "b") is None
+        assert open_window(conn, "main") == window
+        (reconciliation,) = reconciliations_for(conn, b_window.window_id)  # type: ignore[arg-type]
+    assert reconciliation.book_id == "b"
+    assert reconciliation.status == "ok"
+
+
+def test_stop_on_b_with_main_s_account_is_a_reconciliation_fault_on_b_only(
+    journal_settings: Settings,
+    window: PaperWindowRow,
+    b_window: PaperWindowRow,
+    fake: FakeBroker,
+    fixed_clock: FixedClock,
+) -> None:
+    """`paper_windows.account_id` stays the identity check: `b`'s closing stop
+    against `main`'s account (PA1) is a reconciliation mismatch that engages `b`'s
+    switch only."""
+    connect = _connect(journal_settings)
+    stop(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b")
+    fixed_clock.advance(minutes=1)
+    with pytest.raises(WindowCommandRefused) as excinfo:
+        stop(journal_settings, connect, fake, fixed_clock, NOTE, book_id="b")
+    assert excinfo.value.reason == RECONCILIATION
+    assert _engaged(journal_settings, b_window)
+    assert not _engaged(journal_settings, window)

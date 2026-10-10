@@ -509,3 +509,97 @@ def test_run_in_progress_while_another_process_holds_the_lock(
 def test_no_colour_literal_in_page_code() -> None:
     source = Path(ops_page.__file__).read_text(encoding="utf-8")
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source)
+
+
+# --- books (ADR 0017 B.7; plan T156) ----------------------------------------------
+
+
+def _add_book_b(store_path: Path) -> None:
+    """A second open book beside the seeded `main` one: its own window, one
+    finished run on S-1 and two marked positions, and no fill, order or alert."""
+    settings = Settings(_env_file=None, store={"path": str(store_path)})
+    with open_for_write(settings) as conn:
+        window_id = append(
+            conn,
+            PaperWindowRow(
+                hypothesis_id=1,
+                first_rebalance_session=_S_MINUS_1,
+                account_id="PB1",
+                starting_cash=50_000.0,
+                starting_equity=50_000.0,
+                code_version="test",
+                started_at=_at(-30),
+                frozen_json="{}",
+                frozen_sha256="0" * 64,
+                book_id="b",
+                known_at=_at(-30),
+                ingested_at=_at(-30),
+            ),
+        )
+        assert window_id is not None
+        run_id = append(
+            conn,
+            PaperRunRow(
+                window_id=window_id,
+                session=_S_MINUS_1,
+                kind="rebalance",
+                started_at=_at(10),
+                invoked_by="scheduler",
+                code_version="abc",
+                **_stamp(10),
+            ),
+        )
+        assert run_id is not None
+        append(
+            conn,
+            PaperRunResultRow(
+                run_id=run_id, finished_at=_at(12), status="ok", clock_fault=False, **_stamp(12)
+            ),
+        )
+        for security_id in ("DDD", "EEE"):
+            append(
+                conn,
+                PositionDailyRow(
+                    run_id=run_id,
+                    session=_S_MINUS_1,
+                    security_id=security_id,
+                    quantity=1.0,
+                    mark_price=10.0,
+                    value=10.0,
+                    **_stamp(13),
+                ),
+            )
+
+
+def test_one_book_shows_its_summary_row_and_no_selector(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    summary = _dataframe_with_columns(at, "book", "next_rebalance", "kill_switch")
+    assert summary["book"].to_list() == ["main"]
+    assert all(sb.key != ops_page.BOOK_KEY for sb in at.selectbox)
+
+
+def test_two_books_list_two_summary_rows_and_the_selector_switches_the_sections(
+    monkeypatch: pytest.MonkeyPatch, seeded_store: Path
+) -> None:
+    _add_book_b(seeded_store)
+    at = _app(monkeypatch, seeded_store)
+    assert not at.exception
+    summary = _dataframe_with_columns(at, "book", "positions", "last_run")
+    assert summary["book"].to_list() == ["b", "main"]
+    assert summary["positions"].to_list() == [2, 1]
+    assert summary["last_run"].to_list() == ["ok", "ok"]
+    [selector] = [sb for sb in at.selectbox if sb.key == ops_page.BOOK_KEY]
+    assert selector.options == ["b", "main"]
+    assert selector.value == "main"  # `paper.book_id`, not the first token
+    assert {m.label: str(m.value) for m in at.metric}["Positions"] == "1"
+    alerts = _dataframe_with_columns(at, "kind", "message")
+    assert alerts["message"].to_list() == ["SPY has no bar for S"]
+
+    selector.set_value("b").run(timeout=30)
+    assert not at.exception
+    assert {m.label: str(m.value) for m in at.metric}["Positions"] == "2"
+    assert "No alerts in this window." in _text(at)
+    assert "No fills yet in this window." in _text(at)

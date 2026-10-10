@@ -6,6 +6,14 @@ order. Step 6's trading half and the forced exits are dispatched through the
 module names `trade_step` and `exits_step` (T63d); the `stop` kind's step 7
 through `stop_step` (T63f).
 
+**Books** (ADR 0017 B.3, plan T155b). A run is one book's: `tracking_run`
+takes the book (default `paper.book_id`), its broker is that book's, and it
+takes that book's run lock and reads that book's open window only.
+`every_book_run` is `paper run` with no `--book`: every book with an open window
+(`open_books`), in token order, each its own run under its own lock with its
+own `paper_runs` row; a crash in one book's run is that book's entry and never
+stops the next. With one book (`main`, H1's) both are the run before books.
+
 **Entry.** The session is the clock's New York date. The run lock (T59) is
 taken first: a second instance writes a `locked` alert with no run id (its
 session the one containing the clock reading, or the next one on a non-session
@@ -219,7 +227,7 @@ from tradepartner.execution.collect import (
     lag_verdict,
 )
 from tradepartner.execution.ledger import Ledger, from_journal
-from tradepartner.execution.lock import LockHeld, run_lock
+from tradepartner.execution.lock import LockHeld, resolve_book, run_lock
 from tradepartner.execution.lots import LedgerAccount
 from tradepartner.execution.outcomes import write_outcomes_and_lots
 from tradepartner.execution.plan import (
@@ -249,11 +257,13 @@ from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_a
 from tradepartner.store.db import open_read_only, utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
+    CLOSING_STOP_STATES,
     TERMINAL_ORDER_STATUSES,
     AdjustmentRow,
     DecisionEventRow,
     DecisionRow,
     DecisionWithEvents,
+    JournalNotInitialised,
     KillSwitchRow,
     OrderedFill,
     OrderEventRow,
@@ -278,19 +288,24 @@ from tradepartner.store.journal import (
     positions_daily_for,
     rebalance_events_for,
     reconciliations_for,
+    require_journal,
     runs_for,
     window_stops_for,
 )
-from tradepartner.store.schema import WINDOW_STOP_REASON
+from tradepartner.store.schema import DEFAULT_BOOK_ID, WINDOW_STOP_REASON
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
+    "CRASHED",
     "INVOKED_BY_ENV",
+    "BookRun",
     "RunOutcome",
     "StepContext",
     "WindowJournalInputs",
+    "every_book_run",
     "exits_step",
     "invoked_by",
+    "open_books",
     "stop_session",
     "stop_step",
     "submit_window",
@@ -313,6 +328,8 @@ SKIPPED_KILL_SWITCH = "skipped_kill_switch"
 _CLEAN_EXITS = frozenset({OK, NO_SESSION, SKIPPED_KILL_SWITCH})
 _FAILED = "failed"
 _CRASHED = "crashed"
+#: `BookRun.status` of a book whose run raised (or exited) in `every_book_run`.
+CRASHED = _CRASHED
 _STOP, _MARK = "stop", "mark"
 _REQUESTED = "requested"
 _EXECUTED = "executed"
@@ -826,11 +843,14 @@ class _ChunkAlerter(Alerter):
         message: str,
         *,
         clock_fault: bool = False,
+        book_id: str = DEFAULT_BOOK_ID,
     ) -> int:
         """`Alerter.write` in a write chunk of its own."""
         with self._chunk() as conn:
             alerter = Alerter(self._chunk_settings, conn, self._chunk_clock)
-            return alerter.write(kind, run_id, session, message, clock_fault=clock_fault)
+            return alerter.write(
+                kind, run_id, session, message, clock_fault=clock_fault, book_id=book_id
+            )
 
     def scrub(self, text: str) -> str:
         """`text` with every configured secret masked: the `Alerter`'s own
@@ -883,24 +903,104 @@ def tracking_run(
     clock: Callable[[], datetime],
     *,
     sleep: Callable[[float], None] = time.sleep,
+    book_id: str | None = None,
 ) -> RunOutcome:
-    """`paper run` (module docstring). `connect` opens a write chunk
-    (`lambda: store.db.open_for_write(settings)`); `clock` is the clock the
-    broker adapter holds; `sleep` waits between polls, the wrapper's and step
-    7b's (tests advance a fake clock). Returns the outcome of a run that ended `ok`,
-    `skipped_kill_switch`, `no_session`, `no_window` or `locked`; a halt
-    re-raises its fault after the halt path, any other failure propagates
-    after the `failed` result row, and a `kill_switch` row that cannot be
-    written exits with `SystemExit`."""
+    """`paper run --book <book>` (module docstring; `book_id` defaults to
+    `paper.book_id`, `ValueError` outside the token grammar before any lock).
+    `connect` opens a write chunk (`lambda: store.db.open_for_write(settings)`);
+    `broker` is the book's own (`build_broker(settings, clock, book)`); `clock`
+    is the clock the broker adapter holds; `sleep` waits between polls, the
+    wrapper's and step 7b's (tests advance a fake clock). The run takes the
+    book's run lock and reads only the book's open window (ADR 0017 B.3); its
+    `locked` and `no_window` alerts carry the book. Returns the outcome of a run
+    that ended `ok`, `skipped_kill_switch`, `no_session`, `no_window` or
+    `locked`; a halt re-raises its fault after the halt path, any other failure
+    propagates after the `failed` result row, and a `kill_switch` row that
+    cannot be written exits with `SystemExit`."""
+    book = resolve_book(settings, book_id)
     with ExitStack() as stack:
         try:
-            stack.enter_context(run_lock(settings))
+            stack.enter_context(run_lock(settings, book))
         except LockHeld as exc:  # only taking the lock: never a LockHeld from the run
             session = _alert_session(_read_clock(clock))
             alerter = _ChunkAlerter(settings, connect, clock)
-            alerter.write(LOCKED, None, session, alerter.scrub(f"paper run not started: {exc}"))
+            alerter.write(
+                LOCKED,
+                None,
+                session,
+                alerter.scrub(f"paper run not started: {exc}"),
+                book_id=book,
+            )
             return RunOutcome(LOCKED, session=session)
-        return _locked_run(settings, connect, broker, clock, sleep)
+        return _locked_run(settings, connect, broker, clock, sleep, book)
+
+
+@dataclass(frozen=True)
+class BookRun:
+    """One book's part of `every_book_run`: its `status` (the run's outcome
+    status, or `crashed` when the run raised or exited), its `outcome` (None when
+    crashed), the `error` it raised (None otherwise) and its exit code."""
+
+    book_id: str
+    status: str
+    outcome: RunOutcome | None = None
+    error: BaseException | None = None
+    exit_code: int = 0
+
+
+def open_books(settings: Settings) -> tuple[str, ...]:
+    """Every book with an open window (no `closed` or `abandoned` stop row), in
+    token order, over a short read-only connection; empty on a store with no
+    journal. A book with two open windows is listed once: its own run then fails
+    closed on them (`journal.open_window`)."""
+    with open_read_only(settings) as conn:
+        try:
+            require_journal(conn)
+        except JournalNotInitialised:
+            return ()
+        rows = conn.execute(
+            "SELECT DISTINCT book_id FROM paper_windows WHERE window_id NOT IN "
+            "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
+            [list(CLOSING_STOP_STATES)],
+        ).fetchall()
+    return tuple(sorted(str(row[0]) for row in rows))
+
+
+def every_book_run(
+    settings: Settings,
+    connect: Connect,
+    broker_for: Callable[[str], Broker],
+    clock: Callable[[], datetime],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[BookRun, ...]:
+    """`paper run` with no `--book` (ADR 0017 B.3): `tracking_run` for every
+    book of `open_books`, in token order, each with its own broker
+    (`broker_for(book)`, built inside that book's turn), its own run lock and its
+    own `paper_runs` row. With no open book it is `paper.book_id`'s run alone,
+    which writes its `no_window` alert as before books. A book whose broker
+    cannot be built, or whose run raises or exits (`SystemExit`, the halt path's
+    write failure), is that book's `crashed` entry, with the error and its exit
+    code (the `SystemExit` code, else `CRASH_EXIT_CODE`), and the next book still
+    runs; its own journal rows are whatever its run wrote (a `failed` or
+    `halted` result, or an unfinished row its next run closes `crashed`). Only
+    `KeyboardInterrupt` stops the loop. The listing's own errors propagate
+    before any book runs."""
+    books = open_books(settings) or (resolve_book(settings, None),)
+    results: list[BookRun] = []
+    for book in books:
+        try:
+            outcome = tracking_run(
+                settings, connect, broker_for(book), clock, sleep=sleep, book_id=book
+            )
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) and exc.code else CRASH_EXIT_CODE
+            results.append(BookRun(book, _CRASHED, error=exc, exit_code=code))
+        except Exception as exc:
+            results.append(BookRun(book, _CRASHED, error=exc, exit_code=CRASH_EXIT_CODE))
+        else:
+            results.append(BookRun(book, outcome.status, outcome, exit_code=outcome.exit_code))
+    return tuple(results)
 
 
 def _locked_run(
@@ -909,14 +1009,15 @@ def _locked_run(
     broker: Broker,
     clock: Callable[[], datetime],
     sleep: Callable[[float], None],
+    book: str,
 ) -> RunOutcome:
     now = _read_clock(clock)
     with open_read_only(settings) as conn:
-        window = open_window(conn)
+        window = open_window(conn, book)
     if window is None:
         session = _alert_session(now)
         _ChunkAlerter(settings, connect, clock).write(
-            NO_WINDOW, None, session, "paper run: no paper window is open"
+            NO_WINDOW, None, session, "paper run: no paper window is open", book_id=book
         )
         return RunOutcome(NO_WINDOW, session=session)
     window_id = _window_id(window)
@@ -1082,7 +1183,12 @@ class _Run:
         problems: list[str] = []
         try:
             self.alerter.write(
-                "run_failed", self.run_id, self.session, message, clock_fault=clock_fault
+                "run_failed",
+                self.run_id,
+                self.session,
+                message,
+                clock_fault=clock_fault,
+                book_id=self.window.book_id,
             )
         except Exception as alert_error:
             problems.append(f"run_failed alert not written ({type(alert_error).__name__})")
@@ -1198,7 +1304,13 @@ class _Run:
         return {s: self.assets[s] for s in symbols if s in self.assets}
 
     def _alert(self, kind: str, message: str) -> None:
-        self.alerter.write(kind, self.run_id, self.session, self.alerter.scrub(message))
+        self.alerter.write(
+            kind,
+            self.run_id,
+            self.session,
+            self.alerter.scrub(message),
+            book_id=self.window.book_id,
+        )
 
     # --- the steps -----------------------------------------------------------------
 

@@ -4,8 +4,9 @@ Writes one CSV per store fact table into `tests/fixtures/universe/` (or an
 override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
-`statement_facts.csv`, plus `README.md` mapping every spec req 13 case,
-and every statement-facts case (#660), to the rows that exercise it.
+`statement_facts.csv`, `filing_events.csv` (#1358), plus `README.md` mapping
+every spec req 13 case, every statement-facts case (#660) and every
+filing-events case (#1358), to the rows that exercise it.
 
 `statement_facts.csv` rows are **DB-table-level** rows, like every other
 CSV here (as if the as-yet-unbuilt T77/T77a/T77b parser and ingest had
@@ -196,6 +197,17 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "filing_events": (
+        "cik",
+        "accession",
+        "form",
+        "items",
+        "accepted_at",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
 }
 
 
@@ -306,8 +318,10 @@ class Rows:
     corporate_actions: list[dict[str, object]] = field(default_factory=list)
     facts: list[dict[str, object]] = field(default_factory=list)
     statement_facts: list[dict[str, object]] = field(default_factory=list)
+    filing_events: list[dict[str, object]] = field(default_factory=list)
     readme_cases: list[dict[str, str]] = field(default_factory=list)
     statement_readme_cases: list[dict[str, str]] = field(default_factory=list)
+    filing_event_readme_cases: list[dict[str, str]] = field(default_factory=list)
 
     def security(
         self,
@@ -628,6 +642,47 @@ class Rows:
     def statement_case(self, case: str, cik: str, facts: str, dates: str, notes: str) -> None:
         self.statement_readme_cases.append(
             {"case": case, "cik": cik, "facts": facts, "dates": dates, "notes": notes}
+        )
+
+    def filing_event(
+        self,
+        cik: str,
+        accession: str,
+        form: str,
+        items: str,
+        accepted_at: datetime,
+        *,
+        source: str = _SOURCE_EDGAR,
+        ingested_delay: timedelta = timedelta(minutes=10),
+    ) -> None:
+        """One `filing_events` row (#1358): `known_at` is the acceptance,
+        never the filing date (spec "Amendment 2026-10-09 (#1358)")."""
+        self.filing_events.append(
+            {
+                "cik": cik,
+                "accession": accession,
+                "form": form,
+                "items": items,
+                "accepted_at": accepted_at,
+                "known_at": accepted_at,
+                "ingested_at": accepted_at + ingested_delay,
+                "source": source,
+                "provenance": "filing",
+            }
+        )
+
+    def filing_event_case(
+        self, case: str, accession: str, items: str, accepted: str, filed: str, notes: str
+    ) -> None:
+        self.filing_event_readme_cases.append(
+            {
+                "case": case,
+                "accession": accession,
+                "items": items,
+                "accepted": accepted,
+                "filed": filed,
+                "notes": notes,
+            }
         )
 
 
@@ -2124,6 +2179,79 @@ def _statement_facts_profitability(rows: Rows) -> None:
     )
 
 
+#: The issuer carrying the three filing-event rows (#1358): `SEC_SPLIT_PLAIN`'s
+#: cik, a survivor with bars through `_FIXTURE_END`, so T164d's as-of read has a
+#: security to join against at every probe.
+FILING_EVENTS_CIK = "CIK0001000011"
+
+
+def _filing_events(rows: Rows) -> None:
+    """Three 8-K rows for one issuer (#1358, plan T164b). The submissions
+    record's filing date (`filed`) is not a column: it is documented in the
+    README so T164d can show a `filed`-keyed read failing.
+
+    - A `2.02,9.01` accepted at 16:05 New York on a session T, after the
+      close but before EDGAR's 17:30 filing-date cut, so its `filed` date is
+      T: invisible at `close(T)`, first visible at T + 1; a `filed`-keyed read
+      would see it at T (the look-ahead case with teeth).
+    - A `2.02,9.01` accepted at 20:30 New York, `filed` the next day (the lag
+      case, which a `filed`-keyed read passes by accident).
+    - A `5.02` before the open of a session, `filed` that day (a non-2.02 8-K,
+      so an `items` filter has a row to drop).
+    """
+    cik = FILING_EVENTS_CIK
+    teeth_session = _session_on_or_after(date(2020, 4, 30))
+    lag_session = _session_on_or_after(date(2020, 5, 5))
+    other_session = _session_on_or_after(date(2020, 5, 12))
+    teeth_at = _new_york(teeth_session, 16, 5)
+    lag_at = _new_york(lag_session, 20, 30)
+    other_at = _new_york(other_session, 9)
+    if not session_close(teeth_session) < teeth_at < _new_york(teeth_session, 17, 30):
+        raise AssertionError(f"{teeth_at} is not between the close and 17:30 New York")
+    lag_filed = lag_at.astimezone(_NEW_YORK).date() + timedelta(days=1)
+    if not is_session(lag_filed):
+        raise AssertionError(f"expected {lag_filed} to be a session")
+    for seq, items, accepted_at, filed, case, notes in (
+        (
+            101,
+            "2.02,9.01",
+            teeth_at,
+            teeth_session,
+            "After-close 2.02 whose filed date is its session (the filed-date trap)",
+            f"invisible at session_close {session_close(teeth_session).isoformat()}, first "
+            f"visible at {next_session(teeth_session)}; a filed-keyed read sees it at "
+            f"{teeth_session}",
+        ),
+        (
+            102,
+            "2.02,9.01",
+            lag_at,
+            lag_filed,
+            "Evening 2.02 filed the next day (the lag case)",
+            f"first visible at {lag_filed}; a filed-keyed read passes by accident",
+        ),
+        (
+            103,
+            "5.02",
+            other_at,
+            other_session,
+            "Pre-open 5.02 (not a 2.02)",
+            f"visible at session_close {session_close(other_session).isoformat()}; an "
+            "items filter on 2.02 drops it",
+        ),
+    ):
+        accession = _statement_accession(cik, accepted_at.year, seq)
+        rows.filing_event(cik, accession, "8-K", items, accepted_at)
+        rows.filing_event_case(
+            case,
+            accession,
+            items,
+            f"{accepted_at.isoformat()} ({accepted_at.astimezone(_NEW_YORK):%H:%M} New York)",
+            filed.isoformat(),
+            notes,
+        )
+
+
 # ---------------------------------------------------------------------------
 # CSV / README writing.
 # ---------------------------------------------------------------------------
@@ -2154,7 +2282,10 @@ def _write_csv(
 
 
 def _write_readme(
-    path: Path, cases: list[dict[str, str]], statement_cases: list[dict[str, str]]
+    path: Path,
+    cases: list[dict[str, str]],
+    statement_cases: list[dict[str, str]],
+    filing_event_cases: list[dict[str, str]],
 ) -> None:
     ordered = sorted(cases, key=lambda c: c["case"])
     statement_ordered = sorted(statement_cases, key=lambda c: c["case"])
@@ -2223,8 +2354,23 @@ def _write_readme(
             "- `basis='derived'` and a restated key's single surviving row are authored "
             "directly as the (future) ingest's expected output, not computed by this "
             "generator or verified against a parser here (T77/T77b's job).",
+            "",
+            "## Filing events (#1358)",
+            "",
+            f"Three 8-K rows (`filing_events.csv`) for cik `{FILING_EVENTS_CIK}` "
+            "(`SEC_SPLIT_PLAIN`), for T164c-T164e authors. `known_at` = `accepted_at`; the "
+            "submissions record's filing date is not stored and is listed here so a "
+            "`filed`-keyed read can be shown failing.",
+            "",
+            "| Case | Accession | items | accepted_at | filed | Notes |",
+            "|---|---|---|---|---|---|",
         ]
     )
+    for c in sorted(filing_event_cases, key=lambda c: c["accession"]):
+        lines.append(
+            f"| {c['case']} | {c['accession']} | `{c['items']}` | {c['accepted']} | "
+            f"{c['filed']} | {c['notes']} |"
+        )
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -2259,6 +2405,7 @@ def build_rows() -> Rows:
     _statement_facts_dual_class(rows)
     _statement_facts_no_securities_row_yet(rows)
     _statement_facts_profitability(rows)
+    _filing_events(rows)
     return rows
 
 
@@ -2310,7 +2457,18 @@ def write_fixtures(output_dir: Path) -> None:
         rows.statement_facts,
         ("cik", "fact_name", "period_end", "period_days"),
     )
-    _write_readme(output_dir / "README.md", rows.readme_cases, rows.statement_readme_cases)
+    _write_csv(
+        output_dir / "filing_events.csv",
+        "filing_events",
+        rows.filing_events,
+        ("cik", "accession"),
+    )
+    _write_readme(
+        output_dir / "README.md",
+        rows.readme_cases,
+        rows.statement_readme_cases,
+        rows.filing_event_readme_cases,
+    )
 
 
 def main(argv: list[str]) -> int:

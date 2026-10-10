@@ -28,6 +28,7 @@ from tradepartner.config import (
     FORBIDDEN_AXIS_PREFIXES,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
+    MAIN_BOOK_ID,
     PAPER_FAMILIES,
     AlpacaConfig,
     CombinedConfig,
@@ -43,7 +44,9 @@ from tradepartner.config import (
     _default_env_file,
     _settings_has_key,
     clean_message,
+    paper_key_variable_names,
     render_validation_errors,
+    secret_values,
 )
 from tradepartner.store.schema import DEFAULT_BOOK_ID
 
@@ -868,6 +871,7 @@ def test_lab_defaults() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     ]
@@ -1094,7 +1098,7 @@ def test_engine_families_derives_at_today_s_value() -> None:
 
 
 def test_paper_families_derives_at_today_s_value() -> None:
-    assert PAPER_FAMILIES == ("momentum", "oracle")
+    assert PAPER_FAMILIES == ("momentum", "oracle", "profitability", "combined")
 
 
 def test_default_sweepable_keys_derives_at_today_s_value() -> None:
@@ -1104,6 +1108,7 @@ def test_default_sweepable_keys_derives_at_today_s_value() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
         "schedule.rebalance_cadence",
         "schedule.signal_anchor",
     )
@@ -1120,8 +1125,9 @@ def test_momentum_family_spec() -> None:
     assert spec.parent is None
     assert spec.engine_ready is True
     assert spec.paper_ready is True
-    assert spec.exclusion_reasons == ("no_history",)
-    assert spec.count_names == ("n_excluded_no_history",)
+    # B10's screen (#1358): its reason and counts, reported only below 1.0.
+    assert spec.exclusion_reasons == ("no_history", "no_turnover")
+    assert spec.count_names == ("n_excluded_no_history", "n_screened", "n_excluded_no_turnover")
     assert spec.benchmark == "MTUM"
     assert spec.sweepable_keys == (
         "strategy.formation_months",
@@ -1129,7 +1135,17 @@ def test_momentum_family_spec() -> None:
         "strategy.top_fraction",
         "strategy.weighting",
         "strategy.signal_total_return",
+        "strategy.turnover_top_fraction",
     )
+
+
+def test_turnover_top_fraction_defaults_to_no_screen() -> None:
+    """B10's key (backtest spec amendment #1358): 1.0 by default, in (0, 1]."""
+    assert StrategyConfig().turnover_top_fraction == 1.0
+    assert StrategyConfig(turnover_top_fraction=0.2).turnover_top_fraction == 0.2
+    for bad in (0, 1.5, -0.1):
+        with pytest.raises(ValidationError):
+            StrategyConfig(turnover_top_fraction=bad)
 
 
 def test_oracle_family_spec_reads_momentum_s_section() -> None:
@@ -1148,7 +1164,7 @@ def test_profitability_family_spec() -> None:
     assert spec.params_model is ProfitabilityConfig
     assert spec.parent is None
     assert spec.engine_ready is True
-    assert spec.paper_ready is False
+    assert spec.paper_ready is True
     assert spec.exclusion_reasons == ("sector", "no_facts", "stale_facts", "malformed")
     assert spec.count_names == (
         "n_ranked",
@@ -1210,7 +1226,7 @@ def test_combined_family_spec() -> None:
     assert spec.params_model is CombinedConfig
     assert spec.parent == "momentum"
     assert spec.engine_ready is True
-    assert spec.paper_ready is False
+    assert spec.paper_ready is True
     assert spec.exclusion_reasons == (
         "no_history",
         "sector",
@@ -1566,7 +1582,10 @@ def test_risk_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> 
 
 def test_paper_defaults() -> None:
     p = _settings().paper
-    assert p.min_rebalances == 6
+    # ADR 0017 part C, open question 2: six months, a quarter of weeks, a quarter of
+    # sessions; `paper start` freezes the window's cadence's entry as a scalar.
+    assert p.min_rebalances == {"month_end": 6, "week_end": 13, "daily": 63}
+    # One k at every cadence (ADR 0017 open question 6): a scalar, never a table.
     assert p.tracking_k == pytest.approx(2.0)
     assert p.tracking_rule == "residual"  # T70, ADR 0005 amendment 2026-10-09 (#247 Q4)
     assert p.max_catch_up_sessions == 5
@@ -1605,6 +1624,10 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
     "override",
     [
         {"min_rebalances": 0},
+        {"min_rebalances": 6},
+        {"min_rebalances": {"month_end": 6, "week_end": 13}},
+        {"min_rebalances": {"month_end": 6, "week_end": 13, "daily": 0}},
+        {"min_rebalances": {"month_end": 6, "week_end": 13, "daily": 63, "quarter_end": 2}},
         {"tracking_k": -1.0},
         {"max_catch_up_sessions": -1},
         {"submit_window_before_open_minutes": -1},
@@ -1627,6 +1650,15 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
 def test_paper_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper=override)
+
+
+def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
+    """The table is the config key (ADR 0017 part C); an override restates every
+    cadence, and the validator names a missing one."""
+    table = {"month_end": 6, "week_end": 10, "daily": 63}
+    assert Settings(_env_file=None, paper={"min_rebalances": table}).paper.min_rebalances == table
+    with pytest.raises(ValidationError, match="missing an entry for"):
+        Settings(_env_file=None, paper={"min_rebalances": {"month_end": 6, "week_end": 13}})
 
 
 def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
@@ -1908,6 +1940,74 @@ def test_env_example_lists_phase_4_variables_but_never_alpaca_paper() -> None:
         "ALERT_EMAIL_TO",
     ):
         assert name in upper
+
+
+# --- one paper key pair per book (ADR 0017 B.1, plan T153) -------------------
+
+
+def test_main_keeps_todays_paper_variables_and_other_books_are_named_by_token() -> None:
+    assert MAIN_BOOK_ID == DEFAULT_BOOK_ID == PaperConfig().book_id
+    assert paper_key_variable_names("main") == ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    assert paper_key_variable_names("daily1") == (
+        "ALPACA_PAPER_BOOKS__DAILY1__API_KEY",
+        "ALPACA_PAPER_BOOKS__DAILY1__API_SECRET",
+    )
+
+
+def test_a_books_pair_loads_from_the_environment_and_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The names `paper_key_variable_names` gives are the names `Settings` reads, from the
+    shell and from `.env`; a half-set or mistyped pair still loads (the adapter refuses
+    that book alone) and `main`'s variables are untouched."""
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "pk-main-111")
+    monkeypatch.setenv("ALPACA_PAPER_API_SECRET", "ps-main-222")
+    for name, value in zip(paper_key_variable_names("b"), ("pk-b-333", "ps-b-444"), strict=True):
+        monkeypatch.setenv(name, value)
+    env_file = tmp_path / "books.env"
+    key_c, _secret_c = paper_key_variable_names("c")
+    env_file.write_text(
+        f"{key_c}=pk-c-555\nALPACA_PAPER_BOOKS__C__API_SECRT=typo-666\n", encoding="utf-8"
+    )
+    s = Settings(_env_file=env_file)
+    assert s.alpaca_paper_api_key is not None and s.alpaca_paper_api_secret is not None
+    assert s.alpaca_paper_api_key.get_secret_value() == "pk-main-111"
+    assert s.alpaca_paper_api_secret.get_secret_value() == "ps-main-222"
+    assert sorted(s.alpaca_paper_books) == ["b", "c"]
+    b, c = s.alpaca_paper_books["b"], s.alpaca_paper_books["c"]
+    assert b.api_key is not None and b.api_key.get_secret_value() == "pk-b-333"
+    assert b.api_secret is not None and b.api_secret.get_secret_value() == "ps-b-444"
+    assert c.api_key is not None and c.api_key.get_secret_value() == "pk-c-555"
+    assert c.api_secret is None
+
+
+def test_book_pairs_default_empty_and_never_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "pk-main-111")
+    monkeypatch.setenv("ALPACA_API_KEY", "sk-data-abc123")
+    assert _settings().alpaca_paper_books == {}
+
+
+def test_book_pairs_are_redacted_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every book's key and secret are in `secret_values` (so `clean_message` and the
+    recorder's scrub redact them) and absent from repr/str."""
+    for name, value in zip(
+        paper_key_variable_names("b"), ("pk-book-b-777", "ps-book-b-888"), strict=True
+    ):
+        monkeypatch.setenv(name, value)
+    s = _settings()
+    assert {"pk-book-b-777", "ps-book-b-888"} <= set(secret_values(s))
+    for blob in (repr(s), str(s), repr(s.alpaca_paper_books)):
+        assert "pk-book-b-777" not in blob and "ps-book-b-888" not in blob
+    cleaned = clean_message("401 for pk-book-b-777:ps-book-b-888", s)
+    assert "pk-book-b-777" not in cleaned and "ps-book-b-888" not in cleaned
+
+
+def test_env_example_names_the_per_book_pair_pattern() -> None:
+    text = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    for name in paper_key_variable_names("daily"):
+        assert f"# {name}=" in text
+    assert "ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY" in text
+    assert "ALPACA_PAPER_BOOKS__<TOKEN>__API_SECRET" in text
 
 
 @pytest.mark.parametrize("pair", [{"BFB": "BFB"}, {"bfb": "BF.B"}, {"BFB": "BF-B"}, {"B1": "B.B"}])

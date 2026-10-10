@@ -168,3 +168,79 @@ def test_t_is_recorded_in_utc() -> None:
     provider.universe(T_JAN.astimezone(ZoneInfo("America/New_York")))
     assert provider.calls[0].t == T_JAN
     assert provider.calls[0].t.utcoffset() == timedelta(0)
+
+
+# --- the turnover read (T165b) ---------------------------------------------------------
+
+
+def _turnover_provider() -> FakeProvider:
+    jan2, jan3 = date(2024, 1, 2), date(2024, 1, 3)
+    raw = pl.DataFrame(
+        {
+            "security_id": ["A", "A", "A", "B", "B"],
+            "session": [jan2, jan3, JAN, jan2, JAN],
+            "close": [10.0, 10.0, 10.0, 20.0, 20.0],
+            "volume": [100, 200, 300, 0, 50],  # B's 2024-01-02 bar did not trade
+            "known_at": [T_JAN, T_JAN, T_JAN, T_JAN, T_FEB],  # B's Jan 31 bar is late
+        }
+    )
+    shares = pl.DataFrame(
+        {
+            "security_id": ["A", "A", "A", "B"],
+            "as_of_date": [date(2023, 10, 1), date(2024, 1, 15), date(2024, 1, 15), JAN],
+            "value": [1_000.0, 1_100.0, 1_200.0, 500.0],
+            # A's 2024-01-15 fact is restated after January's close; B's is filed then.
+            "known_at": [T_JAN, T_JAN, T_FEB, T_FEB],
+        }
+    )
+    splits = pl.DataFrame(
+        {
+            "security_id": ["A", "A", "B", "B"],
+            "action_id": ["s1", "s1", "s2", "s2"],
+            # A's split is re-dated once known; B's is cancelled after February's close.
+            "ex_date": [date(2024, 1, 10), date(2024, 1, 12), date(2024, 2, 5), date(2024, 2, 5)],
+            "ratio": [2.0, 2.0, 3.0, 3.0],
+            "cancelled": [False, False, False, True],
+            "known_at": [T_JAN - timedelta(days=30), T_JAN, T_FEB, T_FEB + timedelta(days=1)],
+        }
+    )
+    return FakeProvider(
+        prices=raw.drop("volume"),
+        raw=raw,
+        members={},
+        benchmarks={},
+        shares_rows=shares,
+        split_rows=splits,
+    )
+
+
+def test_turnover_inputs_read_only_rows_known_at_t() -> None:
+    provider = _turnover_provider()
+    jan = provider.turnover_inputs(T_JAN, ["A", "B"], date(2024, 1, 1))
+    feb = provider.turnover_inputs(T_FEB, ["A", "B"], date(2024, 1, 1))
+    # The zero-volume bar is a missing row; B's late bar is absent at January's close.
+    assert jan.bars.select("security_id", "session", "volume").rows() == [
+        ("A", date(2024, 1, 2), 100),
+        ("A", date(2024, 1, 3), 200),
+        ("A", JAN, 300),
+    ]
+    assert feb.bars.filter(pl.col("security_id") == "B")["session"].to_list() == [JAN]
+    # The latest as_of_date's latest revision known at t; B has no pick in January.
+    assert dict(jan.shares) == {"A": (date(2024, 1, 15), 1_100.0)}
+    assert dict(feb.shares) == {"A": (date(2024, 1, 15), 1_200.0), "B": (JAN, 500.0)}
+    # One split per identity, at its latest known ex-date; none before it is known.
+    assert dict(jan.splits) == {"A": ((date(2024, 1, 12), 2.0),)}
+    assert dict(feb.splits) == {"A": ((date(2024, 1, 12), 2.0),), "B": ((date(2024, 2, 5), 3.0),)}
+    later = provider.turnover_inputs(T_FEB + timedelta(days=2), ["B"], date(2024, 2, 1))
+    assert dict(later.splits) == {}
+
+
+def test_turnover_inputs_bound_the_bars_and_are_recorded() -> None:
+    provider = _turnover_provider()
+    got = provider.turnover_inputs(T_JAN, ["A"], date(2024, 1, 3))
+    assert got.bars["session"].to_list() == [date(2024, 1, 3), JAN]
+    assert provider.calls == [
+        Call("turnover_inputs", T_JAN, ids=("A",), sessions_from=date(2024, 1, 3))
+    ]
+    with pytest.raises(TypeError, match="sessions_from"):
+        provider.turnover_inputs(T_JAN, ["A"], T_JAN)  # type: ignore[arg-type]

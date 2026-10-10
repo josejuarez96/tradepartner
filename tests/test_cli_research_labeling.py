@@ -481,6 +481,58 @@ def test_label_scores_a_gold_split_on_a_non_synthetic_run(s: Settings) -> None:
     assert datafiles.inference_path(s, 1).is_file()
 
 
+def test_label_reversed_order_pass_uses_drift_registration(s: Settings) -> None:
+    gold_id, baseline = _baseline(s)
+    client = ScriptedModelClient([Answer(MERGER)])
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-drift",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        "--reversed-order-baseline-run",
+        str(baseline),
+        client=lambda _s, _h: client,
+    )
+    assert result.exit_code == 0, result.output
+    assert "run 2: ok" in result.output
+    assert "flip_rate: 0.000; unresolved share: 0.000" in result.output
+    assert len(client.requests) == 1
+    assert next(iter(client.requests[0].criteria)) == "unresolved"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [("--limit", "1"), ("--accepted-from", "2016-01-01"), ("--accepted-to", "2016-12-31")],
+)
+def test_reversed_pass_refuses_filters_before_open(s: Settings, extra: tuple[str, str]) -> None:
+    gold_id, baseline = _baseline(s)
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-drift",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        "--reversed-order-baseline-run",
+        str(baseline),
+        *extra,
+        client=lambda _s, _h: ScriptedModelClient([]),
+    )
+    assert result.exit_code == 2
+    assert "--reversed-order-baseline-run cannot use" in result.output
+    assert _count(s, "SELECT count(*) FROM research_runs") == 1
+
+
 def test_label_runs_a_frame_batch_after_the_drift_probe(s: Settings) -> None:
     run_id = _batch(s)
     assert _count(s, "SELECT count(*) FROM research_results WHERE run_id = ?", run_id) == 0
@@ -652,6 +704,41 @@ def test_label_a_refusal_class_error_after_the_run_opened_is_a_failure(
     )
     assert result.exit_code == 1, result.output
     assert "failed (run 1)" in result.output
+
+
+def test_label_a_failing_close_keeps_its_own_error(
+    s: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_batch` commits on its way out, so no transaction is open when the CLI
+    closes runs; a close that raises must surface its own error, not the
+    "no transaction is active" of `open_for_write`'s rollback (#1351)."""
+    gold_id = _gold(s, _dev(1), _pilot(1))
+
+    def explode(_s: Settings, _h: RunHandle) -> ScriptedModelClient:
+        raise RuntimeError("client broke")
+
+    def broken_close(*_args: Any) -> list[int]:
+        raise RuntimeError("close broke")
+
+    monkeypatch.setattr(cli, "_close_open_runs", broken_close)
+    result = _cli(
+        s,
+        "research",
+        "label",
+        "departure-reason-pilot",
+        "--dataset",
+        str(gold_id),
+        "--split",
+        "dev",
+        "--model",
+        MODEL,
+        client=explode,
+    )
+    assert result.exit_code == 1, result.output
+    assert "close broke" in result.output, result.output
+    assert "no transaction" not in result.output, result.output
+    # The job's own `failed` close was committed before the CLI's close ran.
+    assert _count(s, "SELECT count(*) FROM research_results WHERE outcome = 'failed'") == 1
 
 
 def test_label_ctrl_c_closes_the_open_run_failed(s: Settings) -> None:

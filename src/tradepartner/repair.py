@@ -83,7 +83,7 @@ from tradepartner.ingest import SourceRun, _read, _write_run
 from tradepartner.store.asof import facts_as_of, listings_as_of
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.delistings import listing_ends_as_of
-from tradepartner.store.master import _first_session, _session_of
+from tradepartner.store.master import first_session, session_of
 from tradepartner.store.registry import open_release
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -157,15 +157,15 @@ def first_sessions(
     (a renamed, or retracted and restored, row would move the floor past
     the first span and take the lead away). A `known_at` before the
     calendar's first session maps to that session (the calendar raises
-    before it, `store.master._first_session`)."""
+    before it, `store.master.first_session`)."""
     at = ensure_tz_aware_utc(at, field_name="at")
-    floor = datetime.combine(_first_session(settings), time(12), tzinfo=UTC)
+    floor = datetime.combine(first_session(settings), time(12), tzinfo=UTC)
     rows = conn.execute(
         "SELECT security_id, min(known_at) FROM securities WHERE known_at <= ? GROUP BY ALL",
         [at],
     ).fetchall()
     return {
-        str(sid): _session_of(max(ensure_tz_aware_utc(known, field_name="known_at"), floor))
+        str(sid): session_of(max(ensure_tz_aware_utc(known, field_name="known_at"), floor))
         for sid, known in rows
     }
 

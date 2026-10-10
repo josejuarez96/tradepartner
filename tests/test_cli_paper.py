@@ -11,6 +11,7 @@ one is written once the owner's first export exists.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -29,13 +30,16 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, PartialFill, SetPosition, Vanish
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
+from tradepartner.execution import ops, switch, window
+from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
-from tradepartner.execution import switch, window
+from tradepartner.execution import shakedown as paper_shakedown
+from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
-from tradepartner.store import journal, registry
+from tradepartner.store import journal, registry, schema
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     DecisionRow,
@@ -496,19 +500,20 @@ NO_WINDOW = cli.PAPER_REFUSAL_EXIT["no_window"]
 #: Every `paper` command's exact options (spec req 16: no endpoint, run-session,
 #: store-path or bypass flag; `override --session` is the override's rebalance session).
 PAPER_OPTIONS = {
-    "start": {"--hypothesis"},
-    "stop": {"--reason"},
-    "run": set(),
-    "reconcile": set(),
-    "kill": {"--reason"},
-    "resume": {"--reason", "--accept-broker-fills", "--accept-rejections"},
-    "report": set(),
-    "check": set(),
-    "status": set(),
-    "abandon": {"--reason"},
-    "settle": {"--order", "--reason"},
-    "override": {"--kind", "--session", "--name", "--reason"},
+    "start": {"--hypothesis", "--book"},
+    "stop": {"--reason", "--book"},
+    "run": {"--book"},
+    "reconcile": {"--book"},
+    "kill": {"--reason", "--book", "--all"},
+    "resume": {"--reason", "--accept-broker-fills", "--accept-rejections", "--book"},
+    "report": {"--book"},
+    "check": {"--book"},
+    "status": {"--book", "--all"},
+    "abandon": {"--reason", "--book"},
+    "settle": {"--order", "--reason", "--book"},
+    "override": {"--kind", "--session", "--name", "--reason", "--book"},
     "lots-reconcile": {"--export", "--tax-year"},
+    "shakedown": set(),
 }
 
 
@@ -526,17 +531,19 @@ class _Clock:
 
 
 class _Factory:
-    """The command's broker parameter: records every clock it is handed and
-    returns one scripted fake on the test's clock."""
+    """The command's broker parameter: records every clock and book it is handed
+    and returns one scripted fake on the test's clock."""
 
     def __init__(self, clock: _Clock) -> None:
         self.fake = FakeBroker(
             clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1"
         )
         self.clocks: list[Any] = []
+        self.books: list[str] = []
 
-    def __call__(self, _settings: Settings, clock: Any) -> FakeBroker:
+    def __call__(self, _settings: Settings, clock: Any, book_id: str) -> FakeBroker:
         self.clocks.append(clock)
+        self.books.append(book_id)
         return self.fake
 
 
@@ -796,7 +803,7 @@ def test_stop_reconcile_resume_abandon_and_check_on_an_open_window(
 
 
 def test_a_broker_that_cannot_be_built_fails_scrubbed(clock: _Clock) -> None:
-    def broken(_settings: Settings, _clock: Any) -> FakeBroker:
+    def broken(_settings: Settings, _clock: Any, _book: str) -> FakeBroker:
         raise RuntimeError(f"no paper client for key {ALPACA_KEY} / {ALPACA_SECRET}")
 
     for args in (("run",), ("reconcile",), ("stop", "--reason", LONG_REASON)):
@@ -857,7 +864,7 @@ def test_resume_passes_the_owners_flags_on_unchanged(
     monkeypatch.setattr(paper_resume, "resume", recording)
     out = _paper(clock, factory, "resume", "--reason", LONG_REASON, *flags)
     assert out.exit_code == 0, out.output
-    assert seen == [(False, {"accept_rejections": accepted})]
+    assert seen == [(False, {"accept_rejections": accepted, "book_id": "main"})]
 
 
 def test_accept_rejections_is_a_plain_off_by_default_flag() -> None:
@@ -888,7 +895,286 @@ def test_accept_rejections_ignores_an_auto_envvar_prefix(
         app, ["paper", "resume", "--reason", LONG_REASON], auto_envvar_prefix="TP"
     )
     assert result.exit_code == 0, result.output
-    assert seen == [{"accept_rejections": False}]
+    assert seen == [{"accept_rejections": False, "book_id": "main"}]
+
+
+# --- `--book` and the multi-book `paper run` (ADR 0017 B.2 to B.5; plan T155b) -----------
+
+#: Every command that takes `--book` here (T156 owns `report`, `check` and `status`),
+#: with the other arguments it needs.
+BOOK_COMMANDS: dict[str, tuple[str, ...]] = {
+    "start": ("--hypothesis", "h1"),
+    "stop": ("--reason", LONG_REASON),
+    "run": (),
+    "reconcile": (),
+    "kill": ("--reason", LONG_REASON),
+    "resume": ("--reason", LONG_REASON),
+    "abandon": ("--reason", LONG_REASON),
+    "override": ("--kind", "engage_kill_switch", "--reason", LONG_REASON),
+    "settle": ("--order", "tp-a", "--reason", LONG_REASON),
+}
+
+
+class _BookFactory(_Factory):
+    """One scripted fake per book, each on its own account (`PA1` for `main`,
+    `P<book>` otherwise), so a second book can start flat on its own account."""
+
+    def __init__(self, clock: _Clock) -> None:
+        super().__init__(clock)
+        self.fakes: dict[str, FakeBroker] = {"main": self.fake}
+
+    def __call__(self, _settings: Settings, clock: Any, book_id: str) -> FakeBroker:
+        self.clocks.append(clock)
+        self.books.append(book_id)
+        if book_id not in self.fakes:
+            self.fakes[book_id] = FakeBroker(
+                clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id=f"P{book_id}"
+            )
+        return self.fakes[book_id]
+
+
+@pytest.fixture
+def books(tmp_path: Path, clock: _Clock) -> _BookFactory:
+    """Windows open in books `main` and `zeta`, each started by `paper start`."""
+    factory = _BookFactory(clock)
+    _register_h1(tmp_path, signed_off=True)
+    for book in ("zeta", "main"):
+        out = _paper(clock, factory, "start", "--hypothesis", "h1", "--book", book)
+        assert out.exit_code == 0, out.output
+    factory.books.clear()
+    return factory
+
+
+@pytest.mark.parametrize("command", sorted(BOOK_COMMANDS))
+@pytest.mark.parametrize("token", ["../x", "a.b", "", "main\n"])
+def test_a_book_outside_the_token_grammar_is_a_usage_error_before_any_broker(
+    command: str, token: str, clock: _Clock, factory: _Factory
+) -> None:
+    store = Path(_settings().store.path)
+    before = _sha256(store)
+    out = _paper(clock, factory, command, *BOOK_COMMANDS[command], "--book", token)
+    assert out.exit_code == 2, out.output
+    assert "--book: book_id must match ^[A-Za-z0-9]+$" in out.output
+    assert factory.clocks == []
+    assert _sha256(store) == before
+    assert list(store.parent.glob("*.lock")) == []
+
+
+def test_book_is_a_plain_option_never_read_from_the_environment() -> None:
+    group: Any = typer.main.get_command(cli.make_app())
+    for name in BOOK_COMMANDS:
+        (param,) = [p for p in group.commands["paper"].commands[name].params if "--book" in p.opts]
+        assert param.opts == ["--book"], name
+        assert param.default is None, name
+        assert param.envvar is None, name
+        assert param.allow_from_autoenv is False, name
+
+
+def test_the_default_broker_is_the_paper_factory_for_every_book() -> None:
+    """No flag selects an endpoint: `--book` reaches only `build_broker`'s book,
+    which picks a paper key pair (ADR 0017 B.2)."""
+    default = inspect.signature(cli.make_app).parameters["broker"].default
+    assert default is build_broker
+    assert list(inspect.signature(build_broker).parameters) == ["settings", "clock", "book_id"]
+
+
+@pytest.mark.parametrize(
+    ("command", "builds"),
+    [
+        ("stop", True),
+        ("reconcile", True),
+        ("resume", True),
+        ("abandon", True),
+        ("kill", False),
+        ("override", False),
+    ],
+)
+def test_book_selects_the_books_window_and_its_broker(
+    command: str, builds: bool, clock: _Clock, books: _BookFactory
+) -> None:
+    main_calls = books.fakes["main"].calls
+    out = _paper(clock, books, command, *BOOK_COMMANDS[command], "--book", "zeta")
+    assert out.exit_code == 0, out.output
+    assert books.books == (["zeta"] if builds else [])
+    assert books.fakes["main"].calls == main_calls  # main's account is never read
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        zeta = conn.execute("SELECT window_id FROM paper_windows WHERE book_id = 'zeta'").fetchone()
+        main = conn.execute("SELECT window_id FROM paper_windows WHERE book_id = 'main'").fetchone()
+        touched = {
+            r[0]
+            for r in conn.execute(
+                "SELECT window_id FROM kill_switch UNION ALL SELECT window_id FROM overrides "
+                "UNION ALL SELECT window_id FROM paper_window_stops "
+                "UNION ALL SELECT window_id FROM reconciliations"
+            ).fetchall()
+        }
+    assert zeta is not None and main is not None
+    assert touched <= {zeta[0]}, (command, touched)
+
+
+def test_start_with_book_opens_the_window_in_that_book_on_its_broker(
+    books: _BookFactory,
+) -> None:
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT window_id, book_id, account_id FROM paper_windows ORDER BY window_id"
+        ).fetchall()
+    assert rows == [(1, "zeta", "Pzeta"), (2, "main", "PA1")]
+
+
+def test_a_command_with_no_book_acts_on_paper_book_id_only(
+    clock: _Clock, books: _BookFactory
+) -> None:
+    zeta_calls = books.fakes["zeta"].calls
+    out = _paper(clock, books, "reconcile")
+    assert out.exit_code == 0, out.output
+    assert books.books == ["main"]
+    assert books.fakes["zeta"].calls == zeta_calls
+    assert "zeta" not in books.books
+
+
+def test_paper_run_with_no_book_runs_every_open_book_in_token_order(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: _BookFactory
+) -> None:
+    order: list[str | None] = []
+    real = paper_run.tracking_run
+
+    def recording(*args: Any, **kwargs: Any) -> paper_run.RunOutcome:
+        order.append(kwargs.get("book_id"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(paper_run, "tracking_run", recording)
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == 0, out.output
+    assert order == books.books == ["main", "zeta"]
+    assert "paper run: book main: no_session" in out.output
+    assert "paper run: book zeta: no_session" in out.output
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT w.book_id, s.status FROM paper_runs r JOIN paper_windows w USING (window_id) "
+            "JOIN paper_run_results s USING (run_id) ORDER BY r.run_id"
+        ).fetchall()
+    assert rows == [("main", "no_session"), ("zeta", "no_session")]
+
+
+def test_paper_run_with_book_runs_that_book_alone(clock: _Clock, books: _BookFactory) -> None:
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run", "--book", "zeta")
+    assert out.exit_code == 0, out.output
+    assert books.books == ["zeta"]
+    assert "paper run: no_session" in out.output
+    assert _count("paper_runs") == 1
+
+
+def test_a_crash_in_one_book_does_not_stop_the_next_and_exits_non_zero_scrubbed(
+    clock: _Clock, books: _BookFactory
+) -> None:
+    def broken_main(settings: Settings, at: Any, book_id: str) -> FakeBroker:
+        if book_id == "main":
+            raise RuntimeError(f"no paper client for key {ALPACA_KEY} / {ALPACA_SECRET}")
+        return books(settings, at, book_id)
+
+    clock.now = SATURDAY
+    result = CliRunner().invoke(cli.make_app(clock=clock, broker=broken_main), ["paper", "run"])
+    assert result.exit_code == 1, result.output
+    assert "paper run: book main: failed: RuntimeError" in result.output
+    assert "paper run: book zeta: no_session" in result.output
+    assert scrub_text(result.output, secrets=[ALPACA_KEY, ALPACA_SECRET])[1] == 0
+    assert books.books == ["zeta"]
+
+
+def test_a_write_failed_exit_in_any_book_is_the_drivers_exit(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: _BookFactory
+) -> None:
+    real = paper_run.tracking_run
+
+    def halted(*args: Any, **kwargs: Any) -> paper_run.RunOutcome:
+        if kwargs["book_id"] == "main":
+            raise SystemExit(WRITE_FAILED_EXIT_CODE)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(paper_run, "tracking_run", halted)
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == WRITE_FAILED_EXIT_CODE
+    assert "paper run: book main: exited 3" in out.output
+    assert "paper run: book zeta: no_session" in out.output
+
+
+def test_a_single_book_other_than_paper_book_id_is_named_on_its_line(
+    clock: _Clock, books: _BookFactory
+) -> None:
+    assert _paper(clock, books, "stop", "--reason", LONG_REASON).exit_code == 0
+    assert _paper(clock, books, "abandon", "--reason", LONG_REASON).exit_code == 0
+    books.books.clear()
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == 0, out.output
+    assert books.books == ["zeta"]
+    assert "paper run: book zeta: no_session" in out.output
+
+
+def test_a_run_exiting_with_a_message_keeps_it_on_its_line(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: _BookFactory
+) -> None:
+    real = paper_run.tracking_run
+
+    def exiting(*args: Any, **kwargs: Any) -> paper_run.RunOutcome:
+        if kwargs["book_id"] == "main":
+            raise SystemExit("the halt path could not finish")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(paper_run, "tracking_run", exiting)
+    clock.now = SATURDAY
+    out = _paper(clock, books, "run")
+    assert out.exit_code == 1
+    assert "paper run: book main: exited 1: the halt path could not finish" in out.output
+
+
+def test_paper_kill_all_engages_every_open_book(clock: _Clock, books: _BookFactory) -> None:
+    out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
+    assert out.exit_code == 0, out.output
+    assert "paper kill: book main: engaged" in out.output
+    assert "paper kill: book zeta: engaged" in out.output
+    with duckdb.connect(_settings().store.path, read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT w.book_id FROM kill_switch k JOIN paper_windows w USING (window_id) "
+            "WHERE k.state = 'engaged' ORDER BY k.event_id"
+        ).fetchall()
+    assert rows == [("main",), ("zeta",)]
+    assert books.books == []  # kill builds no broker
+
+
+@pytest.mark.usefixtures("books")
+def test_paper_kill_all_tries_every_book_after_one_fails(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, books: _BookFactory
+) -> None:
+    real = window.kill
+
+    def failing(*args: Any, book_id: str | None = None) -> int:
+        if book_id == "main":
+            raise window.KillWriteFailed("store gone")
+        return real(*args, book_id=book_id)
+
+    monkeypatch.setattr(window, "kill", failing)
+    out = _paper(clock, books, "kill", "--all", "--reason", LONG_REASON)
+    assert out.exit_code == WRITE_FAILED_EXIT_CODE
+    assert "paper kill: book main: NOT engaged" in out.output
+    assert "paper kill: book zeta: engaged" in out.output
+
+
+def test_paper_kill_all_with_book_is_a_usage_error(clock: _Clock, factory: _Factory) -> None:
+    out = _paper(clock, factory, "kill", "--all", "--book", "main", "--reason", LONG_REASON)
+    assert out.exit_code == 2
+    assert "--all and --book" in out.output
+
+
+def test_paper_kill_all_with_no_open_book_exits_no_window(clock: _Clock, factory: _Factory) -> None:
+    _register_h1(Path(), signed_off=False)  # a store with a journal, no window
+    out = _paper(clock, factory, "kill", "--all", "--reason", LONG_REASON)
+    assert out.exit_code == NO_WINDOW, out.output
+    assert "no_window" in out.output
 
 
 # --- `paper settle` (plan T84c; spec req 17, #571) ---------------------------------------
@@ -1184,17 +1470,21 @@ def test_settle_hands_the_writer_the_built_broker_and_the_one_clock(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
     seen: list[tuple[Any, ...]] = []
+    books: list[Any] = []
 
-    def recording(*args: Any) -> window.SettleResult:
+    def recording(*args: Any, book_id: Any = None) -> window.SettleResult:
         seen.append(args)
+        books.append(book_id)
         return window.SettleResult(7, args[4], SETTLE_CLOCK, reset=False)
 
     monkeypatch.setattr(window, "settle_order", recording)
     factory.clocks.clear()
+    factory.books.clear()
     out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
     assert out.exit_code == 0, out.output
     ((settings, _connect, broker, settle_clock, coid, reason),) = seen
     assert broker is factory.fake
+    assert books == factory.books == ["main"]
     assert settle_clock is clock is factory.clocks[0]
     assert (coid, reason) == ("tp-a", LONG_REASON)
     assert settings.store.path == _settings().store.path
@@ -1206,3 +1496,252 @@ def test_settle_order_is_never_read_from_an_auto_envvar() -> None:
     (param,) = [p for p in settle.params if "--order" in p.opts]
     assert param.envvar is None
     assert param.allow_from_autoenv is False
+
+
+# --- `--book` on status, report and check (ADR 0017 B.7; plan T156) ---------------
+
+#: `paper status` and `paper check` on the `started` window exactly as they printed
+#: before books existed (captured on main before T156): with one book, `main`, and
+#: `month_end`, H1's output must not change by a byte.
+STATUS_MAIN = (
+    "window 1 (first rebalance 2026-10-30)\n"
+    "as of 2026-10-01 14:00:00+00:00; last updated n/a; STALE: no run for S-1\n"
+    "positions 0 (value 0.00); open orders 0; targets 0\n"
+    "kill switch released (causes: -)\n"
+    "reconciliation n/a\n"
+    "alerts (0):\n"
+)
+CHECK_MAIN = (
+    "FAIL rebalance_count: 0 scheduler-executed rebalance session(s) [], need >= 6 "
+    "(query: distinct rebalance_events.rebalance_session with status='executed' whose "
+    "writing paper_runs row has invoked_by='scheduler')\n"
+    "FAIL tracking: no paper_reports row yet (query: req 10 tracking check "
+    "(report.compare_months) over the window's latest paper_reports row's trial)\n"
+    "PASS chain: no incomplete chain once due (query: every order's chain (order -> "
+    "terminal event -> outcome) once its outcome is due (spec req 8), and no live fill "
+    "journaled after its order's terminal event (req 17))\n"
+    "PASS override_reason: every override reason meets the frozen minimum (query: "
+    "overrides.reason, trimmed, against the frozen paper.min_override_reason_chars)\n"
+)
+
+
+def _open_book_b() -> int:
+    """A second book's window beside `started`'s, on its own account."""
+    with open_for_write(_settings()) as conn:
+        main = journal.latest_window(conn, "main")
+        assert main is not None
+        window_id = journal.append(
+            conn, replace(main, window_id=None, account_id="PB1", book_id="b")
+        )
+    assert window_id is not None
+    return window_id
+
+
+@pytest.mark.usefixtures("started")
+@pytest.mark.parametrize("flags", [(), ("--book", "main")])
+def test_status_and_check_for_main_are_byte_identical(
+    flags: tuple[str, ...], clock: _Clock, factory: _Factory
+) -> None:
+    _open_book_b()  # a newer window of another book changes nothing for `main`
+    status = _paper(clock, factory, "status", *flags)
+    check = _paper(clock, factory, "check", *flags)
+    assert (status.exit_code, status.output) == (0, STATUS_MAIN)
+    assert (check.exit_code, check.output) == (1, CHECK_MAIN)
+
+
+@pytest.mark.usefixtures("started")
+def test_status_and_check_for_another_book_read_that_books_window(
+    clock: _Clock, factory: _Factory
+) -> None:
+    missing = _paper(clock, factory, "status", "--book", "b")
+    assert (missing.exit_code, missing.output) == (
+        0,
+        "paper status: no paper window yet for book 'b'\n",
+    )
+    no_window = _paper(clock, factory, "check", "--book", "b")
+    assert no_window.exit_code == 1
+    assert "no paper window" in no_window.output
+    b_window = _open_book_b()
+    status = _paper(clock, factory, "status", "--book", "b")
+    assert status.exit_code == 0
+    assert status.output.startswith(f"window {b_window} (first rebalance 2026-10-30)\n")
+
+
+@pytest.mark.usefixtures("started")
+def test_status_all_prints_one_summary_line_per_book(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    monkeypatch.setattr(ops, "utc_now", lambda: SESSION_CLOCK)
+    b_window = _open_book_b()
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == 0, out.output
+    assert out.output == (
+        f"book b: window {b_window} open; positions 0; open orders 0; kill switch released; "
+        "last run n/a; next rebalance 2026-10-30\n"
+        "book main: window 1 open; positions 0; open orders 0; kill switch released; "
+        "last run n/a; next rebalance 2026-10-30\n"
+    )
+
+
+def test_status_all_with_no_window(clock: _Clock, factory: _Factory) -> None:
+    out = _paper(clock, factory, "status", "--all")
+    assert (out.exit_code, out.output) == (0, "paper status: no paper window yet\n")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("status", "--book", "b-1"),
+        ("check", "--book", ""),
+        ("report", "--book", "../x"),
+        ("status", "--all", "--book", "main"),
+    ],
+)
+def test_a_bad_book_or_all_with_book_is_a_usage_error(
+    args: tuple[str, ...], clock: _Clock, factory: _Factory
+) -> None:
+    out = _paper(clock, factory, *args)
+    assert out.exit_code == cli.USAGE_ERROR, out.output
+    assert factory.clocks == []
+
+
+def test_report_passes_the_book_and_prints_the_same_lines(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """`paper report --book b` hands `b` to `report.report` (no flag hands None, so
+    `paper.book_id`); the printed lines are the pre-T156 format, unchanged."""
+    t0, t1 = date(2026, 10, 30), date(2026, 11, 30)
+    canned = paper_report.Report(
+        comparison=paper_report.PeriodComparison(
+            tracking_rule="raw",
+            tracking_k=2.0,
+            periods=(
+                paper_report.PeriodRow(
+                    rebalance_session=t0,
+                    next_session=t1,
+                    raw=0.001,
+                    dividend_term=0.0,
+                    fill_timing_term=-0.0005,
+                    residual=0.0005,
+                    residue_term=0.0,
+                    modelled_cost=0.002,
+                    missed=False,
+                    override=True,
+                    skip_names=(),
+                    excluded=False,
+                    passed=True,
+                ),
+            ),
+            passed=True,
+            failing_period=None,
+        ),
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=t1,
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+    )
+    books: list[str | None] = []
+
+    def fake_report(_settings: Settings, _connect: Any, book_id: str | None = None) -> Any:
+        books.append(book_id)
+        return canned
+
+    monkeypatch.setattr(paper_report, "report", fake_report)
+    expected = (
+        "paper report: trial 7 through 2026-11-30; rule raw, k 2; passed\n"
+        "  2026-10-30: raw 0.001000 dividend 0.000000 fill -0.000500 residual 0.000500 "
+        "residue 0.000000 cost 0.002000 override pass\n"
+    )
+    plain = _paper(clock, factory, "report")
+    for_b = _paper(clock, factory, "report", "--book", "b")
+    assert (plain.exit_code, plain.output) == (0, expected)
+    assert (for_b.exit_code, for_b.output) == (0, expected)
+    assert books == [None, "b"]
+
+
+# --- `paper shakedown` (ADR 0017 part E; plan T157b) --------------------------------
+
+
+def _shakedown_line(name: str, passed: bool) -> paper_shakedown.ShakedownLine:
+    return paper_shakedown.ShakedownLine(
+        name=name, passed=passed, rows="r", query="q", thresholds="t", detail="d"
+    )
+
+
+def test_paper_shakedown_with_no_span_row_fails(clock: _Clock, factory: _Factory) -> None:
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 1
+    assert "no shakedown_span decision" in out.output
+    assert factory.fake.calls == ()
+
+
+def test_paper_shakedown_prints_seven_lines_and_fails_on_an_empty_journal(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    class _Healthy:
+        ok = True
+        failures: tuple[str, ...] = ()
+
+    monkeypatch.setattr(paper_shakedown, "health_report", lambda conn, t, s: _Healthy())
+    with open_for_write(_settings()) as conn:
+        registry.record_decision(
+            conn,
+            kind=registry.SHAKEDOWN_SPAN_KIND,
+            reason="H1 goes live first",
+            values={"sessions": 10, "order_sessions": 5},
+        )
+    clock.now = datetime(2026, 12, 1, 14, tzinfo=UTC)
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 1
+    lines = out.output.strip().splitlines()
+    assert len(lines) == 7
+    assert lines[0].startswith("FAIL E.1 sessions:")
+    assert "sessions >= 10, order sessions >= 5" in lines[0]
+    assert [line.split(":")[0].split(" ", 1)[1] for line in lines] == [
+        "E.1 sessions",
+        "E.2 reconciliation",
+        "E.3 orders",
+        "E.4 kill-switch drill",
+        "E.5 journal",
+        "E.6 alerts",
+        "E.7 data",
+    ]
+    assert factory.fake.calls == ()
+
+
+def test_paper_shakedown_exits_zero_when_every_line_passes_on_a_read_only_store(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    seen: list[datetime] = []
+
+    def fake(
+        conn: duckdb.DuckDBPyConnection, s: Settings, *, now: datetime
+    ) -> paper_shakedown.Shakedown:
+        seen.append(now)
+        with pytest.raises(duckdb.Error):
+            conn.execute("CREATE TABLE probe (x INTEGER)")
+        lines = tuple(_shakedown_line(f"E.{i}", True) for i in range(1, 8))
+        return paper_shakedown.Shakedown(span=None, lines=lines)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper_shakedown, "shakedown", fake)
+    out = _paper(clock, factory, "shakedown")
+    assert out.exit_code == 0, out.output
+    assert out.output.count("PASS E.") == 7
+    assert seen == [SESSION_CLOCK]
+
+
+def test_status_all_on_an_outdated_journal_is_refused_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    def outdated(*_args: Any) -> Any:
+        raise schema.SchemaVersionError("the journal predates schema version 17")
+
+    monkeypatch.setattr(ops, "book_summaries", outdated)
+    out = _paper(clock, factory, "status", "--all")
+    assert out.exit_code == REFUSED
+    assert out.output == "paper status: the journal predates schema version 17\n"

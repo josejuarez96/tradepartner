@@ -71,10 +71,11 @@ def conn() -> Iterator[duckdb.DuckDBPyConnection]:
         c.close()
 
 
-def _window(conn: duckdb.DuckDBPyConnection, minutes: int = 0) -> int:
+def _window(conn: duckdb.DuckDBPyConnection, minutes: int = 0, book_id: str = "main") -> int:
     window_id = append(
         conn,
         PaperWindowRow(
+            book_id=book_id,
             hypothesis_id=1,
             first_rebalance_session=_SESSION,
             account_id="PA1",
@@ -400,6 +401,90 @@ def test_two_open_windows_fail_closed(conn: duckdb.DuckDBPyConnection) -> None:
     _window(conn)
     with pytest.raises(JournalIntegrityError, match="open"):
         journal.open_window(conn)
+
+
+# --- windows per book (ADR 0017 B.2, plan T154) -------------------------------------------
+
+
+def test_open_window_fails_closed_on_two_open_main_windows_and_ignores_another_books(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    main = _window(conn)
+    other = _window(conn, 1, book_id="b")
+    assert (window := journal.open_window(conn, "main")) is not None
+    assert window.window_id == main and window.book_id == "main"
+    assert (window := journal.open_window(conn, "b")) is not None
+    assert window.window_id == other and window.book_id == "b"
+    # Without a book every book is read, as before version 19: two open windows
+    # of any books fail closed.
+    with pytest.raises(JournalIntegrityError, match=f"window: {main}, {other}"):
+        journal.open_window(conn)
+    _window(conn, 2, book_id="b")  # a second open `b` window: `b` fails closed ...
+    with pytest.raises(JournalIntegrityError, match="book 'b'"):
+        journal.open_window(conn, "b")
+    # ... and `main` is unaffected, since another book's windows are never read.
+    assert (window := journal.open_window(conn, "main")) is not None
+    assert window.window_id == main
+    second_main = _window(conn, 3)
+    with pytest.raises(JournalIntegrityError, match=f"book 'main': {main}, {second_main}"):
+        journal.open_window(conn, "main")
+
+
+def test_a_book_with_no_window_reads_none_beside_another_books_open_window(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    other = _window(conn, book_id="b")
+    assert journal.open_window(conn, "main") is None
+    assert journal.latest_window(conn, "main") is None
+    # Without a book every book is read, as before version 19.
+    assert (window := journal.open_window(conn)) is not None and window.window_id == other
+
+
+def test_latest_window_is_per_book(conn: duckdb.DuckDBPyConnection) -> None:
+    first_main = _window(conn)
+    _stop(conn, first_main, "closed", 1)
+    second_main = _window(conn, 2)
+    only_b = _window(conn, 3, book_id="b")
+    assert (latest := journal.latest_window(conn, "main")) is not None
+    assert latest.window_id == second_main
+    assert (latest := journal.latest_window(conn, "b")) is not None
+    assert latest.window_id == only_b
+    assert journal.latest_window(conn) == journal.latest_window(conn, "b")  # every book
+
+
+@pytest.mark.parametrize("book_id", ["", "Main-1", "b:1", " main", "main\n"])
+def test_the_per_book_readers_refuse_a_book_outside_the_token_grammar(
+    conn: duckdb.DuckDBPyConnection, book_id: str
+) -> None:
+    _window(conn)
+    with pytest.raises(ValueError, match="book_id"):
+        journal.open_window(conn, book_id)
+    with pytest.raises(ValueError, match="book_id"):
+        journal.latest_window(conn, book_id)
+    with pytest.raises(ValueError, match="book_id"):
+        journal.alerts_for(conn, kind="locked", session=_SESSION, book_id=book_id)
+
+
+def test_alerts_for_is_keyed_on_the_book(conn: duckdb.DuckDBPyConnection) -> None:
+    for book_id in ("main", "b", "main"):
+        append(
+            conn,
+            AlertRow(
+                session=_SESSION,
+                kind="locked",
+                message=f"locked {book_id}",
+                at=_NOW,
+                book_id=book_id,
+                **_stamp(),
+            ),
+        )
+    main = journal.alerts_for(conn, kind="locked", session=_SESSION, book_id="main")
+    other = journal.alerts_for(conn, kind="locked", session=_SESSION, book_id="b")
+    assert [(a.alert_id, a.book_id) for a in main] == [(1, "main"), (3, "main")]
+    assert [(a.alert_id, a.book_id) for a in other] == [(2, "b")]
+    every = journal.alerts_for(conn, kind="locked", session=_SESSION)
+    assert [a.alert_id for a in every] == [1, 2, 3]  # without a book, every book
+    assert journal.alerts_for(conn, kind="locked", session=_SESSION, book_id="c") == []
 
 
 # --- runs ----------------------------------------------------------------------------------

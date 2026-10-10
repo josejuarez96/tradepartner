@@ -67,13 +67,14 @@ from tradepartner.store.journal import (
     OrderRow,
     PaperRunRow,
     PaperWindowRow,
+    PaperWindowStopRow,
     append,
     decisions_for,
     order_events_for,
 )
 from tradepartner.store.schema import HALT_REASON, LONG
 
-from .test_wrapper_phases import T_I, A, Env, _execute, _gate, _missed, _submits
+from .test_wrapper_phases import T_I, A, Env, _decision, _execute, _gate, _missed, _submits
 
 pytest_plugins = ("execution.test_wrapper_phases",)
 
@@ -1367,3 +1368,96 @@ def test_a_replayed_limit_order_halts_after_its_replay_event(
     with pytest.raises(SystemFaultError, match="refused_order_shape"):
         gate.replay(_request(), DuplicateClientOrderIdError("tp-r"))
     assert _events(journal_settings, "tp-r") == [("pending", None), ("replay", None)]
+
+
+# --- books (ADR 0017 B.2, plan T155) ----------------------------------------------------
+
+
+def test_another_book_s_open_window_never_stops_this_run_s_phase(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The phase reads its run's own book's open window: book `b`'s open window
+    beside `main`'s is not a second open window, and `main`'s buy is submitted
+    as it is with `main` alone."""
+    _append(env.settings, replace(env.window, window_id=None, book_id="b", account_id="PB1"))
+
+    _execute(_gate(env, alerter_conn), env, [_decision(env, A, "buy", notional=300.0)])
+
+    assert [r.symbol for r in _submits(env.fake)] == ["DUALA"]
+
+
+def test_a_run_whose_window_is_closed_is_refused_before_any_submit(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """With the run's window closed, another book's open window never stands in
+    for it: the phase refuses before any broker call."""
+    _append(env.settings, replace(env.window, window_id=None, book_id="b", account_id="PB1"))
+    at = env.run.started_at
+    _append(
+        env.settings,
+        PaperWindowStopRow(
+            window_id=env.window.window_id,  # type: ignore[arg-type]
+            at=at,
+            state="closed",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    calls = len(env.fake.calls)
+
+    with pytest.raises(ValueError, match="is not the open one"):
+        _execute(_gate(env, alerter_conn), env, [_decision(env, A, "buy", notional=300.0)])
+    assert not env.fake.calls[calls:]
+
+
+def test_the_halt_alert_is_journaled_under_the_wrapper_s_book(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """ADR 0017 B.6: the run-scoped halt alert carries the run's window's book
+    (the window row's, never the live `paper.book_id`) when the wrapper is built
+    with no book, and the wrapper's book when it is given one."""
+    (fx_id,) = _append(
+        journal_settings, replace(open_window, window_id=None, book_id="fx", account_id="PX1")
+    )
+    fx_window = replace(open_window, window_id=fx_id, book_id="fx")
+    cases = ((open_window, None, "main"), (fx_window, None, "fx"), (open_window, "b", "b"))
+    for window_row, book_id, expected in cases:
+        run = _run(journal_settings, window_row, fixed_clock())
+        gate = RiskGatedBroker(
+            scripted_fake,
+            fixed_clock,
+            FROZEN,
+            journal_settings,
+            lambda: open_for_write(journal_settings),
+            calendar,
+            Alerter(journal_settings, alerter_conn, fixed_clock),
+            book_id=book_id,
+        )
+        with pytest.raises(LocalFault):
+            _halt(gate, LocalFault("boom"), run)
+        seen = _query(journal_settings, "SELECT book_id FROM alerts WHERE run_id = ?", [run.run_id])
+        assert seen == [(expected,)]
+
+
+def test_a_wrapper_for_another_book_refuses_the_run_s_phase_before_any_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """A wrapper built for book `b` never trades a run of `main`'s window."""
+    gate = RiskGatedBroker(
+        env.fake,
+        env.clock,
+        FROZEN,
+        env.settings,
+        lambda: open_for_write(env.settings),
+        calendar,
+        Alerter(env.settings, alerter_conn, env.clock),
+        book_id="b",
+    )
+    calls = len(env.fake.calls)
+    with pytest.raises(ValueError, match="not this wrapper's 'b'"):
+        _execute(gate, env, [_decision(env, A, "buy", notional=300.0)])
+    assert not env.fake.calls[calls:]

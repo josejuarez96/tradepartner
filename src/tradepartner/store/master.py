@@ -254,7 +254,7 @@ _Marks = Mapping[str, Sequence[datetime]]
 def _registered(stop: _Stop, until: datetime, marks: _Marks) -> bool:
     """An 8-A12B accepted from `stop.window_start` to `until`."""
     return any(
-        stop.window_start <= _session_of(at) and at <= until
+        stop.window_start <= session_of(at) and at <= until
         for form in _NEW_REGISTRATION_FORMS
         for at in marks.get(form, ())
     )
@@ -264,8 +264,8 @@ def _deregistered(stop: _Stop, until: datetime, marks: _Marks, *, windowed: bool
     """A Form 15 accepted by `until` inside the stop's reorganisation window
     (or, with `windowed=False`, any time from the window's start)."""
     return any(
-        stop.reorg_start <= _session_of(at)
-        and (not windowed or _session_of(at) <= stop.reorg_end)
+        stop.reorg_start <= session_of(at)
+        and (not windowed or session_of(at) <= stop.reorg_end)
         and at <= until
         for form in _DEREGISTRATION_FORMS
         for at in marks.get(form, ())
@@ -361,7 +361,7 @@ def _session_on_or_after(day: date) -> date:
     return day if is_session(day) else next_session(day)
 
 
-def _first_session(settings: Settings) -> date:
+def first_session(settings: Settings) -> date:
     """The calendar's first session. `calendar.start` need not be one, and
     the calendar raises (`DateOutOfBounds`, a `ValueError`) for any day
     before its first session, so step forward from it."""
@@ -376,7 +376,8 @@ def _first_session(settings: Settings) -> date:
     raise ValueError("calendar.start..calendar.end holds no session")
 
 
-def _session_of(instant: datetime) -> date:
+def session_of(instant: datetime) -> date:
+    """The New York day of an instant, advanced to the next trading session."""
     return _session_on_or_after(instant.astimezone(_EXCHANGE_TZ).date())
 
 
@@ -487,7 +488,7 @@ def _sessions_around(session: date, sessions: int) -> tuple[date, date]:
 
 
 def _stop(filing: DelistingFiling, settings: Settings, since: datetime | None) -> _Stop:
-    session = _session_of(filing.accepted_at)
+    session = session_of(filing.accepted_at)
     filed_on = filing.accepted_at.astimezone(_EXCHANGE_TZ).date()
     effective = filing.effective_on or filed_on + timedelta(days=_DEFAULT_EFFECTIVE_DAYS)
     window_start, _ = _sessions_around(session, settings.master.transfer_window_sessions)
@@ -598,7 +599,7 @@ class _Builder:
             while events and events[0][0] < page.accepted_at:
                 self._event(first, classes, events.pop(0), marks)
             known_at = max(page.accepted_at, first.accepted_at)
-            valid_from = _session_of(page.accepted_at)
+            valid_from = session_of(page.accepted_at)
             shown: dict[str, set[tuple[str, str]]] = defaultdict(set)
             claimed: dict[str, str] = {}  # security_id -> ticker it took on this page
             starts: dict[tuple[str, str], date] = {}  # (security_id, exchange) -> row start
@@ -695,7 +696,7 @@ class _Builder:
                 successor_issuer = any(
                     (stop.since is None or a > stop.since)
                     and a <= at
-                    and stop.reorg_start <= _session_of(a)
+                    and stop.reorg_start <= session_of(a)
                     for form in _SUCCESSOR_ISSUER_FORMS
                     for a in marks.get(form, ())
                 )
@@ -708,7 +709,7 @@ class _Builder:
                 if stop.filed_at >= at:
                     continue
                 if record is None:  # an 8-K12B
-                    if _session_of(at) <= stop.reorg_end and not _registered(stop, at, marks):
+                    if session_of(at) <= stop.reorg_end and not _registered(stop, at, marks):
                         self._relist(first, classes, cls, exchange, at, "filing", marks)
                     continue
                 tickers = {ticker for ticker, ex in cls.pairs if ex == exchange}
@@ -823,16 +824,16 @@ class _Builder:
             first_listing = cls.first_listing_at(t)
             if first_listing is None:
                 if self.static:
-                    start, provenance = _session_of(cls.known_at), "snapshot_static"
+                    start, provenance = session_of(cls.known_at), "snapshot_static"
                 else:
-                    start, provenance = _session_of(t), "snapshot"
+                    start, provenance = session_of(t), "snapshot"
                 self._snapshot_listing(cls, entry, start, provenance)
             elif self.static:
                 ticker, exchange, first_from = first_listing
                 if (ticker, exchange) != (entry.ticker, entry.exchange):
                     self.unmatched.append(entry)
-                elif _session_of(cls.known_at) < first_from:
-                    self._snapshot_listing(cls, entry, _session_of(cls.known_at), "snapshot_static")
+                elif session_of(cls.known_at) < first_from:
+                    self._snapshot_listing(cls, entry, session_of(cls.known_at), "snapshot_static")
 
     def _snapshot_listing(
         self, cls: _Class, entry: CompanySnapshotEntry, start: date, provenance: str
@@ -863,9 +864,9 @@ class _Builder:
             provenance=name_prov,
         )
         if self.static:
-            start, provenance = _first_session(self.settings), "snapshot_static"
+            start, provenance = first_session(self.settings), "snapshot_static"
         else:
-            start, provenance = _session_of(entry.fetched_at), "snapshot"
+            start, provenance = session_of(entry.fetched_at), "snapshot"
         self.listing(
             security_id,
             entry.ticker,

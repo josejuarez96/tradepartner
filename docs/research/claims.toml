@@ -1237,6 +1237,7 @@ scope = "3 of 3 fixtures matched; library bug is one report"
 source = "docs/research/2026-10-02-edgar-data-pitfalls.md"
 section = "Evidence (E15)"
 bears_on = ["spec:data-foundation"]
+note = "TP-2 (2026-10-09): the bulk submissions.zip, and since about 2026-10-08 the per-CIK API, serve values moved by New York's UTC offset for a subset of filings; the field is still the one to read, its values are no longer true UTC for every filing."
 
 [[claim]]
 id = "EP-P13"
@@ -2854,4 +2855,28 @@ scope = "Primary source, one issuer checked; universe coverage and release-to-10
 source = "docs/research/2026-10-09-short-horizon-candidates.md"
 section = "Evidence"
 bears_on = ["spec:data-foundation"]
-note = "Our EDGAR adapter reads the submissions payload (form, accession, acceptanceDateTime) but does not keep `items`; the store has no filings table."
+note = "Our EDGAR adapter reads the submissions payload (form, accession, acceptanceDateTime) but does not keep `items`; the store has no filings table. Data-foundation amendment #1358 (T164 to T164e) adds `filing_events`. TP-2: the example times are 4 h late (the 8-K was accepted 20:30:28Z, the 10-Q 10:01:02Z); the fact stands."
+
+# ===== TradePartner's own results (TP-) =====
+
+[[claim]]
+id = "TP-1"
+statement = "In the ADR 0006 top-1000 universe, 97.9% to 99.3% of issuers file an 8-K whose items names 2.02 in every calendar quarter 2020Q3-2023Q4 (1,014 to 1,125 filings a quarter); 4.9% of 10-Q/10-K filings have no 2.02 8-K in the prior 60 days; the lag from the 2.02 8-K to the 10-Q/10-K has median 1.0 day (p75 7.4, p90 15.9); among the 7,845 events whose stamps the per-CIK API wrote (a clock presumed true), 45% are accepted before 09:30 New York, 50% between 16:00 and 17:30 and dated that same session, 2.5% during the session, 2.7% after 17:30."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Read-only count on a scratch copy of the owner's store (schema 18) and the cached submissions.zip and stamps, 2026-10-09; universe at each quarter-end close (a name that left inside a quarter is not in that quarter's denominator); the time-of-day shares from a non-random subset (API-stamped CIKs, 2026-10-02 to 10-07) whose clock shows neither moved signature of TP-2 and was checked against fixtures for three CIKs only"
+source = "docs/specs/data-foundation.md"
+section = "Amendment 2026-10-09 (#1358): filing events"
+bears_on = ["spec:data-foundation", "hyp:b9-earnings-reaction-drift", "backlog:B9"]
+note = "Evidence tables on the T164 PR (#1381). Answers the short-horizon report's first follow-up question: a 10-Q/10-K fallback would add about 5% of events at a later time, so B9-6's recommendation (8-K only) stands."
+
+[[claim]]
+id = "TP-2"
+statement = "In October 2026 the SEC submissions data serves acceptanceDateTime values moved by New York's UTC offset (4 h EDT, 5 h EST) in both directions, per CIK member, with the set changing between builds: the 2026-10-08 bulk submissions.zip is late by exactly the offset against the SGML header for the 2 SGML-verified fixture accessions and against the 2026-09-25 API fixtures for all 2,560 filings of three CIKs (13 of them by twice the offset), the per-CIK API answered late values for Apple on 2026-10-09, and at least 103 of the universe's 11,131 bulk-stamped 8-K 2.02 events (34 CIKs) carry stamps provably early by the offset, with the early share estimated at an eighth to a sixth of that group from the hour-of-day signature."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Read-only checks against tests/fixtures/edgar (SGML headers and API payloads of 2026-09-25), the cached 2026-10-08 zip and the owner's stamps cache; 'provably early' = stamped on a session before 17:30 New York and dated the next day by the index; the moved share per filing is undetermined without the SGML header"
+source = "docs/specs/data-foundation.md"
+section = "Amendment 2026-10-09 (#1358): filing events, The clock"
+bears_on = ["spec:data-foundation", "hyp:b9-earnings-reaction-drift"]
+note = "Qualifies EP-P12 (the submissions field is still the one to read, but its values are not true UTC for every filing) and SH-12 (its example times are 4 h late). An early stamp is a look-ahead (an after-close 8-K visible at close(T)); a late one moves a pre-open 8-K's day 0 one session later. Follow-up issue #1382; spec open question 11; edgar.filing_events_enabled stays false until it is closed."
