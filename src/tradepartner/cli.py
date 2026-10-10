@@ -814,6 +814,7 @@ _SWEEP_RUN_REFUSALS = (
     lab.NoCodeVintage,
     lab_queries.SweepNotCompleteError,
     registry.UnmarkedStoreRefused,
+    lab_sweep.DefaultWindowOverlapError,
 )
 
 
