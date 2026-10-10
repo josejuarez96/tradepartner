@@ -1,17 +1,25 @@
-// Workstation view of the trial for review: the finished run and one rebalance mid-run. Run: node shoot-bench.mjs (needs the dev server). Output in shots/.
+// Workstation view of the trial for review: the finished run, one rebalance mid-run (moved with the keyboard on the scrubber),
+// and the month grid pointing the chart. Run: node shoot-bench.mjs [query] (needs the dev server). Output in shots/.
 import { chromium } from "playwright-core";
 import { readdirSync, existsSync } from "node:fs";
 const root = "/opt/pw-browsers", dir = readdirSync(root).find((d) => d.startsWith("chromium-"));
 const exe = [`${root}/${dir}/chrome-linux/chrome`, `${root}/${dir}/chrome-linux64/chrome`].find(existsSync);
+const q = process.argv[2] ?? "", tag = q ? "-" + q.replace(/[^a-z]/g, "") : "";
 const b = await chromium.launch({ executablePath: exe });
-for (const [vp, opts] of [["desktop", { viewport: { width: 1280, height: 900 }, deviceScaleFactor: 2 }], ["phone", { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true }]]) {
+for (const [vp, opts] of [["desktop", { viewport: { width: 1360, height: 900 }, deviceScaleFactor: 2 }], ["phone", { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true }]]) {
   const ctx = await b.newContext(opts); const p = await ctx.newPage();
   p.on("pageerror", (e) => console.log("pageerror", e.message));
-  p.on("console", (m) => m.type() === "error" && console.log("console", m.text()));
-  await p.goto("http://127.0.0.1:5173/#research/bench/h1"); await p.waitForTimeout(1200);
-  await p.screenshot({ path: `shots/bench-${vp}.png`, fullPage: true });
-  await p.getByRole("slider", { name: "Rebalance" }).fill("6"); await p.waitForTimeout(500);
-  await p.screenshot({ path: `shots/bench-step-${vp}.png`, fullPage: vp === "desktop" });
+  await p.goto(`http://127.0.0.1:5173/${q ? "?" + q : ""}#research/bench/h1`); await p.waitForTimeout(1200);
+  await p.screenshot({ path: `shots/bench${tag}-${vp}.png`, fullPage: vp === "desktop" });
+  const s = p.getByRole("slider", { name: "Rebalance" }).filter({ visible: true }).first();
+  await s.focus(); await p.keyboard.press("Home"); for (let i = 0; i < 6; i++) await p.keyboard.press("ArrowRight");
+  await p.waitForTimeout(400);
+  await p.screenshot({ path: `shots/bench${tag}-step-${vp}.png`, fullPage: vp === "desktop" });
+  if (vp === "desktop") {
+    await p.keyboard.press("End"); await p.waitForTimeout(300);
+    await p.getByRole("cell", { name: "+1.8" }).first().hover(); await p.waitForTimeout(400);
+    await p.screenshot({ path: `shots/bench${tag}-linked-desktop.png` });
+  }
   await ctx.close();
 }
 await b.close(); console.log("ok");

@@ -18,6 +18,8 @@ interface Props {
   label: string;
   height: number;
   onScrub?: (date: string | null) => void;
+  /** A date another panel is pointing at; the crosshair moves there. */
+  focusDate?: string | null;
 }
 
 const pctLabel = (v: number) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v * 100).toFixed(0)}%`;
@@ -29,7 +31,7 @@ const dayLabel = (t: Time) =>
  * and the S&P above, the drawdown of each below in its own pane on the same
  * time axis, drawn up to the playhead with the axes fixed.
  */
-export function BenchChart({ you, spy, ddYou, ddSpy, until, current, tone, label, height, onScrub }: Props) {
+export function BenchChart({ you, spy, ddYou, ddSpy, until, current, tone, label, height, onScrub, focusDate }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const s = useRef<{
@@ -67,7 +69,7 @@ export function BenchChart({ you, spy, ddYou, ddSpy, until, current, tone, label
       const rule = token("border");
       c.applyOptions({
         layout: { textColor: token("muted-foreground"), fontFamily: "IBM Plex Mono, ui-monospace, monospace", panes: { separatorColor: rule } },
-        grid: { vertLines: { color: rule }, horzLines: { color: rule } },
+        grid: { vertLines: { color: rule, style: LineStyle.Dotted }, horzLines: { color: rule, style: LineStyle.Dotted } },
         rightPriceScale: { borderColor: rule },
         timeScale: { borderColor: rule },
         crosshair: {
@@ -83,7 +85,8 @@ export function BenchChart({ you, spy, ddYou, ddSpy, until, current, tone, label
     paintRef.current = paint;
     paint();
     const off = onThemeChange(paint);
-    const move = (p: MouseEventParams<Time>) => scrub.current?.(p.time ? String(p.time) : null);
+    // Only the pointer drives the readout; a crosshair placed from another panel does not echo back.
+    const move = (p: MouseEventParams<Time>) => { if (p.sourceEvent) scrub.current?.(p.time ? String(p.time) : null); };
     c.subscribeCrosshairMove(move);
     chart.current = c;
     return () => { off(); c.unsubscribeCrosshairMove(move); c.remove(); chart.current = null; s.current = null; };
@@ -109,6 +112,14 @@ export function BenchChart({ you, spy, ddYou, ddSpy, until, current, tone, label
     x.ddSpy.setData(cut(ddSpy));
     x.marks.setMarkers(current && current <= until ? [{ time: current as Time, position: "inBar" as const, shape: "circle" as const, size: 1, color: token("foreground") }] : []);
   }, [you, spy, ddYou, ddSpy, until, current]);
+
+  useEffect(() => {
+    const x = s.current, c = chart.current;
+    if (!x || !c) return;
+    if (!focusDate) { c.clearCrosshairPosition(); return; }
+    const p = [...you].reverse().find((q) => q.date <= focusDate && q.date <= until);
+    if (p) c.setCrosshairPosition(p.value, p.date as Time, x.you);
+  }, [focusDate, you, until]);
 
   return <div ref={host} role="img" aria-label={label} className="w-full" style={{ height }} />;
 }

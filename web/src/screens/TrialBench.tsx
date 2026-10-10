@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, Maximize2, Minimize2, Pause, Play, SkipBack, SkipForward } from "lucide-react";
 import type { AppData, Idea, Replay, ReplayRebalance } from "@/lib/types";
 import { money, pct, tone } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { BenchChart } from "@/components/BenchChart";
+import { Scrubber } from "@/components/Scrubber";
 import { LuckInfo } from "@/components/LuckInfo";
-import { Assumptions, Controls, CostBars, SignalPicture, YearBars, p0, pts1, useWidth, yearDate } from "@/screens/Trial";
+import { Assumptions, CostBars, SignalPicture, YearBars, p0, pts1, useWidth, yearDate } from "@/screens/Trial";
 
 const toneText = { gain: "text-gain", loss: "text-loss", flat: "text-muted-foreground" } as const;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -31,12 +32,24 @@ function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
   const [playing, setPlaying] = useState(false);
   const [fast, setFast] = useState(false);
   const [hover, setHover] = useState<string | null>(null);
+  const [focusMonth, setFocusMonth] = useState<string | null>(null);
+  const [wide, setWide] = useState<string | null>(null);
 
   useEffect(() => {
     if (!playing) return;
     const t = setInterval(() => setAt((k) => { if (k >= last) { setPlaying(false); return k; } return k + 1; }), fast ? 220 : 700);
     return () => clearInterval(t);
   }, [playing, fast, last]);
+  // Space plays and pauses, unless a control has focus.
+  useEffect(() => {
+    const on = (e: KeyboardEvent) => {
+      if (e.key !== " " || (e.target as HTMLElement).closest("button, input, [role=slider], a")) return;
+      e.preventDefault();
+      setPlaying((p) => { if (!p) setAt((k) => (k >= last ? 0 : k)); return !p; });
+    };
+    addEventListener("keydown", on);
+    return () => removeEventListener("keydown", on);
+  }, [last]);
 
   const series = useMemo(() => {
     const v0 = replay.days[0].v, b0 = replay.days[0].b;
@@ -48,101 +61,134 @@ function Bench({ replay, idea }: { replay: Replay; idea: Idea }) {
     };
   }, [replay]);
   const until = at === last ? replay.window.end : R[at].date;
-  const shown = hover && hover <= until ? hover : until;
+  // The month in focus, from the grid, points the chart at that month's last day.
+  const focusDate = focusMonth ? [...series.you].reverse().find((p) => p.date.startsWith(focusMonth))?.date ?? null : null;
+  const pointed = hover ?? focusDate;
+  const shown = pointed && pointed <= until ? pointed : until;
   const k = series.you.findIndex((p) => p.date === shown);
   const youAt = series.you[k]?.value ?? 0, spyAt = series.spy[k]?.value ?? 0, ddAt = series.ddYou[k]?.value ?? 0;
   const r = R[at];
-  const monthsDone = replay.monthly.filter((m) => `${m.month}-31` <= until || at === last).length;
+  const monthsDone = at === last ? replay.monthly.length : replay.monthly.filter((m) => `${m.month}-31` <= until).length;
+  const seek = (i: number) => { setPlaying(false); setAt(i); };
+  const span = (id: string, normal: string) => (wide === id ? "lg:col-span-12" : normal);
+  const toggle = (id: string) => () => setWide(wide === id ? null : id);
+  const luckWord = replay.end.luck >= 0.95 ? "likely real" : replay.end.luck >= 0.5 ? "could be luck" : "probably luck";
 
   return (
-    <div className="mx-auto max-w-[1440px] px-4 pt-3 pb-12 sm:px-6">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-        <a href={`#research/trial/${idea.id}`} className="text-muted-foreground hover:text-foreground -ml-1 inline-flex h-11 items-center gap-1 text-[13px] sm:h-8">
-          <ChevronLeft className="size-4" />Simple view
-        </a>
-        <h1 className="text-[15px] font-medium">{idea.name}, backtest</h1>
-        <span className="text-muted-foreground text-[13px]">{yearDate(replay.window.start)} to {yearDate(replay.window.end)}</span>
+    <div className="mx-auto max-w-[1440px] px-4 pb-12 sm:px-6">
+      <header className="flex flex-wrap items-end gap-x-8 gap-y-3 pt-4 pb-3">
+        <div className="min-w-0">
+          <a href={`#research/trial/${idea.id}`} className="text-muted-foreground hover:text-foreground -ml-1 inline-flex h-8 items-center gap-1 text-[12.5px]">
+            <ChevronLeft className="size-3.5" />Simple view
+          </a>
+          <h1 className="text-[17px] font-medium tracking-[-0.01em]">{idea.name}, backtest</h1>
+          <p className="text-muted-foreground text-[12.5px]">{yearDate(replay.window.start)} to {yearDate(replay.window.end)}, trial {replay.trial}</p>
+        </div>
+        <dl className="ml-auto grid grid-cols-2 gap-x-8 gap-y-2 sm:flex sm:gap-x-10">
+          <Stat label="A year over the S&P, after costs"><span className={toneText[tone(replay.end.vs_spy)]}>{pts1(replay.end.vs_spy)} pts</span></Stat>
+          <Stat label={<span className="inline-flex items-center gap-1">Luck check <LuckInfo idea={idea} /></span>}>{Math.round(replay.end.luck * 100)}% <span className="text-muted-foreground font-sans text-xs">{luckWord}</span></Stat>
+          <Stat label="Versions tried">{replay.end.tries}</Stat>
+          <Stat label="Exam on paper">{idea.exam?.kind === "paper" ? `${idea.exam.done} of ${idea.exam.of}` : "on hold"}</Stat>
+        </dl>
+      </header>
+
+      {/* The transport stays in view while the panels scroll under it. */}
+      <div className="bg-background sticky top-0 z-20 -mx-4 border-y px-4 py-2 sm:-mx-6 sm:px-6">
+        <div className="flex items-center gap-2">
+          <button onClick={() => { if (at >= last) setAt(0); setPlaying(!playing); }}
+            className="bg-foreground text-background focus-visible:ring-ring/50 inline-flex h-11 shrink-0 items-center gap-1.5 rounded-full pr-3.5 pl-3 text-[12.5px] font-medium outline-none focus-visible:ring-2 sm:h-8">
+            {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}{playing ? "Pause" : at === last ? "Replay" : "Play"}
+          </button>
+          <IconBtn label="Previous rebalance" disabled={at === 0} onClick={() => seek(at - 1)}><SkipBack className="size-3.5" /></IconBtn>
+          <IconBtn label="Next rebalance" disabled={at === last} onClick={() => seek(at + 1)}><SkipForward className="size-3.5" /></IconBtn>
+          <button aria-pressed={fast} onClick={() => setFast(!fast)} className={cn("h-11 shrink-0 rounded-full px-2.5 text-[12.5px] sm:h-8", fast ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground")}>2×</button>
+          <Scrubber className="hidden min-w-0 flex-1 sm:block" values={series.you} stops={R.map((x) => x.date)} at={at} onSeek={seek} label={`Rebalance ${at + 1} of ${R.length}, ${yearDate(r.date)}`} />
+          <span className="num text-muted-foreground ml-auto shrink-0 text-right text-[11.5px] leading-tight sm:ml-0 sm:w-28">{yearDate(r.date)}<br />{at + 1} of {R.length}</span>
+        </div>
+        <Scrubber className="mt-1 sm:hidden" values={series.you} stops={R.map((x) => x.date)} at={at} onSeek={seek} label={`Rebalance ${at + 1} of ${R.length}, ${yearDate(r.date)}`} />
       </div>
 
-      {/* Readouts: the result and whether to believe it, always in view. */}
-      <dl className="bg-border mt-2 grid grid-cols-2 gap-px overflow-hidden rounded-md border sm:grid-cols-4">
-        <Readout label="Over the S&P 500, a year after costs"><span className={toneText[tone(replay.end.vs_spy)]}>{pts1(replay.end.vs_spy)} pts</span></Readout>
-        <Readout label={<span className="inline-flex items-center gap-1.5">Luck check <LuckInfo idea={idea} /></span>}>
-          {Math.round(replay.end.luck * 100)}% <span className="text-muted-foreground font-sans text-xs">{replay.end.luck >= 0.95 ? "likely real" : replay.end.luck >= 0.5 ? "could be luck" : "probably luck"}</span>
-        </Readout>
-        <Readout label="Versions tried in the family">{replay.end.tries}</Readout>
-        <Readout label="Exam on paper">{idea.exam?.kind === "paper" ? `${idea.exam.done} of ${idea.exam.of}` : "on hold"} <span className="text-muted-foreground font-sans text-xs">{idea.exam?.unit}</span></Readout>
-      </dl>
-
-      <div className="bg-border mt-3 grid gap-px overflow-hidden rounded-md border lg:grid-cols-12">
-        <Panel className="lg:col-span-8" title="Equity and drawdown" readout={`${yearDate(shown)}   strategy ${pct(youAt, 1)}   S&P ${pct(spyAt, 1)}   drawdown ${pct(ddAt, 1)}`}>
+      <div className="mt-3 grid gap-2 lg:grid-cols-12">
+        <Panel className={span("equity", "lg:col-span-8")} title="Equity and drawdown" wide={wide === "equity"} onWide={toggle("equity")}
+          readout={<>{yearDate(shown)}<Read k="strategy" v={pct(youAt, 1)} cls={toneText[tone(youAt - spyAt)]} /><Read k="S&P" v={pct(spyAt, 1)} /><Read k="drawdown" v={pct(ddAt, 1)} /></>}>
           <BenchChart
-            you={series.you} spy={series.spy} ddYou={series.ddYou} ddSpy={series.ddSpy} until={until} current={r.date}
-            tone={tone(youAt - spyAt)} height={typeof window !== "undefined" && window.innerWidth < 640 ? 300 : 400} onScrub={setHover}
+            you={series.you} spy={series.spy} ddYou={series.ddYou} ddSpy={series.ddSpy} until={until} current={r.date} focusDate={hover ? null : focusDate}
+            tone={tone(youAt - spyAt)} height={typeof window !== "undefined" && window.innerWidth < 640 ? 300 : wide === "equity" ? 520 : 420} onScrub={setHover}
             label={`Strategy ${pct(youAt, 1)} against the S&P 500 ${pct(spyAt, 1)} by ${yearDate(until)}; drawdown below.`}
           />
-          <div className="border-t px-3">
-            <Controls at={at} total={R.length} date={r.date} playing={playing} fast={fast}
-              onPlay={() => { if (at >= last) setAt(0); setPlaying(!playing); }}
-              onStep={(d) => { setPlaying(false); setAt((x) => Math.max(0, Math.min(last, x + d))); }}
-              onFast={() => setFast(!fast)} onSeek={(v) => { setPlaying(false); setAt(v); }} />
-          </div>
         </Panel>
 
-        <Panel className="lg:col-span-4 lg:row-span-2" title={`Rebalance ${at + 1} of ${R.length}`} readout={yearDate(r.date)}>
+        <Panel className={cn(span("inspector", "lg:col-span-4"), "lg:row-span-2")} title="This rebalance" wide={wide === "inspector"} onWide={toggle("inspector")} readout={`${at + 1} of ${R.length}`}>
           <Inspector r={r} first={at === 0} />
         </Panel>
 
-        <Panel className="lg:col-span-4" title="Scores that day" readout={`cut ${p0(r.cut)}, ${r.hold} held`}>
+        <Panel className={span("scores", "lg:col-span-4")} title="Scores that day" wide={wide === "scores"} onWide={toggle("scores")} readout={`cut ${p0(r.cut)}, ${r.hold} held`}>
           <div className="px-3 pb-3"><SignalPicture r={r} bins={replay.bins} caption={false} /></div>
         </Panel>
 
-        <Panel className="lg:col-span-4" title="Monte Carlo, monthly results reshuffled" readout={`${replay.monte_carlo.runs.toLocaleString("en-US")} runs, ${Math.round(replay.monte_carlo.below_zero * 100)}% end below zero`}>
+        <Panel className={span("mc", "lg:col-span-4")} title="Monte Carlo" wide={wide === "mc"} onWide={toggle("mc")} readout={`${Math.round(replay.monte_carlo.below_zero * 100)}% of ${replay.monte_carlo.runs.toLocaleString("en-US")} reshuffles end below zero`}>
           <MonteCarlo mc={replay.monte_carlo} upTo={monthsDone} />
         </Panel>
 
-        <Panel className="lg:col-span-8" title="Month by month, over the S&P 500" readout="points; strategy minus S&P">
-          <MonthGrid replay={replay} upTo={monthsDone} />
+        <Panel className={span("months", "lg:col-span-8")} title="Month by month" wide={wide === "months"} onWide={toggle("months")} readout="points over the S&P">
+          <MonthGrid replay={replay} upTo={monthsDone} active={(hover ?? "").slice(0, 7) || focusMonth} onFocus={setFocusMonth} />
         </Panel>
 
-        <Panel className="lg:col-span-4" title="Trades that day" readout={at === 0 ? `${r.entries.length} bought` : `${r.entries.length} bought, ${r.exits.length} sold`}>
+        <Panel className={span("tape", "lg:col-span-4")} title="Trades that day" wide={wide === "tape"} onWide={toggle("tape")} readout={at === 0 ? `${r.entries.length} bought` : `${r.entries.length} bought, ${r.exits.length} sold`}>
           <Tape r={r} first={at === 0} />
         </Panel>
 
-        <Panel className="lg:col-span-4" title="By year" readout="over the S&P 500">
-          <div className="px-3 pb-2"><YearBars replay={replay} /></div>
+        <Panel className={span("years", "lg:col-span-4")} title="By year" wide={wide === "years"} onWide={toggle("years")} readout="over the S&P">
+          <div className="px-3 pb-2 [&_ul]:border-t-0"><YearBars replay={replay} /></div>
         </Panel>
-        <Panel className="lg:col-span-4" title="If trading cost more" readout="points a year over the S&P">
-          <div className="px-3 pb-2"><CostBars replay={replay} /></div>
+        <Panel className={span("costs", "lg:col-span-4")} title="If trading cost more" wide={wide === "costs"} onWide={toggle("costs")} readout="points a year">
+          <div className="px-3 pb-2 [&_ul]:border-t-0"><CostBars replay={replay} /></div>
         </Panel>
-        <Panel className="lg:col-span-4" title="Properties" readout={`trial ${replay.trial}`}>
+        <Panel className={span("props", "lg:col-span-4")} title="Properties" wide={wide === "props"} onWide={toggle("props")}>
           <div className="px-3 pb-2 [&_dl]:border-t-0"><Assumptions replay={replay} /></div>
         </Panel>
       </div>
       <p className="text-muted-foreground mt-3 text-xs">
         Trial {replay.trial} of h1-momentum-12-1, {idea.family} family; settings fingerprint and code version {replay.identity.params}; data as known through {yearDate(replay.identity.data_cutoff)}.
-        Sample data: H1&apos;s rule and window, invented stocks and prices.
+        Sample data: H1&apos;s rule and window, invented stocks and prices. Space plays and pauses; arrow keys on the timeline step.
       </p>
     </div>
   );
 }
 
-function Readout({ label, children }: { label: ReactNode; children: ReactNode }) {
+function Stat({ label, children }: { label: ReactNode; children: ReactNode }) {
   return (
-    <div className="bg-background px-3 py-2">
-      <dt className="text-muted-foreground text-[12px]">{label}</dt>
-      <dd className="num mt-0.5 text-[17px]">{children}</dd>
+    <div>
+      <dt className="text-muted-foreground text-[11.5px]">{label}</dt>
+      <dd className="num text-[18px] leading-tight">{children}</dd>
     </div>
   );
 }
 
-/** A figure on the bench: a thin title bar with a live readout, then the figure. */
-function Panel({ title, readout, className, children }: { title: string; readout?: ReactNode; className?: string; children: ReactNode }) {
+function Read({ k, v, cls }: { k: string; v: string; cls?: string }) {
+  return <span className="ml-3"><span className="font-sans">{k}</span> <span className={cn("text-foreground", cls)}>{v}</span></span>;
+}
+
+function IconBtn({ label, disabled, onClick, children }: { label: string; disabled?: boolean; onClick: () => void; children: ReactNode }) {
   return (
-    <section className={cn("bg-background min-w-0", className)}>
-      <header className="flex min-h-9 flex-wrap items-baseline justify-between gap-x-3 border-b px-3 py-2">
+    <button aria-label={label} disabled={disabled} onClick={onClick}
+      className="text-muted-foreground hover:text-foreground hover:bg-secondary focus-visible:ring-ring/50 grid size-11 shrink-0 place-items-center rounded-full outline-none focus-visible:ring-2 disabled:opacity-30 sm:size-8">
+      {children}
+    </button>
+  );
+}
+
+/** A figure on the bench: a soft surface, a quiet title and a live readout, and a button to give it the full width. */
+function Panel({ title, readout, className, wide, onWide, children }: { title: string; readout?: ReactNode; className?: string; wide: boolean; onWide: () => void; children: ReactNode }) {
+  return (
+    <section className={cn("bg-raised min-w-0 overflow-hidden rounded-[10px] border", className)}>
+      <header className="flex min-h-10 flex-wrap items-center gap-x-3 px-3 pt-1 max-lg:pb-1">
         <h2 className="text-[12.5px] font-medium">{title}</h2>
-        {readout && <span className="num text-muted-foreground text-[11.5px] whitespace-pre-wrap">{readout}</span>}
+        <span className="num text-muted-foreground min-w-0 flex-1 text-right text-[11.5px] max-lg:order-last max-lg:basis-full max-lg:text-left lg:truncate">{readout}</span>
+        <button aria-label={wide ? `Shrink ${title}` : `Widen ${title}`} aria-pressed={wide} onClick={onWide}
+          className="text-muted-foreground hover:text-foreground hover:bg-secondary hidden size-7 shrink-0 place-items-center rounded-md lg:grid">
+          {wide ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+        </button>
       </header>
       {children}
     </section>
@@ -200,7 +246,7 @@ function Tape({ r, first }: { r: ReplayRebalance; first: boolean }) {
     ...r.entries.map((x) => ({ side: "Buy", s: x.s, why: first ? `rank ${x.r}` : `rose to rank ${x.r}` })),
   ];
   return (
-    <div className="max-h-[320px] overflow-y-auto">
+    <div className="max-h-[230px] overflow-y-auto">
       <table className="w-full text-[12.5px]">
         <thead className="bg-background sticky top-0">
           <tr className="text-muted-foreground border-b text-[11.5px]"><th className="px-3 py-1.5 text-left font-normal">Side</th><th className="px-3 py-1.5 text-left font-normal">Stock</th><th className="px-3 py-1.5 text-left font-normal">Why</th></tr>
@@ -258,13 +304,13 @@ function MonteCarlo({ mc, upTo }: { mc: Replay["monte_carlo"]; upTo: number }) {
 }
 
 /** Years down, months across, each cell the month's excess in points, tinted by sign and size. A total per year at the end. */
-function MonthGrid({ replay, upTo }: { replay: Replay; upTo: number }) {
+function MonthGrid({ replay, upTo, active, onFocus }: { replay: Replay; upTo: number; active: string | null; onFocus: (m: string | null) => void }) {
   const shown = replay.monthly.slice(0, upTo);
   const years = [...new Set(replay.monthly.map((m) => m.month.slice(0, 4)))];
   const max = Math.max(...replay.monthly.map((m) => Math.abs(m.s - m.b)));
   return (
     <div className="overflow-x-auto px-3 py-2">
-      <table className="num w-full min-w-[600px] table-fixed text-[11.5px]">
+      <table className="num w-full min-w-[600px] table-fixed border-separate border-spacing-[2px] text-[11.5px]">
         <thead>
           <tr className="text-muted-foreground font-sans">
             <th className="w-12 py-1 text-left font-normal" />
@@ -277,14 +323,15 @@ function MonthGrid({ replay, upTo }: { replay: Replay; upTo: number }) {
             const ms = shown.filter((m) => m.month.startsWith(y));
             const total = ms.reduce((a, m) => a * (1 + m.s), 1) - ms.reduce((a, m) => a * (1 + m.b), 1);
             return (
-              <tr key={y} className="border-t">
+              <tr key={y}>
                 <td className="text-muted-foreground py-1 pr-2">{y}</td>
                 {MONTHS.map((_, i) => {
                   const m = ms.find((x) => Number(x.month.slice(5)) === i + 1);
                   if (!m) return <td key={i} />;
                   const e = m.s - m.b, a = Math.min(0.45, (Math.abs(e) / max) * 0.45 + 0.04);
                   return (
-                    <td key={i} className="px-1 py-1 text-right"
+                    <td key={i} tabIndex={0} onMouseEnter={() => onFocus(m.month)} onMouseLeave={() => onFocus(null)} onFocus={() => onFocus(m.month)} onBlur={() => onFocus(null)}
+                      className={cn("cursor-default rounded-[3px] px-1 py-1 text-right outline-none", active === m.month && "ring-foreground ring-1 ring-inset")}
                       style={{ background: `color-mix(in oklab, var(--${e >= 0 ? "gain" : "loss"}) ${Math.round(a * 100)}%, transparent)` }}>
                       {pts1(e)}
                     </td>
