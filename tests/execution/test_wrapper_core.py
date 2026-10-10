@@ -56,6 +56,7 @@ from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
     SUBMIT_ALLOWLIST,
     WRITE_FAILED_EXIT_CODE,
+    BookMismatchError,
     RiskGatedBroker,
     Verdict,
     classify,
@@ -1419,12 +1420,13 @@ def test_the_halt_alert_is_journaled_under_the_wrapper_s_book(
 ) -> None:
     """ADR 0017 B.6: the run-scoped halt alert carries the run's window's book
     (the window row's, never the live `paper.book_id`) when the wrapper is built
-    with no book, and the wrapper's book when it is given one."""
+    with no book, and the wrapper's book (its run's window's, #1400) when it is
+    given one."""
     (fx_id,) = _append(
         journal_settings, replace(open_window, window_id=None, book_id="fx", account_id="PX1")
     )
     fx_window = replace(open_window, window_id=fx_id, book_id="fx")
-    cases = ((open_window, None, "main"), (fx_window, None, "fx"), (open_window, "b", "b"))
+    cases = ((open_window, None, "main"), (fx_window, None, "fx"), (fx_window, "fx", "fx"))
     for window_row, book_id, expected in cases:
         run = _run(journal_settings, window_row, fixed_clock())
         gate = RiskGatedBroker(
@@ -1461,3 +1463,73 @@ def test_a_wrapper_for_another_book_refuses_the_run_s_phase_before_any_call(
     with pytest.raises(ValueError, match="not this wrapper's 'b'"):
         _execute(gate, env, [_decision(env, A, "buy", notional=300.0)])
     assert not env.fake.calls[calls:]
+
+
+def _book_gate(env: Env, alerter_conn: duckdb.DuckDBPyConnection, book_id: str) -> RiskGatedBroker:
+    return RiskGatedBroker(
+        env.fake,
+        env.clock,
+        FROZEN,
+        env.settings,
+        lambda: open_for_write(env.settings),
+        calendar,
+        Alerter(env.settings, alerter_conn, env.clock),
+        book_id=book_id,
+    )
+
+
+def test_a_book_mismatch_refusal_never_takes_the_other_book_s_halt_path(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """#1400: a wrapper for book `b` refusing a run of `main`'s window raises
+    `BookMismatchError` from the halt path the run takes, before any write: no
+    `kill_switch` row on `main`'s window (nor any), no alert under any book, no
+    result row, no broker call."""
+    gate = _book_gate(env, alerter_conn, "b")
+    calls = len(env.fake.calls)
+
+    with pytest.raises(BookMismatchError, match="not this wrapper's 'b'"):
+        try:
+            _execute(gate, env, [_decision(env, A, "buy", notional=300.0)])
+        except Exception as exc:
+            gate.halt(exc, env.run)
+
+    assert _query(env.settings, "SELECT COUNT(*) FROM kill_switch") == [(0,)]
+    assert _query(env.settings, "SELECT COUNT(*) FROM alerts") == [(0,)]
+    assert _halt_trace(env.settings, env.run) == []
+    assert not env.fake.calls[calls:]
+
+
+def test_another_fault_on_another_book_s_run_never_engages_or_cancels_there(
+    journal_settings: Settings,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    open_window: PaperWindowRow,
+    alerter_conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1400: whatever the fault, a wrapper for book `b` halting a run of
+    `main`'s window refuses the halt: `main`'s switch stays clear, its run's
+    acknowledged order is not cancelled through `b`'s broker, and nothing is
+    alerted or journaled; the refusal chains the fault."""
+    run = _run(journal_settings, open_window, fixed_clock())
+    _order(journal_settings, scripted_fake, fixed_clock, run, "tp-acked")
+    gate = RiskGatedBroker(
+        scripted_fake,
+        fixed_clock,
+        FROZEN,
+        journal_settings,
+        lambda: open_for_write(journal_settings),
+        calendar,
+        Alerter(journal_settings, alerter_conn, fixed_clock),
+        book_id="b",
+    )
+    calls = len(scripted_fake.calls)
+
+    with pytest.raises(BookMismatchError, match="is book 'main'") as raised:
+        _halt(gate, LocalFault("boom"), run)
+
+    assert isinstance(raised.value.__cause__, LocalFault)
+    assert _halt_trace(journal_settings, run) == []
+    assert _query(journal_settings, "SELECT COUNT(*) FROM kill_switch") == [(0,)]
+    assert not scripted_fake.calls[calls:]
+    assert _events(journal_settings, "tp-acked") == [("pending", None), ("accepted", None)]
