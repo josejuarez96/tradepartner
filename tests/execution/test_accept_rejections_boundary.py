@@ -73,6 +73,11 @@ Static checks over `src/tradepartner/` and `scripts/`, in the style of
    of `accept_rejections_flag`, or the same shape in any other module, is
    refused.
 5. No config field anywhere in `Settings` is named for it.
+6. Only `cli.py` may import `typer` or `click` (#1312), so no helper outside
+   rule 4's fence can take the Typer app (`configure(paper_app)`) and set
+   app-level context settings or a default map on it. The scan reads
+   `import`/`from` statements and any string constant that names either
+   package (`importlib.import_module("typer")`, `sys.modules["click"]`).
 
 Known limits, not checked here (#696 closed what a name-based scan can):
 a value laundered through control flow into a new name (`if
@@ -761,6 +766,35 @@ def imports_resume(tree: ast.Module) -> bool:
     return False
 
 
+#: Rule 6: the CLI frameworks only `cli.py` may import.
+CLI_FRAMEWORKS = frozenset({"typer", "click"})
+
+
+def _names_cli_framework(name: str) -> bool:
+    return name.split(".", 1)[0] in CLI_FRAMEWORKS
+
+
+def imports_cli_framework(tree: ast.Module) -> list[int]:
+    """Rule 6: the lines that import `typer` or `click`, or spell either
+    package's dotted name as a string (a dynamic import or a `sys.modules`
+    lookup)."""
+    found: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            hit = any(_names_cli_framework(alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            hit = node.level == 0 and _names_cli_framework(node.module or "")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            hit = re.fullmatch(r"[A-Za-z_][\w.]*", node.value) is not None and (
+                _names_cli_framework(node.value)
+            )
+        else:
+            continue
+        if hit:
+            found.append(node.lineno)
+    return found
+
+
 def test_the_scan_sees_the_modules_that_take_the_flag() -> None:
     assert set(MODULES) >= ALLOWED
     assert all(mentions(MODULES[name]) for name in ALLOWED)
@@ -791,6 +825,25 @@ def test_the_flag_is_only_ever_passed_on_by_its_own_name() -> None:
 def test_only_the_cli_may_import_resume() -> None:
     importers = {name for name, tree in MODULES.items() if imports_resume(tree)}
     assert importers - {RESUME_MODULE} <= RESUME_CALLERS
+
+
+def test_only_the_cli_may_import_typer_or_click() -> None:
+    importers = {
+        name: lines for name, tree in MODULES.items() if (lines := imports_cli_framework(tree))
+    }
+    assert CLI_MODULE in importers  # the rule sees `cli.py`'s own import
+    assert {name: lines for name, lines in importers.items() if name != CLI_MODULE} == {}
+
+
+def test_the_framework_rule_lets_lookalikes_through() -> None:
+    allowed = ast.parse(
+        "import typing\n"
+        "from clickhouse import client\n"
+        "from . import typer\n"
+        "label = 'click here'\n"
+        "kind = 'typer.Option(...)'\n"
+    )
+    assert imports_cli_framework(allowed) == []
 
 
 Rule = Callable[[ast.Module], object]
@@ -900,6 +953,16 @@ Rule = Callable[[ast.Module], object]
         ("PAPER = {'paper.accept_rejections': True}", mentions),
         ("from tradepartner.execution.resume import resume", imports_resume),
         ("from tradepartner.execution import resume", imports_resume),
+        # #1312: only `cli.py` may import a CLI framework.
+        ("import typer", imports_cli_framework),
+        ("import click", imports_cli_framework),
+        ("import typer.main as tm", imports_cli_framework),
+        ("import os, click as c", imports_cli_framework),
+        ("from typer import Typer", imports_cli_framework),
+        ("from click.core import Context", imports_cli_framework),
+        ("importlib.import_module('typer')", imports_cli_framework),
+        ("__import__('click')", imports_cli_framework),
+        ("m = sys.modules['typer.main']", imports_cli_framework),
     ],
 )
 def test_each_rule_refuses_a_sample_that_breaks_it(source: str, rule: Rule) -> None:
