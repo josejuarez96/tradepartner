@@ -50,8 +50,9 @@ every lab module call it rather than counting trial rows themselves.
 
 **Research runs raise N, never V** (research-registry spec req 9; backtest spec req 8 as
 amended 2026-10-07, #901, T83b). N = the family's counted backtest trials plus
-`store.research.family_run_count` (Σ `n_configurations` over its `ok`, non-synthetic,
-non-holdout-spending research runs that touch returns); `family_n_split` returns the
+`store.research.family_run_count` (over its non-synthetic, non-holdout-spending research
+runs that touch returns: Σ `n_configurations` of the `ok` runs plus, per `failed` run, the
+larger of its declared and evaluated configurations, #1408); `family_n_split` returns the
 two parts, `write_results` stores the research part in `trial_results.n_research` and
 the sum in `n_trials`. V and the pair Sharpes stay the backtest pairs' alone (a
 regression has no Sharpe). A store without the research tables (one a read-only

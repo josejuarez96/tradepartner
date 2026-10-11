@@ -318,13 +318,15 @@ def check_budget(
     configurations_declared: int,
     budget_configurations: int,
 ) -> BudgetDecision:
-    """Req 6: `chain_run_count` and `chain_configurations` are the amendment
-    chain's totals so far (every run row, failures and refusals included,
-    synthetic excluded), read under the latest registration's budget, not
-    counting the run being opened. Opening is refused once that count has
-    already reached `budget.runs` (so the `budget.runs`-th run opens and
-    the next is refused); declaring configurations that would push the
-    chain's sum past `budget.configurations` is refused before any write."""
+    """Req 6 (amended #1408): `chain_run_count` is the amendment chain's run
+    count so far (every run row, failures and refusals included, synthetic
+    excluded) and `chain_configurations` its declared configurations over the
+    same rows less the refused ones (a refusal spent nothing), read under
+    the latest registration's budget, not counting the run being opened.
+    Opening is refused once that count has already reached `budget.runs`
+    (so the `budget.runs`-th run opens and the next is refused); declaring
+    configurations that would push the chain's sum past
+    `budget.configurations` is refused before any write."""
     if chain_run_count >= budget_runs:
         return BudgetDecision(
             "refused_budget",

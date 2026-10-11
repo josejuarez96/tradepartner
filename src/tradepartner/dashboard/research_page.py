@@ -210,14 +210,17 @@ def _rows(
 
 def _chain_usage(runs: Sequence[research.RunSummary]) -> dict[str, tuple[int, int]]:
     """Per slug, the run count and the configurations declared over every
-    non-synthetic run of its amendment chain, whatever the outcome (req 6)."""
+    non-synthetic run of its amendment chain (req 6, amended #1408): every run
+    counts toward the runs, a refused run's declaration adds no configurations,
+    as `store.research._chain_usage` enforces."""
     counts: dict[str, int] = {}
     configurations: dict[str, int] = {}
     for run in runs:
         if run.synthetic:
             continue
         counts[run.slug] = counts.get(run.slug, 0) + 1
-        configurations[run.slug] = configurations.get(run.slug, 0) + run.n_configurations_declared
+        declared = 0 if run.outcome.startswith("refused_") else run.n_configurations_declared
+        configurations[run.slug] = configurations.get(run.slug, 0) + declared
     return {slug: (count, configurations.get(slug, 0)) for slug, count in counts.items()}
 
 

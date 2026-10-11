@@ -25,6 +25,7 @@ from tradepartner.repair import (
 from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
 RUN = datetime(2026, 10, 4, 18, tzinfo=UTC)
@@ -690,15 +691,20 @@ def test_the_floor_is_the_earliest_securities_row_known_at_the_run(led: Settings
     assert resolver.lead("FB", date(2011, 12, 28)) is None
 
 
-def test_first_session_skips_retracted_securities_rows(led: Settings) -> None:
+def test_a_retraction_never_moves_the_first_session(led: Settings) -> None:
+    """#1408 (owner decision 5 on #987 item 1): the floor skips retracted rows,
+    but `retraction(row, at)` always stamps after the row it withdraws, so on
+    rows the code writes the floor stays the withdrawn row's session, through a
+    retraction and a later restore (the amendment's "changes nothing today")."""
     sid = "0000000999"
-    old = datetime(2011, 12, 29, 22, tzinfo=UTC)
-    live = datetime(2012, 3, 1, 22, tzinfo=UTC)
+    live = _security(sid, datetime(2011, 12, 29, 22, tzinfo=UTC), "wrong")
+    withdrawn = retraction(live, datetime(2012, 2, 1, 22, tzinfo=UTC))
+    restored = _security(sid, datetime(2012, 3, 1, 22, tzinfo=UTC), "right")
     with open_for_write(led) as conn:
-        insert_row(conn, "securities", _security(sid, old, "wrong") | {"retracted": True})
-        insert_row(conn, "securities", _security(sid, live, "right"))
+        for row in (live, withdrawn, restored):
+            insert_row(conn, "securities", row)
     with duckdb.connect(led.store.path, read_only=True) as conn:
-        assert repair.first_sessions(conn, RUN, led)[sid] == date(2012, 3, 1)
+        assert repair.first_sessions(conn, RUN, led)[sid] == date(2011, 12, 29)
 
 
 def test_the_switch_off_lists_the_lead_bars_and_split(led: Settings) -> None:

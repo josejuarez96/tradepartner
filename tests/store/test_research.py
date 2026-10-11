@@ -965,6 +965,40 @@ def test_a_confirmatory_run_on_a_dataset_that_precedes_it_is_refused(
     ).fetchone() == (True, "sealed_split")
 
 
+def test_a_holdout_repeat_of_a_sealed_split_cannot_claim_sealed_split(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """#1408 (req 7 amendment): `open_run` passes the repeat into the req 7
+    check, so a repeat spend of the sealed split by a registration that does
+    not predate the dataset is `refused_split` with basis `none`."""
+    dates = [date(2018, 3, 1), date(2022, 3, 1)]
+    _dataset(conn, tmp_path, name=e1h.dataset_name, dates=dates, splits=["pilot", "pilot"])
+    research.register_experiment(
+        conn, replace(e1h, splits=("pilot", "test"), budget_configurations=5), "owner"
+    )
+    sealed = _dataset(
+        conn,
+        tmp_path,
+        name=e1h.dataset_name,
+        stem="sealed",
+        dates=dates,
+        splits=["pilot", "test"],
+        periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+        seed=e1h.seed,
+    )
+    first = _open(
+        conn, settings, tmp_path, e1h.slug, sealed.dataset_id, "test", flags=SPEND, reasons=WHY
+    )
+    assert first.refusal is None
+    repeat = _open(
+        conn, settings, tmp_path, e1h.slug, sealed.dataset_id, "test", flags=REPEAT, reasons=WHY
+    )
+    assert repeat.refusal == "refused_split"
+    assert conn.execute(
+        "SELECT confirmatory_basis FROM research_runs WHERE run_id = ?", [repeat.run_id]
+    ).fetchone() == ("none",)
+
+
 def test_a_registration_before_its_dataset_opens_as_predates_dataset(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:
@@ -1240,6 +1274,21 @@ def test_load_dataset_checks_hashes_before_parsing(
 
 
 # --- family_run_count -------------------------------------------------------------------
+
+
+def test_a_failed_run_that_evaluated_more_than_declared_counts_the_evaluated(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """#1408: a run declaring 1 that evaluates 5 records `failed` and raises N by
+    5, the larger of its declared and evaluated configurations."""
+    _gated(conn, settings, e1h)
+    research.register_experiment(conn, _returns(e1h, "r0", window_end=date(2023, 12, 31)), "owner")
+    ds = _dataset(conn, tmp_path)
+    handle = _open(conn, settings, tmp_path, "r0", ds.dataset_id)
+    assert _ok(conn, handle, n_configurations=5) == "failed"
+    exceeded = research.CONFIGURATIONS_EXCEEDED_MESSAGE
+    assert _result(conn, handle.run_id) == ("failed", exceeded, None)
+    assert research.family_run_count(conn, "momentum") == 5
 
 
 def test_family_run_count_sums_ok_and_failed_return_configurations_outside_holdout_spends(

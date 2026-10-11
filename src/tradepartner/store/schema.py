@@ -395,8 +395,8 @@ run's open, the result's close, the decision) and no `ingested_at`,
 (`store.research` exposes inserts and reads only). Schema-level backstops:
 a primary key on each table's own id (on `research_results`, the run id,
 so a run has one result), a `CHECK` on every column the spec enumerates
-(`RESEARCH_ENUMS` and `RESEARCH_STAGES`), `verdict` and a positive
-`n_configurations` on exactly the `ok` results, a positive
+(`RESEARCH_ENUMS` and `RESEARCH_STAGES`), `verdict` on exactly the `ok`
+results and a positive `n_configurations` on every `ok` result, a positive
 `n_configurations_declared`, and req 2's `return` implies `touches_returns`
 implies a `family`. No foreign keys; ids come from `store.research`.
 
@@ -2234,9 +2234,11 @@ CREATE TABLE IF NOT EXISTS research_runs (
 """
 
 # One row per run, the primary key, so a second result for a run raises
-# (req 8). The statistics are NULL unless `ok`; `verdict` is set exactly on an
+# (req 8). The statistics are NULL unless `ok` (a `failed` row from
+# `write_result` keeps `n_configurations`, #1408); `verdict` is set exactly on an
 # `ok` row, computed by code from the interval, and an `ok` row reports at least
-# one evaluated configuration (`family_run_count` sums them into N, req 9).
+# one evaluated configuration (`family_run_count` adds `ok` and `failed` runs to
+# N, req 9 as amended by #1408).
 _CREATE_RESEARCH_RESULTS = f"""
 CREATE TABLE IF NOT EXISTS research_results (
     run_id BIGINT NOT NULL PRIMARY KEY,

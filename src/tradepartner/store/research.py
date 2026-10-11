@@ -759,7 +759,9 @@ def _prior_spends(
 
 
 def _chain_usage(conn: duckdb.DuckDBPyConnection, slug: str) -> tuple[int, int]:
-    """Runs include refusals; configuration budget excludes them (#1408)."""
+    """`(runs, configurations declared)` over every non-synthetic run of `slug`'s
+    amendment chain (req 6, amended #1408): every run counts toward the runs,
+    but a refused run's declaration adds nothing to the configurations."""
     row = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(CASE WHEN x.outcome LIKE 'refused_%' THEN 0 "
         "ELSE r.n_configurations_declared END), 0) FROM research_runs r "
@@ -1038,7 +1040,8 @@ def write_result(
     message: str | None = None,
 ) -> Literal["ok", "failed"]:
     """Record `ok` with a verdict from the interval and return `"ok"`; or record
-    `failed` with no statistics and return `"failed"` when `n_configurations`
+    `failed` with no statistics but the evaluated `n_configurations` and
+    return `"failed"` when `n_configurations`
     exceeds the declaration, the export's hash moved, or the store's latest
     `ingested_at` moved for an `economic` or `return` run (req 8). `secondary`
     holds the declared secondary metrics only."""
@@ -1063,7 +1066,9 @@ def write_result(
         ):
             failure = STORE_CHANGED_MESSAGE
     if failure is not None:
-        _insert_result(conn, handle.run_id, "failed", failure)
+        # The evaluated count is kept on a failed row too: `family_run_count`
+        # adds the larger of it and the declaration to N (#1408).
+        _insert_result(conn, handle.run_id, "failed", failure, n_configurations=n_configurations)
         return "failed"
     verdict = compute_verdict(
         n_clusters,
@@ -1153,14 +1158,16 @@ def record_decision(
 
 
 def family_run_count(conn: duckdb.DuckDBPyConnection, family: str) -> int:
-    """Σ evaluated or declared configurations over `ok`/`failed`, non-synthetic,
-    non-holdout-spending runs
-    of `family` whose registration touches returns, exploratory included: the
-    research share of the family's N (req 9)."""
+    """The research share of the family's N (req 9, amended #1408): over the
+    non-synthetic, non-holdout-spending runs of `family` whose registration
+    touches returns, exploratory included, Σ `n_configurations` of the `ok`
+    runs plus, per `failed` run, the larger of its declared and evaluated
+    configurations (a run that evaluated more than it declared fails)."""
     require_research(conn)
     row = conn.execute(
         "SELECT COALESCE(SUM(CASE WHEN x.outcome = 'failed' "
-        "THEN r.n_configurations_declared ELSE x.n_configurations END), 0) "
+        "THEN GREATEST(r.n_configurations_declared, COALESCE(x.n_configurations, 0)) "
+        "ELSE x.n_configurations END), 0) "
         "FROM research_results x "
         "JOIN research_runs r USING (run_id) "
         "JOIN research_registrations g ON g.registration_id = r.registration_id "
