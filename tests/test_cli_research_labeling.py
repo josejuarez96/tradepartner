@@ -324,7 +324,7 @@ def test_every_command_and_option_exists(s: Settings) -> None:
     for args, options in (
         (("corpus", "fetch", "departure-reason"), ("--since", "--until", "--cik", "--limit")),
         (("research", "frame", "build", "departure-reason"), ("--corpus", "--as-of", "--register")),
-        (("research", "gold"), ("--frame", "--seed", "--n", "--exclude", "--lock")),
+        (("research", "gold"), ("--frame", "--seed", "--n", "--exclude", "--lock", "--extend")),
         (
             ("research", "label"),
             (
@@ -1292,4 +1292,39 @@ def test_gold_lock_on_a_locked_session_prints_its_lock_whatever_the_floor(
     assert again.exit_code == 0, again.output
     assert "gold session locked" in again.output and "text-based 5" in again.output
     assert "left unlocked" not in again.output
+    assert _datasets(s, "departure-reason-gold") == 1
+
+
+# --- research gold --extend (#1492, T167b) ----------------------------------------
+
+
+def test_gold_extend_refuses_other_flags_and_a_missing_session(s: Settings) -> None:
+    for extra in (("--frame", "1"), ("--seed", "7"), ("--lock",)):
+        result = _cli(s, "research", "gold", "--extend", "40", *extra)
+        assert result.exit_code == 2, result.output
+        assert "--extend runs alone" in result.output
+    missing = _cli(s, "research", "gold", "--extend", "40")
+    assert missing.exit_code == 2
+    assert "to lock or extend" in missing.output
+
+
+def test_gold_extend_then_complete_runs_the_floor_check_again(s: Settings, tmp_path: Path) -> None:
+    _pilot_file(s, 7)
+    under = _gold_cli(s, tmp_path, _gold_page(s, []))
+    assert under.exit_code == 0, under.output
+    assert "suggested n 42" in under.output  # 30 + ceil((7 + 5) * 5 / 5)
+    assert not _lock_file(s).exists()
+    seen: list[list[str]] = []
+    extended = _cli(
+        s, "research", "gold", "--extend", str(GOLD_N + 2), launcher=_gold_page(s, seen)
+    )
+    assert extended.exit_code == 0, extended.output
+    assert len(seen) == 1
+    assert (
+        f"gold session extended: n {GOLD_N} -> {GOLD_N + 2}, 2 pilot case(s) added in round 1"
+        in extended.output
+    )
+    assert "  round 1 (2 cases): text 2" in extended.output
+    assert "text-based scorable pilot count 7 (floor 7)" in extended.output
+    assert "gold session locked" in extended.output
     assert _datasets(s, "departure-reason-gold") == 1

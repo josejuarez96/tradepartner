@@ -167,7 +167,10 @@ and `store.registry.code_version`, and prints through the `cli_record` scrub:
   lock only at or above the floor, `primary.min_clusters` of
   `departure-reason-pilot.md` in `research.experiments_dir` (parsed by the
   experiment parser); under it they print the floor and the suggested `n` for
-  an extension and exit 0 unlocked.
+  an extension and exit 0 unlocked. `--extend <n>` (alone, on a complete
+  session) raises the session's overall `n` by the next cases of the same
+  seeded `pilot` permutation (`gold.extend_gold_session`), then opens the page
+  on them; the floor check runs again at completion.
 - `tradepartner research review --run <id> [--finish]` builds or resumes the
   review session of an unfinished batch run (`review.build_review_session`, on
   a read-only connection); `--finish` alone finishes a fully decided session
@@ -2973,6 +2976,13 @@ def make_app(
         lock: Annotated[
             bool, typer.Option("--lock", help="lock a complete session; opens no page")
         ] = False,
+        extend: Annotated[
+            int | None,
+            typer.Option(
+                "--extend",
+                help="the new overall n of a complete session under the floor (#1492)",
+            ),
+        ] = None,
     ) -> None:
         """Label the gold sample on the local review page: build the session, or resume
         it with no flags; the session is locked once every case is answered."""
@@ -2980,6 +2990,8 @@ def make_app(
         given = any(v is not None for v in (frame, seed, n, exclude, seeds))
         if lock and given:
             raise _fail("--lock runs alone, on the existing session", USAGE_ERROR)
+        if extend is not None and (given or lock):
+            raise _fail("--extend runs alone, on the existing session", USAGE_ERROR)
         path = gold.session_path(s)
         try:
             if not path.with_name("lock.json").exists():
@@ -2988,8 +3000,18 @@ def make_app(
                 session = gold.open_gold_session(
                     path, gold.GoldFlags(frame, seed, n, exclude, seeds), settings=s
                 )
-            elif lock:
-                raise _fail(f"no gold session at {path} to lock", USAGE_ERROR)
+                if extend is not None:
+                    before = session.n
+                    extended = gold.extend_gold_session(session, extend)
+                    session = extended.session
+                    typer.echo(
+                        f"gold session extended: n {before} -> {session.n}, "
+                        f"{len(extended.added)} pilot case(s) added in round "
+                        f"{extended.draw_round}, {len(extended.flipped)} seed(s) now in the "
+                        "random draw"
+                    )
+            elif lock or extend is not None:
+                raise _fail(f"no gold session at {path} to lock or extend", USAGE_ERROR)
             else:
                 if frame is None or seed is None or exclude is None or seeds is None:
                     raise _fail(
