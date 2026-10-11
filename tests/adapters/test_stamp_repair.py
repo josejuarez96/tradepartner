@@ -60,6 +60,14 @@ def test_shift_adds_the_offset_on_the_stamps_date() -> None:
     assert shift_stamp(_utc(2026, 11, 2, 16, 5)) == _utc(2026, 11, 2, 21, 5)
 
 
+def test_shift_uses_the_offset_at_the_wall_clock_time_on_a_dst_sunday() -> None:
+    # 2026-03-08 01:30 New York was still EST; 03:30 was EDT.
+    assert shift_stamp(_utc(2026, 3, 8, 1, 30)) == _utc(2026, 3, 8, 6, 30)
+    assert shift_stamp(_utc(2026, 3, 8, 3, 30)) == _utc(2026, 3, 8, 7, 30)
+    # 2026-11-01 00:30 New York was still EDT.
+    assert shift_stamp(_utc(2026, 11, 1, 0, 30)) == _utc(2026, 11, 1, 4, 30)
+
+
 def test_shift_refuses_a_naive_stamp() -> None:
     with pytest.raises(ValueError):
         shift_stamp(datetime(2026, 3, 6, 16, 5))  # noqa: DTZ001
@@ -99,6 +107,13 @@ def test_weekend_and_holiday_stamps_prove_nothing() -> None:
     assert not is_provably_early(
         thanksgiving, date(2026, 11, 27), holidays=frozenset({date(2026, 11, 26)})
     )
+
+
+def test_good_friday_is_an_edgar_business_day() -> None:
+    # Good Friday 2026-04-03: NYSE is closed, EDGAR is open. 10:00 New York
+    # (EDT) indexed Monday 04-06 is provably early with EDGAR's holidays.
+    good_friday = _utc(2026, 4, 3, 14, 0)
+    assert is_provably_early(good_friday, date(2026, 4, 6), holidays=frozenset({date(2026, 1, 1)}))
 
 
 def test_rule_reads_the_new_york_date_not_the_utc_date() -> None:

@@ -25,7 +25,7 @@ import math
 import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Literal, get_args
 from zoneinfo import ZoneInfo
 
@@ -80,11 +80,16 @@ def ny_utc_offset(day: date) -> timedelta:
 def shift_stamp(stamp: datetime) -> datetime:
     """Return the repaired stamp for an early stamp: ``stamp`` plus the offset.
 
-    An early stamp is New York wall clock labelled UTC, so its UTC date is the
-    wall-clock date, and the offset is New York's on that date.
+    An early stamp is New York wall clock labelled UTC, so the repair reads
+    its wall clock as New York time and converts it to UTC. That is the stamp
+    plus New York's offset at that wall-clock time, which equals
+    ``ny_utc_offset`` on the stamp's date except in the 00:00-02:00 hours of a
+    DST-change Sunday (EDGAR is closed then); a wall time in the skipped
+    spring-forward hour takes the pre-change (EST) offset.
     """
     utc = ensure_tz_aware_utc(stamp, field_name="stamp")
-    return utc + ny_utc_offset(utc.date())
+    wall = utc.replace(tzinfo=_NEW_YORK, fold=0)
+    return wall.astimezone(UTC)
 
 
 def is_provably_early(
@@ -97,7 +102,10 @@ def is_provably_early(
     """Return True when the filing-date rule proves ``stamp`` early.
 
     A stamp before ``cutoff`` New York time on a business day (a weekday not
-    in ``holidays``) dates the filing to that same day. If the index (filing)
+    in ``holidays``) dates the filing to that same day. ``holidays`` are the
+    days EDGAR is closed (federal holidays and announced closures), never the
+    NYSE calendar: EDGAR is open on Good Friday, so passing exchange holidays
+    would hide early stamps from that day. If the index (filing)
     date is a later day, the true acceptance came later, so the stamp is early.
     A stamp on or after the cutoff, or on a non-business day, proves nothing.
     """
