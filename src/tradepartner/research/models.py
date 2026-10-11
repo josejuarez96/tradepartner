@@ -2,9 +2,11 @@
 
 Research-labeling spec req 7 (the call), req 8 and ADR 0013 point 3 (e) (the zero
 default), req 17 (the key), as the amendment of 2026-10-06 reads them (C4, C8, C9).
-This is the one module that names the vendor's host (through
-`research.labeling.api_base_url`) and reads `Settings.typesafe_api_key`
-(`TYPESAFE_API_KEY`), and only `tradepartner.research.labeling.job` imports it
+This is the one module that names either model vendor's host (through
+`research.labeling.api_base_url` or `research.claude.api_base_url`) and reads
+`Settings.typesafe_api_key` (`TYPESAFE_API_KEY`) or
+`Settings.research_claude_api_key` (`RESEARCH_CLAUDE_API_KEY`); only
+`tradepartner.research.labeling.job` imports it
 (ADR 0013 point 3 (b) and (c); `tests/test_llm_boundary.py`).
 
 - **`build_client(settings, handle)`** refuses without an open `RunHandle`
@@ -30,13 +32,17 @@ This is the one module that names the vendor's host (through
   been billed, so the job records it); a key that cannot go in a header raises
   `ModelKeyInvalid` at construction; connection errors on every attempt raise
   `ModelUnreachable` (nothing was sent, so nothing was billed).
+- **`build_claude_client(settings, handle)`** uses the same run gate and stays disabled
+  until the two research ceilings, Claude's own ceiling and its separate key are set.
+  `ClaudeModelClient` sends a closed-choice Messages request, retries only 429, 529
+  and pre-send connection errors, and keeps a billed invalid response as a record.
 - **`ModelResponse`** is frozen and carries what the inference record (C8) needs from
   the call: `raw_request` is the body exactly as sent and holds no header, so the
   key is in no record. A returned model id that differs from the requested one is
   reported, not refused: stopping the batch on it is the job's rule (req 6 step 4).
 
-The key is a `SecretStr`; its value is read only when the header is built, and no
-message, `repr` or record here contains it.
+Each key is a `SecretStr`; no message, `repr` or record here contains a key.
+Claude additionally redacts a key echoed in a vendor response before making a record.
 """
 
 from __future__ import annotations
@@ -578,6 +584,7 @@ def make_claude_response(
         if (
             not isinstance(answer, dict)
             or set(answer) != {"departure_reason"}
+            or not isinstance(answer["departure_reason"], str)
             or answer["departure_reason"] not in request.criteria
         ):
             raise _Malformed("answer outside the option set")
@@ -633,8 +640,7 @@ class ClaudeModelClient:
         check_claude_model_id(request.model)
         raw = json.dumps(claude_request_body(request, self._config), ensure_ascii=False)
         content = raw.encode("utf-8")
-        secret = self._api_key.get_secret_value().strip()
-        safe_raw = raw.replace(secret, "[redacted]")
+        safe_raw = raw.replace(self._api_key.get_secret_value().strip(), "[redacted]")
         for attempt in range(1, self._config.max_attempts + 1):
             started = time.monotonic()
             try:
@@ -642,7 +648,7 @@ class ClaudeModelClient:
                     f"{self._config.api_base_url.rstrip('/')}/{CLAUDE_ENDPOINT}",
                     content=content,
                     headers={
-                        "x-api-key": secret,
+                        "x-api-key": self._api_key.get_secret_value().strip(),
                         "anthropic-version": self._config.anthropic_version,
                         "Content-Type": "application/json",
                     },
@@ -685,7 +691,9 @@ class ClaudeModelClient:
                 request,
                 raw_request=safe_raw,
                 http_status=status,
-                raw_response=response.text.replace(secret, "[redacted]"),
+                raw_response=response.text.replace(
+                    self._api_key.get_secret_value().strip(), "[redacted]"
+                ),
                 attempts=attempt,
                 latency_ms=_elapsed_ms(started),
             )

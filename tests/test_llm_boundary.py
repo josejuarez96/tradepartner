@@ -1362,3 +1362,21 @@ def test_e_claude_default_is_disabled_and_handle_required(monkeypatch: pytest.Mo
         client.label(None)
     assert settings.research.claude.spend_ceiling_usd_total == 0.0
     assert settings.research_claude_api_key is None
+
+
+@pytest.mark.usefixtures("no_httpx_client")
+def test_e_claude_zero_ceiling_overrides_key_and_global_ceilings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = _models()
+    settings = _settings(
+        monkeypatch,
+        {
+            "RESEARCH__SPEND_CEILING_USD_MONTH": "40",
+            "RESEARCH__SPEND_CEILING_USD_TOTAL": "40",
+            "RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL": "0",
+            "RESEARCH_CLAUDE_API_KEY": "synthetic-token",
+        },
+    )
+    assert isinstance(models.build_claude_client(settings, _handle()), models.DisabledModelClient)
+    assert isinstance(models.build_client(settings, _handle()), models.DisabledModelClient)

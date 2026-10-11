@@ -729,6 +729,14 @@ def test_claude_requires_all_ceilings_and_its_own_key(clean_env: None) -> None:
     for section, key in [
         ({}, None),
         ({"spend_ceiling_usd_month": 40, "spend_ceiling_usd_total": 40}, None),
+        (
+            {
+                "spend_ceiling_usd_month": 40,
+                "spend_ceiling_usd_total": 40,
+                "claude": {"spend_ceiling_usd_total": 0},
+            },
+            KEY,
+        ),
         ({"spend_ceiling_usd_month": 40, "claude": {"spend_ceiling_usd_total": 15}}, KEY),
         ({"spend_ceiling_usd_total": 40, "claude": {"spend_ceiling_usd_total": 15}}, KEY),
     ]:
@@ -746,6 +754,16 @@ def test_claude_requires_all_ceilings_and_its_own_key(clean_env: None) -> None:
         research_claude_api_key=KEY,
     )
     assert isinstance(models.build_claude_client(settings, _handle()), models.ClaudeModelClient)
+    claude_only = Settings(
+        _env_file=None,
+        research={
+            "spend_ceiling_usd_month": 40,
+            "spend_ceiling_usd_total": 40,
+            "claude": {"spend_ceiling_usd_total": 15},
+        },
+        research_claude_api_key=KEY,
+    )
+    assert isinstance(models.build_client(claude_only, _handle()), models.DisabledModelClient)
 
 
 def test_claude_request_and_parse(clean_env: None) -> None:
@@ -828,7 +846,8 @@ def test_claude_refusal_and_invalid_block(clean_env: None) -> None:
     assert raised.value.response.reason == "refused"
 
 
-def test_claude_id_key_and_retry(clean_env: None) -> None:
+@pytest.mark.parametrize("retry_status", [429, 529])
+def test_claude_id_key_and_retry(clean_env: None, retry_status: int) -> None:
     from research.fake_model_client import ClaudeAnswer, ClaudeTimeout, ScriptedClaudeClient
 
     for model in (
@@ -861,7 +880,7 @@ def test_claude_id_key_and_retry(clean_env: None) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         sends.append(req)
         if len(sends) == 1:
-            return httpx.Response(429, headers={"Retry-After": "0"})
+            return httpx.Response(retry_status, headers={"Retry-After": "0"})
         return httpx.Response(
             200,
             json={
@@ -949,3 +968,28 @@ def test_claude_echoed_key_is_absent_from_invalid_record(clean_env: None) -> Non
     assert KEY not in raised.value.response.raw_request
     assert KEY not in raised.value.response.raw_response
     assert KEY not in str(raised.value)
+
+
+def test_claude_unhashable_answer_keeps_billed_record(clean_env: None) -> None:
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "model": "claude-sonnet-5-5",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": '{"departure_reason":[]}'}],
+                    "usage": {"input_tokens": 100, "output_tokens": 4},
+                },
+            )
+        ),
+    )
+    with pytest.raises(models.ModelResponseInvalid) as raised:
+        client.label(_request("claude-sonnet-5-5"))
+    record = raised.value.response
+    assert (record.reason, record.input_tokens, record.output_tokens) == ("refused", 100, 4)
+    assert models.claude_call_cost_usd(
+        _request("claude-sonnet-5-5"), record, Settings(_env_file=None).research.claude
+    ) == pytest.approx((100 * 2 + 4 * 10) / 1_000_000)

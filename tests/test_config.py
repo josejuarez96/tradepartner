@@ -2084,8 +2084,12 @@ def test_research_claude_defaults_env_and_redaction(monkeypatch: pytest.MonkeyPa
 def test_research_claude_https_and_thinking_validation() -> None:
     from pydantic import ValidationError
 
-    from tradepartner.config import Settings
+    from tradepartner.config import ResearchClaudeConfig
 
-    for value in ({"api_base_url": "http://example.test"}, {"thinking": "disabled"}):
-        with pytest.raises(ValidationError):
-            Settings(_env_file=None, research={"claude": value})
+    for value, field in (
+        ({"api_base_url": "http://example.test"}, "api_base_url"),
+        ({"thinking": "disabled"}, "thinking"),
+    ):
+        with pytest.raises(ValidationError) as raised:
+            ResearchClaudeConfig(**value)
+        assert raised.value.errors()[0]["loc"] == (field,)
