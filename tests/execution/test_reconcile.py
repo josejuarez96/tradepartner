@@ -910,6 +910,42 @@ def test_an_own_open_order_of_another_shape_differs_from_its_row(shape: dict[str
     assert mismatch.detail.startswith("refused_order_shape: ")
 
 
+@pytest.mark.parametrize("journaled", [0.0, 5.0], ids=["fills_lagging", "fills_journaled"])
+@pytest.mark.parametrize("status", [OrderStatus.FILLED, OrderStatus.ACCEPTED])
+def test_an_own_order_of_another_shape_off_the_open_list_is_a_mismatch(
+    journaled: float, status: OrderStatus
+) -> None:
+    """#1293 (owner 2026-10-10): a journal-open order the broker no longer
+    lists open, whose `get_order` reading is not the market day order (a
+    limit order that filled before reconciliation), is `order_differs`,
+    never reconciled; its terminal reading no longer exempts it. The default
+    shape still reconciles (lagging, or `missing_open_order` when the reading
+    is not terminal)."""
+    item = _lagging_buy(5.0, journaled)
+    item = replace(item, reading=replace(item.reading, status=status))  # type: ignore[arg-type]
+    shaped = replace(
+        item,
+        reading=replace(item.reading, order_type="limit", limit_price=99.0),  # type: ignore[arg-type]
+    )
+
+    def run(entry: JournalOpenOrder) -> Reconciliation:
+        return _run(
+            _ledger(1_000.0 - journaled * 100.0, SEC_A=10.0 + journaled),
+            _positions(AAA=15.0),
+            500.0,
+            journal_open=[entry],
+        )
+
+    expected = [] if status is OrderStatus.FILLED else ["missing_open_order"]
+    assert _kinds(run(item)) == expected
+    result = run(shaped)
+    assert result.status == "mismatch"
+    assert _kinds(result) == [*expected, "order_differs"]
+    (mismatch,) = [m for m in result.mismatches if m.kind == "order_differs"]
+    assert mismatch.detail.startswith("refused_order_shape: ")
+    assert mismatch.client_order_id == "tp-20261007-SEC_A-buy-1"
+
+
 def test_inputs_that_cannot_be_compared_raise() -> None:
     row = _order_row("tp-20261007-SEC_A-buy-1", "SEC_A", "buy", notional=100.0)
     item = JournalOpenOrder(
