@@ -927,6 +927,36 @@ def test_a_delisted_name_the_broker_no_longer_lists_is_skipped_not_a_breach() ->
     assert _skip_reasons(_check(orders, assets=assets)) == {7: "skip_delisted"}
 
 
+def test_a_forced_exit_of_a_delisted_name_missing_from_the_asset_read_halts() -> None:
+    """#410: `Broker.assets` answers every requested symbol or raises (the Alpaca
+    adapter raises on a short answer and on a 404), so a forced exit whose asset
+    is absent means the read broke its contract: `asset_missing`, fail-closed,
+    never an `untradable` residue guessed from `listing_ended`."""
+    assets = {k: v for k, v in _ASSETS.items() if k != "A"}
+    orders = [_order("A", "sell", 7, quantity=1.0, decision="forced_exit", listing_ended=True)]
+    assert _rules(_check(orders, assets=assets)) == {"asset_missing"}
+
+
+def test_a_forced_exit_of_a_delisted_name_the_broker_answers_untradable_is_a_residue() -> None:
+    """#410, spec req 14: a delisted name the broker answers as not tradable
+    (Alpaca's inactive asset) ends as an `untradable` skip, no order, no halt."""
+    inactive = Asset(tradable=False, fractionable=False, status="inactive", cusip=None)
+    orders = [
+        _order(
+            "A",
+            "sell",
+            7,
+            quantity=1.0,
+            decision="forced_exit",
+            full_exit=True,
+            listing_ended=True,
+        )
+    ]
+    result = _check(orders, assets={**_ASSETS, "A": inactive})
+    assert _skip_reasons(result) == {7: "untradable"}
+    assert result.orders == ()  # type: ignore[union-attr]
+
+
 def test_the_sell_sum_uses_the_holding_rounded_down() -> None:
     ledger = _ledger(A=1.239)
     orders = [_order("A", "sell", 1, quantity=0.62)]
