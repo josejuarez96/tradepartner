@@ -2646,7 +2646,7 @@ class TestAlpacaPriceSource:
         actions = source.corporate_actions(["P", "C"], date(2020, 10, 1), date(2020, 10, 31))
         assert actions == []
         assert source.last_actions_report is not None
-        assert [a.action_type for a in source.last_actions_report.actions] == [ActionType.SPINOFF]
+        assert source.last_actions_report.actions == ()
         changes = source.symbol_changes(["P"], date(2020, 10, 1), date(2020, 10, 31))
         assert len(changes) == 1 and changes[0].security_id == "P"
         assert len(calls) == 2
@@ -2680,7 +2680,9 @@ class TestAlpacaPriceSource:
             ("SEC_MSFT", "dividend", date(2020, 8, 19)),
         ]
         assert source.last_actions_report is not None
-        assert any(a.action_type is ActionType.SPINOFF for a in source.last_actions_report.actions)
+        assert all(
+            a.action_type is not ActionType.SPINOFF for a in source.last_actions_report.actions
+        )
 
     def test_malformed_name_change_does_not_fail_daily_actions(self) -> None:
         recorded = _Recorded()
@@ -2696,6 +2698,26 @@ class TestAlpacaPriceSource:
             ("dividend", date(2020, 8, 7)),
             ("split", date(2020, 8, 31)),
         ]
+
+    def test_malformed_spinoff_does_not_fail_daily_split(self) -> None:
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "forward_splits": [
+                    {
+                        "symbol": "AAPL",
+                        "ex_date": "2020-08-31",
+                        "old_rate": 1,
+                        "new_rate": 4,
+                    }
+                ],
+                "spin_offs": [{}],
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
 
     def test_actions_processed_after_the_window_are_kept(self) -> None:
         # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.

@@ -2085,7 +2085,7 @@ class AlpacaPriceSource(PriceSource):
             for category, rows in self._fetch_actions(
                 symbols, start - self._lag, end + self._lag
             ).items()
-            if category != "name_changes"
+            if category not in ("name_changes", "spin_offs")
         }
         parsed = parse_corporate_actions(
             payload,
