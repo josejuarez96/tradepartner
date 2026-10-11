@@ -16,7 +16,9 @@ In order:
    is opened `synthetic=True`; `RegistryTooLarge` when the store file exceeds
    `lab.registry_size_refuse_gb` (a warning above `lab.registry_size_warn_gb`);
    `NoCodeVintage` outside a git checkout, where no trial could ever be current;
-   an unknown slug; `--rerun` on an incomplete sweep
+   an unknown slug; `sweep.DefaultWindowOverlapError` when a variant's default
+   in-sample window reads another family's holdout months (#1441); `--rerun` on an
+   incomplete sweep
    (`lab_queries.SweepNotCompleteError`). The CLI never passes `store_path`.
 2. **Plan and open the run.** `lab_queries.plan_run` lists the variants (the
    synthetic trials' plan under `store_path`, #1218), and the run's
@@ -100,6 +102,7 @@ import duckdb
 
 from tradepartner import calendar
 from tradepartner.backtest import engine, quiet
+from tradepartner.backtest import sweep as lab_sweep
 from tradepartner.backtest.engine import BacktestResult, SharedReadFailed
 from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide, gap_sessions
 from tradepartner.backtest.hypothesis import load_frozen
@@ -300,6 +303,20 @@ def _refuse_size(conn: duckdb.DuckDBPyConnection, live: Settings) -> list[str]:
     return []
 
 
+def _refuse_exam_overlap(conn: duckdb.DuckDBPyConnection, sweep: SweepRecord) -> None:
+    """#1441: `sweep.DefaultWindowOverlapError` when a variant's default in-sample
+    window, under the development boundary read now, reads another family's holdout
+    months (`sweep.exam_overlap_refusal`)."""
+    boundary = registry.boundary_date(conn)
+    windows = [
+        lab_queries.default_window(conn, variant.hypothesis_id, sweep.sweep_id, boundary)
+        for variant in lab_registry.sweep_variants(conn, sweep.sweep_id)
+    ]
+    reason = lab_sweep.exam_overlap_refusal(conn, sweep.family, windows)
+    if reason is not None:
+        raise lab_sweep.DefaultWindowOverlapError(f"sweep {sweep.slug!r}: {reason}")
+
+
 def _measured(conn: duckdb.DuckDBPyConnection, sweep_id: int) -> dict[Cadence, float | None]:
     """The measured seconds per variant by cadence, a non-positive mean (a run
     faster than the clock's resolution) read as no measurement."""
@@ -323,6 +340,7 @@ def run_sweep(
     Raises, before any row is written: `LabNotInitialised`,
     `registry.UnmarkedStoreRefused` (a `store_path` without the fixture marker),
     `RegistryTooLarge`, `NoCodeVintage`, `LabRegistryError` for an unknown slug,
+    `sweep.DefaultWindowOverlapError` (#1441),
     `lab_queries.SweepNotCompleteError` for `rerun` on an incomplete sweep, and
     `ValueError` for a non-positive budget.
     """
@@ -350,8 +368,10 @@ def run_sweep(
                 "run_sweep refuses every unmarked store"
             )
         warnings = _refuse_size(conn, live)
-        if lab_registry.sweep_by_slug(conn, slug) is None:
+        registered = lab_registry.sweep_by_slug(conn, slug)
+        if registered is None:
             raise LabRegistryError(f"no sweep is registered as {slug!r}")
+        _refuse_exam_overlap(conn, registered)
     code_vintage = registry.code_tree_sha256()
     if code_vintage is None:
         raise NoCodeVintage("no code vintage outside a git checkout; run from the repo")
