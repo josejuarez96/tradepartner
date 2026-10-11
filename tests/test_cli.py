@@ -25,7 +25,7 @@ from tradepartner.adapters.prices import PriceSource
 from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, NamedSecurity
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
-from tradepartner.ingest import FAILED, OK, STALE, IngestResult, SourceRun
+from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, SourceRun
 from tradepartner.store import journal, registry
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.schema import init_schema
@@ -270,6 +270,71 @@ def test_ingest_refuses_statement_flags_where_they_cannot_apply(
     result = _invoke(settings, ["ingest", *args])
     assert result.exit_code == 2, result.output
     assert session.calls == [] and filled.calls == []
+
+
+def _manifest(
+    tmp_path: Path, header: str = "cik,accession,old_stamp,new_stamp,method,evidence"
+) -> Path:
+    path = tmp_path / "manifest.csv"
+    path.write_text(
+        f"{header}\n0000000001,0000000001-19-000001,2019-03-01T16:30:00+00:00,"
+        "2019-03-01T21:30:00+00:00,shift,class early\n"
+    )
+    return path
+
+
+def test_ingest_restamp_from_reads_the_manifest_and_prints_refused_ciks(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, tmp_path: Path
+) -> None:
+    """#1382 (T166b): the manifest reaches `ingest_session` as changes, and
+    the restamp's counts and every refused CIK are printed."""
+    calls: list[dict[str, Any]] = []
+
+    def session(settings: Settings, **kwargs: Any) -> IngestResult:
+        calls.append(kwargs)
+        kwargs["on_restamp"](
+            RestampResult(moved={"securities": 2}, refused={"0000000002": "listings"}, changes=1)
+        )
+        return _ok("edgar")
+
+    monkeypatch.setattr(cli, "ingest_session", session)
+    path = _manifest(tmp_path)
+    result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--restamp-from", str(path)])
+    assert result.exit_code == 0, result.output
+    (change,) = calls[0]["restamp"]
+    assert change.cik == "0000000001" and change.changed
+    assert "moved securities 2; refused 1" in result.output
+    assert "restamp refused 0000000002: listings" in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],  # --source all
+        ["--source", "alpaca"],
+        ["--source", "edgar", "--backfill", "--since", "2016-01-04"],
+    ],
+)
+def test_ingest_refuses_restamp_from_outside_an_edgar_session(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, tmp_path: Path, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    filled = _patched(monkeypatch, "backfill", _ok("edgar"))
+    path = _manifest(tmp_path)
+    result = _invoke(secrets_set, ["ingest", *args, "--restamp-from", str(path)])
+    assert result.exit_code == 2, result.output
+    assert session.calls == [] and filled.calls == []
+
+
+def test_ingest_refuses_a_manifest_missing_a_column(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, tmp_path: Path
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    path = _manifest(tmp_path, header="cik,accession,old_stamp,stamp,method,evidence")
+    result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--restamp-from", str(path)])
+    assert result.exit_code == 2, result.output
+    assert "new_stamp" in result.output
+    assert session.calls == []
 
 
 def test_ingest_refuses_an_unknown_source(secrets_set: Settings) -> None:

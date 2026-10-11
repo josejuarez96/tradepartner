@@ -127,10 +127,23 @@ every row in the same transaction and records the counts before and after.
 The counts go into the run message as `filing_events_<name>: N`
 (`health.filing_event_counts`), with the adapter's `unstamped`,
 `items_missing` and `clock_suspect` counts where the source exposes them.
+
+**Restamp** (#1382, plan T166b). A plain ingest never moves a stored
+filing stamp: after the stamps cache is repaired, the builder's row at the
+new stamp has the stored row's values, so the revision rule above skips it
+and the row stays at the old `known_at`. `restamp` (CLI `ingest --source
+edgar --restamp-from <manifest>`) moves those rows by UPDATE, never a delete
+and re-insert, in the EDGAR chunk's transaction before the day's rows are
+written: `restamp_from_manifest` has the matching rule, the refusals and the
+paper-window abort. A manifest may cover any subset of CIKs; a rerun finds
+no row at its old stamps and moves nothing. `statement_facts` follow
+through `rebuild_statement_facts`, `filing_events` through
+`rebuild_filing_events`.
 """
 
 from __future__ import annotations
 
+import csv
 import re
 import time
 import traceback
@@ -142,6 +155,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -159,7 +173,13 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.calendar import last_completed_session, previous_session
+from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
+from tradepartner.calendar import (
+    is_session,
+    last_completed_session,
+    next_session,
+    previous_session,
+)
 from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
 from tradepartner.store.asof import _validate_t
@@ -176,13 +196,15 @@ from tradepartner.store.db import (
     utc_now,
 )
 from tradepartner.store.delistings import (
+    _DEFAULT_EFFECTIVE_DAYS,
     DELISTED,
     LISTED,
     TRANSFERRED,
     build_delistings,
     listing_ends_as_of,
 )
-from tradepartner.store.master import MasterBuild, build_master, securities_as_of
+from tradepartner.store.journal import CLOSING_STOP_STATES
+from tradepartner.store.master import MasterBuild, build_master, securities_as_of, session_of
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -199,6 +221,8 @@ SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE)
 FACT_NAMES: dict[str, str] = {"EntityCommonStockSharesOutstanding": SHARES_FACT}
 
 Row = dict[str, Any]
+
+_NEW_YORK = ZoneInfo("America/New_York")
 
 #: Per table: the natural key an as-of read collapses on, and the value
 #: columns whose change makes a new row.
@@ -280,6 +304,8 @@ def ingest_session(
     dry_run: bool = False,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    restamp: Sequence[ManifestRow] | None = None,
+    on_restamp: Callable[[RestampResult], None] | None = None,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
     `all`); see the module docstring. `clock` gives the run's instant, used
@@ -289,7 +315,14 @@ def ingest_session(
     in the EDGAR chunk's transaction; it needs the switch on and the EDGAR
     source (`ValueError` otherwise, before anything runs).
     `rebuild_filing_events` (#1358) does the same for `filing_events`, under
-    the same two conditions on `edgar.filing_events_enabled`."""
+    the same two conditions on `edgar.filing_events_enabled`.
+    `restamp` (#1382, T166b) moves the stored stamps a stamps-repair
+    manifest repairs (`restamp_from_manifest`) in the EDGAR chunk's
+    transaction, before that day's rows are written; it needs `source`
+    `edgar`. `on_restamp` receives its `RestampResult` (after a dry run too,
+    though nothing is kept)."""
+    if restamp is not None and source != "edgar":
+        raise ValueError("restamp needs the edgar source")
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
@@ -312,6 +345,8 @@ def ingest_session(
             run_id,
             rebuild_statement_facts=rebuild_statement_facts,
             rebuild_filing_events=rebuild_filing_events,
+            restamp=restamp,
+            on_restamp=on_restamp,
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
@@ -707,6 +742,8 @@ def _ingest_filings(
     *,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    restamp: Sequence[ManifestRow] | None = None,
+    on_restamp: Callable[[RestampResult], None] | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -726,6 +763,20 @@ def _ingest_filings(
         _fetch_and_gate(recorded, settings)
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     master, delistings, classes, facts, unmatched = _build_filings(recorded, settings, now)
+    restamped = ""
+    if restamp is not None:
+        result = restamp_from_manifest(
+            conn, restamp, ingested_at=now, delistings=recorded.delistings()
+        )
+        restamped = result.message()
+        if on_restamp is not None:
+            on_restamp(result)
+        refused_cik = {cik for cik in result.refused}
+        skipped = result.refused_securities | {
+            row["security_id"] for row in master.securities if row["cik"] in refused_cik
+        }
+    else:
+        skipped = frozenset()
     added = 0
     for table, rows in (
         ("securities", master.securities),
@@ -734,7 +785,10 @@ def _ingest_filings(
         ("classifications", classes.classifications),
         ("facts", facts),
     ):
-        added += _add_rows(conn, table, rows, ingested_at=now, current=False)
+        # A refused CIK's rows stay as stored: the repaired cache would add
+        # rows at the new stamps beside them (#1382, an owner decision).
+        kept = [row for row in rows if row["security_id"] not in skipped] if skipped else rows
+        added += _add_rows(conn, table, kept, ingested_at=now, current=False)
     statements = ""
     if settings.edgar.statement_facts_enabled:
         tally = _write_statement_facts(
@@ -766,7 +820,7 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{_source_counts(filings)}; "
+        f"{statements}{events}{restamped}{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
@@ -861,6 +915,308 @@ def _build_filings(
 def _issuer_ciks(master: MasterBuild) -> list[str]:
     """The issuer CIKs the facts and statement facts are asked for, sorted."""
     return sorted({row["cik"] for row in master.securities if not row["benchmark"]})
+
+
+# --- The store restamp from a stamps-repair manifest (#1382, plan T166b) ---
+
+#: The fact tables the restamp moves, in write order.
+RESTAMP_TABLES: tuple[str, ...] = (
+    "securities",
+    "listings",
+    "classifications",
+    "facts",
+    "delistings",
+)
+
+#: A manifest CIK as the store keeps it: ten digits, zero-padded.
+_MANIFEST_CIK = re.compile(r"\d{10}")
+
+
+def read_manifest(path: Path) -> list[ManifestRow]:
+    """The rows of the stamps-repair manifest at `path` (a CSV with
+    T166's `MANIFEST_COLUMNS` as its header), each parsed by
+    `ManifestRow.from_record`. Raises `ValueError` on a missing
+    column, a short row, a CIK that is not ten digits or a naive stamp,
+    before anything is written."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = [f for f in MANIFEST_COLUMNS if f not in (reader.fieldnames or ())]
+        if missing:
+            raise ValueError(f"{path}: manifest lacks column(s) {', '.join(missing)}")
+        changes: list[ManifestRow] = []
+        for line, record in enumerate(reader, start=2):
+            if any(record.get(f) is None for f in MANIFEST_COLUMNS):
+                raise ValueError(f"{path}:{line}: a row with too few fields")
+            cik = record["cik"]
+            if not _MANIFEST_CIK.fullmatch(cik):
+                raise ValueError(f"{path}:{line}: cik must be 10 digits, got {cik!r}")
+            changes.append(ManifestRow.from_record(record))
+        return changes
+
+
+class RestampAborted(ValueError):
+    """A manifest change touches an open paper window: nothing is written
+    (data-releases runbook, rule 5)."""
+
+
+@dataclass(frozen=True)
+class RestampResult:
+    """What one restamp did: `moved` rows per table, the CIKs it `refused`
+    (security CIK -> why; none of their rows moved, an owner decision on
+    #1382), the number of manifest rows that change a stamp, and the stored
+    `security_id`s of the refused CIKs (the run writes none of their rows)."""
+
+    moved: Mapping[str, int]
+    refused: Mapping[str, str]
+    changes: int
+    refused_securities: frozenset[str] = frozenset()
+
+    def message(self) -> str:
+        """The run message's restamp part."""
+        moved = ", ".join(f"{t} {self.moved.get(t, 0)}" for t in RESTAMP_TABLES)
+        refused = ", ".join(f"{cik} ({why})" for cik, why in sorted(self.refused.items()))
+        return (
+            f"; restamp: {self.changes} changes, moved {moved}; "
+            f"refused {len(self.refused)} CIKs{': ' + refused if refused else ''}"
+        )
+
+
+def _ny_date(instant: datetime) -> date:
+    return instant.astimezone(_NEW_YORK).date()
+
+
+def window_first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
+    """The earliest first session of any open paper window (one with no
+    `closed` or `abandoned` stop): the XNYS session on or after its
+    `started_at`'s New York date. None when no window is open."""
+    started = conn.execute(
+        "SELECT min(started_at) FROM paper_windows WHERE window_id NOT IN "
+        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
+        [list(CLOSING_STOP_STATES)],
+    ).fetchone()
+    if started is None or started[0] is None:
+        return None
+    day = _ny_date(ensure_tz_aware_utc(started[0], field_name="started_at"))
+    return day if is_session(day) else next_session(day)
+
+
+#: The rows a restamp may move in every table: EDGAR-sourced, `filing`
+#: provenance, never a row stamped at its own ingest (a revision or a
+#: retraction stamped at `ingested_at`).
+_RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <> t.ingested_at"
+
+
+def restamp_from_manifest(
+    conn: duckdb.DuckDBPyConnection,
+    changes: Sequence[ManifestRow],
+    *,
+    ingested_at: datetime,
+    delistings: Iterable[DelistingFiling],
+) -> RestampResult:
+    """Move the stored stamps the manifest `changes` repair, inside the
+    caller's transaction; never a delete and re-insert.
+
+    **One matching rule.** A row moves with a change (stamps-file CIK `C`,
+    accession `A`, old -> new) when its `known_at` is the old stamp and it
+    belongs to a CIK whose rows `A`'s stamp is written on: `C` itself (a
+    company's own filings stamp its own `securities`, `listings`,
+    `classifications` and `facts` rows), and, when `A` is a Form 25 or
+    25-NSE in `delistings` (the source's records), that filing's subject
+    company, whose relisting or successor rows can carry the Form 25's stamp
+    (master's `_event`) though the stamp is read from the exchange's stamps
+    file. A `delistings` row moves only with its own accession: the subject,
+    form, class title and exchange of `A`'s record, and `filed_at` equal to
+    the old stamp. Only EDGAR `filing` rows not stamped at their own
+    `ingested_at` move (`_RESTAMPABLE`); retractions and snapshot rows never
+    do. A moved row gets the new stamp as `known_at` (and as `filed_at`, a
+    delisting's stamp) and `ingested_at` as its `ingested_at`; nothing else
+    changes.
+
+    **Refused CIKs**, by the matched rows' security CIK (none of the CIK's
+    rows move; listed in the result): a change moving a date a column was
+    derived from (a matched `listings` row when the acceptance's session
+    moves, as `valid_from` is that session; a successor `securities` id
+    `<cik>@<session>` likewise; a matched `facts` row whose `as_of_date` is
+    the old New York date, the cap, when that date moves; a matched
+    `delistings` row whose `effective_on` is the old date plus the Rule
+    12d2-2 default); one row matched by two different new stamps; a moved
+    row landing on a row already stored at the new stamp.
+
+    **Aborts** with `RestampAborted`, before any write, when any change's old
+    or new stamp falls on or after the first session of an open paper
+    window (`window_first_session`). After the writes, a changed set of
+    `security_id`s in any table raises `RuntimeError`, so the caller's
+    transaction rolls back (the restamp never mints an id)."""
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    moving = [c for c in changes if c.changed]
+    first = window_first_session(conn)
+    if first is not None:
+        inside = [
+            c for c in moving if _ny_date(c.old_stamp) >= first or _ny_date(c.new_stamp) >= first
+        ]
+        if inside:
+            listed = "; ".join(
+                f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"
+                for c in inside
+            )
+            raise RestampAborted(
+                f"{len(inside)} manifest change(s) at or after the open paper window's "
+                f"first session {first.isoformat()}: {listed}"
+            )
+    for change in moving:
+        if change.new_stamp > ingested_at:
+            raise ValueError(
+                f"{change.accession}: new stamp {change.new_stamp.isoformat()} is after "
+                f"ingested_at {ingested_at.isoformat()}"
+            )
+
+    # Per change, the CIKs whose rows its accession stamped: the stamps-file
+    # CIK, and for a Form 25 or 25-NSE also its subject (a relisting or a
+    # successor's rows can carry the Form 25's stamp, master's `_event`).
+    filed = {d.accession: d for d in delistings}
+    cik_map: set[tuple[str, datetime, datetime, bool, bool, date]] = set()
+    delisting_map: set[tuple[str, str, str, str, datetime, datetime, bool, date]] = set()
+    for c in moving:
+        flags = (
+            _ny_date(c.old_stamp) != _ny_date(c.new_stamp),
+            session_of(c.old_stamp) != session_of(c.new_stamp),
+            _ny_date(c.old_stamp),
+        )
+        cik_map.add((c.cik, c.old_stamp, c.new_stamp, *flags))
+        if (d := filed.get(c.accession)) is not None:
+            cik_map.add((d.cik, c.old_stamp, c.new_stamp, *flags))
+            delisting_map.add(
+                (
+                    d.cik,
+                    d.form,
+                    d.class_title,
+                    d.exchange,
+                    c.old_stamp,
+                    c.new_stamp,
+                    flags[0],
+                    flags[2],
+                )
+            )
+    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+        conn.execute(f"DROP TABLE IF EXISTS {temp}")
+    conn.execute(
+        "CREATE TEMP TABLE _restamp_cik (cik VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, "
+        "date_moves BOOLEAN, session_moves BOOLEAN, old_day DATE)"
+    )
+    conn.execute(
+        "CREATE TEMP TABLE _restamp_delisting (subject VARCHAR, form VARCHAR, "
+        "class_title VARCHAR, exchange VARCHAR, old TIMESTAMPTZ, new TIMESTAMPTZ, "
+        "date_moves BOOLEAN, old_day DATE)"
+    )
+    conn.execute(
+        "CREATE TEMP TABLE _restamp_sids AS SELECT DISTINCT security_id, cik FROM securities"
+    )
+    conn.execute("CREATE TEMP TABLE _restamp_refused (cik VARCHAR)")
+    if cik_map:
+        conn.executemany("INSERT INTO _restamp_cik VALUES (?, ?, ?, ?, ?, ?)", sorted(cik_map))
+    if delisting_map:
+        conn.executemany(
+            "INSERT INTO _restamp_delisting VALUES (?, ?, ?, ?, ?, ?, ?, ?)", sorted(delisting_map)
+        )
+    # Each table's matched rows over `t`, with the row's security CIK `s.cik`
+    # and its change `m`; a refused CIK's rows never match.
+    keep = "s.cik NOT IN (SELECT cik FROM _restamp_refused)"
+    matched: dict[str, str] = {
+        table: (
+            f"FROM {table} t JOIN _restamp_sids s ON s.security_id = t.security_id "
+            "JOIN _restamp_cik m ON m.cik = s.cik AND m.old = t.known_at "
+            f"WHERE {_RESTAMPABLE} AND {keep}"
+            + (
+                " AND NOT coalesce(t.retracted, FALSE)"
+                if table in ("securities", "listings")
+                else ""
+            )
+        )
+        for table in RESTAMP_TABLES
+        if table != "delistings"
+    }
+    matched["delistings"] = (
+        "FROM delistings t JOIN _restamp_sids s ON s.security_id = t.security_id "
+        "JOIN _restamp_delisting m ON m.subject = s.cik AND m.form = t.form "
+        "AND m.class_title = t.class_title AND m.exchange = t.exchange "
+        f"AND m.old = t.known_at AND m.old = t.filed_at WHERE {_RESTAMPABLE} AND {keep}"
+    )
+    refused: dict[str, str] = {}
+    derived: dict[str, str] = {
+        "securities": "m.session_moves AND t.security_id LIKE '%@%'",  # a successor's id
+        "listings": "m.session_moves",  # valid_from: the session of the acceptance
+        "facts": "m.date_moves AND t.as_of_date = m.old_day",  # the cap
+        "delistings": f"m.date_moves AND t.effective_on = m.old_day + {_DEFAULT_EFFECTIVE_DAYS}",
+    }
+    for table, condition in derived.items():
+        for (cik,) in conn.execute(
+            f"SELECT DISTINCT s.cik {matched[table]} AND {condition}"
+        ).fetchall():
+            refused.setdefault(cik, f"{table}: a date column derived from the old date")
+    for table in RESTAMP_TABLES:
+        for (cik,) in conn.execute(
+            f"SELECT DISTINCT any_value(s.cik) {matched[table]} GROUP BY t.rowid "
+            "HAVING count(DISTINCT m.new) > 1"
+        ).fetchall():
+            refused.setdefault(cik, f"{table}: one row, two new stamps")
+        keys = _RESTAMP_KEYS[table]
+        same_key = " AND ".join(f"o.{k} = t.{k}" for k in keys)
+        target = "o.known_at = m.new" + (" AND o.filed_at = m.new" if table == "delistings" else "")
+        for (cik,) in conn.execute(
+            f"SELECT DISTINCT s.cik {matched[table]} AND EXISTS "
+            f"(SELECT 1 FROM {table} o WHERE {same_key} AND {target})"
+        ).fetchall():
+            refused.setdefault(cik, f"{table}: a row is already stored at the new stamp")
+    if refused:
+        conn.executemany("INSERT INTO _restamp_refused VALUES (?)", [[c] for c in sorted(refused)])
+    refused_ids = frozenset(
+        r[0]
+        for r in conn.execute(
+            "SELECT security_id FROM _restamp_sids WHERE list_contains(?, cik)", [sorted(refused)]
+        ).fetchall()
+    )
+
+    before = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
+    moved: dict[str, int] = {}
+    for table in RESTAMP_TABLES:
+        (count,) = conn.execute(f"SELECT count(DISTINCT t.rowid) {matched[table]}").fetchone() or (
+            0,
+        )
+        moved[table] = int(count)
+        if not count:
+            continue
+        stamps = "known_at = u.new" + (", filed_at = u.new" if table == "delistings" else "")
+        conn.execute(
+            f"UPDATE {table} SET {stamps}, ingested_at = ? FROM (SELECT DISTINCT t.rowid AS rid, "
+            f"m.new AS new {matched[table]}) u WHERE {table}.rowid = u.rid",
+            [ingested_at],
+        )
+    for temp in ("_restamp_cik", "_restamp_delisting", "_restamp_sids", "_restamp_refused"):
+        conn.execute(f"DROP TABLE {temp}")
+    after = {t: _security_ids(conn, t) for t in RESTAMP_TABLES}
+    if after != before:
+        changed = sorted(t for t in RESTAMP_TABLES if after[t] != before[t])
+        raise RuntimeError(f"restamp changed the security_ids of {', '.join(changed)}")
+    return RestampResult(
+        moved=moved, refused=refused, changes=len(moving), refused_securities=refused_ids
+    )
+
+
+#: Each restamped table's UNIQUE key without `known_at`: a moved row must not
+#: land on a stored row with the same key at the new stamp.
+_RESTAMP_KEYS: dict[str, tuple[str, ...]] = {
+    "securities": ("security_id",),
+    "listings": ("security_id", "ticker", "exchange", "valid_from"),
+    "classifications": ("security_id", "rule"),
+    "facts": ("security_id", "fact_name", "as_of_date", "class_member"),
+    "delistings": ("security_id", "form", "class_title", "exchange"),
+}
+
+
+def _security_ids(conn: duckdb.DuckDBPyConnection, table: str) -> frozenset[str]:
+    return frozenset(
+        r[0] for r in conn.execute(f"SELECT DISTINCT security_id FROM {table}").fetchall()
+    )
 
 
 #: Why a rebuild is refused while the switch is off: it would delete the
