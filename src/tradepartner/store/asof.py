@@ -563,26 +563,35 @@ def price_jumps_as_of(
     return pl.DataFrame(rows, schema=_JUMP_SCHEMA)
 
 
-def rates_as_of(conn: duckdb.DuckDBPyConnection, t: datetime) -> pl.DataFrame:
+def rates_as_of(
+    conn: duckdb.DuckDBPyConnection, t: datetime, series: str | None = None
+) -> pl.DataFrame:
     """Published rates known by `t`, latest revision per series and observation date.
 
     The observation date describes the rate; only `known_at` controls when a
-    row becomes visible. The result retains the rates table's column order.
+    row becomes visible. A named `series` limits the result; None reads all
+    series. A store before schema 23 has no `rates` table, so this read raises.
     """
     t = _validate_t(t)
+    params: list[Any] = [t]
+    series_filter = ""
+    if series is not None:
+        series_filter = "AND series = ?"
+        params.append(series)
     return conn.execute(
-        """
-        SELECT * EXCLUDE (_rn) FROM (
+        f"""
+        SELECT series, observation_date, value, vintage_date, known_at FROM (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY series, observation_date ORDER BY known_at DESC
             ) AS _rn
             FROM rates
             WHERE known_at <= ?
+            {series_filter}
         )
         WHERE _rn = 1
         ORDER BY series, observation_date
         """,
-        [t],
+        params,
     ).pl()
 
 

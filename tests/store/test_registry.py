@@ -1111,6 +1111,23 @@ def test_rates_move_store_max_but_not_trial_vintage(
     assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "ok"
 
 
+def test_every_fact_table_is_classified_for_trial_vintage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def assert_classified() -> None:
+        facts = set(schema.TABLE_NAMES) - {"ingestion_runs", "schema_version"}
+        included = set(registry._TRIAL_FACT_TABLES)
+        excluded = {"rates"}
+        assert included.isdisjoint(excluded)
+        assert facts == included | excluded
+
+    assert_classified()
+    with monkeypatch.context() as patch:
+        patch.setattr(schema, "TABLE_NAMES", (*schema.TABLE_NAMES, "future_fact"))
+        with pytest.raises(AssertionError):
+            assert_classified()
+
+
 def test_open_trial_records_the_data_vintage_at_its_cutoff(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
