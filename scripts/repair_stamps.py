@@ -146,9 +146,11 @@ from tradepartner.adapters.stamp_repair import (
     audit_decision,
     audit_sample,
     classify_cik,
+    in_window_change_allowed,
     is_provably_early,
     shift_stamp,
 )
+from tradepartner.store import restamp_precheck
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _EASTERN = _NEW_YORK
@@ -900,54 +902,52 @@ class Precheck:
 
     path: Path
     instants: tuple[datetime, ...]
+    sha256: str
 
 
 def load_precheck(path: Path, *, release: str, window_start: date, now: datetime) -> Precheck:
-    """Read ``--window-earlier-ok``'s file; `RepairStop` unless it says pass for
-    this release and window start and was made on ``now``'s New York date (the
-    driver has no store, so the day is its staleness rule; amendment (d))."""
+    """Read ``--window-earlier-ok``'s file with T166f's loader; `RepairStop`
+    unless it says pass for this release and window start and was made on
+    ``now``'s New York date (the driver has no store, so the day is its
+    staleness rule; amendment (d))."""
     try:
-        data = json.loads(path.read_bytes())
-        passed = data["pass"]
-        file_release = data["release"]
-        file_window = data["window_first_session"]
-        made_at = _parse_stamp(data["made_at"])
-        instants = tuple(sorted(_parse_stamp(t) for t in data["instants"]))
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        data = restamp_precheck.load_precheck(path)
+    except (OSError, ValueError) as exc:
         raise RepairStop(f"--window-earlier-ok {path}: unreadable pre-check file: {exc}") from exc
-    if passed is not True:
+    if not data.passed:
         raise RepairStop(f"--window-earlier-ok {path}: the pre-check did not pass")
-    if file_release != release:
+    if data.release != release:
         raise RepairStop(
-            f"--window-earlier-ok {path}: made for release {file_release!r}, not {release!r}"
+            f"--window-earlier-ok {path}: made for release {data.release!r}, not {release!r}"
         )
-    if file_window != window_start.isoformat():
+    if data.window_first_session != window_start:
         raise RepairStop(
-            f"--window-earlier-ok {path}: made for window start {file_window}, "
+            f"--window-earlier-ok {path}: made for window start {data.window_first_session}, "
             f"not {window_start.isoformat()}"
         )
-    if _ny_date(made_at) != _ny_date(now):
+    if _ny_date(data.made_at) != _ny_date(now):
         raise RepairStop(
-            f"--window-earlier-ok {path}: made {made_at.isoformat()}, not on the run's "
+            f"--window-earlier-ok {path}: made {data.made_at.isoformat()}, not on the run's "
             f"New York date {_ny_date(now).isoformat()}; run the pre-check again"
         )
-    return Precheck(path, instants)
+    return Precheck(path, tuple(sorted(data.instants)), data.sha256)
 
 
 def instant_violations(
     rows: Iterable[ManifestRow], instants: Sequence[datetime]
 ) -> list[ManifestRow]:
     """Changes that cross a read instant ``t`` (amendment (d), the exact
-    check): ``new <= t < old`` for an earlier move, ``old <= t < new`` for a
-    later one, so a paper decision at ``t`` read the row differently. Every
+    check, T166f's `crossed_instants`): ``new <= t < old`` for an earlier
+    move and, read the other way, ``old <= t < new`` for a later one. Every
     changed row is checked, not only in-window ones: a correction dated the
     day before the window's first session can still cross ``close(S-1)``."""
     return [
         r
         for r in rows
         if r.changed
-        and any(
-            min(r.old_stamp, r.new_stamp) <= t < max(r.old_stamp, r.new_stamp) for t in instants
+        and (
+            restamp_precheck.crossed_instants(r.old_stamp, r.new_stamp, instants)
+            or restamp_precheck.crossed_instants(r.new_stamp, r.old_stamp, instants)
         )
     ]
 
@@ -959,14 +959,6 @@ def _refuse_instants(rows: Iterable[ManifestRow], precheck: Precheck) -> None:
             f"{len(read)} change(s) cross a read instant of {precheck.path} "
             f"(new <= t < old or old <= t < new): {_list_rows(read)}"
         )
-
-
-def _window_rule() -> WindowRule:
-    """T166f's in-window rule, imported where the flag is used."""
-    from tradepartner.adapters import stamp_repair
-
-    rule: WindowRule = stamp_repair.in_window_change_allowed  # type: ignore[attr-defined]
-    return rule
 
 
 def rewrite_file(stamps_file: StampsFile, changes: Mapping[str, datetime]) -> bytes:
@@ -1135,8 +1127,9 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
             window_start=args.window_start,
             now=datetime.now(UTC),
         )
-        allowed = _window_rule()
+        allowed = in_window_change_allowed
         report["window_earlier_ok"] = str(precheck.path)
+        report["window_earlier_ok_sha256"] = precheck.sha256
     inputs = load_inputs(backup if args.apply and args.resume else live, args, universe)
     plan = make_plan(inputs)
     report.update(_plan_report(inputs, plan, args))

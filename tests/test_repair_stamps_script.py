@@ -905,33 +905,6 @@ WIN = "0000001505"
 W_OLD = _day(date(2026, 10, 9), 18) + timedelta(minutes=30)  # 14:30 EDT, served 4 h late
 
 
-def _stub_in_window_change_allowed(row: Any, window_start: date) -> bool:
-    """T166f's rule exactly as the plan line states it, a TEST-ONLY stub until
-    T166f lands (then this test imports the real one)."""
-    from tradepartner.adapters.stamp_repair import ny_utc_offset
-
-    def ny(d: datetime) -> date:
-        return d.astimezone(NY).date()
-
-    if ny(row.old_stamp) < window_start and ny(row.new_stamp) < window_start:
-        return True
-    earlier = row.old_stamp - row.new_stamp
-    return bool(row.method == "sgml" and timedelta(0) < earlier <= ny_utc_offset(ny(row.old_stamp)))
-
-
-@pytest.fixture
-def window_rule(monkeypatch: Any) -> None:
-    from tradepartner.adapters import stamp_repair
-
-    if not hasattr(stamp_repair, "in_window_change_allowed"):
-        monkeypatch.setattr(
-            stamp_repair,
-            "in_window_change_allowed",
-            _stub_in_window_change_allowed,
-            raising=False,
-        )
-
-
 def windowed(tmp_path: Path, sgml: datetime) -> tuple[Cache, FakeSec]:
     c, sec = amended(tmp_path)
     c.add_cik(
@@ -980,9 +953,7 @@ def _apply(c: Cache, sec: FakeSec, *extra: str) -> int:
     return run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50", *extra)
 
 
-def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(
-    tmp_path: Path, window_rule: None
-) -> None:
+def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(tmp_path: Path) -> None:
     true = W_OLD - timedelta(hours=4)
     c, sec = windowed(tmp_path, true)
     before = _stamps(c)
@@ -1003,9 +974,7 @@ def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(
         {"made_at": datetime.now(UTC) - timedelta(days=1)},
     ],
 )
-def test_a_precheck_that_does_not_fit_is_refused(
-    tmp_path: Path, window_rule: None, bad: dict[str, Any]
-) -> None:
+def test_a_precheck_that_does_not_fit_is_refused(tmp_path: Path, bad: dict[str, Any]) -> None:
     c, sec = windowed(tmp_path, W_OLD - timedelta(hours=4))
     before = c.snapshot()
     file = precheck(tmp_path / "precheck.json", **bad)
@@ -1014,9 +983,7 @@ def test_a_precheck_that_does_not_fit_is_refused(
     assert c.snapshot() == before
 
 
-def test_a_read_instant_inside_the_move_aborts_before_writing(
-    tmp_path: Path, window_rule: None, capsys: Any
-) -> None:
+def test_a_read_instant_inside_the_move_aborts_before_writing(tmp_path: Path, capsys: Any) -> None:
     true = W_OLD - timedelta(hours=4)
     c, sec = windowed(tmp_path, true)
     before = _stamps(c)
@@ -1033,7 +1000,7 @@ def test_a_read_instant_inside_the_move_aborts_before_writing(
     ids=["later", "earlier-than-offset"],
 )
 def test_other_in_window_moves_abort_with_and_without_the_flag(
-    tmp_path: Path, window_rule: None, sgml: datetime
+    tmp_path: Path, sgml: datetime
 ) -> None:
     for flag in (False, True):
         c, sec = windowed(tmp_path / str(flag), sgml)
@@ -1043,7 +1010,7 @@ def test_other_in_window_moves_abort_with_and_without_the_flag(
         assert _stamps(c) == before
 
 
-def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path, window_rule: None) -> None:
+def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path) -> None:
     c, sec = amended(tmp_path)
     late_true = utc(2026, 10, 9, 14, 0)
     c.add_cik(
@@ -1060,7 +1027,7 @@ def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path, window_rule: No
 
 
 def test_a_correction_the_day_before_the_window_that_crosses_an_instant_aborts(
-    tmp_path: Path, window_rule: None, capsys: Any
+    tmp_path: Path, capsys: Any
 ) -> None:
     """quant-auditor pass 1: 10-08 18:30 EDT served late, true 14:30 EDT; the
     move crosses close(10-08) = 20:00Z, though both stamps predate the window."""
@@ -1101,9 +1068,7 @@ def test_a_correction_the_day_before_the_window_that_crosses_an_instant_aborts(
     assert c2.stamp(pre, acc(pre, 1)) == old - timedelta(hours=4)
 
 
-def test_a_step_1_shift_across_an_instant_stops_before_any_request(
-    tmp_path: Path, window_rule: None
-) -> None:
+def test_a_step_1_shift_across_an_instant_stops_before_any_request(tmp_path: Path) -> None:
     """code-review pass 1: a pre-window shift crossing an instant is known
     from the plan, so the run stops before the backup and any request."""
     c, sec = amended(tmp_path)
