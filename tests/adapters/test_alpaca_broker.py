@@ -847,6 +847,18 @@ def test_an_asset_answered_for_another_symbol_raises() -> None:
         broker.assets(["KO"])
 
 
+def test_an_asset_read_the_broker_answers_404_raises_not_omits() -> None:
+    """#410: a symbol Alpaca does not know (a 404 on `GET /v2/assets/{symbol}`)
+    is raised, never dropped from the answer, so `Broker.assets` keeps its
+    one-`Asset`-per-symbol contract and the run halts fail-closed."""
+    broker, http = _broker()
+    http.route("GET", "/v2/assets/KO", (200, _load("assets")[0]))
+    http.route("GET", "/v2/assets/GONE", (404, {"code": 40410000, "message": "asset not found"}))
+    with pytest.raises(AlpacaTradingError) as raised:
+        broker.assets(["KO", "GONE"])
+    assert raised.value.status_code == 404
+
+
 # --- symbols ---------------------------------------------------------------------
 
 CLASS_SYMBOLS = {"BFB": "BF.B"}
