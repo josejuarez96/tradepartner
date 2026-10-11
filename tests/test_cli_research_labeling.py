@@ -68,6 +68,15 @@ BATCH: dict[str, tuple[str, Step]] = {
 }
 GOLD_FRAME_ROWS = 340
 GOLD_N = 35
+#: The fixture copy of the pilot experiment file (min_clusters = 75) and the claims
+#: file its parser checks against (#1492: the gold lock's floor is read from it).
+REPO = Path(__file__).resolve().parents[1]
+PILOT_FIXTURE = (
+    REPO / "tests" / "fixtures" / "research" / "experiments" / "departure-reason-pilot.md"
+)
+CLAIMS = REPO / "docs" / "research" / "claims.toml"
+#: The floor the `s` fixture's pilot file carries: the 5 `pilot` cases of GOLD_N reach it.
+GOLD_FLOOR = 5
 
 Launcher = Callable[[list[str]], int]
 
@@ -89,8 +98,10 @@ def s(tmp_path: Path) -> Settings:
             "data_dir": str(tmp_path / "research"),
             "spend_ceiling_usd_month": 40.0,
             "spend_ceiling_usd_total": 40.0,
+            "experiments_dir": str(tmp_path / "docs" / "experiments"),
         },
     )
+    _pilot_file(base, GOLD_FLOOR)
     labeling = base.research.labeling.model_copy(update={"requests_per_second": 1000.0})
     edgar = base.edgar.model_copy(update={"requests_per_second": 1e6})
     out = base.model_copy(
@@ -129,6 +140,23 @@ def s(tmp_path: Path) -> Settings:
         ):
             research.register_experiment(conn, parsed, "owner")
     return out
+
+
+def _pilot_file(s: Settings, min_clusters: int | None) -> Path:
+    """The fixture pilot experiment file in `research.experiments_dir`, its
+    `min_clusters` replaced (`None` keeps the file's 75), with the claims file beside."""
+    directory = Path(s.research.experiments_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    claims = directory.parent / "research" / "claims.toml"
+    claims.parent.mkdir(parents=True, exist_ok=True)
+    claims.write_bytes(CLAIMS.read_bytes())
+    text = PILOT_FIXTURE.read_text(encoding="utf-8")
+    assert text.count("min_clusters = 75\n") == 1
+    if min_clusters is not None:
+        text = text.replace("min_clusters = 75\n", f"min_clusters = {min_clusters}\n")
+    path = directory / "departure-reason-pilot.md"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _parquet(rows: Sequence[Mapping[str, Any]]) -> tuple[bytes, str]:
@@ -983,19 +1011,24 @@ def _seeds(tmp_path: Path) -> Path:
     return path
 
 
-def _label_cases(s: Settings, *, stop_after: int | None = None) -> None:
+def _label_cases(s: Settings, *, stop_after: int | None = None, provision_pilot: int = 0) -> None:
     """What the page does in gold mode: resume the session (no store connection) and
-    answer cases in order."""
+    answer cases in order, `text`-based except the first `provision_pilot` `pilot`
+    cases, labelled on the Form 25 provision (#1492)."""
     session = gold.open_gold_session(gold.session_path(s), gold.GoldFlags(), settings=s)
     n = 0
+    provision = 0
     while (i := gold.next_case(session)) is not None:
         if stop_after is not None and n >= stop_after:
             break
+        on_provision = session.cases[i].split == "pilot" and provision < provision_pilot
+        provision += on_provision
         gold.record_label(
             session,
             session.cases[i].listing_end_id,
             label=MERGER,
-            relied_on="notice",
+            relied_on="form 25" if on_provision else "notice",
+            basis="provision" if on_provision else "text",
             seconds_spent=42.0,
         )
         n += 1
@@ -1006,6 +1039,7 @@ def _gold_page(
     seen: list[list[str]],
     *,
     stop_after: int | None = None,
+    provision_pilot: int = 0,
     then: Callable[[], int] = lambda: 0,
 ) -> Launcher:
     def launch(argv: list[str]) -> int:
@@ -1013,7 +1047,7 @@ def _gold_page(
         flags, page = _page_args(argv)
         _assert_localhost(flags)
         assert page == ["--session", str(gold.session_path(s))]
-        _label_cases(s, stop_after=stop_after)
+        _label_cases(s, stop_after=stop_after, provision_pilot=provision_pilot)
         return then()
 
     return launch
@@ -1058,7 +1092,7 @@ def test_gold_builds_launches_and_locks_a_complete_session(s: Settings, tmp_path
     lock = json.loads((gold.session_path(s).with_name("lock.json")).read_text())
     assert (
         f"gold session locked: dataset {lock['dataset_id']}, scorable pilot count 5, "
-        f"sha256 {lock['sha256']}" in result.output
+        f"text-based 5, sha256 {lock['sha256']}" in result.output
     )
     assert _datasets(s, "departure-reason-gold") == 1
     _assert_no_content(result.output, _case_ids(s))
@@ -1157,3 +1191,76 @@ def test_gold_a_new_session_needs_its_flags(s: Settings) -> None:
 def _busy(_settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
     raise StoreLockedError("held by another process")
     yield  # pragma: no cover
+
+
+# --- research gold: the basis counts and the floor (#1492) ------------------------
+
+
+def _lock_file(s: Settings) -> Path:
+    return gold.session_path(s).with_name("lock.json")
+
+
+def test_gold_at_the_floor_prints_the_basis_counts_before_it_locks(
+    s: Settings, tmp_path: Path
+) -> None:
+    result = _gold_cli(s, tmp_path, _gold_page(s, []))
+    assert result.exit_code == 0, result.output
+    counts = (
+        "gold basis counts (pilot, random draw, 5 cases): text 5, exchange_rule 0, "
+        "provision 0, unresolved 0, unlabelled 0"
+    )
+    assert counts in result.output
+    assert "  round 0 (5 cases): text 5, exchange_rule 0" in result.output
+    assert "text-based scorable pilot count 5 (floor 5); scorable pilot count 5" in result.output
+    assert result.output.index(counts) < result.output.index("gold session locked")
+    lock = json.loads(_lock_file(s).read_text())
+    assert lock["scorable_pilot_text"] == 5
+    assert lock["basis_counts"]["text"] == 5
+    assert _datasets(s, "departure-reason-gold") == 1
+
+
+@pytest.mark.parametrize(("min_clusters", "floor", "suggested"), [(None, 75, 110), (60, 60, 95)])
+def test_gold_under_the_floor_suggests_n_exits_0_and_locks_nothing(
+    s: Settings, tmp_path: Path, min_clusters: int | None, floor: int, suggested: int
+) -> None:
+    """The floor is the pilot file's `min_clusters`: 75 as committed, 60 when the
+    fixture file says so. Suggested n = 30 + ceil((floor + 5) * 5 / 5)."""
+    _pilot_file(s, min_clusters)
+    snapshot: dict[str, bytes] = {}
+
+    def then() -> int:
+        snapshot["working"] = datafiles.gold_working_path(s).read_bytes()
+        return 0
+
+    result = _gold_cli(s, tmp_path, _gold_page(s, [], then=then))
+    assert result.exit_code == 0, result.output
+    assert f"text-based scorable pilot count 5 (floor {floor})" in result.output
+    assert f"under the floor {floor}; left unlocked" in result.output
+    assert f"suggested n {suggested}: `tradepartner research gold --extend {suggested}`" in (
+        result.output
+    )
+    assert "gold session locked" not in result.output
+    assert not _lock_file(s).exists()
+    assert datafiles.gold_working_path(s).read_bytes() == snapshot["working"]
+    assert _datasets(s, "departure-reason-gold") == 0
+
+    again = _cli(s, "research", "gold", "--lock")
+    assert again.exit_code == 0, again.output
+    assert f"under the floor {floor}; left unlocked" in again.output
+    assert f"suggested n {suggested}" in again.output
+    assert not _lock_file(s).exists()
+    assert _datasets(s, "departure-reason-gold") == 0
+
+    _pilot_file(s, GOLD_FLOOR)
+    locked = _cli(s, "research", "gold", "--lock")
+    assert locked.exit_code == 0, locked.output
+    assert "gold session locked" in locked.output
+
+
+def test_gold_with_no_text_based_item_suggests_no_n(s: Settings, tmp_path: Path) -> None:
+    result = _gold_cli(s, tmp_path, _gold_page(s, [], provision_pilot=5))
+    assert result.exit_code == 0, result.output
+    assert "text 0, exchange_rule 0, provision 5" in result.output
+    assert "no text-based items: no extension suggested" in result.output
+    assert "suggested n" not in result.output
+    assert not _lock_file(s).exists()

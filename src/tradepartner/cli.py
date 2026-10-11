@@ -163,7 +163,11 @@ and `store.registry.code_version`, and prints through the `cli_record` scrub:
   against the row's SHA-256) or, with no flags, resumes
   it (`gold.open_gold_session`, which refuses flags that differ from the
   session); `--lock` alone locks an existing complete session and launches
-  nothing.
+  nothing. On a complete session both first print the basis counts (#1492) and
+  lock only at or above the floor, `primary.min_clusters` of
+  `departure-reason-pilot.md` in `research.experiments_dir` (parsed by the
+  experiment parser); under it they print the floor and the suggested `n` for
+  an extension and exit 0 unlocked.
 - `tradepartner research review --run <id> [--finish]` builds or resumes the
   review session of an unfinished batch run (`review.build_review_session`, on
   a read-only connection); `--finish` alone finishes a fully decided session
@@ -1110,10 +1114,42 @@ def _gold_open_count(session: gold.GoldSession) -> int:
     return sum(1 for s in status.values() if s in ("open", "skipped"))
 
 
+#: The pilot experiment file whose `primary.min_clusters` is the gold lock's floor (#1492).
+GOLD_PILOT_FILE = "departure-reason-pilot.md"
+
+
+def _gold_floor(settings: Settings) -> int:
+    """The text-based floor: `primary.min_clusters` of the pilot experiment file in
+    `research.experiments_dir`, parsed by the experiment parser (one copy, #1492)."""
+    directory = _experiments_dir(settings)
+    path = directory / GOLD_PILOT_FILE
+    if not path.is_file():
+        raise ExperimentFileError(f"no pilot experiment file at {path}; the floor comes from it")
+    return parse_experiment_file(path, directory, settings=settings).primary_min_clusters
+
+
+def _echo_basis_counts(counts: gold.BasisCounts, floor: int) -> None:
+    """The pre-lock summary (#1492 item 4): the five counts over the random draw's
+    `pilot` cases, the text-based scorable count against the floor, and per round."""
+
+    def five(c: gold.RoundCounts) -> str:
+        return ", ".join(f"{k} {c.counts[k]}" for k in gold.BASIS_COUNT_KEYS)
+
+    typer.echo(f"gold basis counts (pilot, random draw, {counts.n_pilot} cases): {five(counts)}")
+    for draw_round, c in counts.by_round.items():
+        typer.echo(f"  round {draw_round} ({c.n_pilot} cases): {five(c)}")
+    typer.echo(
+        f"text-based scorable pilot count {counts.scorable_pilot_text} (floor {floor}); "
+        f"scorable pilot count {counts.scorable_pilot}"
+    )
+
+
 def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: bool) -> None:
-    """After the page (or for `--lock`): lock a complete session on an
-    `open_for_write` connection and print the scorable `pilot` count and the export's
-    hash; a partial one prints its open count and stays unlocked (#1330 point 3)."""
+    """After the page (or for `--lock`): on a complete session print the basis
+    counts; at or above the floor lock it on an `open_for_write` connection and print
+    the scorable `pilot` counts and the export's hash; under the floor print the
+    floor and the suggested `n` and leave it unlocked (exit 0, #1492 item 4); a
+    partial one prints its open count and stays unlocked (#1330 point 3)."""
     open_count = _gold_open_count(session)
     if open_count:
         message = (
@@ -1124,12 +1160,29 @@ def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: boo
             raise _fail(f"refused: {message}", USAGE_ERROR)
         typer.echo(message)
         return
-    result = gold.lock_gold(session, lambda: open_for_write(settings))
+    floor = _gold_floor(settings)
+    counts = gold.basis_counts(session)
+    _echo_basis_counts(counts, floor)
+    if counts.scorable_pilot_text < floor:
+        suggested = gold.suggested_n(session, counts, floor)
+        typer.echo(
+            f"gold session: the text-based scorable pilot count is under the floor {floor}; "
+            "left unlocked"
+        )
+        if suggested is None:
+            typer.echo("  no text-based items: no extension suggested")
+        else:
+            typer.echo(
+                f"  suggested n {suggested}: `tradepartner research gold --extend {suggested}`"
+            )
+        return
+    result = gold.lock_gold(session, lambda: open_for_write(settings), text_floor=floor)
     if result.state == "busy":
         raise _fail(_scrubbed(result.message or "store busy", settings), 1)
     typer.echo(
         f"gold session locked: dataset {result.dataset_id}, scorable pilot count "
-        f"{result.scorable_pilot}, sha256 {result.sha256}"
+        f"{result.scorable_pilot}, text-based {result.scorable_pilot_text}, "
+        f"sha256 {result.sha256}"
     )
 
 

@@ -33,6 +33,13 @@ server; the launching CLI (T124) then runs `gold.lock_gold` or `review.finish` a
 prints the count and the hash. A complete session that is not locked yet shows the
 same message and stops the server again; a locked or finished session only displays.
 
+**The basis** (#1492). Gold mode shows a "Basis" choice beside "Relied on", one
+caption per value (`BASIS_CAPTIONS`), and adds `form 25` to the relied-on choices.
+Only the default follows what the page shows: `text` when the case shows a text
+notice or an 8-K, nothing when it shows neither, where an answer without a basis is
+refused with nothing saved. An `unresolved` answer passes no basis. Nothing here
+reads `rule_provision` or the notice's citations to set or suggest it.
+
 **Keys.** A small listener (`st.iframe` on a constant HTML string, the successor
 Streamlit 1.64 names for the deprecated `st.components.v1.html`) clicks the button whose label
 starts with the pressed key: gold mode `1` to `9` (the options), `s` (skip) and `b`
@@ -87,6 +94,12 @@ REVIEW_LABELS: Final[Mapping[str, str]] = {
     "unresolved": "unresolved",
 }
 OUTSIDE: Final = "outside"
+#: #1492: one caption per basis value, in `gold.BASES` order.
+BASIS_CAPTIONS: Final[Mapping[str, str]] = {
+    "text": "the notice or an 8-K (shown, or outside) states the reason",
+    "exchange_rule": "a cited exchange rule names one reason; no text states it",
+    "provision": "the Form 25 provision alone, where it has one meaning",
+}
 DONE_MESSAGE: Final = "done, you may close this tab"
 #: Seconds between the done message and the server stop, so the message reaches the tab.
 STOP_DELAY_SECONDS: Final = 2.0
@@ -192,13 +205,23 @@ doc.addEventListener("keydown", doc.__reviewKeys);
 </script>"""
 
 
-def relied_on_choices(notice: str | None, eightk: gold.EightKView | None) -> list[str]:
+def relied_on_choices(
+    notice: str | None, eightk: gold.EightKView | None, *, form25: bool = False
+) -> list[str]:
     """C10's "relied on" choice: `notice` when the notice is text, each shown 8-K item,
-    then `outside`; the first entry is the default (`outside` alone when nothing is
-    shown as text, so no label claims a passage the page did not show)."""
+    then `outside`, then (gold mode, #1492) `form 25`, the provision field; the first
+    entry is the default (`outside` when nothing is shown as text, so no label claims
+    a passage the page did not show)."""
     choices = ["notice"] if notice else []
     choices += [f"8-K item {item}" for item, _ in (eightk.items if eightk else ())]
-    return [*choices, OUTSIDE]
+    return [*choices, OUTSIDE, *([gold.FORM_25] if form25 else [])]
+
+
+def basis_default(notice: str | None, eightk: gold.EightKView | None) -> int | None:
+    """The "Basis" choice's preselected index (#1492): `text` when the case shows a
+    text notice or an 8-K, none when it shows neither. It reads only what is shown,
+    never `rule_provision` or a rule citation."""
+    return gold.BASES.index("text") if notice or eightk else None
 
 
 def _final_lines(lines: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
@@ -351,6 +374,10 @@ def on_gold_answer(page: Page, lid: str, label: str) -> None:
     assert session is not None
     if not _gold_current(session, lid):
         return
+    basis = st.session_state.get(f"basis-{lid}") if label != gold.UNRESOLVED else None
+    if label != gold.UNRESOLVED and basis is None:
+        _flash("error", "Choose the basis of this label; nothing was saved.")
+        return
     relied_on = str(st.session_state.get(f"relied-{lid}") or "notice")
     passage = str(st.session_state.get(f"passage-{lid}") or "").strip()
     if relied_on == OUTSIDE and not passage:
@@ -363,6 +390,7 @@ def on_gold_answer(page: Page, lid: str, label: str) -> None:
             lid,
             label=label,
             relied_on=relied_on,
+            basis=None if basis is None else str(basis),
             seconds_spent=_elapsed(lid),
             passage_ref=passage if relied_on == OUTSIDE else None,
             text_states=text_states,
@@ -495,7 +523,8 @@ def _passages(view: gold.CaseView | review.ItemView) -> None:
 
 
 def _relied_on(lid: str, view: gold.CaseView | review.ItemView, options: Sequence[str]) -> str:
-    choices = relied_on_choices(view.notice, view.eightk)
+    gold_mode = isinstance(view, gold.CaseView)
+    choices = relied_on_choices(view.notice, view.eightk, form25=gold_mode)
     relied = st.radio("Relied on", choices, key=f"relied-{lid}", horizontal=True)
     if relied == OUTSIDE:
         st.text_input("Accession or URL of the filing you used", key=f"passage-{lid}")
@@ -535,8 +564,9 @@ def draw_gold(page: Page) -> None:
     i = gold.next_case(session)
     if i is None:
         _complete(
-            "Every case is answered. The CLI locks the session and prints the scorable "
-            "`pilot` count and the export's hash once this page stops."
+            "Every case is answered. Once this page stops, the CLI prints the basis "
+            "counts and, at or above the floor, locks the session and prints the "
+            "scorable `pilot` count and the export's hash."
         )
         return
     lines = _read_jsonl(session.working_path)
@@ -557,6 +587,14 @@ def draw_gold(page: Page) -> None:
     _passages(view)
     names = [name for name, _ in view.options]
     _relied_on(lid, view, names)
+    st.radio(
+        "Basis",
+        list(gold.BASES),
+        index=basis_default(view.notice, view.eightk),
+        captions=[BASIS_CAPTIONS[b] for b in gold.BASES],
+        key=f"basis-{lid}",
+        horizontal=True,
+    )
     st.toggle("Low confidence", key=f"low-{lid}")
     for k, (name, description) in enumerate(view.options, start=1):
         st.button(f"{k} · {name}", key=f"opt-{k}", on_click=on_gold_answer, args=(page, lid, name))

@@ -186,6 +186,7 @@ def _label_all(session: gold.GoldSession, label: str = OUTSIDE_LABEL) -> None:
             session.cases[i].listing_end_id,
             label=label,
             relied_on="notice",
+            basis="text",
             seconds_spent=30.0,
         )
 
@@ -482,7 +483,7 @@ def test_record_label_appends_before_returning(gsettings: Settings, tmp_path: Pa
     session = _build(gsettings, tmp_path).session
     lid = session.cases[0].listing_end_id
     gold.record_label(
-        session, lid, label="bankruptcy", relied_on="8-K item 1.03", seconds_spent=700
+        session, lid, label="bankruptcy", relied_on="8-K item 1.03", basis="text", seconds_spent=700
     )
     (line,) = _working(session)
     assert line["listing_end_id"] == lid and line["gold_label"] == "bankruptcy"
@@ -494,14 +495,20 @@ def test_record_label_appends_before_returning(gsettings: Settings, tmp_path: Pa
 def test_second_answer_refused_until_undo(gsettings: Settings, tmp_path: Path) -> None:
     session = _build(gsettings, tmp_path).session
     lid = session.cases[0].listing_end_id
-    gold.record_label(session, lid, label="bankruptcy", relied_on="notice", seconds_spent=5)
+    gold.record_label(
+        session, lid, label="bankruptcy", relied_on="notice", basis="text", seconds_spent=5
+    )
     with pytest.raises(gold.AlreadyAnswered):
-        gold.record_label(session, lid, label="going_private", relied_on="notice", seconds_spent=5)
+        gold.record_label(
+            session, lid, label="going_private", relied_on="notice", basis="text", seconds_spent=5
+        )
     with pytest.raises(gold.AlreadyAnswered):
         gold.record_skip(session, lid)
     gold.record_undo(session, lid)
     assert gold.next_case(session) == 0
-    gold.record_label(session, lid, label="going_private", relied_on="notice", seconds_spent=5)
+    gold.record_label(
+        session, lid, label="going_private", relied_on="notice", basis="text", seconds_spent=5
+    )
     assert [ln.get("gold_label") for ln in _working(session)] == [
         "bankruptcy",
         None,
@@ -514,16 +521,20 @@ def test_a_final_undo_leaves_the_session_partial(gsettings: Settings, tmp_path: 
     _label_all(session)
     gold.record_undo(session, session.cases[2].listing_end_id)
     with pytest.raises(gold.SessionPartial):
-        gold.lock_gold(session, _connect(gsettings))
+        gold.lock_gold(session, _connect(gsettings), text_floor=0)
 
 
 def test_label_checks(gsettings: Settings, tmp_path: Path) -> None:
     session = _build(gsettings, tmp_path).session
     lid = session.cases[0].listing_end_id
     with pytest.raises(gold.GoldRefused, match="not one of the options"):
-        gold.record_label(session, lid, label="other", relied_on="notice", seconds_spent=1)
+        gold.record_label(
+            session, lid, label="other", relied_on="notice", basis="text", seconds_spent=1
+        )
     with pytest.raises(gold.GoldRefused, match="accession or URL"):
-        gold.record_label(session, lid, label="bankruptcy", relied_on="outside", seconds_spent=1)
+        gold.record_label(
+            session, lid, label="bankruptcy", relied_on="outside", basis="text", seconds_spent=1
+        )
     assert not session.working_path.exists()
 
 
@@ -534,14 +545,19 @@ def test_skip_restart_skip_ends_unlabelled(gsettings: Settings, tmp_path: Path) 
     gold.record_skip(session, first)
     for case in session.cases[1:]:
         gold.record_label(
-            session, case.listing_end_id, label="bankruptcy", relied_on="notice", seconds_spent=1
+            session,
+            case.listing_end_id,
+            label="bankruptcy",
+            relied_on="notice",
+            basis="text",
+            seconds_spent=1,
         )
     resumed = gold.open_gold_session(session.session_file, gold.GoldFlags(), settings=gsettings)
     assert gold.next_case(resumed) == 0
     gold.record_skip(resumed, first)
     assert _working(resumed)[-1]["unlabelled"] is True
     assert gold.next_case(resumed) is None
-    result = gold.lock_gold(resumed, _connect(gsettings))
+    result = gold.lock_gold(resumed, _connect(gsettings), text_floor=0)
     export = pl.read_parquet(datafiles.gold_path(gsettings, result.sha256))
     assert export.height == N  # no replacement case
     row = export.filter(pl.col("listing_end_id") == first).to_dicts()[0]
@@ -556,13 +572,19 @@ def test_next_case_resumes_with_the_skipped_case_last(gsettings: Settings, tmp_p
         session.cases[1].listing_end_id,
         label="bankruptcy",
         relied_on="notice",
+        basis="text",
         seconds_spent=1,
     )
     resumed = gold.open_gold_session(session.session_file, gold.GoldFlags(), settings=gsettings)
     assert gold.next_case(resumed) == 2
     for case in resumed.cases[2:]:
         gold.record_label(
-            resumed, case.listing_end_id, label="bankruptcy", relied_on="notice", seconds_spent=1
+            resumed,
+            case.listing_end_id,
+            label="bankruptcy",
+            relied_on="notice",
+            basis="text",
+            seconds_spent=1,
         )
     assert gold.next_case(resumed) == 0
 
@@ -577,10 +599,11 @@ def test_lock_refuses_a_partial_session(gsettings: Settings, tmp_path: Path) -> 
         session.cases[0].listing_end_id,
         label="bankruptcy",
         relied_on="notice",
+        basis="text",
         seconds_spent=1,
     )
     with pytest.raises(gold.SessionPartial):
-        gold.lock_gold(session, _connect(gsettings))
+        gold.lock_gold(session, _connect(gsettings), text_floor=0)
 
 
 def test_lock_rejects_a_label_outside_the_set(gsettings: Settings, tmp_path: Path) -> None:
@@ -602,7 +625,7 @@ def test_lock_rejects_a_label_outside_the_set(gsettings: Settings, tmp_path: Pat
         ],
     )
     with pytest.raises(gold.GoldRefused, match="not one of the options"):
-        gold.lock_gold(session, _connect(gsettings))
+        gold.lock_gold(session, _connect(gsettings), text_floor=0)
 
 
 def test_lock_demands_passage_ref_on_outside(gsettings: Settings, tmp_path: Path) -> None:
@@ -623,7 +646,7 @@ def test_lock_demands_passage_ref_on_outside(gsettings: Settings, tmp_path: Path
         ],
     )
     with pytest.raises(gold.GoldRefused, match="accession or URL"):
-        gold.lock_gold(session, _connect(gsettings))
+        gold.lock_gold(session, _connect(gsettings), text_floor=0)
 
 
 def test_lock_writes_and_registers_the_export(gsettings: Settings, tmp_path: Path) -> None:
@@ -637,21 +660,26 @@ def test_lock_writes_and_registers_the_export(gsettings: Settings, tmp_path: Pat
         if lid == unresolved_pilot.listing_end_id:
             gold.record_label(session, lid, label="unresolved", relied_on="notice", seconds_spent=1)
         elif lid == undone:
-            gold.record_label(session, lid, label="bankruptcy", relied_on="notice", seconds_spent=1)
+            gold.record_label(
+                session, lid, label="bankruptcy", relied_on="notice", basis="text", seconds_spent=1
+            )
             gold.record_undo(session, lid)
             gold.record_label(
                 session,
                 lid,
                 label=OUTSIDE_LABEL,
                 relied_on="outside",
+                basis="text",
                 passage_ref="0000000000-17-000001",
                 text_states="unresolved",
                 seconds_spent=1,
             )
         else:
-            gold.record_label(session, lid, label="bankruptcy", relied_on="notice", seconds_spent=1)
+            gold.record_label(
+                session, lid, label="bankruptcy", relied_on="notice", basis="text", seconds_spent=1
+            )
 
-    result = gold.lock_gold(session, _connect(gsettings))
+    result = gold.lock_gold(session, _connect(gsettings), text_floor=0)
     assert result.state == "locked"
     n_pilot_drawn = sum(1 for c in cases if c.split == "pilot" and c.in_random_draw)
     assert result.scorable_pilot == n_pilot_drawn - 1
@@ -700,7 +728,7 @@ def test_lock_writes_and_registers_the_export(gsettings: Settings, tmp_path: Pat
     assert session.lock_path.exists()
     with pytest.raises(gold.SessionLocked):
         gold.record_undo(session, undone)
-    assert gold.lock_gold(session, _connect(gsettings)).sha256 == result.sha256
+    assert gold.lock_gold(session, _connect(gsettings), text_floor=0).sha256 == result.sha256
 
 
 def test_store_locked_at_the_lock_is_retryable(gsettings: Settings, tmp_path: Path) -> None:
@@ -713,11 +741,11 @@ def test_store_locked_at_the_lock_is_retryable(gsettings: Settings, tmp_path: Pa
         raise StoreLockedError("locked by another process")
         yield  # pragma: no cover
 
-    result = gold.lock_gold(session, busy)
+    result = gold.lock_gold(session, busy, text_floor=0)
     assert result.state == "busy" and "store busy" in (result.message or "")
     assert session.working_path.read_bytes() == before
     assert not session.lock_path.exists()
-    assert gold.lock_gold(session, _connect(gsettings)).state == "locked"
+    assert gold.lock_gold(session, _connect(gsettings), text_floor=0).state == "locked"
 
 
 def test_no_runtime_store_connection_outside_the_lock(
@@ -736,7 +764,7 @@ def test_no_runtime_store_connection_outside_the_lock(
     gold.case_view(resumed, 0)
     _label_all(resumed)
     assert calls == []
-    gold.lock_gold(resumed, _connect(gsettings))
+    gold.lock_gold(resumed, _connect(gsettings), text_floor=0)
     assert len(calls) == 1  # the caller's own write connection, for the registration
 
 
@@ -764,14 +792,15 @@ def test_lock_a_session_over_a_hundred_cases(gsettings: Settings, tmp_path: Path
                 lid,
                 label="bankruptcy",
                 relied_on="outside",
+                basis="text",
                 passage_ref="https://www.sec.gov/x",
                 seconds_spent=12,
             )
         else:
             gold.record_label(
-                session, lid, label="bankruptcy", relied_on="notice", seconds_spent=30
+                session, lid, label="bankruptcy", relied_on="notice", basis="text", seconds_spent=30
             )
-    result = gold.lock_gold(session, _connect(gsettings))
+    result = gold.lock_gold(session, _connect(gsettings), text_floor=0)
     export = pl.read_parquet(datafiles.gold_path(gsettings, result.sha256))
     assert export.height == len(session.cases)
     assert export["passage_ref"].drop_nulls().to_list() == ["https://www.sec.gov/x"]
@@ -781,3 +810,254 @@ def test_lock_a_session_over_a_hundred_cases(gsettings: Settings, tmp_path: Path
         export.schema["form25_accepted_at"]
         == pl.read_parquet(frame.file).schema["form25_accepted_at"]
     )
+
+
+# --- the basis (#1492) ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "relied_on", "basis", "match"),
+    [
+        ("bankruptcy", "notice", None, "needs a basis"),
+        ("unresolved", "notice", "text", "has no basis"),
+        ("bankruptcy", "notice", "rule", "is not one of"),
+        ("bankruptcy", "notice", "provision", "needs relied_on `form 25`"),
+        ("bankruptcy", "8-K item 1.03", "provision", "needs relied_on `form 25`"),
+        ("bankruptcy", "8-K item 1.03", "exchange_rule", "needs relied_on `notice`"),
+        ("bankruptcy", "form 25", "exchange_rule", "needs relied_on `notice`"),
+        ("bankruptcy", "form 25", "text", "a `text` basis needs"),
+    ],
+)
+def test_record_label_refuses_a_missing_or_contradicting_basis(
+    gsettings: Settings,
+    tmp_path: Path,
+    label: str,
+    relied_on: str,
+    basis: str | None,
+    match: str,
+) -> None:
+    session = _build(gsettings, tmp_path).session
+    lid = session.cases[0].listing_end_id
+    with pytest.raises(gold.GoldRefused, match=match):
+        gold.record_label(
+            session, lid, label=label, relied_on=relied_on, basis=basis, seconds_spent=1
+        )
+    assert not session.working_path.exists()
+
+
+def test_record_label_accepts_form_25_and_each_agreeing_basis(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _build(gsettings, tmp_path).session
+    ids = [c.listing_end_id for c in session.cases]
+    answers = [
+        ("instrument_retirement", "form 25", "provision", None),
+        ("bankruptcy", "notice", "exchange_rule", None),
+        ("bankruptcy", "8-K item 1.03", "text", None),
+        ("bankruptcy", "outside", "text", "0000000000-17-000001"),
+        ("unresolved", "form 25", None, None),
+    ]
+    for lid, (label, relied_on, basis, passage) in zip(ids, answers, strict=False):
+        gold.record_label(
+            session,
+            lid,
+            label=label,
+            relied_on=relied_on,
+            basis=basis,
+            passage_ref=passage,
+            seconds_spent=1,
+        )
+    assert [(ln["relied_on"], ln["basis"]) for ln in _working(session)] == [
+        (r, b) for _, r, b, _ in answers
+    ]
+
+
+def _pilot_ids(session: gold.GoldSession) -> list[str]:
+    return [c.listing_end_id for c in session.cases if c.split == "pilot" and c.in_random_draw]
+
+
+def _label_by_basis(session: gold.GoldSession, plan: dict[str, str]) -> None:
+    """Answer every case: `plan` maps a listing end to `provision`, `exchange_rule`,
+    `unresolved` or `unlabelled`; every other case is a `text` label."""
+    for case in session.cases:
+        lid = case.listing_end_id
+        kind = plan.get(lid, "text")
+        if kind == "unlabelled":
+            continue
+        if kind == "unresolved":
+            gold.record_label(session, lid, label="unresolved", relied_on="notice", seconds_spent=1)
+            continue
+        relied_on = {"provision": "form 25", "exchange_rule": "notice", "text": "notice"}[kind]
+        gold.record_label(
+            session, lid, label="bankruptcy", relied_on=relied_on, basis=kind, seconds_spent=1
+        )
+    for lid, kind in plan.items():
+        if kind == "unlabelled":
+            gold.record_skip(session, lid)
+            gold.record_skip(session, lid)
+
+
+def test_basis_counts_counts_the_random_pilot_draw_per_round(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    # LE030 is a seed outside the draw (its CIK excluded), so it counts nowhere.
+    built = _build(gsettings, tmp_path, excluded=[("LE030", "")], seed_cases=("LE030",))
+    path = built.session.session_file
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    pilot = _pilot_ids(built.session)
+    # Mark two random pilot cases as an extension round (what T167b writes).
+    for case in doc["cases"]:
+        if case["listing_end_id"] in pilot[-2:]:
+            case["draw_round"] = 1
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    session = gold.open_gold_session(path, gold.GoldFlags(), settings=gsettings)
+    assert sorted(c.draw_round for c in session.cases if c.listing_end_id in pilot) == [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+    ]
+    plan = {
+        pilot[0]: "provision",
+        pilot[1]: "exchange_rule",
+        pilot[2]: "unresolved",
+        pilot[4]: "provision",
+        "LE030": "provision",
+    }
+    _label_by_basis(session, plan)
+    before = session.working_path.read_bytes()
+    counts = gold.basis_counts(session)
+    assert session.working_path.read_bytes() == before
+    assert dict(counts.counts) == {
+        "text": 2,
+        "exchange_rule": 1,
+        "provision": 2,
+        "unresolved": 1,
+        "unlabelled": 0,
+    }
+    assert (counts.n_pilot, counts.scorable_pilot_text, counts.scorable_pilot) == (6, 2, 5)
+    assert set(counts.by_round) == {0, 1}
+    assert dict(counts.by_round[0].counts) == {
+        "text": 1,
+        "exchange_rule": 1,
+        "provision": 1,
+        "unresolved": 1,
+        "unlabelled": 0,
+    }
+    assert (counts.by_round[1].n_pilot, counts.by_round[1].scorable_pilot_text) == (2, 1)
+    assert counts.by_round[1].counts["provision"] == 1
+
+
+def test_basis_counts_ignores_rule_provision(gsettings: Settings, tmp_path: Path) -> None:
+    """Nothing reads the frame's provision: a sentinel changes no count."""
+    rows = _frame_rows()
+    for row in rows:
+        docs = json.loads(row["documents"])
+        docs["rule_provision"] = docs["rule_provision_raw"] = "12d2-2(a)(1)"
+        row["documents"] = json.dumps(docs, sort_keys=True)
+    session = _build(gsettings, tmp_path, rows=rows).session
+    _label_all(session)
+    counts = gold.basis_counts(session)
+    assert counts.counts["text"] == len(_pilot_ids(session))
+    assert counts.counts["provision"] == 0
+
+
+def test_lock_refuses_a_labelled_line_without_basis_naming_the_case(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _build(gsettings, tmp_path).session
+    _label_all(session)
+    lid = session.cases[1].listing_end_id
+    datafiles.append_jsonl(
+        session.working_path,
+        [
+            {"listing_end_id": lid, "undo": True},
+            {
+                "listing_end_id": lid,
+                "gold_label": "bankruptcy",
+                "relied_on": "notice",
+                "confidence": "high",
+            },
+        ],
+    )
+    with pytest.raises(gold.GoldRefused, match=f"{lid}: a `bankruptcy` label needs a basis"):
+        gold.lock_gold(session, _connect(gsettings), text_floor=0)
+    assert not session.lock_path.exists()
+
+
+def _gold_datasets(settings: Settings) -> int:
+    conn = duckdb.connect(settings.store.path, read_only=True)
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM research_datasets WHERE name = ?", [gold.DATASET_NAME]
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row else 0
+
+
+def test_lock_under_the_floor_refuses_and_writes_nothing(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _build(gsettings, tmp_path).session
+    pilot = _pilot_ids(session)
+    _label_by_basis(session, {pilot[0]: "provision", pilot[1]: "unresolved"})
+    text = len(pilot) - 2
+    with pytest.raises(gold.BelowFloor, match=f"is {text}, under the floor {text + 1}"):
+        gold.lock_gold(session, _connect(gsettings), text_floor=text + 1)
+    assert not session.lock_path.exists()
+    assert _gold_datasets(gsettings) == 0
+    gold_dir = datafiles.gold_working_path(gsettings).parent
+    assert sorted(p.name for p in gold_dir.iterdir()) == ["session.json", "working.jsonl"]
+    result = gold.lock_gold(session, _connect(gsettings), text_floor=text)
+    assert result.state == "locked"
+    assert _gold_datasets(gsettings) == 1
+
+
+def test_the_export_carries_basis_draw_round_and_the_protocol_version(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _build(gsettings, tmp_path).session
+    pilot = _pilot_ids(session)
+    plan = {pilot[0]: "provision", pilot[1]: "exchange_rule", pilot[2]: "unresolved"}
+    plan[pilot[3]] = "unlabelled"
+    _label_by_basis(session, plan)
+    result = gold.lock_gold(session, _connect(gsettings), text_floor=2)
+    assert (result.scorable_pilot, result.scorable_pilot_text) == (4, 2)
+    assert dict(result.basis_counts.counts) == {
+        "text": 2,
+        "exchange_rule": 1,
+        "provision": 1,
+        "unresolved": 1,
+        "unlabelled": 1,
+    }
+    assert set(result.basis_counts.by_round) == {0}
+    export_path = datafiles.gold_path(gsettings, result.sha256)
+    export = pl.read_parquet(export_path)
+    assert export.schema["basis"] == pl.String and export.schema["draw_round"] == pl.Int64
+    by_id = {r["listing_end_id"]: r for r in export.to_dicts()}
+    assert by_id[pilot[0]]["basis"] == "provision"
+    assert by_id[pilot[1]]["basis"] == "exchange_rule"
+    assert by_id[pilot[2]]["basis"] is None  # unresolved
+    assert by_id[pilot[3]]["basis"] is None and by_id[pilot[3]]["unlabelled"] is True
+    assert by_id[pilot[4]]["basis"] == "text"
+    assert set(export["draw_round"].to_list()) == {0}
+    assert pl.read_parquet_metadata(export_path)["protocol_version"] == "1"
+    lock = json.loads(session.lock_path.read_text(encoding="utf-8"))
+    assert lock["scorable_pilot_text"] == 2
+    assert lock["basis_counts"]["by_round"]["0"]["provision"] == 1
+    again = gold.lock_gold(session, _connect(gsettings), text_floor=99)
+    assert (again.sha256, again.scorable_pilot_text) == (result.sha256, 2)
+
+
+def test_suggested_n_follows_the_spec_formula(gsettings: Settings, tmp_path: Path) -> None:
+    session = _build(gsettings, tmp_path).session
+    pilot = _pilot_ids(session)
+    _label_by_basis(session, {pilot[0]: "provision", pilot[1]: "provision"})
+    counts = gold.basis_counts(session)
+    # n_dev + ceil((floor + 5) * n_pilot / text) = 3 + ceil(15 * 6 / 4) = 3 + 23
+    assert gold.suggested_n(session, counts, 10) == N_DEV + 23
+    none = gold.BasisCounts(6, dict.fromkeys(gold.BASIS_COUNT_KEYS, 0), {})
+    assert gold.suggested_n(session, none, 10) is None

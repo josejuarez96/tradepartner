@@ -752,3 +752,121 @@ def test_review_mode_on_a_locked_store_shows_store_busy(
     )
     assert any("store busy" in str(e.value) for e in at.error)
     assert not at.button
+
+
+# --- the basis (#1492) ------------------------------------------------------------
+
+#: A one-meaning provision planted on every case: it must not set or change the basis.
+PROVISION_SENTINEL = "12d2-2(a)(1)"
+
+
+def _session_with(
+    gsettings: Settings, tmp_path: Path, *, stub: bool, provision: str | None = None
+) -> gold.GoldSession:
+    """T131's synthetic frame; `stub` makes every case a stub notice with no 8-K."""
+    rows = []
+    for row in _frame_rows():
+        docs = json.loads(row["documents"])
+        if stub:
+            docs["exhibit"] = {"status": "stub"}
+            docs["eightk"] = None
+        if provision is not None:
+            docs["rule_provision"] = provision
+            docs["rule_provision_raw"] = f"17 CFR 240.{provision}"
+        rows.append({**row, "documents": json.dumps(docs, sort_keys=True)})
+    return gold.build_gold_session(
+        _write_frame(tmp_path, rows),
+        SEED,
+        N,
+        _exclusion(tmp_path, []),
+        settings=gsettings,
+        n_dev=N_DEV,
+        dev_span_min_rows=DEV_ROWS,
+    ).session
+
+
+def _shown_lid(at: AppTest) -> str:
+    """The listing end on screen, from the basis radio's key."""
+    (key,) = [str(r.key) for r in at.radio if str(r.key).startswith("basis-")]
+    return key.removeprefix("basis-")
+
+
+def _unresolved_key() -> str:
+    names = [name for name, _ in DEFAULT_OPTION_SET.options]
+    return f"opt-{names.index('unresolved') + 1}"
+
+
+def test_basis_default_reads_only_what_is_shown() -> None:
+    eightk = gold.EightKView("8-K", "A1", None, (("2.01", "t"),), None)
+    assert review_page.basis_default("notice", None) == 0
+    assert review_page.basis_default(None, eightk) == 0
+    assert review_page.basis_default(None, None) is None
+    assert review_page.relied_on_choices(None, None, form25=True) == ["outside", "form 25"]
+
+
+@pytest.mark.parametrize("provision", [None, PROVISION_SENTINEL])
+def test_the_basis_radio_preselects_text_on_a_text_case_with_three_captions(
+    monkeypatch: pytest.MonkeyPatch,
+    gsettings: Settings,
+    tmp_path: Path,
+    stops: list[int],
+    provision: str | None,
+) -> None:
+    session = _session_with(gsettings, tmp_path, stub=False, provision=provision)
+    at = _gold_app(monkeypatch, session, stops)
+    lid = _shown_lid(at)
+    radio = at.radio(key=f"basis-{lid}")
+    assert radio.label == "Basis"
+    assert list(radio.options) == ["text", "exchange_rule", "provision"]
+    assert radio.value == "text"
+    assert list(radio.proto.captions) == [
+        review_page.BASIS_CAPTIONS[b] for b in ("text", "exchange_rule", "provision")
+    ]
+    assert "form 25" in list(at.radio(key=f"relied-{lid}").options)
+    _press(at, "opt-1")
+    (line,) = _lines(session.working_path)
+    assert (line["listing_end_id"], line["basis"]) == (lid, "text")
+
+
+@pytest.mark.parametrize("provision", [None, PROVISION_SENTINEL])
+def test_a_stub_case_has_no_default_and_refuses_an_answer_until_a_basis_is_chosen(
+    monkeypatch: pytest.MonkeyPatch,
+    gsettings: Settings,
+    tmp_path: Path,
+    stops: list[int],
+    provision: str | None,
+) -> None:
+    session = _session_with(gsettings, tmp_path, stub=True, provision=provision)
+    at = _gold_app(monkeypatch, session, stops)
+    lid = _shown_lid(at)
+    assert at.radio(key=f"basis-{lid}").value is None
+    _press(at, "opt-3")
+    assert _lines(session.working_path) == []
+    assert any("Choose the basis" in str(e.value) for e in at.error)
+    assert _shown_lid(at) == lid
+    at.radio(key=f"relied-{lid}").set_value("form 25")
+    at.radio(key=f"basis-{lid}").set_value("provision")
+    _press(at, "opt-3")
+    (line,) = _lines(session.working_path)
+    assert (line["listing_end_id"], line["relied_on"], line["basis"]) == (
+        lid,
+        "form 25",
+        "provision",
+    )
+
+
+def test_the_picked_basis_reaches_the_line_and_unresolved_records_none(
+    monkeypatch: pytest.MonkeyPatch, gsettings: Settings, tmp_path: Path, stops: list[int]
+) -> None:
+    session = _session_with(gsettings, tmp_path, stub=False)
+    at = _gold_app(monkeypatch, session, stops)
+    first = _shown_lid(at)
+    at.radio(key=f"basis-{first}").set_value("exchange_rule")
+    _press(at, "opt-5")
+    second = _shown_lid(at)
+    _press(at, _unresolved_key())  # `text` is preselected; an unresolved answer drops it
+    lines = _lines(session.working_path)
+    assert [(ln["listing_end_id"], ln["gold_label"], ln["basis"]) for ln in lines] == [
+        (first, "bankruptcy", "exchange_rule"),
+        (second, "unresolved", None),
+    ]
