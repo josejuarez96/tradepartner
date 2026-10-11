@@ -1098,7 +1098,12 @@ def test_gold_metrics_writes_the_split_and_counts_the_text_set_only() -> None:
             "listing_end_id": r["listing_end_id"],
             "reason": "ok",
             "selected_option": answers.get(r["listing_end_id"], "unresolved"),
-            "probabilities": {},
+            # sure on the text rows, unsure elsewhere: pooled, the calibration share drops
+            "probabilities": (
+                {answers[r["listing_end_id"]]: 1.0}
+                if r["basis"] == "text"
+                else {"unresolved": 0.5, "instrument_retirement": 0.5}
+            ),
         }
         for r in rows
     ]
@@ -1124,7 +1129,9 @@ def test_gold_metrics_writes_the_split_and_counts_the_text_set_only() -> None:
     # the arm never scores a provision-decided label
     assert metrics["arm_class_accuracy"]["n"] == 0 and metrics["arm_coverage"] == 0.0
     assert metrics["per_option"]["instrument_retirement"]["recall_n"] == 0
-    assert metrics["worst_case_lower_bound"] > 0.0
+    assert metrics["worst_case_lower_bound"] == pytest.approx(scoring.wilson_lower_bound(2, 3))
+    assert metrics["class_accuracy_text_states"]["n"] == 3
+    assert metrics["share_p_at_or_above_0_999"] == 1.0
 
 
 def test_a_pilot_runs_n_clusters_is_the_text_count(world: World) -> None:
