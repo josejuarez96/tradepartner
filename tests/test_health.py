@@ -21,7 +21,12 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from pydantic import ValidationError
 
-from tradepartner.calendar import all_sessions, last_session_of_month, session_close
+from tradepartner.calendar import (
+    all_sessions,
+    last_completed_session,
+    last_session_of_month,
+    session_close,
+)
 from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
@@ -51,6 +56,7 @@ from tradepartner.health import (
     health_report,
     integrity_checks,
     last_ingests,
+    listed_without_bars,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -522,6 +528,89 @@ def test_transfer_counts_as_delisted_before_the_new_listing_is_known(
 ) -> None:
     ids = delisted_names(fixture_store, T_TRANSFER_PROBE, settings).frame["security_id"]
     assert "SEC_TRANSFER" in ids.to_list()
+
+
+# --- Listed with no bars after a Form 25 (#1460, #828 item 5) ----------------
+
+#: SEC_25NSE (NSEX, NYSE) is delisted by a 25-NSE effective 2018-09-02 and
+#: has no bar after it (fixture README). A stale cover page reopens it.
+REOPENED_ON = date(2019, 3, 1)
+
+
+def _reopen(conn: duckdb.DuckDBPyConnection, exchange: str = "NYSE") -> None:
+    insert_row(conn, "listings", _listing_row("SEC_25NSE", "NSEX", exchange, REOPENED_ON))
+
+
+def test_fixture_store_has_no_listed_row_without_bars_after_a_form25(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    found = listed_without_bars(fixture_store, T_END, settings)
+    assert found.count == 0
+    assert found.frame.is_empty()
+
+
+def test_stale_cover_page_after_a_form25_is_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    found = listed_without_bars(fixture_store, T_END, settings)
+    assert found.count == 1
+    row = found.frame.row(0, named=True)
+    assert row["security_id"] == "SEC_25NSE"
+    assert row["ticker"] == "NSEX"
+    assert row["exchange"] == "NYSE"
+    assert row["valid_from"] == REOPENED_ON
+    assert row["delisting_form"] == "25-NSE"
+    assert row["delisting_effective_on"] == date(2018, 9, 2)
+    # Report-only: the full report carries it and still passes every rule.
+    report = health_report(fixture_store, T_END, settings)
+    assert report.listed_without_bars.count == 1
+    assert report.ok, report.failures
+
+
+def test_reopened_row_is_not_counted_before_it_is_known(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    before = session_close(REOPENED_ON) - timedelta(seconds=1)
+    assert listed_without_bars(fixture_store, before, settings).count == 0
+    assert listed_without_bars(fixture_store, session_close(REOPENED_ON), settings).count == 1
+
+
+def test_reopened_row_with_a_bar_since_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    bar_day = date(2019, 3, 4)
+    # A late bar: known 12 hours after its session's close.
+    known = session_close(bar_day) + timedelta(hours=12)
+    insert_row(fixture_store, "prices_daily", _bar("SEC_25NSE", bar_day, known=known))
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
+    # The bar counts only from its own known_at, not from its session.
+    early = session_close(bar_day) + timedelta(hours=1)
+    assert last_completed_session(early) == bar_day
+    assert listed_without_bars(fixture_store, early, settings).count == 1
+    assert listed_without_bars(fixture_store, known, settings).count == 0
+
+
+@pytest.mark.parametrize("exchange", ["NONE", "OTC"])
+def test_off_exchange_row_after_a_form25_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings, exchange: str
+) -> None:
+    # The normal suspension / OTC quote sequence: the feed has no OTC bars.
+    _reopen(fixture_store, exchange)
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
+
+
+def test_listed_row_with_no_earlier_form25_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # A new listing with no bars and no prior delisting is coverage's
+    # business, not this count's.
+    insert_row(
+        fixture_store, "listings", _listing_row("SEC_NEW_NOBARS", "NEWX", "NYSE", REOPENED_ON)
+    )
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
 
 
 # --- Integrity rules, one injected violation each ----------------------------

@@ -307,39 +307,63 @@ def test_unlabelled_share() -> None:
 # --- seeded_recall ---------------------------------------------------------------
 
 
-def test_seeded_recall_with_no_seeds_is_one() -> None:
-    assert scoring.seeded_recall([]) == 1.0
+def test_seeded_recall_with_no_seeds_is_none_not_a_vacuous_one() -> None:
+    """#1351: no seed (or only seeds off rows 6 and 7) makes no claim; the old
+    `1.0` passed the gate on an empty seed set."""
+    assert scoring.seeded_recall([]) is None
+    row4 = crosswalk.RuleAnswer(status="delisted", form15_in_window=True)
+    seed = scoring.ScoredItem(
+        "seed",
+        "redomicile_or_reorganisation",
+        "redomicile_or_reorganisation",
+        "ok",
+        is_seed=True,
+        pre_fix_rule_answer=row4,
+    )
+    assert scoring.seeded_recall([seed]) is None
 
 
-def test_seeded_recall_3_of_4_caught() -> None:
-    row6 = crosswalk.RuleAnswer(status="listed")  # a disagreement by construction
-    row1 = crosswalk.RuleAnswer(status="transferred")  # consistent only with exchange_transfer
+def test_seeded_recall_gates_rows_6_and_7_and_reports_the_rest() -> None:
+    """#1351 option (a): a correct label on a row-4 or row-5 seed agrees with the
+    pre-fix rule, so it is not caught; it is reported, never gated."""
+    row6 = crosswalk.RuleAnswer(status="listed")
+    row7 = crosswalk.RuleAnswer(status="unmatched")
+    row4 = crosswalk.RuleAnswer(status="delisted", form15_in_window=True)
+    row5 = crosswalk.RuleAnswer(status="delisted")
     items = [
-        # caught: row 6 disagrees with every non-unresolved option
         scoring.ScoredItem(
-            "seed-1", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6
+            "seed-6", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6
         ),
-        # caught: a timeout is always shortlisted
         scoring.ScoredItem(
-            "seed-2", "bankruptcy", None, "timeout", is_seed=True, pre_fix_rule_answer=row6
+            "seed-7", "bankruptcy", None, "timeout", is_seed=True, pre_fix_rule_answer=row7
         ),
-        # caught: a model unresolved is always shortlisted
-        scoring.ScoredItem(
-            "seed-3", "bankruptcy", UNRESOLVED, "ok", is_seed=True, pre_fix_rule_answer=row6
-        ),
-        # not caught: exchange_transfer is consistent with row 1, so it's an agreement
+        # Seagate 2021's shape: a correct redomicile label agrees with row 4
         scoring.ScoredItem(
             "seed-4",
+            "redomicile_or_reorganisation",
+            "redomicile_or_reorganisation",
+            "ok",
+            is_seed=True,
+            pre_fix_rule_answer=row4,
+        ),
+        # a row-5 seed the model labels outside the row's set is caught, still ungated
+        scoring.ScoredItem(
+            "seed-5",
             "exchange_transfer",
             "exchange_transfer",
             "ok",
             is_seed=True,
-            pre_fix_rule_answer=row1,
+            pre_fix_rule_answer=row5,
         ),
-        # a non-seed item never counts toward the denominator
         scoring.ScoredItem("not-a-seed", "bankruptcy", "bankruptcy", "ok", is_seed=False),
     ]
-    assert scoring.seeded_recall(items) == 0.75
+    assert scoring.seeded_recall(items) == 1.0
+    assert scoring.seeded_report(items) == (
+        scoring.SeedOutcome("seed-4", 4, gated=False, caught=False),
+        scoring.SeedOutcome("seed-5", 5, gated=False, caught=True),
+        scoring.SeedOutcome("seed-6", 6, gated=True, caught=True),
+        scoring.SeedOutcome("seed-7", 7, gated=True, caught=True),
+    )
 
 
 # --- per_option_precision_recall -------------------------------------------------

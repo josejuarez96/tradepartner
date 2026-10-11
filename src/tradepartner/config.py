@@ -1415,9 +1415,12 @@ class RiskConfig(BaseModel):
     whole-share sell were accepted (`min_order_notional`, Alpaca's documented $1);
     position quantities equalled the summed 9-decimal fills exactly
     (`reconcile_quantity_tolerance`); `cash` is reported in cents and moved within
-    $0.0022 of the six fills' exact value (`reconcile_cash_tolerance`; its scaling with
-    the fill count is the owner's question in #1290). After the
-    first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
+    $0.0022 of the six fills' exact value. `reconcile_cash_tolerance` was widened from
+    0.01 to 1.26 by ADR 0010's amendment of 2026-10-10 (#1290, owner's option (b)):
+    if Alpaca rounds each fill to the cent, the ledger drifts by up to $0.005 per fill,
+    so the band is 0.005 x `max_orders_per_run` (250) + 0.01. The value is a fixed
+    default, not derived at run time; a window keeps the value it froze at `paper start`.
+    After the first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1436,7 +1439,7 @@ class RiskConfig(BaseModel):
     clock_max_sessions_late: int = Field(default=1, ge=0)
     max_broker_clock_skew_seconds: float = Field(default=60.0, ge=0)
     reconcile_quantity_tolerance: float = Field(default=1e-6, ge=0)
-    reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
+    reconcile_cash_tolerance: float = Field(default=1.26, ge=0)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
