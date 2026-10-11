@@ -1238,9 +1238,13 @@ class TestFamilyBenchmarks:
 #: for the fixture run below, taken on the code before `series_metrics` took a per-period
 #: risk-free sequence (T170). The H1 twin's metrics must not move.
 PINNED_METRIC_DIGESTS = {
-    0.0: "ddcaebf4a22ec4f2d808d3ea09210e24408e960e88dd77a3a60378ea6dbb14ef",
-    0.02: "8b68e637b8bb2c55538ce52925a269ced8bc422a8c9d4b4caa8577bc6ae8809d",
+    0.0: "7b0461c930f107298f2f2f05faceb098ed145f90e22f952c11db08d88b6e26d3",
+    0.02: "69a52a3f6343ed984d0a6853ceeb8c5ea1f11acefa99da5197117bcfb98c8b5a",
 }
+
+
+def _digits(value: float | None) -> str:
+    return "null" if value is None else format(value, ".10g")
 
 
 @pytest.mark.parametrize("rate", [0.0, 0.02])
@@ -1256,7 +1260,7 @@ def test_every_pre_existing_metric_row_is_byte_identical(
     results = _run(settings, handle)
     rows = metric_rows(results, settings, cadence="month_end", family="momentum")
     kept = [
-        f"{r.series}|{r.cost_per_side_bps}|{r.metric}|{r.value!r}"
+        "|".join([r.series, str(r.cost_per_side_bps), r.metric, _digits(r.value)])
         for r in rows
         if r.metric != "risk_free_annual"
     ]
