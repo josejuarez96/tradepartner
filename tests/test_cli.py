@@ -7,6 +7,7 @@ touches the network, the owner's store or a browser.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -273,9 +274,11 @@ def test_ingest_refuses_statement_flags_where_they_cannot_apply(
 
 
 def _manifest(
-    tmp_path: Path, header: str = "cik,accession,old_stamp,new_stamp,method,evidence"
+    tmp_path: Path,
+    header: str = "cik,accession,old_stamp,new_stamp,method,evidence",
+    name: str = "manifest.csv",
 ) -> Path:
-    path = tmp_path / "manifest.csv"
+    path = tmp_path / name
     path.write_text(
         f"{header}\n0000000001,0000000001-19-000001,2019-03-01T16:30:00+00:00,"
         "2019-03-01T21:30:00+00:00,shift,class early\n"
@@ -334,6 +337,80 @@ def test_ingest_refuses_a_manifest_missing_a_column(
     result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--restamp-from", str(path)])
     assert result.exit_code == 2, result.output
     assert "new_stamp" in result.output
+    assert session.calls == []
+
+
+#: The cache driver's manifest name for release `restamp-x` (T166a).
+_RELEASED = "v1.restamp-x.manifest.csv"
+
+
+def _precheck_file(tmp_path: Path, **fields: Any) -> Path:
+    path = tmp_path / "precheck.restamp-x.json"
+    data: dict[str, Any] = {
+        "release": "restamp-x",
+        "window_first_session": "2026-10-12",
+        "pass": True,
+        "instants": ["2026-10-09T20:00:00+00:00"],
+        "journal_high_water": "2026-10-09T21:00:00+00:00",
+        "made_at": "2026-10-12T13:00:00+00:00",
+    }
+    data.update(fields)
+    path.write_text(json.dumps({k: v for k, v in data.items() if v is not ...}))
+    return path
+
+
+def test_ingest_restamp_window_earlier_ok_hands_the_precheck_and_release_on(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, tmp_path: Path
+) -> None:
+    """#1497 (T166e): the pre-check file reaches `ingest_session` parsed,
+    with the release read from the manifest's name; whether it allows the
+    restamp is decided in the store transaction, not here."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    manifest = _manifest(tmp_path, name=_RELEASED)
+    precheck = _precheck_file(tmp_path)
+    args = ["ingest", "--source", "edgar", "--restamp-from", str(manifest)]
+    result = _invoke(secrets_set, [*args, "--restamp-window-earlier-ok", str(precheck)])
+    assert result.exit_code == 0, result.output
+    ok = session.calls[0]["restamp_window_ok"]
+    assert ok.release == ok.file_release == "restamp-x" and ok.passed
+    assert ok.window_first_session == date(2026, 10, 12)
+    assert ok.instants == (datetime(2026, 10, 9, 20, tzinfo=UTC),)
+    assert ok.journal_high_water == datetime(2026, 10, 9, 21, tzinfo=UTC)
+
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 0, result.output
+    assert session.calls[1]["restamp_window_ok"] is None
+
+
+@pytest.mark.parametrize(
+    ("manifest_name", "fields", "with_manifest", "why"),
+    [
+        (_RELEASED, {}, False, "needs --restamp-from"),
+        ("manifest.csv", {}, True, "v1.<release>.manifest.csv"),
+        (_RELEASED, {"instants": ...}, True, "instants"),
+        (_RELEASED, {"pass": "yes"}, True, "pass must be"),
+        (_RELEASED, {"instants": ["2026-10-09T20:00:00"]}, True, "instants"),
+    ],
+    ids=["no-manifest", "unnamed-manifest", "missing-field", "pass-not-bool", "naive-instant"],
+)
+def test_ingest_refuses_an_unusable_restamp_window_earlier_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    secrets_set: Settings,
+    tmp_path: Path,
+    manifest_name: str,
+    fields: dict[str, Any],
+    with_manifest: bool,
+    why: str,
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    manifest = _manifest(tmp_path, name=manifest_name)
+    precheck = _precheck_file(tmp_path, **fields)
+    args = ["ingest", "--source", "edgar", "--restamp-window-earlier-ok", str(precheck)]
+    if with_manifest:
+        args += ["--restamp-from", str(manifest)]
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 2, result.output
+    assert why in result.output
     assert session.calls == []
 
 

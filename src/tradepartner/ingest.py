@@ -135,7 +135,10 @@ and the row stays at the old `known_at`. `restamp` (CLI `ingest --source
 edgar --restamp-from <manifest>`) moves those rows by UPDATE, never a delete
 and re-insert, in the EDGAR chunk's transaction before the day's rows are
 written: `restamp_from_manifest` has the matching rule, the refusals and the
-paper-window abort. A manifest may cover any subset of CIKs; a rerun finds
+paper-window abort. `restamp_window_ok` (#1497, T166e; CLI
+`--restamp-window-earlier-ok <precheck.json>`) lets a late stamp inside an
+open window move earlier to its SGML header time, under T166f's rule and
+pre-check. A manifest may cover any subset of CIKs; a rerun finds
 no row at its old stamps and moves nothing. `statement_facts` follow
 through `rebuild_statement_facts`, `filing_events` through
 `rebuild_filing_events`.
@@ -144,6 +147,7 @@ through `rebuild_statement_facts`, `filing_events` through
 from __future__ import annotations
 
 import csv
+import json
 import re
 import time
 import traceback
@@ -306,6 +310,7 @@ def ingest_session(
     rebuild_filing_events: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
+    restamp_window_ok: WindowEarlierOk | None = None,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
     `all`); see the module docstring. `clock` gives the run's instant, used
@@ -320,9 +325,13 @@ def ingest_session(
     manifest repairs (`restamp_from_manifest`) in the EDGAR chunk's
     transaction, before that day's rows are written; it needs `source`
     `edgar`. `on_restamp` receives its `RestampResult` (after a dry run too,
-    though nothing is kept)."""
+    though nothing is kept). `restamp_window_ok` (#1497, T166e) is the
+    pre-check that lets in-window corrections move (`restamp_from_manifest`);
+    it needs `restamp`."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
+    if restamp_window_ok is not None and restamp is None:
+        raise ValueError("restamp_window_ok needs restamp")
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
@@ -347,6 +356,7 @@ def ingest_session(
             rebuild_filing_events=rebuild_filing_events,
             restamp=restamp,
             on_restamp=on_restamp,
+            restamp_window_ok=restamp_window_ok,
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
@@ -744,6 +754,7 @@ def _ingest_filings(
     rebuild_filing_events: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
+    restamp_window_ok: WindowEarlierOk | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -766,7 +777,11 @@ def _ingest_filings(
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
-            conn, restamp, ingested_at=now, delistings=recorded.delistings()
+            conn,
+            restamp,
+            ingested_at=now,
+            delistings=recorded.delistings(),
+            window_ok=restamp_window_ok,
         )
         restamped = result.message()
         if on_restamp is not None:
@@ -963,6 +978,125 @@ class RestampAborted(ValueError):
     (data-releases runbook, rule 5)."""
 
 
+#: A stamps-repair manifest's file name: `v<PARSER_VERSION>.<release>.manifest.csv`.
+_MANIFEST_NAME = re.compile(r"v(\d+)\.(.+)\.manifest\.csv")
+
+
+def manifest_release(path: Path) -> str:
+    """The release a stamps-repair manifest belongs to, read from its name
+    (`v<PARSER_VERSION>.<release>.manifest.csv`, the cache driver's name).
+    Raises `ValueError` for any other name or another parser version."""
+    from tradepartner.adapters.edgar_source import PARSER_VERSION  # it imports this module
+
+    match = _MANIFEST_NAME.fullmatch(path.name)
+    if match is None or int(match.group(1)) != PARSER_VERSION:
+        raise ValueError(
+            f"{path.name}: a manifest named v{PARSER_VERSION}.<release>.manifest.csv "
+            "is needed to read its release"
+        )
+    return match.group(2)
+
+
+@dataclass(frozen=True)
+class WindowEarlierOk:
+    """The read-only pre-check (T166f's `precheck.<release>.json`) that lets
+    a restamp move in-window corrections (#1497 decision (d)), with the
+    `release` of the manifest it is used with. `passed`, the file's
+    `release`, `window_first_session`, `instants` and `journal_high_water`
+    are the file's own fields; `path` names it in refusals."""
+
+    path: Path
+    release: str
+    file_release: str
+    passed: bool
+    window_first_session: date | None
+    instants: tuple[datetime, ...]
+    journal_high_water: datetime | None
+
+    @classmethod
+    def read(cls, path: Path, *, release: str) -> WindowEarlierOk:
+        """Parse the pre-check file at `path` for the manifest's `release`.
+        Raises `ValueError` on a missing field or a naive instant; whether
+        the file allows the restamp is decided inside the restamp's
+        transaction (`restamp_from_manifest`), not here."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: a pre-check file is a JSON object")
+        missing = [
+            k
+            for k in ("release", "window_first_session", "pass", "instants", "journal_high_water")
+            if k not in data
+        ]
+        if missing:
+            raise ValueError(f"{path}: pre-check lacks field(s) {', '.join(missing)}")
+        if not isinstance(data["pass"], bool):
+            raise ValueError(f"{path}: pass must be true or false")
+        first = data["window_first_session"]
+        high = data["journal_high_water"]
+        return cls(
+            path=path,
+            release=release,
+            file_release=str(data["release"]),
+            passed=data["pass"],
+            window_first_session=None if first is None else date.fromisoformat(first),
+            instants=tuple(
+                sorted(
+                    ensure_tz_aware_utc(datetime.fromisoformat(t), field_name="instants")
+                    for t in data["instants"]
+                )
+            ),
+            journal_high_water=(
+                None
+                if high is None
+                else ensure_tz_aware_utc(
+                    datetime.fromisoformat(high), field_name="journal_high_water"
+                )
+            ),
+        )
+
+    def backup(self) -> str:
+        """The stamps cache backup a stale-file refusal names (runbook)."""
+        from tradepartner.adapters.edgar_source import PARSER_VERSION  # it imports this module
+
+        return f"stamps/v{PARSER_VERSION}.{self.release}.bak"
+
+
+def _window_ok_refusal(
+    conn: duckdb.DuckDBPyConnection, ok: WindowEarlierOk, first: date | None
+) -> str | None:
+    """Why the pre-check file `ok` cannot let this restamp move in-window
+    corrections, or None when it can: it must say pass, for this manifest's
+    release and the store's window start, and the instants and the journal
+    high-water mark T166f's query recomputes now must equal the file's."""
+    from tradepartner.store import restamp_precheck  # T166f; see `restamp_from_manifest`
+
+    name = ok.path.name
+    if not ok.passed:
+        return f"pre-check {name} does not say pass"
+    if ok.file_release != ok.release:
+        return f"pre-check {name} is for release {ok.file_release}, the manifest's is {ok.release}"
+    if ok.window_first_session != first:
+        return (
+            f"pre-check {name} is for window start {ok.window_first_session}, "
+            f"the store's is {first}"
+        )
+    instants = tuple(
+        sorted(
+            ensure_tz_aware_utc(t, field_name="instant")
+            for t in restamp_precheck.read_instants(conn)
+        )
+    )
+    high = restamp_precheck.journal_high_water(conn)
+    high = None if high is None else ensure_tz_aware_utc(high, field_name="journal_high_water")
+    if instants != ok.instants or high != ok.journal_high_water:
+        return (
+            f"pre-check {name} is stale: the store's read instants or journal high-water mark "
+            f"changed since it was made; restore the stamps cache from {ok.backup()}, "
+            "close the release as rolled back and start a new one with a fresh pre-check"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class RestampResult:
     """What one restamp did: `moved` rows per table, the CIKs it `refused`
@@ -1010,12 +1144,25 @@ def window_first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
 _RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <> t.ingested_at"
 
 
+def _earlier_ok(change: ManifestRow, first: date, instants: Sequence[datetime]) -> bool:
+    """True when the in-window `change` may move under a passing pre-check:
+    T166f's rule allows it and no read instant `t` has `new <= t < old` (no
+    paper decision read the row before the correction that reads it
+    differently after)."""
+    from tradepartner.adapters.stamp_repair import in_window_change_allowed  # T166f
+
+    return in_window_change_allowed(change, first) and not any(
+        change.new_stamp <= t < change.old_stamp for t in instants
+    )
+
+
 def restamp_from_manifest(
     conn: duckdb.DuckDBPyConnection,
     changes: Sequence[ManifestRow],
     *,
     ingested_at: datetime,
     delistings: Iterable[DelistingFiling],
+    window_ok: WindowEarlierOk | None = None,
 ) -> RestampResult:
     """Move the stored stamps the manifest `changes` repair, inside the
     caller's transaction; never a delete and re-insert.
@@ -1048,16 +1195,29 @@ def restamp_from_manifest(
 
     **Aborts** with `RestampAborted`, before any write, when any change's old
     or new stamp falls on or after the first session of an open paper
-    window (`window_first_session`). After the writes, a changed set of
+    window (`window_first_session`). With `window_ok` (#1497 decision (d),
+    T166e) an in-window change may move, but only when the pre-check file
+    passes for this release and window start and still matches the store
+    (`_window_ok_refusal`, else `RestampAborted` naming the cache backup),
+    when T166f's `in_window_change_allowed` allows it (an `sgml` move earlier
+    by at most New York's offset), and when no read instant `t` of the file
+    has `new <= t < old`; any other in-window change aborts as without it.
+    The refusals below apply to the in-window changes as to any. After the writes, a changed set of
     `security_id`s in any table raises `RuntimeError`, so the caller's
     transaction rolls back (the restamp never mints an id)."""
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     moving = [c for c in changes if c.changed]
     first = window_first_session(conn)
+    if window_ok is not None:
+        why = _window_ok_refusal(conn, window_ok, first)
+        if why is not None:
+            raise RestampAborted(why)
     if first is not None:
         inside = [
             c for c in moving if _ny_date(c.old_stamp) >= first or _ny_date(c.new_stamp) >= first
         ]
+        if window_ok is not None:
+            inside = [c for c in inside if not _earlier_ok(c, first, window_ok.instants)]
         if inside:
             listed = "; ".join(
                 f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"
