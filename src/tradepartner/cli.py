@@ -150,8 +150,10 @@ Research labeling (research-labeling spec C12 and req 18, amendment 2026-10-08
 and `store.registry.code_version`, and prints through the `cli_record` scrub:
 
 - `tradepartner corpus fetch departure-reason [--since] [--until] [--cik]...
-  [--limit]` runs `corpus.departure_fetch.fetch_departure_corpus` through the
-  paced EDGAR client and prints the corpus path and its count identity.
+  [--limit] [--max-requests]` runs `corpus.departure_fetch.fetch_departure_corpus`
+  through the paced EDGAR client, prints the requests still to make once the
+  listing ends are known (stopping there above `--max-requests`, T168), then the
+  corpus path and its count identity.
 - `tradepartner research frame build departure-reason --corpus <path> --as-of
   <t> [--register]` runs `research.labeling.frame.build_frame` at `t` (an ISO
   datetime with its UTC offset) and either registers the frame
@@ -2859,6 +2861,12 @@ def make_app(
         limit: Annotated[
             int | None, typer.Option(help="only the first n accessions by filing date")
         ] = None,
+        max_requests: Annotated[
+            int,
+            typer.Option(
+                help="stop before the SGML headers and 8-Ks when more requests than this remain"
+            ),
+        ] = departure_fetch.DEFAULT_MAX_REQUESTS,
     ) -> None:
         """Fetch the departure-reason corpus (Form 25s, notices, one 8-K each)."""
         start = _parse_day("--since", since)
@@ -2866,6 +2874,8 @@ def make_app(
         end = _parse_day("--until", until)
         if limit is not None and limit < 1:
             raise _fail("--limit must be at least 1", USAGE_ERROR)
+        if max_requests < 0:
+            raise _fail("--max-requests must be at least 0", USAGE_ERROR)
         ciks = tuple(c.strip() for c in cik or ())
         bad = [c for c in ciks if not (c.isascii() and c.isdigit())]
         if bad:
@@ -2888,6 +2898,8 @@ def make_app(
                 settings=s,
                 client=edgar_client,
                 now=now,
+                max_requests=max_requests,
+                report=lambda line: _echo_scrubbed(line, s),
             )
         except (httpx.HTTPError, OSError, ValueError, RuntimeError) as exc:
             raise _fail(_scrubbed(f"corpus fetch failed: {_describe(exc)}", s), 1) from None
