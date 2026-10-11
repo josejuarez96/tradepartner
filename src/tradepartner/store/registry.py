@@ -134,7 +134,6 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Cadence, Settings, get_settings
 from tradepartner.store.db import configure_connection, insert_row, utc_now
-from tradepartner.store.lab_schema import is_lab_initialised
 from tradepartner.store.schema import (
     REBALANCE_COUNT_COLUMNS,
     REBALANCE_COUNTS_TABLE_NAME,
@@ -2105,9 +2104,16 @@ def list_trials(
 def is_sweep_variant(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
     """Whether a hypothesis is a sweep variant (a `sweep_variants` row), false on a
     pre-lab store. `paper start` and `decision gap-signoff` refuse a variant (#1454);
-    it lives here, not in `lab_registry`, because execution imports no lab module
-    and every `lab_registry` function refuses a pre-lab store."""
-    if not is_lab_initialised(conn):
+    it lives here, not in `lab_registry`, because execution loads no lab module,
+    not even through this one (so the table check is a plain catalog query, not
+    `lab_schema.is_lab_initialised`), and every `lab_registry` function refuses a
+    pre-lab store."""
+    (tables,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog = "
+        "current_database() AND table_schema = current_schema() "
+        "AND table_name = 'sweep_variants'"
+    ).fetchone()
+    if not tables:
         return False
     return (
         conn.execute(
