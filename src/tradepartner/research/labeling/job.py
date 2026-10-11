@@ -499,8 +499,10 @@ def _pre_fix_rule_answer(row: Mapping[str, Any]) -> crosswalk.RuleAnswer | None:
 def scored_items(
     rows: Sequence[Mapping[str, Any]], records: Iterable[Mapping[str, Any]]
 ) -> list[scoring.ScoredItem]:
-    """One `ScoredItem` per gold row: the owner's labels against the final answer,
-    and a seed's pre-fix rule answer (`seeded_recall`, #1351)."""
+    """One `ScoredItem` per gold row: the owner's labels and their `basis` (#1492)
+    against the final answer, and a seed's pre-fix rule answer (`seeded_recall`,
+    #1351). A labelled row without a `basis` (an export without the column) is
+    refused by `ScoredItem`."""
     last = final_records(records)
     items = []
     for row in rows:
@@ -522,6 +524,7 @@ def scored_items(
                 is_seed=is_seed,
                 in_random_draw=True if in_draw is None else bool(in_draw),
                 pre_fix_rule_answer=_pre_fix_rule_answer(row) if is_seed else None,
+                basis=row.get("basis"),
             )
         )
     return items
@@ -531,10 +534,17 @@ def gold_metrics(
     items: Sequence[scoring.ScoredItem],
 ) -> tuple[scoring.AccuracyResult, dict[str, Any]]:
     """The primary bar (`class_accuracy` against `gold_label`) and the reported
-    metrics of req 10 as C6 amends them."""
-    primary = scoring.class_accuracy(items)
+    metrics of req 10 as C6 amends them, split by `basis` as #1492 item 3 says:
+    the primary bar (whose `n` is the result row's `n_clusters`), the worst case,
+    the per-option gate, the calibration and the `rule_provision` arm on the
+    headline (`text`) set only; `exchange_rule` and `provision` each scored apart;
+    the shares and the seeds over every item."""
+    headline = scoring.headline_items(items)
+    primary = scoring.class_accuracy(headline)
     usable = [
-        item for item in items if item.in_random_draw and item.gold_label not in (None, UNRESOLVED)
+        item
+        for item in headline
+        if item.in_random_draw and item.gold_label not in (None, UNRESOLVED)
     ]
     calibration = [
         scoring.CalibrationItem(item.probabilities, str(crosswalk.class_of(item.gold_label or "")))
@@ -552,19 +562,26 @@ def gold_metrics(
         for item in usable
         if item.probabilities
     ]
-    arm = scoring.rule_provision_arm_score(items)
+    arm = scoring.rule_provision_arm_score(headline)
     metrics: dict[str, Any] = {
         "class_accuracy_text_states": dataclasses.asdict(
-            scoring.class_accuracy(items, against="text_states")
+            scoring.class_accuracy(headline, against="text_states")
         ),
-        "worst_case_lower_bound": scoring.worst_case_lower_bound(items),
+        "class_accuracy_exchange_rule": dataclasses.asdict(
+            scoring.class_accuracy(scoring.by_basis(items, "exchange_rule"))
+        ),
+        "class_accuracy_provision": dataclasses.asdict(
+            scoring.class_accuracy(scoring.by_basis(items, "provision"))
+        ),
+        "basis_counts": scoring.basis_counts(items),
+        "worst_case_lower_bound": scoring.worst_case_lower_bound(headline),
         "unresolved_share": scoring.unresolved_share(items),
         "unlabelled_share": scoring.unlabelled_share(items),
         "seeded_recall": scoring.seeded_recall(items),
         "seeded_report": [dataclasses.asdict(o) for o in scoring.seeded_report(items)],
         "per_option": {
             name: dataclasses.asdict(value)
-            for name, value in scoring.per_option_precision_recall(items).items()
+            for name, value in scoring.per_option_precision_recall(headline).items()
         },
         "arm_coverage": arm.coverage,
         "arm_class_accuracy": dataclasses.asdict(arm.class_accuracy),

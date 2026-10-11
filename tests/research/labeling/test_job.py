@@ -28,7 +28,7 @@ from tradepartner.config import Settings
 from tradepartner.research import DatasetChanged, RunHandle, datafiles
 from tradepartner.research.experiment import ParsedExperiment
 from tradepartner.research.gates import Flags, Reasons
-from tradepartner.research.labeling import job, questions
+from tradepartner.research.labeling import job, questions, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET
 from tradepartner.research.models import ModelRequest, ModelResponse
 from tradepartner.store import research, schema
@@ -326,6 +326,7 @@ def _gold_row(lid: str, accepted: datetime, label: str | None, *, eightk: bool =
     return {
         **_row(lid, accepted, eightk=eightk),
         "gold_label": label,
+        "basis": None if label in (None, "unresolved") else "text",
         "text_states": None,
         "gold_class": None,
         "seed_case": False,
@@ -1035,3 +1036,112 @@ def test_scored_items_reads_a_seeds_pre_fix_answer_and_gates_rows_6_and_7() -> N
     ]
     _, no_seeds = job.gold_metrics(job.scored_items([plain], records))
     assert no_seeds["seeded_recall"] is None
+
+
+# --- the split score (#1492, item 3) -------------------------------------------------------
+
+
+def test_scored_items_reads_basis_and_refuses_a_labelled_row_without_one() -> None:
+    accepted = datetime(2020, 9, 4, 15, tzinfo=UTC)
+    rows = [
+        {**_gold_row("T1", accepted, MERGER), "basis": "text"},
+        {**_gold_row("E1", accepted, "bankruptcy"), "basis": "exchange_rule"},
+        {**_gold_row("P1", accepted, "instrument_retirement"), "basis": "provision"},
+        _gold_row("U1", accepted, "unresolved"),
+        _gold_row("N1", accepted, None),
+    ]
+    rows = [{**r, "documents": json.loads(r["documents"])} for r in rows]
+    records = [
+        {
+            "listing_end_id": r["listing_end_id"],
+            "reason": "ok",
+            "selected_option": MERGER,
+            "probabilities": {},
+        }
+        for r in rows
+    ]
+    by_id = {i.listing_end_id: i.basis for i in job.scored_items(rows, records)}
+    assert by_id == {"T1": "text", "E1": "exchange_rule", "P1": "provision", "U1": None, "N1": None}
+    no_column = {k: v for k, v in rows[0].items() if k != "basis"}
+    with pytest.raises(ValueError, match="needs a basis"):
+        job.scored_items([no_column], records)
+
+
+def test_gold_metrics_writes_the_split_and_counts_the_text_set_only() -> None:
+    accepted = datetime(2020, 9, 4, 15, tzinfo=UTC)
+    # no rule_provision on the text rows: whatever the arm scores below came from
+    # a provision row, which (a)(2) maps to one class, so pooled it would score 4
+    text = [
+        {
+            **_gold_row(f"T{i}", accepted, MERGER),
+            "basis": "text",
+            "documents": json.dumps({"rule_provision": None}),
+        }
+        for i in range(3)
+    ]
+    exchange_rule = [
+        {**_gold_row(f"E{i}", accepted, "bankruptcy"), "basis": "exchange_rule"} for i in range(2)
+    ]
+    provision = [
+        {
+            **_gold_row(f"P{i}", accepted, "instrument_retirement"),
+            "basis": "provision",
+            "documents": json.dumps({"rule_provision": "12d2-2(a)(2)"}),
+        }
+        for i in range(4)
+    ]
+    rows = [*text, *exchange_rule, *provision, _gold_row("U1", accepted, "unresolved")]
+    rows = [{**r, "documents": json.loads(r["documents"])} for r in rows]
+    answers = {"T0": MERGER, "T1": MERGER, "T2": "bankruptcy", "E0": "bankruptcy"}
+    records = [
+        {
+            "listing_end_id": r["listing_end_id"],
+            "reason": "ok",
+            "selected_option": answers.get(r["listing_end_id"], "unresolved"),
+            "probabilities": {},
+        }
+        for r in rows
+    ]
+    items = job.scored_items(rows, records)
+    assert scoring.rule_provision_arm_score(items).class_accuracy.n == 4  # pooled control
+    primary, metrics = job.gold_metrics(items)
+    assert (primary.n, primary.correct) == (3, 2)  # n_clusters is this n
+    assert (
+        metrics["class_accuracy_exchange_rule"]["n"],
+        metrics["class_accuracy_exchange_rule"]["correct"],
+    ) == (2, 1)
+    assert (
+        metrics["class_accuracy_provision"]["n"],
+        metrics["class_accuracy_provision"]["correct"],
+    ) == (4, 0)
+    assert metrics["basis_counts"] == {
+        "text": 3,
+        "exchange_rule": 2,
+        "provision": 4,
+        "unresolved": 1,
+        "unlabelled": 0,
+    }
+    # the arm never scores a provision-decided label
+    assert metrics["arm_class_accuracy"]["n"] == 0 and metrics["arm_coverage"] == 0.0
+    assert metrics["per_option"]["instrument_retirement"]["recall_n"] == 0
+    assert metrics["worst_case_lower_bound"] > 0.0
+
+
+def test_a_pilot_runs_n_clusters_is_the_text_count(world: World) -> None:
+    pilot = _pilot(5)
+    pilot[3]["basis"] = "provision"
+    pilot[4]["basis"] = "exchange_rule"
+    gold_id = world.gold(_dev(2), pilot)
+    spent = world.run(
+        ScriptedModelClient([Answer(MERGER)] * 5),
+        gold_id,
+        "pilot",
+        flags=Flags(spend_holdout=True),
+        reasons=Reasons(holdout_reason="the one pilot score"),
+    )
+    assert spent.outcome == "ok"
+    row = world.conn.execute(
+        "SELECT n_clusters, n_observations FROM research_results WHERE run_id = ?",
+        [spent.run_id],
+    ).fetchone()
+    assert row == (3, 5)
