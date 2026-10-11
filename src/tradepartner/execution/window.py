@@ -263,7 +263,7 @@ from tradepartner.execution.reconcile_run import (
     frozen_risk,
     reconcile_now,
 )
-from tradepartner.store import lab_registry, registry
+from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_for_write
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -719,7 +719,7 @@ def start(
     with run_lock(settings, book):
         with connect() as conn:
             hyp = registry.get_hypothesis(conn, slug)
-            if lab_registry.is_sweep_variant(conn, hyp.hypothesis_id):
+            if registry.is_sweep_variant(conn, hyp.hypothesis_id):
                 raise StartRefusedError(
                     "sweep_variant",
                     f"{slug!r} is a sweep variant; promote it before starting a paper book",
