@@ -1057,3 +1057,45 @@ def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path, window_rule: No
     assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
     assert sec.calls == []
     assert _stamps(c) == before
+
+
+def test_a_correction_the_day_before_the_window_that_crosses_an_instant_aborts(
+    tmp_path: Path, window_rule: None, capsys: Any
+) -> None:
+    """quant-auditor pass 1: 10-08 18:30 EDT served late, true 14:30 EDT; the
+    move crosses close(10-08) = 20:00Z, though both stamps predate the window."""
+    pre = "0000001606"
+    old = _day(date(2026, 10, 8), 22) + timedelta(minutes=30)
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        pre,
+        [
+            (acc(pre, 1), old, old.date(), False),
+            (acc(pre, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c.finish()
+    sec.truth[(pre, acc(pre, 1))] = old - timedelta(hours=4)
+    sec.truth[(pre, acc(pre, 0))] = _day(date(2024, 1, 2))
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 8), 20)])
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert _stamps(c) == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    assert acc(pre, 1) in capsys.readouterr().err
+    # Without an instant there, the same correction goes through.
+    c2, sec2 = amended(tmp_path / "ok")
+    c2.add_cik(
+        pre,
+        [
+            (acc(pre, 1), old, old.date(), False),
+            (acc(pre, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c2.finish()
+    sec2.truth.update(sec.truth)
+    ok = precheck(tmp_path / "ok.json", instants=[_day(date(2026, 10, 9), 20)])
+    assert _apply(c2, sec2, "--window-earlier-ok", str(ok)) == 0
+    assert c2.stamp(pre, acc(pre, 1)) == old - timedelta(hours=4)

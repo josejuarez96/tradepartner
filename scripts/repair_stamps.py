@@ -95,8 +95,9 @@ changes. With ``--window-earlier-ok <precheck.json>`` (amendment 2026-10-11,
 (d); T166f's pre-check file, which must say pass for this ``--release`` and
 ``--window-start`` and be made on the run's New York date) an in-window change
 that ``stamp_repair.in_window_change_allowed`` passes (an ``sgml`` move earlier
-by at most New York's offset) is allowed, unless ``new <= t < old`` for one of
-the file's read instants ``t``, which aborts the run. Each changed file is
+by at most New York's offset) is allowed; and any change, in the window or
+not, that crosses one of the file's read instants ``t`` (``new <= t < old``
+or ``old <= t < new``) aborts the run. Each changed file is
 rewritten atomically in ``STAMPS_LAYOUT``; every
 unchanged record, ``items`` and ``items_refreshed`` stay byte-identical.
 ``--resume`` reuses the backup and the request journal, so no request repeats.
@@ -934,14 +935,20 @@ def load_precheck(path: Path, *, release: str, window_start: date, now: datetime
 
 
 def instant_violations(
-    rows: Iterable[ManifestRow], window_start: date, instants: Sequence[datetime]
+    rows: Iterable[ManifestRow], instants: Sequence[datetime]
 ) -> list[ManifestRow]:
-    """In-window changes with ``new <= t < old`` for a read instant ``t``: a
-    paper decision read the row at ``t`` (amendment (d), the exact check)."""
+    """Changes that cross a read instant ``t`` (amendment (d), the exact
+    check): ``new <= t < old`` for an earlier move, ``old <= t < new`` for a
+    later one, so a paper decision at ``t`` read the row differently. Every
+    changed row is checked, not only in-window ones: a correction dated the
+    day before the window's first session can still cross ``close(S-1)``."""
     return [
         r
         for r in rows
-        if in_window(r, window_start) and any(r.new_stamp <= t < r.old_stamp for t in instants)
+        if r.changed
+        and any(
+            min(r.old_stamp, r.new_stamp) <= t < max(r.old_stamp, r.new_stamp) for t in instants
+        )
     ]
 
 
@@ -1155,11 +1162,11 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
     outcome = execute(inputs, plan, journal)
     _refuse_window(outcome.rows.values(), inputs.window_start, allowed)
     if precheck is not None:
-        read = instant_violations(outcome.rows.values(), inputs.window_start, precheck.instants)
+        read = instant_violations(outcome.rows.values(), precheck.instants)
         if read:
             raise RepairStop(
-                f"{len(read)} in-window change(s) cross a read instant of {precheck.path} "
-                f"(new <= t < old): {_list_rows(read)}"
+                f"{len(read)} change(s) cross a read instant of {precheck.path} "
+                f"(new <= t < old or old <= t < new): {_list_rows(read)}"
             )
 
     changes: dict[str, dict[str, datetime]] = defaultdict(dict)
