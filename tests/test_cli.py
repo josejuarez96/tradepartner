@@ -195,6 +195,39 @@ def _statements_on(settings: Settings, on: bool = True) -> Settings:
     return settings.model_copy(update={"edgar": edgar})
 
 
+def test_ingest_filing_event_flag_and_configured_forms(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    built = _SourceRecorder()
+    monkeypatch.setattr(cli, "EdgarFilingSource", built)
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    edgar = secrets_set.edgar.model_copy(
+        update={"filing_events_enabled": True, "event_forms": ["8-K", "10-Q"]}
+    )
+    settings = secrets_set.model_copy(update={"edgar": edgar})
+    result = _invoke(settings, ["ingest", "--source", "edgar", "--rebuild-filing-events"])
+    assert result.exit_code == 0, result.output
+    assert built.kwargs[0]["event_forms"] == ["8-K", "10-Q"]
+    assert session.calls[0]["rebuild_filing_events"] is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--rebuild-filing-events"],
+        ["--source", "alpaca", "--rebuild-filing-events"],
+        ["--backfill", "--since", "2016-01-04", "--rebuild-filing-events"],
+    ],
+)
+def test_ingest_refuses_filing_event_rebuild_outside_enabled_session(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    result = _invoke(secrets_set, ["ingest", *args])
+    assert result.exit_code == 2, result.output
+    assert session.calls == []
+
+
 def test_ingest_statement_flags_reach_the_adapter_and_are_off_by_default(
     monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
 ) -> None:
