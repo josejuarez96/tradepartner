@@ -75,3 +75,16 @@ Three 8-K rows (`filing_events.csv`) for cik `CIK0001000011` (`SEC_SPLIT_PLAIN`)
 | After-close 2.02 whose filed date is its session (the filed-date trap) | 0001000011-20-000101 | `2.02,9.01` | 2020-04-30T20:05:00+00:00 (16:05 New York) | 2020-04-30 | invisible at session_close 2020-04-30T20:00:00+00:00, first visible at 2020-05-01; a filed-keyed read sees it at 2020-04-30 |
 | Evening 2.02 filed the next day (the lag case) | 0001000011-20-000102 | `2.02,9.01` | 2020-05-06T00:30:00+00:00 (20:30 New York) | 2020-05-06 | first visible at 2020-05-06; a filed-keyed read passes by accident |
 | Pre-open 5.02 (not a 2.02) | 0001000011-20-000103 | `5.02` | 2020-05-12T13:00:00+00:00 (09:00 New York) | 2020-05-12 | visible at session_close 2020-05-12T20:00:00+00:00; an items filter on 2.02 drops it |
+
+## Rates (#1498)
+
+A generated `DTB3`-shaped daily series (`rates.csv`), never recorded from FRED (ADR 0020 point 5), for T169b-T170d authors: one observation per XNYS session from 5 sessions before `2017-01-03` to the last observation stamped at or before the close of `2020-06-30`. `known_at` = the close of the first XNYS session strictly after `vintage_date`; `ingested_at` = `known_at` + 10 min; `provenance = release`.
+
+| Case | observation_date | vintage_date | Notes |
+|---|---|---|---|
+| (a) Ordinary observation | 2019-05-07 | 2019-05-08 | known_at 2019-05-09T20:00:00+00:00 (close of D+2) |
+| (b) Vintage dated a Friday | 2018-03-08 | 2018-03-09 | stamped at Monday's close, 2018-03-12T20:00:00+00:00 |
+| (c) Exchange holiday | none on 2018-11-22 | n/a | Thanksgiving, the fixture's exchange holiday; the observations either side are 2018-11-21 and 2018-11-23 |
+| (d) Bank-holiday gap of two business days | none on 2018-10-08 or 2018-10-09 | 2018-10-05 served 2018-10-09 | Columbus Day (a session, a bank holiday) and the day after; 2018-10-05's value is stamped 2018-10-10T20:00:00+00:00 |
+| (e) Revision | 2019-03-12 | 2019-03-13 and 2019-03-20 | 2.25 stamped 2019-03-14T20:00:00+00:00, then 2.27 stamped 2019-03-21T20:00:00+00:00 |
+| (f) Vintage dated a Saturday | 2018-06-15 | 2018-06-16 | stamped at Monday's close, 2018-06-18T20:00:00+00:00 |

@@ -356,7 +356,25 @@ registry; #83 took version 2 first, so the registry is version 3):
   included) is touched. A read-only connection accepts a version-21 store:
   every read works (an `operations_book` row cannot exist there, so
   `lab_registry.operations_book_for` reads None).
-- **A later DDL change goes to version 23**, with its own migration and a
+- **Version 23** (#1498, data-foundation plan T169; the spec's "Amendment
+  2026-10-11 (#1498)", ADR 0020): adds `rates` (one row per series,
+  observation date and value of a published interest-rate series, `DTB3`
+  first; `known_at` = the close of the first XNYS session strictly after
+  `vintage_date`, `adapters.rates.rate_known_at`, applied by the ingest).
+  Purely additive, like version 21: the migration from any earlier
+  migratable version just creates the table (`init_schema`'s DDL pass,
+  `_RATES_TABLE_DDL`) and appends a version-23 row; no existing table or row
+  changes. UNIQUE `(series, observation_date, known_at)`: a later vintage
+  with a different value is a revision row with its own stamp. The table
+  joins `TABLE_NAMES` and `TABLE_PROVENANCE_VALUES` (`release` only, a new
+  `PROVENANCE_VALUES` member), so the look-ahead harness truncates it and
+  `health`'s common-column rules cover it; T169b takes it out of
+  `registry.data_vintage`. Nothing writes it before T169d. A read-only
+  connection accepts a version-22 store: every read works but a `rates`
+  read, which fails on the missing table (the per-table loops skip an
+  absent table), and the next writable `init_schema` call migrates the
+  store.
+- **A later DDL change goes to version 24**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -441,6 +459,7 @@ PROVENANCE_VALUES: tuple[str, ...] = (
     "action",
     "snapshot",
     "snapshot_static",
+    "release",
 )
 
 #: The provenance values each fact table's CHECK constraint allows, per
@@ -458,6 +477,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "facts": ("filing",),
     "statement_facts": ("filing",),
     "filing_events": ("filing",),
+    "rates": ("release",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -582,9 +602,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 22 (#1442, paper-trading plan T160b): `owner_decisions.kind` widened with
 #:   `operations_book`, every row kept (`_migrate_operations_kinds`, on every
 #:   store; module docstring, "Schema versions").
-#: - A later DDL change goes to version 23, with its own migration and a
+#: - 23 (#1498, data-foundation plan T169): the `rates` table, created by the
+#:   DDL pass (`_RATES_TABLE_DDL`); no existing table changes (module
+#:   docstring, "Schema versions").
+#: - A later DDL change goes to version 24, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 22
+CURRENT_SCHEMA_VERSION = 23
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -679,6 +702,11 @@ _PRE_FILING_EVENTS_VERSION = 20
 #: version 22): read-only connections serve every read (no operations row can
 #: exist).
 _PRE_OPERATIONS_BOOK_VERSION = 21
+
+#: The last version without `rates` (#1498, T169, version 23): read-only
+#: connections serve every other read; a `rates` read there fails on the
+#: missing table, as a `filing_events` read did at version 20.
+_PRE_RATES_VERSION = 22
 
 
 class SchemaVersionError(RuntimeError):
@@ -912,6 +940,30 @@ CREATE TABLE IF NOT EXISTS filing_events (
 )
 """
 
+# Rates (amendment 2026-10-11, #1498, ADR 0020; spec "Data / interfaces" >
+# Amendment 2026-10-11 (#1498)). One row per (series, observation_date,
+# value) of a published interest-rate series. `series` is the source's id
+# verbatim (`DTB3`); `observation_date` the business day the rate is for;
+# `value` the published number in the series' own unit (DTB3: percent,
+# discount basis; nothing is converted here); `vintage_date` the date the
+# source first served that value for that day. `known_at` is the close of
+# the first XNYS session strictly after `vintage_date`
+# (`adapters.rates.rate_known_at`, applied by the ingest; `health --check`
+# recomputes it). UNIQUE (series, observation_date, known_at): a later
+# vintage with a different value is a revision row carrying its own
+# vintage's stamp; the as-of read takes the latest revision. A missing
+# value (FRED's '.') is never a row.
+_CREATE_RATES = f"""
+CREATE TABLE IF NOT EXISTS rates (
+    series VARCHAR NOT NULL,
+    observation_date DATE NOT NULL,
+    value DOUBLE NOT NULL,
+    vintage_date DATE NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["rates"])},
+    UNIQUE (series, observation_date, known_at)
+)
+"""
+
 # Not a fact table (spec "Data / interfaces" > Tables): no known_at,
 # ingested_at, source or provenance columns, and no per-fact provenance
 # concept applies to an ingest job's own status row.
@@ -949,6 +1001,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "facts",
     "statement_facts",
     "filing_events",
+    "rates",
     "ingestion_runs",
     "schema_version",
 )
@@ -986,6 +1039,12 @@ _STATEMENT_FACTS_TABLE_DDL: tuple[str, ...] = (_CREATE_STATEMENT_FACTS,)
 #: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
 #: schema version with its own migration.
 _FILING_EVENTS_TABLE_DDL: tuple[str, ...] = (_CREATE_FILING_EVENTS,)
+
+#: `rates` (#1498, T169), added at version 23: its own tuple, as
+#: `_FILING_EVENTS_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
+#: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
+#: schema version with its own migration.
+_RATES_TABLE_DDL: tuple[str, ...] = (_CREATE_RATES,)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -2391,6 +2450,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SHAKEDOWN_VERSION,
         _PRE_FILING_EVENTS_VERSION,
         _PRE_OPERATIONS_BOOK_VERSION,
+        _PRE_RATES_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2412,7 +2472,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # before T142b); version 18 every read but `journal.alerts_for` (no
         # `alerts.book_id`), which only the writing `Alerter` calls; version 19
         # every read (no shakedown row can exist there); version 20 every read
-        # but `filing_events`; version 21 every read (no operations row can exist).
+        # but `filing_events`; version 21 every read (no operations row can exist);
+        # version 22 every read but `rates`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3028,7 +3089,7 @@ def _migrate_operations_kinds(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 21 store to version 22.
+    version-2 to 22 store to version 23.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3040,7 +3101,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets `rates`
+    created where it lacks it (purely additive; a version-22 store gets a
+    version-23 row; #1498, T169); every store gets
     `owner_decisions.kind` widened with `operations_book` (every row kept), and a
     version-21 store a version-22 row (#1442, T160b); every store gets
     `filing_events` created where it lacks it (purely additive; a version-20
@@ -3095,7 +3158,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-22, 21, 20 (every read but
+    On a read-only connection no DDL runs: a version-23, 22 (every read but
+    `rates`, missing there), 21, 20 (every read but
     `filing_events`, missing there), 19, 18 (every read but
     `journal.alerts_for`, which only a writer calls) or 17 store passes, and a
     version-16 store serves fact, registry and lab reads while every journal
@@ -3148,6 +3212,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_SHAKEDOWN_VERSION,
         _PRE_FILING_EVENTS_VERSION,
         _PRE_OPERATIONS_BOOK_VERSION,
+        _PRE_RATES_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3185,6 +3250,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _RESEARCH_TABLE_DDL
             + _REBALANCE_COUNTS_TABLE_DDL
             + _FILING_EVENTS_TABLE_DDL
+            + _RATES_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
