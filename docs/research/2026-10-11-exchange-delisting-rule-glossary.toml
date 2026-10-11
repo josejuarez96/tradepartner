@@ -1,0 +1,674 @@
+# Exchange delisting-rule glossary (#1490), machine-readable twin of
+# 2026-10-11-exchange-delisting-rule-glossary.md. Data only: no code reads it yet.
+#
+# One [[rule]] table per exchange rule cited in Form 25 exchange notices (exhibit text) of the
+# departure-reason corpus (9,694 Form 25s, 2016-2026), kept while the rules together cover >= 95%
+# of citations: 55 rules, 2306 of 2423 citations (95.17%). A rule counts once per
+# filing, at the specificity cited (5550(b) and 5550(b)(1) are separate rows; a bare 5550(b) is
+# dropped when the same notice also cites 5550(b)(1)).
+#
+# Fields: exchange, rule (as cited), meaning (plain words), label (under the owner rules on #963:
+#   bankruptcy | compliance_delisting | instrument_retirement | merger_or_acquisition |
+#   "decides nothing alone" | "depends on the notice text"), reason, quote (verbatim official text,
+#   typographic quotes and line breaks normalised), url, retrieved (UTC date), count (filings),
+#   verified (false when the official text could not be retrieved).
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5815"
+meaning = "Hearings Panel review: how a company appeals a staff delisting decision."
+label = "decides nothing alone"
+reason = "Procedure only; it says who reviewed the case, not why the class was removed. Look for the rule it is cited with."
+quote = ["When a Company receives a Staff Delisting Determination or a Public Reprimand Letter issued by the Listing Qualifications Department, or when its application for initial listing is denied, it may request in writing that the Hearings Panel review the matter in a written or an oral hearing."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5800-series"
+retrieved = 2026-10-11
+count = 266
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5101"
+meaning = "Nasdaq's general discretion to delist for any reason it finds makes listing inadvisable."
+label = "decides nothing alone"
+reason = "Owner rule 3: general discretion. In this corpus it is cited with 5110(b) in 167 of 210 notices; the other rule decides."
+quote = ["Nasdaq may use such discretion to deny initial listing, apply additional or more stringent criteria for the initial or continued listing of particular securities, or suspend or delist particular securities based on any event, condition, or circumstance that exists or occurs that makes initial or continued listing of the securities on Nasdaq inadvisable or unwarranted in the opinion of Nasdaq, even though the securities meet all enumerated criteria for initial or continued listing on Nasdaq."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 210
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5110(b)"
+meaning = "Bankruptcy and liquidation: Nasdaq may delist a company that filed for bankruptcy protection, or whose board authorised a liquidation it is committed to."
+label = "bankruptcy"
+reason = "Owner rule 3 names it the bankruptcy rule. The text also covers a board-authorised liquidation; in this corpus 125 of the 140 notices with an 8-K have bankruptcy wording in the 8-K and 1 has liquidation wording only (see notes)."
+quote = ["Nasdaq may use its discretionary authority under the Rule 5100 Series to suspend or terminate the listing of a Company that has filed for protection under any provision of the federal bankruptcy laws or comparable foreign laws, or has announced that liquidation has been authorized by its board of directors and that it is committed to proceed, even though the Company's securities otherwise meet all enumerated criteria for continued listing on Nasdaq."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 176
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "IM-5101-1"
+meaning = "Interpretive note on how Nasdaq uses its 5101 discretion (bad actors, bankruptcy, disclaimer opinions)."
+label = "decides nothing alone"
+reason = "Owner rule 3 names it as deciding nothing alone. Cited with 5110(b) in 166 of 168 notices."
+quote = ["Nasdaq may also use its discretionary authority, for example, when a Company files for protection under any provision of the federal bankruptcy laws or comparable foreign laws, when a Company's independent accountants issue a disclaimer opinion on financial statements required to be audited, or when financial statements do not contain a required certification."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 168
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(a)(2)"
+meaning = "Capital Market: bid price under $1."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(2) Minimum bid price of at least $1 per share;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 162
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5250(c)(1)"
+meaning = "Late or missing 10-K / 10-Q."
+label = "compliance_delisting"
+reason = "A failed filing requirement."
+quote = ["(1) A Company shall timely file all required periodic financial reports with the Commission through the EDGAR System or with the Other Regulatory Authority."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5200-series"
+retrieved = 2026-10-11
+count = 155
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "IM-5101-2"
+meaning = "SPAC rule: a blank-check company must finish its deal within 36 months (or its own shorter deadline) and the combined company must then meet initial listing."
+label = "depends on the notice text"
+reason = "The rule names a failed listing requirement (missed SPAC deadline, or post-deal company not qualifying). Open question for the owner, see notes."
+quote = ["(b) Within 36 months of the effectiveness of its IPO registration statement, or such shorter period that the company specifies in its registration statement, the Company must complete one or more business combinations", "If the Company does not meet the requirements for initial listing following a business combination or does not comply with one of the requirements set forth above, Nasdaq will issue a Staff Delisting Determination under Rule 5810 to delist the Company's securities."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 98
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(b)(1)"
+meaning = "Capital Market: stockholders' equity under $2.5 million (and no other (b) standard met)."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(1) Equity Standard: Stockholders' equity of at least $2.5 million;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 68
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(b)(2)"
+meaning = "Capital Market: market value of listed securities under $35 million (and no other (b) standard met)."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(2) Market Value of Listed Securities Standard: Market Value of Listed Securities of at least $35 million; or"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 53
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(a)(1)"
+meaning = "Global Market: bid price under $1."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(1) Minimum bid price of $1 per share;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 43
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(b)(2)(A)"
+meaning = "Global Market: market value of listed securities under $50 million."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(A) Market Value of Listed Securities of at least $50 million;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 43
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(b)"
+meaning = "Capital Market: meets none of the three (b) standards (equity, market value, net income)."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["A Company that has its Primary Equity Security listed on the Capital Market must continue to meet all of the requirements set forth in Rule 5550(a) and at least one of the Standards set forth in Rule 5550(b)."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 33
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5620(a)"
+meaning = "No annual shareholder meeting within a year of fiscal year-end."
+label = "compliance_delisting"
+reason = "A failed governance requirement."
+quote = ["(a) Each Company listing common stock or voting preferred stock, and their equivalents, shall hold an annual meeting of Shareholders no later than one year after the end of the Company's fiscal year-end"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5600-series"
+retrieved = 2026-10-11
+count = 28
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5820(a)"
+meaning = "Appeal of a Hearings Panel decision to the Listing Council."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["A Company may appeal any Panel Decision to the Listing Council by submitting a written request for appeal"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5800-series"
+retrieved = 2026-10-11
+count = 21
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(a)(3)"
+meaning = "Capital Market: fewer than 300 public holders."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(3) At least 300 Public Holders;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 20
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5250(f)"
+meaning = "Unpaid Nasdaq listing fees."
+label = "compliance_delisting"
+reason = "A failed listing obligation."
+quote = ["The Company is required to pay all applicable fees as described in the Rule 5900 Series."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5200-series"
+retrieved = 2026-10-11
+count = 20
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(b)(2)(C)"
+meaning = "Global Market: market value of publicly held shares under $15 million."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(C) Market Value of Publicly Held Shares of at least $15 million; and"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 20
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5100"
+meaning = "Heading of the 5100 series (Nasdaq's regulatory authority); cited loosely for the discretion rules."
+label = "decides nothing alone"
+reason = "A series heading, no ground."
+quote = ["5100. NASDAQ'S REGULATORY AUTHORITY"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 17
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5825(a)"
+meaning = "Discretionary review by the Nasdaq Board."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["This review will be undertaken solely at the discretion of the Nasdaq Board and will not operate as a stay of the Panel or Listing Council Decision"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5800-series"
+retrieved = 2026-10-11
+count = 16
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(a)(2)"
+meaning = "Global Market: fewer than 400 total holders."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(2) At least 400 Total Holders; and"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 14
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5605(c)(2)"
+meaning = "Audit committee short of three independent members."
+label = "compliance_delisting"
+reason = "A failed governance requirement."
+quote = ["(A) Each Company must have, and certify that it has and will continue to have, an audit committee of at least three members"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5600-series"
+retrieved = 2026-10-11
+count = 11
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(b)(1)(A)"
+meaning = "Global Market: stockholders' equity under $10 million."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(A) Stockholders' equity of at least $10 million;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 11
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(b)(2)(B)"
+meaning = "Global Market: fewer than 1,100,000 publicly held shares."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(B) At least 1,100,000 Publicly Held Shares;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 9
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5110(a)"
+meaning = "Change of control with a non-Nasdaq company: the combined company must re-apply and be approved before closing."
+label = "compliance_delisting"
+reason = "The stated ground is that the post-deal company was not approved for listing, a failed requirement; the issuer survives, so not merger_or_acquisition."
+quote = ["If the Company's application for initial listing has not been approved prior to consummation of the transaction, Nasdaq will issue a Staff Delisting Determination and begin delisting proceedings pursuant to the Rule 5800 Series."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5100-series"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(a)(4)"
+meaning = "Capital Market: fewer than 500,000 publicly held shares."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(4) At least 500,000 Publicly Held Shares;"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5450(b)(3)(C)"
+meaning = "Global Market (assets/revenue standard): market value of publicly held shares under $15 million."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(C) Market Value of Publicly Held Shares of at least $15 million; and"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 6
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5605(b)(1)"
+meaning = "Board without an independent majority."
+label = "compliance_delisting"
+reason = "A failed governance requirement."
+quote = ["A majority of the board of directors must be comprised of Independent Directors as defined in Rule 5605(a)(2)."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5600-series"
+retrieved = 2026-10-11
+count = 6
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5605(d)(2)"
+meaning = "Compensation committee short of two independent members."
+label = "compliance_delisting"
+reason = "A failed governance requirement."
+quote = ["(A) Each Company must have, and certify that it has and will continue to have, a compensation committee of at least two members."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5600-series"
+retrieved = 2026-10-11
+count = 6
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5250(b)(1)"
+meaning = "Failure to disclose material information promptly."
+label = "compliance_delisting"
+reason = "A failed listing obligation."
+quote = ["a Nasdaq-listed Company shall make prompt disclosure to the public through any Regulation FD compliant method (or combination of methods) of disclosure of any material information that would reasonably be expected to affect the value of its securities or influence investors' decisions."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5200-series"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(b)(3)"
+meaning = "Capital Market: net income standard not met."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(3) Net Income Standard: Net income from continuing operations of $500,000 in the most recently completed fiscal year or in two of the three most recently completed fiscal years."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5250(c)(2)"
+meaning = "Foreign private issuer missed its half-year 6-K."
+label = "compliance_delisting"
+reason = "A failed filing requirement."
+quote = ["Each Foreign Private Issuer shall submit on a Form 6-K an interim balance sheet and income statement as of the end of its second quarter."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5200-series"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5452(b)(C)"
+meaning = "SPAC (listed under 5406) warrants: aggregate market value under $1 million."
+label = "compliance_delisting"
+reason = "A failed numeric standard for the warrant class."
+quote = ["(C) Aggregate market value of warrants outstanding is at least $1,000,000."]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5400-series"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5620(b)"
+meaning = "Proxies not solicited for a shareholder meeting."
+label = "compliance_delisting"
+reason = "A failed governance requirement."
+quote = ["Each Company that is not a limited partnership shall solicit proxies and provide proxy statements for all meetings of Shareholders"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5600-series"
+retrieved = 2026-10-11
+count = 4
+verified = true
+
+[[rule]]
+exchange = "Nasdaq"
+rule = "5550(a)(5)"
+meaning = "Capital Market: market value of publicly held shares under $1 million."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["(5) Market Value of Publicly Held Shares of at least $1 million; and"]
+url = "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-5500-series"
+retrieved = 2026-10-11
+count = 4
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "802.01D"
+meaning = "\"Other criteria\": a list of separate grounds (bankruptcy, abnormally low price, redemption of the class, public interest, specialised-security thresholds and more)."
+label = "depends on the notice text"
+reason = "Mixed: the ground the notice names decides (see notes). In this corpus 97 of 262 notices or their 8-Ks mention bankruptcy."
+quote = ["If any of the following factors apply to a listed company, the Exchange may in its sole discretion subject the company to the procedures outlined in Paras. 802.02 and 802.03", "An intent to file under any of the sections of the bankruptcy law has been announced or a filing has been made or liquidation has been authorized and the company is committed to proceed.", "Whenever the entire outstanding amount of a listed class, issue, or series is to be retired through payment at maturity, or through redemption, reclassification or otherwise.", "Abnormally low selling price or volume of trading."]
+url = "https://nyse.wolterskluwer.cloud/listed-company-manual/09013e2c8503fccf"
+retrieved = 2026-10-11
+count = 262
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "802.01B"
+meaning = "Numerical criteria: market cap and equity both under $50 million, or market cap under $15 million; also the SPAC (\"Acquisition Company\") market-value and holder criteria."
+label = "compliance_delisting"
+reason = "A failed numeric standard. When cited with 102.06e it is the SPAC deadline: treat like IM-5101-2."
+quote = ["A company (including the issuer of an Equity Investment Tracking Stock) will be considered to be below compliance if its average global market capitalization over a consecutive 30 trading-day period is less than $50,000,000 and, at the same time stockholders’ equity is less than $50,000,000.", "if a company is determined to have average global market capitalization over a consecutive 30 trading-day period of less than $15,000,000, regardless of the original standard under which it listed."]
+url = "https://nyse.wolterskluwer.cloud/listed-company-manual/09013e2c8503fccf"
+retrieved = 2026-10-11
+count = 122
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "802.01E"
+meaning = "Late 10-K / 10-Q (or annual report without an audit report)."
+label = "compliance_delisting"
+reason = "A failed filing requirement; 3 of 18 notices also mention bankruptcy, where owner rule 4 (stated ground) applies."
+quote = ["the company fails to file its annual report (Forms 10-K, 20-F, 40-F or N-CSR) or its quarterly report on Form 10-Q with the SEC by the date such report was required to be filed by the applicable form"]
+url = "https://nyse.wolterskluwer.cloud/listed-company-manual/09013e2c8503fccf"
+retrieved = 2026-10-11
+count = 18
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "802.01C"
+meaning = "Average closing price under $1.00 over 30 trading days."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["A company will be considered to be below compliance standards if the average closing price of a security as reported on the consolidated tape is less than $1.00 over a consecutive 30 trading-day period (the “Price Criteria”)."]
+url = "https://nyse.wolterskluwer.cloud/listed-company-manual/09013e2c8503fccf"
+retrieved = 2026-10-11
+count = 17
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "102.06e"
+meaning = "SPAC deadline: the Acquisition Company must close its business combination within its own deadline or three years."
+label = "depends on the notice text"
+reason = "Same question as Nasdaq IM-5101-2 (see notes). 15 of 17 notices or 8-Ks mention redemption, trust or liquidation."
+quote = ["e. the AC will be liquidated if no Business Combination has been consummated within a specified time period not to exceed three years. The Exchange will promptly commence delisting procedures with respect to any AC that fails to consummate its Business Combination within (i) the time period specified by its constitutive documents or by contract or (ii) three years, whichever is shorter;"]
+url = "https://nyse.wolterskluwer.cloud/browse/396b18e983e4426093eb7ae01b6f52c6"
+retrieved = 2026-10-11
+count = 17
+verified = true
+
+[[rule]]
+exchange = "NYSE"
+rule = "802.02"
+meaning = "Procedure after a company falls below the criteria (notice letter, 18-month plan)."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["The following procedures shall be applied by the Exchange to domestic companies that are identified as being below the Exchange's continued listing criteria."]
+url = "https://nyse.wolterskluwer.cloud/listed-company-manual/09013e2c8503fccf"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(c)(iii)"
+meaning = "Authoritative advice that the security is without value."
+label = "depends on the notice text"
+reason = "The rule names worthlessness, not a cause. All 18 notices here cite a bankruptcy or restructuring filing as the basis: label bankruptcy when the notice says so."
+quote = ["If advice has been received, deemed by the Exchange to be authoritative, that the security is without value."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 18
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1001"
+meaning = "General section: factors the Exchange weighs for continued listing."
+label = "decides nothing alone"
+reason = "General discretion. All 18 notices here are warrants, and 16 of them say the warrants were removed for a low trading or selling price; the notice wording decides."
+quote = ["In considering whether a security warrants continued trading and/or listing on the Exchange, many factors are taken into account"]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 18
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003"
+meaning = "Umbrella section for all continued-listing standards."
+label = "depends on the notice text"
+reason = "The paragraph is unnamed; read the standard the notice describes (11 of 15 say abnormally low price, a compliance_delisting ground)."
+quote = ["The Exchange has adopted certain standards, outlined below, under which it will normally give consideration to suspending dealings in, or removing, a security from listing or unlisted trading."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 15
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(a)(ii)"
+meaning = "Stockholders' equity under $4 million with losses in three of the last four years."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["has stockholders' equity of less than $4,000,000 if such issuer has sustained losses from continuing operations and/or net losses in three of its four most recent fiscal years"]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 13
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(f)(v)"
+meaning = "Low selling price, no reverse split when asked."
+label = "compliance_delisting"
+reason = "A failed listing standard."
+quote = ["In the case of a common stock selling for a substantial period of time at a low price per share, if the issuer shall fail to effect a reverse split of such shares within a reasonable time after being notified that the Exchange deems such action to be appropriate under all the circumstances."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 11
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(a)(i)"
+meaning = "Stockholders' equity under $2 million with losses in two of the last three years."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["has stockholders' equity of less than $2,000,000 if such issuer has sustained losses from continuing operations and/or net losses in two of its three most recent fiscal years"]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 11
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "119(f)"
+meaning = "SPAC rule: delisting when the SPAC breaks a 119 condition or the combined company fails initial listing."
+label = "depends on the notice text"
+reason = "Same question as Nasdaq IM-5101-2 (see notes); 8 of 9 notices or 8-Ks mention redemption or the trust."
+quote = ["If the company does not meet the requirements for initial listing following a business combination or does not comply with one of the requirements set forth above, the Exchange shall commence delisting proceedings under Section 1010 to delist the company’s securities."]
+url = "https://nyseamerican.wolterskluwer.cloud/citation/@@AMEX%20AMEX-ACG119"
+retrieved = 2026-10-11
+count = 9
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1203"
+meaning = "Request for a hearing on a staff delisting decision."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["An issuer may, within seven calendar days of the date of the Staff Determination, request either a written or oral hearing to review the Staff Determination."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa98b"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1009(a)"
+meaning = "Procedure for companies below the standards; the Exchange may suspend at once."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["The following procedures shall be applied by the Exchange staff to companies identified as being below the Exchange's continued listing policies and standards."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(a)(iii)"
+meaning = "Stockholders' equity under $6 million with losses in the last five years."
+label = "compliance_delisting"
+reason = "A failed numeric listing standard."
+quote = ["has stockholders' equity of less than $6,000,000 if such issuer has sustained losses from continuing operations and/or net losses in its five most recent fiscal years"]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "119(b)"
+meaning = "SPAC deadline: close the business combination within 36 months (or the shorter period in the prospectus)."
+label = "depends on the notice text"
+reason = "Same question as Nasdaq IM-5101-2 (see notes)."
+quote = ["Within 36 months of the effectiveness of its initial public offering registration statement, or such shorter period that the company specifies in its registration statement, the company must complete one or more business combinations"]
+url = "https://nyseamerican.wolterskluwer.cloud/citation/@@AMEX%20AMEX-ACG119"
+retrieved = 2026-10-11
+count = 7
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1009"
+meaning = "Continued listing evaluation and follow-up procedure."
+label = "decides nothing alone"
+reason = "Procedure only."
+quote = ["The following procedures shall be applied by the Exchange staff to companies identified as being below the Exchange's continued listing policies and standards."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 6
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1003(a)(iv)"
+meaning = "Losses so large, or finances so impaired, that the company may not keep operating or pay its debts."
+label = "depends on the notice text"
+reason = "A failed financial standard by its words, but all 5 notices here cite a bankruptcy filing as the basis; owner rule 4: the stated ground (the bankruptcy) wins."
+quote = ["has sustained losses which are so substantial in relation to its overall operations or its existing financial resources, or its financial condition has become so impaired that it appears questionable, in the opinion of the Exchange, as to whether such issuer will be able to continue operations and/or meet its obligations as they mature."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 5
+verified = true
+
+[[rule]]
+exchange = "NYSE American"
+rule = "1009(d)"
+meaning = "Exchange did not accept the company's compliance plan."
+label = "decides nothing alone"
+reason = "Procedure only; read the standard the company failed."
+quote = ["If the Exchange staff does not accept the Plan, the Exchange staff will promptly initiate delisting proceedings."]
+url = "https://nyseamerican.wolterskluwer.cloud/browse/09013e2c853aa97f"
+retrieved = 2026-10-11
+count = 4
+verified = true
+
+[[rule]]
+exchange = "NYSE Arca"
+rule = "5.2(j)(6)(B)(II)"
+meaning = "Index-linked notes: continued-listing threshold (the notices say the notes fell below the minimum market value)."
+label = "compliance_delisting"
+reason = "Official text not retrieved (see notes); label read from the notice wording only."
+quote = []
+url = ""
+retrieved = 2026-10-11
+count = 5
+verified = false
