@@ -253,6 +253,15 @@ def test_a_reconciliation_on_a_session_day_reads_close_of_the_previous_session(
     assert _close(MARK) in read_instants(conn)
 
 
+def test_a_reconciliation_on_a_holiday_reads_close_of_the_session_before_the_last(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # Thanksgiving 2026-11-26: `paper reconcile` states 11-25, so it read at close(11-24).
+    _window(conn, 1, STARTED)
+    _reconcile(conn, 1, datetime(2026, 11, 26, 16, tzinfo=UTC))
+    assert read_instants(conn) == [STARTED, _close(date(2026, 11, 24))]
+
+
 def test_a_plan_with_no_trial_raises_rather_than_drop_its_instant(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:

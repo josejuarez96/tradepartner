@@ -420,25 +420,66 @@ class PrecheckFile:
     sha256: str
 
 
+def _field(data: Mapping[str, Any], name: str, path: Path) -> Any:
+    if name not in data:
+        raise ValueError(f"{path}: {name} is missing")
+    return data[name]
+
+
+def _instant_field(value: Any, name: str, path: Path) -> datetime:
+    """A tz-aware ISO instant, as UTC; anything else is refused."""
+    if not isinstance(value, str):
+        raise ValueError(f"{path}: {name} is not an ISO instant: {value!r}")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {name} is not an ISO instant: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{path}: {name} is not tz-aware: {value!r}")
+    return parsed.astimezone(UTC)
+
+
 def load_precheck(path: Path) -> PrecheckFile:
-    """Read a `precheck.<release>.json` written by `Precheck.to_bytes`."""
+    """Read a `precheck.<release>.json` written by `Precheck.to_bytes`.
+
+    Every field the repair tools check is type-checked, and a missing or
+    mistyped one raises `ValueError` (a gate fails closed): `pass` must be a
+    JSON boolean, `release` a string, `window_first_session` an ISO date or
+    null, `instants` a list of tz-aware ISO instants, `journal_high_water` a
+    tz-aware ISO instant or null, and `made_at` a tz-aware ISO instant.
+    """
     raw = path.read_bytes()
     data = json.loads(raw)
-
-    def instant(value: str | None, field: str) -> datetime | None:
-        return None if value is None else _utc(datetime.fromisoformat(value), field)
-
-    first = data["window_first_session"]
-    made_at = instant(data["made_at"], "made_at")
-    if made_at is None:
-        raise ValueError(f"{path}: made_at is missing")
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: not a JSON object")
+    passed = _field(data, "pass", path)
+    if not isinstance(passed, bool):
+        raise ValueError(f"{path}: pass is not a JSON boolean: {passed!r}")
+    release = _field(data, "release", path)
+    if not isinstance(release, str):
+        raise ValueError(f"{path}: release is not a string: {release!r}")
+    first = _field(data, "window_first_session", path)
+    window_first: date | None = None
+    if first is not None:
+        if not isinstance(first, str) or len(first) != 10:
+            raise ValueError(f"{path}: window_first_session is not an ISO date: {first!r}")
+        try:
+            window_first = date.fromisoformat(first)
+        except ValueError as exc:
+            raise ValueError(f"{path}: window_first_session is not an ISO date: {first!r}") from exc
+    instants = _field(data, "instants", path)
+    if not isinstance(instants, list):
+        raise ValueError(f"{path}: instants is not a list: {instants!r}")
+    high = _field(data, "journal_high_water", path)
     return PrecheckFile(
-        release=str(data["release"]),
-        window_first_session=None if first is None else date.fromisoformat(first),
-        passed=bool(data["pass"]),
-        instants=tuple(_utc(datetime.fromisoformat(t), "instant") for t in data["instants"]),
-        journal_high_water=instant(data["journal_high_water"], "journal_high_water"),
-        made_at=made_at,
+        release=release,
+        window_first_session=window_first,
+        passed=passed,
+        instants=tuple(_instant_field(t, "instants", path) for t in instants),
+        journal_high_water=None
+        if high is None
+        else _instant_field(high, "journal_high_water", path),
+        made_at=_instant_field(_field(data, "made_at", path), "made_at", path),
         sha256=hashlib.sha256(raw).hexdigest(),
     )
 

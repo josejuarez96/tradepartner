@@ -167,3 +167,56 @@ def test_an_existing_file_is_never_overwritten(settings: Settings, tmp_path: Pat
 
 def test_a_bad_release_name_is_refused(settings: Settings, tmp_path: Path) -> None:
     assert script.main(["--release", "Bad Name", "--out", str(tmp_path)], settings=settings) == 2
+
+
+def _written(settings: Settings, tmp_path: Path) -> dict[str, object]:
+    _store(settings, late_filing=False)
+    script.main(["--release", "r5", "--out", str(tmp_path)], now=MADE, settings=settings)
+    data: dict[str, object] = json.loads((tmp_path / "precheck.r5.json").read_text())
+    return data
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pass", "false"),
+        ("pass", "true"),
+        ("pass", 1),
+        ("pass", None),
+        ("release", 5),
+        ("window_first_session", 20261009),
+        ("window_first_session", "2026-10-09T00:00:00"),
+        ("instants", "2026-10-09T18:00:00+00:00"),
+        ("instants", [1]),
+        ("instants", ["2026-10-09T18:00:00"]),  # naive
+        ("journal_high_water", 0),
+        ("made_at", None),
+        ("made_at", "not a time"),
+    ],
+)
+def test_load_refuses_a_field_of_the_wrong_type(
+    settings: Settings, tmp_path: Path, field: str, value: object
+) -> None:
+    data = _written(settings, tmp_path)
+    data[field] = value
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=field):
+        load_precheck(bad)
+
+
+@pytest.mark.parametrize("field", ["pass", "release", "instants", "made_at"])
+def test_load_refuses_a_missing_field(settings: Settings, tmp_path: Path, field: str) -> None:
+    data = _written(settings, tmp_path)
+    del data[field]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=field):
+        load_precheck(bad)
+
+
+def test_load_refuses_a_file_that_is_not_an_object(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("[]")
+    with pytest.raises(ValueError):
+        load_precheck(bad)
