@@ -1380,6 +1380,11 @@ def test_a_packet_never_sent_scores_unresolved_not_dropped() -> None:
     acc = scoring.class_accuracy(cascade_items)
     row = _row(scoring.ladder_table(cascade_items), "jev", "cascade")
     assert (row.n, row.correct) == (acc.n, acc.correct) == (30, 22)
+    no_calls = _item("no-calls", BK, BK, "ok", calls=())
+    assert scoring.level_answer(no_calls, "jev", "cascade") == UNRESOLVED
+    assert scoring.level_answer(no_calls, "claude", "E1") is None
+    with_none = [*items, no_calls]
+    assert _row(scoring.ladder_table(with_none), "jev", "E1").n == 31
     only_b = _item("only-b", BK, BK, "ok", calls=(_jev("B", BK),), has_eightk=True)
     assert scoring.level_answer(only_b, "jev", "E2") == BK
     assert scoring.level_answer(only_b, "jev", "E1") == UNRESOLVED

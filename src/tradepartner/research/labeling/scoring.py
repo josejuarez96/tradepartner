@@ -889,8 +889,9 @@ def _from(call: ArmCall | None, paid: tuple[ArmCall | None, ...], b_refused: boo
 
 
 def _resolve(item: ScoredItem, arm: Arm, level: Level) -> _Resolved | None:
-    """The level's answer for `arm` on `item`, `None` when the arm made no call on the
-    item (an item it never reached is not scored for it); a packet the level needs but
+    """The level's answer for `arm` on `item`, `None` when Claude made no call on the
+    item (an item it never reached is not scored for it; Jev's missing item reads
+    `unresolved`); a packet the level needs but
     that was never sent reads `unresolved`, as the primary counts it."""
     if level not in LADDER_LEVELS:
         raise ValueError(f"unknown ladder level {level!r}")
@@ -899,7 +900,9 @@ def _resolve(item: ScoredItem, arm: Arm, level: Level) -> _Resolved | None:
     a_call = _call_of(item, arm, "A")
     b_call = _call_of(item, arm, "B")
     if a_call is None and b_call is None:
-        return None
+        # Jev is the primary arm: an item it has no record on (both packets over the
+        # cap) counts wrong in `class_accuracy`, so it reads `unresolved` here too.
+        return _NOT_SENT if arm == "jev" else None
     if level == "E1":
         return _from(a_call, (a_call,), False) if a_call else _NOT_SENT
     if level == "E2":
@@ -925,7 +928,7 @@ def level_answer(item: ScoredItem, arm: Arm, level: Level) -> str | None:
     one more document" is the Form 25 alone when there is none, or when B was refused
     before sending, which `LadderRow.b_refused` counts; a B call the vendor refused
     reads `unresolved`); `cascade` (Jev only) B where B ran and resolved, else A. A
-    `refused` or `timeout` call reads as `unresolved`. `None` only when the arm made no call on the
+    `refused` or `timeout` call reads as `unresolved`. `None` only when Claude made no call on the
     item; a level whose packet was never sent reads `unresolved`."""
     resolved = _resolve(item, arm, level)
     return resolved.answer if resolved else None
