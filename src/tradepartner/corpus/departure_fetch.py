@@ -39,7 +39,9 @@ whose primary document is downloaded and split on its `Item N.NN` headings
 requests it still has to make (the SGML headers of the kept 8-Ks and markers
 and the 8-K documents, less what the cache holds), reports that count, and
 raises `RequestLimitExceeded` before making any of them when it is over
-`max_requests`.
+`max_requests`. The count is one per header: a header cut before
+`</SEC-HEADER>` at `edgar.header_bytes` is asked once more, uncounted, so the
+limit bounds the headers and documents, not every range request.
 
 **I/O.** Every request goes through `adapters.edgar_raw` (its paced client at
 `edgar.requests_per_second`, its User-Agent and retry policy). Raw responses
@@ -596,7 +598,8 @@ def fetch_departure_corpus(
     current UTC time), so a narrowed corpus is never mistaken for the full one.
 
     Once the listing ends are known, the requests still to make are counted
-    and passed to `report`; above `max_requests` the fetch raises
+    and passed to `report` (one per header; a cut header's second range is
+    not counted); above `max_requests` the fetch raises
     `RequestLimitExceeded` before making them and writes nothing.
     """
     settings = settings or get_settings()
@@ -667,7 +670,8 @@ def fetch_departure_corpus(
     if report is not None:
         report(
             f"requests to make: {to_make} ({header_requests} SGML headers, "
-            f"{document_requests} 8-K documents; --max-requests {max_requests})"
+            f"{document_requests} 8-K documents, a cut header asking once more; "
+            f"--max-requests {max_requests})"
         )
     if to_make > max_requests:
         raise RequestLimitExceeded(
@@ -763,7 +767,7 @@ def _filing_rows(payload: Mapping[str, Any]) -> list[dict[str, str]]:
     """A submissions payload's (or older page's) column lists as rows."""
     filings = payload.get("filings")
     columns = filings["recent"] if isinstance(filings, Mapping) else payload
-    keys = ("form", "filingDate", "accessionNumber", "acceptanceDateTime", "primaryDocument")
+    keys = ("form", "filingDate", "accessionNumber", "primaryDocument")
     count = len(columns["accessionNumber"])
     rows = [{key: str(columns[key][i] or "") for key in keys} for i in range(count)]
     items = columns.get("items") or [""] * count

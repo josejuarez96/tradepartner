@@ -450,8 +450,9 @@ def test_corpus_fetch_stops_above_max_requests(s: Settings) -> None:
         edgar_client=router.client(),
     )
     assert fetched.exit_code == 1, fetched.output
-    assert "requests to make: 3 (2 SGML headers, 1 8-K documents; --max-requests 2)" in (
-        fetched.output
+    assert (
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 2)" in (fetched.output)
     )
     assert "RequestLimitExceeded" in fetched.output
     assert not any(url.endswith(".htm") for url in router.urls())

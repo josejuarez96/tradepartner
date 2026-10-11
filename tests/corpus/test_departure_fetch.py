@@ -371,8 +371,18 @@ class _RangeRouter(Router):
 
 def test_a_header_cut_short_is_asked_once_more_at_the_longer_range(tmp_path: Path) -> None:
     router = _RangeRouter(_routes())
+    lines: list[str] = []
 
-    klx = _records(_run(_settings(tmp_path, header_bytes=200), router))[0]
+    result = _run(
+        _settings(tmp_path, header_bytes=200), router, max_requests=3, report=lines.append
+    )
+    klx = _records(result)[0]
+
+    # The count is one per header (documented): the second range is not counted,
+    # so a limit of 3 lets 4 header-and-8-K requests through here.
+    assert lines[0].startswith("requests to make: 3 (2 SGML headers, 1 8-K documents")
+    after = [u for u in router.urls() if u in {EIGHTK_URL, EIGHTK_HEADER_URL, MARKER_HEADER_URL}]
+    assert len(after) == 4
 
     asked = [r.headers["Range"] for r in router.requests if str(r.url) == EIGHTK_HEADER_URL]
     assert asked == ["bytes=0-199", "bytes=0-65535"]
@@ -391,7 +401,10 @@ def test_the_request_count_is_reported_and_over_the_limit_nothing_is_fetched(
     with pytest.raises(departure_fetch.RequestLimitExceeded, match="3 requests"):
         _run(_settings(tmp_path), router, max_requests=2, report=lines.append)
 
-    assert lines == ["requests to make: 3 (2 SGML headers, 1 8-K documents; --max-requests 2)"]
+    assert lines == [
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 2)"
+    ]
     asked = router.urls()
     assert not {EIGHTK_URL, EIGHTK_HEADER_URL, MARKER_HEADER_URL} & set(asked)
     out = tmp_path / "corpus" / "departure-reason"
@@ -406,8 +419,10 @@ def test_at_the_limit_the_fetch_runs_and_a_cached_rerun_counts_zero(tmp_path: Pa
     _run(settings, Router(_routes()), now=LATER, max_requests=0, report=lines.append)
 
     assert lines == [
-        "requests to make: 3 (2 SGML headers, 1 8-K documents; --max-requests 3)",
-        "requests to make: 0 (0 SGML headers, 0 8-K documents; --max-requests 0)",
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 3)",
+        "requests to make: 0 (0 SGML headers, 0 8-K documents, "
+        "a cut header asking once more; --max-requests 0)",
     ]
 
 
