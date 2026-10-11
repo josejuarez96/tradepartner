@@ -485,9 +485,24 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
     return sha256("".join(lines).encode()).hexdigest()
 
 
+# Facts that can affect a trial. Rates are stored for later consumers, but
+# today's trial path does not read them; adding one must not stale a trial.
+_TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
+    "securities",
+    "listings",
+    "classifications",
+    "delistings",
+    "prices_daily",
+    "corporate_actions",
+    "facts",
+    "statement_facts",
+    "filing_events",
+)
+
+
 def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
-    latest of the `ingested_at` over every fact table's rows with `known_at <=
+    latest of the `ingested_at` over trial-readable fact rows with `known_at <=
     cutoff` and the `made_at` of every closed data release whose touched sessions
     start on or before `cutoff` (`_release_vintage`, #1319 T140b); None when there
     is neither. A nightly ingest that only adds later sessions leaves it
@@ -496,7 +511,8 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     `store_max_ingested_at` is."""
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
-    tables = _present_fact_tables(conn)
+    present = set(_present_fact_tables(conn))
+    tables = [table for table in _TRIAL_FACT_TABLES if table in present]
     facts: datetime | None = None
     if tables:
         union = " UNION ALL ".join(
