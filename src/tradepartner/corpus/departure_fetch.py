@@ -7,9 +7,16 @@ accession: the exchange's copy of a 25-NSE, which the index lists under the
 exchange's CIK with the same accession, is counted `exchange_copy`. Each
 accession's full-submission `.txt` gives the notification fields; one whose
 text holds no XML `notificationOfRemoval` is counted `pre_xml`. The issuer CIK
-named in the XML gives the submissions JSON, whose `acceptanceDateTime` is the
-only acceptance used; a filing it carries no acceptance for is counted
-`unstamped` and never dated from the index. An amendment is attached to the
+named in the XML gives the submissions JSON, which is the filing list (forms,
+accessions, filing dates, the older pages) but never an acceptance: SEC has
+served its `acceptanceDateTime` hours late since about 2026-10-01 (#1496,
+#1497 (e), plan T168). Every acceptance the corpus records or orders by is the
+`ACCEPTANCE-DATETIME` of the filing's own SGML header (`edgar.sgml_acceptance`):
+a Form 25's from the `<SEC-HEADER>` of the `.txt` already downloaded, an 8-K's
+or marker's from `edgar_raw.filing_sgml_header` (one raw-cached request each).
+A Form 25 whose header does not read (not served, truncated, naming another
+accession, or with no acceptance) is counted `unstamped` and never dated from
+the index or the JSON. An amendment is attached to the
 latest earlier-accepted original of the same issuer CIK and exchange (counted
 `amendment_attached`); one with no original is its own listing end, flagged
 `orphan_amendment`. So listing ends kept + `pre_xml` + `unstamped` +
@@ -28,6 +35,12 @@ whose primary document is downloaded and split on its `Item N.NN` headings
 (`eightk_items` order, each cut at `item_max_chars`, all at
 `eightk_max_chars`), or its body's head when no listed item segments.
 
+**Request limit.** Once the listing ends are known, the fetch counts the
+requests it still has to make (the SGML headers of the kept 8-Ks and markers
+and the 8-K documents, less what the cache holds), reports that count, and
+raises `RequestLimitExceeded` before making any of them when it is over
+`max_requests`.
+
 **I/O.** Every request goes through `adapters.edgar_raw` (its paced client at
 `edgar.requests_per_second`, its User-Agent and retry policy). Raw responses
 are cached under `edgar.cache_dir/corpus/departure-reason/raw/`, which
@@ -37,11 +50,14 @@ a quarter's index until `INDEX_SETTLE_DAYS` after the quarter ends, and an
 issuer's submissions JSON while a window of one of its listing ends was still
 open when it was fetched (so a later amendment, 8-K or marker is seen). A
 document EDGAR answers with an HTTP error is recorded under the listing end's
-`missing` with its status (a Form 25 not served leaves `exhibit` null), and a
-`404` or `410` is remembered so a rerun does not ask again. Output: `corpus.jsonl` (one object
-per listing end, sorted by filing date and accession) and `counts.json` beside
-`raw/`. This module imports nothing from `tradepartner.research`, never opens
-the runtime store, and writes nothing in the research store.
+`missing` with its status (a Form 25 not served is `unstamped`; an 8-K's or
+marker's header not served leaves its `accepted_at` null), and a `404` or
+`410` is remembered so a rerun does not ask again. Output: `corpus.jsonl` (one
+object per listing end, sorted by filing date and accession) and `counts.json`
+beside `raw/`, both carrying `fetch_version` (`FETCH_VERSION`), so a corpus
+fetched before the SGML acceptances is never taken for one fetched after.
+This module imports nothing from `tradepartner.research`, never opens the
+runtime store, and writes nothing in the research store.
 
 The reference implementation is the sample test's `jev_sample.py`
 (`fill_form25`, `fill_exhibit`, `fill_eightk`, `segment_items`,
@@ -66,12 +82,19 @@ import httpx
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar import (
     UnstampedFiling,
-    acceptance_times,
     normalize_exchange,
     parse_filing_index,
+    sgml_acceptance,
 )
 from tradepartner.config import Settings, get_settings
 
+#: Written into `counts.json` and every `corpus.jsonl` row. 2: every acceptance
+#: is the filing's SGML header's (T168); the T120 corpus (no field) took the
+#: submissions JSON's `acceptanceDateTime`, served hours late since 2026-10.
+FETCH_VERSION = 2
+#: `corpus fetch --max-requests`'s default (plan T168): the requests still to
+#: make once the listing ends are known, above which the fetch stops.
+DEFAULT_MAX_REQUESTS = 40_000
 #: The population's first filing date (spec Definitions "Listing end").
 POPULATION_START = date(2016, 1, 1)
 ORIGINAL_FORMS = frozenset({"25", "25-NSE"})
@@ -269,6 +292,16 @@ def eightk_passage(
     return EightKPassage({}, truncate_sentence(text, min(item_max_chars, eightk_max_chars)))
 
 
+def sgml_stamp(text: str, accession: str) -> datetime | None:
+    """The `ACCEPTANCE-DATETIME` (UTC) of the SGML header at the top of `text`,
+    or `None` when that header does not read: cut before `</SEC-HEADER>`,
+    naming another accession, carrying no acceptance or holding a malformed one."""
+    try:
+        return sgml_acceptance(text, accession)
+    except ValueError:  # the Sgml*Error cases subclass it
+        return None
+
+
 # --- cached EDGAR access ---------------------------------------------------------
 
 
@@ -335,6 +368,49 @@ class _CachedEdgar:
         except httpx.HTTPStatusError as error:
             return self._not_served(path, url, error)
         return downloaded.read_bytes()
+
+    def has_document(self, cik: str, accession: str, filename: str) -> bool:
+        """Whether `document` would answer from the cache (or a remembered 404)."""
+        path = edgar_raw.cached_filing_path(cik, accession, filename, settings=self._raw_settings)
+        return path.is_file() or self._marker(path).is_file()
+
+    def _header_path(self, cik: str, accession: str) -> Path:
+        name = f"{accession}.sgml-header.txt"
+        return edgar_raw.cached_filing_path(cik, accession, name, settings=self._raw_settings)
+
+    def has_header(self, cik: str, accession: str) -> bool:
+        """Whether `header_acceptance` would answer from the cache."""
+        path = self._header_path(cik, accession)
+        return path.is_file() or self._marker(path).is_file()
+
+    def header_acceptance(self, cik: str, accession: str) -> datetime | _NotServed | None:
+        """The filing's SGML-header acceptance (`sgml_stamp`), `None` when the
+        header does not read, `_NotServed` on an HTTP error. The first
+        `edgar.header_bytes` are asked for, and `edgar.stamp_header_bytes` once
+        more when that range ends before `</SEC-HEADER>`; the last text fetched
+        is cached, so a rerun reads it without a request."""
+        path = self._header_path(cik, accession)
+        if path.is_file():
+            return sgml_stamp(path.read_text(encoding="utf-8"), accession)
+        remembered = self._remembered(path)
+        if remembered is not None:
+            return remembered
+        url = (
+            "https://www.sec.gov/Archives/edgar/data/"
+            f"{int(cik)}/{accession.replace('-', '')}/{accession}.txt"
+        )
+        text = ""
+        for size in (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes):
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=self._settings, client=self._client
+                )
+            except httpx.HTTPStatusError as error:
+                return self._not_served(path, url, error)
+            if "</SEC-HEADER>" in text:
+                break
+        edgar_raw.write_atomic(path, text.encode("utf-8"))
+        return sgml_stamp(text, accession)
 
     def submissions(self, cik: str, *, open_until: date) -> Any:
         """The issuer's submissions payload (`_NotServed` on an HTTP error).
@@ -442,6 +518,10 @@ class FetchCounts:
         }
 
 
+class RequestLimitExceeded(RuntimeError):
+    """The requests still to make exceed `max_requests`; nothing more was asked."""
+
+
 @dataclass(frozen=True)
 class FetchResult:
     """Where the fetch wrote and what it counted."""
@@ -473,7 +553,20 @@ class _Filing:
 @dataclass(frozen=True)
 class _Submissions:
     rows: list[dict[str, str]]
-    acceptance: dict[str, datetime]
+
+
+@dataclass(frozen=True)
+class _Context:
+    """A kept listing end's 8-K row (or why there is none) and marker rows,
+    chosen from its issuer's submissions before any of them is requested."""
+
+    eightk_row: dict[str, str] | None
+    eightk_note: str | None
+    marker_rows: list[dict[str, str]]
+
+
+#: An 8-K's or marker's header acceptance, by accession (`header_acceptance`).
+_Stamps = Mapping[str, datetime | _NotServed | None]
 
 
 def corpus_dir(settings: Settings) -> Path:
@@ -490,6 +583,8 @@ def fetch_departure_corpus(
     settings: Settings | None = None,
     client: httpx.Client | None = None,
     now: datetime | None = None,
+    max_requests: int = DEFAULT_MAX_REQUESTS,
+    report: Callable[[str], None] | None = None,
 ) -> FetchResult:
     """Fetch the departure-reason corpus for Form 25s filed in `[since, until]`
     and write `corpus.jsonl` and `counts.json` (module docstring).
@@ -499,6 +594,10 @@ def fetch_departure_corpus(
     rows seen, so the counts identity holds over what was kept; `counts.json`
     records the range, both filters and `fetched_at` (`now`, default the
     current UTC time), so a narrowed corpus is never mistaken for the full one.
+
+    Once the listing ends are known, the requests still to make are counted
+    and passed to `report`; above `max_requests` the fetch raises
+    `RequestLimitExceeded` before making them and writes nothing.
     """
     settings = settings or get_settings()
     fetched_at = (now or datetime.now(UTC)).astimezone(UTC)
@@ -528,26 +627,59 @@ def fetch_departure_corpus(
                 )
             )
             continue
-        notification = parse_notification(raw.decode("utf-8", "replace"))
+        text = raw.decode("utf-8", "replace")
+        notification = parse_notification(text)
         if notification is None:
             pre_xml += 1
             continue
         issuer = notification.issuer_cik or head.cik
-        filings.append(_Filing(accession, head.form, head.filed_on, issuer, raw, notification, []))
+        filing = _Filing(accession, head.form, head.filed_on, issuer, raw, notification, [])
+        filing.accepted_at = sgml_stamp(text, accession)  # the .txt's own <SEC-HEADER>
+        filings.append(filing)
 
-    submissions = _load_submissions(edgar, filings, settings)
-    for filing in filings:
-        table = submissions.get(filing.issuer_cik)
-        filing.accepted_at = table.acceptance.get(filing.accession) if table else None
     stamped = [f for f in filings if f.accepted_at is not None]
     unstamped = len(filings) - len(stamped)
 
     kept, attached = _attach_amendments(stamped)
     kept.sort(key=lambda f: (f.filed_on, f.accession))
 
-    # Every kept filing is stamped, so its issuer's submissions were served.
+    submissions = _load_submissions(edgar, kept, settings)
+    contexts = [_context(filing, kept, submissions, settings) for filing in kept]
+    headers = sorted(
+        {
+            (filing.issuer_cik, row["accessionNumber"])
+            for filing, context in zip(kept, contexts, strict=True)
+            for row in [*([context.eightk_row] if context.eightk_row else []), *context.marker_rows]
+        }
+    )
+    documents = {
+        (
+            filing.issuer_cik,
+            context.eightk_row["accessionNumber"],
+            context.eightk_row["primaryDocument"],
+        )
+        for filing, context in zip(kept, contexts, strict=True)
+        if context.eightk_row is not None
+    }
+    header_requests = sum(not edgar.has_header(*key) for key in headers)
+    document_requests = sum(not edgar.has_document(*key) for key in documents)
+    to_make = header_requests + document_requests
+    if report is not None:
+        report(
+            f"requests to make: {to_make} ({header_requests} SGML headers, "
+            f"{document_requests} 8-K documents; --max-requests {max_requests})"
+        )
+    if to_make > max_requests:
+        raise RequestLimitExceeded(
+            f"{to_make} requests to make exceed --max-requests {max_requests}; nothing fetched"
+        )
+
+    stamps: dict[str, datetime | _NotServed | None] = {
+        accession: edgar.header_acceptance(cik, accession) for cik, accession in headers
+    }
     records = [
-        _record(filing, kept, submissions[filing.issuer_cik], edgar, settings) for filing in kept
+        _record(filing, context, stamps, edgar, settings)
+        for filing, context in zip(kept, contexts, strict=True)
     ]
     counts = FetchCounts(
         index_rows_seen=index_rows_seen,
@@ -572,6 +704,7 @@ def fetch_departure_corpus(
         "ciks": sorted(f"{int(cik):010d}" for cik in ciks),
         "limit": limit,
         "fetched_at": fetched_at.isoformat(),
+        "fetch_version": FETCH_VERSION,
     }
     edgar_raw.write_atomic(counts_path, (json.dumps(summary, indent=2) + "\n").encode())
     return FetchResult(corpus_path, counts_path, counts)
@@ -642,8 +775,8 @@ def _filing_rows(payload: Mapping[str, Any]) -> list[dict[str, str]]:
 def _load_submissions(
     edgar: _CachedEdgar, filings: Sequence[_Filing], settings: Settings
 ) -> dict[str, _Submissions]:
-    """Each issuer's submissions rows and acceptance times, with the older pages
-    that overlap any of its listing ends' windows."""
+    """Each issuer's submissions rows, with the older pages that overlap any
+    of its listing ends' windows (the filing list only: no acceptance is read)."""
     labeling = settings.research.labeling
     before = timedelta(days=max(labeling.context_before_days, MARKER_BEFORE_DAYS))
     after = timedelta(days=max(labeling.context_after_days, labeling.marker_after_days))
@@ -675,7 +808,7 @@ def _load_submissions(
                 continue
             parts.append(older)
         rows = [row for part in parts for row in _filing_rows(part)]
-        tables[issuer] = _Submissions(rows, acceptance_times(*parts))
+        tables[issuer] = _Submissions(rows)
     return tables
 
 
@@ -714,14 +847,24 @@ def _items(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _accepted(table: _Submissions, accession: str) -> str | None:
-    accepted = table.acceptance.get(accession)
-    return accepted.isoformat() if accepted else None
+def _context(
+    filing: _Filing,
+    kept: Sequence[_Filing],
+    submissions: Mapping[str, _Submissions],
+    settings: Settings,
+) -> _Context:
+    """The listing end's 8-K row and marker rows, or a note when its issuer's
+    submissions were not served (already under `missing`)."""
+    table = submissions.get(filing.issuer_cik)
+    if table is None:
+        return _Context(None, "issuer submissions not served", [])
+    row, note = _eightk_row(filing, table, settings)
+    return _Context(row, note, _marker_rows(filing, kept, table, settings))
 
 
-def _markers(
+def _marker_rows(
     filing: _Filing, kept: Sequence[_Filing], table: _Submissions, settings: Settings
-) -> list[dict[str, Any]]:
+) -> list[dict[str, str]]:
     """The issuer's marker filings in req 2's window, from the submissions rows."""
     lo = filing.filed_on - timedelta(days=MARKER_BEFORE_DAYS)
     hi = filing.filed_on + timedelta(days=settings.research.labeling.marker_after_days)
@@ -731,28 +874,21 @@ def _markers(
         if other.issuer_cik == filing.issuer_cik and other.filed_on > filing.filed_on
     ]
     next_end = min(later) if later else None
-    markers = []
+    rows = []
     for row in table.rows:
         if row["form"] not in MARKER_FORMS or not row["filingDate"]:
             continue
         filed = date.fromisoformat(row["filingDate"])
         if not lo <= filed <= hi or (next_end is not None and filed >= next_end):
             continue
-        markers.append(
-            {
-                "form": row["form"],
-                "accession": row["accessionNumber"],
-                "filed_on": row["filingDate"],
-                "accepted_at": _accepted(table, row["accessionNumber"]),
-            }
-        )
-    return sorted(markers, key=lambda m: (m["filed_on"], m["accession"]))
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["filingDate"], r["accessionNumber"]))
 
 
-def _eightk(
-    filing: _Filing, table: _Submissions, edgar: _CachedEdgar, settings: Settings
-) -> tuple[dict[str, Any] | None, str | None]:
-    """C2's one 8-K for the listing end, or `None` with a note."""
+def _eightk_row(
+    filing: _Filing, table: _Submissions, settings: Settings
+) -> tuple[dict[str, str] | None, str | None]:
+    """C2's one 8-K row for the listing end, or `None` with a note."""
     labeling = settings.research.labeling
     lo = filing.filed_on - timedelta(days=labeling.context_before_days)
     hi = filing.filed_on + timedelta(days=labeling.context_after_days)
@@ -771,9 +907,30 @@ def _eightk(
     if not candidates:
         return None, "no 8-K in window"
     row = min(candidates, key=lambda c: c[:4])[4]
-    accession, document = row["accessionNumber"], row["primaryDocument"]
-    if not document:
+    if not row["primaryDocument"]:
         return None, "8-K has no primary document"
+    return row, None
+
+
+def _header_stamp(filing: _Filing, accession: str, stamps: _Stamps, document: str) -> str | None:
+    """`accession`'s SGML acceptance as ISO text; a header EDGAR did not serve
+    goes under the listing end's `missing` as `document`."""
+    stamp = stamps[accession]
+    if isinstance(stamp, _NotServed):
+        filing.missing.append(stamp.missing(document))
+        return None
+    return stamp.isoformat() if stamp is not None else None
+
+
+def _eightk(
+    filing: _Filing, context: _Context, stamps: _Stamps, edgar: _CachedEdgar, settings: Settings
+) -> tuple[dict[str, Any] | None, str | None]:
+    """C2's one 8-K for the listing end, or `None` with a note."""
+    row = context.eightk_row
+    if row is None:
+        return None, context.eightk_note
+    labeling = settings.research.labeling
+    accession, document = row["accessionNumber"], row["primaryDocument"]
     raw = edgar.document(filing.issuer_cik, accession, document)
     if isinstance(raw, _NotServed):
         filing.missing.append(raw.missing("eightk"))
@@ -789,7 +946,7 @@ def _eightk(
             "accession": accession,
             "form": row["form"],
             "filed_on": row["filingDate"],
-            "accepted_at": _accepted(table, accession),
+            "accepted_at": _header_stamp(filing, accession, stamps, "eightk_header"),
             "index_items": _items(row["items"]),
             "items": passage.items,
             "body_head": passage.body_head,
@@ -801,13 +958,13 @@ def _eightk(
 
 def _record(
     filing: _Filing,
-    kept: Sequence[_Filing],
-    table: _Submissions,
+    context: _Context,
+    stamps: _Stamps,
     edgar: _CachedEdgar,
     settings: Settings,
 ) -> dict[str, Any]:
     """One `corpus.jsonl` object (amendment C11's fields, plus `issuer`,
-    `exchange_name` and `orphan_amendment`)."""
+    `exchange_name`, `orphan_amendment` and `fetch_version`)."""
     labeling = settings.research.labeling
     notification = filing.notification
     exhibit: dict[str, Any] | None = None  # the Form 25 was not served: unknown
@@ -822,9 +979,18 @@ def _record(
             "sha256": hashlib.sha256(filing.raw).hexdigest(),
         }
     raw_provision = notification.rule_provision_raw if notification else None
-    eightk, note = _eightk(filing, table, edgar, settings)
-    markers = _markers(filing, kept, table, settings)
+    eightk, note = _eightk(filing, context, stamps, edgar, settings)
+    markers = [
+        {
+            "form": row["form"],
+            "accession": row["accessionNumber"],
+            "filed_on": row["filingDate"],
+            "accepted_at": _header_stamp(filing, row["accessionNumber"], stamps, "marker_header"),
+        }
+        for row in context.marker_rows
+    ]
     return {
+        "fetch_version": FETCH_VERSION,
         "listing_end_id": filing.accession,
         "cik": filing.issuer_cik,
         "issuer": notification.issuer if notification else None,
