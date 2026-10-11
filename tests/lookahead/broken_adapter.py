@@ -69,6 +69,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     check_request,
 )
+from tradepartner.adapters.rates import RateObservation, rate_known_at
 from tradepartner.calendar import session_close, session_open
 
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
@@ -364,3 +365,30 @@ def broken_statement_fact(violation: StatementFactViolation) -> BrokenStatementF
     else:
         known_at = datetime.combine(record.filed, time.min, tzinfo=UTC)
     return BrokenStatementFact(record, known_at)
+
+
+class RateStampViolation(StrEnum):
+    AT_OBSERVATION_CLOSE = "at_observation_close"
+    AT_VINTAGE_CLOSE = "at_vintage_close"
+
+
+@dataclass(frozen=True)
+class StampedRate:
+    record: RateObservation
+    known_at: datetime
+
+
+_RATE_RECORD = RateObservation("DTB3", date(2020, 3, 16), 0.65, date(2020, 3, 17))
+
+
+def clean_rate() -> StampedRate:
+    return StampedRate(_RATE_RECORD, rate_known_at(_RATE_RECORD.vintage_date))
+
+
+def broken_rate(violation: RateStampViolation) -> StampedRate:
+    stamp_date = (
+        _RATE_RECORD.observation_date
+        if violation is RateStampViolation.AT_OBSERVATION_CLOSE
+        else _RATE_RECORD.vintage_date
+    )
+    return StampedRate(_RATE_RECORD, session_close(stamp_date))

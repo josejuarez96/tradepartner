@@ -1083,6 +1083,34 @@ def test_data_vintage_is_the_latest_ingest_of_facts_known_at_the_cutoff(
         registry.data_vintage(conn, datetime(2024, 6, 28, 20, 0))  # noqa: DTZ001
 
 
+def test_rates_move_store_max_but_not_trial_vintage(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _register(conn, settings)
+    known = datetime(2026, 9, 24, 20, tzinfo=UTC)
+    _price(conn, "A", known, _T0.replace(hour=1))
+    handle = _open(conn, settings, tmp_path)
+    ingested = datetime(2026, 9, 28, 1, tzinfo=UTC)
+    before = registry.data_vintage(conn, _T0)
+    insert_row(
+        conn,
+        "rates",
+        {
+            "series": "DTB3",
+            "observation_date": date(2026, 9, 22),
+            "value": 5.1,
+            "vintage_date": date(2026, 9, 23),
+            "known_at": known,
+            "ingested_at": ingested,
+            "source": "fred",
+            "provenance": "release",
+        },
+    )
+    assert registry.data_vintage(conn, _T0) == before == handle.data_vintage
+    assert registry.store_max_ingested_at(conn) == ingested
+    assert registry.write_result(conn, handle, registry.ResultStatistics(dsr=0.9)) == "ok"
+
+
 def test_open_trial_records_the_data_vintage_at_its_cutoff(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
