@@ -26,9 +26,15 @@ path's read, `paper resume`'s settlement). In order:
    0015 seam 3), such as an order the broker replaced with a limit price
    after its acknowledgement, raises `SystemFaultError` naming
    `refused_order_shape`, also before anything is written (#1293, owner
-   2026-10-10): its fills are never journaled, so the caller halts (a run's
-   collection, `_await_sells` included), notes it (the halt path's read) or
-   refuses (`paper resume`).
+   2026-10-10): this collection journals nothing, so the caller halts (a
+   run's collection, `_await_sells` included), notes it (the halt path's
+   read) or refuses (`paper resume`). Only the orders collected are read: a
+   collection of other orders still journals the account-wide feed's fills
+   of an open own order it does not read, whatever that order's shape. That
+   order stays open in the journal (its terminal event needs a reading), so
+   the next collection that reads it refuses, and reconciliation, which
+   reads every journal-open order, flags it (`open_order_differs` or
+   `order_differs`).
 3. **Write** (one chunk, so the journal never holds half a collection):
    - each fill of an own order whose `broker_fill_id` no row has, superseded
      rows included (insert-or-ignore), stamped with the collection time as

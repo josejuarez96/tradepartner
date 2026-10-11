@@ -565,6 +565,42 @@ def test_a_get_order_reading_of_another_shape_is_refused_with_nothing_written(
     assert _cursors(journal_settings) == []
 
 
+def test_a_collection_of_other_orders_journals_an_unread_orders_fill_but_never_ends_it(
+    journal_settings: Settings,
+    open_window: PaperWindowRow,
+    scripted_fake: FakeBroker,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1293 backstop (module docstring, step 2): a collection reads only its
+    own orders, so a limit-shaped order it does not collect has its feed fill
+    journaled but no terminal event; it stays journal-open, and the next
+    collection that reads it refuses."""
+    run_id = _run(journal_settings, open_window, fixed_clock())
+    shaped = _order(journal_settings, scripted_fake, fixed_clock, run_id, "tp-a", quantity=10.0)
+    other = _order(
+        journal_settings, scripted_fake, fixed_clock, run_id, "tp-b", quantity=5.0, symbol="BBB"
+    )
+    fixed_clock.advance(minutes=1)
+    scripted_fake.apply("tp-a", FillAt(50.0))
+    fixed_clock.advance(minutes=1)
+    read = scripted_fake.get_order
+
+    def limit_a(coid: str) -> Any:
+        order = read(coid)
+        return replace(order, order_type="limit", limit_price=49.5) if coid == "tp-a" else order
+
+    monkeypatch.setattr(scripted_fake, "get_order", limit_a)
+
+    _collect(journal_settings, scripted_fake, fixed_clock, [other], writer_id=run_id)
+    assert [f.fill.client_order_id for f in _fills(journal_settings)] == ["tp-a"]
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
+    fixed_clock.advance(minutes=1)
+    with pytest.raises(SystemFaultError, match="refused_order_shape"):
+        _collect(journal_settings, scripted_fake, fixed_clock, [shaped], writer_id=run_id)
+    assert _statuses(journal_settings, "tp-a") == ["pending", "accepted"]
+
+
 def test_a_pending_order_is_refused_before_any_broker_call(
     journal_settings: Settings,
     open_window: PaperWindowRow,
