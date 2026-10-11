@@ -4,9 +4,10 @@
 
 Three things live here, and nothing else:
 
-- **Records.** `Bar` (one raw OHLCV row) and `CorporateAction` (one split or
-  dividend), frozen and validated at construction. Each carries its own
-  `known_at` (tz-aware UTC, normalized on construction) and `source`. Neither
+- **Records.** `Bar` (one raw OHLCV row), `CorporateAction` (one split,
+  dividend or spin-off), and `SymbolChange`, frozen and validated at
+  construction. Each carries its own
+  `known_at` (tz-aware UTC, normalized on construction) and `source`. None
   carries `ingested_at` or `provenance`: the ingest job (T16) stamps
   `ingested_at` when it writes, and provenance is fixed by record type
   (`bar` for `Bar`, `action` for `CorporateAction`, per
@@ -61,6 +62,7 @@ class ActionType(StrEnum):
 
     SPLIT = "split"
     DIVIDEND = "dividend"
+    SPINOFF = "spinoff"
 
 
 class UnknownSecurityIdError(LookupError):
@@ -164,7 +166,7 @@ class Bar:
 
 @dataclass(frozen=True)
 class CorporateAction:
-    """One split or dividend for one security and ex-date.
+    """One split, dividend or spin-off for one security and ex-date.
 
     Validated on construction: `action_type` coerced to `ActionType` (an
     unknown string raises `ValueError`), `ex_date` a `date`, a split ratio
@@ -205,8 +207,8 @@ class CorporateAction:
         action_type = ActionType(self.action_type)
         object.__setattr__(self, "action_type", action_type)
         value = _require_finite(self.ratio_or_amount, field_name="ratio_or_amount")
-        if action_type is ActionType.SPLIT and value <= 0:
-            raise ValueError(f"a split ratio must be positive, got {value!r}")
+        if action_type in (ActionType.SPLIT, ActionType.SPINOFF) and value <= 0:
+            raise ValueError(f"a {action_type.value} ratio must be positive, got {value!r}")
         if action_type is ActionType.DIVIDEND and value < 0:
             raise ValueError(f"a dividend amount must be non-negative, got {value!r}")
         object.__setattr__(self, "ratio_or_amount", value)
@@ -238,6 +240,53 @@ class CorporateAction:
             other.ex_date,
             other.ratio_or_amount,
             other.cancelled,
+        )
+
+
+@dataclass(frozen=True)
+class SymbolChange:
+    """An Alpaca name change, known at the close after its process date."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+    old_cusip: str
+    new_cusip: str
+    process_date: date
+    known_at: datetime
+    source: str
+    source_action_id: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("security_id", "old_symbol", "new_symbol", "source"):
+            _require_identifier(getattr(self, name), field_name=name)
+        for name in ("old_cusip", "new_cusip", "source_action_id"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
+        _require_date(self.process_date, field_name="process_date")
+        object.__setattr__(
+            self, "known_at", ensure_tz_aware_utc(self.known_at, field_name="known_at")
+        )
+
+    @property
+    def key(self) -> tuple[str, ...]:
+        if self.source_action_id:
+            return (self.security_id, "source_action_id", self.source_action_id)
+        return (self.security_id, self.old_symbol, self.new_symbol, self.process_date.isoformat())
+
+    def same_values(self, other: SymbolChange) -> bool:
+        return (
+            self.old_symbol,
+            self.new_symbol,
+            self.old_cusip,
+            self.new_cusip,
+            self.process_date,
+        ) == (
+            other.old_symbol,
+            other.new_symbol,
+            other.old_cusip,
+            other.new_cusip,
+            other.process_date,
         )
 
 
@@ -384,7 +433,17 @@ class PriceSource(abc.ABC):
     def corporate_actions(
         self, security_ids: Sequence[str], start: date, end: date
     ) -> list[CorporateAction]:
-        """Splits and dividends for `security_ids` with `start <= ex_date <= end`."""
+        """Actions for `security_ids`; spin-offs follow the process-date window."""
+
+    def symbol_changes(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[SymbolChange]:
+        """Name changes for ids with `start <= process_date <= end`.
+
+        Existing price sources without a name-change feed return none.
+        """
+        check_request(security_ids, start, end)
+        return []
 
     def resolution_summary(self) -> str:
         """What the source left unassigned while mapping its rows to

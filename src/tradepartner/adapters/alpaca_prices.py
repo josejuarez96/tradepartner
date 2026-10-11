@@ -247,10 +247,9 @@ rules, and the payload's symbols resolve as they are.
 - a zero-volume placeholder bar (`v == 0` and `n == 0`) that Alpaca can
   serve after a delisting (#104): it is not a trade and counts as missing;
 - a symbol or row that resolves to no security;
-- corporate-action categories this module does not store (spin-offs,
-  mergers, stock dividends, name changes, ...): only splits (forward and
-  reverse, ratio `new_rate / old_rate`) and cash dividends (`rate`) are
-  `CorporateAction`s.
+- corporate-action categories this module does not store (mergers, stock
+  dividends, ...): splits, cash dividends and spin-offs are
+  `CorporateAction`s; name changes are `SymbolChange`s.
 
 A malformed payload raises `ValueError`, never a partial record: a
 missing field, a non-numeric, boolean, non-finite or non-positive rate, a
@@ -274,8 +273,10 @@ from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
     PriceSource,
+    SymbolChange,
     UnknownSecurityIdError,
     action_first_seen_known_at,
+    announcement_date_known_at,
     bar_known_at,
     check_request,
 )
@@ -1618,13 +1619,24 @@ class ActionsParse:
     actions: tuple[CorporateAction, ...]
     unresolved: tuple[tuple[str, date], ...]  # (symbol, ex_date)
     unsupported: tuple[str, ...]  # categories present but not stored
+    symbol_changes: tuple[SymbolChange, ...] = ()
+    self_spinoff: int = 0
+    symbol_change_reused: int = 0
+    symbol_change_conflict: int = 0
+    reused_symbols: tuple[str, ...] = ()
 
 
 @_fail_closed
 def parse_corporate_actions(
-    payload: Mapping[str, Any], resolve: Resolve, lead: Resolve | None = None
+    payload: Mapping[str, Any],
+    resolve: Resolve,
+    lead: Resolve | None = None,
+    *,
+    process_start: date | None = None,
+    process_end: date | None = None,
+    lag_days: int = 90,
 ) -> ActionsParse:
-    """Splits and cash dividends from an `alpaca_raw.corporate_actions`
+    """Splits, dividends, spin-offs and name changes from an actions
     payload, on the first-seen proxy, resolved on the last session before
     each ex-date. Alpaca's stable `id` becomes `source_action_id`, so a
     re-dated action is a revision of one event (#108, #181); a row without
@@ -1637,11 +1649,21 @@ def parse_corporate_actions(
     actions: list[CorporateAction] = []
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
+    symbol_changes: list[SymbolChange] = []
+    self_spinoff = reused = conflict = 0
+    reused_symbols: list[str] = []
+
+    def holder(symbol: str, day: date) -> str | None:
+        result = resolve(symbol, day)
+        return result if result is not None else lead(symbol, day) if lead is not None else None
+
     for category, rows in sorted(payload.items()):
         if category in _SPLIT_CATEGORIES:
             action_type = ActionType.SPLIT
         elif category in _DIVIDEND_CATEGORIES:
             action_type = ActionType.DIVIDEND
+        elif category in ("spin_offs", "name_changes"):
+            action_type = None
         else:
             if not isinstance(rows, list):
                 raise ValueError(f"category {category!r} is not a list")
@@ -1651,14 +1673,93 @@ def parse_corporate_actions(
         if not isinstance(rows, list):
             raise ValueError(f"category {category!r} is not a list")
         for row in rows:
+            if category in ("spin_offs", "name_changes"):
+                process_date = date.fromisoformat(row["process_date"])
+                if (process_start is not None and process_date < process_start) or (
+                    process_end is not None and process_date > process_end
+                ):
+                    continue
+                if category == "spin_offs":
+                    ex_date = date.fromisoformat(row["ex_date"])
+                    ratio = _rate(row, "new_rate", positive=True) / _rate(
+                        row, "source_rate", positive=True
+                    )
+                    parent = holder(row["source_symbol"], previous_session(ex_date))
+                    child = holder(row["new_symbol"], ex_date)
+                    if parent is None:
+                        unresolved.append((row["source_symbol"], ex_date))
+                    if child is None:
+                        unresolved.append((row["new_symbol"], ex_date))
+                    if parent is None or child is None:
+                        continue
+                    if parent == child:
+                        self_spinoff += 1
+                        continue
+                    actions.append(
+                        CorporateAction(
+                            security_id=child,
+                            action_type=ActionType.SPINOFF,
+                            ex_date=ex_date,
+                            ratio_or_amount=ratio,
+                            known_at=announcement_date_known_at(process_date),
+                            source=_ACTIONS_SOURCE,
+                            source_action_id=parent,
+                        )
+                    )
+                else:
+                    old = row["old_symbol"]
+                    new = row["new_symbol"]
+                    first = process_date if is_session(process_date) else next_session(process_date)
+                    new_holder = holder(new, first)
+                    window_start = process_date - timedelta(days=lag_days)
+                    day = window_start if is_session(window_start) else next_session(window_start)
+                    old_holders: list[str] = []
+                    while day < process_date:
+                        found = holder(old, day)
+                        if found is not None and (not old_holders or found != old_holders[-1]):
+                            old_holders.append(found)
+                        day = next_session(day)
+                    if not old_holders:
+                        unresolved.append((old, process_date))
+                        continue
+                    if new_holder is not None:
+                        if new_holder not in old_holders:
+                            conflict += 1
+                            continue
+                        security_id = new_holder
+                    else:
+                        old_holder = holder(old, previous_session(process_date))
+                        if old_holder is None:
+                            unresolved.append((old, process_date))
+                            continue
+                        security_id = old_holder
+                        if len(old_holders) > 1 and old_holders[0] != security_id:
+                            security_id = old_holders[0]
+                            reused += 1
+                            reused_symbols.append(f"{old}->{new}: {security_id}")
+                    symbol_changes.append(
+                        SymbolChange(
+                            security_id=security_id,
+                            old_symbol=old,
+                            new_symbol=new,
+                            old_cusip=row["old_cusip"],
+                            new_cusip=row["new_cusip"],
+                            process_date=process_date,
+                            known_at=announcement_date_known_at(process_date),
+                            source=_ACTIONS_SOURCE,
+                            source_action_id=row.get("id") or "",
+                        )
+                    )
+                continue
             ex_date = date.fromisoformat(row["ex_date"])
             session = previous_session(ex_date)
-            security_id = resolve(row["symbol"], session)
-            if security_id is None and lead is not None:
-                security_id = lead(row["symbol"], session)
-            if security_id is None:
+            resolved_id = resolve(row["symbol"], session)
+            if resolved_id is None and lead is not None:
+                resolved_id = lead(row["symbol"], session)
+            if resolved_id is None:
                 unresolved.append((row["symbol"], ex_date))
                 continue
+            assert action_type is not None
             if action_type is ActionType.SPLIT:
                 value = _rate(row, "new_rate", positive=True) / _rate(
                     row, "old_rate", positive=True
@@ -1667,7 +1768,7 @@ def parse_corporate_actions(
                 value = _rate(row, "rate", positive=False)
             actions.append(
                 CorporateAction(
-                    security_id=security_id,
+                    security_id=resolved_id,
                     action_type=action_type,
                     ex_date=ex_date,
                     ratio_or_amount=value,
@@ -1678,7 +1779,18 @@ def parse_corporate_actions(
             )
     actions.sort(key=lambda a: (a.security_id, a.action_type.value, a.ex_date))
     _require_unique([a.key for a in actions], "action")
-    return ActionsParse(tuple(actions), tuple(unresolved), tuple(unsupported))
+    symbol_changes.sort(key=lambda c: (c.security_id, c.process_date, c.old_symbol))
+    _require_unique([c.key for c in symbol_changes], "symbol change")
+    return ActionsParse(
+        tuple(actions),
+        tuple(unresolved),
+        tuple(unsupported),
+        tuple(symbol_changes),
+        self_spinoff,
+        reused,
+        conflict,
+        tuple(reused_symbols),
+    )
 
 
 Fetched = tuple[Mapping[str, Any], Mapping[str, set[str]], Resolve]
@@ -1751,6 +1863,31 @@ def _default_fetch_actions(symbols: list[str], start: date, end: date) -> Mappin
     return payload
 
 
+def _default_fetch_name_changes(
+    symbols: list[str], start: date, end: date, *, settings: Settings
+) -> Mapping[str, Any]:
+    """One type-filtered, fully paged name-change request per symbol batch."""
+    from alpaca.data.enums import CorporateActionsType
+    from alpaca.data.requests import CorporateActionsRequest
+
+    from tradepartner.adapters import alpaca_raw
+
+    client = alpaca_raw._corporate_actions_client(settings)
+    batches = [
+        client.get_corporate_actions(
+            CorporateActionsRequest(
+                symbols=batch,
+                types=[CorporateActionsType.NAME_CHANGE],
+                start=start,
+                end=end,
+                limit=None,
+            )
+        )
+        for batch in alpaca_raw._symbol_batches(symbols, settings)
+    ]
+    return alpaca_raw._merge_batches(alpaca_raw._drop_actions_seen_in_earlier_batches(batches))
+
+
 class AlpacaPriceSource(PriceSource):
     """`PriceSource` over Alpaca: asks for every symbol the requested
     securities traded under in the range, parses, and keeps only the
@@ -1760,8 +1897,8 @@ class AlpacaPriceSource(PriceSource):
     a renamed company's history under both symbols, #104) resolves to no
     requested span and is left out; so is a placeholder bar. The parse
     reports of the latest call stay on `last_bars_report` and
-    `last_actions_report` (unresolved rows, placeholders, unsupported
-    categories such as spin-offs), for ingest to count or refuse. `fetch_bars` and
+    `last_actions_report` (unresolved rows and unsupported categories),
+    for ingest to count or refuse. `fetch_bars` and
     `fetch_actions` default to `alpaca_raw` (network, owner's keys); tests
     pass recorded payloads.
     """
@@ -1772,6 +1909,7 @@ class AlpacaPriceSource(PriceSource):
         *,
         fetch_bars: FetchBars = _default_fetch_bars,
         fetch_actions: FetchActions = _default_fetch_actions,
+        fetch_name_changes: FetchActions | None = None,
         settings: Settings | None = None,
         fill_handovers: bool = False,
     ) -> None:
@@ -1783,6 +1921,11 @@ class AlpacaPriceSource(PriceSource):
         self._fetch_bars = fetch_bars
         self._fetch_actions = fetch_actions
         settings = settings or get_settings()
+        self._fetch_name_changes = fetch_name_changes or (
+            fetch_actions
+            if fetch_actions is not _default_fetch_actions
+            else functools.partial(_default_fetch_name_changes, settings=settings)
+        )
         self._lag = timedelta(days=settings.alpaca.actions_process_lag_days)
         self._asof_offset = settings.alpaca.asof_offset_days
         self._asof_served: set[tuple[str, str]] = set()  # (security, symbol) asof found
@@ -1911,6 +2054,18 @@ class AlpacaPriceSource(PriceSource):
             line += f"; {len(self.last_asof_fallbacks)} symbol(s) asked without asof: {named}"
         if self.last_actions_report is not None:
             line += f"; {len(self.last_actions_report.unresolved)} action rows unresolved"
+            if self.last_actions_report.self_spinoff:
+                line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
+            if self.last_actions_report.symbol_change_reused:
+                named = ", ".join(self.last_actions_report.reused_symbols)
+                line += (
+                    f"; {self.last_actions_report.symbol_change_reused} symbol change(s) "
+                    f"with reused tickers: {named}"
+                )
+            if self.last_actions_report.symbol_change_conflict:
+                line += (
+                    f"; {self.last_actions_report.symbol_change_conflict} symbol change conflict(s)"
+                )
         if symbols := self.symbol_summary():
             line += f"; {symbols}"
         return line
@@ -1930,6 +2085,34 @@ class AlpacaPriceSource(PriceSource):
             payload,
             self._resolver.resolve,
             functools.partial(self._resolver.lead, actions=True),  # #974: no rename lead
+            process_start=start - self._lag,
+            process_end=end + self._lag,
+            lag_days=self._lag.days,
         )
         self.last_actions_report = parsed
-        return [a for a in parsed.actions if a.security_id in ids and start <= a.ex_date <= end]
+        return [
+            a
+            for a in parsed.actions
+            if a.security_id in ids
+            and (a.action_type is ActionType.SPINOFF or start <= a.ex_date <= end)
+        ]
+
+    def symbol_changes(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[SymbolChange]:
+        self.last_actions_report = None
+        check_request(security_ids, start, end)
+        ids, symbols = self._plan(security_ids, start, end, symbols_from=start - self._lag)
+        if not symbols:
+            return []
+        payload = self._fetch_name_changes(symbols, start, end)
+        parsed = parse_corporate_actions(
+            {"name_changes": payload.get("name_changes", [])},
+            self._resolver.resolve,
+            functools.partial(self._resolver.lead, actions=True),
+            process_start=start,
+            process_end=end,
+            lag_days=self._lag.days,
+        )
+        self.last_actions_report = parsed
+        return [change for change in parsed.symbol_changes if change.security_id in ids]

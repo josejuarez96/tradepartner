@@ -75,8 +75,10 @@ from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
     PriceSource,
+    SymbolChange,
     UnknownSecurityIdError,
     action_first_seen_known_at,
+    announcement_date_known_at,
     bar_known_at,
     check_request,
     revision_of,
@@ -85,6 +87,7 @@ from tradepartner.adapters.prices import (
 _SECURITIES_CSV = "securities.csv"
 _PRICES_CSV = "prices_daily.csv"
 _ACTIONS_CSV = "corporate_actions.csv"
+_SYMBOL_CHANGES_CSV = "symbol_changes.csv"
 
 _COMMON_COLUMNS = ("security_id", "known_at", "ingested_at", "source", "provenance")
 _PRICES_COLUMNS = (*_COMMON_COLUMNS, "session", "open", "high", "low", "close", "volume")
@@ -94,6 +97,15 @@ _ACTIONS_COLUMNS = (
     "ex_date",
     "ratio_or_amount",
     "announced_at",
+)
+_SYMBOL_CHANGES_COLUMNS = (
+    *_COMMON_COLUMNS,
+    "old_symbol",
+    "new_symbol",
+    "old_cusip",
+    "new_cusip",
+    "process_date",
+    "source_action_id",
 )
 
 #: `bar_known_at` builds a pandas timestamp per call; the fixture has ~900
@@ -282,6 +294,12 @@ def _check_action_first_seen(
             f"{row.where}: first-seen action {action.key} is cancelled; a cancel only "
             "revises an action already recorded"
         )
+    if action.action_type.value == "spinoff":
+        expected = action_first_seen_known_at(action.ex_date)
+        if action.known_at < expected:
+            raise FixtureContractError(
+                f"{row.where}: spinoff known_at is before the ex-date proxy {expected.isoformat()}"
+            )
     if (action.security_id, action.action_type.value, row.ingested_at) in cancel_ingests:
         if action.known_at != row.ingested_at:
             raise FixtureContractError(
@@ -289,6 +307,8 @@ def _check_action_first_seen(
                 f"ingest ({row.ingested_at.isoformat()}), so it revises a known event and "
                 f"must be stamped at that ingested_at, not {action.known_at.isoformat()}"
             )
+        return
+    if action.action_type.value == "spinoff":
         return
     expected = action_first_seen_known_at(action.ex_date, announced_at=action.announced_at)
     if action.known_at == expected:
@@ -414,6 +434,36 @@ class FixturePriceSource(PriceSource):
         bar_rows = _load_bars(prices_path, self._known_ids) if prices_path.is_file() else []
         actions_path = fixtures_dir / _ACTIONS_CSV
         action_rows = _load_actions(actions_path, self._known_ids) if actions_path.is_file() else []
+        changes_path = fixtures_dir / _SYMBOL_CHANGES_CSV
+        self._changes: defaultdict[str, list[SymbolChange]] = defaultdict(list)
+        if changes_path.is_file():
+            for where, row in _read_csv(changes_path, _SYMBOL_CHANGES_COLUMNS):
+                known_at, _ = _check_common(
+                    row, provenance="action", known_ids=self._known_ids, where=where
+                )
+                try:
+                    change = SymbolChange(
+                        security_id=row["security_id"],
+                        old_symbol=row["old_symbol"],
+                        new_symbol=row["new_symbol"],
+                        old_cusip=row["old_cusip"],
+                        new_cusip=row["new_cusip"],
+                        process_date=_parse_date(
+                            row["process_date"], column="process_date", where=where
+                        ),
+                        known_at=known_at,
+                        source=row["source"],
+                        source_action_id=row["source_action_id"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FixtureContractError(f"{where}: {exc}") from exc
+                if known_at < announcement_date_known_at(change.process_date):
+                    raise FixtureContractError(
+                        f"{where}: symbol change stamped before process date"
+                    )
+                self._changes[change.security_id].append(change)
+            for changes in self._changes.values():
+                changes.sort(key=lambda c: (c.process_date, c.old_symbol, c.known_at))
 
         self._bars: defaultdict[str, list[Bar]] = defaultdict(list)
         for bar in _check_history(bar_rows, lambda b: b.key, _check_bar_first_seen):
@@ -473,4 +523,14 @@ class FixturePriceSource(PriceSource):
             for security_id in self._resolve(security_ids, start, end)
             for action in self._actions.get(security_id, [])
             if start <= action.ex_date <= end
+        ]
+
+    def symbol_changes(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[SymbolChange]:
+        return [
+            change
+            for security_id in self._resolve(security_ids, start, end)
+            for change in self._changes.get(security_id, [])
+            if start <= change.process_date <= end
         ]
