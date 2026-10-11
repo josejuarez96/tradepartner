@@ -64,7 +64,9 @@ class RiskFreeMissing(ValueError):
 def to_yield(rate: float, basis: Basis = "discount") -> float:
     """The annual bond-equivalent yield of the published `rate` (a fraction: 5% is 0.05).
 
-    `discount`: `365 d / (360 - 91 d)` (d = 0.05 gives 0.051336...); `yield`: `rate`."""
+    `discount`: `365 d / (360 - 91 d)` (d = 0.05 gives 0.0513434...); `yield`: `rate`."""
+    if not math.isfinite(rate):
+        raise ValueError(f"rate must be finite, got {rate}")
     if basis == "yield":
         return rate
     if basis != "discount":
@@ -114,6 +116,8 @@ def period_risk_free(
         raise ValueError("need at least two period ends (T_0 and T_1)")
     if not sessions or sessions[0] != period_ends[0] or sessions[-1] != period_ends[-1]:
         raise ValueError("sessions must run from the first to the last period end")
+    if not set(period_ends) <= set(sessions):
+        raise ValueError("period_ends must be sessions of the run")
     accruals = session_accruals(
         sessions, {s: to_yield(r, basis) for s, r in rates.items()}, series=series
     )

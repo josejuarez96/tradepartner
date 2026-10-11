@@ -111,3 +111,11 @@ def test_annualised_of_the_constant_is_the_rate() -> None:
     assert annualised([0.01, 0.02], 12) == pytest.approx(math.sqrt(1.01 * 1.02) ** 12 - 1)
     with pytest.raises(ValueError):
         annualised([], 12)
+
+
+def test_a_nan_rate_and_a_stray_period_end_are_refused() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        to_yield(float("nan"))
+    rates = dict.fromkeys(SESSIONS[1:], 0.05)
+    with pytest.raises(ValueError, match="sessions of the run"):
+        period_risk_free(SESSIONS, [THU, date(2024, 3, 2), NEXT_THU], rates)

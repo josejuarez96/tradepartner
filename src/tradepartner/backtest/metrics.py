@@ -185,7 +185,7 @@ def series_metrics(
     and `tracking_error_<name>` (name lower-cased, `family_benchmark_keys`), and `None`
     adds nothing, so the key set and values of a family without one are unchanged.
     `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
-    one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_rate` is
+    one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_period_returns` is
     one return per period (`riskfree.constant_period_returns` or `riskfree.period_risk_free`).
     `sharpe_period` is the Sharpe of the excess series `r_i - rf_i`; `skew_period` and
     `kurtosis_period` are its moments (a constant `rf` leaves the central moments as they
