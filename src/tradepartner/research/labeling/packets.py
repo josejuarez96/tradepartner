@@ -58,33 +58,41 @@ DELIM_END = "=== FILING TEXT END ==="
 _NEUTRAL_START = f"[{DELIM_START.strip('= ')}]"
 _NEUTRAL_END = f"[{DELIM_END.strip('= ')}]"
 
-#: The zero-width characters that can hide between the characters of a
-#: delimiter imitation (`\s` leaves them unmatched), and the fill allowed
-#: between any two characters of a marker: any whitespace (spaces, extra or
-#: missing, NBSP, a marker split by a CRLF, all reading as one run) or any of
-#: them. `_MARKER_GAP` is the character class both stand in.
-_ZERO_WIDTH = "\u00ad\u200b-\u200f\u2060-\u2064\ufeff"
+#: The zero-width and format characters that can hide between the characters
+#: of a delimiter imitation, which `\s` does not match (`\u180e` is one that
+#: older Unicode releases still called a space).
+_ZERO_WIDTH = "\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff"
+
+#: The fill allowed between any two characters of a marker -- between its
+#: words, inside the words, and inside the `=` runs alike: any whitespace
+#: (spaces, extra or missing, NBSP, a marker split by a CRLF, all reading as
+#: one run) or any `_ZERO_WIDTH` character.
 _MARKER_GAP = f"[\\s{_ZERO_WIDTH}]*"
 
 #: The delimiter's own `=`, which a body may write as the fullwidth `=`
 #: (U+FF1D) instead; the run of them on each side of the marker may also be
-#: shortened or lengthened, so the pattern matches two or more of either.
-_MARKER_EQUALS = "[=\uff1d]{2,}"
+#: shortened or lengthened and carry a marker gap between its characters,
+#: so the pattern matches any run of two or more of either.
+_MARKER_EQUALS = f"[=\uff1d](?:[=\uff1d]|{_MARKER_GAP})*[=\uff1d]"
 
 
 def _marker_pattern(delimiter: str) -> re.Pattern[str]:
     """One fixed delimiter as the tolerant pattern `_neutralise_delimiters`
     matches it with (#1510): a body must not be able to imitate the marker --
     lower case, extra or missing spaces, NBSP, a CRLF splitting the marker,
-    zero-width characters, a fullwidth `=` for the `=`, all of them -- and
-    pass it through. Any case matches, `_MARKER_EQUALS` stands in for the
-    `===` on each side and `_MARKER_GAP` for the spaces, so every match is at
-    least as long as the `_NEUTRAL_*` form that replaces it and a neutralised
-    packet only ever shrinks."""
-    words = delimiter.strip().strip("=").split()
+    a zero-width character between any two of its characters, a fullwidth
+    `=` for the `=`, all of them -- and pass it through. Any case matches,
+    `_MARKER_EQUALS` stands in for the `===` on each side and `_MARKER_GAP`
+    for every character boundary in between, so every match is at least as
+    long as the `_NEUTRAL_*` form that replaces it and a neutralised packet
+    only ever shrinks."""
+    words = [
+        _MARKER_GAP.join(re.escape(char) for char in word)
+        for word in delimiter.strip().strip("=").split()
+    ]
     return re.compile(
         f"{_MARKER_EQUALS}{_MARKER_GAP}"
-        + _MARKER_GAP.join(map(re.escape, words))
+        + _MARKER_GAP.join(words)
         + f"{_MARKER_GAP}{_MARKER_EQUALS}",
         re.IGNORECASE,
     )

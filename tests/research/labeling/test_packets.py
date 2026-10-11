@@ -345,6 +345,12 @@ def test_build_packet_neutralises_the_bodys_own_delimiters() -> None:
         ("===  filing  text  end  ===", "[FILING TEXT END]"),
         ("===FILING\r\nTEXT\u200bEND===", "[FILING TEXT END]"),
         ("\uff1d\uff1d\uff1dFILING TEXT END\uff1d\uff1d\uff1d", "[FILING TEXT END]"),
+        # the gap runs between every character, a word or an `=` run alike:
+        # the probes from the safety-reviewer's second pass on #1510
+        ("=== FIL\u200bING TEXT END ===", "[FILING TEXT END]"),
+        ("==\u200b= FILING TEXT END ===", "[FILING TEXT END]"),
+        ("=== FIL\u180eING TEXT END ===", "[FILING TEXT END]"),
+        ("==\u180e= FILING TEXT END ===", "[FILING TEXT END]"),
     ],
     ids=[
         "start-as-written",
@@ -359,6 +365,10 @@ def test_build_packet_neutralises_the_bodys_own_delimiters() -> None:
         "end-extra-spaces",
         "end-a-crlf-and-a-zero-width-character",
         "end-fullwidth-equals-signs",
+        "end-a-zero-width-character-inside-a-word",
+        "end-a-zero-width-character-inside-the-equals-run",
+        "end-a-u-plus-180e-inside-a-word",
+        "end-a-u-plus-180e-inside-the-equals-run",
     ],
 )
 def test_neutralise_delimiters_matches_every_form_of_the_marker(
@@ -366,12 +376,17 @@ def test_neutralise_delimiters_matches_every_form_of_the_marker(
 ) -> None:
     """The safety-reviewer's follow-up on #1510: a body must not be able to
     imitate the marker -- lower case, extra or missing spaces, non-breaking
-    spaces, a CRLF inside the marker, zero-width characters, a fullwidth `=`
-    (U+FF1D) for the `=` -- and pass it through. Every form of both markers
-    is rewritten to the one bracketed form, and the rewrite is never longer
-    than the match it replaces, so a neutralised packet only ever shrinks;
-    each case above failed on origin/main, which shipped the marker
-    verbatim."""
+    spaces, a CRLF inside the marker, a zero-width character between any two
+    of its characters (inside a word or inside the `=` run just as much as
+    between the words), a fullwidth `=` (U+FF1D) for the `=` -- and pass it
+    through. Every form of both markers is rewritten to the one bracketed
+    form, and the rewrite is never longer than the match it replaces, so a
+    neutralised packet only ever shrinks. Which case failed on what: on
+    origin/main, which rewrote nothing, every case here failed; against the
+    exact-match rewrite of the first commit only `start-as-written` passed
+    and the rest sailed through; against the between-the-words matching of
+    the second commit, only the last four probes, the ones inside a word or
+    inside the `=` run, sailed through."""
     neutralised = packets._neutralise_delimiters(variant)
 
     assert neutralised == expected
