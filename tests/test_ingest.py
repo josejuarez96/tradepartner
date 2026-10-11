@@ -2606,6 +2606,14 @@ def test_one_accessions_components_derive_gross_profit_at_its_acceptance() -> No
     assert counts.derived == 2
 
 
+def test_derived_comparative_groups_leap_year_and_prior_year() -> None:
+    current = (date(2016, 1, 1), date(2016, 12, 31))
+    prior = (date(2015, 1, 1), date(2015, 12, 31))
+    rows, _ = _rows([*_components(F1, AT1, period=current), *_components(F1, AT1, period=prior)])
+    assert rows[("gross_profit", current[1])]["comparative"] is False
+    assert rows[("gross_profit", prior[1])]["comparative"] is True
+
+
 def test_components_from_two_accessions_derive_nothing() -> None:
     rows, counts = _rows(
         [_sf("revenue", 100, F1, AT1), _sf("cost_of_revenue", 60, F2, AT2, comparative=True)]

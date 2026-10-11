@@ -146,6 +146,7 @@ from typing import Any
 import duckdb
 import pyarrow as pa
 
+from tradepartner.adapters.edgar import duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -1072,7 +1073,7 @@ def _derived_candidates(
 ) -> list[Row]:
     """`filing`'s derived `gross_profit` rows (`statement_fact_rows`), each
     with a `_filed` entry for the hold rule. `comparative` follows the
-    Periods rule over the periods the filing can derive, per `period_days`."""
+    Periods rule over the periods the filing can derive, per duration class."""
     by_period: dict[tuple[date, int], dict[str, StatementFactRecord]] = defaultdict(dict)
     for record in filing:
         by_period[(record.period_end, record.period_days)][record.fact_name] = record
@@ -1083,7 +1084,8 @@ def _derived_candidates(
     }
     latest: dict[int, date] = {}
     for end, days in pairs:
-        latest[days] = max(latest.get(days, end), end)
+        kind = duration_class(days)
+        latest[kind] = max(latest.get(kind, end), end)
     out: list[Row] = []
     for (end, days), (revenue, cost) in sorted(pairs.items()):
         accession = revenue.accession
@@ -1104,7 +1106,7 @@ def _derived_candidates(
             xbrl_tag=f"{revenue.xbrl_tag}-{cost.xbrl_tag}",
             value=revenue.value - cost.value,
             basis="derived",
-            comparative=end < latest[days],
+            comparative=end < latest[duration_class(days)],
             _filed=max(revenue.filed, cost.filed),
         )
         out.append(row)

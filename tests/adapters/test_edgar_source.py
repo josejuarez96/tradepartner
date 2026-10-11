@@ -15,7 +15,7 @@ import gzip
 import io
 import json
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +32,12 @@ from edgar_transport import (
     load,
 )
 
-from tradepartner.adapters.edgar import acceptance_times
+from tradepartner.adapters.edgar import UnstampedFiling, acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
     STAMPS_LAYOUT,
     EdgarFilingSource,
+    SubmissionRecord,
     reduce_submissions,
 )
 from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
@@ -753,6 +754,70 @@ def test_event_forms_are_configurable_and_never_empty(settings: Settings) -> Non
     assert {e.form for e in source.filing_events(APPLE)} == {"10-Q"}
     with pytest.raises(ValueError, match="event_forms"):
         EdgarFilingSource(settings, client=_router().client(), event_forms=[])
+
+
+def test_clock_detector_reports_refresh_and_new_stamps_once(settings: Settings) -> None:
+    source = _source(settings, _router())
+    early = SubmissionRecord("early", "8-K", "doc.htm", False, datetime(2024, 1, 2, 20, tzinfo=UTC))
+    late = SubmissionRecord("late", "8-K", "doc.htm", False, datetime(2024, 1, 3, 21, tzinfo=UTC))
+    source._items_source = lambda cik, wanted: (  # type: ignore[method-assign]
+        {
+            "early": SubmissionRecord(
+                "early", "8-K", "doc.htm", False, early.accepted_at, "2.02", date(2024, 1, 3)
+            ),
+            "late": SubmissionRecord(
+                "late", "8-K", "doc.htm", False, late.accepted_at, "2.02", date(2024, 1, 2)
+            ),
+        },
+        True,
+    )
+    source._refresh_items(APPLE, {"early": early, "late": late})
+    assert source.filing_events_clock_suspect == 2
+    assert source.filing_events_clock_suspect_accessions == ["early", "late"]
+
+
+def test_per_cik_stamping_tolerates_bad_and_short_filing_dates(settings: Settings) -> None:
+    bad, short, early, absent = (
+        "0000320193-24-000101",
+        "0000320193-24-000102",
+        "0000320193-24-000103",
+        "0000320193-24-000105",
+    )
+    payload = _payload(
+        int(APPLE),
+        (bad, "8-K", "2024-01-02T20:00:00"),
+        (short, "8-K", "2024-01-02T20:00:00"),
+        (early, "8-K", "2024-01-02T20:00:00"),
+        (absent, "8-K", "2024-01-02T20:00:00"),
+    )
+    payload["filings"]["recent"]["filingDate"] = ["bad", "2024", "2024-01-03"]
+    router = _router()
+    router.add(f"{SUBMISSIONS_URL}CIK{APPLE}.json", payload)
+    source = _source(settings, router)
+    kept = {
+        accession: (UnstampedFiling(APPLE, "Apple", "8-K", accession, date(2024, 1, 3)), (2024, 1))
+        for accession in (bad, short, early, absent)
+    }
+    stamps = source._stamp({APPLE: kept})[APPLE]
+    assert set(stamps) == {bad, short, early, absent}
+    assert all(stamps[a].filing_date is None for a in (bad, short, absent))
+    assert source.filing_events_clock_suspect_accessions == [early]
+
+
+def test_bulk_stamping_runs_the_clock_detector(settings: Settings) -> None:
+    accession = "0000320193-24-000104"
+    payload = _payload(int(APPLE), (accession, "8-K", "2024-01-02T20:00:00"))
+    payload["filings"]["recent"]["filingDate"] = ["2024-01-03"]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(f"CIK{APPLE}.json", json.dumps(payload))
+    router = _router()
+    router.add(BULK_URL, buffer.getvalue())
+    source = _source(settings, router)
+    stamps: dict[str, dict[str, SubmissionRecord]] = {APPLE: {}}
+    assert source._stamp_bulk({APPLE: {accession}}, stamps) == set()
+    assert accession in stamps[APPLE]
+    assert source.filing_events_clock_suspect_accessions == [accession]
 
 
 def _bulk_zip(settings: Settings, *members: tuple[str, bytes]) -> None:

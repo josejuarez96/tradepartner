@@ -626,6 +626,8 @@ def test_review_mode_shows_a_and_b_as_class_descriptions_and_nothing_that_attrib
     view = review.item_view(session, 0)
     text = _text(at)
     assert f"**a:** {view.a}" in text and f"**b:** {view.b}" in text
+    assert "Choose the most specific correct answer" in text
+    assert "If a single class is correct and the other answer is a set containing it" in text
     known = {*review.CLASS_DESCRIPTIONS.values(), review.UNRESOLVED_PHRASE}
     known |= set(review.RULE_PHRASES.values())
     for answer in (view.a, view.b):
