@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -324,6 +326,20 @@ def test_execution_imports_no_lab_module() -> None:
         if _imports_any(tree, LAB_MODULES)
     ]
     assert offenders == []
+
+
+def test_execution_window_loads_no_lab_module_even_transitively() -> None:
+    """The direct-import scan above misses a lab module reached through another
+    module (#1454: `store.registry` once imported `lab_schema`). Importing
+    `execution.window` in a clean interpreter must leave no lab module loaded."""
+    code = (
+        "import sys, tradepartner.execution.window\n"
+        f"lab = {LAB_MODULES!r}\n"
+        "print(sorted(m for m in sys.modules\n"
+        "             if m in lab or m.startswith('tradepartner.store.lab_')))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]", out.stdout
 
 
 @pytest.mark.parametrize(

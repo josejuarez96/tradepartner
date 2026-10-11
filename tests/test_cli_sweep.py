@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import shutil
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,13 +36,15 @@ from conftest import load_universe_fixtures, mark_pre_lab
 from typer.testing import CliRunner
 
 from tradepartner import cli
+from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.backtest import frozen, hypothesis, lab, sweep, sweep_report
 from tradepartner.backtest.holdout import Flags
 from tradepartner.backtest.run import run_hypothesis
 from tradepartner.cli_record import scrub_text
 from tradepartner.config import Settings
+from tradepartner.execution import window
 from tradepartner.store import lab_registry, lab_schema, registry, schema
-from tradepartner.store.db import configure_connection, open_for_write
+from tradepartner.store.db import configure_connection, open_for_write, open_read_only
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 SWEEP_SOURCE = FIXTURES / "sweeps" / "fixture-sweep.md"
@@ -519,6 +521,62 @@ def test_hypothesis_register_operations_book_of_writes_the_decision(
         "hypothesis", "register", str(file), "--operations-book-of", other.slug, "--reason", "r"
     )
     assert again.exit_code == 2 and "already registered" in again.output, again.output
+
+
+def test_an_operations_book_passes_the_variant_gates_its_variant_does_not(
+    done: Path, tmp_path: Path
+) -> None:
+    """#1454: `paper start` and `decision gap-signoff` refuse a sweep variant, but an
+    operations file registered with `--operations-book-of` (T160b) is its own
+    hypothesis, not a variant: it backtests, takes a gap signoff and starts a paper
+    window, while its variant is refused at `paper start` before any broker call."""
+    with _read(done) as conn:
+        report = sweep_report.sweep_report(conn, SLUG)
+    assert report.verdicts is not None
+    with _read(done) as conn:
+        # a month_end variant: the ops window's holdout.end (2020-06-30) is a month-end
+        other = next(
+            r
+            for r in report.rows
+            if r.slug != report.verdicts.argmax.slug
+            and frozen.frozen_values(registry.get_hypothesis(conn, r.slug))[
+                "schedule.rebalance_cadence"
+            ]
+            == "month_end"
+        )
+    file = _operations_file(done, tmp_path / "ops", other.slug)
+    registered = _cli(
+        "hypothesis", "register", str(file), "--operations-book-of", other.slug, "--reason", "r"
+    )
+    assert registered.exit_code == 0, registered.output
+    ran = _cli("backtest", "ops-book")
+    assert ran.exit_code == 0, ran.output
+    trial_id = next(
+        int(line.split()[1].rstrip(":"))
+        for line in ran.stdout.splitlines()
+        if line.startswith("trial ")
+    )
+    signed = _cli("decision", "gap-signoff", "--trial", str(trial_id), "--reason", "ops book")
+    assert signed.exit_code == 0, signed.output
+    assert "sweep variant" not in signed.output.lower()
+
+    settings = Settings(_env_file=None, store={"path": str(done)})
+
+    def connect() -> AbstractContextManager[duckdb.DuckDBPyConnection]:
+        return open_read_only(settings)
+
+    def fake() -> FakeBroker:
+        return FakeBroker(
+            clock=lambda: SATURDAY, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1"
+        )
+
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(settings, connect, fake(), lambda: SATURDAY, other.slug)
+    assert exc.value.reason == "sweep_variant"
+    started = window.start(settings, connect, fake(), lambda: SATURDAY, "ops-book")
+    with _read(done) as conn:
+        ops = registry.get_hypothesis(conn, "ops-book")
+    assert started.window.hypothesis_id == ops.hypothesis_id
 
 
 def test_sweep_promote_refuses_a_blank_reason_and_a_missing_file(

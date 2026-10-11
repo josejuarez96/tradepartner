@@ -16,7 +16,7 @@ import duckdb
 import pytest
 from conftest import version_4_store
 
-from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
+from tradepartner.adapters.broker import Account, Fill, Order, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
 from tradepartner.execution import report, window
@@ -174,6 +174,42 @@ class BookedFake(FakeBroker):
         return {s: Position(symbol=s, quantity=q) for s, q in held.items() if q != 0}
 
 
+class CallCountingFake(FakeBroker):
+    """A fake that records every broker call, so a refusal can show it made none."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.broker_calls: list[str] = []
+
+    def account(self) -> Account:
+        self.broker_calls.append("account")
+        return super().account()
+
+    def positions(self) -> dict[str, Position]:
+        self.broker_calls.append("positions")
+        return super().positions()
+
+    def open_orders(self) -> list[Order]:
+        self.broker_calls.append("open_orders")
+        return super().open_orders()
+
+    def fills(self, since: datetime | None = None) -> list[Fill]:
+        self.broker_calls.append("fills")
+        return super().fills(since)
+
+    def submit(self, request: OrderRequest) -> Order:
+        self.broker_calls.append("submit")
+        return super().submit(request)
+
+    def cancel(self, client_order_id: str) -> None:
+        self.broker_calls.append("cancel")
+        super().cancel(client_order_id)
+
+    def get_order(self, client_order_id: str) -> Order:
+        self.broker_calls.append("get_order")
+        return super().get_order(client_order_id)
+
+
 class FailingAccountFake(FakeBroker):
     def account(self) -> Account:
         raise RuntimeError("paper endpoint unreachable")
@@ -261,6 +297,30 @@ def _write_closed_window(
 
 
 # --- refusals ---------------------------------------------------------------
+
+
+def test_refuses_sweep_variant_before_broker_call(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    from tradepartner.store import lab_schema
+
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "variant", HOLDOUT_END_PAST)
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+        lab_schema.apply_lab_schema(conn)
+        conn.execute(
+            "INSERT INTO sweep_variants VALUES (1, 1, ?, 'fingerprint', '{}')",
+            [hyp.hypothesis_id],
+        )
+    broker = CallCountingFake(
+        clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, auto_fill=False
+    )
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), broker, fixed_clock, "variant")
+    assert exc.value.reason == "sweep_variant"
+    assert broker.broker_calls == []
+    with open_read_only(journal_settings) as conn:
+        assert conn.execute("SELECT count(*) FROM paper_windows").fetchone() == (0,)
 
 
 def test_refuses_without_gap_signoff(

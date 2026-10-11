@@ -2099,3 +2099,25 @@ def list_trials(
         [slug, slug, include_synthetic],
     ).fetchall()
     return [TrialSummary(*row) for row in rows]
+
+
+def is_sweep_variant(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
+    """Whether a hypothesis is a sweep variant (a `sweep_variants` row), false on a
+    pre-lab store. `paper start` and `decision gap-signoff` refuse a variant (#1454);
+    it lives here, not in `lab_registry`, because execution loads no lab module,
+    not even through this one (so the table check is a plain catalog query, not
+    `lab_schema.is_lab_initialised`), and every `lab_registry` function refuses a
+    pre-lab store."""
+    (tables,) = conn.execute(  # type: ignore[misc]
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog = "
+        "current_database() AND table_schema = current_schema() "
+        "AND table_name = 'sweep_variants'"
+    ).fetchone()
+    if not tables:
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM sweep_variants WHERE hypothesis_id = ? LIMIT 1", [hypothesis_id]
+        ).fetchone()
+        is not None
+    )
