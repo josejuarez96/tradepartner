@@ -2080,7 +2080,13 @@ class AlpacaPriceSource(PriceSource):
         if not symbols:
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
-        payload = self._fetch_actions(symbols, start - self._lag, end + self._lag)
+        payload = {
+            category: rows
+            for category, rows in self._fetch_actions(
+                symbols, start - self._lag, end + self._lag
+            ).items()
+            if category != "name_changes"
+        }
         parsed = parse_corporate_actions(
             payload,
             self._resolver.resolve,
@@ -2094,7 +2100,8 @@ class AlpacaPriceSource(PriceSource):
             a
             for a in parsed.actions
             if a.security_id in ids
-            and (a.action_type is ActionType.SPINOFF or start <= a.ex_date <= end)
+            and a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
+            and start <= a.ex_date <= end
         ]
 
     def symbol_changes(
