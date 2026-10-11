@@ -604,6 +604,44 @@ _HEADER_FIELD = re.compile(r"^\s*(?P<key>[A-Z][A-Z0-9 -]*?):\s*(?P<value>.*?)\s*
 _SIC = re.compile(r"\[(\d{4})\]")
 
 
+_SGML_ACCESSION = re.compile(r"^ACCESSION NUMBER:\s*(\S+)\s*$", re.MULTILINE)
+_SGML_ACCEPTANCE = re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})")
+
+
+def _eastern_acceptance(stamp: str) -> datetime:
+    naive = datetime.strptime(stamp, "%Y%m%d%H%M%S")  # noqa: DTZ007
+    # fold=1: in the repeated hour when clocks go back, take the later
+    # (EST) instant, never the earlier one.
+    return naive.replace(tzinfo=_EASTERN, fold=1).astimezone(UTC)
+
+
+class SgmlTruncatedError(ValueError):
+    """The fetched range ends before `</SEC-HEADER>` (#1494): a longer range may read."""
+
+
+class SgmlNoAcceptanceError(ValueError):
+    """The header carries no `ACCEPTANCE-DATETIME` (pre-2001 filings, #1494)."""
+
+
+def sgml_acceptance(text: str, accession: str) -> datetime:
+    """The SGML header's `ACCEPTANCE-DATETIME` (Eastern wall clock) as UTC, for
+    any form: unlike `parse_sgml_header` it never resolves an issuer, so a
+    Form 3/4/5 header (ISSUER and REPORTING-OWNER blocks) reads too (#1494).
+    Only the text before `</SEC-HEADER>` is read. Raises `ValueError` for a
+    header naming another accession, `SgmlTruncatedError` for a truncated one
+    and `SgmlNoAcceptanceError` for one with no acceptance (pre-2001 filings)."""
+    header, closed, _ = text.partition("</SEC-HEADER>")
+    if not closed:
+        raise SgmlTruncatedError("SGML header is truncated: no </SEC-HEADER>")
+    named = _SGML_ACCESSION.search(header)
+    if named is None or named.group(1) != accession:
+        raise ValueError(f"SGML header for {accession} names {named.group(1) if named else None}")
+    stamp = _SGML_ACCEPTANCE.search(header)
+    if stamp is None:
+        raise SgmlNoAcceptanceError("SGML header has no ACCEPTANCE-DATETIME")
+    return _eastern_acceptance(stamp.group(1))
+
+
 @_fail_closed
 def parse_sgml_header(text: str, cik: str | None = None) -> FilingHeader:
     """A filing's SGML header: form, accession, acceptance (Eastern time in
@@ -620,13 +658,10 @@ def parse_sgml_header(text: str, cik: str | None = None) -> FilingHeader:
     if not closed:
         raise ValueError("SGML header is truncated: no </SEC-HEADER>")
     text = header
-    stamp = re.search(r"<ACCEPTANCE-DATETIME>(\d{14})", text)
+    stamp = _SGML_ACCEPTANCE.search(text)
     if stamp is None:
         raise ValueError("SGML header has no ACCEPTANCE-DATETIME")
-    naive = datetime.strptime(stamp.group(1), "%Y%m%d%H%M%S")  # noqa: DTZ007
-    # fold=1: in the repeated hour when clocks go back, take the later
-    # (EST) instant, never the earlier one.
-    accepted_at = naive.replace(tzinfo=_EASTERN, fold=1).astimezone(UTC)
+    accepted_at = _eastern_acceptance(stamp.group(1))
 
     fields: dict[str, str] = {}
     blocks: dict[str, list[dict[str, str]]] = {}

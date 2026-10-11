@@ -57,6 +57,12 @@ items refresh (above) reads the zip under `reuse_cached` but writes `items`
 only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
 when its quarter had settled before the per-CIK fetch that lacked it.
+With `edgar.stamp_sgml_check` on (default, #1494: from 2026-10 the per-CIK
+API has served `acceptanceDateTime` moved late by New York's UTC offset), a
+CIK's new per-CIK stamps are cached only once the newest one matches its SGML
+header's `ACCEPTANCE-DATETIME`; on a mismatch each takes its own header's
+acceptance, or stays unstamped this run when that header does not read
+(`_sgml_checked`).
 
 **Cover pages and headers (T11d).** `cover_pages` and `filing_headers` serve
 the FSN caches T11c built, each row re-stamped at read time from
@@ -237,6 +243,7 @@ holds the full list whenever the check fails with them, dry run or not
 from __future__ import annotations
 
 import contextlib
+import enum
 import fcntl
 import gzip
 import hashlib
@@ -265,6 +272,8 @@ from tradepartner.adapters.edgar import (
     CoverPageParse,
     FsnFiling,
     FsnShare,
+    SgmlNoAcceptanceError,
+    SgmlTruncatedError,
     StatementConflict,
     StatementFactsParse,
     UnstampedFiling,
@@ -278,6 +287,7 @@ from tradepartner.adapters.edgar import (
     parse_fsn,
     parse_sgml_header,
     parse_statement_facts,
+    sgml_acceptance,
 )
 from tradepartner.adapters.edgar_validation import PARSE_ERRORS, ValidationFailures
 from tradepartner.adapters.filings import (
@@ -559,6 +569,14 @@ class EdgarFilingSource(FilingSource):
         # #576: per-CIK API answers of 200 `{}` (SEC's "nothing here").
         self.facts_api_empty = 0
         self.submissions_api_empty = 0
+        # #1494: the SGML check of new per-CIK stamps (`_sgml_checked`): CIKs
+        # whose payload disagreed with its anchor's header, CIKs written
+        # unchecked (no anchor header read), stamps taken from their own
+        # header, and stamps left out because their header did not read.
+        self.stamp_check_mismatched_ciks = 0
+        self.stamp_check_unread_ciks = 0
+        self.stamps_from_sgml = 0
+        self.stamps_sgml_unread = 0
         # #599: a payload with `facts` but no `cik` (SEC ships this shape for
         # a few CIKs, identically from the zip and the API): identified by
         # the CIK it was requested under, not treated as absent.
@@ -728,12 +746,98 @@ class EdgarFilingSource(FilingSource):
                 row, quarter = kept[cik][accession]
                 if self._settled(quarter, submissions.fetched_at):
                     new[accession] = SubmissionRecord(accession, row.form, "", False, None)
+            new = self._sgml_checked(cik, new)
             if new:
                 for record in new.values():
                     self._check_event_clock(cik, record)
                 stamps[cik].update(new)
                 self._save_stamps(cik, stamps[cik])
         return stamps
+
+    def _sgml_checked(
+        self, cik: str, new: Mapping[str, SubmissionRecord]
+    ) -> dict[str, SubmissionRecord]:
+        """#1494: `new` (a CIK's records about to be cached) with its stamps
+        proven against the SGML header, the master acceptance.
+
+        The newest stamped record is the anchor (the next one, up to
+        `_SGML_ANCHORS`, when its header cannot be read). When the anchor's
+        payload stamp equals its header's, the payload is trusted as it is.
+        When it differs (SEC's API served stamps moved by New York's UTC offset
+        in 2026-10, late; the zip's were early, #1382), every stamped record
+        takes its own header's acceptance, and one whose header cannot be read
+        is left out: not cached, not unstampable, asked again next run. When no
+        anchor decides, the payload's stamps are kept (and the CIK counted)
+        only if every anchor's header reads but carries no acceptance (pre-2001
+        filings, where the payload is the only source); otherwise (a 404/410 or
+        an unparseable header) every stamp is left out for this run. Any other
+        HTTP error propagates, as on every EDGAR path. Unstampable records
+        (`accepted_at` `None`) pass through untouched."""
+        checked = dict(new)
+        stamped = sorted(
+            (r for r in new.values() if r.accepted_at is not None),
+            key=lambda r: (r.accepted_at, r.accession),
+            reverse=True,
+        )
+        if not self._settings.edgar.stamp_sgml_check or not stamped:
+            return checked
+        headers: dict[str, datetime | _HeaderMiss] = {}
+        agrees: bool | None = None
+        for record in stamped[:_SGML_ANCHORS]:
+            truth = headers[record.accession] = self._header_acceptance(cik, record.accession)
+            if isinstance(truth, datetime):
+                agrees = truth == record.accepted_at
+                break
+        if agrees is None:
+            if all(miss is _HeaderMiss.NO_ACCEPTANCE for miss in headers.values()):
+                self.stamp_check_unread_ciks += 1
+                return checked
+            for record in stamped:
+                del checked[record.accession]
+            self.stamps_sgml_unread += len(stamped)
+            return checked
+        if agrees:
+            return checked
+        self.stamp_check_mismatched_ciks += 1
+        for record in stamped:
+            if record.accession in headers:
+                truth = headers[record.accession]
+            else:
+                truth = self._header_acceptance(cik, record.accession)
+            if isinstance(truth, datetime):
+                checked[record.accession] = replace(record, accepted_at=truth)
+                self.stamps_from_sgml += 1
+            else:
+                del checked[record.accession]
+                self.stamps_sgml_unread += 1
+        return checked
+
+    def _header_acceptance(self, cik: str, accession: str) -> datetime | _HeaderMiss:
+        """`accession`'s SGML acceptance (UTC), or why it is missing: a 404/410
+        or an unparseable header (`UNREAD`), or a header with no acceptance
+        (`NO_ACCEPTANCE`). A header cut before `</SEC-HEADER>` is asked once
+        more with `edgar.stamp_header_bytes`. Any other HTTP error, and a
+        tripped path-safety guard, propagate."""
+        sizes = (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
+        for size in sizes:
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=self._settings, client=self._client
+                )
+                return sgml_acceptance(text, accession)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code not in (404, 410):
+                    raise
+                return _HeaderMiss.UNREAD
+            except edgar_raw.InvalidFilingReferenceError:
+                raise  # a path-safety guard is not a missing header (#275)
+            except SgmlNoAcceptanceError:
+                return _HeaderMiss.NO_ACCEPTANCE
+            except SgmlTruncatedError:
+                continue
+            except ValueError:
+                return _HeaderMiss.UNREAD
+        return _HeaderMiss.UNREAD
 
     def _fetch_submissions(self, cik: str, wanted: set[str]) -> _Submissions:
         """`cik`'s submissions, memoised; older pages fetched while any of
@@ -2697,6 +2801,18 @@ _FSN_PARSE_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, duckdb.InvalidI
 _FACTS_MEMBER = "companyfacts.zip member"
 _FACTS_API = "companyfacts API"
 _SUBMISSIONS_API = "submissions API"
+
+
+class _HeaderMiss(enum.Enum):
+    """Why `_header_acceptance` has no acceptance (#1494)."""
+
+    UNREAD = "unread"
+    NO_ACCEPTANCE = "no acceptance"
+
+
+#: #1494: how many of a CIK's newest new stamps are tried, newest first, as the
+#: anchor whose SGML header decides whether its submissions payload is trusted.
+_SGML_ANCHORS = 3
 #: What `response.json()` raises on a per-CIK API body that is not JSON
 #: (#578 part 3): recorded like any other parse failure of that input.
 _UNDECODABLE: tuple[type[Exception], ...] = (json.JSONDecodeError, UnicodeDecodeError)
