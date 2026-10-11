@@ -40,6 +40,7 @@ from tradepartner.errors import (
     RejectionCapError,
     StaleDataError,
 )
+from tradepartner.execution import alerts as alerts_module
 from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.lock import is_held, legacy_lock_path, lock_path, run_lock
@@ -158,16 +159,25 @@ class Env:
     def count(self, table: str) -> int:
         return int(self.query(f"SELECT count(*) FROM {table}")[0][0])
 
-    def ingest(self, finished: datetime, status: str = "ok") -> None:
+    def ingest(
+        self,
+        finished: datetime,
+        status: str = "ok",
+        *,
+        source: str = "alpaca",
+        mode: str = "session",
+    ) -> None:
         with open_for_write(self.settings) as conn:
             conn.execute(
                 "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, "
-                "mode) VALUES (?, ?, ?, ?, 'alpaca', 'daily')",
+                "mode) VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    f"ingest-{finished.isoformat()}",
+                    f"ingest-{source}-{mode}-{finished.isoformat()}",
                     finished - timedelta(minutes=5),
                     finished,
                     status,
+                    source,
+                    mode,
                 ],
             )
 
@@ -717,6 +727,33 @@ def test_staleness_reads_no_bar_known_after_the_last_ok_ingest(env: Env) -> None
         env.run(_at(TUE))
 
 
+@pytest.mark.parametrize(
+    ("source", "mode"), [("edgar", "session"), ("alpaca", "backfill"), ("alpaca", "repair")]
+)
+def test_staleness_counts_only_the_price_sources_daily_ingest(
+    env: Env, source: str, mode: str
+) -> None:
+    """#1440 Q3 (owner, 2026-10-10): only an `ok` daily (`session`-mode) run of
+    the price source counts. An EDGAR run, an Alpaca backfill or a repair that
+    finished after Monday's close says nothing about today's prices: with only
+    that one the run is stale; with the price run as well it is not."""
+    env.window()
+    env.ingest(_at(MON, 21), source=source, mode=mode)
+    with pytest.raises(StaleDataError, match="no ok daily price ingest"):
+        env.run(_at(TUE))
+    assert env.alerts() == [("stale_data", env.latest_run(), TUE)]
+
+
+def test_a_later_edgar_run_does_not_move_the_price_ingest_read(
+    env: Env, exits_done: list[object]
+) -> None:
+    """The as-of read of step 2 is the price run's finish, never a later EDGAR
+    run's: an EDGAR run after the price run leaves an ok run ok."""
+    _marked(env)
+    env.ingest(_at(MON, 23), source="edgar")
+    assert env.run(_at(TUE)).status == "ok"
+
+
 # --- step 3: collection, the rejection cap, the lag bound ------------------------------------
 
 
@@ -1075,6 +1112,120 @@ def test_a_locked_alert_that_cannot_be_written_still_exits_non_zero(
     assert env.count("paper_runs") == 0
     assert env.alerts() == []
     assert env.fake.calls == ()
+
+
+# --- #1440: the alert clock and failures before the run row ---------------------------------
+
+
+def test_a_run_alert_is_stamped_by_the_gate_clock(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1440 Q1 (owner, 2026-10-10): run alerts are stamped by the gate's checked
+    reading. A clock gone back by the time of the `run_failed` alert is refused
+    by the gate, so the alert is stamped by the raw clock (`utc_now()`) and says
+    so, never by the earlier reading the raw clock now gives."""
+    _marked(env)
+
+    def back_then_fail(_context: object) -> None:
+        env.clock.now -= timedelta(hours=1)
+        raise RuntimeError("the step failed")
+
+    monkeypatch.setattr(run_module, "exits_step", back_then_fail)
+    before = datetime.now(UTC)
+    with pytest.raises(RuntimeError):
+        env.run(_at(TUE))
+    ((at, message),) = env.query("SELECT \"at\", message FROM alerts WHERE kind = 'run_failed'")
+    assert at >= before
+    assert alerts_module.RAW_CLOCK_NOTE in message
+
+
+def test_a_good_gate_reading_stamps_the_alert_with_no_note(env: Env, step_fails: None) -> None:
+    _marked(env)
+    with pytest.raises(RuntimeError):
+        env.run(_at(TUE))
+    assert env.query("SELECT \"at\", message FROM alerts WHERE kind = 'run_failed'") == [
+        (_at(TUE), "RuntimeError: the step failed")
+    ]
+
+
+class BrokenClock:
+    """A clock that raises on every reading."""
+
+    def __call__(self) -> datetime:
+        raise OSError("clock gone")
+
+
+def test_a_clock_error_before_the_run_row_sends_run_failed_with_no_run(env: Env) -> None:
+    """#1440 Q2 (owner, 2026-10-10): the entry's `ClockError` (no run row yet)
+    sends a `run_failed` alert with no run id, stamped by the raw clock with the
+    note, its session the one containing `utc_now()`, and still raises."""
+    _marked(env)
+    before = datetime.now(UTC)
+    with pytest.raises(ClockError):
+        tracking_run(env.settings, env.connect, env.fake, BrokenClock())
+    assert env.count("paper_runs") == 0
+    ((kind, run_id, book, at, message),) = env.query(
+        'SELECT kind, run_id, book_id, "at", message FROM alerts'
+    )
+    assert (kind, run_id, book) == ("run_failed", None, "main")
+    assert at >= before
+    assert message.startswith("paper run not started: ClockError")
+    assert alerts_module.RAW_CLOCK_NOTE in message
+
+
+def test_a_store_error_before_the_run_row_sends_one_run_failed_per_session(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1440 Q2: a store error reading the window (no run row yet) sends a
+    `run_failed` alert with no run id on the clock's session, deduped per
+    (book, session) across a retrying scheduler, and still raises."""
+    _marked(env)
+
+    def broken(*_args: object) -> None:
+        raise duckdb.IOException("disk gone")
+
+    monkeypatch.setattr(run_module, "open_window", broken)
+    for _ in range(2):
+        with pytest.raises(duckdb.IOException):
+            env.run(_at(TUE))
+    assert env.count("paper_runs") == 0
+    assert env.alerts() == [("run_failed", None, TUE)]
+    ((message,),) = env.query("SELECT message FROM alerts")
+    assert message == "paper run not started: IOException: disk gone"
+
+
+def test_a_pre_run_alert_that_cannot_be_written_is_noted_on_the_error(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _marked(env)
+
+    def broken(*_args: object) -> None:
+        raise duckdb.IOException("disk gone")
+
+    def no_alert(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(run_module, "open_window", broken)
+    monkeypatch.setattr(run_module._ChunkAlerter, "write", no_alert)
+    with pytest.raises(duckdb.IOException) as raised:
+        env.run(_at(TUE))
+    assert raised.value.__notes__ == ["failed path: run_failed alert not written (RuntimeError)"]
+
+
+def test_another_error_before_the_run_row_sends_no_alert(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a clock or store fault is #1440 Q2's: any other error before the run
+    row propagates to the scheduler's log as before."""
+    _marked(env)
+
+    def broken(*_args: object) -> None:
+        raise ValueError("not a store fault")
+
+    monkeypatch.setattr(run_module, "open_window", broken)
+    with pytest.raises(ValueError, match="not a store fault"):
+        env.run(_at(TUE))
+    assert env.alerts() == []
 
 
 # --- the clock between the steps (#523) ------------------------------------------------------

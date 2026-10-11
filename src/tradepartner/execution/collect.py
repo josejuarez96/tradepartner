@@ -20,7 +20,21 @@ path's read, `paper resume`'s settlement). In order:
    `risk.max_broker_clock_skew_seconds` is a `ClockError`, raised before
    anything is written. Then `get_order` once per order to collect. Broker
    errors propagate: every method's allowlist but `cancel`'s is empty
-   (req 4), so the caller halts.
+   (req 4), so the caller halts. A reading that is not the default order
+   shape (`risk.order_shape_violation`: anything but a market day order of a
+   `us_equity`, `simple` order with no limit or stop price and no legs; ADR
+   0015 seam 3), such as an order the broker replaced with a limit price
+   after its acknowledgement, raises `SystemFaultError` naming
+   `refused_order_shape`, also before anything is written (#1293, owner
+   2026-10-10): this collection journals nothing, so the caller halts (a
+   run's collection, `_await_sells` included), notes it (the halt path's
+   read) or refuses (`paper resume`). Only the orders collected are read: a
+   collection of other orders still journals the account-wide feed's fills
+   of an open own order it does not read, whatever that order's shape. That
+   order stays open in the journal (its terminal event needs a reading), so
+   the next collection that reads it refuses, and reconciliation, which
+   reads every journal-open order, flags it (`open_order_differs` or
+   `order_differs`).
 3. **Write** (one chunk, so the journal never holds half a collection):
    - each fill of an own order whose `broker_fill_id` no row has, superseded
      rows included (insert-or-ignore), stamped with the collection time as
@@ -107,8 +121,9 @@ import polars as pl
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Fill, Order
 from tradepartner.calendar import all_sessions, is_session
 from tradepartner.config import RiskConfig, Settings
-from tradepartner.errors import ClockError, RejectionCapError
+from tradepartner.errors import ClockError, RejectionCapError, SystemFaultError
 from tradepartner.execution.plan import decision_state
+from tradepartner.execution.risk import order_shape_violation
 from tradepartner.store.journal import (
     DecisionEventRow,
     FillCursorRow,
@@ -243,9 +258,11 @@ def collect(
     run-time `paper.fill_read_overlap_seconds`. `writer_kind` is `run` or
     `resume` and `writer_id` its run or resume id. Raises `ValueError` for a
     `pending` order, an unknown writer kind or `write_offs` outside a run, and
-    `ClockError` for a fill beyond the broker-clock skew, all before any
-    write, and `RejectionCapError` when the write-off back-fill fails after
-    this collection found a rejection verdict."""
+    `ClockError` for a fill beyond the broker-clock skew and
+    `SystemFaultError` naming `refused_order_shape` for a reading that is not
+    the default order shape, all before any write, and `RejectionCapError`
+    when the write-off back-fill fails after this collection found a
+    rejection verdict."""
     if writer_kind not in WRITER_KINDS:
         raise ValueError(f"writer_kind must be one of {WRITER_KINDS}, got {writer_kind!r}")
     if write_offs is not None and writer_kind != _RUN:
@@ -274,6 +291,7 @@ def collect(
     now = _read_clock(clock)
     _check_skew(seen, now, frozen.max_broker_clock_skew_seconds)
     readings = {o.client_order_id: broker.get_order(o.client_order_id) for o in to_read}
+    _refuse_shapes(readings.values())
 
     with connect() as conn:
         stamp = _read_clock(clock)
@@ -326,6 +344,18 @@ def collect(
         rejections=rejections,
         written_off=written_off,
     )
+
+
+def _refuse_shapes(readings: Iterable[Order]) -> None:
+    """Raise `SystemFaultError` naming `refused_order_shape` for every reading
+    that is not the default order shape (module docstring, step 2)."""
+    violations = [v for r in readings if (v := order_shape_violation(r)) is not None]
+    if violations:
+        raise SystemFaultError(
+            "; ".join(
+                f"{v.rule}: {Broker.get_order.__name__} returned {v.detail}" for v in violations
+            )
+        )
 
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:

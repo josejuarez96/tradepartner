@@ -722,7 +722,7 @@ _RECORDED_HOST = f'{{"url": "https://api.{_HOST_NAME.pattern.replace(chr(92), ""
 def test_c_reads_a_gzipped_fixture_decompressed(tmp_path: Path, name: str, layers: int) -> None:
     data = _RECORDED_HOST.encode()
     for _ in range(layers):
-        data = gzip.compress(data)
+        data = gzip.compress(data, mtime=0)
     recording = tmp_path / name
     recording.write_bytes(data)
     assert not _HOST_NAME.search(data.decode("utf-8", errors="replace"))
@@ -736,10 +736,13 @@ def test_c_reads_a_gzipped_fixture_decompressed(tmp_path: Path, name: str, layer
     [
         ("recording.json", bz2.compress(_RECORDED_HOST.encode())),
         ("recording.json", lzma.compress(_RECORDED_HOST.encode())),
-        ("recording.json.gz", gzip.compress(bz2.compress(_RECORDED_HOST.encode()))),
+        # mtime=0: a gzip header carries the current time, and a time-dependent
+        # parametrize value gives xdist workers different test ids (#1477).
+        ("recording.json.gz", gzip.compress(bz2.compress(_RECORDED_HOST.encode()), mtime=0)),
         ("recording.ZIP", b"anything"),
         ("recording.br", b"anything"),
     ],
+    ids=["bz2", "lzma", "gzip-over-bz2", "zip", "brotli"],
 )
 def test_c_refuses_a_compressed_file_it_cannot_read(tmp_path: Path, name: str, data: bytes) -> None:
     path = tmp_path / name
