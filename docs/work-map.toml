@@ -992,13 +992,18 @@ why = "The table, the record and the diff rule are what every later task and the
 unblocks = ["task:T171b", "task:T171c"]
 
 [task.T171b]
-what = "The as-of read borrow_status_as_of (latest row per asset at or before T, vanished assets dropped) with the flip, vanish and truncation-invariance cases."
-why = "The borrow record is only as point-in-time as this read."
-unblocks = ["task:T171d"]
+what = "The as-of read borrow_status_as_of (latest row per asset at or before T, vanished assets dropped, observed_at from the run cursor), the data-vintage list that leaves the new tables and spinoff rows out, the header's freshness reads, and the flip, vanish, rename and truncation-invariance cases."
+why = "The borrow record is only as point-in-time as this read, and without the vintage rule the first backfill would stale every registered trial."
+unblocks = ["task:T171d", "task:T172b"]
 
 [task.T171c]
-what = "ingest --source alpaca_assets (one request a day, the diff, one run row), the --import-dir path for the recorder's files, the borrow.* config keys, the raw keep and the health block with its stale warning."
+what = "ingest --source alpaca_assets (one unfiltered request a day, last under --source all, the diff, the truncation guard, one run row with the fetch time as cursor), the --import-dir path for the recorder's files keyed on the run cursor, the borrow.* config keys and the raw keep."
 why = "Nothing reaches the owner's store until the ingest writes it under the store's own rules, and the import is how no day since 2026-10-11 is lost."
+unblocks = ["task:T171d"]
+
+[task.T171e]
+what = "The health block for borrow status (counts, the latest observation from the run cursor, shortable and ETB counts, the stale and switch warnings, the --check rules) on the page and in the CLI."
+why = "A lapse in the daily snapshot is a permanent hole; the warning is the owner's only cue."
 unblocks = ["task:T171d"]
 
 [task.T171d]
@@ -1006,18 +1011,23 @@ what = "The owner's import of the recorder's files, the first daily run on the r
 why = "The forward record only has value if it runs every day from now on; the flip and the scheduled job make it so."
 
 [task.T172]
-what = "ActionType.SPINOFF, the SymbolChange record, the process-date stamp rule and the parser reading Alpaca's spin_offs and name_changes categories instead of dropping them."
+what = "ActionType.SPINOFF, the SymbolChange record and PriceSource.symbol_changes, the date-only process-date stamp, the parser reading Alpaca's spin_offs and name_changes by process_date with the holder rule, and the fixture source's per-type contract bound."
 why = "The adapter already fetches these rows; parsing them is the one pure step every later task needs."
 unblocks = ["task:T172b"]
 
 [task.T172b]
-what = "The symbol_changes table (schema version bump), symbol_changes_as_of, the fixture rows, the look-ahead cases and the pin tests that show every existing reader of corporate_actions byte-identical with a spinoff row present."
-why = "A spin-off row in the actions table must change no adjusted price, no paper comparison and no pinned fingerprint; the pins prove it before the ingest writes one."
+what = "The symbol_changes table (schema version bump), symbol_changes_as_of, the fixture rows, the look-ahead cases, the pin tests that show every existing reader of corporate_actions byte-identical with a spinoff row present, and the paper reader's refusal of a short child position."
+why = "A spin-off row in the actions table must change no adjusted price, no paper comparison and no pinned fingerprint; the pins prove it before the ingest writes one, and the one intended reader is checked with safety-reviewer."
 unblocks = ["task:T172c"]
 
 [task.T172c]
-what = "The ingest writes for both kinds with the not-yet-known skip, the repair rule that leaves spinoff rows alone, and the symbol-less actions backfill from 2020-06-01 with its floor."
-why = "The daily path and the backfill are the only writers; the repair rule keeps a real spin-off from being deleted as misattributed."
+what = "The writes for both kinds on every writer (daily, month backfill, fill-holes) with the not-yet-known skip and the process-date window, and the repair rules: typed counts and deletes, a spinoff judged by its own parent-and-child rule, name changes listed as unjudged."
+why = "Every path that fetches actions must store spin-offs the same way, and the repair must neither delete a real spin-off by a split's rule nor leave a misresolved one in place."
+unblocks = ["task:T172e"]
+
+[task.T172e]
+what = "The symbol-less actions backfill from 2020-06-01 with its floor, one request per month, written through the T172c writers."
+why = "Six years of spin-offs and renames reach the store in about seventy requests; the floor records where coverage is known."
 unblocks = ["task:T172d"]
 
 [task.T172d]
