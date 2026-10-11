@@ -1,0 +1,3 @@
+- #1497: plan amendment 2026-10-11 for the #1382 phase A rework: decisions (a)-(e), T166d/T166e (request cap, rewritten CIKs, late API stamps, in-window earlier-only), T167 (corpus SGML times); phase A ~12k requests, ceiling ~44k.
+### Changed
+- Plan amendment 2026-10-11 (#1497): the #1382 phase A rework (request floor and ceiling with the cap enforced during the run, rewritten CIKs probed instead of re-read, the 2026-10-01 onward late API stamps re-stamped from SGML, in-window corrections allowed only earlier behind a flag after a read-only pre-check), the departure corpus re-timed from SGML (T167) before T126's frame, and the data-releases runbook's rule 5 exception.
