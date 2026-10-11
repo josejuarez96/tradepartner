@@ -51,6 +51,11 @@ contradicts `relied_on` (`provision` needs `form 25`, `exchange_rule` needs
 counts the final lines of the random draw's `pilot` cases by basis, overall and per
 `draw_round`; the text-based count is the headline's `n_clusters`.
 
+**The extended draw** (`extend_gold_session`, #1492 item 4). Under the floor the
+owner raises the session's `n`: the same seeded permutation of the `pilot` period
+continues over CIKs the random draw had not drawn, the new cases appended with the
+next `draw_round`, a reached seed flipped into the draw with its label kept.
+
 **The lock** (`lock_gold`). A partial session is never locked, nor one whose
 text-based scorable `pilot` count is under `text_floor` (`BelowFloor`; the caller
 reads the floor from the pilot experiment file's `min_clusters`). The export is the
@@ -503,24 +508,29 @@ def _dev_boundary(rows: Sequence[Mapping[str, Any]], min_rows: int) -> date:
     return _accepted_day(times[min_rows - 1])
 
 
-def _draw(
-    candidates: Sequence[Mapping[str, Any]], count: int, rng: random.Random, split: str
-) -> list[str]:
-    """One listing end per CIK: permute under `rng`, keep each new CIK's first."""
+def _permutation(candidates: Sequence[Mapping[str, Any]], rng: random.Random) -> list[str]:
+    """Every CIK's first listing end in the order one shuffle under `rng` gives: a
+    draw of `k` is the first `k`, so a larger draw extends a smaller one (#1492)."""
     ordered = sorted(candidates, key=lambda r: r["listing_end_id"])
     rng.shuffle(ordered)
     drawn: list[str] = []
     seen: set[str] = set()
     for row in ordered:
-        if len(drawn) == count:
-            break
         cik = _cik10(row["cik"])
         if cik not in seen:
             seen.add(cik)
             drawn.append(row["listing_end_id"])
+    return drawn
+
+
+def _draw(
+    candidates: Sequence[Mapping[str, Any]], count: int, rng: random.Random, split: str
+) -> list[str]:
+    """One listing end per CIK: permute under `rng`, keep each new CIK's first."""
+    drawn = _permutation(candidates, rng)
     if len(drawn) < count:
         raise GoldRefused(f"the {split} period has {len(drawn)} CIKs to draw from; {count} asked")
-    return drawn
+    return drawn[:count]
 
 
 def _bool_cell(value: str, column: str, line: int) -> bool:
@@ -665,6 +675,7 @@ def build_gold_session(
         "n": n,
         "n_dev": n_dev,
         "exclusion": {
+            "path": str(exclude.resolve()),
             "sha256": exclusion.sha256,
             "accessions_matched": exclusion.accessions_matched,
             "ciks": exclusion.ciks,
@@ -687,12 +698,17 @@ def build_gold_session(
             for c in cases
         ],
     }
+    _write_session(path, doc)
+    session = _session_from(path, doc, settings, table)
+    return BuildResult(session=session, exclusion=exclusion, seed_cases_missing=missing)
+
+
+def _write_session(path: Path, doc: Mapping[str, Any]) -> None:
+    """`session.json`, replaced atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
-    session = _session_from(path, doc, settings, table)
-    return BuildResult(session=session, exclusion=exclusion, seed_cases_missing=missing)
 
 
 def _session_from(
@@ -759,6 +775,108 @@ def open_gold_session(path: Path, flags: GoldFlags, *, settings: Settings) -> Go
         doc["frame"]["dataset_id"], Path(doc["frame"]["path"]), doc["frame"]["sha256"]
     )
     return _session_from(path, doc, settings, _read_frame(frame))
+
+
+# --- the extended draw (#1492, T167b) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExtendResult:
+    """`extend_gold_session`'s reopened session, the cases it appended (in draw
+    order), the seeds it flipped into the random draw, and the new cases' round."""
+
+    session: GoldSession
+    added: tuple[str, ...]
+    flipped: tuple[str, ...]
+    draw_round: int
+
+
+def extend_gold_session(session: GoldSession, n: int) -> ExtendResult:
+    """Raise the session's overall `n` (`dev` plus `pilot`, as `--n`) by continuing
+    the same seeded permutation of the `pilot` period over CIKs the random draw had
+    not drawn, as a larger first draw would have (spec #1492 item 4). The new cases
+    are appended with `in_random_draw = true` and the next `draw_round`; a seed
+    outside the draw that the permutation reaches is flipped to `in_random_draw =
+    true` with its label kept, never duplicated; every existing case, label and
+    working line is untouched. Only `listing_end_id`, `cik` and
+    `form25_accepted_at` take part, as in the first draw.
+
+    Refuses a locked session, a case with no final answer, an `n` not above the
+    session's, an inference file present, and a session whose `dev` or `pilot` draw
+    it cannot reproduce (the frame or the exclusion file changed or is missing)."""
+    refuse_if_inference_files(session.settings)
+    if session.lock_path.exists():
+        raise SessionLocked(f"the gold session {session.session_file} is locked")
+    status, _, _ = _states(session)
+    open_ids = sorted(lid for lid, s in status.items() if s in ("open", "skipped"))
+    if open_ids:
+        raise GoldRefused(
+            f"{len(open_ids)} case(s) have no final answer ({open_ids[:5]}); finish them "
+            "before extending"
+        )
+    if n <= session.n:
+        raise GoldRefused(f"--extend {n} must exceed the session's n = {session.n}")
+    path = session.session_file
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    n_dev = int(doc["n_dev"])
+    exclude_path = doc["exclusion"].get("path")
+    if not exclude_path or not Path(exclude_path).is_file():
+        raise GoldRefused(
+            f"cannot reproduce the draw: the session's exclusion file {exclude_path!r} is missing"
+        )
+    rows = (
+        _read_frame(session.frame)
+        .select("listing_end_id", "cik", "form25_accepted_at", "documents")
+        .to_dicts()
+    )
+    removed, exclusion = apply_exclusion(rows, Path(exclude_path))
+    if exclusion.sha256 != session.exclusion_sha256:
+        raise GoldRefused(
+            f"cannot reproduce the draw: the exclusion file {exclude_path} changed since the build"
+        )
+
+    def split_of(row: Mapping[str, Any]) -> Split:
+        day = _accepted_day(row["form25_accepted_at"])
+        return "dev" if day <= session.dev_boundary else "pilot"
+
+    kept = [r for r in rows if r["listing_end_id"] not in removed]
+    rng = random.Random(session.seed)
+    dev = _draw([r for r in kept if split_of(r) == "dev"], n_dev, rng, "dev")
+    order = _permutation([r for r in kept if split_of(r) == "pilot"], rng)
+    in_draw: dict[str, set[str]] = {"dev": set(), "pilot": set()}
+    for case in session.cases:
+        if case.in_random_draw:
+            in_draw[case.split].add(case.listing_end_id)
+    old_pilot = session.n - n_dev
+    if set(dev) != in_draw["dev"] or set(order[:old_pilot]) != in_draw["pilot"]:
+        raise GoldRefused("cannot reproduce the session's dev or pilot draw from its frame")
+    new_pilot = n - n_dev
+    if len(order) < new_pilot:
+        raise GoldRefused(f"the pilot period has {len(order)} CIKs to draw from; {new_pilot} asked")
+    reached = order[old_pilot:new_pilot]
+    present = {c["listing_end_id"]: c for c in doc["cases"]}
+    draw_round = 1 + max(int(c.get("draw_round", 0)) for c in doc["cases"])
+    flipped = tuple(lid for lid in reached if lid in present)
+    added = tuple(lid for lid in reached if lid not in present)
+    for lid in flipped:
+        present[lid]["in_random_draw"] = True
+    doc["cases"] = [
+        *doc["cases"],
+        *(
+            {
+                "listing_end_id": lid,
+                "split": "pilot",
+                "seed_case": False,
+                "in_random_draw": True,
+                "draw_round": draw_round,
+            }
+            for lid in added
+        ),
+    ]
+    doc["n"] = n
+    _write_session(path, doc)
+    reopened = _session_from(path, doc, session.settings, _read_frame(session.frame))
+    return ExtendResult(reopened, added, flipped, draw_round)
 
 
 # --- what the page draws ----------------------------------------------------------

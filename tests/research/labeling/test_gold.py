@@ -1061,3 +1061,147 @@ def test_suggested_n_follows_the_spec_formula(gsettings: Settings, tmp_path: Pat
     assert gold.suggested_n(session, counts, 10) == N_DEV + 23
     none = gold.BasisCounts(6, dict.fromkeys(gold.BASIS_COUNT_KEYS, 0), {})
     assert gold.suggested_n(session, none, 10) is None
+
+
+# --- the extended draw (#1492, T167b) ---------------------------------------------
+
+
+def _random_ids(session: gold.GoldSession) -> set[str]:
+    return {c.listing_end_id for c in session.cases if c.in_random_draw}
+
+
+def _fresh(gsettings: Settings, tmp_path: Path, name: str, n: int) -> gold.GoldSession:
+    """The same frame, seed and exclusion drawn with `n` in a separate research store."""
+    other = tmp_path / name
+    other.mkdir()
+    research = gsettings.research.model_copy(update={"data_dir": str(other / "research")})
+    settings = gsettings.model_copy(update={"research": research})
+    return gold.build_gold_session(
+        _write_frame(other, _frame_rows()),
+        SEED,
+        n,
+        _exclusion(other, [("LE030", "")]),
+        settings=settings,
+        n_dev=N_DEV,
+        dev_span_min_rows=DEV_ROWS,
+    ).session
+
+
+def _built_and_labelled(
+    gsettings: Settings, tmp_path: Path, seed_cases: tuple[str, ...] = ()
+) -> gold.GoldSession:
+    session = _build(gsettings, tmp_path, excluded=[("LE030", "")], seed_cases=seed_cases).session
+    _label_all(session)
+    return session
+
+
+def test_extend_continues_the_permutation_and_leaves_every_case_unchanged(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _built_and_labelled(gsettings, tmp_path)
+    before_doc = json.loads(session.session_file.read_text(encoding="utf-8"))
+    before_lines = session.working_path.read_bytes()
+    result = gold.extend_gold_session(session, N + 3)
+    after = result.session
+    doc = json.loads(after.session_file.read_text(encoding="utf-8"))
+    assert doc["n"] == after.n == N + 3
+    assert doc["cases"][: len(before_doc["cases"])] == before_doc["cases"]
+    assert session.working_path.read_bytes() == before_lines
+    assert (len(result.added), result.flipped, result.draw_round) == (3, (), 1)
+    assert [c["listing_end_id"] for c in doc["cases"][-3:]] == list(result.added)
+    for case in after.cases[-3:]:
+        assert (case.split, case.in_random_draw, case.seed_case, case.draw_round) == (
+            "pilot",
+            True,
+            False,
+            1,
+        )
+        assert (
+            after.pilot_period[0]
+            <= after.rows[case.listing_end_id]["form25_accepted_at"].date()
+            <= after.pilot_period[1]
+        )
+    pilot = [c.listing_end_id for c in after.cases if c.split == "pilot" and c.in_random_draw]
+    ciks = [_cik10(after.rows[lid]["cik"]) for lid in pilot]
+    assert len(set(ciks)) == len(ciks)
+    assert _cik10(1030) not in ciks  # the exclusion still applies
+    # exactly what a first draw of n + 3 would have drawn
+    assert _random_ids(after) == _random_ids(_fresh(gsettings, tmp_path, "fresh", N + 3))
+    # the added cases are open and labelled like any other; the count sees round 1
+    assert gold.next_case(after) == len(before_doc["cases"])
+    _label_all(after)
+    counts = gold.basis_counts(after)
+    assert (counts.by_round[0].n_pilot, counts.by_round[1].n_pilot) == (N - N_DEV, 3)
+    assert counts.by_round[1].scorable_pilot_text == 3
+    assert counts.scorable_pilot_text == N - N_DEV + 3
+    again = gold.extend_gold_session(after, N + 4)
+    assert again.draw_round == 2 and len(again.added) == 1
+
+
+def _cik10(value: object) -> str:
+    return f"{int(str(value)):010d}"
+
+
+def test_extend_flips_a_reached_seed_and_keeps_its_label(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    (reached,) = _random_ids(_fresh(gsettings, tmp_path, "plus1", N + 1)) - _random_ids(
+        _fresh(gsettings, tmp_path, "base", N)
+    )
+    session = _built_and_labelled(gsettings, tmp_path, seed_cases=(reached,))
+    seed = next(c for c in session.cases if c.listing_end_id == reached)
+    assert (seed.seed_case, seed.in_random_draw) == (True, False)
+    label = next(ln for ln in _working(session) if ln["listing_end_id"] == reached)
+    result = gold.extend_gold_session(session, N + 1)
+    assert (result.added, result.flipped) == ((), (reached,))
+    after = result.session
+    ids = [c.listing_end_id for c in after.cases]
+    assert ids.count(reached) == 1 and len(ids) == len(session.cases)
+    flipped = next(c for c in after.cases if c.listing_end_id == reached)
+    assert (flipped.seed_case, flipped.in_random_draw, flipped.draw_round) == (True, True, 0)
+    assert gold.next_case(after) is None  # its label stands
+    assert gold._final_by_case(after)[reached] == label
+
+
+def test_extend_refuses(gsettings: Settings, tmp_path: Path) -> None:
+    session = _build(gsettings, tmp_path).session
+    gold.record_label(
+        session,
+        session.cases[0].listing_end_id,
+        label="bankruptcy",
+        relied_on="notice",
+        basis="text",
+        seconds_spent=1,
+    )
+    with pytest.raises(gold.GoldRefused, match="no final answer"):
+        gold.extend_gold_session(session, N + 1)
+    _label_all(session)
+    with pytest.raises(gold.GoldRefused, match="must exceed the session's n"):
+        gold.extend_gold_session(session, N)
+    planted = _plant(gsettings, "departure-reason/1.jsonl")
+    with pytest.raises(gold.InferenceFilesPresent):
+        gold.extend_gold_session(session, N + 1)
+    planted.unlink()
+    exclude = Path(json.loads(session.session_file.read_text())["exclusion"]["path"])
+    original = exclude.read_bytes()
+    exclude.write_text("accession,cik\nLE005,\n", encoding="utf-8")
+    with pytest.raises(gold.GoldRefused, match="cannot reproduce"):
+        gold.extend_gold_session(session, N + 1)
+    exclude.write_bytes(original)
+    gold.lock_gold(session, _connect(gsettings), text_floor=0)
+    with pytest.raises(gold.SessionLocked):
+        gold.extend_gold_session(session, N + 1)
+    assert json.loads(session.session_file.read_text())["n"] == N
+
+
+def test_extend_refuses_a_session_whose_draw_it_cannot_reproduce(
+    gsettings: Settings, tmp_path: Path
+) -> None:
+    session = _built_and_labelled(gsettings, tmp_path)
+    path = session.session_file
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["seed"] = SEED + 1  # the cases on file are not this seed's draw
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    edited = gold.open_gold_session(path, gold.GoldFlags(), settings=gsettings)
+    with pytest.raises(gold.GoldRefused, match="cannot reproduce"):
+        gold.extend_gold_session(edited, N + 1)
