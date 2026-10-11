@@ -222,8 +222,6 @@ Pilots C, E and every other row of ADR 0013's table (each is its own registratio
 - **Store locks.** The frame build holds one short read of the owner's store after extraction; runs and the review read no runtime store at all; nothing here contends with ingest or the paper window's run beyond that read.
 - **Registry reading.** A `pilot` run on the sealed period is a flagged holdout spend on a non-`test` split, which research-registry req 5 allows with `--spend-holdout`; it is not the exploratory run on a sealed `test` split that its open question 4 keeps impossible. T81's tests should pin that reading (a follow-up on the registry plan, not this spec).
 
-**Owner decisions 2026-10-10 (#1237).** On review items with a class set and a single class, the owner selects the most specific correct answer supported by the filings; if the single class is correct and belongs to the set, the single class is selected. There is no `both_right` decision. The accepted blinding limit above includes the row 6 and 7 rule phrases, the rule-only "one of" form, and the model-only unresolved phrase. The page still hides attribution and probability until after the decision.
-
 ## Open questions
 
 Each had options and a recommendation; the owner answered all six on 2026-10-05 (the section after this one), so none is open and the plan can be drafted once the owner merges this spec. The questions stand as asked.
@@ -374,3 +372,12 @@ The CLI test (T124) asserts:
 - `research gold` and `research review` lock or finish a complete session after the launcher returns, whether it returns by the page's stop, by Ctrl-C or with a non-zero status, and print the count and the hash;
 - on a locked store they print "store busy" and exit non-zero, with nothing written to the store and the working file and review file unchanged;
 - on a partial session they print the open count, exit 0 and leave the session unlocked.
+
+## Amendment 2026-10-10 (#1237): the most specific answer in review mode
+
+Owner decision on #1237 (Jose, 2026-10-10). This section governs C10's review mode (req 9) where an item shows a class set beside a single class. Nothing else changes.
+
+1. **The most specific correct answer.** On a review item where one answer is a class set and the other a single class, the owner selects the most specific correct answer the filings support; when the single class is correct and belongs to the set, he selects the single class. There is no `both_right` decision; the decisions stay `a`, `b`, `both_wrong` and `unresolved`. Review mode shows this instruction on the page.
+2. **The blinding limit stays as req 9 and C10 state it.** The accepted limit of "Anchoring and blinding's limit" (Risks), for the review screen of req 9 and C10, includes the row 6 and 7 rule phrases ("the rule kept the line listed", "the rule placed no filing"), the rule-only "one of" class-set form, and the model-only unresolved phrase ("the filings shown do not state the reason"). The page still hides attribution and probability until after the decision.
+
+**Acceptance.** The review-page test asserts that review mode shows the most-specific-answer instruction.
