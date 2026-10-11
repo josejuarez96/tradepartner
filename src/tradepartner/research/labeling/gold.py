@@ -117,6 +117,8 @@ BASES: tuple[str, ...] = ("text", "exchange_rule", "provision")
 BASIS_COUNT_KEYS: tuple[str, ...] = (*BASES, UNRESOLVED, "unlabelled")
 #: The labelling protocol's version (spec #1492, Appendix A), in the export's metadata.
 PROTOCOL_VERSION = "1"
+#: Spec #1492 item 4: the suggested extension aims this many text items above the floor.
+EXTENSION_MARGIN = 5
 CONFIDENCE = frozenset({"high", "low"})
 #: The gold columns the lock joins to the sampled frame rows (C10).
 GOLD_SCHEMA: dict[str, pl.DataType] = {
@@ -1039,7 +1041,7 @@ def suggested_n(session: GoldSession, counts: BasisCounts, floor: int) -> int | 
     if text == 0:
         return None
     n_dev = sum(1 for c in session.cases if c.split == "dev" and c.in_random_draw)
-    return n_dev + -(-(floor + 5) * counts.n_pilot // text)
+    return n_dev + -(-(floor + EXTENSION_MARGIN) * counts.n_pilot // text)
 
 
 # --- the lock ---------------------------------------------------------------------
@@ -1092,7 +1094,7 @@ def lock_gold(
             "locked",
             done["sha256"],
             done["scorable_pilot"],
-            counts.scorable_pilot_text,
+            done.get("scorable_pilot_text", counts.scorable_pilot_text),
             counts,
             done["dataset_id"],
         )
@@ -1111,7 +1113,7 @@ def lock_gold(
         )
     out: list[dict[str, Any]] = []
     splits: list[str] = []
-    scorable = 0
+    scorable = counts.scorable_pilot
     for case in sorted(session.cases, key=lambda c: c.listing_end_id):
         final = finals[case.listing_end_id]
         unlabelled = bool(final.get("skipped"))
@@ -1140,8 +1142,6 @@ def lock_gold(
             }
         )
         splits.append(case.split)
-        if case.split == "pilot" and case.in_random_draw and label not in (None, "unresolved"):
-            scorable += 1
     metadata = {
         "exclusion_sha256": session.exclusion_sha256,
         "frame_dataset_id": str(session.frame.dataset_id),

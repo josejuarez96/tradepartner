@@ -221,7 +221,8 @@ def basis_default(notice: str | None, eightk: gold.EightKView | None) -> int | N
     """The "Basis" choice's preselected index (#1492): `text` when the case shows a
     text notice or an 8-K, none when it shows neither. It reads only what is shown,
     never `rule_provision` or a rule citation."""
-    return gold.BASES.index("text") if notice or eightk else None
+    shown_8k = eightk is not None and bool(eightk.items or eightk.body_head)
+    return gold.BASES.index("text") if notice or shown_8k else None
 
 
 def _final_lines(lines: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:

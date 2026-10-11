@@ -1160,6 +1160,9 @@ def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: boo
             raise _fail(f"refused: {message}", USAGE_ERROR)
         typer.echo(message)
         return
+    if session.lock_path.exists():  # already locked: print its lock, no floor check
+        _echo_locked(gold.lock_gold(session, lambda: open_for_write(settings), text_floor=0))
+        return
     floor = _gold_floor(settings)
     counts = gold.basis_counts(session)
     _echo_basis_counts(counts, floor)
@@ -1179,6 +1182,10 @@ def _settle_gold(session: gold.GoldSession, settings: Settings, *, recovery: boo
     result = gold.lock_gold(session, lambda: open_for_write(settings), text_floor=floor)
     if result.state == "busy":
         raise _fail(_scrubbed(result.message or "store busy", settings), 1)
+    _echo_locked(result)
+
+
+def _echo_locked(result: gold.LockResult) -> None:
     typer.echo(
         f"gold session locked: dataset {result.dataset_id}, scorable pilot count "
         f"{result.scorable_pilot}, text-based {result.scorable_pilot_text}, "
@@ -2975,6 +2982,8 @@ def make_app(
             raise _fail("--lock runs alone, on the existing session", USAGE_ERROR)
         path = gold.session_path(s)
         try:
+            if not path.with_name("lock.json").exists():
+                _gold_floor(s)  # a missing or broken pilot file refuses before any labelling
             if path.exists():
                 session = gold.open_gold_session(
                     path, gold.GoldFlags(frame, seed, n, exclude, seeds), settings=s

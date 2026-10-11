@@ -801,6 +801,8 @@ def test_basis_default_reads_only_what_is_shown() -> None:
     assert review_page.basis_default("notice", None) == 0
     assert review_page.basis_default(None, eightk) == 0
     assert review_page.basis_default(None, None) is None
+    empty = gold.EightKView("8-K", "A2", None, (), None)  # nothing of it shown as text
+    assert review_page.basis_default(None, empty) is None
     assert review_page.relied_on_choices(None, None, form25=True) == ["outside", "form 25"]
 
 

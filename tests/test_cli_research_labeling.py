@@ -1264,3 +1264,32 @@ def test_gold_with_no_text_based_item_suggests_no_n(s: Settings, tmp_path: Path)
     assert "no text-based items: no extension suggested" in result.output
     assert "suggested n" not in result.output
     assert not _lock_file(s).exists()
+
+
+def test_gold_refuses_before_any_labelling_without_a_readable_pilot_file(
+    s: Settings, tmp_path: Path
+) -> None:
+    pilot = Path(s.research.experiments_dir) / "departure-reason-pilot.md"
+    pilot.unlink()
+    seen: list[list[str]] = []
+    missing = _gold_cli(s, tmp_path, _gold_page(s, seen))
+    assert missing.exit_code == 2, missing.output
+    assert "no pilot experiment file" in missing.output
+    pilot.write_text("not an experiment file\n", encoding="utf-8")
+    broken = _cli(s, "research", "gold", "--lock")
+    assert broken.exit_code == 2, broken.output
+    assert seen == []
+    assert not gold.session_path(s).exists()
+
+
+def test_gold_lock_on_a_locked_session_prints_its_lock_whatever_the_floor(
+    s: Settings, tmp_path: Path
+) -> None:
+    first = _gold_cli(s, tmp_path, _gold_page(s, []))
+    assert "gold session locked" in first.output
+    _pilot_file(s, 60)  # raised after the lock
+    again = _cli(s, "research", "gold", "--lock")
+    assert again.exit_code == 0, again.output
+    assert "gold session locked" in again.output and "text-based 5" in again.output
+    assert "left unlocked" not in again.output
+    assert _datasets(s, "departure-reason-gold") == 1
