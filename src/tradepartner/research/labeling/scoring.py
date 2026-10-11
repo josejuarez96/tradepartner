@@ -156,6 +156,45 @@ def clopper_pearson_lower_bound(successes: int, n: int, *, confidence: float = 0
     return (lo + hi) / 2
 
 
+Arm = Literal["jev", "claude"]
+ARMS: tuple[Arm, ...] = ("jev", "claude")
+PacketKind = Literal["A", "B"]
+
+
+@dataclass(frozen=True)
+class ArmCall:
+    """One model call's record as the evidence ladder reads it (the 2026-10-11
+    amendment, #1504, item 3): which `arm` made it, on which packet `kind`
+    (`A`: the Form 25 fields and notice; `B`: A plus the one 8-K), the `option`
+    it returned (`None` on a `timeout` or `refused` call), its `reason`, the
+    vendor's `stop_reason` (only meaningful on a `refused` record), and the
+    tokens, cost and latency the record keeps."""
+
+    arm: Arm
+    kind: PacketKind
+    option: str | None
+    reason: Reason
+    stop_reason: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.arm not in ARMS:
+            raise ValueError(f"ArmCall: arm {self.arm!r} is not one of {', '.join(ARMS)}")
+        if self.kind not in ("A", "B"):
+            raise ValueError(f"ArmCall: kind {self.kind!r} is not 'A' or 'B'")
+
+    @property
+    def answer(self) -> str:
+        """The option this call answers, `unresolved` for a `timeout`, a
+        `refused` record or a call with no option (#1504 item 6)."""
+        if self.reason != "ok" or self.option is None:
+            return UNRESOLVED
+        return self.option
+
+
 @dataclass(frozen=True)
 class ScoredItem:
     """One gold or batch item's scoring inputs (req 10): the owner's labels
@@ -186,6 +225,8 @@ class ScoredItem:
     in_random_draw: bool = True
     pre_fix_rule_answer: crosswalk.RuleAnswer | None = None
     basis: Basis | None = None
+    calls: tuple[ArmCall, ...] = ()
+    has_eightk: bool = False
 
     def __post_init__(self) -> None:
         if not self.in_random_draw and not self.is_seed:
@@ -796,3 +837,506 @@ def mean_abs_probability_shift(comparisons: Sequence[DriftComparison]) -> float:
         if c.probabilities and c.baseline_probabilities
     ]
     return sum(shifts) / len(shifts) if shifts else 0.0
+
+
+# --- the evidence ladder, the hybrid router, paired comparisons (#1504) -------------
+#
+# Reported, never gating: nothing below enters `class_accuracy`'s denominator, the
+# per-option gate, `seeded_recall` or any bar. Every function reads `ScoredItem.calls`
+# and `has_eightk` only; the functions above ignore both.
+
+Level = Literal["E1", "E2", "cascade"]
+LADDER_LEVELS: tuple[Level, ...] = ("E1", "E2", "cascade")
+
+#: The sets a ladder table is cut on: the headline `text` set, its 8-K subset
+#: (`has_eightk` and the arm's B packet sent), and the two label bases reported apart.
+LadderSet = Literal["text", "text_eightk", "exchange_rule", "provision"]
+LADDER_SETS: tuple[LadderSet, ...] = ("text", "text_eightk", "exchange_rule", "provision")
+
+#: A level (or its hybrid) with fewer scorable items than this is reported without a
+#: claim (#1504 item 5).
+MIN_LADDER_ITEMS = 20
+
+_ALPHA = 0.05
+
+
+@dataclass(frozen=True)
+class _Resolved:
+    """The answer an arm gives at a level on one item, and the calls it paid for."""
+
+    answer: str
+    answering: ArmCall
+    paid: tuple[ArmCall, ...]
+    b_refused: bool
+
+
+def _call_of(item: ScoredItem, arm: Arm, kind: PacketKind) -> ArmCall | None:
+    found = [c for c in item.calls if c.arm == arm and c.kind == kind]
+    if len(found) > 1:
+        raise ValueError(f"{item.listing_end_id}: {len(found)} {arm} calls on packet {kind}")
+    return found[0] if found else None
+
+
+#: An item the arm reached (it made some call) but whose packet for the level was never
+#: sent (over `max_packet_tokens`): it scores `unresolved`, as the primary counts it, never
+#: dropped from the denominator.
+_NOT_SENT = _Resolved(UNRESOLVED, ArmCall("jev", "A", None, "refused", "not_sent"), (), False)
+
+
+def _from(call: ArmCall | None, paid: tuple[ArmCall | None, ...], b_refused: bool) -> _Resolved:
+    assert call is not None
+    return _Resolved(call.answer, call, tuple(c for c in paid if c), b_refused)
+
+
+def _resolve(item: ScoredItem, arm: Arm, level: Level) -> _Resolved | None:
+    """The level's answer for `arm` on `item`, `None` when Claude made no call on the
+    item (an item it never reached is not scored for it; Jev's missing item reads
+    `unresolved`); a packet the level needs but
+    that was never sent reads `unresolved`, as the primary counts it."""
+    if level not in LADDER_LEVELS:
+        raise ValueError(f"unknown ladder level {level!r}")
+    if level == "cascade" and arm != "jev":
+        raise ValueError("the cascade is Jev's registered treatment only")
+    a_call = _call_of(item, arm, "A")
+    b_call = _call_of(item, arm, "B")
+    if a_call is None and b_call is None:
+        # Jev is the primary arm: an item it has no record on (both packets over the
+        # cap) counts wrong in `class_accuracy`, so it reads `unresolved` here too.
+        return _NOT_SENT if arm == "jev" else None
+    if level == "E1":
+        return _from(a_call, (a_call,), False) if a_call else _NOT_SENT
+    if level == "E2":
+        if item.has_eightk and b_call is not None:
+            return _Resolved(b_call.answer, b_call, (b_call,), False)
+        if a_call is None:
+            return _NOT_SENT
+        return _Resolved(a_call.answer, a_call, (a_call,), item.has_eightk)
+    # cascade: B where it ran and resolved, else A
+    if b_call is not None and b_call.answer != UNRESOLVED:
+        return _Resolved(b_call.answer, b_call, (b_call,), False)
+    if a_call is None:
+        return _Resolved(
+            UNRESOLVED, b_call or _NOT_SENT.answering, (b_call,) if b_call else (), False
+        )
+    paid = (b_call, a_call) if b_call is not None else (a_call,)
+    return _Resolved(a_call.answer, a_call, paid, False)
+
+
+def level_answer(item: ScoredItem, arm: Arm, level: Level) -> str | None:
+    """`arm`'s answer at `level` on `item` (#1504 item 6): `E1` the A call; `E2` the B
+    call where the item has an 8-K and B was sent, else the A call (the bundle "up to
+    one more document" is the Form 25 alone when there is none, or when B was refused
+    before sending, which `LadderRow.b_refused` counts; a B call the vendor refused
+    reads `unresolved`); `cascade` (Jev only) B where B ran and resolved, else A. A
+    `refused` or `timeout` call reads as `unresolved`. `None` only when Claude made no call on the
+    item; a level whose packet was never sent reads `unresolved`."""
+    resolved = _resolve(item, arm, level)
+    return resolved.answer if resolved else None
+
+
+def _is_correct(item: ScoredItem, answer: str) -> bool:
+    assert item.gold_label is not None
+    return answer != UNRESOLVED and crosswalk.class_of(answer) == crosswalk.class_of(
+        item.gold_label
+    )
+
+
+def _scorable(items: Sequence[ScoredItem], basis: Basis) -> list[ScoredItem]:
+    """The items `class_accuracy` would score (in the draw, a usable gold label) whose
+    label rests on `basis`, in input order."""
+    return [
+        item
+        for item in items
+        if item.in_random_draw and item.gold_label not in (None, UNRESOLVED) and item.basis == basis
+    ]
+
+
+def _in_set(item: ScoredItem, arm: Arm, set_name: LadderSet) -> bool:
+    if set_name == "text_eightk":
+        return item.has_eightk and _call_of(item, arm, "B") is not None
+    return True
+
+
+def _set_items(items: Sequence[ScoredItem], arm: Arm, set_name: LadderSet) -> list[ScoredItem]:
+    if set_name not in LADDER_SETS:
+        raise ValueError(f"unknown ladder set {set_name!r}")
+    basis: Basis = "text" if set_name == "text_eightk" else set_name
+    return [i for i in _scorable(items, basis) if _in_set(i, arm, set_name)]
+
+
+def _nearest_rank(values: Sequence[float], q: float) -> float | None:
+    """The nearest-rank percentile (`q` in (0, 1]); `None` for no values."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(math.ceil(q * len(ordered)), 1) - 1]
+
+
+@dataclass(frozen=True)
+class LadderRow:
+    """One arm and level line of a ladder table on one set (#1504 item 6). `n` is the
+    scorable items the arm answered at the level out of `n_eligible` in the set;
+    `refused_by_stop_reason` and `timeouts` count the answering calls; the token, cost
+    and latency figures are over the calls the level paid for (the cascade's A call
+    only when B did not resolve); `cost_per_correct` is `None` with no correct item;
+    `lower_bound` is `None` when `underpowered` (under `MIN_LADDER_ITEMS`)."""
+
+    arm: Arm
+    level: Level
+    set_name: LadderSet
+    n_eligible: int
+    n: int
+    correct: int
+    point_estimate: float
+    lower_bound: float | None
+    unresolved_share: float
+    refused_by_stop_reason: Mapping[str, int]
+    timeouts: int
+    b_refused: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_p50_ms: float | None
+    latency_p90_ms: float | None
+    cost_per_correct: float | None
+    underpowered: bool
+
+
+def _row(
+    arm: Arm,
+    level: Level,
+    set_name: LadderSet,
+    n_eligible: int,
+    pairs: Sequence[tuple[ScoredItem, _Resolved]],
+) -> LadderRow:
+    n = len(pairs)
+    correct = sum(1 for item, r in pairs if _is_correct(item, r.answer))
+    paid = [call for _, r in pairs for call in r.paid]
+    refused: dict[str, int] = {}
+    for _, r in pairs:
+        if r.answering.reason == "refused":
+            key = r.answering.stop_reason or "unknown"
+            refused[key] = refused.get(key, 0) + 1
+    cost = sum(c.cost_usd for c in paid)
+    latencies = [c.latency_ms for c in paid]
+    underpowered = n < MIN_LADDER_ITEMS
+    return LadderRow(
+        arm=arm,
+        level=level,
+        set_name=set_name,
+        n_eligible=n_eligible,
+        n=n,
+        correct=correct,
+        point_estimate=correct / n if n else 0.0,
+        lower_bound=None if underpowered else wilson_lower_bound(correct, n),
+        unresolved_share=(sum(1 for _, r in pairs if r.answer == UNRESOLVED) / n) if n else 0.0,
+        refused_by_stop_reason=dict(sorted(refused.items())),
+        timeouts=sum(1 for _, r in pairs if r.answering.reason == "timeout"),
+        b_refused=sum(1 for _, r in pairs if r.b_refused),
+        input_tokens=sum(c.input_tokens for c in paid),
+        output_tokens=sum(c.output_tokens for c in paid),
+        cost_usd=cost,
+        latency_p50_ms=_nearest_rank(latencies, 0.5),
+        latency_p90_ms=_nearest_rank(latencies, 0.9),
+        cost_per_correct=(cost / correct) if correct else None,
+        underpowered=underpowered,
+    )
+
+
+def _arms_present(items: Sequence[ScoredItem]) -> list[Arm]:
+    return [arm for arm in ARMS if any(c.arm == arm for i in items for c in i.calls)]
+
+
+def _levels_for(arm: Arm) -> tuple[Level, ...]:
+    return LADDER_LEVELS if arm == "jev" else ("E1", "E2")
+
+
+def ladder_table(items: Sequence[ScoredItem]) -> tuple[LadderRow, ...]:
+    """The ladder table (#1504 item 6): one `LadderRow` per arm and level (the cascade a
+    third level for Jev only) on the `text` set, on its 8-K subset, and on the
+    `exchange_rule` and `provision` sets reported apart, never pooled. An arm with no
+    call on any item has no lines (absent, not zero). Order: set, arm, level."""
+    rows: list[LadderRow] = []
+    for set_name in LADDER_SETS:
+        for arm in _arms_present(items):
+            eligible = _set_items(items, arm, set_name)
+            for level in _levels_for(arm):
+                pairs = [(i, r) for i in eligible if (r := _resolve(i, arm, level)) is not None]
+                rows.append(_row(arm, level, set_name, len(eligible), pairs))
+    return tuple(rows)
+
+
+@dataclass(frozen=True)
+class E0Result:
+    """E0 (#1504 item 6): the `rule_provision` arm's score on the text set (no call)
+    and `decisive_share`, the share of text-set scorable items whose arm set holds
+    exactly one class (`decisive` of `n`); `arm.class_accuracy.n == decisive`."""
+
+    arm: ArmResult
+    n: int
+    decisive: int
+    decisive_share: float
+
+
+def e0_report(items: Sequence[ScoredItem]) -> E0Result:
+    """E0 beside the ladder: `rule_provision_arm_score` on the `text` set and
+    `decisive_share` over the same set."""
+    text = _scorable(items, "text")
+    decisive = sum(1 for i in text if is_rule_decisive(i.rule_provision))
+    return E0Result(
+        arm=rule_provision_arm_score(text),
+        n=len(text),
+        decisive=decisive,
+        decisive_share=decisive / len(text) if text else 0.0,
+    )
+
+
+def _rule_class(provision: str | None) -> str | None:
+    """The one class the `rule_provision` arm names, `None` unless it names exactly
+    one (`unresolved` dropped first, as `rule_provision_arm_score` drops it)."""
+    if not provision:
+        return None
+    classes = {
+        crosswalk.class_of(o) for o in crosswalk.rule_provision_arm(provision) if o != UNRESOLVED
+    }
+    return next(iter(classes)) if len(classes) == 1 else None
+
+
+def is_rule_decisive(provision: str | None) -> bool:
+    """Whether the `rule_provision` arm decides on `provision` (#1504 item 7): its class
+    set, `unresolved` dropped first, holds exactly one class. An unmapped provision's
+    `{unresolved}` is never decisive; neither is a missing provision."""
+    return _rule_class(provision) is not None
+
+
+@dataclass(frozen=True)
+class RoutedApart:
+    """The items the router sent to the rule, reported apart (#1504 item 7): their
+    count, gold class mix, and the rule's and the model's accuracy on them (`None`
+    with no routed item). The rule's accuracy is near 1 almost by construction on
+    `text` labels, so the hybrid's gain over the model is bounded by `model_n -
+    model_correct`."""
+
+    count: int
+    gold_class_mix: Mapping[str, int]
+    rule_correct: int
+    model_correct: int
+    rule_accuracy: float | None
+    model_accuracy: float | None
+
+
+@dataclass(frozen=True)
+class RouterResult:
+    """The hybrid's line for one arm and level on one set (#1504 item 7). `cost_usd` is
+    the model's cost on the routed-to-model items only (the rule is free)."""
+
+    arm: Arm
+    level: Level
+    set_name: LadderSet
+    n: int
+    correct: int
+    point_estimate: float
+    lower_bound: float | None
+    unresolved_share: float
+    routed_to_rule_share: float
+    cost_usd: float
+    cost_per_correct: float | None
+    routed: RoutedApart
+    underpowered: bool
+
+
+def _hybrid_outcomes(
+    items: Sequence[ScoredItem], arm: Arm, level: Level, set_name: LadderSet
+) -> list[tuple[ScoredItem, _Resolved, str | None]]:
+    """Each answered item in the set with its model resolution and the rule's class
+    where the router sends it to the rule (else `None`)."""
+    out = []
+    for item in _set_items(items, arm, set_name):
+        resolved = _resolve(item, arm, level)
+        if resolved is not None:
+            out.append((item, resolved, _rule_class(item.rule_provision)))
+    return out
+
+
+def _hybrid_correct(item: ScoredItem, resolved: _Resolved, rule_class: str | None) -> bool:
+    assert item.gold_label is not None
+    if rule_class is not None:
+        return rule_class == crosswalk.class_of(item.gold_label)
+    return _is_correct(item, resolved.answer)
+
+
+def hybrid_router(
+    items: Sequence[ScoredItem],
+    arm: Arm,
+    level: Level,
+    *,
+    set_name: LadderSet = "text",
+) -> RouterResult:
+    """The rule-first hybrid, computed and never run (#1504 item 7): where
+    `is_rule_decisive` the rule's class is the answer, else the level's answer. Only
+    `text` and `text_eightk` sets are routed: a `provision`-basis label agrees with the
+    rule by construction and never enters this score."""
+    if set_name not in ("text", "text_eightk"):
+        raise ValueError("the router scores the text set (and its 8-K subset) only")
+    rows = _hybrid_outcomes(items, arm, level, set_name)
+    n = len(rows)
+    correct = sum(1 for item, r, rc in rows if _hybrid_correct(item, r, rc))
+    to_model = [(item, r) for item, r, rc in rows if rc is None]
+    routed = [(item, r, rc) for item, r, rc in rows if rc is not None]
+    unresolved = sum(1 for _, r in to_model if r.answer == UNRESOLVED)
+    cost = sum(c.cost_usd for _, r in to_model for c in r.paid)
+    mix: dict[str, int] = {}
+    for item, _, _ in routed:
+        assert item.gold_label is not None
+        gold_class = crosswalk.class_of(item.gold_label)
+        assert gold_class is not None
+        mix[gold_class] = mix.get(gold_class, 0) + 1
+    rule_correct = sum(1 for item, _, rc in routed if _hybrid_correct(item, _NO_MODEL, rc))
+    model_correct = sum(1 for item, r, _ in routed if _is_correct(item, r.answer))
+    underpowered = n < MIN_LADDER_ITEMS
+    return RouterResult(
+        arm=arm,
+        level=level,
+        set_name=set_name,
+        n=n,
+        correct=correct,
+        point_estimate=correct / n if n else 0.0,
+        lower_bound=None if underpowered else wilson_lower_bound(correct, n),
+        unresolved_share=unresolved / n if n else 0.0,
+        routed_to_rule_share=len(routed) / n if n else 0.0,
+        cost_usd=cost,
+        cost_per_correct=(cost / correct) if correct else None,
+        routed=RoutedApart(
+            count=len(routed),
+            gold_class_mix=dict(sorted(mix.items())),
+            rule_correct=rule_correct,
+            model_correct=model_correct,
+            rule_accuracy=rule_correct / len(routed) if routed else None,
+            model_accuracy=model_correct / len(routed) if routed else None,
+        ),
+        underpowered=underpowered,
+    )
+
+
+#: A placeholder resolution for scoring the rule's answer alone (never read: the rule
+#: branch of `_hybrid_correct` ignores it).
+_NO_MODEL = _Resolved(UNRESOLVED, ArmCall("jev", "A", None, "ok"), (), False)
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """McNemar's exact two-sided test on the discordant pairs (#1504 item 8): the
+    binomial probability, at p = 0.5, of a split at least as uneven as `(b, c)`; no
+    continuity correction, no asymptotic form. `1.0` when `b + c == 0`. Symmetric."""
+    if b < 0 or c < 0:
+        raise ValueError(f"discordant counts must be non-negative, got ({b}, {c})")
+    m = b + c
+    if m == 0:
+        return 1.0
+    tail = sum(math.comb(m, i) for i in range(min(b, c) + 1))
+    return min(1.0, 2 * tail / (1 << m))
+
+
+def min_significant_split(m: int, *, alpha: float = _ALPHA) -> int | None:
+    """The smallest majority count `k` such that a `k`-to-`(m - k)` split of `m`
+    discordant pairs has an exact two-sided p of at most `alpha` (#1504 item 8's
+    "minimum split that reaches 0.05": `m = 6` gives 6, `m = 20` gives 15); `None`
+    when even `m`-to-0 does not reach it."""
+    for k in range(math.ceil(m / 2), m + 1):
+        if mcnemar_exact(k, m - k) <= alpha:
+            return k
+    return None
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """One paired comparison (#1504 item 8) between `first` and `second` (labels such
+    as `jev:E1` or `claude:E2:hybrid`) over the same items: `b` first right and second
+    wrong, `c` first wrong and second right, `n` items paired, the accuracy difference
+    (first minus second) and the exact p. `min_split` is the smallest majority count
+    that would reach 0.05 at this `b + c` (the claim quotes it beside the p)."""
+
+    first: str
+    second: str
+    set_name: LadderSet
+    n: int
+    b: int
+    c: int
+    accuracy_difference: float
+    p_value: float
+    min_split: int | None
+    underpowered: bool
+
+
+_ARM_LEVELS: tuple[Level, ...] = ("E1", "E2")
+_Spec = tuple[Arm, Level, bool]  # (arm, level, hybrid)
+
+
+def _label(spec: _Spec) -> str:
+    arm, level, hybrid = spec
+    return f"{arm}:{level}" + (":hybrid" if hybrid else "")
+
+
+def _spec_outcomes(
+    items: Sequence[ScoredItem], spec: _Spec, set_name: LadderSet
+) -> dict[int, bool]:
+    """Item index -> whether the spec was right, over the set's answered items."""
+    arm, level, hybrid = spec
+    index = {id(item): k for k, item in enumerate(items)}
+    out: dict[int, bool] = {}
+    for item, resolved, rule_class in _hybrid_outcomes(items, arm, level, set_name):
+        out[index[id(item)]] = (
+            _hybrid_correct(item, resolved, rule_class)
+            if hybrid
+            else _is_correct(item, resolved.answer)
+        )
+    return out
+
+
+def _compare(
+    items: Sequence[ScoredItem], first: _Spec, second: _Spec, set_name: LadderSet
+) -> Comparison:
+    one = _spec_outcomes(items, first, set_name)
+    two = _spec_outcomes(items, second, set_name)
+    shared = sorted(one.keys() & two.keys())
+    b = sum(1 for k in shared if one[k] and not two[k])
+    c = sum(1 for k in shared if not one[k] and two[k])
+    n = len(shared)
+    return Comparison(
+        first=_label(first),
+        second=_label(second),
+        set_name=set_name,
+        n=n,
+        b=b,
+        c=c,
+        accuracy_difference=(b - c) / n if n else 0.0,
+        p_value=mcnemar_exact(b, c),
+        min_split=min_significant_split(b + c),
+        underpowered=n < MIN_LADDER_ITEMS,
+    )
+
+
+def paired_comparisons(items: Sequence[ScoredItem]) -> tuple[Comparison, ...]:
+    """The twelve comparisons of #1504 item 8 on the `text` set and the same twelve on
+    its 8-K subset (so up to twenty-four; no multiplicity correction, none claimed):
+    `jev` against `claude` at E1, at E2 and on each level's hybrid (four); E1 against
+    E2 within each arm, and Jev's E2 against the cascade (three); each level against
+    its own hybrid (five: Jev's three levels, Claude's two). Pairs are over the same
+    items (the intersection of what both sides answered). A comparison involving an
+    arm with no calls is absent. Order: set, then the order above."""
+    arms = _arms_present(items)
+    out: list[Comparison] = []
+    for set_name in ("text", "text_eightk"):
+        pairs: list[tuple[_Spec, _Spec]] = []
+        if "jev" in arms and "claude" in arms:
+            for hybrid in (False, True):
+                for level in _ARM_LEVELS:
+                    pairs.append((("jev", level, hybrid), ("claude", level, hybrid)))
+        for arm in arms:
+            pairs.append(((arm, "E1", False), (arm, "E2", False)))
+        if "jev" in arms:
+            pairs.append((("jev", "E2", False), ("jev", "cascade", False)))
+        for arm in arms:
+            for level in _levels_for(arm):
+                pairs.append(((arm, level, False), (arm, level, True)))
+        out.extend(_compare(items, a, b, set_name) for a, b in pairs)
+    return tuple(out)
