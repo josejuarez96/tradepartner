@@ -1016,6 +1016,50 @@ unblocks = ["task:T166c"]
 what = "The owner's repair release restamp-1382: repair, rebuild, health check, the trial records (B3 trial 3 re-run, trial 4 checked and not re-run) and the evidence on #1382."
 why = "Closes #1382 so the B9 work and T164e's real-store run can read filing times that are point in time."
 
+[issue.1498]
+what = "The docs for a stored, point-in-time 3-month T-bill rate: ADR 0020 (FRED/ALFRED DTB3 as the source), the data-foundation rates table and its known_at rule, the backtest metrics reading a per-period risk-free series with the constant kept as the frozen fallback, and plan tasks T169 to T170c."
+why = "Every stored Sharpe is computed against a constant zero while bills pay 4 to 5%; B11 fetched the rate by hand and B12, the hedged line and any market-neutral benchmark need it in the store with a known_at."
+unblocks = ["adr:0020", "task:T169", "task:T170"]
+
+[adr.0020]
+what = "FRED/ALFRED is the source of a stored, point-in-time T-bill rate (DTB3): one source-agnostic rates table, known_at at the close of the first session after the vintage date, vintages as revisions, the constant kept so no registered trial moves, FRED's terms quoted and the Board's own H.15 download named as the fallback."
+why = "A new external data source always needs a decision record; the storage rule is costly to change once rows are loaded, and the terms tension (personal-use licence against the storage clause) is the owner's to accept."
+unblocks = ["task:T169"]
+
+[task.T169]
+what = "The rates table (schema version bump), the RateSource interface and RateObservation record, the pure known_at rule, the fixture rate source and six generated fixture cases."
+why = "The table and the fixture are what every later task and the look-ahead tests read."
+unblocks = ["task:T169b", "task:T169c"]
+
+[task.T169b]
+what = "The as-of read rates_as_of (latest revision per observation date, known_at at or before T) with truncation invariance and the broken adapter's early-stamped rate."
+why = "The risk-free series is only as point-in-time as this read."
+unblocks = ["task:T169d", "task:T170b"]
+
+[task.T169c]
+what = "The FRED raw client (the key as a query parameter, never logged), the observations parser, the FRED RateSource adapter, the fred_api_key and rates.* config keys and .env.example."
+why = "The adapter is the only module that knows FRED's field names; swapping to the Board's download later is this one module."
+unblocks = ["task:T169d"]
+
+[task.T169d]
+what = "ingest --source fred (backfill and daily requests, the not-yet-known skip, revisions, staleness), the CLI source list and the health block with the attribution line."
+why = "Nothing reaches the owner's store until the ingest writes it under the store's own rules."
+unblocks = ["task:T170c"]
+
+[task.T170]
+what = "The pure risk-free module (discount-to-yield conversion, per-session accrual, per-period product) and series_metrics taking a per-period risk-free sequence, with risk_free_annual as a metric key."
+why = "The Sharpe's denominator input becomes a series; done as a pure module first so H1's pinned metrics are proved unchanged before any store read exists."
+unblocks = ["task:T170b"]
+
+[task.T170b]
+what = "The three frozen metrics.* keys with their table entries, the provider's rates read at the data cutoff, the engine and results wiring, and the look-ahead tests."
+why = "Wires the pure module to the store under the frozen-key rules so no registered trial moves and a run to T reads no rate known after T."
+unblocks = ["task:T170c"]
+
+[task.T170c]
+what = "The owner's backfill of DTB3 from 2016-01-04 on the real store, the health check, five hand-checked dates against H.15, and the flip of metrics.risk_free_source to store."
+why = "New registrations read the real rate only once the store holds it; flipping before the backfill would fail their runs."
+
 [issue.1358]
 what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
 why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."
