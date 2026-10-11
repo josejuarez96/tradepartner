@@ -1356,3 +1356,30 @@ def test_existing_metrics_are_byte_identical_with_and_without_calls() -> None:
         scoring.basis_counts,
     ):
         assert fn(with_calls) == fn(without), fn.__name__  # type: ignore[operator]
+
+
+def test_a_packet_never_sent_scores_unresolved_not_dropped() -> None:
+    """The primary counts an item whose A packet was over the cap as wrong; the ladder
+    must keep it in the denominator, so Jev's cascade row equals `class_accuracy`."""
+    items = _ladder_items(with_claude=False)
+    no_a = dataclasses.replace(
+        items[30 - 1],  # K9: keep only its B call
+        calls=(items[29].calls[1],),
+        predicted_option=MA,
+    )
+    items[29] = no_a
+    assert scoring.level_answer(no_a, "jev", "E1") == UNRESOLVED
+    assert scoring.level_answer(no_a, "jev", "cascade") == MA
+    rows = scoring.ladder_table(items)
+    assert _row(rows, "jev", "E1").n == 30
+    # a Jev-only fixture whose primary label is the cascade answer scores identically
+    cascade_items = [
+        dataclasses.replace(i, predicted_option=scoring.level_answer(i, "jev", "cascade"))
+        for i in items
+    ]
+    acc = scoring.class_accuracy(cascade_items)
+    row = _row(scoring.ladder_table(cascade_items), "jev", "cascade")
+    assert (row.n, row.correct) == (acc.n, acc.correct) == (30, 22)
+    only_b = _item("only-b", BK, BK, "ok", calls=(_jev("B", BK),), has_eightk=True)
+    assert scoring.level_answer(only_b, "jev", "E2") == BK
+    assert scoring.level_answer(only_b, "jev", "E1") == UNRESOLVED

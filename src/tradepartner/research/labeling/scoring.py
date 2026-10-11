@@ -877,28 +877,44 @@ def _call_of(item: ScoredItem, arm: Arm, kind: PacketKind) -> ArmCall | None:
     return found[0] if found else None
 
 
+#: An item the arm reached (it made some call) but whose packet for the level was never
+#: sent (over `max_packet_tokens`): it scores `unresolved`, as the primary counts it, never
+#: dropped from the denominator.
+_NOT_SENT = _Resolved(UNRESOLVED, ArmCall("jev", "A", None, "refused", "not_sent"), (), False)
+
+
+def _from(call: ArmCall | None, paid: tuple[ArmCall | None, ...], b_refused: bool) -> _Resolved:
+    assert call is not None
+    return _Resolved(call.answer, call, tuple(c for c in paid if c), b_refused)
+
+
 def _resolve(item: ScoredItem, arm: Arm, level: Level) -> _Resolved | None:
-    """The level's answer for `arm` on `item`, `None` when the arm made none of the
-    calls the level needs (an item the arm never reached is not scored for it)."""
+    """The level's answer for `arm` on `item`, `None` when the arm made no call on the
+    item (an item it never reached is not scored for it); a packet the level needs but
+    that was never sent reads `unresolved`, as the primary counts it."""
     if level not in LADDER_LEVELS:
         raise ValueError(f"unknown ladder level {level!r}")
     if level == "cascade" and arm != "jev":
         raise ValueError("the cascade is Jev's registered treatment only")
     a_call = _call_of(item, arm, "A")
     b_call = _call_of(item, arm, "B")
+    if a_call is None and b_call is None:
+        return None
     if level == "E1":
-        return _Resolved(a_call.answer, a_call, (a_call,), False) if a_call else None
+        return _from(a_call, (a_call,), False) if a_call else _NOT_SENT
     if level == "E2":
         if item.has_eightk and b_call is not None:
             return _Resolved(b_call.answer, b_call, (b_call,), False)
         if a_call is None:
-            return None
+            return _NOT_SENT
         return _Resolved(a_call.answer, a_call, (a_call,), item.has_eightk)
     # cascade: B where it ran and resolved, else A
     if b_call is not None and b_call.answer != UNRESOLVED:
         return _Resolved(b_call.answer, b_call, (b_call,), False)
     if a_call is None:
-        return None
+        return _Resolved(
+            UNRESOLVED, b_call or _NOT_SENT.answering, (b_call,) if b_call else (), False
+        )
     paid = (b_call, a_call) if b_call is not None else (a_call,)
     return _Resolved(a_call.answer, a_call, paid, False)
 
@@ -907,9 +923,10 @@ def level_answer(item: ScoredItem, arm: Arm, level: Level) -> str | None:
     """`arm`'s answer at `level` on `item` (#1504 item 6): `E1` the A call; `E2` the B
     call where the item has an 8-K and B was sent, else the A call (the bundle "up to
     one more document" is the Form 25 alone when there is none, or when B was refused
-    before sending); `cascade` (Jev only) B where B ran and resolved, else A. A
-    `refused` or `timeout` call reads as `unresolved`. `None` when the arm has no call
-    for the level."""
+    before sending, which `LadderRow.b_refused` counts; a B call the vendor refused
+    reads `unresolved`); `cascade` (Jev only) B where B ran and resolved, else A. A
+    `refused` or `timeout` call reads as `unresolved`. `None` only when the arm made no call on the
+    item; a level whose packet was never sent reads `unresolved`."""
     resolved = _resolve(item, arm, level)
     return resolved.answer if resolved else None
 
