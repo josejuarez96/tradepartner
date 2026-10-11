@@ -147,7 +147,6 @@ through `rebuild_statement_facts`, `filing_events` through
 from __future__ import annotations
 
 import csv
-import json
 import re
 import time
 import traceback
@@ -1025,12 +1024,8 @@ class WindowEarlierOk:
         (`restamp_from_manifest`), not here."""
         try:
             precheck = load_precheck(path)
-            # A gate's verdict is a JSON boolean, never a truthy string.
-            strict = json.loads(path.read_bytes())["pass"]
         except (KeyError, TypeError) as exc:
             raise ValueError(f"{path}: not a pre-check file ({exc!r})") from None
-        if not isinstance(strict, bool):
-            raise ValueError(f"{path}: pass must be true or false, got {strict!r}")
         return cls(path=path, release=release, precheck=precheck)
 
     def backup(self) -> str:

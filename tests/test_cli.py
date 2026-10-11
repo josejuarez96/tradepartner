@@ -388,7 +388,7 @@ def test_ingest_restamp_window_earlier_ok_hands_the_precheck_and_release_on(
         (_RELEASED, {}, False, "needs --restamp-from"),
         ("manifest.csv", {}, True, "v1.<release>.manifest.csv"),
         (_RELEASED, {"instants": ...}, True, "instants"),
-        (_RELEASED, {"pass": "yes"}, True, "pass must be"),
+        (_RELEASED, {"pass": "yes"}, True, "pass is not a JSON boolean"),
         (_RELEASED, {"instants": ["2026-10-09T20:00:00"]}, True, "tz-aware"),
     ],
     ids=["no-manifest", "unnamed-manifest", "missing-field", "pass-not-bool", "naive-instant"],
