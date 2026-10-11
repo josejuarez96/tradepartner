@@ -16,6 +16,10 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
   `rejection_cap`, `skip_cap`, `missed_run`, `missed_rebalance`, `drawdown`,
   `unspent_cash`: the tracking run and the risk-gated wrapper (T60 to T63f).
   Run-scoped: one alert per (kind, run), `alerts.session` = the run's S.
+  `run_failed` alone may also have no run (`RUNLESS_KINDS`, owner decision on
+  #1440 Q2, 2026-10-10): a `ClockError` or store error before the run row
+  exists; that one is deduped on (book, kind, session) like `locked`, among the
+  run-less rows only, so a run's own `run_failed` never hides it.
 - `lot_ledger`: the tracking run (T63), when the lot ledger cannot be rebuilt
   (`execution.outcomes`); added 2026-10-01 by the owner's answer to #366 Q5.
   Run-scoped.
@@ -42,11 +46,15 @@ was given (#394). The sender is `ALERT_EMAIL_FROM` when set, else the SMTP login
 the delivery counts as made even if the server answers QUIT badly (#403). No
 secret value is ever logged or journaled (see "Secrets" below).
 
-The clock stamps `at`, `known_at` and `ingested_at` (converted to UTC). On the
+The clock stamps `at`, `known_at` and `ingested_at` (converted to UTC); the
+tracking run hands its alerter the risk gate's checked reading
+(`RiskGatedBroker.read_clock`, owner decision on #1440 Q1, 2026-10-10). On the
 halt path after a `ClockError` the caller passes `clock_fault=True`: the clock
 is never read and every row is stamped with `store.db.utc_now()` (spec
 Definitions). If the clock raises or returns a naive value anyway, the stamp
 falls back the same way: the alert for a clock fault must still be written.
+Whenever the alert row is so stamped by the raw clock, its message (as stored
+and as sent) ends with `RAW_CLOCK_NOTE` and the reason (#1440 Q1).
 
 Secrets: every `SecretStr` value in `Settings` (the Alpaca keys and the
 `ALERT_*` values, as `config.secret_values` lists them: stripped, blanks left
@@ -80,6 +88,8 @@ from tradepartner.store.schema import DEFAULT_BOOK_ID
 __all__ = [
     "ALERT_KINDS",
     "NON_STORE_KINDS",
+    "RAW_CLOCK_NOTE",
+    "RUNLESS_KINDS",
     "SESSION_SCOPED_KINDS",
     "Alerter",
     "Delivery",
@@ -107,6 +117,11 @@ ALERT_KINDS: tuple[str, ...] = (
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
 #: Kinds that never touch the store.
 NON_STORE_KINDS: tuple[str, ...] = ("kill_switch_write_failed",)
+#: Run-scoped kinds that may also come with no run (before the run row exists,
+#: #1440 Q2), then deduped on (book, kind, session) among the run-less rows.
+RUNLESS_KINDS: tuple[str, ...] = ("run_failed",)
+#: Appended to the message of an alert stamped by the raw clock (#1440 Q1).
+RAW_CLOCK_NOTE = "alert stamped by the raw clock"
 
 _MASK = "***"
 #: The SMTP submission port, used when `ALERT_SMTP_HOST` names none.
@@ -179,13 +194,15 @@ class Alerter:
             raise ValueError(f"{kind} never touches the store: use deliver_without_store")
         if kind in SESSION_SCOPED_KINDS and run_id is not None:
             raise ValueError(f"{kind} has no run; got run {run_id}")
-        if kind not in SESSION_SCOPED_KINDS and run_id is None:
+        if kind not in (*SESSION_SCOPED_KINDS, *RUNLESS_KINDS) and run_id is None:
             raise ValueError(f"{kind} is run-scoped and needs a run id")
         message = self._scrub(message)
         existing = self._existing(kind, run_id, session, book_id)
         if existing is not None:
             return existing
-        now = self._now(clock_fault)
+        now, raw = self._stamp(clock_fault)
+        if raw is not None:
+            message = f"{message}; {RAW_CLOCK_NOTE} ({raw})"
         alert_id = journal.append(
             self._conn,
             AlertRow(
@@ -205,7 +222,7 @@ class Alerter:
                 outcome = Delivery("store", True)
             else:
                 outcome = self._deliver(channel, kind, message)
-            stamp = self._now(clock_fault)
+            stamp, _ = self._stamp(clock_fault)
             journal.append(
                 self._conn,
                 AlertDeliveryRow(
@@ -235,23 +252,27 @@ class Alerter:
     def _existing(self, kind: str, run_id: int | None, session: date, book_id: str) -> int | None:
         if run_id is None:
             rows = journal.alerts_for(self._conn, kind=kind, session=session, book_id=book_id)
-            return rows[0].alert_id if rows else None
+            runless = [row for row in rows if row.run_id is None]
+            return runless[0].alert_id if runless else None
         journal.require_journal(self._conn)
         row = self._conn.execute(
             "SELECT MIN(alert_id) FROM alerts WHERE kind = ? AND run_id = ?", [kind, run_id]
         ).fetchone()
         return None if row is None or row[0] is None else int(row[0])
 
-    def _now(self, clock_fault: bool) -> datetime:
+    def _stamp(self, clock_fault: bool) -> tuple[datetime, str | None]:
+        """The clock's reading in UTC and None, or `utc_now()` and why the raw
+        clock stamped it (a fault the caller named, or a clock that raised or
+        returned no tz-aware datetime)."""
         if clock_fault:
-            return utc_now()
+            return utc_now(), "clock fault"
         try:
             now = self._clock()
-            if not isinstance(now, datetime) or now.utcoffset() is None:
-                return utc_now()
-            return now.astimezone(UTC)
-        except Exception:
-            return utc_now()
+        except Exception as exc:
+            return utc_now(), f"clock raised {type(exc).__name__}"
+        if not isinstance(now, datetime) or now.utcoffset() is None:
+            return utc_now(), "clock returned no tz-aware datetime"
+        return now.astimezone(UTC), None
 
     def _deliver(self, channel: str, kind: str, message: str) -> Delivery:
         try:
