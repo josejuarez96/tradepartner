@@ -28,6 +28,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   the day's filings as usual; it needs `--source edgar` and no `--backfill`,
   prints the moved rows per table and each refused CIK, and a change inside
   an open paper window fails the run with nothing written.
+  `--restamp-window-earlier-ok PRECHECK` (#1497, T166e) takes the
+  pre-check file `scripts/restamp_precheck.py` wrote for the manifest's
+  release (from its name, `v<PARSER_VERSION>.<release>.manifest.csv`):
+  with it a late stamp inside the window moves earlier to its SGML time
+  when the file passes and still matches the store
+  (`ingest.restamp_from_manifest`); any other in-window change still fails
+  the run with nothing written.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -382,8 +389,10 @@ from tradepartner.ingest import (
     SOURCES,
     IngestResult,
     RestampResult,
+    WindowEarlierOk,
     _read,
     ingest_session,
+    manifest_release,
     read_manifest,
 )
 from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
@@ -1556,6 +1565,16 @@ def make_app(
                 help="move stored stamps per a stamps-repair manifest CSV (#1382); --source edgar",
             ),
         ] = None,
+        restamp_window_earlier_ok: Annotated[
+            Path | None,
+            typer.Option(
+                "--restamp-window-earlier-ok",
+                help=(
+                    "a passing pre-check JSON (scripts/restamp_precheck.py) that lets in-window "
+                    "late stamps move earlier to their SGML time (#1497); with --restamp-from"
+                ),
+            ),
+        ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -1588,6 +1607,16 @@ def make_app(
                 restamp = read_manifest(restamp_from)
             except (OSError, ValueError, KeyError) as exc:
                 raise _fail(f"--restamp-from: {exc}", USAGE_ERROR) from None
+        window_ok: WindowEarlierOk | None = None
+        if restamp_window_earlier_ok is not None:
+            if restamp_from is None:
+                raise _fail("--restamp-window-earlier-ok needs --restamp-from", USAGE_ERROR)
+            try:
+                window_ok = WindowEarlierOk.read(
+                    restamp_window_earlier_ok, release=manifest_release(restamp_from)
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                raise _fail(f"--restamp-window-earlier-ok: {exc}", USAGE_ERROR) from None
         named: list[str] | None = None
         if security is not None:
             if not fill_holes_:
@@ -1661,6 +1690,7 @@ def make_app(
                 rebuild_filing_events=rebuild_filing_events,
                 restamp=restamp,
                 on_restamp=restamped.append,
+                restamp_window_ok=window_ok,
             )
         _print_result(result)
         for done in restamped:
