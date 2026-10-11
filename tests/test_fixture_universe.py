@@ -91,6 +91,7 @@ _CSV_TABLES = (
     "corporate_actions",
     "facts",
     "statement_facts",
+    "rates",
 )
 
 #: Every statement-facts fixture case (#660, T76) as a keyword that must
@@ -109,6 +110,17 @@ _STATEMENT_FACTS_CASE_KEYWORDS = [
     "total_assets accepted after its gross-profit filing",
     "Acceptance stamps on an ordinary month-end",
     "Acceptance stamps on the half-day month-end",
+]
+
+
+#: Every rates fixture case (#1498, T169; the spec's "Fixture" paragraph).
+_RATES_CASE_KEYWORDS = [
+    "(a) Ordinary observation",
+    "(b) Vintage dated a Friday",
+    "(c) Exchange holiday",
+    "(d) Bank-holiday gap of two business days",
+    "(e) Revision",
+    "(f) Vintage dated a Saturday",
 ]
 
 
@@ -183,6 +195,7 @@ _DATE_COLUMNS = {
     "corporate_actions": {"ex_date"},
     "facts": {"as_of_date"},
     "statement_facts": {"period_end"},
+    "rates": {"observation_date", "vintage_date"},
 }
 _TZ_COLUMNS_COMMON = {"known_at", "ingested_at"}
 _EXTRA_TZ_COLUMNS = {"delistings": {"filed_at"}}
@@ -242,6 +255,7 @@ def test_timestamp_and_date_cell_formats() -> None:
         # (spec "Statement facts" > Schema), the deliberate exception to
         # every other table's known_at-keyed uniqueness above.
         ("statement_facts", ("cik", "fact_name", "period_end", "period_days")),
+        ("rates", ("series", "observation_date", "known_at")),
     ],
 )
 def test_no_unique_key_violations(table: str, unique_cols: tuple[str, ...]) -> None:
@@ -720,3 +734,81 @@ def test_five_acceptance_stamps() -> None:
         filed = [r for r in _statement_rows() if _known(r) == known_at]
         assert {r["cik"] for r in filed} == {cik}, known_at
         assert {r["fact_name"] for r in filed} == fact_names, known_at
+
+
+# --- rates (#1498, T169) ------------------------------------------------------
+
+
+def _rate_rows() -> list[dict[str, str]]:
+    with (_FIXTURES_DIR / "rates.csv").open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_readme_documents_every_rates_case() -> None:
+    readme = (_FIXTURES_DIR / "README.md").read_text()
+    missing = [kw for kw in _RATES_CASE_KEYWORDS if kw not in readme]
+    assert not missing, f"README missing rates case(s): {missing}"
+
+
+def test_every_rate_is_stamped_by_rate_known_at_and_ingested_ten_minutes_later() -> None:
+    """The generator computes the stamp from the calendar; the core's rule
+    (`adapters.rates.rate_known_at`) must agree on every row."""
+    from tradepartner.adapters.rates import rate_known_at
+
+    rows = _rate_rows()
+    assert rows
+    for row in rows:
+        known_at = datetime.fromisoformat(row["known_at"])
+        assert known_at == rate_known_at(date.fromisoformat(row["vintage_date"])), row
+        assert datetime.fromisoformat(row["ingested_at"]) == known_at + timedelta(minutes=10)
+        assert (row["series"], row["source"], row["provenance"]) == ("DTB3", "fred", "release")
+
+
+def test_rates_cover_every_fixture_session_and_stay_inside_the_window() -> None:
+    """The series starts at least five business days before the first fixture
+    session, so a rate is known at every bar's close, and no stamp is after
+    the fixture's last close; observations fall on sessions only."""
+    rows = _rate_rows()
+    observed = sorted({date.fromisoformat(r["observation_date"]) for r in rows})
+    stamps = sorted(datetime.fromisoformat(r["known_at"]) for r in rows)
+    with (_FIXTURES_DIR / "prices_daily.csv").open(newline="") as fh:
+        bar_sessions = sorted({date.fromisoformat(r["session"]) for r in csv.DictReader(fh)})
+    first, last = bar_sessions[0], bar_sessions[-1]
+    lead = first
+    for _ in range(5):
+        lead = previous_session(lead)
+    assert observed[0] <= lead
+    assert stamps[0] <= session_close(first)
+    assert stamps[-1] <= session_close(last)
+    assert all(is_session(day) for day in observed)
+
+
+def test_rates_holiday_and_bank_holiday_gap_have_no_observation() -> None:
+    observed = {date.fromisoformat(r["observation_date"]) for r in _rate_rows()}
+    assert date(2018, 11, 22) not in observed  # Thanksgiving, the exchange holiday
+    assert date(2018, 10, 8) not in observed and date(2018, 10, 9) not in observed
+    assert is_session(date(2018, 10, 8)) and is_session(date(2018, 10, 9))
+    # Every other session in the series' span has its observation.
+    span = [d for d in observed if d.year == 2018]
+    day, expected = min(span), set()
+    while day <= max(span):
+        expected.add(day)
+        day = next_session(day)
+    assert expected - observed == {date(2018, 10, 8), date(2018, 10, 9)}
+
+
+def test_rates_vintages_follow_the_next_business_day_except_the_cases() -> None:
+    """Ordinary vintage = the next session; the exceptions are exactly the
+    Saturday vintage (f), the observation before the bank holiday (d) and the
+    revision (e)."""
+    exceptions = []
+    for row in _rate_rows():
+        observed = date.fromisoformat(row["observation_date"])
+        vintage = date.fromisoformat(row["vintage_date"])
+        if vintage != next_session(observed):
+            exceptions.append((observed, vintage))
+    assert sorted(exceptions) == [
+        (date(2018, 6, 15), date(2018, 6, 16)),
+        (date(2018, 10, 5), date(2018, 10, 9)),
+        (date(2019, 3, 12), date(2019, 3, 20)),
+    ]

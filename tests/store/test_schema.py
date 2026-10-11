@@ -49,6 +49,7 @@ FACT_TABLES: tuple[str, ...] = (
     "facts",
     "statement_facts",
     "filing_events",
+    "rates",
 )
 
 
@@ -146,6 +147,13 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "form": "8-K",
             "items": "2.02,9.01",
             "accepted_at": known_at,
+        }
+    elif table == "rates":
+        business = {
+            "series": "DTB3",
+            "observation_date": date(2020, 1, 2),
+            "value": 1.52,
+            "vintage_date": date(2020, 1, 3),
         }
     else:
         raise ValueError(f"no minimal row defined for {table!r}")
@@ -588,7 +596,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (22,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (23,)
     finally:
         conn.close()
 
@@ -598,7 +606,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
 _V21_FILING_EVENTS_DDL_SHA256 = "aff98d8eecb42c4ffb6cf47d75d6e1976ff8d0ceb01f26becb1dee0de3f8730d"
 
 
-def test_filing_events_ddl_is_pinned_at_version_22() -> None:
+def test_filing_events_ddl_is_pinned_at_version_23() -> None:
     digest = hashlib.sha256("".join(schema._FILING_EVENTS_TABLE_DDL).encode()).hexdigest()
     assert digest == _V21_FILING_EVENTS_DDL_SHA256, (
         "filing_events DDL changed: bump the schema version and add a "
@@ -737,9 +745,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22]
+        assert _versions(conn) == [20, 21, 22, 23]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22]
+        assert _versions(conn) == [20, 21, 22, 23]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -785,6 +793,181 @@ def test_no_trial_path_reads_filing_events() -> None:
     assert all((src / package).is_dir() for package in _TRIAL_PATH_PACKAGES)
     assert (src / "backtest" / "signals.py").is_file()
     assert readers == []
+
+
+# --- rates (#1498, T169; schema version 23) ---------------------------
+
+_V23_RATES_DDL_SHA256 = "e8de7603d0baa3876d78ce45d3f083e747b00fd673d00b99f2692a5e18bc3b9f"
+
+
+def test_rates_ddl_is_pinned_at_version_23() -> None:
+    digest = hashlib.sha256("".join(schema._RATES_TABLE_DDL).encode()).hexdigest()
+    assert digest == _V23_RATES_DDL_SHA256, (
+        "rates DDL changed: bump the schema version and add a migration instead "
+        "of editing the table in place"
+    )
+
+
+def test_rates_is_a_release_fact_table_keyed_by_series_date_and_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The spec's columns plus the four common ones, `provenance = release`
+    only, UNIQUE `(series, observation_date, known_at)`, and nothing else (no
+    other constraint than the common two `CHECK`s); in `TABLE_NAMES` so the
+    look-ahead harness truncates it."""
+    assert "rates" in schema.TABLE_NAMES
+    assert "release" in schema.PROVENANCE_VALUES
+    assert schema.TABLE_PROVENANCE_VALUES["rates"] == ("release",)
+    assert [t for t, v in schema.TABLE_PROVENANCE_VALUES.items() if "release" in v] == ["rates"]
+    info = fixture_store.execute("PRAGMA table_info('rates')").fetchall()
+    assert [(row[1], row[2], bool(row[3])) for row in info] == [
+        ("series", "VARCHAR", True),
+        ("observation_date", "DATE", True),
+        ("value", "DOUBLE", True),
+        ("vintage_date", "DATE", True),
+        ("known_at", "TIMESTAMP WITH TIME ZONE", True),
+        ("ingested_at", "TIMESTAMP WITH TIME ZONE", True),
+        ("source", "VARCHAR", True),
+        ("provenance", "VARCHAR", True),
+    ]
+    constraints = fixture_store.execute(
+        "SELECT constraint_type, constraint_column_names, constraint_text "
+        "FROM duckdb_constraints() WHERE table_name = 'rates' AND constraint_type <> 'NOT NULL'"
+    ).fetchall()
+    assert sorted(c[0] for c in constraints) == ["CHECK", "CHECK", "UNIQUE"]
+    checks = sorted(c[2] for c in constraints if c[0] == "CHECK")
+    assert checks == sorted(
+        ["CHECK((provenance IN ('release')))", "CHECK((known_at <= ingested_at))"]
+    )
+    assert [set(c[1]) for c in constraints if c[0] == "UNIQUE"] == [
+        {"series", "observation_date", "known_at"}
+    ]
+
+
+def test_a_second_rates_row_for_a_key_raises(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """The same `(series, observation_date, known_at)` twice raises, even
+    with another value; a revision (another `known_at`) is a second row."""
+    now = _now()
+    insert_row(fixture_store, "rates", _minimal_row("rates", known_at=now, ingested_at=now))
+    again = _minimal_row("rates", known_at=now, ingested_at=now)
+    again["value"] = 1.60
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "rates", again)
+    later = now + timedelta(days=7)
+    revision = _minimal_row("rates", known_at=later, ingested_at=later)
+    revision["value"] = 1.60
+    revision["vintage_date"] = date(2020, 1, 10)
+    insert_row(fixture_store, "rates", revision)
+    assert fixture_store.execute(
+        "SELECT count(*) FROM rates WHERE source = 'test' AND series = 'DTB3' "
+        "AND observation_date = DATE '2020-01-02'"
+    ).fetchone() == (2,)
+
+
+@pytest.mark.parametrize("provenance", ["filing", "bar", "action", "snapshot", "snapshot_static"])
+def test_rates_refuses_every_other_provenance(
+    fixture_store: duckdb.DuckDBPyConnection, provenance: str
+) -> None:
+    now = _now()
+    row = _minimal_row("rates", known_at=now, ingested_at=now)
+    row["provenance"] = provenance
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "rates", row)
+
+
+def _version_22_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 22 left it: today's schema without `rates` and a
+    single version-22 row, holding a `prices_daily`, a `statement_facts` and a
+    `filing_events` row."""
+    configure_connection(conn)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO prices_daily VALUES ('S1', DATE '2020-01-02', 1, 1, 1, 1, 1, "
+        "TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
+        "'test', 'bar')"
+    )
+    conn.execute(
+        "INSERT INTO statement_facts VALUES ('0000000001', 'revenue', 'us-gaap:Revenues', "
+        "DATE '2019-01-01', DATE '2019-12-31', 364, 1.0, 'USD', '10-K', 'a1', 'reported', "
+        "FALSE, TIMESTAMPTZ '2020-02-03 21:00:00+00', TIMESTAMPTZ '2020-02-03 21:10:00+00', "
+        "'test', 'filing')"
+    )
+    conn.execute(
+        "INSERT INTO filing_events VALUES ('0000000001', 'a2', '8-K', '2.02', "
+        "TIMESTAMPTZ '2020-02-04 21:30:00+00', TIMESTAMPTZ '2020-02-04 21:30:00+00', "
+        "TIMESTAMPTZ '2020-02-04 21:40:00+00', 'test', 'filing')"
+    )
+    conn.execute("DROP TABLE rates")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (22, TIMESTAMPTZ "
+        "'2026-10-11 12:00:00+00')"
+    )
+
+
+def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
+    """From 22: `rates` appears, empty and shaped as a fresh store's; every
+    other table's DDL and every row are unchanged; the versions go to [22, 23]
+    and a second open adds nothing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_22_store(conn)
+        shape_before = _shape(conn)
+        tables_before = sorted(set(shape_before) - {"schema_version"})
+        rows_before = _all_rows(conn, tables_before)
+        assert "rates" not in shape_before
+        assert sum(len(rows) for rows in rows_before.values()) >= 3
+        schema.init_schema(conn)
+        shape_after = _shape(conn)
+        assert set(shape_after) - set(shape_before) == {"rates"}
+        assert {t: shape_after[t] for t in shape_before} == shape_before
+        assert _all_rows(conn, tables_before) == rows_before
+        assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
+        assert _versions(conn) == [22, 23]
+        schema.init_schema(conn)
+        assert _versions(conn) == [22, 23]
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        assert shape_after["rates"] == _shape(fresh)["rates"]
+        fresh.close()
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_22_store_passes_and_a_rates_read_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v22.duckdb"
+    conn = duckdb.connect(str(path))
+    _version_22_store(conn)
+    conn.close()
+    with duckdb.connect(str(path), read_only=True) as ro:
+        schema.init_schema(ro)
+        assert _versions(ro) == [22]
+        assert ro.execute("SELECT count(*) FROM filing_events").fetchone() == (1,)
+        with pytest.raises(duckdb.CatalogException):
+            ro.execute("SELECT * FROM rates")
+
+
+def test_the_fixture_store_holds_the_rates_series(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`rates.csv` loads: one `DTB3` series, `release` rows only, a rate
+    known at the close of the fixture's first session, and the one revised
+    key."""
+    assert fixture_store.execute(
+        "SELECT DISTINCT series, source, provenance FROM rates"
+    ).fetchall() == [("DTB3", "fred", "release")]
+    first_close = fixture_store.execute("SELECT min(known_at) FROM prices_daily").fetchone()
+    assert first_close is not None
+    known = fixture_store.execute(
+        "SELECT count(*) FROM rates WHERE known_at <= ?", [first_close[0]]
+    ).fetchone()
+    assert known is not None and known[0] >= 1
+    revised = fixture_store.execute(
+        "SELECT observation_date FROM rates GROUP BY ALL HAVING count(*) > 1"
+    ).fetchall()
+    assert revised == [(date(2019, 3, 12),)]
 
 
 # --- version 13 (#720, #1033, T85d): profitability rebalance columns ----
@@ -872,7 +1055,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (22,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (23,)
     finally:
         conn.close()
 
@@ -994,7 +1177,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -1491,7 +1674,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `signals.reason` prefix `CHECK` (#1153, T127) is version 14; the period keys
     (#1179, T97) are version 15; the lab migration (#1195, T113) is version 16;
     the ADR 0015 expansion seams (#1258, T132) are version 17."""
-    assert schema.CURRENT_SCHEMA_VERSION == 22
+    assert schema.CURRENT_SCHEMA_VERSION == 23
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
