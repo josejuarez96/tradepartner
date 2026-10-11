@@ -987,9 +987,9 @@ why = "New data to ingest needs a decision record; the stamp and the change-only
 unblocks = ["task:T171"]
 
 [task.T171]
-what = "The borrow_status table (schema version bump), the BorrowStatus record with its fetched_at guard, the pure parser over the recorder's payload shape and the change-only diff, with four fixture cases."
+what = "The borrow_status table (schema version bump), the BorrowStatus record with its fetched_at guard, the pure parser over the recorder's payload shape and the change-only diff, with six fixture cases."
 why = "The table, the record and the diff rule are what every later task and the look-ahead tests read."
-unblocks = ["task:T171b", "task:T171c"]
+unblocks = ["task:T171b", "task:T171c", "task:T171e"]
 
 [task.T171b]
 what = "The as-of read borrow_status_as_of (latest row per asset at or before T, vanished assets dropped, observed_at from the run cursor), the data-vintage list that leaves the new tables and spinoff rows out, the header's freshness reads, and the flip, vanish, rename and truncation-invariance cases."
