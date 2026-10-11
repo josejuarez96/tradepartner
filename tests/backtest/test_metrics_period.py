@@ -13,6 +13,7 @@ import math
 import pytest
 
 from tradepartner.backtest.metrics import METRIC_KEYS, series_metrics
+from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.backtest.schedule import PERIODS_PER_YEAR
 
 PPY = PERIODS_PER_YEAR["week_end"]
@@ -67,7 +68,7 @@ def _weekly(series: str = "strategy") -> dict[str, float | None]:
         spy_period_returns=SPY,
         mtum_period_returns=MTUM,
         periods_per_year=PPY,
-        risk_free_rate=RF,
+        risk_free_period_returns=constant_period_returns(RF, PPY, len(NET)),
     )
 
 
@@ -104,6 +105,7 @@ def test_every_key_matches_hand_computed_weekly_values() -> None:
         "kurtosis_period_excess_spy": _kurt(ex_spy),
         "n_periods": 6.0,
         "periods_per_year": 52.0,
+        "risk_free_annual": pytest.approx(RF, rel=1e-12),
     }
     assert set(expected) == set(METRIC_KEYS) == set(m)
     for key, value in expected.items():

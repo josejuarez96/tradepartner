@@ -25,11 +25,13 @@ from tradepartner.backtest.metrics import (
     red_flag,
     series_metrics,
 )
+from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.config import Settings
 
 BACKTEST_SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "backtest"
 METRICS_PY = BACKTEST_SRC / "metrics.py"
 SCHEDULE_PY = BACKTEST_SRC / "schedule.py"
+RISKFREE_PY = BACKTEST_SRC / "riskfree.py"
 
 NET = [0.02, -0.01, 0.03, 0.005]
 GROSS = [0.021, -0.009, 0.031, 0.006]
@@ -82,7 +84,7 @@ def _metrics(series: str = "strategy", rf: float = 0.0) -> dict[str, float | Non
         spy_period_returns=SPY,
         mtum_period_returns=MTUM,
         periods_per_year=12,
-        risk_free_rate=rf,
+        risk_free_period_returns=constant_period_returns(rf, 12, len(NET)),
     )
 
 
@@ -111,6 +113,7 @@ def test_metric_keys_are_exactly_the_spec_list() -> None:
         "kurtosis_period_excess_spy",
         "n_periods",
         "periods_per_year",
+        "risk_free_annual",
     )
     assert not any("monthly" in key or "months" in key for key in METRIC_KEYS)
     assert set(_metrics()) == set(METRIC_KEYS)
@@ -140,6 +143,7 @@ def test_every_key_matches_hand_computed_values() -> None:
         "kurtosis_period_excess_spy": _kurt(ex_spy),
         "n_periods": 4.0,
         "periods_per_year": 12.0,
+        "risk_free_annual": 0.0,
     }
     assert set(expected) == set(METRIC_KEYS)
     for key, value in expected.items():
@@ -185,7 +189,7 @@ def test_empty_turnover_is_zero() -> None:
         spy_period_returns=SPY,
         mtum_period_returns=MTUM,
         periods_per_year=12,
-        risk_free_rate=0.0,
+        risk_free_period_returns=[0.0] * len(NET),
     )
     assert m["turnover_period"] == 0.0
     assert m["turnover_annual"] == 0.0
@@ -219,7 +223,7 @@ def test_series_metrics_rejects_misaligned_or_degenerate_inputs(
         "spy_period_returns": SPY,
         "mtum_period_returns": MTUM,
         "periods_per_year": 12,
-        "risk_free_rate": 0.0,
+        "risk_free_period_returns": [0.0] * len(NET),
     }
     kwargs.update(override)
     with pytest.raises(ValueError):
@@ -476,6 +480,8 @@ def test_red_flag_threshold_comes_from_config() -> None:
 # allowed in `schedule.py` only.
 ALLOWED_LITERALS = {0, 1, -1, 2, 4, 10_000, 100}
 PERIODS_PER_YEAR_LITERALS = {12, 52, 252}
+#: `riskfree.py`: the day counts of the bill's yield conversion, named once there.
+DAY_COUNT_LITERALS = {365, 360, 91}
 
 
 def _stray_literals(path: Path, allowed: set[int]) -> list[tuple[int, object]]:
@@ -496,6 +502,12 @@ def test_metrics_module_has_no_stray_numeric_literals() -> None:
 
 def test_schedule_module_allows_only_the_periods_per_year_counts() -> None:
     assert _stray_literals(SCHEDULE_PY, ALLOWED_LITERALS | PERIODS_PER_YEAR_LITERALS) == []
+
+
+def test_riskfree_module_allows_only_the_day_counts() -> None:
+    assert _stray_literals(RISKFREE_PY, {0, 1, -1} | DAY_COUNT_LITERALS) == []
+    # With the day counts removed from the allowance the check has teeth.
+    assert {v for _, v in _stray_literals(RISKFREE_PY, {0, 1, -1})} == DAY_COUNT_LITERALS
 
 
 @pytest.mark.parametrize(
@@ -519,7 +531,7 @@ def test_zero_variance_series_refused_not_nan(
             spy_period_returns=spy,
             mtum_period_returns=MTUM,
             periods_per_year=12,
-            risk_free_rate=0.0,
+            risk_free_period_returns=[0.0] * len(monthly),
         )
 
 
@@ -534,7 +546,7 @@ def test_spy_series_equal_to_itself_is_fine() -> None:
         spy_period_returns=SPY,
         mtum_period_returns=MTUM,
         periods_per_year=12,
-        risk_free_rate=0.0,
+        risk_free_period_returns=[0.0] * len(SPY),
     )
     assert m["tracking_error_spy"] == 0.0
     assert m["sharpe_period_excess_spy"] is None
@@ -566,7 +578,7 @@ def test_non_finite_inputs_refused(override: dict[str, list[float]]) -> None:
         "spy_period_returns": SPY,
         "mtum_period_returns": MTUM,
         "periods_per_year": 12,
-        "risk_free_rate": 0.0,
+        "risk_free_period_returns": [0.0] * len(NET),
     }
     kwargs.update(override)
     with pytest.raises(ValueError, match="finite"):
@@ -602,7 +614,7 @@ def test_rounding_noise_excess_series_refused_as_zero_variance() -> None:
             spy_period_returns=spy,
             mtum_period_returns=MTUM,
             periods_per_year=12,
-            risk_free_rate=0.0,
+            risk_free_period_returns=[0.0] * len(net),
         )
 
 
@@ -631,7 +643,7 @@ def _with_family_benchmark(
         spy_period_returns=SPY,
         mtum_period_returns=MTUM,
         periods_per_year=12,
-        risk_free_rate=0.0,
+        risk_free_period_returns=[0.0] * len(NET),
         family_benchmark=benchmark,
     )
 
@@ -661,3 +673,83 @@ def test_family_benchmark_must_match_the_period_count_and_be_finite() -> None:
         _with_family_benchmark(("QUAL", QUAL[:3]))
     with pytest.raises(ValueError, match="finite"):
         _with_family_benchmark(("QUAL", [0.01, float("nan"), 0.0, 0.0]))
+
+
+# --- per-period risk-free input (T170) ---------------------------------------------
+
+RF_SERIES = [0.0010, 0.0012, 0.0008, 0.0011]
+
+
+def _with_rf(rf: list[float], series: str = "strategy") -> dict[str, float | None]:
+    return series_metrics(
+        series,  # type: ignore[arg-type]
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=SPY,
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_period_returns=rf,
+    )
+
+
+def test_a_varying_risk_free_series_moves_the_raw_keys_to_the_excess_series() -> None:
+    excess = _diff(NET, RF_SERIES)
+    m, base = _with_rf(RF_SERIES), _metrics()
+    assert m["sharpe_period"] == pytest.approx(_mean(excess) / _sample_std(excess), rel=1e-12)
+    assert m["sharpe_period"] < base["sharpe_period"]  # type: ignore[operator]
+    assert m["sharpe_annual"] == pytest.approx(m["sharpe_period"] * math.sqrt(12), rel=1e-15)  # type: ignore[operator]
+    assert m["skew_period"] == pytest.approx(_skew(excess), rel=1e-12)
+    assert m["kurtosis_period"] == pytest.approx(_kurt(excess), rel=1e-12)
+    assert m["skew_period"] != base["skew_period"]
+    expected_annual = math.prod(1 + r for r in RF_SERIES) ** (12 / 4) - 1
+    assert m["risk_free_annual"] == pytest.approx(expected_annual, rel=1e-12)
+
+
+def test_the_varying_series_leaves_every_other_key_and_the_excess_spy_keys_bitwise() -> None:
+    m, base = _with_rf(RF_SERIES), _metrics()
+    unchanged = set(METRIC_KEYS) - {
+        "sharpe_period",
+        "sharpe_annual",
+        "skew_period",
+        "kurtosis_period",
+        "risk_free_annual",
+    }
+    assert {k: m[k] for k in unchanged} == {k: base[k] for k in unchanged}
+    for k in EXCESS_SPY_KEYS:
+        assert m[k] == base[k]
+
+
+def test_the_raw_dsr_falls_with_the_series_and_the_excess_spy_basis_does_not() -> None:
+    m, base = _with_rf(RF_SERIES), _metrics()
+    pairs = [0.4, 0.9, 0.6]
+    raw = deflated_sharpe(m, "raw", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+    raw0 = deflated_sharpe(base, "raw", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+    assert raw.dsr < raw0.dsr
+    ex = deflated_sharpe(m, "excess_spy", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+    ex0 = deflated_sharpe(base, "excess_spy", n_trials=5, pair_sharpes=pairs, periods_per_year=12)
+    assert ex == ex0
+
+
+def test_a_constant_sequence_is_the_old_scalar_to_the_last_bit() -> None:
+    rf = 1.12 ** (1 / 12) - 1
+    old = _with_rf([rf] * len(NET))
+    excess = [v - rf for v in NET]
+    assert old["sharpe_period"] == pytest.approx(_mean(excess) / _sample_std(excess), rel=1e-12)
+    # Moments of a constant-shifted series are read off the returns: bit-identical.
+    assert old["skew_period"] == _metrics()["skew_period"]
+    assert old["kurtosis_period"] == _metrics()["kurtosis_period"]
+    assert old["risk_free_annual"] == pytest.approx(0.12, rel=1e-12)
+
+
+def test_risk_free_annual_is_on_every_series_and_zero_under_a_zero_rate() -> None:
+    for series in ("strategy", "SPY", "MTUM"):
+        assert _metrics(series)["risk_free_annual"] == 0.0
+
+
+def test_risk_free_sequence_must_match_the_periods_and_be_finite() -> None:
+    with pytest.raises(ValueError, match="risk_free_period_returns"):
+        _with_rf(RF_SERIES[:3])
+    with pytest.raises(ValueError, match="finite"):
+        _with_rf([0.001, float("nan"), 0.001, 0.001])
