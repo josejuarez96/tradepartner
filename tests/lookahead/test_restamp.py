@@ -67,6 +67,8 @@ def _early(true: datetime) -> datetime:
 A_INDEX = (f"{ACME}-18-000001", _true(2018, 3, 1))
 A_COVER = (f"{ACME}-19-000001", _true(2019, 3, 1))
 A_25NSE = (f"{EXCHANGE}-19-000007", _true(2019, 5, 1))
+# An 8-K12B before the 25-NSE: master relists ACME at the 25-NSE's stamp.
+A_8K12B = (f"{ACME}-19-000050", _true(2019, 4, 29))
 # DUAL's.
 D_INDEX = (f"{DUAL}-18-000001", _true(2018, 3, 2))
 D_COVER = (f"{DUAL}-19-000001", _true(2019, 3, 4))
@@ -80,6 +82,7 @@ def _source(
     dual_early: bool = True,
     dual_cover_at: datetime | None = None,
     statements: bool = False,
+    relisted: bool = False,
 ) -> FixtureFilingSource:
     """The cache: ACME's stamps early or repaired, DUAL's early by default."""
 
@@ -94,6 +97,11 @@ def _source(
         index=[
             FilingIndexEntry(ACME, "Acme Corp", "10-K", A_INDEX[0], acme(A_INDEX[1])),
             FilingIndexEntry(DUAL, "Dual Corp", "10-K", D_INDEX[0], dual(D_INDEX[1])),
+            *(
+                [FilingIndexEntry(ACME, "Acme Corp", "8-K12B", A_8K12B[0], acme(A_8K12B[1]))]
+                if relisted
+                else []
+            ),
         ],
         cover_pages=[
             CoverPage(
@@ -327,6 +335,41 @@ def test_the_form_25_nse_moves_by_the_exchange_files_cik_not_the_subjects(
     assert result.moved["securities"] == result.moved["facts"] == 0
 
 
+def test_a_relisting_stamped_by_the_exchange_filed_25_nse_moves_with_it(
+    settings: Settings,
+) -> None:
+    """quant-auditor on #1487: with an 8-K12B before the Form 25, master writes
+    the subject's relisting row at the 25-NSE's stamp, which the exchange's
+    stamps file holds. It moves with the 25-NSE's change, to where a fresh
+    build from the repaired cache puts it."""
+    store = _Store(settings.store.path)
+    status, message, _ = _ingest(settings, _source(acme_early=True, relisted=True), now=FIRST_RUN)
+    assert status == OK, message
+    assert _early(A_25NSE[1]) in store.known_ats("listings", ACME)
+    manifest = [
+        *_acme_manifest(),
+        ManifestChange(ACME, A_8K12B[0], _early(A_8K12B[1]), A_8K12B[1], "shift"),
+    ]
+
+    status, message, (result,) = _ingest(
+        settings, _source(acme_early=False, relisted=True), now=RESTAMP_RUN, restamp=manifest
+    )
+
+    assert status == OK, message
+    assert result.refused == {}
+    fresh_settings = settings.model_copy(
+        update={
+            "store": settings.store.model_copy(
+                update={"path": str(Path(settings.store.path).with_name("fresh.duckdb"))}
+            )
+        }
+    )
+    _ingest(fresh_settings, _source(acme_early=False, relisted=True), now=RESTAMP_RUN)
+    fresh = _Store(fresh_settings.store.path)
+    for table in RESTAMP_TABLES:
+        assert store.known_ats(table, ACME) == fresh.known_ats(table, ACME), table
+
+
 def test_unchanged_ciks_snapshot_rows_retractions_and_ingest_stamped_rows_stay_byte_identical(
     settings: Settings, early_store: _Store
 ) -> None:
@@ -421,8 +464,13 @@ def test_a_date_crossing_change_is_refused_and_listed_and_moves_none_of_its_cik(
     manifest = [*_acme_manifest(), ManifestChange(DUAL, D_COVER[0], old, crossing, "sgml")]
     dual_before = {t: early_store.known_ats(t, DUAL) for t in RESTAMP_TABLES}
 
+    # The cache holds DUAL's repaired stamp: the day's build writes none of
+    # the refused CIK's rows beside the stored ones.
     status, message, (result,) = _ingest(
-        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=manifest
+        settings,
+        _source(acme_early=False, dual_cover_at=crossing),
+        now=RESTAMP_RUN,
+        restamp=manifest,
     )
 
     assert status == OK, message
@@ -634,4 +682,13 @@ def test_read_manifest_reads_t166s_columns(tmp_path: Path) -> None:
     )
     path.write_text("cik,accession\n")
     with pytest.raises(ValueError, match="old_stamp"):
+        read_manifest(path)
+    header = ",".join(MANIFEST_FIELDS)
+    path.write_text(f"{header}\n{ACME},{A_COVER[0]}\n")
+    with pytest.raises(ValueError, match="too few fields"):
+        read_manifest(path)
+    path.write_text(
+        f"{header}\n1,{A_COVER[0]},{A_COVER[1].isoformat()},{A_COVER[1].isoformat()},kept,x\n"
+    )
+    with pytest.raises(ValueError, match="10 digits"):
         read_manifest(path)

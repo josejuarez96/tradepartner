@@ -527,11 +527,16 @@ def _print_result(result: IngestResult) -> None:
         )
 
 
-def _print_restamp(result: RestampResult) -> None:
+def _print_restamp(result: RestampResult, *, committed: bool) -> None:
     """A restamp's counts, then every refused CIK on its own line (#1382:
-    each needs an owner decision)."""
+    each needs an owner decision). Printed after the run, saying when the
+    chunk rolled back (a dry run or a failed run) so no count is taken as
+    written."""
     moved = ", ".join(f"{table} {count}" for table, count in result.moved.items())
-    typer.echo(f"restamp: {result.changes} changes; moved {moved}; refused {len(result.refused)}")
+    state = "" if committed else " (rolled back: nothing written)"
+    typer.echo(
+        f"restamp{state}: {result.changes} changes; moved {moved}; refused {len(result.refused)}"
+    )
     for cik, why in sorted(result.refused.items()):
         typer.echo(f"restamp refused {cik}: {why}")
 
@@ -1508,6 +1513,7 @@ def make_app(
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         restamp: list[ManifestChange] | None = None
+        restamped: list[RestampResult] = []
         if restamp_from is not None:
             if backfill_ or source != "edgar":
                 raise _fail(
@@ -1589,9 +1595,11 @@ def make_app(
                 rebuild_statement_facts=rebuild_statement_facts,
                 rebuild_filing_events=rebuild_filing_events,
                 restamp=restamp,
-                on_restamp=_print_restamp,
+                on_restamp=restamped.append,
             )
         _print_result(result)
+        for done in restamped:
+            _print_restamp(done, committed=result.ok and not dry_run)
         raise typer.Exit(result.exit_code)
 
     @app.command("backfill-benchmark")
