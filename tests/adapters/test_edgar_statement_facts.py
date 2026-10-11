@@ -25,6 +25,7 @@ from edgar_transport import EdgarRouter, edgar_settings
 from tradepartner.adapters.edgar import (
     StatementConflict,
     StatementFactsParse,
+    duration_class,
     parse_statement_facts,
 )
 from tradepartner.adapters.edgar_source import (
@@ -168,13 +169,63 @@ def test_ten_k_with_two_comparative_years_yields_three_keys_on_their_own_dates()
 
 
 def test_comparative_groups_on_exact_period_days_as_the_spec_reads() -> None:
-    """The Periods rule compares within one `period_days`: a leap-year
-    current column (365 days) and its prior year (364) are separate groups,
-    so the prior year is not flagged. Pinned as written; the open question
-    is on the PR."""
+    """#1034 inverts this pin: 365 and 364 days are one annual class."""
     result = parse(payload({"Revenues": [entry(K2020, FY2020, 300), entry(K2020, FY2019, 200)]}))
     flags = {r.period_end: (r.period_days, r.comparative) for r in result.records}
-    assert flags == {date(2020, 12, 31): (365, False), date(2019, 12, 31): (364, False)}
+    assert flags == {date(2020, 12, 31): (365, False), date(2019, 12, 31): (364, True)}
+
+
+def test_53_week_year_and_quarter_ytd_use_separate_duration_classes() -> None:
+    result = parse(
+        payload(
+            {
+                "Revenues": [
+                    entry(K2023, ("2021-12-26", "2022-12-31"), 370, filed="2024-02-23"),
+                    entry(K2023, ("2020-12-31", "2021-12-29"), 363, filed="2024-02-23"),
+                    entry(K2023, ("2023-10-01", "2023-12-31"), 90, filed="2024-02-23"),
+                    entry(K2023, ("2023-04-01", "2023-12-31"), 270, filed="2024-02-23"),
+                ]
+            }
+        )
+    )
+    annual = [r for r in result.records if r.period_days > 300]
+    assert {r.period_days: r.comparative for r in annual} == {370: False, 363: True}
+    assert all(not r.comparative for r in result.records if r.period_days < 300)
+
+
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [
+        (0, 0),  # instant
+        (59, 2),  # two-month 10-KT stub, apart from a quarter
+        *((d, 3) for d in (89, 90, 91, 97)),  # quarters, a 14-week quarter
+        *((d, 6) for d in (181, 182, 184, 188)),  # half-years
+        *((d, 9) for d in (272, 273, 275, 279)),  # nine-month year-to-date
+        *((d, 12) for d in (363, 364, 365, 370)),  # 52/53-week and leap years
+    ],
+)
+def test_duration_class_matches_the_spec_ranges(days: int, expected: int) -> None:
+    """The #1034 amendment's ranges: whole months, an instant is class 0."""
+    assert duration_class(days) == expected
+
+
+def test_a_ytd_ending_before_the_quarter_is_not_flagged_against_it() -> None:
+    """A quarter and a nine-month YTD are separate classes: the YTD ending
+    before the quarter is the only nine-month column, so it is not a
+    comparative. One merged sub-annual class would flag it."""
+    q = {"fy": 2022, "fp": "Q2", "form": "10-Q", "filed": "2022-07-29"}
+    result = parse(
+        payload(
+            {
+                "Revenues": [
+                    entry(Q2022, ("2022-04-01", "2022-06-30"), 90, **q),
+                    entry(Q2022, ("2021-07-01", "2022-03-31"), 270, **q),
+                ]
+            }
+        )
+    )
+    flags = {r.period_days: r.comparative for r in result.records}
+    assert flags == {90: False, 273: False}
 
 
 def test_misleading_fy_and_no_frame_still_land_on_the_entry_dates() -> None:
@@ -669,6 +720,21 @@ def test_switch_off_makes_no_call_no_request_and_no_cache(tmp_path: Path) -> Non
     source.facts(CIK, [SHARES])  # the shares path's payload read fills no statement cache
     assert source.requests == 1
     assert not _cache_dir(settings).exists()
+
+
+def test_cache_hit_recomputes_leap_year_comparative_by_duration_class(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    body = _company(
+        CIK, {"Revenues": {"USD": [entry(K2020, FY2020, 300), entry(K2020, FY2019, 200)]}}
+    )
+    source = _adapter(settings, _router(**{f"c{CIK}": body}))
+    _stamps(source, CIK, {K2020: ("10-K", ACCEPTANCE[K2020].accepted_at)})
+    source.statement_facts(CIK)
+    cached = _adapter(settings, EdgarRouter())
+    rows = {r.period_end: r for r in cached.statement_facts(CIK)}
+    assert cached.requests == 0
+    assert rows[date(2020, 12, 31)].comparative is False
+    assert rows[date(2019, 12, 31)].comparative is True
 
 
 def _conflicted() -> dict[str, Any]:
