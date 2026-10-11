@@ -353,6 +353,20 @@ def test_sweep_run_refuses_above_the_registry_size_limit(
     assert _counts(store) == before
 
 
+def test_sweep_run_refuses_a_window_reading_another_familys_exam(
+    store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1441: `DefaultWindowOverlapError` exits 2 as a refusal, writing nothing."""
+    assert _cli("sweep", "register", str(_sweep_file(tmp_path / "files"))).exit_code == 0
+    before = _counts(store)
+    monkeypatch.setattr(sweep, "exam_overlap_refusal", lambda *_args: "reads an exam")
+    out = _cli("sweep", "run", SLUG)
+    assert out.exit_code == 2, out.output
+    assert "reads an exam" in out.output
+    assert "rows written so far" not in out.output
+    assert _counts(store) == before
+
+
 # --- sweep status, report ---------------------------------------------------------------
 
 

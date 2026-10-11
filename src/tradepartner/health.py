@@ -48,6 +48,19 @@ here is this module's and is stated once:
   delisted at `t` (Forms 25 and 25-NSE; a transfer counts as delisted until its
   new listing is known, spec req 4), with ticker, exchange, class, form, filing
   time, end session and effective date.
+- **Listed with no bars after a Form 25** (`listed_without_bars`, #1460,
+  #828 item 5): securities whose current listing at `session` (as
+  `delisted_names` picks it) is listed, on an exchange (not `NONE` or `OTC`,
+  which the feed has no bars for), and starts after an earlier listing of
+  the same security that a Form 25 or 25-NSE ended, with no bar known at
+  `t` from that listing's `valid_from` through `session`. It is the known
+  limit of the master's 8-A12B/cover-page rules: a stale 10-K or 10-Q cover
+  page that still names the exchange after a real delisting reopens a
+  listed row with nothing behind it. One row per security, with the
+  current listing and the latest earlier delisting (form, filing time,
+  effective date). Report-only, like `delisted_names`: no rule reads it,
+  `health --check` does not fail on it, and it has no grace period, so a
+  genuine relisting whose first bars are not in yet shows until they are.
 - **Price jumps** (`price_jumps`): the owner's review list (#787),
   `store.asof.price_jumps_as_of` at `t` over every security: each one-day
   close move between traded bars outside the `universe` jump bounds that no
@@ -87,6 +100,14 @@ here is this module's and is stated once:
   not, since this is a reported figure, not one of the integrity rules
   below. A CLI warning, like the quarantined-count one `cli._quarantined`
   already prints, is T77b's to add alongside the run message it reads.
+
+- **Filing events** (`filing_events`, #1358, T164e): `edgar.filing_events_enabled`'s
+  state; the row count and latest `accepted_at` per form (every row in the
+  table, whatever its `known_at`: a count of the store, not a read at `t`);
+  `counts` is `filing_event_counts` of the latest EDGAR run's message, with a
+  warning while `items_missing` or `clock_suspect` is positive. Coverage is
+  reported, not thresholded. `clock_suspect` is the clock detector's rule
+  (a health finding, never a repair): a stamp that fits only a moved clock.
 
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
@@ -176,7 +197,16 @@ derived at `t`, as the data is read.
   `schema.STATEMENT_FACT_BASIS_VALUES` (`{reported, derived}`). The
   schema's own `CHECK` already blocks this too.
 
-This module holds no threshold; the only numbers in it are 0 and 1.
+- `filing_events_known_at_is_accepted_at`, `filing_events_form_allowed`
+  (`form` in `edgar.event_forms`), `filing_events_items_not_null` and
+  `filing_events_unique` (`(cik, accession)`), #1358, T164e. The schema's
+  `CHECK`, `NOT NULL` and `UNIQUE` already block three of them; the rules
+  restate them for a store built by other code. Narrowing `edgar.event_forms`
+  fails `filing_events_form_allowed` on the stored rows of a dropped form
+  until a `rebuild_filing_events`.
+
+This module holds no threshold; the only numbers in it are 0 and 1, and
+EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 """
 
 from __future__ import annotations
@@ -186,8 +216,9 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
@@ -198,7 +229,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
-from tradepartner.calendar import all_sessions, last_completed_session
+from tradepartner.calendar import all_sessions, is_session, last_completed_session
 from tradepartner.config import (
     _GUARDED_EXCLUDE_SIC_RANGES,
     Settings,
@@ -220,6 +251,7 @@ from tradepartner.store.delistings import (
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import STATEMENT_FACT_BASIS_VALUES, TABLE_PROVENANCE_VALUES
+from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import shares_as_of, universe_as_of
 
 STATIC = "snapshot_static"
@@ -246,6 +278,10 @@ UNDERIVED_MASTER_ROWS = "underived_master_rows"
 STATEMENT_PERIOD_DAYS = "statement_period_days"
 STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
 STATEMENT_BASIS_ALLOWED = "statement_basis_allowed"
+FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
+FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
+FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
+FILING_EVENTS_UNIQUE = "filing_events_unique"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -262,7 +298,18 @@ INTEGRITY_RULES: tuple[str, ...] = (
     STATEMENT_PERIOD_DAYS,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
     STATEMENT_BASIS_ALLOWED,
+    FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    FILING_EVENTS_FORM_ALLOWED,
+    FILING_EVENTS_ITEMS_NOT_NULL,
+    FILING_EVENTS_UNIQUE,
 )
+
+#: EDGAR's filing-date rule: a submission accepted on a business day after
+#: 17:30 New York is dated the next business day, one before it that day
+#: (#1358, "The clock"; T164's count found the cutoff holds for 8-Ks). A
+#: rule of the source, not a tunable threshold.
+EDGAR_FILING_DATE_CUTOFF = time(17, 30)
+_NEW_YORK = ZoneInfo("America/New_York")
 
 _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
 
@@ -319,6 +366,16 @@ _GAP_SCHEMA: dict[str, Any] = {
     "bars": pl.Int64,
     "missing_sessions": pl.Int64,
     "longest_run": pl.Int64,
+}
+_LISTED_WITHOUT_BARS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "exchange": pl.Utf8,
+    "class_title": pl.Utf8,
+    "valid_from": pl.Date,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "delisting_effective_on": pl.Date,
 }
 _DELISTED_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
@@ -413,6 +470,19 @@ class DelistedNames:
 
 
 @dataclass(frozen=True, eq=False)
+class ListedWithoutBars:
+    """Securities listed at `t` on a row that starts after a Form 25 and has
+    no bar known at `t` (#1460; module docstring), one row per security."""
+
+    frame: pl.DataFrame
+
+    @property
+    def count(self) -> int:
+        """How many securities are listed with no bars after a Form 25."""
+        return self.frame.height
+
+
+@dataclass(frozen=True, eq=False)
 class PriceJumps:
     """The price-jump review list at `t` (#787), one row per jump, only sessions
     before `before` when it is set."""
@@ -498,6 +568,29 @@ class StatementFacts:
 
 
 @dataclass(frozen=True, eq=False)
+class FilingEvents:
+    """Filing-events health (#1358, T164e; module docstring). `enabled` is
+    `edgar.filing_events_enabled`; `per_form` has one row per stored form
+    (`form`, `rows`, `latest_accepted_at`), empty when the table is; `counts`
+    is `filing_event_counts` of the latest EDGAR run's message, empty when it
+    names none."""
+
+    enabled: bool
+    per_form: pl.DataFrame
+    counts: dict[str, int]
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """The two warnings: `items_missing` and `clock_suspect`, each
+        while its count in the latest run is positive."""
+        return tuple(
+            f"filing_events_{name}: {self.counts[name]}"
+            for name in ("items_missing", "clock_suspect")
+            if self.counts.get(name, 0) > 0
+        )
+
+
+@dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
 
@@ -523,11 +616,13 @@ class HealthReport:
     unclassifiable: Unclassifiable
     static_reliance: StaticReliance
     delisted: DelistedNames
+    listed_without_bars: ListedWithoutBars
     price_jumps: PriceJumps
     shares_outliers: SharesOutliers
     accepted_same_day_pairs: AcceptedSameDayPairs
     settings: dict[str, Any]
     statement: StatementFacts
+    filing_events: FilingEvents
     integrity: tuple[IntegrityCheck, ...]
 
     @property
@@ -572,6 +667,7 @@ def health_report(
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
+        listed_without_bars=_listed_without_bars(conn, t, session, listings, current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
         accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
@@ -580,6 +676,7 @@ def health_report(
             "fill_price": settings.execution.fill_price,
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
+        filing_events=_filing_events_report(conn, settings, ingests),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps),
     )
 
@@ -707,6 +804,57 @@ def _statement_facts_report(
         enabled=enabled,
         coverage=_statement_coverage(conn, t, settings) if enabled else None,
         counts=statement_counts(message),
+    )
+
+
+#: `filing_events_<name>: <N>` (T164e's run-message convention, #1358).
+_EVENT_COUNT = re.compile(r"\bfiling_events_(\w+): (\d+)\b")
+
+_EVENT_FORM_SCHEMA: dict[str, Any] = {
+    "form": pl.Utf8,
+    "rows": pl.Int64,
+    "latest_accepted_at": pl.Datetime("us", "UTC"),
+}
+
+
+def filing_event_counts(message: str | None) -> dict[str, int]:
+    """Every `filing_events_<name>: <N>` figure in an EDGAR run's message
+    (T164e, #1358), keyed by `name` with the prefix stripped. Empty when
+    `message` is `None` or names none (the switch has always been off)."""
+    if not message:
+        return {}
+    return {name: int(n) for name, n in _EVENT_COUNT.findall(message)}
+
+
+def clock_suspect(accepted_at: datetime, filed: date) -> bool:
+    """The clock detector (#1358, "The clock"): whether a stamp fits only a
+    moved clock, given the submissions payload's filing date. Early: accepted
+    on a session before `EDGAR_FILING_DATE_CUTOFF` New York and dated a later
+    day. Late: accepted on a New York date after its filing date. A health
+    finding, never a repair; it catches only the moves that cross the
+    filing-date rule."""
+    local = ensure_tz_aware_utc(accepted_at, field_name="accepted_at").astimezone(_NEW_YORK)
+    day = local.date()
+    if day > filed:
+        return True
+    return is_session(day) and local.time() < EDGAR_FILING_DATE_CUTOFF and filed > day
+
+
+def _filing_events_report(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, ingests: tuple[IngestStatus, ...]
+) -> FilingEvents:
+    message = next((i.latest_message for i in ingests if i.source == "edgar"), None)
+    if "filing_events" in _present_tables(conn):
+        found = conn.execute(
+            "SELECT form, count(*), max(accepted_at) FROM filing_events GROUP BY form ORDER BY form"
+        ).fetchall()
+    else:
+        found = []
+    rows = [{"form": f, "rows": int(n), "latest_accepted_at": at} for f, n, at in found]
+    return FilingEvents(
+        enabled=settings.edgar.filing_events_enabled,
+        per_form=pl.DataFrame(rows, schema=_EVENT_FORM_SCHEMA),
+        counts=filing_event_counts(message),
     )
 
 
@@ -952,6 +1100,71 @@ def _delisted_names(current: dict[str, dict[str, Any]]) -> DelistedNames:
     return DelistedNames(frame=pl.DataFrame(rows, schema=_DELISTED_SCHEMA))
 
 
+def listed_without_bars(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> ListedWithoutBars:
+    """Securities listed at `t` on an exchange row that starts after a
+    Form 25 and has no bar known at `t` since (#1460; module docstring),
+    sorted by id. A bare date raises `TypeError`, a naive datetime
+    `ValueError`."""
+    t = _validate_t(t)
+    session = last_completed_session(t)
+    listings = listing_ends_as_of(conn, t, settings)
+    return _listed_without_bars(conn, t, session, listings, _current_from(listings, session))
+
+
+def _listed_without_bars(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    listings: pl.DataFrame,
+    current: dict[str, dict[str, Any]],
+) -> ListedWithoutBars:
+    delisted_before: dict[str, dict[str, Any]] = {}
+    for row in listings.iter_rows(named=True):
+        now = current.get(row["security_id"])
+        if (
+            now is None
+            or now["status"] != LISTED
+            or now["exchange"] in OFF_EXCHANGE
+            or row["status"] != DELISTED
+            or row["valid_from"] >= now["valid_from"]
+        ):
+            continue
+        held = delisted_before.get(row["security_id"])
+        if held is None or row["valid_from"] > held["valid_from"]:
+            delisted_before[row["security_id"]] = row
+    if not delisted_before:
+        return ListedWithoutBars(frame=pl.DataFrame([], schema=_LISTED_WITHOUT_BARS_SCHEMA))
+    ids = sorted(delisted_before)
+    marks = ", ".join("?" for _ in ids)
+    last_bar: dict[str, date] = {}
+    for sid, latest in conn.execute(
+        f"""
+        SELECT security_id, max(session) FROM prices_daily
+        WHERE known_at <= ? AND session <= ? AND security_id IN ({marks})
+        GROUP BY security_id
+        """,
+        [t, session, *ids],
+    ).fetchall():
+        last_bar[sid] = latest
+    rows = [
+        {
+            "security_id": sid,
+            "ticker": current[sid]["ticker"],
+            "exchange": current[sid]["exchange"],
+            "class_title": current[sid]["class_title"],
+            "valid_from": current[sid]["valid_from"],
+            "delisting_form": delisted_before[sid]["delisting_form"],
+            "delisting_filed_at": delisted_before[sid]["delisting_filed_at"],
+            "delisting_effective_on": delisted_before[sid]["effective_on"],
+        }
+        for sid in ids
+        if sid not in last_bar or last_bar[sid] < current[sid]["valid_from"]
+    ]
+    return ListedWithoutBars(frame=pl.DataFrame(rows, schema=_LISTED_WITHOUT_BARS_SCHEMA))
+
+
 def integrity_checks(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
 ) -> tuple[IntegrityCheck, ...]:
@@ -986,6 +1199,7 @@ def _integrity_checks(
         STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
+        **_filing_event_rules(conn, settings),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -1411,3 +1625,50 @@ def _statement_basis_allowed(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
     ).fetchall()
     rows = [{"basis": basis, "rows": int(n)} for basis, n in found]
     return pl.DataFrame(rows, schema=_STATEMENT_BASIS_SCHEMA)
+
+
+_EVENT_KEY_SCHEMA: dict[str, Any] = {"cik": pl.Utf8, "accession": pl.Utf8, "rows": pl.Int64}
+_EVENT_FORM_RULE_SCHEMA: dict[str, Any] = {"form": pl.Utf8, "rows": pl.Int64}
+
+
+def _filing_event_rules(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> dict[str, pl.DataFrame]:
+    """The four `filing_events` rules (module docstring, #1358): offending
+    keys (`cik`, `accession`, rows) or, for the form rule, forms and their
+    row counts. A store without the table passes all four."""
+    if "filing_events" not in _present_tables(conn):
+        return {
+            FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT: pl.DataFrame(schema=_EVENT_KEY_SCHEMA),
+            FILING_EVENTS_FORM_ALLOWED: pl.DataFrame(schema=_EVENT_FORM_RULE_SCHEMA),
+            FILING_EVENTS_ITEMS_NOT_NULL: pl.DataFrame(schema=_EVENT_KEY_SCHEMA),
+            FILING_EVENTS_UNIQUE: pl.DataFrame(schema=_EVENT_KEY_SCHEMA),
+        }
+
+    def keys(where: str, group: str = "") -> pl.DataFrame:
+        found = conn.execute(
+            f"SELECT cik, accession, count(*) FROM filing_events {where} "
+            f"GROUP BY cik, accession {group} ORDER BY cik, accession"
+        ).fetchall()
+        rows = [{"cik": c, "accession": a, "rows": int(n)} for c, a, n in found]
+        return pl.DataFrame(rows, schema=_EVENT_KEY_SCHEMA)
+
+    forms = list(settings.edgar.event_forms)
+    marks = ", ".join("?" for _ in forms)
+    found = conn.execute(
+        f"""
+        SELECT form, count(*) FROM filing_events
+        WHERE form IS NULL OR form NOT IN ({marks})
+        GROUP BY form ORDER BY form NULLS FIRST
+        """,
+        forms,
+    ).fetchall()
+    bad_forms = pl.DataFrame(
+        [{"form": f, "rows": int(n)} for f, n in found], schema=_EVENT_FORM_RULE_SCHEMA
+    )
+    return {
+        FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT: keys("WHERE known_at IS DISTINCT FROM accepted_at"),
+        FILING_EVENTS_FORM_ALLOWED: bad_forms,
+        FILING_EVENTS_ITEMS_NOT_NULL: keys("WHERE items IS NULL"),
+        FILING_EVENTS_UNIQUE: keys("", "HAVING count(*) > 1"),
+    }

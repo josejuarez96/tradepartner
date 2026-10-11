@@ -21,11 +21,20 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from pydantic import ValidationError
 
-from tradepartner.calendar import all_sessions, last_session_of_month, session_close
+from tradepartner.calendar import (
+    all_sessions,
+    last_completed_session,
+    last_session_of_month,
+    session_close,
+)
 from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
+    FILING_EVENTS_FORM_ALLOWED,
+    FILING_EVENTS_ITEMS_NOT_NULL,
+    FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    FILING_EVENTS_UNIQUE,
     GUARDED_SIC_DEFAULT,
     INTEGRITY_RULES,
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
@@ -40,11 +49,14 @@ from tradepartner.health import (
     STATEMENT_PERIOD_DAYS,
     HealthReport,
     bar_gaps,
+    clock_suspect,
     coverage,
     delisted_names,
+    filing_event_counts,
     health_report,
     integrity_checks,
     last_ingests,
+    listed_without_bars,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -516,6 +528,89 @@ def test_transfer_counts_as_delisted_before_the_new_listing_is_known(
 ) -> None:
     ids = delisted_names(fixture_store, T_TRANSFER_PROBE, settings).frame["security_id"]
     assert "SEC_TRANSFER" in ids.to_list()
+
+
+# --- Listed with no bars after a Form 25 (#1460, #828 item 5) ----------------
+
+#: SEC_25NSE (NSEX, NYSE) is delisted by a 25-NSE effective 2018-09-02 and
+#: has no bar after it (fixture README). A stale cover page reopens it.
+REOPENED_ON = date(2019, 3, 1)
+
+
+def _reopen(conn: duckdb.DuckDBPyConnection, exchange: str = "NYSE") -> None:
+    insert_row(conn, "listings", _listing_row("SEC_25NSE", "NSEX", exchange, REOPENED_ON))
+
+
+def test_fixture_store_has_no_listed_row_without_bars_after_a_form25(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    found = listed_without_bars(fixture_store, T_END, settings)
+    assert found.count == 0
+    assert found.frame.is_empty()
+
+
+def test_stale_cover_page_after_a_form25_is_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    found = listed_without_bars(fixture_store, T_END, settings)
+    assert found.count == 1
+    row = found.frame.row(0, named=True)
+    assert row["security_id"] == "SEC_25NSE"
+    assert row["ticker"] == "NSEX"
+    assert row["exchange"] == "NYSE"
+    assert row["valid_from"] == REOPENED_ON
+    assert row["delisting_form"] == "25-NSE"
+    assert row["delisting_effective_on"] == date(2018, 9, 2)
+    # Report-only: the full report carries it and still passes every rule.
+    report = health_report(fixture_store, T_END, settings)
+    assert report.listed_without_bars.count == 1
+    assert report.ok, report.failures
+
+
+def test_reopened_row_is_not_counted_before_it_is_known(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    before = session_close(REOPENED_ON) - timedelta(seconds=1)
+    assert listed_without_bars(fixture_store, before, settings).count == 0
+    assert listed_without_bars(fixture_store, session_close(REOPENED_ON), settings).count == 1
+
+
+def test_reopened_row_with_a_bar_since_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _reopen(fixture_store)
+    bar_day = date(2019, 3, 4)
+    # A late bar: known 12 hours after its session's close.
+    known = session_close(bar_day) + timedelta(hours=12)
+    insert_row(fixture_store, "prices_daily", _bar("SEC_25NSE", bar_day, known=known))
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
+    # The bar counts only from its own known_at, not from its session.
+    early = session_close(bar_day) + timedelta(hours=1)
+    assert last_completed_session(early) == bar_day
+    assert listed_without_bars(fixture_store, early, settings).count == 1
+    assert listed_without_bars(fixture_store, known, settings).count == 0
+
+
+@pytest.mark.parametrize("exchange", ["NONE", "OTC"])
+def test_off_exchange_row_after_a_form25_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings, exchange: str
+) -> None:
+    # The normal suspension / OTC quote sequence: the feed has no OTC bars.
+    _reopen(fixture_store, exchange)
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
+
+
+def test_listed_row_with_no_earlier_form25_is_not_counted(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    # A new listing with no bars and no prior delisting is coverage's
+    # business, not this count's.
+    insert_row(
+        fixture_store, "listings", _listing_row("SEC_NEW_NOBARS", "NEWX", "NYSE", REOPENED_ON)
+    )
+    assert listed_without_bars(fixture_store, T_END, settings).count == 0
 
 
 # --- Integrity rules, one injected violation each ----------------------------
@@ -1781,3 +1876,171 @@ def test_statement_integrity_rules_pass_on_a_version_8_store(
     ):
         check = next(c for c in report.integrity if c.rule == rule)
         assert check.passed, rule
+
+
+# --- Filing events (#1358, T164e) -------------------------------------------
+
+_EVENT_RULES = (
+    FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
+    FILING_EVENTS_FORM_ALLOWED,
+    FILING_EVENTS_ITEMS_NOT_NULL,
+    FILING_EVENTS_UNIQUE,
+)
+
+
+def _event(accession: str, *, form: str = "8-K", items: str | None = "2.02") -> dict[str, Any]:
+    known = datetime(2020, 3, 2, 21, 0, tzinfo=UTC)
+    return {
+        "cik": "CIK0001000011",
+        "accession": accession,
+        "form": form,
+        "items": items,
+        "accepted_at": known,
+        "known_at": known,
+        "ingested_at": known,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _only_failure(conn: duckdb.DuckDBPyConnection, rule: str, settings: Settings) -> Any:
+    report = health_report(conn, T_END, settings)
+    check = next(c for c in report.integrity if c.rule == rule)
+    assert not check.passed
+    for other in report.integrity:
+        if other.rule != rule:
+            assert other.passed, other.rule
+    return check.violations
+
+
+def test_filing_events_report_counts_per_form_and_the_switch(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The fixture's three 8-K rows; the switch's state; no counts while no
+    run names any."""
+    report = health_report(fixture_store, T_END, _settings(edgar={"filing_events_enabled": True}))
+    events = report.filing_events
+    assert events.enabled is True
+    assert events.per_form.to_dicts() == [
+        {
+            "form": "8-K",
+            "rows": 3,
+            "latest_accepted_at": datetime(2020, 5, 12, 13, 0, tzinfo=UTC),
+        }
+    ]
+    assert events.counts == {}
+    assert events.warnings == ()
+    assert health_report(fixture_store, T_END, _settings()).filing_events.enabled is False
+
+
+def test_filing_events_report_reads_the_last_runs_counts_with_the_two_warnings(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    message = (
+        "10 securities; filing_events_added: 3, filing_events_not_yet_known: 1, "
+        "filing_events_unstamped: 2, filing_events_items_missing: 4, "
+        "filing_events_clock_suspect: 5; missing benchmarks: none"
+    )
+    _run(fixture_store, "r-events", "edgar", "ok", T_END - timedelta(hours=1), message=message)
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.filing_events.counts == {
+        "added": 3,
+        "not_yet_known": 1,
+        "unstamped": 2,
+        "items_missing": 4,
+        "clock_suspect": 5,
+    }
+    assert report.filing_events.warnings == (
+        "filing_events_items_missing: 4",
+        "filing_events_clock_suspect: 5",
+    )
+    assert filing_event_counts(None) == {}
+    assert filing_event_counts("statement_added: 3") == {}
+
+
+def test_filing_events_rules_pass_on_the_fixture_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    report = health_report(fixture_store, T_END, settings)
+    for rule in _EVENT_RULES:
+        assert next(c for c in report.integrity if c.rule == rule).passed, rule
+
+
+def test_filing_events_rules_pass_on_a_store_without_the_table(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    fixture_store.execute("DROP TABLE filing_events")
+    report = health_report(fixture_store, T_END, settings)
+    for rule in _EVENT_RULES:
+        assert next(c for c in report.integrity if c.rule == rule).passed, rule
+    assert report.filing_events.per_form.is_empty()
+
+
+def test_known_at_not_the_acceptance_fails_its_rule(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    row = _event("ACC-E1")
+    row["known_at"] = row["accepted_at"] - timedelta(days=1)  # the `filed`-date trap
+    insert_row(loose_store, "filing_events", row)
+    violations = _only_failure(loose_store, FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT, settings)
+    assert violations.to_dicts() == [{"cik": "CIK0001000011", "accession": "ACC-E1", "rows": 1}]
+
+
+def test_a_form_outside_event_forms_fails_its_rule(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    insert_row(fixture_store, "filing_events", _event("ACC-E2", form="8-K/A"))
+    narrowed = _settings(edgar={"event_forms": ["8-K"]})
+    violations = _only_failure(fixture_store, FILING_EVENTS_FORM_ALLOWED, narrowed)
+    assert violations.to_dicts() == [{"form": "8-K/A", "rows": 1}]
+    report = health_report(fixture_store, T_END, _settings())
+    assert next(c for c in report.integrity if c.rule == FILING_EVENTS_FORM_ALLOWED).passed
+
+
+def test_null_items_fails_its_rule(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(loose_store, "filing_events", _event("ACC-E3", items=None))
+    violations = _only_failure(loose_store, FILING_EVENTS_ITEMS_NOT_NULL, settings)
+    assert violations["accession"].to_list() == ["ACC-E3"]
+
+
+def test_a_duplicate_accession_fails_its_rule(
+    loose_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    insert_row(loose_store, "filing_events", _event("ACC-E4"))
+    insert_row(loose_store, "filing_events", _event("ACC-E4", items="5.02"))
+    violations = _only_failure(loose_store, FILING_EVENTS_UNIQUE, settings)
+    assert violations.to_dicts() == [{"cik": "CIK0001000011", "accession": "ACC-E4", "rows": 2}]
+
+
+@pytest.mark.parametrize(
+    ("accepted_at", "filed"),
+    [
+        # The fixture's three rows (T164b): the 16:05 New York trap filed the
+        # same session, the 20:30 one filed the next day, the 09:00 `5.02`.
+        (datetime(2020, 4, 30, 20, 5, tzinfo=UTC), date(2020, 4, 30)),
+        (datetime(2020, 5, 6, 0, 30, tzinfo=UTC), date(2020, 5, 6)),
+        (datetime(2020, 5, 12, 13, 0, tzinfo=UTC), date(2020, 5, 12)),
+        # A Saturday filing is dated the next business day: not a moved clock.
+        (datetime(2020, 5, 2, 14, 0, tzinfo=UTC), date(2020, 5, 4)),
+    ],
+)
+def test_the_clock_detector_flags_nothing_on_true_stamps(
+    accepted_at: datetime, filed: date
+) -> None:
+    assert clock_suspect(accepted_at, filed) is False
+
+
+@pytest.mark.parametrize(
+    ("accepted_at", "filed"),
+    [
+        # Early: 13:40 New York on session 2021-11-03, dated 11-04 (the
+        # amendment's CIK 0000077877 example).
+        (datetime(2021, 11, 3, 17, 40, tzinfo=UTC), date(2021, 11, 4)),
+        # Late: stamped 20:30 New York on 04-30, a day after its 04-29 filing date.
+        (datetime(2020, 5, 1, 0, 30, tzinfo=UTC), date(2020, 4, 29)),
+    ],
+)
+def test_the_clock_detector_flags_a_moved_stamp(accepted_at: datetime, filed: date) -> None:
+    assert clock_suspect(accepted_at, filed) is True

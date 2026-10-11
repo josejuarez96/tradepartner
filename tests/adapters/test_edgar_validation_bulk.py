@@ -110,7 +110,9 @@ def test_a_bad_submissions_member_or_page_is_recorded_and_never_topped_up(
         bulk.writestr(f"CIK{ALPHABET}.json", "not json")
     router = _router()
     router.add(BULK_URL, buffer.getvalue())
-    settings = edgar_settings(tmp_path / "cache", bulk_stamp_threshold_ciks=2)
+    settings = edgar_settings(
+        tmp_path / "cache", bulk_stamp_threshold_ciks=2, bulk_stamps_enabled=True
+    )
     source = _source(settings, router)
     entries = source.filing_index()
     assert sorted(_failures(source)) == [

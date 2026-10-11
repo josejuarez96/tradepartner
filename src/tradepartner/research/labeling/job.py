@@ -482,10 +482,25 @@ def batch_shortlist(
     )
 
 
+def _pre_fix_rule_answer(row: Mapping[str, Any]) -> crosswalk.RuleAnswer | None:
+    """A seed row's pre-fix rule answer from the gold export's `pre_fix_*` columns
+    (#1351; `gold.lock_gold` writes them), `None` on a row with none."""
+    status = row.get("pre_fix_status")
+    if status is None:
+        return None
+    return crosswalk.RuleAnswer(
+        status=status,
+        relisted=bool(row.get("pre_fix_relisted")),
+        successor_id=row.get("pre_fix_successor_id"),
+        form15_in_window=bool(row.get("pre_fix_form15_in_window")),
+    )
+
+
 def scored_items(
     rows: Sequence[Mapping[str, Any]], records: Iterable[Mapping[str, Any]]
 ) -> list[scoring.ScoredItem]:
-    """One `ScoredItem` per gold row: the owner's labels against the final answer."""
+    """One `ScoredItem` per gold row: the owner's labels against the final answer,
+    and a seed's pre-fix rule answer (`seeded_recall`, #1351)."""
     last = final_records(records)
     items = []
     for row in rows:
@@ -506,6 +521,7 @@ def scored_items(
                 else None,
                 is_seed=is_seed,
                 in_random_draw=True if in_draw is None else bool(in_draw),
+                pre_fix_rule_answer=_pre_fix_rule_answer(row) if is_seed else None,
             )
         )
     return items
@@ -545,6 +561,7 @@ def gold_metrics(
         "unresolved_share": scoring.unresolved_share(items),
         "unlabelled_share": scoring.unlabelled_share(items),
         "seeded_recall": scoring.seeded_recall(items),
+        "seeded_report": [dataclasses.asdict(o) for o in scoring.seeded_report(items)],
         "per_option": {
             name: dataclasses.asdict(value)
             for name, value in scoring.per_option_precision_recall(items).items()

@@ -972,6 +972,17 @@ def _exclusion(tmp_path: Path) -> Path:
     return path
 
 
+def _seeds(tmp_path: Path) -> Path:
+    """A seed file (#1351) naming one listing end the gold frame lacks."""
+    path = tmp_path / "seeds.csv"
+    path.write_text(
+        "listing_end_id,status,relisted,successor_id,form15_in_window,code_version,issue\n"
+        "NO-SUCH-SEED,listed,false,,false,f2b5261,#921\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _label_cases(s: Settings, *, stop_after: int | None = None) -> None:
     """What the page does in gold mode: resume the session (no store connection) and
     answer cases in order."""
@@ -1022,6 +1033,8 @@ def _gold_cli(s: Settings, tmp_path: Path, launcher: Launcher, *extra: str) -> R
         str(GOLD_N),
         "--exclude",
         str(_exclusion(tmp_path)),
+        "--seeds",
+        str(_seeds(tmp_path)),
         *extra,
         launcher=launcher,
     )
@@ -1038,6 +1051,9 @@ def test_gold_builds_launches_and_locks_a_complete_session(s: Settings, tmp_path
     assert result.exit_code == 0, result.output
     assert len(seen) == 1
     assert "exclusion: 1 accessions matched, 1 issuer CIKs, 1 rows removed" in result.output
+    assert "seeds: 0 of 1 in the frame, 0 gated (row 6 or 7)" in result.output
+    assert "seeds the frame does not hold (dropped): NO-SUCH-SEED" in result.output
+    assert "no gated seed: seeded_recall will be null (no claim)" in result.output
     assert f"gold session: {GOLD_N} cases (30 dev, 5 pilot), {GOLD_N} open" in result.output
     lock = json.loads((gold.session_path(s).with_name("lock.json")).read_text())
     assert (
@@ -1134,7 +1150,7 @@ def test_gold_refuses_while_an_inference_file_exists(s: Settings, tmp_path: Path
 def test_gold_a_new_session_needs_its_flags(s: Settings) -> None:
     result = _cli(s, "research", "gold", "--seed", "7")
     assert result.exit_code == 2
-    assert "needs --frame, --seed and --exclude" in result.output
+    assert "needs --frame, --seed, --exclude and --seeds" in result.output
 
 
 @contextmanager

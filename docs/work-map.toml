@@ -997,6 +997,25 @@ why = "The event signal is only as point-in-time as this read; the filed-date tr
 what = "The ingest write, the config switch and keys, the health count, and the first real-store run under a named data release."
 why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
 
+[task.T166]
+what = "The pure rules of the EDGAR stamps repair: New York's offset, the filing-date rule, the per-CIK class from SGML probes, the audit sample and stop rule, the manifest row."
+why = "Stamps written from the 2026-10-01 bulk zip are early for thousands of CIKs, and an early stamp is a look-ahead (#1382); the SGML header is the only per-filing truth."
+unblocks = ["task:T166a", "task:T166b"]
+
+[task.T166a]
+what = "The driver that applies the repair rules to the stamps cache: frozen inputs, a backup, the SGML reads, the manifest, a dry run first."
+why = "The cache is what every later ingest stamps from, so it is repaired once, resumably, with a record of every change."
+unblocks = ["task:T166c"]
+
+[task.T166b]
+what = "Restamp the store from the repair manifest: only rows whose known_at is a changed stamp move, in one transaction; retractions, revisions and every other row stay as they are, security ids unchanged."
+why = "A repaired cache changes nothing in the store until the rows that carry its stamps move, and a delete-and-reinsert would lose rows the cache cannot reproduce."
+unblocks = ["task:T166c"]
+
+[task.T166c]
+what = "The owner's repair release restamp-1382: repair, rebuild, health check, the trial records (B3 trial 3 re-run, trial 4 checked and not re-run) and the evidence on #1382."
+why = "Closes #1382 so the B9 work and T164e's real-store run can read filing times that are point in time."
+
 [issue.1358]
 what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
 why = "Fast paper books need candidates with days-to-weeks horizons; these two are the report's best, written up with priors, costs at our scale, kill rules and the data and engine work each needs, before anything is built."

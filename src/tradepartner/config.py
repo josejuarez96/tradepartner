@@ -292,6 +292,12 @@ class EdgarConfig(BaseModel):
     index_first_year: int = Field(default=1993, ge=1993)
     index_settle_days: int = Field(default=3, ge=0)
     bulk_stamp_threshold_ciks: int = Field(default=500, gt=0)
+    # #1382 guard: SEC's `submissions.zip` serves `acceptanceDateTime` moved by
+    # New York's UTC offset (early for many CIKs, a look-ahead), so stamps never
+    # come from it unless this is turned on; above the threshold, stamping goes
+    # per CIK like below it. Turn on only once the zip is shown to match the
+    # SGML header again (data-foundation plan, the #1382 repair task).
+    bulk_stamps_enabled: bool = False
     cover_page_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"], min_length=1
     )
@@ -346,6 +352,18 @@ class EdgarConfig(BaseModel):
         min_length=1,
     )
     statement_units: list[str] = Field(default_factory=lambda: ["USD"], min_length=1)
+    # T164e (#1358, spec amendment 2026-10-09): filing events. While the
+    # switch is off the ingest never asks `filing_events`, so the adapter makes
+    # no request and no cache write for it and no row is added. It stays off
+    # until the real-store run has passed and the owner has closed #1382 (the
+    # stamps clock: an early stamp is a look-ahead for an event read). Only a
+    # form in `event_forms` is ever a row; never empty. Narrowing it later
+    # fails `health --check` on the stored rows of a dropped form until a
+    # rebuild (the amendment's open question 12).
+    filing_events_enabled: bool = False
+    event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["8-K", "8-K/A"], min_length=1
+    )
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
@@ -1397,9 +1415,12 @@ class RiskConfig(BaseModel):
     whole-share sell were accepted (`min_order_notional`, Alpaca's documented $1);
     position quantities equalled the summed 9-decimal fills exactly
     (`reconcile_quantity_tolerance`); `cash` is reported in cents and moved within
-    $0.0022 of the six fills' exact value (`reconcile_cash_tolerance`; its scaling with
-    the fill count is the owner's question in #1290). After the
-    first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
+    $0.0022 of the six fills' exact value. `reconcile_cash_tolerance` was widened from
+    0.01 to 1.26 by ADR 0010's amendment of 2026-10-10 (#1290, owner's option (b)):
+    if Alpaca rounds each fill to the cent, the ledger drifts by up to $0.005 per fill,
+    so the band is 0.005 x `max_orders_per_run` (250) + 0.01. The value is a fixed
+    default, not derived at run time; a window keeps the value it froze at `paper start`.
+    After the first `paper start` any change to a default is a new ADR (ADR 0010 point 5).
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1418,7 +1439,7 @@ class RiskConfig(BaseModel):
     clock_max_sessions_late: int = Field(default=1, ge=0)
     max_broker_clock_skew_seconds: float = Field(default=60.0, ge=0)
     reconcile_quantity_tolerance: float = Field(default=1e-6, ge=0)
-    reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
+    reconcile_cash_tolerance: float = Field(default=1.26, ge=0)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper

@@ -31,6 +31,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
@@ -46,7 +47,7 @@ from tradepartner.adapters.prices import (
     bar_known_at,
 )
 from tradepartner.config import Settings, secret_values
-from tradepartner.health import statement_counts
+from tradepartner.health import filing_event_counts, statement_counts
 from tradepartner.ingest import (
     DARK,
     FACT_NAMES,
@@ -2998,3 +2999,186 @@ def test_under_the_lock_each_cik_is_one_cache_read_and_the_proxy_holds_no_record
         ("gross_profit", FY18[1], 40),
         ("revenue", FY18[1], 100),
     ]
+
+
+# --- filing events (amendment 2026-10-09, #1358; plan T164e) ----------------
+
+#: The fixture's three 8-K shapes (T164b), for ACME in 2019, before `NOW`: the
+#: 16:05 New York `2.02,9.01` whose `filed` date is its session (the trap),
+#: the 20:30 one (the lag case) and a `5.02` before the open.
+EVENTS = (
+    FilingEvent(
+        ACME, f"{ACME}-19-000101", "8-K", "2.02,9.01", datetime(2019, 5, 1, 20, 5, tzinfo=UTC)
+    ),
+    FilingEvent(
+        ACME, f"{ACME}-19-000102", "8-K", "2.02,9.01", datetime(2019, 5, 7, 0, 30, tzinfo=UTC)
+    ),
+    FilingEvent(ACME, f"{ACME}-19-000103", "8-K", "5.02", datetime(2019, 5, 13, 13, 0, tzinfo=UTC)),
+)
+
+
+class _EventSource(FixtureFilingSource):
+    """`_filings()` with filing events, recording each `filing_events` call
+    and exposing the adapter's three counts as plain attributes."""
+
+    def __init__(self, events: Sequence[FilingEvent] = EVENTS) -> None:
+        base = _filings()
+        super().__init__(
+            index=base._index,
+            snapshot=base._snapshot,
+            facts=base._facts,
+            headers=base._headers,
+            cover_pages=base._cover_pages,
+            delistings=base._delistings,
+            filing_events=events,
+        )
+        self.event_calls: list[str] = []
+        self.filing_events_unstamped = 2
+        self.filing_events_items_missing = 1
+        self.filing_events_clock_suspect = 0
+
+    def filing_events(self, cik: str) -> list[FilingEvent]:
+        self.event_calls.append(cik)
+        return super().filing_events(cik)
+
+
+def _events_on(settings: Settings, on: bool = True) -> Settings:
+    edgar = settings.edgar.model_copy(update={"filing_events_enabled": on})
+    return settings.model_copy(update={"edgar": edgar})
+
+
+def _event_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read(
+        "SELECT cik, accession, form, items, accepted_at, known_at FROM filing_events "
+        "ORDER BY accepted_at"
+    )
+
+
+def test_the_fixture_run_stores_the_three_rows_at_their_acceptances(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    source = _EventSource()
+    run = _edgar(on, source)
+    assert _event_rows(read) == [
+        (e.cik, e.accession, e.form, e.items, e.accepted_at, e.accepted_at) for e in EVENTS
+    ]
+    assert read("SELECT DISTINCT ingested_at, source, provenance FROM filing_events") == [
+        (NOW, "edgar", "filing")
+    ]
+    assert filing_event_counts(run.message) == {
+        "added": 3,
+        "not_yet_known": 0,
+        "unstamped": 2,
+        "items_missing": 1,
+        "clock_suspect": 0,
+    }
+    # The fetch pass asks every issuer CIK once, the write phase once more.
+    assert source.event_calls == [ACME, DUAL, ACME, DUAL]
+
+
+def test_an_events_rerun_adds_zero_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource())
+    before = _event_rows(read)
+    again = _edgar(on, _EventSource())
+    assert filing_event_counts(again.message)["added"] == 0
+    assert _event_rows(read) == before
+
+
+def test_events_switch_off_asks_nothing_and_adds_no_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The default: the ingest never asks `filing_events`, so the adapter
+    makes no request and no cache write for it, and no row is added."""
+    assert settings.edgar.filing_events_enabled is False
+    source = _EventSource()
+    run = _edgar(settings, source)
+    assert source.event_calls == []
+    assert "filing_events_" not in run.message
+    assert read("SELECT count(*) FROM filing_events") == [(0,)]
+    with pytest.raises(ValueError, match="filing_events_enabled"):
+        _run(settings, filings=source, source="edgar", rebuild_filing_events=True)
+    assert source.event_calls == []
+    assert read("SELECT count(*) FROM filing_events") == [(0,)]
+
+
+def test_an_events_dry_run_writes_nothing(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _run(on)  # the store and its other tables, with no events
+    runs_before = read("SELECT count(*) FROM ingestion_runs")
+    result = _run(on, filings=_EventSource(), source="edgar", dry_run=True)
+    assert result.ok
+    assert result.runs[0].message.startswith("dry run")
+    assert read("SELECT count(*) FROM filing_events") == [(0,)]
+    assert read("SELECT count(*) FROM ingestion_runs") == runs_before
+
+
+def test_a_record_accepted_after_the_clock_is_skipped_and_counted(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Never clamped, never fatal: no row until a run whose clock has passed it."""
+    late = FilingEvent(ACME, f"{ACME}-19-000104", "8-K", "2.02", NOW + timedelta(hours=3))
+    on = _events_on(settings)
+    run = _edgar(on, _EventSource((*EVENTS, late)))
+    assert filing_event_counts(run.message)["not_yet_known"] == 1
+    assert late.accession not in [r[1] for r in _event_rows(read)]
+    later = _run(
+        on, filings=_EventSource((*EVENTS, late)), source="edgar", now=NOW + timedelta(days=1)
+    )
+    assert later.ok
+    assert filing_event_counts(later.runs[0].message)["added"] == 1
+    assert _event_rows(read)[-1][4:] == (late.accepted_at, late.accepted_at)
+
+
+def test_a_form_outside_event_forms_is_never_a_row(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    amended = FilingEvent(
+        ACME, f"{ACME}-19-000105", "8-K/A", "2.02", datetime(2019, 5, 2, 12, tzinfo=UTC)
+    )
+    on = _events_on(settings)
+    edgar = on.edgar.model_copy(update={"event_forms": ["8-K"]})
+    _edgar(on.model_copy(update={"edgar": edgar}), _EventSource((*EVENTS, amended)))
+    assert [r[2] for r in _event_rows(read)] == ["8-K", "8-K", "8-K"]
+
+
+def test_the_rebuild_deletes_and_reinserts_and_records_the_counts(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    on = _events_on(settings)
+    _edgar(on, _EventSource(EVENTS[:2]))
+    rebuilt = _edgar(on, _EventSource(EVENTS), rebuild_filing_events=True)
+    counts = filing_event_counts(rebuilt.message)
+    assert (counts["before"], counts["added"], counts["after"]) == (2, 3, 3)
+    assert read("SELECT DISTINCT ingested_at FROM filing_events") == [(NOW,)]
+    assert len(_event_rows(read)) == 3
+
+
+def test_a_failed_rebuild_rolls_back_the_delete_with_the_chunk(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    read: Callable[[str], list[tuple[Any, ...]]],
+) -> None:
+    """The delete and the re-insert are one transaction: a failure after the
+    delete leaves every earlier row in place."""
+    on = _events_on(settings)
+    _edgar(on, _EventSource())
+    before = _event_rows(read)
+
+    def broken(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("insert failed")
+
+    monkeypatch.setattr(ingest_module, "_insert_event_frame", broken)
+    result = _run(on, filings=_EventSource(), source="edgar", rebuild_filing_events=True)
+    assert result.runs[0].status == FAILED
+    assert _event_rows(read) == before
+
+
+def test_the_rebuild_needs_the_edgar_source(settings: Settings) -> None:
+    with pytest.raises(ValueError, match="edgar source"):
+        _run(_events_on(settings), source="alpaca", rebuild_filing_events=True)

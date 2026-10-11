@@ -153,7 +153,7 @@ and `store.registry.code_version`, and prints through the `cli_record` scrub:
   (`frame.register`, on an `open_for_write` connection) or prints the `dataset
   register` line that would.
 - `tradepartner research gold [--frame <id> --seed <s> [--n 150] --exclude
-  <csv>] [--lock]` builds the gold session (`gold.build_gold_session`, the
+  <csv> --seeds <csv>] [--lock]` builds the gold session (`gold.build_gold_session`, the
   frame's export read at its content address in the research store and checked
   against the row's SHA-256) or, with no flags, resumes
   it (`gold.open_gold_session`, which refuses flags that differ from the
@@ -384,7 +384,7 @@ from tradepartner.research.experiment import (
 from tradepartner.research.gates import Flags as ResearchFlags
 from tradepartner.research.gates import Reasons as ResearchReasons
 from tradepartner.research.labeling import frame as labeling_frame
-from tradepartner.research.labeling import gold, job, review
+from tradepartner.research.labeling import gold, job, review, scoring
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, REVERSED_OPTION_SET
 from tradepartner.retract import RetractRefused, master_retract
 from tradepartner.store import (
@@ -603,6 +603,13 @@ def _print_report(report: HealthReport) -> None:
     echo(f"delisted names: {report.delisted.count}")
     for row in report.delisted.frame.iter_rows(named=True):
         echo(f"  {row['security_id']} {row['ticker']} {row['exchange']} ended {row['end_session']}")
+    reopened = report.listed_without_bars
+    echo(f"listed with no bars after a Form 25: {reopened.count}")
+    for row in reopened.frame.iter_rows(named=True):
+        echo(
+            f"  {row['security_id']} {row['ticker']} {row['exchange']} from {row['valid_from']} "
+            f"(form {row['delisting_form']} effective {row['delisting_effective_on']})"
+        )
     jumps = report.price_jumps
     shown = "" if jumps.before is None else f" before {jumps.before.isoformat()}"
     echo(f"price jumps{shown}: {jumps.pending.height} to review, {jumps.frame.height} in all")
@@ -807,6 +814,7 @@ _SWEEP_RUN_REFUSALS = (
     lab.NoCodeVintage,
     lab_queries.SweepNotCompleteError,
     registry.UnmarkedStoreRefused,
+    lab_sweep.DefaultWindowOverlapError,
 )
 
 
@@ -2834,6 +2842,10 @@ def make_app(
         exclude: Annotated[
             Path | None, typer.Option(help="the exclusion CSV (new session)")
         ] = None,
+        seeds: Annotated[
+            Path | None,
+            typer.Option(help="the seeded error set CSV with pre-fix rule answers (new session)"),
+        ] = None,
         lock: Annotated[
             bool, typer.Option("--lock", help="lock a complete session; opens no page")
         ] = False,
@@ -2841,22 +2853,25 @@ def make_app(
         """Label the gold sample on the local review page: build the session, or resume
         it with no flags; the session is locked once every case is answered."""
         s = settings()
-        given = any(v is not None for v in (frame, seed, n, exclude))
+        given = any(v is not None for v in (frame, seed, n, exclude, seeds))
         if lock and given:
             raise _fail("--lock runs alone, on the existing session", USAGE_ERROR)
         path = gold.session_path(s)
         try:
             if path.exists():
                 session = gold.open_gold_session(
-                    path, gold.GoldFlags(frame, seed, n, exclude), settings=s
+                    path, gold.GoldFlags(frame, seed, n, exclude, seeds), settings=s
                 )
             elif lock:
                 raise _fail(f"no gold session at {path} to lock", USAGE_ERROR)
             else:
-                if frame is None or seed is None or exclude is None:
+                if frame is None or seed is None or exclude is None or seeds is None:
                     raise _fail(
-                        "a new gold session needs --frame, --seed and --exclude", USAGE_ERROR
+                        "a new gold session needs --frame, --seed, --exclude and --seeds",
+                        USAGE_ERROR,
                     )
+                seed_file = gold.read_seed_file(seeds)
+                seed_cases = seed_file.seeds
                 if (missing := _store_missing(s)) is not None:
                     raise missing
                 with open_read_only(s) as conn:
@@ -2871,6 +2886,8 @@ def make_app(
                     GOLD_N_DEFAULT if n is None else n,
                     exclude,
                     settings=s,
+                    seed_cases=seed_cases,
+                    seeds_sha256=seed_file.sha256,
                 )
                 session = built.session
                 x = built.exclusion
@@ -2880,6 +2897,18 @@ def make_app(
                 )
                 if x.unmatched:
                     typer.echo(f"  accessions matching no frame row: {', '.join(x.unmatched)}")
+                gated = [c for c in session.seed_cases.values() if c.row in scoring.GATED_SEED_ROWS]
+                typer.echo(
+                    f"seeds: {len(session.seed_cases)} of {len(seed_cases)} in the frame, "
+                    f"{len(gated)} gated (row 6 or 7)"
+                )
+                if not gated:
+                    typer.echo("  no gated seed: seeded_recall will be null (no claim)")
+                if built.seed_cases_missing:
+                    typer.echo(
+                        f"  seeds the frame does not hold (dropped): "
+                        f"{', '.join(built.seed_cases_missing)}"
+                    )
             if lock:
                 _settle_gold(session, s, recovery=True)
                 return

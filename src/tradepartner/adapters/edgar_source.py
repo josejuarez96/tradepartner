@@ -46,11 +46,15 @@ without `items` after the refresh is terminal and counted.
 
 **Stamping.** A row's `known_at` is its SEC acceptance instant from the
 submissions payloads, never its index filing date. Accessions not in the
-cache are stamped from one `submissions.zip` download when they belong to
-more than `edgar.bulk_stamp_threshold_ciks` CIKs, and per CIK otherwise
-(older pages fetched only while accessions remain unstamped); the zip is
-rebuilt about 03:00 ET, so after a bulk pass the CIKs still unstamped get
-the per-CIK fetch. A row still unstamped is excluded and reported on
+cache are stamped per CIK (older pages fetched only while accessions remain
+unstamped). Only with `edgar.bulk_stamps_enabled` on (default off, #1382:
+the zip's `acceptanceDateTime` is moved by New York's UTC offset, early for
+many CIKs, so a zip stamp can be a look-ahead) are they stamped from one
+`submissions.zip` download when they belong to more than
+`edgar.bulk_stamp_threshold_ciks` CIKs; the zip is rebuilt about 03:00 ET,
+so after a bulk pass the CIKs still unstamped get the per-CIK fetch. The
+items refresh (above) reads the zip under `reuse_cached` but writes `items`
+only, never an `accepted_at`. A row still unstamped is excluded and reported on
 `.unstamped_filings`; it is cached as unstampable (and not re-fetched) only
 when its quarter had settled before the per-CIK fetch that lacked it.
 
@@ -680,8 +684,9 @@ class EdgarFilingSource(FilingSource):
         pending = {cik: {a for a in rows if a not in stamps[cik]} for cik, rows in kept.items()}
         pending = {cik: wanted for cik, wanted in pending.items() if wanted}
         unparsed: set[str] = set()
-        if len(pending) > self._settings.edgar.bulk_stamp_threshold_ciks:
-            unparsed = self._stamp_bulk(pending, stamps)
+        edgar = self._settings.edgar
+        if edgar.bulk_stamps_enabled and len(pending) > edgar.bulk_stamp_threshold_ciks:
+            unparsed = self._stamp_bulk(pending, stamps)  # #1382: off by default
         for cik, wanted in pending.items():
             wanted -= stamps[cik].keys()
             if not wanted or cik in unparsed:
