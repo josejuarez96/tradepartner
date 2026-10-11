@@ -175,7 +175,9 @@ from tradepartner.adapters.filings import (
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
 from tradepartner.calendar import (
+    is_session,
     last_completed_session,
+    next_session,
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
@@ -201,8 +203,8 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
+from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of, session_of
-from tradepartner.store.restamp_precheck import window_first_session
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -985,6 +987,21 @@ class RestampResult:
 
 def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
+
+
+def window_first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
+    """The earliest first session of any open paper window (one with no
+    `closed` or `abandoned` stop): the XNYS session on or after its
+    `started_at`'s New York date. None when no window is open."""
+    started = conn.execute(
+        "SELECT min(started_at) FROM paper_windows WHERE window_id NOT IN "
+        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
+        [list(CLOSING_STOP_STATES)],
+    ).fetchone()
+    if started is None or started[0] is None:
+        return None
+    day = _ny_date(ensure_tz_aware_utc(started[0], field_name="started_at"))
+    return day if is_session(day) else next_session(day)
 
 
 #: The rows a restamp may move in every table: EDGAR-sourced, `filing`
