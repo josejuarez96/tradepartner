@@ -1105,6 +1105,18 @@ def _earlier_ok(change: ManifestRow, first: date, instants: Sequence[datetime]) 
     )
 
 
+def _crosses(change: ManifestRow, instants: Sequence[datetime]) -> bool:
+    """True when a read instant `t` lies between the change's stamps, in
+    either direction (`new <= t < old` or `old <= t < new`): a paper decision
+    at `t` would read the row differently after the move. A row dated before
+    the window's first session can still cross one (`close(S-1)`, a window's
+    `started_at`), so this is checked for every changed row (#1522)."""
+    return bool(
+        crossed_instants(change.old_stamp, change.new_stamp, instants)
+        or crossed_instants(change.new_stamp, change.old_stamp, instants)
+    )
+
+
 def restamp_from_manifest(
     conn: duckdb.DuckDBPyConnection,
     changes: Sequence[ManifestRow],
@@ -1149,8 +1161,12 @@ def restamp_from_manifest(
     passes for this release and window start and still matches the store
     (`_window_ok_refusal`, else `RestampAborted` naming the cache backup),
     when T166f's `in_window_change_allowed` allows it (an `sgml` move earlier
-    by at most New York's offset), and when no read instant `t` of the file
-    has `new <= t < old`; any other in-window change aborts as without it.
+    by at most New York's offset); any other in-window change aborts as
+    without it. Whenever a window is open, with or without `window_ok`, any
+    changed row, in or before the window, whose move crosses one of the
+    store's read instants (`restamp_precheck.read_instants`) aborts the run
+    (`_crosses`, both directions; #1522: a row dated S-1 can cross
+    `close(S-1)`).
     The refusals below apply to the in-window changes as to any. After the writes, a changed set of
     `security_id`s in any table raises `RuntimeError`, so the caller's
     transaction rolls back (the restamp never mints an id)."""
@@ -1162,6 +1178,17 @@ def restamp_from_manifest(
         if why is not None:
             raise RestampAborted(why)
     if first is not None:
+        instants = read_instants(conn)
+        crossing = [c for c in moving if _crosses(c, instants)]
+        if crossing:
+            listed = "; ".join(
+                f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"
+                for c in crossing
+            )
+            raise RestampAborted(
+                f"{len(crossing)} manifest change(s) cross a read instant of the open paper "
+                f"window (first session {first.isoformat()}): {listed}"
+            )
         inside = [
             c for c in moving if _ny_date(c.old_stamp) >= first or _ny_date(c.new_stamp) >= first
         ]

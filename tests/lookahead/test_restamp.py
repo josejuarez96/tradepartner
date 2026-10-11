@@ -914,3 +914,63 @@ def test_manifest_release_reads_the_cache_drivers_name(tmp_path: Path) -> None:
     for bad in ("manifest.csv", f"v{PARSER_VERSION + 1}.r.manifest.csv", "v1.r.csv"):
         with pytest.raises(ValueError):
             manifest_release(tmp_path / bad)
+
+
+# --- A row dated S-1 that crosses close(S-1) (#1522's finding, T166e) ---
+
+# A window started 08:00 New York on Thu 2019-05-02: first session 05-02,
+# S-1 = 05-01, close(S-1) = 20:00Z 05-01 (a mark run of 05-02 read the store then).
+S1_WINDOW_STARTED = datetime(2019, 5, 2, 12, tzinfo=UTC)
+S1_CLOSE = datetime(2019, 5, 1, 20, tzinfo=UTC)
+S1_TRUE = datetime(2019, 5, 1, 17, tzinfo=UTC)  # 13:00 New York
+
+
+def _s1_store(settings: Settings, stored_at: datetime) -> _Store:
+    """The 25-NSE stored at `stored_at` on S-1, a window open with a mark run."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=False, nse_at=stored_at), now=FIRST_RUN
+    )
+    assert status == OK, message
+    _open_window(settings, S1_WINDOW_STARTED)
+    _mark_run(settings, date(2019, 5, 2))
+    return _Store(settings.store.path)
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_s_minus_1_row_crossing_close_s_minus_1_aborts_with_and_without_the_precheck(
+    settings: Settings, tmp_path: Path, flag: bool
+) -> None:
+    stored = datetime(2019, 5, 1, 21, tzinfo=UTC)  # 17:00 New York: after the close
+    store = _s1_store(settings, stored)
+    ok = _precheck(settings, tmp_path) if flag else None
+    assert ok is None or (ok.precheck.passed and S1_CLOSE in ok.precheck.instants)
+    before = _snapshot(store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False, nse_at=S1_TRUE),
+        now=RESTAMP_RUN,
+        restamp=[ManifestRow(EXCHANGE, A_25NSE[0], stored, S1_TRUE, "sgml", "test")],
+        restamp_window_ok=ok,
+    )
+    assert status != OK and "cross a read instant" in message and A_25NSE[0] in message
+    assert results == []
+    assert _snapshot(store) == before
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_s_minus_1_row_crossing_no_instant_still_applies(
+    settings: Settings, tmp_path: Path, flag: bool
+) -> None:
+    stored = datetime(2019, 5, 1, 19, tzinfo=UTC)  # 15:00 New York: before the close
+    store = _s1_store(settings, stored)
+    ok = _precheck(settings, tmp_path) if flag else None
+    status, message, (result,) = _ingest(
+        settings,
+        _source(acme_early=False, nse_at=S1_TRUE),
+        now=RESTAMP_RUN,
+        restamp=[ManifestRow(EXCHANGE, A_25NSE[0], stored, S1_TRUE, "sgml", "test")],
+        restamp_window_ok=ok,
+    )
+    assert status == OK, message
+    assert result.refused == {} and result.moved["delistings"] == 1
+    assert store.known_ats("delistings", ACME) == {S1_TRUE}
