@@ -42,6 +42,7 @@ from tradepartner.backtest.results import (
     metric_rows,
     write_results,
 )
+from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import FAMILIES, Cadence, Settings
@@ -316,7 +317,9 @@ class TestMetrics:
             spy_period_returns=_monthly(base, "SPY"),
             mtum_period_returns=_monthly(base, "MTUM"),
             periods_per_year=12,
-            risk_free_rate=settings.metrics.risk_free_rate,
+            risk_free_period_returns=constant_period_returns(
+                settings.metrics.risk_free_rate, 12, len(_monthly(base, "strategy"))
+            ),
         )
         assert _metrics(conn, handle.trial_id, "strategy", BASE) == pytest.approx(expected)
 
@@ -1229,3 +1232,33 @@ class TestFamilyBenchmarks:
             assert results_module.family_series(family) == ("strategy", "SPY", "MTUM")
         with pytest.raises(KeyError):
             results_module.family_series("nosuch")
+
+
+#: sha256 of every metric row (series, level, key, value as repr) except `risk_free_annual`,
+#: for the fixture run below, taken on the code before `series_metrics` took a per-period
+#: risk-free sequence (T170). The H1 twin's metrics must not move.
+PINNED_METRIC_DIGESTS = {
+    0.0: "ddcaebf4a22ec4f2d808d3ea09210e24408e960e88dd77a3a60378ea6dbb14ef",
+    0.02: "8b68e637b8bb2c55538ce52925a269ced8bc422a8c9d4b4caa8577bc6ae8809d",
+}
+
+
+@pytest.mark.parametrize("rate", [0.0, 0.02])
+def test_every_pre_existing_metric_row_is_byte_identical(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path, rate: float
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={"metrics": settings.metrics.model_copy(update={"risk_free_rate": rate})}
+    )
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    results = _run(settings, handle)
+    rows = metric_rows(results, settings, cadence="month_end", family="momentum")
+    kept = [
+        f"{r.series}|{r.cost_per_side_bps}|{r.metric}|{r.value!r}"
+        for r in rows
+        if r.metric != "risk_free_annual"
+    ]
+    digest = sha256("\n".join(kept).encode()).hexdigest()
+    assert digest == PINNED_METRIC_DIGESTS[rate], digest
