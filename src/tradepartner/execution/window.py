@@ -4,8 +4,10 @@ req 9, req 17 and open question 13; ADR 0009 point 3; plans T64, T64b and
 T84b).
 
 `start(settings, connect, broker, clock, slug)` is `paper start --hypothesis
-<slug>`. First it refuses a family paper trading cannot run
-(`family_not_runnable`). Every cadence is accepted (ADR 0017 part C,
+<slug>`. First it refuses a sweep variant (`sweep_variant`: a variant is
+promoted, or run through an operations file, before it trades, #1454; an
+operations file registered with `--operations-book-of` is not a variant) and a
+family paper trading cannot run (`family_not_runnable`). Every cadence is accepted (ADR 0017 part C,
 strategy-lab spec req 11 as amended 2026-10-09): the hypothesis's
 `schedule.rebalance_cadence`, read through `backtest.frozen.frozen_values` (a
 pre-lab registration, stored without `schedule.*` keys, reads as `month_end`),
