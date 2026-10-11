@@ -66,6 +66,19 @@ backup. Any change whose old or new stamp falls on or after ``--window-start``
 changes. Each changed file is rewritten atomically in ``STAMPS_LAYOUT``; every
 unchanged record, ``items`` and ``items_refreshed`` stay byte-identical.
 ``--resume`` reuses the backup and the request journal, so no request repeats.
+The backup is copied under a temporary name and renamed when whole, so a
+half-made copy is never resumed. Before writing, each live file to rewrite
+must still be byte-identical to its backup (or already rewritten): a file an
+ingest touched meanwhile stops the run, with nothing written.
+
+**Other stops**, all before any request: a stored accession with no record in
+its CIK's stamps file (``--store-ciks`` keyed by the wrong CIK); more than
+``--max-requests`` requests known before the run (steps 2 to 4, default
+10,000, per phase); a step-1 shift in the window. A 404/410 or a header with
+no acceptance is journalled, never retried, and its stamp listed
+``unrepaired``; an audit read that fails is not counted as a mismatch. The
+SGML acceptance is read for any form (`sgml_acceptance`), since a Form 4
+header names no FILER.
 """
 
 from __future__ import annotations
@@ -102,9 +115,15 @@ from tradepartner.adapters.stamp_repair import (
 )
 
 _NEW_YORK = ZoneInfo("America/New_York")
+_EASTERN = _NEW_YORK
 _RELEASE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_CIK = re.compile(r"^\d{10}$")
+_ACCEPTANCE = re.compile(r"<ACCEPTANCE-DATETIME>(\d{14})")
+_ACCESSION = re.compile(r"^ACCESSION NUMBER:\s*(\S+)\s*$", re.M)
+_FREE_SPACE_MARGIN = 1.1  # the backup copy plus 10% headroom
 _OLD_STAMPS_LAYOUT = 1
 DEFAULT_MAX_STEP2_REQUESTS = 10_000
+DEFAULT_MAX_REQUESTS = 10_000  # steps 2 to 4 known before the run, per phase
 DEFAULT_SEED = 1382
 BULK_WRITTEN_DAY = date(2026, 10, 1)
 _PROBES_PER_CIK = 2
@@ -171,19 +190,28 @@ def load_cik_list(path: Path) -> set[str]:
     return {_norm_cik(line) for line in lines}
 
 
-def load_index_dates(index_dir: Path, wanted: set[str]) -> dict[str, date]:
+def load_index_dates(index_dir: Path, wanted: set[str]) -> tuple[dict[str, date], list[str]]:
     """``accession -> filing date`` from the cached quarterly ``form.idx``
     files, for the accessions in ``wanted`` (the first quarter listing one
-    wins, as in the cache's own reads)."""
+    wins, as in the cache's own reads), and the quarters skipped because they
+    do not parse (#578). A quarter the cache has not kept yet (younger than
+    `edgar.index_settle_days`) gives its filings no date: the report counts
+    them, since step 2 cannot judge them."""
     out: dict[str, date] = {}
+    skipped: list[str] = []
     if not index_dir.is_dir():
-        return out
+        return out, skipped
     for path in sorted(index_dir.glob("*.idx.gz")):
-        text = gzip.decompress(path.read_bytes()).decode("utf-8")
-        for row in parse_filing_index(text, {}).unstamped:
+        try:
+            text = gzip.decompress(path.read_bytes()).decode("utf-8")
+            rows = parse_filing_index(text, {}).unstamped
+        except (OSError, ValueError, EOFError) as exc:
+            skipped.append(f"{path.name}: {exc}")
+            continue
+        for row in rows:
             if row.accession in wanted:
                 out.setdefault(row.accession, row.filed_on)
-    return out
+    return out, skipped
 
 
 def federal_holidays(start_year: int, end_year: int) -> frozenset[date]:
@@ -213,7 +241,7 @@ def read_stamps_file(path: Path) -> StampsFile | None:
     try:
         raw = path.read_bytes()
         data = json.loads(raw)
-        if data["version"] != PARSER_VERSION:
+        if data["version"] != PARSER_VERSION or data["cik"] != path.stem:
             return None
         stamps: dict[str, datetime | None] = {}
         for accession, row in data["records"].items():
@@ -250,6 +278,8 @@ def export_bulk_written(cache_dir: Path, out: Path, *, day: date = BULK_WRITTEN_
     """Write the frozen ``--bulk-written`` CSV: every stamped record of the
     stamps files whose New York modification date is ``day``. Read-only on
     the cache. Returns the number of records written."""
+    if out.resolve().is_relative_to((cache_dir / "stamps").resolve()):
+        raise RepairStop(f"write the frozen export outside {cache_dir / 'stamps'}")
     rows: list[tuple[str, str, str]] = []
     for path in sorted(stamps_dir(cache_dir).glob("*.json")):
         modified = datetime.fromtimestamp(path.stat().st_mtime, _NEW_YORK).date()
@@ -284,6 +314,8 @@ class Inputs:
     holidays: frozenset[date]
     window_start: date
     seed: int = DEFAULT_SEED
+    skipped_quarters: list[str] = field(default_factory=list)
+    stored_without_stamp: list[str] = field(default_factory=list)
 
 
 def _is_bulk(inputs: Inputs, cik: str, accession: str, stamp: datetime | None) -> bool:
@@ -396,10 +428,13 @@ class Journal:
         if path is not None and path.exists():
             with path.open(newline="") as f:
                 for r in csv.DictReader(f):
-                    key = (r["cik"], r["accession"])
-                    self.answers[key] = (
-                        _parse_stamp(r["sgml_stamp"]) if r["sgml_stamp"] else r["error"]
-                    )
+                    try:  # a line torn by a crash is asked again
+                        key = (r["cik"], r["accession"])
+                        answer = _parse_stamp(r["sgml_stamp"]) if r["sgml_stamp"] else r["error"]
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if answer is not None:
+                        self.answers[key] = answer
 
     def get(self, cik: str, accession: str) -> datetime | str:
         """The SGML acceptance stamp, or the error text when the header did not
@@ -431,15 +466,38 @@ class Journal:
         return answer
 
 
+def sgml_acceptance(text: str, accession: str) -> datetime:
+    """A header's ``ACCEPTANCE-DATETIME`` as UTC, for any form.
+
+    `parse_sgml_header` also resolves the issuer, which a Form 3/4/5 header
+    (ISSUER and REPORTING-OWNER blocks) does not name the way it expects; the
+    acceptance does not depend on the issuer. When the issuer does resolve,
+    its acceptance is used, so both paths share one Eastern-time rule; the
+    fallback applies that same rule (Eastern wall clock, ``fold=1``).
+    Raises ``ValueError`` for a truncated header or another accession."""
+    header, closed, _ = text.partition("</SEC-HEADER>")
+    if not closed:
+        raise ValueError("SGML header is truncated: no </SEC-HEADER>")
+    named = _ACCESSION.search(header)
+    if named is None or named.group(1) != accession:
+        raise ValueError(f"SGML header for {accession} names {named.group(1) if named else None}")
+    try:
+        return parse_sgml_header(text).accepted_at
+    except ValueError:
+        stamp = _ACCEPTANCE.search(header)
+        if stamp is None:
+            raise
+        naive = datetime.strptime(stamp.group(1), "%Y%m%d%H%M%S")  # noqa: DTZ007
+        return naive.replace(tzinfo=_EASTERN, fold=1).astimezone(UTC)
+
+
 def sgml_fetch(settings: Any = None) -> Fetch:
     """The live fetch: ``edgar_raw.filing_sgml_header`` (throttled), parsed."""
 
     def fetch(cik: str, accession: str) -> datetime:
-        text = edgar_raw.filing_sgml_header(cik, accession, settings=settings)
-        header = parse_sgml_header(text, cik=cik)
-        if header.accession != accession:
-            raise ValueError(f"SGML header for {accession} names {header.accession}")
-        return header.accepted_at
+        return sgml_acceptance(
+            edgar_raw.filing_sgml_header(cik, accession, settings=settings), accession
+        )
 
     return fetch
 
@@ -473,14 +531,14 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     """Steps 1 to 5 with requests through ``journal``. Raises `RepairStop`
     when the audit stop rule fires."""
     rows: dict[Key, ManifestRow] = dict(plan.step1)
-    errors: list[str] = []
+    errors: dict[Key, str] = {}
 
     def restamp(cik: str, accession: str, why: str) -> None:
         old = inputs.files[cik].stamps[accession]
         assert old is not None
         row = _sgml_row(journal, cik, accession, old, why)
         if row is None:
-            errors.append(f"{cik} {accession}: {journal.get(cik, accession)}")
+            errors[(cik, accession)] = str(journal.get(cik, accession))
             rows.pop((cik, accession), None)
         else:
             rows[(cik, accession)] = row
@@ -513,6 +571,8 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
 
     step4: dict[str, list[str]] = dict(plan.step4_known)
     for cik, found in step3_classes.items():
+        if found == "true":
+            continue
         accessions = _step4_accessions(inputs, cik, mixed=found == "mixed")
         if accessions:
             step4[cik] = accessions
@@ -530,8 +590,14 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
             shifted[cik].append(accession)
     sample = audit_sample(shifted, seed=inputs.seed)
     mismatches: dict[str, int] = {}
+    audit_errors = 0
     for cik, accession in sample:
         answer = journal.get(cik, accession)
+        if not isinstance(answer, datetime):
+            # No header is no evidence either way: not counted as audited.
+            errors[(cik, accession)] = answer
+            audit_errors += 1
+            continue
         expected = rows[(cik, accession)].new_stamp
         mismatches[cik] = mismatches.get(cik, 0) + (answer != expected)
     decision = audit_decision(mismatches)
@@ -552,15 +618,18 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     unrepaired: list[ManifestRow] = []
     unrepaired_ciks: set[str] = set()
     for cik in sorted(inputs.files):
-        if cik in true_ciks:
-            continue
         for accession, stamp in sorted(inputs.files[cik].stamps.items()):
-            if stamp is None or (cik, accession) in rows:
+            key = (cik, accession)
+            if stamp is None or key in rows:
                 continue
-            if cik in early_ciks and (cik, accession) not in inputs.bulk_written:
+            if key in errors:
+                why = f"SGML gave no stamp: {errors[key]}"
+            elif cik in true_ciks:
+                continue
+            elif cik in early_ciks and key not in inputs.bulk_written:
                 why = "early CIK, record not bulk-written"
             elif cik in early_ciks:
-                continue  # bulk-written but already moved since 10-01: not shifted
+                why = "early CIK, stamp differs from --bulk-written"
             else:
                 why = f"class {inputs.classes.get(cik, 'undetermined')}, not repaired"
             unrepaired.append(ManifestRow(cik, accession, stamp, stamp, "unrepaired", why))
@@ -584,9 +653,11 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         "unrepaired": len(unrepaired),
         "unrepaired_ciks": len(unrepaired_ciks),
         "sgml_errors": len(errors),
+        "audit_errors": audit_errors,
         "requests_made": journal.requests,
     }
-    return Outcome(rows, unrepaired, sorted(unrepaired_ciks), counts, errors)
+    listed = [f"{c} {a}: {e}" for (c, a), e in sorted(errors.items())]
+    return Outcome(rows, unrepaired, sorted(unrepaired_ciks), counts, listed)
 
 
 def window_violations(rows: Iterable[ManifestRow], window_start: date) -> list[ManifestRow]:
@@ -601,6 +672,16 @@ def window_violations(rows: Iterable[ManifestRow], window_start: date) -> list[M
             or r.new_stamp.astimezone(_NEW_YORK).date() >= window_start
         )
     ]
+
+
+def _refuse_window(rows: Iterable[ManifestRow], window_start: date) -> None:
+    bad = window_violations(rows, window_start)
+    if bad:
+        listed = "; ".join(
+            f"{r.cik} {r.accession} {r.old_stamp.isoformat()} -> {r.new_stamp.isoformat()}"
+            for r in bad
+        )
+        raise RepairStop(f"{len(bad)} change(s) on or after {window_start}: {listed}")
 
 
 def rewrite_file(stamps_file: StampsFile, changes: Mapping[str, datetime]) -> bytes:
@@ -639,6 +720,33 @@ def _write_rows(path: Path, rows: Iterable[ManifestRow], *, compress: bool = Fal
 # --- run --------------------------------------------------------------------
 
 
+def _read_or_none(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _plan_report(inputs: Inputs, plan: Plan, args: argparse.Namespace) -> dict[str, Any]:
+    """The dry run's report: counts, known requests, and what would stop."""
+    out: dict[str, Any] = dict(plan.report(), ciks=len(inputs.files))
+    out["requests_known"] = (
+        out["step2_requests"] + out["step3_requests"] + out["step4_known_requests"]
+    )
+    out["step2_over_limit"] = len(plan.step2) > args.max_step2_requests
+    out["requests_over_limit"] = out["requests_known"] > args.max_requests
+    out["window_changes_known"] = len(window_violations(plan.step1.values(), inputs.window_start))
+    out["stamps_without_index_date"] = sum(
+        1
+        for f in inputs.files.values()
+        for a, st in f.stamps.items()
+        if st is not None and a not in inputs.index_dates
+    )
+    out["skipped_quarters"] = inputs.skipped_quarters
+    out["stored_without_stamp"] = len(inputs.stored_without_stamp)
+    return out
+
+
 def _dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
@@ -659,15 +767,27 @@ def load_inputs(
 ) -> Inputs:
     """Read the stamps files of the phase's CIKs from ``source`` and the
     frozen input files."""
-    names = {_norm_cik(p.stem): p for p in source.glob("*.json")}
+    names = {p.stem: p for p in source.glob("*.json") if _CIK.match(p.stem)}
     files: dict[str, StampsFile] = {}
     for cik in sorted(_scope(names, args.phase, universe)):
         parsed = read_stamps_file(names[cik])
         if parsed is not None:
             files[cik] = parsed
-    store = {c: a for c, a in load_store_ciks(args.store_ciks).items() if c in files}
+    scope = _scope(names, args.phase, universe)
+    store_all = load_store_ciks(args.store_ciks)
+    # `--store-ciks` is keyed by the CIK of the stamps file holding the
+    # accession (a 25-NSE sits under the exchange's CIK). A stored accession
+    # missing from its file means the keys are wrong: listed, and --apply stops.
+    missing = sorted(
+        f"{c} {a}"
+        for c, accessions in store_all.items()
+        if c in scope
+        for a in accessions
+        if c not in files or a not in files[c].stamps
+    )
+    store = {c: a for c, a in store_all.items() if c in files}
     wanted = {a for f in files.values() for a, s in f.stamps.items() if s is not None}
-    index_dates = load_index_dates(args.cache_dir / "index", wanted)
+    index_dates, skipped = load_index_dates(args.cache_dir / "index", wanted)
     years = [d.year for d in index_dates.values()] or [2000]
     return Inputs(
         files=files,
@@ -678,6 +798,8 @@ def load_inputs(
         holidays=federal_holidays(min(years) - 1, max(years) + 1),
         window_start=args.window_start,
         seed=args.seed,
+        skipped_quarters=skipped,
+        stored_without_stamp=missing,
     )
 
 
@@ -693,48 +815,58 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
     manifest = manifest_path(args.cache_dir, args.release)
     report: dict[str, Any] = {"release": args.release, "phase": args.phase, "apply": args.apply}
 
+    if args.apply:
+        if backup.exists() and not args.resume:
+            raise RepairStop(f"backup {backup} exists; pick another --release or pass --resume")
+        if args.resume and not backup.exists():
+            raise RepairStop(f"--resume needs the backup {backup}")
+    inputs = load_inputs(backup if args.apply and args.resume else live, args, universe)
+    plan = make_plan(inputs)
+    report.update(_plan_report(inputs, plan, args))
     if not args.apply:
-        inputs = load_inputs(live, args, universe)
-        plan = make_plan(inputs)
-        report.update(plan.report(), ciks=len(inputs.files))
-        report["step2_over_limit"] = len(plan.step2) > args.max_step2_requests
-        report["requests_known"] = (
-            report["step2_requests"] + report["step3_requests"] + report["step4_known_requests"]
-        )
         return report
-
-    if backup.exists() and not args.resume:
-        raise RepairStop(f"backup {backup} exists; pick another --release or pass --resume")
-    if args.resume and not backup.exists():
-        raise RepairStop(f"--resume needs the backup {backup}")
-    if not backup.exists():
+    if inputs.stored_without_stamp:
+        raise RepairStop(
+            f"{len(inputs.stored_without_stamp)} stored accession(s) have no record in their "
+            f"CIK's stamps file: {'; '.join(inputs.stored_without_stamp[:20])}"
+        )
+    if report["step2_over_limit"]:
+        raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
+    if report["requests_over_limit"]:
+        raise RepairStop(
+            f"the known requests ({report['requests_known']}) exceed --max-requests "
+            f"{args.max_requests}"
+        )
+    _refuse_window(plan.step1.values(), inputs.window_start)
+    if not args.resume:
         need = _dir_bytes(live)
         free = shutil.disk_usage(live).free
-        if free <= need:
-            raise RepairStop(f"disk has {free} bytes free, the backup needs {need}")
-        # Plan before copying, so the step 2 limit refuses without a backup.
-        if len(make_plan(load_inputs(live, args, universe)).step2) > args.max_step2_requests:
-            raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
-        shutil.copytree(live, backup)
-    inputs = load_inputs(backup, args, universe)
-    plan = make_plan(inputs)
-    if len(plan.step2) > args.max_step2_requests:
-        raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
+        if free < need * _FREE_SPACE_MARGIN:
+            raise RepairStop(f"disk has {free} bytes free, the backup needs {need} plus 10%")
+        partial = backup.with_name(f".{backup.name}.partial")
+        if partial.exists():
+            shutil.rmtree(partial)  # an earlier copy that never finished
+        shutil.copytree(live, partial)
+        partial.rename(backup)  # the backup name exists only once the copy is whole
     journal = Journal(_sidecar(manifest, ".requests.csv"), fetch or sgml_fetch())
     outcome = execute(inputs, plan, journal)
-    bad = window_violations(outcome.rows.values(), inputs.window_start)
-    if bad:
-        listed = "; ".join(
-            f"{r.cik} {r.accession} {r.old_stamp.isoformat()} -> {r.new_stamp.isoformat()}"
-            for r in bad
-        )
-        raise RepairStop(f"{len(bad)} change(s) on or after {inputs.window_start}: {listed}")
+    _refuse_window(outcome.rows.values(), inputs.window_start)
 
     changes: dict[str, dict[str, datetime]] = defaultdict(dict)
     for (cik, accession), row in outcome.rows.items():
         if row.changed:
             changes[cik][accession] = row.new_stamp
     rewritten = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
+    moved = [
+        cik
+        for cik in sorted(rewritten)
+        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, rewritten[cik])
+    ]
+    if moved:
+        raise RepairStop(
+            f"{len(moved)} live stamps file(s) changed since the backup (an ingest ran?): "
+            f"{', '.join(moved[:20])}; rerun under a new --release"
+        )
     for cik, data in sorted(rewritten.items()):
         edgar_raw.write_atomic(live / f"{cik}.json", data)
     _write_rows(manifest, (outcome.rows[k] for k in sorted(outcome.rows)))
@@ -769,6 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--phase", choices=("universe", "rest", "all"), default="all")
     r.add_argument("--universe-ciks", type=Path, default=None)
     r.add_argument("--max-step2-requests", type=int, default=DEFAULT_MAX_STEP2_REQUESTS)
+    r.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     r.add_argument("--seed", type=int, default=DEFAULT_SEED)
     r.add_argument("--apply", action="store_true")
     r.add_argument("--resume", action="store_true")

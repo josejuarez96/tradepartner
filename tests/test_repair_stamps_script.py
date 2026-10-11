@@ -69,6 +69,8 @@ class FakeSec:
         self.truth = dict(truth)
         self.calls: list[tuple[str, str]] = []
         self.fail_after: int | None = None
+        self.broken: set[tuple[str, str]] = set()
+        self.on_call: Any = None
 
     def __call__(self, cik: str, accession: str) -> datetime:
         if self.fail_after is not None and len(self.calls) >= self.fail_after:
@@ -77,11 +79,15 @@ class FakeSec:
                 "503", request=request, response=httpx.Response(503, request=request)
             )
         self.calls.append((cik, accession))
+        if self.on_call is not None:
+            self.on_call()
+        if (cik, accession) in self.broken:
+            return repair_stamps.sgml_acceptance("no header here", accession)
         if (cik, accession) == (APPLE, APPLE_ACC) and cik not in self.truth:
             text = APPLE_HEADER
         else:
             text = header_for(cik, accession, self.truth[(cik, accession)])
-        return parse_sgml_header(text, cik=cik).accepted_at
+        return repair_stamps.sgml_acceptance(text, accession)
 
 
 # --- a fixture cache --------------------------------------------------------
@@ -526,3 +532,148 @@ def test_shift_matches_t166(tmp_path: Path) -> None:
     assert true == utc(2026, 2, 5, 2, 56, 3)
     assert shift_stamp(early(true)) == true
     assert true - early(true) == timedelta(hours=5)
+
+
+# --- review fixes (pass 1) --------------------------------------------------
+
+
+def test_a_form_4_header_gives_its_acceptance() -> None:
+    """A Form 4 header names ISSUER and REPORTING-OWNER, not FILER: the
+    acceptance still reads, with the same Eastern-time rule."""
+    form4 = (
+        "<SEC-DOCUMENT>0001209191-24-000001.txt : 20240315\n"
+        "<SEC-HEADER>0001209191-24-000001.hdr.sgml : 20240315\n"
+        "<ACCEPTANCE-DATETIME>20240315190000\n"
+        "ACCESSION NUMBER:\t\t0001209191-24-000001\n"
+        "CONFORMED SUBMISSION TYPE:\t4\n\n"
+        "REPORTING-OWNER:\n\n\tOWNER DATA:\n\t\tCOMPANY CONFORMED NAME:\tDOE JANE\n"
+        "\t\tCENTRAL INDEX KEY:\t\t\t0001111111\n\n"
+        "ISSUER:\n\n\tCOMPANY DATA:\n\t\tCOMPANY CONFORMED NAME:\tSOME CO\n"
+        "\t\tCENTRAL INDEX KEY:\t\t\t0000000101\n"
+        "</SEC-HEADER>\n"
+    )
+    got = repair_stamps.sgml_acceptance(form4, "0001209191-24-000001")
+    assert got == API_TRUE
+    with pytest.raises(ValueError):
+        repair_stamps.sgml_acceptance(form4, "0001209191-24-000002")
+    # The issuer path agrees with the fallback on the E15 fixture.
+    assert repair_stamps.sgml_acceptance(APPLE_HEADER, APPLE_ACC) == APPLE_TRUE
+
+
+def test_an_sgml_change_in_the_window_aborts_before_writing(tmp_path: Path) -> None:
+    c, sec = scenario(tmp_path)
+    late = "0000000707"
+    a = acc(late, 1)
+    # Thursday 2026-10-08 11:00 EDT, filed 10-09: provably early; SGML on 10-09.
+    c.add_cik(late, [(a, utc(2026, 10, 8, 15, 0), date(2026, 10, 9), False)], cls="true")
+    sec.truth[(late, a)] = utc(2026, 10, 9, 4, 30)
+    c.finish()
+    before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert run(c, sec, "--apply") == 1
+    assert (late, a) in sec.calls
+    after = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert after == before
+
+
+def test_a_live_file_changed_since_the_backup_stops_the_write(tmp_path: Path) -> None:
+    c, sec = scenario(tmp_path)
+    path = c.stamps / f"{APPLE}.json"
+
+    def ingest_runs() -> None:
+        data = json.loads(path.read_bytes())
+        data["records"]["0000320193-26-000001"] = ["8-K", "x.htm", False, None, None]
+        path.write_bytes(json.dumps(data).encode())
+        sec.on_call = None
+
+    sec.on_call = ingest_runs
+    assert run(c, sec, "--apply") == 1
+    assert "0000320193-26-000001" in c.records(APPLE)  # the ingest's record survives
+    assert c.stamp(APPLE, APPLE_ACC) == early(APPLE_TRUE)
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+
+
+def test_audit_read_errors_are_not_mismatches(tmp_path: Path, capsys: Any) -> None:
+    c, sec = _many_early(tmp_path, 1, 0)
+    only = f"{9000000000:010d}"
+    sec.broken.add((only, acc(only, 1)))
+    assert run(c, sec, "--apply") == 0  # one CIK, its only read failed: no stop
+    report = json.loads(capsys.readouterr().out)
+    assert report["audit_errors"] == 1
+    assert report["audit_ciks"] == 0
+    assert report["sgml_errors"] == 1
+
+
+def test_a_failed_read_of_a_true_cik_is_unrepaired(tmp_path: Path, capsys: Any) -> None:
+    c, sec = scenario(tmp_path)
+    sec.broken.add((API, API_ACC))
+    assert run(c, sec, "--apply") == 0
+    assert c.stamp(API, API_ACC) == API_STAMP
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest.unrepaired.csv.gz"
+    with gzip.open(side, "rt", newline="") as f:
+        rows = {(r["cik"], r["accession"]): r for r in csv.DictReader(f)}
+    assert rows[(API, API_ACC)]["evidence"].startswith("SGML gave no stamp")
+    assert json.loads(capsys.readouterr().out)["sgml_errors"] == 1
+
+
+def test_a_stored_accession_missing_from_its_file_stops_apply(tmp_path: Path, capsys: Any) -> None:
+    c, sec = scenario(tmp_path)
+    c.store.append((TRUE_CIK, "0000000202-24-999999"))
+    c.finish()
+    assert run(c, sec) == 0
+    assert json.loads(capsys.readouterr().out)["stored_without_stamp"] == 1
+    before = c.snapshot()
+    assert run(c, sec, "--apply") == 1
+    assert c.snapshot() == before
+
+
+def test_the_known_request_total_has_its_own_stop(tmp_path: Path) -> None:
+    c, sec = scenario(tmp_path)
+    before = c.snapshot()
+    assert run(c, sec, "--apply", "--max-requests", "4") == 1  # 5 known
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_a_half_copied_backup_is_never_resumed(tmp_path: Path) -> None:
+    c, sec = scenario(tmp_path)
+    partial = c.dir / "stamps" / ".v1.restamp-1382.bak.partial"
+    partial.mkdir()
+    (partial / "junk").write_text("x")
+    assert run(c, sec, "--apply", "--resume") == 1
+    assert run(c, sec, "--apply") == 0
+    assert not partial.exists()
+    assert c.stamp(APPLE, APPLE_ACC) == APPLE_TRUE
+
+
+def test_a_torn_journal_line_is_asked_again(tmp_path: Path) -> None:
+    c, sec = scenario(tmp_path)
+    sec.fail_after = 1
+    with pytest.raises(httpx.HTTPStatusError):
+        run(c, sec, "--apply")
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    with journal.open("a") as f:
+        f.write("0000000303,0000000303-24-000001,2024-06-0")  # torn mid-write
+    sec.fail_after = None
+    assert run(c, sec, "--apply", "--resume") == 0
+    assert c.stamp(MIXED, acc(MIXED, 1)) == utc(2024, 6, 3, 14, 0)
+
+
+def test_export_refuses_a_path_inside_the_stamps_directory(tmp_path: Path) -> None:
+    c, _ = scenario(tmp_path)
+    out = c.dir / "stamps" / "bulk.csv"
+    argv = ["--cache-dir", str(c.dir), "export", "--out", str(out)]
+    assert repair_stamps.main(argv) == 1
+    assert not out.exists()
+
+
+def test_the_live_fetch_reads_only_filing_sgml_header(monkeypatch: Any) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def fake_header(cik: str, accession: str, **_kw: Any) -> str:
+        seen.append((cik, accession))
+        return APPLE_HEADER
+
+    monkeypatch.setattr(repair_stamps.edgar_raw, "filing_sgml_header", fake_header)
+    fetch = repair_stamps.sgml_fetch()
+    assert fetch(APPLE, APPLE_ACC) == APPLE_TRUE
+    assert seen == [(APPLE, APPLE_ACC)]
