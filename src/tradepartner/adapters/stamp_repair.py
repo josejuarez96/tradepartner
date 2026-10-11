@@ -14,6 +14,8 @@ inputs and with no I/O:
 - `ManifestRow`: one row of the repair manifest, the contract between the
   cache driver (T166a, `scripts/repair_stamps.py`) and the store restamp
   (T166b, `ingest --restamp-from`).
+- `in_window_change_allowed`: the in-window rule of amendment 2026-10-11
+  (#1497, decision (d), T166f), which both tools import.
 
 The cache driver and the store restamp import these names; neither re-derives
 a rule.
@@ -281,6 +283,33 @@ class ManifestRow:
         )
 
 
+def in_window_change_allowed(row: ManifestRow, window_start: date | None) -> bool:
+    """Whether a manifest row may be applied given an open paper window.
+
+    True for a row outside the window: one that does not move its stamp, or
+    whose old and new stamps both fall before ``window_start`` (New York
+    dates), or any row when no window is open (``window_start`` is None).
+    Inside the window (old or new stamp's New York date on or after
+    ``window_start``) only an ``sgml`` row whose new stamp is earlier than its
+    old one by at most ``ny_utc_offset`` on the old stamp's New York date is
+    allowed: a late stamp corrected to its header time. A later move, a
+    ``shift`` and an earlier move larger than the offset are not.
+
+    This is the rule only: the caller still needs a passing pre-check and the
+    exact check against its read instants (``new <= t < old`` refuses).
+    """
+    if window_start is None or not row.changed:
+        return True
+    old_day = row.old_stamp.astimezone(_NEW_YORK).date()
+    new_day = row.new_stamp.astimezone(_NEW_YORK).date()
+    if old_day < window_start and new_day < window_start:
+        return True
+    if row.method != "sgml":
+        return False
+    earlier_by = row.old_stamp - row.new_stamp
+    return timedelta(0) < earlier_by <= ny_utc_offset(old_day)
+
+
 __all__ = [
     "AUDIT_FRACTION",
     "FILING_DAY_CUTOFF",
@@ -293,6 +322,7 @@ __all__ = [
     "audit_decision",
     "audit_sample",
     "classify_cik",
+    "in_window_change_allowed",
     "is_provably_early",
     "ny_utc_offset",
     "shift_stamp",
