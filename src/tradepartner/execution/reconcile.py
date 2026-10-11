@@ -28,7 +28,10 @@ caller (T61's `reconcile_now`) gathers every input, writes the
   0015 seam 3), is `open_order_differs`. A journal order that was
   acknowledged and is absent from `open_orders()` is `missing_open_order`
   unless its `get_order` reading is terminal (finished; the collector journals
-  it once its fills arrive).
+  it once its fills arrive). One absent from `open_orders()` whose reading is
+  not the default shape (a limit order that filled before this
+  reconciliation, say) is `order_differs` whatever its status (#1293, owner
+  2026-10-10).
 
 **Allowances, never a re-base.** An acknowledged order is `fills_lagging` when
 its reading's `filled_quantity` exceeds its journaled fills by more than the
@@ -532,6 +535,15 @@ def _order_mismatches(
                 Mismatch(
                     "missing_open_order",
                     "journal-open order the broker does not list open",
+                    security_id=item.order.security_id,
+                    client_order_id=coid,
+                )
+            )
+        if reading is not None and (shape := order_shape_violation(reading)) is not None:
+            found.append(
+                Mismatch(
+                    "order_differs",
+                    f"{shape.rule}: {shape.detail}",
                     security_id=item.order.security_id,
                     client_order_id=coid,
                 )

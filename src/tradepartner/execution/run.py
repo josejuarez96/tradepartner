@@ -33,7 +33,9 @@ same chunk every unfinished earlier run of the window is closed `crashed`.
 Then `account()`: an `account_id` other than the window's halts with
 `ReconciliationError`.
 
-**Step 2. Staleness.** The latest `ok` ingestion run finished at or before the
+**Step 2. Staleness.** The latest `ok` daily ingest of the price source
+(`wrapper.last_ok_price_ingest`: source `ingest.PRICE_SOURCE`, mode
+`ingest.MODE`; owner decision on #1440 Q3, 2026-10-10) finished at or before the
 clock reading must cover S-1 for `ingest.reference_symbol`: that symbol's
 security (its listing current at S-1) has a bar for S-1 known by that run's
 `finished_at`. Otherwise `StaleDataError`, before any plan read, any
@@ -175,7 +177,11 @@ the `halted` or `stale` result row, and re-raises. Any other exception (a
 `PlanTrialError`, a stub's `NotImplementedError`, a store error) writes the
 `run_failed` alert and the `failed` result row, best-effort, and propagates;
 that path never runs after a halt, whose result row stands, so a stale halt
-does not engage the switch for the next run.
+does not engage the switch for the next run. A `ClockError` or store error
+before the run row exists (the lock's `locked` alert, the window read, the
+overrides, the run row's own chunk) sends a `run_failed` alert with no run id,
+deduped per (book, session), best-effort, and propagates (owner decision on
+#1440 Q2, 2026-10-10).
 
 **Connections.** Writes go through `connect` (a write chunk each,
 `store.db.open_for_write`); the run's own reads use short read-only
@@ -184,7 +190,8 @@ call but one: the planning step holds its write chunk, with its transaction
 open, across its second `assets_read` (the targets not held), as T63c's
 contract requires; the override form waits for that call. Every row the run
 writes itself is stamped by the wrapper's checked clock, which also checks that
-the clock never goes back.
+the clock never goes back; so is every alert once the gate exists (#1440 Q1),
+an alert whose reading fails being stamped by the raw clock with a note.
 """
 
 from __future__ import annotations
@@ -250,11 +257,12 @@ from tradepartner.execution.wrapper import (
     RiskGatedBroker,
     Verdict,
     classify,
+    last_ok_price_ingest,
 )
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
-from tradepartner.store.db import open_read_only, utc_now
+from tradepartner.store.db import StoreLockedError, open_read_only, utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -263,6 +271,7 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     DecisionRow,
     DecisionWithEvents,
+    JournalIntegrityError,
     JournalNotInitialised,
     KillSwitchRow,
     OrderedFill,
@@ -292,7 +301,7 @@ from tradepartner.store.journal import (
     runs_for,
     window_stops_for,
 )
-from tradepartner.store.schema import DEFAULT_BOOK_ID, WINDOW_STOP_REASON
+from tradepartner.store.schema import DEFAULT_BOOK_ID, WINDOW_STOP_REASON, SchemaVersionError
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 __all__ = [
@@ -322,6 +331,17 @@ _TTY = "tty"
 OK = "ok"
 LOCKED = "locked"
 NO_WINDOW = "no_window"
+RUN_FAILED = "run_failed"
+#: A clock or store fault before the run row exists: `tracking_run` sends a
+#: `run_failed` alert with no run id, then re-raises (owner decision on #1440 Q2).
+_PRE_RUN_FAULTS: tuple[type[Exception], ...] = (
+    ClockError,
+    duckdb.Error,
+    StoreLockedError,
+    JournalNotInitialised,
+    JournalIntegrityError,
+    SchemaVersionError,
+)
 NO_SESSION = "no_session"
 SKIPPED_KILL_SWITCH = "skipped_kill_switch"
 #: Outcomes that exit 0; every other outcome, and every exception, is non-zero.
@@ -340,7 +360,6 @@ _UNSPENT_CASH = "unspent_cash"
 _RUN_WRITER = "run"
 _DRAWDOWN = "drawdown"
 _KILL_SWITCH = "kill_switch"
-_INGEST_OK = "ok"
 #: The lot ledger's account (spec req 13: Phase 4 holds one account, paper).
 _ACCOUNT_TYPE, _ACCOUNT_OWNER = "paper", "self"
 _LAG_BOUND_KIND = "fill_lag_bound"
@@ -857,6 +876,13 @@ class _ChunkAlerter(Alerter):
         masking, so the run's result rows and notes share it."""
         return self._scrub(text)
 
+    def stamp_with(self, clock: Callable[[], datetime]) -> None:
+        """Stamp every later alert with `clock` (the run hands it the gate's
+        checked `read_clock` once the gate exists, #1440 Q1); a reading that
+        fails falls back to the raw clock with a note (`alerts.RAW_CLOCK_NOTE`)."""
+        self._clock = clock
+        self._chunk_clock = clock
+
 
 def _read_clock(clock: Callable[[], datetime]) -> datetime:
     """One clock reading, tz-aware UTC, or `ClockError` (ADR 0007 point 4)."""
@@ -920,19 +946,70 @@ def tracking_run(
     book = resolve_book(settings, book_id)
     with ExitStack() as stack:
         try:
-            stack.enter_context(run_lock(settings, book))
-        except LockHeld as exc:  # only taking the lock: never a LockHeld from the run
-            session = _alert_session(_read_clock(clock))
-            alerter = _ChunkAlerter(settings, connect, clock)
-            alerter.write(
-                LOCKED,
-                None,
-                session,
-                alerter.scrub(f"paper run not started: {exc}"),
-                book_id=book,
-            )
-            return RunOutcome(LOCKED, session=session)
-        return _locked_run(settings, connect, broker, clock, sleep, book)
+            started = _start(settings, connect, broker, clock, sleep, book, stack)
+        except _PRE_RUN_FAULTS as exc:
+            _pre_run_failed(settings, connect, clock, book, exc)
+            raise
+        return started if isinstance(started, RunOutcome) else started.execute()
+
+
+def _start(
+    settings: Settings,
+    connect: Connect,
+    broker: Broker,
+    clock: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    book: str,
+    stack: ExitStack,
+) -> RunOutcome | _Run:
+    """Everything before the run row exists: the lock (held by `stack`), then
+    `_locked_run`; an outcome when the run ends there, else the `_Run`."""
+    try:
+        stack.enter_context(run_lock(settings, book))
+    except LockHeld as exc:  # only taking the lock: never a LockHeld from the run
+        session = _alert_session(_read_clock(clock))
+        alerter = _ChunkAlerter(settings, connect, clock)
+        alerter.write(
+            LOCKED,
+            None,
+            session,
+            alerter.scrub(f"paper run not started: {exc}"),
+            book_id=book,
+        )
+        return RunOutcome(LOCKED, session=session)
+    return _locked_run(settings, connect, broker, clock, sleep, book)
+
+
+def _pre_run_failed(
+    settings: Settings,
+    connect: Connect,
+    clock: Callable[[], datetime],
+    book: str,
+    exc: Exception,
+) -> None:
+    """The `run_failed` alert with no run id for a fault before the run row
+    exists (#1440 Q2), best-effort: its session is the one containing the clock
+    reading (or `utc_now()`'s, after a clock fault, the stamp then noted as the
+    raw clock's); a failure to write it is noted on `exc`, which the caller
+    re-raises."""
+    clock_fault = isinstance(exc, ClockError)
+    alerter = _ChunkAlerter(settings, connect, clock)
+    try:
+        reading = utc_now() if clock_fault else _read_clock(clock)
+    except ClockError:
+        reading, clock_fault = utc_now(), True
+    try:
+        alerter.write(
+            RUN_FAILED,
+            None,
+            _alert_session(reading),
+            alerter.scrub(f"paper run not started: {type(exc).__name__}: {exc}"),
+            clock_fault=clock_fault,
+            book_id=book,
+        )
+    except Exception as alert_error:
+        problem = f"run_failed alert not written ({type(alert_error).__name__})"
+        exc.add_note(alerter.scrub(f"failed path: {problem}"))
 
 
 @dataclass(frozen=True)
@@ -1010,7 +1087,7 @@ def _locked_run(
     clock: Callable[[], datetime],
     sleep: Callable[[float], None],
     book: str,
-) -> RunOutcome:
+) -> RunOutcome | _Run:
     now = _read_clock(clock)
     with open_read_only(settings) as conn:
         window = open_window(conn, book)
@@ -1056,6 +1133,7 @@ def _locked_run(
     frozen = frozen_risk(window)
     alerter = _ChunkAlerter(settings, connect, clock)
     gate = RiskGatedBroker(broker, clock, frozen, settings, connect, calendar, alerter, sleep=sleep)
+    alerter.stamp_with(gate.read_clock)
     engaged = switch.engage_from_overrides(
         settings, gate.read_clock, window_id=window_id, run_id=None
     )
@@ -1122,7 +1200,7 @@ def _locked_run(
     run = replace(row, run_id=run_id)
     return _Run(
         settings, connect, broker, gate, alerter, window, frozen, run, state.engaged, sleep, cadence
-    ).execute()
+    )
 
 
 class _Run:
@@ -1183,7 +1261,7 @@ class _Run:
         problems: list[str] = []
         try:
             self.alerter.write(
-                "run_failed",
+                RUN_FAILED,
                 self.run_id,
                 self.session,
                 message,
@@ -1423,15 +1501,11 @@ class _Run:
         before = previous_session(self.session)
         symbol = self.settings.ingest.reference_symbol
         with open_read_only(self.settings) as conn:
-            row = conn.execute(
-                "SELECT max(finished_at) FROM ingestion_runs WHERE status = ? AND finished_at <= ?",
-                [_INGEST_OK, now],
-            ).fetchone()
-            finished = None if row is None or row[0] is None else row[0]
+            finished = last_ok_price_ingest(conn, by=now)
             if finished is None:
                 raise StaleDataError(
-                    f"no ok ingestion run finished by {now.isoformat()}: {symbol} is not "
-                    f"covered for {before.isoformat()}"
+                    f"no ok daily price ingest finished by {now.isoformat()}: {symbol} is "
+                    f"not covered for {before.isoformat()}"
                 )
             finished = ensure_tz_aware_utc(finished, field_name="finished_at")
             reference = _current_ids(listings_as_of(conn, finished), before, symbol)
@@ -1442,7 +1516,7 @@ class _Run:
             )
         if bars.is_empty():
             raise StaleDataError(
-                f"the last ok ingestion run (finished {finished.isoformat()}) does not "
+                f"the last ok daily price ingest (finished {finished.isoformat()}) does not "
                 f"cover {before.isoformat()} for {symbol}"
             )
 

@@ -190,7 +190,10 @@ from tradepartner.universe import SHARES_FACT
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 MODE = "session"
-SOURCES: tuple[str, ...] = ("edgar", "alpaca")
+#: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
+#: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
+PRICE_SOURCE = "alpaca"
+SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE)
 
 #: XBRL concept requested from `FilingSource.facts` -> the store's `fact_name`.
 FACT_NAMES: dict[str, str] = {"EntityCommonStockSharesOutstanding": SHARES_FACT}

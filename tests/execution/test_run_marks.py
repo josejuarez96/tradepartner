@@ -120,7 +120,7 @@ class Env:
         with open_for_write(self.settings) as conn:
             conn.execute(
                 "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, "
-                "mode) VALUES (?, ?, ?, 'ok', 'alpaca', 'daily')",
+                "mode) VALUES (?, ?, ?, 'ok', 'alpaca', 'session')",
                 [run_id, finished - timedelta(minutes=5), finished],
             )
 

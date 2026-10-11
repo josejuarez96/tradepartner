@@ -47,6 +47,7 @@ from tradepartner.errors import (
     SystemFaultError,
 )
 from tradepartner.execution import alerts, switch, wrapper
+from tradepartner.execution import wrapper as wrapper_module
 from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import WriteOffContext, collect
 from tradepartner.execution.plan import State, decision_state
@@ -60,7 +61,9 @@ from tradepartner.execution.wrapper import (
     RiskGatedBroker,
     Verdict,
     classify,
+    last_ok_price_ingest,
 )
+from tradepartner.store import schema as store_schema
 from tradepartner.store.db import open_for_write
 from tradepartner.store.journal import (
     DecisionRow,
@@ -1294,7 +1297,7 @@ def test_a_limit_order_from_the_broker_halts_after_its_event_is_journaled(
     `refused_order_shape`, a fault after a submit (no `missed` row, not
     `LimitBreachError`), and the second buy is never submitted. The run's
     halt path writes the `kill_switch` row with that reason and cancels the
-    limit order."""
+    limit order; its read of a limit order is refused (#1293)."""
     fake = _shaped_env(env, shaped)
     gate = _gate(env, alerter_conn)
 
@@ -1327,10 +1330,11 @@ def test_a_limit_order_from_the_broker_halts_after_its_event_is_journaled(
     )
     assert (source, fault_type) == ("fault", "SystemFaultError")
     assert "refused_order_shape" in reason
-    assert _events(env.settings, coid)[2:] == [
-        ("cancel_requested", HALT_REASON),
-        ("cancelled", None),
-    ]
+    # The halt read collects the cancelled order. A limit order read back by
+    # `get_order` is refused there too (#1293): it stays open in the journal,
+    # noted `cancel_failed`, for the owner, since no collection journals it.
+    read_back = ("cancel_failed", HALT_REASON) if shaped == "get_order" else ("cancelled", None)
+    assert _events(env.settings, coid)[2:] == [("cancel_requested", HALT_REASON), read_back]
     assert _events(env.settings, second) == [("pending", None)]  # resume settles it
     assert [r.client_order_id for r in _submits(fake)] == [coid]
 
@@ -1533,3 +1537,34 @@ def test_another_fault_on_another_book_s_run_never_engages_or_cancels_there(
     assert _query(journal_settings, "SELECT COUNT(*) FROM kill_switch") == [(0,)]
     assert not scripted_fake.calls[calls:]
     assert _events(journal_settings, "tp-acked") == [("pending", None), ("accepted", None)]
+
+
+# --- #1440 Q3: which ingest runs count -------------------------------------------------------
+
+
+def test_only_the_price_sources_daily_ingest_counts_for_the_floor() -> None:
+    """#1440 Q3 (owner, 2026-10-10): the clock pre-check's floor (and the run's
+    staleness read) is the latest `ok` `alpaca` run of mode `session`; a later
+    EDGAR run, backfill, repair or failed run never moves it, and `by` bounds it."""
+    conn = duckdb.connect(":memory:")
+    store_schema.init_schema(conn)
+    price = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
+    rows = [
+        ("p0", price - timedelta(days=1), "ok", "alpaca", "session"),
+        ("p1", price, "ok", "alpaca", "session"),
+        ("e", price + timedelta(hours=1), "ok", "edgar", "session"),
+        ("b", price + timedelta(hours=2), "ok", "alpaca", "backfill"),
+        ("r", price + timedelta(hours=3), "repaired", "alpaca", "repair"),
+        ("f", price + timedelta(hours=4), "failed", "alpaca", "session"),
+    ]
+    for run_id, finished, status, source, mode in rows:
+        conn.execute(
+            "INSERT INTO ingestion_runs (run_id, started_at, finished_at, status, source, mode) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [run_id, finished - timedelta(minutes=5), finished, status, source, mode],
+        )
+    assert last_ok_price_ingest(conn) == price
+    assert wrapper_module._last_ok_ingest(conn) == price
+    assert last_ok_price_ingest(conn, by=price - timedelta(seconds=1)) == price - timedelta(days=1)
+    assert last_ok_price_ingest(conn, by=price - timedelta(days=2)) is None
+    conn.close()
