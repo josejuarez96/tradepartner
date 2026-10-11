@@ -30,6 +30,11 @@ in the cache; ``--phase all`` (default) repairs the whole cache. Each phase is
 its own named release (``--release``). Every step below is limited to the
 phase's CIKs.
 
+**Rewritten CIKs** (amendment 2026-10-11, (b)). A CIK of the phase with no
+record in ``--bulk-written`` is ``rewritten``: an ingest after 10-01 rewrote
+its file, keeping its older records. Steps 1, 3 and 4 skip it (its class from
+``--classes`` is not used). Step 3b probes it instead.
+
 **Steps.** SGML is read only through ``edgar_raw.filing_sgml_header``, at the
 configured throttle, and every answer is journalled before it is used.
 
@@ -41,9 +46,20 @@ configured throttle, and every answer is journalled before it is used.
 3. Undetermined store-backing CIKs: two SGML probes each (bulk-written
    records, stored ones first, latest stamps first), then ``classify_cik``.
    Early ones are shifted as in step 1; mixed ones join step 4.
+3b. Rewritten CIKs: two SGML probes each from its records dated (New York)
+   before 2026-10-01 and not in step 2, stored ones first, newest first, then
+   ``classify_cik``; an unreadable probe is no probe, and no readable probe is
+   ``mixed``. ``true`` lists the CIK in ``<manifest>.rewritten_ciks.txt`` and
+   none of its records is ``unrepaired``; ``early`` or ``mixed`` sends its
+   stored accessions to step 4 and its other records dated before 10-01 to
+   ``unrepaired``. The audit stop rule does not apply to these probes.
 4. Mixed store-backing CIKs: their stored accessions are re-stamped from
    SGML. So are the stored accessions missing from ``--bulk-written`` (files
    touched after 10-01) of every store-backing CIK not classed ``true``.
+4b. Late API stamps (amendment 2026-10-11, (c)), with ``--late-api-from`` and
+   ``--late-api-to`` (New York dates, inclusive): every record of the phase
+   whose stamp's New York date is in the range and has no SGML row yet is
+   re-stamped from SGML, whatever its class or export status.
 5. Audit: ``audit_sample`` over the shifted stamps that back stored rows, one
    SGML read each; ``audit_decision`` sends a mismatching CIK filing by filing
    (its stored accessions re-stamped from SGML, its other shifts dropped to
@@ -56,6 +72,18 @@ step 3) is ``unrepaired``; those rows go to ``<manifest>.unrepaired.csv.gz``
 the manifest itself holds only the rows T166b acts on (plan amendment of
 2026-10-10).
 
+**The count** (amendment 2026-10-11, (a)). The dry run reports
+``requests_floor`` (steps 2, 3, 3b, 4 known and 4b, plus the audit as if no
+step-3 CIK comes out early), ``requests_ceiling`` (the floor plus the stored
+accessions of step 3's CIKs as if every one came out mixed, with the audit as
+if every one came out early) and ``rewritten_if_all_mixed`` (step 3b's
+possible filing-by-filing load, not in the ceiling). ``--apply`` refuses when
+the floor exceeds ``--max-requests``. The cap also holds during the run:
+before each step's requests, the release's journal lines (resumed runs
+included) plus the requests the step still has to make must fit under it, or
+the run stops with the journal kept and nothing written; ``--resume`` under a
+higher cap repeats no request.
+
 **Writes and refusals.** ``--apply`` first copies the stamps directory to
 ``stamps/v<PARSER_VERSION>.<release>.bak``; it refuses when that name exists
 (unless ``--resume``) or when the disk lacks room for the copy. The plan is
@@ -63,7 +91,14 @@ then computed from the backup, so a resumed run sees the same input. The
 manifest, the request journal and the unrepaired files are written beside the
 backup. Any change whose old or new stamp falls on or after ``--window-start``
 (New York date) aborts the run before any stamps file is written, listing the
-changes. Each changed file is rewritten atomically in ``STAMPS_LAYOUT``; every
+changes. With ``--window-earlier-ok <precheck.json>`` (amendment 2026-10-11,
+(d); T166f's pre-check file, which must say pass for this ``--release`` and
+``--window-start`` and be made on the run's New York date) an in-window change
+that ``stamp_repair.in_window_change_allowed`` passes (an ``sgml`` move earlier
+by at most New York's offset) is allowed; and any change, in the window or
+not, that crosses one of the file's read instants ``t`` (``new <= t < old``
+or ``old <= t < new``) aborts the run. Each changed file is
+rewritten atomically in ``STAMPS_LAYOUT``; every
 unchanged record, ``items`` and ``items_refreshed`` stay byte-identical.
 ``--resume`` reuses the backup and the request journal, so no request repeats.
 The backup is copied under a temporary name and renamed when whole, so a
@@ -72,9 +107,9 @@ must still be byte-identical to its backup (or already rewritten): a file an
 ingest touched meanwhile stops the run, with nothing written.
 
 **Other stops**, all before any request: a stored accession with no record in
-its CIK's stamps file (``--store-ciks`` keyed by the wrong CIK); more than
-``--max-requests`` requests known before the run (steps 2 to 4, default
-10,000, per phase); a step-1 shift in the window. A 404/410 or a header with
+its CIK's stamps file (``--store-ciks`` keyed by the wrong CIK); a request
+floor above ``--max-requests`` (default 10,000, per phase); a step-1 shift in
+the window. A 404/410 or a header with
 no acceptance is journalled, never retried, and its stamp listed
 ``unrepaired``; an audit read that fails is not counted as a mismatch. The
 SGML acceptance is read for any form (`sgml_acceptance`), since a Form 4
@@ -106,13 +141,16 @@ from tradepartner.adapters.edgar import parse_filing_index, parse_sgml_header
 from tradepartner.adapters.edgar_source import PARSER_VERSION, STAMPS_LAYOUT
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
+    CikClass,
     ManifestRow,
     audit_decision,
     audit_sample,
     classify_cik,
+    in_window_change_allowed,
     is_provably_early,
     shift_stamp,
 )
+from tradepartner.store import restamp_precheck
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _EASTERN = _NEW_YORK
@@ -123,7 +161,7 @@ _ACCESSION = re.compile(r"^ACCESSION NUMBER:\s*(\S+)\s*$", re.M)
 _FREE_SPACE_MARGIN = 1.1  # the backup copy plus 10% headroom
 _OLD_STAMPS_LAYOUT = 1
 DEFAULT_MAX_STEP2_REQUESTS = 10_000
-DEFAULT_MAX_REQUESTS = 10_000  # steps 2 to 4 known before the run, per phase
+DEFAULT_MAX_REQUESTS = 10_000  # the request cap, per phase (release)
 DEFAULT_SEED = 1382
 BULK_WRITTEN_DAY = date(2026, 10, 1)
 _PROBES_PER_CIK = 2
@@ -316,11 +354,16 @@ class Inputs:
     seed: int = DEFAULT_SEED
     skipped_quarters: list[str] = field(default_factory=list)
     stored_without_stamp: list[str] = field(default_factory=list)
+    late_api: tuple[date, date] | None = None
 
 
 def _is_bulk(inputs: Inputs, cik: str, accession: str, stamp: datetime | None) -> bool:
     written = inputs.bulk_written.get((cik, accession))
     return stamp is not None and written is not None and written == stamp
+
+
+def _ny_date(stamp: datetime) -> date:
+    return stamp.astimezone(_NEW_YORK).date()
 
 
 @dataclass
@@ -331,16 +374,38 @@ class Plan:
     step2: list[Key] = field(default_factory=list)
     step3: dict[str, list[str]] = field(default_factory=dict)
     step4_known: dict[str, list[str]] = field(default_factory=dict)
+    rewritten: list[str] = field(default_factory=list)
+    rewritten_probes: dict[str, list[str]] = field(default_factory=dict)
+    step4b: list[Key] = field(default_factory=list)
+    audit_floor: int = 0
+    audit_ceiling: int = 0
+    carry_ceiling: int = 0
+    rewritten_if_all_mixed: int = 0
+
+    def known_keys(self) -> set[Key]:
+        """Every record the plan reads from SGML whatever the probes find."""
+        keys = set(self.step2) | set(self.step4b)
+        for source in (self.step3, self.step4_known, self.rewritten_probes):
+            keys.update((cik, a) for cik, accessions in source.items() for a in accessions)
+        return keys
 
     def report(self) -> dict[str, int]:
         """The counts of each step's work and requests."""
+        floor = len(self.known_keys()) + self.audit_floor
         return {
             "step1_shifts": len(self.step1),
             "step2_requests": len(self.step2),
             "step3_ciks": len(self.step3),
             "step3_requests": sum(len(v) for v in self.step3.values()),
+            "rewritten_ciks": len(self.rewritten),
+            "rewritten_probe_requests": sum(len(v) for v in self.rewritten_probes.values()),
             "step4_known_ciks": len(self.step4_known),
             "step4_known_requests": sum(len(v) for v in self.step4_known.values()),
+            "step4b_requests": len(self.step4b),
+            "audit_floor": self.audit_floor,
+            "requests_floor": floor,
+            "requests_ceiling": floor - self.audit_floor + self.carry_ceiling + self.audit_ceiling,
+            "rewritten_if_all_mixed": self.rewritten_if_all_mixed,
         }
 
 
@@ -368,11 +433,38 @@ def _step4_accessions(inputs: Inputs, cik: str, *, mixed: bool) -> list[str]:
     return out
 
 
+def rewritten_ciks(inputs: Inputs) -> set[str]:
+    """The phase's CIKs with no record in ``--bulk-written`` (amendment (b))."""
+    bulk_ciks = {cik for cik, _ in inputs.bulk_written}
+    return {cik for cik in inputs.files if cik not in bulk_ciks}
+
+
+def _in_late_range(inputs: Inputs, stamp: datetime | None) -> bool:
+    if inputs.late_api is None or stamp is None:
+        return False
+    start, end = inputs.late_api
+    return start <= _ny_date(stamp) <= end
+
+
+def late_api_keys(inputs: Inputs, done: set[Key]) -> list[Key]:
+    """Step 4b: the records whose stamp's New York date is in the late-API
+    range, less ``done`` (records already read from SGML)."""
+    return [
+        (cik, accession)
+        for cik in sorted(inputs.files)
+        for accession, stamp in sorted(inputs.files[cik].stamps.items())
+        if _in_late_range(inputs, stamp) and (cik, accession) not in done
+    ]
+
+
 def make_plan(inputs: Inputs) -> Plan:
-    """Steps 1 and 2 in full, step 3's probes and step 4's known part."""
+    """Steps 1 and 2 in full, step 3's and 3b's probes, step 4's known part,
+    step 4b, and the count's floor and ceiling (no requests)."""
     plan = Plan()
+    rewritten = rewritten_ciks(inputs)
+    plan.rewritten = sorted(rewritten)
     for cik in sorted(inputs.files):
-        if inputs.classes.get(cik) == "early":
+        if inputs.classes.get(cik) == "early" and cik not in rewritten:
             plan.step1.update(_shift_rows(inputs, cik, "class early (stampcheck)"))
     for cik in sorted(inputs.files):
         for accession, stamp in sorted(inputs.files[cik].stamps.items()):
@@ -383,7 +475,7 @@ def make_plan(inputs: Inputs) -> Plan:
                 plan.step2.append((cik, accession))
     step2 = set(plan.step2)
     for cik in sorted(inputs.store):
-        if cik not in inputs.files:
+        if cik not in inputs.files or cik in rewritten:
             continue
         cls = inputs.classes.get(cik)
         if cls == "mixed":
@@ -396,6 +488,35 @@ def make_plan(inputs: Inputs) -> Plan:
                 plan.step4_known[cik] = missing
     for cik, accessions in list(plan.step4_known.items()):
         plan.step4_known[cik] = [a for a in accessions if (cik, a) not in step2]
+    for cik in plan.rewritten:
+        plan.rewritten_probes[cik] = _rewritten_picks(inputs, cik, step2)
+    plan.step4b = late_api_keys(inputs, plan.known_keys())
+    known = plan.known_keys()
+
+    # The audit: over the step-1 shifts that back stored rows and that no
+    # SGML read replaces; the ceiling adds every step-3 CIK as if early.
+    shifted: dict[str, list[str]] = defaultdict(list)
+    for cik, accession in plan.step1:
+        if accession in inputs.store.get(cik, ()) and (cik, accession) not in known:
+            shifted[cik].append(accession)
+    plan.audit_floor = len(audit_sample(shifted, seed=inputs.seed))
+    for cik in plan.step3:
+        for _, accession in _shift_rows(inputs, cik, ""):
+            if accession in inputs.store.get(cik, ()) and (cik, accession) not in known:
+                shifted[cik].append(accession)
+    plan.audit_ceiling = len(audit_sample(shifted, seed=inputs.seed))
+    plan.carry_ceiling = sum(
+        1
+        for cik in plan.step3
+        for a in _step4_accessions(inputs, cik, mixed=True)
+        if (cik, a) not in known
+    )
+    plan.rewritten_if_all_mixed = sum(
+        1
+        for cik in plan.rewritten
+        for a in _step4_accessions(inputs, cik, mixed=True)
+        if (cik, a) not in known
+    )
     return plan
 
 
@@ -413,6 +534,22 @@ def _probe_picks(inputs: Inputs, cik: str, step2: set[Key]) -> list[str]:
     return [accession for _, _, accession in candidates[:_PROBES_PER_CIK]]
 
 
+def _rewritten_picks(inputs: Inputs, cik: str, step2: set[Key]) -> list[str]:
+    """Step 3b's probes: records dated before 2026-10-01 (New York) and not
+    in step 2, stored ones first, newest first."""
+    stamps = inputs.files[cik].stamps
+    stored = inputs.store.get(cik, set())
+    candidates = [
+        (accession in stored, stamp, accession)
+        for accession, stamp in stamps.items()
+        if stamp is not None
+        and _ny_date(stamp) < BULK_WRITTEN_DAY
+        and (cik, accession) not in step2
+    ]
+    candidates.sort(reverse=True)
+    return [accession for _, _, accession in candidates[:_PROBES_PER_CIK]]
+
+
 # --- requests ---------------------------------------------------------------
 
 
@@ -420,14 +557,17 @@ class Journal:
     """SGML answers by ``(cik, accession)``, appended to a CSV as they come,
     so a resumed run repeats no request."""
 
-    def __init__(self, path: Path | None, fetch: Fetch) -> None:
+    def __init__(self, path: Path | None, fetch: Fetch, *, cap: int | None = None) -> None:
         self._path = path
         self._fetch = fetch
+        self.cap = cap
         self.answers: dict[Key, datetime | str] = {}
         self.requests = 0
+        self.lines = 0  # every request of the release, resumed runs included
         if path is not None and path.exists():
             with path.open(newline="") as f:
                 for r in csv.DictReader(f):
+                    self.lines += 1
                     try:  # a line torn by a crash is asked again
                         key = (r["cik"], r["accession"])
                         answer = _parse_stamp(r["sgml_stamp"]) if r["sgml_stamp"] else r["error"]
@@ -436,13 +576,26 @@ class Journal:
                     if answer is not None:
                         self.answers[key] = answer
 
+    def budget(self, keys: Iterable[Key], step: str) -> None:
+        """Stop the run (`RepairStop`) unless the release's requests so far plus
+        the ones ``keys`` still need fit under the cap (amendment (a))."""
+        new = {k for k in keys if k not in self.answers}
+        if self.cap is not None and self.lines + len(new) > self.cap:
+            raise RepairStop(
+                f"{step}: {self.lines} request(s) made in this release plus {len(new)} still "
+                f"to make exceed --max-requests {self.cap}; the journal is kept, nothing is "
+                "written; resume with --resume under a higher cap"
+            )
+
     def get(self, cik: str, accession: str) -> datetime | str:
         """The SGML acceptance stamp, or the error text when the header did not
         give one; fetched once, ever."""
         key = (cik, accession)
         if key in self.answers:
             return self.answers[key]
+        self.budget([key], "request")
         self.requests += 1
+        self.lines += 1
         answer: datetime | str
         try:
             answer = self._fetch(cik, accession)
@@ -514,6 +667,7 @@ class Outcome:
     unrepaired_ciks: list[str]
     counts: dict[str, int]
     sgml_errors: list[str]
+    rewritten_true: list[str] = field(default_factory=list)
 
 
 def _sgml_row(
@@ -529,7 +683,7 @@ def _sgml_row(
 
 def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     """Steps 1 to 5 with requests through ``journal``. Raises `RepairStop`
-    when the audit stop rule fires."""
+    when the audit stop rule fires or a step does not fit under the cap."""
     rows: dict[Key, ManifestRow] = dict(plan.step1)
     errors: dict[Key, str] = {}
 
@@ -543,22 +697,29 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         else:
             rows[(cik, accession)] = row
 
+    journal.budget(plan.step2, "step 2")
     for cik, accession in plan.step2:
         restamp(cik, accession, "step 2: provably early by filing date")
 
+    rewritten = set(plan.rewritten)
     true_ciks = {c for c, cls in inputs.classes.items() if cls == "true"}
     early_ciks = {c for c, cls in inputs.classes.items() if cls == "early"}
     mixed_ciks = {c for c, cls in inputs.classes.items() if cls == "mixed"}
-    step3_classes: dict[str, str] = {}
-    for cik, picks in plan.step3.items():
+
+    def probe(cik: str, picks: list[str], why: str) -> CikClass:
         probes = []
         for accession in picks:
-            restamp(cik, accession, "step 3: class probe")
+            restamp(cik, accession, why)
             answer = journal.get(cik, accession)
             old = inputs.files[cik].stamps[accession]
             if isinstance(answer, datetime) and old is not None:
                 probes.append((old, answer))
-        cls = classify_cik(probes) if probes else "mixed"
+        return classify_cik(probes) if probes else "mixed"
+
+    journal.budget(((c, a) for c, p in plan.step3.items() for a in p), "step 3")
+    step3_classes: dict[str, str] = {}
+    for cik, picks in plan.step3.items():
+        cls = probe(cik, picks, "step 3: class probe")
         step3_classes[cik] = cls
         if cls == "early":
             early_ciks.add(cik)
@@ -569,6 +730,11 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         else:
             mixed_ciks.add(cik)
 
+    journal.budget(((c, a) for c, p in plan.rewritten_probes.items() for a in p), "step 3b")
+    rewritten_classes: dict[str, str] = {}
+    for cik, picks in plan.rewritten_probes.items():
+        rewritten_classes[cik] = probe(cik, picks, "step 3b: rewritten CIK probe")
+
     step4: dict[str, list[str]] = dict(plan.step4_known)
     for cik, found in step3_classes.items():
         if found == "true":
@@ -576,19 +742,32 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         accessions = _step4_accessions(inputs, cik, mixed=found == "mixed")
         if accessions:
             step4[cik] = accessions
-    step4_count = 0
-    for cik, accessions in sorted(step4.items()):
-        for accession in accessions:
-            if rows.get((cik, accession)) is not None and rows[(cik, accession)].method != "shift":
-                continue
-            step4_count += 1
-            restamp(cik, accession, "step 4: mixed or not bulk-written, filing by filing")
+    for cik, found in rewritten_classes.items():
+        if found != "true":
+            accessions = _step4_accessions(inputs, cik, mixed=True)
+            if accessions:
+                step4[cik] = accessions
+
+    def needs_sgml(key: Key) -> bool:
+        row = rows.get(key)
+        return key not in errors and (row is None or row.method == "shift")
+
+    step4_keys = [(c, a) for c, accs in sorted(step4.items()) for a in accs if needs_sgml((c, a))]
+    journal.budget(step4_keys, "step 4")
+    for cik, accession in step4_keys:
+        restamp(cik, accession, "step 4: mixed or not bulk-written, filing by filing")
+
+    step4b_keys = [k for k in late_api_keys(inputs, set()) if needs_sgml(k)]
+    journal.budget(step4b_keys, "step 4b")
+    for cik, accession in step4b_keys:
+        restamp(cik, accession, "step 4b: late API stamp")
 
     shifted: dict[str, list[str]] = defaultdict(list)
     for (cik, accession), row in rows.items():
         if row.method == "shift" and accession in inputs.store.get(cik, ()):
             shifted[cik].append(accession)
     sample = audit_sample(shifted, seed=inputs.seed)
+    journal.budget(sample, "step 5 audit")
     mismatches: dict[str, int] = {}
     audit_errors = 0
     for cik, accession in sample:
@@ -606,14 +785,20 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
             f"audit stop rule: {decision.mismatched_ciks} of {decision.audited_ciks} "
             f"audited CIKs mismatch: {', '.join(decision.per_filing_ciks)}"
         )
+    per_filing = [
+        (cik, accession)
+        for cik in decision.per_filing_ciks
+        for accession in sorted(inputs.store.get(cik, ()))
+        if inputs.files[cik].stamps.get(accession) is not None
+    ]
+    journal.budget(per_filing, "step 5 filing by filing")
     for cik in decision.per_filing_ciks:
         early_ciks.discard(cik)
         mixed_ciks.add(cik)
         for key in [k for k, r in rows.items() if k[0] == cik and r.method == "shift"]:
             del rows[key]
-        for accession in sorted(inputs.store.get(cik, ())):
-            if inputs.files[cik].stamps.get(accession) is not None:
-                restamp(cik, accession, "step 5: audit mismatch, filing by filing")
+    for cik, accession in per_filing:
+        restamp(cik, accession, "step 5: audit mismatch, filing by filing")
 
     unrepaired: list[ManifestRow] = []
     unrepaired_ciks: set[str] = set()
@@ -624,6 +809,11 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
                 continue
             if key in errors:
                 why = f"SGML gave no stamp: {errors[key]}"
+            elif cik in rewritten:
+                found = rewritten_classes.get(cik, "mixed")
+                if found == "true" or _ny_date(stamp) >= BULK_WRITTEN_DAY:
+                    continue
+                why = f"rewritten CIK, probes {found}, not repaired"
             elif cik in true_ciks:
                 continue
             elif cik in early_ciks and key not in inputs.bulk_written:
@@ -643,7 +833,11 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         "step3_early": sum(1 for c in step3_classes.values() if c == "early"),
         "step3_true": sum(1 for c in step3_classes.values() if c == "true"),
         "step3_mixed": sum(1 for c in step3_classes.values() if c == "mixed"),
-        "step4_requests": step4_count,
+        "rewritten_true": sum(1 for c in rewritten_classes.values() if c == "true"),
+        "rewritten_early": sum(1 for c in rewritten_classes.values() if c == "early"),
+        "rewritten_mixed": sum(1 for c in rewritten_classes.values() if c == "mixed"),
+        "step4_requests": len(step4_keys),
+        "step4b_reads": len(step4b_keys),
         "audit_sample": len(sample),
         "audit_ciks": decision.audited_ciks,
         "audit_mismatched_ciks": decision.mismatched_ciks,
@@ -655,33 +849,116 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
         "sgml_errors": len(errors),
         "audit_errors": audit_errors,
         "requests_made": journal.requests,
+        "requests_release": journal.lines,
     }
     listed = [f"{c} {a}: {e}" for (c, a), e in sorted(errors.items())]
-    return Outcome(rows, unrepaired, sorted(unrepaired_ciks), counts, listed)
+    rewritten_true = sorted(c for c, found in rewritten_classes.items() if found == "true")
+    return Outcome(rows, unrepaired, sorted(unrepaired_ciks), counts, listed, rewritten_true)
 
 
-def window_violations(rows: Iterable[ManifestRow], window_start: date) -> list[ManifestRow]:
+WindowRule = Callable[[ManifestRow, date], bool]
+
+
+def in_window(row: ManifestRow, window_start: date) -> bool:
+    """True when the row changes a stamp whose old or new New York date is on
+    or after ``window_start``."""
+    return row.changed and (
+        _ny_date(row.old_stamp) >= window_start or _ny_date(row.new_stamp) >= window_start
+    )
+
+
+def window_violations(
+    rows: Iterable[ManifestRow], window_start: date, allowed: WindowRule | None = None
+) -> list[ManifestRow]:
     """Changes whose old or new stamp falls on or after ``window_start``
-    (New York date): any one aborts the run (data-releases runbook, rule 5)."""
+    (New York date): any one aborts the run (data-releases runbook, rule 5).
+    With ``allowed`` (T166f's ``in_window_change_allowed``, under
+    ``--window-earlier-ok``), an in-window change it passes is not one."""
+    return [
+        r
+        for r in rows
+        if in_window(r, window_start) and (allowed is None or not allowed(r, window_start))
+    ]
+
+
+def _refuse_window(
+    rows: Iterable[ManifestRow], window_start: date, allowed: WindowRule | None = None
+) -> None:
+    bad = window_violations(rows, window_start, allowed)
+    if bad:
+        raise RepairStop(f"{len(bad)} change(s) on or after {window_start}: {_list_rows(bad)}")
+
+
+def _list_rows(rows: Iterable[ManifestRow]) -> str:
+    return "; ".join(
+        f"{r.cik} {r.accession} {r.old_stamp.isoformat()} -> {r.new_stamp.isoformat()}"
+        for r in rows
+    )
+
+
+@dataclass(frozen=True)
+class Precheck:
+    """The parts of T166f's ``precheck.<release>.json`` the driver uses."""
+
+    path: Path
+    instants: tuple[datetime, ...]
+    sha256: str
+
+
+def load_precheck(path: Path, *, release: str, window_start: date, now: datetime) -> Precheck:
+    """Read ``--window-earlier-ok``'s file with T166f's loader; `RepairStop`
+    unless it says pass for this release and window start and was made on
+    ``now``'s New York date (the driver has no store, so the day is its
+    staleness rule; amendment (d))."""
+    try:
+        data = restamp_precheck.load_precheck(path)
+    except (OSError, ValueError) as exc:
+        raise RepairStop(f"--window-earlier-ok {path}: unreadable pre-check file: {exc}") from exc
+    if not data.passed:
+        raise RepairStop(f"--window-earlier-ok {path}: the pre-check did not pass")
+    if data.release != release:
+        raise RepairStop(
+            f"--window-earlier-ok {path}: made for release {data.release!r}, not {release!r}"
+        )
+    if data.window_first_session != window_start:
+        raise RepairStop(
+            f"--window-earlier-ok {path}: made for window start {data.window_first_session}, "
+            f"not {window_start.isoformat()}"
+        )
+    if _ny_date(data.made_at) != _ny_date(now):
+        raise RepairStop(
+            f"--window-earlier-ok {path}: made {data.made_at.isoformat()}, not on the run's "
+            f"New York date {_ny_date(now).isoformat()}; run the pre-check again"
+        )
+    return Precheck(path, tuple(sorted(data.instants)), data.sha256)
+
+
+def instant_violations(
+    rows: Iterable[ManifestRow], instants: Sequence[datetime]
+) -> list[ManifestRow]:
+    """Changes that cross a read instant ``t`` (amendment (d), the exact
+    check, T166f's `crossed_instants`): ``new <= t < old`` for an earlier
+    move and, read the other way, ``old <= t < new`` for a later one. Every
+    changed row is checked, not only in-window ones: a correction dated the
+    day before the window's first session can still cross ``close(S-1)``."""
     return [
         r
         for r in rows
         if r.changed
         and (
-            r.old_stamp.astimezone(_NEW_YORK).date() >= window_start
-            or r.new_stamp.astimezone(_NEW_YORK).date() >= window_start
+            restamp_precheck.crossed_instants(r.old_stamp, r.new_stamp, instants)
+            or restamp_precheck.crossed_instants(r.new_stamp, r.old_stamp, instants)
         )
     ]
 
 
-def _refuse_window(rows: Iterable[ManifestRow], window_start: date) -> None:
-    bad = window_violations(rows, window_start)
-    if bad:
-        listed = "; ".join(
-            f"{r.cik} {r.accession} {r.old_stamp.isoformat()} -> {r.new_stamp.isoformat()}"
-            for r in bad
+def _refuse_instants(rows: Iterable[ManifestRow], precheck: Precheck) -> None:
+    read = instant_violations(rows, precheck.instants)
+    if read:
+        raise RepairStop(
+            f"{len(read)} change(s) cross a read instant of {precheck.path} "
+            f"(new <= t < old or old <= t < new): {_list_rows(read)}"
         )
-        raise RepairStop(f"{len(bad)} change(s) on or after {window_start}: {listed}")
 
 
 def rewrite_file(stamps_file: StampsFile, changes: Mapping[str, datetime]) -> bytes:
@@ -730,12 +1007,21 @@ def _read_or_none(path: Path) -> bytes | None:
 def _plan_report(inputs: Inputs, plan: Plan, args: argparse.Namespace) -> dict[str, Any]:
     """The dry run's report: counts, known requests, and what would stop."""
     out: dict[str, Any] = dict(plan.report(), ciks=len(inputs.files))
-    out["requests_known"] = (
-        out["step2_requests"] + out["step3_requests"] + out["step4_known_requests"]
-    )
     out["step2_over_limit"] = len(plan.step2) > args.max_step2_requests
-    out["requests_over_limit"] = out["requests_known"] > args.max_requests
+    out["requests_over_limit"] = out["requests_floor"] > args.max_requests
     out["window_changes_known"] = len(window_violations(plan.step1.values(), inputs.window_start))
+    out["late_api_range"] = (
+        [d.isoformat() for d in inputs.late_api] if inputs.late_api is not None else None
+    )
+    # Candidates already dated in the window: a later move there aborts the run.
+    for name, keys in (("step2", plan.step2), ("step4b", plan.step4b)):
+        dated = [
+            (c, a)
+            for c, a in keys
+            if (st := inputs.files[c].stamps[a]) is not None and _ny_date(st) >= inputs.window_start
+        ]
+        out[f"{name}_in_window"] = len(dated)
+        out[f"{name}_in_window_list"] = [f"{c} {a}" for c, a in dated]
     out["stamps_without_index_date"] = sum(
         1
         for f in inputs.files.values()
@@ -800,7 +1086,19 @@ def load_inputs(
         seed=args.seed,
         skipped_quarters=skipped,
         stored_without_stamp=missing,
+        late_api=_late_api(args),
     )
+
+
+def _late_api(args: argparse.Namespace) -> tuple[date, date] | None:
+    start, end = args.late_api_from, args.late_api_to
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        raise RepairStop("--late-api-from and --late-api-to go together")
+    if end < start:
+        raise RepairStop(f"--late-api-to {end} is before --late-api-from {start}")
+    return (start, end)
 
 
 def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
@@ -820,6 +1118,18 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
             raise RepairStop(f"backup {backup} exists; pick another --release or pass --resume")
         if args.resume and not backup.exists():
             raise RepairStop(f"--resume needs the backup {backup}")
+    precheck: Precheck | None = None
+    allowed: WindowRule | None = None
+    if args.window_earlier_ok is not None:
+        precheck = load_precheck(
+            args.window_earlier_ok,
+            release=args.release,
+            window_start=args.window_start,
+            now=datetime.now(UTC),
+        )
+        allowed = in_window_change_allowed
+        report["window_earlier_ok"] = str(precheck.path)
+        report["window_earlier_ok_sha256"] = precheck.sha256
     inputs = load_inputs(backup if args.apply and args.resume else live, args, universe)
     plan = make_plan(inputs)
     report.update(_plan_report(inputs, plan, args))
@@ -834,10 +1144,12 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
         raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
     if report["requests_over_limit"]:
         raise RepairStop(
-            f"the known requests ({report['requests_known']}) exceed --max-requests "
+            f"the request floor ({report['requests_floor']}) exceeds --max-requests "
             f"{args.max_requests}"
         )
-    _refuse_window(plan.step1.values(), inputs.window_start)
+    _refuse_window(plan.step1.values(), inputs.window_start, allowed)
+    if precheck is not None:
+        _refuse_instants(plan.step1.values(), precheck)
     if not args.resume:
         need = _dir_bytes(live)
         free = shutil.disk_usage(live).free
@@ -848,26 +1160,38 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
             shutil.rmtree(partial)  # an earlier copy that never finished
         shutil.copytree(live, partial)
         partial.rename(backup)  # the backup name exists only once the copy is whole
-    journal = Journal(_sidecar(manifest, ".requests.csv"), fetch or sgml_fetch())
+    journal = Journal(
+        _sidecar(manifest, ".requests.csv"), fetch or sgml_fetch(), cap=args.max_requests
+    )
     outcome = execute(inputs, plan, journal)
-    _refuse_window(outcome.rows.values(), inputs.window_start)
+    _refuse_window(outcome.rows.values(), inputs.window_start, allowed)
+    if precheck is not None:
+        _refuse_instants(outcome.rows.values(), precheck)
+        # A long run may pass New York midnight: the file must still be the
+        # run's day when the moves are written (amendment (d), staleness).
+        load_precheck(
+            precheck.path,
+            release=args.release,
+            window_start=args.window_start,
+            now=datetime.now(UTC),
+        )
 
     changes: dict[str, dict[str, datetime]] = defaultdict(dict)
     for (cik, accession), row in outcome.rows.items():
         if row.changed:
             changes[cik][accession] = row.new_stamp
-    rewritten = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
+    new_files = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
     moved = [
         cik
-        for cik in sorted(rewritten)
-        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, rewritten[cik])
+        for cik in sorted(new_files)
+        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, new_files[cik])
     ]
     if moved:
         raise RepairStop(
             f"{len(moved)} live stamps file(s) changed since the backup (an ingest ran?): "
             f"{', '.join(moved[:20])}; rerun under a new --release"
         )
-    for cik, data in sorted(rewritten.items()):
+    for cik, data in sorted(new_files.items()):
         edgar_raw.write_atomic(live / f"{cik}.json", data)
     _write_rows(manifest, (outcome.rows[k] for k in sorted(outcome.rows)))
     _write_rows(_sidecar(manifest, ".unrepaired.csv.gz"), outcome.unrepaired, compress=True)
@@ -875,7 +1199,11 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
         _sidecar(manifest, ".unrepaired_ciks.txt"),
         "".join(f"{c}\n" for c in outcome.unrepaired_ciks).encode(),
     )
-    report.update(outcome.counts, files_rewritten=len(rewritten), manifest=str(manifest))
+    edgar_raw.write_atomic(
+        _sidecar(manifest, ".rewritten_ciks.txt"),
+        "".join(f"{c}\n" for c in outcome.rewritten_true).encode(),
+    )
+    report.update(outcome.counts, files_rewritten=len(new_files), manifest=str(manifest))
     report["sgml_error_list"] = outcome.sgml_errors
     return report
 
@@ -903,6 +1231,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-step2-requests", type=int, default=DEFAULT_MAX_STEP2_REQUESTS)
     r.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     r.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    r.add_argument("--late-api-from", type=_date, default=None)
+    r.add_argument("--late-api-to", type=_date, default=None)
+    r.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     r.add_argument("--apply", action="store_true")
     r.add_argument("--resume", action="store_true")
     return parser
