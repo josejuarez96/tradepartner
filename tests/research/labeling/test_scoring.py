@@ -20,6 +20,28 @@ import pytest
 from tradepartner.research.labeling import crosswalk, scoring
 from tradepartner.research.labeling.questions import UNRESOLVED
 
+
+def _item(
+    listing_end_id: str,
+    gold_label: str | None,
+    predicted_option: str | None,
+    reason: scoring.Reason,
+    **kwargs: object,
+) -> scoring.ScoredItem:
+    """A `ScoredItem` whose labelled gold rests on `text` unless the test says
+    otherwise (#1492: a labelled item needs a basis; the tests written before it
+    score the text set)."""
+    if gold_label not in (None, UNRESOLVED):
+        kwargs.setdefault("basis", "text")
+    return scoring.ScoredItem(
+        listing_end_id,
+        gold_label,
+        predicted_option,
+        reason,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
 # --- wilson_lower_bound --------------------------------------------------------
 
 
@@ -105,19 +127,17 @@ def _labelled_items(
     score wrong (req 10), never excluded."""
     items = []
     for i in range(n_correct):
-        items.append(scoring.ScoredItem(f"correct-{i}", "bankruptcy", "bankruptcy", "ok"))
+        items.append(_item(f"correct-{i}", "bankruptcy", "bankruptcy", "ok"))
     for i in range(n_wrong_option):
-        items.append(
-            scoring.ScoredItem(f"wrong-option-{i}", "bankruptcy", "exchange_transfer", "ok")
-        )
+        items.append(_item(f"wrong-option-{i}", "bankruptcy", "exchange_transfer", "ok"))
     for i in range(n_timeout):
-        items.append(scoring.ScoredItem(f"timeout-{i}", "bankruptcy", None, "timeout"))
+        items.append(_item(f"timeout-{i}", "bankruptcy", None, "timeout"))
     for i in range(n_unresolved):
-        items.append(scoring.ScoredItem(f"unresolved-{i}", "bankruptcy", UNRESOLVED, "ok"))
+        items.append(_item(f"unresolved-{i}", "bankruptcy", UNRESOLVED, "ok"))
     for i in range(extra_unlabelled):
-        items.append(scoring.ScoredItem(f"unlabelled-{i}", None, "bankruptcy", "ok"))
+        items.append(_item(f"unlabelled-{i}", None, "bankruptcy", "ok"))
     for i in range(extra_gold_unresolved):
-        items.append(scoring.ScoredItem(f"gold-unresolved-{i}", UNRESOLVED, "bankruptcy", "ok"))
+        items.append(_item(f"gold-unresolved-{i}", UNRESOLVED, "bankruptcy", "ok"))
     return items
 
 
@@ -166,10 +186,10 @@ def test_class_accuracy_excludes_unlabelled_and_gold_unresolved() -> None:
 
 
 def test_class_accuracy_against_text_states() -> None:
-    item_matches = scoring.ScoredItem(
+    item_matches = _item(
         "a", "bankruptcy", "bankruptcy", "ok", text_states=None
     )  # text_states defaults to gold_label (Q6)
-    item_differs = scoring.ScoredItem(
+    item_differs = _item(
         "b", "bankruptcy", "exchange_transfer", "ok", text_states="compliance_delisting"
     )
     result_gold = scoring.class_accuracy([item_matches, item_differs], against="gold_label")
@@ -184,7 +204,7 @@ def test_class_accuracy_against_text_states() -> None:
 
 def test_worst_case_lower_bound_counts_unlabelled_as_wrong() -> None:
     scored = _labelled_items(n_correct=108, n_wrong_option=6, n_timeout=3, n_unresolved=3)
-    unlabelled = [scoring.ScoredItem(f"u-{i}", None, "bankruptcy", "ok") for i in range(5)]
+    unlabelled = [_item(f"u-{i}", None, "bankruptcy", "ok") for i in range(5)]
     items = scored + unlabelled
 
     ordinary = scoring.class_accuracy(items)
@@ -203,7 +223,7 @@ def test_worst_case_lower_bound_excludes_a_seed_not_in_the_random_draw() -> None
     drawn = _labelled_items(n_correct=10, n_wrong_option=0, n_timeout=0, n_unresolved=0)
     without_seed = scoring.worst_case_lower_bound(drawn)
 
-    extra_seed = scoring.ScoredItem(
+    extra_seed = _item(
         "extra-seed", "bankruptcy", "exchange_transfer", "ok", is_seed=True, in_random_draw=False
     )
     with_seed = scoring.worst_case_lower_bound([*drawn, extra_seed])
@@ -220,7 +240,7 @@ def test_in_random_draw_true_seed_counts_in_both_class_accuracy_and_seeded_recal
     `seeded_recall` (req 10's exception: "except a seed the random draw
     itself picked")."""
     row6 = crosswalk.RuleAnswer(status="listed")  # a disagreement by construction
-    drawn_seed = scoring.ScoredItem(
+    drawn_seed = _item(
         "drawn-seed", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6
     )
     items = [
@@ -237,7 +257,7 @@ def test_in_random_draw_true_seed_counts_in_both_class_accuracy_and_seeded_recal
 
 def test_scored_item_rejects_in_random_draw_false_on_a_non_seed() -> None:
     with pytest.raises(ValueError):
-        scoring.ScoredItem("x", "bankruptcy", "bankruptcy", "ok", in_random_draw=False)
+        _item("x", "bankruptcy", "bankruptcy", "ok", in_random_draw=False)
 
 
 def test_seed_not_in_random_draw_changes_seeded_recall_not_class_accuracy() -> None:
@@ -247,7 +267,7 @@ def test_seed_not_in_random_draw_changes_seeded_recall_not_class_accuracy() -> N
     this flag)."""
     row6 = crosswalk.RuleAnswer(status="listed")  # a disagreement by construction
     drawn = _labelled_items(n_correct=10, n_wrong_option=0, n_timeout=0, n_unresolved=0)
-    extra_seed = scoring.ScoredItem(
+    extra_seed = _item(
         "extra-seed",
         "bankruptcy",
         "bankruptcy",
@@ -267,12 +287,10 @@ def test_seed_not_in_random_draw_changes_seeded_recall_not_class_accuracy() -> N
 
 
 def test_in_random_draw_excludes_from_unresolved_and_unlabelled_share() -> None:
-    not_drawn = scoring.ScoredItem(
-        "not-drawn", None, None, "timeout", is_seed=True, in_random_draw=False
-    )
+    not_drawn = _item("not-drawn", None, None, "timeout", is_seed=True, in_random_draw=False)
     items = [
-        scoring.ScoredItem("a", "bankruptcy", "bankruptcy", "ok"),
-        scoring.ScoredItem("b", None, "bankruptcy", "ok"),
+        _item("a", "bankruptcy", "bankruptcy", "ok"),
+        _item("b", None, "bankruptcy", "ok"),
         not_drawn,
     ]
     assert scoring.unresolved_share(items) == 0.0  # only "a" and "b" counted, neither unresolved
@@ -284,10 +302,10 @@ def test_in_random_draw_excludes_from_unresolved_and_unlabelled_share() -> None:
 
 def test_unresolved_share() -> None:
     items = [
-        scoring.ScoredItem("a", "bankruptcy", "bankruptcy", "ok"),
-        scoring.ScoredItem("b", "bankruptcy", UNRESOLVED, "ok"),
-        scoring.ScoredItem("c", "bankruptcy", None, "timeout"),
-        scoring.ScoredItem("d", "bankruptcy", None, "refused"),
+        _item("a", "bankruptcy", "bankruptcy", "ok"),
+        _item("b", "bankruptcy", UNRESOLVED, "ok"),
+        _item("c", "bankruptcy", None, "timeout"),
+        _item("d", "bankruptcy", None, "refused"),
     ]
     assert scoring.unresolved_share(items) == 0.75
     assert scoring.unresolved_share([]) == 0.0
@@ -295,10 +313,10 @@ def test_unresolved_share() -> None:
 
 def test_unlabelled_share() -> None:
     items = [
-        scoring.ScoredItem("a", "bankruptcy", "bankruptcy", "ok"),
-        scoring.ScoredItem("b", None, "bankruptcy", "ok"),
-        scoring.ScoredItem("c", None, None, "timeout"),
-        scoring.ScoredItem("d", UNRESOLVED, "bankruptcy", "ok"),
+        _item("a", "bankruptcy", "bankruptcy", "ok"),
+        _item("b", None, "bankruptcy", "ok"),
+        _item("c", None, None, "timeout"),
+        _item("d", UNRESOLVED, "bankruptcy", "ok"),
     ]
     assert scoring.unlabelled_share(items) == 0.5
     assert scoring.unlabelled_share([]) == 0.0
@@ -312,7 +330,7 @@ def test_seeded_recall_with_no_seeds_is_none_not_a_vacuous_one() -> None:
     `1.0` passed the gate on an empty seed set."""
     assert scoring.seeded_recall([]) is None
     row4 = crosswalk.RuleAnswer(status="delisted", form15_in_window=True)
-    seed = scoring.ScoredItem(
+    seed = _item(
         "seed",
         "redomicile_or_reorganisation",
         "redomicile_or_reorganisation",
@@ -331,14 +349,10 @@ def test_seeded_recall_gates_rows_6_and_7_and_reports_the_rest() -> None:
     row4 = crosswalk.RuleAnswer(status="delisted", form15_in_window=True)
     row5 = crosswalk.RuleAnswer(status="delisted")
     items = [
-        scoring.ScoredItem(
-            "seed-6", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6
-        ),
-        scoring.ScoredItem(
-            "seed-7", "bankruptcy", None, "timeout", is_seed=True, pre_fix_rule_answer=row7
-        ),
+        _item("seed-6", "bankruptcy", "bankruptcy", "ok", is_seed=True, pre_fix_rule_answer=row6),
+        _item("seed-7", "bankruptcy", None, "timeout", is_seed=True, pre_fix_rule_answer=row7),
         # Seagate 2021's shape: a correct redomicile label agrees with row 4
-        scoring.ScoredItem(
+        _item(
             "seed-4",
             "redomicile_or_reorganisation",
             "redomicile_or_reorganisation",
@@ -347,7 +361,7 @@ def test_seeded_recall_gates_rows_6_and_7_and_reports_the_rest() -> None:
             pre_fix_rule_answer=row4,
         ),
         # a row-5 seed the model labels outside the row's set is caught, still ungated
-        scoring.ScoredItem(
+        _item(
             "seed-5",
             "exchange_transfer",
             "exchange_transfer",
@@ -355,14 +369,14 @@ def test_seeded_recall_gates_rows_6_and_7_and_reports_the_rest() -> None:
             is_seed=True,
             pre_fix_rule_answer=row5,
         ),
-        scoring.ScoredItem("not-a-seed", "bankruptcy", "bankruptcy", "ok", is_seed=False),
+        _item("not-a-seed", "bankruptcy", "bankruptcy", "ok", is_seed=False),
     ]
     assert scoring.seeded_recall(items) == 1.0
     assert scoring.seeded_report(items) == (
-        scoring.SeedOutcome("seed-4", 4, gated=False, caught=False),
-        scoring.SeedOutcome("seed-5", 5, gated=False, caught=True),
-        scoring.SeedOutcome("seed-6", 6, gated=True, caught=True),
-        scoring.SeedOutcome("seed-7", 7, gated=True, caught=True),
+        scoring.SeedOutcome("seed-4", 4, gated=False, caught=False, basis="text"),
+        scoring.SeedOutcome("seed-5", 5, gated=False, caught=True, basis="text"),
+        scoring.SeedOutcome("seed-6", 6, gated=True, caught=True, basis="text"),
+        scoring.SeedOutcome("seed-7", 7, gated=True, caught=True, basis="text"),
     )
 
 
@@ -370,17 +384,14 @@ def test_seeded_recall_gates_rows_6_and_7_and_reports_the_rest() -> None:
 
 
 def test_per_option_precision_recall_against_the_scipy_oracle() -> None:
-    recall_items = [
-        scoring.ScoredItem(f"r-correct-{i}", "bankruptcy", "bankruptcy", "ok") for i in range(5)
-    ] + [
-        scoring.ScoredItem(f"r-wrong-{i}", "bankruptcy", "exchange_transfer", "ok")
-        for i in range(15)
+    recall_items = [_item(f"r-correct-{i}", "bankruptcy", "bankruptcy", "ok") for i in range(5)] + [
+        _item(f"r-wrong-{i}", "bankruptcy", "exchange_transfer", "ok") for i in range(15)
     ]
     precision_items = [
-        scoring.ScoredItem(f"p-correct-{i}", "compliance_delisting", "compliance_delisting", "ok")
+        _item(f"p-correct-{i}", "compliance_delisting", "compliance_delisting", "ok")
         for i in range(3)
     ] + [
-        scoring.ScoredItem(f"p-wrong-{i}", "voluntary_withdrawal", "compliance_delisting", "ok")
+        _item(f"p-wrong-{i}", "voluntary_withdrawal", "compliance_delisting", "ok")
         for i in range(12)
     ]
     result = scoring.per_option_precision_recall(recall_items + precision_items)
@@ -413,9 +424,9 @@ def test_per_option_precision_recall_excludes_non_scorable_gold_from_precision()
     """A model call on an item the owner left gold-`unresolved` or
     unlabelled makes no claim precision can be scored against (quant-auditor
     SHOULD FIX on PR #1069): it must not lower that option's precision."""
-    scorable_true_positive = scoring.ScoredItem("tp", "bankruptcy", "bankruptcy", "ok")
-    non_scorable_unresolved = scoring.ScoredItem("unresolved-gold", UNRESOLVED, "bankruptcy", "ok")
-    non_scorable_unlabelled = scoring.ScoredItem("unlabelled-gold", None, "bankruptcy", "ok")
+    scorable_true_positive = _item("tp", "bankruptcy", "bankruptcy", "ok")
+    non_scorable_unresolved = _item("unresolved-gold", UNRESOLVED, "bankruptcy", "ok")
+    non_scorable_unlabelled = _item("unlabelled-gold", None, "bankruptcy", "ok")
     items = [scorable_true_positive, non_scorable_unresolved, non_scorable_unlabelled]
 
     result = scoring.per_option_precision_recall(items)
@@ -440,7 +451,7 @@ def test_per_option_precision_recall_no_support_is_none() -> None:
 def test_rule_provision_arm_score() -> None:
     items = [
         # one-class arm ((a)(1) -> {instrument_retirement}), gold matches: covered and correct
-        scoring.ScoredItem(
+        _item(
             "one-class-correct",
             "instrument_retirement",
             "instrument_retirement",
@@ -449,7 +460,7 @@ def test_rule_provision_arm_score() -> None:
         ),
         # multi-class arm ((a)(3)): covered (bankruptcy's class is among the arm's classes),
         # never counted toward class_accuracy
-        scoring.ScoredItem(
+        _item(
             "multi-class-covered",
             "bankruptcy",
             "bankruptcy",
@@ -457,7 +468,7 @@ def test_rule_provision_arm_score() -> None:
             rule_provision="12d2-2(a)(3)",
         ),
         # one-class arm again, gold outside it: not covered, counted wrong
-        scoring.ScoredItem(
+        _item(
             "one-class-wrong",
             "bankruptcy",
             "bankruptcy",
@@ -485,7 +496,7 @@ def test_rule_provision_arm_score_excludes_a_seed_not_in_the_random_draw() -> No
     coverage or accuracy either (quant-auditor SHOULD FIX on PR #1069,
     pass 2)."""
     drawn = [
-        scoring.ScoredItem(
+        _item(
             "one-class-correct",
             "instrument_retirement",
             "instrument_retirement",
@@ -495,7 +506,7 @@ def test_rule_provision_arm_score_excludes_a_seed_not_in_the_random_draw() -> No
     ]
     without_seed = scoring.rule_provision_arm_score(drawn)
 
-    extra_seed = scoring.ScoredItem(
+    extra_seed = _item(
         "extra-seed",
         "bankruptcy",
         "bankruptcy",
@@ -521,7 +532,7 @@ def test_rule_provision_arm_score_scores_the_arm_against_gold_not_the_model() ->
     items = [
         # arm right (gold == instrument_retirement), model disagrees with
         # the arm (bankruptcy): must count correct for the arm.
-        scoring.ScoredItem(
+        _item(
             "arm-right-model-wrong",
             "instrument_retirement",
             "bankruptcy",
@@ -531,7 +542,7 @@ def test_rule_provision_arm_score_scores_the_arm_against_gold_not_the_model() ->
         # arm wrong (gold == bankruptcy, outside the arm's one class), model
         # happens to agree with the arm (instrument_retirement): must count
         # wrong for the arm.
-        scoring.ScoredItem(
+        _item(
             "arm-wrong-model-agrees-with-arm",
             "bankruptcy",
             "instrument_retirement",
@@ -799,3 +810,140 @@ def test_mean_abs_probability_shift() -> None:
 
 def test_mean_abs_probability_shift_nothing_comparable_is_zero() -> None:
     assert scoring.mean_abs_probability_shift([scoring.DriftComparison("a", "x", "x")]) == 0.0
+
+
+# --- the split score (#1492, item 3) ---------------------------------------------------
+
+
+def _split_items() -> list[scoring.ScoredItem]:
+    """Ten `text` items (eight right), four `provision` items the model calls
+    unresolved (the arm's `(a)(2)` agrees with their gold by construction), three
+    `exchange_rule` items (one right), one gold `unresolved`, one unlabelled."""
+    items = [
+        scoring.ScoredItem(f"t-right-{i}", "bankruptcy", "bankruptcy", "ok", basis="text")
+        for i in range(8)
+    ]
+    items += [
+        scoring.ScoredItem(f"t-wrong-{i}", "bankruptcy", "exchange_transfer", "ok", basis="text")
+        for i in range(2)
+    ]
+    items += [
+        scoring.ScoredItem(
+            f"p-{i}",
+            "instrument_retirement",
+            UNRESOLVED,
+            "ok",
+            rule_provision="12d2-2(a)(2)",
+            basis="provision",
+        )
+        for i in range(4)
+    ]
+    items += [
+        scoring.ScoredItem("e-right", "bankruptcy", "bankruptcy", "ok", basis="exchange_rule"),
+        scoring.ScoredItem("e-wrong-0", "bankruptcy", UNRESOLVED, "ok", basis="exchange_rule"),
+        scoring.ScoredItem("e-wrong-1", "bankruptcy", None, "timeout", basis="exchange_rule"),
+        scoring.ScoredItem("gold-unresolved", UNRESOLVED, "bankruptcy", "ok"),
+        scoring.ScoredItem("unlabelled", None, "bankruptcy", "ok"),
+    ]
+    return items
+
+
+def test_a_provision_item_never_enters_the_headline_or_the_arm() -> None:
+    items = _split_items()
+    headline = scoring.headline_items(items)
+    assert {i.listing_end_id for i in headline} == {
+        *(f"t-right-{i}" for i in range(8)),
+        "t-wrong-0",
+        "t-wrong-1",
+        "unlabelled",
+    }
+    primary = scoring.class_accuracy(headline)
+    assert (primary.n, primary.correct) == (10, 8)
+    # the worst case adds the one unlabelled item as wrong: 8 of 11
+    assert scoring.worst_case_lower_bound(headline) == pytest.approx(
+        scoring.wilson_lower_bound(8, 11)
+    )
+    per_option = scoring.per_option_precision_recall(headline, min_gold=1)
+    assert per_option["instrument_retirement"].recall_n == 0
+    assert per_option["bankruptcy"].recall_n == 10
+    # the four provision items carry the arm's own provision: on the headline set the
+    # arm sees none of them (no text item has a rule_provision here)
+    arm = scoring.rule_provision_arm_score(headline)
+    assert arm.class_accuracy.n == 0 and arm.coverage == 0.0
+    # pooled, the same functions would have counted them: the test's own control
+    pooled = scoring.rule_provision_arm_score(items)
+    assert pooled.class_accuracy.n == 4
+
+
+def test_exchange_rule_and_provision_each_get_their_own_accuracy() -> None:
+    items = _split_items()
+    exchange_rule = scoring.class_accuracy(scoring.by_basis(items, "exchange_rule"))
+    provision = scoring.class_accuracy(scoring.by_basis(items, "provision"))
+    assert (exchange_rule.n, exchange_rule.correct) == (3, 1)
+    assert exchange_rule.lower_bound == pytest.approx(scoring.wilson_lower_bound(1, 3))
+    # a model unresolved on a provision item counts wrong, as everywhere
+    assert (provision.n, provision.correct) == (4, 0)
+    assert [i.listing_end_id for i in scoring.by_basis(items, "text")][:1] == ["t-right-0"]
+
+
+def test_basis_counts_counts_the_random_draw() -> None:
+    items = _split_items()
+    items.append(
+        scoring.ScoredItem(
+            "extra-seed",
+            "bankruptcy",
+            "bankruptcy",
+            "ok",
+            basis="text",
+            is_seed=True,
+            in_random_draw=False,
+        )
+    )
+    assert scoring.basis_counts(items) == {
+        "text": 10,
+        "exchange_rule": 3,
+        "provision": 4,
+        "unresolved": 1,
+        "unlabelled": 1,
+    }
+
+
+@pytest.mark.parametrize("label", ["bankruptcy", "instrument_retirement"])
+def test_a_labelled_item_without_a_basis_raises(label: str) -> None:
+    with pytest.raises(ValueError, match="needs a basis"):
+        scoring.ScoredItem("x", label, label, "ok")
+
+
+@pytest.mark.parametrize("label", [UNRESOLVED, None])
+def test_a_basis_on_an_unresolved_or_unlabelled_item_raises(label: str | None) -> None:
+    with pytest.raises(ValueError, match="basis 'text' on a gold"):
+        scoring.ScoredItem("x", label, "bankruptcy", "ok", basis="text")
+
+
+def test_a_basis_outside_the_three_raises() -> None:
+    with pytest.raises(ValueError, match="not one of"):
+        scoring.ScoredItem("x", "bankruptcy", "bankruptcy", "ok", basis="notice")  # type: ignore[arg-type]
+
+
+def test_seeded_recall_is_unchanged_by_basis_and_the_report_carries_it() -> None:
+    answer = crosswalk.RuleAnswer(
+        status="listed", relisted=False, successor_id=None, form15_in_window=False
+    )
+
+    def seeds(basis: scoring.Basis) -> list[scoring.ScoredItem]:
+        return [
+            scoring.ScoredItem(
+                "s6",
+                "bankruptcy",
+                "bankruptcy",
+                "ok",
+                basis=basis,
+                is_seed=True,
+                in_random_draw=False,
+                pre_fix_rule_answer=answer,
+            )
+        ]
+
+    by_basis = {basis: scoring.seeded_recall(seeds(basis)) for basis in scoring.BASES}
+    assert set(by_basis.values()) == {1.0}
+    assert [o.basis for o in scoring.seeded_report(seeds("provision"))] == ["provision"]
