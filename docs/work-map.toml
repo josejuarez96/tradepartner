@@ -1017,7 +1017,7 @@ what = "The owner's repair release restamp-1382: repair, rebuild, health check, 
 why = "Closes #1382 so the B9 work and T164e's real-store run can read filing times that are point in time."
 
 [issue.1498]
-what = "The docs for a stored, point-in-time 3-month T-bill rate: ADR 0020 (FRED/ALFRED DTB3 as the source), the data-foundation rates table and its known_at rule, the backtest metrics reading a per-period risk-free series with the constant kept as the frozen fallback, and plan tasks T169 to T170c."
+what = "The docs for a stored, point-in-time 3-month T-bill rate: ADR 0020 (FRED/ALFRED DTB3 as the source), the data-foundation rates table and its known_at rule, the backtest metrics reading a per-period risk-free series with the constant kept as the frozen fallback, and plan tasks T169 to T170d."
 why = "Every stored Sharpe is computed against a constant zero while bills pay 4 to 5%; B11 fetched the rate by hand and B12, the hedged line and any market-neutral benchmark need it in the store with a known_at."
 unblocks = ["adr:0020", "task:T169", "task:T170"]
 
@@ -1042,9 +1042,14 @@ why = "The adapter is the only module that knows FRED's field names; swapping to
 unblocks = ["task:T169d"]
 
 [task.T169d]
-what = "ingest --source fred (backfill and daily requests, the not-yet-known skip, revisions, staleness), the CLI source list and the health block with the attribution line."
+what = "ingest --source fred (the backfill request, a daily window that starts at the latest stored observation so a lapse leaves no hole, the not-yet-known skip, revisions, staleness, the run-row counts) and the CLI source."
 why = "Nothing reaches the owner's store until the ingest writes it under the store's own rules."
-unblocks = ["task:T170c"]
+unblocks = ["task:T169e"]
+
+[task.T169e]
+what = "The health block for rates (latest observation and vintage, revisions, late rows, the longest gap, plausibility, the --check rules) on the page and in the CLI, with the FRED attribution sentence, and the same sentence in the README."
+why = "A revision or a late row cannot stale a trial, since the table is outside the data vintage, so the health warning is the owner's only cue to rerun; the attribution is a term of the API."
+unblocks = ["task:T170d"]
 
 [task.T170]
 what = "The pure risk-free module (discount-to-yield conversion, per-session accrual, per-period product) and series_metrics taking a per-period risk-free sequence, with risk_free_annual as a metric key."
@@ -1052,11 +1057,16 @@ why = "The Sharpe's denominator input becomes a series; done as a pure module fi
 unblocks = ["task:T170b"]
 
 [task.T170b]
-what = "The three frozen metrics.* keys with their table entries, the provider's rates read at the data cutoff, the engine and results wiring, and the look-ahead tests."
-why = "Wires the pure module to the store under the frozen-key rules so no registered trial moves and a run to T reads no rate known after T."
+what = "The three frozen metrics.* keys with their table entries (constant, DTB3, discount) and the provider's rates read at the data cutoff."
+why = "The keys enter under the frozen-key rules so no registered trial moves; the provider read is the one seam the engine will call."
 unblocks = ["task:T170c"]
 
 [task.T170c]
+what = "The engine's one rates read at the last step under store, the results wiring that builds the per-period risk-free series and fails risk_free_missing, and the look-ahead tests including one fixture backtest end to end under store."
+why = "A run to T must read no rate known after T, and a run before the series starts must fail rather than read zero."
+unblocks = ["task:T170d"]
+
+[task.T170d]
 what = "The owner's backfill of DTB3 from 2016-01-04 on the real store, the health check, five hand-checked dates against H.15, and the flip of metrics.risk_free_source to store."
 why = "New registrations read the real rate only once the store holds it; flipping before the backfill would fail their runs."
 
