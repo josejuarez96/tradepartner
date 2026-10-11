@@ -873,6 +873,10 @@ def _source_counts(filings: FilingSource) -> str:
         ("submissions_bulk_empty", "empty bulk submissions"),
         ("facts_api_empty", "empty API facts"),  # #576: per-CIK API 200 `{}`
         ("submissions_api_empty", "empty API submissions"),
+        ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
+        ("stamps_from_sgml", "stamps from SGML"),
+        ("stamps_sgml_unread", "stamps unread in SGML"),
+        ("stamp_check_unread_ciks", "CIKs stamped unchecked"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
         ("facts_api_keyless", "keyless API facts"),
         ("facts_capped_dropped", "capped facts dropped"),  # #610 X2
