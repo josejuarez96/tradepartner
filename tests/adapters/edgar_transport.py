@@ -33,11 +33,20 @@ _Route = Callable[[httpx.Request], httpx.Response]
 
 
 def edgar_settings(cache_dir: Path, **edgar: Any) -> Settings:
-    """Test settings: index from 2024, throttle negligible, cache in `cache_dir`.
+    """Test settings: index from 2024, throttle negligible, cache in `cache_dir`,
+    the SGML stamp check (#1494) off unless `stamp_sgml_check=True` is passed.
 
     `edgar.requests_per_second` is capped at SEC's 10 (#1108), so the negligible
     throttle is set past validation with `model_copy`."""
-    overrides: dict[str, Any] = {"index_first_year": 2024, "cache_dir": str(cache_dir), **edgar}
+    overrides: dict[str, Any] = {
+        "index_first_year": 2024,
+        "cache_dir": str(cache_dir),
+        # #1494's SGML check of new stamps asks one header per stamped CIK; the
+        # recorded fixtures route none, so it is on only where a test asks
+        # (tests/adapters/test_edgar_stamp_check.py).
+        "stamp_sgml_check": False,
+        **edgar,
+    }
     settings = Settings(_env_file=None, sec_edgar_user_agent=USER_AGENT, edgar=overrides)
     return unthrottled(settings) if "requests_per_second" not in edgar else settings
 

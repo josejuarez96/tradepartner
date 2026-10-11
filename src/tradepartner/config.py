@@ -298,6 +298,15 @@ class EdgarConfig(BaseModel):
     # per CIK like below it. Turn on only once the zip is shown to match the
     # SGML header again (data-foundation plan, the #1382 repair task).
     bulk_stamps_enabled: bool = False
+    # #1494 guard: since 2026-10 SEC's per-CIK submissions API has (on and off)
+    # served `acceptanceDateTime` moved LATE by New York's UTC offset. With this
+    # on, a CIK's new per-CIK stamps are written only after one of them matches
+    # its SGML header's ACCEPTANCE-DATETIME (the master acceptance); on a
+    # mismatch each new stamp is taken from its own SGML header instead.
+    stamp_sgml_check: bool = True
+    # The longer range asked once for a stamp check's header that the first
+    # `header_bytes` cut before `</SEC-HEADER>` (a Form 4 with many owners).
+    stamp_header_bytes: int = Field(default=65536, gt=0)
     cover_page_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["10-K", "10-Q", "20-F", "40-F"], min_length=1
     )
