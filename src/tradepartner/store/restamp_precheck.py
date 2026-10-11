@@ -147,8 +147,10 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
     `close(previous_session(S))` and `close(S)`; for every `paper_plans` row,
     its `plan_trial_id`'s `trials.data_cutoff`; for every `paper_reports`
     row, `close(through_session)`; and for every `reconciliations` row,
-    `close(previous_session(session of at))`, the session of an instant
-    being the session on or after its New York date.
+    `close(previous_session(session of at))`, the session of ``at`` being
+    its New York date when that is a session, else the latest session before
+    it, as `paper reconcile` states it. A plan whose trial or `data_cutoff`
+    is missing raises `ValueError`: an instant is never dropped.
     """
     windows = open_windows(conn)
     ids = [w.window_id for w in windows]
@@ -170,11 +172,13 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
     plans = conn.execute(
         "SELECT p.run_id, t.data_cutoff FROM paper_plans p "
         "JOIN paper_runs r ON r.run_id = p.run_id "
-        "JOIN trials t ON t.trial_id = p.plan_trial_id "
-        "WHERE list_contains(?, r.window_id) AND t.data_cutoff IS NOT NULL ORDER BY p.run_id",
+        "LEFT JOIN trials t ON t.trial_id = p.plan_trial_id "
+        "WHERE list_contains(?, r.window_id) ORDER BY p.run_id",
         [ids],
     ).fetchall()
     for run_id, cutoff in plans:
+        if cutoff is None:
+            raise ValueError(f"plan {run_id}: its trial or data_cutoff is missing")
         found.append(ReadInstant(_utc(cutoff, "data_cutoff"), f"plan {run_id} data_cutoff"))
     reports = conn.execute(
         "SELECT window_id, through_session FROM paper_reports "
@@ -193,7 +197,11 @@ def read_instant_sources(conn: duckdb.DuckDBPyConnection) -> list[ReadInstant]:
         [ids],
     ).fetchall()
     for rec_id, at in recs:
-        session = _session_on_or_after(_ny_date(_utc(at, "at")))
+        # `paper reconcile`'s session: the clock's New York date when it is
+        # a session, else the latest session before it
+        # (`execution.reconcile_run.command_session`).
+        day = _ny_date(_utc(at, "at"))
+        session = day if is_session(day) else previous_session(day)
         found.append(
             ReadInstant(
                 session_close(previous_session(session)), f"reconciliation {rec_id} close(S-1)"

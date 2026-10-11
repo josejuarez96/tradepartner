@@ -33,7 +33,7 @@ STARTED = datetime(2026, 10, 9, 18, tzinfo=UTC)  # Friday 14:00 New York
 MARK = date(2026, 10, 12)  # Monday, a session
 REBALANCE = date(2026, 10, 30)
 CATCH_UP = date(2026, 11, 2)  # EST: close 21:00Z
-RECONCILE_AT = datetime(2026, 10, 17, 15, tzinfo=UTC)  # Saturday: session 10-19
+RECONCILE_AT = datetime(2026, 10, 17, 15, tzinfo=UTC)  # Saturday: session Friday 10-16
 
 
 def _close(day: date) -> datetime:
@@ -220,7 +220,7 @@ def test_open_window_lists_every_read_instant(conn: duckdb.DuckDBPyConnection) -
         _close(date(2026, 10, 29)),  # rebalance close(S-1)
         _close(REBALANCE),  # rebalance close(S), plan data_cutoff, report, catch_up S-1
         _close(CATCH_UP),  # catch_up close(S)
-        _close(date(2026, 10, 16)),  # standalone reconciliation close(S-1)
+        _close(date(2026, 10, 15)),  # standalone reconciliation close(S-1)
     }
     assert read_instants(conn) == sorted(expected)
     sources = {i.source for i in read_instant_sources(conn)}
@@ -243,6 +243,25 @@ def test_plan_data_cutoff_is_its_own_instant(conn: duckdb.DuckDBPyConnection) ->
     cutoff = _close(REBALANCE) - timedelta(minutes=7)  # distinct from close(S)
     _plan(conn, 1, 7, cutoff)
     assert cutoff in read_instants(conn)
+
+
+def test_a_reconciliation_on_a_session_day_reads_close_of_the_previous_session(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _window(conn, 1, STARTED)
+    _reconcile(conn, 1, datetime(2026, 10, 13, 15, tzinfo=UTC))  # Tuesday 11:00 NY
+    assert _close(MARK) in read_instants(conn)
+
+
+def test_a_plan_with_no_trial_raises_rather_than_drop_its_instant(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _window(conn, 1, STARTED)
+    _run(conn, 1, REBALANCE, "rebalance")
+    _plan(conn, 1, 7, _close(REBALANCE))
+    conn.execute("DELETE FROM trials")
+    with pytest.raises(ValueError, match="plan 1"):
+        read_instants(conn)
 
 
 def test_high_water_mark_moves_when_a_run_row_is_added(conn: duckdb.DuckDBPyConnection) -> None:
