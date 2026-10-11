@@ -1013,8 +1013,28 @@ why = "A repaired cache changes nothing in the store until the rows that carry i
 unblocks = ["task:T166c"]
 
 [task.T166c]
-what = "The owner's repair release restamp-1382: repair, rebuild, health check, the trial records (B3 trial 3 re-run, trial 4 checked and not re-run) and the evidence on #1382."
+what = "The owner's repair releases restamp-1382a2 and restamp-1382b: repair, rebuild, health check, the trial records (B3 trial 3 re-run, trial 4 checked and not re-run) and the evidence on #1382."
 why = "Closes #1382 so the B9 work and T164e's real-store run can read filing times that are point in time."
+
+[task.T166f]
+what = "The in-window gate of #1497 as code: the pure rule (an SGML-timed move earlier by at most New York's offset) and the read-only pre-check script that lists every instant a paper run read the store at and the rows a release could move."
+why = "ADR 0016 point 7 keeps repairs out of an open paper window; the one exception needs a check the tools can refuse on, not an honour rule."
+unblocks = ["task:T166d", "task:T166e"]
+
+[task.T166d]
+what = "The driver rework of #1497: a request floor and ceiling with the cap enforced during the run, rewritten CIKs probed instead of re-read, the late API stamps of 2026-10-01 onward re-stamped from SGML, and in-window corrections only through the pre-check file."
+why = "The first dry run undercounted a 255k-request run as 5,300, and the window rule would have aborted phase A on 2,406 late stamps that only need to move earlier."
+unblocks = ["task:T166c"]
+
+[task.T166e]
+what = "The store restamp accepts an in-window change only through the same pre-check file and rule; everything else in the window still aborts."
+why = "Without it the cache would be corrected and the store would still refuse the same rows, so the two would disagree inside H1's window."
+unblocks = ["task:T166c"]
+
+[task.T168]
+what = "The departure corpus reads every acceptance time from the filing's SGML header instead of the submissions JSON."
+why = "The corpus fetched on 2026-10-11 carries times the SEC served 4 h late; the T126 frame orders its events by them."
+unblocks = ["task:T126"]
 
 [issue.1358]
 what = "Hypothesis files for the two short-horizon candidates the owner approved: earnings-reaction drift (B9, a new root family) and short-term momentum (B10, a momentum-family key), with backlog entries and the 8-K items task."
