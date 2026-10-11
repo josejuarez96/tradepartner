@@ -12,7 +12,8 @@ calendar. The run orchestration (T39) opens the trial handle first, then asks
    `refused_holdout` unless `--spend-holdout` comes with a non-blank reason.
    A holdout run is marked `holdout_repeat` when any hypothesis in the family
    already spent the holdout (domain rule 3); a prior spend by the **same**
-   hypothesis additionally needs `--holdout-repeat`. Every spend the caller
+   hypothesis, or by research in its family, additionally needs
+   `--holdout-repeat`. Every spend the caller
    passes counts, whatever its outcome (`registry.family_holdout_spends`).
 3. **Gap gate** (holdout runs only, ADR 0003 rule 6). The run is
    `refused_gap` when the survivorship-gap count share at any rebalance close
@@ -470,13 +471,13 @@ def decide(
         refusal = _lab_spend_refusal(lab, prior_spends)
         if refusal is not None:
             return Decision("refused_holdout", None, refusal)
-    same_hypothesis = [s for s in prior_spends if s.hypothesis_id == frozen.hypothesis_id]
+    same_hypothesis = [s for s in prior_spends if s.hypothesis_id in (None, frozen.hypothesis_id)]
     if same_hypothesis and not flags.holdout_repeat:
         trials = ", ".join(str(s.trial_id) for s in same_hypothesis)
         return Decision(
             "refused_holdout",
             None,
-            f"this hypothesis already spent the holdout (trials {trials}); "
+            f"this hypothesis or its family research already spent the holdout (runs {trials}); "
             "a repeat needs --holdout-repeat",
         )
     spend = Decision(

@@ -446,7 +446,8 @@ def test_reader_lists_runs_and_derives_chain_usage(
         conn.close()
 
     assert seeded.synthetic not in {run.run_id for run in view.runs}
-    assert research_page._chain_usage(view.runs)["r1"] == (4, 4)  # type: ignore[attr-defined]
+    # Four runs; the refused window and split runs add no configurations (#1408).
+    assert research_page._chain_usage(view.runs)["r1"] == (4, 2)  # type: ignore[attr-defined]
     by_slug = {reg.slug: reg for reg in view.registrations if reg.amends_registration_id is None}
     assert by_slug["e1h-demand-deterioration-revenue"].budget_runs == 1
     assert any(reg.amends_registration_id is not None for reg in view.registrations)

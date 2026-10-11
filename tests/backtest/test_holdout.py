@@ -244,6 +244,23 @@ def test_a_prior_spend_by_the_same_hypothesis_needs_the_repeat_flag() -> None:
     assert allowed.holdout_repeat is True
 
 
+def test_a_prior_family_research_spend_needs_the_repeat_flag() -> None:
+    research_spend = replace(_spend(99), hypothesis_id=None, source="research_run")
+    refused = _decide(
+        HOLDOUT, SPEND, SPEND_REASON, gap_series=_gap(0.0), prior_spends=(research_spend,)
+    )
+    assert refused.outcome == "refused_holdout"
+    assert "--holdout-repeat" in refused.message
+    allowed = _decide(
+        HOLDOUT,
+        Flags(spend_holdout=True, holdout_repeat=True),
+        SPEND_REASON,
+        gap_series=_gap(0.0),
+        prior_spends=(research_spend,),
+    )
+    assert (allowed.outcome, allowed.holdout_repeat) == ("run", True)
+
+
 def test_in_sample_run_ignores_prior_spends() -> None:
     decision = _decide(IN_SAMPLE, prior_spends=(_spend(HYPOTHESIS_ID),))
     assert decision.outcome == "run"

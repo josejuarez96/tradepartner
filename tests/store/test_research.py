@@ -965,6 +965,40 @@ def test_a_confirmatory_run_on_a_dataset_that_precedes_it_is_refused(
     ).fetchone() == (True, "sealed_split")
 
 
+def test_a_holdout_repeat_of_a_sealed_split_cannot_claim_sealed_split(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """#1408 (req 7 amendment): `open_run` passes the repeat into the req 7
+    check, so a repeat spend of the sealed split by a registration that does
+    not predate the dataset is `refused_split` with basis `none`."""
+    dates = [date(2018, 3, 1), date(2022, 3, 1)]
+    _dataset(conn, tmp_path, name=e1h.dataset_name, dates=dates, splits=["pilot", "pilot"])
+    research.register_experiment(
+        conn, replace(e1h, splits=("pilot", "test"), budget_configurations=5), "owner"
+    )
+    sealed = _dataset(
+        conn,
+        tmp_path,
+        name=e1h.dataset_name,
+        stem="sealed",
+        dates=dates,
+        splits=["pilot", "test"],
+        periods=((date(2022, 1, 1), date(2022, 12, 31)),),
+        seed=e1h.seed,
+    )
+    first = _open(
+        conn, settings, tmp_path, e1h.slug, sealed.dataset_id, "test", flags=SPEND, reasons=WHY
+    )
+    assert first.refusal is None
+    repeat = _open(
+        conn, settings, tmp_path, e1h.slug, sealed.dataset_id, "test", flags=REPEAT, reasons=WHY
+    )
+    assert repeat.refusal == "refused_split"
+    assert conn.execute(
+        "SELECT confirmatory_basis FROM research_runs WHERE run_id = ?", [repeat.run_id]
+    ).fetchone() == ("none",)
+
+
 def test_a_registration_before_its_dataset_opens_as_predates_dataset(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:
@@ -1002,10 +1036,27 @@ def test_budgets_count_refusals_but_not_synthetic_runs(
     synthetic = _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", synthetic=True)
     assert synthetic.refusal is None
     over = _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", configurations=3)
-    assert (over.refusal, "configurations" in str(over.message)) == ("refused_budget", True)
-    # Two non-synthetic rows now (the refused split and the refused budget).
+    assert over.refusal is None  # the refused split used no configurations
+    # Two non-synthetic rows now (the refused split and the accepted run).
     assert _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot").refusal == (
         "refused_budget"
+    )
+
+
+def test_refusal_uses_a_run_slot_but_no_configuration_budget(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    research.register_experiment(
+        conn,
+        _variant(e1h, "b", confirmatory=False, budget_runs=3, budget_configurations=2),
+        "owner",
+    )
+    ds = _dataset(conn, tmp_path, name=e1h.dataset_name, splits=["pilot", "pilot"])
+    assert _open(conn, settings, tmp_path, "b", ds.dataset_id, "cal", configurations=1000).refusal
+    assert research._chain_usage(conn, "b") == (1, 0)
+    assert (
+        _open(conn, settings, tmp_path, "b", ds.dataset_id, "pilot", configurations=2).refusal
+        is None
     )
 
 
@@ -1225,11 +1276,26 @@ def test_load_dataset_checks_hashes_before_parsing(
 # --- family_run_count -------------------------------------------------------------------
 
 
-def test_family_run_count_sums_ok_return_configurations_outside_holdout_spends(
+def test_a_failed_run_that_evaluated_more_than_declared_counts_the_evaluated(
     conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
 ) -> None:
-    """Counted: an `ok`, non-synthetic return run's configurations. Not counted: a
-    synthetic run, a `benchmark` run, a failed run, a holdout-spending run."""
+    """#1408: a run declaring 1 that evaluates 5 records `failed` and raises N by
+    5, the larger of its declared and evaluated configurations."""
+    _gated(conn, settings, e1h)
+    research.register_experiment(conn, _returns(e1h, "r0", window_end=date(2023, 12, 31)), "owner")
+    ds = _dataset(conn, tmp_path)
+    handle = _open(conn, settings, tmp_path, "r0", ds.dataset_id)
+    assert _ok(conn, handle, n_configurations=5) == "failed"
+    exceeded = research.CONFIGURATIONS_EXCEEDED_MESSAGE
+    assert _result(conn, handle.run_id) == ("failed", exceeded, None)
+    assert research.family_run_count(conn, "momentum") == 5
+
+
+def test_family_run_count_sums_ok_and_failed_return_configurations_outside_holdout_spends(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, e1h: ParsedExperiment, tmp_path: Path
+) -> None:
+    """A failed return run counts its declaration; synthetic, benchmark and
+    holdout-spending runs do not count."""
     _gated(conn, settings, e1h)
     before_holdout = date(2023, 12, 31)
     for parsed in (
@@ -1256,7 +1322,7 @@ def test_family_run_count_sums_ok_return_configurations_outside_holdout_spends(
     spend = _open(conn, settings, tmp_path, "r1", ds.dataset_id, flags=SPEND, reasons=WHY)
     assert spend.refusal is None
     _ok(conn, spend)
-    assert research.family_run_count(conn, "momentum") == 3
+    assert research.family_run_count(conn, "momentum") == 4
     listed = research.list_runs(conn, family="momentum")
     assert [r.run_id for r in listed] == sorted((r.run_id for r in listed), reverse=True)
     assert all(not r.synthetic for r in listed)
@@ -1485,7 +1551,8 @@ def test_a_research_spend_marks_a_later_backtest_holdout_run_a_repeat(
         None,
         [spend],
     )
-    assert (decision.outcome, decision.holdout_repeat) == ("needs_gap", True)
+    assert decision.outcome == "refused_holdout"
+    assert "--holdout-repeat" in decision.message
 
 
 @pytest.mark.parametrize(
