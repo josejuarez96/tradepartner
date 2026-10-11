@@ -607,11 +607,13 @@ def test_b_resolves_relative_imports() -> None:
 # --- (c) text (spec req 14 as C13 amends it) ------------------------------------------
 
 #: Under `tests/` only the host itself: a test may point `api_base_url` at a fake.
-_HOST_NAME = re.compile(r"typesafe\.ai", re.IGNORECASE)
+_HOST_NAME = re.compile(r"typesafe\.ai|anthropic\.com", re.IGNORECASE)
 _HOST = re.compile(rf"{_HOST_NAME.pattern}|\bapi_base_url\b", re.IGNORECASE)
 KEY_NAME = "TYPESAFE_API_KEY"
 #: The env name and the settings attribute that reads it (`typesafe_api_key`).
-_KEY = re.compile(KEY_NAME, re.IGNORECASE)
+_KEY = re.compile(
+    r"TYPESAFE_API_KEY|RESEARCH_CLAUDE_API_KEY|research_claude_api_key", re.IGNORECASE
+)
 #: Where the vendor host (and `research.labeling.api_base_url`, its config key) and the
 #: key's name may appear (and `.env.example`, outside the scanned roots).
 VENDOR_FILES = frozenset({"src/tradepartner/research/models.py", "src/tradepartner/config.py"})
@@ -622,6 +624,7 @@ TEST_HOST_FILES = frozenset(
         "tests/fixtures/llm_boundary/text_cases.toml",
         "tests/research/labeling/test_models.py",
         "tests/test_config.py",
+        "tests/test_llm_boundary.py",
     }
 )
 PACKET_MODULES = frozenset(
@@ -1117,7 +1120,12 @@ def _models() -> Any:
 def _settings(monkeypatch: pytest.MonkeyPatch, env: Mapping[str, str]) -> Any:
     from tradepartner.config import Settings
 
-    for name in (*_CEILING_ENV, _KEY_ENV):
+    for name in (
+        *_CEILING_ENV,
+        _KEY_ENV,
+        "RESEARCH_CLAUDE_API_KEY",
+        "RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL",
+    ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -1329,3 +1337,28 @@ def test_e_contract_accepts_a_versioned_recording() -> None:
 @pytest.mark.parametrize("alias", ["jev-latest", "jev-preview"])
 def test_e_an_alias_in_a_recording_fails(alias: str) -> None:
     assert recording_problems("bankruptcy", {**_GOOD_RECORDING, "model": alias})
+
+
+def test_c_claude_host_and_key_are_confined() -> None:
+    tree = dict(_text_tree())
+    assert text_violations(tree) == []
+    for planted in ("api.anthropic.com", "RESEARCH_CLAUDE_API_KEY", "research_claude_api_key"):
+        for path in ("src/tradepartner/research/labeling/job.py", "src/tradepartner/cli.py"):
+            altered = dict(tree)
+            altered[path] += f"\n# {planted}\n"
+            assert text_violations(altered), (path, planted)
+
+
+@pytest.mark.usefixtures("no_httpx_client")
+def test_e_claude_default_is_disabled_and_handle_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tradepartner.research import NoRunHandle
+
+    models = _models()
+    settings = _settings(monkeypatch, {})
+    with pytest.raises(NoRunHandle, match="RunHandle required"):
+        models.build_claude_client(settings, None)
+    client = models.build_claude_client(settings, _handle())
+    with pytest.raises(models.ModelDisabled):
+        client.label(None)
+    assert settings.research.claude.spend_ceiling_usd_total == 0.0
+    assert settings.research_claude_api_key is None
