@@ -1042,7 +1042,7 @@ why = "The adapter is the only module that knows FRED's field names; swapping to
 unblocks = ["task:T169d"]
 
 [task.T169d]
-what = "ingest --source fred (the backfill request, a daily window that starts at the latest stored observation so a lapse leaves no hole, the not-yet-known skip, revisions, staleness, the run-row counts) and the CLI source."
+what = "ingest --source fred (the backfill request, a daily window that reaches back to the latest stored observation so a lapse leaves no hole, the not-yet-known skip, revisions, staleness, the run-row counts) and the CLI source."
 why = "Nothing reaches the owner's store until the ingest writes it under the store's own rules."
 unblocks = ["task:T169e"]
 
