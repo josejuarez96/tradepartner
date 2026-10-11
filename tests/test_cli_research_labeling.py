@@ -322,7 +322,10 @@ def test_no_out_or_synthetic_flag(s: Settings, args: tuple[str, ...]) -> None:
 
 def test_every_command_and_option_exists(s: Settings) -> None:
     for args, options in (
-        (("corpus", "fetch", "departure-reason"), ("--since", "--until", "--cik", "--limit")),
+        (
+            ("corpus", "fetch", "departure-reason"),
+            ("--since", "--until", "--cik", "--limit", "--max-requests"),
+        ),
         (("research", "frame", "build", "departure-reason"), ("--corpus", "--as-of", "--register")),
         (("research", "gold"), ("--frame", "--seed", "--n", "--exclude", "--lock", "--extend")),
         (
@@ -427,6 +430,34 @@ def test_frame_build_refuses_an_as_of_without_its_offset(s: Settings, tmp_path: 
     )
     assert result.exit_code == 2
     assert "no UTC offset" in result.output
+
+
+def test_corpus_fetch_stops_above_max_requests(s: Settings) -> None:
+    """T168: the requests still to make are printed, and above `--max-requests`
+    the fetch exits 1 before asking for any SGML header or 8-K."""
+    router = Router(_routes())
+    fetched = _cli(
+        s,
+        "corpus",
+        "fetch",
+        "departure-reason",
+        "--since",
+        "2026-07-01",
+        "--until",
+        "2026-09-30",
+        "--max-requests",
+        "2",
+        edgar_client=router.client(),
+    )
+    assert fetched.exit_code == 1, fetched.output
+    assert (
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 2)" in (fetched.output)
+    )
+    assert "RequestLimitExceeded" in fetched.output
+    assert not any(url.endswith(".htm") for url in router.urls())
+    corpus = Path(s.edgar.cache_dir).resolve() / "corpus" / "departure-reason" / "corpus.jsonl"
+    assert not corpus.exists()
 
 
 def test_corpus_fetch_needs_the_edgar_user_agent(s: Settings) -> None:

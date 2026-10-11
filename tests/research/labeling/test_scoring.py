@@ -947,3 +947,444 @@ def test_seeded_recall_is_unchanged_by_basis_and_the_report_carries_it() -> None
     by_basis = {basis: scoring.seeded_recall(seeds(basis)) for basis in scoring.BASES}
     assert set(by_basis.values()) == {1.0}
     assert [o.basis for o in scoring.seeded_report(seeds("provision"))] == ["provision"]
+
+
+# --- the evidence ladder, the hybrid router and McNemar (#1504, T175) -------------
+
+import dataclasses  # noqa: E402
+
+
+def _call(
+    arm: str,
+    kind: str,
+    option: str | None,
+    reason: str = "ok",
+    *,
+    stop_reason: str | None = None,
+    cost: float = 0.01,
+    latency: float = 100.0,
+    tokens_in: int = 100,
+    tokens_out: int = 10,
+) -> scoring.ArmCall:
+    return scoring.ArmCall(
+        arm,  # type: ignore[arg-type]
+        kind,  # type: ignore[arg-type]
+        option,
+        reason,  # type: ignore[arg-type]
+        stop_reason,
+        tokens_in,
+        tokens_out,
+        cost,
+        latency,
+    )
+
+
+def _jev(kind: str, option: str | None, reason: str = "ok", **kw: float) -> scoring.ArmCall:
+    return _call("jev", kind, option, reason, latency=100.0 if kind == "A" else 300.0, **kw)  # type: ignore[arg-type]
+
+
+def _claude(kind: str, option: str | None, reason: str = "ok", **kw: object) -> scoring.ArmCall:
+    return _call("claude", kind, option, reason, cost=0.02, tokens_in=200, **kw)  # type: ignore[arg-type]
+
+
+BK, WRONG, MA = "bankruptcy", "exchange_transfer", "merger_or_acquisition"
+
+
+def _ladder_items(*, with_claude: bool = True) -> list[scoring.ScoredItem]:
+    """30 text items: 20 plain (gold bankruptcy, no 8-K, provision (a)(3)) and 10 with an
+    8-K (gold merger_or_acquisition; K0-3 on (a)(1), the rest on (a)(3)).
+
+    Jev A right on P0-13, K8, K9 (timeout P18, ok-unresolved P19); Jev B right on K0-6
+    and K9 (K7 unresolved, K8 wrong). Claude A right on P0-11, P14-17, K0-3 (P18
+    `max_tokens`, P19 `refusal`); Claude B right on K0-4, wrong K5-8, none on K9 (B was
+    refused before sending)."""
+    items = []
+    for i in range(20):
+        jev_a = (
+            _jev("A", BK)
+            if i < 14
+            else _jev("A", WRONG)
+            if i < 18
+            else _jev("A", None, "timeout")
+            if i == 18
+            else _jev("A", UNRESOLVED)
+        )
+        calls = [jev_a]
+        if with_claude:
+            if i in (12, 13):
+                calls.append(_claude("A", WRONG))
+            elif i == 18:
+                calls.append(_claude("A", None, "refused", stop_reason="max_tokens"))
+            elif i == 19:
+                calls.append(_claude("A", None, "refused", stop_reason="refusal"))
+            else:
+                calls.append(_claude("A", BK))
+        items.append(
+            _item(f"P{i}", BK, BK, "ok", calls=tuple(calls), rule_provision="12d2-2(a)(3)")
+        )
+    for i in range(10):
+        calls = [_jev("A", MA if i >= 8 else BK)]
+        calls.append(
+            _jev("B", UNRESOLVED)
+            if i == 7
+            else _jev("B", MA if i in (0, 1, 2, 3, 4, 5, 6, 9) else BK)
+        )
+        if with_claude:
+            calls.append(_claude("A", MA if i < 4 else BK))
+            if i != 9:
+                calls.append(_claude("B", MA if i < 5 else BK))
+        items.append(
+            _item(
+                f"K{i}",
+                MA,
+                BK,
+                "ok",
+                calls=tuple(calls),
+                has_eightk=True,
+                rule_provision="12d2-2(a)(1)" if i < 4 else "12d2-2(a)(3)",
+            )
+        )
+    return items
+
+
+def _row(
+    rows: tuple[scoring.LadderRow, ...], arm: str, level: str, set_name: str = "text"
+) -> scoring.LadderRow:
+    (row,) = [r for r in rows if (r.arm, r.level, r.set_name) == (arm, level, set_name)]
+    return row
+
+
+def test_mcnemar_exact_matches_the_amendments_worked_values() -> None:
+    assert scoring.mcnemar_exact(10, 1) == pytest.approx(0.012, abs=1e-3)
+    assert scoring.mcnemar_exact(8, 3) == pytest.approx(0.227, abs=1e-3)
+    assert scoring.mcnemar_exact(6, 0) == pytest.approx(0.031, abs=1e-3)
+    assert scoring.mcnemar_exact(15, 5) == pytest.approx(0.041, abs=1e-3)
+    assert scoring.mcnemar_exact(7, 1) == pytest.approx(0.070, abs=1e-3)
+
+
+def test_mcnemar_exact_is_symmetric_and_degenerate_cases() -> None:
+    for b, c in [(10, 1), (8, 3), (0, 6), (4, 4)]:
+        assert scoring.mcnemar_exact(b, c) == scoring.mcnemar_exact(c, b)
+    assert scoring.mcnemar_exact(0, 0) == 1.0
+    assert scoring.mcnemar_exact(4, 4) == 1.0
+    with pytest.raises(ValueError, match="non-negative"):
+        scoring.mcnemar_exact(-1, 3)
+
+
+@pytest.mark.parametrize(
+    ("m", "k"),
+    [(6, 6), (8, 8), (9, 8), (10, 9), (11, 10), (15, 12), (20, 15), (30, 21), (4, None)],
+)
+def test_min_significant_split_matches_the_amendment(m: int, k: int | None) -> None:
+    assert scoring.min_significant_split(m) == k
+
+
+def test_level_answer_e1_e2_and_cascade() -> None:
+    items = {i.listing_end_id: i for i in _ladder_items()}
+    # E1 is the A call; E2 is B where there is an 8-K and B was sent, else A
+    assert scoring.level_answer(items["K0"], "jev", "E1") == BK
+    assert scoring.level_answer(items["K0"], "jev", "E2") == MA
+    assert scoring.level_answer(items["P0"], "jev", "E2") == BK  # no 8-K: E2 = A
+    # B sent but unresolved: E2 reads unresolved, the cascade falls back to A
+    assert scoring.level_answer(items["K7"], "jev", "E2") == UNRESOLVED
+    assert scoring.level_answer(items["K7"], "jev", "cascade") == BK
+    # B resolved (wrong): the cascade keeps B
+    assert scoring.level_answer(items["K8"], "jev", "cascade") == BK
+    assert scoring.level_answer(items["K6"], "jev", "cascade") == MA
+    # a refused or timeout call reads as unresolved
+    assert scoring.level_answer(items["P18"], "jev", "E1") == UNRESOLVED
+    assert scoring.level_answer(items["P18"], "claude", "E1") == UNRESOLVED
+    # B was never sent (refused by max_packet_tokens): E2 = A
+    assert scoring.level_answer(items["K9"], "claude", "E2") == BK
+    assert scoring.level_answer(items["K9"], "claude", "E1") == BK
+
+
+def test_level_answer_edge_cases() -> None:
+    item = _item("x", BK, BK, "ok", calls=(_jev("A", BK),))
+    assert scoring.level_answer(item, "claude", "E1") is None  # arm made no call
+    assert scoring.level_answer(item, "jev", "cascade") == BK
+    with pytest.raises(ValueError, match="Jev's registered treatment"):
+        scoring.level_answer(item, "claude", "cascade")
+    with pytest.raises(ValueError, match="unknown ladder level"):
+        scoring.level_answer(item, "jev", "E3")  # type: ignore[arg-type]
+    twice = _item("y", BK, BK, "ok", calls=(_jev("A", BK), _jev("A", WRONG)))
+    with pytest.raises(ValueError, match="2 jev calls on packet A"):
+        scoring.level_answer(twice, "jev", "E1")
+
+
+def test_arm_call_rejects_an_unknown_arm_or_kind() -> None:
+    with pytest.raises(ValueError, match="arm"):
+        _call("gpt", "A", BK)
+    with pytest.raises(ValueError, match="kind"):
+        _call("jev", "C", BK)
+
+
+def test_ladder_table_counts_bounds_and_sums_on_the_fixture() -> None:
+    rows = scoring.ladder_table(_ladder_items())
+    e1 = _row(rows, "jev", "E1")
+    assert (e1.n_eligible, e1.n, e1.correct) == (30, 30, 16)
+    assert e1.point_estimate == pytest.approx(16 / 30)
+    assert e1.lower_bound == pytest.approx(scoring.wilson_lower_bound(16, 30))
+    assert e1.unresolved_share == pytest.approx(2 / 30)
+    assert e1.timeouts == 1 and dict(e1.refused_by_stop_reason) == {}
+    assert (e1.input_tokens, e1.output_tokens) == (3000, 300)
+    assert e1.cost_usd == pytest.approx(0.30)
+    assert e1.cost_per_correct == pytest.approx(0.30 / 16)
+    assert (e1.latency_p50_ms, e1.latency_p90_ms) == (100.0, 100.0)
+    assert not e1.underpowered
+
+    e2 = _row(rows, "jev", "E2")
+    assert (e2.n, e2.correct) == (30, 22)
+    assert e2.unresolved_share == pytest.approx(3 / 30)
+    assert e2.cost_usd == pytest.approx(0.30)  # 20 A calls + 10 B calls
+    assert (e2.latency_p50_ms, e2.latency_p90_ms) == (100.0, 300.0)
+    assert e2.b_refused == 0
+
+    cascade = _row(rows, "jev", "cascade")
+    assert (cascade.n, cascade.correct) == (30, 22)
+    assert cascade.unresolved_share == pytest.approx(2 / 30)
+    assert cascade.cost_usd == pytest.approx(0.31)  # K7 paid B and A
+    assert cascade.cost_per_correct == pytest.approx(0.31 / 22)
+    assert not [r for r in rows if r.arm == "claude" and r.level == "cascade"]
+
+
+def test_ladder_table_claude_lines_refusals_and_b_refused() -> None:
+    rows = scoring.ladder_table(_ladder_items())
+    e1 = _row(rows, "claude", "E1")
+    assert e1.correct == 20 and e1.unresolved_share == pytest.approx(2 / 30)
+    assert dict(e1.refused_by_stop_reason) == {"max_tokens": 1, "refusal": 1}
+    assert e1.timeouts == 0
+    e2 = _row(rows, "claude", "E2")
+    assert e2.correct == 21  # K9 has no B call, so E2 falls back to A (wrong)
+    assert e2.b_refused == 1
+    assert e2.cost_usd == pytest.approx(0.60)  # 20 + (9 B + 1 A) calls at 0.02
+    assert e2.cost_per_correct == pytest.approx(0.60 / 21)
+
+
+def test_ladder_table_eightk_subset_apart_and_underpowered() -> None:
+    rows = scoring.ladder_table(_ladder_items())
+    jev_e1 = _row(rows, "jev", "E1", "text_eightk")
+    jev_e2 = _row(rows, "jev", "E2", "text_eightk")
+    assert (jev_e1.n, jev_e1.correct) == (10, 2)
+    assert (jev_e2.n, jev_e2.correct) == (10, 8)
+    assert jev_e1.underpowered and jev_e1.lower_bound is None  # under 20
+    # the subset is the items with an 8-K AND this arm's B packet sent
+    claude_e1 = _row(rows, "claude", "E1", "text_eightk")
+    claude_e2 = _row(rows, "claude", "E2", "text_eightk")
+    assert (claude_e1.n_eligible, claude_e1.n, claude_e1.correct) == (9, 9, 4)
+    assert (claude_e2.n, claude_e2.correct) == (9, 5)
+
+
+def test_exchange_rule_and_provision_items_are_never_in_the_text_table() -> None:
+    items = _ladder_items()
+    extra = [
+        _item(
+            f"X{i}",
+            "bankruptcy",
+            BK,
+            "ok",
+            basis="exchange_rule",
+            calls=(_jev("A", BK),),
+            rule_provision="12d2-2(a)(1)",
+        )
+        for i in range(3)
+    ] + [
+        _item(
+            f"R{i}",
+            MA,
+            MA,
+            "ok",
+            basis="provision",
+            calls=(_jev("A", MA),),
+            rule_provision="12d2-2(a)(1)",
+        )
+        for i in range(4)
+    ]
+    with_extra = scoring.ladder_table(items + extra)
+    without = scoring.ladder_table(items)
+    for level in ("E1", "E2", "cascade"):
+        assert _row(with_extra, "jev", level) == _row(without, "jev", level)
+    assert _row(with_extra, "jev", "E1", "exchange_rule").n == 3
+    assert _row(with_extra, "jev", "E1", "provision").n == 4
+    assert _row(with_extra, "jev", "E1", "provision").underpowered
+    assert scoring.e0_report(items + extra) == scoring.e0_report(items)
+    for level in ("E1", "E2", "cascade"):
+        assert scoring.hybrid_router(items + extra, "jev", level) == scoring.hybrid_router(
+            items, "jev", level
+        )
+    with pytest.raises(ValueError, match="text set"):
+        scoring.hybrid_router(items + extra, "jev", "E1", set_name="provision")
+
+
+def test_a_jev_only_run_has_no_claude_lines() -> None:
+    items = _ladder_items(with_claude=False)
+    assert {r.arm for r in scoring.ladder_table(items)} == {"jev"}
+    comparisons = scoring.paired_comparisons(items)
+    assert len(comparisons) == 10  # E1/E2, E2/cascade and 3 hybrids, on two sets
+    assert all("claude" not in c.first + c.second for c in comparisons)
+
+
+def test_is_rule_decisive_only_for_a1_and_a2() -> None:
+    assert scoring.is_rule_decisive("12d2-2(a)(1)")
+    assert scoring.is_rule_decisive("12d2-2(a)(2)")
+    for provision in (
+        "12d2-2(a)(3)",  # three classes
+        "12d2-2(a)(4)",
+        "12d2-2(b)",
+        "12d2-2(c)",
+        "something-unmapped",  # {unresolved} is never decisive
+        "",
+        None,
+    ):
+        assert not scoring.is_rule_decisive(provision)
+
+
+def test_e0_decisive_share_matches_the_rule_arm_score() -> None:
+    e0 = scoring.e0_report(_ladder_items())
+    assert (e0.n, e0.decisive) == (30, 4)
+    assert e0.decisive_share == pytest.approx(4 / 30)
+    assert e0.arm.class_accuracy.n == e0.decisive == 4
+    assert e0.arm.class_accuracy.correct == 4  # the rule's terminal matches gold MA
+
+
+def test_hybrid_router_routes_a1_a2_charges_model_cost_only_and_reports_routed() -> None:
+    items = _ladder_items()
+    e1 = scoring.hybrid_router(items, "jev", "E1")
+    assert e1.n == 30 and e1.routed_to_rule_share == pytest.approx(4 / 30)
+    assert e1.correct == 20  # 16 model-right items, none of them routed, + 4 rule-right
+    assert e1.unresolved_share == pytest.approx(2 / 30)
+    assert e1.cost_usd == pytest.approx(0.26)  # 26 model-routed A calls; the rule is free
+    assert e1.cost_per_correct == pytest.approx(0.26 / 20)
+    routed = e1.routed
+    assert routed.count == 4 and dict(routed.gold_class_mix) == {"terminal": 4}
+    assert (routed.rule_correct, routed.model_correct) == (4, 0)
+    assert (routed.rule_accuracy, routed.model_accuracy) == (1.0, 0.0)
+
+    e2 = scoring.hybrid_router(items, "jev", "E2")
+    assert e2.correct == 22 and e2.routed.model_correct == 4
+    assert e2.cost_usd == pytest.approx(0.26)  # 20 A + K4-K9's six B calls
+
+    cascade = scoring.hybrid_router(items, "jev", "cascade")
+    assert cascade.cost_usd == pytest.approx(0.27)  # K7 pays B and A
+
+
+def test_hybrid_router_never_routes_a_provision_basis_item() -> None:
+    items = _ladder_items()
+    provision = _item(
+        "R0", MA, MA, "ok", basis="provision", calls=(_jev("A", MA),), rule_provision="12d2-2(a)(1)"
+    )
+    assert scoring.hybrid_router([*items, provision], "jev", "E1").n == 30
+    assert scoring.hybrid_router([*items, provision], "jev", "E1").routed.count == 4
+
+
+def test_hybrid_router_on_the_eightk_subset() -> None:
+    result = scoring.hybrid_router(_ladder_items(), "claude", "E2", set_name="text_eightk")
+    assert result.n == 9 and result.routed.count == 4  # K0-K8 (Claude sent B on those)
+    assert result.underpowered and result.lower_bound is None
+
+
+def test_paired_comparisons_make_twelve_plus_twelve() -> None:
+    comparisons = scoring.paired_comparisons(_ladder_items())
+    assert len(comparisons) == 24
+    assert sum(1 for c in comparisons if c.set_name == "text") == 12
+    assert sum(1 for c in comparisons if c.set_name == "text_eightk") == 12
+    text = [c for c in comparisons if c.set_name == "text"]
+    assert [(c.first, c.second) for c in text][:4] == [
+        ("jev:E1", "claude:E1"),
+        ("jev:E2", "claude:E2"),
+        ("jev:E1:hybrid", "claude:E1:hybrid"),
+        ("jev:E2:hybrid", "claude:E2:hybrid"),
+    ]
+    adjacent = [c for c in text if c.first.split(":")[0] == c.second.split(":")[0]]
+    hybrid_pairs = [c for c in adjacent if c.second.endswith(":hybrid")]
+    assert len(adjacent) == 8 and len(hybrid_pairs) == 5
+
+
+def _comparison(first: str, second: str, set_name: str = "text") -> scoring.Comparison:
+    (c,) = [
+        c
+        for c in scoring.paired_comparisons(_ladder_items())
+        if (c.first, c.second, c.set_name) == (first, second, set_name)
+    ]
+    return c
+
+
+def test_paired_comparison_discordant_counts_and_p() -> None:
+    c = _comparison("jev:E1", "claude:E1")
+    # Jev right on P0-13, K8, K9; Claude right on P0-11, P14-17, K0-3
+    assert (c.n, c.b, c.c) == (30, 4, 8)
+    assert c.accuracy_difference == pytest.approx((16 - 20) / 30)
+    assert c.p_value == pytest.approx(scoring.mcnemar_exact(4, 8))
+    assert c.min_split == scoring.min_significant_split(12)
+    assert not c.underpowered
+
+    adjacent = _comparison("jev:E1", "jev:E2")
+    assert (adjacent.b, adjacent.c) == (1, 7)  # E1 right and E2 wrong: K8; the reverse: K0-6
+    assert adjacent.accuracy_difference == pytest.approx((16 - 22) / 30)
+
+    subset = _comparison("jev:E1", "claude:E1", "text_eightk")
+    assert (subset.n, subset.b, subset.c) == (9, 1, 4)  # K0-K8, where both sent B
+    assert subset.underpowered
+
+
+def test_paired_comparison_against_the_hybrid_is_on_the_same_items() -> None:
+    c = _comparison("jev:E1", "jev:E1:hybrid")
+    # the hybrid fixes K0-K3 (rule right, Jev A wrong) and changes nothing else
+    assert (c.n, c.b, c.c) == (30, 0, 4)
+    assert c.p_value == pytest.approx(0.125)
+
+
+def test_an_item_one_arm_never_answered_is_not_paired() -> None:
+    items = _ladder_items()
+    items.append(_item("only-jev", BK, BK, "ok", calls=(_jev("A", BK),)))
+    c = next(
+        c for c in scoring.paired_comparisons(items) if (c.first, c.set_name) == ("jev:E1", "text")
+    )
+    assert c.n == 30
+
+
+def test_existing_metrics_are_byte_identical_with_and_without_calls() -> None:
+    with_calls = _ladder_items()
+    without = [dataclasses.replace(i, calls=(), has_eightk=False) for i in with_calls]
+    for fn in (
+        scoring.class_accuracy,
+        scoring.per_option_precision_recall,
+        scoring.seeded_recall,
+        scoring.unresolved_share,
+        scoring.worst_case_lower_bound,
+        scoring.rule_provision_arm_score,
+        scoring.basis_counts,
+    ):
+        assert fn(with_calls) == fn(without), fn.__name__  # type: ignore[operator]
+
+
+def test_a_packet_never_sent_scores_unresolved_not_dropped() -> None:
+    """The primary counts an item whose A packet was over the cap as wrong; the ladder
+    must keep it in the denominator, so Jev's cascade row equals `class_accuracy`."""
+    items = _ladder_items(with_claude=False)
+    no_a = dataclasses.replace(
+        items[30 - 1],  # K9: keep only its B call
+        calls=(items[29].calls[1],),
+        predicted_option=MA,
+    )
+    items[29] = no_a
+    assert scoring.level_answer(no_a, "jev", "E1") == UNRESOLVED
+    assert scoring.level_answer(no_a, "jev", "cascade") == MA
+    rows = scoring.ladder_table(items)
+    assert _row(rows, "jev", "E1").n == 30
+    # a Jev-only fixture whose primary label is the cascade answer scores identically
+    cascade_items = [
+        dataclasses.replace(i, predicted_option=scoring.level_answer(i, "jev", "cascade"))
+        for i in items
+    ]
+    acc = scoring.class_accuracy(cascade_items)
+    row = _row(scoring.ladder_table(cascade_items), "jev", "cascade")
+    assert (row.n, row.correct) == (acc.n, acc.correct) == (30, 22)
+    no_calls = _item("no-calls", BK, BK, "ok", calls=())
+    assert scoring.level_answer(no_calls, "jev", "cascade") == UNRESOLVED
+    assert scoring.level_answer(no_calls, "claude", "E1") is None
+    with_none = [*items, no_calls]
+    assert _row(scoring.ladder_table(with_none), "jev", "E1").n == 31
+    only_b = _item("only-b", BK, BK, "ok", calls=(_jev("B", BK),), has_eightk=True)
+    assert scoring.level_answer(only_b, "jev", "E2") == BK
+    assert scoring.level_answer(only_b, "jev", "E1") == UNRESOLVED
