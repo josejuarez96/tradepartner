@@ -1,0 +1,3 @@
+- Spec/plan/ADR amendment #1504 (PR #1508, class B): a Claude comparison arm, the evidence ladder E0-E2 and a hybrid router for pilot A, reported never gating; tasks T168, T170, T169, T169b; must merge before research gold.
+### Added
+- research-labeling spec amendment 2026-10-11 (#1504): a pinned Claude comparison arm (plain httpx, structured output, its own ceiling inside the $40, RESEARCH_CLAUDE_API_KEY), the evidence ladder E0/E1/E2 per arm and a computed hybrid router on the gold items, with McNemar's exact test on discordant pairs, all reported and never gating; plan tasks T168, T170, T169, T169b; ADR 0013 dated section (question 1 option (c) for this one arm, a departure by owner decision).
