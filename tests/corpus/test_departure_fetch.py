@@ -1,5 +1,6 @@
 """Offline tests for `tradepartner.corpus.departure_fetch` (plan T120; spec
-research-labeling, amendment 2026-10-06 C11 and its corpus acceptance line).
+research-labeling, amendment 2026-10-06 C11 and its corpus acceptance line;
+plan T168: every acceptance from the filing's SGML header).
 
 Every EDGAR response is a hand-built file under `tests/fixtures/corpus/`,
 served by URL through an `httpx.MockTransport`; an unmatched URL fails the
@@ -13,7 +14,7 @@ import hashlib
 import itertools
 import json
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -51,8 +52,14 @@ AMENDMENT_TXT_URL = f"{_ARCHIVES}/1738827/000135445726000910/{KLX_AMENDMENT}.txt
 PREXML_TXT_URL = f"{_ARCHIVES}/1000001/000100000126000002/0001000001-26-000002.txt"
 STUB_TXT_URL = f"{_ARCHIVES}/1999999/000135445726000700/0001354457-26-000700.txt"
 KLX_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK0001738827.json"
-STUB_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK0001999999.json"
 EIGHTK_URL = f"{_ARCHIVES}/1738827/000173882726000046/klxe-20260918.htm"
+EIGHTK_HEADER_URL = f"{_ARCHIVES}/1738827/000173882726000046/{RELEVANT_8K}.txt"
+MARKER_HEADER_URL = f"{_ARCHIVES}/1738827/000173882726000053/{MARKER_8A}.txt"
+#: The SGML headers' acceptances (Eastern wall clock in the fixtures, EDT here).
+KLX_ACCEPTED = "2026-09-24T14:08:40+00:00"
+AMENDMENT_ACCEPTED = "2026-09-25T13:00:00+00:00"
+EIGHTK_ACCEPTED = "2026-09-18T13:26:59+00:00"
+MARKER_ACCEPTED = "2026-09-23T21:15:21+00:00"
 
 
 def _fixture(name: str) -> bytes:
@@ -60,26 +67,30 @@ def _fixture(name: str) -> bytes:
 
 
 def _amendment_txt() -> bytes:
-    """The KLX notice refiled as a `25-NSE/A` (same issuer and exchange)."""
+    """The KLX notice refiled as a `25-NSE/A` (same issuer and exchange), its
+    header accepted the next morning (09:00 EDT, 13:00 UTC)."""
     text = _fixture(f"klx_25nse_{KLX}.txt").decode()
     text = text.replace(KLX, KLX_AMENDMENT).replace("<TYPE>25-NSE\n", "<TYPE>25-NSE/A\n")
+    text = text.replace(
+        "<ACCEPTANCE-DATETIME>20260924100840", "<ACCEPTANCE-DATETIME>20260925090000"
+    )
     return text.encode()
 
 
-def _stub_submissions() -> bytes:
-    """Stubco's submissions carry no row for its 25-NSE: the filing is unstamped."""
-    columns: dict[str, list[str]] = {
-        key: []
-        for key in (
-            "accessionNumber",
-            "filingDate",
-            "acceptanceDateTime",
-            "form",
-            "primaryDocument",
-            "items",
-        )
-    }
-    payload = {"cik": "0001999999", "name": "Stubco", "filings": {"recent": columns, "files": []}}
+def _stub_txt() -> bytes:
+    """Stubco's 25-NSE with no `ACCEPTANCE-DATETIME` in its header: unstamped."""
+    text = _fixture("stub_25nse_0001354457-26-000700.txt").decode()
+    return text.replace("<ACCEPTANCE-DATETIME>20260715101500\n", "").encode()
+
+
+def _shifted_submissions(hours: int) -> bytes:
+    """The KLX submissions with every `acceptanceDateTime` `hours` later (#1496)."""
+    payload = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
+    recent = payload["filings"]["recent"]
+    recent["acceptanceDateTime"] = [
+        (datetime.fromisoformat(value) + timedelta(hours=hours)).isoformat()
+        for value in recent["acceptanceDateTime"]
+    ]
     return json.dumps(payload).encode()
 
 
@@ -89,10 +100,11 @@ def _routes() -> dict[str, tuple[int, bytes]]:
         KLX_TXT_URL: (200, _fixture(f"klx_25nse_{KLX}.txt")),
         AMENDMENT_TXT_URL: (200, _amendment_txt()),
         PREXML_TXT_URL: (200, _fixture("prexml_25_0001000001-26-000002.txt")),
-        STUB_TXT_URL: (200, _fixture("stub_25nse_0001354457-26-000700.txt")),
+        STUB_TXT_URL: (200, _stub_txt()),
         KLX_SUBMISSIONS_URL: (200, _fixture("submissions_klx_CIK0001738827.json")),
-        STUB_SUBMISSIONS_URL: (200, _stub_submissions()),
         EIGHTK_URL: (200, _fixture("klx_8k_klxe-20260918.htm")),
+        EIGHTK_HEADER_URL: (200, _fixture(f"klx_8k_hdr_{RELEVANT_8K}.txt")),
+        MARKER_HEADER_URL: (200, _fixture(f"klx_8a12b_hdr_{MARKER_8A}.txt")),
     }
 
 
@@ -138,13 +150,16 @@ def _settings(cache_dir: Path, **edgar: Any) -> Settings:
     return settings.model_copy(update={"edgar": fast})
 
 
-def _run(settings: Settings, router: Router, *, now: datetime = NOW) -> departure_fetch.FetchResult:
+def _run(
+    settings: Settings, router: Router, *, now: datetime = NOW, **kwargs: Any
+) -> departure_fetch.FetchResult:
     return fetch_departure_corpus(
         since=date(2026, 7, 1),
         until=date(2026, 9, 30),
         settings=settings,
         client=router.client(),
         now=now,
+        **kwargs,
     )
 
 
@@ -176,13 +191,12 @@ def test_one_listing_end_from_the_five_rows_with_the_counts_identity(tmp_path: P
     assert klx["exchange_name"] == "Nasdaq Stock Market LLC"
     assert klx["class_title"] == "rights"
     assert klx["form"] == "25-NSE"
-    assert klx["form25_accepted_at"] == "2026-09-24T14:08:40+00:00"
+    assert klx["fetch_version"] == departure_fetch.FETCH_VERSION == 2
+    assert klx["form25_accepted_at"] == KLX_ACCEPTED
     assert klx["form25_filed_on"] == "2026-09-24"
     assert klx["signature_date"] == "2026-09-24"
     assert klx["effective_on"] == "2026-10-04"
-    assert klx["amendments"] == [
-        {"accession": KLX_AMENDMENT, "accepted_at": "2026-09-25T13:00:00+00:00"}
-    ]
+    assert klx["amendments"] == [{"accession": KLX_AMENDMENT, "accepted_at": AMENDMENT_ACCEPTED}]
     assert klx["orphan_amendment"] is False
     assert klx["missing"] == []
 
@@ -201,6 +215,7 @@ def test_one_listing_end_from_the_five_rows_with_the_counts_identity(tmp_path: P
         "ciks": [],
         "limit": None,
         "fetched_at": "2026-10-06T12:00:00+00:00",
+        "fetch_version": 2,
     }
     assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen
 
@@ -220,28 +235,195 @@ def test_an_amendment_with_no_original_is_its_own_listing_end(tmp_path: Path) ->
     assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 3
 
 
-def test_a_blank_acceptance_in_submissions_is_counted_unstamped_not_raised(
-    tmp_path: Path,
-) -> None:
-    """A row with an empty `acceptanceDateTime` anywhere in an issuer's
-    submissions used to make `edgar.acceptance_times` raise and abort the
-    whole fetch (#1055 item 3); it should instead leave that one accession
-    unstamped, same as a row the submissions carry no acceptance for."""
+def test_a_blank_acceptance_in_submissions_does_not_matter(tmp_path: Path) -> None:
+    """A row with an empty `acceptanceDateTime` used to abort the fetch (#1055
+    item 3), then to leave its filing unstamped; the JSON's acceptance is no
+    longer read at all (T168), so the header stamps the filing as usual."""
     submissions = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
     recent = submissions["filings"]["recent"]
-    index = recent["accessionNumber"].index(KLX)
-    recent["acceptanceDateTime"][index] = ""
+    for index in range(len(recent["acceptanceDateTime"])):
+        recent["acceptanceDateTime"][index] = ""
     routes = _routes()
     routes[KLX_SUBMISSIONS_URL] = (200, json.dumps(submissions).encode())
 
     result = _run(_settings(tmp_path), Router(routes))
 
     records = _records(result)
-    assert [r["listing_end_id"] for r in records] == [KLX_AMENDMENT]
-    assert records[0]["orphan_amendment"] is True
-    # Plus the fixture's existing unstamped row (Stubco), unrelated to KLX.
-    assert result.counts.unstamped == 2
-    assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 5
+    assert [r["listing_end_id"] for r in records] == [KLX]
+    assert records[0]["form25_accepted_at"] == KLX_ACCEPTED
+    assert records[0]["eightk"]["accepted_at"] == EIGHTK_ACCEPTED
+    assert result.counts.unstamped == 1  # Stubco, whose header carries no acceptance
+
+
+# --- the acceptance comes from the SGML header (T168) ----------------------------
+
+
+def test_a_submissions_acceptance_4h_late_gives_way_to_the_header(tmp_path: Path) -> None:
+    """SEC's submissions JSON served `acceptanceDateTime` 4 h late from about
+    2026-10-01 (#1496): the Form 25, its amendment, the 8-K and the marker all
+    carry their SGML header's time, never the JSON's."""
+    routes = _routes()
+    routes[KLX_SUBMISSIONS_URL] = (200, _shifted_submissions(4))
+
+    klx = _records(_run(_settings(tmp_path), Router(routes)))[0]
+
+    assert klx["form25_accepted_at"] == KLX_ACCEPTED
+    assert klx["amendments"] == [{"accession": KLX_AMENDMENT, "accepted_at": AMENDMENT_ACCEPTED}]
+    assert klx["eightk"]["accepted_at"] == EIGHTK_ACCEPTED
+    marker = next(m for m in klx["markers"] if m["accession"] == MARKER_8A)
+    assert marker["accepted_at"] == MARKER_ACCEPTED
+
+
+def test_the_amendment_matching_orders_by_the_header(tmp_path: Path) -> None:
+    """The JSON says the 25-NSE/A was accepted a day BEFORE the original, which
+    would make it an orphan; the headers order it after, so it is attached."""
+    payload = json.loads(_fixture("submissions_klx_CIK0001738827.json"))
+    recent = payload["filings"]["recent"]
+    recent["acceptanceDateTime"][recent["accessionNumber"].index(KLX_AMENDMENT)] = (
+        "2026-09-23T13:00:00.000Z"
+    )
+    routes = _routes()
+    routes[KLX_SUBMISSIONS_URL] = (200, json.dumps(payload).encode())
+    flipped = _routes()
+    flipped[AMENDMENT_TXT_URL] = (
+        200,
+        _amendment_txt().replace(b"20260925090000", b"20260923090000"),
+    )
+
+    attached = _run(_settings(tmp_path / "attached"), Router(routes))
+    orphaned = _run(_settings(tmp_path / "orphaned"), Router(flipped))
+
+    assert (attached.counts.amendment_attached, attached.counts.orphan_amendment) == (1, 0)
+    assert _records(attached)[0]["amendments"] == [
+        {"accession": KLX_AMENDMENT, "accepted_at": AMENDMENT_ACCEPTED}
+    ]
+    # And the header alone decides: an amendment header dated before the original's
+    # makes it an orphan even though the JSON orders it after.
+    assert (orphaned.counts.amendment_attached, orphaned.counts.orphan_amendment) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "header_edit",
+    [
+        pytest.param(lambda t: t.replace("<ACCEPTANCE-DATETIME>20260924100840\n", ""), id="none"),
+        pytest.param(
+            lambda t: t.replace(f"NUMBER:\t\t{KLX}", "NUMBER:\t\t0000000000-26-000001"), id="other"
+        ),
+        pytest.param(lambda t: t.replace("</SEC-HEADER>", ""), id="unclosed"),
+        pytest.param(lambda t: t.replace("20260924100840", "2026092410"), id="malformed"),
+    ],
+)
+def test_a_form25_header_that_does_not_read_leaves_it_unstamped(
+    tmp_path: Path, header_edit: Callable[[str], str]
+) -> None:
+    """The JSON still carries KLX's acceptance; the header's is what counts."""
+    routes = _routes()
+    routes[INDEX_URL] = (200, _index_without(KLX_AMENDMENT))
+    edited = header_edit(_fixture(f"klx_25nse_{KLX}.txt").decode())
+    assert edited.encode() != _fixture(f"klx_25nse_{KLX}.txt")
+    routes[KLX_TXT_URL] = (200, edited.encode())
+
+    result = _run(_settings(tmp_path), Router(routes))
+
+    assert _records(result) == []
+    assert result.counts.unstamped == 2  # KLX and Stubco
+    assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 4
+
+
+def test_an_8k_or_marker_header_that_does_not_read_leaves_accepted_at_null(
+    tmp_path: Path,
+) -> None:
+    routes = _routes()
+    header = _fixture(f"klx_8k_hdr_{RELEVANT_8K}.txt").decode()
+    routes[EIGHTK_HEADER_URL] = (
+        200,
+        header.replace("<ACCEPTANCE-DATETIME>20260918092659\n", "").encode(),
+    )
+    routes[MARKER_HEADER_URL] = (404, b"Not Found")
+    settings = _settings(tmp_path)
+
+    klx = _records(_run(settings, Router(routes), now=LATER))[0]
+
+    assert klx["form25_accepted_at"] == KLX_ACCEPTED
+    assert klx["eightk"]["accession"] == RELEVANT_8K
+    assert klx["eightk"]["accepted_at"] is None
+    marker = next(m for m in klx["markers"] if m["accession"] == MARKER_8A)
+    assert marker["accepted_at"] is None
+    assert klx["missing"] == [
+        {"document": "marker_header", "url": MARKER_HEADER_URL, "status": 404}
+    ]
+    rerun = Router(routes)
+    _run(settings, rerun, now=LATER)
+    assert rerun.requests == []  # the unread header is cached, the 404 remembered
+
+
+class _RangeRouter(Router):
+    """Serves the 8-K header cut at the first `edgar.header_bytes` when asked
+    for that range, the whole header for a longer one."""
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        response = super().__call__(request)
+        if str(request.url) == EIGHTK_HEADER_URL:
+            last = int(request.headers["Range"].removeprefix("bytes=0-"))
+            return httpx.Response(200, content=response.content[: last + 1])
+        return response
+
+
+def test_a_header_cut_short_is_asked_once_more_at_the_longer_range(tmp_path: Path) -> None:
+    router = _RangeRouter(_routes())
+    lines: list[str] = []
+
+    result = _run(
+        _settings(tmp_path, header_bytes=200), router, max_requests=3, report=lines.append
+    )
+    klx = _records(result)[0]
+
+    # The count is one per header (documented): the second range is not counted,
+    # so a limit of 3 lets 4 header-and-8-K requests through here.
+    assert lines[0].startswith("requests to make: 3 (2 SGML headers, 1 8-K documents")
+    after = [u for u in router.urls() if u in {EIGHTK_URL, EIGHTK_HEADER_URL, MARKER_HEADER_URL}]
+    assert len(after) == 4
+
+    asked = [r.headers["Range"] for r in router.requests if str(r.url) == EIGHTK_HEADER_URL]
+    assert asked == ["bytes=0-199", "bytes=0-65535"]
+    assert klx["eightk"]["accepted_at"] == EIGHTK_ACCEPTED
+
+
+# --- the request limit (T168) ----------------------------------------------------
+
+
+def test_the_request_count_is_reported_and_over_the_limit_nothing_is_fetched(
+    tmp_path: Path,
+) -> None:
+    lines: list[str] = []
+    router = Router(_routes())
+
+    with pytest.raises(departure_fetch.RequestLimitExceeded, match="3 requests"):
+        _run(_settings(tmp_path), router, max_requests=2, report=lines.append)
+
+    assert lines == [
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 2)"
+    ]
+    asked = router.urls()
+    assert not {EIGHTK_URL, EIGHTK_HEADER_URL, MARKER_HEADER_URL} & set(asked)
+    out = tmp_path / "corpus" / "departure-reason"
+    assert not (out / "corpus.jsonl").exists()
+    assert not (out / "counts.json").exists()
+
+
+def test_at_the_limit_the_fetch_runs_and_a_cached_rerun_counts_zero(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    lines: list[str] = []
+    _run(settings, Router(_routes()), now=LATER, max_requests=3, report=lines.append)
+    _run(settings, Router(_routes()), now=LATER, max_requests=0, report=lines.append)
+
+    assert lines == [
+        "requests to make: 3 (2 SGML headers, 1 8-K documents, "
+        "a cut header asking once more; --max-requests 3)",
+        "requests to make: 0 (0 SGML headers, 0 8-K documents, "
+        "a cut header asking once more; --max-requests 0)",
+    ]
 
 
 # --- the notice exhibit -----------------------------------------------------
@@ -310,7 +492,7 @@ def test_the_nearest_relevant_8k_is_chosen_over_a_nearer_irrelevant_one(tmp_path
     assert eightk["accession"] == RELEVANT_8K
     assert eightk["form"] == "8-K"
     assert eightk["filed_on"] == "2026-09-18"
-    assert eightk["accepted_at"] == "2026-09-18T13:26:59+00:00"
+    assert eightk["accepted_at"] == EIGHTK_ACCEPTED
     assert eightk["index_items"] == ["3.01", "8.01"]
     assert list(eightk["items"]) == ["3.01", "8.01"]
     assert eightk["body_head"] is None
@@ -354,7 +536,9 @@ def test_the_8k_items_stop_at_the_whole_document_cap() -> None:
 # --- the marker filings --------------------------------------------------------
 
 
-def test_the_marker_filings_are_recorded_without_a_request(tmp_path: Path) -> None:
+def test_the_marker_filings_are_recorded_with_only_their_header_requested(
+    tmp_path: Path,
+) -> None:
     router = Router(_routes())
     result = _run(_settings(tmp_path), router)
 
@@ -367,9 +551,13 @@ def test_the_marker_filings_are_recorded_without_a_request(tmp_path: Path) -> No
         "form": "8-A12B",
         "accession": MARKER_8A,
         "filed_on": "2026-09-23",
-        "accepted_at": "2026-09-23T21:15:21+00:00",
+        "accepted_at": MARKER_ACCEPTED,
     }
-    assert not any(MARKER_8A.replace("-", "") in url for url in router.urls())
+    assert [url for url in router.urls() if MARKER_8A.replace("-", "") in url] == [
+        MARKER_HEADER_URL
+    ]
+    (header,) = [r for r in router.requests if str(r.url) == MARKER_HEADER_URL]
+    assert header.headers["Range"] == "bytes=0-4095"
 
 
 # --- the pace, the cache and the missing documents -----------------------------
@@ -449,28 +637,32 @@ def test_a_rerun_refetches_submissions_whose_windows_were_open(tmp_path: Path) -
 
     assert (second.counts.unstamped, second.counts.amendment_attached) == (1, 1)
     assert _records(second)[0]["amendments"] == [
-        {"accession": KLX_AMENDMENT, "accepted_at": "2026-09-25T13:00:00+00:00"}
+        {"accession": KLX_AMENDMENT, "accepted_at": AMENDMENT_ACCEPTED}
     ]
     assert KLX_SUBMISSIONS_URL in rerun.urls()
     assert EIGHTK_URL not in rerun.urls()
 
 
-def test_an_unserved_form25_takes_the_issuer_row_not_the_exchange_row(tmp_path: Path) -> None:
+def test_an_unserved_form25_is_asked_under_the_issuer_and_counted_unstamped(
+    tmp_path: Path,
+) -> None:
+    """With no `.txt` there is no header, so no acceptance (T168): the filing is
+    `unstamped`, never dated from the JSON. It was asked for under the issuer's
+    row, not the exchange's, even with the exchange's row first in the index."""
     routes = _routes()
     lines = _index_without(KLX_AMENDMENT).decode().splitlines(keepends=True)
     klx_rows = [line for line in lines if f"{KLX}.txt" in line]
     others = [line for line in lines if f"{KLX}.txt" not in line]
     routes[INDEX_URL] = (200, "".join(others + klx_rows[::-1]).encode())  # exchange row first
     routes[KLX_TXT_URL] = (404, b"Not Found")
+    router = Router(routes)
 
-    result = _run(_settings(tmp_path), Router(routes))
+    result = _run(_settings(tmp_path), router)
 
-    klx = _records(result)[0]
-    assert klx["listing_end_id"] == KLX
-    assert klx["cik"] == "0001738827"
-    assert klx["exhibit"] is None
-    assert klx["missing"] == [{"document": "form25", "url": KLX_TXT_URL, "status": 404}]
-    assert result.counts.exchange_copy == 1
+    assert _records(result) == []
+    assert KLX_TXT_URL in router.urls()
+    assert (result.counts.unstamped, result.counts.exchange_copy) == (2, 1)
+    assert result.counts.kept + result.counts.excluded() == result.counts.index_rows_seen == 4
 
 
 def test_an_unfinished_quarter_index_is_not_cached(tmp_path: Path) -> None:
