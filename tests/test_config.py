@@ -2041,3 +2041,55 @@ def test_alpaca_class_symbols_fails_closed_on_a_malformed_pair(pair: dict[str, s
     """#1219: a pair is an undotted ticker and a dotted class symbol, or the config refuses."""
     with pytest.raises(ValidationError, match="class_symbols"):
         Settings(_env_file=None, alpaca={"class_symbols": pair})
+
+
+def test_research_claude_defaults_env_and_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tradepartner.config import Settings, clean_message, secret_values
+
+    monkeypatch.delenv("RESEARCH_CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL", raising=False)
+    settings = Settings(_env_file=None)
+    claude = settings.research.claude
+    assert (claude.api_base_url, claude.spend_ceiling_usd_total, claude.max_output_tokens) == (
+        "https://api.anthropic.com",
+        0.0,
+        1024,
+    )
+    assert (
+        claude.price_usd_per_million_input_tokens,
+        claude.price_usd_per_million_output_tokens,
+        claude.chars_per_token,
+        claude.thinking,
+        claude.effort,
+    ) == (2.0, 10.0, 3.5, "between_tools", "low")
+    assert (
+        claude.requests_per_second,
+        claude.request_timeout_seconds,
+        claude.max_attempts,
+        claude.anthropic_version,
+    ) == (1.0, 120.0, 3, "2023-06-01")
+    assert settings.research_claude_api_key is None
+    monkeypatch.setenv("RESEARCH_CLAUDE_API_KEY", "synthetic-secret-123")
+    monkeypatch.setenv("RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL", "15")
+    enabled = Settings(_env_file=None)
+    assert enabled.research.claude.spend_ceiling_usd_total == 15
+    assert "synthetic-secret-123" in secret_values(enabled)
+    assert "synthetic-secret-123" not in repr(enabled)
+    assert clean_message("value synthetic-secret-123", enabled) == "value [redacted]"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-other-key")
+    monkeypatch.delenv("RESEARCH_CLAUDE_API_KEY")
+    assert Settings(_env_file=None).research_claude_api_key is None
+
+
+def test_research_claude_https_and_thinking_validation() -> None:
+    from pydantic import ValidationError
+
+    from tradepartner.config import ResearchClaudeConfig
+
+    for value, field in (
+        ({"api_base_url": "http://example.test"}, "api_base_url"),
+        ({"thinking": "disabled"}, "thinking"),
+    ):
+        with pytest.raises(ValidationError) as raised:
+            ResearchClaudeConfig(**value)
+        assert raised.value.errors()[0]["loc"] == (field,)

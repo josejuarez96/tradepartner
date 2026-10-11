@@ -1641,6 +1641,32 @@ class ResearchLabelingConfig(BaseModel):
         return value
 
 
+class ResearchClaudeConfig(BaseModel):
+    """Disabled-by-default Claude research comparison arm (#1504)."""
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    api_base_url: str = "https://api.anthropic.com"
+    anthropic_version: str = "2023-06-01"
+    spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
+    price_usd_per_million_input_tokens: float = Field(default=2.0, gt=0)
+    price_usd_per_million_output_tokens: float = Field(default=10.0, gt=0)
+    chars_per_token: float = Field(default=3.5, gt=0)
+    max_output_tokens: int = Field(default=1024, gt=0)
+    thinking: Literal["between_tools", "adaptive"] = "between_tools"
+    effort: Literal["low", "medium", "high", "max"] = "low"
+    requests_per_second: float = Field(default=1.0, gt=0)
+    request_timeout_seconds: float = Field(default=120.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+
+    @field_validator("api_base_url")
+    @classmethod
+    def _validate_api_base_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("research.claude.api_base_url must be an https URL")
+        return value
+
+
 class ResearchConfig(BaseModel):
     """Research-experiment registry (docs/specs/research-registry.md req 2, req 14).
 
@@ -1664,6 +1690,7 @@ class ResearchConfig(BaseModel):
     spend_ceiling_usd_month: float = Field(default=0.0, ge=0)
     spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
     labeling: ResearchLabelingConfig = Field(default_factory=ResearchLabelingConfig)
+    claude: ResearchClaudeConfig = Field(default_factory=ResearchClaudeConfig)
 
 
 class Settings(BaseSettings):
@@ -1731,6 +1758,7 @@ class Settings(BaseSettings):
     # only by `research/models.py`, redacted by `secret_values`; with it absent the
     # real model client cannot be built (ADR 0013 point 3 (e)).
     typesafe_api_key: SecretStr | None = Field(default=None)
+    research_claude_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

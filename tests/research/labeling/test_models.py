@@ -129,6 +129,7 @@ def _handle(refusal: str | None = None) -> RunHandle:
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "TYPESAFE_API_KEY",
+        "RESEARCH_CLAUDE_API_KEY",
         "RESEARCH__SPEND_CEILING_USD_MONTH",
         "RESEARCH__SPEND_CEILING_USD_TOTAL",
         "RESEARCH__DATA_DIR",
@@ -710,3 +711,285 @@ def test_inference_paths_lists_every_records_file(tmp_path: Path) -> None:
         False,
         False,
     ]
+
+
+# T173: Claude comparison arm, all network activity stays on a MockTransport.
+def test_claude_default_and_handle_gate(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(models.httpx, "Client", lambda **_: pytest.fail("constructed HTTP client"))
+    settings = _settings()
+    with pytest.raises(NoRunHandle, match="RunHandle required"):
+        models.build_claude_client(settings, None)
+    client = models.build_claude_client(settings, _handle())
+    assert isinstance(client, models.DisabledModelClient)
+    with pytest.raises(models.ModelDisabled):
+        client.label(_request("claude-sonnet-5-5"))
+
+
+def test_claude_requires_all_ceilings_and_its_own_key(clean_env: None) -> None:
+    for section, key in [
+        ({}, None),
+        ({"spend_ceiling_usd_month": 40, "spend_ceiling_usd_total": 40}, None),
+        (
+            {
+                "spend_ceiling_usd_month": 40,
+                "spend_ceiling_usd_total": 40,
+                "claude": {"spend_ceiling_usd_total": 0},
+            },
+            KEY,
+        ),
+        ({"spend_ceiling_usd_month": 40, "claude": {"spend_ceiling_usd_total": 15}}, KEY),
+        ({"spend_ceiling_usd_total": 40, "claude": {"spend_ceiling_usd_total": 15}}, KEY),
+    ]:
+        settings = Settings(_env_file=None, research=section, research_claude_api_key=key)
+        assert isinstance(
+            models.build_claude_client(settings, _handle()), models.DisabledModelClient
+        )
+    settings = Settings(
+        _env_file=None,
+        research={
+            "spend_ceiling_usd_month": 40,
+            "spend_ceiling_usd_total": 40,
+            "claude": {"spend_ceiling_usd_total": 15},
+        },
+        research_claude_api_key=KEY,
+    )
+    assert isinstance(models.build_claude_client(settings, _handle()), models.ClaudeModelClient)
+    claude_only = Settings(
+        _env_file=None,
+        research={
+            "spend_ceiling_usd_month": 40,
+            "spend_ceiling_usd_total": 40,
+            "claude": {"spend_ceiling_usd_total": 15},
+        },
+        research_claude_api_key=KEY,
+    )
+    assert isinstance(models.build_client(claude_only, _handle()), models.DisabledModelClient)
+
+
+def test_claude_request_and_parse(clean_env: None) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        assert request.headers["x-api-key"] == KEY
+        assert request.headers["anthropic-version"] == "2023-06-01"
+        body = json.loads(request.content)
+        assert body["model"] == "claude-sonnet-5-5"
+        assert body["messages"] == [{"role": "user", "content": _request().state}]
+        assert body["output_config"]["format"]["schema"]["properties"]["departure_reason"][
+            "enum"
+        ] == list(CRITERIA)
+        assert "public filing" in body["system"]
+        assert KEY not in request.content.decode()
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "discard"},
+                    {"type": "text", "text": '{"departure_reason":"bankruptcy"}'},
+                ],
+                "usage": {"input_tokens": 100, "output_tokens": 4},
+            },
+        )
+
+    settings = Settings(_env_file=None)
+    client = models.ClaudeModelClient(
+        config=settings.research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _: None,
+    )
+    result = client.label(_request("claude-sonnet-5-5"))
+    assert result.selected_option == "bankruptcy"
+    assert result.output_tokens == 4
+    assert result.probabilities == {}
+    assert KEY not in result.raw_request
+
+
+def test_claude_refusal_and_invalid_block(clean_env: None) -> None:
+    for stop in ("refusal", "max_tokens"):
+        response_body = {
+            "model": "claude-sonnet-5-5",
+            "stop_reason": stop,
+            "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+        client = models.ClaudeModelClient(
+            config=Settings(_env_file=None).research.claude,
+            api_key=SecretStr(KEY),
+            transport=httpx.MockTransport(
+                lambda _, body=response_body: httpx.Response(200, json=body)
+            ),
+        )
+        result = client.label(_request("claude-sonnet-5-5"))
+        assert (result.reason, result.selected_option, result.stop_reason) == (
+            "refused",
+            "unresolved",
+            stop,
+        )
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "model": "claude-sonnet-5-5",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "{}"}, {"type": "tool_use"}],
+                },
+            )
+        ),
+    )
+    with pytest.raises(models.ModelResponseInvalid) as raised:
+        client.label(_request("claude-sonnet-5-5"))
+    assert raised.value.response.reason == "refused"
+
+
+@pytest.mark.parametrize("retry_status", [429, 529])
+def test_claude_id_key_and_retry(clean_env: None, retry_status: int) -> None:
+    from research.fake_model_client import ClaudeAnswer, ClaudeTimeout, ScriptedClaudeClient
+
+    for model in (
+        "claude-sonnet-5-5-latest",
+        "claude",
+        "CLAUDE-sonnet-5-5",
+        "claude-sonnet-5-5-20261011",
+    ):
+        with pytest.raises(models.ModelIdRefused):
+            models.check_claude_model_id(model)
+    for key in ("bad key", "bad\nkey"):
+        with pytest.raises(models.ModelKeyInvalid) as raised:
+            models.ClaudeModelClient(
+                config=Settings(_env_file=None).research.claude, api_key=SecretStr(key)
+            )
+        assert key not in str(raised.value)
+    scripted = ScriptedClaudeClient(
+        [
+            ClaudeAnswer("bankruptcy", thinking_first=True, rate_limits=1),
+            ClaudeAnswer("unresolved", stop_reason="refusal"),
+            ClaudeTimeout(),
+        ]
+    )
+    first = scripted.label(_request("claude-sonnet-5-5"))
+    assert (first.selected_option, first.attempts) == ("bankruptcy", 2)
+    assert scripted.label(_request("claude-sonnet-5-5")).reason == "refused"
+    assert scripted.label(_request("claude-sonnet-5-5")).reason == "timeout"
+    sends: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sends.append(req)
+        if len(sends) == 1:
+            return httpx.Response(retry_status, headers={"Retry-After": "0"})
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-sonnet-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": '{"departure_reason":"bankruptcy"}'}],
+            },
+        )
+
+    waits: list[float] = []
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(handler),
+        sleep=waits.append,
+    )
+    assert client.label(_request("claude-sonnet-5-5")).attempts == 2
+    assert (len(sends), waits) == (2, [0])
+
+
+def test_claude_no_resend_after_sent_timeout(clean_env: None) -> None:
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("synthetic timeout", request=req)
+
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(handler),
+    )
+    response = client.label(_request("claude-sonnet-5-5"))
+    assert (calls, response.reason, response.selected_option, response.input_tokens) == (
+        1,
+        "timeout",
+        "unresolved",
+        None,
+    )
+
+
+def test_claude_auth_rejection_has_no_secret(clean_env: None) -> None:
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(lambda _: httpx.Response(401)),
+    )
+    with pytest.raises(models.ModelAuthRejected) as raised:
+        client.label(_request("claude-sonnet-5-5"))
+    assert KEY not in str(raised.value)
+
+
+def test_claude_cost_keeps_worst_case_without_usage(clean_env: None) -> None:
+    from research.fake_model_client import ClaudeAnswer, ClaudeTimeout, ScriptedClaudeClient
+
+    request = _request("claude-sonnet-5-5")
+    config = Settings(_env_file=None).research.claude
+    client = ScriptedClaudeClient(
+        [ClaudeAnswer("bankruptcy", input_tokens=100, output_tokens=4), ClaudeTimeout()]
+    )
+    billed = client.label(request)
+    missing = client.label(request)
+    assert models.claude_call_cost_usd(request, billed, config) == pytest.approx(
+        (100 * 2 + 4 * 10) / 1_000_000
+    )
+    assert models.claude_call_cost_usd(request, missing, config) == models.claude_estimate_usd(
+        request, config
+    )
+    assert models.claude_estimate_usd(request, config) > config.max_output_tokens * 10 / 1_000_000
+
+
+def test_claude_echoed_key_is_absent_from_invalid_record(clean_env: None) -> None:
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, json={"stop_reason": "end_turn", "content": [{"type": "text", "text": KEY}]}
+            )
+        ),
+    )
+    with pytest.raises(models.ModelResponseInvalid) as raised:
+        client.label(_request("claude-sonnet-5-5"))
+    assert KEY not in raised.value.response.raw_request
+    assert KEY not in raised.value.response.raw_response
+    assert KEY not in str(raised.value)
+
+
+def test_claude_unhashable_answer_keeps_billed_record(clean_env: None) -> None:
+    client = models.ClaudeModelClient(
+        config=Settings(_env_file=None).research.claude,
+        api_key=SecretStr(KEY),
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "model": "claude-sonnet-5-5",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": '{"departure_reason":[]}'}],
+                    "usage": {"input_tokens": 100, "output_tokens": 4},
+                },
+            )
+        ),
+    )
+    with pytest.raises(models.ModelResponseInvalid) as raised:
+        client.label(_request("claude-sonnet-5-5"))
+    record = raised.value.response
+    assert (record.reason, record.input_tokens, record.output_tokens) == ("refused", 100, 4)
+    assert models.claude_call_cost_usd(
+        _request("claude-sonnet-5-5"), record, Settings(_env_file=None).research.claude
+    ) == pytest.approx((100 * 2 + 4 * 10) / 1_000_000)
