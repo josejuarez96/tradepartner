@@ -1294,7 +1294,7 @@ def test_a_limit_order_from_the_broker_halts_after_its_event_is_journaled(
     `refused_order_shape`, a fault after a submit (no `missed` row, not
     `LimitBreachError`), and the second buy is never submitted. The run's
     halt path writes the `kill_switch` row with that reason and cancels the
-    limit order."""
+    limit order; its read of a limit order is refused (#1293)."""
     fake = _shaped_env(env, shaped)
     gate = _gate(env, alerter_conn)
 
@@ -1327,10 +1327,11 @@ def test_a_limit_order_from_the_broker_halts_after_its_event_is_journaled(
     )
     assert (source, fault_type) == ("fault", "SystemFaultError")
     assert "refused_order_shape" in reason
-    assert _events(env.settings, coid)[2:] == [
-        ("cancel_requested", HALT_REASON),
-        ("cancelled", None),
-    ]
+    # The halt read collects the cancelled order. A limit order read back by
+    # `get_order` is refused there too (#1293): it stays open in the journal,
+    # noted `cancel_failed`, for the owner, since no collection journals it.
+    read_back = ("cancel_failed", HALT_REASON) if shaped == "get_order" else ("cancelled", None)
+    assert _events(env.settings, coid)[2:] == [("cancel_requested", HALT_REASON), read_back]
     assert _events(env.settings, second) == [("pending", None)]  # resume settles it
     assert [r.client_order_id for r in _submits(fake)] == [coid]
 

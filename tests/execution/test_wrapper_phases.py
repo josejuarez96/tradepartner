@@ -28,6 +28,7 @@ from tradepartner.errors import (
     LimitBreachError,
     RejectionCapError,
     SkipCapError,
+    SystemFaultError,
 )
 from tradepartner.execution import switch, wrapper
 from tradepartner.execution.alerts import Alerter
@@ -1092,6 +1093,45 @@ def test_sells_go_before_the_open_and_no_buy_before_the_sells_deadline(
         [env.run.run_id],
     )
     assert in_flight == (True,)
+
+
+def test_a_sell_replaced_by_a_limit_order_after_its_acknowledgement_halts_the_batch(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1293 (owner 2026-10-10): the sell is acknowledged as the market day
+    order, then every later `get_order` (`_await_sells`' status poll and the
+    collection after it) reads it as a limit order. The collection refuses it
+    with `refused_order_shape` before journaling anything, and the buy is
+    never submitted."""
+    _hold(env, A, 10.0)
+    trim = _decision(env, A, "sell", notional=500.0)
+    buy = _decision(env, B, "buy", notional=3000.0)
+    read = env.fake.get_order
+    reads: dict[str, int] = {}
+
+    def replaced(coid: str) -> Any:
+        reads[coid] = reads.get(coid, 0) + 1
+        order = read(coid)
+        if reads[coid] == 1:
+            return order
+        return replace(order, order_type="limit", limit_price=99.5)
+
+    monkeypatch.setattr(env.fake, "get_order", replaced)
+
+    with pytest.raises(SystemFaultError, match="refused_order_shape") as raised:
+        _execute(_gate(env, alerter_conn), env, [trim, buy])
+    assert type(raised.value) is SystemFaultError
+    assert "get_order returned order " in str(raised.value)
+    assert [r.side for r in _submits(env.fake)] == [Side.SELL]
+    (coid,) = [c for c in reads if not c.startswith("fx-")]
+    assert reads[coid] >= 3  # the acknowledgement, the poll, the collection
+    statuses = _query(
+        env.settings, "SELECT status FROM order_events WHERE client_order_id = ?", [coid]
+    )
+    assert statuses == [("pending",), ("accepted",)]
+    assert _query(env.settings, "SELECT COUNT(*) FROM fills WHERE client_order_id = ?", [coid]) == [
+        (0,)
+    ]
 
 
 def test_buys_are_sized_from_cash_never_buying_power(
