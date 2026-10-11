@@ -375,7 +375,23 @@ def test_statement_card_labels_parse_only_counts(
     )
     at = _app(monkeypatch, store_path)
     assert not at.exception
-    assert "parsed CIKs only (a cache hit adds zero)" in _text(at)
+    label = "non_usd, malformed, none: parsed CIKs only (a cache hit adds zero)"
+    assert label in _text(at)
+
+
+def test_statement_card_leaves_the_other_counts_unlabelled(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    _write(
+        store_path,
+        "UPDATE ingestion_runs SET message = ? WHERE source = 'edgar'",
+        ["statement_conflicts: 1, statement_held: 2, statement_derived: 3"],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Last EDGAR run: conflicts 1, derived 3, held 2" in text
+    assert "parsed CIKs only" not in text
 
 
 def test_statement_card_shows_no_warning_when_vintage_late_is_zero(

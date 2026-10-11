@@ -25,6 +25,7 @@ from edgar_transport import EdgarRouter, edgar_settings
 from tradepartner.adapters.edgar import (
     StatementConflict,
     StatementFactsParse,
+    duration_class,
     parse_statement_facts,
 )
 from tradepartner.adapters.edgar_source import (
@@ -190,6 +191,41 @@ def test_53_week_year_and_quarter_ytd_use_separate_duration_classes() -> None:
     annual = [r for r in result.records if r.period_days > 300]
     assert {r.period_days: r.comparative for r in annual} == {370: False, 363: True}
     assert all(not r.comparative for r in result.records if r.period_days < 300)
+
+
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [
+        (0, 0),  # instant
+        (59, 2),  # two-month 10-KT stub, apart from a quarter
+        *((d, 3) for d in (89, 90, 91, 97)),  # quarters, a 14-week quarter
+        *((d, 6) for d in (181, 182, 184, 188)),  # half-years
+        *((d, 9) for d in (272, 273, 275, 279)),  # nine-month year-to-date
+        *((d, 12) for d in (363, 364, 365, 370)),  # 52/53-week and leap years
+    ],
+)
+def test_duration_class_matches_the_spec_ranges(days: int, expected: int) -> None:
+    """The #1034 amendment's ranges: whole months, an instant is class 0."""
+    assert duration_class(days) == expected
+
+
+def test_a_ytd_ending_before_the_quarter_is_not_flagged_against_it() -> None:
+    """A quarter and a nine-month YTD are separate classes: the YTD ending
+    before the quarter is the only nine-month column, so it is not a
+    comparative. One merged sub-annual class would flag it."""
+    q = {"fy": 2022, "fp": "Q2", "form": "10-Q", "filed": "2022-07-29"}
+    result = parse(
+        payload(
+            {
+                "Revenues": [
+                    entry(Q2022, ("2022-04-01", "2022-06-30"), 90, **q),
+                    entry(Q2022, ("2021-07-01", "2022-03-31"), 270, **q),
+                ]
+            }
+        )
+    )
+    flags = {r.period_days: r.comparative for r in result.records}
+    assert flags == {90: False, 273: False}
 
 
 def test_misleading_fy_and_no_frame_still_land_on_the_entry_dates() -> None:
