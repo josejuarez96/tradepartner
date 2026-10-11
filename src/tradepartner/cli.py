@@ -22,7 +22,12 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   with no request for it. `--rebuild-statement-facts` deletes and
   re-ingests `statement_facts` in the EDGAR chunk's transaction and needs
   `edgar.statement_facts_enabled`. Both are off by default and refused with
-  `--backfill` or `--source alpaca` (usage error, 2).
+  `--backfill` or `--source alpaca` (usage error, 2). `--restamp-from
+  MANIFEST` (#1382, T166b) moves the stored stamps a stamps-repair manifest
+  repairs (`ingest.restamp_from_manifest`) in the EDGAR chunk, then writes
+  the day's filings as usual; it needs `--source edgar` and no `--backfill`,
+  prints the moved rows per table and each refused CIK, and a change inside
+  an open paper window fails the run with nothing written.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -334,6 +339,7 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
 from tradepartner.backtest import lab, promotion, sweep_report
 from tradepartner.backtest import sweep as lab_sweep
@@ -363,7 +369,14 @@ from tradepartner.execution.lots_reconcile_export import parse_export as parse_b
 from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import HealthReport, health_report
-from tradepartner.ingest import SOURCES, IngestResult, _read, ingest_session
+from tradepartner.ingest import (
+    SOURCES,
+    IngestResult,
+    RestampResult,
+    _read,
+    ingest_session,
+    read_manifest,
+)
 from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
 from tradepartner.research import EVERY_ROW_SPLITS, DatasetChanged, datafiles
 from tradepartner.research.experiment import (
@@ -512,6 +525,20 @@ def _print_result(result: IngestResult) -> None:
             f"{run.source}: {run.status}, {run.rows_added} rows, "
             f"cursor {run.chunk_cursor}: {run.message}"
         )
+
+
+def _print_restamp(result: RestampResult, *, committed: bool) -> None:
+    """A restamp's counts, then every refused CIK on its own line (#1382:
+    each needs an owner decision). Printed after the run, saying when the
+    chunk rolled back (a dry run or a failed run) so no count is taken as
+    written."""
+    moved = ", ".join(f"{table} {count}" for table, count in result.moved.items())
+    state = "" if committed else " (rolled back: nothing written)"
+    typer.echo(
+        f"restamp{state}: {result.changes} changes; moved {moved}; refused {len(result.refused)}"
+    )
+    for cik, why in sorted(result.refused.items()):
+        typer.echo(f"restamp refused {cik}: {why}")
 
 
 def _print_holes(result: HoleFill) -> None:
@@ -1457,6 +1484,13 @@ def make_app(
                 help="delete and re-ingest filing_events in the EDGAR chunk (#1458)",
             ),
         ] = False,
+        restamp_from: Annotated[
+            Path | None,
+            typer.Option(
+                "--restamp-from",
+                help="move stored stamps per a stamps-repair manifest CSV (#1382); --source edgar",
+            ),
+        ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
         if source not in ("all", *SOURCES):
@@ -1478,6 +1512,17 @@ def make_app(
         ):
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
+        restamp: list[ManifestRow] | None = None
+        restamped: list[RestampResult] = []
+        if restamp_from is not None:
+            if backfill_ or source != "edgar":
+                raise _fail(
+                    "--restamp-from needs a session ingest with --source edgar", USAGE_ERROR
+                )
+            try:
+                restamp = read_manifest(restamp_from)
+            except (OSError, ValueError, KeyError) as exc:
+                raise _fail(f"--restamp-from: {exc}", USAGE_ERROR) from None
         named: list[str] | None = None
         if security is not None:
             if not fill_holes_:
@@ -1549,8 +1594,12 @@ def make_app(
                 dry_run=dry_run,
                 rebuild_statement_facts=rebuild_statement_facts,
                 rebuild_filing_events=rebuild_filing_events,
+                restamp=restamp,
+                on_restamp=restamped.append,
             )
         _print_result(result)
+        for done in restamped:
+            _print_restamp(done, committed=result.ok and not dry_run)
         raise typer.Exit(result.exit_code)
 
     @app.command("backfill-benchmark")
