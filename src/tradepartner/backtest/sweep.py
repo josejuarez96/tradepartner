@@ -49,6 +49,15 @@ is on or after it, or whose variant has no rebalance session at its cadence on o
 before it, is `DevelopmentBoundaryError`, so no default window is ever empty,
 and the readiness check's default windows (`_unrun_standalone`,
 `lab_registry.family_ready_for_sweep`) end at it. With no boundary row nothing changes.
+
+**Another family's exam months** (#1441). `register`, and `lab.run_sweep` before it
+writes a row, refuse with `DefaultWindowOverlapError` a sweep any of whose variants'
+default in-sample windows (under the development boundary, if any) reaches into
+another non-oracle family's holdout (`exam_overlap_refusal`). Without the boundary row
+a child family with a forward holdout (B4) would otherwise practise on its parent's
+spent exam and a sibling's unspent one; with it the window ends at the boundary, which
+`registry.write_development_boundary` keeps before every registered holdout. The
+`oracle` family, refused on the real store, is neither checked nor an exam.
 """
 
 from __future__ import annotations
@@ -71,7 +80,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis, results
-from tradepartner.backtest.holdout import Frozen, default_in_sample_window
+from tradepartner.backtest.holdout import Frozen, Window, default_in_sample_window
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.backtest.signals import check_anchor_feasible
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings, get_settings
@@ -84,6 +93,7 @@ __all__ = [
     "AnchorInfeasibleError",
     "AxisNotSweepableError",
     "CadenceAxisStatisticError",
+    "DefaultWindowOverlapError",
     "DuplicateFingerprintError",
     "DuplicateGridValueError",
     "FamilyLatticeError",
@@ -105,6 +115,7 @@ __all__ = [
     "SweepRegistrationError",
     "TooManyVariantsError",
     "Variant",
+    "exam_overlap_refusal",
     "expand_grid",
     "family_rule_params",
     "parse_sweep_file",
@@ -695,6 +706,42 @@ class DevelopmentBoundaryError(SweepRegistrationError):
     boundary, so its default in-sample window would be empty."""
 
 
+class DefaultWindowOverlapError(SweepRegistrationError):
+    """#1441: a variant's default in-sample window reads another non-oracle family's
+    holdout months (a family with a later holdout and no development boundary row,
+    ADR 0016 point 2). Raised by `register` and by `lab.run_sweep`, before any row."""
+
+
+def exam_overlap_refusal(
+    conn: duckdb.DuckDBPyConnection, family: str, windows: Sequence[Window]
+) -> str | None:
+    """Why `family`'s default in-sample `windows` may not run (#1441), or None: the
+    holdouts of other non-oracle families (`hypotheses` and `family_rules`) that a
+    window touches. `oracle` itself is never refused."""
+    if family == registry.ORACLE_FAMILY or not windows:
+        return None
+    holdouts = conn.execute(
+        "SELECT DISTINCT family, holdout_start, holdout_end FROM hypotheses "
+        "WHERE family NOT IN (?, ?) UNION SELECT family, holdout_start, holdout_end "
+        "FROM family_rules WHERE family NOT IN (?, ?) ORDER BY 1, 2, 3",
+        [family, registry.ORACLE_FAMILY] * 2,
+    ).fetchall()
+    start = min(window.start for window in windows)
+    end = max(window.end for window in windows)
+    hit = [
+        f"{other!r}'s [{first}, {last}]"
+        for other, first, last in holdouts
+        if first <= end and start <= last
+    ]
+    if not hit:
+        return None
+    return (
+        f"family {family!r}'s default in-sample window [{start}, {end}] reads the holdout "
+        f"months of {', '.join(hit)}; the owner's development boundary row (ADR 0016, "
+        "`tradepartner decision development-boundary`) ends it before them"
+    )
+
+
 @dataclass(frozen=True)
 class SweepRegistration:
     """A sweep registration: its `sweeps` row, its variants' `sweep_variants` rows and
@@ -972,6 +1019,24 @@ def register(
                 f"hypothesis {holder.slug!r} (id {holder.hypothesis_id}); the existing "
                 "registration is the record"
             )
+    windows = [
+        default_in_sample_window(
+            Frozen(
+                hypothesis_id=0,
+                in_sample_start=parsed.in_sample_start,
+                holdout_start=parsed.holdout_start,
+                holdout_end=parsed.holdout_end,
+                # The window does not read the gap threshold.
+                gap_count_share_threshold=0.0,
+            ),
+            variant.frozen_set[lab_registry.CADENCE_KEY],
+            boundary,
+        )
+        for variant in variants
+    ]
+    overlap = exam_overlap_refusal(conn, parsed.family, windows)
+    if overlap is not None:
+        raise DefaultWindowOverlapError(f"{file}: {overlap}")
     if not lab_registry.family_ready_for_sweep(conn, parsed.family, boundary):
         unrun = _unrun_standalone(conn, parsed.family, boundary)
         raise FamilyNotReadyError(

@@ -450,6 +450,40 @@ def test_the_size_guard_refuses_with_every_table_unchanged(
     assert _counts(store) == before
 
 
+def test_a_window_reading_another_familys_exam_is_refused_before_any_row(
+    store: Path, clock: FakeClock
+) -> None:
+    """#1441: a registration that reads another family's holdout months (one made
+    before the guard, or before that family's rules) refuses to run without the
+    development boundary row, writing nothing; with the row the window ends before
+    those months and the sweep runs."""
+    with open_for_write(Settings()) as conn:
+        twin = registry.get_hypothesis(conn, "fixture-momentum")
+        lab_registry.write_family_rules(
+            conn,
+            family="profitability",
+            first_hypothesis_id=twin.hypothesis_id,
+            parent_family=None,
+            holdout_start=date(2019, 1, 2),
+            holdout_end=date(2019, 3, 29),
+            in_sample_start=date(2018, 1, 31),
+            fixed_params={},
+            sr_star_seed_annual=None,
+            settings=Settings(_env_file=None),
+        )
+    before = _counts(store)
+    with pytest.raises(
+        sweep.DefaultWindowOverlapError, match=r"'profitability''s \[2019-01-02, 2019-03-29\]"
+    ):
+        lab.run_sweep(SLUG, clock=clock)
+    assert _counts(store) == before
+
+    with open_for_write(Settings()) as conn:
+        registry.write_development_boundary(conn, boundary=date(2018, 12, 31), reason="test")
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert outcome.n_ok == outcome.n_planned == 4
+
+
 # --- failure isolation and terminal failure ----------------------------------------
 
 

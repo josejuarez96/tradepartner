@@ -608,6 +608,7 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert plain.exit_code == 0, plain.output
     for heading in ("edgar", "alpaca", "coverage", "delisted", "integrity"):
         assert heading in plain.output.lower()
+    assert "listed with no bars after a form 25: 0" in plain.output.lower()
     checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert checked.exit_code == 0, checked.output
 

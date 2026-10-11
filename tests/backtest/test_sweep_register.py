@@ -661,6 +661,16 @@ def test_family_rule_params_are_the_forbidden_prefix_keys() -> None:
 
 #: A holdout after the twin's (2023-01-03 to 2025-12-31), so no overlap.
 LATER_HOLDOUT = (date(2026, 1, 2), date(2026, 6, 30))
+#: The development boundary these cases practise under: the twin's last month-end
+#: before its holdout, so a later family's default window stops short of the twin's
+#: exam months (#1441).
+BOUNDARY = date(2022, 12, 30)
+
+
+def _practise_before_the_twins_exam(conn: duckdb.DuckDBPyConnection) -> None:
+    """The development boundary row at `BOUNDARY` (ADR 0016), without which a new
+    family's default window reads the twin's holdout and is refused (#1441)."""
+    registry.write_development_boundary(conn, boundary=BOUNDARY, reason="test")
 
 
 def _profitability_sweep(
@@ -740,6 +750,7 @@ def test_every_non_oracle_family_has_a_family_parents_entry() -> None:
 def test_a_root_familys_first_sweep_writes_its_rules_with_no_parent_and_its_own_mark(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    _practise_before_the_twins_exam(ready)
     # The twin has spent nothing: a root needs no parent's spend.
     assert config.FAMILY_PARENTS["profitability"] is None
     assert lab_registry.family_rules(ready, "profitability") is None
@@ -794,6 +805,7 @@ def test_a_new_familys_holdout_overlapping_an_existing_familys_is_refused(
 def test_an_oracle_familys_holdout_is_no_overlap(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
+    _practise_before_the_twins_exam(ready)
     twin = registry.get_hypothesis(ready, "fixture-momentum")
     lab_registry.write_family_rules(
         ready,
@@ -824,6 +836,7 @@ def test_a_child_naming_its_own_parent_is_accepted(
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     twin = _twin(lab_store, settings, tmp_path)
+    _practise_before_the_twins_exam(lab_store)
     _spend_holdout(lab_store, settings, tmp_path, twin)
 
     path = _profitability_sweep(tmp_path, parent="momentum")
@@ -861,6 +874,7 @@ def test_a_child_is_refused_until_the_parent_spends_and_its_mark_starts_at_the_p
     lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:
     twin = _twin(lab_store, settings, tmp_path, seed=0.77)
+    _practise_before_the_twins_exam(lab_store)
     path = _profitability_sweep(tmp_path)
     _refused(lab_store, path, settings, NewFamilyError, "neither a holdout spend")
 
@@ -897,6 +911,7 @@ def test_a_child_is_accepted_when_the_parent_reached_its_spend_cap(
     # The cap path of `family_holdout_spent_or_capped`: one spend at a cap of one.
     settings = _settings(max_family_holdout_spends=1)
     twin = _twin(lab_store, settings, tmp_path)
+    _practise_before_the_twins_exam(lab_store)
     _spend_holdout(lab_store, settings, tmp_path, twin)
 
     assert register(
@@ -907,6 +922,7 @@ def test_a_child_is_accepted_when_the_parent_reached_its_spend_cap(
 def test_the_rules_are_copied_once_and_a_later_config_change_changes_nothing(
     ready: duckdb.DuckDBPyConnection, tmp_path: Path
 ) -> None:
+    _practise_before_the_twins_exam(ready)
     first_settings = _settings(
         max_family_holdout_spends=2,
         max_family_promotions=1,
@@ -948,3 +964,111 @@ def test_a_non_oracle_family_missing_from_family_parents_is_refused(
     path = _profitability_sweep(tmp_path)
 
     _refused(ready, path, settings, NewFamilyError, "no entry in FAMILY_PARENTS")
+
+
+# ── another family's exam months (#1441) ─────────────────────────────────────────
+
+#: A forward holdout after the twin's, as B4's is after momentum's.
+FORWARD_HOLDOUT = (date(2026, 11, 2), date(2027, 4, 30))
+
+
+@pytest.mark.usefixtures("child_table")
+def test_a_forward_child_without_the_boundary_row_is_refused_and_accepted_with_it(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """B4's shape: a child with a forward holdout and no development boundary row has
+    a default window running to 2026-10-30, through the parent's spent exam."""
+    twin = _twin(lab_store, settings, tmp_path)
+    _spend_holdout(lab_store, settings, tmp_path, twin)
+    path = _profitability_sweep(tmp_path, holdout=FORWARD_HOLDOUT, parent="momentum")
+
+    _refused(
+        lab_store,
+        path,
+        settings,
+        sweep.DefaultWindowOverlapError,
+        r"\[2018-01-31, 2026-10-30\] reads the holdout months of "
+        r"'momentum''s \[2023-01-03, 2025-12-31\]",
+    )
+
+    _practise_before_the_twins_exam(lab_store)
+    result = register(lab_store, path, settings, registered_by="test")
+    assert result.created
+    windows = {
+        default_in_sample_window(
+            Frozen.from_hypothesis(record),
+            frozen.frozen_values(record)["schedule.rebalance_cadence"],
+            BOUNDARY,
+        ).end
+        for record in result.hypotheses
+    }
+    assert max(windows) <= BOUNDARY
+
+
+def test_an_oracle_holdout_is_no_exam_and_an_oracle_window_is_never_refused(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """`oracle` is never an exam, and its own windows are never refused: a window
+    holding the oracle's holdout refuses nothing."""
+    twin = _direct(lab_store, _copy(tmp_path, TWIN_SOURCE), settings)
+    lab_registry.write_family_rules(
+        lab_store,
+        family="oracle",
+        first_hypothesis_id=twin.hypothesis_id,
+        parent_family=None,
+        holdout_start=date(2020, 1, 2),
+        holdout_end=date(2020, 6, 30),
+        in_sample_start=date(2018, 1, 31),
+        fixed_params={},
+        sr_star_seed_annual=None,
+        settings=settings,
+    )
+    # The twin's own window [2018-01-31, 2022-12-30] holds the oracle's holdout.
+    window = default_in_sample_window(Frozen.from_hypothesis(twin))
+
+    assert sweep.exam_overlap_refusal(lab_store, "momentum", [window]) is None
+    assert sweep.exam_overlap_refusal(lab_store, "oracle", [window]) is None
+
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+def test_todays_registrations_and_files_are_unaffected_and_b4_is_refused_without_the_row(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Pin (#1441): H1, B3 and the first sweep (T114) read no other family's exam
+    months with or without the boundary row; B4's sweep file does without it and does
+    not at the owner's 2023-12-29."""
+    h1 = _direct(lab_store, REPO / "docs/hypotheses/h1-momentum-12-1.md", settings)
+    b3 = _direct(lab_store, REPO / "docs/hypotheses/b3-gross-profitability.md", settings)
+
+    def windows(path: Path, boundary: date | None) -> list[Any]:
+        parsed = sweep.parse_sweep_file(path, settings)
+        frozen_dates = Frozen(
+            hypothesis_id=0,
+            in_sample_start=parsed.in_sample_start,
+            holdout_start=parsed.holdout_start,
+            holdout_end=parsed.holdout_end,
+            gap_count_share_threshold=0.0,
+        )
+        return [
+            default_in_sample_window(
+                frozen_dates, v.frozen_set["schedule.rebalance_cadence"], boundary
+            )
+            for v in sweep.expand_grid(parsed, settings)
+        ]
+
+    t114 = REPO / "docs/sweeps/momentum-topfrac-cadence.md"
+    b4 = REPO / "docs/sweeps/b4-momentum-profitability-combined.md"
+    for boundary in (None, date(2023, 12, 29)):
+        for record in (h1, b3):
+            window = default_in_sample_window(Frozen.from_hypothesis(record), "month_end", boundary)
+            assert sweep.exam_overlap_refusal(lab_store, record.family, [window]) is None
+        assert sweep.exam_overlap_refusal(lab_store, "momentum", windows(t114, boundary)) is None
+    reason = sweep.exam_overlap_refusal(lab_store, "combined", windows(b4, None))
+    assert reason is not None
+    assert "'momentum''s [2024-01-01, 2026-09-30]" in reason
+    assert "'profitability''s [2024-01-01, 2026-09-30]" in reason
+    assert (
+        sweep.exam_overlap_refusal(lab_store, "combined", windows(b4, date(2023, 12, 29))) is None
+    )
