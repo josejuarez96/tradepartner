@@ -149,8 +149,8 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
         conn.close()
 
 
-def test_current_schema_version_is_22() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 22
+def test_current_schema_version_is_23() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 23
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -158,7 +158,12 @@ def test_the_rename_table_covers_every_phase3_period_key() -> None:
         k for k in _PHASE3 if "monthly" in k or k == "n_months"
     }
     assert set(schema.PERIOD_KEY_RENAMES.values()) <= set(METRIC_KEYS)
-    added = {"periods_per_year", "turnover_annual", "sharpe_annual_excess_spy"}
+    added = {
+        "periods_per_year",
+        "turnover_annual",
+        "sharpe_annual_excess_spy",
+        "risk_free_annual",
+    }
     kept = {k for k in _PHASE3 if k not in schema.PERIOD_KEY_RENAMES}
     assert kept | set(schema.PERIOD_KEY_RENAMES.values()) | added == set(METRIC_KEYS)
 
@@ -194,7 +199,8 @@ def test_the_migration_inserts_the_period_rows_and_keeps_the_monthly_ones(
     for series in ("strategy", "SPY", "MTUM"):
         for level in _LEVELS:
             keys = {row[3] for row in after if row[1] == series and row[2] == level}
-            assert set(METRIC_KEYS) <= keys
+            # Past trials lack `risk_free_annual` (T170): no migration writes it.
+            assert set(METRIC_KEYS) - {"risk_free_annual"} <= keys
 
 
 def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
@@ -218,6 +224,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (20,),
         (21,),
         (22,),
+        (23,),
     ]
 
 
@@ -254,7 +261,7 @@ def test_a_second_open_inserts_nothing_more(v14: duckdb.DuckDBPyConnection) -> N
     rows = _metric_rows(v14)
     schema.init_schema(v14)
     assert _metric_rows(v14) == rows
-    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (9,)
+    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (10,)
 
 
 def test_new_trials_after_the_migration_carry_no_detail_default(

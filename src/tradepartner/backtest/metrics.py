@@ -17,7 +17,8 @@ Pure functions over plain sequences of returns and equity values.
   SR* = SR*_annual / sqrt(periods_per_year).
 
 Units: every return, CAGR and drawdown is a fraction (0.03 = 3%).
-`metrics.risk_free_rate` is an annual rate, compounded to a per-period one.
+The risk-free input is one return per period (`backtest/riskfree.py`: the compounded
+`metrics.risk_free_rate` under `constant`, the compounded T-bill accrual under `store`).
 `metrics.red_flag_excess_cagr_pp` is in percentage points.
 """
 
@@ -33,6 +34,7 @@ import empyrical
 import numpy as np
 import numpy.typing as npt
 
+from tradepartner.backtest.riskfree import annualised
 from tradepartner.backtest.schedule import MONTHS_PER_YEAR as MONTHS_PER_YEAR
 from tradepartner.config import Settings
 
@@ -70,6 +72,7 @@ METRIC_KEYS: tuple[str, ...] = (
     "kurtosis_period_excess_spy",
     "n_periods",
     "periods_per_year",
+    "risk_free_annual",
 )
 
 
@@ -123,8 +126,8 @@ def _annualized_std(returns: FloatArray, periods_per_year: int) -> float:
     return float(empyrical.annual_volatility(returns, annualization=periods_per_year))
 
 
-def _period_sharpe(returns: FloatArray, risk_free_period: float = 0.0) -> float:
-    return float(empyrical.sharpe_ratio(returns, risk_free=risk_free_period, annualization=1))
+def _period_sharpe(returns: FloatArray) -> float:
+    return float(empyrical.sharpe_ratio(returns, risk_free=0.0, annualization=1))
 
 
 def _skew(x: FloatArray) -> float:
@@ -167,7 +170,7 @@ def series_metrics(
     spy_period_returns: Sequence[float],
     mtum_period_returns: Sequence[float],
     periods_per_year: int,
-    risk_free_rate: float,
+    risk_free_period_returns: Sequence[float],
     family_benchmark: tuple[str, Sequence[float]] | None = None,
 ) -> dict[str, float | None]:
     """Every req 8 key for one series at one cost level.
@@ -182,8 +185,12 @@ def series_metrics(
     and `tracking_error_<name>` (name lower-cased, `family_benchmark_keys`), and `None`
     adds nothing, so the key set and values of a family without one are unchanged.
     `daily_equity` is the equity on every session, for `max_drawdown`. `turnover` is the
-    one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_rate` is
-    annual, compounded to the period. The `*_excess_spy` keys are None when `series` is
+    one-sided turnover per rebalance; an empty sequence gives 0. `risk_free_period_returns` is
+    one return per period (`riskfree.constant_period_returns` or `riskfree.period_risk_free`).
+    `sharpe_period` is the Sharpe of the excess series `r_i - rf_i`; `skew_period` and
+    `kurtosis_period` are its moments (a constant `rf` leaves the central moments as they
+    are, so that case reads them off `r_i` and they stay bit-identical); `risk_free_annual`
+    is the annualised risk-free return of the run. The `*_excess_spy` keys are None when `series` is
     `SPY`. Raises `ValueError` when the series (or, except for SPY, its excess over SPY)
     is constant, or `periods_per_year` is not positive.
     """
@@ -196,6 +203,7 @@ def series_metrics(
         ("gross_period_returns", gross_period_returns),
         ("spy_period_returns", spy_period_returns),
         ("mtum_period_returns", mtum_period_returns),
+        ("risk_free_period_returns", risk_free_period_returns),
     ):
         if len(other) != n:
             raise ValueError(f"{name} has {len(other)} periods, period_returns has {n}")
@@ -204,6 +212,7 @@ def series_metrics(
     equity = _array(daily_equity)
     gross = _array(gross_period_returns)
     spy, mtum = _array(spy_period_returns), _array(mtum_period_returns)
+    rf = _array(risk_free_period_returns)
     extra = None
     if family_benchmark is not None:
         extra_name, extra_returns = family_benchmark
@@ -220,6 +229,7 @@ def series_metrics(
         ("gross_period_returns", gross),
         ("spy_period_returns", spy),
         ("mtum_period_returns", mtum),
+        ("risk_free_period_returns", rf),
         ("daily_equity", equity),
         ("turnover", turnover_values),
     ):
@@ -231,10 +241,14 @@ def series_metrics(
     _require_variance("period_returns", net)
     if series != "SPY":
         _require_variance("period_returns minus spy_period_returns", ex_spy)
-    rf_period = (1 + risk_free_rate) ** (1 / ppy) - 1
+    excess_rf = net - rf
+    _require_variance("period_returns minus risk_free_period_returns", excess_rf)
+    # A constant rf leaves the central moments of `net` as they are; reading them off
+    # `net` keeps them bit-identical to the scalar-rate code.
+    moments_of = net if bool(np.all(rf == rf[0])) else excess_rf
     root_ppy = math.sqrt(ppy)
     cagr = _cagr(net, ppy)
-    sharpe_period = _period_sharpe(net, rf_period)
+    sharpe_period = _period_sharpe(excess_rf)
     turnover_period = float(np.mean(turnover_values)) if len(turnover_values) else 0.0
     daily_returns = equity[1:] / equity[:-1] - 1
 
@@ -253,12 +267,13 @@ def series_metrics(
         "excess_cagr_mtum": cagr - _cagr(mtum, ppy),
         "tracking_error_spy": _annualized_std(ex_spy, ppy),
         "tracking_error_mtum": _annualized_std(ex_mtum, ppy),
-        "skew_period": _skew(net),
-        "kurtosis_period": _kurtosis(net),
+        "skew_period": _skew(moments_of),
+        "kurtosis_period": _kurtosis(moments_of),
         "skew_period_excess_spy": None,
         "kurtosis_period_excess_spy": None,
         "n_periods": float(n),
         "periods_per_year": float(ppy),
+        "risk_free_annual": annualised(risk_free_period_returns, ppy),
     }
     if series != "SPY":
         sharpe_excess = _period_sharpe(ex_spy)
