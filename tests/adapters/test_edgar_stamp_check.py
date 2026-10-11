@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from edgar_transport import EdgarRouter, edgar_settings
 
@@ -242,3 +243,38 @@ def test_sgml_acceptance_refuses_a_wrong_truncated_or_unstamped_header(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         sgml_acceptance(text, FILINGS[0][0])
+
+
+def test_no_anchor_header_read_leaves_every_stamp_out_this_run(settings: Settings) -> None:
+    """Every anchor 404s: the payload is unproven, so nothing is cached (the
+    late stamps this check exists to stop) and the next run asks again."""
+    router = _router(SHIFTED, {a: 404 for a, _, _ in FILINGS})
+    source, stamps = _stamp(settings, router)
+    assert stamps == {}
+    assert source.stamps_sgml_unread == len(FILINGS)
+    assert source.stamp_check_unread_ciks == 0
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_a_header_error_other_than_gone_propagates(settings: Settings, status: int) -> None:
+    """A 400 or a 500 (and SEC's 403 block, once waited out) stops the run, as on every
+    EDGAR path, instead of being read as a missing header."""
+    router = _router(SHIFTED, {FILINGS[0][0]: status})
+    with pytest.raises(httpx.HTTPStatusError):
+        _stamp(settings, router)
+
+
+def test_a_header_cut_by_the_first_range_is_asked_again_longer(settings: Settings) -> None:
+    accession, form, at = FILINGS[0]
+    full = _header(accession, form, at)
+
+    def ranged(request: httpx.Request) -> httpx.Response:
+        last = int(request.headers["Range"].removeprefix("bytes=0-"))
+        cut = full if last + 1 >= settings.edgar.stamp_header_bytes else full[:60]
+        return httpx.Response(206, content=cut.encode())
+
+    router = _router(SHIFTED)
+    router.add(_header_url(accession), ranged)
+    _, stamps = _stamp(settings, router)
+    assert stamps[accession].accepted_at == at
+    assert _header_requests(router).count(_header_url(accession)) == 2

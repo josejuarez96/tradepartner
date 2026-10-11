@@ -615,22 +615,30 @@ def _eastern_acceptance(stamp: str) -> datetime:
     return naive.replace(tzinfo=_EASTERN, fold=1).astimezone(UTC)
 
 
+class SgmlTruncatedError(ValueError):
+    """The fetched range ends before `</SEC-HEADER>` (#1494): a longer range may read."""
+
+
+class SgmlNoAcceptanceError(ValueError):
+    """The header carries no `ACCEPTANCE-DATETIME` (pre-2001 filings, #1494)."""
+
+
 def sgml_acceptance(text: str, accession: str) -> datetime:
     """The SGML header's `ACCEPTANCE-DATETIME` (Eastern wall clock) as UTC, for
     any form: unlike `parse_sgml_header` it never resolves an issuer, so a
     Form 3/4/5 header (ISSUER and REPORTING-OWNER blocks) reads too (#1494).
     Only the text before `</SEC-HEADER>` is read. Raises `ValueError` for a
-    truncated header, a header naming another accession, or one with no
-    acceptance (pre-2001 filings)."""
+    header naming another accession, `SgmlTruncatedError` for a truncated one
+    and `SgmlNoAcceptanceError` for one with no acceptance (pre-2001 filings)."""
     header, closed, _ = text.partition("</SEC-HEADER>")
     if not closed:
-        raise ValueError("SGML header is truncated: no </SEC-HEADER>")
+        raise SgmlTruncatedError("SGML header is truncated: no </SEC-HEADER>")
     named = _SGML_ACCESSION.search(header)
     if named is None or named.group(1) != accession:
         raise ValueError(f"SGML header for {accession} names {named.group(1) if named else None}")
     stamp = _SGML_ACCEPTANCE.search(header)
     if stamp is None:
-        raise ValueError("SGML header has no ACCEPTANCE-DATETIME")
+        raise SgmlNoAcceptanceError("SGML header has no ACCEPTANCE-DATETIME")
     return _eastern_acceptance(stamp.group(1))
 
 

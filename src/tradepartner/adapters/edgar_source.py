@@ -243,6 +243,7 @@ holds the full list whenever the check fails with them, dry run or not
 from __future__ import annotations
 
 import contextlib
+import enum
 import fcntl
 import gzip
 import hashlib
@@ -271,6 +272,8 @@ from tradepartner.adapters.edgar import (
     CoverPageParse,
     FsnFiling,
     FsnShare,
+    SgmlNoAcceptanceError,
+    SgmlTruncatedError,
     StatementConflict,
     StatementFactsParse,
     UnstampedFiling,
@@ -764,8 +767,11 @@ class EdgarFilingSource(FilingSource):
         in 2026-10, late; the zip's were early, #1382), every stamped record
         takes its own header's acceptance, and one whose header cannot be read
         is left out: not cached, not unstampable, asked again next run. When no
-        anchor's header reads (pre-2001 filings carry no acceptance), the
-        payload's stamps are kept and the CIK counted. Unstampable records
+        anchor decides, the payload's stamps are kept (and the CIK counted)
+        only if every anchor's header reads but carries no acceptance (pre-2001
+        filings, where the payload is the only source); otherwise (a 404/410 or
+        an unparseable header) every stamp is left out for this run. Any other
+        HTTP error propagates, as on every EDGAR path. Unstampable records
         (`accepted_at` `None`) pass through untouched."""
         checked = dict(new)
         stamped = sorted(
@@ -775,15 +781,20 @@ class EdgarFilingSource(FilingSource):
         )
         if not self._settings.edgar.stamp_sgml_check or not stamped:
             return checked
-        headers: dict[str, datetime | None] = {}
+        headers: dict[str, datetime | _HeaderMiss] = {}
         agrees: bool | None = None
         for record in stamped[:_SGML_ANCHORS]:
             truth = headers[record.accession] = self._header_acceptance(cik, record.accession)
-            if truth is not None:
+            if isinstance(truth, datetime):
                 agrees = truth == record.accepted_at
                 break
         if agrees is None:
-            self.stamp_check_unread_ciks += 1
+            if all(miss is _HeaderMiss.NO_ACCEPTANCE for miss in headers.values()):
+                self.stamp_check_unread_ciks += 1
+                return checked
+            for record in stamped:
+                del checked[record.accession]
+            self.stamps_sgml_unread += len(stamped)
             return checked
         if agrees:
             return checked
@@ -793,24 +804,40 @@ class EdgarFilingSource(FilingSource):
                 truth = headers[record.accession]
             else:
                 truth = self._header_acceptance(cik, record.accession)
-            if truth is None:
-                del checked[record.accession]
-                self.stamps_sgml_unread += 1
-            else:
+            if isinstance(truth, datetime):
                 checked[record.accession] = replace(record, accepted_at=truth)
                 self.stamps_from_sgml += 1
+            else:
+                del checked[record.accession]
+                self.stamps_sgml_unread += 1
         return checked
 
-    def _header_acceptance(self, cik: str, accession: str) -> datetime | None:
-        """`accession`'s SGML acceptance (UTC), or `None` when its header is
-        missing (an HTTP error status) or does not parse."""
-        try:
-            text = edgar_raw.filing_sgml_header(
-                cik, accession, settings=self._settings, client=self._client
-            )
-            return sgml_acceptance(text, accession)
-        except (httpx.HTTPStatusError, ValueError):
-            return None
+    def _header_acceptance(self, cik: str, accession: str) -> datetime | _HeaderMiss:
+        """`accession`'s SGML acceptance (UTC), or why it is missing: a 404/410
+        or an unparseable header (`UNREAD`), or a header with no acceptance
+        (`NO_ACCEPTANCE`). A header cut before `</SEC-HEADER>` is asked once
+        more with `edgar.stamp_header_bytes`. Any other HTTP error, and a
+        tripped path-safety guard, propagate."""
+        sizes = (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
+        for size in sizes:
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=self._settings, client=self._client
+                )
+                return sgml_acceptance(text, accession)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code not in (404, 410):
+                    raise
+                return _HeaderMiss.UNREAD
+            except edgar_raw.InvalidFilingReferenceError:
+                raise  # a path-safety guard is not a missing header (#275)
+            except SgmlNoAcceptanceError:
+                return _HeaderMiss.NO_ACCEPTANCE
+            except SgmlTruncatedError:
+                continue
+            except ValueError:
+                return _HeaderMiss.UNREAD
+        return _HeaderMiss.UNREAD
 
     def _fetch_submissions(self, cik: str, wanted: set[str]) -> _Submissions:
         """`cik`'s submissions, memoised; older pages fetched while any of
@@ -2774,6 +2801,15 @@ _FSN_PARSE_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, duckdb.InvalidI
 _FACTS_MEMBER = "companyfacts.zip member"
 _FACTS_API = "companyfacts API"
 _SUBMISSIONS_API = "submissions API"
+
+
+class _HeaderMiss(enum.Enum):
+    """Why `_header_acceptance` has no acceptance (#1494)."""
+
+    UNREAD = "unread"
+    NO_ACCEPTANCE = "no acceptance"
+
+
 #: #1494: how many of a CIK's newest new stamps are tried, newest first, as the
 #: anchor whose SGML header decides whether its submissions payload is trusted.
 _SGML_ANCHORS = 3
