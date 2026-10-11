@@ -3190,3 +3190,41 @@ def test_a_failed_rebuild_rolls_back_the_delete_with_the_chunk(
 def test_the_rebuild_needs_the_edgar_source(settings: Settings) -> None:
     with pytest.raises(ValueError, match="edgar source"):
         _run(_events_on(settings), source="alpaca", rebuild_filing_events=True)
+
+
+# --- the store restamp from a stamps-repair manifest (#1382, T166b) ----------
+
+
+def test_a_plain_ingest_of_a_moved_stamp_keeps_the_row_at_the_old_known_at(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """T166b's check before build: move one accession's stamp in the cache
+    (ACME's cover page, four hours later) and run a plain ingest. The
+    revision rule keeps the stored row (same values, earlier known_at), so
+    the row stays at the old stamp and the restamp flag is needed."""
+    old, new = _at(2019, 3, 1), _at(2019, 3, 1) + timedelta(hours=4)
+    assert _run(settings, source="edgar").ok
+    moved = _filings()
+    moved_cover = [
+        CoverPage(p.cik, p.accession, new if p.cik == ACME else p.accepted_at, p.listings)
+        for p in moved.cover_pages(ACME)
+    ]
+    source = FixtureFilingSource(
+        index=moved.filing_index(),
+        snapshot=moved.companies_snapshot(),
+        facts=[*moved.facts(ACME, list(FACT_NAMES)), *moved.facts(DUAL, list(FACT_NAMES))],
+        headers=[*moved.filing_headers(ACME, ["10-K"]), *moved.filing_headers(DUAL, ["10-K"])],
+        cover_pages=[*moved_cover, *moved.cover_pages(DUAL)],
+    )
+    later = NOW + timedelta(days=3)
+    assert _run(settings, filings=source, now=later, source="edgar").ok
+    stamps = {
+        r[0] for r in read(f"SELECT l.known_at FROM listings l WHERE l.security_id = '{ACME}'")
+    }
+    assert old in stamps
+    assert new not in stamps
+
+
+def test_a_restamp_needs_the_edgar_source(settings: Settings) -> None:
+    with pytest.raises(ValueError, match="restamp needs the edgar source"):
+        _run(settings, source="all", restamp=[])
