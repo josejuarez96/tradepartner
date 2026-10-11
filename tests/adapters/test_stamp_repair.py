@@ -13,6 +13,7 @@ from tradepartner.adapters.stamp_repair import (
     audit_decision,
     audit_sample,
     classify_cik,
+    in_window_change_allowed,
     is_provably_early,
     ny_utc_offset,
     shift_stamp,
@@ -244,3 +245,59 @@ def test_manifest_row_refuses_unknown_method_and_naive_stamps() -> None:
     record["method"] = "moved"
     with pytest.raises(ValueError):
         ManifestRow.from_record(record)
+
+
+# --- the in-window rule (T166f, amendment 2026-10-11 decision (d)) -----------
+
+WINDOW = date(2026, 10, 9)
+# 2026-10-09 18:30Z is 14:30 New York (EDT): a late stamp served 4 h late.
+LATE = _utc(2026, 10, 9, 22, 30)
+
+
+def _row(old: datetime, new: datetime, method: str = "sgml") -> ManifestRow:
+    return ManifestRow("320193", "0000320193-26-000001", old, new, method, "test")  # type: ignore[arg-type]
+
+
+def test_window_rule_passes_an_earlier_sgml_move_of_exactly_the_offset() -> None:
+    assert in_window_change_allowed(_row(LATE, LATE - EDT), WINDOW)
+
+
+def test_window_rule_passes_an_earlier_sgml_move_within_the_offset() -> None:
+    assert in_window_change_allowed(_row(LATE, LATE - timedelta(hours=1)), WINDOW)
+
+
+def test_window_rule_passes_a_row_outside_the_window() -> None:
+    old = _utc(2026, 9, 1, 14)
+    assert in_window_change_allowed(_row(old, shift_stamp(old), "shift"), WINDOW)
+    assert in_window_change_allowed(_row(old, old + timedelta(hours=9)), WINDOW)
+
+
+def test_window_rule_passes_anything_with_no_open_window_and_an_unchanged_row() -> None:
+    assert in_window_change_allowed(_row(LATE, LATE + timedelta(hours=9)), None)
+    assert in_window_change_allowed(_row(LATE, LATE, "kept"), WINDOW)
+
+
+def test_window_rule_refuses_a_later_move_in_the_window() -> None:
+    assert not in_window_change_allowed(_row(LATE, LATE + timedelta(minutes=1)), WINDOW)
+
+
+def test_window_rule_refuses_a_shift_in_the_window() -> None:
+    assert not in_window_change_allowed(_row(LATE, shift_stamp(LATE), "shift"), WINDOW)
+
+
+def test_window_rule_refuses_an_earlier_move_larger_than_the_offset() -> None:
+    too_far = LATE - EDT - timedelta(seconds=1)
+    assert not in_window_change_allowed(_row(LATE, too_far), WINDOW)
+
+
+def test_window_rule_counts_a_new_stamp_inside_the_window_as_inside() -> None:
+    # Old stamp the day before the window, moved later into it: refused.
+    old = _utc(2026, 10, 9, 3, 30)  # 2026-10-08 23:30 New York
+    assert not in_window_change_allowed(_row(old, old + timedelta(hours=1)), WINDOW)
+
+
+def test_window_rule_uses_the_old_stamps_date_offset_in_est() -> None:
+    # 2026-11-03 is EST: 5 h is allowed, 5 h and a second is not.
+    old = _utc(2026, 11, 3, 23)
+    assert in_window_change_allowed(_row(old, old - EST), WINDOW)
+    assert not in_window_change_allowed(_row(old, old - EST - timedelta(seconds=1)), WINDOW)
