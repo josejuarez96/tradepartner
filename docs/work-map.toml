@@ -976,6 +976,64 @@ what = "A settled-cash read for the buys phase of a cash account, so the live bo
 why = "The live account is a taxable cash account (#813) while paper is margin; buying on unsettled proceeds is a good-faith violation the paper book can never show."
 
 
+[issue.1506]
+what = "The docs for two small Alpaca ingests into the point-in-time store: ADR 0021 and the data-foundation amendment for a daily borrow-status snapshot (B13), and the amendment and plan lines that persist the spin-off and name-change actions the adapter fetches and drops (#473, #869 option c)."
+why = "A short or hedged book can only be researched honestly with a borrow record that has a known_at, and a spin-off the store never saw halts paper reconciliation for a hand fix; both are data only, and shorting stays closed."
+unblocks = ["adr:0021", "task:T171", "task:T172"]
+
+[adr.0021]
+what = "Alpaca's daily assets list is the source of the point-in-time borrow-status record: one GET /v2/assets a day, known_at at the fetch time, one row per change, the scratch recorder's files from 2026-10-11 imported first, data only."
+why = "New data to ingest needs a decision record; the stamp and the change-only rule are costly to change once rows are stored, and the record is the missing precondition on ADR 0015's shorting row."
+unblocks = ["task:T171"]
+
+[task.T171]
+what = "The borrow_status table (schema version bump), the BorrowStatus record with its fetched_at guard, the pure parser over the recorder's payload shape and the change-only diff, with six fixture cases."
+why = "The table, the record and the diff rule are what every later task and the look-ahead tests read."
+unblocks = ["task:T171b", "task:T171c", "task:T171e"]
+
+[task.T171b]
+what = "The as-of read borrow_status_as_of (latest row per asset at or before T, vanished assets dropped, observed_at from the run cursor), the data-vintage list that leaves the new tables and spinoff rows out, the header's freshness reads, and the flip, vanish, rename and truncation-invariance cases."
+why = "The borrow record is only as point-in-time as this read, and without the vintage rule the first backfill would stale every registered trial."
+unblocks = ["task:T171d", "task:T172b"]
+
+[task.T171c]
+what = "ingest --source alpaca_assets (one unfiltered request a day, last under --source all, the diff, the truncation guard, one run row with the fetch time as cursor), the --import-dir path for the recorder's files keyed on the run cursor, the borrow.* config keys and the raw keep."
+why = "Nothing reaches the owner's store until the ingest writes it under the store's own rules, and the import is how no day since 2026-10-11 is lost."
+unblocks = ["task:T171d"]
+
+[task.T171e]
+what = "The health block for borrow status (counts, the latest observation from the run cursor, shortable and ETB counts, the stale and switch warnings, the --check rules) on the page and in the CLI."
+why = "A lapse in the daily snapshot is a permanent hole; the warning is the owner's only cue."
+unblocks = ["task:T171d"]
+
+[task.T171d]
+what = "The owner's import of the recorder's files, the first daily run on the real store, the health check and the flip of borrow.enabled to true."
+why = "The forward record only has value if it runs every day from now on; the flip and the scheduled job make it so."
+
+[task.T172]
+what = "ActionType.SPINOFF, the SymbolChange record and PriceSource.symbol_changes, the date-only process-date stamp, the parser reading Alpaca's spin_offs and name_changes by process_date with the holder rule, and the fixture source's per-type contract bound."
+why = "The adapter already fetches these rows; parsing them is the one pure step every later task needs."
+unblocks = ["task:T172b"]
+
+[task.T172b]
+what = "The symbol_changes table (schema version bump), symbol_changes_as_of, the fixture rows, the look-ahead cases, the pin tests that show every existing reader of corporate_actions byte-identical with a spinoff row present, and the paper reader's refusal of a short child position."
+why = "A spin-off row in the actions table must change no adjusted price, no paper comparison and no pinned fingerprint; the pins prove it before the ingest writes one, and the one intended reader is checked with safety-reviewer."
+unblocks = ["task:T172c"]
+
+[task.T172c]
+what = "The writes for both kinds on every writer (daily, month backfill, fill-holes) with the not-yet-known skip and the process-date window, and the repair rules: typed counts and deletes, a spinoff judged by its own parent-and-child rule, name changes listed as unjudged."
+why = "Every path that fetches actions must store spin-offs the same way, and the repair must neither delete a real spin-off by a split's rule nor leave a misresolved one in place."
+unblocks = ["task:T172e"]
+
+[task.T172e]
+what = "The symbol-less actions backfill from 2020-06-01 with its floor, one request per month, written through the T172c writers."
+why = "Six years of spin-offs and renames reach the store in about seventy requests; the floor records where coverage is known."
+unblocks = ["task:T172d"]
+
+[task.T172d]
+what = "The owner's actions backfill from 2020-06-01 on the real store, with the AAN/PROG rename and one hand-checked spin-off ratio as the first evidence."
+why = "Reconciliation can explain a spin-off only once real rows exist, and #869's choice needs the rows to be there to compare."
+
 [task.T164]
 what = "The data-foundation spec amendment for filing_events (the EDGAR 8-K items field with its acceptance time) and the read-only coverage count of 2.02 8-Ks across the universe."
 why = "The earnings-reaction hypothesis (B9) keys on the 8-K Item 2.02 acceptance, the release time the free record carries; the count says how many issuers the rule reaches before anything is built (98 to 99% of the universe each quarter, claim TP-1; it also found the stamps-clock defect, TP-2)."
