@@ -58,6 +58,42 @@ DELIM_END = "=== FILING TEXT END ==="
 _NEUTRAL_START = f"[{DELIM_START.strip('= ')}]"
 _NEUTRAL_END = f"[{DELIM_END.strip('= ')}]"
 
+#: The zero-width characters that can hide between the characters of a
+#: delimiter imitation (`\s` leaves them unmatched), and the fill allowed
+#: between any two characters of a marker: any whitespace (spaces, extra or
+#: missing, NBSP, a marker split by a CRLF, all reading as one run) or any of
+#: them. `_MARKER_GAP` is the character class both stand in.
+_ZERO_WIDTH = "\u00ad\u200b-\u200f\u2060-\u2064\ufeff"
+_MARKER_GAP = f"[\\s{_ZERO_WIDTH}]*"
+
+#: The delimiter's own `=`, which a body may write as the fullwidth `=`
+#: (U+FF1D) instead; the run of them on each side of the marker may also be
+#: shortened or lengthened, so the pattern matches two or more of either.
+_MARKER_EQUALS = "[=\uff1d]{2,}"
+
+
+def _marker_pattern(delimiter: str) -> re.Pattern[str]:
+    """One fixed delimiter as the tolerant pattern `_neutralise_delimiters`
+    matches it with (#1510): a body must not be able to imitate the marker --
+    lower case, extra or missing spaces, NBSP, a CRLF splitting the marker,
+    zero-width characters, a fullwidth `=` for the `=`, all of them -- and
+    pass it through. Any case matches, `_MARKER_EQUALS` stands in for the
+    `===` on each side and `_MARKER_GAP` for the spaces, so every match is at
+    least as long as the `_NEUTRAL_*` form that replaces it and a neutralised
+    packet only ever shrinks."""
+    words = delimiter.strip().strip("=").split()
+    return re.compile(
+        f"{_MARKER_EQUALS}{_MARKER_GAP}"
+        + _MARKER_GAP.join(map(re.escape, words))
+        + f"{_MARKER_GAP}{_MARKER_EQUALS}",
+        re.IGNORECASE,
+    )
+
+
+#: The two compiled patterns, one per delimiter.
+_START_MARKER = _marker_pattern(DELIM_START)
+_END_MARKER = _marker_pattern(DELIM_END)
+
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 
 #: `_truncate_sentence` only uses a sentence boundary if it keeps at least
@@ -158,17 +194,20 @@ def _field(label: str, value: str | None) -> str | None:
 
 
 def _neutralise_delimiters(body: str) -> str:
-    """`body` with every occurrence of either fixed delimiter (req 3) rewritten
-    so it can no longer close or reopen the delimited block `build_packet` wraps
-    around it (#1510). Filing text is untrusted (the vendor documents that the
-    model "can be steered by injected text"), so a body carrying
+    """`body` with every occurrence of either fixed delimiter (req 3), in any
+    form an imitation of it takes (`_marker_pattern`), rewritten so it can no
+    longer close or reopen the delimited block `build_packet` wraps around it
+    (#1510). Filing text is untrusted (the vendor documents that the model
+    "can be steered by injected text"), so a body carrying
     `=== FILING TEXT END ===` would otherwise let a filing put its own words
     after what reads as the end of the block. Each marker is rewritten to the
-    same words between square brackets (`_NEUTRAL_START`, `_NEUTRAL_END`), which
-    keeps the text readable and can never match a delimiter; a body carrying
-    neither marker is returned unchanged, so a clean body builds exactly the
-    packet it built before this rewriting."""
-    return body.replace(DELIM_START, _NEUTRAL_START).replace(DELIM_END, _NEUTRAL_END)
+    same words between square brackets (`_NEUTRAL_START`, `_NEUTRAL_END`),
+    which keeps the text readable, never matches a delimiter and is never
+    longer than the marker it replaces; a body carrying no marker is returned
+    unchanged, so a clean body builds exactly the packet it built before this
+    rewriting."""
+    body = _START_MARKER.sub(_NEUTRAL_START, body)
+    return _END_MARKER.sub(_NEUTRAL_END, body)
 
 
 def _form25_fields(documents: Mapping[str, Any]) -> str:

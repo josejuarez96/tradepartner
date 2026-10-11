@@ -1,3 +1,3 @@
 - #1510 research-labeling `build_packet` neutralises the filing-text delimiters a body carries
 ### Fixed
-- research-labeling `build_packet`: a filing body carrying `=== FILING TEXT START ===` or `=== FILING TEXT END ===` can no longer close or reopen the delimited block; each marker inside the body is rewritten to its bracketed form and a body without them builds the same packet as before (#1510)
+- research-labeling `build_packet`: a filing body carrying `=== FILING TEXT START ===` or `=== FILING TEXT END ===`, in any form an imitation of the marker takes (any case, any spacing, non-breaking spaces, a CRLF inside the marker, zero-width characters, a fullwidth equals sign for the `=`), can no longer close or reopen the delimited block; each marker inside the body is rewritten to its bracketed form, which is never longer than the match it replaces, and a body without one builds the same packet as before (#1510)
