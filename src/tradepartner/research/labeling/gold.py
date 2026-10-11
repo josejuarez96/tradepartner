@@ -20,7 +20,11 @@ listing end per CIK per period** under the seed: `n_dev` from the `dev` period
 from the `pilot` period after it. Only `listing_end_id`, `cik` and
 `form25_accepted_at` take part, never a `rule_*` column, `rule_provision` or a
 model output, so the draw selects on nothing the gold measures. The seeded error
-set sits beside the draw, flagged `seed_case`, whatever its CIK.
+set sits beside the draw, flagged `seed_case`, whatever its CIK. Each seed comes
+from the seed file (`read_seed_file`, #1351) with its **pre-fix rule answer**, which
+`session.json` keeps and the lock writes into the export's `pre_fix_*` columns, so
+the gold dataset's hash binds it and `job.scored_items` scores `seeded_recall`
+against it. The page never shows it.
 
 **Blindness** (`InferenceFilesPresent`). The build and every resume refuse when
 any regular file exists anywhere under the research store's `inferences/` (a
@@ -65,12 +69,12 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 import polars as pl
 
 from tradepartner.research import datafiles
-from tradepartner.research.labeling.crosswalk import class_of
+from tradepartner.research.labeling.crosswalk import RuleAnswer, RuleStatus, class_of, crosswalk_row
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, OptionSet
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.research import register_dataset
@@ -106,7 +110,27 @@ GOLD_SCHEMA: dict[str, pl.DataType] = {
     "seed_case": pl.Boolean(),
     "in_random_draw": pl.Boolean(),
     "unlabelled": pl.Boolean(),
+    "pre_fix_status": pl.String(),
+    "pre_fix_relisted": pl.Boolean(),
+    "pre_fix_successor_id": pl.String(),
+    "pre_fix_form15_in_window": pl.Boolean(),
+    "pre_fix_row": pl.Int64(),
+    "pre_fix_code_version": pl.String(),
+    "pre_fix_issue": pl.String(),
 }
+#: The seed file's columns (#1351): the Form 25 accession that is the seed's
+#: `listing_end_id`, its pre-fix rule answer's four fields, the fix's parent commit
+#: and the issue that traced it.
+SEED_FILE_COLUMNS = (
+    "listing_end_id",
+    "status",
+    "relisted",
+    "successor_id",
+    "form15_in_window",
+    "code_version",
+    "issue",
+)
+_RULE_STATUSES: frozenset[str] = frozenset(get_args(RuleStatus))
 EDGAR_INDEX_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
     "&type=&dateb={dateb}&owner=include&count=100"
@@ -178,6 +202,30 @@ class GoldCase:
 
 
 @dataclass(frozen=True)
+class SeedCase:
+    """One seed of the seeded error set (req 10, #1351): its listing end and the
+    pre-fix rule answer traced on its issue at the fix's parent `code_version`."""
+
+    listing_end_id: str
+    pre_fix: RuleAnswer
+    code_version: str
+    issue: str
+
+    @property
+    def row(self) -> int:
+        """The crosswalk row (1 to 7) of the pre-fix rule answer."""
+        return crosswalk_row(self.pre_fix)
+
+
+@dataclass(frozen=True)
+class SeedFile:
+    """`read_seed_file`'s seeds and the SHA-256 of the very bytes it parsed."""
+
+    seeds: tuple[SeedCase, ...]
+    sha256: str
+
+
+@dataclass(frozen=True)
 class GoldFlags:
     """What a resume was given on the command line; `None` means not given."""
 
@@ -185,6 +233,7 @@ class GoldFlags:
     seed: int | None = None
     n: int | None = None
     exclude: Path | None = None
+    seeds: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +251,8 @@ class GoldSession:
     cases: tuple[GoldCase, ...]
     rows: Mapping[str, Mapping[str, Any]] = field(repr=False)
     option_set: OptionSet = DEFAULT_OPTION_SET
+    #: The seeds present in the frame, by `listing_end_id` (#1351).
+    seed_cases: Mapping[str, SeedCase] = field(default_factory=dict)
 
     @property
     def working_path(self) -> Path:
@@ -401,6 +452,79 @@ def _draw(
     return drawn
 
 
+def _bool_cell(value: str, column: str, line: int) -> bool:
+    text = value.strip().lower()
+    if text not in ("true", "false"):
+        raise GoldRefused(f"seed file line {line}: {column} must be true or false, got {value!r}")
+    return text == "true"
+
+
+def read_seed_file(path: Path) -> SeedFile:
+    """The seeded error set from a CSV with `SEED_FILE_COLUMNS` (#1351), parsed and
+    hashed from one read (a BOM is allowed, as for the exclusion file). Refuses a
+    missing column, an unknown `status`, a boolean that is not `true`/`false`, an
+    empty `listing_end_id`, `code_version` or `issue`, a repeated `listing_end_id`,
+    and a non-`delisted` status with `relisted`, `successor_id` or
+    `form15_in_window` set (fields the crosswalk would silently ignore)."""
+    data = path.read_bytes()
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+    missing = [c for c in SEED_FILE_COLUMNS if c not in (reader.fieldnames or ())]
+    if missing:
+        raise GoldRefused(f"seed file {path} lacks column(s): {', '.join(missing)}")
+    seeds: list[SeedCase] = []
+    seen: set[str] = set()
+    for line, raw in enumerate(reader, start=2):
+        cell = {k: (raw.get(k) or "").strip() for k in SEED_FILE_COLUMNS}
+        for required in ("listing_end_id", "code_version", "issue"):
+            if not cell[required]:
+                raise GoldRefused(f"seed file line {line}: {required} is empty")
+        if cell["status"] not in _RULE_STATUSES:
+            raise GoldRefused(
+                f"seed file line {line}: status {cell['status']!r} is not one of "
+                f"{', '.join(sorted(_RULE_STATUSES))}"
+            )
+        if cell["listing_end_id"] in seen:
+            raise GoldRefused(f"seed file line {line}: {cell['listing_end_id']} repeats")
+        seen.add(cell["listing_end_id"])
+        answer = RuleAnswer(
+            status=cast(RuleStatus, cell["status"]),
+            relisted=_bool_cell(cell["relisted"], "relisted", line),
+            successor_id=cell["successor_id"] or None,
+            form15_in_window=_bool_cell(cell["form15_in_window"], "form15_in_window", line),
+        )
+        if answer.status != "delisted" and (
+            answer.relisted or answer.successor_id is not None or answer.form15_in_window
+        ):
+            raise GoldRefused(
+                f"seed file line {line}: status {answer.status!r} takes no relisted, "
+                "successor_id or form15_in_window"
+            )
+        seeds.append(SeedCase(cell["listing_end_id"], answer, cell["code_version"], cell["issue"]))
+    return SeedFile(tuple(seeds), hashlib.sha256(data).hexdigest())
+
+
+def _seed_doc(seed: SeedCase) -> dict[str, Any]:
+    return {
+        "status": seed.pre_fix.status,
+        "relisted": seed.pre_fix.relisted,
+        "successor_id": seed.pre_fix.successor_id,
+        "form15_in_window": seed.pre_fix.form15_in_window,
+        "row": seed.row,
+        "code_version": seed.code_version,
+        "issue": seed.issue,
+    }
+
+
+def _seed_from_doc(listing_end_id: str, doc: Mapping[str, Any]) -> SeedCase:
+    answer = RuleAnswer(
+        status=doc["status"],
+        relisted=doc["relisted"],
+        successor_id=doc["successor_id"],
+        form15_in_window=doc["form15_in_window"],
+    )
+    return SeedCase(listing_end_id, answer, doc["code_version"], doc["issue"])
+
+
 def build_gold_session(
     frame: FrameExport,
     seed: int,
@@ -408,11 +532,14 @@ def build_gold_session(
     exclude: Path,
     *,
     settings: Settings,
-    seed_cases: Sequence[str] = (),
+    seed_cases: Sequence[SeedCase] = (),
+    seeds_sha256: str | None = None,
     n_dev: int = N_DEV,
     dev_span_min_rows: int = DEV_SPAN_MIN_ROWS,
 ) -> BuildResult:
-    """Draw the gold sample (module docstring) and write `session.json`.
+    """Draw the gold sample (module docstring) and write `session.json`, with each
+    seed present in the frame and its pre-fix rule answer (`seed_cases`, #1351;
+    `seeds_sha256` is the seed file's hash, which a resume checks).
 
     Refuses when inference files exist, when a session already exists (resume it
     with `open_gold_session`), when the frame's hash differs from its row, and on
@@ -440,7 +567,10 @@ def build_gold_session(
         "pilot": _draw([r for r in kept if split_of(r) == "pilot"], n - n_dev, rng, "pilot"),
     }
     by_id = {r["listing_end_id"]: r for r in rows}
-    seeds = set(seed_cases)
+    seed_by_id = {c.listing_end_id: c for c in seed_cases}
+    if len(seed_by_id) != len(seed_cases):
+        raise GoldRefused("a seed listing_end_id repeats")
+    seeds = set(seed_by_id)
     missing = tuple(sorted(seeds - set(by_id)))
     groups: dict[Split, list[GoldCase]] = {}
     for split in ("dev", "pilot"):
@@ -474,6 +604,8 @@ def build_gold_session(
         "pilot_period": [d.isoformat() for d in pilot_period],
         "option_set": {"version": DEFAULT_OPTION_SET.version, "hash": DEFAULT_OPTION_SET.hash},
         "seed_cases_missing": list(missing),
+        "seeds_sha256": seeds_sha256,
+        "seed_pre_fix": {i: _seed_doc(seed_by_id[i]) for i in sorted(seeds & set(by_id))},
         "cases": [
             {
                 "listing_end_id": c.listing_end_id,
@@ -519,6 +651,7 @@ def _session_from(
         pilot_period=(start, end),
         cases=cases,
         rows=rows,
+        seed_cases={i: _seed_from_doc(i, d) for i, d in (doc.get("seed_pre_fix") or {}).items()},
     )
 
 
@@ -539,6 +672,10 @@ def open_gold_session(path: Path, flags: GoldFlags, *, settings: Settings) -> Go
         given = hashlib.sha256(flags.exclude.read_bytes()).hexdigest()
         if given != doc["exclusion"]["sha256"]:
             differ.append(f"--exclude {flags.exclude} (a different file from the session's)")
+    if flags.seeds is not None:
+        given = hashlib.sha256(flags.seeds.read_bytes()).hexdigest()
+        if given != doc.get("seeds_sha256"):
+            differ.append(f"--seeds {flags.seeds} (a different file from the session's)")
     if differ:
         raise SessionMismatch("flags differ from the gold session: " + "; ".join(differ))
     frame = FrameExport(
@@ -766,6 +903,14 @@ def _write_once(path: Path, data: bytes) -> None:
         os.replace(tmp, path)
 
 
+def _pre_fix_columns(seed: SeedCase | None) -> dict[str, Any]:
+    """The export's `pre_fix_*` columns for one case: the seed's pre-fix rule answer,
+    its crosswalk row, commit and issue, or all null for a case that is no seed."""
+    if seed is None:
+        return {k: None for k in GOLD_SCHEMA if k.startswith("pre_fix_")}
+    return {f"pre_fix_{k}": v for k, v in _seed_doc(seed).items()}
+
+
 def lock_gold(
     session: GoldSession,
     connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
@@ -810,6 +955,7 @@ def lock_gold(
                 "seed_case": case.seed_case,
                 "in_random_draw": case.in_random_draw,
                 "unlabelled": unlabelled,
+                **_pre_fix_columns(session.seed_cases.get(case.listing_end_id)),
             }
         )
         splits.append(case.split)

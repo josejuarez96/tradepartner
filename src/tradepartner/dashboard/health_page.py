@@ -373,6 +373,9 @@ def _tables(report: HealthReport) -> None:
     st.dataframe(report.gaps.rows, hide_index=True)
     st.subheader(f"Delisted names ({report.delisted.count})")
     st.dataframe(report.delisted.frame, hide_index=True)
+    reopened = report.listed_without_bars
+    st.subheader(f"Listed with no bars after a Form 25 ({reopened.count})")
+    st.dataframe(reopened.frame, hide_index=True)
     missing = report.coverage.missing
     st.subheader(f"Live names with no bar on {report.coverage.session} ({len(missing)})")
     st.dataframe(pl.DataFrame({"security_id": list(missing)}), hide_index=True)

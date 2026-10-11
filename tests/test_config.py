@@ -1554,7 +1554,10 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.clock_max_sessions_late == 1
     assert r.max_broker_clock_skew_seconds == pytest.approx(60.0)
     assert r.reconcile_quantity_tolerance == pytest.approx(1e-6)
-    assert r.reconcile_cash_tolerance == pytest.approx(0.01)
+    # ADR 0010 amendment 2026-10-10 (#1290): a half cent of rounding per fill over the
+    # order cap, plus the cent `cash` is reported in.
+    assert r.reconcile_cash_tolerance == pytest.approx(1.26)
+    assert r.reconcile_cash_tolerance == pytest.approx(0.005 * r.max_orders_per_run + 0.01)
 
 
 @pytest.mark.parametrize(

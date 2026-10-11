@@ -48,6 +48,19 @@ here is this module's and is stated once:
   delisted at `t` (Forms 25 and 25-NSE; a transfer counts as delisted until its
   new listing is known, spec req 4), with ticker, exchange, class, form, filing
   time, end session and effective date.
+- **Listed with no bars after a Form 25** (`listed_without_bars`, #1460,
+  #828 item 5): securities whose current listing at `session` (as
+  `delisted_names` picks it) is listed, on an exchange (not `NONE` or `OTC`,
+  which the feed has no bars for), and starts after an earlier listing of
+  the same security that a Form 25 or 25-NSE ended, with no bar known at
+  `t` from that listing's `valid_from` through `session`. It is the known
+  limit of the master's 8-A12B/cover-page rules: a stale 10-K or 10-Q cover
+  page that still names the exchange after a real delisting reopens a
+  listed row with nothing behind it. One row per security, with the
+  current listing and the latest earlier delisting (form, filing time,
+  effective date). Report-only, like `delisted_names`: no rule reads it,
+  `health --check` does not fail on it, and it has no grace period, so a
+  genuine relisting whose first bars are not in yet shows until they are.
 - **Price jumps** (`price_jumps`): the owner's review list (#787),
   `store.asof.price_jumps_as_of` at `t` over every security: each one-day
   close move between traded bars outside the `universe` jump bounds that no
@@ -354,6 +367,16 @@ _GAP_SCHEMA: dict[str, Any] = {
     "missing_sessions": pl.Int64,
     "longest_run": pl.Int64,
 }
+_LISTED_WITHOUT_BARS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "exchange": pl.Utf8,
+    "class_title": pl.Utf8,
+    "valid_from": pl.Date,
+    "delisting_form": pl.Utf8,
+    "delisting_filed_at": pl.Datetime("us", "UTC"),
+    "delisting_effective_on": pl.Date,
+}
 _DELISTED_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "ticker": pl.Utf8,
@@ -443,6 +466,19 @@ class DelistedNames:
     @property
     def count(self) -> int:
         """How many securities are delisted."""
+        return self.frame.height
+
+
+@dataclass(frozen=True, eq=False)
+class ListedWithoutBars:
+    """Securities listed at `t` on a row that starts after a Form 25 and has
+    no bar known at `t` (#1460; module docstring), one row per security."""
+
+    frame: pl.DataFrame
+
+    @property
+    def count(self) -> int:
+        """How many securities are listed with no bars after a Form 25."""
         return self.frame.height
 
 
@@ -580,6 +616,7 @@ class HealthReport:
     unclassifiable: Unclassifiable
     static_reliance: StaticReliance
     delisted: DelistedNames
+    listed_without_bars: ListedWithoutBars
     price_jumps: PriceJumps
     shares_outliers: SharesOutliers
     accepted_same_day_pairs: AcceptedSameDayPairs
@@ -630,6 +667,7 @@ def health_report(
         unclassifiable=_unclassifiable(securities, classes),
         static_reliance=_static_reliance(securities, classes, current),
         delisted=_delisted_names(current),
+        listed_without_bars=_listed_without_bars(conn, t, session, listings, current),
         price_jumps=_price_jumps(conn, t, settings, jumps_before),
         shares_outliers=_shares_outliers(conn, t, settings, jumps_before),
         accepted_same_day_pairs=AcceptedSameDayPairs(accepted_pairs),
@@ -1060,6 +1098,71 @@ def _delisted_names(current: dict[str, dict[str, Any]]) -> DelistedNames:
         if row["status"] == DELISTED
     ]
     return DelistedNames(frame=pl.DataFrame(rows, schema=_DELISTED_SCHEMA))
+
+
+def listed_without_bars(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> ListedWithoutBars:
+    """Securities listed at `t` on an exchange row that starts after a
+    Form 25 and has no bar known at `t` since (#1460; module docstring),
+    sorted by id. A bare date raises `TypeError`, a naive datetime
+    `ValueError`."""
+    t = _validate_t(t)
+    session = last_completed_session(t)
+    listings = listing_ends_as_of(conn, t, settings)
+    return _listed_without_bars(conn, t, session, listings, _current_from(listings, session))
+
+
+def _listed_without_bars(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    listings: pl.DataFrame,
+    current: dict[str, dict[str, Any]],
+) -> ListedWithoutBars:
+    delisted_before: dict[str, dict[str, Any]] = {}
+    for row in listings.iter_rows(named=True):
+        now = current.get(row["security_id"])
+        if (
+            now is None
+            or now["status"] != LISTED
+            or now["exchange"] in OFF_EXCHANGE
+            or row["status"] != DELISTED
+            or row["valid_from"] >= now["valid_from"]
+        ):
+            continue
+        held = delisted_before.get(row["security_id"])
+        if held is None or row["valid_from"] > held["valid_from"]:
+            delisted_before[row["security_id"]] = row
+    if not delisted_before:
+        return ListedWithoutBars(frame=pl.DataFrame([], schema=_LISTED_WITHOUT_BARS_SCHEMA))
+    ids = sorted(delisted_before)
+    marks = ", ".join("?" for _ in ids)
+    last_bar: dict[str, date] = {}
+    for sid, latest in conn.execute(
+        f"""
+        SELECT security_id, max(session) FROM prices_daily
+        WHERE known_at <= ? AND session <= ? AND security_id IN ({marks})
+        GROUP BY security_id
+        """,
+        [t, session, *ids],
+    ).fetchall():
+        last_bar[sid] = latest
+    rows = [
+        {
+            "security_id": sid,
+            "ticker": current[sid]["ticker"],
+            "exchange": current[sid]["exchange"],
+            "class_title": current[sid]["class_title"],
+            "valid_from": current[sid]["valid_from"],
+            "delisting_form": delisted_before[sid]["delisting_form"],
+            "delisting_filed_at": delisted_before[sid]["delisting_filed_at"],
+            "delisting_effective_on": delisted_before[sid]["effective_on"],
+        }
+        for sid in ids
+        if sid not in last_bar or last_bar[sid] < current[sid]["valid_from"]
+    ]
+    return ListedWithoutBars(frame=pl.DataFrame(rows, schema=_LISTED_WITHOUT_BARS_SCHEMA))
 
 
 def integrity_checks(
