@@ -486,11 +486,13 @@ def test_the_three_labeling_files_parse_and_register(tmp_path: Path, settings: S
         False,
     )
     assert (pilot.dataset_name, pilot.splits) == ("departure-reason-gold", ("dev", "pilot"))
+    # #1492: the floor applies to the text-based scorable `pilot` count.
     assert (pilot.primary_metric, pilot.primary_threshold, pilot.primary_min_clusters) == (
         "class_accuracy",
         0.80,
-        90,
+        75,
     )
+    assert "basis_counts" in pilot.secondary
     assert (pilot.budget_runs, pilot.budget_configurations) == (6, 2)
     batches = parsed["departure-reason-batches"]
     assert (batches.dataset_name, batches.splits, batches.primary_metric) == (
