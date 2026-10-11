@@ -409,3 +409,12 @@ Owner decision on #1351 (Jose, 2026-10-10): **option (a)**. Found by spec-critic
 - the export carries the `pre_fix_*` columns for a seed and nulls otherwise;
 - a resume refuses a different seed file;
 - `research gold` refuses a new session without `--seeds` and prints the seed counts.
+
+## Amendment 2026-10-10 (#1237): the most specific answer in review mode
+
+Owner decision on #1237 (Jose, 2026-10-10). This section governs C10's review mode (req 9) where an item shows a class set beside a single class. Nothing else changes.
+
+1. **The most specific correct answer.** On a review item where one answer is a class set and the other a single class, the owner selects the most specific correct answer the filings support; when the single class is correct and belongs to the set, he selects the single class. There is no `both_right` decision; the decisions stay `a`, `b`, `both_wrong` and `unresolved`. Review mode shows this instruction on the page.
+2. **The blinding limit stays as req 9 and C10 state it.** The accepted limit of "Anchoring and blinding's limit" (Risks), for the review screen of req 9 and C10, includes the row 6 and 7 rule phrases ("the rule kept the line listed", "the rule placed no filing"), the rule-only "one of" class-set form, and the model-only unresolved phrase ("the filings shown do not state the reason"). The page still hides attribution and probability until after the decision.
+
+**Acceptance.** The review-page test asserts that review mode shows the most-specific-answer instruction.
