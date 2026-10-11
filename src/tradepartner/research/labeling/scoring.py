@@ -22,6 +22,17 @@ model class equals the gold class, `gold_label` as owner decision 6 reads it
 with the Wilson one-sided 95% lower bound -- the worked numbers of req 10:
 102, 104 and 108 right of 120 give 0.789, 0.807 and 0.846. The same function
 scores against `text_states` (reported beside it, Q6).
+
+**The split score** (the 2026-10-11 amendment, #1492, item 3): every labelled
+gold item carries the `basis` its label rests on (`text`, `exchange_rule`,
+`provision`; none on a gold `unresolved` or an unlabelled item), and a
+labelled item without one is refused. The headline numbers (`class_accuracy`,
+`worst_case_lower_bound`, `per_option_precision_recall`, the calibration and
+the `rule_provision` arm's score) are computed by the caller on
+`headline_items` (the `text` set plus the unlabelled items the worst case
+counts wrong), so a provision-decided label never scores the arm it agrees
+with by construction; `by_basis` gives the `exchange_rule` and `provision`
+sets, each scored on its own and never pooled.
 """
 
 from __future__ import annotations
@@ -41,6 +52,13 @@ UNRESOLVED = questions.UNRESOLVED
 _Z95 = 1.6448536269514722
 
 Reason = Literal["ok", "timeout", "refused"]
+
+#: The evidence a gold label rests on (the 2026-10-11 amendment, #1492, item 1):
+#: the text shown states the reason, a cited exchange rule names one reason, or
+#: the Form 25 provision alone has one meaning. The labeller sets it; nothing here
+#: derives it.
+Basis = Literal["text", "exchange_rule", "provision"]
+BASES: tuple[Basis, ...] = ("text", "exchange_rule", "provision")
 
 
 def wilson_lower_bound(successes: int, n: int, *, confidence: float = 0.95) -> float:
@@ -153,7 +171,9 @@ class ScoredItem:
     denominator, except a seed the random draw itself picked" -- a seed that
     the random draw happened to select keeps `in_random_draw=True`, its
     default, and is scored normally; `seeded_recall` itself filters on
-    `is_seed` alone and is unaffected by this flag)."""
+    `is_seed` alone and is unaffected by this flag). `basis` is the evidence
+    the gold label rests on (#1492): required on a labelled item that is not
+    `unresolved`, refused on a gold `unresolved` or unlabelled one."""
 
     listing_end_id: str
     gold_label: str | None
@@ -165,6 +185,7 @@ class ScoredItem:
     is_seed: bool = False
     in_random_draw: bool = True
     pre_fix_rule_answer: crosswalk.RuleAnswer | None = None
+    basis: Basis | None = None
 
     def __post_init__(self) -> None:
         if not self.in_random_draw and not self.is_seed:
@@ -173,12 +194,55 @@ class ScoredItem:
                 "(is_seed=True); a non-seed item dropped from every accuracy denominator "
                 "would go unnoticed"
             )
+        labelled = self.gold_label not in (None, UNRESOLVED)
+        if self.basis is not None and self.basis not in BASES:
+            raise ValueError(
+                f"{self.listing_end_id}: basis {self.basis!r} is not one of {', '.join(BASES)}"
+            )
+        if labelled and self.basis is None:
+            raise ValueError(
+                f"{self.listing_end_id}: a labelled item needs a basis (#1492); "
+                "an export without the column cannot be scored"
+            )
+        if not labelled and self.basis is not None:
+            raise ValueError(
+                f"{self.listing_end_id}: basis {self.basis!r} on a gold "
+                f"{'unresolved' if self.gold_label == UNRESOLVED else 'unlabelled'} item"
+            )
 
     @property
     def text_states_label(self) -> str | None:
         """`text_states` when the owner recorded one, else `gold_label`
         (Q6: "the lock copies `gold_label` into it otherwise")."""
         return self.text_states if self.text_states is not None else self.gold_label
+
+
+def by_basis(items: Sequence[ScoredItem], basis: Basis) -> list[ScoredItem]:
+    """The items whose gold label rests on `basis` (#1492, item 3), in input
+    order: no gold `unresolved` or unlabelled item is in any of the three
+    sets, since neither carries a basis."""
+    return [item for item in items if item.basis == basis]
+
+
+def headline_items(items: Sequence[ScoredItem]) -> list[ScoredItem]:
+    """The headline set of #1492 item 3, in input order: the `text`-basis
+    items plus the unlabelled ones (`gold_label is None`), which
+    `worst_case_lower_bound` adds to its denominator as wrong and every other
+    headline function already excludes. An `exchange_rule` or `provision`
+    item is never in it, nor is a gold `unresolved` one (excluded from every
+    headline denominator anyway)."""
+    return [item for item in items if item.basis == "text" or item.gold_label is None]
+
+
+def basis_counts(items: Sequence[ScoredItem]) -> dict[str, int]:
+    """The result row's `basis_counts` (#1492 item 3): how many items in the
+    random draw (`in_random_draw`, matching every accuracy denominator) rest
+    on each basis, plus the gold `unresolved` and the unlabelled counts."""
+    drawn = [item for item in items if item.in_random_draw]
+    counts: dict[str, int] = {b: sum(1 for i in drawn if i.basis == b) for b in BASES}
+    counts[UNRESOLVED] = sum(1 for item in drawn if item.gold_label == UNRESOLVED)
+    counts["unlabelled"] = sum(1 for item in drawn if item.gold_label is None)
+    return counts
 
 
 def _predicted_class(item: ScoredItem) -> str | None:
@@ -299,12 +363,14 @@ GATED_SEED_ROWS: frozenset[int] = frozenset({6, 7})
 class SeedOutcome:
     """One seed's line of `seeded_report`: its pre-fix crosswalk row, whether that
     row is gated (`GATED_SEED_ROWS`), and whether the pre-fix rule answer would have
-    put it on the shortlist."""
+    put it on the shortlist, and the basis of its gold label (#1492; `None` on a
+    gold `unresolved` or unlabelled seed)."""
 
     listing_end_id: str
     pre_fix_row: int
     gated: bool
     caught: bool
+    basis: Basis | None = None
 
 
 def _seeds(items: Sequence[ScoredItem]) -> list[ScoredItem]:
@@ -324,6 +390,7 @@ def seeded_report(items: Sequence[ScoredItem]) -> tuple[SeedOutcome, ...]:
                 pre_fix_row=row,
                 gated=row in GATED_SEED_ROWS,
                 caught=_caught_by_pre_fix_rule(item),
+                basis=item.basis,
             )
         )
     return tuple(outcomes)
