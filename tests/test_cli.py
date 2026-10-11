@@ -372,10 +372,10 @@ def test_ingest_restamp_window_earlier_ok_hands_the_precheck_and_release_on(
     result = _invoke(secrets_set, [*args, "--restamp-window-earlier-ok", str(precheck)])
     assert result.exit_code == 0, result.output
     ok = session.calls[0]["restamp_window_ok"]
-    assert ok.release == ok.file_release == "restamp-x" and ok.passed
-    assert ok.window_first_session == date(2026, 10, 12)
-    assert ok.instants == (datetime(2026, 10, 9, 20, tzinfo=UTC),)
-    assert ok.journal_high_water == datetime(2026, 10, 9, 21, tzinfo=UTC)
+    assert ok.release == ok.precheck.release == "restamp-x" and ok.precheck.passed
+    assert ok.precheck.window_first_session == date(2026, 10, 12)
+    assert ok.precheck.instants == (datetime(2026, 10, 9, 20, tzinfo=UTC),)
+    assert ok.precheck.journal_high_water == datetime(2026, 10, 9, 21, tzinfo=UTC)
 
     result = _invoke(secrets_set, args)
     assert result.exit_code == 0, result.output
@@ -389,7 +389,7 @@ def test_ingest_restamp_window_earlier_ok_hands_the_precheck_and_release_on(
         ("manifest.csv", {}, True, "v1.<release>.manifest.csv"),
         (_RELEASED, {"instants": ...}, True, "instants"),
         (_RELEASED, {"pass": "yes"}, True, "pass must be"),
-        (_RELEASED, {"instants": ["2026-10-09T20:00:00"]}, True, "instants"),
+        (_RELEASED, {"instants": ["2026-10-09T20:00:00"]}, True, "tz-aware"),
     ],
     ids=["no-manifest", "unnamed-manifest", "missing-field", "pass-not-bool", "naive-instant"],
 )

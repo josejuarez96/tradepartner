@@ -177,11 +177,13 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
+from tradepartner.adapters.stamp_repair import (
+    MANIFEST_COLUMNS,
+    ManifestRow,
+    in_window_change_allowed,
+)
 from tradepartner.calendar import (
-    is_session,
     last_completed_session,
-    next_session,
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
@@ -207,8 +209,15 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
-from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of, session_of
+from tradepartner.store.restamp_precheck import (
+    PrecheckFile,
+    crossed_instants,
+    journal_high_water,
+    load_precheck,
+    read_instants,
+    window_first_session,
+)
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -999,60 +1008,30 @@ def manifest_release(path: Path) -> str:
 
 @dataclass(frozen=True)
 class WindowEarlierOk:
-    """The read-only pre-check (T166f's `precheck.<release>.json`) that lets
-    a restamp move in-window corrections (#1497 decision (d)), with the
-    `release` of the manifest it is used with. `passed`, the file's
-    `release`, `window_first_session`, `instants` and `journal_high_water`
-    are the file's own fields; `path` names it in refusals."""
+    """The read-only pre-check file (T166f's `precheck.<release>.json`,
+    read by `restamp_precheck.load_precheck`) that lets a restamp move
+    in-window corrections (#1497 decision (d)), with the `release` of the
+    manifest it is used with. `path` names the file in refusals."""
 
     path: Path
     release: str
-    file_release: str
-    passed: bool
-    window_first_session: date | None
-    instants: tuple[datetime, ...]
-    journal_high_water: datetime | None
+    precheck: PrecheckFile
 
     @classmethod
     def read(cls, path: Path, *, release: str) -> WindowEarlierOk:
-        """Parse the pre-check file at `path` for the manifest's `release`.
-        Raises `ValueError` on a missing field or a naive instant; whether
-        the file allows the restamp is decided inside the restamp's
-        transaction (`restamp_from_manifest`), not here."""
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError(f"{path}: a pre-check file is a JSON object")
-        missing = [
-            k
-            for k in ("release", "window_first_session", "pass", "instants", "journal_high_water")
-            if k not in data
-        ]
-        if missing:
-            raise ValueError(f"{path}: pre-check lacks field(s) {', '.join(missing)}")
-        if not isinstance(data["pass"], bool):
-            raise ValueError(f"{path}: pass must be true or false")
-        first = data["window_first_session"]
-        high = data["journal_high_water"]
-        return cls(
-            path=path,
-            release=release,
-            file_release=str(data["release"]),
-            passed=data["pass"],
-            window_first_session=None if first is None else date.fromisoformat(first),
-            instants=tuple(
-                sorted(
-                    ensure_tz_aware_utc(datetime.fromisoformat(t), field_name="instants")
-                    for t in data["instants"]
-                )
-            ),
-            journal_high_water=(
-                None
-                if high is None
-                else ensure_tz_aware_utc(
-                    datetime.fromisoformat(high), field_name="journal_high_water"
-                )
-            ),
-        )
+        """Load the pre-check file at `path` for the manifest's `release`.
+        Raises `ValueError` on a missing or malformed field; whether the file
+        allows the restamp is decided inside the restamp's transaction
+        (`restamp_from_manifest`), not here."""
+        try:
+            precheck = load_precheck(path)
+            # A gate's verdict is a JSON boolean, never a truthy string.
+            strict = json.loads(path.read_bytes())["pass"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"{path}: not a pre-check file ({exc!r})") from None
+        if not isinstance(strict, bool):
+            raise ValueError(f"{path}: pass must be true or false, got {strict!r}")
+        return cls(path=path, release=release, precheck=precheck)
 
     def backup(self) -> str:
         """The stamps cache backup a stale-file refusal names (runbook)."""
@@ -1068,27 +1047,19 @@ def _window_ok_refusal(
     corrections, or None when it can: it must say pass, for this manifest's
     release and the store's window start, and the instants and the journal
     high-water mark T166f's query recomputes now must equal the file's."""
-    from tradepartner.store import restamp_precheck  # T166f; see `restamp_from_manifest`
-
-    name = ok.path.name
-    if not ok.passed:
+    name, file = ok.path.name, ok.precheck
+    if not file.passed:
         return f"pre-check {name} does not say pass"
-    if ok.file_release != ok.release:
-        return f"pre-check {name} is for release {ok.file_release}, the manifest's is {ok.release}"
-    if ok.window_first_session != first:
+    if file.release != ok.release:
+        return f"pre-check {name} is for release {file.release}, the manifest's is {ok.release}"
+    if file.window_first_session != first:
         return (
-            f"pre-check {name} is for window start {ok.window_first_session}, "
+            f"pre-check {name} is for window start {file.window_first_session}, "
             f"the store's is {first}"
         )
-    instants = tuple(
-        sorted(
-            ensure_tz_aware_utc(t, field_name="instant")
-            for t in restamp_precheck.read_instants(conn)
-        )
-    )
-    high = restamp_precheck.journal_high_water(conn)
-    high = None if high is None else ensure_tz_aware_utc(high, field_name="journal_high_water")
-    if instants != ok.instants or high != ok.journal_high_water:
+    if tuple(read_instants(conn)) != tuple(sorted(set(file.instants))) or (
+        journal_high_water(conn) != file.journal_high_water
+    ):
         return (
             f"pre-check {name} is stale: the store's read instants or journal high-water mark "
             f"changed since it was made; restore the stamps cache from {ok.backup()}, "
@@ -1123,21 +1094,6 @@ def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
 
 
-def window_first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
-    """The earliest first session of any open paper window (one with no
-    `closed` or `abandoned` stop): the XNYS session on or after its
-    `started_at`'s New York date. None when no window is open."""
-    started = conn.execute(
-        "SELECT min(started_at) FROM paper_windows WHERE window_id NOT IN "
-        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
-        [list(CLOSING_STOP_STATES)],
-    ).fetchone()
-    if started is None or started[0] is None:
-        return None
-    day = _ny_date(ensure_tz_aware_utc(started[0], field_name="started_at"))
-    return day if is_session(day) else next_session(day)
-
-
 #: The rows a restamp may move in every table: EDGAR-sourced, `filing`
 #: provenance, never a row stamped at its own ingest (a revision or a
 #: retraction stamped at `ingested_at`).
@@ -1149,10 +1105,8 @@ def _earlier_ok(change: ManifestRow, first: date, instants: Sequence[datetime]) 
     T166f's rule allows it and no read instant `t` has `new <= t < old` (no
     paper decision read the row before the correction that reads it
     differently after)."""
-    from tradepartner.adapters.stamp_repair import in_window_change_allowed  # T166f
-
-    return in_window_change_allowed(change, first) and not any(
-        change.new_stamp <= t < change.old_stamp for t in instants
+    return in_window_change_allowed(change, first) and not crossed_instants(
+        change.old_stamp, change.new_stamp, instants
     )
 
 
@@ -1217,7 +1171,7 @@ def restamp_from_manifest(
             c for c in moving if _ny_date(c.old_stamp) >= first or _ny_date(c.new_stamp) >= first
         ]
         if window_ok is not None:
-            inside = [c for c in inside if not _earlier_ok(c, first, window_ok.instants)]
+            inside = [c for c in inside if not _earlier_ok(c, first, window_ok.precheck.instants)]
         if inside:
             listed = "; ".join(
                 f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"

@@ -11,20 +11,15 @@ from __future__ import annotations
 
 import csv
 import json
-import sys
-import types
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
 
-import tradepartner.store as store_pkg
-from tradepartner.adapters import stamp_repair
 from tradepartner.adapters.edgar_source import PARSER_VERSION
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -41,7 +36,6 @@ from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
     ManifestRow,
-    ny_utc_offset,
     shift_stamp,
 )
 from tradepartner.config import Settings
@@ -55,6 +49,7 @@ from tradepartner.ingest import (
     read_manifest,
 )
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.restamp_precheck import compute_precheck, precheck_file_name
 
 ACME = "0000000001"  # restamped: every filing early by the offset
 DUAL = "0000000002"  # unchanged (outside the manifest), or date-crossing
@@ -713,10 +708,6 @@ def test_read_manifest_reads_t166s_columns(tmp_path: Path) -> None:
 
 
 # --- In-window corrections under a passing pre-check (#1497 decision (d), T166e) ---
-#
-# T166f (`stamp_repair.in_window_change_allowed`, `store.restamp_precheck`)
-# is built in parallel; until it merges, `t166f` below stands in for it, in
-# this test file only, exactly as the plan line states its contract.
 
 RELEASE = "restamp-test"
 # The 25-NSE served late by New York's offset (EDT, 4 h): 20:30 New York on
@@ -727,49 +718,9 @@ WINDOW_STARTED = datetime(2019, 4, 28, 15, tzinfo=UTC)  # first session Mon 04-2
 WINDOW_FIRST = date(2019, 4, 29)
 
 
-class _T166f:
-    """The test stand-in for T166f: the rule as the plan states it, and the
-    store's read instants and journal high-water mark as the test sets them
-    (a `mark` run added to the store is a new instant and a new mark)."""
-
-    def __init__(self) -> None:
-        self.instants: list[datetime] = [WINDOW_STARTED]
-        self.high_water: datetime | None = None
-
-    @staticmethod
-    def in_window_change_allowed(row: ManifestRow, window_start: date) -> bool:
-        def day(t: datetime) -> date:
-            return t.astimezone(ZoneInfo("America/New_York")).date()
-
-        if day(row.old_stamp) < window_start and day(row.new_stamp) < window_start:
-            return True
-        offset = ny_utc_offset(day(row.old_stamp))
-        return row.method == "sgml" and row.old_stamp - offset <= row.new_stamp < row.old_stamp
-
-    def read_instants(self, conn: duckdb.DuckDBPyConnection) -> list[datetime]:
-        return list(self.instants)
-
-    def journal_high_water(self, conn: duckdb.DuckDBPyConnection) -> datetime | None:
-        return self.high_water
-
-
-@pytest.fixture
-def t166f(monkeypatch: pytest.MonkeyPatch) -> _T166f:
-    stub = _T166f()
-    module = types.ModuleType("tradepartner.store.restamp_precheck")
-    module.read_instants = stub.read_instants  # type: ignore[attr-defined]
-    module.journal_high_water = stub.journal_high_water  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "tradepartner.store.restamp_precheck", module)
-    monkeypatch.setattr(store_pkg, "restamp_precheck", module, raising=False)
-    monkeypatch.setattr(
-        stamp_repair, "in_window_change_allowed", stub.in_window_change_allowed, raising=False
-    )
-    return stub
-
-
 @pytest.fixture
 def late_store(settings: Settings) -> _Store:
-    """ACME's stamps true except its 25-NSE, served late; H1-like window open."""
+    """ACME's stamps true except its 25-NSE, served late; a window open."""
     status, message, _ = _ingest(
         settings, _source(acme_early=False, nse_at=NSE_LATE), now=FIRST_RUN
     )
@@ -784,34 +735,50 @@ def _correction() -> list[ManifestRow]:
 
 
 def _precheck(
+    settings: Settings,
     tmp_path: Path,
-    stub: _T166f,
     *,
-    passed: bool = True,
+    passed: bool | None = None,
     release: str = RELEASE,
-    first: date | None = WINDOW_FIRST,
+    first: date | str | None = "store",
 ) -> WindowEarlierOk:
-    path = tmp_path / f"precheck.{release}.json"
-    path.write_text(
-        json.dumps(
-            {
-                "release": release,
-                "window_first_session": None if first is None else first.isoformat(),
-                "pass": passed,
-                "instants": [t.isoformat() for t in stub.instants],
-                "journal_high_water": None
-                if stub.high_water is None
-                else stub.high_water.isoformat(),
-                "made_at": RESTAMP_RUN.isoformat(),
-            }
-        ),
-        encoding="utf-8",
-    )
+    """T166f's pre-check of the store as it is now, written to a file;
+    `passed`, `release` and `first` override the computed fields."""
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        made = compute_precheck(conn, release=release, made_at=RESTAMP_RUN)
+    data = json.loads(made.to_bytes())
+    if passed is not None:
+        data["pass"] = passed
+    if first != "store":
+        data["window_first_session"] = None if first is None else str(first)
+    path = tmp_path / precheck_file_name(release)
+    path.write_text(json.dumps(data), encoding="utf-8")
     return WindowEarlierOk.read(path, release=RELEASE)
 
 
+def _mark_run(settings: Settings, session: date) -> None:
+    """A `mark` run of window 1 on `session`: two new read instants."""
+    at = datetime(2019, 6, 1, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "paper_runs",
+            {
+                "run_id": 1,
+                "window_id": 1,
+                "session": session,
+                "kind": "mark",
+                "started_at": at,
+                "invoked_by": "scheduler",
+                "code_version": "test",
+                "known_at": at,
+                "ingested_at": at,
+            },
+        )
+
+
 def test_an_in_window_earlier_sgml_correction_moves_only_with_a_passing_precheck(
-    settings: Settings, late_store: _Store, t166f: _T166f, tmp_path: Path
+    settings: Settings, late_store: _Store, tmp_path: Path
 ) -> None:
     before = _snapshot(late_store)
     status, message, results = _ingest(
@@ -825,7 +792,7 @@ def test_an_in_window_earlier_sgml_correction_moves_only_with_a_passing_precheck
         _source(acme_early=False),
         now=RESTAMP_RUN,
         restamp=_correction(),
-        restamp_window_ok=_precheck(tmp_path, t166f),
+        restamp_window_ok=_precheck(settings, tmp_path),
     )
     assert status == OK, message
     assert result.refused == {} and result.moved["delistings"] == 1
@@ -843,7 +810,6 @@ def test_an_in_window_earlier_sgml_correction_moves_only_with_a_passing_precheck
 def test_a_failing_or_foreign_precheck_is_refused_and_writes_nothing(
     settings: Settings,
     late_store: _Store,
-    t166f: _T166f,
     tmp_path: Path,
     kwargs: dict[str, Any],
     why: str,
@@ -854,19 +820,18 @@ def test_a_failing_or_foreign_precheck_is_refused_and_writes_nothing(
         _source(acme_early=False),
         now=RESTAMP_RUN,
         restamp=_correction(),
-        restamp_window_ok=_precheck(tmp_path, t166f, **kwargs),
+        restamp_window_ok=_precheck(settings, tmp_path, **kwargs),
     )
     assert status != OK and why in message and results == []
     assert _snapshot(late_store) == before
 
 
 def test_a_precheck_the_store_moved_past_is_stale_and_names_the_cache_backup(
-    settings: Settings, late_store: _Store, t166f: _T166f, tmp_path: Path
+    settings: Settings, late_store: _Store, tmp_path: Path
 ) -> None:
-    ok = _precheck(tmp_path, t166f)
-    # A `mark` run after the pre-check: a new instant and a new high-water mark.
-    t166f.instants.append(datetime(2019, 4, 29, 20, tzinfo=UTC))
-    t166f.high_water = datetime(2019, 4, 29, 21, tzinfo=UTC)
+    ok = _precheck(settings, tmp_path)
+    assert ok.precheck.passed
+    _mark_run(settings, date(2019, 5, 31))  # after the pre-check: new instants, new mark
     before = _snapshot(late_store)
     status, message, results = _ingest(
         settings,
@@ -881,20 +846,30 @@ def test_a_precheck_the_store_moved_past_is_stale_and_names_the_cache_backup(
 
 
 def test_an_instant_between_the_new_and_old_stamps_aborts(
-    settings: Settings, late_store: _Store, t166f: _T166f, tmp_path: Path
+    settings: Settings, tmp_path: Path
 ) -> None:
-    # A decision read the store at 22:00Z 05-01: new (20:30Z) <= t < old (00:30Z).
-    t166f.instants.append(datetime(2019, 5, 1, 22, tzinfo=UTC))
-    before = _snapshot(late_store)
+    """A window started at 22:00Z 05-01 read the store then: new (20:30Z) <=
+    t < old (00:30Z 05-02), so the correction would change what it read."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=False, nse_at=NSE_LATE), now=FIRST_RUN
+    )
+    assert status == OK, message
+    _open_window(settings, datetime(2019, 5, 1, 22, tzinfo=UTC))
+    store = _Store(settings.store.path)
+    # The real pre-check fails here (the late row is in reach of the start);
+    # a file forced to pass shows the restamp's own exact check still aborts.
+    ok = _precheck(settings, tmp_path, passed=True)
+    assert datetime(2019, 5, 1, 22, tzinfo=UTC) in ok.precheck.instants
+    before = _snapshot(store)
     status, message, results = _ingest(
         settings,
         _source(acme_early=False),
         now=RESTAMP_RUN,
         restamp=_correction(),
-        restamp_window_ok=_precheck(tmp_path, t166f),
+        restamp_window_ok=ok,
     )
     assert status != OK and A_25NSE[0] in message and results == []
-    assert _snapshot(late_store) == before
+    assert _snapshot(store) == before
 
 
 @pytest.mark.parametrize("flag", [False, True])
@@ -917,7 +892,6 @@ def test_an_instant_between_the_new_and_old_stamps_aborts(
 def test_other_in_window_changes_abort_with_and_without_the_precheck(
     settings: Settings,
     late_store: _Store,
-    t166f: _T166f,
     tmp_path: Path,
     flag: bool,
     change: Any,
@@ -928,7 +902,7 @@ def test_other_in_window_changes_abort_with_and_without_the_precheck(
         _source(acme_early=False),
         now=RESTAMP_RUN,
         restamp=[change()],
-        restamp_window_ok=_precheck(tmp_path, t166f) if flag else None,
+        restamp_window_ok=_precheck(settings, tmp_path) if flag else None,
     )
     assert status != OK and A_25NSE[0] in message and results == []
     assert _snapshot(late_store) == before
