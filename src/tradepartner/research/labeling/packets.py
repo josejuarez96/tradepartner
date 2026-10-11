@@ -21,7 +21,10 @@ never reads `rule_*`, `gold_*`, `text_states`, `evidence_quote` or `decision`
 `document_ids`, which carries no table token). The text is wrapped between
 fixed delimiters and labelled as filing text; the question and option set are
 sent separately by the caller (`research.models`) and never appear inside the
-delimiters (req 3).
+delimiters (req 3). Filing text is untrusted, so a body's own copies of either
+delimiter are rewritten to a bracketed form before the wrap
+(`_neutralise_delimiters`, #1510): a body can neither close nor reopen the
+delimited block, and a body carrying none of them ships unchanged.
 
 `max_packet_tokens` is a hard refusal (`PacketTooLarge`), never a truncation
 rule (C2): a packet whose estimated tokens (characters divided by
@@ -47,6 +50,13 @@ Kind = Literal["A", "B"]
 #: inside them.
 DELIM_START = "=== FILING TEXT START ==="
 DELIM_END = "=== FILING TEXT END ==="
+
+#: The same two delimiters in the form they take inside a filing body once
+#: `_neutralise_delimiters` has rewritten them: the words they carry, between
+#: square brackets, so the rewritten string can never match the delimiter
+#: again. Derived from the delimiters above, so the two cannot drift.
+_NEUTRAL_START = f"[{DELIM_START.strip('= ')}]"
+_NEUTRAL_END = f"[{DELIM_END.strip('= ')}]"
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 
@@ -145,6 +155,20 @@ def _truncate_sentence(text: str, limit: int) -> str:
 
 def _field(label: str, value: str | None) -> str | None:
     return f"{label}: {value}" if value else None
+
+
+def _neutralise_delimiters(body: str) -> str:
+    """`body` with every occurrence of either fixed delimiter (req 3) rewritten
+    so it can no longer close or reopen the delimited block `build_packet` wraps
+    around it (#1510). Filing text is untrusted (the vendor documents that the
+    model "can be steered by injected text"), so a body carrying
+    `=== FILING TEXT END ===` would otherwise let a filing put its own words
+    after what reads as the end of the block. Each marker is rewritten to the
+    same words between square brackets (`_NEUTRAL_START`, `_NEUTRAL_END`), which
+    keeps the text readable and can never match a delimiter; a body carrying
+    neither marker is returned unchanged, so a clean body builds exactly the
+    packet it built before this rewriting."""
+    return body.replace(DELIM_START, _NEUTRAL_START).replace(DELIM_END, _NEUTRAL_END)
 
 
 def _form25_fields(documents: Mapping[str, Any]) -> str:
@@ -268,7 +292,7 @@ def build_packet(
         if eightk_text:
             sections.append(eightk_text)
             document_ids += eightk_ids
-    body = "\n\n".join(sections)
+    body = _neutralise_delimiters("\n\n".join(sections))
     text = f"{DELIM_START}\n{body}\n{DELIM_END}"
     estimated_tokens = len(text) / limits.chars_per_token
     if estimated_tokens > limits.max_packet_tokens:
