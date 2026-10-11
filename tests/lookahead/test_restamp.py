@@ -31,12 +31,11 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
 from tradepartner.config import Settings
 from tradepartner.ingest import (
-    MANIFEST_FIELDS,
     OK,
     RESTAMP_TABLES,
-    ManifestChange,
     RestampResult,
     ingest_session,
     read_manifest,
@@ -174,11 +173,11 @@ def _source(
     )
 
 
-def _acme_manifest() -> list[ManifestChange]:
+def _acme_manifest() -> list[ManifestRow]:
     return [
-        ManifestChange(ACME, accession, _early(true), true, "shift")
+        ManifestRow(ACME, accession, _early(true), true, "shift", "test")
         for accession, true in (A_INDEX, A_COVER)
-    ] + [ManifestChange(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), A_25NSE[1], "sgml")]
+    ] + [ManifestRow(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), A_25NSE[1], "sgml", "test")]
 
 
 class _NoPrices(PriceSource):
@@ -205,7 +204,7 @@ def _ingest(
     source: FixtureFilingSource,
     *,
     now: datetime,
-    restamp: Sequence[ManifestChange] | None = None,
+    restamp: Sequence[ManifestRow] | None = None,
     **kwargs: Any,
 ) -> tuple[str, str, list[RestampResult]]:
     results: list[RestampResult] = []
@@ -322,12 +321,12 @@ def test_the_form_25_nse_moves_by_the_exchange_files_cik_not_the_subjects(
 ) -> None:
     """The 25-NSE's stamp is in the exchange's stamps file: a manifest row under
     ACME's own CIK for that accession moves no delisting; the exchange's does."""
-    wrong = [ManifestChange(ACME, f"{ACME}-19-000077", _early(A_25NSE[1]), A_25NSE[1], "sgml")]
+    wrong = [ManifestRow(ACME, f"{ACME}-19-000077", _early(A_25NSE[1]), A_25NSE[1], "sgml", "test")]
     _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=wrong)
     assert result.moved["delistings"] == 0
     assert early_store.known_ats("delistings", ACME) == {_early(A_25NSE[1])}
 
-    right = [ManifestChange(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), A_25NSE[1], "sgml")]
+    right = [ManifestRow(EXCHANGE, A_25NSE[0], _early(A_25NSE[1]), A_25NSE[1], "sgml", "test")]
     _, _, (result,) = _ingest(settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=right)
     assert result.moved["delistings"] == 1
     assert early_store.known_ats("delistings", ACME) == {A_25NSE[1]}
@@ -348,7 +347,7 @@ def test_a_relisting_stamped_by_the_exchange_filed_25_nse_moves_with_it(
     assert _early(A_25NSE[1]) in store.known_ats("listings", ACME)
     manifest = [
         *_acme_manifest(),
-        ManifestChange(ACME, A_8K12B[0], _early(A_8K12B[1]), A_8K12B[1], "shift"),
+        ManifestRow(ACME, A_8K12B[0], _early(A_8K12B[1]), A_8K12B[1], "shift", "test"),
     ]
 
     status, message, (result,) = _ingest(
@@ -461,7 +460,7 @@ def test_a_date_crossing_change_is_refused_and_listed_and_moves_none_of_its_cik(
 ) -> None:
     old = _early(D_COVER[1])
     crossing = datetime(2019, 3, 5, 5, 30, tzinfo=UTC)  # 00:30 New York the next day
-    manifest = [*_acme_manifest(), ManifestChange(DUAL, D_COVER[0], old, crossing, "sgml")]
+    manifest = [*_acme_manifest(), ManifestRow(DUAL, D_COVER[0], old, crossing, "sgml", "test")]
     dual_before = {t: early_store.known_ats(t, DUAL) for t in RESTAMP_TABLES}
 
     # The cache holds DUAL's repaired stamp: the day's build writes none of
@@ -486,8 +485,10 @@ def test_two_new_stamps_for_one_old_stamp_refuse_the_cik(
 ) -> None:
     old = _early(A_COVER[1])
     manifest = [
-        ManifestChange(ACME, A_COVER[0], old, A_COVER[1], "sgml"),
-        ManifestChange(ACME, f"{ACME}-19-000002", old, A_COVER[1] + timedelta(minutes=1), "sgml"),
+        ManifestRow(ACME, A_COVER[0], old, A_COVER[1], "sgml", "test"),
+        ManifestRow(
+            ACME, f"{ACME}-19-000002", old, A_COVER[1] + timedelta(minutes=1), "sgml", "test"
+        ),
     ]
     _, _, (result,) = _ingest(settings, _source(acme_early=True), now=RESTAMP_RUN, restamp=manifest)
     assert set(result.refused) == {ACME}
@@ -636,7 +637,7 @@ def test_a_subset_manifest_then_the_rest_and_a_rerun_moves_nothing_more(
     assert early_store.known_ats("securities", DUAL) == {_early(D_INDEX[1]), _early(D_COVER[1])}
 
     dual = [
-        ManifestChange(DUAL, accession, _early(true), true, "shift")
+        ManifestRow(DUAL, accession, _early(true), true, "shift", "test")
         for accession, true in (D_INDEX, D_COVER)
     ]
     later = RESTAMP_RUN + timedelta(days=1)
@@ -661,7 +662,7 @@ def test_a_subset_manifest_then_the_rest_and_a_rerun_moves_nothing_more(
 def test_read_manifest_reads_t166s_columns(tmp_path: Path) -> None:
     path = tmp_path / "manifest.csv"
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(MANIFEST_FIELDS))
+        writer = csv.DictWriter(handle, fieldnames=list(MANIFEST_COLUMNS))
         writer.writeheader()
         writer.writerow(
             {
@@ -683,7 +684,7 @@ def test_read_manifest_reads_t166s_columns(tmp_path: Path) -> None:
     path.write_text("cik,accession\n")
     with pytest.raises(ValueError, match="old_stamp"):
         read_manifest(path)
-    header = ",".join(MANIFEST_FIELDS)
+    header = ",".join(MANIFEST_COLUMNS)
     path.write_text(f"{header}\n{ACME},{A_COVER[0]}\n")
     with pytest.raises(ValueError, match="too few fields"):
         read_manifest(path)

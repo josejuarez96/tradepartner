@@ -173,6 +173,7 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
 from tradepartner.calendar import (
     is_session,
     last_completed_session,
@@ -303,7 +304,7 @@ def ingest_session(
     dry_run: bool = False,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
-    restamp: Sequence[ManifestChange] | None = None,
+    restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
@@ -741,7 +742,7 @@ def _ingest_filings(
     *,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
-    restamp: Sequence[ManifestChange] | None = None,
+    restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
@@ -927,76 +928,29 @@ RESTAMP_TABLES: tuple[str, ...] = (
     "delistings",
 )
 
-#: The manifest's columns (T166's `stamp_repair.MANIFEST_COLUMNS`, the CSV
-#: header T166a writes). Read here by name only; T166's rules are not
-#: re-implemented.
-MANIFEST_FIELDS: tuple[str, ...] = (
-    "cik",
-    "accession",
-    "old_stamp",
-    "new_stamp",
-    "method",
-    "evidence",
-)
-
-
 #: A manifest CIK as the store keeps it: ten digits, zero-padded.
 _MANIFEST_CIK = re.compile(r"\d{10}")
 
 
-@dataclass(frozen=True)
-class ManifestChange:
-    """One manifest row as the restamp reads it: the stamps-file CIK that
-    holds `accession`, and that accession's stamp before and after the cache
-    repair (tz-aware UTC). `method` is T166's (`shift`, `sgml`, `kept`,
-    `unrepaired`); only a row whose stamps differ moves anything."""
-
-    cik: str
-    accession: str
-    old_stamp: datetime
-    new_stamp: datetime
-    method: str
-
-    def __post_init__(self) -> None:
-        """Normalise both stamps to UTC; raise on a naive one."""
-        for name in ("old_stamp", "new_stamp"):
-            object.__setattr__(
-                self, name, ensure_tz_aware_utc(getattr(self, name), field_name=name)
-            )
-
-    @property
-    def changed(self) -> bool:
-        """True when the row moves the stamp."""
-        return self.new_stamp != self.old_stamp
-
-
-def read_manifest(path: Path) -> list[ManifestChange]:
+def read_manifest(path: Path) -> list[ManifestRow]:
     """The rows of the stamps-repair manifest at `path` (a CSV with
-    `MANIFEST_FIELDS` as its header). Raises `ValueError` on a missing
+    T166's `MANIFEST_COLUMNS` as its header), each parsed by
+    `ManifestRow.from_record`. Raises `ValueError` on a missing
     column, a short row, a CIK that is not ten digits or a naive stamp,
     before anything is written."""
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        missing = [f for f in MANIFEST_FIELDS if f not in (reader.fieldnames or ())]
+        missing = [f for f in MANIFEST_COLUMNS if f not in (reader.fieldnames or ())]
         if missing:
             raise ValueError(f"{path}: manifest lacks column(s) {', '.join(missing)}")
-        changes: list[ManifestChange] = []
+        changes: list[ManifestRow] = []
         for line, record in enumerate(reader, start=2):
-            values = [record.get(f) for f in MANIFEST_FIELDS[:5]]
-            if any(v is None for v in values):
+            if any(record.get(f) is None for f in MANIFEST_COLUMNS):
                 raise ValueError(f"{path}:{line}: a row with too few fields")
             cik = record["cik"]
             if not _MANIFEST_CIK.fullmatch(cik):
                 raise ValueError(f"{path}:{line}: cik must be 10 digits, got {cik!r}")
-            changes.append(
-                ManifestChange(
-                    cik=cik,
-                    accession=record["accession"],
-                    old_stamp=datetime.fromisoformat(record["old_stamp"]),
-                    new_stamp=datetime.fromisoformat(record["new_stamp"]),
-                    method=record["method"],
-                )
-            )
+            changes.append(ManifestRow.from_record(record))
         return changes
 
 
@@ -1054,7 +1008,7 @@ _RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <>
 
 def restamp_from_manifest(
     conn: duckdb.DuckDBPyConnection,
-    changes: Sequence[ManifestChange],
+    changes: Sequence[ManifestRow],
     *,
     ingested_at: datetime,
     delistings: Iterable[DelistingFiling],

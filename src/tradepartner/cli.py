@@ -339,6 +339,7 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
 from tradepartner.backtest import lab, promotion, sweep_report
 from tradepartner.backtest import sweep as lab_sweep
@@ -371,7 +372,6 @@ from tradepartner.health import HealthReport, health_report
 from tradepartner.ingest import (
     SOURCES,
     IngestResult,
-    ManifestChange,
     RestampResult,
     _read,
     ingest_session,
@@ -1512,7 +1512,7 @@ def make_app(
         ):
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
-        restamp: list[ManifestChange] | None = None
+        restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
         if restamp_from is not None:
             if backfill_ or source != "edgar":
