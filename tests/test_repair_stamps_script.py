@@ -363,7 +363,8 @@ def test_dry_run_writes_nothing_and_requests_nothing(tmp_path: Path, capsys: Any
     assert report["step2_requests"] == 1
     assert report["step3_requests"] == 2
     assert report["step4_known_requests"] == 2
-    assert report["requests_known"] == 5
+    assert "requests_known" not in report  # amendment 2026-10-11 (a)
+    assert report["requests_floor"] == 6  # the 5 reads above plus Apple's audit read
 
 
 def test_phase_universe_touches_only_universe_ciks(tmp_path: Path, capsys: Any) -> None:
@@ -376,7 +377,7 @@ def test_phase_universe_touches_only_universe_ciks(tmp_path: Path, capsys: Any) 
     report = json.loads(capsys.readouterr().out)
     assert report["phase"] == "universe"
     assert report["ciks"] == 2
-    assert report["requests_known"] == 2  # MIXED's two stored filings
+    assert report["requests_floor"] == 3  # MIXED's two stored filings, Apple's audit
     assert run(c, sec, *phase, "--apply", release="restamp-1382a") == 0
     after = c.snapshot()
     for cik in (API, TRUE_CIK, UNDET, LONELY):
@@ -677,3 +678,382 @@ def test_the_live_fetch_reads_only_filing_sgml_header(monkeypatch: Any) -> None:
     fetch = repair_stamps.sgml_fetch()
     assert fetch(APPLE, APPLE_ACC) == APPLE_TRUE
     assert seen == [(APPLE, APPLE_ACC)]
+
+
+# --- amendment 2026-10-11 (#1497): T166d ------------------------------------
+
+UND = "0000001101"  # undetermined, store-backing: its probes come out mixed
+EAR = "0000001202"  # early class, one stored record
+REW = "0000001303"  # rewritten: no record in --bulk-written
+LAT = "0000001404"  # true class with a late API stamp
+LATE_RANGE = ("--late-api-from", "2026-10-01", "--late-api-to", "2026-10-11")
+
+
+def _day(d: date, hour: int = 14) -> datetime:
+    return datetime(d.year, d.month, d.day, hour, tzinfo=UTC)
+
+
+def amended(tmp_path: Path) -> tuple[Cache, FakeSec]:
+    """The hand-counted fixture plan of the T166d tests (index date = stamp
+    date everywhere, so nothing is provably early unless a test adds it)."""
+    c = Cache(tmp_path)
+    truth: dict[tuple[str, str], datetime] = {}
+    und = [_day(date(2024, 7, d)) for d in (1, 2, 3, 4)]
+    c.add_cik(
+        UND,
+        [(acc(UND, i + 1), s, s.date(), True) for i, s in enumerate(und)],
+        cls="undetermined_with_pe",
+        stored=[acc(UND, i + 1) for i in range(4)],
+    )
+    for i, s in enumerate(und):
+        truth[(UND, acc(UND, i + 1))] = s if i != 2 else shift_stamp(s)  # probes a4 true, a3 early
+    e_true = _day(date(2024, 8, 1))
+    c.add_cik(
+        EAR,
+        [(acc(EAR, 1), early(e_true), date(2024, 8, 1), True)],
+        cls="early",
+        stored=[acc(EAR, 1)],
+    )
+    truth[(EAR, acc(EAR, 1))] = e_true
+    rew = [_day(date(2024, 9, d)) for d in (2, 3, 4)]
+    r4 = _day(date(2026, 10, 5))
+    c.add_cik(
+        REW,
+        [
+            *((acc(REW, i + 1), s, s.date(), False) for i, s in enumerate(rew)),
+            (acc(REW, 4), r4, r4.date(), False),
+        ],
+        cls="mixed",  # stampcheck's class is not used for a rewritten CIK
+        stored=[acc(REW, i + 1) for i in range(3)],
+    )
+    for i, s in enumerate(rew):
+        truth[(REW, acc(REW, i + 1))] = s
+    truth[(REW, acc(REW, 4))] = r4
+    l0, l1 = _day(date(2024, 5, 1)), _day(date(2026, 10, 3), 22)  # Sat 18:00 EDT
+    c.add_cik(
+        LAT, [(acc(LAT, 0), l0, l0.date(), True), (acc(LAT, 1), l1, l1.date(), False)], cls="true"
+    )
+    truth[(LAT, acc(LAT, 0))] = l0
+    truth[(LAT, acc(LAT, 1))] = l1 - timedelta(hours=4)  # the API's late stamp
+    c.finish()
+    return c, FakeSec(truth)
+
+
+def _report(c: Cache, sec: FakeSec, capsys: Any, *extra: str) -> dict[str, Any]:
+    capsys.readouterr()
+    assert run(c, sec, *extra) == 0
+    out: dict[str, Any] = json.loads(capsys.readouterr().out)
+    return out
+
+
+def test_floor_ceiling_and_rewritten_load_equal_the_hand_count(tmp_path: Path, capsys: Any) -> None:
+    c, sec = amended(tmp_path)
+    report = _report(c, sec, capsys, *LATE_RANGE)
+    assert sec.calls == []
+    # Floor: step 3 probes UND a4, a3 (2); step 3b probes REW r3, r2 (2);
+    # step 4b LAT l1 and REW r4 (2); the audit over EAR e1 alone (1).
+    assert report["step3_requests"] == 2
+    assert report["rewritten_ciks"] == 1
+    assert report["rewritten_probe_requests"] == 2
+    assert report["step4b_requests"] == 2
+    assert report["audit_floor"] == 1
+    assert report["requests_floor"] == 7
+    # Ceiling: less the audit floor, plus UND a1, a2 as if mixed (2), plus the
+    # audit as if UND were early: one per CIK (EAR, UND) + ceil(1% of 3) = 3.
+    assert report["requests_ceiling"] == 7 - 1 + 2 + 3
+    # REW's stored accessions not already probed: r1.
+    assert report["rewritten_if_all_mixed"] == 1
+    assert "requests_known" not in report
+    # The floor, not the old known count, is what --apply refuses on.
+    before = c.snapshot()
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "6") == 1
+    assert sec.calls == [] and c.snapshot() == before
+
+
+def test_the_cap_holds_during_the_run_and_a_resume_repeats_nothing(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    stamps_before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    # Floor 7 fits under 8; UND's probes come out mixed, adding a1 and a2,
+    # so the audit (the 9th request) does not fit: the run stops after 8.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "8") == 1
+    assert len(sec.calls) == 8
+    after = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert after == stamps_before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    assert len(journal.read_text().splitlines()) == 1 + 8  # kept, with its header
+    # A resume under the same cap stops again with no request.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--max-requests", "8") == 1
+    assert len(sec.calls) == 8
+    # Under a higher cap it finishes, repeating no request.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--max-requests", "9") == 0
+    assert len(sec.calls) == 9 and len(set(sec.calls)) == 9
+    assert sec.calls[-1] == (EAR, acc(EAR, 1))
+    assert c.stamp(EAR, acc(EAR, 1)) == _day(date(2024, 8, 1))
+
+
+def _unrepaired(c: Cache) -> dict[tuple[str, str], dict[str, str]]:
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest.unrepaired.csv.gz"
+    with gzip.open(side, "rt", newline="") as f:
+        return {(r["cik"], r["accession"]): r for r in csv.DictReader(f)}
+
+
+def test_a_true_rewritten_cik_is_probed_and_left_alone(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    before = c.records(REW)
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50") == 0
+    rew_calls = [a for k, a in sec.calls if k == REW]
+    # Two probes from its pre-10-01 records, stored first, newest first, and
+    # step 4b's read of r4; no shift, no filing-by-filing read of r1.
+    assert rew_calls == [acc(REW, 3), acc(REW, 2), acc(REW, 4)]
+    assert c.records(REW) == before
+    assert not any(k[0] == REW for k in _unrepaired(c))
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest.rewritten_ciks.txt"
+    assert side.read_text().split() == [REW]
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert {rows[(REW, acc(REW, n))]["method"] for n in (2, 3, 4)} == {"kept"}
+
+
+def test_a_mixed_rewritten_cik_goes_filing_by_filing(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    r5 = _day(date(2024, 9, 1))
+    c.add_cik(  # REW again, with one more record that backs no stored row
+        REW,
+        [
+            *(
+                (acc(REW, i + 1), _day(date(2024, 9, d)), date(2024, 9, d), False)
+                for i, d in enumerate((2, 3, 4))
+            ),
+            (acc(REW, 4), _day(date(2026, 10, 5)), date(2026, 10, 5), False),
+            (acc(REW, 5), r5, r5.date(), False),
+        ],
+    )
+    c.finish()
+    sec.truth[(REW, acc(REW, 3))] = _day(date(2024, 9, 4), 15)  # one probe mismatches
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50") == 0
+    rew_calls = [a for k, a in sec.calls if k == REW]
+    assert sorted(rew_calls) == [acc(REW, n) for n in (1, 2, 3, 4)]
+    assert c.stamp(REW, acc(REW, 3)) == _day(date(2024, 9, 4), 15)
+    unrepaired = _unrepaired(c)
+    assert (REW, acc(REW, 5)) in unrepaired
+    assert (REW, acc(REW, 4)) not in unrepaired  # step 4b read it
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest"
+    assert REW in Path(f"{side}.unrepaired_ciks.txt").read_text().split()
+    assert Path(f"{side}.rewritten_ciks.txt").read_text() == ""
+
+
+def test_late_api_stamps_take_their_sgml_value_in_the_range_only(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        LAT,
+        [
+            (acc(LAT, 0), _day(date(2024, 5, 1)), date(2024, 5, 1), True),
+            (acc(LAT, 1), _day(date(2026, 10, 3), 22), date(2026, 10, 3), False),
+            # Fri 2026-10-02 11:00 EDT filed Mon 10-05: provably early (step 2)
+            (acc(LAT, 2), _day(date(2026, 10, 2), 15), date(2026, 10, 5), False),
+            (acc(LAT, 3), _day(date(2026, 9, 30)), date(2026, 9, 30), False),
+        ],
+    )
+    c.finish()
+    sec.truth[(LAT, acc(LAT, 2))] = _day(date(2026, 10, 2), 23)
+    late = ("--late-api-from", "2026-10-01", "--late-api-to", "2026-10-08")
+    assert run(c, sec, *late, "--apply", "--max-requests", "50") == 0
+    assert c.stamp(LAT, acc(LAT, 1)) == _day(date(2026, 10, 3), 18)
+    assert sec.calls.count((LAT, acc(LAT, 2))) == 1  # step 2's read, not again in 4b
+    assert c.stamp(LAT, acc(LAT, 2)) == _day(date(2026, 10, 2), 23)
+    assert (LAT, acc(LAT, 3)) not in sec.calls  # 09-30: outside the range
+    assert c.stamp(LAT, acc(LAT, 3)) == _day(date(2026, 9, 30))
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert rows[(LAT, acc(LAT, 1))]["method"] == "sgml"
+    assert rows[(REW, acc(REW, 4))]["method"] == "kept"
+    # Without the range flags there is no step 4b.
+    c2, sec2 = amended(tmp_path / "b")
+    assert run(c2, sec2, "--apply", "--max-requests", "50") == 0
+    assert (LAT, acc(LAT, 1)) not in sec2.calls
+
+
+def test_late_api_range_flags_go_together(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    assert run(c, sec, "--late-api-from", "2026-10-01") == 1
+    assert run(c, sec, "--late-api-from", "2026-10-05", "--late-api-to", "2026-10-01") == 1
+
+
+def test_a_shift_row_in_the_late_range_is_replaced_by_sgml(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    s2 = _day(date(2026, 10, 1), 2)  # an early-class bulk stamp dated 09-30 22:00 EDT
+    c.add_cik(
+        EAR,
+        [
+            (acc(EAR, 1), early(_day(date(2024, 8, 1))), date(2024, 8, 1), True),
+            (acc(EAR, 2), s2, date(2026, 10, 1), True),
+        ],
+        cls="early",
+        stored=[acc(EAR, 1)],
+    )
+    c.finish()
+    sec.truth[(EAR, acc(EAR, 2))] = s2 + timedelta(minutes=1)
+    late = ("--late-api-from", "2026-09-30", "--late-api-to", "2026-10-08")
+    assert run(c, sec, *late, "--apply", "--max-requests", "50") == 0
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert rows[(EAR, acc(EAR, 2))]["method"] == "sgml"
+    assert c.stamp(EAR, acc(EAR, 2)) == s2 + timedelta(minutes=1)
+
+
+# --- (d) in-window corrections ----------------------------------------------
+
+WIN = "0000001505"
+W_OLD = _day(date(2026, 10, 9), 18) + timedelta(minutes=30)  # 14:30 EDT, served 4 h late
+
+
+def _stub_in_window_change_allowed(row: Any, window_start: date) -> bool:
+    """T166f's rule exactly as the plan line states it, a TEST-ONLY stub until
+    T166f lands (then this test imports the real one)."""
+    from tradepartner.adapters.stamp_repair import ny_utc_offset
+
+    def ny(d: datetime) -> date:
+        return d.astimezone(NY).date()
+
+    if ny(row.old_stamp) < window_start and ny(row.new_stamp) < window_start:
+        return True
+    earlier = row.old_stamp - row.new_stamp
+    return bool(row.method == "sgml" and timedelta(0) < earlier <= ny_utc_offset(ny(row.old_stamp)))
+
+
+@pytest.fixture
+def window_rule(monkeypatch: Any) -> None:
+    from tradepartner.adapters import stamp_repair
+
+    if not hasattr(stamp_repair, "in_window_change_allowed"):
+        monkeypatch.setattr(
+            stamp_repair,
+            "in_window_change_allowed",
+            _stub_in_window_change_allowed,
+            raising=False,
+        )
+
+
+def windowed(tmp_path: Path, sgml: datetime) -> tuple[Cache, FakeSec]:
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        WIN,
+        [
+            (acc(WIN, 1), W_OLD, W_OLD.date(), False),
+            (acc(WIN, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c.finish()
+    sec.truth[(WIN, acc(WIN, 1))] = sgml
+    sec.truth[(WIN, acc(WIN, 0))] = _day(date(2024, 1, 2))
+    return c, sec
+
+
+def precheck(
+    path: Path,
+    *,
+    passed: bool = True,
+    release: str = "restamp-1382",
+    window: date = WINDOW,
+    made_at: datetime | None = None,
+    instants: Iterable[datetime] = (),
+) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "release": release,
+                "window_first_session": window.isoformat(),
+                "pass": passed,
+                "instants": [t.isoformat() for t in instants],
+                "journal_high_water": None,
+                "made_at": (made_at or datetime.now(UTC)).isoformat(),
+            }
+        )
+    )
+    return path
+
+
+def _stamps(c: Cache) -> dict[str, bytes]:
+    return {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+
+
+def _apply(c: Cache, sec: FakeSec, *extra: str) -> int:
+    return run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50", *extra)
+
+
+def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(
+    tmp_path: Path, window_rule: None
+) -> None:
+    true = W_OLD - timedelta(hours=4)
+    c, sec = windowed(tmp_path, true)
+    before = _stamps(c)
+    assert _apply(c, sec) == 1  # without the flag: rule 5 as before
+    assert _stamps(c) == before
+    c2, sec2 = windowed(tmp_path / "ok", true)
+    ok = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 8), 20)])
+    assert _apply(c2, sec2, "--window-earlier-ok", str(ok)) == 0
+    assert c2.stamp(WIN, acc(WIN, 1)) == true
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"passed": False},
+        {"release": "restamp-other"},
+        {"window": date(2026, 10, 8)},
+        {"made_at": datetime.now(UTC) - timedelta(days=1)},
+    ],
+)
+def test_a_precheck_that_does_not_fit_is_refused(
+    tmp_path: Path, window_rule: None, bad: dict[str, Any]
+) -> None:
+    c, sec = windowed(tmp_path, W_OLD - timedelta(hours=4))
+    before = c.snapshot()
+    file = precheck(tmp_path / "precheck.json", **bad)
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_a_read_instant_inside_the_move_aborts_before_writing(
+    tmp_path: Path, window_rule: None, capsys: Any
+) -> None:
+    true = W_OLD - timedelta(hours=4)
+    c, sec = windowed(tmp_path, true)
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 9), 16)])  # 12:00 EDT
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert _stamps(c) == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    assert acc(WIN, 1) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "sgml",
+    [W_OLD + timedelta(hours=1), W_OLD - timedelta(hours=4, minutes=1)],
+    ids=["later", "earlier-than-offset"],
+)
+def test_other_in_window_moves_abort_with_and_without_the_flag(
+    tmp_path: Path, window_rule: None, sgml: datetime
+) -> None:
+    for flag in (False, True):
+        c, sec = windowed(tmp_path / str(flag), sgml)
+        before = _stamps(c)
+        extra = ("--window-earlier-ok", str(precheck(tmp_path / f"{flag}.json"))) if flag else ()
+        assert _apply(c, sec, *extra) == 1
+        assert _stamps(c) == before
+
+
+def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path, window_rule: None) -> None:
+    c, sec = amended(tmp_path)
+    late_true = utc(2026, 10, 9, 14, 0)
+    c.add_cik(
+        "0000000606",
+        [(acc("0000000606", 1), early(late_true), date(2026, 10, 9), True)],
+        cls="early",
+    )
+    c.finish()
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json")
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert _stamps(c) == before
