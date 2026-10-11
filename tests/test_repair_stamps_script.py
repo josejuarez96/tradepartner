@@ -1099,3 +1099,17 @@ def test_a_correction_the_day_before_the_window_that_crosses_an_instant_aborts(
     ok = precheck(tmp_path / "ok.json", instants=[_day(date(2026, 10, 9), 20)])
     assert _apply(c2, sec2, "--window-earlier-ok", str(ok)) == 0
     assert c2.stamp(pre, acc(pre, 1)) == old - timedelta(hours=4)
+
+
+def test_a_step_1_shift_across_an_instant_stops_before_any_request(
+    tmp_path: Path, window_rule: None
+) -> None:
+    """code-review pass 1: a pre-window shift crossing an instant is known
+    from the plan, so the run stops before the backup and any request."""
+    c, sec = amended(tmp_path)
+    t = utc(2024, 8, 1, 12, 0)  # between EAR's early stamp (10:00Z) and its shift (14:00Z)
+    before = c.snapshot()
+    file = precheck(tmp_path / "precheck.json", instants=[t])
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert c.snapshot() == before

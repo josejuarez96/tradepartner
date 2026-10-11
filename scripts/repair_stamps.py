@@ -952,6 +952,15 @@ def instant_violations(
     ]
 
 
+def _refuse_instants(rows: Iterable[ManifestRow], precheck: Precheck) -> None:
+    read = instant_violations(rows, precheck.instants)
+    if read:
+        raise RepairStop(
+            f"{len(read)} change(s) cross a read instant of {precheck.path} "
+            f"(new <= t < old or old <= t < new): {_list_rows(read)}"
+        )
+
+
 def _window_rule() -> WindowRule:
     """T166f's in-window rule, imported where the flag is used."""
     from tradepartner.adapters import stamp_repair
@@ -1146,6 +1155,8 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
             f"{args.max_requests}"
         )
     _refuse_window(plan.step1.values(), inputs.window_start, allowed)
+    if precheck is not None:
+        _refuse_instants(plan.step1.values(), precheck)
     if not args.resume:
         need = _dir_bytes(live)
         free = shutil.disk_usage(live).free
@@ -1162,29 +1173,32 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
     outcome = execute(inputs, plan, journal)
     _refuse_window(outcome.rows.values(), inputs.window_start, allowed)
     if precheck is not None:
-        read = instant_violations(outcome.rows.values(), precheck.instants)
-        if read:
-            raise RepairStop(
-                f"{len(read)} change(s) cross a read instant of {precheck.path} "
-                f"(new <= t < old or old <= t < new): {_list_rows(read)}"
-            )
+        _refuse_instants(outcome.rows.values(), precheck)
+        # A long run may pass New York midnight: the file must still be the
+        # run's day when the moves are written (amendment (d), staleness).
+        load_precheck(
+            precheck.path,
+            release=args.release,
+            window_start=args.window_start,
+            now=datetime.now(UTC),
+        )
 
     changes: dict[str, dict[str, datetime]] = defaultdict(dict)
     for (cik, accession), row in outcome.rows.items():
         if row.changed:
             changes[cik][accession] = row.new_stamp
-    rewritten = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
+    new_files = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
     moved = [
         cik
-        for cik in sorted(rewritten)
-        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, rewritten[cik])
+        for cik in sorted(new_files)
+        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, new_files[cik])
     ]
     if moved:
         raise RepairStop(
             f"{len(moved)} live stamps file(s) changed since the backup (an ingest ran?): "
             f"{', '.join(moved[:20])}; rerun under a new --release"
         )
-    for cik, data in sorted(rewritten.items()):
+    for cik, data in sorted(new_files.items()):
         edgar_raw.write_atomic(live / f"{cik}.json", data)
     _write_rows(manifest, (outcome.rows[k] for k in sorted(outcome.rows)))
     _write_rows(_sidecar(manifest, ".unrepaired.csv.gz"), outcome.unrepaired, compress=True)
@@ -1196,7 +1210,7 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
         _sidecar(manifest, ".rewritten_ciks.txt"),
         "".join(f"{c}\n" for c in outcome.rewritten_true).encode(),
     )
-    report.update(outcome.counts, files_rewritten=len(rewritten), manifest=str(manifest))
+    report.update(outcome.counts, files_rewritten=len(new_files), manifest=str(manifest))
     report["sgml_error_list"] = outcome.sgml_errors
     return report
 
