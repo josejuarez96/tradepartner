@@ -41,10 +41,24 @@ the case (#1029 F5). A case skipped a second time once no unseen case is left is
 recorded `unlabelled`, never replaced (replacing after reading would be
 selection).
 
-**The lock** (`lock_gold`). A partial session is never locked. The export is the
+**The basis** (#1492). Every label other than `unresolved` carries the kind of
+evidence it rests on, `basis` (`text`, `exchange_rule` or `provision`), which the
+labeller sets: nothing here derives or suggests it from `rule_provision`, the
+notice's rule citations or anything else, since a derived basis would make the
+`rule_provision` arm's score circular. `record_label` refuses a basis that
+contradicts `relied_on` (`provision` needs `form 25`, `exchange_rule` needs
+`notice`, `text` needs `notice`, an `8-K item` or `outside`). `basis_counts` (pure)
+counts the final lines of the random draw's `pilot` cases by basis, overall and per
+`draw_round`; the text-based count is the headline's `n_clusters`.
+
+**The lock** (`lock_gold`). A partial session is never locked, nor one whose
+text-based scorable `pilot` count is under `text_floor` (`BelowFloor`; the caller
+reads the floor from the pilot experiment file's `min_clusters`). The export is the
 sampled frame rows, every frame column (`documents` and `form25_accepted_at`
 included), joined to the final working line per case, plus `gold_class`,
-`seed_case`, `in_random_draw` and `unlabelled`; content-addressed under
+`seed_case`, `in_random_draw`, `unlabelled`, `basis` and `draw_round`, with the
+parquet metadata `protocol_version` (the labelling protocol of the spec's Appendix
+A); content-addressed under
 `datafiles.gold_path`, with its split file, and registered `locked` under
 `departure-reason-gold` with the sealed `pilot` period through `store.research`,
 the module's one write outside the research directory. A `StoreLockedError` from
@@ -76,6 +90,7 @@ import polars as pl
 from tradepartner.research import datafiles
 from tradepartner.research.labeling.crosswalk import RuleAnswer, RuleStatus, class_of, crosswalk_row
 from tradepartner.research.labeling.questions import DEFAULT_OPTION_SET, OptionSet
+from tradepartner.research.labeling.questions import UNRESOLVED as UNRESOLVED
 from tradepartner.store.db import StoreLockedError
 from tradepartner.store.research import register_dataset
 
@@ -92,8 +107,18 @@ N_DEV = 30
 DEV_SPAN_MIN_ROWS = 300
 #: C10: `seconds_spent` is capped here and flagged `idle` beyond it.
 SECONDS_CAP = 600.0
-#: C10's "relied on" choice: the notice, an 8-K item, or outside the shown text.
+#: C10's "relied on" choice: the notice, an 8-K item, outside the shown text, or
+#: (#1492) the Form 25's provision field.
 _ITEM_REF = re.compile(r"8-K item \d+\.\d{2}")
+FORM_25 = "form 25"
+#: #1492 item 1: the kinds of evidence a gold label rests on (none on `unresolved`).
+BASES: tuple[str, ...] = ("text", "exchange_rule", "provision")
+#: `basis_counts`'s five counts (spec #1492 item 3), in this order.
+BASIS_COUNT_KEYS: tuple[str, ...] = (*BASES, UNRESOLVED, "unlabelled")
+#: The labelling protocol's version (spec #1492, Appendix A), in the export's metadata.
+PROTOCOL_VERSION = "1"
+#: Spec #1492 item 4: the suggested extension aims this many text items above the floor.
+EXTENSION_MARGIN = 5
 CONFIDENCE = frozenset({"high", "low"})
 #: The gold columns the lock joins to the sampled frame rows (C10).
 GOLD_SCHEMA: dict[str, pl.DataType] = {
@@ -110,6 +135,8 @@ GOLD_SCHEMA: dict[str, pl.DataType] = {
     "seed_case": pl.Boolean(),
     "in_random_draw": pl.Boolean(),
     "unlabelled": pl.Boolean(),
+    "basis": pl.String(),
+    "draw_round": pl.Int64(),
     "pre_fix_status": pl.String(),
     "pre_fix_relisted": pl.Boolean(),
     "pre_fix_successor_id": pl.String(),
@@ -168,6 +195,10 @@ class SessionLocked(GoldRefused):
     """The session is locked; it only displays."""
 
 
+class BelowFloor(GoldRefused):
+    """The text-based scorable `pilot` count is under the floor: extend the draw."""
+
+
 @dataclass(frozen=True)
 class FrameExport:
     """The registered frame the caller names: its dataset id, the export's path as
@@ -193,12 +224,14 @@ class ExclusionResult:
 @dataclass(frozen=True)
 class GoldCase:
     """One case of the session: `in_random_draw` is false only for a seed the draw
-    did not pick (outside the accuracy denominator, req 10)."""
+    did not pick (outside the accuracy denominator, req 10); `draw_round` is 0 for
+    the first draw (#1492)."""
 
     listing_end_id: str
     split: Split
     seed_case: bool
     in_random_draw: bool
+    draw_round: int = 0
 
 
 @dataclass(frozen=True)
@@ -307,12 +340,50 @@ class CaseView:
 
 
 @dataclass(frozen=True)
+class RoundCounts:
+    """The five basis counts (`BASIS_COUNT_KEYS`) of the final lines of the random
+    draw's `pilot` cases, and `n_pilot`, how many such cases there are (open ones
+    included, counted in no basis)."""
+
+    n_pilot: int
+    counts: Mapping[str, int]
+
+    @property
+    def scorable_pilot_text(self) -> int:
+        """The text-based scorable `pilot` count: the headline's `n_clusters`."""
+        return self.counts["text"]
+
+    @property
+    def scorable_pilot(self) -> int:
+        """Every scorable `pilot` item: labelled, not `unresolved`, any basis."""
+        return sum(self.counts[b] for b in BASES)
+
+    def as_dict(self) -> dict[str, int]:
+        """The five counts, then `n_pilot` and `scorable_pilot_text`."""
+        return {
+            **{k: self.counts[k] for k in BASIS_COUNT_KEYS},
+            "n_pilot": self.n_pilot,
+            "scorable_pilot_text": self.scorable_pilot_text,
+        }
+
+
+@dataclass(frozen=True)
+class BasisCounts(RoundCounts):
+    """`basis_counts`'s result: the counts over every round, and per `draw_round`."""
+
+    by_round: Mapping[int, RoundCounts]
+
+
+@dataclass(frozen=True)
 class LockResult:
-    """`locked` with the dataset id, or the retryable `busy` (store locked)."""
+    """`locked` with the dataset id, or the retryable `busy` (store locked); both
+    scorable `pilot` counts and the basis counts (#1492)."""
 
     state: Literal["locked", "busy"]
     sha256: str
     scorable_pilot: int
+    scorable_pilot_text: int
+    basis_counts: BasisCounts
     dataset_id: int | None = None
     message: str | None = None
 
@@ -628,7 +699,13 @@ def _session_from(
     path: Path, doc: Mapping[str, Any], settings: Settings, table: pl.DataFrame
 ) -> GoldSession:
     cases = tuple(
-        GoldCase(c["listing_end_id"], c["split"], c["seed_case"], c["in_random_draw"])
+        GoldCase(
+            c["listing_end_id"],
+            c["split"],
+            c["seed_case"],
+            c["in_random_draw"],
+            int(c.get("draw_round", 0)),
+        )
         for c in doc["cases"]
     )
     ids = {c.listing_end_id for c in cases}
@@ -792,14 +869,37 @@ def _check_label(session: GoldSession, line: Mapping[str, Any]) -> None:
     if line.get("text_states") is not None and line["text_states"] not in names:
         raise GoldRefused(f"{lid}: text_states {line['text_states']!r} is not one of the options")
     relied_on = line.get("relied_on")
-    if relied_on not in ("notice", "outside") and not _ITEM_REF.fullmatch(str(relied_on)):
+    if relied_on not in ("notice", "outside", FORM_25) and not _ITEM_REF.fullmatch(str(relied_on)):
         raise GoldRefused(
-            f"{lid}: relied_on {relied_on!r} must be `notice`, `8-K item N.NN` or `outside`"
+            f"{lid}: relied_on {relied_on!r} must be `notice`, `8-K item N.NN`, "
+            f"`{FORM_25}` or `outside`"
         )
     if relied_on == "outside" and not (line.get("passage_ref") or "").strip():
         raise GoldRefused(f"{lid}: an `outside` label needs the filing's accession or URL")
+    _check_basis(lid, line.get("gold_label"), line.get("basis"), str(relied_on))
     if line.get("confidence") not in CONFIDENCE:
         raise GoldRefused(f"{lid}: confidence {line.get('confidence')!r} is not high or low")
+
+
+def _check_basis(lid: object, label: object, basis: object, relied_on: str) -> None:
+    """#1492 item 1: a basis on every label but `unresolved`, none on `unresolved`,
+    and one that agrees with `relied_on`. Reads nothing but the line."""
+    if label == UNRESOLVED:
+        if basis is not None:
+            raise GoldRefused(f"{lid}: an `unresolved` label has no basis, got {basis!r}")
+        return
+    if basis is None:
+        raise GoldRefused(f"{lid}: a `{label}` label needs a basis ({', '.join(BASES)})")
+    if basis not in BASES:
+        raise GoldRefused(f"{lid}: basis {basis!r} is not one of {', '.join(BASES)}")
+    if basis == "provision" and relied_on != FORM_25:
+        raise GoldRefused(f"{lid}: a `provision` basis needs relied_on `{FORM_25}`")
+    if basis == "exchange_rule" and relied_on != "notice":
+        raise GoldRefused(f"{lid}: an `exchange_rule` basis needs relied_on `notice`")
+    if basis == "text" and relied_on == FORM_25:
+        raise GoldRefused(
+            f"{lid}: a `text` basis needs relied_on `notice`, an `8-K item` or `outside`"
+        )
 
 
 def record_label(
@@ -809,13 +909,16 @@ def record_label(
     label: str,
     relied_on: str,
     seconds_spent: float,
+    basis: str | None = None,
     passage_ref: str | None = None,
     text_states: str | None = None,
     confidence: str = "high",
 ) -> None:
     """Append one answer line. Refuses a case whose final line is an answer or an
     `unlabelled` skip (`AlreadyAnswered`; `record_undo` reopens it), a label
-    outside the option set, and an `outside` label without `passage_ref`."""
+    outside the option set, an `outside` label without `passage_ref`, and a
+    `basis` that is missing, set on `unresolved`, outside `BASES` or contradicts
+    `relied_on` (#1492)."""
     status = _writable(session, listing_end_id)
     if status[listing_end_id] in ("answered", "unlabelled"):
         raise AlreadyAnswered(f"{listing_end_id} is already answered; undo it first")
@@ -825,6 +928,7 @@ def record_label(
         "gold_label": label,
         "text_states": text_states,
         "relied_on": relied_on,
+        "basis": basis,
         "passage_ref": passage_ref,
         "confidence": confidence,
         "seconds_spent": seconds,
@@ -881,6 +985,65 @@ def next_case(session: GoldSession) -> int | None:
     return min(skipped)[1] if skipped else None
 
 
+# --- the basis counts -------------------------------------------------------------
+
+
+def _final_by_case(session: GoldSession) -> dict[str, dict[str, Any]]:
+    """Each case's final working line (an undo line included)."""
+    finals: dict[str, dict[str, Any]] = {}
+    for line in _lines(session):
+        finals[line["listing_end_id"]] = line
+    return finals
+
+
+def _basis_key(line: Mapping[str, Any] | None) -> str | None:
+    """Which of `BASIS_COUNT_KEYS` a final line counts under; `None` when the case
+    has no final answer (open, skipped once, undone)."""
+    if line is None or line.get("undo"):
+        return None
+    if line.get("skipped"):
+        return "unlabelled" if line.get("unlabelled") else None
+    if line.get("gold_label") == UNRESOLVED:
+        return UNRESOLVED
+    basis = line.get("basis")
+    return str(basis) if basis in BASES else None
+
+
+def basis_counts(session: GoldSession) -> BasisCounts:
+    """The five basis counts over the random draw's `pilot` cases (seeds outside the
+    draw counted nowhere), the text-based scorable `pilot` count among them, and
+    both per `draw_round` (#1492 items 3 and 4). Pure: it reads the working file and
+    `session.json`'s cases, nothing of the frame, the rules or any model output."""
+    finals = _final_by_case(session)
+    rounds: dict[int, dict[str, int]] = {}
+    sizes: dict[int, int] = {}
+    for case in session.cases:
+        if case.split != "pilot" or not case.in_random_draw:
+            continue
+        counts = rounds.setdefault(case.draw_round, dict.fromkeys(BASIS_COUNT_KEYS, 0))
+        sizes[case.draw_round] = sizes.get(case.draw_round, 0) + 1
+        key = _basis_key(finals.get(case.listing_end_id))
+        if key is not None:
+            counts[key] += 1
+    total = {k: sum(r[k] for r in rounds.values()) for k in BASIS_COUNT_KEYS}
+    return BasisCounts(
+        n_pilot=sum(sizes.values()),
+        counts=total,
+        by_round={r: RoundCounts(sizes[r], rounds[r]) for r in sorted(rounds)},
+    )
+
+
+def suggested_n(session: GoldSession, counts: BasisCounts, floor: int) -> int | None:
+    """Spec #1492 item 4's suggested overall `n` for `research gold --extend`:
+    `n_dev + ceil((floor + 5) * n_pilot / text_scorable)`, `n_dev` and `n_pilot` the
+    random draw's `dev` and `pilot` cases; `None` with no text-based item."""
+    text = counts.scorable_pilot_text
+    if text == 0:
+        return None
+    n_dev = sum(1 for c in session.cases if c.split == "dev" and c.in_random_draw)
+    return n_dev + -(-(floor + EXTENSION_MARGIN) * counts.n_pilot // text)
+
+
 # --- the lock ---------------------------------------------------------------------
 
 
@@ -914,30 +1077,48 @@ def _pre_fix_columns(seed: SeedCase | None) -> dict[str, Any]:
 def lock_gold(
     session: GoldSession,
     connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
+    *,
+    text_floor: int,
 ) -> LockResult:
     """Lock a complete session (module docstring): write the export and its split
     file, register them through `store.research` on the connection `connect`
     opens, then mark the session locked. A locked session returns its lock again.
-    `SessionPartial` on a case with no final answer; `busy` on `StoreLockedError`."""
+    `SessionPartial` on a case with no final answer; `GoldRefused` naming the case
+    on a final line that fails `record_label`'s checks (a missing basis among them);
+    `BelowFloor`, with nothing written or registered, when the text-based scorable
+    `pilot` count is under `text_floor`; `busy` on `StoreLockedError`."""
+    counts = basis_counts(session)
     if session.lock_path.exists():
         done = json.loads(session.lock_path.read_text(encoding="utf-8"))
-        return LockResult("locked", done["sha256"], done["scorable_pilot"], done["dataset_id"])
+        return LockResult(
+            "locked",
+            done["sha256"],
+            done["scorable_pilot"],
+            done.get("scorable_pilot_text", counts.scorable_pilot_text),
+            counts,
+            done["dataset_id"],
+        )
     status, _, _ = _states(session)
     partial = sorted(lid for lid, s in status.items() if s in ("open", "skipped"))
     if partial:
         raise SessionPartial(f"{len(partial)} case(s) have no final answer: {partial[:5]}")
-    finals: dict[str, dict[str, Any]] = {}
-    for line in _lines(session):
-        finals[line["listing_end_id"]] = line
+    finals = _final_by_case(session)
+    for case in session.cases:
+        if not finals[case.listing_end_id].get("skipped"):
+            _check_label(session, finals[case.listing_end_id])
+    if counts.scorable_pilot_text < text_floor:
+        raise BelowFloor(
+            f"the text-based scorable pilot count is {counts.scorable_pilot_text}, under "
+            f"the floor {text_floor}; extend the draw before the lock"
+        )
     out: list[dict[str, Any]] = []
     splits: list[str] = []
-    scorable = 0
+    scorable = counts.scorable_pilot
     for case in sorted(session.cases, key=lambda c: c.listing_end_id):
         final = finals[case.listing_end_id]
         unlabelled = bool(final.get("skipped"))
         label: str | None = None
         if not unlabelled:
-            _check_label(session, final)
             label = final["gold_label"]
         labeled_at = final.get("labeled_at")
         out.append(
@@ -955,17 +1136,18 @@ def lock_gold(
                 "seed_case": case.seed_case,
                 "in_random_draw": case.in_random_draw,
                 "unlabelled": unlabelled,
+                "basis": final.get("basis") if label not in (None, UNRESOLVED) else None,
+                "draw_round": case.draw_round,
                 **_pre_fix_columns(session.seed_cases.get(case.listing_end_id)),
             }
         )
         splits.append(case.split)
-        if case.split == "pilot" and case.in_random_draw and label not in (None, "unresolved"):
-            scorable += 1
     metadata = {
         "exclusion_sha256": session.exclusion_sha256,
         "frame_dataset_id": str(session.frame.dataset_id),
         "frame_sha256": session.frame.sha256,
         "seed": str(session.seed),
+        "protocol_version": PROTOCOL_VERSION,
     }
     # The frame's own column types, joined to gold columns of a fixed schema, so a
     # column null in the first rows never breaks type inference on a later value.
@@ -1017,12 +1199,26 @@ def lock_gold(
                 note=f"exclusion sha256 {session.exclusion_sha256}",
             )
     except StoreLockedError as exc:
-        return LockResult("busy", sha, scorable, message=f"store busy: {exc}")
+        return LockResult(
+            "busy",
+            sha,
+            scorable,
+            counts.scorable_pilot_text,
+            counts,
+            message=f"store busy: {exc}",
+        )
     lock = {
         "dataset_id": record.dataset_id,
         "sha256": sha,
         "scorable_pilot": scorable,
+        "scorable_pilot_text": counts.scorable_pilot_text,
+        "basis_counts": {
+            **counts.as_dict(),
+            "by_round": {str(r): c.as_dict() for r, c in counts.by_round.items()},
+        },
         "locked_at": _now(),
     }
     session.lock_path.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
-    return LockResult("locked", sha, scorable, record.dataset_id)
+    return LockResult(
+        "locked", sha, scorable, counts.scorable_pilot_text, counts, record.dataset_id
+    )
