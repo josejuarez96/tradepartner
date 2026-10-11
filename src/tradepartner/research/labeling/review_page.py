@@ -590,6 +590,11 @@ def draw_review(page: Page) -> None:
     _form25(view, None)
     _passages(view)
     st.markdown(f"**a:** {view.a}  \n**b:** {view.b}")
+    st.caption(
+        "Choose the most specific correct answer supported by the filings. "
+        "If a single class is correct and the other answer is a set containing it, "
+        "choose the single class."
+    )
     st.radio(
         "Reason", list(review.REASON_PRESETS), index=None, key=f"preset-{lid}", horizontal=True
     )
