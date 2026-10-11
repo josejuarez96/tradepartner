@@ -634,3 +634,54 @@ def test_a_padded_secret_is_masked_by_its_stripped_value(conn: duckdb.DuckDBPyCo
     alerter.write("halted", 7, _SESSION, "auth hunter2-very-secret refused")
     ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
     assert message == "auth *** refused"
+
+
+# --- #1440: the raw-clock note and run_failed before the run row -----------------------------
+
+
+@pytest.mark.parametrize("reading", ["raises", "naive", "clock_fault"])
+def test_a_raw_clock_stamp_is_noted_in_the_message(
+    conn: duckdb.DuckDBPyConnection, reading: str
+) -> None:
+    """#1440 Q1 (owner, 2026-10-10): when the clock fails, the alert is stamped by
+    the raw clock (`utc_now()`) with a note saying so, in the stored message and
+    in what each channel is sent."""
+
+    def clock() -> datetime:
+        if reading == "raises":
+            raise OSError("clock gone")
+        return datetime(2026, 10, 1, 21, 0)  # noqa: DTZ001 (a naive reading on purpose)
+
+    runner = FakeRunner()
+    Alerter(_settings(), conn, clock, runner=runner, smtp=FakeSMTP).write(
+        "halted", 7, _SESSION, "m", clock_fault=reading == "clock_fault"
+    )
+    ((message,),) = conn.execute("SELECT message FROM alerts").fetchall()
+    assert message.startswith("m; ") and alerts.RAW_CLOCK_NOTE in message
+    ((_, _, script),) = runner.calls
+    assert alerts.RAW_CLOCK_NOTE in script
+
+
+def test_a_good_clock_adds_no_note(conn: duckdb.DuckDBPyConnection) -> None:
+    _alerter(conn, _settings()).write("halted", 7, _SESSION, "m")
+    assert conn.execute("SELECT message FROM alerts").fetchall() == [("m",)]
+
+
+def test_run_failed_may_have_no_run_and_then_dedupes_per_book_and_session(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1440 Q2 (owner, 2026-10-10): a failure before the run row exists sends
+    `run_failed` with no run id, deduped on (book, kind, session) as `locked`
+    is; every other run-scoped kind still needs a run."""
+    alerter = _alerter(conn, _settings())
+    with_run = alerter.write("run_failed", 7, _SESSION, "d")
+    first = alerter.write("run_failed", None, _SESSION, "a")
+    assert first != with_run  # a run's own alert never hides a pre-run failure
+    assert alerter.write("run_failed", None, _SESSION, "again") == first
+    assert alerter.write("run_failed", None, _SESSION, "b", book_id="daily") != first
+    assert alerter.write("run_failed", None, date(2026, 10, 2), "c") != first
+    rows = conn.execute("SELECT run_id, book_id FROM alerts ORDER BY alert_id").fetchall()
+    assert rows == [(7, "main"), (None, "main"), (None, "daily"), (None, "main")]
+    for kind in ("halted", "stale_data", "kill_switch", "drawdown"):
+        with pytest.raises(ValueError, match="run"):
+            alerter.write(kind, None, _SESSION, "m")

@@ -19,8 +19,10 @@ classified included.
 or a naive value into `ClockError`, and so does a reading earlier than the
 wrapper's previous one. `clock_precheck` runs before each phase's first submit
 (ADR 0010 point 2): the identity, then a well-formed reading not earlier than
-the last `ok` ingestion run's `finished_at` and not later than the close of the
-session `risk.clock_max_sessions_late` sessions after S.
+the last `ok` daily ingest of the price source's `finished_at`
+(`last_ok_price_ingest`: an EDGAR, backfill or repair run never counts, #1440
+Q3) and not later than the close of the session `risk.clock_max_sessions_late`
+sessions after S.
 
 **The halt path** (`halt`, also the run's halt entry point, T63), in the req 4
 order. A wrapper built with `book_id` first reads the run's window's book: when
@@ -253,6 +255,9 @@ from tradepartner.execution.risk import (
     order_shape_violation,
     unfilled_sells,
 )
+from tradepartner.ingest import MODE as INGEST_MODE
+from tradepartner.ingest import OK as INGEST_OK
+from tradepartner.ingest import PRICE_SOURCE
 from tradepartner.store.asof import listings_as_of, live_actions_as_of
 from tradepartner.store.db import utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -302,6 +307,7 @@ __all__ = [
     "TradingCalendar",
     "Verdict",
     "classify",
+    "last_ok_price_ingest",
 ]
 
 #: The rejection allowlist, one frozen constant per `Broker` method (module
@@ -489,8 +495,8 @@ class _Book:
     for S, the reference prices (and, for a name only an open order brings in
     that has none, the reason, raised when read: #569), each decision's state and each sold name's
     residue, the tickers and ended listings of the batch's names, every own
-    order, event and live fill of any window, and the last `ok` ingestion run's
-    `finished_at`."""
+    order, event and live fill of any window, and the last `ok` daily price
+    ingest's `finished_at` (`last_ok_price_ingest`)."""
 
     window: PaperWindowRow
     costs: BuyCosts
@@ -609,7 +615,8 @@ class RiskGatedBroker:
     def clock_precheck(self, session: date, last_ok_ingest: datetime | None) -> datetime:
         """The pre-check before a phase's first submit (module docstring); return
         the reading or raise `ClockError`. `last_ok_ingest` is the latest `ok`
-        ingestion run's `finished_at` (None when there is none)."""
+        daily price ingest's `finished_at` (`last_ok_price_ingest`; None when
+        there is none)."""
         if getattr(self._broker, "clock", None) is not self._clock:
             raise ClockError("the wrapper and the adapter do not hold one clock object")
         if last_ok_ingest is not None:
@@ -1734,9 +1741,24 @@ def _refuse_reused_tickers(
         )
 
 
+def last_ok_price_ingest(
+    conn: duckdb.DuckDBPyConnection, *, by: datetime | None = None
+) -> datetime | None:
+    """The latest `finished_at` of an `ok` daily ingest of the price source
+    (`ingest.PRICE_SOURCE`, mode `ingest.MODE`), finished at or before `by` when
+    given; None when there is none. Only those runs count for the run's
+    staleness check (step 2) and the clock pre-check's floor (owner decision on
+    #1440 Q3, 2026-10-10): an EDGAR run, a backfill, a holes fill or a repair
+    says nothing about today's prices."""
+    sql = "SELECT max(finished_at) FROM ingestion_runs WHERE status = ? AND source = ? AND mode = ?"
+    params: list[object] = [INGEST_OK, PRICE_SOURCE, INGEST_MODE]
+    if by is not None:
+        sql += " AND finished_at <= ?"
+        params.append(by)
+    row = conn.execute(sql, params).fetchone()
+    return None if row is None or row[0] is None else row[0]
+
+
 def _last_ok_ingest(conn: duckdb.DuckDBPyConnection) -> datetime | None:
-    """The latest `ok` ingestion run's `finished_at` (the clock pre-check's floor)."""
-    row = conn.execute(
-        "SELECT max(finished_at) FROM ingestion_runs WHERE status = ?", [_OK]
-    ).fetchone()
-    return None if row is None else row[0]
+    """The clock pre-check's floor: `last_ok_price_ingest` at any time."""
+    return last_ok_price_ingest(conn)
