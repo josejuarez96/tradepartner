@@ -1031,7 +1031,7 @@ what = "The store restamp accepts an in-window change only through the same pre-
 why = "Without it the cache would be corrected and the store would still refuse the same rows, so the two would disagree inside H1's window."
 unblocks = ["task:T166c"]
 
-[task.T167]
+[task.T168]
 what = "The departure corpus reads every acceptance time from the filing's SGML header instead of the submissions JSON."
 why = "The corpus fetched on 2026-10-11 carries times the SEC served 4 h late; the T126 frame orders its events by them."
 unblocks = ["task:T126"]
