@@ -1091,7 +1091,7 @@ def _filing_events_report(
 
 
 _RATE_COUNT = re.compile(r"\brates_(\w+)=(\d+)\b")
-_RATE_STALE = re.compile(r"\bstale_sessions=(\d+)\b")
+_RATE_STALE = re.compile(r"\bstale_sessions=(\d+)\b|\bis (\d+) sessions behind\b")
 
 
 def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> RatesHealth:
@@ -1149,7 +1149,7 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
                 revised_keys=sum(count > 1 for count in date_counts.values()),
                 longest_gap_sessions=max(gaps, default=0),
                 run_counts=counts,
-                stale_sessions=int(stale_match[1]) if stale_match else None,
+                stale_sessions=int(stale_match[1] or stale_match[2]) if stale_match else None,
                 last_daily_late_rows=daily_counts.get("late_rows", 0),
                 implausible_rows=sum(
                     row[1] is None or not lower <= row[1] <= upper for row in rows

@@ -2594,8 +2594,8 @@ def test_rates_last_daily_late_count_and_plausible_warning_do_not_fail_check(
         "ingestion_runs",
         {
             "run_id": 9999,
-            "started_at": T_END,
-            "finished_at": T_END,
+            "started_at": T_END - timedelta(hours=1),
+            "finished_at": T_END - timedelta(hours=1),
             "status": "ok",
             "source": "fred",
             "mode": "session",
@@ -2689,3 +2689,27 @@ def test_rates_are_covered_by_common_column_rules(
     report = health_report(loose_store, T_END, _settings())
     assert rule in report.failures
     assert not report.ok
+
+
+def test_rates_staleness_is_read_from_an_aborted_stale_run(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": 9998,
+            "started_at": T_END,
+            "finished_at": T_END,
+            "status": "error",
+            "source": "fred",
+            "mode": "session",
+            "rows_added": 0,
+            "chunk_cursor": "rates;series=DTB3;through=",
+            "message": "DTB3: latest observation 2020-06-01 is 17 sessions behind "
+            "2020-06-26; maximum 3",
+        },
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    rate = next(item for item in report.rates.series if item.series == "DTB3")
+    assert rate.stale_sessions == 17
