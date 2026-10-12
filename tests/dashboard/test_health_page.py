@@ -19,10 +19,16 @@ import pytest
 from conftest import load_universe_fixtures
 from streamlit.testing.v1 import AppTest
 
+from tradepartner import health
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import Settings
 from tradepartner.dashboard import app, health_page, theme
-from tradepartner.health import INTEGRITY_RULES, coverage, health_report
+from tradepartner.health import (
+    COVERAGE_REFERENCE_NAMES,
+    INTEGRITY_RULES,
+    coverage,
+    health_report,
+)
 from tradepartner.ingest import SOURCES
 from tradepartner.store import schema
 from tradepartner.store.db import configure_connection, insert_row
@@ -423,6 +429,65 @@ def test_statement_card_shows_coverage_when_the_switch_is_on(
 
 
 # --- theme -------------------------------------------------------------------
+
+
+# --- the coverage-reference card (#1541, T180) -------------------------------
+
+
+def test_view_computes_the_coverage_block_only_when_asked(store_path: Path) -> None:
+    """A plain view never computes the block, even while `check_enabled` is on."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(store_path)},
+        coverage={"reference_names": ["CIK0001000019:PRE9"], "check_enabled": True},
+    )
+    with _connect(store_path) as conn:
+        plain = health_page.load_health_view(conn, T, settings, WINDOW)
+        asked = health_page.load_health_view(
+            conn, T, settings, WINDOW, with_coverage_reference=True
+        )
+    assert plain.report.coverage_reference is None
+    assert asked.report.coverage_reference is not None
+    assert asked.report.coverage_reference.failed
+    assert health_page.coverage_badge(None) == (
+        f"{COVERAGE_REFERENCE_NAMES}: not computed",
+        "warning",
+    )
+    assert health_page.coverage_badge(asked.report.coverage_reference) == (
+        f"{COVERAGE_REFERENCE_NAMES}: fail (2)",
+        "critical",
+    )
+
+
+def test_render_shows_the_coverage_card_not_computed_until_asked(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the coverage block was computed on a refresh")
+
+    monkeypatch.setattr(health, "_coverage_reference", refuse)
+    monkeypatch.setenv("COVERAGE__CHECK_ENABLED", "true")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Coverage against the reference list" in text
+    assert "Not computed" in text
+    assert [b.label for b in at.button] == ["Run coverage check"]
+
+
+def test_render_computes_the_coverage_card_when_its_button_is_pressed(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("COVERAGE__REFERENCE_NAMES", '["CIK0001000019:PRE9"]')
+    at = _app(monkeypatch, store_path)
+    assert "Not computed" in _text(at)
+    at.button(key=health_page.COVERAGE_BUTTON_KEY).click().run()
+    assert not at.exception
+    text = _text(at)
+    assert "Mode: **report-only** (`coverage.check_enabled`)" in text
+    assert "Missing reference names (2)" in text
+    assert "Late-known listings (1)" in text
+    assert "Not computed" not in text
 
 
 def test_no_colour_literal_in_page_code() -> None:

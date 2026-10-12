@@ -109,6 +109,41 @@ here is this module's and is stated once:
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
+- **Coverage against a named reference** (`coverage_reference`, #1541,
+  T180): the one check that compares the store with a list outside its own
+  derivation, `coverage.reference_names` (`CIK:TICKER[:FROM[:TO]]`, the
+  sessions each entry applies on, inclusive). The sample sessions
+  (`sample_sessions`) are the last XNYS session of each
+  `coverage.sample_months` month from `coverage.sample_from` to the last
+  session completed at `t`. On each sample session S, at `t`: (a)
+  `reference_missing`, every entry covering S whose CIK is not a member of
+  `universe_as_of(close(S))` under its ticker (compared as Alpaca symbols,
+  so `BRK.B` is `BRK-B`), with the universe's exclusion of the CIK's
+  security that carries the ticker (else, when the CIK is a member under
+  another ticker, `ticker:<that ticker>`; else the primary id's exclusion,
+  the CIK itself; else the CIK's first security's; else `no_security`); (b)
+  `late_known`, the securities whose current listing at S, from the rows
+  known at `t` (`listing_ends_as_of` at `t`), covers S (listed; or ended on
+  or after S; or a transfer with no end yet) while none of their rows
+  covering S is visible to a read at `close(S)` (its latest revision known
+  by then exists and is not a retraction, #859): names the
+  store lists on S that no read at S could see, with their share of the
+  names listed on S (every exchange code, `NONE` and `OTC` included); (c)
+  the member count on S and, on the latest S only, the count of CIKs known
+  at `t` with a `snapshot` or `snapshot_static` listing on a
+  `universe.exchanges` exchange (the SEC's current list as the store holds
+  it: a cross-check, not an independent source) and the ratio of the two,
+  with no threshold. The rule `coverage_reference_names` is not in
+  `INTEGRITY_RULES` (each of those is emitted on every run, with no
+  skipped state): `HealthReport.failures` names it only when the block was
+  computed with `coverage.check_enabled` on and (a) is non-empty, so
+  `health --check` fails on it only while `check_enabled`; a block computed
+  on request with the switch off reports, and fails nothing. The block costs
+  one `universe_as_of` per sample session, so `health_report` computes it
+  only when asked (`health --coverage`, the page's button) or while
+  `check_enabled` is on; otherwise `coverage_reference` is `None`, "not
+  computed", never a pass.
+
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
 `HealthReport.ok` is true when every rule passes; `health --check` exits
@@ -173,9 +208,6 @@ derived at `t`, as the data is read.
   `master.transfer_window_sessions` of `effective_on`, the same grace a
   genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
   store.
-- `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
-  value (ADR 0006). `Settings` refuses any other value, so this fails only on
-  settings built around the guard.
 - `underived_master_rows` (#859): the stored `securities` and `listings` rows
   the latest master check finished by `t` (an EDGAR ingest chunk or a
   `master-retract --apply`) found the current rules no longer derive, and
@@ -229,9 +261,15 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
-from tradepartner.calendar import all_sessions, is_session, last_completed_session
+from tradepartner.calendar import (
+    all_sessions,
+    is_session,
+    last_completed_session,
+    last_session_of_month,
+    session_close,
+)
 from tradepartner.config import (
-    _GUARDED_EXCLUDE_SIC_RANGES,
+    ReferenceName,
     Settings,
     get_settings,
     parse_accepted_same_day_pair,
@@ -250,7 +288,11 @@ from tradepartner.store.delistings import (
 )
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
-from tradepartner.store.schema import STATEMENT_FACT_BASIS_VALUES, TABLE_PROVENANCE_VALUES
+from tradepartner.store.schema import (
+    STATEMENT_FACT_BASIS_VALUES,
+    TABLE_PROVENANCE_VALUES,
+    has_retracted,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import shares_as_of, universe_as_of
 
@@ -273,7 +315,6 @@ BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
-GUARDED_SIC_DEFAULT = "guarded_sic_default"
 UNDERIVED_MASTER_ROWS = "underived_master_rows"
 STATEMENT_PERIOD_DAYS = "statement_period_days"
 STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
@@ -282,6 +323,9 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+#: The coverage check's rule (#1541): reported from the `coverage_reference`
+#: block, never from `INTEGRITY_RULES` (module docstring).
+COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -293,7 +337,6 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
-    GUARDED_SIC_DEFAULT,
     UNDERIVED_MASTER_ROWS,
     STATEMENT_PERIOD_DAYS,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
@@ -340,7 +383,6 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "exchange": pl.Utf8,
     "effective_on": pl.Date,
 }
-_GUARD_SCHEMA: dict[str, Any] = {"setting": pl.Utf8, "value": pl.Utf8, "expected": pl.Utf8}
 _STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
     "cik": pl.Utf8,
     "fact_name": pl.Utf8,
@@ -590,6 +632,78 @@ class FilingEvents:
         )
 
 
+_REFERENCE_MISSING_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "cik": pl.Utf8,
+    "ticker": pl.Utf8,
+    "security_id": pl.Utf8,
+    "rule": pl.Int64,
+    "rule_name": pl.Utf8,
+    "reason": pl.Utf8,
+}
+_COVERAGE_SAMPLE_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "members": pl.Int64,
+    "references": pl.Int64,
+    "reference_missing": pl.Int64,
+    "listed": pl.Int64,
+    "late_known": pl.Int64,
+    "late_share": pl.Float64,
+}
+_LATE_KNOWN_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "exchange": pl.Utf8,
+    "valid_from": pl.Date,
+    "provenance": pl.Utf8,
+    "first_known_at": pl.Datetime("us", "UTC"),
+}
+#: The companies-snapshot provenances, the (c) cross-check's rows.
+_SNAPSHOT_PROVENANCES: frozenset[str] = frozenset({"snapshot", STATIC})
+
+
+@dataclass(frozen=True, eq=False)
+class CoverageReference:
+    """The coverage check against a named reference at `t` (#1541; module
+    docstring). `samples`: one row per sample session (member count,
+    reference names checked and missing, names listed and late-known, the
+    late share). `reference_missing`: one row per reference name missing on
+    a sample session, with the universe's exclusion for it. `late_known`: one
+    row per late-known security per sample session, with its current listing
+    at that session. `snapshot_ciks` and `member_ratio`: the latest sample's
+    cross-check against the companies snapshot (`member_ratio` is `None`
+    with no sample or no snapshot CIK). `check_enabled` is the setting the
+    block was computed under: only then does it fail `HealthReport.ok`."""
+
+    check_enabled: bool
+    samples: pl.DataFrame
+    reference_missing: pl.DataFrame
+    late_known: pl.DataFrame
+    snapshot_ciks: int
+    member_ratio: float | None
+
+    @property
+    def failed(self) -> bool:
+        """Whether a reference name is missing on some sample session."""
+        return not self.reference_missing.is_empty()
+
+    @property
+    def checked(self) -> bool:
+        """Whether some entry covered some sample session: with none, a block
+        with nothing missing checked nothing and is never a pass."""
+        return not self.samples.is_empty() and int(self.samples["references"].sum()) > 0
+
+    @property
+    def verdict(self) -> str:
+        """`pass`, `nothing checked`, `fail (<n>)` while `check_enabled`, or
+        `<n> missing (report-only)`: the one wording the CLI and page share."""
+        missing = self.reference_missing.height
+        if self.failed:
+            return f"fail ({missing})" if self.check_enabled else f"{missing} missing (report-only)"
+        return "pass" if self.checked else "nothing checked"
+
+
 @dataclass(frozen=True, eq=False)
 class IntegrityCheck:
     """One integrity rule: passed when `violations` is empty."""
@@ -624,15 +738,23 @@ class HealthReport:
     statement: StatementFacts
     filing_events: FilingEvents
     integrity: tuple[IntegrityCheck, ...]
+    #: `None` when the block was not computed ("not computed", never a pass).
+    coverage_reference: CoverageReference | None = None
 
     @property
     def failures(self) -> tuple[str, ...]:
-        """The failing integrity rules, in `INTEGRITY_RULES` order."""
-        return tuple(check.rule for check in self.integrity if not check.passed)
+        """The failing integrity rules, in `INTEGRITY_RULES` order, then
+        `coverage_reference_names` when the block was computed with
+        `coverage.check_enabled` on and a reference name is missing."""
+        failed = tuple(check.rule for check in self.integrity if not check.passed)
+        block = self.coverage_reference
+        if block is not None and block.check_enabled and block.failed:
+            failed += (COVERAGE_REFERENCE_NAMES,)
+        return failed
 
     @property
     def ok(self) -> bool:
-        """True when every integrity rule passes."""
+        """True when nothing in `failures` fails."""
         return not self.failures
 
 
@@ -642,12 +764,15 @@ def health_report(
     settings: Settings | None = None,
     *,
     jumps_before: date | None = None,
+    with_coverage_reference: bool | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
     ends, securities and classifications are read once and shared.
     `jumps_before` limits the price-jump list to sessions before it, and the
-    shares-outlier list to `as_of_date`s before it."""
+    shares-outlier list to `as_of_date`s before it. `with_coverage_reference`
+    computes the `coverage_reference` block when true, never when false, and
+    when `None` (the default) only while `coverage.check_enabled` is on."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -678,6 +803,15 @@ def health_report(
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps),
+        coverage_reference=(
+            _coverage_reference(conn, t, settings, listings)
+            if (
+                settings.coverage.check_enabled
+                if with_coverage_reference is None
+                else with_coverage_reference
+            )
+            else None
+        ),
     )
 
 
@@ -855,6 +989,243 @@ def _filing_events_report(
         enabled=settings.edgar.filing_events_enabled,
         per_form=pl.DataFrame(rows, schema=_EVENT_FORM_SCHEMA),
         counts=filing_event_counts(message),
+    )
+
+
+def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date, ...]:
+    """The coverage check's sample sessions at `t` (#1541): the last XNYS
+    session of each `coverage.sample_months` month, from
+    `coverage.sample_from` (or the calendar's first session, if later) to the
+    last session completed at `t`, ascending."""
+    t = _validate_t(t)
+    cfg = (settings if settings is not None else get_settings()).coverage
+    last = last_completed_session(t)
+    out: list[date] = []
+    first = max(cfg.sample_from, all_sessions()[0])  # never before the calendar
+    year, month = first.year, first.month
+    while (year, month) <= (last.year, last.month):
+        if month in cfg.sample_months:
+            session = last_session_of_month(year, month)
+            if first <= session <= last:
+                out.append(session)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return tuple(out)
+
+
+def coverage_reference(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> CoverageReference:
+    """The coverage check against the named reference at `t` (#1541; module
+    docstring), computed whatever `coverage.check_enabled` says: one
+    `universe_as_of` per sample session, so callers ask for it on demand."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    return _coverage_reference(conn, t, settings, listing_ends_as_of(conn, t, settings))
+
+
+def _covers(row: dict[str, Any], session: date) -> bool:
+    """Whether a `listing_ends_as_of` row covers `session`: it starts on or
+    before it and is not ended before it (listed; a transfer with no end
+    yet; or an end on or after `session`)."""
+    if row["valid_from"] > session:
+        return False
+    if row["status"] == LISTED:
+        return True
+    end = row["end_session"]
+    if end is None:
+        return bool(row["status"] == TRANSFERRED)
+    return bool(end >= session)
+
+
+_ListingKey = tuple[str, str, str, date]
+
+
+def _revisions(
+    conn: duckdb.DuckDBPyConnection, t: datetime
+) -> dict[_ListingKey, list[tuple[datetime, bool]]]:
+    """Per listing key, every revision known at `t` as `(known_at, live)`,
+    oldest first (`live` false for a retraction, #859)."""
+    live = "NOT retracted" if has_retracted(conn, "listings") else "TRUE"
+    rows = conn.execute(
+        f"""
+        SELECT security_id, ticker, exchange, valid_from, known_at, {live}
+        FROM listings WHERE known_at <= ?
+        ORDER BY known_at
+        """,
+        [t],
+    ).fetchall()
+    out: dict[_ListingKey, list[tuple[datetime, bool]]] = defaultdict(list)
+    for sid, ticker, exchange, start, at, is_live in rows:
+        out[(sid, ticker, exchange, start)].append((at, bool(is_live)))
+    return out
+
+
+def _visible_at(revisions: list[tuple[datetime, bool]], close: datetime) -> bool:
+    """Whether a read at `close` sees the key: its latest revision known by
+    then exists and is not a retraction (`_latest_as_of`'s rule)."""
+    index = bisect_right([at for at, _ in revisions], close)
+    return index > 0 and revisions[index - 1][1]
+
+
+def _same_ticker(stored: str, reference: str) -> bool:
+    """A stored ticker is a reference entry's: equal, or one Alpaca symbol
+    under two filer spellings (`BRK-B`, `BRK.B`)."""
+    return stored.strip().upper() == reference or same_alpaca_symbol(stored, reference)
+
+
+def _reference_exclusion(
+    ref: ReferenceName,
+    session: date,
+    members: pl.DataFrame,
+    exclusions: dict[str, dict[str, Any]],
+    cik_of: dict[str, str],
+    rows_by_sid: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """`None` when `ref` is a member on `session` (its CIK under its ticker,
+    compared as Alpaca symbols), else its `reference_missing` row: the
+    exclusion of the CIK's security whose listing rows (known at `t`, started
+    by `session`) carry the ticker; else, when the CIK is a member under
+    another ticker, that ticker (rule null); else the exclusion of the
+    primary id (the CIK itself); else of the CIK's first security; else
+    `no_security` (no `securities` row for the CIK at the session's close)."""
+    tickers = members.filter(pl.col("cik") == ref.cik)["ticker"].to_list()
+    if any(_same_ticker(ticker, ref.ticker) for ticker in tickers):
+        return None
+    candidates = sorted(sid for sid in exclusions if cik_of.get(sid) == ref.cik)
+    matched = [
+        sid
+        for sid in candidates
+        if any(
+            row["valid_from"] <= session and _same_ticker(row["ticker"], ref.ticker)
+            for row in rows_by_sid.get(sid, [])
+        )
+    ]
+    base = {"session": session, "cik": ref.cik, "ticker": ref.ticker}
+    excluded = matched[0] if matched else None
+    if excluded is None and tickers:
+        return {
+            **base,
+            "security_id": None,
+            "rule": None,
+            "rule_name": None,
+            "reason": "ticker:" + ",".join(sorted(tickers)),
+        }
+    if excluded is None and ref.cik in candidates:
+        excluded = ref.cik
+    if excluded is None and candidates:
+        excluded = candidates[0]
+    if excluded is None:
+        return {
+            **base,
+            "security_id": None,
+            "rule": None,
+            "rule_name": None,
+            "reason": "no_security",
+        }
+    found = exclusions[excluded]
+    return {
+        **base,
+        "security_id": excluded,
+        "rule": found["rule"],
+        "rule_name": found["rule_name"],
+        "reason": found["reason"],
+    }
+
+
+def _coverage_reference(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+) -> CoverageReference:
+    refs = settings.coverage.references()
+    cik_of = {
+        r["security_id"]: r["cik"]
+        for r in securities_as_of(conn, t).select("security_id", "cik").iter_rows(named=True)
+    }
+    rows_by_sid: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in listings.iter_rows(named=True):
+        rows_by_sid[row["security_id"]].append(row)
+    revisions = _revisions(conn, t)
+
+    def history(row: dict[str, Any]) -> list[tuple[datetime, bool]]:
+        return revisions.get(
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"]), []
+        )
+
+    def known_by(row: dict[str, Any]) -> datetime | None:
+        return next((at for at, is_live in history(row) if is_live), None)
+
+    samples: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    late: list[dict[str, Any]] = []
+    for session in sample_sessions(t, settings):
+        close = session_close(session)
+        universe = universe_as_of(conn, close, settings)
+        exclusions = {r["security_id"]: r for r in universe.exclusions.iter_rows(named=True)}
+        checked = [ref for ref in refs if ref.covers(session)]
+        found = [
+            entry
+            for ref in checked
+            if (
+                entry := _reference_exclusion(
+                    ref, session, universe.members, exclusions, cik_of, rows_by_sid
+                )
+            )
+            is not None
+        ]
+        missing.extend(found)
+        current = _current_from(listings, session)
+        listed = sorted(sid for sid, row in current.items() if _covers(row, session))
+        late_here = 0
+        for sid in listed:
+            seen = (
+                _visible_at(history(row), close)
+                for row in rows_by_sid[sid]
+                if _covers(row, session)
+            )
+            if not any(seen):
+                head = current[sid]
+                late_here += 1
+                late.append(
+                    {
+                        "session": session,
+                        "security_id": sid,
+                        "ticker": head["ticker"],
+                        "exchange": head["exchange"],
+                        "valid_from": head["valid_from"],
+                        "provenance": head["provenance"],
+                        "first_known_at": known_by(head),
+                    }
+                )
+        samples.append(
+            {
+                "session": session,
+                "members": universe.members.height,
+                "references": len(checked),
+                "reference_missing": len(found),
+                "listed": len(listed),
+                "late_known": late_here,
+                "late_share": late_here / len(listed) if listed else 0.0,
+            }
+        )
+    exchanges = set(settings.universe.exchanges)
+    snapshot_ciks = len(
+        {
+            cik_of[row["security_id"]]
+            for row in listings.iter_rows(named=True)
+            if row["provenance"] in _SNAPSHOT_PROVENANCES
+            and row["exchange"] in exchanges
+            and row["security_id"] in cik_of
+        }
+    )
+    latest_members = samples[-1]["members"] if samples else None
+    return CoverageReference(
+        check_enabled=settings.coverage.check_enabled,
+        samples=pl.DataFrame(samples, schema=_COVERAGE_SAMPLE_SCHEMA),
+        reference_missing=pl.DataFrame(missing, schema=_REFERENCE_MISSING_SCHEMA),
+        late_known=pl.DataFrame(late, schema=_LATE_KNOWN_SCHEMA),
+        snapshot_ciks=snapshot_ciks,
+        member_ratio=(
+            latest_members / snapshot_ciks if latest_members is not None and snapshot_ciks else None
+        ),
     )
 
 
@@ -1194,7 +1565,6 @@ def _integrity_checks(
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
-        GUARDED_SIC_DEFAULT: _guarded_sic(settings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
         STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
@@ -1518,20 +1888,6 @@ def _bars_after_delisting(
         )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
-
-
-def _guarded_sic(settings: Settings) -> pl.DataFrame:
-    actual = tuple(tuple(r) for r in settings.universe.exclude_sic_ranges)
-    rows: list[dict[str, Any]] = []
-    if actual != _GUARDED_EXCLUDE_SIC_RANGES:
-        rows.append(
-            {
-                "setting": "universe.exclude_sic_ranges",
-                "value": repr(actual),
-                "expected": repr(_GUARDED_EXCLUDE_SIC_RANGES),
-            }
-        )
-    return pl.DataFrame(rows, schema=_GUARD_SCHEMA)
 
 
 def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:

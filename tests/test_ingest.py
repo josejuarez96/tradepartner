@@ -85,7 +85,7 @@ from tradepartner.store.asof import (
     prices_as_of,
     statement_facts_as_of,
 )
-from tradepartner.store.classify import build_classifications
+from tradepartner.store.classify import build_classifications, classifications_as_of
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import build_master
 from tradepartner.store.schema import init_schema
@@ -525,6 +525,24 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
         "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
+    )
+    assert counts in message
+
+
+def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: Settings) -> None:
+    """#1541 (T178): listings whose exchange-axis member names another venue
+    than their value are kept and counted on the run row, FSN and per
+    document, beside the incomplete listings."""
+
+    class Mismatched(FixtureFilingSource):
+        cover_incomplete_listings = 6
+        fsn_exchange_axis_mismatch = 7
+        cover_exchange_axis_mismatch = 8
+
+    message = _run(settings, filings=_filings(cls=Mismatched), source="edgar").runs[0].message
+    counts = (
+        "; cover incomplete listings: 6; FSN exchange-axis mismatches: 7; "
+        "cover exchange-axis mismatches: 8; missing"
     )
     assert counts in message
 
@@ -3268,3 +3286,194 @@ def test_a_plain_ingest_of_a_moved_stamp_keeps_the_row_at_the_old_known_at(
 def test_a_restamp_needs_the_edgar_source(settings: Settings) -> None:
     with pytest.raises(ValueError, match="restamp needs the edgar source"):
         _run(settings, source="all", restamp=[])
+
+
+# --- The classification rebuild (#1541, plan T182) ---
+
+_CLASS_SQL = (
+    "SELECT security_id, sic, security_type, rule, known_at "
+    "FROM classifications ORDER BY security_id, known_at, rule"
+)
+
+
+def _stale_acme_row(settings: Settings, known_at: datetime) -> None:
+    """A stored classification an older rule set wrote for ACME at its
+    first-knowable instant: `unclassifiable`, as `title_unrecognized` was."""
+    with open_for_write(settings) as conn:
+        conn.execute("DELETE FROM classifications WHERE security_id = ?", [ACME])
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": ACME,
+                "sic": None,
+                "security_type": "unclassifiable",
+                "rule": "title_unrecognized",
+                "known_at": known_at,
+                "ingested_at": known_at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+
+
+def _acme_first_known(read: Callable[[str], list[tuple[Any, ...]]]) -> datetime:
+    return read(f"SELECT min(known_at) FROM securities WHERE security_id = '{ACME}'")[0][0]
+
+
+def test_a_plain_reingest_keeps_a_stale_classification_and_the_rebuild_replaces_it(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The reason for the flag: a re-derive adds at the run, so the as-of read
+    before it still says `unclassifiable`; the rebuild restores the build's
+    rows at their own `known_at`, never at the run."""
+    assert _run(settings, source="edgar").ok
+    built = read(_CLASS_SQL)
+    first = _acme_first_known(read)
+    _stale_acme_row(settings, first)
+    later = NOW + timedelta(days=3)
+
+    assert _run(settings, source="edgar", now=later).ok
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        stale = classifications_as_of(conn, first, [ACME])["security_type"].to_list()
+    assert stale == ["unclassifiable"]  # forward-only without the rebuild
+
+    stored = read("SELECT count(*) FROM classifications")[0][0]
+    result = _run(settings, source="edgar", now=later, rebuild_classifications=True)
+    (run,) = result.runs
+    assert run.status == OK and f"classifications_deleted: {stored}" in run.message
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        fixed = classifications_as_of(conn, first, [ACME])["security_type"].to_list()
+    assert fixed == ["common"]
+    assert read(_CLASS_SQL) == built  # the build's rows, stamps unchanged
+    assert read(
+        f"SELECT count(*) FROM classifications WHERE known_at = TIMESTAMPTZ '{later.isoformat()}'"
+    ) == [(0,)]
+
+
+def test_a_rebuild_with_unchanged_rules_leaves_every_as_of_read_identical(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    before = read(_CLASS_SQL)
+    assert before
+    instants = sorted({r[4] for r in before} | {NOW})
+    probes = [t + d for t in instants for d in (timedelta(microseconds=-1), timedelta(0))]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        reads = [classifications_as_of(conn, t).drop("ingested_at").rows() for t in probes]
+    assert _run(
+        settings, source="edgar", now=NOW + timedelta(days=2), rebuild_classifications=True
+    ).ok
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert [classifications_as_of(conn, t).drop("ingested_at").rows() for t in probes] == reads
+    assert read(_CLASS_SQL) == before
+
+
+def test_the_rebuild_leaves_the_classifications_of_ciks_it_does_not_cover(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    other = datetime(2019, 1, 2, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": "0000555555",
+                "sic": None,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": other,
+                "ingested_at": other,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    assert _run(settings, source="edgar", rebuild_classifications=True).ok
+    assert read("SELECT count(*) FROM classifications WHERE security_id = '0000555555'") == [(1,)]
+
+
+def test_a_dry_run_rebuild_deletes_nothing(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    _stale_acme_row(settings, _acme_first_known(read))
+    stored = read(_CLASS_SQL)
+    assert _run(settings, source="edgar", dry_run=True, rebuild_classifications=True).ok
+    assert read(_CLASS_SQL) == stored
+
+
+def test_the_classification_rebuild_needs_the_edgar_source(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    stored = read(_CLASS_SQL)
+    with pytest.raises(ValueError, match="rebuild_classifications needs the edgar source"):
+        _run(settings, source="alpaca", rebuild_classifications=True)
+    assert read(_CLASS_SQL) == stored
+
+
+def _plant_classification(settings: Settings, security_id: str, at: datetime) -> None:
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": security_id,
+                "sic": None,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": at,
+                "ingested_at": at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+
+
+def test_the_rebuild_keeps_a_stored_security_the_build_does_not_derive(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """An owner-kept successor (#922) is a stored security of a covered CIK
+    that the build no longer derives: nothing would write its rows back."""
+    assert _run(settings, source="edgar").ok
+    at = datetime(2019, 1, 2, tzinfo=UTC)
+    successor = f"{ACME}@2018-01-01"
+    with open_for_write(settings) as conn:
+        insert_row(conn, "securities", {**_security("Old Acme", at, at), "security_id": successor})
+    _plant_classification(settings, successor, at)
+    assert _run(settings, source="edgar", rebuild_classifications=True).ok
+    assert read(f"SELECT count(*) FROM classifications WHERE security_id = '{successor}'") == [(1,)]
+
+
+class _QuarantinedAcme(FixtureFilingSource):
+    """A fixture source that reports ACME's filings as quarantined this run."""
+
+    def __init__(self, base: FixtureFilingSource) -> None:
+        super().__init__(
+            index=base._index,
+            snapshot=base._snapshot,
+            facts=base._facts,
+            headers=base._headers,
+            cover_pages=base._cover_pages,
+            delistings=base._delistings,
+        )
+        self._quarantined_this_run = {e.accession for e in base._index if e.cik == ACME}
+
+
+def test_the_rebuild_holds_a_cik_whose_filings_failed_this_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    _stale_acme_row(settings, _acme_first_known(read))
+    stored = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
+    assert stored
+    result = _run(
+        settings,
+        filings=_QuarantinedAcme(_filings()),
+        source="edgar",
+        rebuild_classifications=True,
+    )
+    assert result.ok
+    after = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
+    assert all(row in after for row in stored)  # nothing deleted; the plain add may add

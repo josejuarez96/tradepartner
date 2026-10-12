@@ -549,7 +549,7 @@ def test_bool_axis_is_never_lattice_checked(tmp_path: Path) -> None:
     [
         (
             "count_share_threshold = 0.05",
-            "count_share_threshold = 0.05\n\n[universe]\nexclude_sic_ranges = [[1, 2]]",
+            "count_share_threshold = 0.05\n\n[universe]\nexclude_sic_ranges = [[2, 1]]",
             "fixed block",
         ),
         ("end = 2025-12-31", "end = 2023-01-02", "fixed block"),
