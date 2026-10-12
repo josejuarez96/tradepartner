@@ -785,6 +785,25 @@ def test_health_check_exits_non_zero_naming_the_failed_rule(
     assert "bars_on_sessions" in checked.output
 
 
+def test_health_check_fails_naming_the_missing_session(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1575, #1550 part c: a mid-window session with no bars at all is named
+    with its row count, `health` reports it and `--check` fails on it."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    missing = date(2020, 2, 14)
+    with open_for_write(settings) as conn:
+        conn.execute("DELETE FROM prices_daily WHERE session = ?", [missing])
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    assert "session holes: 1 in the universe history window" in plain.output
+    assert "  2020-02-14: 0 rows (previous 2020-02-13: 19)" in plain.output
+    checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 1, checked.output
+    assert "health check failed: session_holes" in checked.output
+    assert "  session_holes: FAIL (1 rows)" in checked.output
+
+
 def test_health_prints_the_price_jump_review_list(tmp_path: Path, fixture_store_path: Path) -> None:
     """#787: an unexplained jump is listed for the owner; it is no integrity failure."""
     settings = _settings(tmp_path, store=fixture_store_path)

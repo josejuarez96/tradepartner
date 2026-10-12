@@ -204,6 +204,23 @@ derived at `t`, as the data is read.
   restate them for a store built by other code. Narrowing `edgar.event_forms`
   fails `filing_events_form_allowed` on the stored rows of a dropped form
   until a `rebuild_filing_events`.
+- `session_holes` (#1575, #1550 part c): one row per XNYS session from the
+  first session of the `universe.min_history_months` window at `t`
+  (`calendar.sessions_in_month_window`, as the universe's own rule 6 reads
+  it) through the latest session the store holds rows for, whose
+  `prices_daily` rows known at `t` are below
+  `health.min_session_rows_share` of the previous session's row count. A
+  session with no row at all is a hole whatever the share says; the default
+  share `0.0` therefore reports an empty session and nothing else, since the
+  bar count moves with listings and delistings and only an empty session has
+  no such explanation. The previous session is the previous calendar
+  session, and a session before the store's first bar is not judged (nothing
+  was ever ingested for it). Sessions after the latest stored one are
+  staleness -- coverage and the ingest checks already report it -- not
+  holes, so a store whose last ingest missed a day passes here and fails
+  there. This is the check that catches a one-day ingest outage the universe
+  would otherwise turn into an empty universe: rule 6 requires a bar on
+  every session of that window, so one missing session fails every name.
 
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
@@ -229,7 +246,13 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
-from tradepartner.calendar import all_sessions, is_session, last_completed_session
+from tradepartner.calendar import (
+    all_sessions,
+    is_session,
+    last_completed_session,
+    previous_session,
+    sessions_in_month_window,
+)
 from tradepartner.config import (
     _GUARDED_EXCLUDE_SIC_RANGES,
     Settings,
@@ -282,6 +305,10 @@ FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT = "filing_events_known_at_is_accepted_at"
 FILING_EVENTS_FORM_ALLOWED = "filing_events_form_allowed"
 FILING_EVENTS_ITEMS_NOT_NULL = "filing_events_items_not_null"
 FILING_EVENTS_UNIQUE = "filing_events_unique"
+#: The session-hole rule (#1575): an XNYS session in the universe history
+#: window whose `prices_daily` row count is below
+#: `health.min_session_rows_share` of the previous session's.
+SESSION_HOLES = "session_holes"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -302,6 +329,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
+    SESSION_HOLES,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -316,6 +344,14 @@ _FACT_TABLES: tuple[str, ...] = tuple(TABLE_PROVENANCE_VALUES)
 _TABLE_COUNT_SCHEMA: dict[str, Any] = {"table": pl.Utf8, "rows": pl.Int64}
 _PROVENANCE_SCHEMA: dict[str, Any] = {"table": pl.Utf8, "provenance": pl.Utf8, "rows": pl.Int64}
 _SESSION_SCHEMA: dict[str, Any] = {"session": pl.Date, "rows": pl.Int64}
+#: `session_holes` (#1575): the hole, the row count that makes it one, and the
+#: session it is measured against with its count.
+_SESSION_HOLE_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "rows": pl.Int64,
+    "previous_session": pl.Date,
+    "previous_rows": pl.Int64,
+}
 _DUPLICATE_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "session": pl.Date,
@@ -1200,6 +1236,7 @@ def _integrity_checks(
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
+        SESSION_HOLES: _session_holes(conn, t, settings),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -1270,6 +1307,58 @@ def _duplicate_bars(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
         {"security_id": sid, "session": s, "known_at": k, "rows": int(n)} for sid, s, k, n in found
     ]
     return pl.DataFrame(rows, schema=_DUPLICATE_SCHEMA)
+
+
+def _session_holes(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> pl.DataFrame:
+    """#1575, #1550 part c: one row per session hole, ascending (module
+    docstring). Rows are counted per session from `prices_daily` known at
+    `t` over the history window's own range, then compared with the
+    previous calendar session's count in Python, where the threshold and
+    the window bounds are visible."""
+    if "prices_daily" not in _present_tables(conn):
+        return pl.DataFrame([], schema=_SESSION_HOLE_SCHEMA)
+    session = last_completed_session(t)
+    window = sessions_in_month_window(session, settings.universe.min_history_months)
+    if not window:
+        return pl.DataFrame([], schema=_SESSION_HOLE_SCHEMA)
+    # The window's own first session is judged against its predecessor when
+    # the store holds it, so one row before the window starts is read too.
+    start = previous_session(window[0])
+    found = conn.execute(
+        """
+        SELECT session, count(*) FROM prices_daily
+        WHERE known_at <= ? AND session <= ? AND session >= ?
+        GROUP BY session ORDER BY session
+        """,
+        [t, session, start],
+    ).fetchall()
+    if not found:
+        return pl.DataFrame([], schema=_SESSION_HOLE_SCHEMA)
+    counts = {day: int(n) for day, n in found}
+    first, latest = min(counts), max(counts)
+    share = settings.health.min_session_rows_share
+    holes: list[dict[str, Any]] = []
+    for day in window:
+        if day < first or day > latest:
+            # Before the store's first bar (nothing was ingested for it), or
+            # after the latest stored session: staleness, not a hole.
+            continue
+        rows = counts.get(day, 0)
+        before = previous_session(day)
+        earlier = counts.get(before, 0)
+        if rows and rows >= share * earlier:
+            continue
+        holes.append(
+            {
+                "session": day,
+                "rows": rows,
+                "previous_session": before,
+                "previous_rows": earlier,
+            }
+        )
+    return pl.DataFrame(holes, schema=_SESSION_HOLE_SCHEMA)
 
 
 def _by_security(listings: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:

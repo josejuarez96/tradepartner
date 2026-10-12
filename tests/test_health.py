@@ -43,6 +43,7 @@ from tradepartner.health import (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     PROVENANCE_ALLOWED,
+    SESSION_HOLES,
     SOURCE_NOT_NULL,
     STATEMENT_BASIS_ALLOWED,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
@@ -681,6 +682,127 @@ def test_duplicate_bar_fails_its_rule(loose_store: duckdb.DuckDBPyConnection) ->
     check = next(c for c in checks if c.rule == NO_DUPLICATE_BARS)
     [row] = check.violations.to_dicts()
     assert (row["security_id"], row["session"], row["rows"]) == ("SEC_DUAL_A", date(2019, 1, 2), 2)
+
+
+# --- session holes (#1575, #1550 part c) ------------------------------------
+
+#: A mid-window XNYS session with the fixture's full bar count (19 names are
+#: live then), the one the 2026-10-08 outage stood for: no bars at all.
+HOLE_SESSION = date(2020, 2, 14)
+BEFORE_HOLE_SESSION = date(2020, 2, 13)
+BARS_PER_SESSION = 19
+
+
+def _rows_on(conn: duckdb.DuckDBPyConnection, session: date) -> int:
+    """How many `prices_daily` rows the fixture store holds for `session`."""
+    return int(
+        conn.execute("SELECT count(*) FROM prices_daily WHERE session = ?", [session]).fetchone()[0]
+    )
+
+
+def _holes(report: HealthReport) -> Any:
+    """The `session_holes` check of a report; `StopIteration` when the rule is
+    not reported at all, so a test that asks for it cannot pass silently on a
+    build without it."""
+    return next(c for c in report.integrity if c.rule == SESSION_HOLES)
+
+
+def test_a_mid_window_session_with_no_bars_fails_session_holes(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """#1575's failing test: the 2026-10-08 outage (one session, no bars at
+    all) empties the universe through rule 6, so `health` names the session
+    and its row count and `--check` fails on it."""
+    fixture_store.execute("DELETE FROM prices_daily WHERE session = ?", [HOLE_SESSION])
+    report = health_report(fixture_store, T_END, settings)
+    assert report.failures == (SESSION_HOLES,)
+    check = next(c for c in report.integrity if c.rule == SESSION_HOLES)
+    assert check.violations.to_dicts() == [
+        {
+            "session": HOLE_SESSION,
+            "rows": 0,
+            "previous_session": BEFORE_HOLE_SESSION,
+            "previous_rows": BARS_PER_SESSION,
+        }
+    ]
+
+
+def test_session_holes_passes_on_a_full_store(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Every session of the window holds its bars, and the bar count moves
+    with listings and delistings, so the rule passes on the untouched fixture
+    store at the default share and at a share well above the moves it makes."""
+    for share in (0.0, 0.75):
+        tightened = _settings(health={"min_session_rows_share": share})
+        report = health_report(fixture_store, T_END, tightened)
+        assert report.failures == (), share
+        assert report.ok
+        assert _holes(report).passed, share
+    assert BARS_PER_SESSION > 0
+
+
+def test_a_half_filled_session_below_the_share_fails_session_holes(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A session that holds fewer rows than the configured share of the
+    previous session's is a hole at that share and not at the default, which
+    reports an empty session only."""
+    kept = BARS_PER_SESSION // 2
+    fixture_store.execute(
+        "DELETE FROM prices_daily WHERE session = ? AND security_id NOT IN "
+        "(SELECT security_id FROM prices_daily WHERE session = ? ORDER BY security_id LIMIT ?)",
+        [HOLE_SESSION, HOLE_SESSION, kept],
+    )
+    assert _rows_on(fixture_store, HOLE_SESSION) == kept
+    report = health_report(fixture_store, T_END, settings)
+    assert SESSION_HOLES not in report.failures
+    tightened = _settings(health={"min_session_rows_share": 0.75})
+    report = health_report(fixture_store, T_END, tightened)
+    assert report.failures == (SESSION_HOLES,)
+    assert next(c for c in report.integrity if c.rule == SESSION_HOLES).violations.to_dicts() == [
+        {
+            "session": HOLE_SESSION,
+            "rows": kept,
+            "previous_session": BEFORE_HOLE_SESSION,
+            "previous_rows": BARS_PER_SESSION,
+        }
+    ]
+
+
+def test_a_session_after_the_latest_stored_one_is_staleness_not_a_hole(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A store whose ingest stopped two sessions early is stale, which
+    coverage and the ingest checks report; the sessions after the latest
+    stored one are not session holes."""
+    fixture_store.execute("DELETE FROM prices_daily WHERE session > ?", [date(2020, 6, 26)])
+    report = health_report(fixture_store, T_END, settings)
+    assert SESSION_HOLES not in report.failures
+    assert _holes(report).passed
+    assert report.coverage.missing, "coverage, not the hole rule, reports the tail"
+
+
+def test_the_hole_window_comes_from_universe_min_history_months(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """The window is `universe.min_history_months` from config: a hole far
+    outside a one-month window is not reported, and one inside it is."""
+    fixture_store.execute("DELETE FROM prices_daily WHERE session = ?", [date(2019, 8, 1)])
+    assert _rows_on(fixture_store, date(2019, 8, 1)) == 0
+    narrow = _settings(universe={"min_history_months": 1})
+    assert SESSION_HOLES not in health_report(fixture_store, T_END, narrow).failures
+    assert health_report(fixture_store, T_END, settings).failures == (SESSION_HOLES,)
+
+
+def test_session_holes_passes_on_a_store_with_no_bars_at_all(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """A store with no bar has no session to compare: nothing is a hole
+    (every other rule and coverage report the empty store)."""
+    fixture_store.execute("DELETE FROM prices_daily")
+    report = health_report(fixture_store, T_END, settings)
+    assert _holes(report).passed
 
 
 def test_overlapping_listing_fails_its_rule(fixture_store: duckdb.DuckDBPyConnection) -> None:

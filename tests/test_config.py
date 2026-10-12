@@ -2093,3 +2093,23 @@ def test_research_claude_https_and_thinking_validation() -> None:
         with pytest.raises(ValidationError) as raised:
             ResearchClaudeConfig(**value)
         assert raised.value.errors()[0]["loc"] == (field,)
+
+
+# --- the health section's session-hole share (#1575, #1550 part c) ----------
+
+
+def test_min_session_rows_share_defaults_to_an_empty_session_only() -> None:
+    """The default `0.0` reports a session with no row at all and nothing
+    else: the bar count moves with listings and delistings."""
+    assert _settings().health.min_session_rows_share == 0.0
+
+
+@pytest.mark.parametrize("share", [-0.1, 1.1, float("nan"), float("inf")])
+def test_min_session_rows_share_stays_a_share(share: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, health={"min_session_rows_share": share})
+
+
+def test_health_section_refuses_an_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, health={"min_session_rows": 0.5})
