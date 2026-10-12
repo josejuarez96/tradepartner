@@ -497,14 +497,20 @@ def build_classifications(
         sid: _listing_timeline(rows_, title_fallback) for sid, rows_ in listings.items()
     }
     siblings: dict[str, list[str]] = defaultdict(list)
+    sibling_known: dict[str, datetime] = {}
     for security in securities:
         if not security["benchmark"]:
             siblings[security["cik"]].append(security["security_id"])
+            sibling_known[security["security_id"]] = security["known_at"]
 
     def sibling_common(security: Row, t: datetime) -> bool:
         """Another class of the CIK is titled common at `t` (rule 8's stop)."""
         for other in siblings[security["cik"]]:
-            if other == security["security_id"] or other not in timelines_by_security:
+            if (
+                other == security["security_id"]
+                or other not in timelines_by_security
+                or sibling_known[other] > t  # not yet in the store at `t`
+            ):
                 continue
             stamps_, states_ = timelines_by_security[other]
             i = bisect_right(stamps_, t)
@@ -540,6 +546,8 @@ def build_classifications(
             for other in siblings[security["cik"]]:
                 if other != security_id and other in timelines_by_security:
                     changes |= {stamp for stamp in timelines_by_security[other][0] if stamp > start}
+                    if sibling_known[other] > start:
+                        changes.add(sibling_known[other])
         previous: tuple[str, str, int | None] | None = None
         for t in sorted({start} | changes):
             i = bisect_right(listing_stamps, t)

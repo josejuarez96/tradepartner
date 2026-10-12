@@ -743,11 +743,6 @@ class TestTitleFallback:
             == _build().classifications
         )
 
-    def test_no_look_ahead_a_build_known_at_t_agrees(self) -> None:
-        on, _ = _fallback_build(True)
-        for row in on.classifications:
-            assert row["known_at"] <= INGESTED_AT
-
 
 SHOCK = "0000000301"
 

@@ -399,11 +399,12 @@ def test_the_fast_build_matches_the_reference_on_a_mid_sized_company() -> None:
     assert actual.classifications == expected.classifications
 
 
+@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("seed", [564, 7])
-def test_rows_known_by_t_ignore_evidence_known_after_t(seed: int) -> None:
+def test_rows_known_by_t_ignore_evidence_known_after_t(seed: int, fallback: bool) -> None:
     """No look-ahead: the rows with `known_at <= t` built from evidence known by
     `t` equal those built from all evidence, for every evidence instant `t`."""
-    settings = _settings()
+    settings = Settings(_env_file=None, edgar={"title_fallback": fallback})  # type: ignore[call-arg, arg-type]
     source, master = _scenario(seed, companies=40)
     full = build_classifications(source, master, settings, ingested_at=INGESTED_AT)
     stamps = sorted(
