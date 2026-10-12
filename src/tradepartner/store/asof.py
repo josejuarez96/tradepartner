@@ -62,6 +62,17 @@ plain `date` fails `isinstance(t, datetime)`) with `TypeError`, then hands
 a genuine `datetime` to `tradepartner.timeutil.ensure_tz_aware_utc`, which
 raises `ValueError` if it is naive and otherwise normalizes it to UTC.
 
+**`borrow_status_as_of` is keyed by the asset, not the symbol, and its
+observation is a run row.** `borrow_status` (amendment 2026-10-11, #1506,
+ADR 0021) has no `security_id`: a symbol may belong to several Alpaca
+`us_equity` assets, so the latest row is picked per `asset_id` and only then
+filtered by `symbols` -- filtering first would let a renamed asset return
+its stale pre-rename row under its old symbol. The status's *observation*
+is read from `ingestion_runs` (`ASSETS_SOURCE`), because rows record change
+only: on a day nothing changed no row is written, yet the day was observed.
+`present = FALSE` on an asset's latest row means the snapshot at `t` lacked
+it, so it reads as absent rather than as its last known flags.
+
 **`listings_as_of` and issue #35 (owner decision: strict `known_at`).**
 Spec req 8 says, literally, "All [as-of functions] take tz-aware T and
 return only rows with `known_at <= T`" -- with no carve-out for any
@@ -222,7 +233,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -285,6 +296,35 @@ _EXCHANGE_TZ = ZoneInfo("America/New_York")
 #: Name of the temporary view `_sessions_registered` exposes the XNYS
 #: sessions under, for a dividend's prior-close gap (#72).
 _SESSIONS_VIEW = "_asof_xnys_sessions"
+
+#: The ingest source whose `ingestion_runs` rows record a borrow snapshot's
+#: observation (spec Amendment 2026-10-11, #1506, ADR 0021 point 3: "rows
+#: record change; the run row records the observation"). T171c writes those
+#: rows; this module is their only reader. `dashboard/header.py`'s freshness
+#: reads exclude the same source so a snapshot never shows the store fresher
+#: than its bars.
+ASSETS_SOURCE: Final[str] = "alpaca_assets"
+
+#: The columns `borrow_status_as_of` returns, in order (spec Amendment
+#: 2026-10-11, #1506, "As-of read (T171b)"): every payload column the table
+#: stores plus `known_at` (the fetch that wrote the row) and `observed_at`
+#: (the last snapshot run at or before T). The bookkeeping columns
+#: `present`, `ingested_at`, `source` and `provenance` are left out: a row
+#: returned has already been checked as present, and the other three say how
+#: it got there, not what it says.
+_BORROW_STATUS_COLUMNS: tuple[str, ...] = (
+    "asset_id",
+    "symbol",
+    "exchange",
+    "status",
+    "tradable",
+    "marginable",
+    "shortable",
+    "easy_to_borrow",
+    "borrow_status",
+    "fractionable",
+    "known_at",
+)
 
 
 def _validate_t(t: datetime) -> datetime:
@@ -791,6 +831,95 @@ def filing_events_as_of(
         return conn.execute(sql, params).pl()
     finally:
         conn.unregister(_FILING_EVENT_SECURITIES_VIEW)
+
+
+def _latest_assets_observation(conn: duckdb.DuckDBPyConnection, t: datetime) -> datetime | None:
+    """The latest `ok` `ASSETS_SOURCE` run cursor at or before `t`, or None
+    when there is none (spec Amendment 2026-10-11, #1506, ADR 0021 point 3:
+    the observation is the run row, never the table's `MAX(known_at)`,
+    which on a quiet day lags the last snapshot).
+
+    The cursor is compared as a timestamp, not as a string: the writer
+    stores ISO-8601 UTC, and a lexical comparison of a differently-padded
+    value would silently order wrong. `TRY_CAST` rather than `CAST` so a
+    row with an unusable cursor is skipped rather than failing every read
+    -- its cursor could not have been written by this code path. A store
+    whose `ingestion_runs` table is absent (the look-ahead harness copies
+    fact tables only, `tests/lookahead/harness.py`) has no observation to
+    report and reads None.
+    """
+    tables = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    if "ingestion_runs" not in {name for (name,) in tables}:
+        return None
+    row = conn.execute(
+        "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
+        "WHERE source = ? AND status = 'ok' "
+        "AND TRY_CAST(chunk_cursor AS TIMESTAMPTZ) <= ?",
+        [ASSETS_SOURCE, t],
+    ).fetchone()
+    return None if row is None or row[0] is None else row[0]
+
+
+def borrow_status_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    symbols: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """The borrow status known at `t` (spec Amendment 2026-10-11, #1506,
+    ADR 0021; plan T171b), in `_BORROW_STATUS_COLUMNS` order, sorted by
+    `(symbol, asset_id)`.
+
+    Per `asset_id` the latest row with `known_at <= t` is chosen **first**,
+    dropped when that row has `present = FALSE` (the asset was missing from
+    the snapshot at `t`), and only then filtered by `symbols`: a renamed
+    asset's old symbol therefore returns nothing rather than its stale
+    pre-rename row, and a symbol several assets share returns several rows.
+    `symbols` matches the row's `symbol` exactly -- the symbol on its fetch
+    day, which is all the table stores -- with `None` for no filter and an
+    empty sequence for no rows. A bare `str` raises `TypeError`.
+
+    `observed_at` is the latest `ok` `ASSETS_SOURCE` run cursor at or before
+    `t` (`_latest_assets_observation`), the same value on every row, and
+    NULL when there is none: it says when the returned status was last
+    confirmed, which on a quiet day is later than any row's `known_at`.
+
+    `t` must be tz-aware (a bare date raises `TypeError`, a naive `datetime`
+    raises `ValueError`). On a store below schema version 24 the table does
+    not exist and the read raises (schema's version-24 note), as
+    `filing_events_as_of` does below its version 21.
+    """
+    t = _validate_t(t)
+    symbol_list = _string_list(symbols, name="symbols")
+    params: list[Any] = [t]
+    symbol_filter = ""
+    if symbol_list is not None:
+        # `list_contains` over an empty list is false for every row, which
+        # is the right answer for "restrict to no symbols"; a bare IN ()
+        # would be a syntax error.
+        symbol_filter = " AND list_contains(?::VARCHAR[], l.symbol)"
+        params.append(symbol_list)
+    columns = ", ".join(f"l.{column}" for column in _BORROW_STATUS_COLUMNS)
+    sql = f"""
+        SELECT {columns} FROM (
+            SELECT * EXCLUDE (_rn) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY asset_id ORDER BY known_at DESC
+                ) AS _rn
+                FROM borrow_status
+                WHERE known_at <= ?
+            )
+            WHERE _rn = 1 AND present
+        ) AS l
+        WHERE TRUE{symbol_filter}
+        ORDER BY l.symbol, l.asset_id
+    """
+    frame = conn.execute(sql, params).pl()
+    return frame.with_columns(
+        pl.lit(
+            _latest_assets_observation(conn, t),
+            dtype=pl.Datetime(time_unit="us", time_zone="UTC"),
+        ).alias("observed_at")
+    )
 
 
 def _adjusted_ctes(action_types: str, bars_filter: str, actions_filter: str) -> str:

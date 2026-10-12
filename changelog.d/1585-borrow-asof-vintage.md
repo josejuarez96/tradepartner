@@ -1,0 +1,6 @@
+- T171b (#1585): the borrow-status as-of read `borrow_status_as_of`, the trial data-vintage rule that leaves the new tables out, and the header's freshness reads that skip the snapshot.
+### Added
+- `borrow_status_as_of(T, symbols)` (`store/asof.py`): the borrow status known at T -- the latest row per `asset_id` with `known_at <= T` first, dropped when it is a `present = FALSE` absence, then filtered by `symbols` (a renamed asset's old symbol returns nothing rather than its stale pre-rename row, and a symbol several assets share returns several rows), sorted by `(symbol, asset_id)`, with `observed_at` the latest `ok` `alpaca_assets` run cursor at or before T (NULL when there is none), which is why a quiet day still reports an observation (T171b, #1506).
+### Changed
+- `registry.data_vintage` reads an explicit trial fact-table list, and of `corporate_actions` only its `split` and `dividend` rows: a daily `borrow_status` snapshot, a `symbol_changes` row or a `spinoff` row no longer moves a trial's data vintage, while `store_max_ingested_at` stays whole over every fact table and a bar or a split still moves it (T171b, #1506).
+- `dashboard/header.store_freshness` leaves `borrow_status` and the `alpaca_assets` source out of its "as of" and "last updated" reads, so a morning snapshot no longer shows the store fresher than its bars (T171b, #1506).

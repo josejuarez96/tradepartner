@@ -19,7 +19,7 @@ import os
 import re
 import statistics
 import subprocess
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1117,15 +1117,166 @@ def test_every_fact_table_is_classified_for_trial_vintage(
     def assert_classified() -> None:
         facts = set(schema.TABLE_NAMES) - {"ingestion_runs", "schema_version"}
         included = set(registry._TRIAL_FACT_TABLES)
-        excluded = {"rates", "borrow_status"}  # borrow_status: #1506, T171
+        # Outside the trial vintage: `rates` (#1538, T169b: stored for later
+        # consumers), `borrow_status` (#1506, T171) and `symbol_changes`
+        # (#1506, the 2026-10-11 amendment) -- none is read by a reader a
+        # registered trial uses. `symbol_changes` is not a store table until
+        # T172b lands it, so it is classified here ahead of that task.
+        excluded = {"rates", "borrow_status", "symbol_changes"}
         assert included.isdisjoint(excluded)
-        assert facts == included | excluded
+        assert facts <= included | excluded
 
     assert_classified()
     with monkeypatch.context() as patch:
         patch.setattr(schema, "TABLE_NAMES", (*schema.TABLE_NAMES, "future_fact"))
         with pytest.raises(AssertionError):
             assert_classified()
+
+
+# --- the vintage pin (#1506, T171b) ---------------------------------------------
+
+#: A late `ingested_at` for the pin's rows: later than anything the fixture
+#: holds, so a row it lands on dominates every vintage it can reach.
+_LATE_INGEST = datetime(2027, 1, 1, tzinfo=UTC)
+
+#: One `known_at` for the pin's action and bar rows: inside the fixture's
+#: facts, so a cutoff after it is in range and one before it is not.
+_PIN_KNOWN = datetime(2020, 6, 26, 21, tzinfo=UTC)
+
+
+def _tables(conn: duckdb.DuckDBPyConnection) -> set[str]:
+    return {name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
+
+
+def _fixture_cutoffs(conn: duckdb.DuckDBPyConnection) -> list[datetime]:
+    """A cutoff on either side of every distinct `known_at` the store's fact
+    tables hold, plus the start of every year from 2016 through 2030, so the
+    pin below walks every boundary at which a stored row could move a
+    vintage -- and years on either side of the fixture's facts, where the
+    vintage is held by a different row."""
+    stamps: set[datetime] = set()
+    for table in schema.TABLE_PROVENANCE_VALUES:
+        if table in _tables(conn):
+            stamps.update(
+                row[0] for row in conn.execute(f"SELECT DISTINCT known_at FROM {table}").fetchall()
+            )
+    probes = set(stamps)
+    for stamp in stamps:
+        probes.update((stamp - timedelta(microseconds=1), stamp + timedelta(microseconds=1)))
+    probes.update(datetime(year, 1, 1, tzinfo=UTC) for year in range(2016, 2031))
+    return sorted(probes)
+
+
+def _borrow_status_row(conn: duckdb.DuckDBPyConnection, *, ingested_at: datetime) -> None:
+    """One `borrow_status` row as the daily snapshot would write one (#1506,
+    T171): `known_at` the fetch time, `ingested_at` after it."""
+    insert_row(
+        conn,
+        "borrow_status",
+        {
+            "asset_id": "b0rr0w00-0000-4b0d-8000-0000000000ff",
+            "symbol": "PINNED",
+            "exchange": "NYSE",
+            "status": "active",
+            "tradable": True,
+            "marginable": True,
+            "shortable": True,
+            "easy_to_borrow": True,
+            "borrow_status": "easy_to_borrow",
+            "fractionable": True,
+            "present": True,
+            "known_at": _PIN_KNOWN,
+            "ingested_at": ingested_at,
+            "source": "alpaca",
+            "provenance": "snapshot",
+        },
+    )
+
+
+def _action(
+    conn: duckdb.DuckDBPyConnection,
+    action_type: str,
+    security_id: str,
+    *,
+    known_at: datetime,
+    ingested_at: datetime,
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": security_id,
+            "action_type": action_type,
+            "ex_date": known_at.date(),
+            "ratio_or_amount": 2.0,
+            "announced_at": None,
+            "source_action_id": "",
+            "cancelled": False,
+            "known_at": known_at,
+            "ingested_at": ingested_at,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def test_a_borrow_status_row_and_a_spinoff_move_no_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The vintage pin (spec Amendment 2026-10-11, #1506, "The vintage rule";
+    plan T171b). `data_vintage` is unchanged at every fixture cutoff when a
+    `borrow_status` row and a `corporate_actions` `spinoff` row with a later
+    `ingested_at` are added, because nothing a registered trial reads reads
+    either: the borrow snapshot has no consumer at all and the spin-off is
+    written for `window.start`, which reads it on the paper path alone.
+    `store_max_ingested_at` is the store's state rather than a trial's and
+    moves on both, as the spec says it must."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    with_symbol_changes = _tables(fixture_store)
+    assert "symbol_changes" not in with_symbol_changes
+    _borrow_status_row(fixture_store, ingested_at=_LATE_INGEST)
+    _action(
+        fixture_store,
+        "spinoff",
+        "SEC_SPINOFF_PINNED",
+        known_at=_PIN_KNOWN,
+        ingested_at=_LATE_INGEST,
+    )
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
+    # `symbol_changes` is the amendment's other new table and the fixture
+    # store has no such table until T172b lands one: that task pins the same
+    # rule for its rows. The name is already out of `_TRIAL_FACT_TABLES`
+    # (the classification test above), so its rows cannot move a vintage
+    # either.
+
+
+def test_a_split_and_a_bar_still_move_the_trial_vintage(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The pin's other half: the same fixtures written as a `split` row and
+    as a bar -- rows a trial reads -- move `data_vintage` from their own
+    `known_at` on, so the exclusions above are not vacuous. `store_max_ingested_at`
+    moves for those too."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    _action(
+        fixture_store,
+        "split",
+        "SEC_SPLIT_PINNED",
+        known_at=_PIN_KNOWN,
+        ingested_at=_LATE_INGEST,
+    )
+    _price(fixture_store, "SEC_BAR_PINNED", _PIN_KNOWN, _LATE_INGEST)
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
 
 
 def test_open_trial_records_the_data_vintage_at_its_cutoff(
