@@ -159,8 +159,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_23() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 23
+def test_current_schema_version_is_24() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 24
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
 
 
@@ -186,7 +186,7 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 
 def test_fresh_init_creates_the_journal_at_version_17(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [23]
+    assert _versions(journal) == [24]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -248,6 +248,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         21,
         22,
         23,
+        24,
     ]
     # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
@@ -295,6 +296,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
             21,
             22,
             23,
+            24,
         ]
 
 
@@ -437,7 +439,7 @@ def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns(
             for table, columns in old_columns.items()
         }
         schema.init_schema(conn)
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24]
         assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
             (1, "main")
         ]
@@ -506,7 +508,7 @@ def test_a_version_16_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24]
     finally:
         conn.close()
 
@@ -663,7 +665,7 @@ def test_migrating_a_version_18_store_keeps_every_alert_and_books_it_main() -> N
         before = conn.execute(select).fetchall()
         assert [row[0] for row in before] == [3, 1, 4]
         schema.init_schema(conn)
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24]
         assert conn.execute(select).fetchall() == before
         assert conn.execute("SELECT alert_id, book_id FROM alerts ORDER BY rowid").fetchall() == [
             (3, "main"),
@@ -719,7 +721,7 @@ def test_a_version_18_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24]
     finally:
         conn.close()
 
@@ -762,7 +764,7 @@ def test_a_version_4_store_gets_alerts_book_id_directly(v4_path: Path) -> None:
     with duckdb.connect(str(v4_path)) as conn:
         schema.init_schema(conn)
         assert _columns(conn, "alerts")["book_id"] is False  # NOT NULL
-        assert _versions(conn)[-1] == 23
+        assert _versions(conn)[-1] == 24
 
 
 def test_default_book_id_is_a_nonempty_word() -> None:
