@@ -2475,6 +2475,7 @@ def _sf(
     cik: str = ACME,
     unit: str = "USD",
     comparative: bool = False,
+    tag: str | None = None,
 ) -> StatementFactRecord:
     """One statement record; `filed` defaults to the acceptance date."""
     if filed is None:
@@ -2483,7 +2484,7 @@ def _sf(
     return StatementFactRecord(
         cik=cik,
         fact_name=fact,
-        xbrl_tag=_TAG[fact],
+        xbrl_tag=_TAG[fact] if tag is None else tag,
         period_start=period[0],
         period_end=period[1],
         value=value,
@@ -2711,7 +2712,7 @@ def test_financial_revenue_is_derived_from_one_filings_constituents() -> None:
         AT1,
         F1,
     )
-    assert revenue["xbrl_tag"] == "us-gaap:InterestIncomeExpenseNet-us-gaap:NoninterestIncome"
+    assert revenue["xbrl_tag"] == "us-gaap:InterestIncomeExpenseNet+us-gaap:NoninterestIncome"
     assert (
         revenue["value"]
         == rows[("net_interest_income", FY18[1])]["value"]
@@ -2755,6 +2756,46 @@ def test_financial_constituents_in_two_units_derive_no_revenue() -> None:
         ]
     )
     assert ("revenue", FY18[1]) not in rows
+
+
+def test_a_derived_revenue_never_blocks_a_later_filings_gross_profit() -> None:
+    """#1556 regression (quant-auditor): a filing with no revenue but both
+    constituents must not preempt a later filing that reports revenue, which
+    would suppress that filing's derived gross profit. The CIK reports a
+    revenue tag (F2), so the sum never fires: revenue is F2's 120 and
+    gross_profit 120 - 70 = 50, exactly as before the change."""
+    rows, _ = _rows(
+        [
+            *_bank_components(F1, AT1),  # net interest 40 + noninterest 60, no revenue tag
+            _sf("revenue", 120, F2, AT2, comparative=True),
+            _sf("cost_of_revenue", 70, F2, AT2, comparative=True),
+        ]
+    )
+    revenue = rows[("revenue", FY18[1])]
+    assert (revenue["value"], revenue["filing_accession"]) == (120, F2)
+    assert revenue["basis"] == "reported"
+    gross_profit = rows[("gross_profit", FY18[1])]
+    assert (gross_profit["value"], gross_profit["basis"]) == (50, "derived")
+    assert ("net_interest_income", FY18[1]) in rows
+    assert ("noninterest_income", FY18[1]) in rows
+
+
+def test_a_financial_revenue_tag_never_displaces_a_classic_one() -> None:
+    """#1556 regression (quant-auditor): a CIK that reports a classic revenue
+    tag anywhere drops the financial-only fallbacks, so an earlier filing's
+    `RevenuesNetOfInterestExpense` can never take the vintage from the classic
+    tag and so can never change revenue or gross profit."""
+    rows, _ = _rows(
+        [
+            _sf("revenue", 100, F1, AT1, tag="us-gaap:RevenuesNetOfInterestExpense"),
+            _sf("cost_of_revenue", 70, F1, AT1),
+            _sf("revenue", 999, F2, AT2, comparative=True),  # a classic tag, later
+        ]
+    )
+    revenue = rows[("revenue", FY18[1])]
+    assert (revenue["value"], revenue["filing_accession"]) == (999, F2)
+    assert revenue["xbrl_tag"] == "us-gaap:Revenues"
+    assert ("gross_profit", FY18[1]) not in rows
 
 
 #: The financial-revenue payload fixtures: companyfacts payloads parsed with
@@ -2842,7 +2883,7 @@ def test_a_regional_bank_like_payload_derives_revenue_from_its_constituents() ->
     assert rows["revenue"]["value"] == 100
     assert (rows["revenue"]["basis"], rows["revenue"]["xbrl_tag"]) == (
         "derived",
-        "us-gaap:InterestIncomeExpenseNet-us-gaap:NoninterestIncome",
+        "us-gaap:InterestIncomeExpenseNet+us-gaap:NoninterestIncome",
     )
 
 

@@ -63,25 +63,32 @@ _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 # (a)): canonical names, each an ordered list of fallbacks, every one the
 # concept itself, never a near relative.
 #
-# #1556 adds the financial-issuer revenue concepts and the two constituents of
-# the one documented financial-revenue definition. A bank's or insurer's
-# `revenue` is **`us-gaap:RevenuesNetOfInterestExpense`** (its total revenue net
-# of interest expense, the concept itself) when the filing reports it, else --
-# for a financial whose filing carries no revenue tag at all, such as a
-# regional bank or a mortgage REIT -- the sum of **net interest income
+# #1556 adds the financial-issuer revenue concept and the two constituents of
+# the one documented financial-revenue definition. When a filing carries none
+# of the revenue tags listed **before** `us-gaap:RevenuesNetOfInterestExpense`
+# (`us-gaap:Revenues` and the other reported concepts a non-financial uses,
+# which always win), a financial issuer's `revenue` is
+# **`us-gaap:RevenuesNetOfInterestExpense`** (its total revenue net of interest
+# expense, the concept itself). Else -- for a CIK that reports none of the
+# listed revenue tags in **any** filing, such as a regional bank or a mortgage
+# REIT -- it is the sum of **net interest income
 # (`us-gaap:InterestIncomeExpenseNet`) plus noninterest income
 # (`us-gaap:NoninterestIncome`)**. The sum is computed by the ingest's
 # derived-candidate rule (`ingest._derived_candidates`), only from the two
-# constituents of **one filing and one period** (never mixing filings), and is
-# stored like any derived row: `basis = derived`, the join of the two source
-# tags in `xbrl_tag`. `net_interest_income` and `noninterest_income` are parsed
-# and stored as filed; they are named here so the derivation can read them from
-# the same filing's records. A non-financial issuer keeps its reported revenue
-# unchanged: `us-gaap:Revenues` and the other reported tags precede
-# `RevenuesNetOfInterestExpense`, and the sum fires only when the filing
-# carries no revenue tag, which is exactly the CIKs that have none today. Gross
-# profit stays N/A for financials (no `cost_of_revenue`). IFRS issuers are out
-# of scope (#1556).
+# constituents of **one filing and one period** (never mixing filings), and
+# only for a CIK that reports **no** revenue tag anywhere. `FINANCIAL_REVENUE_TAGS`
+# are the fallbacks that only a financial issuer reports: a CIK that reports a
+# classic revenue tag anywhere keeps it and these are dropped, so the financial
+# concepts can never take the revenue vintage from a later filing and so can
+# never change a stored `gross_profit` (`ingest.statement_fact_rows`). A
+# financial revenue row is stored like any other: `basis = reported` when the
+# filing reports `RevenuesNetOfInterestExpense`, else `basis = derived` with
+# `xbrl_tag` the join of the two source tags by the operator. The constituents
+# are parsed and stored as filed; they are named here so the derivation can
+# read them from the same filing's records. A non-financial issuer keeps its
+# reported revenue unchanged. Gross profit stays N/A for financials (no
+# `cost_of_revenue`). IFRS issuers are out of scope (#1556).
+FINANCIAL_REVENUE_TAGS: tuple[str, ...] = ("us-gaap:RevenuesNetOfInterestExpense",)
 _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
     "revenue": (
         "us-gaap:Revenues",
@@ -90,7 +97,7 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
         "us-gaap:SalesRevenueGoodsNet",
         "us-gaap:SalesRevenueServicesNet",
-        "us-gaap:RevenuesNetOfInterestExpense",
+        *FINANCIAL_REVENUE_TAGS,
     ),
     "cost_of_revenue": (
         "us-gaap:CostOfRevenue",
