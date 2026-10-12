@@ -156,8 +156,12 @@ def clopper_pearson_lower_bound(successes: int, n: int, *, confidence: float = 0
     return (lo + hi) / 2
 
 
-Arm = Literal["jev", "claude"]
-ARMS: tuple[Arm, ...] = ("jev", "claude")
+#: The arms the evidence ladder scores (#1504). The second slot is the general-purpose
+#: comparison the 2026-10-11 amendment (#1534) names `claude_code`: Claude run through
+#: Claude Code outside this job, never the Claude API's registered `claude` arm (T173's,
+#: merged and not run), whose records keep their own vocabulary in `job`.
+Arm = Literal["jev", "claude_code"]
+ARMS: tuple[Arm, ...] = ("jev", "claude_code")
 PacketKind = Literal["A", "B"]
 
 
@@ -1250,7 +1254,7 @@ def min_significant_split(m: int, *, alpha: float = _ALPHA) -> int | None:
 @dataclass(frozen=True)
 class Comparison:
     """One paired comparison (#1504 item 8) between `first` and `second` (labels such
-    as `jev:E1` or `claude:E2:hybrid`) over the same items: `b` first right and second
+    as `jev:E1` or `claude_code:E2:hybrid`) over the same items: `b` first right and second
     wrong, `c` first wrong and second right, `n` items paired, the accuracy difference
     (first minus second) and the exact p. `min_split` is the smallest majority count
     that would reach 0.05 at this `b + c` (the claim quotes it beside the p)."""
@@ -1318,19 +1322,19 @@ def _compare(
 def paired_comparisons(items: Sequence[ScoredItem]) -> tuple[Comparison, ...]:
     """The twelve comparisons of #1504 item 8 on the `text` set and the same twelve on
     its 8-K subset (so up to twenty-four; no multiplicity correction, none claimed):
-    `jev` against `claude` at E1, at E2 and on each level's hybrid (four); E1 against
+    `jev` against `claude_code` at E1, at E2 and on each level's hybrid (four); E1 against
     E2 within each arm, and Jev's E2 against the cascade (three); each level against
-    its own hybrid (five: Jev's three levels, Claude's two). Pairs are over the same
+    its own hybrid (five: Jev's three levels, claude_code's two). Pairs are over the same
     items (the intersection of what both sides answered). A comparison involving an
     arm with no calls is absent. Order: set, then the order above."""
     arms = _arms_present(items)
     out: list[Comparison] = []
     for set_name in ("text", "text_eightk"):
         pairs: list[tuple[_Spec, _Spec]] = []
-        if "jev" in arms and "claude" in arms:
+        if "jev" in arms and "claude_code" in arms:
             for hybrid in (False, True):
                 for level in _ARM_LEVELS:
-                    pairs.append((("jev", level, hybrid), ("claude", level, hybrid)))
+                    pairs.append((("jev", level, hybrid), ("claude_code", level, hybrid)))
         for arm in arms:
             pairs.append(((arm, "E1", False), (arm, "E2", False)))
         if "jev" in arms:

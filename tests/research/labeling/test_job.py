@@ -271,6 +271,8 @@ class World:
         *,
         slug: str = "departure-reason-pilot",
         settings: Settings | None = None,
+        sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
         **kwargs: Any,
     ) -> job.BatchResult:
         factory = (
@@ -278,6 +280,9 @@ class World:
             if callable(client) and not isinstance(client, ScriptedModelClient)
             else (lambda _s, _h: client)
         )
+        pacers: dict[str, Any] = {"sleep": sleep if sleep is not None else (lambda _s: None)}
+        if monotonic is not None:
+            pacers["monotonic"] = monotonic
         return job.run_batch(
             self.conn,
             settings or self.settings,
@@ -288,7 +293,7 @@ class World:
             model=MODEL,
             synthetic=True,
             clock=lambda: NOW,
-            sleep=lambda _s: None,
+            **pacers,
             **kwargs,
         )
 
@@ -566,39 +571,121 @@ def test_a_timeout_after_send_is_recorded_and_not_resent(world: World) -> None:
     assert json.loads(world.result(result.run_id)["exploratory"])["unresolved_share"] == 0.5
 
 
-def test_call_order_with_and_without_an_eight_k(world: World) -> None:
+def test_a_gold_split_sends_both_packets_of_every_item_b_before_a(world: World) -> None:
+    """#1534 item 5: on a gold split the call set is B first, then A always -- A alone
+    where no 8-K exists -- so the ladder's E1 and E2 are both observable per item,
+    each call paced and spend-checked like every Jev call."""
     start = datetime(2016, 3, 1, 15, tzinfo=UTC)
     dev = [
         _gold_row("D00", start, MERGER, eightk=True),
         _gold_row("D01", start + timedelta(days=1), BANKRUPTCY, eightk=True),
-        _gold_row("D02", start + timedelta(days=2), MERGER, eightk=False),
+        _gold_row("D02", start + timedelta(days=2), UNRESOLVED, eightk=False),
     ]
     gold_id = world.gold(dev, _pilot(1))
     client = ScriptedModelClient(
-        [Answer(MERGER), Answer(UNRESOLVED), Answer(BANKRUPTCY), Answer(MERGER)]
+        [
+            Answer(MERGER),
+            Answer(MERGER),
+            Answer(BANKRUPTCY),
+            Answer(BANKRUPTCY),
+            Answer(UNRESOLVED),
+        ]
     )
-    result = world.run(client, gold_id, "dev")
+    slept: list[float] = []
+    result = world.run(client, gold_id, "dev", monotonic=lambda: 0.0, sleep=slept.append)
+    assert result.outcome == "ok"
     records = _records(world.settings, result.run_id)
     assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [
         ("D00", "B"),
+        ("D00", "A"),
         ("D01", "B"),
         ("D01", "A"),
         ("D02", "A"),
     ]
     assert records[0]["document_ids"] == ["D00", "8K-D00"]
+    assert records[1]["document_ids"] == ["D00"]  # packet A carries no 8-K
+    # every call, the extra A ones included, is paced: a frozen clock sleeps once per
+    # call but the first
+    assert len(slept) == len(client.requests) - 1 == 4
+    # the label is still C2's cascade choice: B where it ran and resolved, else A
     labels = {lid: r["selected_option"] for lid, r in job.jev_label_record(records).items()}
-    assert labels == {"D00": MERGER, "D01": BANKRUPTCY, "D02": MERGER}
+    assert labels == {"D00": MERGER, "D01": BANKRUPTCY, "D02": UNRESOLVED}
     assert world.result(result.run_id)["primary_value"] == pytest.approx(1.0)
+    # #1534 item 1: the $40 is spent by Jev alone, so the anthropic vendor sum is zero
+    sums = job.spend_sums(job.spend_records(world.settings), NOW)
+    assert sums.vendor_spend(job.ANTHROPIC_VENDOR).cumulative_usd == 0.0
+    assert sums.cumulative_usd == pytest.approx(len(client.requests) * 1000 * 0.042 / 1_000_000)
+
+
+def test_a_frame_batch_keeps_c2s_cascade_after_a_resolved_b(world: World) -> None:
+    """On a frame split the call order is C2's and unchanged by #1534: no second
+    packet follows a resolved B."""
+    gold_id, baseline_run, _ = _drift_world(world)
+    frame_id = world.frame(
+        [
+            _row("F1", datetime(2019, 1, 2, 15, tzinfo=UTC), eightk=True),
+            _row("F2", datetime(2019, 1, 3, 15, tzinfo=UTC), eightk=True),
+        ]
+    )
+    drift_client = ScriptedModelClient([Answer(MERGER)] * 20)
+    batch_client = ScriptedModelClient([Answer(MERGER), Answer(UNRESOLVED), Answer(BANKRUPTCY)])
+    result = world.run(
+        _factory(drift_client, batch_client),
+        frame_id,
+        "full",
+        slug="departure-reason-batches",
+        drift=job.DriftProbe(gold_id, baseline_run),
+    )
+    assert result.outcome == "unfinished"
+    records = _records(world.settings, result.run_id)
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [
+        ("F1", "B"),
+        ("F2", "B"),
+        ("F2", "A"),
+    ]
+
+
+def test_the_extra_a_call_is_spend_checked_and_refused_at_the_cap(world: World) -> None:
+    """#1534 item 5: the extra A call of the gold-split call set is spend-checked like
+    every Jev call, in its own name: the cap is set so B fits and A would exceed, so
+    the run stops at the A call -- `failed`, `spend ceiling` -- with B's record
+    written and the A packet never sent."""
+    gold_id = world.gold(_dev(2, eightk=True), _pilot(1))
+    # 15,000 tokens a call at $0.042/M bills $0.00063, so B's record alone sits under
+    # $0.00065 while B's bill plus A's estimate ($0.00066) crosses it; the pre-batch
+    # guard over the two first packets (about $0.00006) still opens the run.
+    tight = world.settings.model_copy(
+        update={
+            "research": world.settings.research.model_copy(
+                update={"spend_ceiling_usd_total": 0.00065, "spend_ceiling_usd_month": 0.00065}
+            )
+        }
+    )
+    client = ScriptedModelClient([Answer(MERGER, input_tokens=15_000)] * 4)
+    result = world.run(client, gold_id, "dev", settings=tight)
+    assert (result.outcome, result.message) == ("failed", "spend ceiling")
+    records = _records(tight, result.run_id)
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [("D00", "B")]
+    assert len(client.requests) == 1  # the A packet was never sent
+    assert world.result(result.run_id)["message"] == "spend ceiling"
 
 
 def test_every_record_carries_c8s_fields(world: World) -> None:
     gold_id = world.gold(_dev(2, eightk=True), _pilot(1))
     probabilities = {name: 0.0 for name in DEFAULT_OPTION_SET.criteria}
     probabilities.update({MERGER: 0.7, BANKRUPTCY: 0.3})
-    client = ScriptedModelClient([Answer(MERGER, probabilities=probabilities), Answer(MERGER)])
+    answered = Answer(MERGER, probabilities=probabilities)
+    client = ScriptedModelClient([answered] * 4)
     result = world.run(client, gold_id, "dev")
     records = _records(world.settings, result.run_id)
-    assert len(records) == 2
+    # the gold-split call set: B then A for each 8-K item
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [
+        ("D00", "B"),
+        ("D00", "A"),
+        ("D01", "B"),
+        ("D01", "A"),
+    ]
+    assert len(records) == 4
     for record in records:
         assert set(record) == C8_FIELDS
         known_at = datetime.fromisoformat(record["known_at"])
@@ -610,7 +697,7 @@ def test_every_record_carries_c8s_fields(world: World) -> None:
         assert record["cost_usd"] == pytest.approx(1000 * 0.042 / 1_000_000)
         body = json.loads(record["raw_request"])
         assert record["passage_sha256"] == sha256(body["state"].encode()).hexdigest()
-    assert records[0]["record_id"] != records[1]["record_id"]
+    assert records[0]["record_id"] != records[3]["record_id"]
 
 
 class _EchoingClient:
@@ -811,6 +898,68 @@ def test_reversed_pass_with_no_ok_baseline_opens_nothing(world: World) -> None:
             reversed_baseline_run_id=baseline.run_id,
         )
     assert world.conn.execute("SELECT count(*) FROM research_runs").fetchone() == before
+
+
+def test_the_reversed_pass_after_an_eight_k_baseline_uses_the_final_passages(
+    world: World,
+) -> None:
+    """The reversed-order pass over a baseline the gold-split call set made: it
+    re-sends each item's final (B) passage -- never the extra A one -- and compares
+    against the final answer, so the coverage and verdict are the ones C2's order
+    gave."""
+    gold_id = world.gold(_dev(2, eightk=True), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER)] * 4), gold_id, "dev")
+    baseline_records = _records(world.settings, baseline.run_id)
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in baseline_records] == [
+        ("D00", "B"),
+        ("D00", "A"),
+        ("D01", "B"),
+        ("D01", "A"),
+    ]
+    client = ScriptedModelClient([Answer(BANKRUPTCY), Answer(BANKRUPTCY)])
+    result = world.run(
+        client,
+        gold_id,
+        "dev",
+        slug=job.DRIFT_SLUG,
+        option_set=questions.REVERSED_OPTION_SET,
+        reversed_baseline_run_id=baseline.run_id,
+    )
+    assert result.outcome == "ok"
+    assert len(client.requests) == 2  # both items comparable; no extra A passage sent
+    final = job.jev_label_record(baseline_records)
+    assert {sha256(r.state.encode()).hexdigest() for r in client.requests} == {
+        r["passage_sha256"] for r in final.values()
+    }
+    assert world.result(result.run_id)["primary_value"] == 1.0
+
+
+def test_the_drift_probe_after_an_eight_k_baseline_uses_the_final_passages(world: World) -> None:
+    gold_id = world.gold(_dev(2, eightk=True), _pilot(1))
+    baseline = world.run(ScriptedModelClient([Answer(MERGER)] * 4), gold_id, "dev")
+    baseline_records = _records(world.settings, baseline.run_id)
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in baseline_records] == [
+        ("D00", "B"),
+        ("D00", "A"),
+        ("D01", "B"),
+        ("D01", "A"),
+    ]
+    frame_id = world.frame([_row("F1", datetime(2019, 1, 2, 15, tzinfo=UTC), eightk=False)])
+    drift_client = ScriptedModelClient([Answer(MERGER)] * 2)
+    batch_client = ScriptedModelClient([Answer(MERGER)])
+    result = world.run(
+        _factory(drift_client, batch_client),
+        frame_id,
+        "full",
+        slug="departure-reason-batches",
+        drift=job.DriftProbe(gold_id, baseline.run_id),
+    )
+    final = job.jev_label_record(baseline_records)
+    assert {sha256(r.state.encode()).hexdigest() for r in drift_client.requests} == {
+        r["passage_sha256"] for r in final.values()
+    }
+    assert len(drift_client.requests) == 2 and len(batch_client.requests) == 1
+    assert result.outcome == "unfinished"  # zero flips: the probe passes
 
 
 # --- review fixes: the run lock, the month rollover, billed refusals, the estimate --------
@@ -1224,6 +1373,210 @@ def test_disagreeing_claude_records_never_move_the_jev_readers() -> None:
     assert plain_items == beside_items
     assert job.gold_metrics(plain_items) == job.gold_metrics(beside_items)
     assert job.jev_label_record(jev) == job.jev_label_record(jev + claude)
+
+
+# --- T174c: the gold-split call set, the Jev-only arms key (#1534) ----------------------
+
+
+def test_with_both_calls_the_label_is_the_cascade_choice_whatever_the_file_order() -> None:
+    """#1534 item 5: the gold-split call set writes an A record after every B, and the
+    label is unchanged -- `jev_label_record`'s cascade choice, C2's, whatever the file
+    order of the two records."""
+    rows = [job._parsed(_gold_row("D00", NOW, MERGER, eightk=True))]
+    b_ok = _rec("D00", "B", MERGER)
+    a_wrong = _rec("D00", "A", BANKRUPTCY)
+    for order in permutations([b_ok, a_wrong]):
+        items = job.scored_items(rows, order)
+        assert {call.kind for call in items[0].calls} == {"B", "A"}
+        assert items[0].predicted_option == MERGER
+        assert items[0].reason == "ok"
+    b_unresolved = _rec("D00", "B", UNRESOLVED)
+    for order in permutations([a_wrong, b_unresolved]):
+        # a B that came back unresolved falls back to A, the C2 cascade
+        assert job.scored_items(rows, order)[0].predicted_option == BANKRUPTCY
+
+
+def test_the_extra_a_records_move_no_label_metric() -> None:
+    """The extra A records of the gold-split call set move no reader of the label:
+    the primary, `per_option`, `seeded_recall` and `unresolved_share` are
+    byte-identical with and without them, as is every metric once the `arms` key --
+    the one key the extras do move -- is set aside."""
+    accepted = datetime(2016, 3, 1, 15, tzinfo=UTC)
+    seed = {
+        **_gold_row("S6", accepted, "bankruptcy"),
+        "seed_case": True,
+        "in_random_draw": False,
+        "pre_fix_status": "listed",
+        "pre_fix_relisted": False,
+        "pre_fix_successor_id": None,
+        "pre_fix_form15_in_window": False,
+    }
+    rows = [
+        job._parsed(_gold_row("D00", accepted, MERGER, eightk=True)),
+        job._parsed(_gold_row("D01", accepted, BANKRUPTCY, eightk=True)),
+        job._parsed(_gold_row("D02", accepted, "going_private", eightk=False)),
+        job._parsed(seed),
+    ]
+    with_extra = [
+        _rec("D00", "B", MERGER),
+        _rec("D00", "A", MERGER),
+        _rec("D01", "B", BANKRUPTCY),
+        _rec("D01", "A", BANKRUPTCY),
+        _rec("D02", "A", "going_private"),
+        _rec("S6", "A", "bankruptcy"),
+    ]
+    # C2's order on the same fixture: B resolved, so no A followed it
+    without = [
+        _rec("D00", "B", MERGER),
+        _rec("D01", "B", BANKRUPTCY),
+        _rec("D02", "A", "going_private"),
+        _rec("S6", "A", "bankruptcy"),
+    ]
+    assert job.jev_label_record(with_extra) == job.jev_label_record(without)
+    primary_with, metrics_with = job.gold_metrics(job.scored_items(rows, with_extra))
+    primary_without, metrics_without = job.gold_metrics(job.scored_items(rows, without))
+    assert primary_with == primary_without
+    assert (primary_with.n, primary_with.correct) == (3, 3)
+    for key in ("per_option", "seeded_recall", "unresolved_share"):
+        assert metrics_with[key] == metrics_without[key]
+    assert {k: v for k, v in metrics_with.items() if k != "arms"} == {
+        k: v for k, v in metrics_without.items() if k != "arms"
+    }
+    # the arms key is the one thing the extra records move: E1 gains the A call
+    assert metrics_with["arms"]["ladder_table"] != metrics_without["arms"]["ladder_table"]
+
+
+def test_scored_items_fills_calls_and_has_eightk_from_a_records_file() -> None:
+    """#1534 item 5: `scored_items` fills `calls` -- one `ArmCall` per Jev record,
+    `arm = jev`, the `malformed`-free mapping of reason and `stop_reason` -- and
+    `has_eightk` from the row's documents; records of another arm are never Jev's
+    calls, and a record of a row the export does not carry is never read."""
+    accepted = datetime(2016, 3, 1, 15, tzinfo=UTC)
+    rows = [
+        job._parsed(_gold_row("D00", accepted, MERGER, eightk=True)),
+        job._parsed(_gold_row("D01", accepted, MERGER, eightk=False)),
+    ]
+    records = [
+        {
+            "listing_end_id": "D00",
+            "passage_kind": "B",
+            "reason": "ok",
+            "selected_option": MERGER,
+            "probabilities": {MERGER: 1.0},
+            "input_tokens": 1000,
+            "output_tokens": 10,
+            "cost_usd": 0.042,
+            "latency_ms": 300.0,
+        },
+        {
+            "listing_end_id": "D00",
+            "passage_kind": "A",
+            "reason": "timeout",
+            "selected_option": UNRESOLVED,
+            "probabilities": {},
+            "input_tokens": None,
+            "output_tokens": None,
+            "cost_usd": 0.01,
+            "latency_ms": 50.0,
+        },
+        # no passage_kind: reads as A, as jev_label_record reads it; no usage: zeroes
+        {"listing_end_id": "D01", "reason": "ok", "selected_option": MERGER, "probabilities": {}},
+        # another arm's record is not a Jev call
+        {
+            "listing_end_id": "D01",
+            "passage_kind": "A",
+            "arm": "claude_code",
+            "vendor": "anthropic",
+            "reason": "ok",
+            "selected_option": BANKRUPTCY,
+            "probabilities": {},
+        },
+        # a record of no row in the export
+        {"listing_end_id": "Z9", "passage_kind": "A", "reason": "ok", "selected_option": MERGER},
+    ]
+    by_id = {item.listing_end_id: item for item in job.scored_items(rows, records)}
+    d00, d01 = by_id["D00"], by_id["D01"]
+    assert d00.has_eightk is True and d01.has_eightk is False
+    assert [call.kind for call in d00.calls] == ["B", "A"]  # file order, one per record
+    assert all(call.arm == "jev" for call in d00.calls)
+    # the mapping is malformed-free: reasons map straight and no stop reason is invented
+    assert [call.reason for call in d00.calls] == ["ok", "timeout"]
+    assert all(call.stop_reason is None for call in d00.calls)
+    assert [call.option for call in d00.calls] == [MERGER, UNRESOLVED]
+    b_call, a_call = d00.calls
+    assert (b_call.input_tokens, b_call.output_tokens) == (1000, 10)
+    assert (b_call.cost_usd, b_call.latency_ms) == (0.042, 300.0)
+    assert (a_call.input_tokens, a_call.output_tokens, a_call.cost_usd) == (0, 0, 0.01)
+    assert [(call.kind, call.option) for call in d01.calls] == [("A", MERGER)]
+    assert job.jev_label_record(records)["D01"] is records[2]
+
+
+def test_gold_metrics_writes_the_jev_only_arms_key() -> None:
+    """#1534 item 5: `gold_metrics` writes `arms` with Jev's ladder lines, E0, Jev's
+    hybrids and Jev's within-arm and level-against-hybrid comparisons -- every figure
+    equal to `ladder_table`, `hybrid_router` and `paired_comparisons` on the same
+    items, no `claude_code` line -- and nothing else in it changes."""
+    accepted = datetime(2016, 3, 1, 15, tzinfo=UTC)
+    rows = [
+        job._parsed(_gold_row(f"D{i}", accepted + timedelta(days=i), MERGER, eightk=i < 2))
+        for i in range(3)
+    ]
+    records = [
+        _rec("D0", "B", MERGER),
+        _rec("D0", "A", MERGER),
+        _rec("D1", "B", UNRESOLVED),
+        _rec("D1", "A", MERGER),
+        _rec("D2", "A", MERGER),
+    ]
+    items = job.scored_items(rows, records)
+    _, metrics = job.gold_metrics(items)
+    arms = metrics["arms"]
+    assert arms["ladder_table"] == [dataclasses.asdict(r) for r in scoring.ladder_table(items)]
+    assert arms["e0"] == dataclasses.asdict(scoring.e0_report(items))
+    assert arms["hybrid_router"] == [
+        dataclasses.asdict(scoring.hybrid_router(items, "jev", level, set_name=set_name))
+        for set_name in ("text", "text_eightk")
+        for level in scoring.LADDER_LEVELS
+    ]
+    assert arms["paired_comparisons"] == [
+        dataclasses.asdict(c) for c in scoring.paired_comparisons(items)
+    ]
+    # Jev's lines only: no claude_code line of any kind, no line of an absent arm
+    assert arms["ladder_table"] and all(row["arm"] == "jev" for row in arms["ladder_table"])
+    assert arms["hybrid_router"] and all(row["arm"] == "jev" for row in arms["hybrid_router"])
+    assert arms["e0"]["n"] == 3
+    assert arms["paired_comparisons"] and all(
+        comparison["first"].startswith("jev:") and comparison["second"].startswith("jev:")
+        for comparison in arms["paired_comparisons"]
+    )
+    # nothing else changes: without the calls the arms are Jev-free but every other
+    # metric is the same
+    _, plain = job.gold_metrics([dataclasses.replace(i, calls=(), has_eightk=False) for i in items])
+    assert {k: v for k, v in plain.items() if k != "arms"} == {
+        k: v for k, v in metrics.items() if k != "arms"
+    }
+    assert plain["arms"]["ladder_table"] == []  # absent, not zero
+
+
+def test_a_gold_runs_result_carries_the_arms_key(world: World) -> None:
+    """The run writes the key through the same path: the result row's `arms` equals
+    the three scoring functions on the run's own scored items."""
+    dev = [
+        _gold_row(
+            f"D{i}", datetime(2016, 3, 1, 15, tzinfo=UTC) + timedelta(days=i), MERGER, eightk=i < 2
+        )
+        for i in range(3)
+    ]
+    gold_id = world.gold(dev, _pilot(1))
+    result = world.run(ScriptedModelClient([Answer(MERGER)] * 5), gold_id, "dev")
+    assert result.outcome == "ok"
+    exploratory = json.loads(world.result(result.run_id)["exploratory"])
+    items = job.scored_items(
+        [job._parsed(row) for row in dev], _records(world.settings, result.run_id)
+    )
+    _, metrics = job.gold_metrics(items)
+    assert exploratory["arms"] == metrics["arms"]
+    assert world.result(result.run_id)["primary_value"] == 1.0
 
 
 def test_spend_sums_splits_by_vendor_and_counts_both_under_the_two_forty_keys() -> None:
