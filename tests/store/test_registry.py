@@ -1124,7 +1124,11 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # T172b lands it, so it is classified here ahead of that task.
         excluded = {"rates", "borrow_status", "symbol_changes"}
         assert included.isdisjoint(excluded)
-        assert facts <= included | excluded
+        # An included name must be a store table, and every store table must
+        # be classified on one side. `symbol_changes` is the amendment's
+        # name before T172b creates its table, so it is excluded either way.
+        assert included <= facts
+        assert facts == included | (excluded & facts)
 
     assert_classified()
     with monkeypatch.context() as patch:
