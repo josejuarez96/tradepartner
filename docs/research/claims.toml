@@ -278,6 +278,7 @@ scope = "All personal trading by the owner"
 source = "docs/research/2026-09-24-initial-research-handoff.md §10"
 section = "Compliance and employment"
 bears_on = ["adr:0006"]
+note = "The utilities clause was mis-recorded (#1540, 2026-10-11): the owner had said he did not care about utilities, not that compliance kept them out; ADR 0006's amendment of that date drops the exclusion. The MNPI principle stands."
 
 # ===== 2026-09-24-tooling-survey.md =====
 
