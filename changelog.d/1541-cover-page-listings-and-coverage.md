@@ -1,3 +1,0 @@
-- Cover-page listings (#1541): spec and plan amendment for the exchange-axis parse fix, the title fallback, a standing coverage check and the owner's release (T178-T182); failed-banks hole disclosed in a research note (TP-4)
-### Changed
-- data-foundation spec and plan (#1541): the cover-page parsers' exchange-axis fix, FSN_VERSION 3 and the `cover-listings-1541` release (T178, T181), the title fallback (T179), a standing coverage check in `health` against a named reference (T180), the classification rebuild (T182); the rules sit behind two `edgar` switches the release flips; the ticker-reuse refetch runs inside the release; the bank-level registrant hole is recorded in docs/research/2026-10-11-h1-known-data-holes.md and as claims TP-3 and TP-4
