@@ -96,6 +96,9 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal
+from typing import Protocol
 
 from tradepartner.adapters.broker import TERMINAL_STATUSES, Account, Order, Position
 from tradepartner.config import RiskConfig
@@ -111,6 +114,44 @@ FILLS_LAGGING = "fills_lagging"
 _BUY = "buy"
 _SELL = "sell"
 _ID_SEPARATOR = "-"
+
+
+class CashActivityRow(Protocol):
+    """A broker non-trade cash activity as the booked-`FEE` rule reads it: the
+    structural type `Broker.cash_activities` returns (#1583, T183b's
+    `CashActivity`, spec item 1). Only the fields the ledger names are given; the
+    real row also carries `symbol` and `description`. It is read by attribute and
+    never constructed here, so the ledger depends only on the adapter's contract,
+    not its type."""
+
+    activity_id: str
+    activity_type: str
+    date: date
+    net_amount: float | None
+    status: str
+    symbol: str | None
+    description: str | None
+
+
+#: The non-trade activity types the ledger knows (spec 2026-10-12, item 2). A
+#: `FEE` is booked as `fee_cash`; a dividend type is left to the store's dividend
+#: rule; a corporate-action type (and any row of null `net_amount`) is read and
+#: recorded but never booked and never a mismatch by itself; any other cash type
+#: is `unexplained_activity`.
+_FEE = "FEE"
+_EXECUTED = "executed"
+_DIVIDEND_TYPES = frozenset(
+    {"DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTW", "DIVFEE", "DIVTXEX"}
+)
+_CORPORATE_ACTION_TYPES = frozenset({"SSP", "SSO", "MA", "NC", "SC", "REORG"})
+
+
+def _cash_bound(cash_tolerance: float, fills_since_base: int) -> Decimal:
+    """The cash-tolerance bound (#1583, T183): `risk.reconcile_cash_tolerance` x
+    (1 + fills_since_base / 2), in `Decimal`, inclusive. A cent of rounding per
+    fill per side replaces the whole-dollar #1290 band; 0 fills keep the bare key.
+    It replaces the bare key in every cash comparison but `bad_reading`."""
+    return Decimal(str(cash_tolerance)) * (Decimal(1) + Decimal(fills_since_base) / Decimal(2))
 
 
 @dataclass(frozen=True)
@@ -136,13 +177,20 @@ class Explanations:
     `security_id` to (parent `security_id`, shares per parent share),
     `ex_date <= S`, not yet journaled. `dividends`: cash due per name for the
     dividends paid by S, not yet journaled. `reference_prices`: close(S-1) per
-    `security_id`."""
+    `security_id`. `activities`: the broker's non-trade cash activities this
+    reconciliation read (the caller reads them after `account()`; empty in the
+    read-only `explanations_as_of` path, #1583 T183). `seen_activity_ids` and
+    `activity_seen_before`: the caller-applied seen-sets and the fallback cutoff
+    that decide whether a `FEE`'s id is already inside the base."""
 
     symbols: Mapping[str, str]
     ended: frozenset[str] = frozenset()
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
+    activities: tuple[CashActivityRow, ...] = ()
+    seen_activity_ids: frozenset[str] = frozenset()
+    activity_seen_before: date | None = None
 
 
 @dataclass(frozen=True)
@@ -159,13 +207,20 @@ class Mismatch:
 @dataclass(frozen=True)
 class ProposedAdjustment:
     """An `adjustments` row an explanation implies: signed `quantity` and
-    `cash` deltas, as `execution.ledger` applies them."""
+    `cash` deltas, as `execution.ledger` applies them.
+
+    `security_id` and `quantity` are None for a cash-only row (a `dividend_cash`,
+    a `corporate_action_cash` proceeds share, a booked `fee_cash`). `broker_activity_id`
+    is the broker cash-activity id a booked `fee_cash` is keyed by (null for every
+    other kind); the store's `adjustments.broker_activity_id` is `UNIQUE`, so a
+    broker fact is booked once by id (#1583, T183)."""
 
     kind: str
-    security_id: str
+    security_id: str | None
     quantity: float | None
     cash: float | None
     explanation: str
+    broker_activity_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +230,17 @@ class Allowed:
     reason: str
     difference: float
     security_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ActivityRecord:
+    """One non-trade cash activity a reconciliation read: its broker id, type
+    and status, for the row's record and the base's seen-set the next
+    reconciliation reads (`Reconciliation.activities`, #1583, T183)."""
+
+    activity_id: str
+    activity_type: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -189,6 +255,7 @@ class Reconciliation:
     adjustments: tuple[ProposedAdjustment, ...]
     explained: tuple[ProposedAdjustment, ...] = ()
     allowed: tuple[Allowed, ...] = ()
+    activities: tuple[ActivityRecord, ...] = ()
 
     @property
     def mismatches_json(self) -> str:
@@ -200,6 +267,7 @@ class Reconciliation:
                 "pending": list(self.pending_ids),
                 "explained": [vars(a) for a in self.explained],
                 "allowed": [vars(a) for a in self.allowed],
+                "activities": [vars(a) for a in self.activities],
             },
             sort_keys=True,
             allow_nan=False,
@@ -231,6 +299,45 @@ def _finite(value: float, what: str) -> float:
     return value
 
 
+def _inside_base(activity: CashActivityRow, explanations: Explanations) -> bool:
+    """Whether a cash activity's id is already inside the base (#1583, T183):
+    in a caller-applied seen-set, or — only when both the base's recorded set
+    and the window's recorded set are null — dated strictly before the window's
+    New York start date. The caller applies the seen-sets and the fallback."""
+    if activity.activity_id in explanations.seen_activity_ids:
+        return True
+    cut = explanations.activity_seen_before
+    return cut is not None and activity.date < cut
+
+
+def _activity_mismatch(activity: CashActivityRow) -> Mismatch | None:
+    """A mismatch of kind `unexplained_activity` for a read this reconciliation
+    cannot place (#1583, T183), else None: a `FEE` or dividend row whose status
+    is not `executed`, or a cash activity (non-null `net_amount`) of a type the
+    rule does not know (`INT`, `JNLC`, ...). A corporate action (a known type or
+    a null `net_amount`) is never a mismatch by itself; an `executed` `FEE` or
+    dividend row is left to booking / the store's dividend rule. The detail names
+    the type, the id, the date, the amount and the status."""
+    amount = "null" if activity.net_amount is None else activity.net_amount
+    detail = (
+        f"{activity.activity_type!r} activity {activity.activity_id!r} on {activity.date} "
+        f"amount {amount} status {activity.status!r}"
+    )
+    kind = activity.activity_type
+    if kind == _FEE or kind in _DIVIDEND_TYPES:
+        return None if activity.status == _EXECUTED else Mismatch("unexplained_activity", detail)
+    if kind in _CORPORATE_ACTION_TYPES or activity.net_amount is None:
+        return None
+    return Mismatch("unexplained_activity", detail)
+
+
+def _cash_allows(band: _Band, difference: Decimal, bound: Decimal) -> bool:
+    """Whether `difference` (in `Decimal`) is within `band` widened by the cash
+    bound `bound` (inclusive; #1583, T183). Kept in `Decimal` so a cent at a
+    six-figure cash balance compares exactly, not by float residue."""
+    return Decimal(str(band.low)) - bound <= difference <= Decimal(str(band.high)) + bound
+
+
 def compare(
     ledger: Ledger,
     positions: Mapping[str, Position],
@@ -252,6 +359,7 @@ def compare(
     q_tol = frozen.reconcile_quantity_tolerance
     cash_tol = frozen.reconcile_cash_tolerance
     buffer = frozen.whole_share_price_buffer
+    cash_bound = _cash_bound(cash_tol, ledger.fills_since_base)
     _validate(ledger, positions, account, explanations)
     security_of = _reverse(explanations.symbols)
     mismatches: list[Mismatch] = []
@@ -305,6 +413,45 @@ def compare(
     explained: list[ProposedAdjustment] = []
     allowed: list[Allowed] = []
 
+    # --- booked `FEE` cash activities, before every other explanation (#1583) ---
+    activities = explanations.activities
+    activity_records = tuple(
+        ActivityRecord(a.activity_id, a.activity_type, a.status) for a in activities
+    )
+    fee_proposals: list[ProposedAdjustment] = []
+    # `cash` is reported in cents and a broker fee is sub-cent, so the broker and
+    # ledger balances are six-figure: the difference is taken in `Decimal`, from
+    # each balance's shortest form, so a whole-cent fee never leaves float residue.
+    difference_decimal = Decimal(str(account.cash)) - Decimal(str(ledger.cash))
+    for activity in activities:
+        unexplained = _activity_mismatch(activity)
+        if unexplained is not None:
+            mismatches.append(unexplained)
+            continue
+        if (
+            activity.activity_type == _FEE
+            and activity.net_amount is not None
+            and not _inside_base(activity, explanations)
+        ):
+            described = activity.description or ""
+            fee_proposals.append(
+                ProposedAdjustment(
+                    "fee_cash",
+                    None,
+                    None,
+                    activity.net_amount,
+                    (
+                        f"{activity.activity_type}: {described}"
+                        if described
+                        else activity.activity_type
+                    ),
+                    broker_activity_id=activity.activity_id,
+                )
+            )
+    for fee in fee_proposals:
+        difference_decimal -= Decimal(str(fee.cash))
+    explained.extend(fee_proposals)
+
     removed = [
         name
         for name in sorted(explanations.ended)
@@ -343,37 +490,39 @@ def compare(
         allowed += [
             Allowed("deferred dividend", amount, name) for name, amount in dividends.items()
         ]
-    cash_ok = cash_band.allows(difference, cash_tol)
+    cash_ok = _cash_allows(cash_band, difference_decimal, cash_bound)
     if removed:
         value = [expected[name] * explanations.reference_prices.get(name, 0.0) for name in removed]
         cap = math.fsum(value) * (1 + buffer)
+        cap_decimal = Decimal(str(cap))
         if deferring:
             cash_band.widen(cap)
-            cash_ok = cash_band.allows(difference, cash_tol)
+            cash_ok = _cash_allows(cash_band, difference_decimal, cash_bound)
         else:
             # The proceeds take the cash first: paper is not expected to credit a
             # dividend (spec req 6), and every dividend due is offered, paid or
             # not. Only cash beyond the proceeds' cap is read as the dividends
             # credited beside them (#400).
+            credited_decimal = Decimal(str(credited))
             cash_ok = False
             for with_dividends in (False, True) if dividends else (False,):
-                proceeds = difference - (credited if with_dividends else 0.0)
-                if -cash_tol <= proceeds <= cap + cash_tol:
+                proceeds = difference_decimal - (credited_decimal if with_dividends else Decimal(0))
+                if -cash_bound <= proceeds <= cap_decimal + cash_bound:
                     cash_ok = True
-                    proceeds = min(max(proceeds, 0.0), cap)
-                    explained += _ended_adjustments(removed, expected, value, proceeds)
+                    proceeds_f = float(min(max(proceeds, Decimal(0)), cap_decimal))
+                    explained += _ended_adjustments(removed, expected, value, proceeds_f)
                     if with_dividends:
                         explained += _dividend_adjustments(dividends)
                     break
         for name in removed:
             expected.pop(name)
     elif not cash_ok and dividends and not deferring:
-        if abs(difference - credited) <= cash_tol:
+        if abs(difference_decimal - Decimal(str(credited))) <= cash_bound:
             cash_ok = True
             explained += _dividend_adjustments(dividends)
     if not cash_ok:
         mismatches.append(Mismatch("cash", f"broker {account.cash}, ledger {ledger.cash}"))
-    elif abs(difference) > cash_tol and deferring:
+    elif abs(difference) > float(cash_bound) and deferring:
         allowed.append(Allowed("cash within the open allowances", difference))
 
     if deferring:
@@ -385,6 +534,13 @@ def compare(
             )
         allowed += [
             Allowed("deferred ended listing", -removed_quantity[name], name) for name in removed
+        ]
+        # A booked `FEE` beside a lagging or pending order is `deferred fee`: its
+        # cash is still subtracted from the difference, but it is never journaled
+        # here; the next `ok` reconciliation reads the same activity id, finds it
+        # not inside its base, and books it once (#1583, T183).
+        allowed += [
+            Allowed("deferred fee", fee.cash, None) for fee in fee_proposals if fee.cash is not None
         ]
         explained = []
 
@@ -422,6 +578,7 @@ def compare(
         adjustments=tuple(explained) if status == OK else (),
         explained=tuple(explained),
         allowed=tuple(allowed),
+        activities=activity_records,
     )
 
 

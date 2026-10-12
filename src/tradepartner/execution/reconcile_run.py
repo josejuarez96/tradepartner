@@ -10,7 +10,9 @@ it decides and raises on a mismatch. A run's steps 4 and 8, `paper reconcile`,
    are `pending` (never acknowledged), with the live fills of each.
 2. Read the broker: `positions()`, `open_orders()`, `account()`, and one
    `get_order` per acknowledged non-terminal order, the `lagging` input. A
-   `pending` order is never read: only `paper resume` settles it (req 4).
+   `pending` order is never read: only `paper resume` settles it (req 4). Read
+   `cash_activities(since = the day before the window's New York start date)`
+   after `account()` (#1583, T183, spec item 1), the booked-`FEE` rule's input.
 3. Build the ledger stated through S, or through the clock's New York date
    while no session has opened since S (a weekend `paper reconcile`, so its
    own earlier `ok` row stays the cash base), from the journal rows known at
@@ -89,8 +91,8 @@ import json
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -362,13 +364,65 @@ def _explanations(
     symbols = _symbols(names, order_symbols, current, broker_symbols)
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
+    seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
     return Explanations(
         symbols=symbols,
         ended=ended,
         spinoffs={},
         dividends=_dividends(state, actions, window, session, tolerance, through),
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
+        seen_activity_ids=seen_ids,
+        activity_seen_before=seen_before,
     )
+
+
+def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:
+    """The cash-activity ids a reconciliation row recorded for a base (the
+    `activities` of its `mismatches_json`), or None when the row is None, holds
+    no JSON, or carries no recorded set (a pre-T183 `ok` row, or any hand-built
+    row without the key): the read-only base of a null set."""
+    if base is None or base.mismatches_json is None:
+        return None
+    try:
+        payload = json.loads(base.mismatches_json)
+    except (ValueError, TypeError):
+        return None
+    entries = payload.get("activities") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return None
+    return {
+        str(entry["activity_id"])
+        for entry in entries
+        if isinstance(entry, dict) and "activity_id" in entry
+    }
+
+
+def _seen_activities(
+    adjustments: Sequence[AdjustmentRow], base: ReconciliationRow | None, window: PaperWindowRow
+) -> tuple[frozenset[str], date | None]:
+    """The caller-applied seen-sets for the booked-`FEE` rule (#1583, T183): the
+    ids every activity a reconciliation reads is treated as already inside the
+    base, and the fallback date cutoff (None when a recorded set exists).
+
+    The window's already-booked activity ids (`adjustments.broker_activity_id`)
+    are always seen, so a fee is booked once by id. The base's recorded set (the
+    last `ok` reconciliation's `activities`) takes precedence; before the first
+    `ok`, the window row's `activities_seen_json` (what `paper start` read); when
+    both are null, the fallback cutoff is the window's New York start date, so a
+    fee dated before the window opened is seen and a fee dated on it is bookable."""
+    booked = frozenset(
+        a.broker_activity_id for a in adjustments if a.broker_activity_id is not None
+    )
+    recorded = _recorded_activity_ids(base)
+    if recorded is not None:
+        return booked | recorded, None
+    if window.activities_seen_json is not None:
+        try:
+            ids = json.loads(window.activities_seen_json)
+        except (ValueError, TypeError):
+            ids = []
+        return booked | frozenset(str(i) for i in ids if isinstance(i, str)), None
+    return booked, window.started_at.astimezone(_NEW_YORK).date()
 
 
 def explanations_as_of(
@@ -470,6 +524,13 @@ def reconcile_now(
     positions: dict[str, Position] = broker.positions()
     open_orders: list[Order] = broker.open_orders()
     account: Account = broker.account()
+    # The booked-`FEE` rule's input (#1583, T183, spec item 1): every non-trade
+    # cash activity from the day before the window's New York start date, read
+    # after `account()` so a fee inside `starting_cash` the read can see is seen.
+    # `cash_activities` is the spec item-1 read (T183b), stubbed in tests.
+    activities = broker.cash_activities(  # type: ignore[attr-defined]
+        window.started_at.astimezone(_NEW_YORK).date() - timedelta(days=1)
+    )
     lagging = [
         JournalOpenOrder(
             order=order,
@@ -491,6 +552,10 @@ def reconcile_now(
         explanations = _explanations(
             conn, state, actions, window, session, settings, positions.keys(), tolerance, through
         )
+    # The read-only `_explanations` names the seen-sets and fallback; the broker's
+    # cash activities are attached here (they are a broker input, never a journal
+    # fact, so the look-ahead cut does not touch them).
+    explanations = replace(explanations, activities=tuple(activities))
     ledger = _ledger(state, actions, window, through, tolerance)
     result = compare(
         ledger,
@@ -522,19 +587,29 @@ def reconcile_now(
                 ingested_at=stamp,
             ),
         )
+        activity_sessions = {a.activity_id: a.date for a in activities}
         for adjustment in result.adjustments:
+            # A booked `fee_cash` is stated on its own activity date (the broker
+            # fee's trade date), not the reconciliation session, so the ledger
+            # applies it from the session it belongs to (#1583, T183).
+            fee_date = (
+                activity_sessions.get(adjustment.broker_activity_id)
+                if adjustment.broker_activity_id is not None
+                else None
+            )
             append(
                 conn,
                 AdjustmentRow(
                     window_id=window_id,
                     run_id=run_id,
-                    session=session,
+                    session=fee_date if fee_date is not None else session,
                     kind=adjustment.kind,
                     security_id=adjustment.security_id,
                     quantity=adjustment.quantity,
                     cash=adjustment.cash,
                     explanation_json=_explanation_json(adjustment.explanation, reconciliation_id),
                     book_id=window.book_id,
+                    broker_activity_id=adjustment.broker_activity_id,
                     known_at=stamp,
                     ingested_at=stamp,
                 ),
