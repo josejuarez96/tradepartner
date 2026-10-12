@@ -440,8 +440,16 @@ def ingest_rates(
             }
             added = revisions = future = late = collisions = 0
             state.through = max((day for day, _, _, _ in stored_rows), default=None)
+            by_stamp: dict[tuple[date, datetime], RateObservation] = {}
+            for record in state.fetched:
+                key = (record.observation_date, rate_known_at(record.vintage_date))
+                previous = by_stamp.get(key)
+                if previous is not None and previous.value != record.value:
+                    collisions += 1
+                if previous is None or record.vintage_date > previous.vintage_date:
+                    by_stamp[key] = record
             for record in sorted(
-                state.fetched,
+                by_stamp.values(),
                 key=lambda row: (
                     row.observation_date,
                     rate_known_at(row.vintage_date),
@@ -457,22 +465,6 @@ def ingest_rates(
                 if existing is not None:
                     if existing[0] != record.value:
                         collisions += 1
-                        if record.vintage_date > existing[1]:
-                            # A later vintage can share a session-close stamp. Keep
-                            # the value that was last served before that close.
-                            conn.execute(
-                                "UPDATE rates SET value = ?, vintage_date = ?, ingested_at = ? "
-                                "WHERE series = ? AND observation_date = ? AND known_at = ?",
-                                [
-                                    record.value,
-                                    record.vintage_date,
-                                    now,
-                                    series,
-                                    record.observation_date,
-                                    stamp,
-                                ],
-                            )
-                            known_values[key] = (record.value, record.vintage_date)
                     continue
                 in_effect = max(
                     (

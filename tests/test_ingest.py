@@ -292,6 +292,28 @@ def test_rates_colliding_vintage_stamps_are_counted(settings: Settings) -> None:
         ).fetchall() == [(sunday.value, sunday.vintage_date)]
 
 
+def test_rates_stored_stamp_is_immutable_on_later_collision(settings: Settings) -> None:
+    """A later run counts a same-stamp conflict without changing the stored row."""
+    saturday = RateObservation("DTB3", date(2020, 10, 9), 0.1, date(2020, 10, 10))
+    sunday = RateObservation("DTB3", date(2020, 10, 9), 0.2, date(2020, 10, 11))
+
+    def clock() -> datetime:
+        return datetime(2020, 10, 13, 22, tzinfo=UTC)
+
+    ingest_module.ingest_rates(
+        settings, FixtureRateSource([saturday]), since=saturday.observation_date, clock=clock
+    )
+    result = ingest_module.ingest_rates(
+        settings, FixtureRateSource([sunday]), since=sunday.observation_date, clock=clock
+    )
+    assert result.runs[0].rows_added == 0
+    assert "rates_colliding_vintages=1" in result.runs[0].message
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT value, vintage_date FROM rates WHERE observation_date = '2020-10-09'"
+        ).fetchall() == [(saturday.value, saturday.vintage_date)]
+
+
 def test_rates_fixture_backfill_matches_every_stamp_and_reruns(settings: Settings) -> None:
     """All generated fixture cases round-trip under the ingest stamp rule."""
     fixture = Path(__file__).parent / "fixtures/universe/rates.csv"
