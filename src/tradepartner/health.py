@@ -191,11 +191,11 @@ derived at `t`, as the data is read.
 - `statement_derived_matches_components`: every `basis = derived` row equals
   the same-filing components it was derived from, per the ingest's
   `_DERIVED_FACTS` table: `gross_profit` the difference of the two stored
-  `revenue` and `cost_of_revenue` rows, and `revenue` (#1556) the sum of the
-  two stored `net_interest_income` and `noninterest_income` rows, each sharing
-  the derived row's `cik`, `period_end`, `period_days` and `filing_accession`,
-  both present -- a missing component row fails it too. Cannot fail on correct
-  data (spec "Health").
+  `revenue` and `cost_of_revenue` rows, and `revenue_financial` (#1556) the
+  sum of the two stored `net_interest_income` and `noninterest_income` rows,
+  each sharing the derived row's `cik`, `period_end`, `period_days` and
+  `filing_accession`, both present -- a missing component row fails it too.
+  Cannot fail on correct data (spec "Health").
 - `statement_basis_allowed`: `statement_facts.basis` is in
   `schema.STATEMENT_FACT_BASIS_VALUES` (`{reported, derived}`). The
   schema's own `CHECK` already blocks this too.
@@ -1571,7 +1571,7 @@ def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl
     """`statement_derived_matches_components` (module docstring): every
     `basis = derived` row must equal the same-filing combination of the two
     stored constituent rows in `ingest._DERIVED_FACTS` (`gross_profit` =
-    `revenue - cost_of_revenue`; `revenue` (#1556) =
+    `revenue - cost_of_revenue`; `revenue_financial` (#1556) =
     `net_interest_income + noninterest_income`), both present (a missing
     component row fails it too). Exact `DOUBLE` equality, no tolerance: the
     ingest derives the row by this same operation at insert time (spec

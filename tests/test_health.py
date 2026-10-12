@@ -1802,7 +1802,7 @@ def test_statement_derived_matches_components_fails_on_a_wrong_value(
 def test_statement_derived_matches_components_fails_on_a_wrong_derived_revenue(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
-    """#1556: a derived `revenue` row is checked against its own components."""
+    """#1556: a derived `revenue_financial` row is checked against its own components."""
     known = datetime(2020, 1, 1, tzinfo=UTC)
     cik = "CIK4444444"
     for name, value in (("net_interest_income", 100.0), ("noninterest_income", 60.0)):
@@ -1818,7 +1818,7 @@ def test_statement_derived_matches_components_fails_on_a_wrong_derived_revenue(
         "statement_facts",
         _statement_fact(
             cik,
-            "revenue",
+            "revenue_financial",
             period_end=date(2019, 12, 31),
             value=200.0,  # wrong: should be 100.0 + 60.0 = 160.0
             accession="ACC6",
@@ -1830,7 +1830,7 @@ def test_statement_derived_matches_components_fails_on_a_wrong_derived_revenue(
     check = next(c for c in report.integrity if c.rule == STATEMENT_DERIVED_MATCHES_COMPONENTS)
     assert not check.passed
     row = check.violations.to_dicts()[0]
-    assert row["fact_name"] == "revenue"
+    assert row["fact_name"] == "revenue_financial"
     assert row["left_value"] == 100.0
     assert row["right_value"] == 60.0
 

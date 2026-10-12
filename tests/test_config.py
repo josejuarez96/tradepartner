@@ -212,8 +212,8 @@ def test_edgar_statement_facts_defaults() -> None:
             "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
             "us-gaap:SalesRevenueGoodsNet",
             "us-gaap:SalesRevenueServicesNet",
-            "us-gaap:RevenuesNetOfInterestExpense",
         ],
+        "revenue_financial": ["us-gaap:RevenuesNetOfInterestExpense"],
         "cost_of_revenue": [
             "us-gaap:CostOfRevenue",
             "us-gaap:CostOfGoodsAndServicesSold",

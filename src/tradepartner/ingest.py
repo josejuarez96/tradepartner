@@ -185,7 +185,7 @@ from tradepartner.calendar import (
     last_completed_session,
     previous_session,
 )
-from tradepartner.config import FINANCIAL_REVENUE_TAGS, Settings, clean_message
+from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
 from tradepartner.store.asof import _validate_t
 from tradepartner.store.classify import (
@@ -1410,19 +1410,21 @@ StatementKey = tuple[str, date, int]
 ConflictKey = tuple[str, str, date, int]
 
 GROSS_PROFIT, REVENUE, COST_OF_REVENUE = "gross_profit", "revenue", "cost_of_revenue"
-#: The financial-revenue constituents (#1556): net interest income plus
-#: noninterest income, the documented sum a filing with no revenue tag yields.
+#: The financial-revenue fact (#1556) and its constituents. Kept out of the
+#: `revenue` key so no financial concept can interact with `revenue` or
+#: `gross_profit`.
+REVENUE_FINANCIAL = "revenue_financial"
 NET_INTEREST_INCOME, NONINTEREST_INCOME = "net_interest_income", "noninterest_income"
 
 #: `_derived_candidates`' two-tag derivations: the target fact, its two
 #: constituent facts and the operator joining them. Both are `basis = derived`
 #: rows from one filing and period; `gross_profit = revenue - cost_of_revenue`
-#: (spec decision (e), #660) and, for a financial issuer whose filing carries
-#: no revenue tag, `revenue = net_interest_income + noninterest_income`
-#: (#1556). The target is dropped when the filing carries it reported.
+#: (spec decision (e), #660) and, for a financial issuer, `revenue_financial =
+#: net_interest_income + noninterest_income` (#1556). The target is dropped
+#: when the filing carries it reported.
 _DERIVED_FACTS: tuple[tuple[str, str, str, str], ...] = (
     (GROSS_PROFIT, REVENUE, COST_OF_REVENUE, "-"),
-    (REVENUE, NET_INTEREST_INCOME, NONINTEREST_INCOME, "+"),
+    (REVENUE_FINANCIAL, NET_INTEREST_INCOME, NONINTEREST_INCOME, "+"),
 )
 
 
@@ -1494,40 +1496,19 @@ def statement_fact_rows(
     as `vintage_late`, else with a different value as `restated`. An unstored
     key is **held** for the rest of the pass when an unstamped record of it
     (`accepted_at = None`) has `filed` on or before the carrier's (a same-day
-    tie holds); `held` counts each holding entry once. A CIK that reports a
-    classic revenue tag anywhere drops the financial-only `revenue` fallbacks
-    (`config.FINANCIAL_REVENUE_TAGS`), so a financial concept never takes the
-    revenue vintage from a later filing's classic tag and never changes a
-    stored `gross_profit` (#1556). After a filing's
-    reported keys, each period it carries both constituents of an enabled
+    tie holds); `held` counts each holding entry once. After a filing's
+    reported keys, each period it carries both constituents of a
     `_DERIVED_FACTS` pair for, in one unit, whose stored vintages are both this
     filing's, and for which it carries no reported target and `conflicts`
     lists none, yields a `derived` candidate (the difference or sum, tags
     joined by the operator): `gross_profit` from `revenue` and
-    `cost_of_revenue`, and -- only for a CIK that reports **no** revenue tag at
-    all, so the sum can never preempt a later filing's reported revenue and its
-    derived gross profit -- `revenue` from `net_interest_income` and
-    `noninterest_income` (#1556). Each is subject to the same stored and held
-    rules; a stored key skips it uncounted. Raises `ValueError` for a record
-    accepted after `ingested_at`."""
+    `cost_of_revenue`, and, for a financial issuer, `revenue_financial` from
+    `net_interest_income` and `noninterest_income` (#1556). Each is subject to
+    the same stored and held rules; a stored key skips it uncounted. The
+    financial fact is separate from `revenue`, so no financial concept can
+    interact with `revenue` or `gross_profit`. Raises `ValueError` for a
+    record accepted after `ingested_at`."""
     records = list(records)
-    # #1556: a CIK that reports any *classic* revenue tag (anything other than
-    # `config.FINANCIAL_REVENUE_TAGS`) keeps it; the financial-only fallbacks
-    # are dropped, so they can never take the revenue vintage from a later
-    # filing that reports a classic tag and so can never change a stored
-    # `gross_profit`. A CIK with no classic tag anywhere -- the CIKs this adds
-    # revenue for -- keeps `RevenuesNetOfInterestExpense` (the parser's
-    # `revenue` list) and, failing that, the derived sum below.
-    reports_classic_revenue = any(
-        record.fact_name == REVENUE and record.xbrl_tag not in FINANCIAL_REVENUE_TAGS
-        for record in records
-    )
-    if reports_classic_revenue:
-        records = [
-            record
-            for record in records
-            if not (record.fact_name == REVENUE and record.xbrl_tag in FINANCIAL_REVENUE_TAGS)
-        ]
     unstamped: dict[StatementKey, list[StatementFactRecord]] = defaultdict(list)
     filings: dict[tuple[datetime, str], list[StatementFactRecord]] = defaultdict(list)
     for record in records:
@@ -1536,18 +1517,6 @@ def statement_fact_rows(
         else:
             filings[(record.accepted_at, record.accession)].append(record)
     vintages = dict(stored)
-    # #1556: the financial-revenue sum is a fallback for a CIK with no revenue
-    # tag *anywhere* (no stored revenue key, none among the records), so it can
-    # never take the revenue vintage from a later filing that reports one and
-    # so can never block that filing's derived `gross_profit`.
-    reports_revenue = any(key[0] == REVENUE for key in stored) or any(
-        record.fact_name == REVENUE for record in records
-    )
-    derivations = (
-        _DERIVED_FACTS
-        if not reports_revenue
-        else tuple(fact for fact in _DERIVED_FACTS if fact[0] != REVENUE)
-    )
     held: set[StatementKey] = set()
     holders: set[tuple[str, StatementKey]] = set()
     counts = StatementCounts()
@@ -1583,7 +1552,7 @@ def statement_fact_rows(
                 continue
             if not holds(key, record.filed):
                 store(key, _statement_row(record, ingested_at))
-        for row in _derived_candidates(filing, vintages, conflicts, ingested_at, derivations):
+        for row in _derived_candidates(filing, vintages, conflicts, ingested_at):
             key = (row["fact_name"], row["period_end"], row["period_days"])
             filed = row.pop("_filed")
             if key not in vintages and not holds(key, filed):
@@ -1620,20 +1589,18 @@ def _derived_candidates(
     vintages: Mapping[StatementKey, StatementVintage],
     conflicts: Container[ConflictKey],
     ingested_at: datetime,
-    derivations: Sequence[tuple[str, str, str, str]] = _DERIVED_FACTS,
 ) -> list[Row]:
     """`filing`'s derived rows (`statement_fact_rows`), one per derivable
-    period of each enabled `derivations` pair, each with a `_filed` entry for
-    the hold rule. `comparative` follows the Periods rule over the periods the
+    period of each `_DERIVED_FACTS` pair, each with a `_filed` entry for the
+    hold rule. `comparative` follows the Periods rule over the periods the
     filing can derive, per duration class and per fact; nothing is derived
     from constituents whose stored vintages are not both this filing's (the
-    same-filing rule, so a financial-revenue sum never mixes filings). The
-    caller enables the revenue pair only for a CIK with no revenue tag."""
+    same-filing rule, so a financial-revenue sum never mixes filings)."""
     by_period: dict[tuple[date, int], dict[str, StatementFactRecord]] = defaultdict(dict)
     for record in filing:
         by_period[(record.period_end, record.period_days)][record.fact_name] = record
     out: list[Row] = []
-    for fact_name, left_name, right_name, operator in derivations:
+    for fact_name, left_name, right_name, operator in _DERIVED_FACTS:
         pairs = {
             period: (facts[left_name], facts[right_name])
             for period, facts in by_period.items()
