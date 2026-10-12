@@ -2890,7 +2890,7 @@ scope = "Read-only on 2026-10-11: one SEC fetch of the ANSYS 10-Q instance, a sc
 source = "docs/specs/data-foundation.md"
 section = "Amendment 2026-10-11 (#1541): cover-page listings under the exchange axis"
 bears_on = ["spec:data-foundation", "hyp:h1-momentum-12-1", "adr:0006"]
-note = "Why health never saw it: every check compared the store with itself. The fix, its release and a standing coverage check against an outside reference are the data-foundation plan's T178 to T181 (#1541). Every registered trial read a universe without these names."
+note = "Why health never saw it: every check compared the store with itself. The fix, its release and a standing coverage check against an outside reference are the data-foundation plan's T178 to T182 (#1541). Every registered trial read a universe without these names."
 
 [[claim]]
 id = "TP-4"

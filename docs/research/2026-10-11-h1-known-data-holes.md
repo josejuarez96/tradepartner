@@ -12,7 +12,7 @@ A bank that is not a holding company registers its securities under Exchange Act
 
 ## Exchange-tagged cover listings were dropped
 
-Both cover-page parsers drop every listing a filer tags with `dei:EntityListingsExchangeAxis` (claim TP-3). Until the `cover-listings-1541` release lands (data-foundation plan, T181), the store's universe lacks IBM, AbbVie, Abbott, 3M, Allstate, Fifth Third and Whirlpool for every session before 2026-10-04 (their only listing is the companies snapshot known then), and P&G's primary id reads as a note from 2022-10-19. Trials 2 and 4 read that store.
+Both cover-page parsers drop every listing a filer tags with `dei:EntityListingsExchangeAxis` (claim TP-3). Until the `cover-listings-1541` release lands (data-foundation plan, T181), the store's universe lacks IBM, AbbVie, Abbott and 3M for every session before 2026-10-04 (their only listing is the companies snapshot known then), lacks Allstate, Fifth Third and Whirlpool on every session including today's (a `securities` row and no listing at all, so the open paper windows do not see them either), and P&G's primary id reads as a note from 2022-10-19. Trials 2 and 4 read that store.
 
 What the release restores and what stays missing (spec amendment, "Point in time"):
 
