@@ -431,27 +431,52 @@ def ingest_rates(
                     f"{settings.rates.max_stale_sessions}"
                 )
             stored_rows = conn.execute(
-                "SELECT observation_date, value, known_at FROM rates WHERE series = ? "
-                "ORDER BY observation_date, known_at",
+                "SELECT observation_date, value, known_at, vintage_date FROM rates "
+                "WHERE series = ? ORDER BY observation_date, known_at",
                 [series],
             ).fetchall()
-            known_values = {(day, stamp): value for day, value, stamp in stored_rows}
-            latest_values = {day: value for day, value, _ in stored_rows}
+            known_values = {
+                (day, stamp): (value, vintage) for day, value, stamp, vintage in stored_rows
+            }
             added = revisions = future = late = collisions = 0
-            state.through = max((day for day, _, _ in stored_rows), default=None)
+            state.through = max((day for day, _, _, _ in stored_rows), default=None)
+            by_stamp: dict[tuple[date, datetime], RateObservation] = {}
             for record in state.fetched:
+                key = (record.observation_date, rate_known_at(record.vintage_date))
+                previous = by_stamp.get(key)
+                if previous is not None and previous.value != record.value:
+                    collisions += 1
+                if previous is None or record.vintage_date > previous.vintage_date:
+                    by_stamp[key] = record
+            for record in sorted(
+                by_stamp.values(),
+                key=lambda row: (
+                    row.observation_date,
+                    rate_known_at(row.vintage_date),
+                    row.vintage_date,
+                ),
+            ):
                 stamp = rate_known_at(record.vintage_date)
                 if stamp > now:
                     future += 1
                     continue
                 key = (record.observation_date, stamp)
-                if key in known_values:
-                    if known_values[key] != record.value:
+                existing = known_values.get(key)
+                if existing is not None:
+                    if existing[0] != record.value:
                         collisions += 1
                     continue
-                if latest_values.get(record.observation_date) == record.value:
+                in_effect = max(
+                    (
+                        (known_stamp, value)
+                        for (day, known_stamp), (value, _) in known_values.items()
+                        if day == record.observation_date and known_stamp <= stamp
+                    ),
+                    default=None,
+                )
+                if in_effect is not None and in_effect[1] == record.value:
                     continue
-                if record.observation_date in latest_values:
+                if any(day == record.observation_date for day, _ in known_values):
                     revisions += 1
                 stamp_lag = max(
                     0, bisect_right(sessions, expected) - bisect_right(sessions, stamp.date())
@@ -472,8 +497,7 @@ def ingest_rates(
                         "provenance": "release",
                     },
                 )
-                known_values[key] = record.value
-                latest_values[record.observation_date] = record.value
+                known_values[key] = (record.value, record.vintage_date)
                 state.through = max(
                     state.through or record.observation_date, record.observation_date
                 )
