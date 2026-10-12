@@ -928,6 +928,40 @@ def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> Non
     assert records and source.statement_conflicts == 1  # counted on the first answer
 
 
+def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
+    """A new filing must reach statements even after shares were cached at Q1."""
+    q1 = "0000123456-26-000001"
+    q2 = "0000123456-26-000002"
+    q1_at = datetime(2026, 5, 1, 20, 0, tzinfo=UTC)
+    q2_at = datetime(2026, 8, 1, 20, 0, tzinfo=UTC)
+    settings = _settings(tmp_path)
+
+    def body(include_q2: bool) -> dict[str, Any]:
+        shares = [entry(q1, "2026-03-31", 10, form="10-Q")]
+        revenue = [entry(q1, ("2026-01-01", "2026-03-31"), 100, form="10-Q")]
+        if include_q2:
+            shares.append(entry(q2, "2026-06-30", 11, form="10-Q"))
+            revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form="10-Q"))
+        return {
+            "cik": int(CIK),
+            "facts": {
+                "dei": {SHARES: {"units": {"shares": shares}}},
+                "us-gaap": {"Revenues": {"units": {"USD": revenue}}},
+            },
+        }
+
+    first = _adapter(settings, _router(**{f"c{CIK}": body(False)}))
+    _stamps(first, CIK, {q1: ("10-Q", q1_at)})
+    assert first.facts(CIK, [SHARES])
+    assert {r.accession for r in first.statement_facts(CIK)} == {q1}
+
+    second = _adapter(settings, _router(**{f"c{CIK}": body(True)}))
+    assert {r.accession for r in second.statement_facts(CIK)} == {q1}
+    _stamps(second, CIK, {q1: ("10-Q", q1_at), q2: ("10-Q", q2_at)})
+    assert {r.accession for r in second.facts(CIK, [SHARES])} == {q1, q2}
+    assert {r.accession for r in second.statement_facts(CIK)} == {q1, q2}
+
+
 def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:
     body = _company(CIK, {"Revenues": {"USD": [entry(K2022, FY2022, 1)]}})
     del body["facts"]["dei"][SHARES]["units"]["shares"][0]["end"]
