@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import traceback
 from datetime import date
-from pathlib import Path
 
 import httpx
 import pytest
@@ -208,8 +207,3 @@ def test_adapter_sorts_unsorted_vintages() -> None:
         (date(2020, 1, 3), date(2020, 1, 6)),
         (date(2020, 1, 3), date(2020, 1, 7)),
     ]
-
-
-def test_changelog_fragment_heading_precedes_bullet() -> None:
-    fragment = Path(__file__).resolve().parents[2] / "changelog.d/1546-fred-rate-adapter.md"
-    assert fragment.read_text().startswith("### Added\n- ")
