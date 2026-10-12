@@ -36,6 +36,7 @@ from tradepartner.adapters.edgar_source import (
     reduce_submissions,
 )
 from tradepartner.config import Settings
+from tradepartner.ingest import StatementCounts, statement_fact_rows
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "edgar"
 CIK = "0000123456"
@@ -928,8 +929,10 @@ def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> Non
     assert records and source.statement_conflicts == 1  # counted on the first answer
 
 
-def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
-    """A new filing must reach statements even after shares were cached at Q1."""
+def _q1_q2_source(
+    tmp_path: Path, *, q2_statement: bool = True
+) -> tuple[EdgarFilingSource, str, datetime]:
+    """Read Q1 statements, then add a Q2 filing to the same source instance."""
     q1 = "0000123456-26-000001"
     q2 = "0000123456-26-000002"
     q1_at = datetime(2026, 5, 1, 20, 0, tzinfo=UTC)
@@ -941,7 +944,8 @@ def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
         revenue = [entry(q1, ("2026-01-01", "2026-03-31"), 100, form="10-Q")]
         if include_q2:
             shares.append(entry(q2, "2026-06-30", 11, form="10-Q"))
-            revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form="10-Q"))
+            if q2_statement:
+                revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form="10-Q"))
         return {
             "cik": int(CIK),
             "facts": {
@@ -959,7 +963,31 @@ def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
     assert {r.accession for r in second.statement_facts(CIK)} == {q1}
     _stamps(second, CIK, {q1: ("10-Q", q1_at), q2: ("10-Q", q2_at)})
     assert {r.accession for r in second.facts(CIK, [SHARES])} == {q1, q2}
+    return second, q2, q2_at
+
+
+def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
+    """A new filing must reach statements even after shares were cached at Q1."""
+    second, q2, _ = _q1_q2_source(tmp_path)
+    q1 = "0000123456-26-000001"
     assert {r.accession for r in second.statement_facts(CIK)} == {q1, q2}
+
+
+def test_refreshed_q2_statement_is_not_known_before_acceptance(tmp_path: Path) -> None:
+    """The refreshed row retains Q2's acceptance stamp through the ingest builder."""
+    second, q2, q2_at = _q1_q2_source(tmp_path)
+    records = second.statement_facts(CIK)
+    rows, _ = statement_fact_rows(records, {}, set(), ingested_at=datetime(2026, 8, 2, tzinfo=UTC))
+    q2_rows = [row for row in rows if row["filing_accession"] == q2]
+    assert q2_rows and all(row["known_at"] == q2_at for row in q2_rows)
+
+
+def test_seen_q2_shares_without_statements_have_named_counter(tmp_path: Path) -> None:
+    """A seen 10-Q with no parsed statement row is visible in the run count."""
+    second, _, _ = _q1_q2_source(tmp_path, q2_statement=False)
+    second.statement_facts(CIK)
+    assert second.statement_no_parsed_rows == 1
+    assert "statement_no_parsed_rows: 1" in StatementCounts().message(second)
 
 
 def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:

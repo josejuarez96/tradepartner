@@ -1400,6 +1400,7 @@ _STATEMENT_SOURCE_COUNTS: tuple[str, ...] = (
     "non_usd",
     "malformed",
     "none",
+    "no_parsed_rows",
 )
 
 #: A statement fact's key: `(fact_name, period_end, period_days)` within a CIK.
