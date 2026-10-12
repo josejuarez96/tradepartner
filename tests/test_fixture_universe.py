@@ -16,6 +16,7 @@ import re
 import sys
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ import pytest
 from conftest import load_universe_fixtures
 from dateutil.relativedelta import relativedelta
 
+from tradepartner.adapters.borrow import BorrowStatus, parse_assets
 from tradepartner.calendar import (
     is_half_day,
     is_session,
@@ -91,7 +93,7 @@ _CSV_TABLES = (
     "corporate_actions",
     "facts",
     "statement_facts",
-    "rates",
+    "borrow_status",
 )
 
 #: Every statement-facts fixture case (#660, T76) as a keyword that must
@@ -121,6 +123,27 @@ _RATES_CASE_KEYWORDS = [
     "(d) Bank-holiday gap of two business days",
     "(e) Revision",
     "(f) Vintage dated a Saturday",
+]
+
+#: One fixture security per borrow-status case (#1506, T171).
+_BORROW_SYMBOLS = {
+    "unchanged": "BNDX",
+    "flipped": "SPLT",
+    "vanished": "DUALA",
+    "new": "TRNS",
+    "renamed": "TCKA",
+    "reappeared": "RDAT",
+}
+
+#: Every borrow-status fixture case (#1506, T171; the spec's "Fixture"
+#: paragraph): three snapshots a day apart over six assets.
+_BORROW_STATUS_CASE_KEYWORDS = [
+    "(a) Unchanged",
+    "(b) ETB to HTB",
+    "(c) Vanished",
+    "(d) New",
+    "(e) Renamed",
+    "(f) Vanished then reappeared",
 ]
 
 
@@ -812,3 +835,172 @@ def test_rates_vintages_follow_the_next_business_day_except_the_cases() -> None:
         (date(2018, 10, 5), date(2018, 10, 9)),
         (date(2019, 3, 12), date(2019, 3, 20)),
     ]
+
+
+# --- borrow_status (#1506, T171) ---------------------------------------------
+
+#: The columns a parsed snapshot carries from the CSV row: everything but the
+#: table's own `present`, `known_at` and `ingested_at`.
+_BORROW_PAYLOAD_COLUMNS = (
+    "asset_id",
+    "symbol",
+    "exchange",
+    "status",
+    "tradable",
+    "marginable",
+    "shortable",
+    "easy_to_borrow",
+    "borrow_status",
+    "fractionable",
+)
+_BORROW_FLAG_COLUMNS = ("tradable", "marginable", "shortable", "easy_to_borrow", "fractionable")
+
+
+def _borrow_rows() -> list[dict[str, str]]:
+    with (_FIXTURES_DIR / "borrow_status.csv").open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _borrow_record(row: dict[str, str]) -> BorrowStatus:
+    """One CSV row as the record the table stores (the two stamps equal:
+    `known_at` is the fetch time)."""
+    return BorrowStatus(
+        asset_id=row["asset_id"],
+        symbol=row["symbol"],
+        exchange=row["exchange"],
+        status=row["status"],
+        tradable=row["tradable"] == "TRUE",
+        marginable=row["marginable"] == "TRUE",
+        shortable=row["shortable"] == "TRUE",
+        easy_to_borrow=row["easy_to_borrow"] == "TRUE",
+        borrow_status=row["borrow_status"],
+        fractionable=row["fractionable"] == "TRUE",
+        present=row["present"] == "TRUE",
+        known_at=datetime.fromisoformat(row["known_at"]),
+        fetched_at=datetime.fromisoformat(row["known_at"]),
+    )
+
+
+def _borrow_payload(row: dict[str, str]) -> dict[str, object]:
+    """One CSV row as the `GET /v2/assets` entry the parser expects (the
+    payload's own field names, real booleans, `present`/`known_at`/
+    `ingested_at` dropped: the parser never sees them)."""
+    payload: dict[str, object] = {
+        "id": row["asset_id"],
+        "class": "us_equity",
+        **{name: row[name] for name in _BORROW_PAYLOAD_COLUMNS if name != "asset_id"},
+    }
+    for name in _BORROW_FLAG_COLUMNS:
+        payload[name] = row[name] == "TRUE"
+    return payload
+
+
+def test_readme_documents_every_borrow_status_case() -> None:
+    readme = (_FIXTURES_DIR / "README.md").read_text()
+    missing = [kw for kw in _BORROW_STATUS_CASE_KEYWORDS if kw not in readme]
+    assert not missing, f"README missing borrow-status case(s): {missing}"
+
+
+def test_the_fixture_holds_three_snapshots_a_day_apart() -> None:
+    """Three fetch times, each a session apart and each after that session's
+    close, so an as-of read at `close(S)` sees that day's snapshot (the spec's
+    "three snapshots a day apart"; ADR 0021 point 2: `known_at` is the fetch
+    time, never a date)."""
+    stamps = sorted({datetime.fromisoformat(r["known_at"]) for r in _borrow_rows()})
+    assert len(stamps) == 3
+    for earlier, later in pairwise(stamps):
+        assert is_session(earlier.date()) and is_session(later.date())
+        assert next_session(earlier.date()) == later.date()
+        assert earlier > session_close(earlier.date())
+        assert earlier.tzinfo is not None
+
+
+def test_every_borrow_row_is_earned_by_a_change() -> None:
+    """Rows record change, so for each asset every stored row after the first
+    differs from the row before it in the compared tuple (`symbol`,
+    `exchange`, `status`, the five flags, `borrow_status` **and `present`**).
+    A row that differs in nothing is a row the diff would not have written:
+    the unchanged asset's later snapshots must be absent, and an asset already
+    recorded vanished must not be re-vanished.
+
+    The payloads themselves cannot be recovered from the table (that is what
+    "rows record change" means), so this is the CSV's own proof that it is
+    exactly a diff's output; `tests/adapters/test_borrow.py` covers the diff
+    itself over constructed payloads.
+    """
+    rows = _borrow_rows()
+    by_asset: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        by_asset.setdefault(row["asset_id"], []).append(row)
+    assert len(by_asset) == 6
+    for asset_id, history in by_asset.items():
+        history = sorted(history, key=lambda r: r["known_at"])
+        assert history[0]["present"] == "TRUE", asset_id  # the first row of a new asset
+        previous: BorrowStatus | None = None
+        for row in history:
+            record = _borrow_record(row)
+            if previous is not None:
+                assert not previous.matches(record), (
+                    f"{asset_id} at {row['known_at']} repeats the row before it: the diff "
+                    "writes nothing for an unchanged asset"
+                )
+            previous = record
+
+
+def test_the_six_cases_each_hold_their_shape() -> None:
+    """The six cases, read off the committed table: one row for the unchanged
+    asset, the ETB to HTB flip, the vanished asset's `present = FALSE` row,
+    the new asset's first snapshot, the rename's two symbols, and the
+    vanished-then-reappeared asset's three rows."""
+    rows = _borrow_rows()
+    # The renamed case holds two symbols, hence the extra key.
+    history = {
+        symbol: [(r["known_at"], r["present"] == "TRUE") for r in rows if r["symbol"] == symbol]
+        for symbol in (*_BORROW_SYMBOLS.values(), "TCKB")
+    }
+    first, second, third = sorted({r["known_at"] for r in rows})
+    assert history["BNDX"] == [(first, True)]  # unchanged: one row only
+    assert history["SPLT"] == [(first, True), (second, True)]  # ETB to HTB
+    assert history["DUALA"] == [(first, True), (second, False)]  # vanished
+    assert history["TRNS"] == [(second, True)]  # new
+    assert [stamp for stamp, _ in history["TCKA"]] == [first]
+    assert [stamp for stamp, _ in history["TCKB"]] == [second]  # renamed
+    assert history["RDAT"] == [(first, True), (second, False), (third, True)]
+    # The flip itself.
+    flipped = [r for r in rows if r["symbol"] == "SPLT"]
+    assert [(r["known_at"], r["easy_to_borrow"], r["borrow_status"]) for r in flipped] == [
+        (first, "TRUE", "easy_to_borrow"),
+        (second, "FALSE", "hard_to_borrow"),
+    ]
+
+
+def test_every_present_row_parses_back_unchanged() -> None:
+    """The CSV's rows are the parser's own records: re-parsing a present row
+    as a payload entry reproduces it exactly, so the fixture and the parser
+    cannot drift apart."""
+    for row in _borrow_rows():
+        if row["present"] != "TRUE":
+            continue
+        (record,) = parse_assets(
+            [_borrow_payload(row)], datetime.fromisoformat(row["known_at"])
+        ).assets
+        assert record == _borrow_record(row)
+
+
+def test_the_vanished_rows_carry_their_last_values() -> None:
+    """A `present = FALSE` row carries the last values the store had for the
+    asset, so a reappearance can be told from a new asset (spec "rows record
+    change")."""
+    rows = _borrow_rows()
+    for row in rows:
+        if row["present"] != "FALSE":
+            continue
+        earlier = [
+            r
+            for r in rows
+            if r["asset_id"] == row["asset_id"]
+            and datetime.fromisoformat(r["known_at"]) < datetime.fromisoformat(row["known_at"])
+        ]
+        assert earlier, row["asset_id"]
+        for column in _BORROW_PAYLOAD_COLUMNS:
+            assert row[column] == earlier[-1][column], (row["asset_id"], column)

@@ -50,6 +50,7 @@ FACT_TABLES: tuple[str, ...] = (
     "statement_facts",
     "filing_events",
     "rates",
+    "borrow_status",
 )
 
 
@@ -154,6 +155,20 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "observation_date": date(2020, 1, 2),
             "value": 1.52,
             "vintage_date": date(2020, 1, 3),
+        }
+    elif table == "borrow_status":
+        business = {
+            "asset_id": "b0rr0w000-0000-4000-8000-00000000000a",
+            "symbol": "BNDX",
+            "exchange": "NYSE",
+            "status": "active",
+            "tradable": True,
+            "marginable": True,
+            "shortable": True,
+            "easy_to_borrow": True,
+            "borrow_status": "easy_to_borrow",
+            "fractionable": True,
+            "present": True,
         }
     else:
         raise ValueError(f"no minimal row defined for {table!r}")
@@ -596,7 +611,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (23,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (24,)
     finally:
         conn.close()
 
@@ -745,9 +760,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22, 23]
+        assert _versions(conn) == [20, 21, 22, 23, 24]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22, 23]
+        assert _versions(conn) == [20, 21, 22, 23, 24]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -908,7 +923,9 @@ def _version_22_store(conn: duckdb.DuckDBPyConnection) -> None:
 def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
     """From 22: `rates` appears, empty and shaped as a fresh store's; every
     other table's DDL and every row are unchanged; the versions go to [22, 23]
-    and a second open adds nothing."""
+    and a second open adds nothing. The same open takes version 24's
+    `borrow_status` step (#1506, T171), so the store ends at [22, 23, 24]:
+    that migration has its own test below."""
     conn = duckdb.connect(":memory:")
     try:
         _version_22_store(conn)
@@ -923,9 +940,9 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
-        assert _versions(conn) == [22, 23]
+        assert _versions(conn) == [22, 23, 24]
         schema.init_schema(conn)
-        assert _versions(conn) == [22, 23]
+        assert _versions(conn) == [22, 23, 24]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["rates"] == _shape(fresh)["rates"]
@@ -968,6 +985,208 @@ def test_the_fixture_store_holds_the_rates_series(
         "SELECT observation_date FROM rates GROUP BY ALL HAVING count(*) > 1"
     ).fetchall()
     assert revised == [(date(2019, 3, 12),)]
+
+
+# --- borrow_status (#1506, T171; schema version 24) --------------------
+
+_V24_BORROW_STATUS_DDL_SHA256 = "f16cb6d1038a4e9cda0a4466e13a89aeb7b45d9dd9faacfff480b4b0d3992226"
+
+
+def test_borrow_status_ddl_is_pinned_at_version_24() -> None:
+    digest = hashlib.sha256("".join(schema._BORROW_STATUS_TABLE_DDL).encode()).hexdigest()
+    assert digest == _V24_BORROW_STATUS_DDL_SHA256, (
+        "borrow_status DDL changed: bump the schema version and add a migration instead "
+        "of editing the table in place"
+    )
+
+
+def test_borrow_status_is_a_snapshot_fact_table_keyed_by_asset_id_and_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The spec's eleven payload columns plus `present` and the four common
+    ones, `provenance = snapshot` only, UNIQUE `(asset_id, known_at)`, and
+    nothing else (no constraint beyond the common two `CHECK`s); in
+    `TABLE_NAMES` so the look-ahead harness truncates it. `borrow_status`
+    is VARCHAR NOT NULL with `''` for "the payload gave none", never NULL."""
+    assert "borrow_status" in schema.TABLE_NAMES
+    assert schema.TABLE_PROVENANCE_VALUES["borrow_status"] == ("snapshot",)
+    info = fixture_store.execute("PRAGMA table_info('borrow_status')").fetchall()
+    assert [(row[1], row[2], bool(row[3])) for row in info] == [
+        ("asset_id", "VARCHAR", True),
+        ("symbol", "VARCHAR", True),
+        ("exchange", "VARCHAR", True),
+        ("status", "VARCHAR", True),
+        ("tradable", "BOOLEAN", True),
+        ("marginable", "BOOLEAN", True),
+        ("shortable", "BOOLEAN", True),
+        ("easy_to_borrow", "BOOLEAN", True),
+        ("borrow_status", "VARCHAR", True),
+        ("fractionable", "BOOLEAN", True),
+        ("present", "BOOLEAN", True),
+        ("known_at", "TIMESTAMP WITH TIME ZONE", True),
+        ("ingested_at", "TIMESTAMP WITH TIME ZONE", True),
+        ("source", "VARCHAR", True),
+        ("provenance", "VARCHAR", True),
+    ]
+    constraints = fixture_store.execute(
+        "SELECT constraint_type, constraint_column_names, constraint_text "
+        "FROM duckdb_constraints() WHERE table_name = 'borrow_status' "
+        "AND constraint_type <> 'NOT NULL'"
+    ).fetchall()
+    assert sorted(c[0] for c in constraints) == ["CHECK", "CHECK", "UNIQUE"]
+    checks = sorted(c[2] for c in constraints if c[0] == "CHECK")
+    assert checks == sorted(
+        ["CHECK((provenance IN ('snapshot')))", "CHECK((known_at <= ingested_at))"]
+    )
+    assert [set(c[1]) for c in constraints if c[0] == "UNIQUE"] == [{"asset_id", "known_at"}]
+
+
+def test_a_second_borrow_status_row_for_a_key_raises(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """One row per `(asset_id, known_at)`: a second snapshot of the same
+    asset at the same fetch time raises even with different flags, and a
+    later fetch time is the change row the diff writes."""
+    now = _now()
+    row = _minimal_row("borrow_status", known_at=now, ingested_at=now)
+    insert_row(fixture_store, "borrow_status", row)
+    again = _minimal_row("borrow_status", known_at=now, ingested_at=now)
+    again["shortable"] = False
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "borrow_status", again)
+    later = now + timedelta(days=1)
+    change = _minimal_row("borrow_status", known_at=later, ingested_at=later)
+    change["shortable"] = False
+    insert_row(fixture_store, "borrow_status", change)
+    assert fixture_store.execute(
+        "SELECT shortable FROM borrow_status WHERE asset_id = "
+        "'b0rr0w000-0000-4000-8000-00000000000a' ORDER BY known_at"
+    ).fetchall() == [(True,), (False,)]
+
+
+@pytest.mark.parametrize("provenance", ["filing", "bar", "action", "snapshot_static", "release"])
+def test_borrow_status_refuses_every_other_provenance(
+    fixture_store: duckdb.DuckDBPyConnection, provenance: str
+) -> None:
+    now = _now()
+    row = _minimal_row("borrow_status", known_at=now, ingested_at=now)
+    row["provenance"] = provenance
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "borrow_status", row)
+
+
+def _version_23_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 23 left it: today's schema without
+    `borrow_status` and a single version-23 row, holding a `prices_daily`,
+    a `rates` and a `borrow_status`-less fact row."""
+    configure_connection(conn)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO prices_daily VALUES ('S1', DATE '2020-01-02', 1, 1, 1, 1, 1, "
+        "TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
+        "'test', 'bar')"
+    )
+    conn.execute(
+        "INSERT INTO rates VALUES ('DTB3', DATE '2020-01-02', 1.52, DATE '2020-01-03', "
+        "TIMESTAMPTZ '2020-01-03 21:00:00+00', TIMESTAMPTZ '2020-01-03 21:10:00+00', "
+        "'test', 'release')"
+    )
+    conn.execute("DROP TABLE borrow_status")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (23, TIMESTAMPTZ "
+        "'2026-10-11 20:00:00+00')"
+    )
+
+
+def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
+    """From 23: `borrow_status` appears, empty and shaped as a fresh store's;
+    every other table's DDL and every row are unchanged; the versions go to
+    [23, 24] and a second open adds nothing. The migration is purely
+    additive (ADR 0021's reversible table): no existing row moves."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_23_store(conn)
+        shape_before = _shape(conn)
+        tables_before = sorted(set(shape_before) - {"schema_version"})
+        rows_before = _all_rows(conn, tables_before)
+        assert "borrow_status" not in shape_before
+        assert sum(len(rows) for rows in rows_before.values()) >= 2
+        schema.init_schema(conn)
+        shape_after = _shape(conn)
+        assert set(shape_after) - set(shape_before) == {"borrow_status"}
+        assert {t: shape_after[t] for t in shape_before} == shape_before
+        assert _all_rows(conn, tables_before) == rows_before
+        assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (0,)
+        assert _versions(conn) == [23, 24]
+        schema.init_schema(conn)
+        assert _versions(conn) == [23, 24]
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        assert shape_after["borrow_status"] == _shape(fresh)["borrow_status"]
+        fresh.close()
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_23_store_passes_and_a_borrow_status_read_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v23.duckdb"
+    conn = duckdb.connect(str(path))
+    _version_23_store(conn)
+    conn.close()
+    with duckdb.connect(str(path), read_only=True) as ro:
+        schema.init_schema(ro)
+        assert _versions(ro) == [23]
+        assert ro.execute("SELECT count(*) FROM rates").fetchone() == (1,)
+        with pytest.raises(duckdb.CatalogException):
+            ro.execute("SELECT * FROM borrow_status")
+
+
+def test_the_fixture_store_holds_the_six_borrow_cases(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`borrow_status.csv` loads and carries the spec's "Fixture" paragraph:
+    three snapshots a day apart over six assets, where an unchanged asset
+    writes one row, a vanished one a `present = FALSE` row at its last
+    snapshot, and a reappeared one its absence and its return."""
+    assert fixture_store.execute(
+        "SELECT DISTINCT source, provenance FROM borrow_status"
+    ).fetchall() == [("alpaca", "snapshot")]
+    stamps_in_table = fixture_store.execute(
+        "SELECT count(DISTINCT known_at) FROM borrow_status"
+    ).fetchone()
+    assert stamps_in_table == (3,)
+    per_asset = fixture_store.execute(
+        "SELECT asset_id, count(*) AS n, count(*) FILTER (WHERE NOT present) AS gone "
+        "FROM borrow_status GROUP BY asset_id ORDER BY asset_id"
+    ).fetchall()
+    stamps = fixture_store.execute(
+        "SELECT DISTINCT known_at FROM borrow_status ORDER BY known_at"
+    ).fetchall()
+    # unchanged, ETB to HTB, vanished, new, renamed, vanished then reappeared.
+    assert [(n, gone) for _, n, gone in per_asset] == [
+        (1, 0),  # unchanged: only the first snapshot writes a row
+        (2, 0),  # ETB to HTB: the flip
+        (2, 1),  # vanished: its second snapshot is `present = FALSE`
+        (1, 0),  # new: first seen at the second snapshot
+        (2, 0),  # renamed: the new symbol is a change
+        (3, 1),  # vanished then reappeared with its old values
+    ]
+    flipped = fixture_store.execute(
+        "SELECT known_at, easy_to_borrow, borrow_status FROM borrow_status "
+        "WHERE asset_id = 'b0rr0w00-0000-4b0d-8000-000000000002' ORDER BY known_at"
+    ).fetchall()
+    assert flipped == [
+        (stamps[0][0], True, "easy_to_borrow"),
+        (stamps[1][0], False, "hard_to_borrow"),
+    ]
+    renamed = fixture_store.execute(
+        "SELECT symbol FROM borrow_status "
+        "WHERE asset_id = 'b0rr0w00-0000-4b0d-8000-000000000005' ORDER BY known_at"
+    ).fetchall()
+    assert renamed == [("TCKA",), ("TCKB",)]
 
 
 # --- version 13 (#720, #1033, T85d): profitability rebalance columns ----
@@ -1055,7 +1274,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (23,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (24,)
     finally:
         conn.close()
 
@@ -1177,7 +1396,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -1673,8 +1892,9 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     #1033, T85d) is version 13; the generic rebalance counts and the
     `signals.reason` prefix `CHECK` (#1153, T127) is version 14; the period keys
     (#1179, T97) are version 15; the lab migration (#1195, T113) is version 16;
-    the ADR 0015 expansion seams (#1258, T132) are version 17."""
-    assert schema.CURRENT_SCHEMA_VERSION == 23
+    the ADR 0015 expansion seams (#1258, T132) are version 17; #1498's `rates`
+    (T169) is version 23; #1506's `borrow_status` (T171) is version 24."""
+    assert schema.CURRENT_SCHEMA_VERSION == 24
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
