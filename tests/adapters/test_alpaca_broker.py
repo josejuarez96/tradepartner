@@ -1162,6 +1162,17 @@ def test_the_activities_read_pages_like_the_fills_read() -> None:
         broker.cash_activities(date(2026, 10, 9))
 
 
+def test_a_page_element_that_is_not_an_object_raises_system_fault() -> None:
+    """A page holding something that is not an activity object is malformed:
+    the adapter fails closed with `SystemFaultError` rather than raising an
+    `AttributeError` from inside the loop (safety-reviewer's fix)."""
+    broker, http = _activity_broker()
+    for page in (["not-an-object"], [{"id": "a", "activity_type": "FEE"}, 7]):
+        http.route("GET", "/v2/account/activities", (200, page))
+        with pytest.raises(SystemFaultError, match="malformed alpaca activity"):
+            broker.cash_activities(date(2026, 10, 9))
+
+
 def test_a_row_the_adapter_cannot_map_raises_system_fault() -> None:
     """A payload with no `id`, no `date`, no `status`, or a `date` carrying a
     time the row does not have, is a malformed activity: fail closed rather

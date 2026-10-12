@@ -111,14 +111,15 @@ non-trade activity list the fake answers `cash_activities(since)` from, and
 it is a plain mutable list on the instance, so a test posts an activity at
 any point of a run (append one), changes a row's status (replace an
 element), repeats an id (append a row with an id already there) or posts a
-type no rule books. The list is answered, not copied into state: the rows
-are the `CashActivity` objects the test built, and each call returns a fresh
-list of those dated `since` or later, oldest first — the order the
-interface promises, whatever order the test scripted them in, stable
-within a date so a repeated id keeps the order it was scripted in. Nothing
-here moves cash or a position: the fake has no fees, and a test that wants
-a fee's cash effect books it through the account it hands the run (T183's
-fixture sets `account()`'s cash directly).
+type no rule books. **The fake drops nothing by date**, like the live read:
+the request asks the broker from the New York midnight that begins the day
+before `since` and a row dated before `since` can come back, so the caller
+applies its own bound — a fake that filtered here would be a weaker fake
+than the adapter it stands in for. Every row is returned oldest first, in a
+stable sort, so rows sharing a date (a repeated id, say) keep the order the
+test scripted them in. Nothing here moves cash or a position: the fake has
+no fees, and a test that wants a fee's cash effect books it through the
+account it hands the run (T183's fixture sets `account()`'s cash directly).
 """
 
 from __future__ import annotations
@@ -573,8 +574,9 @@ class FakeBroker(Broker):
             raise TypeError(f"since must be a date, got {since!r}")
         # Oldest first, the order the interface promises; Python's sort is
         # stable, so rows sharing a date (a repeated id, say) keep the order
-        # the test scripted them in.
-        return [a for a in sorted(self.activities, key=_activity_date) if a.date >= since]
+        # the test scripted them in. Nothing is dropped by date: the caller
+        # applies its own bound (module docstring, "Scripted cash activities").
+        return sorted(self.activities, key=_activity_date)
 
     def positions(self) -> dict[str, Position]:
         self._log("positions")

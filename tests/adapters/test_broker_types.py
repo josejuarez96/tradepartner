@@ -477,18 +477,27 @@ def test_cash_activity_shape() -> None:
         "activity_id",
         "activity_type",
         "date",
-        "net_amount",
         "status",
+        "net_amount",
         "symbol",
         "description",
     ]
     assert activity.activity_id == "fee-1"
     assert activity.activity_type == "FEE"
     assert activity.date == date(2026, 10, 9)
-    assert activity.net_amount == -0.01
     assert activity.status == "executed"
+    assert activity.net_amount == -0.01
     assert activity.symbol == "AAPL"
     assert activity.description == "CAT fee for proceed of 8 trades"
+
+
+def test_cash_activity_status_is_required() -> None:
+    """A row built without a status is never bookable: the fee rule judges a
+    row by its status, so a statusless row cannot be constructed at all
+    (safety-reviewer's fix)."""
+    with pytest.raises(TypeError):
+        CashActivity(activity_id="fee-1", activity_type="FEE", date=date(2026, 10, 9))  # type: ignore[call-arg]
+    assert _activity(status="correct").status == "correct"
 
 
 def test_cash_activity_nullable_fields_default_to_none() -> None:

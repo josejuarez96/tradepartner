@@ -248,16 +248,23 @@ def _activity(payload: Mapping[str, Any]) -> CashActivity:
     )
 
 
-def _cash_activities(activities: Iterable[Mapping[str, Any]]) -> list[CashActivity]:
+def _cash_activities(activities: Iterable[Any]) -> list[CashActivity]:
     """Every non-trade activity of a page as a `CashActivity`, oldest first, in
     the order the page gives them. `FILL` rows are dropped here, client-side:
     the request carries no type filter at all, so a fill may be in the page,
-    and a fill is never a cash activity."""
-    return [
-        _mapped("activity", _activity, activity)
-        for activity in activities
-        if activity.get("activity_type") != _ACTIVITY_FILL
-    ]
+    and a fill is never a cash activity. A page element that is not an object
+    is malformed and fails closed here, rather than as an `AttributeError`
+    from inside the loop."""
+    rows: list[CashActivity] = []
+    for activity in activities:
+        if not isinstance(activity, Mapping):
+            raise SystemFaultError(
+                f"malformed alpaca activity: not an object: {type(activity).__name__}"
+            )
+        if activity.get("activity_type") == _ACTIVITY_FILL:
+            continue
+        rows.append(_mapped("activity", _activity, activity))
+    return rows
 
 
 def _status(text: Any) -> OrderStatus:

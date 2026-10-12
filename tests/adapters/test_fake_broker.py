@@ -610,16 +610,22 @@ REG = CashActivity(
     description="REG fee for proceed of $433.15 on 2026-10-09",
 )
 CLASSIFIED = CashActivity(
-    activity_id="fee-int-1", activity_type="INT", date=date(2026, 10, 8), net_amount=0.01
+    activity_id="fee-int-1",
+    activity_type="INT",
+    date=date(2026, 10, 8),
+    net_amount=0.01,
+    status="executed",
 )
 
 
-def test_cash_activities_returns_the_scripted_list_from_since_on() -> None:
+def test_cash_activities_returns_every_scripted_row_whatever_its_date() -> None:
+    """The fake behaves like the live read (safety-reviewer's fix): it drops
+    nothing by date, so a row dated before `since` comes back and the caller
+    applies its own bound, as it must against the adapter."""
     broker, _ = make_broker(activities=[CLASSIFIED, CAT, REG])
 
-    assert broker.cash_activities(date(2026, 10, 9)) == [CAT, REG]
-    assert broker.cash_activities(date(2026, 10, 8)) == [CLASSIFIED, CAT, REG]
-    assert broker.cash_activities(date(2026, 10, 10)) == []
+    assert broker.cash_activities(date(2026, 10, 9)) == [CLASSIFIED, CAT, REG]
+    assert broker.cash_activities(date(2026, 10, 10)) == [CLASSIFIED, CAT, REG]
 
 
 def test_cash_activities_answers_the_rows_it_was_given_verbatim() -> None:
@@ -640,7 +646,7 @@ def test_cash_activities_answers_the_rows_it_was_given_verbatim() -> None:
 def test_cash_activities_returns_oldest_first_whatever_order_it_was_scripted_in() -> None:
     broker, _ = make_broker(activities=[REG, CLASSIFIED, CAT])
 
-    rows = broker.cash_activities(date(2026, 10, 8))
+    rows = broker.cash_activities(date(2026, 10, 9))
 
     assert [r.date for r in rows] == [date(2026, 10, 8), date(2026, 10, 9), date(2026, 10, 9)]
     # Split by date, the scripted order kept inside one date.

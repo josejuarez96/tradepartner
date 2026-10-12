@@ -38,8 +38,10 @@ identity, the only key by which an activity is counted once — a `date` with
 **no time** (a fee row has only a date; inventing a time for it would be a
 guess about when the broker posted it) and a signed `net_amount` (`None` for a
 row that moves no cash). It never returns a fill, and it returns every row
-from `since` on whatever its type: a type nothing here has classified must
-reach the reconciliation as `unexplained_activity`, not be filtered away.
+the broker lists from `since`'s window on whatever its type — nothing is
+dropped by date, a row dated before `since` included, because the caller
+applies its own bound: a type nothing here has classified must reach the
+reconciliation as `unexplained_activity`, not be filtered away.
 
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
@@ -506,19 +508,21 @@ class CashActivity:
     no time of any kind — a `FEE` row has only a date (spec item 1), and an
     `event_at` field does not exist.
 
-    `net_amount` is the broker's signed amount (`None` for a row that moves no
-    cash, such as a split's `SSP`), `status` the broker's own (`executed` for
-    a posted fee), `symbol` the row's symbol when it names one (canonicalized
-    like every other symbol here) and `description` the broker's free text.
-    Neither `symbol` nor `description` is interpreted: a rule that needed them
-    would be guessing from a string (spec item 2).
+    `status` is the broker's own (`executed` for a posted fee) and is
+    **required**: a rule judges a row by it, so a row built without a status
+    must not be constructible. `net_amount` is the broker's signed amount
+    (`None` for a row that moves no cash, such as a split's `SSP`), `symbol`
+    the row's symbol when it names one (canonicalized like every other symbol
+    here) and `description` the broker's free text. Neither `symbol` nor
+    `description` is interpreted: a rule that needed them would be guessing
+    from a string (spec item 2).
     """
 
     activity_id: str
     activity_type: str
     date: date
+    status: str
     net_amount: float | None = None
-    status: str = "executed"
     symbol: str | None = None
     description: str | None = None
 
@@ -532,10 +536,10 @@ class CashActivity:
             _validate_identifier(self.activity_type, field_name="activity_type"),
         )
         object.__setattr__(self, "date", _validate_date(self.date, field_name="date"))
+        object.__setattr__(self, "status", _validate_identifier(self.status, field_name="status"))
         object.__setattr__(
             self, "net_amount", _validate_optional_finite(self.net_amount, field_name="net_amount")
         )
-        object.__setattr__(self, "status", _validate_identifier(self.status, field_name="status"))
         object.__setattr__(
             self, "symbol", None if self.symbol is None else canonical_symbol(self.symbol)
         )
@@ -614,20 +618,19 @@ class Broker(abc.ABC):
 
     @abc.abstractmethod
     def cash_activities(self, since: date) -> list[CashActivity]:
-        """Every **non-trade** activity dated on or after the New York date
-        `since`, oldest first, and never a fill (paper-trading spec req 1, its
-        amendment of 2026-10-12 item 1, #1583, plan T183b).
+        """Every **non-trade** activity the broker lists, oldest first, and
+        never a fill (paper-trading spec req 1, its amendment of 2026-10-12
+        item 1, #1583, plan T183b).
 
-        A row dated exactly `since` is included: a fee's `date` is its trade
-        date and the broker may post it later, so a read bounded to exclude
-        it would lose the fee. Nothing is dropped by type — a type the caller
-        has not classified is returned like any other, so the caller can halt
-        on it rather than silently ignore a cash movement — and nothing is
-        dropped by date beyond `since`. An adapter asks the broker from
-        earlier than `since` (the Alpaca adapter from the New York midnight
-        that begins the day before, because its `after` is a strict timestamp
-        comparison and its ordering of a date-only row is unknown) and returns
-        every row it gets, so this contract holds whatever the broker does.
+        The broker is asked from the New York midnight that begins `since -
+        1 day` (an adapter's `after` is a strict timestamp comparison and how
+        it orders a date-only row is unknown), so the read's window starts a
+        day early and a row dated **before** `since` can come back. Nothing is
+        dropped by date or by type: a row dated exactly `since` is included, a
+        row dated before it is returned as the broker listed it, and **the
+        caller applies its own bound**. A type the caller has not classified
+        is returned like any other, so the caller can halt on it rather than
+        silently ignore a cash movement.
         """
 
     @abc.abstractmethod
