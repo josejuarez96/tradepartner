@@ -386,7 +386,12 @@ from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
 from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
 from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
-from tradepartner.health import HealthReport, health_report
+from tradepartner.health import (
+    COVERAGE_REFERENCE_NAMES,
+    CoverageReference,
+    HealthReport,
+    health_report,
+)
 from tradepartner.ingest import (
     SOURCES,
     IngestResult,
@@ -684,10 +689,45 @@ def _print_report(report: HealthReport) -> None:
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     echo(f"settings: {report.settings}")
+    _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
     for check in report.integrity:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
+    echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+
+
+def _coverage_verdict(block: CoverageReference | None) -> str:
+    """`coverage_reference_names`' line: never a pass the block did not check."""
+    if block is None:
+        return "not computed (run with --coverage)"
+    if block.failed and not block.check_enabled:
+        return f"{block.verdict}: coverage.check_enabled is off"
+    return block.verdict
+
+
+def _print_coverage_reference(block: CoverageReference | None) -> None:
+    echo = typer.echo
+    if block is None:
+        echo("coverage reference: not computed (run with --coverage)")
+        return
+    mode = "check" if block.check_enabled else "report-only"
+    echo(f"coverage reference ({mode}): {block.samples.height} sample sessions")
+    for row in block.samples.iter_rows(named=True):
+        echo(
+            f"  {row['session']}: {row['members']} members; "
+            f"{row['reference_missing']} of {row['references']} reference names missing; "
+            f"{row['late_known']} of {row['listed']} listed names late-known "
+            f"({row['late_share']:.1%})"
+        )
+    for row in block.reference_missing.iter_rows(named=True):
+        rule = "" if row["rule_name"] is None else f"rule {row['rule_name']}, "
+        echo(
+            f"  missing {row['session']} {row['cik']}:{row['ticker']} "
+            f"({row['security_id'] or '-'}): {rule}{row['reason']}"
+        )
+    ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
+    echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
 
 
 def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
@@ -1911,6 +1951,17 @@ def make_app(
                 )
             ),
         ] = None,
+        coverage: Annotated[
+            bool | None,
+            typer.Option(
+                "--coverage/--no-coverage",
+                help=(
+                    "run (or skip) the coverage check against coverage.reference_names "
+                    "(one universe read per sample session); default: while "
+                    "coverage.check_enabled is on"
+                ),
+            ),
+        ] = None,
     ) -> None:
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
@@ -1920,7 +1971,9 @@ def make_app(
         t = ensure_tz_aware_utc(clock(), field_name="clock()")
         try:
             with open_read_only(s) as conn:
-                report = health_report(conn, t, s, jumps_before=cutoff)
+                report = health_report(
+                    conn, t, s, jumps_before=cutoff, with_coverage_reference=coverage
+                )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except (duckdb.CatalogException, duckdb.BinderException) as exc:
