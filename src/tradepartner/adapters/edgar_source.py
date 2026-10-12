@@ -162,10 +162,12 @@ filters drop (as known when parsed) and the stamped forms outside
 `edgar.statement_forms` (#1060).
 
 When a later stamp becomes visible in the same run, a previously filled
-statement cache is refreshed for that accession. `statement_no_parsed_rows`
-counts stamped 10-K/10-Q accessions whose shares fact was served but whose
-statement read yields no parsed row; it is updated on each read so a late
-refresh removes a previously counted accession.
+statement cache is refreshed for that accession. `statement_payload_trails`
+counts served shares accessions newer than the company-facts payload reached;
+the next run retries that CIK. `statement_no_parsed_rows` counts configured
+statement-form shares accessions the payload reached but whose statement read
+yields no parsed row. Both update on each read so a late refresh removes an
+earlier gap.
 Later calls in the run are cache-file reads, never requests, and add
 nothing to the counts. Conflicts are never `_record_failure`d. With
 `reuse_cached` the bulk path is forced from the cached `companyfacts.zip`
@@ -559,8 +561,10 @@ class EdgarFilingSource(FilingSource):
         self.statement_malformed = 0
         self.statement_unstampable = 0
         self.statement_none = 0
+        self.statement_payload_trails = 0
         self.statement_no_parsed_rows = 0
         self._shares_seen: dict[str, set[str]] = {}
+        self._statement_trailing: dict[str, set[str]] = {}
         self._statement_missing: dict[str, set[str]] = {}
         # CIK -> the key its statement cache was written or found under this
         # run (never the records), and the CIKs already counted.
@@ -2405,13 +2409,29 @@ class EdgarFilingSource(FilingSource):
         records, conflicts, unstampable, late = self._stamp_statement(cik, cached, stamps)
         seen = self._shares_seen.get(cik, set())
         parsed = {record.accession for record in records if record.accepted_at is not None}
-        missing = {
+        reached = self._statement_filled.get(cik, "").partition("|")[0]
+        reached_stamp = stamps.get(reached)
+        forms = set(self._settings.edgar.statement_forms)
+        trailing = {
             accession
             for accession in seen - parsed
             if (stamp := stamps.get(accession)) is not None
             and stamp.accepted_at is not None
-            and stamp.form in {"10-K", "10-Q"}
+            and stamp.form in forms
+            and reached_stamp is not None
+            and reached_stamp.accepted_at is not None
+            and stamp.accepted_at > reached_stamp.accepted_at
         }
+        missing = {
+            accession
+            for accession in seen - parsed - trailing
+            if (stamp := stamps.get(accession)) is not None
+            and stamp.accepted_at is not None
+            and stamp.form in forms
+        }
+        old_trailing = self._statement_trailing.get(cik, set())
+        self.statement_payload_trails += len(trailing) - len(old_trailing)
+        self._statement_trailing[cik] = trailing
         previous = self._statement_missing.get(cik, set())
         self.statement_no_parsed_rows += len(missing) - len(previous)
         self._statement_missing[cik] = missing

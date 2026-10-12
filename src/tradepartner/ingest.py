@@ -1400,6 +1400,7 @@ _STATEMENT_SOURCE_COUNTS: tuple[str, ...] = (
     "non_usd",
     "malformed",
     "none",
+    "payload_trails",
     "no_parsed_rows",
 )
 

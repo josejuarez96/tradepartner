@@ -1,3 +1,3 @@
-- #1555: statement caches refresh when a new filing appears; missing parsed rows are counted, with acceptance-time regression tests. PR #1558.
+- #1555 follow-up: same-run statement cache refresh and separate payload-lag/no-row counters; the production cause remains open. PR #1558.
 ### Added
-- Refresh stale statement caches on newly seen filings and count seen shares accessions without parsed statement rows.
+- Refresh statements after a same-run stamp change and distinguish a trailing company-facts payload from a filing with no parsed statement rows.
