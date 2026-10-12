@@ -55,8 +55,31 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
-# (a)): five canonical names, each an ordered list of fallbacks, every one the
+# (a)): canonical names, each an ordered list of fallbacks, every one the
 # concept itself, never a near relative.
+#
+# #1556 adds a financial-issuer revenue fact and the two constituents of its
+# one documented definition, under names that never touch `revenue` (and so
+# never touch `gross_profit`). `revenue_financial` is a financial issuer's one
+# documented revenue quantity from its own filing: it holds
+# **`us-gaap:RevenuesNetOfInterestExpense`** (the issuer's total revenue net of
+# interest expense, the concept itself) when the filing reports it, else the
+# sum of **net interest income (`us-gaap:InterestIncomeExpenseNet`) plus
+# noninterest income (`us-gaap:NoninterestIncome`)**. The sum is computed by the
+# ingest's derived-candidate rule (`ingest._derived_candidates`) whenever both
+# constituents are the stored vintages of **one filing and one period** (never
+# mixing filings), whatever `revenue` tag that filing carries, and
+# stored like any derived row: `basis = derived`, `xbrl_tag` the join of the
+# two source tags by the operator (`+`). A reported
+# `RevenuesNetOfInterestExpense` row is `basis = reported`. The constituents
+# are parsed and stored as filed; they are named here so the derivation can
+# read them from the same filing's records. Keeping this out of `revenue`
+# leaves non-financial issuers' `revenue` and every `gross_profit` byte-identical
+# to before and keeps every row point-in-time; a consumer wanting one revenue
+# series coalesces `revenue` and `revenue_financial` at read time, taking the
+# later `known_at` of the rows it reads. Gross profit
+# stays N/A for financials (no `cost_of_revenue`). IFRS issuers are out of
+# scope (#1556).
 _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
     "revenue": (
         "us-gaap:Revenues",
@@ -66,6 +89,8 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:SalesRevenueGoodsNet",
         "us-gaap:SalesRevenueServicesNet",
     ),
+    # #1556: a financial issuer's own revenue fact (see the comment above).
+    "revenue_financial": ("us-gaap:RevenuesNetOfInterestExpense",),
     "cost_of_revenue": (
         "us-gaap:CostOfRevenue",
         "us-gaap:CostOfGoodsAndServicesSold",
@@ -78,6 +103,9 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:NetCashProvidedByUsedInOperatingActivities",
         "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
     ),
+    # #1556: the constituents of the financial-revenue sum above.
+    "net_interest_income": ("us-gaap:InterestIncomeExpenseNet",),
+    "noninterest_income": ("us-gaap:NoninterestIncome",),
 }
 #: A CIK as the store keys it, and a lettered common-class member (#1169).
 _CIK = re.compile(r"\d{10}")
