@@ -12,7 +12,7 @@ from typing import Any, Protocol
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
+from tradepartner.adapters.broker import Account, CashActivity, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.calendar import session_close
 from tradepartner.config import RiskConfig, Settings
@@ -1244,3 +1244,138 @@ def test_reconcile_for_a_book_with_no_window_is_no_window(
             book_id="b",
         )
     assert fake.calls == ()
+
+
+# --- booked `FEE` cash activities by observation (2026-10-12, item 6; T183) ------
+
+
+def _fee(activity_id: str, day: date, net: float, status: str = "executed") -> CashActivity:
+    return CashActivity(
+        activity_id=activity_id,
+        activity_type="FEE",
+        date=day,
+        status=status,
+        net_amount=net,
+        symbol="SPY",
+        description="SEC fee",
+    )
+
+
+def test_two_fee_rows_are_booked_once_by_their_id(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The window-1 shape: the broker charged two cents the ledger lacks, each a
+    dated `FEE` row; they are booked once, keyed by id, on the fee's own date,
+    and a second reconciliation books nothing more."""
+    fake.activities = [_fee("f1", S, -0.01), _fee("f2", S, -0.01)]
+    fake.extra_cash = -0.02  # the broker charged two cents the ledger lacks
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    booked = _adjustments(journal_settings, open_window)
+    assert [(a.kind, a.cash, a.broker_activity_id, a.session) for a in booked] == [
+        ("fee_cash", -0.01, "f1", S),
+        ("fee_cash", -0.01, "f2", S),
+    ]
+    fixed_clock.advance(minutes=5)
+    again = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert again.status == OK and again.adjustments == ()
+    assert len(_adjustments(journal_settings, open_window)) == 2
+
+
+def test_the_same_gap_with_no_activity_still_halts_as_cash(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A `FEE` is booked by observation, never inferred from the difference: the
+    -0.02 with no activity read is still a `cash` mismatch."""
+    fake.extra_cash = -0.02  # the broker charged two cents the ledger lacks
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_an_unknown_cash_activity_halts_the_window_as_unexplained_activity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    fake.activities = [
+        CashActivity(
+            activity_id="i-1",
+            activity_type="INT",
+            date=S,
+            status="executed",
+            net_amount=-0.5,
+        )
+    ]
+    with pytest.raises(ReconciliationError, match="unexplained_activity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_under_the_fallback_a_fee_dated_on_the_start_date_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Null sets (no ok base, no `activities_seen_json`): a `FEE` dated on the
+    window's New York start date is booked; an earlier one is inside the base."""
+    fake.activities = [_fee("old", date(2026, 9, 28), -0.02), _fee("on", date(2026, 9, 29), -0.01)]
+    fake.extra_cash = -0.01  # only the start-date fee is a real gap
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["on"]
+
+
+def test_a_fee_beside_a_pending_order_is_deferred_fee_not_journaled(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Beside an open allowance the `FEE` is subtracted and listed under
+    `allowed` as `deferred fee`, but never journaled (#1583, T183)."""
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-pend", MTUM, "MTUM", 3.0, events=("pending",), fill=False)
+    fake.submit(OrderRequest("tp-pend", "MTUM", Side.BUY, quantity=3.0))
+    fake.activities = [_fee("f1", S, -0.01)]
+    fake.extra_cash = -0.01
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+    assert result.status == PENDING_UNRESOLVED
+    assert ("deferred fee", -0.01, None) in [
+        (a.reason, a.difference, a.security_id) for a in result.allowed
+    ]
+    assert result.adjustments == ()
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_fee_posted_between_the_account_and_activity_reads_halts_once_then_passes(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The read race (#1583): a fee the account has charged but the activity read
+    has not yet listed leaves a gap that halts once; the next reconciliation sees
+    both and books it."""
+    fake.extra_cash = -0.02  # the broker charged two cents the ledger lacks
+    fake.activities = []  # `account()` moved the cash; the read has not listed it yet
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    fake.activities = [_fee("f1", S, -0.02)]
+    fixed_clock.advance(minutes=5)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["f1"]

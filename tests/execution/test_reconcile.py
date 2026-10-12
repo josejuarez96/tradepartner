@@ -20,7 +20,7 @@ from datetime import UTC, date, datetime
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, Order, OrderStatus, Position, Side
+from tradepartner.adapters.broker import Account, CashActivity, Order, OrderStatus, Position, Side
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.reconcile import (
@@ -137,8 +137,8 @@ def _run(
     )
 
 
-def _ledger(cash: float = 1_000.0, **positions: float) -> Ledger:
-    return Ledger(positions=positions, cash=cash, through=S)
+def _ledger(cash: float = 1_000.0, *, fills_since_base: int = 0, **positions: float) -> Ledger:
+    return Ledger(positions=positions, cash=cash, through=S, fills_since_base=fills_since_base)
 
 
 def _kinds(result: Reconciliation) -> list[str]:
@@ -178,11 +178,21 @@ def test_each_position_and_cash_mismatch(
     assert kind in json.loads(result.mismatches_json)["mismatches"][0]["kind"]
 
 
-@pytest.mark.parametrize(("cash", "status"), [(1_001.25, "ok"), (1_001.27, "mismatch")])
-def test_the_cash_band_is_the_frozen_tolerance(cash: float, status: str) -> None:
-    """#1290: a $1.25 gap is inside the 1.26 default, which absorbs per-fill cent
-    rounding over `risk.max_orders_per_run` fills; $1.27 is outside it."""
-    result = _run(_ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), cash)
+@pytest.mark.parametrize(
+    ("fills", "cash", "status"),
+    [
+        (0, 1_000.01, "ok"),  # the bare key, inclusive
+        (0, 1_000.02, "mismatch"),
+        (10, 1_000.06, "ok"),  # 0.01 x (1 + 10/2)
+        (10, 1_000.07, "mismatch"),
+    ],
+)
+def test_the_cash_bound_scales_with_the_ledgers_fills(fills: int, cash: float, status: str) -> None:
+    """#1583, T183: the strict bound is `reconcile_cash_tolerance` x
+    (1 + fills_since_base / 2), inclusive — a cent of rounding per fill per side
+    replaces the 1.26 whole-dollar band (#1290), which T183 removes."""
+    ledger = _ledger(1_000.0, fills_since_base=fills, SEC_A=10.0)
+    result = _run(ledger, _positions(AAA=10.0), cash)
 
     assert result.status == status
     assert _kinds(result) == ([] if status == "ok" else ["cash"])
@@ -668,6 +678,7 @@ def test_the_mismatches_json_is_stable() -> None:
         "pending",
         "explained",
         "allowed",
+        "activities",
     }
 
 
@@ -1144,3 +1155,178 @@ def test_a_negative_dividend_due_is_refused() -> None:
             1_000.0,
             explanations=_explanations(dividends={"SEC_A": -1.0}),
         )
+
+
+# --- booked `FEE` cash activities (spec 2026-10-12, item 2; T183, #1583) ---------
+
+
+def _activity(
+    activity_id: str,
+    activity_type: str,
+    day: date,
+    net_amount: float | None,
+    status: str = "executed",
+    description: str | None = None,
+) -> CashActivity:
+    return CashActivity(
+        activity_id=activity_id,
+        activity_type=activity_type,
+        date=day,
+        status=status,
+        net_amount=net_amount,
+        symbol="AAA",
+        description=description,
+    )
+
+
+def test_a_booked_fee_is_subtracted_before_every_other_explanation() -> None:
+    """A `FEE` not inside the base is booked once as a `cash`-only `fee_cash`
+    adjustment keyed by its activity id, and the reconciliation is `ok`."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        999.98,
+        explanations=_explanations(
+            activities=(_activity("act-1", "FEE", S, -0.02, description="SEC fee"),)
+        ),
+    )
+
+    assert result.status == "ok"
+    assert [
+        (a.kind, a.cash, a.security_id, a.quantity, a.broker_activity_id)
+        for a in result.adjustments
+    ] == [("fee_cash", -0.02, None, None, "act-1")]
+    assert result.adjustments[0].explanation == "FEE: SEC fee"
+    assert [(r.activity_id, r.activity_type, r.status) for r in result.activities] == [
+        ("act-1", "FEE", "executed")
+    ]
+    assert json.loads(result.mismatches_json)["activities"] == [
+        {"activity_id": "act-1", "activity_type": "FEE", "status": "executed"}
+    ]
+
+
+def test_the_same_gap_with_no_activity_still_halts_as_cash() -> None:
+    """A `FEE` is booked by observation, never inferred from the difference: a
+    -0.02 gap with no activity read is still a `cash` mismatch."""
+    result = _run(_ledger(1_000.0, SEC_A=10.0), _positions(AAA=10.0), 999.98)
+
+    assert _kinds(result) == ["cash"]
+
+
+def test_a_fee_inside_the_base_is_not_booked_again() -> None:
+    """A `FEE` whose id is in a seen-set is inside the base: not booked, though
+    still recorded."""
+    result = _run(
+        _ledger(999.98, SEC_A=10.0),
+        _positions(AAA=10.0),
+        999.98,
+        explanations=_explanations(
+            activities=(_activity("act-1", "FEE", S, -0.02),),
+            seen_activity_ids=frozenset({"act-1"}),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.adjustments == ()
+    assert [r.activity_id for r in result.activities] == ["act-1"]
+
+
+def test_a_fee_dated_on_or_after_the_fallback_start_is_booked() -> None:
+    """Under the fallback (null sets), a `FEE` dated before the window's start
+    is seen and one dated on it is not."""
+    explanations = _explanations(
+        activities=(
+            _activity("old", "FEE", date(2026, 9, 30), -0.02),
+            _activity("new", "FEE", S, -0.01),
+        ),
+        activity_seen_before=S,
+    )
+    result = _run(
+        _ledger(999.99, SEC_A=10.0), _positions(AAA=10.0), 999.98, explanations=explanations
+    )
+
+    # only the fee dated on the start date (not seen) is booked; the older one is
+    # already in starting_cash.
+    assert result.status == "ok"
+    assert [a.broker_activity_id for a in result.adjustments] == ["new"]
+
+
+@pytest.mark.parametrize("activity_type", ["INT", "JNLC", "ACATC"])
+def test_an_unknown_cash_type_is_unexplained_activity(activity_type: str) -> None:
+    """A cash activity of a type the rule does not know names its type, id, date,
+    amount and status, and halts the window (#1583)."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(activities=(_activity("act-x", activity_type, S, -1.5),)),
+    )
+
+    assert _kinds(result) == ["unexplained_activity"]
+    detail = result.mismatches[0].detail
+    assert activity_type in detail and "act-x" in detail and "executed" in detail
+
+
+def test_a_fee_whose_status_is_not_executed_is_unexplained_activity() -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(activities=(_activity("act-1", "FEE", S, -0.02, "corrected"),)),
+    )
+
+    assert _kinds(result) == ["unexplained_activity"]
+    assert result.adjustments == ()
+
+
+def test_a_journaled_fee_the_broker_corrected_is_a_mismatch() -> None:
+    """A `FEE` the base recorded whose status is no longer `executed` halts even
+    though it is inside the base."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(
+            activities=(_activity("act-1", "FEE", S, -0.02, "canceled"),),
+            seen_activity_ids=frozenset({"act-1"}),
+        ),
+    )
+
+    assert _kinds(result) == ["unexplained_activity"]
+    assert result.adjustments == ()
+
+
+@pytest.mark.parametrize("activity_type", ["SSP", "MA", "REORG"])
+def test_a_corporate_action_row_is_recorded_and_never_a_mismatch(activity_type: str) -> None:
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(activities=(_activity("act-1", activity_type, S, None),)),
+    )
+
+    assert result.status == "ok"
+    assert _kinds(result) == []
+    assert [r.activity_type for r in result.activities] == [activity_type]
+
+
+def test_a_dividend_activity_is_recorded_but_never_booked_by_id() -> None:
+    """A `DIV` row is recorded and left to the store's dividend rule, never booked
+    as an adjustment by its id."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(activities=(_activity("act-1", "DIV", S, 4.5),)),
+    )
+
+    assert result.status == "ok"
+    assert result.adjustments == ()
+    assert [r.activity_type for r in result.activities] == ["DIV"]
+
+
+def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
+    """The bound is computed in `Decimal`, so a whole-cent difference at a
+    six-figure cash balance compares exactly and is inclusive (#1583)."""
+    assert _run(_ledger(100_008.90), _positions(), 100_008.89).status == "ok"
+    assert _kinds(_run(_ledger(100_008.90), _positions(), 100_008.88)) == ["cash"]
