@@ -55,4 +55,5 @@ class FredRateSource(RateSource):
             series, realtime_start, observation_start, settings=self.settings, client=self.client
         )
         rows, self.missing_values = parse_observations(payload, series)
+        rows.sort(key=lambda row: (row.observation_date, row.vintage_date))
         return rows

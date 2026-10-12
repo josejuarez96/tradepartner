@@ -84,23 +84,36 @@ def observations(
         count: int | None = None
         while count is None or offset < count:
             with _quiet_http_logs():
+                failure: str | None = None
                 try:
                     response = client.get(_ENDPOINT, params=params | {"offset": offset})
                     response.raise_for_status()
                     payload = response.json()
                 except httpx.HTTPStatusError as exc:
-                    raise FredRequestError(
-                        f"FRED observations endpoint returned HTTP {exc.response.status_code}"
-                    ) from None
-                except (httpx.RequestError, ValueError):
-                    raise FredRequestError("FRED observations endpoint request failed") from None
+                    failure = f"FRED observations endpoint returned HTTP {exc.response.status_code}"
+                except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+                    failure = "FRED observations endpoint request failed"
+                # Raise outside the except: the original httpx exception may hold
+                # the full URL, and `from None` leaves it in __context__.
+                if failure is not None:
+                    raise FredRequestError(failure)
             if not isinstance(payload, dict) or not isinstance(payload.get("observations"), list):
                 raise ValueError("FRED observations response lacks observations")
             if not isinstance(payload.get("count"), int) or payload["count"] < 0:
                 raise ValueError("FRED observations response has invalid count")
-            count = payload["count"]
-            rows.extend(payload["observations"])
-            offset += _LIMIT
+            page_count = payload["count"]
+            if count is not None and page_count != count:
+                raise ValueError("FRED observations count changed during paging")
+            count = page_count
+            page = payload["observations"]
+            if not page and offset < count:
+                raise ValueError("FRED observations returned an empty page before count")
+            rows.extend(page)
+            offset += len(page)
+            if offset > count:
+                raise ValueError("FRED observations exceeded reported count")
+        if offset != count:
+            raise ValueError("FRED observations total differs from count")
         return {"count": count, "observations": rows}
     finally:
         if owned:
