@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import gzip
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -24,7 +25,7 @@ import httpx
 import pytest
 
 from tradepartner.adapters.edgar import parse_sgml_header
-from tradepartner.adapters.stamp_repair import shift_stamp
+from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, shift_stamp
 
 _SPEC = importlib.util.spec_from_file_location(
     "repair_stamps", Path(__file__).resolve().parents[1] / "scripts" / "repair_stamps.py"
@@ -1078,3 +1079,215 @@ def test_a_step_1_shift_across_an_instant_stops_before_any_request(tmp_path: Pat
     assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
     assert sec.calls == []
     assert c.snapshot() == before
+
+
+# --- restamp-unrepaired (#1553) ---------------------------------------------
+
+HDR = "0000002101"  # an unrepaired CIK from an earlier release
+HDR_OTHER = "0000002202"  # a second listed CIK, all its records true
+H_EARLY_TRUE = utc(2024, 7, 1, 16, 37)  # SGML of an early record
+H_EARLY_OLD = utc(2024, 7, 1, 10, 0)  # not shift_stamp(SGML): no offset rule fits
+H_LATE_OLD = utc(2024, 7, 2, 23, 0)
+H_LATE_TRUE = utc(2024, 7, 2, 14, 5)  # SGML earlier than the stamp
+H_TRUE = utc(2024, 7, 3, 14, 0)
+H_PRE2003 = utc(1998, 3, 10, 15, 0)
+H_BAD = utc(2024, 7, 4, 14, 0)
+H_UNLISTED = utc(2024, 7, 5, 9, 0)
+
+
+class HeaderSec(FakeSec):
+    """`FakeSec` that can also serve a header with no ACCEPTANCE-DATETIME."""
+
+    def __init__(self, truth: dict[tuple[str, str], datetime]) -> None:
+        super().__init__(truth)
+        self.no_acceptance: set[tuple[str, str]] = set()
+
+    def __call__(self, cik: str, accession: str) -> datetime:
+        if (cik, accession) in self.no_acceptance:
+            self.calls.append((cik, accession))
+            text = "\n".join(
+                line
+                for line in header_for(cik, accession, utc(2000, 1, 3, 15)).splitlines()
+                if "ACCEPTANCE-DATETIME" not in line
+            )
+            return repair_stamps.sgml_acceptance(text, accession)
+        return super().__call__(cik, accession)
+
+
+def unrepaired_case(tmp_path: Path) -> tuple[Cache, HeaderSec, Path]:
+    """Two listed CIKs: an early, a late, a true, a pre-2003 and an unreadable
+    record listed; one record not listed; one listed record gone from its file."""
+    c = Cache(tmp_path)
+    records = [
+        (acc(HDR, 1), H_EARLY_OLD, date(2024, 7, 1)),
+        (acc(HDR, 2), H_LATE_OLD, date(2024, 7, 2)),
+        (acc(HDR, 3), H_TRUE, date(2024, 7, 3)),
+        ("0000002101-98-000001", H_PRE2003, date(1998, 3, 10)),
+        (acc(HDR, 5), H_BAD, date(2024, 7, 4)),
+        (acc(HDR, 6), H_UNLISTED, date(2024, 7, 5)),
+    ]
+    c.add_cik(HDR, [(a, s, d, False) for a, s, d in records])
+    c.add_cik(HDR_OTHER, [(acc(HDR_OTHER, 1), H_TRUE, date(2024, 7, 3), False)])
+    c.finish()
+    sec = HeaderSec(
+        {
+            (HDR, acc(HDR, 1)): H_EARLY_TRUE,
+            (HDR, acc(HDR, 2)): H_LATE_TRUE,
+            (HDR, acc(HDR, 3)): H_TRUE,
+            (HDR, acc(HDR, 6)): H_UNLISTED + timedelta(hours=4),
+            (HDR_OTHER, acc(HDR_OTHER, 1)): H_TRUE,
+        }
+    )
+    sec.no_acceptance.add((HDR, "0000002101-98-000001"))
+    sec.broken.add((HDR, acc(HDR, 5)))
+    listed = [(a, s) for a, s, _ in records if a != acc(HDR, 6)]
+    rows = [
+        {
+            "cik": HDR,
+            "accession": a,
+            "old_stamp": s.isoformat(),
+            "new_stamp": s.isoformat(),
+            "method": "unrepaired",
+            "evidence": "class mixed, not repaired",
+        }
+        for a, s in listed
+    ]
+    rows.append({**rows[0], "cik": HDR_OTHER, "accession": acc(HDR_OTHER, 1)})
+    rows.append({**rows[0], "accession": acc(HDR, 9)})  # no longer in its file
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=MANIFEST_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    path = tmp_path / "v1.restamp-1382a2.manifest.unrepaired.csv.gz"
+    path.write_bytes(gzip.compress(buffer.getvalue().encode()))
+    return c, sec, path
+
+
+def run_unrepaired(
+    c: Cache, sec: FakeSec, source: Path, *extra: str, release: str = "restamp-1382a3"
+) -> int:
+    argv = [
+        "--cache-dir",
+        str(c.dir),
+        "restamp-unrepaired",
+        "--from",
+        str(source),
+        "--window-start",
+        WINDOW.isoformat(),
+        "--release",
+        release,
+        *extra,
+    ]
+    return repair_stamps.main(argv, fetch=sec)
+
+
+def _side(c: Cache, release: str = "restamp-1382a3") -> dict[tuple[str, str], dict[str, str]]:
+    path = c.dir / "stamps" / f"v1.{release}.manifest.unrepaired.csv.gz"
+    with gzip.open(path, "rt", newline="") as f:
+        return {(r["cik"], r["accession"]): r for r in csv.DictReader(f)}
+
+
+def test_unrepaired_records_take_their_own_sgml_acceptance(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply") == 0
+
+    # An early record and a late one both become exactly their SGML acceptance,
+    # not an offset-shifted stamp.
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_TRUE
+    assert shift_stamp(H_EARLY_OLD) != H_EARLY_TRUE
+    assert c.stamp(HDR, acc(HDR, 2)) == H_LATE_TRUE
+    # A true record, a pre-2003 header and an unreadable one keep their stamps.
+    assert c.stamp(HDR, acc(HDR, 3)) == H_TRUE
+    assert c.stamp(HDR, "0000002101-98-000001") == H_PRE2003
+    assert c.stamp(HDR, acc(HDR, 5)) == H_BAD
+    # An unlisted record is never asked for and never moves.
+    assert c.stamp(HDR, acc(HDR, 6)) == H_UNLISTED
+    assert (HDR, acc(HDR, 6)) not in sec.calls
+    # HDR_OTHER's only record is true: its file is byte-identical.
+    other = "stamps/v1/" + HDR_OTHER + ".json"
+    assert c.snapshot()[other] == before[other]
+
+    manifest = {(r["cik"], r["accession"]): r for r in c.manifest("restamp-1382a3")}
+    assert manifest[(HDR, acc(HDR, 1))]["method"] == "sgml"
+    assert manifest[(HDR, acc(HDR, 1))]["old_stamp"] == H_EARLY_OLD.isoformat()
+    assert manifest[(HDR, acc(HDR, 1))]["new_stamp"] == H_EARLY_TRUE.isoformat()
+    assert manifest[(HDR, acc(HDR, 2))]["new_stamp"] == H_LATE_TRUE.isoformat()
+    assert manifest[(HDR, acc(HDR, 3))]["method"] == "kept"
+    assert manifest[(HDR_OTHER, acc(HDR_OTHER, 1))]["method"] == "kept"
+    assert len(manifest) == 4
+
+    side = _side(c)
+    assert set(side) == {
+        (HDR, "0000002101-98-000001"),
+        (HDR, acc(HDR, 5)),
+        (HDR, acc(HDR, 9)),
+    }
+    assert side[(HDR, "0000002101-98-000001")]["new_stamp"] == H_PRE2003.isoformat()
+    assert side[(HDR, "0000002101-98-000001")]["evidence"].startswith("SGML gave no stamp:")
+    assert side[(HDR, acc(HDR, 5))]["evidence"].startswith("SGML gave no stamp:")
+    assert side[(HDR, acc(HDR, 9))]["evidence"] == "no stamped record"
+    ciks = c.dir / "stamps" / "v1.restamp-1382a3.manifest.unrepaired_ciks.txt"
+    assert ciks.read_text() == f"{HDR}\n"
+    # The release's backup holds the cache as it was.
+    backup = c.dir / "stamps" / "v1.restamp-1382a3.bak" / f"{HDR}.json"
+    assert backup.read_bytes() == before[f"stamps/v1/{HDR}.json"]
+    # Six requests, each once.
+    assert len(sec.calls) == 6 == len(set(sec.calls))
+
+
+def test_unrepaired_dry_run_reports_the_count_and_writes_nothing(
+    tmp_path: Path, capsys: Any
+) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["requests"] == 6
+    assert report["listed"] == 7
+    assert report["listed_without_stamp"] == 1
+    assert report["listed_in_window"] == 0
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_unrepaired_cap_stops_before_any_request_or_write(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply", "--max-requests", "5") == 1
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_unrepaired_resume_repeats_no_request(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    sec.fail_after = 2
+    with pytest.raises(httpx.HTTPStatusError):
+        run_unrepaired(c, sec, source, "--apply")
+    first = list(sec.calls)
+    assert len(first) == 2
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_OLD  # nothing written yet
+    sec.fail_after = None
+    assert run_unrepaired(c, sec, source, "--apply") == 1  # backup name taken
+    assert run_unrepaired(c, sec, source, "--apply", "--resume") == 0
+    assert not set(first) & set(sec.calls[2:])
+    assert len(sec.calls) == 6 == len(set(sec.calls))
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_TRUE
+
+
+def test_unrepaired_refuses_a_list_that_is_not_unrepaired(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    text = gzip.decompress(source.read_bytes()).decode().replace(",unrepaired,", ",shift,")
+    source.write_bytes(gzip.compress(text.encode()))
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply") == 1
+    assert sec.calls == [] and c.snapshot() == before
+
+
+def test_unrepaired_sgml_change_in_the_window_aborts_before_writing(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    sec.truth[(HDR, acc(HDR, 1))] = utc(2026, 10, 9, 20, 0)
+    before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert run_unrepaired(c, sec, source, "--apply") == 1
+    assert {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")} == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382a3.manifest.csv").exists()
