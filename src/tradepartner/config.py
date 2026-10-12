@@ -7,10 +7,9 @@ lists of the data-foundation and backtest specs and in ADR 0006 is a field
 here with the documented default — never hardcoded elsewhere (CLAUDE.md code
 standards).
 
-`universe.exclude_sic_ranges` is **guarded**: it is a compliance exclusion
-(ADR 0006), not a tunable parameter. A validator rejects any value other
-than the charter default, including an environment override, so it cannot
-be silently loosened; changing it is a charter amendment, not a config edit.
+`universe.exclude_sic_ranges` defaults to `()`: no sector is excluded unless a
+hypothesis file names one (ADR 0006 amendment 2026-10-11, #1540). It is frozen in
+each registration (guard a), so only its shape is validated here (`start <= end`).
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
 Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (book `main`'s pair; every
@@ -21,7 +20,7 @@ their values never appear in `repr()`/`str()` of `Settings`, including
 `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
 personal contact email.
 
-`alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
+`alpaca.paper` is guarded: the
 order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
 changes it by ADR, never by an environment variable.
 
@@ -34,6 +33,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -53,11 +53,6 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
-# SIC 4900-4999 division (electric, gas, water, sanitary services), no
-# carve-outs. Changing it is a charter amendment, not a code or config change.
-_GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
 # (a)): five canonical names, each an ordered list of fallbacks, every one the
@@ -237,6 +232,29 @@ class IngestConfig(_ClosedConfig):
     max_where_chars: int = Field(default=1500, gt=0)
 
 
+class RatesConfig(_ClosedConfig):
+    """FRED series and source-quality limits (data-foundation requirement 18)."""
+
+    series: list[str] = Field(default_factory=lambda: ["DTB3"], min_length=1)
+    max_stale_sessions: int = Field(default=3, ge=0)
+    refetch_days: int = Field(default=10, gt=0)
+    plausible_range_percent: list[float] = Field(default_factory=lambda: [-1.0, 25.0])
+
+    @field_validator("series")
+    @classmethod
+    def _valid_series(cls, value: list[str]) -> list[str]:
+        if any(not name.strip() for name in value) or len(set(value)) != len(value):
+            raise ValueError("rates.series must contain unique nonblank ids")
+        return value
+
+    @field_validator("plausible_range_percent")
+    @classmethod
+    def _valid_range(cls, value: list[float]) -> list[float]:
+        if len(value) != 2 or not all(math.isfinite(x) for x in value) or value[0] >= value[1]:
+            raise ValueError("rates.plausible_range_percent must be finite increasing bounds")
+        return value
+
+
 class EdgarConfig(BaseModel):
     """SEC EDGAR access, incl. `edgartools`' local cache.
 
@@ -370,9 +388,21 @@ class EdgarConfig(BaseModel):
     # fails `health --check` on the stored rows of a dropped form until a
     # rebuild (the amendment's open question 12).
     filing_events_enabled: bool = False
+    # T179 (#1541, spec amendment 2026-10-11): the title fallback in
+    # `store.classify` rule 6 (placeholder titles, whole-word type words,
+    # issuer-name-first titles, class-letter shares). Off, every classification
+    # is as before; the release's own PR (T181) flips it with the cache
+    # version bumps, so a nightly ingest after a plain merge changes nothing.
+    title_fallback: bool = False
     event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["8-K", "8-K/A"], min_length=1
     )
+    # #1541 (spec amendment 2026-10-11): both cover-page parsers read a
+    # context dimensioned by `dei:EntityListingsExchangeAxis` as a listing
+    # context. Off until the owner's release (T181) flips it together with
+    # the `FSN_VERSION` and `COVER_VERSION` bumps: the caches are keyed by
+    # those versions only, so a flip alone re-derives nothing already cached.
+    exchange_axis_listings: bool = False
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
@@ -673,9 +703,9 @@ class UniverseConfig(_ClosedConfig):
 
     security_types: list[str] = Field(default_factory=lambda: ["common"])
     exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN"])
-    # Guarded (ADR 0006): see `_GUARDED_EXCLUDE_SIC_RANGES` and the validator
-    # below. Not a tunable parameter; changes only through a charter amendment.
-    exclude_sic_ranges: tuple[tuple[int, int], ...] = _GUARDED_EXCLUDE_SIC_RANGES
+    # Rule 3, a per-hypothesis choice; default none (ADR 0006 amendment 2026-10-11,
+    # #1540). Frozen in each registration (guard a); shape-checked below.
+    exclude_sic_ranges: tuple[tuple[int, int], ...] = ()
     min_price: float = 5
     # On since T3 (#84): historical bars come from the consolidated SIP feed, so the
     # 20-session median dollar volume is a real liquidity measure (IEX-only volume,
@@ -732,11 +762,12 @@ class UniverseConfig(_ClosedConfig):
 
     @field_validator("exclude_sic_ranges")
     @classmethod
-    def _guard_exclude_sic_ranges(
+    def _check_exclude_sic_ranges(
         cls, value: tuple[tuple[int, int], ...]
     ) -> tuple[tuple[int, int], ...]:
-        if value != _GUARDED_EXCLUDE_SIC_RANGES:
-            raise ValueError("guarded setting; change only by charter amendment")
+        for start, end in value:
+            if start > end:
+                raise ValueError(f"exclude_sic_ranges entry {start, end} has start > end")
         return value
 
 
@@ -775,6 +806,138 @@ class GapConfig(_ClosedConfig):
     # ADR 0003 amendment #1199: a live listing dark longer than this many sessions,
     # its last bar before the window, counts as ended at that bar for the gap only.
     stale_listing_sessions: int = Field(default=63, ge=0)
+
+
+# --- The coverage check against a named reference (spec amendment 2026-10-11, #1541) ---
+
+#: `CIK:TICKER[:FROM[:TO]]`: a 10-digit CIK (the fixture store's `CIK`-prefixed
+#: spelling is accepted too), an upper-case ticker, then optional ISO dates; an
+#: empty `FROM` means "from the first sample".
+_REFERENCE_CIK = re.compile(r"(?:CIK)?\d{10}")
+_REFERENCE_TICKER = re.compile(r"[A-Z0-9][A-Z0-9.\-/]*")
+
+
+@dataclass(frozen=True)
+class ReferenceName:
+    """One `coverage.reference_names` entry: the sessions `first`..`last`
+    (inclusive, `None` = unbounded) on which `cik` is expected in the universe
+    under `ticker`."""
+
+    cik: str
+    ticker: str
+    first: date | None
+    last: date | None
+
+    def covers(self, session: date) -> bool:
+        """Whether the entry applies on `session`."""
+        return (self.first is None or self.first <= session) and (
+            self.last is None or session <= self.last
+        )
+
+
+def parse_reference_name(entry: str) -> ReferenceName:
+    """`"CIK:TICKER[:FROM[:TO]]"` (a `coverage.reference_names` entry) as a
+    `ReferenceName`. Raises `ValueError` on any other shape, on a `FROM` after
+    its `TO`, and on an empty `TO` (leave it out instead)."""
+    parts = entry.split(":")
+    if not 2 <= len(parts) <= 4:
+        raise ValueError(f"reference name {entry!r} is not 'CIK:TICKER[:FROM[:TO]]'")
+    cik, ticker = parts[0], parts[1]
+    if not _REFERENCE_CIK.fullmatch(cik):
+        raise ValueError(f"reference name {entry!r}: CIK must be 10 digits")
+    if not _REFERENCE_TICKER.fullmatch(ticker):
+        raise ValueError(f"reference name {entry!r}: ticker must be upper-case")
+    first = date.fromisoformat(parts[2]) if len(parts) > 2 and parts[2] else None
+    if len(parts) == 4 and not parts[3]:
+        raise ValueError(f"reference name {entry!r}: empty TO; leave it out")
+    last = date.fromisoformat(parts[3]) if len(parts) == 4 else None
+    if first is not None and last is not None and first > last:
+        raise ValueError(f"reference name {entry!r}: FROM is after TO")
+    return ReferenceName(cik=cik, ticker=ticker, first=first, last=last)
+
+
+#: The default reference list (spec amendment 2026-10-11, #1541, item 3): large,
+#: long-listed US common stocks, CIKs pinned from the SEC's
+#: `company_tickers_exchange.json` fetched 2026-10-11, with the ticker and CIK
+#: changes since `sample_from` split into windows from each filer's submissions:
+#: Meta's `FB` until its 2022-06-09 rename to `META`; Exxon's holding-company
+#: reorganisation (8-K12B 2026-07-01 under `0002115436`, the old registrant
+#: `0000034088`'s 25-NSE 2026-07-02); P&G only until 2022-09-30 (spec open
+#: question 4). The owner may edit it.
+DEFAULT_REFERENCE_NAMES: tuple[str, ...] = (
+    "0000320193:AAPL",
+    "0000789019:MSFT",
+    "0001018724:AMZN",
+    "0001652044:GOOGL",
+    "0001326801:FB::2022-06-08",
+    "0001326801:META:2022-06-09",
+    "0001067983:BRK.B",
+    "0000200406:JNJ",
+    "0000019617:JPM",
+    "0000034088:XOM::2026-06-30",
+    "0002115436:XOM:2026-07-01",
+    "0000731766:UNH",
+    "0001403161:V",
+    "0000354950:HD",
+    "0000093410:CVX",
+    "0000310158:MRK",
+    "0000021344:KO",
+    "0000077476:PEP",
+    "0000078003:PFE",
+    "0000858877:CSCO",
+    "0000104169:WMT",
+    "0000070858:BAC",
+    "0001744489:DIS",
+    "0000097745:TMO",
+    "0000051143:IBM",
+    "0001551152:ABBV",
+    "0000001800:ABT",
+    "0000066740:MMM",
+    "0000899051:ALL",
+    "0000035527:FITB",
+    "0000106640:WHR",
+    "0000080424:PG::2022-09-30",
+)
+
+
+class CoverageConfig(_ClosedConfig):
+    """`health`'s coverage check against a named reference (spec amendment
+    2026-10-11, #1541, item 3; `health.coverage_reference`).
+
+    `reference_names`: `CIK:TICKER[:FROM[:TO]]` entries, the sessions each
+    applies on. `sample_months`: the calendar months (1-12) whose last XNYS
+    session is sampled, from `sample_from` to the last completed session.
+    `check_enabled`: off, the block is computed only on request (`health
+    --coverage`, the page's button) and never fails `--check`; on, `health`
+    computes it on every run and `--check` fails `coverage_reference_names`
+    while a reference name is missing."""
+
+    reference_names: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_REFERENCE_NAMES), min_length=1
+    )
+    sample_months: list[int] = Field(default_factory=lambda: [6, 12], min_length=1)
+    sample_from: date = date(2019, 12, 31)
+    check_enabled: bool = False
+
+    @field_validator("reference_names")
+    @classmethod
+    def _check_reference_names(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            parse_reference_name(entry)
+        return value
+
+    @field_validator("sample_months")
+    @classmethod
+    def _check_sample_months(cls, value: list[int]) -> list[int]:
+        if any(not 1 <= month <= 12 for month in value):
+            raise ValueError("sample_months must be calendar months 1-12")
+        if len(set(value)) != len(value):
+            raise ValueError("sample_months must not repeat a month")
+        return value
+
+    def references(self) -> tuple[ReferenceName, ...]:
+        """`reference_names`, parsed."""
+        return tuple(parse_reference_name(entry) for entry in self.reference_names)
 
 
 # --- Phase 3: backtest engine and trial registry (docs/specs/backtest.md, T30) ---
@@ -860,7 +1023,7 @@ class ProfitabilityConfig(BaseModel):
     `basis` is `gross` only until the pre-declared `cash` variant registers.
     `annual_period_days` is the inclusive day-length range an as-filed annual duration
     may have; `max_fact_age_days` bounds a fact's age at the rebalance; and
-    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), not the guarded
+    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), separate from
     `universe.exclude_sic_ranges`. `top_fraction` is a share of scored names in (0, 1].
     """
 
@@ -1641,6 +1804,32 @@ class ResearchLabelingConfig(BaseModel):
         return value
 
 
+class ResearchClaudeConfig(BaseModel):
+    """Disabled-by-default Claude research comparison arm (#1504)."""
+
+    model_config = _PHASE3_MODEL_CONFIG
+
+    api_base_url: str = "https://api.anthropic.com"
+    anthropic_version: str = "2023-06-01"
+    spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
+    price_usd_per_million_input_tokens: float = Field(default=2.0, gt=0)
+    price_usd_per_million_output_tokens: float = Field(default=10.0, gt=0)
+    chars_per_token: float = Field(default=3.5, gt=0)
+    max_output_tokens: int = Field(default=1024, gt=0)
+    thinking: Literal["between_tools", "adaptive"] = "between_tools"
+    effort: Literal["low", "medium", "high", "max"] = "low"
+    requests_per_second: float = Field(default=1.0, gt=0)
+    request_timeout_seconds: float = Field(default=120.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+
+    @field_validator("api_base_url")
+    @classmethod
+    def _validate_api_base_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("research.claude.api_base_url must be an https URL")
+        return value
+
+
 class ResearchConfig(BaseModel):
     """Research-experiment registry (docs/specs/research-registry.md req 2, req 14).
 
@@ -1664,6 +1853,7 @@ class ResearchConfig(BaseModel):
     spend_ceiling_usd_month: float = Field(default=0.0, ge=0)
     spend_ceiling_usd_total: float = Field(default=0.0, ge=0)
     labeling: ResearchLabelingConfig = Field(default_factory=ResearchLabelingConfig)
+    claude: ResearchClaudeConfig = Field(default_factory=ResearchClaudeConfig)
 
 
 class Settings(BaseSettings):
@@ -1682,6 +1872,7 @@ class Settings(BaseSettings):
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
+    rates: RatesConfig = Field(default_factory=RatesConfig)
     edgar: EdgarConfig = Field(default_factory=EdgarConfig)
     master: MasterConfig = Field(default_factory=MasterConfig)
     benchmarks: list[str] = Field(default_factory=lambda: ["SPY", "MTUM"])
@@ -1689,6 +1880,7 @@ class Settings(BaseSettings):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     gap: GapConfig = Field(default_factory=GapConfig)
+    coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     adjust: AdjustConfig = Field(default_factory=AdjustConfig)
     hypotheses: HypothesesConfig = Field(default_factory=HypothesesConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
@@ -1709,6 +1901,7 @@ class Settings(BaseSettings):
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
     sec_edgar_user_agent: SecretStr | None = Field(default=None)
+    fred_api_key: SecretStr | None = Field(default=None)
     # Phase 4 (spec req 2): the paper trading keys are their own variables and never
     # fall back to the data keys, so a live-capable key is never in the order path.
     alpaca_paper_api_key: SecretStr | None = Field(default=None)
@@ -1731,6 +1924,7 @@ class Settings(BaseSettings):
     # only by `research/models.py`, redacted by `secret_values`; with it absent the
     # real model client cannot be built (ADR 0013 point 3 (e)).
     typesafe_api_key: SecretStr | None = Field(default=None)
+    research_claude_api_key: SecretStr | None = Field(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         # A per-instance default (not a class-level `model_config` value) so

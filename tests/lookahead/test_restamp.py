@@ -10,6 +10,7 @@ reads must change only inside each change's [old, new) span.
 from __future__ import annotations
 
 import csv
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -19,6 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
+from tradepartner.adapters.edgar_source import PARSER_VERSION
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverListing,
@@ -31,16 +33,23 @@ from tradepartner.adapters.filings import (
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
+from tradepartner.adapters.stamp_repair import (
+    MANIFEST_COLUMNS,
+    ManifestRow,
+    shift_stamp,
+)
 from tradepartner.config import Settings
 from tradepartner.ingest import (
     OK,
     RESTAMP_TABLES,
     RestampResult,
+    WindowEarlierOk,
     ingest_session,
+    manifest_release,
     read_manifest,
 )
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.restamp_precheck import compute_precheck, precheck_file_name
 
 ACME = "0000000001"  # restamped: every filing early by the offset
 DUAL = "0000000002"  # unchanged (outside the manifest), or date-crossing
@@ -82,6 +91,7 @@ def _source(
     dual_cover_at: datetime | None = None,
     statements: bool = False,
     relisted: bool = False,
+    nse_at: datetime | None = None,
 ) -> FixtureFilingSource:
     """The cache: ACME's stamps early or repaired, DUAL's early by default."""
 
@@ -143,7 +153,9 @@ def _source(
         delistings=[
             # The subject company is ACME; the stamp is read from the exchange's
             # stamps file (an exchange-only 25-NSE).
-            DelistingFiling(ACME, "25-NSE", "Common Stock", "NYSE", A_25NSE[0], acme(A_25NSE[1])),
+            DelistingFiling(
+                ACME, "25-NSE", "Common Stock", "NYSE", A_25NSE[0], nse_at or acme(A_25NSE[1])
+            ),
         ],
         snapshot=[
             CompanySnapshotEntry(
@@ -693,3 +705,272 @@ def test_read_manifest_reads_t166s_columns(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="10 digits"):
         read_manifest(path)
+
+
+# --- In-window corrections under a passing pre-check (#1497 decision (d), T166e) ---
+
+RELEASE = "restamp-test"
+# The 25-NSE served late by New York's offset (EDT, 4 h): 20:30 New York on
+# 05-01 stamped 00:30Z 05-02. Same New York date and session as the true
+# 16:30 acceptance (both after the close), so no derived column moves.
+NSE_LATE = A_25NSE[1] + timedelta(hours=4)
+WINDOW_STARTED = datetime(2019, 4, 28, 15, tzinfo=UTC)  # first session Mon 04-29
+WINDOW_FIRST = date(2019, 4, 29)
+
+
+@pytest.fixture
+def late_store(settings: Settings) -> _Store:
+    """ACME's stamps true except its 25-NSE, served late; a window open."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=False, nse_at=NSE_LATE), now=FIRST_RUN
+    )
+    assert status == OK, message
+    _open_window(settings, WINDOW_STARTED)
+    return _Store(settings.store.path)
+
+
+def _correction() -> list[ManifestRow]:
+    """The late 25-NSE back to its SGML header time: earlier by the offset."""
+    return [ManifestRow(EXCHANGE, A_25NSE[0], NSE_LATE, A_25NSE[1], "sgml", "test")]
+
+
+def _precheck(
+    settings: Settings,
+    tmp_path: Path,
+    *,
+    passed: bool | None = None,
+    release: str = RELEASE,
+    first: date | str | None = "store",
+) -> WindowEarlierOk:
+    """T166f's pre-check of the store as it is now, written to a file;
+    `passed`, `release` and `first` override the computed fields."""
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        made = compute_precheck(conn, release=release, made_at=RESTAMP_RUN)
+    data = json.loads(made.to_bytes())
+    if passed is not None:
+        data["pass"] = passed
+    if first != "store":
+        data["window_first_session"] = None if first is None else str(first)
+    path = tmp_path / precheck_file_name(release)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return WindowEarlierOk.read(path, release=RELEASE)
+
+
+def _mark_run(settings: Settings, session: date) -> None:
+    """A `mark` run of window 1 on `session`: two new read instants."""
+    at = datetime(2019, 6, 1, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "paper_runs",
+            {
+                "run_id": 1,
+                "window_id": 1,
+                "session": session,
+                "kind": "mark",
+                "started_at": at,
+                "invoked_by": "scheduler",
+                "code_version": "test",
+                "known_at": at,
+                "ingested_at": at,
+            },
+        )
+
+
+def test_an_in_window_earlier_sgml_correction_moves_only_with_a_passing_precheck(
+    settings: Settings, late_store: _Store, tmp_path: Path
+) -> None:
+    before = _snapshot(late_store)
+    status, message, results = _ingest(
+        settings, _source(acme_early=False), now=RESTAMP_RUN, restamp=_correction()
+    )
+    assert status != OK and A_25NSE[0] in message and results == []
+    assert _snapshot(late_store) == before
+
+    status, message, (result,) = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN,
+        restamp=_correction(),
+        restamp_window_ok=_precheck(settings, tmp_path),
+    )
+    assert status == OK, message
+    assert result.refused == {} and result.moved["delistings"] == 1
+    assert late_store.known_ats("delistings", ACME) == {A_25NSE[1]}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"passed": False}, "does not say pass"),
+        ({"release": "restamp-other"}, "is for release restamp-other"),
+        ({"first": date(2019, 5, 6)}, "is for window start 2019-05-06"),
+    ],
+)
+def test_a_failing_or_foreign_precheck_is_refused_and_writes_nothing(
+    settings: Settings,
+    late_store: _Store,
+    tmp_path: Path,
+    kwargs: dict[str, Any],
+    why: str,
+) -> None:
+    before = _snapshot(late_store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN,
+        restamp=_correction(),
+        restamp_window_ok=_precheck(settings, tmp_path, **kwargs),
+    )
+    assert status != OK and why in message and results == []
+    assert _snapshot(late_store) == before
+
+
+def test_a_precheck_the_store_moved_past_is_stale_and_names_the_cache_backup(
+    settings: Settings, late_store: _Store, tmp_path: Path
+) -> None:
+    ok = _precheck(settings, tmp_path)
+    assert ok.precheck.passed
+    _mark_run(settings, date(2019, 5, 31))  # after the pre-check: new instants, new mark
+    before = _snapshot(late_store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN,
+        restamp=_correction(),
+        restamp_window_ok=ok,
+    )
+    assert status != OK and "stale" in message and results == []
+    assert f"stamps/v{PARSER_VERSION}.{RELEASE}.bak" in message
+    assert _snapshot(late_store) == before
+
+
+def test_an_instant_between_the_new_and_old_stamps_aborts(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A window started at 22:00Z 05-01 read the store then: new (20:30Z) <=
+    t < old (00:30Z 05-02), so the correction would change what it read."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=False, nse_at=NSE_LATE), now=FIRST_RUN
+    )
+    assert status == OK, message
+    _open_window(settings, datetime(2019, 5, 1, 22, tzinfo=UTC))
+    store = _Store(settings.store.path)
+    # The real pre-check fails here (the late row is in reach of the start);
+    # a file forced to pass shows the restamp's own exact check still aborts.
+    ok = _precheck(settings, tmp_path, passed=True)
+    assert datetime(2019, 5, 1, 22, tzinfo=UTC) in ok.precheck.instants
+    before = _snapshot(store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN,
+        restamp=_correction(),
+        restamp_window_ok=ok,
+    )
+    assert status != OK and A_25NSE[0] in message and results == []
+    assert _snapshot(store) == before
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize(
+    "change",
+    [
+        # A later move inside the window.
+        lambda: ManifestRow(
+            EXCHANGE, A_25NSE[0], NSE_LATE, NSE_LATE + timedelta(hours=1), "sgml", "t"
+        ),
+        # An earlier move larger than the offset (4 h on an EDT date).
+        lambda: ManifestRow(
+            EXCHANGE, A_25NSE[0], NSE_LATE, NSE_LATE - timedelta(hours=4, minutes=1), "sgml", "t"
+        ),
+        # A shift inside the window.
+        lambda: ManifestRow(EXCHANGE, A_25NSE[0], NSE_LATE, shift_stamp(NSE_LATE), "shift", "t"),
+    ],
+    ids=["later", "earlier-beyond-offset", "shift"],
+)
+def test_other_in_window_changes_abort_with_and_without_the_precheck(
+    settings: Settings,
+    late_store: _Store,
+    tmp_path: Path,
+    flag: bool,
+    change: Any,
+) -> None:
+    before = _snapshot(late_store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False),
+        now=RESTAMP_RUN,
+        restamp=[change()],
+        restamp_window_ok=_precheck(settings, tmp_path) if flag else None,
+    )
+    assert status != OK and A_25NSE[0] in message and results == []
+    assert _snapshot(late_store) == before
+
+
+def test_manifest_release_reads_the_cache_drivers_name(tmp_path: Path) -> None:
+    name = f"v{PARSER_VERSION}.restamp-1382a2.manifest.csv"
+    assert manifest_release(tmp_path / name) == "restamp-1382a2"
+    for bad in ("manifest.csv", f"v{PARSER_VERSION + 1}.r.manifest.csv", "v1.r.csv"):
+        with pytest.raises(ValueError):
+            manifest_release(tmp_path / bad)
+
+
+# --- A row dated S-1 that crosses close(S-1) (#1522's finding, T166e) ---
+
+# A window started 08:00 New York on Thu 2019-05-02: first session 05-02,
+# S-1 = 05-01, close(S-1) = 20:00Z 05-01 (a mark run of 05-02 read the store then).
+S1_WINDOW_STARTED = datetime(2019, 5, 2, 12, tzinfo=UTC)
+S1_CLOSE = datetime(2019, 5, 1, 20, tzinfo=UTC)
+S1_TRUE = datetime(2019, 5, 1, 17, tzinfo=UTC)  # 13:00 New York
+
+
+def _s1_store(settings: Settings, stored_at: datetime) -> _Store:
+    """The 25-NSE stored at `stored_at` on S-1, a window open with a mark run."""
+    status, message, _ = _ingest(
+        settings, _source(acme_early=False, nse_at=stored_at), now=FIRST_RUN
+    )
+    assert status == OK, message
+    _open_window(settings, S1_WINDOW_STARTED)
+    _mark_run(settings, date(2019, 5, 2))
+    return _Store(settings.store.path)
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_s_minus_1_row_crossing_close_s_minus_1_aborts_with_and_without_the_precheck(
+    settings: Settings, tmp_path: Path, flag: bool
+) -> None:
+    stored = datetime(2019, 5, 1, 21, tzinfo=UTC)  # 17:00 New York: after the close
+    store = _s1_store(settings, stored)
+    ok = _precheck(settings, tmp_path) if flag else None
+    assert ok is None or (ok.precheck.passed and S1_CLOSE in ok.precheck.instants)
+    before = _snapshot(store)
+    status, message, results = _ingest(
+        settings,
+        _source(acme_early=False, nse_at=S1_TRUE),
+        now=RESTAMP_RUN,
+        restamp=[ManifestRow(EXCHANGE, A_25NSE[0], stored, S1_TRUE, "sgml", "test")],
+        restamp_window_ok=ok,
+    )
+    assert status != OK and "cross a read instant" in message and A_25NSE[0] in message
+    assert results == []
+    assert _snapshot(store) == before
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_s_minus_1_row_crossing_no_instant_still_applies(
+    settings: Settings, tmp_path: Path, flag: bool
+) -> None:
+    stored = datetime(2019, 5, 1, 19, tzinfo=UTC)  # 15:00 New York: before the close
+    store = _s1_store(settings, stored)
+    ok = _precheck(settings, tmp_path) if flag else None
+    status, message, (result,) = _ingest(
+        settings,
+        _source(acme_early=False, nse_at=S1_TRUE),
+        now=RESTAMP_RUN,
+        restamp=[ManifestRow(EXCHANGE, A_25NSE[0], stored, S1_TRUE, "sgml", "test")],
+        restamp_window_ok=ok,
+    )
+    assert status == OK, message
+    assert result.refused == {} and result.moved["delistings"] == 1
+    assert store.known_ats("delistings", ACME) == {S1_TRUE}

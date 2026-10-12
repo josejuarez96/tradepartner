@@ -81,6 +81,7 @@ from tradepartner.backtest.metrics import (
     red_flag,
     series_metrics,
 )
+from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
 from tradepartner.config import FAMILIES, Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, research, schema
@@ -264,7 +265,9 @@ def metric_rows(
                 spy_period_returns=returns[SPY_SERIES],
                 mtum_period_returns=returns[MTUM_SERIES],
                 periods_per_year=ppy,
-                risk_free_rate=params.metrics.risk_free_rate,
+                risk_free_period_returns=constant_period_returns(
+                    params.metrics.risk_free_rate, ppy, len(returns[series])
+                ),
                 family_benchmark=None if third is None else (third, returns[third]),
             )
             rows.extend(MetricRow(series, level, key, value) for key, value in values.items())

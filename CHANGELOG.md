@@ -303,6 +303,40 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - `paper run` with no `--book` runs every book with an open window, each under its own lock; `--book` on `start`, `stop`, `run`, `reconcile`, `kill`, `resume`, `abandon`, `override` and `settle`, and `paper kill --all` (ADR 0017 B.3, T155b).
 - Scheduling runbook: running every open book under one plist, per-book run times, the per-book plist fallback, the kill-switch drill, and the shakedown span, notes and seven lines.
 - ADR 0018 (Proposed): the end-user web app, a local read API and a web front end replacing Streamlit page by page (#1410).
+- Scheduling runbook: when `paper resume --accept-rejections` is the right call, and that it accepts only rejection-cap verdicts on the runs the release would clear (#684).
+- Research report docs/research/2026-10-06-jev-sample-test.md: the Jev sample test's two run summaries, the blind 16-case gold review and the spec audit's assumption table (#1016)
+- LLM boundary test (c) reads `.gz` files decompressed and fails closed on other compressed formats under src/, scripts/ and tests/ (#1085).
+- Guide agreement-item review toward the most specific correct answer; record the accepted blinding limit.
+- B4 sweep file: momentum + gross profitability combined by equal ranks, one variant, forward holdout 2026-11 to 2027-04, kill line at B3 trial 3's -3.28 pp/yr (#1292)
+- Boundary rule: only `cli.py` may import `typer` or `click`, so no helper outside the `--accept-rejections` fence can configure the Typer app (#1312).
+- ADR 0018 amendment (#1412): lab reading in the app, Run and register as subprocess writes with the trial cost (N, SR*) on the confirm, phone access deferred to a later ADR.
+- Hypothesis file `docs/hypotheses/momentum-daily-shakedown.md`: sweep variant v1 (daily, top 20%) as a machine-test operations book for the ADR 0017 shakedown, not a strategy bet (#1416).
+- Optional `store.memory_limit` and `store.threads` config keys cap DuckDB's memory and worker threads on every store connection; unset keeps DuckDB's defaults (#1418).
+- `store.asof.filing_events_as_of`: 8-K filing events known by T, one row per listed class, filtered by exact form and whole item code (#1419, #1358).
+- EDGAR adapter keeps the submissions `items` field per filing and answers `filing_events(cik)` from the stamps cache (T164c, #1358).
+- `hypothesis register --operations-book-of <variant-slug> --reason`: an operations file of a sweep variant (strategy-lab spec req 1, amendment 2026-10-10; ADR 0017 part A), the `operations_book` decision kind (schema version 22) and its `lab status` line; never a promotion, never a holdout spend.
+- Research report `docs/research/2026-10-10-beyond-long-only.md`: long-short and hedged candidates graded, system needs, proposed B11-B15 and LS- claims (#1452).
+- `filing_events` ingest behind `edgar.filing_events_enabled` (default off) and `edgar.event_forms`; `health` reports per-form counts, the last run's counts with two warnings, the clock detector rule, and four integrity rules (#1358, T164e).
+- `health` and the data-health page list securities the master shows as listed after a Form 25 with no bar since (`health.listed_without_bars`, #1460; report-only, not a `--check` rule).
+- Research report: B11 CAPM beta/alpha split of every logged long-only trial, with a point-in-time beta-hedged line against T-bills (docs/research/2026-10-10-b11-beta-alpha-split.md).
+- `ingest --source edgar --restamp-from <manifest>`: moves stored EDGAR filing stamps per a #1382 stamps-repair manifest, never delete-and-reinsert; date-crossing CIKs refused and listed, a change in an open paper window aborts (#1481).
+- The #1382 stamps repair rules (`adapters/stamp_repair.py`): New York offset and shift, the filing-date rule, a CIK's class from SGML probes, the seeded audit sample and stop rule, and the repair manifest row.
+- The #1382 stamps repair cache driver, scripts/repair_stamps.py (T166a), with a two-phase release (universe CIKs first) in the plan.
+- tests/fixtures/typesafe/: the seven owner Jev recordings (spec C9); the recordings contract test now runs (T125).
+- Exchange delisting-rule glossary (docs/research, .md and .toml): official text, plain meaning and #963 label for the 55 listing rules cited in Form 25 notices (#1490).
+- ADR 0020 and the data-foundation, backtest and strategy-lab spec amendments for a stored point-in-time 3-month T-bill rate (FRED/ALFRED `DTB3`): the `rates` table and its `known_at` rule, the FRED adapter and ingest, a per-period risk-free series in the Sharpe behind frozen `metrics.risk_free_*` keys with the constant as the fallback, and plan tasks T169 to T170d (#1498).
+- research-labeling: the gold label's `basis` (field, `form 25` relied-on cross-check, export columns `basis`/`draw_round`, `protocol_version` metadata), the page's Basis choice, and the pre-lock basis counts with the text-based floor read from the pilot experiment file (T167, #1492).
+- research labeling: the pilot score is split by the gold label's evidence basis (#1492 item 3): headline and rule_provision arm on text-based labels only, class_accuracy_exchange_rule, class_accuracy_provision and basis_counts reported beside it (#1502).
+- research-labeling spec amendment 2026-10-11 (#1504): a pinned Claude comparison arm (plain httpx, structured output, its own ceiling inside the $40, RESEARCH_CLAUDE_API_KEY), the evidence ladder E0/E1/E2 per arm and a computed hybrid router on the gold items, with McNemar's exact test on discordant pairs, all reported and never gating; plan tasks T173, T175, T174, T174b; ADR 0013 dated section (question 1 option (c) for this one arm, a departure by owner decision).
+- ADR 0021 (Proposed) and the data-foundation spec and plan amendment 2026-10-11 (#1506): the point-in-time borrow-status record from Alpaca's daily assets list (T171 to T171d) and the Alpaca spin-off and name-change actions persisted in the store (T172 to T172d), data only; shorting stays closed
+- research-labeling: `research gold --extend <n>` and `gold.extend_gold_session`, the extended draw under the text-based floor (T167b, #1492).
+- research/labeling/scoring.py: ArmCall, level_answer, ladder_table, hybrid_router, mcnemar_exact and paired_comparisons for the Claude arm, evidence ladder and router (#1504, T175); existing metrics unchanged.
+- backtest: riskfree.py (to_yield, session_accruals, period_risk_free, constant_period_returns) and series_metrics taking a per-period risk-free sequence; new risk_free_annual metric (ADR 0020, T170)
+- Schema version 23: the point-in-time `rates` table (`release` provenance), the `RateObservation` record, the `rate_known_at` stamp rule (close of the first XNYS session after the vintage date), the fixture `RateSource` and a generated DTB3-shaped fixture series (T169, #1498).
+- The in-window restamp gate (#1497, T166f): `stamp_repair.in_window_change_allowed`, and `scripts/restamp_precheck.py`, a read-only pre-check listing every paper read instant and the in-window rows a correction could move.
+- `tradepartner ingest --restamp-window-earlier-ok PRECHECK` (#1497, T166e): the store restamp moves an in-window late EDGAR stamp earlier to its SGML header time only with a passing, current pre-check for the manifest's release; a stale file names the cache backup to restore.
+- A stub-tested Claude research client, its isolated secret and disabled-by-default spend config, with a vendor terms note.
+- Price adapters now expose stamped spin-off and symbol-change records from Alpaca-shaped actions.
 
 ### Changed
 - `insert_row` now binds the UTC-normalized value for `TIMESTAMPTZ` columns (one canonical stored form) instead of the caller's original tzinfo, and `ensure_tz_aware_utc` re-raises the `OverflowError` from `.astimezone(UTC)` near `datetime.min`/`datetime.max` as `ValueError` naming the field (#43).
@@ -444,6 +478,19 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - Backtest spec: amendment 2026-10-09 (#1358), the `momentum` turnover screen (B10) and decision 13's post-registration own-section keys, so the new key moves no stored fingerprint; strategy-lab spec's Fingerprint definition points at it; backtest plan tasks T165 to T165e.
 - The tracking report's names are per rebalance period (`PeriodComparison`, `compare_periods`, `_trial_periods`); `paper check`'s tracking line names the period of the window's cadence (`week`, `session`), `month` at `month_end` as before.
 - Tests pin the paper path of the turnover screen; plan/spec say the counts live on engine.Plan.counts, not trial_rebalance_counts (#1401).
+- Pinned #410: a forced exit with no asset read stays an `asset_missing` halt, an inactive asset ends `untradable`, and the Alpaca asset read raises on a 404 rather than omitting the symbol.
+- ready_pr requires safety-reviewer for src/tradepartner/dashboard/override_page.py and its test; git-workflow, teams, agents and the scheduling runbook record the other #771 safety follow-ups (#773)
+- store.delistings reuses master's plain-common-stock title check instead of a hand copy, and a test pins that the EDGAR chunk asks the filing source for Form 25s exactly once (#828).
+- Data-foundation spec: `comparative` groups a filing's columns by duration class; three statement run counts documented as parse-only (#1034, #740).
+- `risk.reconcile_cash_tolerance` defaults to 1.26 (was 0.01) so per-fill cent rounding over a full run cannot halt a correct reconciliation; windows already started keep the value they froze (ADR 0010 amendment 2026-10-10, #1290).
+- data-foundation plan: the #1382 stamps-clock repair as T166, T166b and T166c (owner).
+- Paper plan T160 amended 2026-10-10 and T160b added (`hypothesis register --operations-book-of`, the `operations_book` decision kind); strategy-lab spec req 1 amended: an operations file is a third standalone file after the lab, never a promotion and never a road to the holdout (#1416).
+- Docs: fold of 65 fragments into STATUS and CHANGELOG, STATUS board refreshed for 2026-10-10 (#1429)
+- research-labeling spec amendment 2026-10-11 (#1492): the gold label's `basis` field and labelling protocol (Appendix A), the split score on `basis = text`, `departure-reason-pilot` `min_clusters` 75 on the text-based count checked before the lock, the extended draw under it; plan tasks T167 and T167b
+- Plan amendment 2026-10-11 (#1497): the #1382 phase A rework (request floor and ceiling with the cap enforced during the run, rewritten CIKs probed instead of re-read, the 2026-10-01 onward late API stamps re-stamped from SGML, in-window corrections allowed only earlier behind a flag after a read-only pre-check), the departure corpus re-timed from SGML (T168) before T126's frame, and the data-releases runbook's rule 5 exception.
+- `.env.example` documents `FRED_API_KEY` (#1498).
+- corpus fetch departure-reason: every acceptance comes from the filing's SGML header (the submissions JSON was served hours late since 2026-10); the run prints the requests still to make and stops above --max-requests; corpus.jsonl and counts.json carry fetch_version 2 (T168, #1516).
+- scripts/repair_stamps.py: the dry run reports requests_floor, requests_ceiling and rewritten_if_all_mixed (requests_known goes) and the cap holds during the run; rewritten CIKs are probed, not re-read; --late-api-from/--late-api-to re-read late API stamps; --window-earlier-ok admits in-window earlier SGML corrections under T166f's pre-check (#1497, T166d).
 
 ### Fixed
 - `adjusted_prices_as_of(include_dividends=True)` no longer sizes a dividend against a prior close more than `adjust.max_prior_close_gap_sessions` XNYS sessions before its ex-date (default 5); such a dividend is left unapplied instead of mis-sized or failing the query, and the new `dropped_dividends_as_of` lists it (`stale_prior_bar`, `no_prior_bar` or `outside_calendar_range`) for health; `calendar.all_sessions` added (#72).
@@ -618,6 +665,24 @@ Format: [Keep a Changelog](https://keepachangelog.com). Versions are tagged at t
 - A rebalance left pending lapses `missed` once the next rebalance's fill session arrives, even inside `paper.max_catch_up_sessions` (at `daily`, on F_{i+1}), instead of staying pending after `due_rebalance` had moved on (T151, ADR 0017 section 2).
 - The recorder's secret scrub now removes the HTTP Basic form of every configured book's Alpaca paper key pair, not only book main's (#1405).
 - Sweeps no longer run out of memory: `engine.run_many(..., keep_marking_frames=False)` from the lab drops the per-step marking frames only the `bt` oracle reads (#1414).
+- Paper planning: `rebalance_kind`/`due_rebalance` return None before the window's first rebalance session instead of raising (#649).
+- The EDGAR statement-facts counts: `statement_malformed` now counts entries a late stamp drops for ending after acceptance, and `statement_non_usd`/`statement_malformed` no longer count co-registrant accessions' entries (#1060).
+- Paper collection refuses a broker order reading that is not a market day order (`refused_order_shape`), and reconciliation flags such an order that left the open list (`order_differs`) instead of reconciling it (#1293).
+- Research labeling: seeded_recall is no longer vacuously 1.0; the seeds enter the gold session from research gold --seeds with their pre-fix rule answers, and only row-6/7 seeds gate, the others are reported in seeded_report (#1351)
+- EDGAR stamps are no longer taken from SEC's bulk submissions.zip, whose acceptance times are moved by New York's UTC offset (early for many CIKs); `edgar.bulk_stamps_enabled` (default off) re-enables it (#1382).
+- A wrapper built for one book no longer engages another book's kill switch, cancels its orders or files its alert when handed that book's run; it raises BookMismatchError instead (#1400).
+- Apply the owner's five research, backtest holdout, and repair decisions; record spec amendments.
+- Long single backtests no longer grow without bound: `run_hypothesis` passes `keep_marking_frames=False` to `engine.run` (the `bt` oracle opts back in) (#1417).
+- Group statement comparative flags by duration class in parser, cache reads, and derived candidates; label parse-only health counts.
+- Paper run: alerts are stamped by the risk gate's checked clock (a failed reading falls back to the raw clock with a note), a clock or store fault before the run row now sends a run_failed alert, and only Alpaca's daily ingest runs count for staleness and the clock floor (#1440).
+- `sweep register` and `sweep run` refuse a sweep whose default in-sample window reads another family's holdout months (no development boundary row), so B4 cannot practise on momentum's and profitability's exams by mistake (#1441).
+- Open-buy reserve: a quantity buy with fills on both sides of a split now reserves its true post-split unfilled shares (#1445).
+- A tiny `strategy.top_fraction` (e.g. 1e-7) selects at least one name instead of raising ZeroDivisionError (#1446).
+- Summary-level sweeps no longer hold every step's position values and every cost level's weight rows in memory (#1448).
+- Refuse a sweep variant before gap signoff or paper book start; promotion remains the entry path.
+- Wire filing-event rebuild and configured forms through ingest; report suspect EDGAR acceptance clocks.
+- test_llm_boundary: a collection-time gzip.compress embedded the current mtime, so xdist workers could collect different test ids; now mtime=0 and explicit ids (#1477).
+- EDGAR stamping checks each CIK's new per-CIK stamps against one SGML header and takes every stamp from its own header when SEC's submissions API disagrees (it served acceptance times late by New York's UTC offset from 2026-10) (#1494).
 
 ## [0.1.0] - 2026-09-24
 Phases 0 and 1: foundations, charter and decisions.

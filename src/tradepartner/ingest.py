@@ -135,10 +135,26 @@ and the row stays at the old `known_at`. `restamp` (CLI `ingest --source
 edgar --restamp-from <manifest>`) moves those rows by UPDATE, never a delete
 and re-insert, in the EDGAR chunk's transaction before the day's rows are
 written: `restamp_from_manifest` has the matching rule, the refusals and the
-paper-window abort. A manifest may cover any subset of CIKs; a rerun finds
+paper-window abort. `restamp_window_ok` (#1497, T166e; CLI
+`--restamp-window-earlier-ok <precheck.json>`) lets a late stamp inside an
+open window move earlier to its SGML header time, under T166f's rule and
+pre-check. A manifest may cover any subset of CIKs; a rerun finds
 no row at its old stamps and moves nothing. `statement_facts` follow
 through `rebuild_statement_facts`, `filing_events` through
 `rebuild_filing_events`.
+
+**Classification rebuild** (#1541, plan T182). Classifications are keyed
+by `security_id` alone and a re-derive only ever adds a row at the run
+(`_add_rows`, "Filed rows"), so a changed rule reaches no read before the
+run. `rebuild_classifications` (CLI `ingest --source edgar
+--rebuild-classifications`) first deletes every `classifications` row of
+the securities the build derives (a stored security it no longer derives,
+an owner-kept successor, and a CIK held for a refused restamp or failed
+filings keep their rows), in the EDGAR chunk's transaction, then writes
+the build's rows as they stand: each at the `known_at` the classification
+first became knowable (`store.classify` timing), never the run. A dry
+run rolls it back. The count goes into the run message as
+`classifications_deleted: N`.
 """
 
 from __future__ import annotations
@@ -173,11 +189,13 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
-from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, ManifestRow
+from tradepartner.adapters.stamp_repair import (
+    MANIFEST_COLUMNS,
+    ManifestRow,
+    in_window_change_allowed,
+)
 from tradepartner.calendar import (
-    is_session,
     last_completed_session,
-    next_session,
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
@@ -203,8 +221,15 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
-from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import MasterBuild, build_master, securities_as_of, session_of
+from tradepartner.store.restamp_precheck import (
+    PrecheckFile,
+    crossed_instants,
+    journal_high_water,
+    load_precheck,
+    read_instants,
+    window_first_session,
+)
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -304,8 +329,10 @@ def ingest_session(
     dry_run: bool = False,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    rebuild_classifications: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
+    restamp_window_ok: WindowEarlierOk | None = None,
 ) -> IngestResult:
     """Ingest the expected session from `source` (`edgar`, `alpaca` or
     `all`); see the module docstring. `clock` gives the run's instant, used
@@ -316,13 +343,20 @@ def ingest_session(
     source (`ValueError` otherwise, before anything runs).
     `rebuild_filing_events` (#1358) does the same for `filing_events`, under
     the same two conditions on `edgar.filing_events_enabled`.
+    `rebuild_classifications` (#1541, T182) deletes the build's securities'
+    `classifications` rows and writes the build's (module docstring); it
+    needs the EDGAR source (`ValueError` otherwise, before anything runs).
     `restamp` (#1382, T166b) moves the stored stamps a stamps-repair
     manifest repairs (`restamp_from_manifest`) in the EDGAR chunk's
     transaction, before that day's rows are written; it needs `source`
     `edgar`. `on_restamp` receives its `RestampResult` (after a dry run too,
-    though nothing is kept)."""
+    though nothing is kept). `restamp_window_ok` (#1497, T166e) is the
+    pre-check that lets in-window corrections move (`restamp_from_manifest`);
+    it needs `restamp`."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
+    if restamp_window_ok is not None and restamp is None:
+        raise ValueError("restamp_window_ok needs restamp")
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
     if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
@@ -333,6 +367,8 @@ def ingest_session(
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
     if rebuild_filing_events and source == "alpaca":
         raise ValueError("rebuild_filing_events needs the edgar source")
+    if rebuild_classifications and source == "alpaca":
+        raise ValueError("rebuild_classifications needs the edgar source")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
@@ -345,8 +381,10 @@ def ingest_session(
             run_id,
             rebuild_statement_facts=rebuild_statement_facts,
             rebuild_filing_events=rebuild_filing_events,
+            rebuild_classifications=rebuild_classifications,
             restamp=restamp,
             on_restamp=on_restamp,
+            restamp_window_ok=restamp_window_ok,
         ),
         "alpaca": lambda conn, _run_id: _write_prices(conn, fetched["alpaca"]),
     }
@@ -742,8 +780,10 @@ def _ingest_filings(
     *,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    rebuild_classifications: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
+    restamp_window_ok: WindowEarlierOk | None = None,
 ) -> tuple[int, str]:
     """The EDGAR chunk: build the master, delistings, classifications and
     facts once more from the recorded answers, add what changes an as-of
@@ -766,7 +806,11 @@ def _ingest_filings(
     restamped = ""
     if restamp is not None:
         result = restamp_from_manifest(
-            conn, restamp, ingested_at=now, delistings=recorded.delistings()
+            conn,
+            restamp,
+            ingested_at=now,
+            delistings=recorded.delistings(),
+            window_ok=restamp_window_ok,
         )
         restamped = result.message()
         if on_restamp is not None:
@@ -777,6 +821,10 @@ def _ingest_filings(
         }
     else:
         skipped = frozenset()
+    rebuilt = ""
+    if rebuild_classifications:
+        deleted = _delete_classifications(conn, master, skipped, _unjudged_ciks(recorded).ciks)
+        rebuilt = f"; classifications_deleted: {deleted}"
     added = 0
     for table, rows in (
         ("securities", master.securities),
@@ -820,10 +868,35 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{restamped}{_source_counts(filings)}; "
+        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _delete_classifications(
+    conn: duckdb.DuckDBPyConnection,
+    master: MasterBuild,
+    skipped: Container[str],
+    unjudged: Container[str],
+) -> int:
+    """Delete the `classifications` rows of the securities the build derives,
+    less those of a CIK it cannot rewrite whole: one a restamp refused
+    (`skipped`) or one whose filings failed this run (`unjudged`, #859's
+    hold). A stored security the build no longer derives (an owner-kept
+    successor, #922) keeps its rows: nothing would write them back."""
+    held = {
+        row["cik"]
+        for row in master.securities
+        if row["security_id"] in skipped or row["cik"] in unjudged
+    }
+    ids = sorted({r["security_id"] for r in master.securities if r["cik"] not in held})
+    if not ids:
+        return 0
+    deleted = conn.execute(
+        "DELETE FROM classifications WHERE list_contains(?, security_id)", [ids]
+    ).fetchone()
+    return int(deleted[0]) if deleted else 0
 
 
 def _source_counts(filings: FilingSource) -> str:
@@ -863,6 +936,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
         ("fsn_incomplete_listings", "FSN incomplete listings"),
         ("cover_incomplete_listings", "cover incomplete listings"),  # #612: per-document
+        ("fsn_exchange_axis_mismatch", "FSN exchange-axis mismatches"),  # #1541
+        ("cover_exchange_axis_mismatch", "cover exchange-axis mismatches"),
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
         ("unstamped_delistings", "unstamped delistings"),  # T11f
@@ -963,6 +1038,83 @@ class RestampAborted(ValueError):
     (data-releases runbook, rule 5)."""
 
 
+#: A stamps-repair manifest's file name: `v<PARSER_VERSION>.<release>.manifest.csv`.
+_MANIFEST_NAME = re.compile(r"v(\d+)\.(.+)\.manifest\.csv")
+
+
+def manifest_release(path: Path) -> str:
+    """The release a stamps-repair manifest belongs to, read from its name
+    (`v<PARSER_VERSION>.<release>.manifest.csv`, the cache driver's name).
+    Raises `ValueError` for any other name or another parser version."""
+    from tradepartner.adapters.edgar_source import PARSER_VERSION  # it imports this module
+
+    match = _MANIFEST_NAME.fullmatch(path.name)
+    if match is None or int(match.group(1)) != PARSER_VERSION:
+        raise ValueError(
+            f"{path.name}: a manifest named v{PARSER_VERSION}.<release>.manifest.csv "
+            "is needed to read its release"
+        )
+    return match.group(2)
+
+
+@dataclass(frozen=True)
+class WindowEarlierOk:
+    """The read-only pre-check file (T166f's `precheck.<release>.json`,
+    read by `restamp_precheck.load_precheck`) that lets a restamp move
+    in-window corrections (#1497 decision (d)), with the `release` of the
+    manifest it is used with. `path` names the file in refusals."""
+
+    path: Path
+    release: str
+    precheck: PrecheckFile
+
+    @classmethod
+    def read(cls, path: Path, *, release: str) -> WindowEarlierOk:
+        """Load the pre-check file at `path` for the manifest's `release`.
+        Raises `ValueError` on a missing or malformed field; whether the file
+        allows the restamp is decided inside the restamp's transaction
+        (`restamp_from_manifest`), not here."""
+        try:
+            precheck = load_precheck(path)
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"{path}: not a pre-check file ({exc!r})") from None
+        return cls(path=path, release=release, precheck=precheck)
+
+    def backup(self) -> str:
+        """The stamps cache backup a stale-file refusal names (runbook)."""
+        from tradepartner.adapters.edgar_source import PARSER_VERSION  # it imports this module
+
+        return f"stamps/v{PARSER_VERSION}.{self.release}.bak"
+
+
+def _window_ok_refusal(
+    conn: duckdb.DuckDBPyConnection, ok: WindowEarlierOk, first: date | None
+) -> str | None:
+    """Why the pre-check file `ok` cannot let this restamp move in-window
+    corrections, or None when it can: it must say pass, for this manifest's
+    release and the store's window start, and the instants and the journal
+    high-water mark T166f's query recomputes now must equal the file's."""
+    name, file = ok.path.name, ok.precheck
+    if not file.passed:
+        return f"pre-check {name} does not say pass"
+    if file.release != ok.release:
+        return f"pre-check {name} is for release {file.release}, the manifest's is {ok.release}"
+    if file.window_first_session != first:
+        return (
+            f"pre-check {name} is for window start {file.window_first_session}, "
+            f"the store's is {first}"
+        )
+    if tuple(read_instants(conn)) != tuple(sorted(set(file.instants))) or (
+        journal_high_water(conn) != file.journal_high_water
+    ):
+        return (
+            f"pre-check {name} is stale: the store's read instants or journal high-water mark "
+            f"changed since it was made; restore the stamps cache from {ok.backup()}, "
+            "close the release as rolled back and start a new one with a fresh pre-check"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class RestampResult:
     """What one restamp did: `moved` rows per table, the CIKs it `refused`
@@ -989,25 +1141,32 @@ def _ny_date(instant: datetime) -> date:
     return instant.astimezone(_NEW_YORK).date()
 
 
-def window_first_session(conn: duckdb.DuckDBPyConnection) -> date | None:
-    """The earliest first session of any open paper window (one with no
-    `closed` or `abandoned` stop): the XNYS session on or after its
-    `started_at`'s New York date. None when no window is open."""
-    started = conn.execute(
-        "SELECT min(started_at) FROM paper_windows WHERE window_id NOT IN "
-        "(SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))",
-        [list(CLOSING_STOP_STATES)],
-    ).fetchone()
-    if started is None or started[0] is None:
-        return None
-    day = _ny_date(ensure_tz_aware_utc(started[0], field_name="started_at"))
-    return day if is_session(day) else next_session(day)
-
-
 #: The rows a restamp may move in every table: EDGAR-sourced, `filing`
 #: provenance, never a row stamped at its own ingest (a revision or a
 #: retraction stamped at `ingested_at`).
 _RESTAMPABLE = "t.source = 'edgar' AND t.provenance = 'filing' AND t.known_at <> t.ingested_at"
+
+
+def _earlier_ok(change: ManifestRow, first: date, instants: Sequence[datetime]) -> bool:
+    """True when the in-window `change` may move under a passing pre-check:
+    T166f's rule allows it and no read instant `t` has `new <= t < old` (no
+    paper decision read the row before the correction that reads it
+    differently after)."""
+    return in_window_change_allowed(change, first) and not crossed_instants(
+        change.old_stamp, change.new_stamp, instants
+    )
+
+
+def _crosses(change: ManifestRow, instants: Sequence[datetime]) -> bool:
+    """True when a read instant `t` lies between the change's stamps, in
+    either direction (`new <= t < old` or `old <= t < new`): a paper decision
+    at `t` would read the row differently after the move. A row dated before
+    the window's first session can still cross one (`close(S-1)`, a window's
+    `started_at`), so this is checked for every changed row (#1522)."""
+    return bool(
+        crossed_instants(change.old_stamp, change.new_stamp, instants)
+        or crossed_instants(change.new_stamp, change.old_stamp, instants)
+    )
 
 
 def restamp_from_manifest(
@@ -1016,6 +1175,7 @@ def restamp_from_manifest(
     *,
     ingested_at: datetime,
     delistings: Iterable[DelistingFiling],
+    window_ok: WindowEarlierOk | None = None,
 ) -> RestampResult:
     """Move the stored stamps the manifest `changes` repair, inside the
     caller's transaction; never a delete and re-insert.
@@ -1048,16 +1208,44 @@ def restamp_from_manifest(
 
     **Aborts** with `RestampAborted`, before any write, when any change's old
     or new stamp falls on or after the first session of an open paper
-    window (`window_first_session`). After the writes, a changed set of
+    window (`window_first_session`). With `window_ok` (#1497 decision (d),
+    T166e) an in-window change may move, but only when the pre-check file
+    passes for this release and window start and still matches the store
+    (`_window_ok_refusal`, else `RestampAborted` naming the cache backup),
+    when T166f's `in_window_change_allowed` allows it (an `sgml` move earlier
+    by at most New York's offset); any other in-window change aborts as
+    without it. Whenever a window is open, with or without `window_ok`, any
+    changed row, in or before the window, whose move crosses one of the
+    store's read instants (`restamp_precheck.read_instants`) aborts the run
+    (`_crosses`, both directions; #1522: a row dated S-1 can cross
+    `close(S-1)`).
+    The refusals below apply to the in-window changes as to any. After the writes, a changed set of
     `security_id`s in any table raises `RuntimeError`, so the caller's
     transaction rolls back (the restamp never mints an id)."""
     ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
     moving = [c for c in changes if c.changed]
     first = window_first_session(conn)
+    if window_ok is not None:
+        why = _window_ok_refusal(conn, window_ok, first)
+        if why is not None:
+            raise RestampAborted(why)
     if first is not None:
+        instants = read_instants(conn)
+        crossing = [c for c in moving if _crosses(c, instants)]
+        if crossing:
+            listed = "; ".join(
+                f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"
+                for c in crossing
+            )
+            raise RestampAborted(
+                f"{len(crossing)} manifest change(s) cross a read instant of the open paper "
+                f"window (first session {first.isoformat()}): {listed}"
+            )
         inside = [
             c for c in moving if _ny_date(c.old_stamp) >= first or _ny_date(c.new_stamp) >= first
         ]
+        if window_ok is not None:
+            inside = [c for c in inside if not _earlier_ok(c, first, window_ok.precheck.instants)]
         if inside:
             listed = "; ".join(
                 f"{c.cik} {c.accession} {c.old_stamp.isoformat()} -> {c.new_stamp.isoformat()}"
@@ -1264,6 +1452,8 @@ _STATEMENT_SOURCE_COUNTS: tuple[str, ...] = (
     "non_usd",
     "malformed",
     "none",
+    "payload_trails",
+    "no_parsed_rows",
 )
 
 #: A statement fact's key: `(fact_name, period_end, period_days)` within a CIK.

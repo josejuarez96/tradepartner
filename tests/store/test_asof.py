@@ -42,6 +42,7 @@ from tradepartner.store.asof import (
     filing_events_as_of,
     listings_as_of,
     prices_as_of,
+    rates_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
@@ -56,6 +57,65 @@ def _one(df: pl.DataFrame, **match: object) -> dict[str, object]:
         filtered = filtered.filter(pl.col(key) == value)
     assert filtered.height == 1, f"expected exactly one match for {match}, got {filtered}"
     return filtered.row(0, named=True)
+
+
+def test_rates_as_of_empty_and_revised_fixture(
+    synthetic_store: duckdb.DuckDBPyConnection,
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    first = datetime(2019, 3, 14, 20, tzinfo=UTC)
+    revised = datetime(2019, 3, 21, 20, tzinfo=UTC)
+    key = {"series": "DTB3", "observation_date": date(2019, 3, 12)}
+    assert rates_as_of(synthetic_store, revised).is_empty()
+    assert (
+        rates_as_of(fixture_store, first - timedelta(microseconds=1))
+        .filter(
+            (pl.col("series") == "DTB3") & (pl.col("observation_date") == key["observation_date"])
+        )
+        .is_empty()
+    )
+    assert _one(rates_as_of(fixture_store, first), **key)["value"] == 2.25
+    assert (
+        _one(rates_as_of(fixture_store, revised - timedelta(microseconds=1)), **key)["value"]
+        == 2.25
+    )
+    assert _one(rates_as_of(fixture_store, revised), **key)["value"] == 2.27
+    with pytest.raises(TypeError, match="tz-aware datetime"):
+        rates_as_of(fixture_store, date(2019, 3, 21))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="tz-aware"):
+        rates_as_of(fixture_store, datetime(2019, 3, 21, 20))  # noqa: DTZ001
+
+
+def test_rates_as_of_series_filter_and_columns(
+    synthetic_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2020, 3, 18, 20, tzinfo=UTC)
+    for series, value in (("DTB3", 0.65), ("OTHER", 1.25)):
+        insert_row(
+            synthetic_store,
+            "rates",
+            {
+                "series": series,
+                "observation_date": date(2020, 3, 16),
+                "value": value,
+                "vintage_date": date(2020, 3, 17),
+                "known_at": known,
+                "ingested_at": known,
+                "source": "test",
+                "provenance": "release",
+            },
+        )
+    all_rates = rates_as_of(synthetic_store, known)
+    assert all_rates.columns == [
+        "series",
+        "observation_date",
+        "value",
+        "vintage_date",
+        "known_at",
+    ]
+    assert all_rates["series"].to_list() == ["DTB3", "OTHER"]
+    assert rates_as_of(synthetic_store, known, series="DTB3")["series"].to_list() == ["DTB3"]
+    assert rates_as_of(synthetic_store, known, series="MISSING").is_empty()
 
 
 @pytest.fixture

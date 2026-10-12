@@ -36,6 +36,7 @@ from tradepartner.adapters.edgar_source import (
     reduce_submissions,
 )
 from tradepartner.config import Settings
+from tradepartner.ingest import StatementCounts, statement_fact_rows
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "edgar"
 CIK = "0000123456"
@@ -926,6 +927,166 @@ def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> Non
     records = source.statement_facts(CIK)
     assert router.urls == [API.format(cik=CIK)]
     assert records and source.statement_conflicts == 1  # counted on the first answer
+
+
+def _q1_q2_source(
+    tmp_path: Path, *, q2_statement: bool = True, skips: bool = False
+) -> tuple[EdgarFilingSource, str, datetime]:
+    """Read Q1 statements, then add a Q2 filing to the same source instance."""
+    q1 = "0000123456-26-000001"
+    q2 = "0000123456-26-000002"
+    q1_at = datetime(2026, 5, 1, 20, 0, tzinfo=UTC)
+    q2_at = datetime(2026, 8, 1, 20, 0, tzinfo=UTC)
+    settings = _settings(tmp_path)
+
+    def body(include_q2: bool) -> dict[str, Any]:
+        shares = [entry(q1, "2026-03-31", 10, form="10-Q")]
+        revenue = [entry(q1, ("2026-01-01", "2026-03-31"), 100, form="10-Q")]
+        if include_q2:
+            shares.append(entry(q2, "2026-06-30", 11, form="10-Q"))
+            if q2_statement:
+                revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form="10-Q"))
+        gaap: dict[str, Any] = {"Revenues": {"units": {"USD": revenue}}}
+        if skips:
+            gaap["GrossProfit"] = {
+                "units": {
+                    "EUR": [entry(q1, ("2026-01-01", "2026-03-31"), 4, form="10-Q")],
+                    "USD": (
+                        [
+                            entry(q2, ("2026-04-01", "2026-06-30"), 5, form="10-Q"),
+                            entry(q2, ("2026-04-01", "2026-06-30"), 6, form="10-Q"),
+                        ]
+                        if include_q2
+                        else []
+                    ),
+                }
+            }
+            if include_q2:
+                gaap["Assets"] = {"units": {"USD": [entry(q2, "2026-09-30", 90, form="10-Q")]}}
+        return {
+            "cik": int(CIK),
+            "facts": {
+                "dei": {SHARES: {"units": {"shares": shares}}},
+                "us-gaap": gaap,
+            },
+        }
+
+    first = _adapter(settings, _router(**{f"c{CIK}": body(False)}))
+    _stamps(first, CIK, {q1: ("10-Q", q1_at)})
+    assert first.facts(CIK, [SHARES])
+    assert {r.accession for r in first.statement_facts(CIK)} == {q1}
+
+    second = _adapter(settings, _router(**{f"c{CIK}": body(True)}))
+    assert {r.accession for r in second.statement_facts(CIK)} == {q1}
+    _stamps(second, CIK, {q1: ("10-Q", q1_at), q2: ("10-Q", q2_at)})
+    assert {r.accession for r in second.facts(CIK, [SHARES])} == {q1, q2}
+    return second, q2, q2_at
+
+
+def test_q1_facts_cache_refreshes_q2_statement_facts(tmp_path: Path) -> None:
+    """A new filing must reach statements even after shares were cached at Q1."""
+    second, q2, _ = _q1_q2_source(tmp_path)
+    q1 = "0000123456-26-000001"
+    assert {r.accession for r in second.statement_facts(CIK)} == {q1, q2}
+    assert second.requests == 1  # facts' Q2 fetch also filled the statement cache
+
+
+def test_refreshed_q2_statement_is_not_known_before_acceptance(tmp_path: Path) -> None:
+    """The refreshed row retains Q2's acceptance stamp through the ingest builder."""
+    second, q2, q2_at = _q1_q2_source(tmp_path)
+    records = second.statement_facts(CIK)
+    rows, _ = statement_fact_rows(records, {}, set(), ingested_at=datetime(2026, 8, 2, tzinfo=UTC))
+    q2_rows = [row for row in rows if row["filing_accession"] == q2]
+    assert q2_rows and all(row["known_at"] == q2_at for row in q2_rows)
+
+
+def test_seen_q2_shares_without_statements_have_named_counter(tmp_path: Path) -> None:
+    """A seen 10-Q with no parsed statement row is visible in the run count."""
+    second, _, _ = _q1_q2_source(tmp_path, q2_statement=False)
+    second.statement_facts(CIK)
+    assert second.statement_no_parsed_rows == 1
+    assert "statement_no_parsed_rows: 1" in StatementCounts().message(second)
+
+
+@pytest.mark.parametrize("q2_form", ["10-Q", "10-Q/A", "10-K/A"])
+def test_trailing_payload_is_retried_across_runs_until_q2_arrives(
+    tmp_path: Path, q2_form: str
+) -> None:
+    """Production order: stamps precede facts; a trailing payload is retried per run."""
+    q1, q2 = "0000123456-26-000001", "0000123456-26-000002"
+    q1_at = datetime(2026, 5, 1, 20, tzinfo=UTC)
+    q2_at = datetime(2026, 8, 1, 20, tzinfo=UTC)
+    settings = _settings(tmp_path)
+
+    def body(with_q2: bool) -> dict[str, Any]:
+        shares = [entry(q1, "2026-03-31", 10, form="10-Q")]
+        revenue = [entry(q1, ("2026-01-01", "2026-03-31"), 100, form="10-Q")]
+        if with_q2:
+            shares.append(entry(q2, "2026-06-30", 11, form=q2_form))
+            revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form=q2_form))
+        return {
+            "cik": int(CIK),
+            "facts": {
+                "dei": {SHARES: {"units": {"shares": shares}}},
+                "us-gaap": {"Revenues": {"units": {"USD": revenue}}},
+            },
+        }
+
+    first = _adapter(settings, _router(**{f"c{CIK}": body(False)}))
+    _stamps(first, CIK, {q1: ("10-Q", q1_at)})
+    first.facts(CIK, [SHARES])
+    first.statement_facts(CIK)
+
+    cover = first._cover_cache_path(q2)
+    cover.parent.mkdir(parents=True, exist_ok=True)
+    cover.write_text(
+        json.dumps(
+            {
+                "version": COVER_VERSION,
+                "accession": q2,
+                "cik": CIK,
+                "entity_cik": CIK,
+                "listings": [],
+                "facts": [[SHARES, "2026-06-30", "", 11]],
+            }
+        )
+    )
+    stamps = {q1: ("10-Q", q1_at), q2: (q2_form, q2_at)}
+    for _ in range(2):
+        trailing = _adapter(settings, _router(**{f"c{CIK}": body(False)}))
+        _stamps(trailing, CIK, stamps)
+        assert {r.accession for r in trailing.facts(CIK, [SHARES])} == {q1, q2}
+        assert {r.accession for r in trailing.statement_facts(CIK)} == {q1}
+        assert trailing.requests == 1
+        assert trailing.statement_payload_trails == 1
+        assert trailing.statement_no_parsed_rows == 0
+        assert "statement_payload_trails: 1" in StatementCounts().message(trailing)
+
+    caught_up = _adapter(settings, _router(**{f"c{CIK}": body(True)}))
+    _stamps(caught_up, CIK, stamps)
+    caught_up.facts(CIK, [SHARES])
+    records = caught_up.statement_facts(CIK)
+    assert {r.accession for r in records} == {q1, q2}
+    assert caught_up.requests == 1
+    assert caught_up.statement_payload_trails == 0
+    rows, _ = statement_fact_rows(records, {}, set(), ingested_at=datetime(2026, 8, 2, tzinfo=UTC))
+    assert all(row["known_at"] == q2_at for row in rows if row["filing_accession"] == q2)
+
+    warm = _adapter(settings, EdgarRouter())
+    assert {r.accession for r in warm.facts(CIK, [SHARES])} == {q1, q2}
+    assert {r.accession for r in warm.statement_facts(CIK)} == {q1, q2}
+    assert warm.requests == 0
+
+
+def test_refresh_replaces_per_cik_skip_counts(tmp_path: Path) -> None:
+    """Q1 parse skips count once; new Q2 conflicts and late rows count too."""
+    second, _, _ = _q1_q2_source(tmp_path, skips=True)
+    second.statement_facts(CIK)
+    assert (second.statement_non_usd, second.statement_conflicts, second.statement_malformed) == (
+        1,
+        1,
+        1,
+    )
 
 
 def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:

@@ -21,13 +21,22 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   `reuse_cached`: company facts come from the cached `companyfacts.zip`
   with no request for it. `--rebuild-statement-facts` deletes and
   re-ingests `statement_facts` in the EDGAR chunk's transaction and needs
-  `edgar.statement_facts_enabled`. Both are off by default and refused with
-  `--backfill` or `--source alpaca` (usage error, 2). `--restamp-from
+  `edgar.statement_facts_enabled`. `--rebuild-classifications` (#1541,
+  T182) deletes the covered securities' `classifications` rows and writes
+  the build's at their own `known_at` in the same transaction. All are off
+  by default and refused with `--backfill` or `--source alpaca` (usage error, 2). `--restamp-from
   MANIFEST` (#1382, T166b) moves the stored stamps a stamps-repair manifest
   repairs (`ingest.restamp_from_manifest`) in the EDGAR chunk, then writes
   the day's filings as usual; it needs `--source edgar` and no `--backfill`,
   prints the moved rows per table and each refused CIK, and a change inside
   an open paper window fails the run with nothing written.
+  `--restamp-window-earlier-ok PRECHECK` (#1497, T166e) takes the
+  pre-check file `scripts/restamp_precheck.py` wrote for the manifest's
+  release (from its name, `v<PARSER_VERSION>.<release>.manifest.csv`):
+  with it a late stamp inside the window moves earlier to its SGML time
+  when the file passes and still matches the store
+  (`ingest.restamp_from_manifest`); any other in-window change still fails
+  the run with nothing written.
 - `tradepartner backfill-benchmark SYMBOL --since DATE [--cik --name
   --exchange]` runs `backfill.backfill_benchmark` (#840): the owner's one-off
   for a configured benchmark the store lacks (MTUM), seeded from the three
@@ -377,13 +386,20 @@ from tradepartner.execution.lots_reconcile_export import UnknownExportFormat
 from tradepartner.execution.lots_reconcile_export import parse_export as parse_broker_export
 from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
-from tradepartner.health import HealthReport, health_report
+from tradepartner.health import (
+    COVERAGE_REFERENCE_NAMES,
+    CoverageReference,
+    HealthReport,
+    health_report,
+)
 from tradepartner.ingest import (
     SOURCES,
     IngestResult,
     RestampResult,
+    WindowEarlierOk,
     _read,
     ingest_session,
+    manifest_release,
     read_manifest,
 )
 from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
@@ -673,10 +689,45 @@ def _print_report(report: HealthReport) -> None:
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     echo(f"settings: {report.settings}")
+    _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
     for check in report.integrity:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
+    echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+
+
+def _coverage_verdict(block: CoverageReference | None) -> str:
+    """`coverage_reference_names`' line: never a pass the block did not check."""
+    if block is None:
+        return "not computed (run with --coverage)"
+    if block.failed and not block.check_enabled:
+        return f"{block.verdict}: coverage.check_enabled is off"
+    return block.verdict
+
+
+def _print_coverage_reference(block: CoverageReference | None) -> None:
+    echo = typer.echo
+    if block is None:
+        echo("coverage reference: not computed (run with --coverage)")
+        return
+    mode = "check" if block.check_enabled else "report-only"
+    echo(f"coverage reference ({mode}): {block.samples.height} sample sessions")
+    for row in block.samples.iter_rows(named=True):
+        echo(
+            f"  {row['session']}: {row['members']} members; "
+            f"{row['reference_missing']} of {row['references']} reference names missing; "
+            f"{row['late_known']} of {row['listed']} listed names late-known "
+            f"({row['late_share']:.1%})"
+        )
+    for row in block.reference_missing.iter_rows(named=True):
+        rule = "" if row["rule_name"] is None else f"rule {row['rule_name']}, "
+        echo(
+            f"  missing {row['session']} {row['cik']}:{row['ticker']} "
+            f"({row['security_id'] or '-'}): {rule}{row['reason']}"
+        )
+    ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
+    echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
 
 
 def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
@@ -1549,11 +1600,28 @@ def make_app(
                 help="delete and re-ingest filing_events in the EDGAR chunk (#1458)",
             ),
         ] = False,
+        rebuild_classifications: Annotated[
+            bool,
+            typer.Option(
+                "--rebuild-classifications",
+                help="delete and rewrite the covered securities' classifications (#1541)",
+            ),
+        ] = False,
         restamp_from: Annotated[
             Path | None,
             typer.Option(
                 "--restamp-from",
                 help="move stored stamps per a stamps-repair manifest CSV (#1382); --source edgar",
+            ),
+        ] = None,
+        restamp_window_earlier_ok: Annotated[
+            Path | None,
+            typer.Option(
+                "--restamp-window-earlier-ok",
+                help=(
+                    "a passing pre-check JSON (scripts/restamp_precheck.py) that lets in-window "
+                    "late stamps move earlier to their SGML time (#1497); with --restamp-from"
+                ),
             ),
         ] = None,
     ) -> None:
@@ -1574,6 +1642,7 @@ def make_app(
             ("--bulk-from-cache", bulk_from_cache),
             ("--rebuild-statement-facts", rebuild_statement_facts),
             ("--rebuild-filing-events", rebuild_filing_events),
+            ("--rebuild-classifications", rebuild_classifications),
         ):
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
@@ -1588,6 +1657,16 @@ def make_app(
                 restamp = read_manifest(restamp_from)
             except (OSError, ValueError, KeyError) as exc:
                 raise _fail(f"--restamp-from: {exc}", USAGE_ERROR) from None
+        window_ok: WindowEarlierOk | None = None
+        if restamp_window_earlier_ok is not None:
+            if restamp_from is None:
+                raise _fail("--restamp-window-earlier-ok needs --restamp-from", USAGE_ERROR)
+            try:
+                window_ok = WindowEarlierOk.read(
+                    restamp_window_earlier_ok, release=manifest_release(restamp_from)
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                raise _fail(f"--restamp-window-earlier-ok: {exc}", USAGE_ERROR) from None
         named: list[str] | None = None
         if security is not None:
             if not fill_holes_:
@@ -1659,8 +1738,10 @@ def make_app(
                 dry_run=dry_run,
                 rebuild_statement_facts=rebuild_statement_facts,
                 rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
                 restamp=restamp,
                 on_restamp=restamped.append,
+                restamp_window_ok=window_ok,
             )
         _print_result(result)
         for done in restamped:
@@ -1870,6 +1951,17 @@ def make_app(
                 )
             ),
         ] = None,
+        coverage: Annotated[
+            bool | None,
+            typer.Option(
+                "--coverage/--no-coverage",
+                help=(
+                    "run (or skip) the coverage check against coverage.reference_names "
+                    "(one universe read per sample session); default: while "
+                    "coverage.check_enabled is on"
+                ),
+            ),
+        ] = None,
     ) -> None:
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
@@ -1879,7 +1971,9 @@ def make_app(
         t = ensure_tz_aware_utc(clock(), field_name="clock()")
         try:
             with open_read_only(s) as conn:
-                report = health_report(conn, t, s, jumps_before=cutoff)
+                report = health_report(
+                    conn, t, s, jumps_before=cutoff, with_coverage_reference=coverage
+                )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
         except (duckdb.CatalogException, duckdb.BinderException) as exc:

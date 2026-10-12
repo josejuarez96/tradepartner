@@ -38,6 +38,7 @@ from tradepartner.config import (
     HypothesisFamily,
     PaperConfig,
     ProfitabilityConfig,
+    ReferenceName,
     RiskConfig,
     Settings,
     StrategyConfig,
@@ -45,6 +46,7 @@ from tradepartner.config import (
     _settings_has_key,
     clean_message,
     paper_key_variable_names,
+    parse_reference_name,
     render_validation_errors,
     secret_values,
 )
@@ -106,6 +108,37 @@ def test_ingest_defaults() -> None:
     assert s.ingest.reference_symbol == "SPY"
     assert s.ingest.max_missing_share == pytest.approx(0.05)
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
+
+
+def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    assert settings.fred_api_key is None
+    assert settings.rates.series == ["DTB3"]
+    assert settings.rates.max_stale_sessions == 3
+    assert settings.rates.refetch_days == 10
+    assert settings.rates.plausible_range_percent == [-1.0, 25.0]
+    monkeypatch.setenv("FRED_API_KEY", "dummy-secret")
+    monkeypatch.setenv("RATES__SERIES", '["DTB3", "DGS3MO"]')
+    configured = _settings()
+    assert configured.fred_api_key is not None
+    assert configured.fred_api_key.get_secret_value() == "dummy-secret"
+    assert configured.rates.series == ["DTB3", "DGS3MO"]
+
+
+@pytest.mark.parametrize(
+    "rates",
+    [
+        {"series": []},
+        {"series": ["DTB3", "DTB3"]},
+        {"max_stale_sessions": -1},
+        {"refetch_days": 0},
+        {"plausible_range_percent": [25.0, -1.0]},
+        {"plausible_range_percent": [float("nan"), 25.0]},
+    ],
+)
+def test_invalid_fred_rate_config_is_rejected(rates: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rates=rates)
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.5, float("nan")])
@@ -235,6 +268,24 @@ def test_edgar_filing_events_defaults() -> None:
     s = Settings(_env_file=None)
     assert s.edgar.filing_events_enabled is False
     assert s.edgar.event_forms == ["8-K", "8-K/A"]
+
+
+def test_edgar_exchange_axis_listings_is_off_by_default_and_settable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1541 (T178): off until the owner's release (T181) flips it."""
+    assert Settings(_env_file=None).edgar.exchange_axis_listings is False
+    monkeypatch.setenv("EDGAR__EXCHANGE_AXIS_LISTINGS", "true")
+    assert Settings(_env_file=None).edgar.exchange_axis_listings is True
+
+
+def test_edgar_title_fallback_is_off_by_default_and_reads_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T179 (#1541): the title fallback switch is off until the release."""
+    assert Settings(_env_file=None).edgar.title_fallback is False
+    monkeypatch.setenv("EDGAR__TITLE_FALLBACK", "true")
+    assert Settings(_env_file=None).edgar.title_fallback is True
 
 
 def test_edgar_filing_events_keys_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -639,18 +690,23 @@ def test_universe_defaults() -> None:
     assert u.top_n_by_cap == 1000
 
 
-def test_guarded_sic_exclusion_pinned_to_charter_range() -> None:
-    """Guarded per ADR 0006: full SIC 4900-4999 division, no carve-outs.
-
-    Changing this default is a charter amendment, not a routine code change.
-    """
-    assert _settings().universe.exclude_sic_ranges == ((4900, 4999),)
+def test_sic_exclusion_defaults_to_none() -> None:
+    """ADR 0006 amendment 2026-10-11 (#1540): no sector is excluded by default."""
+    assert _settings().universe.exclude_sic_ranges == ()
 
 
-def test_guarded_sic_exclusion_rejects_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A env override can't silently loosen the guarded SIC exclusion."""
-    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[]")
-    with pytest.raises(ValidationError, match="guarded setting; change only by charter amendment"):
+@pytest.mark.parametrize(
+    "raw", ["[[4900, 4999]]", "[[4900, 4949]]", "[[4900, 4999], [6000, 6099]]", "[[1, 2]]", "[]"]
+)
+def test_sic_exclusion_accepts_env_overrides(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", raw)
+    got = Settings(_env_file=None).universe.exclude_sic_ranges
+    assert got == tuple(tuple(r) for r in json.loads(raw))
+
+
+def test_sic_exclusion_refuses_a_reversed_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[[2, 1]]")
+    with pytest.raises(ValidationError, match="start > end"):
         Settings(_env_file=None)
 
 
@@ -2041,3 +2097,161 @@ def test_alpaca_class_symbols_fails_closed_on_a_malformed_pair(pair: dict[str, s
     """#1219: a pair is an undotted ticker and a dotted class symbol, or the config refuses."""
     with pytest.raises(ValidationError, match="class_symbols"):
         Settings(_env_file=None, alpaca={"class_symbols": pair})
+
+
+def test_research_claude_defaults_env_and_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tradepartner.config import Settings, clean_message, secret_values
+
+    monkeypatch.delenv("RESEARCH_CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL", raising=False)
+    settings = Settings(_env_file=None)
+    claude = settings.research.claude
+    assert (claude.api_base_url, claude.spend_ceiling_usd_total, claude.max_output_tokens) == (
+        "https://api.anthropic.com",
+        0.0,
+        1024,
+    )
+    assert (
+        claude.price_usd_per_million_input_tokens,
+        claude.price_usd_per_million_output_tokens,
+        claude.chars_per_token,
+        claude.thinking,
+        claude.effort,
+    ) == (2.0, 10.0, 3.5, "between_tools", "low")
+    assert (
+        claude.requests_per_second,
+        claude.request_timeout_seconds,
+        claude.max_attempts,
+        claude.anthropic_version,
+    ) == (1.0, 120.0, 3, "2023-06-01")
+    assert settings.research_claude_api_key is None
+    monkeypatch.setenv("RESEARCH_CLAUDE_API_KEY", "synthetic-secret-123")
+    monkeypatch.setenv("RESEARCH__CLAUDE__SPEND_CEILING_USD_TOTAL", "15")
+    enabled = Settings(_env_file=None)
+    assert enabled.research.claude.spend_ceiling_usd_total == 15
+    assert "synthetic-secret-123" in secret_values(enabled)
+    assert "synthetic-secret-123" not in repr(enabled)
+    assert clean_message("value synthetic-secret-123", enabled) == "value [redacted]"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-other-key")
+    monkeypatch.delenv("RESEARCH_CLAUDE_API_KEY")
+    assert Settings(_env_file=None).research_claude_api_key is None
+
+
+def test_research_claude_https_and_thinking_validation() -> None:
+    from pydantic import ValidationError
+
+    from tradepartner.config import ResearchClaudeConfig
+
+    for value, field in (
+        ({"api_base_url": "http://example.test"}, "api_base_url"),
+        ({"thinking": "disabled"}, "thinking"),
+    ):
+        with pytest.raises(ValidationError) as raised:
+            ResearchClaudeConfig(**value)
+        assert raised.value.errors()[0]["loc"] == (field,)
+
+
+# --- coverage: the reference list (#1541, T180) --------------------------------
+
+#: The spec amendment's default names, by ticker (BRK.B as the filer spells it).
+_SPEC_REFERENCE_TICKERS = {
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK.B", "JNJ", "JPM", "XOM", "UNH", "V",
+    "HD", "CVX", "MRK", "KO", "PEP", "PFE", "CSCO", "WMT", "BAC", "DIS", "TMO",
+    "IBM", "ABBV", "ABT", "MMM", "ALL", "FITB", "WHR", "PG",
+}  # fmt: skip
+
+
+def test_coverage_defaults_are_the_spec_amendments() -> None:
+    cfg = Settings(_env_file=None).coverage
+    assert cfg.sample_months == [6, 12]
+    assert cfg.sample_from == date(2019, 12, 31)
+    assert cfg.check_enabled is False
+    refs = cfg.references()
+    assert {r.ticker for r in refs} - {"FB"} == _SPEC_REFERENCE_TICKERS
+    # Pinned CIKs, from company_tickers_exchange.json (2026-10-11).
+    by_ticker = {(r.ticker, r.first): r.cik for r in refs}
+    assert by_ticker[("IBM", None)] == "0000051143"
+    assert by_ticker[("AAPL", None)] == "0000320193"
+    assert by_ticker[("BRK.B", None)] == "0001067983"
+    # Delisted names are left to the release's evidence (ANSYS, US Steel).
+    assert not {"ANSS", "X"} & {r.ticker for r in refs}
+    # P&G only up to the partial variant's note (spec open question 4).
+    [pg] = [r for r in refs if r.ticker == "PG"]
+    assert (pg.cik, pg.first, pg.last) == ("0000080424", None, date(2022, 9, 30))
+    # A rename and a holding-company change split one name into two windows.
+    meta = sorted((r.ticker, r.first, r.last) for r in refs if r.cik == "0001326801")
+    assert meta == [("FB", None, date(2022, 6, 8)), ("META", date(2022, 6, 9), None)]
+    xom = sorted((r.cik, r.first, r.last) for r in refs if r.ticker == "XOM")
+    assert xom == [
+        ("0000034088", None, date(2026, 6, 30)),
+        ("0002115436", date(2026, 7, 1), None),
+    ]
+    assert len({(r.cik, r.ticker, r.first) for r in refs}) == len(refs)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("0000051143:IBM", ReferenceName("0000051143", "IBM", None, None)),
+        (
+            "0000080424:PG::2022-09-30",
+            ReferenceName("0000080424", "PG", None, date(2022, 9, 30)),
+        ),
+        (
+            "0001326801:META:2022-06-09",
+            ReferenceName("0001326801", "META", date(2022, 6, 9), None),
+        ),
+        (
+            "CIK0001000016:FRST:2019-12-31:2019-12-31",
+            ReferenceName("CIK0001000016", "FRST", date(2019, 12, 31), date(2019, 12, 31)),
+        ),
+    ],
+)
+def test_parse_reference_name(entry: str, expected: ReferenceName) -> None:
+    assert parse_reference_name(entry) == expected
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "IBM",
+        "51143:IBM",
+        "0000051143:",
+        "0000051143:ibm",
+        "0000051143:IBM:2020-13-01",
+        "0000051143:IBM:2021-01-01:2020-01-01",
+        "0000051143:IBM:2020-01-01:",
+        "0000051143:IBM:2020-01-01:2021-01-01:extra",
+        "0000051143 :IBM",
+    ],
+)
+def test_reference_names_validator_refuses_a_bad_shape(entry: str) -> None:
+    with pytest.raises(ValueError):
+        parse_reference_name(entry)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"reference_names": [entry]})
+
+
+def test_reference_name_covers_its_window_inclusive() -> None:
+    ref = parse_reference_name("0000051143:IBM:2020-01-02:2020-06-30")
+    assert not ref.covers(date(2020, 1, 1))
+    assert ref.covers(date(2020, 1, 2))
+    assert ref.covers(date(2020, 6, 30))
+    assert not ref.covers(date(2020, 7, 1))
+    assert parse_reference_name("0000051143:IBM").covers(date(1990, 1, 2))
+
+
+@pytest.mark.parametrize("months", [[], [0], [13], [6, 6]])
+def test_sample_months_must_be_distinct_calendar_months(months: list[int]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"sample_months": months})
+
+
+def test_reference_names_must_not_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"reference_names": []})
+
+
+def test_coverage_section_refuses_an_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"check_enable": True})
