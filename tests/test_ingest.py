@@ -274,13 +274,14 @@ def test_rates_old_value_refetched_after_revision_adds_no_duplicate(
         assert read("SELECT count(*) FROM rates WHERE observation_date = '2020-07-02'") == [(2,)]
 
 
-def test_rates_colliding_vintage_stamps_are_counted(settings: Settings) -> None:
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_rates_colliding_vintage_stamps_are_counted(settings: Settings, newest_first: bool) -> None:
     """Two changed weekend vintages at one session close cannot both be stored."""
     saturday = RateObservation("DTB3", date(2020, 10, 9), 0.1, date(2020, 10, 10))
     sunday = RateObservation("DTB3", date(2020, 10, 9), 0.2, date(2020, 10, 11))
     result = ingest_module.ingest_rates(
         settings,
-        FixtureRateSource([saturday, sunday]),
+        FixtureRateSource([sunday, saturday] if newest_first else [saturday, sunday]),
         since=date(2020, 10, 9),
         clock=lambda: datetime(2020, 10, 13, 22, tzinfo=UTC),
     )
