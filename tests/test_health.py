@@ -46,6 +46,9 @@ from tradepartner.health import (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     PROVENANCE_ALLOWED,
+    RATE_KNOWN_AT,
+    RATE_UNIQUE,
+    RATE_VALUE_FINITE,
     SESSION_HOLES,
     SOURCE_NOT_NULL,
     STATEMENT_BASIS_ALLOWED,
@@ -2558,3 +2561,131 @@ def test_a_sample_from_before_the_calendar_starts_at_the_calendars_first_session
     sessions = sample_sessions(T_END, settings)
     assert sessions[0] >= all_sessions()[0]
     assert sessions[-2:] == (S_2019, S_2020)
+
+
+# --- Rates health (#1498, T169e) ---------------------------------------------
+
+
+def test_rates_fixture_health_and_fred_last_ingest(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The generated rate fixture passes every check and reports its revision."""
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.ok
+    rate = next(item for item in report.rates.series if item.series == "DTB3")
+    expected = fixture_store.execute("SELECT count(*) FROM rates").fetchone()[0]
+    assert rate.rows == expected
+    assert rate.latest_observation_date == date(2020, 6, 26)
+    assert rate.latest_known_at == T_END
+    assert rate.revised_keys == 1
+    assert rate.longest_gap_sessions >= 1
+    assert any("revised keys" in warning for warning in rate.warnings)
+    assert "fred" in [item.source for item in report.ingests]
+    for rule in (RATE_KNOWN_AT, RATE_UNIQUE, RATE_VALUE_FINITE):
+        assert next(check for check in report.integrity if check.rule == rule).passed
+
+
+def test_rates_last_daily_late_count_and_plausible_warning_do_not_fail_check(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Recent late rows and an implausible print warn, while --check passes."""
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": 9999,
+            "started_at": T_END,
+            "finished_at": T_END,
+            "status": "ok",
+            "source": "fred",
+            "mode": "session",
+            "rows_added": 1,
+            "chunk_cursor": "rates;series=DTB3;through=2020-06-26",
+            "message": "series=DTB3; rates_revisions=0; rates_late_rows=1; "
+            "rates_missing_values=2; stale_sessions=2",
+        },
+    )
+    insert_row(
+        fixture_store,
+        "ingestion_runs",
+        {
+            "run_id": 10000,
+            "started_at": T_END,
+            "finished_at": T_END,
+            "status": "ok",
+            "source": "fred",
+            "mode": "backfill",
+            "rows_added": 0,
+            "chunk_cursor": "rates;series=DTB3;through=2020-06-26",
+            "message": "series=DTB3; rates_late_rows=0; stale_sessions=0",
+        },
+    )
+    fixture_store.execute("UPDATE rates SET value = 26.0 WHERE observation_date = '2020-06-26'")
+    report = health_report(fixture_store, T_END, _settings())
+    rate = next(item for item in report.rates.series if item.series == "DTB3")
+    # The last run overall is the backfill; the warning reads the last daily run.
+    assert rate.run_counts["rows_added"] == 0
+    assert rate.run_counts["late_rows"] == 0
+    assert rate.stale_sessions == 0
+    assert rate.last_daily_late_rows == 1
+    assert rate.implausible_rows == 1
+    assert any("last daily late rows" in warning for warning in rate.warnings)
+    assert any("outside plausible range" in warning for warning in rate.warnings)
+    assert report.ok
+
+
+def test_rates_gap_warns_without_failing_check(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    settings = _settings(rates={"max_stale_sessions": 0})
+    report = health_report(fixture_store, T_END, settings)
+    rate = next(item for item in report.rates.series if item.series == "DTB3")
+    assert rate.longest_gap_sessions > 0
+    assert any("longest gap" in warning for warning in rate.warnings)
+    assert report.ok
+
+
+def test_rates_stamp_rule_fails_on_wrong_vintage_stamp(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    loose_store.execute(
+        "UPDATE rates SET known_at = known_at - INTERVAL '1 hour' "
+        "WHERE observation_date = '2020-06-26'"
+    )
+    assert _only_failure(loose_store, RATE_KNOWN_AT, _settings()).height == 1
+
+
+def test_rates_unique_rule_fails_on_duplicate_key(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    loose_store.execute(
+        "INSERT INTO rates SELECT * FROM rates WHERE observation_date = '2020-06-26'"
+    )
+    assert _only_failure(loose_store, RATE_UNIQUE, _settings()).height == 1
+
+
+def test_rates_finite_rule_fails_on_nan(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    loose_store.execute(
+        "UPDATE rates SET value = CAST('NaN' AS DOUBLE) WHERE observation_date = '2020-06-26'"
+    )
+    assert _only_failure(loose_store, RATE_VALUE_FINITE, _settings()).height == 1
+
+
+@pytest.mark.parametrize(
+    ("assignment", "rule"),
+    [
+        ("known_at = NULL", KNOWN_AT_NOT_NULL),
+        ("known_at = ingested_at + INTERVAL '1 hour'", KNOWN_AT_NOT_AFTER_INGESTED_AT),
+        ("source = NULL", SOURCE_NOT_NULL),
+        ("provenance = 'unknown'", PROVENANCE_ALLOWED),
+    ],
+)
+def test_rates_are_covered_by_common_column_rules(
+    loose_store: duckdb.DuckDBPyConnection, assignment: str, rule: str
+) -> None:
+    loose_store.execute(f"UPDATE rates SET {assignment} WHERE observation_date = '2020-06-26'")
+    report = health_report(loose_store, T_END, _settings())
+    assert rule in report.failures
+    assert not report.ok

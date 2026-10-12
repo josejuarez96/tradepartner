@@ -109,6 +109,14 @@ here is this module's and is stated once:
   reported, not thresholded. `clock_suspect` is the clock detector's rule
   (a health finding, never a repair): a stamp that fits only a moved clock.
 
+- **Rates** (`rates`, #1498, T169e): per configured or stored series, the
+  stored row count, latest observation, vintage and stamp, revised-key count,
+  the longest missing XNYS-session span between observations, and the last
+  run's counts and staleness. A revised key, a late row in the last daily run,
+  a gap beyond `rates.max_stale_sessions`, or a value outside
+  `rates.plausible_range_percent` warns on the page; none fails `--check`.
+  The stamp, unique key and finite value are integrity rules below.
+
 - **Coverage against a named reference** (`coverage_reference`, #1541,
   T180): the one check that compares the store with a list outside its own
   derivation, `coverage.reference_names` (`CIK:TICKER[:FROM[:TO]]`, the
@@ -239,6 +247,10 @@ derived at `t`, as the data is read.
   restate them for a store built by other code. Narrowing `edgar.event_forms`
   fails `filing_events_form_allowed` on the stored rows of a dropped form
   until a `rebuild_filing_events`.
+- `rates_known_at_from_vintage`, `rates_unique` and `rates_value_finite`
+  (#1498): every rate stamp equals `rate_known_at(vintage_date)`, no two
+  rows share `(series, observation_date, known_at)`, and every value is
+  finite. The four common-column rules above also cover `rates`.
 - `session_holes` (#1575, #1550 part c): one row per XNYS session from the
   first session of the `universe.min_history_months` window at `t`
   (`calendar.sessions_in_month_window`, as the universe's own rule 6 reads
@@ -263,12 +275,14 @@ EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 
 from __future__ import annotations
 
+import math
 import re
 from bisect import bisect_left, bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -281,6 +295,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
+from tradepartner.adapters.rates import rate_known_at
 from tradepartner.calendar import (
     all_sessions,
     is_session,
@@ -297,7 +312,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import DERIVED_FACTS, OK, SOURCES
+from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
@@ -352,6 +367,9 @@ COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
 SESSION_HOLES = "session_holes"
+RATE_KNOWN_AT = "rates_known_at_from_vintage"
+RATE_UNIQUE = "rates_unique"
+RATE_VALUE_FINITE = "rates_value_finite"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -372,6 +390,9 @@ INTEGRITY_RULES: tuple[str, ...] = (
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_UNIQUE,
     SESSION_HOLES,
+    RATE_KNOWN_AT,
+    RATE_UNIQUE,
+    RATE_VALUE_FINITE,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -699,6 +720,45 @@ _LATE_KNOWN_SCHEMA: dict[str, Any] = {
 _SNAPSHOT_PROVENANCES: frozenset[str] = frozenset({"snapshot", STATIC})
 
 
+@dataclass(frozen=True)
+class RateSeriesHealth:
+    """One stored series, its latest FRED run and report-only warnings."""
+
+    series: str
+    rows: int
+    latest_observation_date: date | None
+    latest_vintage_date: date | None
+    latest_known_at: datetime | None
+    revised_keys: int
+    longest_gap_sessions: int
+    run_counts: dict[str, int]
+    stale_sessions: int | None
+    last_daily_late_rows: int
+    implausible_rows: int
+    max_stale_sessions: int
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """Quality warnings; none is an integrity failure."""
+        out: list[str] = []
+        if self.revised_keys:
+            out.append(f"revised keys: {self.revised_keys}")
+        if self.last_daily_late_rows:
+            out.append(f"last daily late rows: {self.last_daily_late_rows}")
+        if self.longest_gap_sessions > self.max_stale_sessions:
+            out.append(f"longest gap: {self.longest_gap_sessions} sessions")
+        if self.implausible_rows:
+            out.append(f"outside plausible range: {self.implausible_rows}")
+        return tuple(out)
+
+
+@dataclass(frozen=True)
+class RatesHealth:
+    """Rate summaries for configured or stored series."""
+
+    series: tuple[RateSeriesHealth, ...]
+
+
 @dataclass(frozen=True, eq=False)
 class CoverageReference:
     """The coverage check against a named reference at `t` (#1541; module
@@ -773,6 +833,7 @@ class HealthReport:
     settings: dict[str, Any]
     statement: StatementFacts
     filing_events: FilingEvents
+    rates: RatesHealth
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
@@ -838,6 +899,7 @@ def health_report(
         },
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
+        rates=_rates_report(conn, t, settings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps),
         coverage_reference=(
             _coverage_reference(conn, t, settings, listings)
@@ -1026,6 +1088,76 @@ def _filing_events_report(
         per_form=pl.DataFrame(rows, schema=_EVENT_FORM_SCHEMA),
         counts=filing_event_counts(message),
     )
+
+
+_RATE_COUNT = re.compile(r"\brates_(\w+)=(\d+)\b")
+_RATE_STALE = re.compile(r"\bstale_sessions=(\d+)\b")
+
+
+def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> RatesHealth:
+    """Per-series stored coverage and the latest run visible at `t`."""
+    if "rates" not in _present_tables(conn):
+        return RatesHealth(())
+    stored = conn.execute(
+        "SELECT series, observation_date, value, vintage_date, known_at FROM rates "
+        "ORDER BY series, observation_date, known_at"
+    ).fetchall()
+    runs = conn.execute(
+        "SELECT mode, chunk_cursor, message, rows_added FROM ingestion_runs "
+        "WHERE source = 'fred' AND coalesce(finished_at, started_at) <= ? "
+        "ORDER BY coalesce(finished_at, started_at), run_id",
+        [t],
+    ).fetchall()
+    by_series: dict[str, list[tuple[date, float, date, datetime]]] = defaultdict(list)
+    for series, day, value, vintage, stamp in stored:
+        by_series[series].append((day, value, vintage, stamp))
+    result: list[RateSeriesHealth] = []
+    lower, upper = settings.rates.plausible_range_percent
+    sessions = all_sessions()
+    for series in sorted(set(settings.rates.series) | set(by_series)):
+        rows = by_series.get(series, [])
+        date_counts = Counter(row[0] for row in rows)
+        days = sorted(date_counts)
+        gaps = [
+            bisect_left(sessions, right) - bisect_right(sessions, left)
+            for left, right in pairwise(days)
+        ]
+        series_runs = [
+            (mode, message or "", rows_added)
+            for mode, cursor, message, rows_added in runs
+            if cursor is not None and cursor.startswith(f"rates;series={series};")
+        ]
+        counts = (
+            {name: int(value) for name, value in _RATE_COUNT.findall(series_runs[-1][1])}
+            if series_runs
+            else {}
+        )
+        if series_runs:
+            counts["rows_added"] = int(series_runs[-1][2])
+        stale_match = _RATE_STALE.search(series_runs[-1][1]) if series_runs else None
+        last_daily = next((msg for mode, msg, _ in reversed(series_runs) if mode == MODE), "")
+        daily_counts = {name: int(value) for name, value in _RATE_COUNT.findall(last_daily)}
+        result.append(
+            RateSeriesHealth(
+                series=series,
+                rows=len(rows),
+                latest_observation_date=max(days, default=None),
+                latest_vintage_date=max(
+                    (row[2] for row in rows if row[2] is not None), default=None
+                ),
+                latest_known_at=max((row[3] for row in rows if row[3] is not None), default=None),
+                revised_keys=sum(count > 1 for count in date_counts.values()),
+                longest_gap_sessions=max(gaps, default=0),
+                run_counts=counts,
+                stale_sessions=int(stale_match[1]) if stale_match else None,
+                last_daily_late_rows=daily_counts.get("late_rows", 0),
+                implausible_rows=sum(
+                    row[1] is None or not lower <= row[1] <= upper for row in rows
+                ),
+                max_stale_sessions=settings.rates.max_stale_sessions,
+            )
+        )
+    return RatesHealth(tuple(result))
 
 
 def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date, ...]:
@@ -1607,8 +1739,50 @@ def _integrity_checks(
         STATEMENT_BASIS_ALLOWED: _statement_basis_allowed(conn),
         **_filing_event_rules(conn, settings),
         SESSION_HOLES: _session_holes(conn, t, settings),
+        **_rate_rules(conn),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
+
+
+_RATE_RULE_SCHEMA: dict[str, Any] = {
+    "series": pl.Utf8,
+    "observation_date": pl.Date,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _rate_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Check every stored rate stamp, unique key and finite value."""
+    rows = (
+        conn.execute(
+            "SELECT series, observation_date, value, vintage_date, known_at FROM rates"
+        ).fetchall()
+        if "rates" in _present_tables(conn)
+        else []
+    )
+    bad_stamp: list[dict[str, Any]] = []
+    bad_value: list[dict[str, Any]] = []
+    seen: set[tuple[str, date, datetime]] = set()
+    duplicates: list[dict[str, Any]] = []
+    for series, day, value, vintage, stamp in rows:
+        key = {"series": series, "observation_date": day, "known_at": stamp}
+        try:
+            correct = rate_known_at(vintage) if vintage is not None else None
+        except (ValueError, IndexError):
+            correct = None
+        if stamp != correct:
+            bad_stamp.append(key)
+        if value is None or not math.isfinite(value):
+            bad_value.append(key)
+        identity = (series, day, stamp)
+        if identity in seen:
+            duplicates.append(key)
+        seen.add(identity)
+    return {
+        RATE_KNOWN_AT: pl.DataFrame(bad_stamp, schema=_RATE_RULE_SCHEMA),
+        RATE_UNIQUE: pl.DataFrame(duplicates, schema=_RATE_RULE_SCHEMA),
+        RATE_VALUE_FINITE: pl.DataFrame(bad_value, schema=_RATE_RULE_SCHEMA),
+    }
 
 
 def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:

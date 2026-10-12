@@ -25,5 +25,7 @@ uv run pytest
 | `tests/` | Tests |
 | `data/` | Local data (gitignored) |
 
+This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of St. Louis.
+
 ## How we work
 Every change goes through issue → branch → PR → owner merge. See [git workflow](docs/ways-of-working/git-workflow.md), [development process](docs/ways-of-working/development-process.md) and [agents](docs/ways-of-working/agents.md).
