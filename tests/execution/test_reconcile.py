@@ -1374,3 +1374,16 @@ def test_a_cent_fee_exactly_at_the_bound_passes() -> None:
     )
     assert result.status == "ok"
     assert [a.broker_activity_id for a in result.adjustments] == ["act-1"]
+
+
+def test_a_repeated_activity_id_in_one_read_is_refused() -> None:
+    """A broker fact is keyed by its id (S-NIT2): an id listed twice in one read is
+    a broker fault, never two facts to book; `compare` refuses it, naming the id."""
+    duplicated = (_activity("act-1", "FEE", S, -0.01), _activity("act-1", "FEE", S, -0.01))
+    with pytest.raises(ValueError, match="'act-1' is listed twice"):
+        _run(
+            _ledger(1_000.0, SEC_A=10.0),
+            _positions(AAA=10.0),
+            1_000.0,
+            explanations=_explanations(activities=duplicated),
+        )
