@@ -22,6 +22,7 @@ from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
     ListingResolver,
     RegistrantEvidence,
+    _default_fetch_name_changes,
     alpaca_symbol,
     feed_source,
     is_same_day_typo,
@@ -32,8 +33,10 @@ from tradepartner.adapters.alpaca_prices import (
 )
 from tradepartner.adapters.prices import (
     ActionType,
+    CorporateAction,
     UnknownSecurityIdError,
     action_first_seen_known_at,
+    announcement_date_known_at,
     bar_known_at,
 )
 from tradepartner.config import Settings
@@ -1652,11 +1655,12 @@ class TestCorporateActions:
     def test_other_categories_are_reported(self, resolver: ListingResolver) -> None:
         payload = {
             **_json("corporate_actions.json"),
-            "spin_offs": [{"source_symbol": "KO", "ex_date": "2020-09-14"}],
-            "stock_dividends": [],
+            "spin_offs": [],
+            "name_changes": [],
+            "stock_dividends": [{"symbol": "KO"}],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
-        assert parsed.unsupported == ("spin_offs",)
+        assert parsed.unsupported == ("stock_dividends",)
 
     def test_resolved_on_the_session_before_ex_date(self) -> None:
         # A ticker change on the ex-date: the action belongs to the security
@@ -1709,6 +1713,179 @@ class TestCorporateActions:
     def test_malformed_action_raises_value_error(self, resolver: ListingResolver) -> None:
         with pytest.raises(ValueError, match="malformed"):
             parse_corporate_actions({"forward_splits": [{"symbol": "AAPL"}]}, resolver.resolve)
+
+
+def _spinoff(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "alpaca-spin-id",
+        "source_symbol": "PARENT",
+        "new_symbol": "CHILD",
+        "ex_date": "2020-09-29",
+        "process_date": "2020-10-16",
+        "source_rate": 2,
+        "new_rate": 1,
+    }
+    row.update(changes)
+    return row
+
+
+def _name_change(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "alpaca-name-id",
+        "old_symbol": "OLD",
+        "new_symbol": "NEW",
+        "old_cusip": "111111111",
+        "new_cusip": "222222222",
+        "ex_date": "2020-09-29",
+        "process_date": "2020-10-16",
+    }
+    row.update(changes)
+    return row
+
+
+class TestNewActions:
+    def test_name_change_request_is_type_filtered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from alpaca.data.enums import CorporateActionsType
+
+        from tradepartner.adapters import alpaca_raw
+
+        requests: list[object] = []
+
+        class Client:
+            def get_corporate_actions(self, request: object) -> dict[str, object]:
+                requests.append(request)
+                return {"name_changes": [_name_change()]}
+
+        monkeypatch.setattr(alpaca_raw, "_corporate_actions_client", lambda _settings: Client())
+        payload = _default_fetch_name_changes(
+            ["OLD"], date(2020, 10, 1), date(2020, 10, 31), settings=_settings()
+        )
+        assert payload == {"name_changes": [_name_change()]}
+        assert len(requests) == 1
+        assert requests[0].types == [CorporateActionsType.NAME_CHANGE]
+        assert requests[0].limit is None
+
+    def test_spinoff_record_and_friday_stamp(self) -> None:
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        parsed = parse_corporate_actions({"spin_offs": [_spinoff()]}, resolver.resolve)
+        [action] = parsed.actions
+        assert (action.security_id, action.action_type, action.ex_date) == (
+            "C",
+            ActionType.SPINOFF,
+            date(2020, 9, 29),
+        )
+        assert action.ratio_or_amount == 0.5
+        assert action.source_action_id == "P"
+        assert action.announced_at is None
+        assert action.known_at == announcement_date_known_at(date(2020, 10, 16))
+        assert action.known_at == datetime(2020, 10, 19, 20, tzinfo=UTC)
+
+    def test_spinoff_unresolved_and_self_are_reported(self) -> None:
+        resolver = ListingResolver([_listing("P", "PARENT", START)])
+        parsed = parse_corporate_actions({"spin_offs": [_spinoff()]}, resolver.resolve)
+        assert parsed.actions == ()
+        assert ("CHILD", date(2020, 9, 29)) in parsed.unresolved
+        parsed = parse_corporate_actions(
+            {"spin_offs": [_spinoff(source_symbol="MISSING")]}, resolver.resolve
+        )
+        assert ("MISSING", date(2020, 9, 29)) in parsed.unresolved
+        parsed = parse_corporate_actions(
+            {"spin_offs": [_spinoff(new_symbol="PARENT")]}, resolver.resolve
+        )
+        assert parsed.actions == ()
+        assert parsed.self_spinoff == 1
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("source_rate", 0),
+            ("new_rate", -1),
+            ("new_rate", float("nan")),
+            ("source_rate", float("inf")),
+        ],
+    )
+    def test_bad_spinoff_rates_raise(self, field: str, value: object) -> None:
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        with pytest.raises(ValueError):
+            parse_corporate_actions({"spin_offs": [_spinoff(**{field: value})]}, resolver.resolve)
+
+    def test_spinoff_record_rejects_nonpositive_ratio(self) -> None:
+        assert (
+            CorporateAction(
+                "C",
+                ActionType("spinoff"),
+                date(2020, 9, 29),
+                0.5,
+                announcement_date_known_at(date(2020, 10, 16)),
+                "alpaca",
+            ).ratio_or_amount
+            == 0.5
+        )
+        for ratio in (0, -1, float("nan")):
+            with pytest.raises(ValueError):
+                CorporateAction(
+                    "C",
+                    ActionType("spinoff"),
+                    date(2020, 9, 29),
+                    ratio,
+                    announcement_date_known_at(date(2020, 10, 16)),
+                    "alpaca",
+                )
+
+    def test_name_change_candidates_reuse_conflict_and_unresolved(self) -> None:
+        process = date(2020, 10, 16)
+        plain = ListingResolver([_listing("A", "OLD", START), _listing("A", "NEW", process)])
+        [change] = parse_corporate_actions(
+            {"name_changes": [_name_change()]}, plain.resolve
+        ).symbol_changes
+        assert (change.security_id, change.old_symbol, change.new_symbol) == ("A", "OLD", "NEW")
+        assert (change.old_cusip, change.new_cusip, change.source_action_id) == (
+            "111111111",
+            "222222222",
+            "alpaca-name-id",
+        )
+        assert change.known_at == announcement_date_known_at(process)
+        renamed_with_reuse = ListingResolver(
+            [
+                _listing("A", "OLD", START),
+                _listing("A", "NEW", process),
+                _listing("B", "OLD", date(2020, 10, 15)),
+            ]
+        )
+        assert (
+            parse_corporate_actions({"name_changes": [_name_change()]}, renamed_with_reuse.resolve)
+            .symbol_changes[0]
+            .security_id
+            == "A"
+        )
+        fallback = ListingResolver([_listing("A", "OLD", START)])
+        assert (
+            parse_corporate_actions({"name_changes": [_name_change()]}, fallback.resolve)
+            .symbol_changes[0]
+            .security_id
+            == "A"
+        )
+        reused = ListingResolver(
+            [_listing("A", "OLD", START), _listing("B", "OLD", date(2020, 10, 15))]
+        )
+        parsed = parse_corporate_actions({"name_changes": [_name_change()]}, reused.resolve)
+        assert parsed.symbol_changes[0].security_id == "A"
+        assert parsed.symbol_change_reused == 1
+        assert parsed.reused_symbols == ("OLD->NEW: A",)
+        conflict = ListingResolver([_listing("A", "OLD", START), _listing("B", "NEW", process)])
+        parsed = parse_corporate_actions({"name_changes": [_name_change()]}, conflict.resolve)
+        assert parsed.symbol_changes == ()
+        assert parsed.symbol_change_conflict == 1
+        parsed = parse_corporate_actions(
+            {"name_changes": [_name_change()]},
+            ListingResolver([_listing("B", "NEW", process)]).resolve,
+        )
+        assert parsed.symbol_changes == ()
+        assert parsed.unresolved
 
 
 def _row(day: date, close: float) -> dict[str, object]:
@@ -2446,6 +2623,101 @@ class TestAlpacaPriceSource:
             fetch_actions=recorded.actions,
             settings=_settings(**alpaca),
         )
+
+    def test_new_actions_use_process_date_range_and_independent_request(self) -> None:
+        calls: list[tuple[list[str], date, date]] = []
+        payload = {
+            "spin_offs": [_spinoff()],
+            "name_changes": [_name_change(old_symbol="PARENT", new_symbol="PNEW")],
+        }
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+            calls.append((symbols, start, end))
+            return payload
+
+        resolver = ListingResolver(
+            [
+                _listing("P", "PARENT", START),
+                _listing("P", "PNEW", date(2020, 10, 16)),
+                _listing("C", "CHILD", date(2020, 9, 29)),
+            ]
+        )
+        source = AlpacaPriceSource(resolver, fetch_actions=fetch, settings=_settings())
+        actions = source.corporate_actions(["P", "C"], date(2020, 10, 1), date(2020, 10, 31))
+        assert actions == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.actions == ()
+        changes = source.symbol_changes(["P"], date(2020, 10, 1), date(2020, 10, 31))
+        assert len(changes) == 1 and changes[0].security_id == "P"
+        assert len(calls) == 2
+        assert source.symbol_changes(["P"], date(2020, 9, 1), date(2020, 9, 30)) == []
+
+    def test_daily_actions_keep_only_splits_and_dividends(self) -> None:
+        recorded = _Recorded()
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+            return {
+                **recorded.actions(symbols, start, end),
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    )
+                ],
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(
+            ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+        )
+        assert [(a.security_id, a.action_type.value, a.ex_date) for a in actions] == [
+            ("SEC_AAPL", "dividend", date(2020, 8, 7)),
+            ("SEC_AAPL", "split", date(2020, 8, 31)),
+            ("SEC_MSFT", "dividend", date(2020, 8, 19)),
+        ]
+        assert source.last_actions_report is not None
+        assert all(
+            a.action_type is not ActionType.SPINOFF for a in source.last_actions_report.actions
+        )
+
+    def test_malformed_name_change_does_not_fail_daily_actions(self) -> None:
+        recorded = _Recorded()
+
+        def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+            return {**recorded.actions(symbols, start, end), "name_changes": [{}]}
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert [(a.action_type.value, a.ex_date) for a in actions] == [
+            ("dividend", date(2020, 8, 7)),
+            ("split", date(2020, 8, 31)),
+        ]
+
+    def test_malformed_spinoff_does_not_fail_daily_split(self) -> None:
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "forward_splits": [
+                    {
+                        "symbol": "AAPL",
+                        "ex_date": "2020-08-31",
+                        "old_rate": 1,
+                        "new_rate": 4,
+                    }
+                ],
+                "spin_offs": [{}],
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
 
     def test_actions_processed_after_the_window_are_kept(self) -> None:
         # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.

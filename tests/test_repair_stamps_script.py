@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import gzip
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -24,7 +25,7 @@ import httpx
 import pytest
 
 from tradepartner.adapters.edgar import parse_sgml_header
-from tradepartner.adapters.stamp_repair import shift_stamp
+from tradepartner.adapters.stamp_repair import MANIFEST_COLUMNS, shift_stamp
 
 _SPEC = importlib.util.spec_from_file_location(
     "repair_stamps", Path(__file__).resolve().parents[1] / "scripts" / "repair_stamps.py"
@@ -363,7 +364,8 @@ def test_dry_run_writes_nothing_and_requests_nothing(tmp_path: Path, capsys: Any
     assert report["step2_requests"] == 1
     assert report["step3_requests"] == 2
     assert report["step4_known_requests"] == 2
-    assert report["requests_known"] == 5
+    assert "requests_known" not in report  # amendment 2026-10-11 (a)
+    assert report["requests_floor"] == 6  # the 5 reads above plus Apple's audit read
 
 
 def test_phase_universe_touches_only_universe_ciks(tmp_path: Path, capsys: Any) -> None:
@@ -376,7 +378,7 @@ def test_phase_universe_touches_only_universe_ciks(tmp_path: Path, capsys: Any) 
     report = json.loads(capsys.readouterr().out)
     assert report["phase"] == "universe"
     assert report["ciks"] == 2
-    assert report["requests_known"] == 2  # MIXED's two stored filings
+    assert report["requests_floor"] == 3  # MIXED's two stored filings, Apple's audit
     assert run(c, sec, *phase, "--apply", release="restamp-1382a") == 0
     after = c.snapshot()
     for cik in (API, TRUE_CIK, UNDET, LONELY):
@@ -677,3 +679,615 @@ def test_the_live_fetch_reads_only_filing_sgml_header(monkeypatch: Any) -> None:
     fetch = repair_stamps.sgml_fetch()
     assert fetch(APPLE, APPLE_ACC) == APPLE_TRUE
     assert seen == [(APPLE, APPLE_ACC)]
+
+
+# --- amendment 2026-10-11 (#1497): T166d ------------------------------------
+
+UND = "0000001101"  # undetermined, store-backing: its probes come out mixed
+EAR = "0000001202"  # early class, one stored record
+REW = "0000001303"  # rewritten: no record in --bulk-written
+LAT = "0000001404"  # true class with a late API stamp
+LATE_RANGE = ("--late-api-from", "2026-10-01", "--late-api-to", "2026-10-11")
+
+
+def _day(d: date, hour: int = 14) -> datetime:
+    return datetime(d.year, d.month, d.day, hour, tzinfo=UTC)
+
+
+def amended(tmp_path: Path) -> tuple[Cache, FakeSec]:
+    """The hand-counted fixture plan of the T166d tests (index date = stamp
+    date everywhere, so nothing is provably early unless a test adds it)."""
+    c = Cache(tmp_path)
+    truth: dict[tuple[str, str], datetime] = {}
+    und = [_day(date(2024, 7, d)) for d in (1, 2, 3, 4)]
+    c.add_cik(
+        UND,
+        [(acc(UND, i + 1), s, s.date(), True) for i, s in enumerate(und)],
+        cls="undetermined_with_pe",
+        stored=[acc(UND, i + 1) for i in range(4)],
+    )
+    for i, s in enumerate(und):
+        truth[(UND, acc(UND, i + 1))] = s if i != 2 else shift_stamp(s)  # probes a4 true, a3 early
+    e_true = _day(date(2024, 8, 1))
+    c.add_cik(
+        EAR,
+        [(acc(EAR, 1), early(e_true), date(2024, 8, 1), True)],
+        cls="early",
+        stored=[acc(EAR, 1)],
+    )
+    truth[(EAR, acc(EAR, 1))] = e_true
+    rew = [_day(date(2024, 9, d)) for d in (2, 3, 4)]
+    r4 = _day(date(2026, 10, 5))
+    c.add_cik(
+        REW,
+        [
+            *((acc(REW, i + 1), s, s.date(), False) for i, s in enumerate(rew)),
+            (acc(REW, 4), r4, r4.date(), False),
+        ],
+        cls="mixed",  # stampcheck's class is not used for a rewritten CIK
+        stored=[acc(REW, i + 1) for i in range(3)],
+    )
+    for i, s in enumerate(rew):
+        truth[(REW, acc(REW, i + 1))] = s
+    truth[(REW, acc(REW, 4))] = r4
+    l0, l1 = _day(date(2024, 5, 1)), _day(date(2026, 10, 3), 22)  # Sat 18:00 EDT
+    c.add_cik(
+        LAT, [(acc(LAT, 0), l0, l0.date(), True), (acc(LAT, 1), l1, l1.date(), False)], cls="true"
+    )
+    truth[(LAT, acc(LAT, 0))] = l0
+    truth[(LAT, acc(LAT, 1))] = l1 - timedelta(hours=4)  # the API's late stamp
+    c.finish()
+    return c, FakeSec(truth)
+
+
+def _report(c: Cache, sec: FakeSec, capsys: Any, *extra: str) -> dict[str, Any]:
+    capsys.readouterr()
+    assert run(c, sec, *extra) == 0
+    out: dict[str, Any] = json.loads(capsys.readouterr().out)
+    return out
+
+
+def test_floor_ceiling_and_rewritten_load_equal_the_hand_count(tmp_path: Path, capsys: Any) -> None:
+    c, sec = amended(tmp_path)
+    report = _report(c, sec, capsys, *LATE_RANGE)
+    assert sec.calls == []
+    # Floor: step 3 probes UND a4, a3 (2); step 3b probes REW r3, r2 (2);
+    # step 4b LAT l1 and REW r4 (2); the audit over EAR e1 alone (1).
+    assert report["step3_requests"] == 2
+    assert report["rewritten_ciks"] == 1
+    assert report["rewritten_probe_requests"] == 2
+    assert report["step4b_requests"] == 2
+    assert report["audit_floor"] == 1
+    assert report["requests_floor"] == 7
+    # Ceiling: less the audit floor, plus UND a1, a2 as if mixed (2), plus the
+    # audit as if UND were early: one per CIK (EAR, UND) + ceil(1% of 3) = 3.
+    assert report["requests_ceiling"] == 7 - 1 + 2 + 3
+    # REW's stored accessions not already probed: r1.
+    assert report["rewritten_if_all_mixed"] == 1
+    assert "requests_known" not in report
+    # The floor, not the old known count, is what --apply refuses on.
+    before = c.snapshot()
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "6") == 1
+    assert sec.calls == [] and c.snapshot() == before
+
+
+def test_the_cap_holds_during_the_run_and_a_resume_repeats_nothing(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    stamps_before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    # Floor 7 fits under 8; UND's probes come out mixed, adding a1 and a2,
+    # so the audit (the 9th request) does not fit: the run stops after 8.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "8") == 1
+    assert len(sec.calls) == 8
+    after = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert after == stamps_before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    journal = c.dir / "stamps" / "v1.restamp-1382.manifest.requests.csv"
+    assert len(journal.read_text().splitlines()) == 1 + 8  # kept, with its header
+    # A resume under the same cap stops again with no request.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--max-requests", "8") == 1
+    assert len(sec.calls) == 8
+    # Under a higher cap it finishes, repeating no request.
+    assert run(c, sec, *LATE_RANGE, "--apply", "--resume", "--max-requests", "9") == 0
+    assert len(sec.calls) == 9 and len(set(sec.calls)) == 9
+    assert sec.calls[-1] == (EAR, acc(EAR, 1))
+    assert c.stamp(EAR, acc(EAR, 1)) == _day(date(2024, 8, 1))
+
+
+def _unrepaired(c: Cache) -> dict[tuple[str, str], dict[str, str]]:
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest.unrepaired.csv.gz"
+    with gzip.open(side, "rt", newline="") as f:
+        return {(r["cik"], r["accession"]): r for r in csv.DictReader(f)}
+
+
+def test_a_true_rewritten_cik_is_probed_and_left_alone(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    before = c.records(REW)
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50") == 0
+    rew_calls = [a for k, a in sec.calls if k == REW]
+    # Two probes from its pre-10-01 records, stored first, newest first, and
+    # step 4b's read of r4; no shift, no filing-by-filing read of r1.
+    assert rew_calls == [acc(REW, 3), acc(REW, 2), acc(REW, 4)]
+    assert c.records(REW) == before
+    assert not any(k[0] == REW for k in _unrepaired(c))
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest.rewritten_ciks.txt"
+    assert side.read_text().split() == [REW]
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert {rows[(REW, acc(REW, n))]["method"] for n in (2, 3, 4)} == {"kept"}
+
+
+def test_a_mixed_rewritten_cik_goes_filing_by_filing(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    r5 = _day(date(2024, 9, 1))
+    c.add_cik(  # REW again, with one more record that backs no stored row
+        REW,
+        [
+            *(
+                (acc(REW, i + 1), _day(date(2024, 9, d)), date(2024, 9, d), False)
+                for i, d in enumerate((2, 3, 4))
+            ),
+            (acc(REW, 4), _day(date(2026, 10, 5)), date(2026, 10, 5), False),
+            (acc(REW, 5), r5, r5.date(), False),
+        ],
+    )
+    c.finish()
+    sec.truth[(REW, acc(REW, 3))] = _day(date(2024, 9, 4), 15)  # one probe mismatches
+    assert run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50") == 0
+    rew_calls = [a for k, a in sec.calls if k == REW]
+    assert sorted(rew_calls) == [acc(REW, n) for n in (1, 2, 3, 4)]
+    assert c.stamp(REW, acc(REW, 3)) == _day(date(2024, 9, 4), 15)
+    unrepaired = _unrepaired(c)
+    assert (REW, acc(REW, 5)) in unrepaired
+    assert (REW, acc(REW, 4)) not in unrepaired  # step 4b read it
+    side = c.dir / "stamps" / "v1.restamp-1382.manifest"
+    assert REW in Path(f"{side}.unrepaired_ciks.txt").read_text().split()
+    assert Path(f"{side}.rewritten_ciks.txt").read_text() == ""
+
+
+def test_late_api_stamps_take_their_sgml_value_in_the_range_only(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        LAT,
+        [
+            (acc(LAT, 0), _day(date(2024, 5, 1)), date(2024, 5, 1), True),
+            (acc(LAT, 1), _day(date(2026, 10, 3), 22), date(2026, 10, 3), False),
+            # Fri 2026-10-02 11:00 EDT filed Mon 10-05: provably early (step 2)
+            (acc(LAT, 2), _day(date(2026, 10, 2), 15), date(2026, 10, 5), False),
+            (acc(LAT, 3), _day(date(2026, 9, 30)), date(2026, 9, 30), False),
+        ],
+    )
+    c.finish()
+    sec.truth[(LAT, acc(LAT, 2))] = _day(date(2026, 10, 2), 23)
+    late = ("--late-api-from", "2026-10-01", "--late-api-to", "2026-10-08")
+    assert run(c, sec, *late, "--apply", "--max-requests", "50") == 0
+    assert c.stamp(LAT, acc(LAT, 1)) == _day(date(2026, 10, 3), 18)
+    assert sec.calls.count((LAT, acc(LAT, 2))) == 1  # step 2's read, not again in 4b
+    assert c.stamp(LAT, acc(LAT, 2)) == _day(date(2026, 10, 2), 23)
+    assert (LAT, acc(LAT, 3)) not in sec.calls  # 09-30: outside the range
+    assert c.stamp(LAT, acc(LAT, 3)) == _day(date(2026, 9, 30))
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert rows[(LAT, acc(LAT, 1))]["method"] == "sgml"
+    assert rows[(REW, acc(REW, 4))]["method"] == "kept"
+    # Without the range flags there is no step 4b.
+    c2, sec2 = amended(tmp_path / "b")
+    assert run(c2, sec2, "--apply", "--max-requests", "50") == 0
+    assert (LAT, acc(LAT, 1)) not in sec2.calls
+
+
+def test_late_api_range_flags_go_together(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    assert run(c, sec, "--late-api-from", "2026-10-01") == 1
+    assert run(c, sec, "--late-api-from", "2026-10-05", "--late-api-to", "2026-10-01") == 1
+
+
+def test_a_shift_row_in_the_late_range_is_replaced_by_sgml(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    s2 = _day(date(2026, 10, 1), 2)  # an early-class bulk stamp dated 09-30 22:00 EDT
+    c.add_cik(
+        EAR,
+        [
+            (acc(EAR, 1), early(_day(date(2024, 8, 1))), date(2024, 8, 1), True),
+            (acc(EAR, 2), s2, date(2026, 10, 1), True),
+        ],
+        cls="early",
+        stored=[acc(EAR, 1)],
+    )
+    c.finish()
+    sec.truth[(EAR, acc(EAR, 2))] = s2 + timedelta(minutes=1)
+    late = ("--late-api-from", "2026-09-30", "--late-api-to", "2026-10-08")
+    assert run(c, sec, *late, "--apply", "--max-requests", "50") == 0
+    rows = {(r["cik"], r["accession"]): r for r in c.manifest()}
+    assert rows[(EAR, acc(EAR, 2))]["method"] == "sgml"
+    assert c.stamp(EAR, acc(EAR, 2)) == s2 + timedelta(minutes=1)
+
+
+# --- (d) in-window corrections ----------------------------------------------
+
+WIN = "0000001505"
+W_OLD = _day(date(2026, 10, 9), 18) + timedelta(minutes=30)  # 14:30 EDT, served 4 h late
+
+
+def windowed(tmp_path: Path, sgml: datetime) -> tuple[Cache, FakeSec]:
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        WIN,
+        [
+            (acc(WIN, 1), W_OLD, W_OLD.date(), False),
+            (acc(WIN, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c.finish()
+    sec.truth[(WIN, acc(WIN, 1))] = sgml
+    sec.truth[(WIN, acc(WIN, 0))] = _day(date(2024, 1, 2))
+    return c, sec
+
+
+def precheck(
+    path: Path,
+    *,
+    passed: bool = True,
+    release: str = "restamp-1382",
+    window: date = WINDOW,
+    made_at: datetime | None = None,
+    instants: Iterable[datetime] = (),
+) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "release": release,
+                "window_first_session": window.isoformat(),
+                "pass": passed,
+                "instants": [t.isoformat() for t in instants],
+                "journal_high_water": None,
+                "made_at": (made_at or datetime.now(UTC)).isoformat(),
+            }
+        )
+    )
+    return path
+
+
+def _stamps(c: Cache) -> dict[str, bytes]:
+    return {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+
+
+def _apply(c: Cache, sec: FakeSec, *extra: str) -> int:
+    return run(c, sec, *LATE_RANGE, "--apply", "--max-requests", "50", *extra)
+
+
+def test_an_earlier_sgml_move_in_the_window_needs_a_passing_precheck(tmp_path: Path) -> None:
+    true = W_OLD - timedelta(hours=4)
+    c, sec = windowed(tmp_path, true)
+    before = _stamps(c)
+    assert _apply(c, sec) == 1  # without the flag: rule 5 as before
+    assert _stamps(c) == before
+    c2, sec2 = windowed(tmp_path / "ok", true)
+    ok = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 8), 20)])
+    assert _apply(c2, sec2, "--window-earlier-ok", str(ok)) == 0
+    assert c2.stamp(WIN, acc(WIN, 1)) == true
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"passed": False},
+        {"release": "restamp-other"},
+        {"window": date(2026, 10, 8)},
+        {"made_at": datetime.now(UTC) - timedelta(days=1)},
+    ],
+)
+def test_a_precheck_that_does_not_fit_is_refused(tmp_path: Path, bad: dict[str, Any]) -> None:
+    c, sec = windowed(tmp_path, W_OLD - timedelta(hours=4))
+    before = c.snapshot()
+    file = precheck(tmp_path / "precheck.json", **bad)
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_a_read_instant_inside_the_move_aborts_before_writing(tmp_path: Path, capsys: Any) -> None:
+    true = W_OLD - timedelta(hours=4)
+    c, sec = windowed(tmp_path, true)
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 9), 16)])  # 12:00 EDT
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert _stamps(c) == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    assert acc(WIN, 1) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "sgml",
+    [W_OLD + timedelta(hours=1), W_OLD - timedelta(hours=4, minutes=1)],
+    ids=["later", "earlier-than-offset"],
+)
+def test_other_in_window_moves_abort_with_and_without_the_flag(
+    tmp_path: Path, sgml: datetime
+) -> None:
+    for flag in (False, True):
+        c, sec = windowed(tmp_path / str(flag), sgml)
+        before = _stamps(c)
+        extra = ("--window-earlier-ok", str(precheck(tmp_path / f"{flag}.json"))) if flag else ()
+        assert _apply(c, sec, *extra) == 1
+        assert _stamps(c) == before
+
+
+def test_an_in_window_shift_aborts_with_the_flag(tmp_path: Path) -> None:
+    c, sec = amended(tmp_path)
+    late_true = utc(2026, 10, 9, 14, 0)
+    c.add_cik(
+        "0000000606",
+        [(acc("0000000606", 1), early(late_true), date(2026, 10, 9), True)],
+        cls="early",
+    )
+    c.finish()
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json")
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert _stamps(c) == before
+
+
+def test_a_correction_the_day_before_the_window_that_crosses_an_instant_aborts(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """quant-auditor pass 1: 10-08 18:30 EDT served late, true 14:30 EDT; the
+    move crosses close(10-08) = 20:00Z, though both stamps predate the window."""
+    pre = "0000001606"
+    old = _day(date(2026, 10, 8), 22) + timedelta(minutes=30)
+    c, sec = amended(tmp_path)
+    c.add_cik(
+        pre,
+        [
+            (acc(pre, 1), old, old.date(), False),
+            (acc(pre, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c.finish()
+    sec.truth[(pre, acc(pre, 1))] = old - timedelta(hours=4)
+    sec.truth[(pre, acc(pre, 0))] = _day(date(2024, 1, 2))
+    before = _stamps(c)
+    file = precheck(tmp_path / "precheck.json", instants=[_day(date(2026, 10, 8), 20)])
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert _stamps(c) == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382.manifest.csv").exists()
+    assert acc(pre, 1) in capsys.readouterr().err
+    # Without an instant there, the same correction goes through.
+    c2, sec2 = amended(tmp_path / "ok")
+    c2.add_cik(
+        pre,
+        [
+            (acc(pre, 1), old, old.date(), False),
+            (acc(pre, 0), _day(date(2024, 1, 2)), date(2024, 1, 2), True),
+        ],
+        cls="true",
+    )
+    c2.finish()
+    sec2.truth.update(sec.truth)
+    ok = precheck(tmp_path / "ok.json", instants=[_day(date(2026, 10, 9), 20)])
+    assert _apply(c2, sec2, "--window-earlier-ok", str(ok)) == 0
+    assert c2.stamp(pre, acc(pre, 1)) == old - timedelta(hours=4)
+
+
+def test_a_step_1_shift_across_an_instant_stops_before_any_request(tmp_path: Path) -> None:
+    """code-review pass 1: a pre-window shift crossing an instant is known
+    from the plan, so the run stops before the backup and any request."""
+    c, sec = amended(tmp_path)
+    t = utc(2024, 8, 1, 12, 0)  # between EAR's early stamp (10:00Z) and its shift (14:00Z)
+    before = c.snapshot()
+    file = precheck(tmp_path / "precheck.json", instants=[t])
+    assert _apply(c, sec, "--window-earlier-ok", str(file)) == 1
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+# --- restamp-unrepaired (#1553) ---------------------------------------------
+
+HDR = "0000002101"  # an unrepaired CIK from an earlier release
+HDR_OTHER = "0000002202"  # a second listed CIK, all its records true
+H_EARLY_TRUE = utc(2024, 7, 1, 16, 37)  # SGML of an early record
+H_EARLY_OLD = utc(2024, 7, 1, 10, 0)  # not shift_stamp(SGML): no offset rule fits
+H_LATE_OLD = utc(2024, 7, 2, 23, 0)
+H_LATE_TRUE = utc(2024, 7, 2, 14, 5)  # SGML earlier than the stamp
+H_TRUE = utc(2024, 7, 3, 14, 0)
+H_PRE2003 = utc(1998, 3, 10, 15, 0)
+H_BAD = utc(2024, 7, 4, 14, 0)
+H_UNLISTED = utc(2024, 7, 5, 9, 0)
+
+
+class HeaderSec(FakeSec):
+    """`FakeSec` that can also serve a header with no ACCEPTANCE-DATETIME."""
+
+    def __init__(self, truth: dict[tuple[str, str], datetime]) -> None:
+        super().__init__(truth)
+        self.no_acceptance: set[tuple[str, str]] = set()
+
+    def __call__(self, cik: str, accession: str) -> datetime:
+        if (cik, accession) in self.no_acceptance:
+            self.calls.append((cik, accession))
+            text = "\n".join(
+                line
+                for line in header_for(cik, accession, utc(2000, 1, 3, 15)).splitlines()
+                if "ACCEPTANCE-DATETIME" not in line
+            )
+            return repair_stamps.sgml_acceptance(text, accession)
+        return super().__call__(cik, accession)
+
+
+def unrepaired_case(tmp_path: Path) -> tuple[Cache, HeaderSec, Path]:
+    """Two listed CIKs: an early, a late, a true, a pre-2003 and an unreadable
+    record listed; one record not listed; one listed record gone from its file."""
+    c = Cache(tmp_path)
+    records = [
+        (acc(HDR, 1), H_EARLY_OLD, date(2024, 7, 1)),
+        (acc(HDR, 2), H_LATE_OLD, date(2024, 7, 2)),
+        (acc(HDR, 3), H_TRUE, date(2024, 7, 3)),
+        ("0000002101-98-000001", H_PRE2003, date(1998, 3, 10)),
+        (acc(HDR, 5), H_BAD, date(2024, 7, 4)),
+        (acc(HDR, 6), H_UNLISTED, date(2024, 7, 5)),
+    ]
+    c.add_cik(HDR, [(a, s, d, False) for a, s, d in records])
+    c.add_cik(HDR_OTHER, [(acc(HDR_OTHER, 1), H_TRUE, date(2024, 7, 3), False)])
+    c.finish()
+    sec = HeaderSec(
+        {
+            (HDR, acc(HDR, 1)): H_EARLY_TRUE,
+            (HDR, acc(HDR, 2)): H_LATE_TRUE,
+            (HDR, acc(HDR, 3)): H_TRUE,
+            (HDR, acc(HDR, 6)): H_UNLISTED + timedelta(hours=4),
+            (HDR_OTHER, acc(HDR_OTHER, 1)): H_TRUE,
+        }
+    )
+    sec.no_acceptance.add((HDR, "0000002101-98-000001"))
+    sec.broken.add((HDR, acc(HDR, 5)))
+    listed = [(a, s) for a, s, _ in records if a != acc(HDR, 6)]
+    rows = [
+        {
+            "cik": HDR,
+            "accession": a,
+            "old_stamp": s.isoformat(),
+            "new_stamp": s.isoformat(),
+            "method": "unrepaired",
+            "evidence": "class mixed, not repaired",
+        }
+        for a, s in listed
+    ]
+    rows.append({**rows[0], "cik": HDR_OTHER, "accession": acc(HDR_OTHER, 1)})
+    rows.append({**rows[0], "accession": acc(HDR, 9)})  # no longer in its file
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=MANIFEST_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    path = tmp_path / "v1.restamp-1382a2.manifest.unrepaired.csv.gz"
+    path.write_bytes(gzip.compress(buffer.getvalue().encode()))
+    return c, sec, path
+
+
+def run_unrepaired(
+    c: Cache, sec: FakeSec, source: Path, *extra: str, release: str = "restamp-1382a3"
+) -> int:
+    argv = [
+        "--cache-dir",
+        str(c.dir),
+        "restamp-unrepaired",
+        "--from",
+        str(source),
+        "--window-start",
+        WINDOW.isoformat(),
+        "--release",
+        release,
+        *extra,
+    ]
+    return repair_stamps.main(argv, fetch=sec)
+
+
+def _side(c: Cache, release: str = "restamp-1382a3") -> dict[tuple[str, str], dict[str, str]]:
+    path = c.dir / "stamps" / f"v1.{release}.manifest.unrepaired.csv.gz"
+    with gzip.open(path, "rt", newline="") as f:
+        return {(r["cik"], r["accession"]): r for r in csv.DictReader(f)}
+
+
+def test_unrepaired_records_take_their_own_sgml_acceptance(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply") == 0
+
+    # An early record and a late one both become exactly their SGML acceptance,
+    # not an offset-shifted stamp.
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_TRUE
+    assert shift_stamp(H_EARLY_OLD) != H_EARLY_TRUE
+    assert c.stamp(HDR, acc(HDR, 2)) == H_LATE_TRUE
+    # A true record, a pre-2003 header and an unreadable one keep their stamps.
+    assert c.stamp(HDR, acc(HDR, 3)) == H_TRUE
+    assert c.stamp(HDR, "0000002101-98-000001") == H_PRE2003
+    assert c.stamp(HDR, acc(HDR, 5)) == H_BAD
+    # An unlisted record is never asked for and never moves.
+    assert c.stamp(HDR, acc(HDR, 6)) == H_UNLISTED
+    assert (HDR, acc(HDR, 6)) not in sec.calls
+    # HDR_OTHER's only record is true: its file is byte-identical.
+    other = "stamps/v1/" + HDR_OTHER + ".json"
+    assert c.snapshot()[other] == before[other]
+
+    manifest = {(r["cik"], r["accession"]): r for r in c.manifest("restamp-1382a3")}
+    assert manifest[(HDR, acc(HDR, 1))]["method"] == "sgml"
+    assert manifest[(HDR, acc(HDR, 1))]["old_stamp"] == H_EARLY_OLD.isoformat()
+    assert manifest[(HDR, acc(HDR, 1))]["new_stamp"] == H_EARLY_TRUE.isoformat()
+    assert manifest[(HDR, acc(HDR, 2))]["new_stamp"] == H_LATE_TRUE.isoformat()
+    assert manifest[(HDR, acc(HDR, 3))]["method"] == "kept"
+    assert manifest[(HDR_OTHER, acc(HDR_OTHER, 1))]["method"] == "kept"
+    assert len(manifest) == 4
+
+    side = _side(c)
+    assert set(side) == {
+        (HDR, "0000002101-98-000001"),
+        (HDR, acc(HDR, 5)),
+        (HDR, acc(HDR, 9)),
+    }
+    assert side[(HDR, "0000002101-98-000001")]["new_stamp"] == H_PRE2003.isoformat()
+    assert side[(HDR, "0000002101-98-000001")]["evidence"].startswith("SGML gave no stamp:")
+    assert side[(HDR, acc(HDR, 5))]["evidence"].startswith("SGML gave no stamp:")
+    assert side[(HDR, acc(HDR, 9))]["evidence"] == "no stamped record"
+    ciks = c.dir / "stamps" / "v1.restamp-1382a3.manifest.unrepaired_ciks.txt"
+    assert ciks.read_text() == f"{HDR}\n"
+    # The release's backup holds the cache as it was.
+    backup = c.dir / "stamps" / "v1.restamp-1382a3.bak" / f"{HDR}.json"
+    assert backup.read_bytes() == before[f"stamps/v1/{HDR}.json"]
+    # Six requests, each once.
+    assert len(sec.calls) == 6 == len(set(sec.calls))
+
+
+def test_unrepaired_dry_run_reports_the_count_and_writes_nothing(
+    tmp_path: Path, capsys: Any
+) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["requests"] == 6
+    assert report["listed"] == 7
+    assert report["listed_without_stamp"] == 1
+    assert report["listed_in_window"] == 0
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_unrepaired_cap_stops_before_any_request_or_write(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply", "--max-requests", "5") == 1
+    assert sec.calls == []
+    assert c.snapshot() == before
+
+
+def test_unrepaired_resume_repeats_no_request(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    sec.fail_after = 2
+    with pytest.raises(httpx.HTTPStatusError):
+        run_unrepaired(c, sec, source, "--apply")
+    first = list(sec.calls)
+    assert len(first) == 2
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_OLD  # nothing written yet
+    sec.fail_after = None
+    assert run_unrepaired(c, sec, source, "--apply") == 1  # backup name taken
+    assert run_unrepaired(c, sec, source, "--apply", "--resume") == 0
+    assert not set(first) & set(sec.calls[2:])
+    assert len(sec.calls) == 6 == len(set(sec.calls))
+    assert c.stamp(HDR, acc(HDR, 1)) == H_EARLY_TRUE
+
+
+def test_unrepaired_refuses_a_list_that_is_not_unrepaired(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    text = gzip.decompress(source.read_bytes()).decode().replace(",unrepaired,", ",shift,")
+    source.write_bytes(gzip.compress(text.encode()))
+    before = c.snapshot()
+    assert run_unrepaired(c, sec, source, "--apply") == 1
+    assert sec.calls == [] and c.snapshot() == before
+
+
+def test_unrepaired_sgml_change_in_the_window_aborts_before_writing(tmp_path: Path) -> None:
+    c, sec, source = unrepaired_case(tmp_path)
+    sec.truth[(HDR, acc(HDR, 1))] = utc(2026, 10, 9, 20, 0)
+    before = {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")}
+    assert run_unrepaired(c, sec, source, "--apply") == 1
+    assert {k: v for k, v in c.snapshot().items() if k.startswith("stamps/v1/")} == before
+    assert not (c.dir / "stamps" / "v1.restamp-1382a3.manifest.csv").exists()

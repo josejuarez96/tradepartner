@@ -605,6 +605,31 @@ def _write_fixture_dir(
 
 
 class TestFixtureContract:
+    def test_spinoff_stamp_at_or_after_ex_date_proxy(self, tmp_path: Path) -> None:
+        row = _action_row(
+            action_type="spinoff",
+            source_action_id="SEC_PARENT",
+            known_at="2019-03-04T21:00:00+00:00",
+            ingested_at="2019-03-04T21:10:00+00:00",
+        )
+        fixtures = _write_fixture_dir(tmp_path)
+        header = [*_ACTIONS_HEADER, "source_action_id"]
+        _write_csv(fixtures / "corporate_actions.csv", header, [row])
+        assert (
+            FixturePriceSource(fixtures)
+            .corporate_actions(["SEC_A"], FAR_PAST, FAR_FUTURE)[0]
+            .action_type
+            is ActionType.SPINOFF
+        )
+        row["known_at"] = "2019-02-28T21:00:00+00:00"
+        _write_csv(fixtures / "corporate_actions.csv", header, [row])
+        with pytest.raises(FixtureContractError, match=r"spinoff|proxy"):
+            FixturePriceSource(fixtures)
+
+    def test_absent_symbol_changes_file_returns_none(self, tmp_path: Path) -> None:
+        source = FixturePriceSource(_write_fixture_dir(tmp_path))
+        assert source.symbol_changes(["SEC_A"], FAR_PAST, FAR_FUTURE) == []
+
     def test_a_well_formed_fixture_loads(self, tmp_path: Path) -> None:
         fixtures = _write_fixture_dir(
             tmp_path,

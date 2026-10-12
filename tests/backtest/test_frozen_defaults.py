@@ -331,8 +331,13 @@ def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {k: v for k, v in params.items() if k not in keys}
 
 
+#: The pins describe the records on the owner's store, which store the old universe
+#: (ADR 0006 amendment 2026-10-11, #1540, property 6); the live default is now `[]`.
+_PINNED_UNIVERSE = {"exclude_sic_ranges": [[4900, 4999]]}
+
+
 def _defaults_settings() -> Settings:
-    return Settings(_env_file=None)  # type: ignore[call-arg]
+    return Settings(_env_file=None, universe=_PINNED_UNIVERSE)
 
 
 def _prof_params(settings: Settings) -> dict[str, Any]:
@@ -376,6 +381,14 @@ def test_h1_twin_canonical_set_fingerprint_and_hash_unchanged() -> None:
     h1_pre_lab = {k: v for k, v in h1.items() if k not in (*SCHEDULE_KEYS, *LATER_KEYS)}
     assert registry.params_sha256(h1_pre_lab) == H1_PRE_LAB_PARAMS_SHA256
     assert frozen.fingerprint("momentum", h1, parsed.in_sample_start) == H1_FINGERPRINT
+
+
+def test_h1_file_under_live_defaults_stores_no_exclusion_and_fingerprints_differently() -> None:
+    """Property 2/6 of the ADR 0006 amendment (#1540): computed, not registered."""
+    parsed = hypothesis.parse_file(H1_FILE)
+    live = hypothesis.frozen_params(parsed, Settings(_env_file=None))  # type: ignore[call-arg]
+    assert live["universe.exclude_sic_ranges"] == []
+    assert frozen.fingerprint("momentum", live, parsed.in_sample_start) != H1_FINGERPRINT
 
 
 def test_momentum_record_overlays_no_profitability_default(settings: Settings) -> None:
@@ -427,7 +440,7 @@ def _combined_params(settings: Settings) -> dict[str, Any]:
 
 
 def _combined_defaults_settings() -> Settings:
-    return Settings(_env_file=None)  # type: ignore[call-arg]
+    return Settings(_env_file=None, universe=_PINNED_UNIVERSE)
 
 
 def test_combined_table_entries_are_pinned_by_value() -> None:

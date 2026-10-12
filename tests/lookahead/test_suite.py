@@ -63,9 +63,13 @@ from lookahead.broken_adapter import (
     BrokenPriceSource,
     BrokenStatementFact,
     Ingested,
+    RateStampViolation,
+    StampedRate,
     StatementFactViolation,
     Violation,
+    broken_rate,
     broken_statement_fact,
+    clean_rate,
     clean_statement_fact,
     fixture_history,
     security_ids,
@@ -81,6 +85,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
+from tradepartner.adapters.rates import rate_known_at
 
 #: ~11k bars per run; `bar_known_at` builds a pandas timestamp per call.
 _bar_known_at: Callable[[date], datetime] = cache(bar_known_at)
@@ -419,3 +424,29 @@ def test_statement_fact_violation_is_caught_by_its_named_check(
     (finding,) = check_statement_fact_known_at_matches_acceptance([item])
     assert item.record.cik in finding
     assert item.record.fact_name in finding
+
+
+def check_early_rate_stamp(items: Sequence[StampedRate]) -> list[str]:
+    """A date-only rate release is knowable at the next XNYS close."""
+    findings = []
+    for item in items:
+        expected = rate_known_at(item.record.vintage_date)
+        if item.known_at < expected:
+            findings.append(
+                f"early_rate_stamp: {item.record.series} "
+                f"{item.record.observation_date} known_at={item.known_at.isoformat()} "
+                f"expected={expected.isoformat()}"
+            )
+    return findings
+
+
+def test_clean_rate_stamp_passes() -> None:
+    assert check_early_rate_stamp([clean_rate()]) == []
+
+
+@pytest.mark.parametrize("violation", list(RateStampViolation))
+def test_broken_rate_stamp_is_caught(violation: RateStampViolation) -> None:
+    item = broken_rate(violation)
+    (finding,) = check_early_rate_stamp([item])
+    assert "DTB3" in finding
+    assert str(item.record.observation_date) in finding

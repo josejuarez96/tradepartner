@@ -1156,3 +1156,27 @@ why = "Fast paper books need candidates with days-to-weeks horizons; these two a
 what = "One ADR (0018, Proposed) recording the owner's 2026-10-09 decision to replace the Streamlit pages with a web front end over a small local read API, with the API contract, the two writes, the stack, phone access, coexistence, testing and the validating spike each decided with options and a recommendation."
 why = "The plan and spec for the end-user app can only be written against an accepted record; the ADR also takes 0018 so the Phase 6 live-book ADR (T163) takes 0019."
 unblocks = ["adr:0018"]
+
+[task.T178]
+what = "Both cover-page parsers read a listing tagged with dei:EntityListingsExchangeAxis behind edgar.exchange_axis_listings (default off), the FSN group key separates exchanges, and a fixture built from the real shapes puts IBM, AbbVie, Abbott, 3M and P&G common in the universe on 2021-06-30."
+why = "The parsers dropped every exchange-tagged listing, so those names and others were out of the universe for most of 2019-2026 and names delisted before the snapshot had no listing at all (#1541)."
+unblocks = ["task:T181"]
+
+[task.T179]
+what = "Classification rule 6, behind edgar.title_fallback (default off): a placeholder title does not count as a title, type words match whole words, an issuer-name-first title is re-read over its later segments, and class-letter shares are common."
+why = "A title the head rule did not recognise made a name unclassifiable while the resolver already fetched its bars, so it had prices and no membership (#1541)."
+unblocks = ["task:T181"]
+
+[task.T180]
+what = "A standing coverage check in health against a named reference list with per-entry windows, cross-checked against the companies snapshot: reference names missing on sample sessions, names listed only by later knowledge, and the member count, with a --check rule behind coverage.check_enabled and the block computed only on request or while the gate is on."
+why = "Every health check compared the store with itself, which is why the cover-page defect went unseen; a named reference catches the next one (#1541)."
+unblocks = ["task:T181"]
+
+[task.T182]
+what = "ingest --source edgar --rebuild-classifications: delete and re-derive every classification row with the build's own known_at, in the chunk's transaction, so a corrected rule reaches past sessions without stamping anything earlier than its evidence."
+why = "Classification rows are keyed by security id, so a corrected title rule otherwise lands at the run and every as-of read before it keeps the old type (#1541, spec open question 5)."
+unblocks = ["task:T181"]
+
+[task.T181]
+what = "The owner's release cover-listings-1541: the switch flips and cache version bumps, the FSN re-extract and master re-derive, the retraction of the note rows on a primary id, the resolution repair, the classification rebuild, the fill-holes run for the newly listed names and the ten ticker-reuse old holders, health and the coverage report, the trial note, and the check_enabled gate."
+why = "Puts the dropped listings and their bars in the store before any H1 re-run or holdout spend, under one named release with a backup and a dry run, and nothing reaches the store before it (#1541)."

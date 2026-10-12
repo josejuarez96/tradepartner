@@ -109,3 +109,83 @@ class ScriptedModelClient:
             attempts=step.rate_limits + 1,
             latency_ms=0,
         )
+
+
+@dataclass(frozen=True)
+class ClaudeAnswer:
+    """Synthetic Claude reply; no vendor recording or credential."""
+
+    choice: str = "unresolved"
+    model: str | None = None
+    thinking_first: bool = False
+    rate_limits: int = 0
+    stop_reason: str = "end_turn"
+    extra_block: bool = False
+    input_tokens: int | None = 1000
+    output_tokens: int | None = 3
+
+
+@dataclass(frozen=True)
+class ClaudeTimeout:
+    """A sent request with no response or returned usage."""
+
+
+ClaudeStep = ClaudeAnswer | ClaudeTimeout
+
+
+class ScriptedClaudeClient:
+    """A closed-choice Claude double sharing the production response parser."""
+
+    def __init__(self, steps: Iterable[ClaudeStep], *, max_attempts: int = 3) -> None:
+        self._steps: deque[ClaudeStep] = deque(steps)
+        self._max_attempts = max_attempts
+        self.requests: list[ModelRequest] = []
+
+    def label(self, request: ModelRequest) -> ModelResponse:
+        from tradepartner.research.models import check_claude_model_id, make_claude_response
+
+        check_claude_model_id(request.model)
+        self.requests.append(request)
+        if not self._steps:
+            raise AssertionError("script exhausted")
+        step = self._steps.popleft()
+        raw_request = json.dumps({"model": request.model, "state": request.state})
+        if isinstance(step, ClaudeTimeout):
+            return make_claude_response(
+                request,
+                raw_request=raw_request,
+                http_status=None,
+                raw_response="",
+                attempts=1,
+                latency_ms=0,
+            )
+        if step.rate_limits >= self._max_attempts:
+            return make_claude_response(
+                request,
+                raw_request=raw_request,
+                http_status=429,
+                raw_response="",
+                attempts=self._max_attempts,
+                latency_ms=0,
+            )
+        blocks: list[dict[str, str]] = []
+        if step.thinking_first:
+            blocks.append({"type": "thinking", "thinking": "synthetic"})
+        blocks.append({"type": "text", "text": json.dumps({"departure_reason": step.choice})})
+        if step.extra_block:
+            blocks.append({"type": "tool_use", "id": "synthetic"})
+        body: dict[str, object] = {
+            "model": step.model or request.model,
+            "stop_reason": step.stop_reason,
+            "content": blocks,
+        }
+        if step.input_tokens is not None and step.output_tokens is not None:
+            body["usage"] = {"input_tokens": step.input_tokens, "output_tokens": step.output_tokens}
+        return make_claude_response(
+            request,
+            raw_request=raw_request,
+            http_status=200,
+            raw_response=json.dumps(body),
+            attempts=step.rate_limits + 1,
+            latency_ms=0,
+        )

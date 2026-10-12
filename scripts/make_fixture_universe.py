@@ -4,9 +4,10 @@ Writes one CSV per store fact table into `tests/fixtures/universe/` (or an
 override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
-`statement_facts.csv`, `filing_events.csv` (#1358), plus `README.md` mapping
-every spec req 13 case, every statement-facts case (#660) and every
-filing-events case (#1358), to the rows that exercise it.
+`statement_facts.csv`, `filing_events.csv` (#1358), `rates.csv` (#1498), plus
+`README.md` mapping every spec req 13 case, every statement-facts case (#660),
+every filing-events case (#1358) and every rates case (#1498), to the rows that
+exercise it.
 
 `statement_facts.csv` rows are **DB-table-level** rows, like every other
 CSV here (as if the as-yet-unbuilt T77/T77a/T77b parser and ingest had
@@ -49,6 +50,7 @@ import random
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -79,6 +81,10 @@ _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 _SOURCE_EDGAR = "edgar"
 _SOURCE_ALPACA = "alpaca"
 _SOURCE_CONFIG = "config"
+_SOURCE_FRED = "fred"
+
+#: The rates fixture's one series (#1498): DTB3-shaped, generated, never recorded.
+RATES_SERIES = "DTB3"
 
 # A single shared bar-history start for every security whose case needs to
 # demonstrate passing universe rule 6 (min_history_months) and/or rule 7
@@ -208,6 +214,16 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "rates": (
+        "series",
+        "observation_date",
+        "value",
+        "vintage_date",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
 }
 
 
@@ -319,9 +335,11 @@ class Rows:
     facts: list[dict[str, object]] = field(default_factory=list)
     statement_facts: list[dict[str, object]] = field(default_factory=list)
     filing_events: list[dict[str, object]] = field(default_factory=list)
+    rates: list[dict[str, object]] = field(default_factory=list)
     readme_cases: list[dict[str, str]] = field(default_factory=list)
     statement_readme_cases: list[dict[str, str]] = field(default_factory=list)
     filing_event_readme_cases: list[dict[str, str]] = field(default_factory=list)
+    rate_readme_cases: list[dict[str, str]] = field(default_factory=list)
 
     def security(
         self,
@@ -683,6 +701,38 @@ class Rows:
                 "filed": filed,
                 "notes": notes,
             }
+        )
+
+    def rate(
+        self,
+        observation_date: date,
+        value: float,
+        vintage_date: date,
+        *,
+        series: str = RATES_SERIES,
+        ingested_delay: timedelta = timedelta(minutes=10),
+    ) -> None:
+        """One `rates` row (#1498): `known_at` is the close of the first XNYS
+        session strictly after the vintage date (`adapters.rates.rate_known_at`,
+        recomputed here from the calendar so the fixture tests check the rule
+        against an independent computation)."""
+        known_at = session_close(next_session(vintage_date))
+        self.rates.append(
+            {
+                "series": series,
+                "observation_date": observation_date,
+                "value": value,
+                "vintage_date": vintage_date,
+                "known_at": known_at,
+                "ingested_at": known_at + ingested_delay,
+                "source": _SOURCE_FRED,
+                "provenance": "release",
+            }
+        )
+
+    def rate_case(self, case: str, observation_date: str, vintage: str, notes: str) -> None:
+        self.rate_readme_cases.append(
+            {"case": case, "observation_date": observation_date, "vintage": vintage, "notes": notes}
         )
 
 
@@ -2257,6 +2307,137 @@ def _filing_events(rows: Rows) -> None:
 # ---------------------------------------------------------------------------
 
 
+# The rates fixture (#1498, plan T169). Anchor values (percent, discount basis)
+# the generated series interpolates between, by calendar day: DTB3-shaped, not
+# DTB3 (ADR 0020 point 5: nothing from FRED enters the repository).
+_RATE_ANCHORS: tuple[tuple[date, float], ...] = (
+    (date(2016, 12, 1), 0.50),
+    (date(2017, 12, 29), 1.37),
+    (date(2018, 12, 31), 2.36),
+    (date(2019, 7, 31), 2.03),
+    (date(2019, 12, 31), 1.52),
+    (date(2020, 2, 28), 1.27),
+    (date(2020, 3, 31), 0.11),
+    (date(2020, 6, 30), 0.15),
+)
+#: How many sessions before the fixture's first session the series starts, so a
+#: rate is known at every fixture session's close (spec "Fixture": at least five).
+_RATES_LEAD_SESSIONS = 5
+_RATES_FRIDAY_VINTAGE_OBS = date(2018, 3, 8)  # a Thursday: vintage Friday
+_RATES_SATURDAY_VINTAGE_OBS = date(2018, 6, 15)  # a Friday: vintage Saturday
+_RATES_BANK_HOLIDAY = date(2018, 10, 8)  # Columbus Day: an XNYS session, a bank holiday
+_RATES_REVISED_OBS = date(2019, 3, 12)
+_RATES_REVISION_VINTAGE = date(2019, 3, 20)
+_RATES_REVISION_DELTA = 0.02
+
+
+def _rate_value(day: date) -> float:
+    for (start, low), (end, high) in pairwise(_RATE_ANCHORS):
+        if start <= day <= end:
+            share = (day - start).days / (end - start).days
+            return round(low + (high - low) * share, 2)
+    raise AssertionError(f"{day} is outside the rate anchors")
+
+
+def _rates(rows: Rows) -> None:
+    """The `DTB3`-shaped daily series (#1498, plan T169; the spec's "Fixture"
+    paragraph): one observation per XNYS session from `_RATES_LEAD_SESSIONS`
+    sessions before the first fixture session to the last observation whose
+    stamp is at or before the fixture's last close, with the six cases:
+
+    (a) an ordinary observation D, vintage the next session D+1, `known_at` =
+        close(D+2);
+    (b) a vintage dated a Friday (a Thursday's observation), stamped at Monday's
+        close;
+    (c) the fixture's exchange holiday (Thanksgiving 2018): no observation;
+    (d) a bank-holiday gap of two business days (Columbus Day 2018, an XNYS
+        session, and the day after): no observation on either, and the Friday
+        before is served on the first business day after the holiday;
+    (e) one observation with two vintages and two values (a revision), the
+        second stamped at its own vintage's next close;
+    (f) a vintage dated a Saturday (a Friday's observation), stamped at Monday's
+        close.
+    """
+    first = nth_session_before(_GLOBAL_START_SESSION, _RATES_LEAD_SESSIONS)
+    last = nth_session_before(_FIXTURE_END, 2)
+    holiday, _ = _holiday_and_half_day(2018)
+    gap = (_RATES_BANK_HOLIDAY, next_session(_RATES_BANK_HOLIDAY))
+    if not is_session(_RATES_BANK_HOLIDAY) or _RATES_BANK_HOLIDAY.weekday() != 0:
+        raise AssertionError(
+            f"expected {_RATES_BANK_HOLIDAY} (Columbus Day) to be a Monday session"
+        )
+    if _RATES_FRIDAY_VINTAGE_OBS.weekday() != 3 or _RATES_SATURDAY_VINTAGE_OBS.weekday() != 4:
+        raise AssertionError("the Friday/Saturday vintage cases need a Thursday and a Friday")
+    for day in sessions_between(first, last):
+        if day in gap:
+            continue
+        vintage = next_session(day)
+        if vintage == _RATES_BANK_HOLIDAY:
+            vintage = next_session(vintage)  # the Board does not post on a bank holiday
+        if day == _RATES_SATURDAY_VINTAGE_OBS:
+            vintage = day + timedelta(days=1)
+        rows.rate(day, _rate_value(day), vintage)
+        if day == _RATES_REVISED_OBS:
+            rows.rate(
+                day,
+                round(_rate_value(day) + _RATES_REVISION_DELTA, 2),
+                _RATES_REVISION_VINTAGE,
+            )
+
+    def stamp(vintage: date) -> str:
+        return session_close(next_session(vintage)).isoformat()
+
+    ordinary = date(2019, 5, 7)
+    friday = next_session(_RATES_FRIDAY_VINTAGE_OBS)
+    saturday = _RATES_SATURDAY_VINTAGE_OBS + timedelta(days=1)
+    before_gap = previous_session(_RATES_BANK_HOLIDAY)
+    for case, obs, vintage, notes in (
+        (
+            "(a) Ordinary observation",
+            ordinary.isoformat(),
+            next_session(ordinary).isoformat(),
+            f"known_at {stamp(next_session(ordinary))} (close of D+2)",
+        ),
+        (
+            "(b) Vintage dated a Friday",
+            _RATES_FRIDAY_VINTAGE_OBS.isoformat(),
+            friday.isoformat(),
+            f"stamped at Monday's close, {stamp(friday)}",
+        ),
+        (
+            "(c) Exchange holiday",
+            f"none on {holiday.isoformat()}",
+            "n/a",
+            f"Thanksgiving, the fixture's exchange holiday; the observations either side "
+            f"are {previous_session(holiday).isoformat()} and {next_session(holiday).isoformat()}",
+        ),
+        (
+            "(d) Bank-holiday gap of two business days",
+            f"none on {gap[0].isoformat()} or {gap[1].isoformat()}",
+            f"{before_gap.isoformat()} served {next_session(_RATES_BANK_HOLIDAY).isoformat()}",
+            f"Columbus Day (a session, a bank holiday) and the day after; "
+            f"{before_gap.isoformat()}'s value is stamped "
+            f"{stamp(next_session(_RATES_BANK_HOLIDAY))}",
+        ),
+        (
+            "(e) Revision",
+            _RATES_REVISED_OBS.isoformat(),
+            f"{next_session(_RATES_REVISED_OBS).isoformat()} and "
+            f"{_RATES_REVISION_VINTAGE.isoformat()}",
+            f"{_rate_value(_RATES_REVISED_OBS)} stamped {stamp(next_session(_RATES_REVISED_OBS))}, "
+            f"then {round(_rate_value(_RATES_REVISED_OBS) + _RATES_REVISION_DELTA, 2)} stamped "
+            f"{stamp(_RATES_REVISION_VINTAGE)}",
+        ),
+        (
+            "(f) Vintage dated a Saturday",
+            _RATES_SATURDAY_VINTAGE_OBS.isoformat(),
+            saturday.isoformat(),
+            f"stamped at Monday's close, {stamp(saturday)}",
+        ),
+    ):
+        rows.rate_case(case, obs, vintage, notes)
+
+
 def _format_cell(value: object) -> str:
     if value is None:
         return ""
@@ -2286,6 +2467,7 @@ def _write_readme(
     cases: list[dict[str, str]],
     statement_cases: list[dict[str, str]],
     filing_event_cases: list[dict[str, str]],
+    rate_cases: list[dict[str, str]],
 ) -> None:
     ordered = sorted(cases, key=lambda c: c["case"])
     statement_ordered = sorted(statement_cases, key=lambda c: c["case"])
@@ -2371,6 +2553,25 @@ def _write_readme(
             f"| {c['case']} | {c['accession']} | `{c['items']}` | {c['accepted']} | "
             f"{c['filed']} | {c['notes']} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Rates (#1498)",
+            "",
+            f"A generated `{RATES_SERIES}`-shaped daily series (`rates.csv`), never recorded "
+            "from FRED (ADR 0020 point 5), for T169b-T170d authors: one observation per "
+            f"XNYS session from {_RATES_LEAD_SESSIONS} sessions before "
+            f"`{_GLOBAL_START_SESSION.isoformat()}` to the last observation stamped at or "
+            f"before the close of `{_FIXTURE_END.isoformat()}`. `known_at` = the close of "
+            "the first XNYS session strictly after `vintage_date`; `ingested_at` = "
+            "`known_at` + 10 min; `provenance = release`.",
+            "",
+            "| Case | observation_date | vintage_date | Notes |",
+            "|---|---|---|---|",
+        ]
+    )
+    for c in rate_cases:
+        lines.append(f"| {c['case']} | {c['observation_date']} | {c['vintage']} | {c['notes']} |")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -2406,6 +2607,7 @@ def build_rows() -> Rows:
     _statement_facts_no_securities_row_yet(rows)
     _statement_facts_profitability(rows)
     _filing_events(rows)
+    _rates(rows)
     return rows
 
 
@@ -2463,11 +2665,18 @@ def write_fixtures(output_dir: Path) -> None:
         rows.filing_events,
         ("cik", "accession"),
     )
+    _write_csv(
+        output_dir / "rates.csv",
+        "rates",
+        rows.rates,
+        ("series", "observation_date", "known_at"),
+    )
     _write_readme(
         output_dir / "README.md",
         rows.readme_cases,
         rows.statement_readme_cases,
         rows.filing_event_readme_cases,
+        rows.rate_readme_cases,
     )
 
 

@@ -7,6 +7,7 @@ touches the network, the owner's store or a browser.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -272,10 +273,41 @@ def test_ingest_refuses_statement_flags_where_they_cannot_apply(
     assert session.calls == [] and filled.calls == []
 
 
+def test_ingest_rebuild_classifications_reaches_the_session_and_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """#1541 (T182): needs no switch, only the edgar source."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    assert _invoke(secrets_set, ["ingest", "--source", "edgar"]).exit_code == 0
+    assert session.calls[0]["rebuild_classifications"] is False
+    args = ["ingest", "--source", "edgar", "--rebuild-classifications"]
+    assert _invoke(secrets_set, args).exit_code == 0
+    assert session.calls[1]["rebuild_classifications"] is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--source", "alpaca", "--rebuild-classifications"],
+        ["--backfill", "--since", "2016-01-04", "--rebuild-classifications"],
+    ],
+)
+def test_ingest_refuses_rebuild_classifications_where_it_cannot_apply(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    filled = _patched(monkeypatch, "backfill", _ok("edgar"))
+    result = _invoke(secrets_set, ["ingest", *args])
+    assert result.exit_code == 2, result.output
+    assert session.calls == [] and filled.calls == []
+
+
 def _manifest(
-    tmp_path: Path, header: str = "cik,accession,old_stamp,new_stamp,method,evidence"
+    tmp_path: Path,
+    header: str = "cik,accession,old_stamp,new_stamp,method,evidence",
+    name: str = "manifest.csv",
 ) -> Path:
-    path = tmp_path / "manifest.csv"
+    path = tmp_path / name
     path.write_text(
         f"{header}\n0000000001,0000000001-19-000001,2019-03-01T16:30:00+00:00,"
         "2019-03-01T21:30:00+00:00,shift,class early\n"
@@ -334,6 +366,80 @@ def test_ingest_refuses_a_manifest_missing_a_column(
     result = _invoke(secrets_set, ["ingest", "--source", "edgar", "--restamp-from", str(path)])
     assert result.exit_code == 2, result.output
     assert "new_stamp" in result.output
+    assert session.calls == []
+
+
+#: The cache driver's manifest name for release `restamp-x` (T166a).
+_RELEASED = "v1.restamp-x.manifest.csv"
+
+
+def _precheck_file(tmp_path: Path, **fields: Any) -> Path:
+    path = tmp_path / "precheck.restamp-x.json"
+    data: dict[str, Any] = {
+        "release": "restamp-x",
+        "window_first_session": "2026-10-12",
+        "pass": True,
+        "instants": ["2026-10-09T20:00:00+00:00"],
+        "journal_high_water": "2026-10-09T21:00:00+00:00",
+        "made_at": "2026-10-12T13:00:00+00:00",
+    }
+    data.update(fields)
+    path.write_text(json.dumps({k: v for k, v in data.items() if v is not ...}))
+    return path
+
+
+def test_ingest_restamp_window_earlier_ok_hands_the_precheck_and_release_on(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, tmp_path: Path
+) -> None:
+    """#1497 (T166e): the pre-check file reaches `ingest_session` parsed,
+    with the release read from the manifest's name; whether it allows the
+    restamp is decided in the store transaction, not here."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    manifest = _manifest(tmp_path, name=_RELEASED)
+    precheck = _precheck_file(tmp_path)
+    args = ["ingest", "--source", "edgar", "--restamp-from", str(manifest)]
+    result = _invoke(secrets_set, [*args, "--restamp-window-earlier-ok", str(precheck)])
+    assert result.exit_code == 0, result.output
+    ok = session.calls[0]["restamp_window_ok"]
+    assert ok.release == ok.precheck.release == "restamp-x" and ok.precheck.passed
+    assert ok.precheck.window_first_session == date(2026, 10, 12)
+    assert ok.precheck.instants == (datetime(2026, 10, 9, 20, tzinfo=UTC),)
+    assert ok.precheck.journal_high_water == datetime(2026, 10, 9, 21, tzinfo=UTC)
+
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 0, result.output
+    assert session.calls[1]["restamp_window_ok"] is None
+
+
+@pytest.mark.parametrize(
+    ("manifest_name", "fields", "with_manifest", "why"),
+    [
+        (_RELEASED, {}, False, "needs --restamp-from"),
+        ("manifest.csv", {}, True, "v1.<release>.manifest.csv"),
+        (_RELEASED, {"instants": ...}, True, "instants"),
+        (_RELEASED, {"pass": "yes"}, True, "pass is not a JSON boolean"),
+        (_RELEASED, {"instants": ["2026-10-09T20:00:00"]}, True, "tz-aware"),
+    ],
+    ids=["no-manifest", "unnamed-manifest", "missing-field", "pass-not-bool", "naive-instant"],
+)
+def test_ingest_refuses_an_unusable_restamp_window_earlier_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    secrets_set: Settings,
+    tmp_path: Path,
+    manifest_name: str,
+    fields: dict[str, Any],
+    with_manifest: bool,
+    why: str,
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    manifest = _manifest(tmp_path, name=manifest_name)
+    precheck = _precheck_file(tmp_path, **fields)
+    args = ["ingest", "--source", "edgar", "--restamp-window-earlier-ok", str(precheck)]
+    if with_manifest:
+        args += ["--restamp-from", str(manifest)]
+    result = _invoke(secrets_set, args)
+    assert result.exit_code == 2, result.output
+    assert why in result.output
     assert session.calls == []
 
 
@@ -676,6 +782,70 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert "listed with no bars after a form 25: 0" in plain.output.lower()
     checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert checked.exit_code == 0, checked.output
+
+
+def test_health_reports_the_coverage_block_not_computed_by_default(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1541: without `--coverage` and with `coverage.check_enabled` off the
+    block is not computed, and its rule says so, never "pass"."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "coverage reference: not computed (run with --coverage)" in result.output
+    assert "  coverage_reference_names: not computed (run with --coverage)" in result.output
+
+
+def test_health_coverage_is_report_only_with_the_default_off(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """The default list names real CIKs the fixture store lacks: `--coverage`
+    lists them and `--check` still exits 0 while `check_enabled` is off."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "coverage reference (report-only): 2 sample sessions" in result.output
+    assert "  2019-12-31: 1 members; 30 of 30 reference names missing;" in result.output
+    assert "  missing 2019-12-31 0000051143:IBM (-): no_security" in result.output
+    assert (
+        "  coverage_reference_names: 60 missing (report-only): coverage.check_enabled is off"
+        in (result.output)
+    )
+
+
+def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    pre9 = "CIK0001000019:PRE9"
+    enforced = _settings(
+        tmp_path,
+        store=fixture_store_path,
+        coverage={"reference_names": [pre9], "check_enabled": True},
+    )
+    failed = _invoke(enforced, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "health check failed: coverage_reference_names" in failed.output
+    assert "  coverage_reference_names: fail (2)" in failed.output
+    skipped = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert skipped.exit_code == 0, skipped.output
+    assert "coverage reference: not computed" in skipped.output
+    assert (
+        "  missing 2019-12-31 CIK0001000019:PRE9 (SEC_STATIC_PRE2019): "
+        "rule exchange, not_listed" in failed.output
+    )
+    report_only = _settings(
+        tmp_path, store=fixture_store_path, coverage={"reference_names": [pre9]}
+    )
+    plain = _invoke(report_only, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    listed = _settings(
+        tmp_path,
+        store=fixture_store_path,
+        coverage={"reference_names": ["CIK0001000016:FRST::2019-12-31"], "check_enabled": True},
+    )
+    passed = _invoke(listed, ["health", "--check"], clock=lambda: T_END)
+    assert passed.exit_code == 0, passed.output
+    assert "  coverage_reference_names: pass" in passed.output
 
 
 def test_health_check_exits_non_zero_naming_the_failed_rule(
