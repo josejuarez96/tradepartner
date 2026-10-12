@@ -2803,6 +2803,20 @@ def test_financial_revenue_is_point_in_time() -> None:
     assert with_later["revenue"]["value"] == 999
 
 
+def test_a_later_revenue_tag_for_another_period_never_erases_the_sum() -> None:
+    """#1556 regression (quant-auditor case (b)): the derived sum for F1's
+    period is the same with or without a later filing that reports a classic
+    `revenue` for a different period (truncation at AT1 changes nothing). A
+    whole-history "this CIK reports revenue" gate on the sum fails this."""
+    only_at1, _ = _rows([*_bank_components(F1, AT1)])
+    with_later, _ = _rows(
+        [*_bank_components(F1, AT1), _sf("revenue", 120, F2, AT2, period=FY17, comparative=True)]
+    )
+    assert only_at1[("revenue_financial", FY18[1])]["value"] == 100
+    assert with_later[("revenue_financial", FY18[1])] == only_at1[("revenue_financial", FY18[1])]
+    assert with_later[("revenue", FY17[1])]["value"] == 120
+
+
 def test_a_two_run_store_keeps_gross_profit() -> None:
     """#1556 regression (quant-auditor): a store built run by run must match a
     one-pass build. Run 1 stores the derived `revenue_financial`; run 2 sees a

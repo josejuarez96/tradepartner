@@ -1582,6 +1582,8 @@ def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl
         return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
     rows: list[dict[str, Any]] = []
     for fact_name, left_name, right_name, operator in DERIVED_FACTS:
+        if operator not in ("+", "-"):
+            raise ValueError(f"DERIVED_FACTS {fact_name}: unknown operator {operator!r}")
         found = conn.execute(
             f"""
             SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,

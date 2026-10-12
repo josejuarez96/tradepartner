@@ -68,12 +68,12 @@ _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 # never touch `gross_profit`). `revenue_financial` is a financial issuer's one
 # documented revenue quantity from its own filing: it holds
 # **`us-gaap:RevenuesNetOfInterestExpense`** (the issuer's total revenue net of
-# interest expense, the concept itself) when the filing reports it, else -- for
-# a filing that carries neither it nor a `revenue` tag -- the sum of **net
-# interest income (`us-gaap:InterestIncomeExpenseNet`) plus noninterest income
-# (`us-gaap:NoninterestIncome`)**. The sum is computed by the ingest's
-# derived-candidate rule (`ingest._derived_candidates`), only from the two
-# constituents of **one filing and one period** (never mixing filings), and
+# interest expense, the concept itself) when the filing reports it, else the
+# sum of **net interest income (`us-gaap:InterestIncomeExpenseNet`) plus
+# noninterest income (`us-gaap:NoninterestIncome`)**. The sum is computed by the
+# ingest's derived-candidate rule (`ingest._derived_candidates`) whenever both
+# constituents are the stored vintages of **one filing and one period** (never
+# mixing filings), whatever `revenue` tag that filing carries, and
 # stored like any derived row: `basis = derived`, `xbrl_tag` the join of the
 # two source tags by the operator (`+`). A reported
 # `RevenuesNetOfInterestExpense` row is `basis = reported`. The constituents
@@ -81,7 +81,8 @@ _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 # read them from the same filing's records. Keeping this out of `revenue`
 # leaves non-financial issuers' `revenue` and every `gross_profit` byte-identical
 # to before and keeps every row point-in-time; a consumer wanting one revenue
-# series coalesces `revenue` and `revenue_financial` at read time. Gross profit
+# series coalesces `revenue` and `revenue_financial` at read time, taking the
+# later `known_at` of the rows it reads. Gross profit
 # stays N/A for financials (no `cost_of_revenue`). IFRS issuers are out of
 # scope (#1556).
 _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {

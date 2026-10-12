@@ -1835,6 +1835,19 @@ def test_statement_derived_matches_components_fails_on_a_wrong_derived_revenue(
     assert row["right_value"] == 60.0
 
 
+def test_statement_derived_matches_components_rejects_an_unknown_operator(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1556 (safety nit): the operator is pasted into the SQL, so health
+    accepts only `+` or `-`, the two the ingest computes."""
+    monkeypatch.setattr(
+        "tradepartner.health.DERIVED_FACTS",
+        (("gross_profit", "revenue", "cost_of_revenue", "*"),),
+    )
+    with pytest.raises(ValueError, match="operator"):
+        health_report(fixture_store, T_END, _settings())
+
+
 def test_statement_derived_matches_components_fails_on_a_missing_component(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
