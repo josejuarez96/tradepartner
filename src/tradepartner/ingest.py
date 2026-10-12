@@ -194,7 +194,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -216,6 +216,7 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.rates import RateObservation, RateSource, rate_known_at
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
     ManifestRow,
@@ -269,7 +270,7 @@ MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
 PRICE_SOURCE = "alpaca"
-SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE)
+SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE, "fred")
 
 #: XBRL concept requested from `FilingSource.facts` -> the store's `fact_name`.
 FACT_NAMES: dict[str, str] = {"EntityCommonStockSharesOutstanding": SHARES_FACT}
@@ -348,11 +349,207 @@ def expected_session(now: datetime, settings: Settings) -> date:
     return last_completed_session(now - timedelta(minutes=settings.ingest.settle_delay_minutes))
 
 
+@dataclass
+class _RateFetch:
+    """One series' fetched rows and source counters, bound to one chunk."""
+
+    fetched: list[RateObservation] = field(default_factory=list)
+    missing: int = 0
+    latest_returned: RateObservation | None = None
+    through: date | None = None
+
+
+def ingest_rates(
+    settings: Settings,
+    rates: RateSource,
+    *,
+    since: date | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> IngestResult:
+    """Fetch and commit one atomic FRED chunk per configured series.
+
+    A backfill can be repeated; a daily run requires an existing observation
+    and extends its request window across any lapse. All stamps come from the
+    published vintage date, and a future stamp is never written.
+    """
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    today = now.astimezone(_NEW_YORK).date()
+    expected = expected_session(now, settings)
+    runs: list[SourceRun] = []
+    for series in settings.rates.series:
+        state = _RateFetch()
+
+        def prepare(series: str = series, state: _RateFetch = state) -> None:
+            if since is not None:
+                window = since
+            else:
+                latest_stored: date | None = None
+                if Path(settings.store.path).exists():
+                    with _read(settings) as conn:
+                        row = conn.execute(
+                            "SELECT max(observation_date) FROM rates WHERE series = ?", [series]
+                        ).fetchone()
+                        latest_stored = row[0] if row is not None else None
+                if latest_stored is None:
+                    raise ValueError(
+                        f"{series} has no stored rate; run ingest --source fred "
+                        "--backfill --since YYYY-MM-DD first"
+                    )
+                window = min(
+                    today - timedelta(days=settings.rates.refetch_days),
+                    latest_stored + timedelta(days=1),
+                )
+            state.fetched = rates.observations(series, window, window)
+            state.missing = rates.missing_values
+            state.latest_returned = max(
+                state.fetched,
+                key=lambda row: (row.observation_date, row.vintage_date),
+                default=None,
+            )
+
+        def write(
+            conn: duckdb.DuckDBPyConnection,
+            _run_id: str,
+            series: str = series,
+            state: _RateFetch = state,
+        ) -> tuple[int, str]:
+            if state.latest_returned is None:
+                raise _Stale(
+                    f"{series}: no observation returned; rates_missing_values={state.missing}"
+                )
+            sessions = all_sessions()
+            lag = max(
+                0,
+                bisect_right(sessions, expected)
+                - bisect_right(sessions, state.latest_returned.observation_date),
+            )
+            if since is None and lag > settings.rates.max_stale_sessions:
+                raise _Stale(
+                    f"{series}: latest observation {state.latest_returned.observation_date} is "
+                    f"{lag} sessions behind {expected}; maximum "
+                    f"{settings.rates.max_stale_sessions}"
+                )
+            stored_rows = conn.execute(
+                "SELECT observation_date, value, known_at, vintage_date FROM rates "
+                "WHERE series = ? ORDER BY observation_date, known_at",
+                [series],
+            ).fetchall()
+            known_values = {
+                (day, stamp): (value, vintage) for day, value, stamp, vintage in stored_rows
+            }
+            added = revisions = future = late = collisions = 0
+            state.through = max((day for day, _, _, _ in stored_rows), default=None)
+            by_stamp: dict[tuple[date, datetime], RateObservation] = {}
+            for record in state.fetched:
+                key = (record.observation_date, rate_known_at(record.vintage_date))
+                previous = by_stamp.get(key)
+                if previous is not None and previous.value != record.value:
+                    collisions += 1
+                if previous is None or record.vintage_date > previous.vintage_date:
+                    by_stamp[key] = record
+            for record in sorted(
+                by_stamp.values(),
+                key=lambda row: (
+                    row.observation_date,
+                    rate_known_at(row.vintage_date),
+                    row.vintage_date,
+                ),
+            ):
+                stamp = rate_known_at(record.vintage_date)
+                if stamp > now:
+                    future += 1
+                    continue
+                key = (record.observation_date, stamp)
+                existing = known_values.get(key)
+                if existing is not None:
+                    if existing[0] != record.value:
+                        collisions += 1
+                    continue
+                in_effect = max(
+                    (
+                        (known_stamp, value)
+                        for (day, known_stamp), (value, _) in known_values.items()
+                        if day == record.observation_date and known_stamp <= stamp
+                    ),
+                    default=None,
+                )
+                if in_effect is not None and in_effect[1] == record.value:
+                    continue
+                if any(day == record.observation_date for day, _ in known_values):
+                    revisions += 1
+                stamp_lag = max(
+                    0, bisect_right(sessions, expected) - bisect_right(sessions, stamp.date())
+                )
+                if since is None and stamp_lag > settings.rates.max_stale_sessions:
+                    late += 1
+                insert_row(
+                    conn,
+                    "rates",
+                    {
+                        "series": record.series,
+                        "observation_date": record.observation_date,
+                        "value": record.value,
+                        "vintage_date": record.vintage_date,
+                        "known_at": stamp,
+                        "ingested_at": now,
+                        "source": rates.name,
+                        "provenance": "release",
+                    },
+                )
+                known_values[key] = (record.value, record.vintage_date)
+                state.through = max(
+                    state.through or record.observation_date, record.observation_date
+                )
+                added += 1
+            message = (
+                f"series={series}; rates_revisions={revisions}; rates_not_yet_known={future}; "
+                f"rates_missing_values={state.missing}; rates_late_rows={late}; "
+                f"rates_colliding_vintages={collisions}; "
+                f"latest_observation={state.latest_returned.observation_date}; "
+                f"latest_vintage={state.latest_returned.vintage_date}; stale_sessions={lag}"
+            )
+            return added, message
+
+        def rate_cursor(series: str = series, state: _RateFetch = state) -> str:
+            """Identify this series and its latest committed observation."""
+            return f"rates;series={series};through={state.through or ''}"
+
+        run = _run_source(
+            "fred",
+            write,
+            settings,
+            now,
+            clock,
+            rate_cursor,
+            dry_run,
+            mode="backfill" if since is not None else MODE,
+            prepare=prepare,
+        )
+        runs.append(run)
+        if run.status != OK:
+            break
+    return IngestResult(tuple(runs))
+
+
+def rates_seeded(settings: Settings) -> bool:
+    """Whether every configured series has a stored observation for daily ingest."""
+    if not Path(settings.store.path).exists():
+        return False
+    with _read(settings) as conn:
+        try:
+            rows = conn.execute("SELECT DISTINCT series FROM rates").fetchall()
+        except duckdb.CatalogException:
+            return False
+    return set(settings.rates.series) <= {str(row[0]) for row in rows}
+
+
 def ingest_session(
     settings: Settings,
     *,
     prices: PriceSource,
     filings: FilingSource,
+    rates: RateSource | None = None,
     source: str = "all",
     clock: Callable[[], datetime] = utc_now,
     dry_run: bool = False,
@@ -388,6 +585,10 @@ def ingest_session(
         raise ValueError("restamp_window_ok needs restamp")
     if source not in ("all", *SOURCES):
         raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
+    if source == "fred":
+        if rates is None:
+            raise ValueError("fred source requires a RateSource")
+        return ingest_rates(settings, rates, clock=clock, dry_run=dry_run)
     if rebuild_statement_facts and not settings.edgar.statement_facts_enabled:
         raise ValueError(_REBUILD_NEEDS_SWITCH)
     if rebuild_statement_facts and source == "alpaca":
@@ -430,7 +631,7 @@ def ingest_session(
         "alpaca": None,
     }
     runs: list[SourceRun] = []
-    for name in SOURCES if source == "all" else (source,):
+    for name in ("edgar", "alpaca") if source == "all" else (source,):
         run = _run_source(
             name,
             work[name],
@@ -445,6 +646,13 @@ def ingest_session(
         runs.append(run)
         if run.status != OK:
             break
+    if (
+        source == "all"
+        and rates is not None
+        and all(run.status == OK for run in runs)
+        and rates_seeded(settings)
+    ):
+        runs.extend(ingest_rates(settings, rates, clock=clock, dry_run=dry_run).runs)
     return IngestResult(tuple(runs))
 
 
@@ -454,7 +662,7 @@ def _run_source(
     settings: Settings,
     now: datetime,
     clock: Callable[[], datetime],
-    cursor: str,
+    cursor: str | Callable[[], str],
     dry_run: bool,
     mode: str = MODE,
     prepare: Callable[[], object] | None = None,
@@ -469,7 +677,9 @@ def _run_source(
     run_id = uuid.uuid4().hex
 
     def outcome(status: str, rows: int, message: str) -> SourceRun:
-        return SourceRun(name, status, rows, cursor, _clean(message, settings))
+        return SourceRun(
+            name, status, rows, cursor() if callable(cursor) else cursor, _clean(message, settings)
+        )
 
     try:
         if prepare is not None:
