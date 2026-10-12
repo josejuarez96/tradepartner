@@ -186,6 +186,8 @@ _EXCHANGES: dict[str, str] = {
 }
 
 
+_EXCHANGE_CODES = frozenset(_EXCHANGES.values())
+
 #: The ISO MICs of the venues `_EXCHANGES` names, as the exchange axis's
 #: members spell them (`exch:XNGS`, FSN `XNGS`), to the same codes (#1541).
 #: Used only to count a member that names another exchange than its
@@ -214,7 +216,9 @@ def _exchange_axis_mismatch(member: str, exchange: str) -> bool:
     known MIC naming another venue than the normalized `exchange` (#1541,
     spec open question 1: counted, and the value wins)."""
     venue = _MIC_EXCHANGES.get(member.rsplit(":", 1)[-1].strip().upper())
-    return venue is not None and venue != exchange
+    # A value outside the exact-name table (its slug) names no known venue
+    # either, so it is not judged against the member.
+    return venue is not None and exchange in _EXCHANGE_CODES and venue != exchange
 
 
 def normalize_exchange(raw: str) -> str:
@@ -880,7 +884,7 @@ def parse_cover_page(
     classes: dict[str, dict[str, str]] = {}
     exchange_members: dict[str, str] = {}
     shares: list[FactRecord] = []
-    share_values: dict[tuple[str, str], tuple[float, bool]] = {}
+    share_values: dict[tuple[str, str], list[tuple[float, bool]]] = {}
     other: set[str] = set()
     for name, value, context in facts:
         if not context.get("id"):
@@ -894,28 +898,31 @@ def parse_cover_page(
             if _EXCHANGE_AXIS in dimensions:
                 exchange_members[context["id"]] = str(dimensions[_EXCHANGE_AXIS])
         elif name == _SHARES_CONCEPT:
-            member = str(context.get("dimensions", {}).get(_CLASS_AXIS, ""))
+            member = normalize_class_member(str(context.get("dimensions", {}).get(_CLASS_AXIS, "")))
+            count = float(Decimal(value))
             if exchange_axis:
-                # #1541: an exchange-axis context beside another context of the
-                # same member and date carries the same count (collapsed) or
-                # a conflict (fail closed); pairs without the axis are as today.
-                key = (member, str(context["instant"]))
-                count, on_axis = float(Decimal(value)), _EXCHANGE_AXIS in dimensions
-                held = share_values.get(key)
-                if held is not None and (on_axis or held[1]):
-                    if held[0] != count:
+                # #1541: an exchange-axis fact beside another fact of the same
+                # (normalized) member and date carries the same count (collapsed)
+                # or a conflict (fail closed), whatever the document order;
+                # facts without the axis are compared only with axis facts, so
+                # pairs without it are as today.
+                key, on_axis = (member, str(context["instant"])), _EXCHANGE_AXIS in dimensions
+                held = share_values.setdefault(key, [])
+                compared = held if on_axis else [h for h in held if h[1]]
+                if compared:
+                    if any(other_count != count for other_count, _ in compared):
                         raise ValueError(
                             f"{accession}: two share values for {member or 'no class'} on {key[1]}"
                         )
                     continue  # the same count again: collapsed
-                share_values[key] = (count, on_axis or (held is not None and held[1]))
+                held.append((count, on_axis))
             shares.append(
                 FactRecord(
                     cik,
                     _SHARES_CONCEPT,
                     date.fromisoformat(context["instant"]),
-                    normalize_class_member(member),
-                    float(Decimal(value)),
+                    member,
+                    count,
                     accession,
                     accepted_at,
                 )

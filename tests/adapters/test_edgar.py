@@ -877,6 +877,44 @@ class TestCoverPageExchangeAxis:
                 _context("s2", {_EXCH: "exch:XNYS"}, instant=True),
             )
 
+    def test_shares_of_one_class_spelt_two_ways_are_compared_once_normalized(self) -> None:
+        """code-review on #1571: `us-gaap:` and a filer prefix name one member."""
+        with pytest.raises(ValueError, match="two share values"):
+            _axis_cover(
+                _shares("s1", "5000") + _shares("s2", "5001"),
+                _context("s1", {_CLASS_AXIS_NAME: "us-gaap:CommonStockMember"}, instant=True),
+                _context(
+                    "s2",
+                    {_CLASS_AXIS_NAME: "so:CommonStockMember", _EXCH: "exch:XNYS"},
+                    instant=True,
+                ),
+            )
+
+    @pytest.mark.parametrize("axis_first", [True, False])
+    def test_an_axis_fact_is_compared_with_every_earlier_count_in_any_order(
+        self, axis_first: bool
+    ) -> None:
+        """code-review on #1571: two plain counts (as today) and an axis count
+        equal to the later one fail the same way whatever the document order."""
+        plain = _shares("s1", "10") + _shares("s2", "20")
+        axis = _shares("s3", "20")
+        with pytest.raises(ValueError, match="two share values"):
+            _axis_cover(
+                axis + plain if axis_first else plain + axis,
+                _context("s1", instant=True),
+                _context("s2", instant=True),
+                _context("s3", {_EXCH: "exch:XNYS"}, instant=True),
+            )
+
+    def test_a_value_outside_the_exchange_table_is_never_a_mismatch(self) -> None:
+        """code-review on #1571: a slug names no known venue to compare."""
+        parsed = _axis_cover(
+            _listing_facts("c1", "Common Stock", "SO", "Nasdaq Global Select Market"),
+            _context("c1", {_EXCH: "exch:XNGS"}),
+        )
+        assert [i.exchange for i in parsed.cover.listings] == ["NASDAQ_GLOBAL_SELECT_MARKET"]
+        assert parsed.exchange_axis_mismatch == 0
+
     def test_a_member_naming_another_exchange_is_counted_and_the_value_wins(self) -> None:
         """Spec open question 1, its recommended option: count and keep."""
         parsed = _axis_cover(
