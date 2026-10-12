@@ -142,6 +142,19 @@ pre-check. A manifest may cover any subset of CIKs; a rerun finds
 no row at its old stamps and moves nothing. `statement_facts` follow
 through `rebuild_statement_facts`, `filing_events` through
 `rebuild_filing_events`.
+
+**Classification rebuild** (#1541, plan T182). Classifications are keyed
+by `security_id` alone and a re-derive only ever adds a row at the run
+(`_add_rows`, "Filed rows"), so a changed rule reaches no read before the
+run. `rebuild_classifications` (CLI `ingest --source edgar
+--rebuild-classifications`) first deletes every `classifications` row of
+the securities the build derives (a stored security it no longer derives,
+an owner-kept successor, and a CIK held for a refused restamp or failed
+filings keep their rows), in the EDGAR chunk's transaction, then writes
+the build's rows as they stand: each at the `known_at` the classification
+first became knowable (`store.classify` timing), never the run. A dry
+run rolls it back. The count goes into the run message as
+`classifications_deleted: N`.
 """
 
 from __future__ import annotations
@@ -316,6 +329,7 @@ def ingest_session(
     dry_run: bool = False,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    rebuild_classifications: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
@@ -329,6 +343,9 @@ def ingest_session(
     source (`ValueError` otherwise, before anything runs).
     `rebuild_filing_events` (#1358) does the same for `filing_events`, under
     the same two conditions on `edgar.filing_events_enabled`.
+    `rebuild_classifications` (#1541, T182) deletes the build's securities'
+    `classifications` rows and writes the build's (module docstring); it
+    needs the EDGAR source (`ValueError` otherwise, before anything runs).
     `restamp` (#1382, T166b) moves the stored stamps a stamps-repair
     manifest repairs (`restamp_from_manifest`) in the EDGAR chunk's
     transaction, before that day's rows are written; it needs `source`
@@ -350,6 +367,8 @@ def ingest_session(
         raise ValueError(_REBUILD_EVENTS_NEEDS_SWITCH)
     if rebuild_filing_events and source == "alpaca":
         raise ValueError("rebuild_filing_events needs the edgar source")
+    if rebuild_classifications and source == "alpaca":
+        raise ValueError("rebuild_classifications needs the edgar source")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
     cursor = expected_session(now, settings).isoformat()
     recorded = _Recorded(filings)
@@ -362,6 +381,7 @@ def ingest_session(
             run_id,
             rebuild_statement_facts=rebuild_statement_facts,
             rebuild_filing_events=rebuild_filing_events,
+            rebuild_classifications=rebuild_classifications,
             restamp=restamp,
             on_restamp=on_restamp,
             restamp_window_ok=restamp_window_ok,
@@ -760,6 +780,7 @@ def _ingest_filings(
     *,
     rebuild_statement_facts: bool = False,
     rebuild_filing_events: bool = False,
+    rebuild_classifications: bool = False,
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
@@ -800,6 +821,10 @@ def _ingest_filings(
         }
     else:
         skipped = frozenset()
+    rebuilt = ""
+    if rebuild_classifications:
+        deleted = _delete_classifications(conn, master, skipped, _unjudged_ciks(recorded).ciks)
+        rebuilt = f"; classifications_deleted: {deleted}"
     added = 0
     for table, rows in (
         ("securities", master.securities),
@@ -843,10 +868,35 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{restamped}{_source_counts(filings)}; "
+        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _delete_classifications(
+    conn: duckdb.DuckDBPyConnection,
+    master: MasterBuild,
+    skipped: Container[str],
+    unjudged: Container[str],
+) -> int:
+    """Delete the `classifications` rows of the securities the build derives,
+    less those of a CIK it cannot rewrite whole: one a restamp refused
+    (`skipped`) or one whose filings failed this run (`unjudged`, #859's
+    hold). A stored security the build no longer derives (an owner-kept
+    successor, #922) keeps its rows: nothing would write them back."""
+    held = {
+        row["cik"]
+        for row in master.securities
+        if row["security_id"] in skipped or row["cik"] in unjudged
+    }
+    ids = sorted({r["security_id"] for r in master.securities if r["cik"] not in held})
+    if not ids:
+        return 0
+    deleted = conn.execute(
+        "DELETE FROM classifications WHERE list_contains(?, security_id)", [ids]
+    ).fetchone()
+    return int(deleted[0]) if deleted else 0
 
 
 def _source_counts(filings: FilingSource) -> str:
@@ -1402,6 +1452,8 @@ _STATEMENT_SOURCE_COUNTS: tuple[str, ...] = (
     "non_usd",
     "malformed",
     "none",
+    "payload_trails",
+    "no_parsed_rows",
 )
 
 #: A statement fact's key: `(fact_name, period_end, period_days)` within a CIK.
