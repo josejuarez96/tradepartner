@@ -21,6 +21,7 @@ import pytest
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from pydantic import ValidationError
 
+from tradepartner import health
 from tradepartner.calendar import (
     all_sessions,
     last_completed_session,
@@ -31,6 +32,7 @@ from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
+    COVERAGE_REFERENCE_NAMES,
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
@@ -47,16 +49,20 @@ from tradepartner.health import (
     STATEMENT_BASIS_ALLOWED,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
     STATEMENT_PERIOD_DAYS,
+    STATIC,
+    CoverageReference,
     HealthReport,
     bar_gaps,
     clock_suspect,
     coverage,
+    coverage_reference,
     delisted_names,
     filing_event_counts,
     health_report,
     integrity_checks,
     last_ingests,
     listed_without_bars,
+    sample_sessions,
     statement_counts,
     statement_coverage,
     static_reliance,
@@ -2044,3 +2050,228 @@ def test_the_clock_detector_flags_nothing_on_true_stamps(
 )
 def test_the_clock_detector_flags_a_moved_stamp(accepted_at: datetime, filed: date) -> None:
     assert clock_suspect(accepted_at, filed) is True
+
+
+# --- The coverage check against a named reference (#1541, T180) --------------
+
+#: SEC_STATIC_PRE2019's only listing is `snapshot_static`, known 2020-01-15:
+#: after the 2019-12-31 sample, before the 2020-06-30 one (fixture README).
+PRE9 = "CIK0001000019:PRE9"
+#: SEC_FACTS_RESTATED: the one member of `universe_as_of(close(2019-12-31))`.
+FRST_CIK = "CIK0001000016"
+S_2019 = date(2019, 12, 31)
+S_2020 = date(2020, 6, 30)
+
+
+def _coverage_settings(*names: str, check_enabled: bool = False, **extra: Any) -> Settings:
+    return _settings(
+        coverage={"reference_names": list(names), "check_enabled": check_enabled, **extra}
+    )
+
+
+def _missing_at(block: CoverageReference, session: date) -> list[dict[str, Any]]:
+    return block.reference_missing.filter(pl.col("session") == session).to_dicts()
+
+
+def _late_at(block: CoverageReference, session: date) -> list[str]:
+    return block.late_known.filter(pl.col("session") == session)["security_id"].to_list()
+
+
+def test_sample_sessions_are_month_ends_from_sample_from_and_a_weekend_samples_the_friday() -> None:
+    settings = _coverage_settings(sample_months=[5, 12])
+    # 2020-05-31 is a Sunday: the month's last session is Friday 2020-05-29.
+    assert sample_sessions(T_END, settings) == (S_2019, date(2020, 5, 29))
+    assert sample_sessions(T_END, _coverage_settings()) == (S_2019, S_2020)
+    # Only sessions completed at `t`: the close of 2020-06-30 itself counts, the
+    # instant before it does not.
+    before = T_END - timedelta(microseconds=1)
+    assert sample_sessions(before, _coverage_settings()) == (S_2019,)
+    later = _coverage_settings(sample_from=date(2020, 1, 1))
+    assert sample_sessions(T_END, later) == (S_2020,)
+
+
+def test_a_static_only_name_known_after_s_is_missing_with_its_exclusion_and_late_known(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    block = coverage_reference(fixture_store, T_END, _coverage_settings(PRE9))
+    [row] = _missing_at(block, S_2019)
+    assert row["security_id"] == "SEC_STATIC_PRE2019"
+    assert (row["rule"], row["rule_name"], row["reason"]) == (2, "exchange", "not_listed")
+    assert _late_at(block, S_2019) == ["SEC_STATIC_PRE2019"]
+    [late] = block.late_known.to_dicts()
+    assert late["provenance"] == STATIC
+    assert late["first_known_at"] == datetime(2020, 1, 15, 14, 0, tzinfo=UTC)
+    # Known by 2020-06-30: listed then, and missing only for its own shares rule.
+    assert _late_at(block, S_2020) == []
+    [later] = _missing_at(block, S_2020)
+    assert (later["rule_name"], later["reason"]) == ("shares", "no_shares")
+    samples = block.samples.to_dicts()
+    assert [s["late_known"] for s in samples] == [1, 0]
+    assert samples[0]["late_share"] == 1 / samples[0]["listed"]
+    assert block.failed
+
+
+def test_a_filing_row_known_before_s_beside_the_static_one_is_in_neither(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2018, 12, 3, 20, 30, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": "SEC_STATIC_PRE2019",
+            "ticker": "PRE9",
+            "exchange": "NYSE",
+            "class_title": "Common Stock",
+            "valid_from": date(2019, 1, 2),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    shares_known = datetime(2019, 11, 1, 20, 30, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "facts",
+        {
+            "security_id": "SEC_STATIC_PRE2019",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2019, 10, 31),
+            "class_member": "",
+            "value": 10_000_000,
+            "filing_accession": "0001000019-19-000001",
+            "known_at": shares_known,
+            "ingested_at": shares_known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    block = coverage_reference(fixture_store, T_END, _coverage_settings(PRE9))
+    assert _missing_at(block, S_2019) == []
+    assert _late_at(block, S_2019) == []
+    assert block.reference_missing.is_empty()
+    assert not block.failed
+
+
+def test_an_entrys_from_and_to_bound_the_sessions_it_is_checked_on(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # FRST is a member on 2019-12-31 and excluded (stale shares) on 2020-06-30.
+    open_ended = coverage_reference(fixture_store, T_END, _coverage_settings(f"{FRST_CIK}:FRST"))
+    assert [r["session"] for r in open_ended.reference_missing.to_dicts()] == [S_2020]
+    to_2019 = coverage_reference(
+        fixture_store, T_END, _coverage_settings(f"{FRST_CIK}:FRST::2019-12-31")
+    )
+    assert to_2019.reference_missing.is_empty()
+    assert to_2019.samples["references"].to_list() == [1, 0]
+    from_2020 = coverage_reference(
+        fixture_store, T_END, _coverage_settings(f"{FRST_CIK}:FRST:2020-01-01")
+    )
+    assert from_2020.samples["references"].to_list() == [0, 1]
+    [row] = from_2020.reference_missing.to_dicts()
+    assert (row["session"], row["rule_name"], row["reason"]) == (S_2020, "shares", "stale_shares")
+    only_2019 = coverage_reference(
+        fixture_store, T_END, _coverage_settings(f"{FRST_CIK}:FRST:2019-12-31:2019-12-31")
+    )
+    assert only_2019.samples["references"].to_list() == [1, 0]
+    assert only_2019.reference_missing.is_empty()
+
+
+def test_a_missing_reference_names_a_member_under_another_ticker_or_no_security(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    settings = _coverage_settings(f"{FRST_CIK}:FRSX::2019-12-31", "CIK0009999999:NOPE::2019-12-31")
+    block = coverage_reference(fixture_store, T_END, settings)
+    reasons = {
+        (r["ticker"], r["security_id"], r["rule"], r["reason"]) for r in _missing_at(block, S_2019)
+    }
+    assert reasons == {("FRSX", None, None, "ticker:FRST"), ("NOPE", None, None, "no_security")}
+
+
+def test_the_latest_sample_is_cross_checked_against_the_snapshot_ciks(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    block = coverage_reference(fixture_store, T_END, _coverage_settings())
+    # SEC_SPY, SEC_MTUM and SEC_STATIC_PRE2019: `snapshot_static` rows on NYSE.
+    expected = fixture_store.execute(
+        """
+        SELECT count(DISTINCT s.cik) FROM listings l JOIN securities s USING (security_id)
+        WHERE l.provenance IN ('snapshot', 'snapshot_static')
+          AND l.exchange IN ('NYSE', 'NASDAQ', 'NYSE_AMERICAN')
+        """
+    ).fetchone()
+    assert expected is not None
+    assert block.snapshot_ciks == expected[0] == 3
+    assert block.samples["members"].to_list() == [1, 0]
+    assert block.member_ratio == 0 / 3
+    empty = coverage_reference(fixture_store, T_END, _coverage_settings(sample_months=[7]))
+    assert empty.samples.is_empty()
+    assert empty.member_ratio is None
+
+
+def test_coverage_reference_names_fails_only_with_check_enabled(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    report_only = health_report(
+        fixture_store, T_END, _coverage_settings(PRE9), with_coverage_reference=True
+    )
+    assert report_only.coverage_reference is not None
+    assert report_only.coverage_reference.failed
+    assert COVERAGE_REFERENCE_NAMES not in report_only.failures
+    assert report_only.ok
+    enforced = health_report(fixture_store, T_END, _coverage_settings(PRE9, check_enabled=True))
+    assert enforced.coverage_reference is not None
+    assert enforced.failures == (COVERAGE_REFERENCE_NAMES,)
+    assert not enforced.ok
+    assert COVERAGE_REFERENCE_NAMES not in INTEGRITY_RULES
+    assert [check.rule for check in enforced.integrity] == list(INTEGRITY_RULES)
+
+
+def test_check_enabled_passes_on_the_fixture_with_names_the_fixture_lists(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    settings = _coverage_settings(f"{FRST_CIK}:FRST::2019-12-31", check_enabled=True)
+    report = health_report(fixture_store, T_END, settings)
+    assert report.coverage_reference is not None
+    assert report.coverage_reference.reference_missing.is_empty()
+    assert report.ok, report.failures
+
+
+def test_without_the_flag_and_with_the_default_off_nothing_is_computed(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the coverage block was computed")
+
+    monkeypatch.setattr(health, "_coverage_reference", refuse)
+    settings = _settings()
+    assert settings.coverage.check_enabled is False
+    report = health_report(fixture_store, T_END, settings)
+    assert report.coverage_reference is None
+    assert report.ok
+    # Asked never, even while the switch is on (the page's plain refresh).
+    enforced = _coverage_settings(PRE9, check_enabled=True)
+    assert (
+        health_report(
+            fixture_store, T_END, enforced, with_coverage_reference=False
+        ).coverage_reference
+        is None
+    )
+    with pytest.raises(AssertionError, match="computed"):
+        health_report(fixture_store, T_END, settings, with_coverage_reference=True)
+
+
+def test_coverage_reference_reads_only_rows_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    """Truncation invariance: at `t`, the block on the full store equals the
+    block on a store holding only the rows known at `t` (spec "Look-ahead")."""
+    settings = _coverage_settings(PRE9, f"{FRST_CIK}:FRST")
+    for t in (T_END, datetime(2020, 1, 15, 14, 0, tzinfo=UTC), session_close(S_2019)):
+        full = coverage_reference(fixture_store, t, settings)
+        cut = coverage_reference(truncated.at(t), t, settings)
+        assert full.samples.equals(cut.samples), t
+        assert full.reference_missing.equals(cut.reference_missing), t
+        assert full.late_known.equals(cut.late_known), t
+        assert full.snapshot_ciks == cut.snapshot_ciks, t

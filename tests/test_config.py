@@ -38,6 +38,7 @@ from tradepartner.config import (
     HypothesisFamily,
     PaperConfig,
     ProfitabilityConfig,
+    ReferenceName,
     RiskConfig,
     Settings,
     StrategyConfig,
@@ -45,6 +46,7 @@ from tradepartner.config import (
     _settings_has_key,
     clean_message,
     paper_key_variable_names,
+    parse_reference_name,
     render_validation_errors,
     secret_values,
 )
@@ -2093,3 +2095,104 @@ def test_research_claude_https_and_thinking_validation() -> None:
         with pytest.raises(ValidationError) as raised:
             ResearchClaudeConfig(**value)
         assert raised.value.errors()[0]["loc"] == (field,)
+
+
+# --- coverage: the reference list (#1541, T180) --------------------------------
+
+#: The spec amendment's default names, by ticker (BRK.B as the filer spells it).
+_SPEC_REFERENCE_TICKERS = {
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META", "BRK.B", "JNJ", "JPM", "XOM", "UNH", "V",
+    "HD", "CVX", "MRK", "KO", "PEP", "PFE", "CSCO", "WMT", "BAC", "DIS", "TMO",
+    "IBM", "ABBV", "ABT", "MMM", "ALL", "FITB", "WHR", "PG",
+}  # fmt: skip
+
+
+def test_coverage_defaults_are_the_spec_amendments() -> None:
+    cfg = Settings(_env_file=None).coverage
+    assert cfg.sample_months == [6, 12]
+    assert cfg.sample_from == date(2019, 12, 31)
+    assert cfg.check_enabled is False
+    refs = cfg.references()
+    assert {r.ticker for r in refs} - {"FB"} == _SPEC_REFERENCE_TICKERS
+    # Pinned CIKs, from company_tickers_exchange.json (2026-10-11).
+    by_ticker = {(r.ticker, r.first): r.cik for r in refs}
+    assert by_ticker[("IBM", None)] == "0000051143"
+    assert by_ticker[("AAPL", None)] == "0000320193"
+    assert by_ticker[("BRK.B", None)] == "0001067983"
+    # Delisted names are left to the release's evidence (ANSYS, US Steel).
+    assert not {"ANSS", "X"} & {r.ticker for r in refs}
+    # P&G only up to the partial variant's note (spec open question 4).
+    [pg] = [r for r in refs if r.ticker == "PG"]
+    assert (pg.cik, pg.first, pg.last) == ("0000080424", None, date(2022, 9, 30))
+    # A rename and a holding-company change split one name into two windows.
+    meta = sorted((r.ticker, r.first, r.last) for r in refs if r.cik == "0001326801")
+    assert meta == [("FB", None, date(2022, 6, 8)), ("META", date(2022, 6, 9), None)]
+    xom = sorted((r.cik, r.first, r.last) for r in refs if r.ticker == "XOM")
+    assert xom == [
+        ("0000034088", None, date(2026, 6, 30)),
+        ("0002115436", date(2026, 7, 1), None),
+    ]
+    assert len({(r.cik, r.ticker, r.first) for r in refs}) == len(refs)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("0000051143:IBM", ReferenceName("0000051143", "IBM", None, None)),
+        (
+            "0000080424:PG::2022-09-30",
+            ReferenceName("0000080424", "PG", None, date(2022, 9, 30)),
+        ),
+        (
+            "0001326801:META:2022-06-09",
+            ReferenceName("0001326801", "META", date(2022, 6, 9), None),
+        ),
+        (
+            "CIK0001000016:FRST:2019-12-31:2019-12-31",
+            ReferenceName("CIK0001000016", "FRST", date(2019, 12, 31), date(2019, 12, 31)),
+        ),
+    ],
+)
+def test_parse_reference_name(entry: str, expected: ReferenceName) -> None:
+    assert parse_reference_name(entry) == expected
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "IBM",
+        "51143:IBM",
+        "0000051143:",
+        "0000051143:ibm",
+        "0000051143:IBM:2020-13-01",
+        "0000051143:IBM:2021-01-01:2020-01-01",
+        "0000051143:IBM:2020-01-01:",
+        "0000051143:IBM:2020-01-01:2021-01-01:extra",
+        "0000051143 :IBM",
+    ],
+)
+def test_reference_names_validator_refuses_a_bad_shape(entry: str) -> None:
+    with pytest.raises(ValueError):
+        parse_reference_name(entry)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"reference_names": [entry]})
+
+
+def test_reference_name_covers_its_window_inclusive() -> None:
+    ref = parse_reference_name("0000051143:IBM:2020-01-02:2020-06-30")
+    assert not ref.covers(date(2020, 1, 1))
+    assert ref.covers(date(2020, 1, 2))
+    assert ref.covers(date(2020, 6, 30))
+    assert not ref.covers(date(2020, 7, 1))
+    assert parse_reference_name("0000051143:IBM").covers(date(1990, 1, 2))
+
+
+@pytest.mark.parametrize("months", [[], [0], [13], [6, 6]])
+def test_sample_months_must_be_distinct_calendar_months(months: list[int]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"sample_months": months})
+
+
+def test_coverage_section_refuses_an_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"check_enable": True})
