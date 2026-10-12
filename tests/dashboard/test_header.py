@@ -13,6 +13,7 @@ from streamlit.testing.v1 import AppTest
 from tradepartner.calendar import session_close
 from tradepartner.dashboard import header
 from tradepartner.store import schema
+from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import configure_connection, insert_row
 
 UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
@@ -20,6 +21,36 @@ T = session_close(date(2020, 6, 30)) + timedelta(hours=3)
 
 
 def _run(conn: duckdb.DuckDBPyConnection, run_id: int, status: str, finished: datetime) -> None:
+    _run_row(conn, run_id, status, finished, source="alpaca")
+
+
+def _run_row(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: int,
+    status: str,
+    finished: datetime,
+    *,
+    source: str,
+) -> None:
+    _assets_run_row(
+        conn,
+        run_id,
+        status,
+        finished,
+        source=source,
+        cursor=None,
+    )
+
+
+def _assets_run_row(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: int,
+    status: str,
+    finished: datetime,
+    *,
+    source: str,
+    cursor: datetime | None,
+) -> None:
     insert_row(
         conn,
         "ingestion_runs",
@@ -28,11 +59,37 @@ def _run(conn: duckdb.DuckDBPyConnection, run_id: int, status: str, finished: da
             "started_at": finished - timedelta(minutes=5),
             "finished_at": finished,
             "status": status,
-            "source": "alpaca",
+            "source": source,
             "mode": "daily",
             "rows_added": 0,
-            "chunk_cursor": None,
+            "chunk_cursor": None if cursor is None else cursor.isoformat(),
             "message": None,
+        },
+    )
+
+
+def _borrow_row(conn: duckdb.DuckDBPyConnection, known_at: datetime) -> None:
+    """One `borrow_status` row in the fixture's shape (T171b): the daily
+    snapshot's fetch time as `known_at`, an hour after the last bar."""
+    insert_row(
+        conn,
+        "borrow_status",
+        {
+            "asset_id": "b0rr0w00-0000-4b0d-8000-0000000000ff",
+            "symbol": "PINNED",
+            "exchange": "NYSE",
+            "status": "active",
+            "tradable": True,
+            "marginable": True,
+            "shortable": True,
+            "easy_to_borrow": True,
+            "borrow_status": "easy_to_borrow",
+            "fractionable": True,
+            "present": True,
+            "known_at": known_at,
+            "ingested_at": known_at + timedelta(minutes=10),
+            "source": "alpaca",
+            "provenance": "snapshot",
         },
     )
 
@@ -66,6 +123,28 @@ def test_last_updated_is_the_latest_ok_run_finished_by_t(
     _run(conn, 2, "failed", ok + timedelta(minutes=30))
     _run(conn, 3, "ok", T + timedelta(hours=1))  # finished after t
     assert header.store_freshness(conn, T).last_updated == ok
+
+
+def test_a_borrow_snapshot_leaves_both_reads_on_the_bars(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """The borrow snapshot (#1506, T171b) is fetched after every other
+    source and is read by nothing these two numbers describe, so neither
+    its table nor its run row may make the store look fresher than its
+    bars: "as of" stays the last bar's `known_at` even at a `t` an hour
+    later, and "last updated" stays the bars' run."""
+    load_universe_fixtures(conn, UNIVERSE_DIR)
+    snapshot = datetime(2020, 6, 30, 21, tzinfo=UTC)  # close 20:00 plus an hour
+    _borrow_row(conn, snapshot)
+    _assets_run_row(conn, 9, "ok", snapshot, source=ASSETS_SOURCE, cursor=snapshot)
+    before = header.store_freshness(conn, T)
+    assert before.as_of == session_close(date(2020, 6, 30))
+    assert before.last_updated is None
+    # With a bars run at the same close, the later snapshot run still does
+    # not become "last updated".
+    _run(conn, 1, "ok", snapshot - timedelta(minutes=1))
+    assert header.store_freshness(conn, T).last_updated == snapshot - timedelta(minutes=1)
+    assert header.store_freshness(conn, T).as_of == session_close(date(2020, 6, 30))
 
 
 def test_when_formats_utc() -> None:
