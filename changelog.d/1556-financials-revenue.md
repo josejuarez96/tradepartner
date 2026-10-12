@@ -1,0 +1,3 @@
+- Financial issuers: revenue_financial from RevenuesNetOfInterestExpense, else net interest income + noninterest income, per filing and period (#1556)
+### Fixed
+- statement facts: banks, insurers and mortgage REITs now get a `revenue_financial` row (#1556) — `us-gaap:RevenuesNetOfInterestExpense` when the filing reports it, else the derived sum of net interest income (`us-gaap:InterestIncomeExpenseNet`) and noninterest income (`us-gaap:NoninterestIncome`), from one filing and one period only. It is a separate fact, so `revenue` and every `gross_profit` are byte-identical to before and each row stays point-in-time; a consumer coalesces the two. `health --check` verifies derived `revenue_financial` rows too, and the data-foundation spec carries the amendment.

@@ -1464,6 +1464,23 @@ StatementKey = tuple[str, date, int]
 ConflictKey = tuple[str, str, date, int]
 
 GROSS_PROFIT, REVENUE, COST_OF_REVENUE = "gross_profit", "revenue", "cost_of_revenue"
+#: The financial-revenue fact (#1556) and its constituents. Kept out of the
+#: `revenue` key so no financial concept can interact with `revenue` or
+#: `gross_profit`.
+REVENUE_FINANCIAL = "revenue_financial"
+NET_INTEREST_INCOME, NONINTEREST_INCOME = "net_interest_income", "noninterest_income"
+
+#: `_derived_candidates`' two-tag derivations: the target fact, its two
+#: constituent facts and the operator joining them. Both are `basis = derived`
+#: rows from one filing and period; `gross_profit = revenue - cost_of_revenue`
+#: (spec decision (e), #660) and, for a financial issuer, `revenue_financial =
+#: net_interest_income + noninterest_income` (#1556). The target is dropped
+#: when the filing carries it reported. Public so `health`'s
+#: `statement_derived_matches_components` checks the same table.
+DERIVED_FACTS: tuple[tuple[str, str, str, str], ...] = (
+    (GROSS_PROFIT, REVENUE, COST_OF_REVENUE, "-"),
+    (REVENUE_FINANCIAL, NET_INTEREST_INCOME, NONINTEREST_INCOME, "+"),
+)
 
 
 @dataclass(frozen=True)
@@ -1535,13 +1552,17 @@ def statement_fact_rows(
     key is **held** for the rest of the pass when an unstamped record of it
     (`accepted_at = None`) has `filed` on or before the carrier's (a same-day
     tie holds); `held` counts each holding entry once. After a filing's
-    reported keys, each period it carries both `revenue` and
-    `cost_of_revenue` for, in one unit, whose stored vintages are both this
-    filing's, and for which it carries no `gross_profit` and `conflicts`
-    lists none, yields a `derived` `gross_profit` candidate (the difference,
-    tags joined by `-`), subject to the same stored and held rules; a stored
-    key skips it uncounted. Raises `ValueError` for a record accepted after
-    `ingested_at`."""
+    reported keys, each period it carries both constituents of a
+    `DERIVED_FACTS` pair for, in one unit, whose stored vintages are both this
+    filing's, and for which it carries no reported target and `conflicts`
+    lists none, yields a `derived` candidate (the difference or sum, tags
+    joined by the operator): `gross_profit` from `revenue` and
+    `cost_of_revenue`, and, for a financial issuer, `revenue_financial` from
+    `net_interest_income` and `noninterest_income` (#1556). Each is subject to
+    the same stored and held rules; a stored key skips it uncounted. The
+    financial fact is separate from `revenue`, so no financial concept can
+    interact with `revenue` or `gross_profit`. Raises `ValueError` for a
+    record accepted after `ingested_at`."""
     records = list(records)
     unstamped: dict[StatementKey, list[StatementFactRecord]] = defaultdict(list)
     filings: dict[tuple[datetime, str], list[StatementFactRecord]] = defaultdict(list)
@@ -1587,7 +1608,7 @@ def statement_fact_rows(
             if not holds(key, record.filed):
                 store(key, _statement_row(record, ingested_at))
         for row in _derived_candidates(filing, vintages, conflicts, ingested_at):
-            key = (GROSS_PROFIT, row["period_end"], row["period_days"])
+            key = (row["fact_name"], row["period_end"], row["period_days"])
             filed = row.pop("_filed")
             if key not in vintages and not holds(key, filed):
                 store(key, row)
@@ -1624,45 +1645,49 @@ def _derived_candidates(
     conflicts: Container[ConflictKey],
     ingested_at: datetime,
 ) -> list[Row]:
-    """`filing`'s derived `gross_profit` rows (`statement_fact_rows`), each
-    with a `_filed` entry for the hold rule. `comparative` follows the
-    Periods rule over the periods the filing can derive, per duration class."""
+    """`filing`'s derived rows (`statement_fact_rows`), one per derivable
+    period of each `DERIVED_FACTS` pair, each with a `_filed` entry for the
+    hold rule. `comparative` follows the Periods rule over the periods the
+    filing can derive, per duration class and per fact; nothing is derived
+    from constituents whose stored vintages are not both this filing's (the
+    same-filing rule, so a financial-revenue sum never mixes filings)."""
     by_period: dict[tuple[date, int], dict[str, StatementFactRecord]] = defaultdict(dict)
     for record in filing:
         by_period[(record.period_end, record.period_days)][record.fact_name] = record
-    pairs = {
-        period: (facts[REVENUE], facts[COST_OF_REVENUE])
-        for period, facts in by_period.items()
-        if REVENUE in facts and COST_OF_REVENUE in facts
-    }
-    latest: dict[int, date] = {}
-    for end, days in pairs:
-        kind = duration_class(days)
-        latest[kind] = max(latest.get(kind, end), end)
     out: list[Row] = []
-    for (end, days), (revenue, cost) in sorted(pairs.items()):
-        accession = revenue.accession
-        if (
-            revenue.unit != cost.unit
-            or GROSS_PROFIT in by_period[(end, days)]
-            or (accession, GROSS_PROFIT, end, days) in conflicts
-            or any(
-                (vintage := vintages.get(_statement_key(r))) is None
-                or vintage.accession != accession
-                for r in (revenue, cost)
+    for fact_name, left_name, right_name, operator in DERIVED_FACTS:
+        pairs = {
+            period: (facts[left_name], facts[right_name])
+            for period, facts in by_period.items()
+            if left_name in facts and right_name in facts
+        }
+        latest: dict[int, date] = {}
+        for end, days in pairs:
+            kind = duration_class(days)
+            latest[kind] = max(latest.get(kind, end), end)
+        for (end, days), (left, right) in sorted(pairs.items()):
+            accession = left.accession
+            if (
+                left.unit != right.unit
+                or fact_name in by_period[(end, days)]
+                or (accession, fact_name, end, days) in conflicts
+                or any(
+                    (vintage := vintages.get(_statement_key(r))) is None
+                    or vintage.accession != accession
+                    for r in (left, right)
+                )
+            ):
+                continue
+            row = _statement_row(left, ingested_at)
+            row.update(
+                fact_name=fact_name,
+                xbrl_tag=f"{left.xbrl_tag}{operator}{right.xbrl_tag}",
+                value=(left.value + right.value if operator == "+" else left.value - right.value),
+                basis="derived",
+                comparative=end < latest[duration_class(days)],
+                _filed=max(left.filed, right.filed),
             )
-        ):
-            continue
-        row = _statement_row(revenue, ingested_at)
-        row.update(
-            fact_name=GROSS_PROFIT,
-            xbrl_tag=f"{revenue.xbrl_tag}-{cost.xbrl_tag}",
-            value=revenue.value - cost.value,
-            basis="derived",
-            comparative=end < latest[duration_class(days)],
-            _filed=max(revenue.filed, cost.filed),
-        )
-        out.append(row)
+            out.append(row)
     return out
 
 

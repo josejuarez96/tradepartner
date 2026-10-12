@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from tradepartner import ingest as ingest_module
-from tradepartner.adapters.edgar import StatementConflict
+from tradepartner.adapters.edgar import StatementConflict, parse_statement_facts
 from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
@@ -2474,9 +2474,12 @@ FY18 = (date(2018, 1, 1), date(2018, 12, 31))
 FY17 = (date(2017, 1, 1), date(2017, 12, 31))
 _TAG = {
     "revenue": "us-gaap:Revenues",
+    "revenue_financial": "us-gaap:RevenuesNetOfInterestExpense",
     "cost_of_revenue": "us-gaap:CostOfRevenue",
     "gross_profit": "us-gaap:GrossProfit",
     "total_assets": "us-gaap:Assets",
+    "net_interest_income": "us-gaap:InterestIncomeExpenseNet",
+    "noninterest_income": "us-gaap:NoninterestIncome",
 }
 
 
@@ -2491,6 +2494,7 @@ def _sf(
     cik: str = ACME,
     unit: str = "USD",
     comparative: bool = False,
+    tag: str | None = None,
 ) -> StatementFactRecord:
     """One statement record; `filed` defaults to the acceptance date."""
     if filed is None:
@@ -2499,7 +2503,7 @@ def _sf(
     return StatementFactRecord(
         cik=cik,
         fact_name=fact,
-        xbrl_tag=_TAG[fact],
+        xbrl_tag=_TAG[fact] if tag is None else tag,
         period_start=period[0],
         period_end=period[1],
         value=value,
@@ -2694,6 +2698,286 @@ def test_a_conflict_withheld_gross_profit_derives_nothing_until_a_clean_filing()
 def test_components_in_two_units_derive_nothing() -> None:
     rows, _ = _rows([_sf("revenue", 100, F1, AT1), _sf("cost_of_revenue", 60, F1, AT1, unit="EUR")])
     assert ("gross_profit", FY18[1]) not in rows
+
+
+# --- financial-issuer revenue (#1556) ----------------------------------------
+
+
+def _bank_components(
+    accession: str, accepted_at: datetime, *, period: tuple[date | None, date] = FY18
+) -> list[StatementFactRecord]:
+    """A regional-bank-like filing's constituents: net interest income plus
+    noninterest income, and no revenue tag."""
+    return [
+        _sf("net_interest_income", 40, accession, accepted_at, period=period),
+        _sf("noninterest_income", 60, accession, accepted_at, period=period),
+    ]
+
+
+def test_financial_revenue_is_derived_from_one_filings_constituents() -> None:
+    """#1556: a filing with no financial revenue tag but both constituents
+    yields `revenue_financial = net interest income + noninterest income`, from
+    that one filing and period, tagged with both source tags and known at its
+    acceptance."""
+    rows, counts = _rows(
+        [
+            *_bank_components(F1, AT1),
+            _sf("total_assets", 900, F1, AT1, period=(None, FY18[1])),
+        ]
+    )
+    revenue = rows[("revenue_financial", FY18[1])]
+    assert revenue["value"] == 100
+    assert (revenue["basis"], revenue["known_at"], revenue["filing_accession"]) == (
+        "derived",
+        AT1,
+        F1,
+    )
+    assert revenue["xbrl_tag"] == "us-gaap:InterestIncomeExpenseNet+us-gaap:NoninterestIncome"
+    assert (
+        revenue["value"]
+        == rows[("net_interest_income", FY18[1])]["value"]
+        + rows[("noninterest_income", FY18[1])]["value"]
+    )
+    assert counts.derived == 1
+
+
+def test_a_reported_financial_revenue_beats_the_sum() -> None:
+    """A bank whose filing reports `RevenuesNetOfInterestExpense` keeps it,
+    even when the constituents are also present (Goldman tags all three): the
+    reported row is stored first and the derived candidate is skipped."""
+    rows, counts = _rows([_sf("revenue_financial", 105, F1, AT1), *_bank_components(F1, AT1)])
+    revenue = rows[("revenue_financial", FY18[1])]
+    assert (revenue["value"], revenue["basis"], revenue["xbrl_tag"]) == (
+        105,
+        "reported",
+        "us-gaap:RevenuesNetOfInterestExpense",
+    )
+    assert counts.derived == 0
+
+
+def test_financial_constituents_split_across_filings_derive_no_revenue() -> None:
+    """The sum is same-filing only: net interest income from one filing and
+    noninterest income from another never mix."""
+    rows, counts = _rows(
+        [
+            _sf("net_interest_income", 40, F1, AT1),
+            _sf("noninterest_income", 60, F2, AT2, comparative=True),
+        ]
+    )
+    assert ("revenue_financial", FY18[1]) not in rows
+    assert counts.derived == 0
+
+
+def test_financial_constituents_in_two_units_derive_no_revenue() -> None:
+    rows, _ = _rows(
+        [
+            _sf("net_interest_income", 40, F1, AT1),
+            _sf("noninterest_income", 60, F1, AT1, unit="EUR"),
+        ]
+    )
+    assert ("revenue_financial", FY18[1]) not in rows
+
+
+def test_a_financial_revenue_tag_never_feeds_gross_profit() -> None:
+    """#1556: `RevenuesNetOfInterestExpense` is its own fact, never `revenue`,
+    so a filing that reports it with a `cost_of_revenue` but no classic
+    revenue derives no `gross_profit` (main stores none, spec "gross profit
+    stays N/A for financials")."""
+    rows = _payload_rows(
+        {
+            "RevenuesNetOfInterestExpense": [_cf_entry(ACC_10K, FY20, 100)],
+            "CostOfRevenue": [_cf_entry(ACC_10K, FY20, 70)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert rows["revenue_financial"]["value"] == 100
+    assert "gross_profit" not in rows
+    assert "revenue" not in rows
+
+
+def test_financial_revenue_is_point_in_time() -> None:
+    """#1556 regression (quant-auditor): the financial fact for FY20 comes from
+    the AT1 filing and is unchanged when a later filing reports a classic
+    `Revenues` for the same period (which it must not displace)."""
+    only_at1 = _payload_rows(
+        {
+            "RevenuesNetOfInterestExpense": [_cf_entry(ACC_10K, FY20, 100)],
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+        }
+    )
+    with_later = _payload_rows(
+        {
+            "RevenuesNetOfInterestExpense": [_cf_entry(ACC_10K, FY20, 100)],
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+            "Revenues": [_cf_entry(ACC_LATER, FY20, 999)],
+        },
+        STAMPS_LATER,
+    )
+    assert only_at1["revenue_financial"]["value"] == 100
+    assert with_later["revenue_financial"]["value"] == 100
+    assert with_later["revenue_financial"]["filing_accession"] == ACC_10K
+    assert with_later["revenue"]["value"] == 999
+
+
+def test_a_later_revenue_tag_for_another_period_never_erases_the_sum() -> None:
+    """#1556 regression (quant-auditor case (b)): the derived sum for F1's
+    period is the same with or without a later filing that reports a classic
+    `revenue` for a different period (truncation at AT1 changes nothing). A
+    whole-history "this CIK reports revenue" gate on the sum fails this."""
+    only_at1, _ = _rows([*_bank_components(F1, AT1)])
+    with_later, _ = _rows(
+        [*_bank_components(F1, AT1), _sf("revenue", 120, F2, AT2, period=FY17, comparative=True)]
+    )
+    assert only_at1[("revenue_financial", FY18[1])]["value"] == 100
+    assert with_later[("revenue_financial", FY18[1])] == only_at1[("revenue_financial", FY18[1])]
+    assert with_later[("revenue", FY17[1])]["value"] == 120
+
+
+def test_a_two_run_store_keeps_gross_profit() -> None:
+    """#1556 regression (quant-auditor): a store built run by run must match a
+    one-pass build. Run 1 stores the derived `revenue_financial`; run 2 sees a
+    later classic `revenue` and `cost_of_revenue` and must still derive the
+    same `gross_profit` (50), not lose it to the financial fact."""
+    run1, _ = _rows([*_bank_components(F1, AT1)])
+    stored = {
+        (row["fact_name"], row["period_end"], row["period_days"]): StatementVintage(
+            row["known_at"], row["value"], row["filing_accession"]
+        )
+        for row in run1.values()
+    }
+    run2, _ = _rows(
+        [
+            *_bank_components(F1, AT1),
+            _sf("revenue", 120, F2, AT2, comparative=True),
+            _sf("cost_of_revenue", 70, F2, AT2, comparative=True),
+        ],
+        stored,
+    )
+    assert run2[("revenue", FY18[1])]["value"] == 120
+    assert run2[("gross_profit", FY18[1])]["value"] == 50
+    # The FY18 financial fact is unchanged: still run 1's, not re-emitted.
+    fin = run1[("revenue_financial", FY18[1])]
+    assert stored[("revenue_financial", fin["period_end"], fin["period_days"])].value == 100
+    assert ("revenue_financial", FY18[1]) not in run2
+
+
+#: The financial-revenue payload fixtures: companyfacts payloads parsed with
+#: the real `edgar.statement_tags` config and run through the ingest's
+#: first-vintage pass, as the adapter and `_ingest_filings` do.
+_PAYLOAD_TAGS = Settings(_env_file=None).edgar.statement_tags
+_PAYLOAD_FORMS = Settings(_env_file=None).edgar.statement_forms
+_PAYLOAD_UNITS = Settings(_env_file=None).edgar.statement_units
+ACC_10K = f"{ACME}-21-000001"
+ACC_LATER = f"{ACME}-21-000002"
+ACCEPTED = datetime(2021, 2, 26, 21, 30, tzinfo=UTC)
+ACCEPTED_LATER = datetime(2021, 5, 1, 21, 30, tzinfo=UTC)
+INGESTED = datetime(2021, 6, 1, 20, 0, tzinfo=UTC)
+FY20 = ("2020-01-01", "2020-12-31")
+
+
+@dataclass(frozen=True)
+class _Stamp:
+    form: str
+    accepted_at: datetime
+
+
+STAMPS = {ACC_10K: _Stamp("10-K", ACCEPTED)}
+STAMPS_LATER = {
+    ACC_10K: _Stamp("10-K", ACCEPTED),
+    ACC_LATER: _Stamp("10-Q", ACCEPTED_LATER),
+}
+
+
+def _cf_entry(
+    accn: str,
+    period: tuple[str, str] | str,
+    value: float,
+    *,
+    form: str = "10-K",
+    filed: str = "2021-02-26",
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "val": value,
+        "accn": accn,
+        "fy": 2020,
+        "fp": "FY",
+        "form": form,
+        "filed": filed,
+    }
+    if isinstance(period, tuple):
+        row["start"], row["end"] = period
+    else:
+        row["end"] = period
+    return row
+
+
+def _payload_rows(
+    facts: dict[str, list[dict[str, Any]]], stamps: dict[str, _Stamp] | None = None
+) -> dict[str, Any]:
+    payload = {
+        "cik": int(ACME),
+        "facts": {"us-gaap": {tag: {"units": {"USD": entries}} for tag, entries in facts.items()}},
+    }
+    parsed = parse_statement_facts(
+        payload, _PAYLOAD_TAGS, _PAYLOAD_FORMS, _PAYLOAD_UNITS, STAMPS if stamps is None else stamps
+    )
+    rows, _ = statement_fact_rows(parsed.records, {}, set(), ingested_at=INGESTED)
+    return {r["fact_name"]: r for r in rows}
+
+
+def test_a_goldman_like_payload_reports_revenues_net_of_interest_expense() -> None:
+    """Goldman tags `RevenuesNetOfInterestExpense`; the reported concept wins
+    over the constituents it also tags."""
+    rows = _payload_rows(
+        {
+            "RevenuesNetOfInterestExpense": [_cf_entry(ACC_10K, FY20, 105)],
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert rows["revenue_financial"]["value"] == 105
+    assert (rows["revenue_financial"]["basis"], rows["revenue_financial"]["xbrl_tag"]) == (
+        "reported",
+        "us-gaap:RevenuesNetOfInterestExpense",
+    )
+    assert "revenue" not in rows
+
+
+def test_a_regional_bank_like_payload_derives_revenue_from_its_constituents() -> None:
+    """Regions, Valley National and BOK tag no revenue concept at all; the
+    sum of net interest income and noninterest income is the revenue."""
+    rows = _payload_rows(
+        {
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert rows["revenue_financial"]["value"] == 100
+    assert (rows["revenue_financial"]["basis"], rows["revenue_financial"]["xbrl_tag"]) == (
+        "derived",
+        "us-gaap:InterestIncomeExpenseNet+us-gaap:NoninterestIncome",
+    )
+
+
+def test_an_industrial_payload_keeps_its_reported_revenue() -> None:
+    """The guard: an issuer tagging `us-gaap:Revenues` (and cost of revenue)
+    is untouched — its `revenue` and `gross_profit` are main's, and it gains
+    no financial fact."""
+    rows = _payload_rows(
+        {
+            "Revenues": [_cf_entry(ACC_10K, FY20, 100)],
+            "CostOfRevenue": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert (rows["revenue"]["value"], rows["revenue"]["xbrl_tag"]) == (100, "us-gaap:Revenues")
+    assert rows["gross_profit"]["value"] == 40
+    assert "revenue_financial" not in rows
+    assert "net_interest_income" not in rows and "noninterest_income" not in rows
 
 
 # --- statement facts through the EDGAR chunk ---------------------------------
