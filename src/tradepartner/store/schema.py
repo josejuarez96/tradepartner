@@ -374,7 +374,28 @@ registry; #83 took version 2 first, so the registry is version 3):
   read, which fails on the missing table (the per-table loops skip an
   absent table), and the next writable `init_schema` call migrates the
   store.
-- **A later DDL change goes to version 24**, with its own migration and a
+- **Version 24** (#1506, data-foundation plan T171; the spec's "Amendment
+  2026-10-11 (#1506)", ADR 0021): adds `borrow_status` (one row per Alpaca
+  `us_equity` asset per *change* of its tradability and borrow flags, from
+  one unfiltered `GET /v2/assets` a day; `known_at` = the fetch time).
+  Purely additive, like versions 21 and 23: the migration from any earlier
+  migratable version just creates the table (`init_schema`'s DDL pass,
+  `_BORROW_STATUS_TABLE_DDL`) and appends a version-24 row; no existing
+  table or row changes. UNIQUE `(asset_id, known_at)`: `asset_id` is
+  Alpaca's asset UUID, and a symbol may belong to more than one asset, so
+  the id is the key. `present` is TRUE on every row written from a payload
+  and FALSE on the one row written when an asset the store has is missing
+  from a snapshot (its other columns carried from its last row);
+  `borrow_status` is the payload's string verbatim, `''` when the field is
+  absent, never NULL. The table joins `TABLE_NAMES` and
+  `TABLE_PROVENANCE_VALUES` (`snapshot` only), so the look-ahead harness
+  truncates it and `health`'s common-column rules cover it; T171b takes it
+  out of `registry.data_vintage`. Nothing writes it before T171c. A
+  read-only connection accepts a version-23 store: every read works but a
+  `borrow_status` read, which fails on the missing table (the per-table
+  loops skip an absent table), and the next writable `init_schema` call
+  migrates the store.
+- **A later DDL change goes to version 25**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -478,6 +499,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "statement_facts": ("filing",),
     "filing_events": ("filing",),
     "rates": ("release",),
+    "borrow_status": ("snapshot",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -605,9 +627,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 23 (#1498, data-foundation plan T169): the `rates` table, created by the
 #:   DDL pass (`_RATES_TABLE_DDL`); no existing table changes (module
 #:   docstring, "Schema versions").
-#: - A later DDL change goes to version 24, with its own migration and a
+#: - 24 (#1506, data-foundation plan T171): the `borrow_status` table, created
+#:   by the DDL pass (`_BORROW_STATUS_TABLE_DDL`); no existing table changes
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 25, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 23
+CURRENT_SCHEMA_VERSION = 24
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -707,6 +732,11 @@ _PRE_OPERATIONS_BOOK_VERSION = 21
 #: connections serve every other read; a `rates` read there fails on the
 #: missing table, as a `filing_events` read did at version 20.
 _PRE_RATES_VERSION = 22
+
+#: The last version without `borrow_status` (#1506, T171, version 24):
+#: read-only connections serve every other read; a `borrow_status` read there
+#: fails on the missing table, as a `rates` read did at version 22.
+_PRE_BORROW_STATUS_VERSION = 23
 
 
 class SchemaVersionError(RuntimeError):
@@ -964,6 +994,41 @@ CREATE TABLE IF NOT EXISTS rates (
 )
 """
 
+# Borrow status (amendment 2026-10-11, #1506, ADR 0021; spec "Data /
+# interfaces" > Amendment 2026-10-11 (#1506)"). One row per Alpaca
+# `us_equity` asset per *change* of its tradability and borrow flags, from
+# one unfiltered `GET /v2/assets` a day. `asset_id` is Alpaca's asset UUID:
+# a symbol may belong to more than one `us_equity` asset, so the id, never
+# the symbol, is the key (the recorder's first file: 252 symbols with more
+# than one asset). `symbol`, `exchange` and `status` are the payload's
+# strings verbatim; the five flags are booleans; `borrow_status` is the
+# payload's string verbatim and the empty string when the field is absent,
+# never NULL. `present` is TRUE on every row written from a payload and
+# FALSE on the one row written when an asset the store has is missing from
+# a snapshot (its other columns carried from its last row), and a
+# reappearance is a normal row. `known_at` is the fetch time
+# (`adapters.borrow`, ADR 0021 point 2). UNIQUE (asset_id, known_at): a
+# change, a rename, an absence and a return are each one row with its own
+# fetch time. No `security_id` column: the asset's symbol maps to a
+# security through the store resolver at that session, as action rows do.
+_CREATE_BORROW_STATUS = f"""
+CREATE TABLE IF NOT EXISTS borrow_status (
+    asset_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
+    exchange VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    tradable BOOLEAN NOT NULL,
+    marginable BOOLEAN NOT NULL,
+    shortable BOOLEAN NOT NULL,
+    easy_to_borrow BOOLEAN NOT NULL,
+    borrow_status VARCHAR NOT NULL,
+    fractionable BOOLEAN NOT NULL,
+    present BOOLEAN NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["borrow_status"])},
+    UNIQUE (asset_id, known_at)
+)
+"""
+
 # Not a fact table (spec "Data / interfaces" > Tables): no known_at,
 # ingested_at, source or provenance columns, and no per-fact provenance
 # concept applies to an ingest job's own status row.
@@ -1002,6 +1067,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "statement_facts",
     "filing_events",
     "rates",
+    "borrow_status",
     "ingestion_runs",
     "schema_version",
 )
@@ -1045,6 +1111,12 @@ _FILING_EVENTS_TABLE_DDL: tuple[str, ...] = (_CREATE_FILING_EVENTS,)
 #: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
 #: schema version with its own migration.
 _RATES_TABLE_DDL: tuple[str, ...] = (_CREATE_RATES,)
+
+#: `borrow_status` (#1506, T171), added at version 24: its own tuple, as
+#: `_FILING_EVENTS_TABLE_DDL` and `_RATES_TABLE_DDL` are, so no earlier pin
+#: moves. Pinned by hash in `tests/store/test_schema.py`; a later edit of
+#: this DDL goes to the next schema version with its own migration.
+_BORROW_STATUS_TABLE_DDL: tuple[str, ...] = (_CREATE_BORROW_STATUS,)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -2451,6 +2523,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_EVENTS_VERSION,
         _PRE_OPERATIONS_BOOK_VERSION,
         _PRE_RATES_VERSION,
+        _PRE_BORROW_STATUS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2473,7 +2546,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `alerts.book_id`), which only the writing `Alerter` calls; version 19
         # every read (no shakedown row can exist there); version 20 every read
         # but `filing_events`; version 21 every read (no operations row can exist);
-        # version 22 every read but `rates`.
+        # version 22 every read but `rates`; version 23 every read but
+        # `borrow_status`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3089,7 +3163,7 @@ def _migrate_operations_kinds(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 22 store to version 23.
+    version-2 to 23 store to version 24.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3101,7 +3175,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
-    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets `rates`
+    `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `borrow_status` created where it lacks it (purely additive; a version-23
+    store gets a version-24 row; #1506, T171); every store gets `rates`
     created where it lacks it (purely additive; a version-22 store gets a
     version-23 row; #1498, T169); every store gets
     `owner_decisions.kind` widened with `operations_book` (every row kept), and a
@@ -3158,7 +3234,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-23, 22 (every read but
+    On a read-only connection no DDL runs: a version-24, 23 (every read but
+    `borrow_status`, missing there), 22 (every read but
     `rates`, missing there), 21, 20 (every read but
     `filing_events`, missing there), 19, 18 (every read but
     `journal.alerts_for`, which only a writer calls) or 17 store passes, and a
@@ -3213,6 +3290,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FILING_EVENTS_VERSION,
         _PRE_OPERATIONS_BOOK_VERSION,
         _PRE_RATES_VERSION,
+        _PRE_BORROW_STATUS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3251,6 +3329,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _REBALANCE_COUNTS_TABLE_DDL
             + _FILING_EVENTS_TABLE_DDL
             + _RATES_TABLE_DDL
+            + _BORROW_STATUS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

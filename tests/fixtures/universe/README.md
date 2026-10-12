@@ -88,3 +88,16 @@ A generated `DTB3`-shaped daily series (`rates.csv`), never recorded from FRED (
 | (d) Bank-holiday gap of two business days | none on 2018-10-08 or 2018-10-09 | 2018-10-05 served 2018-10-09 | Columbus Day (a session, a bank holiday) and the day after; 2018-10-05's value is stamped 2018-10-10T20:00:00+00:00 |
 | (e) Revision | 2019-03-12 | 2019-03-13 and 2019-03-20 | 2.25 stamped 2019-03-14T20:00:00+00:00, then 2.27 stamped 2019-03-21T20:00:00+00:00 |
 | (f) Vintage dated a Saturday | 2018-06-15 | 2018-06-16 | stamped at Monday's close, 2018-06-18T20:00:00+00:00 |
+
+## Borrow status (#1506)
+
+Three snapshots a day apart (`borrow_status.csv`) — the fixture's last three sessions, each fetched an hour after that session's close — over six assets, one per case, for T171b-T171e authors. Rows record change only: `known_at` is the fetch time, `ingested_at` = `known_at` + 10 min, `source = alpaca`, `provenance = snapshot`. The six cases are the spec's "Fixture" paragraph, and `tests/test_fixture_universe.py` recomputes the diff that produced them.
+
+| Case | asset_id / symbol | Notes |
+|---|---|---|
+| (a) Unchanged | BNDX | one row, at 2020-06-26T21:00:00+00:00; the second and third snapshots write nothing |
+| (b) ETB to HTB | SPLT | easy_to_borrow TRUE at 2020-06-26T21:00:00+00:00, FALSE and hard_to_borrow from 2020-06-29T21:00:00+00:00 on |
+| (c) Vanished | DUALA | present at 2020-06-26T21:00:00+00:00, and its `present = FALSE` row at 2020-06-29T21:00:00+00:00 carrying its last values; absent from the third, which writes nothing more |
+| (d) New | TRNS | first seen at 2020-06-29T21:00:00+00:00; no row at 2020-06-26T21:00:00+00:00 and none at 2020-06-30T21:00:00+00:00 (unchanged) |
+| (e) Renamed | TCKA to TCKB | one row per symbol, at 2020-06-26T21:00:00+00:00 and 2020-06-29T21:00:00+00:00; the same `asset_id` throughout |
+| (f) Vanished then reappeared | RDAT | present at 2020-06-26T21:00:00+00:00, `present = FALSE` at 2020-06-29T21:00:00+00:00, back with its old values at 2020-06-30T21:00:00+00:00 |

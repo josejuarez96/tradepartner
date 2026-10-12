@@ -4,10 +4,10 @@ Writes one CSV per store fact table into `tests/fixtures/universe/` (or an
 override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
-`statement_facts.csv`, `filing_events.csv` (#1358), `rates.csv` (#1498), plus
-`README.md` mapping every spec req 13 case, every statement-facts case (#660),
-every filing-events case (#1358) and every rates case (#1498), to the rows that
-exercise it.
+`statement_facts.csv`, `filing_events.csv` (#1358), `rates.csv` (#1498),
+`borrow_status.csv` (#1506), plus `README.md` mapping every spec req 13 case,
+every statement-facts case (#660), every filing-events case (#1358), every rates
+case (#1498) and every borrow-status case (#1506), to the rows that exercise it.
 
 `statement_facts.csv` rows are **DB-table-level** rows, like every other
 CSV here (as if the as-yet-unbuilt T77/T77a/T77b parser and ingest had
@@ -85,6 +85,36 @@ _SOURCE_FRED = "fred"
 
 #: The rates fixture's one series (#1498): DTB3-shaped, generated, never recorded.
 RATES_SERIES = "DTB3"
+
+#: The borrow-status fixture (#1506, plan T171): Alpaca-shaped asset ids (UUIDs,
+#: never recorded: ADR 0021 point 6 — history starts at the first recording, so
+#: these are the store's own synthetic first three snapshots), the symbols of
+#: fixture securities the resolver can map, and the three fetch times.
+_BORROW_ASSET_IDS: dict[str, str] = {
+    "unchanged": "b0rr0w00-0000-4b0d-8000-000000000001",
+    "flipped": "b0rr0w00-0000-4b0d-8000-000000000002",
+    "vanished": "b0rr0w00-0000-4b0d-8000-000000000003",
+    "new": "b0rr0w00-0000-4b0d-8000-000000000004",
+    "renamed": "b0rr0w00-0000-4b0d-8000-000000000005",
+    "reappeared": "b0rr0w00-0000-4b0d-8000-000000000006",
+}
+#: One fixture symbol per case (the table stores no `security_id`). Not every
+#: one resolves to a fixture security at the fetch day's session (BNDX and TCKA
+#: do not in 2020); T171b's read returns the rows by symbol whether or not they
+#: resolve.
+_BORROW_SYMBOLS: dict[str, str] = {
+    "unchanged": "BNDX",
+    "flipped": "SPLT",
+    "vanished": "DUALA",
+    "new": "TRNS",
+    "renamed": "TCKA",
+    "reappeared": "RDAT",
+}
+#: The renamed asset's symbol after the rename (the fixture's ticker-change
+#: case's new ticker).
+_BORROW_RENAMED_TO = "TCKB"
+#: The ingest delay after the fetch time, as every other fixture table's.
+_BORROW_INGESTED_DELAY = timedelta(minutes=10)
 
 # A single shared bar-history start for every security whose case needs to
 # demonstrate passing universe rule 6 (min_history_months) and/or rule 7
@@ -224,6 +254,23 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "borrow_status": (
+        "asset_id",
+        "symbol",
+        "exchange",
+        "status",
+        "tradable",
+        "marginable",
+        "shortable",
+        "easy_to_borrow",
+        "borrow_status",
+        "fractionable",
+        "present",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
 }
 
 
@@ -336,10 +383,12 @@ class Rows:
     statement_facts: list[dict[str, object]] = field(default_factory=list)
     filing_events: list[dict[str, object]] = field(default_factory=list)
     rates: list[dict[str, object]] = field(default_factory=list)
+    borrow_status: list[dict[str, object]] = field(default_factory=list)
     readme_cases: list[dict[str, str]] = field(default_factory=list)
     statement_readme_cases: list[dict[str, str]] = field(default_factory=list)
     filing_event_readme_cases: list[dict[str, str]] = field(default_factory=list)
     rate_readme_cases: list[dict[str, str]] = field(default_factory=list)
+    borrow_readme_cases: list[dict[str, str]] = field(default_factory=list)
 
     def security(
         self,
@@ -734,6 +783,45 @@ class Rows:
         self.rate_readme_cases.append(
             {"case": case, "observation_date": observation_date, "vintage": vintage, "notes": notes}
         )
+
+    def borrow(
+        self,
+        case: str,
+        *,
+        symbol: str,
+        fetched_at: datetime,
+        present: bool = True,
+        shortable: bool = True,
+        easy_to_borrow: bool = True,
+        borrow_status: str = "easy_to_borrow",
+        ingested_delay: timedelta = _BORROW_INGESTED_DELAY,
+    ) -> None:
+        """One `borrow_status` row (#1506, plan T171): `known_at` is the fetch
+        time itself (ADR 0021 point 2 — never the request start, never a date,
+        never back-dated), `ingested_at` is the ingest's own clock read after
+        the response, and `provenance = snapshot`."""
+        self.borrow_status.append(
+            {
+                "asset_id": _BORROW_ASSET_IDS[case],
+                "symbol": symbol,
+                "exchange": "NYSE",
+                "status": "active",
+                "tradable": True,
+                "marginable": True,
+                "shortable": shortable,
+                "easy_to_borrow": easy_to_borrow,
+                "borrow_status": borrow_status,
+                "fractionable": True,
+                "present": present,
+                "known_at": fetched_at,
+                "ingested_at": fetched_at + ingested_delay,
+                "source": _SOURCE_ALPACA,
+                "provenance": "snapshot",
+            }
+        )
+
+    def borrow_case(self, case: str, symbol: str, notes: str) -> None:
+        self.borrow_readme_cases.append({"case": case, "symbol": symbol, "notes": notes})
 
 
 # ---------------------------------------------------------------------------
@@ -2438,6 +2526,102 @@ def _rates(rows: Rows) -> None:
         rows.rate_case(case, obs, vintage, notes)
 
 
+def _borrow_status(rows: Rows) -> None:
+    """The `borrow_status` fixture (#1506, plan T171): three snapshots a day
+    apart — the last three fixture sessions, each fetched an hour after that
+    session's close — over six assets, one per case of the spec's "Fixture"
+    paragraph:
+
+    (a) unchanged: identical in all three snapshots, so only the first writes
+        a row;
+    (b) ETB to HTB: `easy_to_borrow` flips between the first and the second
+        snapshot and stays flipped;
+    (c) vanished: present in the first snapshot, absent from the second,
+        which writes its `present = FALSE` row carrying its last values;
+    (d) new: absent from the first, first seen at the second;
+    (e) renamed: the payload's symbol changes between the first and the
+        second snapshot;
+    (f) vanished then reappeared with its old values, which writes its
+        reappearance row because `present` is in the compared tuple.
+
+    The rows are DB-table-level, as every other CSV here: `known_at` is the
+    fetch time (ADR 0021 point 2) and the diff that would have produced them
+    is recomputed independently in `tests/test_fixture_universe.py`.
+    """
+    sessions = [nth_session_before(_FIXTURE_END, 2), previous_session(_FIXTURE_END), _FIXTURE_END]
+    if len({*sessions}) != 3:
+        raise AssertionError(f"expected three distinct sessions, got {sessions}")
+    first, second, third = (session_close(s) + timedelta(hours=1) for s in sessions)
+    for fetched_at in (first, second, third):
+        if not fetched_at > session_close(fetched_at.date()):
+            raise AssertionError(f"{fetched_at} is not after its own session's close")
+    # The first snapshot: one row per asset (every one of them is new).
+    for case in ("unchanged", "flipped", "vanished", "renamed", "reappeared"):
+        rows.borrow(case, symbol=_BORROW_SYMBOLS[case], fetched_at=first)
+    # The second snapshot: the flip, the rename and the new asset, plus one
+    # `present = FALSE` row for each of the two assets the list lacks.
+    rows.borrow(
+        "flipped",
+        symbol=_BORROW_SYMBOLS["flipped"],
+        fetched_at=second,
+        shortable=True,
+        easy_to_borrow=False,
+        borrow_status="hard_to_borrow",
+    )
+    rows.borrow("renamed", symbol=_BORROW_RENAMED_TO, fetched_at=second)
+    rows.borrow("new", symbol=_BORROW_SYMBOLS["new"], fetched_at=second)
+    rows.borrow("vanished", symbol=_BORROW_SYMBOLS["vanished"], fetched_at=second, present=False)
+    rows.borrow(
+        "reappeared", symbol=_BORROW_SYMBOLS["reappeared"], fetched_at=second, present=False
+    )
+    # The third snapshot: only the reappeared asset earns a row. The flipped,
+    # renamed and new assets are unchanged from the second snapshot, the
+    # unchanged asset never changed, and the vanished asset is still absent
+    # (a stored `present = FALSE` row is unchanged by a snapshot that lacks
+    # the asset).
+    rows.borrow("reappeared", symbol=_BORROW_SYMBOLS["reappeared"], fetched_at=third)
+
+    for case, symbol, notes in (
+        (
+            "(a) Unchanged",
+            _BORROW_SYMBOLS["unchanged"],
+            f"one row, at {first.isoformat()}; the second and third snapshots write nothing",
+        ),
+        (
+            "(b) ETB to HTB",
+            _BORROW_SYMBOLS["flipped"],
+            f"easy_to_borrow TRUE at {first.isoformat()}, FALSE and "
+            f"hard_to_borrow from {second.isoformat()} on",
+        ),
+        (
+            "(c) Vanished",
+            _BORROW_SYMBOLS["vanished"],
+            f"present at {first.isoformat()}, and its `present = FALSE` row at "
+            f"{second.isoformat()} carrying its last values; absent from the third, "
+            "which writes nothing more",
+        ),
+        (
+            "(d) New",
+            _BORROW_SYMBOLS["new"],
+            f"first seen at {second.isoformat()}; no row at {first.isoformat()} and none "
+            f"at {third.isoformat()} (unchanged)",
+        ),
+        (
+            "(e) Renamed",
+            f"{_BORROW_SYMBOLS['renamed']} to {_BORROW_RENAMED_TO}",
+            f"one row per symbol, at {first.isoformat()} and "
+            f"{second.isoformat()}; the same `asset_id` throughout",
+        ),
+        (
+            "(f) Vanished then reappeared",
+            _BORROW_SYMBOLS["reappeared"],
+            f"present at {first.isoformat()}, `present = FALSE` at "
+            f"{second.isoformat()}, back with its old values at {third.isoformat()}",
+        ),
+    ):
+        rows.borrow_case(case, symbol, notes)
+
+
 def _format_cell(value: object) -> str:
     if value is None:
         return ""
@@ -2468,6 +2652,7 @@ def _write_readme(
     statement_cases: list[dict[str, str]],
     filing_event_cases: list[dict[str, str]],
     rate_cases: list[dict[str, str]],
+    borrow_cases: list[dict[str, str]],
 ) -> None:
     ordered = sorted(cases, key=lambda c: c["case"])
     statement_ordered = sorted(statement_cases, key=lambda c: c["case"])
@@ -2572,6 +2757,25 @@ def _write_readme(
     )
     for c in rate_cases:
         lines.append(f"| {c['case']} | {c['observation_date']} | {c['vintage']} | {c['notes']} |")
+    lines.extend(
+        [
+            "",
+            "## Borrow status (#1506)",
+            "",
+            "Three snapshots a day apart (`borrow_status.csv`) — the fixture's last "
+            "three sessions, each fetched an hour after that session's close — over six "
+            "assets, one per case, for T171b-T171e authors. Rows record change only: "
+            "`known_at` is the fetch time, `ingested_at` = `known_at` + 10 min, "
+            "`source = alpaca`, `provenance = snapshot`. The six cases are the spec's "
+            '"Fixture" paragraph, and `tests/test_fixture_universe.py` recomputes the '
+            "diff that produced them.",
+            "",
+            "| Case | asset_id / symbol | Notes |",
+            "|---|---|---|",
+        ]
+    )
+    for c in borrow_cases:
+        lines.append(f"| {c['case']} | {c['symbol']} | {c['notes']} |")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -2608,6 +2812,7 @@ def build_rows() -> Rows:
     _statement_facts_profitability(rows)
     _filing_events(rows)
     _rates(rows)
+    _borrow_status(rows)
     return rows
 
 
@@ -2671,12 +2876,19 @@ def write_fixtures(output_dir: Path) -> None:
         rows.rates,
         ("series", "observation_date", "known_at"),
     )
+    _write_csv(
+        output_dir / "borrow_status.csv",
+        "borrow_status",
+        rows.borrow_status,
+        ("asset_id", "known_at"),
+    )
     _write_readme(
         output_dir / "README.md",
         rows.readme_cases,
         rows.statement_readme_cases,
         rows.filing_event_readme_cases,
         rows.rate_readme_cases,
+        rows.borrow_readme_cases,
     )
 
 

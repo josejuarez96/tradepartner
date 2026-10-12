@@ -543,8 +543,9 @@ def version_4_store(path: Path) -> Path:
     included, so the table must exist for that call to succeed — the same
     simplification this function already makes for every other fact
     table's shape. `schema._FILING_EVENTS_TABLE_DDL` (version 21, #1358) is
-    there for the same reason (`filing_events.csv`), and so is
-    `schema._RATES_TABLE_DDL` (version 23, #1498; `rates.csv`)."""
+    there for the same reason (`filing_events.csv`), as are
+    `schema._RATES_TABLE_DDL` (version 23, #1498; `rates.csv`) and
+    `schema._BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -554,6 +555,7 @@ def version_4_store(path: Path) -> Path:
             + schema._STATEMENT_FACTS_TABLE_DDL
             + schema._FILING_EVENTS_TABLE_DDL
             + schema._RATES_TABLE_DDL
+            + schema._BORROW_STATUS_TABLE_DDL
         ):
             conn.execute(ddl)
         conn.execute(

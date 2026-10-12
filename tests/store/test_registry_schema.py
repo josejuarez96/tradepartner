@@ -102,13 +102,15 @@ def _make_old_store(path: Path, version: int) -> None:
         # loads every fixture CSV generically, `statement_facts.csv`
         # included, so the table must exist for that call to succeed —
         # the same simplification `conftest.version_4_store` makes, as is
-        # `_FILING_EVENTS_TABLE_DDL` (version 21, #1358; `filing_events.csv`) and
-        # `_RATES_TABLE_DDL` (version 23, #1498; `rates.csv`).
+        # `_FILING_EVENTS_TABLE_DDL` (version 21, #1358; `filing_events.csv`),
+        # `_RATES_TABLE_DDL` (version 23, #1498; `rates.csv`) and
+        # `_BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`).
         for ddl in (
             schema._TABLE_DDL
             + schema._STATEMENT_FACTS_TABLE_DDL
             + schema._FILING_EVENTS_TABLE_DDL
             + schema._RATES_TABLE_DDL
+            + schema._BORROW_STATUS_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:
@@ -220,11 +222,11 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) & set(schema.TABLE_NAMES) == set()
 
 
-def test_current_schema_version_is_23() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 23
+def test_current_schema_version_is_24() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 24
 
 
-def test_fresh_init_creates_every_table_at_version_23() -> None:
+def test_fresh_init_creates_every_table_at_version_24() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     assert _table_names(conn) == (
@@ -235,14 +237,14 @@ def test_fresh_init_creates_every_table_at_version_23() -> None:
         | set(schema.RESEARCH_TABLE_NAMES)
         | {schema.REBALANCE_COUNTS_TABLE_NAME}
     )
-    assert [version for version, _ in _versions(conn)] == [23]
+    assert [version for version, _ in _versions(conn)] == [24]
 
 
 def test_fresh_init_twice_keeps_one_version_row() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     schema.init_schema(conn)
-    assert [version for version, _ in _versions(conn)] == [23]
+    assert [version for version, _ in _versions(conn)] == [24]
 
 
 def test_registry_tables_carry_no_fact_columns() -> None:
@@ -262,7 +264,7 @@ def test_registry_tables_carry_no_fact_columns() -> None:
         assert columns.isdisjoint({"known_at", "ingested_at", "provenance"}), table
 
 
-def test_write_open_of_version_2_store_migrates_to_version_23(version_2_store: Path) -> None:
+def test_write_open_of_version_2_store_migrates_to_version_24(version_2_store: Path) -> None:
     conn = duckdb.connect(str(version_2_store))
     try:
         assert _table_names(conn).isdisjoint(_PHASE3_REGISTRY)
@@ -294,13 +296,14 @@ def test_write_open_of_version_2_store_migrates_to_version_23(version_2_store: P
         21,
         22,
         23,
+        24,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
     assert versions[3][1] == versions[2][1] == versions[1][1]
 
 
-def test_write_open_of_version_3_store_migrates_to_version_23(version_3_store: Path) -> None:
+def test_write_open_of_version_3_store_migrates_to_version_24(version_3_store: Path) -> None:
     conn = duckdb.connect(str(version_3_store))
     try:
         # Version 12 (#926) adds `trial_results.n_research`; version 13
@@ -343,6 +346,7 @@ def test_write_open_of_version_3_store_migrates_to_version_23(version_3_store: P
         21,
         22,
         23,
+        24,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
@@ -504,7 +508,7 @@ def test_read_only_open_of_version_21_store_passes(tmp_path: Path) -> None:
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == [23]
+        assert [version for version, _ in _versions(conn)] == [24]
     finally:
         conn.close()
 
@@ -749,7 +753,7 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         )
         assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
         assert conn.execute("SELECT development_boundary FROM trials").fetchall() == [(None,)]
-        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23]
+        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24]
         for decision_id, kind in enumerate(lab_schema.RELEASE_DECISION_KINDS, start=10):
             conn.execute(
                 "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -770,7 +774,7 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         rows, check = _every_row(conn), _kind_check(conn)
         schema.init_schema(conn)
         assert (_every_row(conn), _kind_check(conn)) == (rows, check)
-        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23]
+        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24]
 
 
 def test_a_failed_version_18_migration_leaves_the_store_at_17(
