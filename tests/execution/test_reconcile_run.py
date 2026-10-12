@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -30,6 +31,8 @@ from tradepartner.execution.reconcile import (
 from tradepartner.execution.reconcile_run import (
     _NEW_YORK,
     NoWindowError,
+    _journal_state,
+    _ledger,
     command_session,
     explanations_as_of,
     frozen_risk,
@@ -1531,13 +1534,16 @@ def test_a_booked_fee_is_not_rebooked_when_the_base_is_older_than_the_booking(
     fixed_clock: FixedClock,
 ) -> None:
     """(f) A booked id is never re-booked even when `base(through)` picks an `ok`
-    row older than the booking (the journaled `broker_activity_id` is seen)."""
+    row older than the booking and the booking is the only guard: the base's
+    recorded set names a different id, so the journaled `broker_activity_id`
+    alone keeps the booked fee from counting twice (it is what mutation M3, dropping
+    the booked-id set, would break)."""
     _ok_base(
         journal_settings,
         open_window,
         at=session_close(_day_before(S)),
         broker_cash=100_000.0,
-        activity_ids=("f1",),
+        activity_ids=("other",),  # the base recorded a different id; only the booking knows f1
     )
     _journal_fee(
         journal_settings, open_window, "f1", S, -0.02, at=fixed_clock() - timedelta(minutes=5)
@@ -1832,6 +1838,29 @@ def test_a_superseded_fill_is_hidden_and_not_counted_in_fills_since_base(
     assert ledger.fills_since_base == 1  # the superseded row was never counted
 
 
+def test_cash_within_the_open_allowances_carries_the_decimal_difference(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """S-NIT1: the `cash within the open allowances` record carries the Decimal-derived
+    difference; reverting to the pre-fee float gap leaves residue at a six-figure
+    balance (100000.10 vs 100000.00 -> 0.1, never 0.09999999999404023)."""
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-pend", MTUM, "MTUM", 3.0, events=("pending",), fill=False)
+    fake.submit(OrderRequest("tp-pend", "MTUM", Side.BUY, quantity=3.0))
+    fake.extra_cash = -0.1  # a $0.10 gap inside the open allowance, at a six-figure balance
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+    by_reason = {a.reason: a.difference for a in result.allowed}
+    assert "cash within the open allowances" in by_reason
+    assert (
+        by_reason["cash within the open allowances"] == -0.1
+    )  # Decimal-derived, not the float residue
+
+
 # --- the window-1 case to item 6's letter (Q5, S3) ----------------------------
 
 
@@ -1901,6 +1930,18 @@ def test_window_1_resume_books_its_two_start_date_fees_under_the_fallback(
     again = _reconcile(journal_settings, fake, window, fixed_clock)
     assert again.status == OK and again.adjustments == ()
     assert len(_adjustments(journal_settings, window)) == 2
+    # the second-read ledger is 100008.88 exactly: the reconcile re-based on the ok
+    # row and the two fees it already holds (known at that base) are not re-applied
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, window.window_id, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, fixed_clock()),
+            window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert Decimal(repr(ledger.cash)) == Decimal("100008.88")
 
 
 def test_window_1_no_activity_twin_still_halts(
