@@ -1,6 +1,6 @@
 # Hypothesis: H1, long-only 12-1 momentum, monthly
 
-**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only); 2026-10-05 (#975, `in_sample_start` re-pinned to 2020-08-31 for the #974 bar gap; owner decision on #974, 2026-10-05, before registration); 2026-10-05 (#984, Healthpeak 0000765880 named as a disclosed exception to the rule-6 half of the pre-registration check; owner decision (a) on #984, 2026-10-05, before registration)
+**Family:** momentum  ·  **Author:** team emory (agent draft); owner answers by Jose Juarez on #156  ·  **Date:** 2026-09-25  ·  **Amended:** 2026-10-04 (#842, `in_sample_start`; owner decision (b) on #842, before registration; #854, wording only); 2026-10-05 (#975, `in_sample_start` re-pinned to 2020-08-31 for the #974 bar gap; owner decision on #974, 2026-10-05, before registration); 2026-10-05 (#984, Healthpeak 0000765880 named as a disclosed exception to the rule-6 half of the pre-registration check; owner decision (a) on #984, 2026-10-05, before registration); 2026-10-11 (#1541, a "Known data holes" disclosure section; wording only, no frozen value changes)
 
 Merging this file does not register it. The owner runs
 `tradepartner hypothesis register docs/hypotheses/h1-momentum-12-1.md` after merge (spec req
@@ -515,6 +515,30 @@ concentration, and its ten-year windows to mid-2026 turned positive. A holdout s
 confirms this is weak evidence; one that contradicts it is informative about the design
 gap between this portfolio and MTUM's. That is why the holdout counts as a process
 rehearsal for Phase 4 tracking more than a test of an edge.
+
+## Known data holes (disclosure, 2026-10-11, #1541)
+
+Recorded after registration as a disclosure; no frozen value changes.
+
+**Bank-level registrants are absent.** First Republic Bank, Signature Bank and Cadence Bank
+filed their periodic reports with the FDIC or the Federal Reserve, not with EDGAR, so the
+store has no `securities` row for any of them (First Republic's CIK 0001132979 has none;
+the only Cadence row is the old holding company, Cadence Bancorporation, 0001614184): no
+listing, no bars, no delisting. Two of the three 2023 bank failures therefore sit outside
+the universe on every session inside the in-sample window (2020-08-31 to 2023-12-29),
+and the holdout never held them either. SVB Financial Group (0000719739) is an SEC filer
+and is in the store with bars through 2023-03-09 and its 25-NSE row. Only a vendor or a
+hand seed fills the hole (data-foundation spec, amendment 2026-10-11, #1541, item 5); no
+pipeline is planned. Any H1 result read so far, trials 2 and 4 included, is a result on a
+universe that could not have held those names, a survivorship hole that flatters the
+2023 bank rows by their absence.
+
+**Exchange-tagged cover listings were dropped.** Until the `cover-listings-1541` release
+lands (data-foundation plan, T181), the store's universe lacks the large companies whose
+cover pages tag their listing by exchange (IBM, AbbVie, Abbott, 3M, Allstate, Fifth
+Third, Whirlpool, and P&G's common until 2024) for most of 2019 to 2026. Trials 2 and 4
+read that store. After the release every registered trial is stale; whether H1 is
+re-run is the owner's call, recorded on the release's `after` entry.
 
 ## Retirement condition
 

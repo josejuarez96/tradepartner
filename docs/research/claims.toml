@@ -2880,3 +2880,25 @@ source = "docs/specs/data-foundation.md"
 section = "Amendment 2026-10-09 (#1358): filing events, The clock"
 bears_on = ["spec:data-foundation", "hyp:b9-earnings-reaction-drift"]
 note = "Qualifies EP-P12 (the submissions field is still the one to read, but its values are not true UTC for every filing) and SH-12 (its example times are 4 h late). An early stamp is a look-ahead (an after-close 8-K visible at close(T)); a late one moves a pre-open 8-K's day 0 one session later. Follow-up issue #1382; spec open question 11; edgar.filing_events_enabled stays false until it is closed."
+
+[[claim]]
+id = "TP-3"
+statement = "Both cover-page parsers drop every listing in a context dimensioned by dei:EntityListingsExchangeAxis: ANSYS's 10-Q instance carries its title, symbol and exchange only in the context FD2019Q2YTD_dei_EntityListingsExchangeAxis_exch_XNGS and its FSN cache records hold no listing on any 10-K or 10-Q; 3,111 of the 11,421 CIKs with a 2019-or-later cover-page filing in the owner's fsn/v2 cache have no extracted listing; in the store copy taken before restamp-1382a, IBM, AbbVie, Abbott and 3M each have one listing only, snapshot_static known 2026-10-04T02:16:55Z, ANSYS, Allstate, Fifth Third, Whirlpool and US Steel have a securities row and no listing, and P&G's primary id 0000080424 carries the 1.375% Notes due 2025 from 2022-10-19."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Read-only on 2026-10-11: one SEC fetch of the ANSYS 10-Q instance, a scan of the owner's FSN v2 cache, and the store copy taken before restamp-1382a; the 3,111 include registrants with no listed class; how many universe-months the defect costs was sized against vendor rows and stays in the owner's local research library"
+source = "docs/specs/data-foundation.md"
+section = "Amendment 2026-10-11 (#1541): cover-page listings under the exchange axis"
+bears_on = ["spec:data-foundation", "hyp:h1-momentum-12-1", "adr:0006"]
+note = "Why health never saw it: every check compared the store with itself. The fix, its release and a standing coverage check against an outside reference are the data-foundation plan's T178 to T181 (#1541). Every registered trial read a universe without these names."
+
+[[claim]]
+id = "TP-4"
+statement = "First Republic Bank, Signature Bank and Cadence Bank filed their periodic reports with the FDIC or the Federal Reserve, not EDGAR: the store has no securities row for any of them (First Republic's CIK 0001132979 has none; the only Cadence row is the old holding company, Cadence Bancorporation, 0001614184), so two of the three 2023 bank failures are outside the universe on every session; SVB Financial Group (0000719739) is in the store with bars through 2023-03-09 and its 25-NSE row."
+kind = "fact"
+grade = "UNGRADED"
+scope = "Read-only on the store copy taken before restamp-1382a, 2026-10-11; EDGAR cannot fill it, only a vendor or a hand seed"
+source = "docs/hypotheses/h1-momentum-12-1.md"
+section = "Known data holes (disclosure, 2026-10-11, #1541)"
+bears_on = ["hyp:h1-momentum-12-1", "spec:data-foundation"]
+note = "Recorded as a known survivorship hole in H1's write-up (#1541 item 5); no pipeline. Qualifies HO-17 from the other side: the free EDGAR route also misses a class of delisted names, the bank-level registrants."

@@ -1,0 +1,3 @@
+- Cover-page listings (#1541): spec and plan amendment for the exchange-axis parse fix, the title fallback, a standing coverage check and the owner's release (T178-T181); failed-banks hole disclosed on H1 (TP-4)
+### Changed
+- data-foundation spec and plan (#1541): the cover-page parsers' exchange-axis fix, FSN_VERSION 3 and the `cover-listings-1541` release (T178, T181), the title fallback (T179), a standing coverage check in `health` against an outside reference (T180); the ticker-reuse refetch runs inside the release; the failed-banks survivorship hole is recorded on H1's hypothesis file and as claims TP-3 and TP-4
