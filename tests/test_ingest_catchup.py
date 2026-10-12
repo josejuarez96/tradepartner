@@ -11,23 +11,30 @@ never the weekdays, names the sessions.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
 import duckdb
 import pytest
 from test_ingest import (
+    ACME,
+    DUAL,
+    DUAL_B,
     IDS,
     NOW,
     SESSION,
+    SPY,
+    _delisting,
+    _filings,
     _Prices,
     _run,
     _seed_prices,
     _sessions,
 )
 
-from tradepartner.adapters.prices import bar_known_at
+from tradepartner.adapters.prices import Bar, bar_known_at
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import OK, STALE, IngestResult
@@ -154,3 +161,54 @@ def test_a_caught_up_session_brings_its_month_of_actions(
     assert ("bars", tuple(sorted(IDS)), MAY_31, MAY_31) in prices.calls
     assert ("actions", tuple(sorted(IDS)), date(2019, 5, 1), D) in prices.calls
     assert _sessions_stored(read) == {*hole, MAY_31, D}
+
+
+@dataclass
+class _ThinOn(_Prices):
+    """`_Prices` returning, for each session in `thin`, bars of `kept` only."""
+
+    thin: dict[date, frozenset[str]] = field(default_factory=dict)
+
+    def bars(self, security_ids: Sequence[str], start: date, end: date) -> list[Bar]:
+        return [
+            bar
+            for bar in super().bars(security_ids, start, end)
+            if bar.session not in self.thin or bar.security_id in self.thin[bar.session]
+        ]
+
+
+@pytest.mark.parametrize(
+    "kept",
+    [frozenset(), frozenset({SPY}), frozenset({ACME, DUAL, DUAL_B})],
+    ids=["no-bar", "reference-only", "no-reference"],
+)
+def test_a_caught_up_session_that_comes_back_thin_fails_the_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]], kept: frozenset[str]
+) -> None:
+    # #1572: a missed session the fetch fills with no bar, only the reference's
+    # bar, or every bar but the reference's would count as stored and never be
+    # fetched again, so the run fails naming it and the backfill command, and
+    # stores no bar.
+    _store(settings, [D3, D1])
+    run = _alpaca(settings, _ThinOn(thin={D2: kept})).runs[-1]
+    assert run.status == STALE, run.message
+    assert D2.isoformat() in run.message
+    assert f"--backfill --since {D2.isoformat()}" in run.message
+    assert _sessions_stored(read) == {D3, D1}
+
+
+def test_a_name_delisted_inside_the_gap_gets_its_missed_bars(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #1572: ACME is delisted effective D-1, so the run for D would not fetch it,
+    # but its D-2 bar (one of its last) is part of the hole and is caught up.
+    filings = _filings(delistings=[_delisting(D1)])
+    assert _run(settings, source="edgar", filings=filings).ok
+    _seed_prices(settings, [D3, D1], IDS, NOW)
+    prices = _Prices()
+    run = _run(settings, prices, source="alpaca", filings=filings).runs[-1]
+    assert run.status == OK, run.message
+    assert ("bars", tuple(sorted(IDS)), D2, D2) in prices.calls
+    assert ("bars", tuple(sorted(set(IDS) - {ACME})), D, D) in prices.calls
+    stored = read(f"SELECT session FROM prices_daily WHERE security_id = '{ACME}'")
+    assert {row[0] for row in stored} == {D3, D2, D1}

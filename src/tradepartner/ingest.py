@@ -54,12 +54,17 @@ window. The calendar, never weekdays, decides what a session is
 `alpaca.max_catchup_sessions` sessions is a lapse this path must not paper
 over: the run is `_Stale`, names the missing sessions and the
 `ingest --source alpaca --backfill --since <first missed session>` command
-that clears them, and writes only its run row. So does a fetch that
-returns no bar at all for a session the run must leave stored. The run
-message names how many sessions it caught up (`catch-up:`), so an
-operator can see the state of the hole in every run row. The staleness
-checks above stay at the expected session; a caught-up session's own
-per-name holes are the backfill's `--fill-holes`, not this path's.
+that clears them, and writes only its run row. So does a caught-up
+session that comes back thin: without the reference symbol's bar, or
+with more than `ingest.max_missing_share` of the names counted at the
+expected session (and holding a bar there) missing, since a thin session
+would count as stored and never be fetched again. A name delisted inside
+the gap is fetched for the missed sessions (its last bars), never for
+the expected one. The run message names how many sessions it caught up
+(`catch-up:`), so an operator can see the state of the hole in every run
+row. The dark and stale-listing checks stay at the expected session; a
+caught-up session's remaining per-name holes are the backfill's
+`--fill-holes`, not this path's.
 
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
@@ -2035,6 +2040,7 @@ def _fetch_prices(
     may_count: set[str] | None = None
     read_at = now
     missed: list[date] = []
+    gap_only: set[str] = set()
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
@@ -2044,17 +2050,27 @@ def _fetch_prices(
                 conn, read_at, session, settings
             )
             missed = _missed_sessions(conn, settings, session)
+            if missed:
+                # #1572: a name delisted inside the gap is fetched for the missed
+                # sessions it still traded on (its last bars), never for `session`.
+                gap_only = _price_names(conn, read_at, missed[0], settings)[0] - fetch
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
+    every = sorted(fetch | gap_only)
     # #1572: every session the run must leave stored, in contiguous runs, so one
     # request asks for exactly the sessions it fetches and never a span of them.
     runs = _fetch_runs([*missed, session])
     bars: list[Bar] = []
     for first, last in runs:
-        bars += [bar for bar in prices.bars(ids, first, last) if first <= bar.session <= last]
+        bars += [
+            bar
+            for bar in prices.bars(every if first < session else ids, first, last)
+            if first <= bar.session <= last
+            and not (bar.session == session and bar.security_id in gap_only)
+        ]
     action_window = (runs[0][0].replace(day=1), session)
-    actions = prices.corporate_actions(ids, *action_window)
+    actions = prices.corporate_actions(every, *action_window)
     have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
@@ -2063,16 +2079,6 @@ def _fetch_prices(
     ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")  # revisions: when fetched
     if reference not in have:
         raise _Stale(f"reference symbol {symbol} ({reference}) has no bar for {session}")
-    landed = {bar.session for bar in bars}
-    unstored = [day for day in missed if day not in landed]
-    if unstored:
-        # A hole the fetch did not fill: reporting ok would leave it, so the run
-        # fails naming it and the command that clears it (#1572).
-        raise _Stale(
-            f"no bar fetched for the missed sessions "
-            f"{', '.join(day.isoformat() for day in unstored)}; run tradepartner ingest "
-            f"--source alpaca --backfill --since {unstored[0].isoformat()}"
-        )
     counted, missing, reported = _staleness(listed, have, static_only, may_count, stale_ids)
     share = len(missing) / len(counted) if counted else 0.0
     limit = settings.ingest.max_missing_share
@@ -2083,8 +2089,9 @@ def _fetch_prices(
         )
     if stale := _dark_stale(listed, reported, settings, f"for {session}"):
         raise _Stale(stale)
+    _check_caught_up(bars, missed, reference, set(counted) & have, limit)
     message = (
-        f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
+        f"{len(bars)} bars and {len(actions)} actions for {len(every)} names; "
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
@@ -2099,6 +2106,30 @@ def _fetch_prices(
         ingested_at,
         message,
     )
+
+
+def _check_caught_up(
+    bars: Sequence[Bar], missed: Sequence[date], reference: str, base: set[str], limit: float
+) -> None:
+    """Raise `_Stale` unless every `missed` session came back whole (#1572):
+    the reference symbol's bar, and no more than `limit` (`ingest.max_missing_share`)
+    of `base` (the counted names with a bar at the expected session) without
+    one. A thin caught-up session would count as stored and never be fetched
+    again, so the run fails naming it and the command that clears it."""
+    held: dict[date, set[str]] = defaultdict(set)
+    for bar in bars:
+        held[bar.session].add(bar.security_id)
+    thin = [
+        day
+        for day in missed
+        if reference not in held[day] or (base and len(base - held[day]) / len(base) > limit)
+    ]
+    if thin:
+        raise _Stale(
+            f"the missed sessions {', '.join(day.isoformat() for day in thin)} came back "
+            f"without the reference bar or over the {limit:.1%} missing share; run "
+            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}"
+        )
 
 
 def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
@@ -2136,7 +2167,8 @@ def _missed_sessions(
             f"{len(missed)} XNYS sessions from {missed[0].isoformat()} to "
             f"{missed[-1].isoformat()} have no bar, over the {bound}-session catch-up "
             f"bound (alpaca.max_catchup_sessions): "
-            f"{', '.join(day.isoformat() for day in missed[:10])}; "
+            f"{', '.join(day.isoformat() for day in missed[:10])}"
+            f"{f' and {len(missed) - 10} more' if len(missed) > 10 else ''}; "
             f"run tradepartner ingest --source alpaca --backfill --since "
             f"{missed[0].isoformat()}"
         )
