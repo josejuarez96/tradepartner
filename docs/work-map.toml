@@ -1182,48 +1182,48 @@ what = "The owner's release cover-listings-1541: the switch flips and cache vers
 why = "Puts the dropped listings and their bars in the store before any H1 re-run or holdout spend, under one named release with a backup and a dry run, and nothing reaches the store before it (#1541)."
 
 [issue.1598]
-what = "A known-answer check of the data pipeline: hold the whole universe, equal- and cap-weighted, monthly, total return, no costs, no signal, and compare it year by year with SPY and RSP, with the worst months traced to names; spec and plan first, build as T184 to T184g."
+what = "A known-answer check of the data pipeline: hold the whole universe, equal- and cap-weighted, monthly, total return, no costs, no signal, and compare it year by year with SPY and RSP, with the worst months traced to names; spec and plan first, build as T185 to T185g."
 why = "Every trial result rests on the universe, the marking and the return arithmetic, and nothing checks them against a number the world knows; a jump or drift in the gap points at a data defect before it reaches a hypothesis."
-unblocks = ["task:T184", "task:T184b", "task:T184c"]
+unblocks = ["task:T185", "task:T185b", "task:T185c"]
 
 [spec.index-validation]
 what = "What the whole-universe index validation computes (equal and cap weight, month-end, zero cost, 2019-08 to 2026-09), which benchmarks it compares with (SPY from the store, RSP from a reference series no trial can read), what it prints (per-year gap and tracking error, worst months, attribution), the holdout guard on what it states, and the validation record outside the trial count."
 why = "The owner wants a standing data-quality suite; this fixes its rules so a run is logged, repeatable after each data release and never a strategy trial."
 
 [plan.index-validation]
-what = "How the validation is built: config (T184), the store tables and writers (T184b) and the pure index (T184c) in parallel, then the driver (T184d), its look-ahead and parity suite (T184g), the CLI and runbook (T184e) and the owner's first run with the pass-bar decision (T184f)."
+what = "How the validation is built: config (T185), the store tables and writers (T185b) and the pure index (T185c) in parallel, then the driver (T185d), its look-ahead and parity suite (T185g), the CLI and runbook (T185e) and the owner's first run with the pass-bar decision (T185f)."
 why = "Without a build order the spec's guarantees (no trial row, no vintage move, the guard) have no tests and no team can claim a task."
 
-[task.T184]
+[task.T185]
 what = "The validation config section: window, benchmarks, weightings, worst-month and attribution counts, the suspect threshold, the exemption date, the pass bars and the report directory, none of it frozen."
 why = "Thresholds come from config, never code; the section must land without moving any registered hypothesis's frozen set."
-unblocks = ["task:T184d"]
+unblocks = ["task:T185d"]
 
-[task.T184b]
-what = "Schema version 25: validation_runs, validation_months, validation_attribution and reference_series, with the handle-first writers in store/validation.py."
+[task.T185b]
+what = "The validation tables at the next free schema version: validation_runs, validation_months, validation_attribution and reference_series, with the handle-first writers in store/validation.py."
 why = "A validation run must have an id before it reads (ADR 0005) and a record no trial count can reach; the reference series must live where it moves no trial's vintage."
-unblocks = ["task:T184d"]
+unblocks = ["task:T185d"]
 
-[task.T184c]
+[task.T185c]
 what = "The pure index arithmetic: weights, the monthly step over the engine's valuation, year gaps, tracking error, worst months, attribution flags, the reference total-return index, the guard and the verdict."
 why = "Pure functions over frames are hand-testable; the driver then only reads and records."
-unblocks = ["task:T184d"]
+unblocks = ["task:T185d"]
 
-[task.T184d]
+[task.T185d]
 what = "The driver: the as-of reads at rebalance closes on one connection, the handle, holdouts, benchmark identity and reference series on the registry connection, the guard, the record and the report; the planted-defect and guard tests."
-why = "This is where a look-ahead could enter; the planted-defect test proves the tool sees a missing name, and T184g's suite proves the reads are point-in-time."
-unblocks = ["task:T184g"]
+why = "This is where a look-ahead could enter; the planted-defect test proves the tool sees a missing name, and T185g's suite proves the reads are point-in-time."
+unblocks = ["task:T185g"]
 
-[task.T184g]
+[task.T185g]
 what = "The look-ahead suite on the harness (truncation and prefix invariance, three seeded revisions checked alone, non-vacuity) and the engine-parity test (a synthetic zero-cost all-names fixture trial equals the equal-weight index to 1e-9)."
 why = "Without these the driver's point-in-time claim and its tie to the engine's own loop are assertions, not tests."
-unblocks = ["task:T184e"]
+unblocks = ["task:T185e"]
 
-[task.T184e]
+[task.T185e]
 what = "The validation CLI (index, fetch-reference, list), the one add_typer line and the runbook, with the rerun triggers after a data release and the month-end ingest."
 why = "The owner runs it by hand after each release; without the commands and the runbook it is not a standing suite."
-unblocks = ["task:T184f"]
+unblocks = ["task:T185f"]
 
-[task.T184f]
+[task.T185f]
 what = "The owner's reference fetch and first full run on the real store, the before/after trials diff, the report on #1598, the pass-bar decision and the disclosure record for the four registered files."
 why = "The first report is the number the owner has not seen; the bars are set from it, not before it."
