@@ -427,3 +427,16 @@ def test_rows_known_by_t_ignore_evidence_known_after_t(seed: int) -> None:
         assert partial.classifications == tuple(
             r for r in full.classifications if r["known_at"] <= t
         ), f"T={t!r}"
+
+
+@pytest.mark.parametrize("seed", [564, 1])
+def test_the_switch_off_is_the_reference_and_on_keeps_every_scenario_title(seed: int) -> None:
+    """T179: `title_fallback` off is the pre-fallback build (the reference
+    above); every scenario title classifies the same with the fallback on."""
+    for title in (t for t in _TITLES if t is not None):
+        assert _title_type(title, True) == _title_type(title), title
+    settings = Settings(_env_file=None, edgar={"title_fallback": False})  # type: ignore[call-arg, arg-type]
+    source, master = _scenario(seed, companies=60)
+    expected = _reference_build_classifications(source, master, settings, ingested_at=INGESTED_AT)
+    actual = build_classifications(source, master, settings, ingested_at=INGESTED_AT)
+    assert actual.classifications == expected.classifications

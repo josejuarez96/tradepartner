@@ -25,7 +25,20 @@ known at one instant:
    or debt word gives `title_<type>`; else a common-equity title (the
    master's `_is_common`) gives `title_common`; anything else is
    `unclassifiable` by `title_unrecognized` ("Shares of Beneficial
-   Interest" is a trust, not common stock).
+   Interest" is a trust, not common stock). Under `edgar.title_fallback`
+   (default off; #1541, T179) four things change, in this order, before
+   `title_unrecognized`: (a) a null, blank or placeholder title (no letter
+   in its head, or one of `_PLACEHOLDER_TITLES`) is no title, so a class
+   keeps its last real title and a class with none falls to rules 7 and 8,
+   where rule 8 does not apply while another class of the CIK has a title
+   naming common (it stays `unclassifiable`); (b) type words match whole
+   words ("United Therapeutics" is no unit; "depository" is "depositary";
+   depositary shares representing preferred stock are preferred);
+   (c) a head no word matches is re-read over the whole title, comma
+   segment by comma segment (the first segment naming a type word, else
+   the first naming common), never for a title holding `%`; (d) a head
+   naming only a class letter and shares is `title_common` when no
+   non-equity word is anywhere in the title.
 7. A class with no titled listing: its latest snapshot ticker's suffix
    (`suffix_<type>`, `provenance = snapshot_static`): after a separator,
    `W`/`WS`/`WT` warrant, `U`/`UN`/`UT` unit, `R`/`RT`/`RI` right, `P`,
@@ -141,13 +154,69 @@ def _base_form(form: str) -> str:
     return form.removesuffix("/A")
 
 
-def _title_type(title: str) -> tuple[str, str]:
-    norm = _norm_title(title)
+#: Normalised title heads that are no title (a word list, not a tunable).
+_PLACEHOLDER_TITLES = frozenset({"none", "n a", "na", "no", "nonw"})
+_CLASS_SHARES = re.compile(r"^class [a-z0-9] shares?$")
+#: Words that keep a class-letter head out of common, anywhere in the title.
+_NON_EQUITY_TITLE = re.compile(r"%|\bbeneficial interest\b|\blimited partner|\btrusts?\b")
+
+
+def is_placeholder_title(title: str | None) -> bool:
+    """True when `title` is null, blank or a placeholder: its normalised head
+    holds no letter or is in `_PLACEHOLDER_TITLES` (`NONE`, `N/A`, `0.01`)."""
+    if title is None:
+        return True
+    head = _norm_title(title)
+    return not re.search(r"[a-z]", head) or head in _PLACEHOLDER_TITLES
+
+
+def _word_type(norm: str) -> str | None:
+    """The first `_TITLE_TYPES` type naming a whole word of `norm`."""
     for word, security_type in _TITLE_TYPES:
-        if re.search(rf"\b{word}", norm):
+        pattern = r"\bdeposit[ao]ry\b" if word == "depositary" else rf"\b{word}s?\b"
+        if re.search(pattern, norm):
+            return security_type
+    return None
+
+
+def _whole(title: str) -> str:
+    """The whole title, normalised as `_norm_title` does a head."""
+    return " ".join(re.sub(r"[^a-z0-9%]+", " ", title.lower()).split())
+
+
+def _title_type(title: str, title_fallback: bool = False) -> tuple[str, str]:
+    norm = _norm_title(title)
+    if title_fallback:
+        security_type = _word_type(norm)
+        if security_type == "depositary" and re.search(r"\bprefer(?:red|ence)\b", _whole(title)):
+            security_type = "preferred"  # depositary shares of preferred stock
+        if security_type is not None:
             return security_type, f"title_{security_type}"
+    else:
+        for word, security_type in _TITLE_TYPES:
+            if re.search(rf"\b{word}", norm):
+                return security_type, f"title_{security_type}"
     if _is_common(title):
         return COMMON, "title_common"
+    if title_fallback:
+        return _title_fallback_type(title, norm)
+    return UNCLASSIFIABLE, "title_unrecognized"
+
+
+def _title_fallback_type(title: str, head: str) -> tuple[str, str]:
+    """Steps (c) and (d) of the title fallback, for a head nothing matched."""
+    if "%" not in title:
+        segments = [_norm_title(part) for part in title.split(",")]
+        for segment in segments:
+            security_type = _word_type(segment)
+            if security_type is not None:
+                return security_type, f"title_{security_type}"
+        if any(_is_common(segment) for segment in segments):
+            return COMMON, "title_common"
+    if _CLASS_SHARES.match(head):
+        whole = _whole(title)
+        if _word_type(whole) is None and _NON_EQUITY_TITLE.search(whole) is None:
+            return COMMON, "title_common"
     return UNCLASSIFIABLE, "title_unrecognized"
 
 
@@ -321,9 +390,14 @@ def _classify(
     titled: Row | None,
     known: Row | None,
     benchmark: Row | None,
+    *,
+    title_fallback: bool = False,
+    sibling_common: bool = False,
 ) -> tuple[str, str, int | None, str]:
     """(security_type, rule, sic, provenance) from the issuer's `state` and the
-    class's latest titled and latest listing rows, all known at one instant."""
+    class's latest titled and latest listing rows, all known at one instant.
+    `sibling_common`: another class of the CIK has a title naming common
+    (read only under `title_fallback`, where it stops rule 8)."""
     sic = state.sic
     if benchmark is not None:
         return "etf", "benchmark_config", sic, benchmark["provenance"]
@@ -336,27 +410,31 @@ def _classify(
     if sic == SPAC_SIC:
         return "spac", "sic_6770", sic, "filing"
     if titled is not None:
-        security_type, rule = _title_type(titled["class_title"])
+        security_type, rule = _title_type(titled["class_title"], title_fallback)
         return security_type, rule, sic, "filing"
     if known is not None:
         suffix_type = ticker_suffix_type(known["ticker"])
         if suffix_type is not None:
             return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
-    if state.domestic:
+    if state.domestic and not (title_fallback and sibling_common):
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
 
 
 def _listing_timeline(
     rows: Sequence[Row],
+    title_fallback: bool = False,
 ) -> tuple[list[datetime], list[tuple[Row | None, Row | None]]]:
     """A class's (latest titled, latest) listing row after all rows at each
-    instant; `rows` are in `known_at` order (ties in master order)."""
+    instant; `rows` are in `known_at` order (ties in master order). Under
+    `title_fallback` a placeholder title is no title (it never replaces or
+    masks a real one)."""
     stamps: list[datetime] = []
     states: list[tuple[Row | None, Row | None]] = []
     titled: Row | None = None
     for row in rows:
-        if row["class_title"] is not None:
+        title = row["class_title"]
+        if title is not None and not (title_fallback and is_placeholder_title(title)):
             titled = row
         if stamps and stamps[-1] == row["known_at"]:
             states[-1] = (titled, row)
@@ -414,6 +492,30 @@ def build_classifications(
     for row in sorted(master.listings, key=lambda r: r["known_at"]):
         listings[row["security_id"]].append(row)
 
+    title_fallback = settings.edgar.title_fallback
+    timelines_by_security = {
+        sid: _listing_timeline(rows_, title_fallback) for sid, rows_ in listings.items()
+    }
+    siblings: dict[str, list[str]] = defaultdict(list)
+    for security in securities:
+        if not security["benchmark"]:
+            siblings[security["cik"]].append(security["security_id"])
+
+    def sibling_common(security: Row, t: datetime) -> bool:
+        """Another class of the CIK is titled common at `t` (rule 8's stop)."""
+        for other in siblings[security["cik"]]:
+            if other == security["security_id"] or other not in timelines_by_security:
+                continue
+            stamps_, states_ = timelines_by_security[other]
+            i = bisect_right(stamps_, t)
+            titled_ = states_[i - 1][0] if i else None
+            if (
+                titled_ is not None
+                and _title_type(titled_["class_title"], True)[1] == "title_common"
+            ):
+                return True
+        return False
+
     rows: list[Row] = []
     for security in sorted(securities, key=lambda r: r["security_id"]):
         security_id = security["security_id"]
@@ -421,7 +523,7 @@ def build_classifications(
         issuer = timelines.get(security["cik"], _NO_TIMELINE)
         if benchmark is not None:
             issuer = _NO_TIMELINE
-        listing_stamps, listing_states = _listing_timeline(listings[security_id])
+        listing_stamps, listing_states = _listing_timeline(listings[security_id], title_fallback)
         latest = max(
             (stamp for stamp in (issuer.last, *listing_stamps[-1:]) if stamp is not None),
             default=None,
@@ -434,11 +536,25 @@ def build_classifications(
         start = security["known_at"]
         changes = {stamp for stamp in issuer.stamps if stamp > start}
         changes |= {stamp for stamp in listing_stamps if stamp > start}
+        if title_fallback and benchmark is None:  # a sibling's title can stop rule 8
+            for other in siblings[security["cik"]]:
+                if other != security_id and other in timelines_by_security:
+                    changes |= {stamp for stamp in timelines_by_security[other][0] if stamp > start}
         previous: tuple[str, str, int | None] | None = None
         for t in sorted({start} | changes):
             i = bisect_right(listing_stamps, t)
             titled, known = listing_states[i - 1] if i else (None, None)
-            security_type, rule, sic, provenance = _classify(issuer.at(t), titled, known, benchmark)
+            security_type, rule, sic, provenance = _classify(
+                issuer.at(t),
+                titled,
+                known,
+                benchmark,
+                title_fallback=title_fallback,
+                sibling_common=title_fallback
+                and titled is None
+                and benchmark is None
+                and sibling_common(security, t),
+            )
             if (security_type, rule, sic) == previous:
                 continue
             previous = (security_type, rule, sic)

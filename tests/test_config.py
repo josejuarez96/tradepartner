@@ -237,6 +237,15 @@ def test_edgar_filing_events_defaults() -> None:
     assert s.edgar.event_forms == ["8-K", "8-K/A"]
 
 
+def test_edgar_title_fallback_is_off_by_default_and_reads_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T179 (#1541): the title fallback switch is off until the release."""
+    assert Settings(_env_file=None).edgar.title_fallback is False
+    monkeypatch.setenv("EDGAR__TITLE_FALLBACK", "true")
+    assert Settings(_env_file=None).edgar.title_fallback is True
+
+
 def test_edgar_filing_events_keys_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EDGAR__FILING_EVENTS_ENABLED", "true")
     monkeypatch.setenv("EDGAR__EVENT_FORMS", '["8-K"]')
