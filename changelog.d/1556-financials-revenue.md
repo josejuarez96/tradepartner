@@ -1,0 +1,3 @@
+- Financial issuers: revenue from RevenuesNetOfInterestExpense, else net interest income + noninterest income, per filing and period (#1556)
+### Fixed
+- statement facts: banks, insurers and mortgage REITs now get a revenue row (#1556). `edgar.statement_tags.revenue` gains `us-gaap:RevenuesNetOfInterestExpense`, and the ingest derives `revenue = net interest income (us-gaap:InterestIncomeExpenseNet) + noninterest income (us-gaap:NoninterestIncome)` for a filing with no revenue tag, from one filing and one period only; gross profit stays N/A for financials, and non-financial revenue is unchanged.

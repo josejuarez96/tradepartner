@@ -212,6 +212,7 @@ def test_edgar_statement_facts_defaults() -> None:
             "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
             "us-gaap:SalesRevenueGoodsNet",
             "us-gaap:SalesRevenueServicesNet",
+            "us-gaap:RevenuesNetOfInterestExpense",
         ],
         "cost_of_revenue": [
             "us-gaap:CostOfRevenue",
@@ -225,6 +226,8 @@ def test_edgar_statement_facts_defaults() -> None:
             "us-gaap:NetCashProvidedByUsedInOperatingActivities",
             "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
         ],
+        "net_interest_income": ["us-gaap:InterestIncomeExpenseNet"],
+        "noninterest_income": ["us-gaap:NoninterestIncome"],
     }
     assert s.edgar.statement_forms == ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
     assert s.edgar.statement_units == ["USD"]

@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from tradepartner import ingest as ingest_module
-from tradepartner.adapters.edgar import StatementConflict
+from tradepartner.adapters.edgar import StatementConflict, parse_statement_facts
 from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
 from tradepartner.adapters.filings import (
@@ -2459,6 +2459,8 @@ _TAG = {
     "cost_of_revenue": "us-gaap:CostOfRevenue",
     "gross_profit": "us-gaap:GrossProfit",
     "total_assets": "us-gaap:Assets",
+    "net_interest_income": "us-gaap:InterestIncomeExpenseNet",
+    "noninterest_income": "us-gaap:NoninterestIncome",
 }
 
 
@@ -2676,6 +2678,187 @@ def test_a_conflict_withheld_gross_profit_derives_nothing_until_a_clean_filing()
 def test_components_in_two_units_derive_nothing() -> None:
     rows, _ = _rows([_sf("revenue", 100, F1, AT1), _sf("cost_of_revenue", 60, F1, AT1, unit="EUR")])
     assert ("gross_profit", FY18[1]) not in rows
+
+
+# --- financial-issuer revenue (#1556) ----------------------------------------
+
+
+def _bank_components(
+    accession: str, accepted_at: datetime, *, period: tuple[date | None, date] = FY18
+) -> list[StatementFactRecord]:
+    """A regional-bank-like filing's constituents: net interest income plus
+    noninterest income, and no revenue tag."""
+    return [
+        _sf("net_interest_income", 40, accession, accepted_at, period=period),
+        _sf("noninterest_income", 60, accession, accepted_at, period=period),
+    ]
+
+
+def test_financial_revenue_is_derived_from_one_filings_constituents() -> None:
+    """#1556: a filing with no revenue tag but both constituents yields
+    `revenue = net interest income + noninterest income`, from that one filing
+    and period, tagged with both source tags and known at its acceptance."""
+    rows, counts = _rows(
+        [
+            *_bank_components(F1, AT1),
+            _sf("total_assets", 900, F1, AT1, period=(None, FY18[1])),
+        ]
+    )
+    revenue = rows[("revenue", FY18[1])]
+    assert revenue["value"] == 100
+    assert (revenue["basis"], revenue["known_at"], revenue["filing_accession"]) == (
+        "derived",
+        AT1,
+        F1,
+    )
+    assert revenue["xbrl_tag"] == "us-gaap:InterestIncomeExpenseNet-us-gaap:NoninterestIncome"
+    assert (
+        revenue["value"]
+        == rows[("net_interest_income", FY18[1])]["value"]
+        + rows[("noninterest_income", FY18[1])]["value"]
+    )
+    assert counts.derived == 1
+
+
+def test_a_reported_revenue_tag_beats_the_financial_sum() -> None:
+    """A bank whose filing reports a revenue tag keeps it, even when the
+    constituents are also present (Goldman tags all three): the reported row
+    is stored first and the derived candidate is skipped."""
+    rows, counts = _rows([_sf("revenue", 105, F1, AT1), *_bank_components(F1, AT1)])
+    revenue = rows[("revenue", FY18[1])]
+    assert (revenue["value"], revenue["basis"], revenue["xbrl_tag"]) == (
+        105,
+        "reported",
+        "us-gaap:Revenues",
+    )
+    assert counts.derived == 0
+
+
+def test_financial_constituents_split_across_filings_derive_no_revenue() -> None:
+    """The sum is same-filing only: net interest income from one filing and
+    noninterest income from another never mix."""
+    rows, counts = _rows(
+        [
+            _sf("net_interest_income", 40, F1, AT1),
+            _sf("noninterest_income", 60, F2, AT2, comparative=True),
+        ]
+    )
+    assert ("revenue", FY18[1]) not in rows
+    assert counts.derived == 0
+
+
+def test_financial_constituents_in_two_units_derive_no_revenue() -> None:
+    rows, _ = _rows(
+        [
+            _sf("net_interest_income", 40, F1, AT1),
+            _sf("noninterest_income", 60, F1, AT1, unit="EUR"),
+        ]
+    )
+    assert ("revenue", FY18[1]) not in rows
+
+
+#: The financial-revenue payload fixtures: companyfacts payloads parsed with
+#: the real `edgar.statement_tags` config and run through the ingest's
+#: first-vintage pass, as the adapter and `_ingest_filings` do.
+_PAYLOAD_TAGS = Settings(_env_file=None).edgar.statement_tags
+_PAYLOAD_FORMS = Settings(_env_file=None).edgar.statement_forms
+_PAYLOAD_UNITS = Settings(_env_file=None).edgar.statement_units
+ACC_10K = f"{ACME}-21-000001"
+ACCEPTED = datetime(2021, 2, 26, 21, 30, tzinfo=UTC)
+INGESTED = datetime(2021, 3, 1, 20, 0, tzinfo=UTC)
+FY20 = ("2020-01-01", "2020-12-31")
+
+
+@dataclass(frozen=True)
+class _Stamp:
+    form: str
+    accepted_at: datetime
+
+
+STAMPS = {ACC_10K: _Stamp("10-K", ACCEPTED)}
+
+
+def _cf_entry(
+    accn: str,
+    period: tuple[str, str] | str,
+    value: float,
+    *,
+    form: str = "10-K",
+    filed: str = "2021-02-26",
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "val": value,
+        "accn": accn,
+        "fy": 2020,
+        "fp": "FY",
+        "form": form,
+        "filed": filed,
+    }
+    if isinstance(period, tuple):
+        row["start"], row["end"] = period
+    else:
+        row["end"] = period
+    return row
+
+
+def _payload_rows(facts: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    payload = {
+        "cik": int(ACME),
+        "facts": {"us-gaap": {tag: {"units": {"USD": entries}} for tag, entries in facts.items()}},
+    }
+    parsed = parse_statement_facts(payload, _PAYLOAD_TAGS, _PAYLOAD_FORMS, _PAYLOAD_UNITS, STAMPS)
+    rows, _ = statement_fact_rows(parsed.records, {}, set(), ingested_at=INGESTED)
+    return {r["fact_name"]: r for r in rows}
+
+
+def test_a_goldman_like_payload_reports_revenues_net_of_interest_expense() -> None:
+    """Goldman tags `RevenuesNetOfInterestExpense`; the reported concept wins
+    over the constituents it also tags."""
+    rows = _payload_rows(
+        {
+            "RevenuesNetOfInterestExpense": [_cf_entry(ACC_10K, FY20, 105)],
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert rows["revenue"]["value"] == 105
+    assert (rows["revenue"]["basis"], rows["revenue"]["xbrl_tag"]) == (
+        "reported",
+        "us-gaap:RevenuesNetOfInterestExpense",
+    )
+
+
+def test_a_regional_bank_like_payload_derives_revenue_from_its_constituents() -> None:
+    """Regions, Valley National and BOK tag no revenue concept at all; the
+    sum of net interest income and noninterest income is the revenue."""
+    rows = _payload_rows(
+        {
+            "InterestIncomeExpenseNet": [_cf_entry(ACC_10K, FY20, 40)],
+            "NoninterestIncome": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert rows["revenue"]["value"] == 100
+    assert (rows["revenue"]["basis"], rows["revenue"]["xbrl_tag"]) == (
+        "derived",
+        "us-gaap:InterestIncomeExpenseNet-us-gaap:NoninterestIncome",
+    )
+
+
+def test_an_industrial_payload_keeps_its_reported_revenue() -> None:
+    """The guard: an issuer tagging `us-gaap:Revenues` (and cost of revenue)
+    is untouched by the financial-revenue rule."""
+    rows = _payload_rows(
+        {
+            "Revenues": [_cf_entry(ACC_10K, FY20, 100)],
+            "CostOfRevenue": [_cf_entry(ACC_10K, FY20, 60)],
+            "Assets": [_cf_entry(ACC_10K, "2020-12-31", 900)],
+        }
+    )
+    assert (rows["revenue"]["value"], rows["revenue"]["xbrl_tag"]) == (100, "us-gaap:Revenues")
+    assert rows["gross_profit"]["value"] == 40
+    assert "net_interest_income" not in rows and "noninterest_income" not in rows
 
 
 # --- statement facts through the EDGAR chunk ---------------------------------

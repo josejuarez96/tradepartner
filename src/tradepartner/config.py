@@ -60,8 +60,28 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
-# (a)): five canonical names, each an ordered list of fallbacks, every one the
+# (a)): canonical names, each an ordered list of fallbacks, every one the
 # concept itself, never a near relative.
+#
+# #1556 adds the financial-issuer revenue concepts and the two constituents of
+# the one documented financial-revenue definition. A bank's or insurer's
+# `revenue` is **`us-gaap:RevenuesNetOfInterestExpense`** (its total revenue net
+# of interest expense, the concept itself) when the filing reports it, else --
+# for a financial whose filing carries no revenue tag at all, such as a
+# regional bank or a mortgage REIT -- the sum of **net interest income
+# (`us-gaap:InterestIncomeExpenseNet`) plus noninterest income
+# (`us-gaap:NoninterestIncome`)**. The sum is computed by the ingest's
+# derived-candidate rule (`ingest._derived_candidates`), only from the two
+# constituents of **one filing and one period** (never mixing filings), and is
+# stored like any derived row: `basis = derived`, the join of the two source
+# tags in `xbrl_tag`. `net_interest_income` and `noninterest_income` are parsed
+# and stored as filed; they are named here so the derivation can read them from
+# the same filing's records. A non-financial issuer keeps its reported revenue
+# unchanged: `us-gaap:Revenues` and the other reported tags precede
+# `RevenuesNetOfInterestExpense`, and the sum fires only when the filing
+# carries no revenue tag, which is exactly the CIKs that have none today. Gross
+# profit stays N/A for financials (no `cost_of_revenue`). IFRS issuers are out
+# of scope (#1556).
 _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
     "revenue": (
         "us-gaap:Revenues",
@@ -70,6 +90,7 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
         "us-gaap:SalesRevenueGoodsNet",
         "us-gaap:SalesRevenueServicesNet",
+        "us-gaap:RevenuesNetOfInterestExpense",
     ),
     "cost_of_revenue": (
         "us-gaap:CostOfRevenue",
@@ -83,6 +104,9 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:NetCashProvidedByUsedInOperatingActivities",
         "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
     ),
+    # #1556: the constituents of the financial-revenue sum above.
+    "net_interest_income": ("us-gaap:InterestIncomeExpenseNet",),
+    "noninterest_income": ("us-gaap:NoninterestIncome",),
 }
 #: A CIK as the store keys it, and a lettered common-class member (#1169).
 _CIK = re.compile(r"\d{10}")
