@@ -767,3 +767,178 @@ class TestDelisting:
                 accession="0001354457-26-000904",
                 accepted_at=datetime(2026, 9, 24, 14, 8, 40, tzinfo=UTC),
             )
+
+
+# --- #1541 (T178): listings under `dei:EntityListingsExchangeAxis` -----------
+
+SHAPES = FIXTURES / "cover_exchange_axis"
+_EXCH = "dei:EntityListingsExchangeAxis"
+_CLASS_AXIS_NAME = "us-gaap:StatementClassOfStockAxis"
+_ACCEPTED = datetime(2019, 7, 30, 20, 30, tzinfo=UTC)
+
+
+def _shape(name: str, *, on: bool) -> Any:
+    return parse_cover_page(
+        (SHAPES / name).read_bytes(),
+        accession="0000000001-19-000001",
+        accepted_at=_ACCEPTED,
+        exchange_axis=on,
+    )
+
+
+def _listed(parsed: Any) -> list[tuple[str, str, str]]:
+    return [(i.title, i.ticker, i.exchange) for i in parsed.cover.listings]
+
+
+def _axis_cover(facts: str, *contexts: str, on: bool = True) -> Any:
+    return parse_cover_page(
+        _ixbrl("".join(contexts), facts),
+        accession="0000092122-24-000001",
+        accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+        exchange_axis=on,
+    )
+
+
+def _listing_facts(context: str, title: str, symbol: str, exchange: str) -> str:
+    return (
+        _nn("Security12bTitle", context, title)
+        + _nn("TradingSymbol", context, symbol)
+        + _nn("SecurityExchangeName", context, exchange)
+    )
+
+
+class TestCoverPageExchangeAxis:
+    """The spec amendment's "Parsers" acceptance, per document."""
+
+    def test_ansys_shape_yields_its_listing_and_shares(self) -> None:
+        """The context the spec quotes: the exchange axis alone, holding the
+        three listing facts; the shares fact undimensioned."""
+        parsed = _shape("ansys_10q_2019q2.htm", on=True)
+        assert _listed(parsed) == [("Common Stock, $0.01 par value per share", "ANSS", "NASDAQ")]
+        assert [(f.class_member, f.value) for f in parsed.facts] == [("", 84_100_767)]
+        assert parsed.other_contexts == ()
+        assert parsed.exchange_axis_mismatch == 0  # XNGS is a Nasdaq tier
+
+    def test_ibm_shape_yields_its_listing(self) -> None:
+        parsed = _shape("ibm_10q_2019q2.htm", on=True)
+        assert _listed(parsed) == [("Capital stock, par value $.20 per share", "IBM", "NYSE")]
+        assert [f.value for f in parsed.facts] == [885_941_232]
+
+    def test_pg_shape_yields_the_common_first_and_the_note_after_it(self) -> None:
+        parsed = _shape("pg_10k_2019.htm", on=True)
+        assert [i.ticker for i in parsed.cover.listings] == ["PG", "PG25"]
+
+    def test_a_class_on_two_exchanges_is_two_listings(self) -> None:
+        parsed = _shape("abbvie_10q_2019q2.htm", on=True)
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("ABBV", "NYSE"),
+            ("ABBV", "NYSE_CHICAGO"),
+        ]
+
+    def test_a_context_with_both_axes_keeps_its_class_member(self) -> None:
+        both = {_CLASS_AXIS_NAME: "us-gaap:CommonStockMember", _EXCH: "exch:XNYS"}
+        parsed = _axis_cover(
+            _listing_facts("c1", "Common Stock", "SO", "NYSE") + _shares("s1", "1000"),
+            _context("c1", both),
+            _context("s1", both, instant=True),
+        )
+        assert _listed(parsed) == [("Common Stock", "SO", "NYSE")]
+        assert [(f.class_member, f.value) for f in parsed.facts] == [("CommonStock", 1000)]
+        assert _listed(_shape("mmm_10q_2019q2.htm", on=True))[1][1] == "MMM26"
+
+    def test_a_legal_entity_context_is_still_another_context(self) -> None:
+        sub = {"dei:LegalEntityAxis": "so:SubsidiaryMember"}
+        parsed = _axis_cover(
+            _listing_facts("c1", "Common Stock", "SO", "NYSE")
+            + _listing_facts("x1", "Series A Notes", "SUBX", "NYSE")
+            + _listing_facts("x2", "Series B Notes", "SUBY", "NYSE"),
+            _context("c1", {_EXCH: "exch:XNYS"}),
+            _context("x1", sub),
+            _context("x2", {**sub, _EXCH: "exch:XNYS"}),
+        )
+        assert [i.ticker for i in parsed.cover.listings] == ["SO"]
+        assert parsed.other_contexts == ("x1", "x2")
+
+    def test_an_exchange_axis_shares_fact_equal_to_the_undimensioned_one_collapses(
+        self,
+    ) -> None:
+        parsed = _axis_cover(
+            _shares("s1", "5000") + _shares("s2", "5000"),
+            _context("s1", instant=True),
+            _context("s2", {_EXCH: "exch:XNYS"}, instant=True),
+        )
+        assert [(f.class_member, f.value) for f in parsed.facts] == [("", 5000)]
+
+    def test_an_exchange_axis_shares_fact_that_differs_fails_closed(self) -> None:
+        with pytest.raises(ValueError, match="two share values"):
+            _axis_cover(
+                _shares("s1", "5000") + _shares("s2", "5001"),
+                _context("s1", instant=True),
+                _context("s2", {_EXCH: "exch:XNYS"}, instant=True),
+            )
+
+    def test_a_member_naming_another_exchange_is_counted_and_the_value_wins(self) -> None:
+        """Spec open question 1, its recommended option: count and keep."""
+        parsed = _axis_cover(
+            _listing_facts("c1", "Common Stock", "SO", "NASDAQ")
+            + _listing_facts("c2", "Common Stock", "SO", "NYSE")
+            + _listing_facts("c3", "Preferred Stock", "SOP", "NYSE"),
+            _context("c1", {_EXCH: "exch:XNYS"}),  # names NYSE, the value says Nasdaq
+            _context("c2", {_EXCH: "exch:XNYS"}),
+            _context("c3", {_EXCH: "so:NewYorkStockExchangeMember"}),  # no MIC: not judged
+        )
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("SO", "NASDAQ"),
+            ("SO", "NYSE"),
+            ("SOP", "NYSE"),
+        ]
+        assert parsed.exchange_axis_mismatch == 1
+
+
+class TestCoverPageExchangeAxisOff:
+    """With the switch off every parse is today's: pinned on the shapes (the
+    exchange-axis contexts land in `other_contexts`, as on the merge-base),
+    and the recorded covers parse the same with it on."""
+
+    @pytest.mark.parametrize(
+        ("name", "listed", "other"),
+        [
+            ("ansys_10q_2019q2.htm", [], ("FD2019Q2YTD_dei_EntityListingsExchangeAxis_exch_XNGS",)),
+            ("ibm_10q_2019q2.htm", [], ("FD2019Q2YTD_dei_EntityListingsExchangeAxis_exch_XNYS",)),
+            (
+                "pg_10k_2019.htm",
+                [("1.375% Notes due 2025", "PG25", "NYSE")],
+                ("FD2019Q4YTD_dei_EntityListingsExchangeAxis_exch_XNYS",),
+            ),
+            ("abbvie_10q_2019q2.htm", [], ("D_XCHI", "D_XNYS")),
+        ],
+    )
+    def test_the_shapes_parse_as_today(
+        self, name: str, listed: list[tuple[str, str, str]], other: tuple[str, ...]
+    ) -> None:
+        parsed = _shape(name, on=False)
+        assert _listed(parsed) == listed
+        assert parsed.other_contexts == other
+        assert parsed.exchange_axis_mismatch == 0
+        assert parsed == parse_cover_page(
+            (SHAPES / name).read_bytes(),
+            accession="0000000001-19-000001",
+            accepted_at=_ACCEPTED,
+        )  # the default is off
+
+    @pytest.mark.parametrize(
+        ("name", "accession"),
+        [
+            ("filing_plain_issuer_aapl-20250927.htm.gz", "0000320193-25-000079"),
+            ("filing_dual_class_goog-20251231.htm.gz", "0001652044-26-000018"),
+        ],
+    )
+    def test_recorded_covers_without_the_axis_parse_the_same_either_way(
+        self, name: str, accession: str
+    ) -> None:
+        def parse(on: bool) -> Any:
+            return parse_cover_page(
+                _gz(name), accession=accession, accepted_at=_ACCEPTED, exchange_axis=on
+            )
+
+        assert parse(True) == parse(False)

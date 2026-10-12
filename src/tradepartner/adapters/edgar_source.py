@@ -86,6 +86,12 @@ until the version bumps or the cache is cleared. A cover parse's skipped
 listings (no title or exchange, #609) are written to its cache entry and
 counted on `.cover_incomplete_listings` when it is parsed, never on a cache
 hit (#612), as FSN's are on `.fsn_incomplete_listings` when extracted.
+Under `edgar.exchange_axis_listings` (#1541) both parsers also read
+listings tagged by `dei:EntityListingsExchangeAxis`; a member naming another
+exchange than the listing's value is counted the same way, on
+`.cover_exchange_axis_mismatch` and `.fsn_exchange_axis_mismatch`. The
+switch does not change `FSN_VERSION` or `COVER_VERSION`: cached entries
+are re-derived only when the release bumps them (T181).
 
 **Facts (T11e).** `facts` joins two sources, both stamped at read time from
 `_load_stamps(cik)`: company facts (`companyfacts.zip` above the stamping
@@ -527,6 +533,12 @@ class EdgarFilingSource(FilingSource):
         # #612: listings skipped (no title or exchange, #609) by this run's
         # per-document cover parses; as FSN's count, cache hits add nothing.
         self.cover_incomplete_listings = 0
+        # #1541: exchange-axis listings whose member MIC names another venue
+        # than their `SecurityExchangeName` (the value is kept), counted as
+        # the incomplete listings are; 0 while `edgar.exchange_axis_listings`
+        # is off.
+        self.fsn_exchange_axis_mismatch = 0
+        self.cover_exchange_axis_mismatch = 0
         self.fsn_missing = 0
         self._filing_index_ran = False
         self._fsn_ready = False
@@ -1220,6 +1232,7 @@ class EdgarFilingSource(FilingSource):
         self.fsn_reissued = 0
         self.fsn_reissue_undetected = 0
         self.fsn_incomplete_listings = 0
+        self.fsn_exchange_axis_mismatch = 0
         self.fsn_missing = 0
         self._fsn_extraction_failures_this_run = 0
         self._fsn_unwritten_periods = []
@@ -1340,7 +1353,13 @@ class EdgarFilingSource(FilingSource):
                 if dimhashes
                 else []
             )
-            parsed = parse_fsn(sub_rows, num_rows, txt_rows, dim_rows)
+            parsed = parse_fsn(
+                sub_rows,
+                num_rows,
+                txt_rows,
+                dim_rows,
+                exchange_axis=self._settings.edgar.exchange_axis_listings,
+            )
         except _FSN_PARSE_ERRORS as error:
             # #578: the period is absent for this run (no manifest, so the
             # next run downloads and extracts it again); `record` re-raises
@@ -1358,7 +1377,7 @@ class EdgarFilingSource(FilingSource):
         form_by_accession = {str(row["adsh"]): str(row["form"]) for row in sub_rows}
         per_cik_new: dict[str, dict[str, FsnFiling]] = {}
         served: list[str] = []
-        incomplete = 0
+        incomplete = mismatched = 0
         for record in parsed.records:
             if record.accession in known_accessions:
                 self.fsn_duplicates += 1
@@ -1368,7 +1387,9 @@ class EdgarFilingSource(FilingSource):
                 per_cik_new.setdefault(record.cik, {})[record.accession] = record
                 served.append(record.accession)
                 incomplete += record.incomplete_listings
+                mismatched += record.exchange_axis_mismatch
         self.fsn_incomplete_listings += incomplete
+        self.fsn_exchange_axis_mismatch += mismatched
         for cik, records in per_cik_new.items():
             existing = self._load_fsn_cache(cik, strict=True)
             existing.update(records)
@@ -1576,11 +1597,17 @@ class EdgarFilingSource(FilingSource):
         )
         try:
             document = path.read_bytes()
-            parsed = parse_cover_page(document, accession=accession, accepted_at=accepted_at)
+            parsed = parse_cover_page(
+                document,
+                accession=accession,
+                accepted_at=accepted_at,
+                exchange_axis=self._settings.edgar.exchange_axis_listings,
+            )
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
         self._save_cover_cache(accession, cik, parsed)
         self.cover_incomplete_listings += parsed.incomplete_listings
+        self.cover_exchange_axis_mismatch += parsed.exchange_axis_mismatch
         return parsed
 
     def _cover_cache_path(self, accession: str) -> Path:
