@@ -305,6 +305,7 @@ def test_the_allowlist_constants_are_pinned() -> None:
         "POSITIONS_ALLOWLIST",
         "ACCOUNT_ALLOWLIST",
         "ASSETS_ALLOWLIST",
+        "CASH_ACTIVITIES_ALLOWLIST",
     ):
         assert getattr(wrapper, name) == ()
     with pytest.raises(TypeError):

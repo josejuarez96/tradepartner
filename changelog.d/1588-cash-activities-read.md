@@ -1,0 +1,3 @@
+- T183b (order path): the broker read of non-trade cash activities — Broker.cash_activities(since) with CashActivity, the fake's scripted list, and the Alpaca adapter's unfiltered activities read.
+### Added
+- Broker.cash_activities(since: date) and the CashActivity type (activity_id, activity_type, date, net_amount, status, symbol, description; a date with no time); FakeBroker answers a scripted activity list; AlpacaTradingRaw.list_activities reads GET /v2/account/activities with no type filter, every page, and AlpacaBroker.cash_activities drops FILL rows client-side and asks from the New York midnight that begins the day before since.

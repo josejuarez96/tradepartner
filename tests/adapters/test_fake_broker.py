@@ -22,7 +22,8 @@ bad clock (naive, overflowing, not a `datetime`, or raising) making
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,6 +34,7 @@ from tradepartner.adapters.broker import (
     Account,
     Asset,
     Broker,
+    CashActivity,
     DuplicateClientOrderIdError,
     Fill,
     Order,
@@ -44,6 +46,7 @@ from tradepartner.adapters.broker import (
     UnknownOrderError,
 )
 from tradepartner.adapters.fake_broker import (
+    BrokerCall,
     FakeBroker,
     HoldCancel,
     PartialFill,
@@ -585,6 +588,141 @@ def test_mutating_returned_positions_dict_does_not_affect_broker_state() -> None
     del positions["AAPL"]
 
     assert broker.positions()["AAPL"].quantity == 10
+
+
+# --- cash_activities (#1583, paper-trading spec req 1 item 1, plan T183b) ----
+
+
+CAT = CashActivity(
+    activity_id="fee-cat-1",
+    activity_type="FEE",
+    date=date(2026, 10, 9),
+    net_amount=-0.01,
+    status="executed",
+    description="CAT fee for proceed of 8 trades on 2026-10-09",
+)
+REG = CashActivity(
+    activity_id="fee-reg-1",
+    activity_type="FEE",
+    date=date(2026, 10, 9),
+    net_amount=-0.01,
+    status="executed",
+    description="REG fee for proceed of $433.15 on 2026-10-09",
+)
+CLASSIFIED = CashActivity(
+    activity_id="fee-int-1",
+    activity_type="INT",
+    date=date(2026, 10, 8),
+    net_amount=0.01,
+    status="executed",
+)
+
+
+def test_cash_activities_returns_every_scripted_row_whatever_its_date() -> None:
+    """The fake behaves like the live read (safety-reviewer's fix): it drops
+    nothing by date, so a row dated before `since` comes back and the caller
+    applies its own bound, as it must against the adapter."""
+    broker, _ = make_broker(activities=[CLASSIFIED, CAT, REG])
+
+    assert broker.cash_activities(date(2026, 10, 9)) == [CLASSIFIED, CAT, REG]
+    assert broker.cash_activities(date(2026, 10, 10)) == [CLASSIFIED, CAT, REG]
+
+
+def test_cash_activities_answers_the_rows_it_was_given_verbatim() -> None:
+    """A repeated id, a status no rule books and a type nothing classifies
+    are all the test's to script, so the fake passes them through: the rule
+    that judges them is T183's, not the fake's."""
+    repeated = replace(CAT, activity_id=REG.activity_id)
+    corrected = replace(REG, status="canceled")
+    broker, _ = make_broker(activities=[CAT, corrected, repeated])
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert [r.activity_id for r in rows] == [CAT.activity_id, REG.activity_id, REG.activity_id]
+    assert [r.status for r in rows] == ["executed", "canceled", "executed"]
+    assert [r.net_amount for r in rows] == [-0.01, -0.01, -0.01]
+
+
+def test_cash_activities_returns_oldest_first_whatever_order_it_was_scripted_in() -> None:
+    broker, _ = make_broker(activities=[REG, CLASSIFIED, CAT])
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert [r.date for r in rows] == [date(2026, 10, 8), date(2026, 10, 9), date(2026, 10, 9)]
+    # Split by date, the scripted order kept inside one date.
+    assert [r.activity_id for r in rows] == [
+        CLASSIFIED.activity_id,
+        REG.activity_id,
+        CAT.activity_id,
+    ]
+
+
+def test_an_activity_posted_mid_run_is_on_the_next_read() -> None:
+    """A fee the test posts at any point of a run is read by the next read,
+    which is the read race the spec's item 2 gives the reconciliation
+    (#1583)."""
+    broker, _ = make_broker(activities=[CAT])
+
+    assert len(broker.cash_activities(date(2026, 10, 9))) == 1
+    broker.activities.append(REG)
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+    assert [r.activity_id for r in rows] == [CAT.activity_id, REG.activity_id]
+
+
+def test_a_corrected_row_is_replaced_by_replacing_the_scripted_row() -> None:
+    broker, _ = make_broker(activities=[CAT, REG])
+    broker.activities[1] = replace(REG, status="correct")
+
+    assert [r.status for r in broker.cash_activities(date(2026, 10, 9))] == [
+        "executed",
+        "correct",
+    ]
+
+
+def test_mutating_the_returned_activity_list_does_not_affect_the_script() -> None:
+    broker, _ = make_broker(activities=[CAT, REG])
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+    rows.clear()
+    rows.append(CLASSIFIED)
+
+    assert broker.cash_activities(date(2026, 10, 9)) == [CAT, REG]
+    assert [a.activity_id for a in broker.activities] == [CAT.activity_id, REG.activity_id]
+
+
+def test_cash_activities_refuses_a_naive_or_mistyped_since() -> None:
+    broker, _ = make_broker(activities=[CAT])
+
+    with pytest.raises(TypeError, match="since must be a date"):
+        broker.cash_activities(datetime(2026, 10, 9, tzinfo=UTC))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="since must be a date"):
+        broker.cash_activities("2026-10-09")  # type: ignore[arg-type]
+    assert broker.calls[-1] == BrokerCall("cash_activities", ("2026-10-09",))
+
+
+def test_a_scripted_activity_must_be_a_cash_activity() -> None:
+    with pytest.raises(TypeError, match="activities values must be CashActivity"):
+        make_broker(activities=["not-an-activity"])  # type: ignore[list-item]
+
+
+def test_cash_activities_is_logged_as_a_broker_call() -> None:
+    broker, _ = make_broker(activities=[CAT])
+
+    broker.cash_activities(date(2026, 10, 9))
+
+    assert broker.calls == (BrokerCall("cash_activities", (date(2026, 10, 9),)),)
+
+
+def test_the_scripted_activities_survive_a_paper_account_reset() -> None:
+    """A `Reset` is the broker forgetting its orders, positions and fills
+    (module docstring, "Account scripts"); the script is the test's, not the
+    account's, so a reset leaves it alone."""
+    broker, _ = make_broker(activities=[CAT])
+    broker.submit(make_request(client_order_id="co-1"))
+    broker.apply_account(Reset())
+
+    assert broker.cash_activities(date(2026, 10, 9)) == [CAT]
 
 
 # --- Validation: quantity / price -----------------------------------------
