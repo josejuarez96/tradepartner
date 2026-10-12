@@ -648,18 +648,23 @@ def test_universe_defaults() -> None:
     assert u.top_n_by_cap == 1000
 
 
-def test_guarded_sic_exclusion_pinned_to_charter_range() -> None:
-    """Guarded per ADR 0006: full SIC 4900-4999 division, no carve-outs.
-
-    Changing this default is a charter amendment, not a routine code change.
-    """
-    assert _settings().universe.exclude_sic_ranges == ((4900, 4999),)
+def test_sic_exclusion_defaults_to_none() -> None:
+    """ADR 0006 amendment 2026-10-11 (#1540): no sector is excluded by default."""
+    assert _settings().universe.exclude_sic_ranges == ()
 
 
-def test_guarded_sic_exclusion_rejects_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A env override can't silently loosen the guarded SIC exclusion."""
-    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[]")
-    with pytest.raises(ValidationError, match="guarded setting; change only by charter amendment"):
+@pytest.mark.parametrize(
+    "raw", ["[[4900, 4999]]", "[[4900, 4949]]", "[[4900, 4999], [6000, 6099]]", "[[1, 2]]", "[]"]
+)
+def test_sic_exclusion_accepts_env_overrides(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", raw)
+    got = Settings(_env_file=None).universe.exclude_sic_ranges
+    assert got == tuple(tuple(r) for r in json.loads(raw))
+
+
+def test_sic_exclusion_refuses_a_reversed_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[[2, 1]]")
+    with pytest.raises(ValidationError, match="start > end"):
         Settings(_env_file=None)
 
 

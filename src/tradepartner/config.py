@@ -7,10 +7,9 @@ lists of the data-foundation and backtest specs and in ADR 0006 is a field
 here with the documented default — never hardcoded elsewhere (CLAUDE.md code
 standards).
 
-`universe.exclude_sic_ranges` is **guarded**: it is a compliance exclusion
-(ADR 0006), not a tunable parameter. A validator rejects any value other
-than the charter default, including an environment override, so it cannot
-be silently loosened; changing it is a charter amendment, not a config edit.
+`universe.exclude_sic_ranges` defaults to `()`: no sector is excluded unless a
+hypothesis file names one (ADR 0006 amendment 2026-10-11, #1540). It is frozen in
+each registration (guard a), so only its shape is validated here (`start <= end`).
 
 Secrets (`ALPACA_API_KEY`, `ALPACA_API_SECRET`, `SEC_EDGAR_USER_AGENT`, the
 Phase 4 `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_API_SECRET` (book `main`'s pair; every
@@ -21,7 +20,7 @@ their values never appear in `repr()`/`str()` of `Settings`, including
 `SEC_EDGAR_USER_AGENT`, `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM`, which embed a
 personal contact email.
 
-`alpaca.paper` is guarded the same way as `universe.exclude_sic_ranges`: the
+`alpaca.paper` is guarded: the
 order path reaches the paper endpoint only (Phase 4 spec req 2), and Phase 6
 changes it by ADR, never by an environment variable.
 
@@ -53,11 +52,6 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# The only value `universe.exclude_sic_ranges` may take (ADR 0006): the full
-# SIC 4900-4999 division (electric, gas, water, sanitary services), no
-# carve-outs. Changing it is a charter amendment, not a code or config change.
-_GUARDED_EXCLUDE_SIC_RANGES: tuple[tuple[int, int], ...] = ((4900, 4999),)
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
 # (a)): five canonical names, each an ordered list of fallbacks, every one the
@@ -679,9 +673,9 @@ class UniverseConfig(_ClosedConfig):
 
     security_types: list[str] = Field(default_factory=lambda: ["common"])
     exchanges: list[str] = Field(default_factory=lambda: ["NYSE", "NASDAQ", "NYSE_AMERICAN"])
-    # Guarded (ADR 0006): see `_GUARDED_EXCLUDE_SIC_RANGES` and the validator
-    # below. Not a tunable parameter; changes only through a charter amendment.
-    exclude_sic_ranges: tuple[tuple[int, int], ...] = _GUARDED_EXCLUDE_SIC_RANGES
+    # Rule 3, a per-hypothesis choice; default none (ADR 0006 amendment 2026-10-11,
+    # #1540). Frozen in each registration (guard a); shape-checked below.
+    exclude_sic_ranges: tuple[tuple[int, int], ...] = ()
     min_price: float = 5
     # On since T3 (#84): historical bars come from the consolidated SIP feed, so the
     # 20-session median dollar volume is a real liquidity measure (IEX-only volume,
@@ -738,11 +732,12 @@ class UniverseConfig(_ClosedConfig):
 
     @field_validator("exclude_sic_ranges")
     @classmethod
-    def _guard_exclude_sic_ranges(
+    def _check_exclude_sic_ranges(
         cls, value: tuple[tuple[int, int], ...]
     ) -> tuple[tuple[int, int], ...]:
-        if value != _GUARDED_EXCLUDE_SIC_RANGES:
-            raise ValueError("guarded setting; change only by charter amendment")
+        for start, end in value:
+            if start > end:
+                raise ValueError(f"exclude_sic_ranges entry {start, end} has start > end")
         return value
 
 
@@ -866,7 +861,7 @@ class ProfitabilityConfig(BaseModel):
     `basis` is `gross` only until the pre-declared `cash` variant registers.
     `annual_period_days` is the inclusive day-length range an as-filed annual duration
     may have; `max_fact_age_days` bounds a fact's age at the rebalance; and
-    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), not the guarded
+    `exclude_sic_ranges` is a signal-domain scope (inclusive ranges), separate from
     `universe.exclude_sic_ranges`. `top_fraction` is a share of scored names in (0, 1].
     """
 
