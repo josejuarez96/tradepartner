@@ -36,7 +36,9 @@ from tradepartner.calendar import next_session
 from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
 from tradepartner.store.asof import (
+    ASSETS_SOURCE,
     adjusted_prices_as_of,
+    borrow_status_as_of,
     dropped_dividends_as_of,
     facts_as_of,
     filing_events_as_of,
@@ -1753,3 +1755,263 @@ class TestFilingEventsAsOf:
         filing_events_as_of(fixture_store, self._AFTER_ALL)
         with pytest.raises(duckdb.CatalogException):
             fixture_store.execute("SELECT * FROM _asof_filing_event_securities")
+
+
+def _borrow_row(
+    conn: duckdb.DuckDBPyConnection,
+    asset_id: str,
+    symbol: str,
+    *,
+    known_at: datetime,
+    easy_to_borrow: bool = True,
+    present: bool = True,
+    ingested_at: datetime | None = None,
+) -> None:
+    """One `borrow_status` row in the fixture's shape (T171b synthetic-store
+    tests): `borrow_status` tracks `easy_to_borrow` the way Alpaca's does,
+    and `ingested_at` is `known_at` + 10 minutes as the fixture's is."""
+    stamp = ingested_at if ingested_at is not None else known_at + timedelta(minutes=10)
+    insert_row(
+        conn,
+        "borrow_status",
+        {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "exchange": "NYSE",
+            "status": "active",
+            "tradable": True,
+            "marginable": True,
+            "shortable": True,
+            "easy_to_borrow": easy_to_borrow,
+            "borrow_status": "easy_to_borrow" if easy_to_borrow else "hard_to_borrow",
+            "fractionable": True,
+            "present": present,
+            "known_at": known_at,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "snapshot",
+        },
+    )
+
+
+def _assets_run(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: str,
+    *,
+    cursor: datetime,
+    status: str = "ok",
+    source: str = ASSETS_SOURCE,
+    finished_at: datetime | None = None,
+) -> None:
+    """One `ingestion_runs` row for the borrow snapshot (T171c writes them;
+    T171b's `observed_at` reads them back). The cursor is the fetch time as
+    ISO-8601 UTC, exactly what the ingest stores."""
+    finished = cursor if finished_at is None else finished_at
+    insert_row(
+        conn,
+        "ingestion_runs",
+        {
+            "run_id": run_id,
+            "started_at": finished - timedelta(minutes=1),
+            "finished_at": finished,
+            "status": status,
+            "source": source,
+            "mode": "daily",
+            "rows_added": 1,
+            "chunk_cursor": cursor.isoformat(),
+            "message": "assets=1;us_equity=1;new=1",
+        },
+    )
+
+
+class TestBorrowStatusAsOf:
+    """T171b (#1506, ADR 0021): `borrow_status_as_of(t, symbols)` picks the
+    latest row per `asset_id` with `known_at <= t`, drops it when its
+    `present` is FALSE, then filters `symbols`, and carries the snapshot's
+    observation on `observed_at`. The fixture's six cases
+    (`tests/fixtures/universe/borrow_status.csv`) cover the reads; the
+    filters, the shared symbol and the run cursor use a `synthetic_store`.
+    The look-ahead cases and truncation invariance are in
+    `tests/lookahead/test_borrow_status.py`."""
+
+    #: The fixture's three snapshots: the close plus an hour, a day apart
+    #: (2020-06-26 is a Friday, 06-29 a Monday, 06-30 a Tuesday).
+    _FIRST = datetime(2020, 6, 26, 21, tzinfo=UTC)
+    _SECOND = datetime(2020, 6, 29, 21, tzinfo=UTC)
+    _THIRD = datetime(2020, 6, 30, 21, tzinfo=UTC)
+    _AFTER_ALL = datetime(2020, 7, 1, tzinfo=UTC)
+
+    def test_columns_are_the_stated_list_in_order(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        rows = borrow_status_as_of(fixture_store, self._AFTER_ALL)
+        assert rows.columns == [
+            "asset_id",
+            "symbol",
+            "exchange",
+            "status",
+            "tradable",
+            "marginable",
+            "shortable",
+            "easy_to_borrow",
+            "borrow_status",
+            "fractionable",
+            "known_at",
+            "observed_at",
+        ]
+
+    def test_sorted_by_symbol_then_asset_id(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        rows = borrow_status_as_of(fixture_store, self._AFTER_ALL)
+        assert list(zip(rows["symbol"], rows["asset_id"], strict=True)) == sorted(
+            zip(rows["symbol"], rows["asset_id"], strict=True)
+        )
+        # Five of the fixture's six assets read at once: BNDX unchanged,
+        # SPLT flipped to HTB, TRNS new, TCKB renamed, RDAT back after
+        # vanishing, and DUALA gone.
+        assert rows["symbol"].to_list() == ["BNDX", "RDAT", "SPLT", "TCKB", "TRNS"]
+
+    def test_nothing_is_known_before_the_first_snapshot(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        before = borrow_status_as_of(fixture_store, self._FIRST - timedelta(microseconds=1))
+        assert before.height == 0
+        assert borrow_status_as_of(fixture_store, self._FIRST).height == 5
+
+    def test_flipped_asset_reads_etb_then_htb(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        after_first = _one(borrow_status_as_of(fixture_store, self._FIRST), symbol="SPLT")
+        assert after_first["easy_to_borrow"] is True
+        assert after_first["borrow_status"] == "easy_to_borrow"
+        after_second = _one(borrow_status_as_of(fixture_store, self._SECOND), symbol="SPLT")
+        assert after_second["easy_to_borrow"] is False
+        assert after_second["borrow_status"] == "hard_to_borrow"
+        assert after_second["known_at"] == self._SECOND
+        # The flip is invisible until its own snapshot's fetch time.
+        assert (
+            _one(
+                borrow_status_as_of(fixture_store, self._SECOND - timedelta(seconds=1)),
+                symbol="SPLT",
+            )["easy_to_borrow"]
+            is True
+        )
+
+    def test_vanished_asset_reads_after_its_first_snapshot_and_not_after_its_second(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        assert _one(borrow_status_as_of(fixture_store, self._FIRST), symbol="DUALA") is not None
+        after_second = borrow_status_as_of(fixture_store, self._SECOND).filter(
+            pl.col("symbol") == "DUALA"
+        )
+        assert after_second.height == 0
+        assert (
+            borrow_status_as_of(fixture_store, self._THIRD)
+            .filter(pl.col("symbol") == "DUALA")
+            .height
+            == 0
+        )
+
+    def test_renamed_asset_reads_under_its_new_symbol_only(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        first = borrow_status_as_of(fixture_store, self._FIRST)
+        assert first["symbol"].to_list() == ["BNDX", "DUALA", "RDAT", "SPLT", "TCKA"]
+        after_second = borrow_status_as_of(fixture_store, self._SECOND)
+        assert "TCKA" not in after_second["symbol"].to_list()
+        renamed = _one(after_second, symbol="TCKB")
+        assert renamed["asset_id"] == _one(first, symbol="TCKA")["asset_id"]
+
+    def test_reappeared_asset_reads_again_after_its_return(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The fixture's case (f): the asset vanished at the second snapshot
+        and was back at the third with its old values, so the third snapshot
+        wrote a normal row and the asset reads again."""
+        back = _one(borrow_status_as_of(fixture_store, self._THIRD), symbol="RDAT")
+        assert back["known_at"] == self._THIRD
+        assert back["easy_to_borrow"] is True
+
+    def test_a_symbol_held_by_two_assets_returns_two_rows(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        first, second = datetime(2020, 6, 26, 21, tzinfo=UTC), datetime(2020, 6, 29, 21, tzinfo=UTC)
+        _borrow_row(synthetic_store, "asset-1", "SHARED", known_at=first)
+        _borrow_row(synthetic_store, "asset-2", "SHARED", known_at=first, easy_to_borrow=False)
+        _borrow_row(synthetic_store, "asset-1", "SHARED", known_at=second, easy_to_borrow=False)
+        rows = borrow_status_as_of(synthetic_store, second, symbols=["SHARED"])
+        assert list(zip(rows["symbol"], rows["asset_id"], strict=True)) == [
+            ("SHARED", "asset-1"),
+            ("SHARED", "asset-2"),
+        ]
+        assert rows["easy_to_borrow"].to_list() == [False, False]
+        # Before the second snapshot both assets still read ETB: the flip
+        # belongs to `asset-1` alone, and its first snapshot read below is
+        # that row, not the other asset's.
+        before = borrow_status_as_of(synthetic_store, first, symbols=["SHARED"])
+        assert before["easy_to_borrow"].to_list() == [True, False]
+
+    def test_symbols_filter_matches_the_row_symbol_exactly(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        known = datetime(2020, 6, 26, 21, tzinfo=UTC)
+        _borrow_row(synthetic_store, "asset-1", "AAAA", known_at=known)
+        _borrow_row(synthetic_store, "asset-2", "BBBB", known_at=known)
+        assert borrow_status_as_of(synthetic_store, known, symbols=["AAAA"])[
+            "symbol"
+        ].to_list() == ["AAAA"]
+        assert borrow_status_as_of(synthetic_store, known, symbols=["AAAA", "BBBB"])[
+            "symbol"
+        ].to_list() == ["AAAA", "BBBB"]
+        assert borrow_status_as_of(synthetic_store, known, symbols=["AAAA", "MISSING"])[
+            "symbol"
+        ].to_list() == ["AAAA"]
+        assert borrow_status_as_of(synthetic_store, known).height == 2
+        assert borrow_status_as_of(synthetic_store, known, symbols=[]).height == 0
+
+    def test_a_bare_string_symbols_raises(self, synthetic_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(TypeError):
+            borrow_status_as_of(synthetic_store, self._AFTER_ALL, symbols="AAAA")  # type: ignore[arg-type]
+
+    def test_bare_date_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(TypeError):
+            borrow_status_as_of(fixture_store, date(2020, 7, 1))  # type: ignore[arg-type]
+
+    def test_naive_datetime_raises(self, fixture_store: duckdb.DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError):
+            borrow_status_as_of(fixture_store, datetime(2020, 7, 1, 21, 0))  # noqa: DTZ001
+
+    def test_observed_at_is_the_latest_ok_assets_run_cursor_at_or_before_t(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        first = datetime(2020, 6, 26, 21, tzinfo=UTC)
+        second = datetime(2020, 6, 29, 21, tzinfo=UTC)
+        later = datetime(2020, 7, 1, 21, tzinfo=UTC)
+        # A quiet day: one row, two snapshot runs. Nothing changed on the
+        # second snapshot, so no row was written for it -- the latest row is
+        # still the first snapshot's while the observation is the second
+        # run's cursor.
+        _borrow_row(synthetic_store, "asset-1", "AAAA", known_at=first)
+        _assets_run(synthetic_store, "run-1", cursor=first)
+        _assets_run(synthetic_store, "run-2", cursor=second)
+        # A later failed snapshot and a later run of another source say
+        # nothing about the borrow observation.
+        _assets_run(synthetic_store, "run-3", cursor=later, status="failed")
+        _assets_run(synthetic_store, "run-4", cursor=later, source="alpaca")
+        for t, expected in (
+            (first - timedelta(seconds=1), None),
+            (first, first),
+            (second - timedelta(seconds=1), first),
+            (second, second),
+            (later, second),
+        ):
+            rows = borrow_status_as_of(synthetic_store, t)
+            assert rows["observed_at"].to_list() == [expected] * rows.height, t
+        assert borrow_status_as_of(synthetic_store, second)["known_at"].to_list() == [first]
+
+    def test_observed_at_is_null_when_no_run_was_ok(
+        self, fixture_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        """The fixture store has no `ingestion_runs` CSV, so no snapshot has
+        recorded an observation: the read still answers, with NULL."""
+        rows = borrow_status_as_of(fixture_store, self._AFTER_ALL)
+        assert rows["observed_at"].to_list() == [None] * rows.height
