@@ -273,6 +273,35 @@ def test_ingest_refuses_statement_flags_where_they_cannot_apply(
     assert session.calls == [] and filled.calls == []
 
 
+def test_ingest_rebuild_classifications_reaches_the_session_and_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """#1541 (T182): needs no switch, only the edgar source."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    assert _invoke(secrets_set, ["ingest", "--source", "edgar"]).exit_code == 0
+    assert session.calls[0]["rebuild_classifications"] is False
+    args = ["ingest", "--source", "edgar", "--rebuild-classifications"]
+    assert _invoke(secrets_set, args).exit_code == 0
+    assert session.calls[1]["rebuild_classifications"] is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--source", "alpaca", "--rebuild-classifications"],
+        ["--backfill", "--since", "2016-01-04", "--rebuild-classifications"],
+    ],
+)
+def test_ingest_refuses_rebuild_classifications_where_it_cannot_apply(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings, args: list[str]
+) -> None:
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar"))
+    filled = _patched(monkeypatch, "backfill", _ok("edgar"))
+    result = _invoke(secrets_set, ["ingest", *args])
+    assert result.exit_code == 2, result.output
+    assert session.calls == [] and filled.calls == []
+
+
 def _manifest(
     tmp_path: Path,
     header: str = "cik,accession,old_stamp,new_stamp,method,evidence",
@@ -753,6 +782,70 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert "listed with no bars after a form 25: 0" in plain.output.lower()
     checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert checked.exit_code == 0, checked.output
+
+
+def test_health_reports_the_coverage_block_not_computed_by_default(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1541: without `--coverage` and with `coverage.check_enabled` off the
+    block is not computed, and its rule says so, never "pass"."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "coverage reference: not computed (run with --coverage)" in result.output
+    assert "  coverage_reference_names: not computed (run with --coverage)" in result.output
+
+
+def test_health_coverage_is_report_only_with_the_default_off(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """The default list names real CIKs the fixture store lacks: `--coverage`
+    lists them and `--check` still exits 0 while `check_enabled` is off."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "coverage reference (report-only): 2 sample sessions" in result.output
+    assert "  2019-12-31: 1 members; 30 of 30 reference names missing;" in result.output
+    assert "  missing 2019-12-31 0000051143:IBM (-): no_security" in result.output
+    assert (
+        "  coverage_reference_names: 60 missing (report-only): coverage.check_enabled is off"
+        in (result.output)
+    )
+
+
+def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    pre9 = "CIK0001000019:PRE9"
+    enforced = _settings(
+        tmp_path,
+        store=fixture_store_path,
+        coverage={"reference_names": [pre9], "check_enabled": True},
+    )
+    failed = _invoke(enforced, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "health check failed: coverage_reference_names" in failed.output
+    assert "  coverage_reference_names: fail (2)" in failed.output
+    skipped = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert skipped.exit_code == 0, skipped.output
+    assert "coverage reference: not computed" in skipped.output
+    assert (
+        "  missing 2019-12-31 CIK0001000019:PRE9 (SEC_STATIC_PRE2019): "
+        "rule exchange, not_listed" in failed.output
+    )
+    report_only = _settings(
+        tmp_path, store=fixture_store_path, coverage={"reference_names": [pre9]}
+    )
+    plain = _invoke(report_only, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    listed = _settings(
+        tmp_path,
+        store=fixture_store_path,
+        coverage={"reference_names": ["CIK0001000016:FRST::2019-12-31"], "check_enabled": True},
+    )
+    passed = _invoke(listed, ["health", "--check"], clock=lambda: T_END)
+    assert passed.exit_code == 0, passed.output
+    assert "  coverage_reference_names: pass" in passed.output
 
 
 def test_health_check_exits_non_zero_naming_the_failed_rule(

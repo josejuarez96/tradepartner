@@ -232,7 +232,10 @@ def test_frozen_values_are_json_normalized(settings: Settings) -> None:
     frozen = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
     assert frozen["holdout.start"] == "2023-01-03"
     assert frozen["holdout.end"] == "2025-12-31"
-    assert frozen["universe.exclude_sic_ranges"] == [[4900, 4999]]
+    assert frozen["universe.exclude_sic_ranges"] == []
+    named = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    stored = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), named)
+    assert stored["universe.exclude_sic_ranges"] == [[4900, 4999]]
     assert frozen["universe.min_price"] == 5.0
     assert isinstance(frozen["universe.min_price"], float)
 
@@ -1524,3 +1527,38 @@ def test_an_operations_file_of_a_non_variant_or_registered_slug_is_refused(ops: 
         hypothesis.register_operations_book(
             ops.conn, ops.file(OPS_SLUG, 0.25), v2.slug, " ", registered_by="owner"
         )
+
+
+# --- ADR 0006 amendment 2026-10-11 (#1540), property 9: family rules unchanged -----
+
+
+def _named_settings(settings: Settings) -> Settings:
+    """Settings naming the pre-T176 universe, as the registrations on the owner's store."""
+    return settings.model_copy(
+        update={
+            "universe": settings.universe.model_copy(update={"exclude_sic_ranges": ((4900, 4999),)})
+        }
+    )
+
+
+def test_load_frozen_returns_a_stored_utility_exclusion_under_the_new_default(
+    conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    assert settings.universe.exclude_sic_ranges == ()
+    _direct(conn, FIXTURE, _named_settings(settings))
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.universe.exclude_sic_ranges == ((4900, 4999),)
+
+
+def test_on_the_lab_the_h1_twins_unchanged_file_is_refused_under_the_new_default(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Property 9 (iii): the live default no longer reproduces the stored set, so the
+    unchanged file returns no record; the record stands."""
+    twin = _pre_lab_twin(lab_store, _named_settings(settings), tmp_path)
+    before = _counts(lab_store)
+
+    with pytest.raises(LabRegistrationError):
+        _register(lab_store, _lab_file(tmp_path), settings)
+    assert _counts(lab_store) == before
+    assert _register(lab_store, _lab_file(tmp_path), _named_settings(settings)) == twin

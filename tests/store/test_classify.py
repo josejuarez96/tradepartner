@@ -34,13 +34,15 @@ from tradepartner.store import schema
 from tradepartner.store.classify import (
     EQUITY,
     ClassificationBuild,
+    _title_type,
     build_classifications,
     classifications_as_of,
+    is_placeholder_title,
     listing_kind,
     write_classifications,
 )
 from tradepartner.store.db import configure_connection
-from tradepartner.store.master import build_master, primary_security_id, write_master
+from tradepartner.store.master import MasterBuild, build_master, primary_security_id, write_master
 
 INGESTED_AT = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 FETCHED_AT = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
@@ -558,3 +560,250 @@ def test_listing_kind_reads_the_class_title(title: str, kind: str) -> None:
 def test_an_untitled_listing_takes_its_ticker_suffix(ticker: str, kind: str) -> None:
     assert listing_kind(ticker, None) == kind
     assert listing_kind(ticker, " ") == kind
+
+
+# --- T179 (#1541): the title fallback ----------------------------------------
+
+# Real titles the spec amendment quotes, as `(title, off, on)` where each side is
+# `(security_type, rule)` of `_title_type` with the switch off and on.
+_UNREC = ("unclassifiable", "title_unrecognized")
+_COMMON = ("common", "title_common")
+_TITLE_CASES = [
+    ("ShockWave Medical Inc., common stock, par value $0.001 per share", _UNREC, _COMMON),
+    ("HD Supply Holdings, Inc. common stock, par value $0.01 per share", _UNREC, _COMMON),
+    ("BioLife Solutions, Inc. Common Shares", _UNREC, _COMMON),
+    ("Class A Shares", _UNREC, _COMMON),
+    ("United Therapeutics Corporation, Common Stock", ("unit", "title_unit"), _COMMON),
+    (
+        "Depository Shares, each representing 1/1000th of a share of Preferred Stock",
+        _UNREC,
+        ("preferred", "title_preferred"),
+    ),
+    ("Depository Shares", _UNREC, ("depositary", "title_depositary")),
+    ("Acme Corp., 5.5% Notes due 2030", _UNREC, _UNREC),
+    # a `%` title with "Common Stock" after the comma is no common
+    ("Acme Corp 6% Debt, convertible into Common Stock", _UNREC, _UNREC),
+    ("Shares of Beneficial Interest", _UNREC, _UNREC),
+    ("Commorn Stock", _UNREC, _UNREC),
+    # class-letter shares with a non-equity word anywhere stay out
+    ("Class A Shares, representing limited partner interests", _UNREC, _UNREC),
+    ("Class A Shares, 6% Trust Preferred", _UNREC, _UNREC),
+    ("Class A Shares, Trust Preferred", _UNREC, ("preferred", "title_preferred")),
+    ("Class A Shares, beneficial interest in the Trust", _UNREC, _UNREC),
+    # unchanged either way
+    ("Common Stock, par value $0.01", _COMMON, _COMMON),
+    ("Class A Common Stock", _COMMON, _COMMON),
+    (
+        "6.5% Series A Preferred Stock",
+        ("preferred", "title_preferred"),
+        ("preferred", "title_preferred"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("title", "off", "on"), _TITLE_CASES)
+def test_title_type_with_the_fallback_off_and_on(
+    title: str, off: tuple[str, str], on: tuple[str, str]
+) -> None:
+    assert _title_type(title) == off
+    assert _title_type(title, True) == on
+
+
+@pytest.mark.parametrize(
+    ("title", "placeholder"),
+    [
+        (None, True),
+        ("", True),
+        ("  ", True),
+        ("NONE", True),
+        ("N/A", True),
+        ("NA", True),
+        ("NO", True),
+        ("NONW", True),
+        ("0.01", True),
+        ("None, par value", True),
+        ("Common Stock", False),
+        ("Nonesuch Common Stock", False),
+        ("Class A Shares", False),
+    ],
+)
+def test_placeholder_titles(title: str | None, placeholder: bool) -> None:
+    assert is_placeholder_title(title) is placeholder
+
+
+FB = "0000000201"  # a placeholder title with a warrant ticker, then common
+FB_LATER = "0000000202"  # a real title, then a placeholder cover page
+FB_NOTE = "0000000203"  # a placeholder-titled note beside a titled common
+FB_ONLY = "0000000204"  # only placeholder titles
+FB_TIME = "0000000205"  # placeholder-titled class, common named by a later page
+
+
+def _fallback_source() -> FixtureFilingSource:
+    return FixtureFilingSource(
+        index=[_filing(cik, "10-K", _at(2018, 3, 1)) for cik in (FB, FB_LATER, FB_NOTE, FB_ONLY)]
+        + [_filing(FB_TIME, "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(FB, _at(2019, 3, 1), ("NONE", "FB-WS", "NYSE")),
+            _cover(FB_LATER, _at(2019, 3, 1), ("Common Stock", "FBL", "NYSE")),
+            _cover(FB_LATER, _at(2020, 3, 1), ("N/A", "FBL", "NASDAQ")),
+            _cover(
+                FB_NOTE,
+                _at(2019, 3, 1),
+                ("Common Stock", "FBN", "NYSE"),
+                ("NONE", "FBN1", "NYSE"),
+            ),
+            _cover(FB_ONLY, _at(2019, 3, 1), ("N/A", "FBO", "NYSE")),
+            _cover(FB_TIME, _at(2019, 3, 1), ("NONE", "FBT1", "NYSE")),
+            _cover(
+                FB_TIME,
+                _at(2021, 3, 1),
+                ("NONE", "FBT1", "NYSE"),
+                ("Common Stock", "FBT", "NYSE"),
+            ),
+        ],
+    )
+
+
+def _fallback_build(
+    on: bool, source: FixtureFilingSource | None = None
+) -> tuple[ClassificationBuild, MasterBuild]:
+    source = source or _fallback_source()
+    settings = _settings(edgar={"title_fallback": on})
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    return build_classifications(source, master, settings, ingested_at=INGESTED_AT), master
+
+
+def _latest_type(built: ClassificationBuild, security_id: str) -> tuple[str, str]:
+    row = _latest(built, security_id)
+    return (str(row["security_type"]), str(row["rule"]))
+
+
+def _ids(master: MasterBuild, cik: str) -> list[str]:
+    return sorted(r["security_id"] for r in master.securities if r["cik"] == cik)
+
+
+class TestTitleFallback:
+    def test_a_placeholder_title_with_a_warrant_ticker_is_a_warrant_by_rule_7(self) -> None:
+        source = _fallback_source()
+        on, master = _fallback_build(True, source)
+        off, _ = _fallback_build(False, source)
+        (sid,) = _ids(master, FB)
+        assert _latest_type(on, sid) == ("warrant", "suffix_warrant")
+        assert _latest_type(off, sid) == ("unclassifiable", "title_unrecognized")
+
+    def test_a_placeholder_class_with_no_real_title_defaults_to_common(self) -> None:
+        on, master = _fallback_build(True)
+        off, _ = _fallback_build(False)
+        (sid,) = _ids(master, FB_ONLY)
+        assert _latest_type(on, sid) == ("common", "common_default")
+        assert _latest_type(off, sid) == ("unclassifiable", "title_unrecognized")
+
+    def test_a_later_placeholder_never_masks_the_real_title(self) -> None:
+        on, master = _fallback_build(True)
+        off, _ = _fallback_build(False)
+        (sid,) = _ids(master, FB_LATER)
+        assert _history(on, sid)[-1][:2] == ("common", "title_common")
+        assert _latest_type(off, sid) == ("unclassifiable", "title_unrecognized")
+
+    def test_a_placeholder_note_beside_a_titled_common_stays_unclassifiable(self) -> None:
+        on, master = _fallback_build(True)
+        off, _ = _fallback_build(False)
+        ids = _ids(master, FB_NOTE)
+        assert len(ids) == 2
+        assert sorted(_latest_type(on, sid) for sid in ids) == [
+            ("common", "title_common"),
+            ("unclassifiable", "no_rule_matched"),
+        ]
+        assert ("unclassifiable", "title_unrecognized") in {_latest_type(off, s) for s in ids}
+
+    def test_a_sibling_title_arriving_later_stops_rule_8_from_then(self) -> None:
+        on, master = _fallback_build(True)
+        ids = _ids(master, FB_TIME)
+        assert len(ids) == 2
+        placeholder = next(s for s in ids if _history(on, s)[0][1] == "common_default")
+        history = _history(on, placeholder)
+        assert history[0] == ("common", "common_default", history[0][2])
+        assert history[-1][:2] == ("unclassifiable", "no_rule_matched")
+        assert history[-1][2] == _at(2021, 3, 1)
+
+    def test_switch_off_is_the_same_as_the_default(self) -> None:
+        explicit, _ = _fallback_build(False)
+        source = _fallback_source()
+        settings = _settings()
+        master = build_master(source, settings, ingested_at=INGESTED_AT)
+        default = build_classifications(source, master, settings, ingested_at=INGESTED_AT)
+        assert explicit.classifications == default.classifications
+
+    def test_the_fixture_universe_is_unchanged_with_the_switch_off(self) -> None:
+        source = _source()
+        off = _settings(edgar={"title_fallback": False})
+        master = build_master(source, off, ingested_at=INGESTED_AT)
+        assert (
+            build_classifications(source, master, off, ingested_at=INGESTED_AT).classifications
+            == _build().classifications
+        )
+
+
+SHOCK = "0000000301"
+
+
+def test_shares_of_a_shockwave_shaped_issuer_continue_after_its_titled_listing() -> None:
+    """Shares facts are keyed by class member, never by title: a 10-K filer
+    whose first cover page carries an issuer-name-first title is common again
+    from that page under the fallback, and its shares facts land before and
+    after it (off, the facts after the page are unmatched)."""
+    from tradepartner.adapters.filings import FactRecord
+    from tradepartner.ingest import fact_rows
+
+    source = FixtureFilingSource(
+        index=[_filing(SHOCK, "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(
+                SHOCK,
+                _at(2019, 3, 1),
+                (
+                    "ShockWave Medical Inc., common stock, par value $0.001 per share",
+                    "SWAV",
+                    "NASDAQ",
+                ),
+            )
+        ],
+    )
+    records = [
+        FactRecord(
+            SHOCK,
+            "EntityCommonStockSharesOutstanding",
+            date(2018, 2, 15),
+            "",
+            1.0,
+            "a1",
+            _at(2018, 3, 1),
+        ),
+        FactRecord(
+            SHOCK,
+            "EntityCommonStockSharesOutstanding",
+            date(2019, 2, 15),
+            "",
+            2.0,
+            "a2",
+            _at(2019, 3, 1, 21),
+        ),
+        FactRecord(
+            SHOCK,
+            "EntityCommonStockSharesOutstanding",
+            date(2020, 2, 15),
+            "",
+            3.0,
+            "a3",
+            _at(2020, 3, 1),
+        ),
+    ]
+    landed = {}
+    for on in (False, True):
+        settings = _settings(edgar={"title_fallback": on})
+        master = build_master(source, settings, ingested_at=INGESTED_AT)
+        classes = build_classifications(source, master, settings, ingested_at=INGESTED_AT)
+        rows, unmatched = fact_rows(records, master, classes, ingested_at=INGESTED_AT)
+        landed[on] = ([r["value"] for r in rows], [u.accession for u in unmatched])
+    assert landed[False] == ([1.0], ["a2", "a3"])
+    assert landed[True] == ([1.0, 2.0, 3.0], [])
