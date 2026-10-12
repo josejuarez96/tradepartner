@@ -1180,3 +1180,27 @@ unblocks = ["task:T181"]
 [task.T181]
 what = "The owner's release cover-listings-1541: the switch flips and cache version bumps, the FSN re-extract and master re-derive, the retraction of the note rows on a primary id, the resolution repair, the classification rebuild, the fill-holes run for the newly listed names and the ten ticker-reuse old holders, health and the coverage report, the trial note, and the check_enabled gate."
 why = "Puts the dropped listings and their bars in the store before any H1 re-run or holdout spend, under one named release with a backup and a dry run, and nothing reaches the store before it (#1541)."
+
+[task.T184]
+what = "Pure parsers over a filing's index.json names and a 10-K's text: the XBRL instance prefix, the Nasdaq Form 25 exhibit ticker and the Section 12(b) exchange; the FilenameListing record, the FilingSource method and the fixture adapter."
+why = "The store has no listing known before 2019-06, so the universe is empty before 2019 and 732 of 779 2016-2018 delisters were never asked for; the filings' own file names and cover text are the filing-time evidence (#1597)."
+unblocks = ["task:T184b", "task:T184c"]
+
+[task.T184b]
+what = "The EDGAR adapter's filename_listings behind edgar.filename_listings: one index.json and one 10-K document per issuer-year, the extract cached per CIK, the FSN record keeping a symbol-only dei:TradingSymbol, three config keys, the fetch-pass counts."
+why = "Fetches the evidence once and keeps only the extract, so the release's fetch pass is bounded and repeatable (#1597)."
+unblocks = ["task:T184e"]
+
+[task.T184c]
+what = "listings rows with provenance filing_name known at the filing's acceptance, confirmed against the security's other readings at the run, refused on contradiction, the Form 25 row of last resort, rule 7 on these rows, the run-row counts, the six fixture cases and the look-ahead tests."
+why = "Gives survivors and delisters alike a point-in-time listing before 2019 so the universe and the backfill see them, with no row stamped earlier than its filing (#1597)."
+unblocks = ["task:T184d"]
+
+[task.T184d]
+what = "The filename_listings health block, the page card and the --check rules for filing_name rows."
+why = "The reliance on inferred tickers and the rows with no bars must be visible before a trial reads them (#1597)."
+unblocks = ["task:T184e"]
+
+[task.T184e]
+what = "The owner's release pre2019-listings-1597: the switch flip and FSN bump, the fetch pass, the rows, the asof backfill with fill-holes, the retraction of collision rows, health, and the before/after universe and gap evidence from 2017-01 to 2019-06."
+why = "Puts the 2016-2018 universe in the store under one named release with a backup, so the next sweeps have two more practice years (#1597)."
