@@ -246,18 +246,73 @@ def test_rates_same_value_at_later_vintage_writes_nothing(settings: Settings) ->
     assert "rates_revisions=0" in result.runs[0].message
 
 
-def test_rates_colliding_vintage_stamps_are_counted(settings: Settings) -> None:
+def test_rates_old_value_refetched_after_revision_adds_no_duplicate(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Daily re-fetches of an earlier value do not repeat a stored revision."""
+    first = RateObservation("DTB3", date(2020, 7, 2), 0.1, date(2020, 7, 2))
+    revised = RateObservation("DTB3", date(2020, 7, 2), 0.2, date(2020, 7, 7))
+    recent = RateObservation("DTB3", date(2020, 7, 8), 0.3, date(2020, 7, 9))
+    ingest_module.ingest_rates(
+        settings,
+        FixtureRateSource([first, revised]),
+        since=first.observation_date,
+        clock=lambda: datetime(2020, 7, 9, 22, tzinfo=UTC),
+    )
+    assert read("SELECT count(*) FROM rates WHERE observation_date = '2020-07-02'") == [(2,)]
+
+    for day in (9, 10, 11):
+        # The source re-serves the old value at a window-clamped vintage.
+        clamped = RateObservation("DTB3", first.observation_date, first.value, date(2020, 7, 6))
+        result = ingest_module.ingest_rates(
+            settings,
+            FixtureRateSource([clamped, revised, recent]),
+            clock=lambda day=day: datetime(2020, 7, day, 22, tzinfo=UTC),
+        )
+        assert result.runs[0].status == OK
+        assert "rates_revisions=0" in result.runs[0].message
+        assert read("SELECT count(*) FROM rates WHERE observation_date = '2020-07-02'") == [(2,)]
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_rates_colliding_vintage_stamps_are_counted(settings: Settings, newest_first: bool) -> None:
     """Two changed weekend vintages at one session close cannot both be stored."""
     saturday = RateObservation("DTB3", date(2020, 10, 9), 0.1, date(2020, 10, 10))
     sunday = RateObservation("DTB3", date(2020, 10, 9), 0.2, date(2020, 10, 11))
     result = ingest_module.ingest_rates(
         settings,
-        FixtureRateSource([saturday, sunday]),
+        FixtureRateSource([sunday, saturday] if newest_first else [saturday, sunday]),
         since=date(2020, 10, 9),
         clock=lambda: datetime(2020, 10, 13, 22, tzinfo=UTC),
     )
     assert result.runs[0].rows_added == 1
     assert "rates_colliding_vintages=1" in result.runs[0].message
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT value, vintage_date FROM rates WHERE observation_date = '2020-10-09'"
+        ).fetchall() == [(sunday.value, sunday.vintage_date)]
+
+
+def test_rates_stored_stamp_is_immutable_on_later_collision(settings: Settings) -> None:
+    """A later run counts a same-stamp conflict without changing the stored row."""
+    saturday = RateObservation("DTB3", date(2020, 10, 9), 0.1, date(2020, 10, 10))
+    sunday = RateObservation("DTB3", date(2020, 10, 9), 0.2, date(2020, 10, 11))
+
+    def clock() -> datetime:
+        return datetime(2020, 10, 13, 22, tzinfo=UTC)
+
+    ingest_module.ingest_rates(
+        settings, FixtureRateSource([saturday]), since=saturday.observation_date, clock=clock
+    )
+    result = ingest_module.ingest_rates(
+        settings, FixtureRateSource([sunday]), since=sunday.observation_date, clock=clock
+    )
+    assert result.runs[0].rows_added == 0
+    assert "rates_colliding_vintages=1" in result.runs[0].message
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT value, vintage_date FROM rates WHERE observation_date = '2020-10-09'"
+        ).fetchall() == [(saturday.value, saturday.vintage_date)]
 
 
 def test_rates_fixture_backfill_matches_every_stamp_and_reruns(settings: Settings) -> None:
