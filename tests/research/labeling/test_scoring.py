@@ -983,21 +983,23 @@ def _jev(kind: str, option: str | None, reason: str = "ok", **kw: float) -> scor
     return _call("jev", kind, option, reason, latency=100.0 if kind == "A" else 300.0, **kw)  # type: ignore[arg-type]
 
 
-def _claude(kind: str, option: str | None, reason: str = "ok", **kw: object) -> scoring.ArmCall:
-    return _call("claude", kind, option, reason, cost=0.02, tokens_in=200, **kw)  # type: ignore[arg-type]
+def _claude_code(
+    kind: str, option: str | None, reason: str = "ok", **kw: object
+) -> scoring.ArmCall:
+    return _call("claude_code", kind, option, reason, cost=0.02, tokens_in=200, **kw)  # type: ignore[arg-type]
 
 
 BK, WRONG, MA = "bankruptcy", "exchange_transfer", "merger_or_acquisition"
 
 
-def _ladder_items(*, with_claude: bool = True) -> list[scoring.ScoredItem]:
+def _ladder_items(*, with_claude_code: bool = True) -> list[scoring.ScoredItem]:
     """30 text items: 20 plain (gold bankruptcy, no 8-K, provision (a)(3)) and 10 with an
     8-K (gold merger_or_acquisition; K0-3 on (a)(1), the rest on (a)(3)).
 
     Jev A right on P0-13, K8, K9 (timeout P18, ok-unresolved P19); Jev B right on K0-6
-    and K9 (K7 unresolved, K8 wrong). Claude A right on P0-11, P14-17, K0-3 (P18
-    `max_tokens`, P19 `refusal`); Claude B right on K0-4, wrong K5-8, none on K9 (B was
-    refused before sending)."""
+    and K9 (K7 unresolved, K8 wrong). The claude_code arm A right on P0-11, P14-17,
+    K0-3 (P18 `max_tokens`, P19 `refusal`); its B right on K0-4, wrong K5-8, none on K9
+    (B was refused before sending)."""
     items = []
     for i in range(20):
         jev_a = (
@@ -1010,15 +1012,15 @@ def _ladder_items(*, with_claude: bool = True) -> list[scoring.ScoredItem]:
             else _jev("A", UNRESOLVED)
         )
         calls = [jev_a]
-        if with_claude:
+        if with_claude_code:
             if i in (12, 13):
-                calls.append(_claude("A", WRONG))
+                calls.append(_claude_code("A", WRONG))
             elif i == 18:
-                calls.append(_claude("A", None, "refused", stop_reason="max_tokens"))
+                calls.append(_claude_code("A", None, "refused", stop_reason="max_tokens"))
             elif i == 19:
-                calls.append(_claude("A", None, "refused", stop_reason="refusal"))
+                calls.append(_claude_code("A", None, "refused", stop_reason="refusal"))
             else:
-                calls.append(_claude("A", BK))
+                calls.append(_claude_code("A", BK))
         items.append(
             _item(f"P{i}", BK, BK, "ok", calls=tuple(calls), rule_provision="12d2-2(a)(3)")
         )
@@ -1029,10 +1031,10 @@ def _ladder_items(*, with_claude: bool = True) -> list[scoring.ScoredItem]:
             if i == 7
             else _jev("B", MA if i in (0, 1, 2, 3, 4, 5, 6, 9) else BK)
         )
-        if with_claude:
-            calls.append(_claude("A", MA if i < 4 else BK))
+        if with_claude_code:
+            calls.append(_claude_code("A", MA if i < 4 else BK))
             if i != 9:
-                calls.append(_claude("B", MA if i < 5 else BK))
+                calls.append(_claude_code("B", MA if i < 5 else BK))
         items.append(
             _item(
                 f"K{i}",
@@ -1093,18 +1095,18 @@ def test_level_answer_e1_e2_and_cascade() -> None:
     assert scoring.level_answer(items["K6"], "jev", "cascade") == MA
     # a refused or timeout call reads as unresolved
     assert scoring.level_answer(items["P18"], "jev", "E1") == UNRESOLVED
-    assert scoring.level_answer(items["P18"], "claude", "E1") == UNRESOLVED
+    assert scoring.level_answer(items["P18"], "claude_code", "E1") == UNRESOLVED
     # B was never sent (refused by max_packet_tokens): E2 = A
-    assert scoring.level_answer(items["K9"], "claude", "E2") == BK
-    assert scoring.level_answer(items["K9"], "claude", "E1") == BK
+    assert scoring.level_answer(items["K9"], "claude_code", "E2") == BK
+    assert scoring.level_answer(items["K9"], "claude_code", "E1") == BK
 
 
 def test_level_answer_edge_cases() -> None:
     item = _item("x", BK, BK, "ok", calls=(_jev("A", BK),))
-    assert scoring.level_answer(item, "claude", "E1") is None  # arm made no call
+    assert scoring.level_answer(item, "claude_code", "E1") is None  # arm made no call
     assert scoring.level_answer(item, "jev", "cascade") == BK
     with pytest.raises(ValueError, match="Jev's registered treatment"):
-        scoring.level_answer(item, "claude", "cascade")
+        scoring.level_answer(item, "claude_code", "cascade")
     with pytest.raises(ValueError, match="unknown ladder level"):
         scoring.level_answer(item, "jev", "E3")  # type: ignore[arg-type]
     twice = _item("y", BK, BK, "ok", calls=(_jev("A", BK), _jev("A", WRONG)))
@@ -1117,6 +1119,16 @@ def test_arm_call_rejects_an_unknown_arm_or_kind() -> None:
         _call("gpt", "A", BK)
     with pytest.raises(ValueError, match="kind"):
         _call("jev", "C", BK)
+
+
+def test_arm_call_refuses_the_retired_claude_api_arms_name() -> None:
+    """#1534: the second scoring slot is `claude_code` (Claude through Claude Code,
+    outside this job), so the Claude API arm's `claude` -- merged and never run
+    (T173) -- is no longer a slot here and a call naming it is refused. Its records
+    keep their own vocabulary in `job`, whose slots are independent."""
+    with pytest.raises(ValueError, match=r"arm 'claude' is not one of jev, claude_code"):
+        scoring.ArmCall("claude", "A", BK, "ok")
+    assert scoring.ARMS == ("jev", "claude_code")
 
 
 def test_ladder_table_counts_bounds_and_sums_on_the_fixture() -> None:
@@ -1145,16 +1157,16 @@ def test_ladder_table_counts_bounds_and_sums_on_the_fixture() -> None:
     assert cascade.unresolved_share == pytest.approx(2 / 30)
     assert cascade.cost_usd == pytest.approx(0.31)  # K7 paid B and A
     assert cascade.cost_per_correct == pytest.approx(0.31 / 22)
-    assert not [r for r in rows if r.arm == "claude" and r.level == "cascade"]
+    assert not [r for r in rows if r.arm == "claude_code" and r.level == "cascade"]
 
 
-def test_ladder_table_claude_lines_refusals_and_b_refused() -> None:
+def test_ladder_table_claude_code_lines_refusals_and_b_refused() -> None:
     rows = scoring.ladder_table(_ladder_items())
-    e1 = _row(rows, "claude", "E1")
+    e1 = _row(rows, "claude_code", "E1")
     assert e1.correct == 20 and e1.unresolved_share == pytest.approx(2 / 30)
     assert dict(e1.refused_by_stop_reason) == {"max_tokens": 1, "refusal": 1}
     assert e1.timeouts == 0
-    e2 = _row(rows, "claude", "E2")
+    e2 = _row(rows, "claude_code", "E2")
     assert e2.correct == 21  # K9 has no B call, so E2 falls back to A (wrong)
     assert e2.b_refused == 1
     assert e2.cost_usd == pytest.approx(0.60)  # 20 + (9 B + 1 A) calls at 0.02
@@ -1169,10 +1181,10 @@ def test_ladder_table_eightk_subset_apart_and_underpowered() -> None:
     assert (jev_e2.n, jev_e2.correct) == (10, 8)
     assert jev_e1.underpowered and jev_e1.lower_bound is None  # under 20
     # the subset is the items with an 8-K AND this arm's B packet sent
-    claude_e1 = _row(rows, "claude", "E1", "text_eightk")
-    claude_e2 = _row(rows, "claude", "E2", "text_eightk")
-    assert (claude_e1.n_eligible, claude_e1.n, claude_e1.correct) == (9, 9, 4)
-    assert (claude_e2.n, claude_e2.correct) == (9, 5)
+    claude_code_e1 = _row(rows, "claude_code", "E1", "text_eightk")
+    claude_code_e2 = _row(rows, "claude_code", "E2", "text_eightk")
+    assert (claude_code_e1.n_eligible, claude_code_e1.n, claude_code_e1.correct) == (9, 9, 4)
+    assert (claude_code_e2.n, claude_code_e2.correct) == (9, 5)
 
 
 def test_exchange_rule_and_provision_items_are_never_in_the_text_table() -> None:
@@ -1216,12 +1228,12 @@ def test_exchange_rule_and_provision_items_are_never_in_the_text_table() -> None
         scoring.hybrid_router(items + extra, "jev", "E1", set_name="provision")
 
 
-def test_a_jev_only_run_has_no_claude_lines() -> None:
-    items = _ladder_items(with_claude=False)
+def test_a_jev_only_run_has_no_claude_code_lines() -> None:
+    items = _ladder_items(with_claude_code=False)
     assert {r.arm for r in scoring.ladder_table(items)} == {"jev"}
     comparisons = scoring.paired_comparisons(items)
     assert len(comparisons) == 10  # E1/E2, E2/cascade and 3 hybrids, on two sets
-    assert all("claude" not in c.first + c.second for c in comparisons)
+    assert all("claude_code" not in c.first + c.second for c in comparisons)
 
 
 def test_is_rule_decisive_only_for_a1_and_a2() -> None:
@@ -1278,7 +1290,7 @@ def test_hybrid_router_never_routes_a_provision_basis_item() -> None:
 
 
 def test_hybrid_router_on_the_eightk_subset() -> None:
-    result = scoring.hybrid_router(_ladder_items(), "claude", "E2", set_name="text_eightk")
+    result = scoring.hybrid_router(_ladder_items(), "claude_code", "E2", set_name="text_eightk")
     assert result.n == 9 and result.routed.count == 4  # K0-K8 (Claude sent B on those)
     assert result.underpowered and result.lower_bound is None
 
@@ -1290,10 +1302,10 @@ def test_paired_comparisons_make_twelve_plus_twelve() -> None:
     assert sum(1 for c in comparisons if c.set_name == "text_eightk") == 12
     text = [c for c in comparisons if c.set_name == "text"]
     assert [(c.first, c.second) for c in text][:4] == [
-        ("jev:E1", "claude:E1"),
-        ("jev:E2", "claude:E2"),
-        ("jev:E1:hybrid", "claude:E1:hybrid"),
-        ("jev:E2:hybrid", "claude:E2:hybrid"),
+        ("jev:E1", "claude_code:E1"),
+        ("jev:E2", "claude_code:E2"),
+        ("jev:E1:hybrid", "claude_code:E1:hybrid"),
+        ("jev:E2:hybrid", "claude_code:E2:hybrid"),
     ]
     adjacent = [c for c in text if c.first.split(":")[0] == c.second.split(":")[0]]
     hybrid_pairs = [c for c in adjacent if c.second.endswith(":hybrid")]
@@ -1310,7 +1322,7 @@ def _comparison(first: str, second: str, set_name: str = "text") -> scoring.Comp
 
 
 def test_paired_comparison_discordant_counts_and_p() -> None:
-    c = _comparison("jev:E1", "claude:E1")
+    c = _comparison("jev:E1", "claude_code:E1")
     # Jev right on P0-13, K8, K9; Claude right on P0-11, P14-17, K0-3
     assert (c.n, c.b, c.c) == (30, 4, 8)
     assert c.accuracy_difference == pytest.approx((16 - 20) / 30)
@@ -1322,7 +1334,7 @@ def test_paired_comparison_discordant_counts_and_p() -> None:
     assert (adjacent.b, adjacent.c) == (1, 7)  # E1 right and E2 wrong: K8; the reverse: K0-6
     assert adjacent.accuracy_difference == pytest.approx((16 - 22) / 30)
 
-    subset = _comparison("jev:E1", "claude:E1", "text_eightk")
+    subset = _comparison("jev:E1", "claude_code:E1", "text_eightk")
     assert (subset.n, subset.b, subset.c) == (9, 1, 4)  # K0-K8, where both sent B
     assert subset.underpowered
 
@@ -1361,7 +1373,7 @@ def test_existing_metrics_are_byte_identical_with_and_without_calls() -> None:
 def test_a_packet_never_sent_scores_unresolved_not_dropped() -> None:
     """The primary counts an item whose A packet was over the cap as wrong; the ladder
     must keep it in the denominator, so Jev's cascade row equals `class_accuracy`."""
-    items = _ladder_items(with_claude=False)
+    items = _ladder_items(with_claude_code=False)
     no_a = dataclasses.replace(
         items[30 - 1],  # K9: keep only its B call
         calls=(items[29].calls[1],),
@@ -1382,7 +1394,7 @@ def test_a_packet_never_sent_scores_unresolved_not_dropped() -> None:
     assert (row.n, row.correct) == (acc.n, acc.correct) == (30, 22)
     no_calls = _item("no-calls", BK, BK, "ok", calls=())
     assert scoring.level_answer(no_calls, "jev", "cascade") == UNRESOLVED
-    assert scoring.level_answer(no_calls, "claude", "E1") is None
+    assert scoring.level_answer(no_calls, "claude_code", "E1") is None
     with_none = [*items, no_calls]
     assert _row(scoring.ladder_table(with_none), "jev", "E1").n == 31
     only_b = _item("only-b", BK, BK, "ok", calls=(_jev("B", BK),), has_eightk=True)
