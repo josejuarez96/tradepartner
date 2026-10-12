@@ -1,0 +1,3 @@
+- Spec, plan (T183) and ADR 0010 amended (#1583, class B): the ledger books Alpaca FEE activities by id; the cash tolerance is a strict bound (0.01 + 0.005 per fill since the base). T183 lands before 2026-10-14 08:05 ET (Daily book).
+### Changed
+- Paper spec, plan and ADR 0010 amendments of 2026-10-12 (#1583): the ledger books Alpaca's non-trade cash activities (FEE: CAT, REG) as id-keyed fee_cash adjustments, other types halt as unexplained_activity, and risk.reconcile_cash_tolerance returns to 0.01 as the fixed term of a strict per-fill rounding bound (half a unit of the new alpaca.cash_decimals per fill since the last ok reconciliation); supersedes #1466's 1.26 band, whose record stands; the build is plan task T183 (schema 25), due before 2026-10-14 08:05 ET.
