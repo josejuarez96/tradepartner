@@ -22,7 +22,9 @@ from typer.testing import CliRunner
 from tradepartner import cli
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.fixture_rates import FixtureRateSource
 from tradepartner.adapters.prices import PriceSource
+from tradepartner.adapters.rates import RateObservation
 from tradepartner.backfill import FILLED, NO_HOLE, UNASSIGNED, Hole, HoleFill, NamedSecurity
 from tradepartner.calendar import session_close
 from tradepartner.config import Settings
@@ -83,6 +85,81 @@ def _run_row(
 # --- ingest --------------------------------------------------------------------
 
 
+def test_fred_cli_refuses_missing_key_without_fetch(tmp_path: Path) -> None:
+    """The key is checked before a FRED request or store write."""
+    settings = _settings(tmp_path)
+    result = _invoke(
+        settings, ["ingest", "--source", "fred", "--backfill", "--since", "2020-06-29"]
+    )
+    assert result.exit_code == 2
+    assert "FRED_API_KEY" in result.output
+    assert not Path(settings.store.path).exists()
+
+
+def test_fred_cli_backfill_uses_injected_source(tmp_path: Path) -> None:
+    """The CLI routes FRED backfill through the rates ingest only."""
+    settings = _settings(tmp_path, fred_api_key="fixture-secret")
+    rates = FixtureRateSource([RateObservation("DTB3", date(2020, 6, 29), 0.1, date(2020, 6, 30))])
+    result = _invoke(
+        settings,
+        ["ingest", "--source", "fred", "--backfill", "--since", "2020-06-29"],
+        rate_source=lambda _settings: rates,
+        clock=lambda: datetime(2020, 7, 3, 22, tzinfo=UTC),
+    )
+    assert result.exit_code == 0, result.output
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM rates").fetchone() == (1,)
+
+
+def test_all_with_blank_fred_key_runs_legacy_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unset FRED key cannot stop the scheduled price ingest."""
+    settings = _settings(
+        tmp_path,
+        sec_edgar_user_agent=USER_AGENT,
+        alpaca_api_key="test-key-id",
+        alpaca_api_secret="test-key-secret",
+    )
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    result = _invoke(settings, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert session.calls and session.calls[0]["rates"] is None
+    assert "FRED_API_KEY" in result.output
+
+
+def test_all_without_seeded_rate_runs_legacy_sources(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """An unseeded rate series asks for backfill without failing all."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    result = _invoke(secrets_set, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert session.calls and session.calls[0]["rates"] is None
+    assert "--source fred --backfill" in result.output
+
+
+def test_all_backfill_appends_fred_run(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """The all-source backfill routes the configured FRED series too."""
+    legacy = _patched(monkeypatch, "backfill", _ok("edgar", "alpaca"))
+    rates = FixtureRateSource([RateObservation("DTB3", date(2020, 6, 29), 0.1, date(2020, 6, 30))])
+    result = _invoke(
+        secrets_set,
+        ["ingest", "--backfill", "--since", "2020-06-29"],
+        rate_source=lambda _settings: rates,
+        clock=lambda: datetime(2020, 7, 3, 22, tzinfo=UTC),
+    )
+    assert result.exit_code == 0, result.output
+    assert legacy.calls
+    assert "fred" in result.output
+    with duckdb.connect(str(secrets_set.store.path), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE source='fred'"
+        ).fetchone() == (1,)
+
+
 class _Recorder:
     """Stands in for `ingest_session`/`backfill`, recording its arguments."""
 
@@ -112,6 +189,7 @@ def secrets_set(tmp_path: Path) -> Settings:
         sec_edgar_user_agent=USER_AGENT,
         alpaca_api_key="test-key-id",
         alpaca_api_secret="test-key-secret",
+        fred_api_key="test-fred-key",
     )
 
 
