@@ -617,5 +617,8 @@ def test_the_re_anchor_adds_no_frozen_universe_key(monkeypatch: pytest.MonkeyPat
             monkeypatch.delenv(name)
     keys = [k for k in frozen_keys() if k.startswith("universe.")]
     assert keys == list(UNIVERSE_FROZEN)
-    params = frozen_params_of(Settings(_env_file=None, universe={}), family="momentum")
+    params = frozen_params_of(
+        Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]}),
+        family="momentum",
+    )
     assert {k: params[k] for k in keys} == UNIVERSE_FROZEN

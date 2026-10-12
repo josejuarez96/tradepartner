@@ -9,8 +9,11 @@ checks as status chips, per-source ingest status, survivorship gap,
 unclassifiable and `snapshot_static` reliance, settings, statement facts
 (issue 660, T77c: the switch's state, coverage and derived share while it
 is on, the last EDGAR run's `statement_*` counts and a warning badge while
-`statement_vintage_late > 0`)); and the gap, delisted and missing-name
-tables. Read-only.
+`statement_vintage_late > 0`), the coverage check against the named
+reference (issue 1541, T180: "not computed" until the viewer presses its
+button, since it costs one universe read per sample session; never computed
+on a refresh, whatever `coverage.check_enabled` says)); and the gap,
+delisted and missing-name tables. Read-only.
 
 Two layers, like the other pages: `load_health_view` reads everything
 through the connection it is given (the shell's single read-only
@@ -57,7 +60,12 @@ from tradepartner.backfill import FILLED
 from tradepartner.calendar import all_sessions, last_completed_session
 from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
-from tradepartner.health import HealthReport, health_report
+from tradepartner.health import (
+    COVERAGE_REFERENCE_NAMES,
+    CoverageReference,
+    HealthReport,
+    health_report,
+)
 from tradepartner.repair import REPAIRED
 from tradepartner.store.classify import COMMON, classifications_as_of
 from tradepartner.store.delistings import LISTED, TRANSFERRED, listing_ends_as_of
@@ -73,6 +81,9 @@ DEFAULT_WINDOW_SESSIONS: Final = 60
 #: alarm. Shared from `repair`/`backfill`, never copied, so a renamed
 #: status can't drift silently out of this set.
 _MAINTENANCE_STATUSES: Final[frozenset[str]] = frozenset({REPAIRED, FILLED})
+
+#: The coverage card's button: true only on the rerun its press triggers.
+COVERAGE_BUTTON_KEY: Final = "health_coverage_reference"
 
 _SERIES_SCHEMA: Final[dict[str, Any]] = {
     "session": pl.Date,
@@ -168,10 +179,14 @@ def load_health_view(
     t: datetime,
     settings: Settings,
     window: tuple[date, date] | None,
+    *,
+    with_coverage_reference: bool = False,
 ) -> HealthView:
     """The health report at `t` and the per-session series over `window` (clipped to
-    the last completed session; no series when None), read through `conn` only."""
-    report = health_report(conn, t, settings)
+    the last completed session; no series when None), read through `conn` only. The
+    coverage-reference block is computed only when `with_coverage_reference` is true
+    (the card's button), never on a plain refresh."""
+    report = health_report(conn, t, settings, with_coverage_reference=with_coverage_reference)
     finished = [i.last_ok_finished_at for i in report.ingests if i.last_ok_finished_at]
     return HealthView(
         report=report,
@@ -284,6 +299,55 @@ def _integrity_card(report: HealthReport) -> None:
                 theme.status_badge(f"{check.rule}: pass", "good")
             else:
                 theme.status_badge(f"{check.rule}: fail ({check.violations.height})", "critical")
+        label, tone = coverage_badge(report.coverage_reference)
+        theme.status_badge(label, tone)
+
+
+def coverage_badge(block: CoverageReference | None) -> tuple[str, theme.Status]:
+    """`coverage_reference_names`' status chip: "not computed", a caution (never a
+    pass it did not check), until the block is computed; "nothing checked" a
+    caution too; a missing reference name is critical only while
+    `coverage.check_enabled` is on, else a caution."""
+    if block is None:
+        return f"{COVERAGE_REFERENCE_NAMES}: not computed", "warning"
+    label = f"{COVERAGE_REFERENCE_NAMES}: {block.verdict}"
+    if block.failed and block.check_enabled:
+        return label, "critical"
+    return label, "good" if block.checked and not block.failed else "warning"
+
+
+def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
+    """The coverage-reference card. Its button reruns the page, which then reads
+    the button's state before loading the view (`render`)."""
+    block = report.coverage_reference
+    with st.container(border=True):
+        st.subheader("Coverage against the reference list")
+        st.button("Run coverage check", key=COVERAGE_BUTTON_KEY)
+        if block is None:
+            st.caption(
+                "Not computed: it reads the universe once per sample session "
+                "(`coverage.sample_months`)."
+            )
+            if check_enabled:
+                theme.status_badge(
+                    "coverage.check_enabled is on: `health --check` enforces this check",
+                    "warning",
+                )
+            return
+        mode = "check" if block.check_enabled else "report-only"
+        st.markdown(f"Mode: **{mode}** (`coverage.check_enabled`)")
+        st.dataframe(block.samples, hide_index=True)
+        if not block.reference_missing.is_empty():
+            st.markdown(f"Missing reference names ({block.reference_missing.height})")
+            st.dataframe(block.reference_missing, hide_index=True)
+        ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
+        st.caption(
+            f"Snapshot CIKs on universe exchanges: {block.snapshot_ciks}; "
+            f"latest members per snapshot CIK: {ratio}"
+        )
+        if not block.late_known.is_empty():
+            st.markdown(f"Late-known listings ({block.late_known.height})")
+            st.dataframe(block.late_known, hide_index=True)
 
 
 def _sources_card(report: HealthReport) -> None:
@@ -396,7 +460,8 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
     )
     picked_dates = list(picked) if isinstance(picked, tuple | list) else [picked]
     window = (picked_dates[0], picked_dates[1]) if len(picked_dates) == 2 else None
-    view = load_health_view(conn, t, settings, window)
+    asked = bool(st.session_state.get(COVERAGE_BUTTON_KEY, False))
+    view = load_health_view(conn, t, settings, window, with_coverage_reference=asked)
     with controls:
         _header(view)
     palette = theme.palette()
@@ -411,4 +476,5 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _sources_card(view.report)
         _survivorship_card(view.report)
         _statement_card(view.report)
+        _coverage_card(view.report, settings.coverage.check_enabled)
     _tables(view.report)

@@ -919,3 +919,70 @@ def test_the_missing_count_waits_for_the_refresh_that_succeeds(settings: Setting
     source._submissions.clear()  # a later run's fresh memo
     assert source.filing_events(APPLE) == []
     assert source.filing_events_items_missing == 2  # both 8-Ks terminal, counted once
+
+
+# --- #1541 (T178): `edgar.exchange_axis_listings` reaches both parsers ------------
+
+_ANSYS = "0001013462"
+_ANSYS_ACCESSION = "0001013462-19-000023"
+_ANSYS_ACCEPTED = datetime(2019, 7, 31, 20, 30, tzinfo=UTC)
+#: The spec's ANSYS shape with its member patched to name NYSE while the value
+#: says Nasdaq: a listing kept and counted (spec open question 1).
+_MISMATCHED_ANSYS = (
+    (FIXTURES / "cover_exchange_axis" / "ansys_10q_2019q2.htm")
+    .read_bytes()
+    .replace(b'">exch:XNGS<', b'">exch:XNYS<')
+)
+
+
+def _axis_fsn_zip() -> bytes:
+    from test_edgar_fsn import _dim, _fsn_zip_bytes, _sub, _txt
+
+    adsh, dimh = _ANSYS_ACCESSION, "0x1dc0af108c94fa3ada3018ad13966aeb"
+    txt = [
+        _txt(adsh, tag, value, dimh=dimh, dimn="1")
+        for tag, value in (
+            ("Security12bTitle", "Common Stock"),
+            ("TradingSymbol", "ANSS"),
+            ("SecurityExchangeName", "NYSE"),  # the member names Nasdaq
+        )
+    ]
+    return _fsn_zip_bytes(
+        [_sub(adsh, "1013462", "10-Q")], [], txt, [_dim(dimh, "EntityListingsExchange=XNAS;")]
+    )
+
+
+def _axis_source(tmp_path: Path, on: bool) -> tuple[EdgarFilingSource, EdgarRouter]:
+    from test_edgar_fsn import FSN_PAGE_URL, _fsn_zip_url
+
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, f'<html><body><a href="{_fsn_zip_url("2019q3")}">x</a></body></html>')
+    router.add(_fsn_zip_url("2019q3"), _axis_fsn_zip())
+    nodash = _ANSYS_ACCESSION.replace("-", "")
+    router.add(
+        f"https://www.sec.gov/Archives/edgar/data/{int(_ANSYS)}/{nodash}/anss-10q.htm",
+        _MISMATCHED_ANSYS,
+    )
+    settings = edgar_settings(tmp_path, fsn_first_year=2019, exchange_axis_listings=on)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    return source, router
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_the_switch_reaches_the_fsn_extraction_and_its_count(tmp_path: Path, on: bool) -> None:
+    source, _ = _axis_source(tmp_path, on)
+    source._ensure_fsn()
+    [record] = source._load_fsn_cache(_ANSYS).values()
+    assert [(i.ticker, i.exchange) for i in record.listings] == ([("ANSS", "NYSE")] if on else [])
+    assert source.fsn_exchange_axis_mismatch == (1 if on else 0)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path, on: bool) -> None:
+    source, _ = _axis_source(tmp_path, on)
+    parsed = source._fetch_cover_page(_ANSYS, _ANSYS_ACCESSION, "anss-10q.htm", _ANSYS_ACCEPTED)
+    assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == (
+        [("ANSS", "NASDAQ")] if on else []
+    )
+    assert source.cover_exchange_axis_mismatch == (1 if on else 0)

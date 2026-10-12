@@ -25,7 +25,7 @@ import io
 import json
 import zipfile
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1223,3 +1223,147 @@ def test_a_class_member_with_a_folded_tab_fails_that_accession(segments: str) ->
     parsed = parse_fsn(sub, num, [], dim)
     assert [r.accession for r in parsed.records] == [good]
     assert [f.accession for f in parsed.failures] == [bad]
+
+
+# --- #1541 (T178): listings under the exchange axis ---------------------------
+
+#: One real `dim.tsv` row, verbatim (FSN period 2025_10, read 2026-10-11): FSN
+#: spells `dei:EntityListingsExchangeAxis` as `EntityListingsExchange`, the
+#: MIC member unprefixed.
+REAL_EXCHANGE_DIM = ("0x1dc0af108c94fa3ada3018ad13966aeb", "EntityListingsExchange=XNAS;")
+#: A real 2025_10 row with both axes, the class segment first.
+REAL_BOTH_DIM = (
+    "0x082f9f4ab49f2c8aa8b2e1305746ee37",
+    "ClassOfStock=CommonStock;EntityListingsExchange=XNYS;",
+)
+
+
+def _listing_rows(adsh: str, dimh: str, title: str, symbol: str, exchange: str) -> list[Any]:
+    dimn = "1" if dimh else "0"
+    return [
+        _txt(adsh, "Security12bTitle", title, dimh=dimh, dimn=dimn),
+        _txt(adsh, "TradingSymbol", symbol, dimh=dimh, dimn=dimn),
+        _txt(adsh, "SecurityExchangeName", exchange, dimh=dimh, dimn=dimn),
+    ]
+
+
+class TestParseFsnExchangeAxis:
+    """The spec amendment's "Parsers" acceptance, FSN rows."""
+
+    adsh = "0001013462-19-000023"
+
+    def _parse(
+        self, txt: list[Any], dim: list[Any], num: list[Any] | None = None, *, on: bool
+    ) -> Any:
+        sub = [_sub(self.adsh, "1013462", "10-Q")]
+        return parse_fsn(sub, num or [], txt, dim, exchange_axis=on)
+
+    def test_the_exchange_axis_alone_yields_the_listing(self) -> None:
+        dimh, segments = REAL_EXCHANGE_DIM
+        txt = _listing_rows(self.adsh, dimh, "Common Stock", "ANSS", "NASDAQ")
+        [record] = self._parse(txt, [_dim(dimh, segments)], on=True).records
+        assert record.listings == (CoverListing("Common Stock", "ANSS", "NASDAQ"),)
+        assert record.exchange_axis_mismatch == 0
+        [off] = self._parse(txt, [_dim(dimh, segments)], on=False).records
+        assert off.listings == ()  # today's parse: the axis drops the listing
+
+    def test_the_exchange_axis_beside_class_of_stock_keeps_the_class_member(self) -> None:
+        dimh, segments = REAL_BOTH_DIM
+        txt = _listing_rows(self.adsh, dimh, "Common Stock", "IBM", "NYSE")
+        num = [_num(self.adsh, SHARES_TAG, "885941232", "20190630", dimh=dimh, dimn="2")]
+        [record] = self._parse(txt, [_dim(dimh, segments)], num, on=True).records
+        assert record.listings == (CoverListing("Common Stock", "IBM", "NYSE"),)
+        assert record.shares == (FsnShare("CommonStock", 885_941_232, date(2019, 6, 30)),)
+        [off] = self._parse(txt, [_dim(dimh, segments)], num, on=False).records
+        assert (off.listings, off.shares) == ((), ())
+
+    def test_the_group_key_separates_two_exchanges_of_one_class(self) -> None:
+        nyse, chicago = "0xa1", "0xa2"
+        dim = [
+            _dim(nyse, "ClassOfStock=CommonStock;EntityListingsExchange=XNYS;"),
+            _dim(chicago, "ClassOfStock=CommonStock;EntityListingsExchange=XCHI;"),
+        ]
+        txt = _listing_rows(self.adsh, nyse, "Common Stock", "ABBV", "NYSE")
+        txt += _listing_rows(self.adsh, chicago, "Common Stock", "ABBV", "CHX")
+        parsed = self._parse(txt, dim, on=True)
+        assert parsed.failures == ()  # never "two values for SecurityExchangeName"
+        [record] = parsed.records
+        assert [(i.ticker, i.exchange) for i in record.listings] == [
+            ("ABBV", "NYSE"),
+            ("ABBV", "NYSE_CHICAGO"),
+        ]
+
+    def test_an_undimensioned_and_an_exchange_axis_share_count_collapse_when_equal(
+        self,
+    ) -> None:
+        dimh, segments = REAL_EXCHANGE_DIM
+        num = [
+            _num(self.adsh, SHARES_TAG, "84100767", "20190731"),
+            _num(self.adsh, SHARES_TAG, "84100767", "20190731", dimh=dimh, dimn="1"),
+        ]
+        [record] = self._parse([], [_dim(dimh, segments)], num, on=True).records
+        assert record.shares == (FsnShare("", 84_100_767, date(2019, 7, 31)),)
+        num[1] = _num(self.adsh, SHARES_TAG, "84100768", "20190731", dimh=dimh, dimn="1")
+        parsed = self._parse([], [_dim(dimh, segments)], num, on=True)
+        assert [f.accession for f in parsed.failures] == [self.adsh]
+
+    @pytest.mark.parametrize(
+        "segments",
+        ["EntityListingsExchange=XN�AS;", "EntityListingsExchange=XNAS;�"],
+    )
+    def test_an_undecodable_byte_in_an_exchange_segment_fails_closed(self, segments: str) -> None:
+        txt = _listing_rows(self.adsh, "0xbb", "Common Stock", "ANSS", "NASDAQ")
+        parsed = self._parse(txt, [_dim("0xbb", segments)], on=True)
+        assert [f.accession for f in parsed.failures] == [self.adsh]
+        assert "undecodable byte" in parsed.failures[0].error
+        # today's parse drops the row instead, and keeps the accession
+        assert [
+            r.listings for r in self._parse(txt, [_dim("0xbb", segments)], on=False).records
+        ] == [()]
+
+    def test_a_member_naming_another_exchange_is_counted_and_the_value_wins(self) -> None:
+        dim = [
+            _dim("0xc1", "EntityListingsExchange=XNYS;"),
+            _dim("0xc2", "EntityListingsExchange=NYSE;"),
+        ]
+        txt = _listing_rows(self.adsh, "0xc1", "Common Stock", "SO", "NASDAQ")
+        txt += _listing_rows(self.adsh, "0xc2", "Preferred Stock", "SOP", "NASDAQ")  # no MIC
+        [record] = self._parse(txt, dim, on=True).records
+        assert [(i.ticker, i.exchange) for i in record.listings] == [
+            ("SO", "NASDAQ"),
+            ("SOP", "NASDAQ"),
+        ]
+        assert record.exchange_axis_mismatch == 1
+
+    def test_another_axis_beside_the_exchange_axis_is_still_excluded(self) -> None:
+        dim = [_dim("0xd1", "EntityListingsExchange=XNYS;LegalEntity=RZC;")]
+        txt = _listing_rows(self.adsh, "0xd1", "Notes", "RZC", "NYSE")
+        [record] = self._parse(txt, dim, on=True).records
+        assert record.listings == ()
+
+
+@pytest.mark.parametrize("period", ["2025_10", "2026_02"])
+def test_recorded_periods_parse_the_same_with_the_switch_on(period: str) -> None:
+    """The recorded filings tag no exchange axis: the switch changes nothing."""
+    sub, num, txt, dim = _read_period_tsvs(FIXTURES / period)
+    assert parse_fsn(sub, num, txt, dim, exchange_axis=True) == parse_fsn(sub, num, txt, dim)
+
+
+def test_fsn_and_the_cover_page_agree_on_the_ansys_shape() -> None:
+    """With the switch on, both parsers read the spec's ANSYS shape alike."""
+    from tradepartner.adapters.edgar import parse_cover_page
+
+    document = (EDGAR_FIXTURES / "cover_exchange_axis" / "ansys_10q_2019q2.htm").read_bytes()
+    cover = parse_cover_page(
+        document,
+        accession="0001013462-19-000023",
+        accepted_at=datetime(2019, 7, 31, 20, tzinfo=UTC),
+        exchange_axis=True,
+    )
+    dimh, segments = REAL_EXCHANGE_DIM
+    adsh = "0001013462-19-000023"
+    txt = _listing_rows(adsh, dimh, "Common Stock, $0.01 par value per share", "ANSS", "NASDAQ")
+    [record] = parse_fsn(
+        [_sub(adsh, "1013462", "10-Q")], [], txt, [_dim(dimh, segments)], exchange_axis=True
+    ).records
+    assert record.listings == cover.cover.listings

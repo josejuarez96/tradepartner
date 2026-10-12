@@ -76,6 +76,10 @@ _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25-NSE"})
 _SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 _CLASS_AXIS = "us-gaap:StatementClassOfStockAxis"
+#: The DEI taxonomy's "this class on this exchange" axis (#1541): its member
+#: is an ISO MIC (`exch:XNGS`). Read as a listing axis only under
+#: `edgar.exchange_axis_listings`; a grouping key, never the exchange's source.
+_EXCHANGE_AXIS = "dei:EntityListingsExchangeAxis"
 _CIK_SCHEME = "http://www.sec.gov/CIK"
 _CIK_CONCEPT = "EntityCentralIndexKey"
 _COVER_CONCEPTS = frozenset(
@@ -180,6 +184,41 @@ _EXCHANGES: dict[str, str] = {
     }.items()
     for name in names
 }
+
+
+_EXCHANGE_CODES = frozenset(_EXCHANGES.values())
+
+#: The ISO MICs of the venues `_EXCHANGES` names, as the exchange axis's
+#: members spell them (`exch:XNGS`, FSN `XNGS`), to the same codes (#1541).
+#: Used only to count a member that names another exchange than its
+#: context's `SecurityExchangeName` (`exchange_axis_mismatch`); a member not
+#: listed here (a filer's own `NewYorkStockExchange`) names nothing and is
+#: never counted. Nasdaq's three tiers and its operating MIC are one code.
+_MIC_EXCHANGES: dict[str, str] = {
+    "XNYS": "NYSE",
+    "XNAS": "NASDAQ",
+    "XNGS": "NASDAQ",
+    "XNMS": "NASDAQ",
+    "XNCM": "NASDAQ",
+    "XASE": "NYSE_AMERICAN",
+    "ARCX": "NYSE_ARCA",
+    "BATS": "CBOE_BZX",
+    "XCHI": "NYSE_CHICAGO",
+    "XCIS": "NYSE_NATIONAL",
+    "XBOS": "NASDAQ_BX",
+    "XPHL": "NASDAQ_PHLX",
+    "XCBO": "CBOE",
+}
+
+
+def _exchange_axis_mismatch(member: str, exchange: str) -> bool:
+    """Whether an exchange-axis `member` (`exch:XNGS` or FSN's `XNGS`) is a
+    known MIC naming another venue than the normalized `exchange` (#1541,
+    spec open question 1: counted, and the value wins)."""
+    venue = _MIC_EXCHANGES.get(member.rsplit(":", 1)[-1].strip().upper())
+    # A value outside the exact-name table (its slug) names no known venue
+    # either, so it is not judged against the member.
+    return venue is not None and exchange in _EXCHANGE_CODES and venue != exchange
 
 
 def normalize_exchange(raw: str) -> str:
@@ -720,6 +759,10 @@ class CoverPageParse:
     #: counted (owner decision #224, as `FsnFiling.incomplete_listings`;
     #: #609 C1): the filing's shares and complete listings are kept.
     incomplete_listings: int = 0
+    #: Exchange-axis listing contexts whose member MIC names another exchange
+    #: than their `SecurityExchangeName` (#1541): counted, and the value is
+    #: written. Always 0 unless parsed with `exchange_axis=True`.
+    exchange_axis_mismatch: int = 0
 
 
 def _is_nil(element: Any) -> bool:
@@ -786,7 +829,9 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
 
 
 @_fail_closed
-def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) -> CoverPageParse:
+def parse_cover_page(
+    document: bytes, *, accession: str, accepted_at: datetime, exchange_axis: bool = False
+) -> CoverPageParse:
     """The listed classes (`Security12bTitle`, `TradingSymbol`,
     `SecurityExchangeName`, grouped by context) and the
     `EntityCommonStockSharesOutstanding` facts of one periodic filing's
@@ -803,6 +848,17 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
     other than the class axis (a co-registrant in a combined filing) is
     skipped and returned in `other_contexts`: its shares and listings are
     not the filer's.
+
+    With `exchange_axis` (`edgar.exchange_axis_listings`, #1541) the allowed
+    axis set is {the class axis, `dei:EntityListingsExchangeAxis`}: a context
+    dimensioned by the exchange axis, alone or beside the class axis, is a
+    listing context like an undimensioned one, and any other axis still goes
+    to `other_contexts`. Each context is still one listing. The exchange
+    written is still `normalize_exchange(SecurityExchangeName)`; a member MIC
+    naming another exchange is counted in `exchange_axis_mismatch` and the
+    value wins. A shares fact keeps its class member (`""` without one); two
+    shares facts of one member and date in different contexts collapse when
+    equal and raise when not. With it off (the default) the parse is today's.
 
     A cover with no listing, shares or title fact at all (a registrant
     with no listed class that reports no share count) is an empty parse for
@@ -824,34 +880,57 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
         raise ValueError(f"{accession}: cover-page entity is not a CIK: {scheme!r} {entity!r}")
     cik = _cik(entity)
 
+    allowed = {_CLASS_AXIS, _EXCHANGE_AXIS} if exchange_axis else {_CLASS_AXIS}
     classes: dict[str, dict[str, str]] = {}
+    exchange_members: dict[str, str] = {}
     shares: list[FactRecord] = []
+    share_values: dict[tuple[str, str], list[tuple[float, bool]]] = {}
     other: set[str] = set()
     for name, value, context in facts:
         if not context.get("id"):
             raise ValueError(f"{accession}: dei:{name} has no context")
-        if set(context.get("dimensions") or {}) - {_CLASS_AXIS}:
+        dimensions = context.get("dimensions") or {}
+        if set(dimensions) - allowed:
             other.add(context["id"])
             continue
         if name != _SHARES_CONCEPT:
             classes.setdefault(context["id"], {})[name] = value
+            if _EXCHANGE_AXIS in dimensions:
+                exchange_members[context["id"]] = str(dimensions[_EXCHANGE_AXIS])
         elif name == _SHARES_CONCEPT:
-            member = str(context.get("dimensions", {}).get(_CLASS_AXIS, ""))
+            member = normalize_class_member(str(context.get("dimensions", {}).get(_CLASS_AXIS, "")))
+            count = float(Decimal(value))
+            if exchange_axis:
+                # #1541: an exchange-axis fact beside another fact of the same
+                # (normalized) member and date carries the same count (collapsed)
+                # or a conflict (fail closed), whatever the document order;
+                # facts without the axis are compared only with axis facts, so
+                # pairs without it are as today.
+                key, on_axis = (member, str(context["instant"])), _EXCHANGE_AXIS in dimensions
+                held = share_values.setdefault(key, [])
+                compared = held if on_axis else [h for h in held if h[1]]
+                if compared:
+                    if any(other_count != count for other_count, _ in compared):
+                        raise ValueError(
+                            f"{accession}: two share values for {member or 'no class'} on {key[1]}"
+                        )
+                    continue  # the same count again: collapsed
+                held.append((count, on_axis))
             shares.append(
                 FactRecord(
                     cik,
                     _SHARES_CONCEPT,
                     date.fromisoformat(context["instant"]),
-                    normalize_class_member(member),
-                    float(Decimal(value)),
+                    member,
+                    count,
                     accession,
                     accepted_at,
                 )
             )
 
     listings: list[CoverListing] = []
-    incomplete = 0
-    for group in classes.values():
+    incomplete = mismatched = 0
+    for context_id, group in classes.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if symbol is None:
@@ -859,12 +938,17 @@ def parse_cover_page(document: bytes, *, accession: str, accepted_at: datetime) 
         if title is None or exchange is None:
             incomplete += 1  # skipped and counted, not a failure (owner, #224; #609 C1)
             continue
-        listings.append(CoverListing(title, symbol, normalize_exchange(exchange)))
+        code = normalize_exchange(exchange)
+        axis_member = exchange_members.get(context_id)
+        if axis_member is not None and _exchange_axis_mismatch(axis_member, code):
+            mismatched += 1  # counted; the value wins (#1541 open question 1)
+        listings.append(CoverListing(title, symbol, code))
     return CoverPageParse(
         CoverPage(cik, accession, accepted_at, tuple(listings)),
         tuple(shares),
         tuple(sorted(other)),
         incomplete,
+        mismatched,
     )
 
 
@@ -924,6 +1008,10 @@ def parse_delisting(
 
 _FSN_LISTING_TAGS = frozenset({"Security12bTitle", "TradingSymbol", "SecurityExchangeName"})
 _FSN_CLASS_AXIS = "ClassOfStock"
+#: `dei:EntityListingsExchangeAxis` as FSN's `dim.segments` spells it (prefix
+#: and `Axis` dropped), pinned from a real row (2025_10 `dim.tsv`, #1541):
+#: `0x1dc0af108c94fa3ada3018ad13966aeb  EntityListingsExchange=XNAS;`
+_FSN_EXCHANGE_AXIS = "EntityListingsExchange"
 
 
 @dataclass(frozen=True)
@@ -958,6 +1046,10 @@ class FsnFiling:
     #: (owner decision 2026-09-26, #224): the filing's SIC, shares and complete
     #: listings are kept rather than failing the whole accession.
     incomplete_listings: int = 0
+    #: Exchange-axis listing groups whose member MIC names another exchange
+    #: than their `SecurityExchangeName` (#1541): counted, the value written.
+    #: Always 0 unless parsed with `exchange_axis=True`.
+    exchange_axis_mismatch: int = 0
 
 
 @dataclass(frozen=True)
@@ -1010,9 +1102,10 @@ def _fsn_spaced_title(first: str, second: str) -> str:
     return max(candidates, key=lambda t: (len(t), t))
 
 
-def _fsn_segments(raw: str) -> dict[str, str] | None:
+def _fsn_segments(raw: str, *, exchange_axis: bool = False) -> dict[str, str] | None:
     """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
-    member}`, or `None` if it names any axis other than `ClassOfStock`."""
+    member}`, or `None` if it names any axis other than `ClassOfStock` (and,
+    with `exchange_axis`, `EntityListingsExchange`, #1541)."""
     pairs: dict[str, str] = {}
     for part in raw.split(";"):
         part = part.strip()
@@ -1020,7 +1113,8 @@ def _fsn_segments(raw: str) -> dict[str, str] | None:
             continue
         axis, _, member = part.partition("=")
         pairs[axis.strip()] = member.strip()
-    if set(pairs) - {_FSN_CLASS_AXIS}:
+    allowed = {_FSN_CLASS_AXIS, _FSN_EXCHANGE_AXIS} if exchange_axis else {_FSN_CLASS_AXIS}
+    if set(pairs) - allowed:
         return None
     return pairs
 
@@ -1036,28 +1130,37 @@ def _fsn_is_coreg(row: Mapping[str, str]) -> bool:
     return bool((row.get("coreg") or "").strip())
 
 
-def _fsn_class_member(row: Mapping[str, str], dim_segments: Mapping[str, str]) -> str | None:
-    """The row's class member: `""` when `dimn` is `0` (undimensioned), or
-    `None` when the row should be excluded (a non-`ClassOfStock` axis, or a
-    `dimh` with no matching `dim.tsv` row)."""
+def _fsn_class_member(
+    row: Mapping[str, str], dim_segments: Mapping[str, str], *, exchange_axis: bool = False
+) -> tuple[str, str] | None:
+    """The row's (class member, exchange member): `("", "")` when `dimn` is
+    `0` (undimensioned), or `None` when the row should be excluded (an axis
+    outside the allowed set, or a `dimh` with no matching `dim.tsv` row).
+    The exchange member is `""` unless `exchange_axis` (#1541) lets an
+    `EntityListingsExchange` segment in."""
     dimn = (row.get("dimn") or "0").strip()
     if dimn in ("", "0"):
-        return ""
+        return "", ""
     segments_raw = dim_segments.get((row.get("dimh") or "").strip())
     if segments_raw is None:
         return None
     # An invalid byte or a tab `_fsn_rows` replaced (#498), anywhere in a
-    # ClassOfStock segment: beside the axis key it would read as another
-    # axis and drop the class silently, so the accession fails instead.
-    if "\ufffd" in segments_raw and _FSN_CLASS_AXIS in segments_raw:
+    # ClassOfStock segment (or, under `exchange_axis`, an exchange segment,
+    # #1541): beside the axis key it would read as another axis and drop the
+    # class silently, so the accession fails instead.
+    guarded = (_FSN_CLASS_AXIS, _FSN_EXCHANGE_AXIS) if exchange_axis else (_FSN_CLASS_AXIS,)
+    if "\ufffd" in segments_raw and any(axis in segments_raw for axis in guarded):
         raise ValueError(
             f"{row.get('adsh', '')}: undecodable byte or embedded tab in "
             f"segments {segments_raw[:60]!r}"
         )
-    segments = _fsn_segments(segments_raw)
+    segments = _fsn_segments(segments_raw, exchange_axis=exchange_axis)
     if segments is None:
         return None
-    return normalize_class_member(segments.get(_FSN_CLASS_AXIS, ""))
+    return (
+        normalize_class_member(segments.get(_FSN_CLASS_AXIS, "")),
+        segments.get(_FSN_EXCHANGE_AXIS, ""),
+    )
 
 
 @_fail_closed
@@ -1067,6 +1170,7 @@ def _parse_one_fsn_filing(
     num_rows: Sequence[Mapping[str, str]],
     txt_rows: Sequence[Mapping[str, str]],
     dim_segments: Mapping[str, str],
+    exchange_axis: bool = False,
 ) -> FsnFiling:
     raw_cik = str(sub_row["cik"]).strip()
     if not re.fullmatch(r"\d{1,10}", raw_cik):  # it names a cache file downstream
@@ -1076,15 +1180,19 @@ def _parse_one_fsn_filing(
     sic_raw = (sub_row.get("sic") or "").strip()
     sic = int(sic_raw) if sic_raw else None
 
-    groups: dict[str, dict[str, str]] = {}
+    # Keyed by (class member, exchange member) (#1541): one class on two
+    # exchanges is two groups, never two values for `SecurityExchangeName`.
+    # Without `exchange_axis` the exchange member is always "".
+    groups: dict[tuple[str, str], dict[str, str]] = {}
     for row in txt_rows:
         tag = row.get("tag")
         if tag not in _FSN_LISTING_TAGS or _fsn_is_coreg(row):
             continue
-        member = _fsn_class_member(row, dim_segments)
-        if member is None:
+        dims = _fsn_class_member(row, dim_segments, exchange_axis=exchange_axis)
+        if dims is None:
             continue
-        group, value = groups.setdefault(member, {}), row.get("value") or ""
+        member = dims[0]
+        group, value = groups.setdefault(dims, {}), row.get("value") or ""
         if "\ufffd" in value:  # an invalid byte or a tab `_fsn_rows` replaced (#455, #498)
             raise ValueError(
                 f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
@@ -1098,8 +1206,8 @@ def _parse_one_fsn_filing(
         group[tag] = value
 
     listings: list[CoverListing] = []
-    incomplete = 0
-    for group in groups.values():
+    incomplete = mismatched = 0
+    for (_, exchange_member), group in groups.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if symbol is None:
@@ -1107,9 +1215,10 @@ def _parse_one_fsn_filing(
         if title is None or exchange is None:
             incomplete += 1  # skipped and counted, not a failure (owner, #224)
             continue
-        listings.append(
-            CoverListing(restore_class_letter_space(title), symbol, normalize_exchange(exchange))
-        )
+        code = normalize_exchange(exchange)
+        if exchange_member and _exchange_axis_mismatch(exchange_member, code):
+            mismatched += 1  # counted; the value wins (#1541 open question 1)
+        listings.append(CoverListing(restore_class_letter_space(title), symbol, code))
 
     # member -> ddate -> value. A filing may report its share count at several
     # ddates (a prior year-end beside the cover date, #609 F1): every ddate is
@@ -1118,9 +1227,10 @@ def _parse_one_fsn_filing(
     for row in num_rows:
         if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
             continue
-        member = _fsn_class_member(row, dim_segments)
-        if member is None:
+        dims = _fsn_class_member(row, dim_segments, exchange_axis=exchange_axis)
+        if dims is None:
             continue
+        member = dims[0]  # an exchange-axis count is its class's (#1541)
         raw_value = row.get("value")
         if raw_value is None or not str(raw_value).strip():
             continue  # FSN's NULL: an `xsi:nil` fact reports no count (#609 F3)
@@ -1132,7 +1242,7 @@ def _parse_one_fsn_filing(
             )
     shares = tuple(FsnShare(m, values[max(values)], max(values)) for m, values in dated.items())
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), shares, incomplete)
+    return FsnFiling(accession, cik, form, sic, tuple(listings), shares, incomplete, mismatched)
 
 
 def parse_fsn(
@@ -1140,13 +1250,24 @@ def parse_fsn(
     num: Iterable[Mapping[str, str]],
     txt: Iterable[Mapping[str, str]],
     dim: Iterable[Mapping[str, str]],
+    *,
+    exchange_axis: bool = False,
 ) -> FsnParse:
     """One unstamped record per accession in `sub`, from one FSN period's
     members. A `num`/`txt` row carrying a non-null `coreg`, or naming any
     axis other than `ClassOfStock`, is excluded exactly as `parse_cover_page`
     skips other axes. An accession whose rows do not parse yields one
     failure; every other accession still parses (never raises for one bad
-    accession)."""
+    accession).
+
+    With `exchange_axis` (`edgar.exchange_axis_listings`, #1541) a row whose
+    segments name `EntityListingsExchange`, alone or beside `ClassOfStock`,
+    is read too: listings group by (class member, exchange member), the
+    exchange written is still the `SecurityExchangeName` value (a member MIC
+    naming another venue is counted in `exchange_axis_mismatch`), a shares
+    row keeps its class member, and an undecodable byte in an exchange
+    segment fails the accession. With it off (the default) the parse is
+    today's."""
     dim_segments = {str(row["dimhash"]): str(row["segments"]) for row in dim}
     num_by_adsh: dict[str, list[Mapping[str, str]]] = {}
     for row in num:
@@ -1167,6 +1288,7 @@ def parse_fsn(
                     num_by_adsh.get(accession, []),
                     txt_by_adsh.get(accession, []),
                     dim_segments,
+                    exchange_axis,
                 )
             )
         except ValueError as error:
