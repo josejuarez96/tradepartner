@@ -370,6 +370,12 @@ class EdgarConfig(BaseModel):
     # fails `health --check` on the stored rows of a dropped form until a
     # rebuild (the amendment's open question 12).
     filing_events_enabled: bool = False
+    # T179 (#1541, spec amendment 2026-10-11): the title fallback in
+    # `store.classify` rule 6 (placeholder titles, whole-word type words,
+    # issuer-name-first titles, class-letter shares). Off, every classification
+    # is as before; the release's own PR (T181) flips it with the cache
+    # version bumps, so a nightly ingest after a plain merge changes nothing.
+    title_fallback: bool = False
     event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["8-K", "8-K/A"], min_length=1
     )

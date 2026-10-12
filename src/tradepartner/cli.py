@@ -21,8 +21,10 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   `reuse_cached`: company facts come from the cached `companyfacts.zip`
   with no request for it. `--rebuild-statement-facts` deletes and
   re-ingests `statement_facts` in the EDGAR chunk's transaction and needs
-  `edgar.statement_facts_enabled`. Both are off by default and refused with
-  `--backfill` or `--source alpaca` (usage error, 2). `--restamp-from
+  `edgar.statement_facts_enabled`. `--rebuild-classifications` (#1541,
+  T182) deletes the covered securities' `classifications` rows and writes
+  the build's at their own `known_at` in the same transaction. All are off
+  by default and refused with `--backfill` or `--source alpaca` (usage error, 2). `--restamp-from
   MANIFEST` (#1382, T166b) moves the stored stamps a stamps-repair manifest
   repairs (`ingest.restamp_from_manifest`) in the EDGAR chunk, then writes
   the day's filings as usual; it needs `--source edgar` and no `--backfill`,
@@ -1598,6 +1600,13 @@ def make_app(
                 help="delete and re-ingest filing_events in the EDGAR chunk (#1458)",
             ),
         ] = False,
+        rebuild_classifications: Annotated[
+            bool,
+            typer.Option(
+                "--rebuild-classifications",
+                help="delete and rewrite the covered securities' classifications (#1541)",
+            ),
+        ] = False,
         restamp_from: Annotated[
             Path | None,
             typer.Option(
@@ -1633,6 +1642,7 @@ def make_app(
             ("--bulk-from-cache", bulk_from_cache),
             ("--rebuild-statement-facts", rebuild_statement_facts),
             ("--rebuild-filing-events", rebuild_filing_events),
+            ("--rebuild-classifications", rebuild_classifications),
         ):
             if given and (backfill_ or source == "alpaca"):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
@@ -1728,6 +1738,7 @@ def make_app(
                 dry_run=dry_run,
                 rebuild_statement_facts=rebuild_statement_facts,
                 rebuild_filing_events=rebuild_filing_events,
+                rebuild_classifications=rebuild_classifications,
                 restamp=restamp,
                 on_restamp=restamped.append,
                 restamp_window_ok=window_ok,
