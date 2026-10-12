@@ -212,7 +212,13 @@ def _scrub_text_line(line: str, secrets_pattern: re.Pattern[str] | None) -> tupl
     scrubbed, n = SENSITIVE_HEADER_LINE_PATTERN.subn(SCRUBBED, line)
     if n:
         return scrubbed, n
-    return _scrub_content(line, secrets_pattern)
+    if re.fullmatch(r"(?i)\s*api_key=[^&#\s]+", line.strip()):
+        return SCRUBBED + ("\n" if line.endswith("\n") else ""), 1
+    scrubbed, query_count = re.subn(
+        r"(?i)(\bapi_key=)[^&#\s]+", lambda match: match.group(1) + SCRUBBED, line
+    )
+    scrubbed, other_count = _scrub_content(scrubbed, secrets_pattern)
+    return scrubbed, query_count + other_count
 
 
 def _non_blank_secret(secret: SecretStr | None) -> str | None:
