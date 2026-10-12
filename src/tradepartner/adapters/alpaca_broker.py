@@ -28,7 +28,10 @@ Alpaca's `type`, `time_in_force`, `limit_price`, `stop_price`, `asset_class`,
 `"simple"`, #1298) and `legs`; `Account` takes `short_market_value`,
 `maintenance_margin` and `daytrade_count` (`None` when the response has none);
 `Asset` takes `shortable`, `easy_to_borrow` and `marginable`. `Fill.fee` stays
-`None`: account activities other than fills are not fetched.
+`None`: a fee is never a field of the fill it belongs to. Alpaca's non-trade
+cash activities — a regulatory `FEE`, a dividend, a corporate action — are read
+by `cash_activities`, the read the paper spec's amendment of 2026-10-12 (#1583,
+plan T183b) adds for the ledger to book a fee by its activity id.
 
 **Dedupe.** `submit` reads the broker for the `client_order_id` first
 (`get_order`) and raises `DuplicateClientOrderIdError` before any submit when
@@ -47,6 +50,19 @@ raises `SystemFaultError` (#1298). `since=None` reads from the Unix epoch; the
 request asks from `since` less `_AFTER_MARGIN` (Alpaca's `after` is strict) and
 the result is filtered to `filled_at >= since`. No time is parsed from an
 activity id (its prefix is New York local time, T48b fact 13).
+
+**Non-trade activities** (paper-trading spec req 1 and req 2, the amendment of
+2026-10-12 item 1, #1583, plan T183b). `cash_activities(since)` reads
+`GET /v2/account/activities` with **no type filter** and drops `FILL` rows
+client-side, so a type nothing here has classified (`INT`, `JNLC`, `SSP`, …)
+reaches the reconciliation instead of being filtered away. Alpaca's `after` is a
+strict timestamp comparison and how it orders a date-only row is unknown, so the
+request asks from the New York midnight that begins the day **before** the New
+York date `since`, and the adapter then drops **nothing** by date: a row dated
+`since` is returned whatever the broker does with it, and so is a row dated
+before it (the caller's bound is the one that counts). A `FEE` row has only a
+`date`, so no time is invented for it — `CashActivity.date` stays a date and
+there is no `event_at` — and the activity `id` is the row's identity.
 
 **Clock** (ADR 0007 point 4): the injected `clock` is exposed as `.clock`, and
 every public method reads it first, wrapped, so a failing or invalid reading
@@ -72,9 +88,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from tradepartner.adapters.alpaca_prices import master_symbol
 from tradepartner.adapters.alpaca_trading_raw import (
@@ -88,6 +105,7 @@ from tradepartner.adapters.broker import (
     Account,
     Asset,
     Broker,
+    CashActivity,
     DuplicateClientOrderIdError,
     Fill,
     Order,
@@ -128,6 +146,13 @@ _CANCEL_REFUSALS = frozenset({_NOT_FOUND, _DUPLICATE_STATUS})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 #: Alpaca's activities `after` is strict; ask from a second earlier, then filter.
 _AFTER_MARGIN = timedelta(seconds=1)
+#: The trade activity this adapter refuses to return as a cash activity
+#: (paper-trading spec req 2, amendment of 2026-10-12 item 1, #1583).
+_ACTIVITY_FILL = "FILL"
+#: A calendar day, for `cash_activities`'s one-day-earlier read.
+_ONE_DAY = timedelta(days=1)
+#: The zone an activity's `date` is a date of (a fee's `date` is its trade date).
+_NEW_YORK = ZoneInfo("America/New_York")
 _TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)")
 _MICROSECOND_DIGITS = 6
 
@@ -196,6 +221,45 @@ def _optional_number(text: Any) -> float | None:
     return None if text is None else _number(text)
 
 
+def _activity_date(text: Any) -> date:
+    """An Alpaca activity `date` (a New York calendar date, no time) as a
+    `date`. A payload carrying a time is refused rather than truncated: a
+    fee's `date` is its trade date and the broker records no time for it
+    (#1583), so a time in the payload would be the broker's, not ours to
+    reinterpret."""
+    if not isinstance(text, str):
+        raise ValueError(f"not an activity date: {text!r}")
+    return date.fromisoformat(text)
+
+
+def _activity(payload: Mapping[str, Any]) -> CashActivity:
+    """One Alpaca non-trade activity payload as a `CashActivity`: the id and
+    type as reported, the date as a date, the signed `net_amount`, the row's
+    status, and the symbol and description when the row has them. A payload
+    missing `id`, `activity_type`, `date` or `status` is malformed."""
+    return CashActivity(
+        activity_id=payload["id"],
+        activity_type=payload["activity_type"],
+        date=_activity_date(payload["date"]),
+        net_amount=_optional_number(payload.get("net_amount")),
+        status=payload["status"],
+        symbol=payload.get("symbol"),
+        description=payload.get("description"),
+    )
+
+
+def _cash_activities(activities: Iterable[Mapping[str, Any]]) -> list[CashActivity]:
+    """Every non-trade activity of a page as a `CashActivity`, oldest first, in
+    the order the page gives them. `FILL` rows are dropped here, client-side:
+    the request carries no type filter at all, so a fill may be in the page,
+    and a fill is never a cash activity."""
+    return [
+        _mapped("activity", _activity, activity)
+        for activity in activities
+        if activity.get("activity_type") != _ACTIVITY_FILL
+    ]
+
+
 def _status(text: Any) -> OrderStatus:
     status = STATUS_TABLE.get(text) if isinstance(text, str) else None
     if status is None:
@@ -253,6 +317,13 @@ def _error_code(error: AlpacaTradingError) -> object:
 def _decimals(value: float) -> int:
     exponent = Decimal(repr(value)).normalize().as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def _ny_midnight(day: date) -> datetime:
+    """The UTC instant of the New York midnight that begins `day`
+    (DST-correct: New York's midnight exists on every date, and `zoneinfo`
+    maps it to the offset in force that day)."""
+    return datetime(day.year, day.month, day.day, tzinfo=_NEW_YORK).astimezone(UTC)
 
 
 class AlpacaBroker(Broker):
@@ -400,6 +471,22 @@ class AlpacaBroker(Broker):
             if position.quantity:
                 positions[position.symbol] = position
         return positions
+
+    def cash_activities(self, since: date) -> list[CashActivity]:
+        """Every non-trade activity from the New York date `since` on, oldest
+        first, never a fill (paper-trading spec req 1 and req 2, the amendment
+        of 2026-10-12 item 1, #1583, plan T183b; module docstring).
+
+        The request asks the broker from the New York midnight that begins the
+        day **before** `since`: Alpaca's `after` is a strict timestamp
+        comparison and how it orders a date-only row is unknown, so a read
+        bounded at `since`'s own midnight could miss a row dated `since`.
+        Nothing is then dropped by date — a row dated before `since` comes
+        back too, because the caller's bound is the one that counts and a
+        broker's ordering of a date-only row is not ours to assume."""
+        self._now()
+        start = _ny_midnight(since - _ONE_DAY)
+        return _cash_activities(self._raw.list_activities(start))
 
     def account(self) -> Account:
         """Alpaca's account, as of the clock's reading."""

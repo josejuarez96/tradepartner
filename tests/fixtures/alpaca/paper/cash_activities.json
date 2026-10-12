@@ -1,0 +1,18 @@
+[
+  {
+    "activity_type": "FEE",
+    "date": "2026-10-09",
+    "description": "CAT fee for proceed of 8 trades on 2026-10-09",
+    "id": "fixture-fee-cat-2026-10-09",
+    "net_amount": "-0.01",
+    "status": "executed"
+  },
+  {
+    "activity_type": "FEE",
+    "date": "2026-10-09",
+    "description": "REG fee for proceed of $433.15 on 2026-10-09",
+    "id": "fixture-fee-reg-2026-10-09",
+    "net_amount": "-0.01",
+    "status": "executed"
+  }
+]

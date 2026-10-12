@@ -367,6 +367,19 @@ class AlpacaTradingRaw:
 
     def list_fill_activities(self, after: datetime) -> list[Any]:
         """Every `FILL` activity after `after` (tz-aware UTC), oldest first, all pages."""
+        return self._pages("/account/activities/FILL", "fill activities", after)
+
+    def list_activities(self, after: datetime) -> list[Any]:
+        """Every account activity after `after` (tz-aware UTC), oldest first, all
+        pages: `GET /v2/account/activities` with **no type filter**, so `FILL`
+        rows and every other type come back together and the caller decides
+        (paper-trading spec req 2, its amendment of 2026-10-12 item 1, #1583,
+        plan T183b)."""
+        return self._pages("/account/activities", "account activities", after)
+
+    def _pages(self, path: str, what: str, after: datetime) -> list[Any]:
+        """Every page of `path`'s activity read from `after` on (tz-aware UTC,
+        strict), oldest first. `what` names the read in the refusal."""
         after = ensure_tz_aware_utc(after, field_name="after")
         params: dict[str, Any] = {
             "after": after.isoformat(),
@@ -375,12 +388,12 @@ class AlpacaTradingRaw:
         }
         activities: list[Any] = []
         while True:
-            page = list(self._call(self._client.get, "/account/activities/FILL", dict(params)))
+            page = list(self._call(self._client.get, path, dict(params)))
             activities.extend(page)
             if len(page) < ACTIVITIES_PAGE_SIZE:
                 return activities
             if params.get("page_token") == page[-1]["id"]:
-                raise RuntimeError("fill activities paging did not advance")
+                raise RuntimeError(f"{what} paging did not advance")
             params["page_token"] = page[-1]["id"]
 
     def get_assets(self, symbols: Sequence[str]) -> list[Any]:

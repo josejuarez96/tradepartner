@@ -104,6 +104,21 @@ so a sequence like +0.1, +0.2, -0.3 nets to exactly zero instead of a
 `float` rounding artifact (~5e-17) that would leave a phantom position
 behind; the running total is converted back to `float` only when building
 the `Position` returned to callers.
+
+**Scripted cash activities (#1583, paper-trading spec req 1, the amendment
+of 2026-10-12 item 1; plan T183b).** `activities=` is the scripted
+non-trade activity list the fake answers `cash_activities(since)` from, and
+it is a plain mutable list on the instance, so a test posts an activity at
+any point of a run (append one), changes a row's status (replace an
+element), repeats an id (append a row with an id already there) or posts a
+type no rule books. The list is answered, not copied into state: the rows
+are the `CashActivity` objects the test built, and each call returns a fresh
+list of those dated `since` or later, oldest first — the order the
+interface promises, whatever order the test scripted them in, stable
+within a date so a repeated id keeps the order it was scripted in. Nothing
+here moves cash or a position: the fake has no fees, and a test that wants
+a fee's cash effect books it through the account it hands the run (T183's
+fixture sets `account()`'s cash directly).
 """
 
 from __future__ import annotations
@@ -122,6 +137,7 @@ from tradepartner.adapters.broker import (
     Account,
     Asset,
     Broker,
+    CashActivity,
     DuplicateClientOrderIdError,
     Fill,
     Order,
@@ -279,6 +295,7 @@ class FakeBroker(Broker):
         cash: float = 100_000.0,
         account_id: str = "fake-account",
         assets: Mapping[str, Asset] | None = None,
+        activities: Sequence[CashActivity] | None = None,
         buying_power: float | None = None,
         round_cash_to_cent: bool = False,
         on_submit: Callable[[OrderRequest], None] | None = None,
@@ -295,6 +312,14 @@ class FakeBroker(Broker):
         self._assets: dict[str, list[tuple[date, Asset]]] = {}
         for symbol, asset in (assets or {}).items():
             self.set_asset(symbol, asset)
+        #: The scripted non-trade activities (module docstring): a test mutates
+        #: it to post, correct or repeat a row at any point of a run.
+        self.activities: list[CashActivity] = list(activities or [])
+        for activity in self.activities:
+            if not isinstance(activity, CashActivity):
+                raise TypeError(
+                    f"activities values must be CashActivity, got {type(activity).__name__}"
+                )
         self._orders: dict[str, Order] = {}
         self._filled: dict[str, tuple[Decimal, Decimal]] = {}  # (quantity, notional)
         self._fills: list[Fill] = []
@@ -542,6 +567,15 @@ class FakeBroker(Broker):
             return visible
         return [fill for fill in visible if fill.filled_at >= since]
 
+    def cash_activities(self, since: date) -> list[CashActivity]:
+        self._log(self.cash_activities.__name__, since)
+        if isinstance(since, datetime) or not isinstance(since, date):
+            raise TypeError(f"since must be a date, got {since!r}")
+        # Oldest first, the order the interface promises; Python's sort is
+        # stable, so rows sharing a date (a repeated id, say) keep the order
+        # the test scripted them in.
+        return [a for a in sorted(self.activities, key=_activity_date) if a.date >= since]
+
     def positions(self) -> dict[str, Position]:
         self._log("positions")
         return {
@@ -710,6 +744,12 @@ def _transport_error(fault: TransportFault, message: str) -> Exception:
     """A fresh exception per raise, so one scripted fault object raised
     twice never carries the first raise's traceback."""
     return FakeTransportError(message) if fault.error is None else copy.copy(fault.error)
+
+
+def _activity_date(activity: CashActivity) -> date:
+    """A scripted activity's date, its sort key (already a `date`: the
+    `CashActivity` validator refuses anything else)."""
+    return activity.date
 
 
 def _signed(side: Side, amount: Decimal) -> Decimal:

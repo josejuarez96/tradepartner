@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import fields
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -20,6 +20,7 @@ from tradepartner.adapters.broker import (
     Account,
     Asset,
     Broker,
+    CashActivity,
     Fill,
     Order,
     OrderRequest,
@@ -454,6 +455,104 @@ def test_asset_status_and_cusip_must_be_identifiers() -> None:
         Asset(True, True, "active", "")
 
 
+# --- CashActivity (paper-trading spec req 1, amendment 2026-10-12 item 1, #1583, T183b)
+
+
+def _activity(**overrides: Any) -> CashActivity:
+    values: dict[str, Any] = {
+        "activity_id": "fee-1",
+        "activity_type": "FEE",
+        "date": date(2026, 10, 9),
+        "net_amount": -0.01,
+        "status": "executed",
+    }
+    values.update(overrides)
+    return CashActivity(**values)
+
+
+def test_cash_activity_shape() -> None:
+    activity = _activity(symbol="aapl", description="CAT fee for proceed of 8 trades")
+
+    assert [f.name for f in fields(CashActivity)] == [
+        "activity_id",
+        "activity_type",
+        "date",
+        "net_amount",
+        "status",
+        "symbol",
+        "description",
+    ]
+    assert activity.activity_id == "fee-1"
+    assert activity.activity_type == "FEE"
+    assert activity.date == date(2026, 10, 9)
+    assert activity.net_amount == -0.01
+    assert activity.status == "executed"
+    assert activity.symbol == "AAPL"
+    assert activity.description == "CAT fee for proceed of 8 trades"
+
+
+def test_cash_activity_nullable_fields_default_to_none() -> None:
+    activity = _activity()
+
+    assert activity.symbol is None and activity.description is None and activity.net_amount == -0.01
+    assert _activity(net_amount=None).net_amount is None
+
+
+def test_cash_activity_date_is_a_date_and_never_a_datetime() -> None:
+    """A `FEE` row has only a `date` (#1583), so a `datetime` — which
+    `isinstance` would accept as a `date` — is refused rather than kept with
+    its time as an invented one."""
+    assert type(_activity().date) is date
+    for bad in (
+        datetime(2026, 10, 9, tzinfo=UTC),
+        datetime(2026, 10, 9),  # noqa: DTZ001
+        "2026-10-09",
+        7,
+    ):
+        with pytest.raises(ValueError, match="date"):
+            _activity(date=bad)
+
+
+def test_cash_activity_net_amount_is_signed_and_finite() -> None:
+    """The amount is the broker's, signed as it reports it: a fee is negative
+    and a credit is positive (#1583)."""
+    assert _activity(net_amount=-0.02).net_amount == -0.02
+    assert _activity(net_amount=12.5).net_amount == 12.5
+    assert _activity(net_amount=0.0).net_amount == 0.0
+    for bad in (float("nan"), float("inf"), float("-inf"), True, "-0.01"):
+        with pytest.raises(ValueError, match="net_amount"):
+            _activity(net_amount=bad)
+
+
+def test_cash_activity_ids_types_and_status_are_identifiers() -> None:
+    """The id is the row's identity, so it cannot be padded (a `"fee-1 "`
+    would dedupe against nothing), and the type and status are the broker's
+    own strings, passed through uninterpreted."""
+    for field_name, bad in [("activity_id", ""), ("activity_type", " FEE"), ("status", " ")]:
+        with pytest.raises(ValueError, match=field_name):
+            _activity(**{field_name: bad})
+    assert _activity(activity_type="INT").activity_type == "INT"
+    assert _activity(activity_type="SSP").activity_type == "SSP"
+    assert _activity(status="correct").status == "correct"
+
+
+def test_cash_activity_symbol_is_canonicalized_when_it_names_one() -> None:
+    assert _activity(symbol="brk.b").symbol == "BRK.B"
+    for bad in ("", " KO", 5):
+        with pytest.raises(ValueError, match="symbol"):
+            _activity(symbol=bad)
+
+
+def test_cash_activity_description_is_free_text() -> None:
+    """A description is never interpreted by a rule (spec item 2), so it is
+    kept verbatim, spaces and punctuation included."""
+    assert _activity(description="REG fee for proceed of $433.15 on 2026-10-09").description == (
+        "REG fee for proceed of $433.15 on 2026-10-09"
+    )
+    with pytest.raises(ValueError, match="description"):
+        _activity(description=7)
+
+
 # --- The Broker interface -------------------------------------------------------------
 
 
@@ -465,6 +564,7 @@ def test_broker_declares_every_method_abstract() -> None:
             "get_order",
             "open_orders",
             "fills",
+            "cash_activities",
             "positions",
             "account",
             "assets",
@@ -481,3 +581,16 @@ def test_cancel_returns_none_and_fills_takes_an_optional_since() -> None:
     assert inspect.signature(Broker.cancel).return_annotation in (None, "None")
     since = inspect.signature(Broker.fills).parameters["since"]
     assert since.default is None
+
+
+def test_cash_activities_takes_a_required_new_york_date_and_returns_a_list() -> None:
+    """Spec item 1: `cash_activities(since) -> list[CashActivity]`, "every
+    non-trade activity the broker lists from the New York date `since` on",
+    so `since` is required (there is no "everything" reading of it) and it is
+    a date, never an instant."""
+    signature = inspect.signature(Broker.cash_activities)
+    assert list(signature.parameters) == ["self", "since"]
+    assert signature.parameters["since"].default is signature.empty
+    assert signature.return_annotation in (None, "list[CashActivity]")
+    annot = inspect.signature(Broker.cash_activities).parameters["since"].annotation
+    assert annot in (None, "date")

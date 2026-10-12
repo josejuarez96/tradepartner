@@ -12,7 +12,7 @@ import inspect
 import json
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -22,6 +22,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from tradepartner.adapters import alpaca_broker as broker_mod
+from tradepartner.adapters import alpaca_trading_raw as raw_mod
 from tradepartner.adapters.alpaca_broker import (
     STATUS_TABLE,
     AlpacaBroker,
@@ -38,6 +39,7 @@ from tradepartner.adapters.alpaca_trading_raw import (
 from tradepartner.adapters.broker import (
     Account,
     Asset,
+    CashActivity,
     DuplicateClientOrderIdError,
     Fill,
     Order,
@@ -163,6 +165,18 @@ def _broker(
     http = Recorded()
     raw._client._session.mount("https://", http)  # type: ignore[attr-defined]
     return AlpacaBroker(settings, clock, client=raw, book_id="main"), http
+
+
+def _activity_broker() -> tuple[AlpacaBroker, Recorded]:
+    """A broker whose `GET /v2/account/activities` answers the activities page
+    it is handed (one page: less than a page stops the read)."""
+    broker, http = _broker()
+
+    def activities(request: requests.PreparedRequest) -> tuple[int, Any]:
+        return 200, _load("cash_activities")
+
+    http.route("GET", "/v2/account/activities", activities)
+    return broker, http
 
 
 def _by_client_id(orders: dict[str, Any]) -> Responder:
@@ -403,6 +417,7 @@ def _route_everything(http: Recorded) -> None:
     http.route("GET", "/v2/account", (200, _load("account_after")))
     http.route("GET", "/v2/assets/KO", (200, _load("assets")[0]))
     http.route("GET", "/v2/account/activities/FILL", (200, _load("fill_activities")))
+    http.route("GET", "/v2/account/activities", (200, _load("cash_activities")))
 
 
 def test_the_base_url_of_every_request_is_the_paper_endpoint() -> None:
@@ -414,6 +429,7 @@ def test_the_base_url_of_every_request_is_the_paper_endpoint() -> None:
     broker.get_order("rec20261008151015-5")
     broker.open_orders()
     broker.fills()
+    broker.cash_activities(date(2026, 10, 9))
     broker.positions()
     broker.account()
     broker.assets(["KO"])
@@ -516,6 +532,7 @@ CALLS: dict[str, Callable[[AlpacaBroker], object]] = {
     "get_order": lambda b: b.get_order("rec20261008151015-5"),
     "open_orders": lambda b: b.open_orders(),
     "fills": lambda b: b.fills(),
+    "cash_activities": lambda b: b.cash_activities(date(2026, 10, 9)),
     "positions": lambda b: b.positions(),
     "account": lambda b: b.account(),
     "assets": lambda b: b.assets(["KO"]),
@@ -958,6 +975,250 @@ def test_fills_before_since_resolve_no_order() -> None:
     assert len(fills) == 5
     resolved = [urlsplit(r.url or "").path for r in http.calls("GET", "/v2/orders/[^/]+")]
     assert not any(path.endswith(first_order) for path in resolved)
+
+
+# --- non-trade cash activities (paper-trading spec req 1 item 1, #1583, T183b) ----
+
+
+def test_the_recorded_fees_map_to_cash_activities_with_no_time() -> None:
+    """The scrubbed fixture's two `FEE` rows (dated 2026-10-09, -0.01 each,
+    `status = executed`, no `transaction_time`): the date stays a **date** —
+    no time is invented for a row that has none — and the ids are as given."""
+    broker, _ = _activity_broker()
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert rows == [
+        CashActivity(
+            activity_id="fixture-fee-cat-2026-10-09",
+            activity_type="FEE",
+            date=date(2026, 10, 9),
+            net_amount=-0.01,
+            status="executed",
+            symbol=None,
+            description="CAT fee for proceed of 8 trades on 2026-10-09",
+        ),
+        CashActivity(
+            activity_id="fixture-fee-reg-2026-10-09",
+            activity_type="FEE",
+            date=date(2026, 10, 9),
+            net_amount=-0.01,
+            status="executed",
+            symbol=None,
+            description="REG fee for proceed of $433.15 on 2026-10-09",
+        ),
+    ]
+    for row in rows:
+        assert type(row.date) is date
+    assert not any(hasattr(row.date, name) for row in rows for name in ("hour", "tzinfo"))
+
+
+def test_a_fill_row_in_the_page_is_dropped_client_side() -> None:
+    """The request carries no type filter, so a `FILL` row can be in the page;
+    a fill is never a cash activity (spec item 1's "it never returns a fill")."""
+    broker, http = _broker()
+    fill = _load("fill_activities")[0]
+    page = [_load("cash_activities")[0], dict(fill, activity_type="FILL")]
+    http.route("GET", "/v2/account/activities", (200, page))
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert [r.activity_type for r in rows] == ["FEE"]
+
+
+def test_an_unclassified_type_is_returned_not_refused() -> None:
+    """`INT` and `SSP` are types the adapter has never seen: they reach the
+    reconciliation instead of being filtered away, so an unknown cash
+    movement halts there rather than passing silently."""
+    broker, http = _broker()
+    http.route(
+        "GET",
+        "/v2/account/activities",
+        (
+            200,
+            [
+                {
+                    "id": "act-int",
+                    "activity_type": "INT",
+                    "date": "2026-10-09",
+                    "net_amount": "0.01",
+                    "status": "executed",
+                },
+                {
+                    "id": "act-ssp",
+                    "activity_type": "SSP",
+                    "date": "2026-10-09",
+                    "net_amount": None,
+                    "status": "executed",
+                },
+            ],
+        ),
+    )
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert [(r.activity_id, r.activity_type, r.net_amount) for r in rows] == [
+        ("act-int", "INT", 0.01),
+        ("act-ssp", "SSP", None),
+    ]
+
+
+def test_a_row_dated_before_since_is_returned_too() -> None:
+    """Nothing is dropped by date: the adapter asks from earlier than `since`
+    and returns every row it gets, because the caller's bound is the one that
+    counts (spec item 2)."""
+    broker, http = _broker()
+    page = [
+        {
+            "id": "act-earlier",
+            "activity_type": "FEE",
+            "date": "2026-10-08",
+            "net_amount": "-0.02",
+            "status": "executed",
+            "description": "REG fee for proceed of $527.47",
+        },
+        *_load("cash_activities"),
+    ]
+    http.route("GET", "/v2/account/activities", (200, page))
+
+    rows = broker.cash_activities(date(2026, 10, 9))
+
+    assert [(r.activity_id, r.date) for r in rows] == [
+        ("act-earlier", date(2026, 10, 8)),
+        ("fixture-fee-cat-2026-10-09", date(2026, 10, 9)),
+        ("fixture-fee-reg-2026-10-09", date(2026, 10, 9)),
+    ]
+
+
+def test_the_activities_request_asks_from_the_new_york_midnight_before_since() -> None:
+    """`after` is the New York midnight that begins the day before the New York
+    date `since`, and the request carries no `activity_types` filter (spec
+    item 2): Alpaca's `after` is strict and its ordering of a date-only row is
+    unknown, so a read bounded at `since`'s own midnight could miss a row
+    dated `since`."""
+    broker, http = _activity_broker()
+
+    broker.cash_activities(date(2026, 10, 9))
+
+    (read,) = http.calls("GET", "/v2/account/activities")
+    query = parse_qs(urlsplit(read.url or "").query)
+    assert query["after"] == ["2026-10-08T04:00:00+00:00"]  # 2026-10-09 less 1 day, EDT
+    assert "activity_types" not in query
+    assert query["direction"] == ["asc"]
+
+
+@pytest.mark.parametrize(
+    ("since", "after"),
+    [
+        (date(2026, 7, 2), "2026-07-01T04:00:00+00:00"),  # EDT
+        (date(2026, 3, 10), "2026-03-09T04:00:00+00:00"),  # EDT, the day after the switch
+        (date(2026, 3, 9), "2026-03-08T05:00:00+00:00"),  # the day before the 2026-03-08 switch
+        (date(2026, 11, 3), "2026-11-02T05:00:00+00:00"),  # EST, after the 2026-11-01 switch
+    ],
+)
+def test_the_reads_start_is_one_new_york_day_before_since_across_dst(
+    since: date, after: str
+) -> None:
+    """The midnight of `since` less one day is a DST-correct UTC instant, so
+    the read never starts inside the wrong day."""
+    broker, http = _activity_broker()
+
+    broker.cash_activities(since)
+
+    (read,) = http.calls("GET", "/v2/account/activities")
+    assert parse_qs(urlsplit(read.url or "").query)["after"] == [after]
+
+
+def test_the_activities_read_pages_like_the_fills_read() -> None:
+    """Paging stops as the fills read does: a short page ends the read, a full
+    page is followed by its `page_token`, and a page that does not advance is
+    refused rather than looped."""
+    size = raw_mod.ACTIVITIES_PAGE_SIZE
+    broker, http = _activity_broker()
+    http.routes.clear()
+
+    def fee(index: object) -> dict[str, Any]:
+        return {
+            "id": f"a{index}",
+            "activity_type": "FEE",
+            "date": "2026-10-09",
+            "net_amount": "-0.01",
+            "status": "executed",
+        }
+
+    def paged(request: requests.PreparedRequest) -> tuple[int, Any]:
+        token = parse_qs(urlsplit(request.url or "").query).get("page_token", [None])[0]
+        if token is None:
+            return 200, [fee(i) for i in range(size)]
+        return 200, [fee("last")]
+
+    http.route("GET", "/v2/account/activities", paged)
+    rows = broker.cash_activities(date(2026, 10, 9))
+    assert len(rows) == size + 1
+    assert len(http.calls("GET", "/v2/account/activities")) == 2
+
+    http.route("GET", "/v2/account/activities", (200, [fee(i) for i in range(size)]))
+    with pytest.raises(RuntimeError, match="account activities paging did not advance"):
+        broker.cash_activities(date(2026, 10, 9))
+
+
+def test_a_row_the_adapter_cannot_map_raises_system_fault() -> None:
+    """A payload with no `id`, no `date`, no `status`, or a `date` carrying a
+    time the row does not have, is a malformed activity: fail closed rather
+    than guess."""
+    broker, http = _activity_broker()
+    for bad in (
+        {"activity_type": "FEE", "date": "2026-10-09", "net_amount": "-0.01", "status": "executed"},
+        {"id": "act", "activity_type": "FEE", "net_amount": "-0.01", "status": "executed"},
+        {"id": "act", "activity_type": "FEE", "date": "2026-10-09", "net_amount": "-0.01"},
+        {
+            "id": "act",
+            "activity_type": "FEE",
+            "date": "2026-10-09T00:00:00Z",
+            "net_amount": "-0.01",
+            "status": "executed",
+        },
+    ):
+        http.route("GET", "/v2/account/activities", (200, [bad]))
+        with pytest.raises(SystemFaultError, match="malformed alpaca activity"):
+            broker.cash_activities(date(2026, 10, 9))
+
+
+def test_a_read_activity_row_names_no_symbol_and_keeps_one_that_does() -> None:
+    """A `FEE` row names no symbol; one that does is canonicalized like every
+    symbol in this module."""
+    broker, http = _activity_broker()
+    http.route(
+        "GET",
+        "/v2/account/activities",
+        (
+            200,
+            [
+                {
+                    "id": "act-div",
+                    "activity_type": "DIV",
+                    "date": "2026-10-09",
+                    "net_amount": "1.25",
+                    "status": "executed",
+                    "symbol": "ko",
+                    "description": "Cash dividend of 1.25 on KO",
+                },
+            ],
+        ),
+    )
+
+    (row,) = broker.cash_activities(date(2026, 10, 9))
+
+    assert row.symbol == "KO" and row.description == "Cash dividend of 1.25 on KO"
+
+
+def test_cash_activities_reads_the_clock_before_any_request() -> None:
+    """ADR 0007 point 4: the wrapped clock reading comes before every request,
+    this new read included."""
+    broker, http = _broker(_raises)
+    with pytest.raises(ClockError):
+        broker.cash_activities(date(2026, 10, 9))
+    assert http.sent == []
 
 
 def test_a_whole_share_float_quantity_passes_a_zero_decimal_precision() -> None:
