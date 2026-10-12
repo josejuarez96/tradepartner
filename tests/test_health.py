@@ -35,7 +35,6 @@ from tradepartner.health import (
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
     FILING_EVENTS_UNIQUE,
-    GUARDED_SIC_DEFAULT,
     INTEGRITY_RULES,
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
     KNOWN_AT_NOT_NULL,
@@ -1366,20 +1365,19 @@ def test_with_no_earlier_bar_the_gap_counts_from_the_effective_date(
     assert _violating_sessions(fixture_store, _settings()) == (bars if fails else [])
 
 
-def test_changed_guarded_sic_default_fails_its_rule(
-    fixture_store: duckdb.DuckDBPyConnection,
-) -> None:
-    # The config validator refuses the change; a copy with the guard
-    # bypassed stands for a store read with tampered settings.
+def test_no_rule_reads_the_universe_sic_key(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """ADR 0006 amendment 2026-10-11 (#1540), property 8: the `guarded_sic_default`
+    rule is gone and a store read under a named range still passes."""
     settings = _settings()
-    tampered = settings.model_copy(
+    named = settings.model_copy(
         update={
-            "universe": settings.universe.model_copy(update={"exclude_sic_ranges": ((4900, 4949),)})
+            "universe": settings.universe.model_copy(update={"exclude_sic_ranges": ((4900, 4999),)})
         }
     )
-    report = health_report(fixture_store, T_END, tampered)
-    assert not report.ok
-    assert report.failures == (GUARDED_SIC_DEFAULT,)
+    from tradepartner.health import INTEGRITY_RULES
+
+    assert "guarded_sic_default" not in INTEGRITY_RULES
+    assert health_report(fixture_store, T_END, named).ok
 
 
 def test_report_fails_naming_each_injected_rule(fixture_store: duckdb.DuckDBPyConnection) -> None:

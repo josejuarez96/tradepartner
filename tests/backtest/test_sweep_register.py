@@ -435,6 +435,44 @@ def test_a_file_off_the_family_rules_is_refused_naming_the_rule(
     _refused(ready, _copy(tmp_path, SWEEP_SOURCE, edit), settings, FamilyRuleError, rule)
 
 
+def _named(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={
+            "universe": settings.universe.model_copy(update={"exclude_sic_ranges": ((4900, 4999),)})
+        }
+    )
+
+
+def test_a_momentum_file_omitting_the_utility_key_is_refused_by_name_and_naming_it_registers(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """ADR 0006 amendment 2026-10-11 (#1540), property 9 (i): the family's rule holds
+    `[[4900, 4999]]` (H1's stored value); the live default is `[]`."""
+    named = _named(settings)
+    _twin(lab_store, named, tmp_path)
+    path = _copy(tmp_path, SWEEP_SOURCE)
+
+    _refused(lab_store, path, settings, FamilyRuleError, r"universe\.exclude_sic_ranges")
+
+    result = register(lab_store, path, named, registered_by="test")
+    assert isinstance(result, SweepRegistration) and result.created
+
+
+def test_the_twins_unchanged_file_no_longer_returns_its_record_under_the_new_default(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """Property 9 (iii): refused on the lab store, and the record stands."""
+    twin = _twin(lab_store, _named(settings), tmp_path, run=False)
+    before = _counts(lab_store)
+
+    with pytest.raises(Exception, match="standalone file"):
+        hypothesis.register(
+            lab_store, _copy(tmp_path, TWIN_SOURCE), registered_by="test", settings=settings
+        )
+    assert _counts(lab_store) == before
+    assert registry.get_hypothesis_by_id(lab_store, twin.hypothesis_id) == twin
+
+
 def test_a_file_naming_another_parent_family_is_refused(
     ready: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:

@@ -162,7 +162,7 @@ def test_delisted_name_present_on_its_last_session_absent_after(
     assert _excluded(universe_as_of(fixture_store, later, _settings()))["SEC_WINDOW_DELIST"][0] == 2
 
 
-def test_utility_sic_fails_rule_3(fixture_store: duckdb.DuckDBPyConnection) -> None:
+def _insert_utility_sic(fixture_store: duckdb.DuckDBPyConnection) -> None:
     known = datetime(2018, 1, 2, 21, 0, tzinfo=UTC)
     insert_row(
         fixture_store,
@@ -178,8 +178,24 @@ def test_utility_sic_fails_rule_3(fixture_store: duckdb.DuckDBPyConnection) -> N
             "provenance": "filing",
         },
     )
-    excluded = _excluded(universe_as_of(fixture_store, T_SPLIT_BETWEEN, _settings()))
+
+
+def test_utility_sic_fails_rule_3_under_an_explicit_range(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """Rule 3 is a per-hypothesis choice (ADR 0006 amendment 2026-10-11, #1540)."""
+    _insert_utility_sic(fixture_store)
+    settings = _settings(exclude_sic_ranges=[[4900, 4999]])
+    excluded = _excluded(universe_as_of(fixture_store, T_SPLIT_BETWEEN, settings))
     assert excluded["SEC_SPLIT_BETWEEN"] == (3, "sector", "sic:4911")
+
+
+def test_utility_sic_is_admitted_under_the_default(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_utility_sic(fixture_store)
+    u = universe_as_of(fixture_store, T_SPLIT_BETWEEN, _settings())
+    assert "sector" not in u.exclusions["rule_name"].to_list()
 
 
 def test_liquidity_rule_off_is_skipped_and_recorded(
