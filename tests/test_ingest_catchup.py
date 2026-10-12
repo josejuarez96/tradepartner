@@ -30,7 +30,7 @@ from test_ingest import (
 from tradepartner.adapters.prices import bar_known_at
 from tradepartner.calendar import next_session, previous_session
 from tradepartner.config import Settings
-from tradepartner.ingest import OK, STALE
+from tradepartner.ingest import OK, STALE, IngestResult
 
 # The run's expected session and the sessions before it, by the XNYS calendar:
 # 2019-06-28 is a Friday, so 06-22 and 06-23 (a Saturday and a Sunday) are not
@@ -39,10 +39,9 @@ D = SESSION  # 2019-06-28
 D1 = previous_session(D)  # 2019-06-27, Thursday
 D2 = previous_session(D1)  # 2019-06-26, the day the #1550 run failed
 D3 = previous_session(D2)  # 2019-06-25
-D4 = previous_session(D3)  # 2019-06-24, Monday
-D5 = previous_session(D4)  # 2019-06-21, Friday
-D6 = previous_session(D5)  # 2019-06-20
+D6 = previous_session(previous_session(previous_session(D3)))  # 2019-06-20
 D7 = previous_session(D6)  # 2019-06-19
+MAY_31 = date(2019, 5, 31)  # a Friday in the month before the run's
 
 
 @pytest.fixture
@@ -62,7 +61,7 @@ def _store(settings: Settings, sessions: list[date]) -> None:
     _seed_prices(settings, sessions, IDS, NOW)
 
 
-def _alpaca(settings: Settings, prices: _Prices | None = None) -> Any:
+def _alpaca(settings: Settings, prices: _Prices | None = None) -> IngestResult:
     """The daily alpaca run for `D`, its fetch pass and its run row."""
     return _run(settings, prices if prices is not None else _Prices(), source="alpaca")
 
@@ -139,3 +138,19 @@ def test_a_gap_at_the_bound_is_caught_up_not_failed(
     assert run.status == OK, run.message
     assert f"catch-up: {len(missed)} sessions" in run.message
     assert _sessions_stored(read) == set(_sessions(D6, D))
+
+
+def test_a_caught_up_session_brings_its_month_of_actions(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    # #1572: a caught-up session in an earlier month asks for that month of
+    # corporate actions as the backfill of that month would, so a split with
+    # an ex-date in it adjusts the bars the run stores for it.
+    hole = [day for day in _sessions(date(2019, 5, 30), date(2019, 6, 27)) if day != MAY_31]
+    _store(settings, hole)
+    prices = _Prices()
+    run = _alpaca(settings, prices).runs[-1]
+    assert run.status == OK, run.message
+    assert ("bars", tuple(sorted(IDS)), MAY_31, MAY_31) in prices.calls
+    assert ("actions", tuple(sorted(IDS)), date(2019, 5, 1), D) in prices.calls
+    assert _sessions_stored(read) == {*hole, MAY_31, D}

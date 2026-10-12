@@ -1818,11 +1818,10 @@ def _march_then_june(
     catching up the un-ingested 06-21..06-27. Returns the 06-28 price run."""
     filings = _filings(fetched_at=MARCH_FILINGS)
     assert _run(settings, now=MARCH, filings=filings).ok
-    trading = (ACME, DUAL, DUAL_B, SPY)
     _seed_prices(
         settings,
         _sessions(date(2019, 3, 6), date(2019, 6, 19)),
-        [sid for sid in trading if sid not in dark],
+        [sid for sid in IDS if sid not in dark],
         NOW,
     )
     loose = _missing_share(settings, 0.5)
