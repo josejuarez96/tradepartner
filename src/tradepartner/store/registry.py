@@ -487,6 +487,12 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 
 # Facts that can affect a trial. Rates are stored for later consumers, but
 # today's trial path does not read them; adding one must not stale a trial.
+# The 2026-10-11 amendment (#1506) adds two more for the same reason, and
+# they are excluded here rather than read and then filtered out:
+# `borrow_status` (T171, no consumer at all) and `symbol_changes` (T172b,
+# not a store table until that task lands) are written by ingests nothing a
+# registered trial reads. `tests/store/test_registry.py` pins that this list
+# and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "securities",
     "listings",
@@ -499,6 +505,15 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "filing_events",
 )
 
+#: The rows of `corporate_actions` a trial can read: the action types that
+#: move a price series. A `spinoff` row (#1506, T172) is written by the
+#: corporate-actions ingests for `window.start` alone -- the paper path --
+#: and nothing a registered trial reads, so it must not stale a trial.
+#: Every other trial table contributes all of its rows.
+_TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
+    "corporate_actions": " AND action_type IN ('split', 'dividend')",
+}
+
 
 def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
@@ -508,7 +523,16 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     is neither. A nightly ingest that only adds later sessions leaves it
     unchanged; a late fact for an in-window session changes it, and so does a
     release that only deletes rows. Guarded against an absent table as
-    `store_max_ingested_at` is."""
+    `store_max_ingested_at` is.
+
+    **Which rows count** (spec Amendment 2026-10-11, #1506, "The vintage rule"):
+    over `_TRIAL_FACT_TABLES` -- an explicit list, not every fact table the
+    store happens to have -- with a table absent from the store skipped, and
+    with `corporate_actions` counted only for its `split` and `dividend` rows
+    (`_TRIAL_TABLE_ROWS`). Writing a `borrow_status` or `symbol_changes` row
+    therefore moves no trial's vintage, while `store_max_ingested_at` below
+    stays whole over every fact table: it is the store's state, not a trial's.
+    """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
     present = set(_present_fact_tables(conn))
@@ -517,6 +541,7 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     if tables:
         union = " UNION ALL ".join(
             f"SELECT MAX(ingested_at) AS m FROM {table} WHERE known_at <= $cutoff"
+            f"{_TRIAL_TABLE_ROWS.get(table, '')}"
             for table in tables
         )
         row = conn.execute(f"SELECT MAX(m) FROM ({union})", {"cutoff": cutoff}).fetchone()
