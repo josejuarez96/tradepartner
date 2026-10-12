@@ -39,6 +39,7 @@ from tradepartner.adapters.filings import (
     StatementFactRecord,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
+from tradepartner.adapters.fixture_rates import FixtureRateSource
 from tradepartner.adapters.prices import (
     ActionType,
     Bar,
@@ -47,6 +48,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
+from tradepartner.adapters.rates import RateObservation, rate_known_at
 from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, secret_values
 from tradepartner.health import filing_event_counts, statement_counts
@@ -89,6 +91,106 @@ from tradepartner.store.classify import build_classifications, classifications_a
 from tradepartner.store.db import insert_row, open_for_write
 from tradepartner.store.master import build_master
 from tradepartner.store.schema import init_schema
+
+
+def test_rates_backfill_is_point_in_time_and_idempotent(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A future vintage waits; a changed value becomes a second row."""
+    first = RateObservation("DTB3", date(2020, 6, 29), 0.10, date(2020, 6, 30))
+    revision = RateObservation("DTB3", date(2020, 6, 29), 0.12, date(2020, 7, 1))
+    source = FixtureRateSource([first, revision], missing=[("DTB3", date(2020, 6, 30))])
+    early = datetime(2020, 7, 1, 19, 0, tzinfo=UTC)
+    result = ingest_module.ingest_rates(
+        settings, source, since=date(2020, 6, 29), clock=lambda: early
+    )
+    assert result.runs[0].rows_added == 0
+    assert "rates_not_yet_known=2" in result.runs[0].message
+    assert read("SELECT count(*) FROM rates") == [(0,)]
+
+    later = datetime(2020, 7, 3, 22, 0, tzinfo=UTC)
+    result = ingest_module.ingest_rates(
+        settings, source, since=date(2020, 6, 29), clock=lambda: later
+    )
+    assert result.runs[0].rows_added == 2
+    assert "rates_revisions=1" in result.runs[0].message
+    assert "rates_missing_values=1" in result.runs[0].message
+    assert read("SELECT value, vintage_date, known_at FROM rates ORDER BY known_at") == [
+        (first.value, first.vintage_date, rate_known_at(first.vintage_date)),
+        (revision.value, revision.vintage_date, rate_known_at(revision.vintage_date)),
+    ]
+    assert (
+        ingest_module.ingest_rates(settings, source, since=date(2020, 6, 29), clock=lambda: later)
+        .runs[0]
+        .rows_added
+        == 0
+    )
+
+
+def test_rates_daily_window_catches_a_lapse_and_counts_late_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A lapse starts the query after the latest stored observation."""
+    old = RateObservation("DTB3", date(2020, 6, 1), 0.1, date(2020, 6, 2))
+    ingest_module.ingest_rates(
+        settings,
+        FixtureRateSource([old]),
+        since=old.observation_date,
+        clock=lambda: datetime(2020, 6, 5, 22, tzinfo=UTC),
+    )
+    hole = RateObservation("DTB3", date(2020, 6, 3), 0.15, date(2020, 6, 4))
+    recent = RateObservation("DTB3", date(2020, 6, 29), 0.2, date(2020, 6, 30))
+    requests: list[tuple[str, date, date]] = []
+
+    class RecordingRates(FixtureRateSource):
+        def observations(
+            self, series: str, realtime_start: date, observation_start: date
+        ) -> list[RateObservation]:
+            requests.append((series, realtime_start, observation_start))
+            return super().observations(series, realtime_start, observation_start)
+
+    source = RecordingRates([hole, recent])
+    result = ingest_module.ingest_rates(
+        settings, source, clock=lambda: datetime(2020, 7, 2, 22, tzinfo=UTC)
+    )
+    assert requests[-1][1:] == (date(2020, 6, 2), date(2020, 6, 2))
+    assert result.runs[0].rows_added == 2
+    assert "rates_late_rows=1" in result.runs[0].message
+    assert read("SELECT count(*) FROM rates") == [(3,)]
+
+
+def test_rates_stale_rolls_back_and_daily_needs_backfill(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """No daily bootstrap and no stale fact commit."""
+    now = datetime(2020, 7, 9, 22, tzinfo=UTC)
+    source = FixtureRateSource([RateObservation("DTB3", date(2020, 6, 29), 0.1, date(2020, 6, 30))])
+    absent = ingest_module.ingest_rates(settings, source, clock=lambda: now)
+    assert absent.exit_code == 1
+    assert "--backfill" in absent.runs[0].message
+    ingest_module.ingest_rates(settings, source, since=date(2020, 6, 29), clock=lambda: now)
+    stale = ingest_module.ingest_rates(settings, source, clock=lambda: now)
+    assert stale.runs[0].status == STALE
+    assert read("SELECT count(*) FROM rates") == [(1,)]
+
+
+def test_rates_dry_run_writes_nothing(settings: Settings) -> None:
+    """Dry runs fetch without opening a persistent rate or run row."""
+    source = FixtureRateSource([RateObservation("DTB3", date(2020, 6, 29), 0.1, date(2020, 6, 30))])
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+    result = ingest_module.ingest_rates(
+        settings,
+        source,
+        since=date(2020, 6, 29),
+        clock=lambda: datetime(2020, 7, 3, 22, tzinfo=UTC),
+        dry_run=True,
+    )
+    assert result.runs[0].rows_added == 1
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM ingestion_runs").fetchone() == (0,)
+
 
 ACME = "0000000001"  # one class, NYSE
 DUAL = "0000000002"  # Class A and Class B, NASDAQ

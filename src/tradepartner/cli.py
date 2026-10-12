@@ -356,7 +356,9 @@ from tradepartner.adapters import alpaca_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
 from tradepartner.backtest import lab, promotion, sweep_report
@@ -399,6 +401,7 @@ from tradepartner.ingest import (
     RestampResult,
     WindowEarlierOk,
     _read,
+    ingest_rates,
     ingest_session,
     manifest_release,
     read_manifest,
@@ -537,6 +540,8 @@ def _missing_secrets(settings: Settings, source: str) -> list[str]:
             missing.append("ALPACA_API_KEY")
         if _blank(settings.alpaca_api_secret):
             missing.append("ALPACA_API_SECRET")
+    if source in ("all", "fred") and _blank(settings.fred_api_key):
+        missing.append("FRED_API_KEY")
     return missing
 
 
@@ -1565,6 +1570,7 @@ def make_app(
     clock: Clock = utc_now,
     edgar_client: httpx.Client | None = None,
     price_source: Callable[[Settings], PriceSource] | None = None,
+    rate_source: Callable[[Settings], RateSource] = lambda s: FredRateSource(settings=s),
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
@@ -1577,7 +1583,7 @@ def make_app(
     @app.command()
     def ingest(
         source: Annotated[
-            str, typer.Option(help="alpaca, edgar or all", show_default=True)
+            str, typer.Option(help="alpaca, edgar, fred or all", show_default=True)
         ] = "all",
         backfill_: Annotated[
             bool, typer.Option("--backfill", help="backfill from --since, resuming")
@@ -1655,7 +1661,7 @@ def make_app(
             raise _fail("--fill-holes needs --backfill and --since", USAGE_ERROR)
         if fill_holes_ and source != "alpaca":
             raise _fail("--fill-holes refetches prices only: pass --source alpaca", USAGE_ERROR)
-        if backfill_ and dry_run and not fill_holes_:
+        if backfill_ and dry_run and not fill_holes_ and source != "fred":
             raise _fail("--dry-run is not available with --backfill", USAGE_ERROR)
         for flag, given in (
             ("--bulk-from-cache", bulk_from_cache),
@@ -1663,7 +1669,7 @@ def make_app(
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
         ):
-            if given and (backfill_ or source == "alpaca"):
+            if given and (backfill_ or source in ("alpaca", "fred")):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
@@ -1727,6 +1733,10 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
+        if source == "fred":
+            result = ingest_rates(s, rate_source(s), since=start, clock=clock, dry_run=dry_run)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
         filings = EdgarFilingSource(
             s,
             client=edgar_client,
@@ -1747,11 +1757,15 @@ def make_app(
             result = backfill(
                 s, prices=prices, filings=filings, since=start, source=source, clock=clock
             )
+            if source == "all" and result.ok:
+                fred = ingest_rates(s, rate_source(s), since=start, clock=clock)
+                result = IngestResult(result.runs + fred.runs)
         else:
             result = ingest_session(
                 s,
                 prices=prices,
                 filings=filings,
+                rates=rate_source(s) if source == "all" else None,
                 source=source,
                 clock=clock,
                 dry_run=dry_run,
