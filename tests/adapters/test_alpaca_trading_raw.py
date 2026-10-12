@@ -533,6 +533,45 @@ def test_fill_activities_refuse_a_naive_instant() -> None:
         _raw().list_fill_activities(datetime(2026, 9, 28, 13, 30))  # noqa: DTZ001
 
 
+def test_activities_read_every_page_of_the_unfiltered_endpoint() -> None:
+    """Every account activity, `FILL` rows included: `GET /v2/account/activities`
+    with **no type filter** (paper-trading spec req 2, amendment of 2026-10-12
+    item 1, #1583, plan T183b), paged exactly as the fills read is."""
+    client = FakeClient()
+    size = raw_mod.ACTIVITIES_PAGE_SIZE
+    client.pages = [
+        [{"id": f"a{i}", "activity_type": "FEE"} for i in range(size)],
+        [{"id": "last", "activity_type": "INT"}],
+    ]
+    after = datetime(2026, 10, 8, 4, 0, tzinfo=UTC)  # New York midnight, 2026-10-08
+
+    activities = _raw(client=client).list_activities(after)
+
+    assert len(activities) == size + 1
+    (path1, params1), (_, params2) = [c[1] for c in client.calls]
+    assert path1 == "/account/activities"
+    assert params1 == {
+        "after": "2026-10-08T04:00:00+00:00",
+        "direction": "asc",
+        "page_size": size,
+    }
+    assert params2["page_token"] == f"a{size - 1}"
+    assert "activity_types" not in params1 and "activity_types" not in params2
+
+
+def test_activities_raise_when_paging_does_not_advance() -> None:
+    client = FakeClient()
+    page = [{"id": f"a{i}"} for i in range(raw_mod.ACTIVITIES_PAGE_SIZE)]
+    client.pages = [page, page, page]
+    with pytest.raises(RuntimeError, match="did not advance"):
+        _raw(client=client).list_activities(datetime(2026, 10, 8, 4, 0, tzinfo=UTC))
+
+
+def test_activities_refuse_a_naive_instant() -> None:
+    with pytest.raises(ValueError):
+        _raw().list_activities(datetime(2026, 10, 8, 4, 0))  # noqa: DTZ001
+
+
 def test_get_order_by_id_is_paced_and_retried_like_every_call() -> None:
     clock = FakeClock()
     client = FakeClient(fail_with=[requests.Timeout("slow")])

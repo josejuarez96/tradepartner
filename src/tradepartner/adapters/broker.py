@@ -29,6 +29,20 @@ Alpaca adapter maps a broker's response once; the risk wrapper does not yet
 refuse a non-default shape — that refusal (`refused_order_shape`) is T135b,
 not this task.
 
+**Non-trade cash activities (paper-trading spec req 1, the amendment of
+2026-10-12, #1583, plan T183b).** `Broker.cash_activities(since)` is the read
+of the broker's non-trade account activities (`FEE` a regulatory fee, `DIV` a
+dividend, `SSP` a corporate action, and any type this system has not
+classified). A `CashActivity` carries the broker's own activity `id` — its
+identity, the only key by which an activity is counted once — a `date` with
+**no time** (a fee row has only a date; inventing a time for it would be a
+guess about when the broker posted it) and a signed `net_amount` (`None` for a
+row that moves no cash). It never returns a fill, and it returns every row
+the broker lists from `since`'s window on whatever its type — nothing is
+dropped by date, a row dated before `since` included, because the caller
+applies its own bound: a type nothing here has classified must reach the
+reconciliation as `unexplained_activity`, not be filtered away.
+
 Every timestamp field on these value objects is tz-aware UTC
 (CLAUDE.md: "Datetimes are always timezone-aware UTC"); a naive `datetime`
 raises `ValueError` at construction, and any tz-aware value that isn't
@@ -50,7 +64,7 @@ import abc
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -167,6 +181,28 @@ def _validate_optional_count(value: int | None, *, field_name: str) -> int | Non
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative int or None, got {value!r}")
+    return value
+
+
+def _validate_optional_identifier(value: str | None, *, field_name: str) -> str | None:
+    """`_validate_identifier` for a nullable field: `None` stays `None`."""
+    return None if value is None else _validate_identifier(value, field_name=field_name)
+
+
+def _validate_optional_text(value: str | None, *, field_name: str) -> str | None:
+    """`None` or a `str`, with no rule about its content (a broker's
+    `description` is free text, punctuation and spaces included)."""
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a str or None, got {value!r}")
+    return value
+
+
+def _validate_date(value: date, *, field_name: str) -> date:
+    """`value` must be a calendar `date`. A `datetime` is refused explicitly
+    (it subclasses `date`, so `isinstance` alone would pass it): a fee row has
+    no time, and a time supplied here would be an invented one."""
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise ValueError(f"{field_name} must be a date, got {value!r}")
     return value
 
 
@@ -458,6 +494,61 @@ class Account:
 
 
 @dataclass(frozen=True)
+class CashActivity:
+    """One non-trade account activity the broker lists (paper-trading spec
+    req 1, its amendment of 2026-10-12 item 1, #1583, plan T183b).
+
+    `activity_id` is the broker's own activity id and the row's **identity**:
+    an activity is counted once by it, never by its date or its time, because
+    the evidence says nothing about how long after its trade date a fee posts.
+    `activity_type` is the broker's type string, passed through as reported
+    (`FEE`, `DIV`, `SSP`, `INT`, `JNLC`, …): **nothing here classifies a
+    type**, so a type this system has not seen still reaches the caller, which
+    is the point of the read. `date` is the activity's New York **date**, with
+    no time of any kind — a `FEE` row has only a date (spec item 1), and an
+    `event_at` field does not exist.
+
+    `status` is the broker's own (`executed` for a posted fee) and is
+    **required**: a rule judges a row by it, so a row built without a status
+    must not be constructible. `net_amount` is the broker's signed amount
+    (`None` for a row that moves no cash, such as a split's `SSP`), `symbol`
+    the row's symbol when it names one (canonicalized like every other symbol
+    here) and `description` the broker's free text. Neither `symbol` nor
+    `description` is interpreted: a rule that needed them would be guessing
+    from a string (spec item 2).
+    """
+
+    activity_id: str
+    activity_type: str
+    date: date
+    status: str
+    net_amount: float | None = None
+    symbol: str | None = None
+    description: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "activity_id", _validate_identifier(self.activity_id, field_name="activity_id")
+        )
+        object.__setattr__(
+            self,
+            "activity_type",
+            _validate_identifier(self.activity_type, field_name="activity_type"),
+        )
+        object.__setattr__(self, "date", _validate_date(self.date, field_name="date"))
+        object.__setattr__(self, "status", _validate_identifier(self.status, field_name="status"))
+        object.__setattr__(
+            self, "net_amount", _validate_optional_finite(self.net_amount, field_name="net_amount")
+        )
+        object.__setattr__(
+            self, "symbol", None if self.symbol is None else canonical_symbol(self.symbol)
+        )
+        object.__setattr__(
+            self, "description", _validate_optional_text(self.description, field_name="description")
+        )
+
+
+@dataclass(frozen=True)
 class Asset:
     """What the broker says about one symbol. `cusip` is `None` when the
     broker does not report one. `shortable`, `easy_to_borrow` and
@@ -524,6 +615,23 @@ class Broker(abc.ABC):
     def fills(self, since: datetime | None = None) -> list[Fill]:
         """Every fill with `filled_at >= since` (all when `None`), in fill
         order."""
+
+    @abc.abstractmethod
+    def cash_activities(self, since: date) -> list[CashActivity]:
+        """Every **non-trade** activity the broker lists, oldest first, and
+        never a fill (paper-trading spec req 1, its amendment of 2026-10-12
+        item 1, #1583, plan T183b).
+
+        The broker is asked from the New York midnight that begins `since -
+        1 day` (an adapter's `after` is a strict timestamp comparison and how
+        it orders a date-only row is unknown), so the read's window starts a
+        day early and a row dated **before** `since` can come back. Nothing is
+        dropped by date or by type: a row dated exactly `since` is included, a
+        row dated before it is returned as the broker listed it, and **the
+        caller applies its own bound**. A type the caller has not classified
+        is returned like any other, so the caller can halt on it rather than
+        silently ignore a cash movement.
+        """
 
     @abc.abstractmethod
     def positions(self) -> dict[str, Position]:

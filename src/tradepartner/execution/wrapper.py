@@ -294,6 +294,7 @@ __all__ = [
     "ALLOWLISTS",
     "ASSETS_ALLOWLIST",
     "CANCEL_ALLOWLIST",
+    "CASH_ACTIVITIES_ALLOWLIST",
     "CRASH_EXIT_CODE",
     "FILLS_ALLOWLIST",
     "GET_ORDER_ALLOWLIST",
@@ -320,6 +321,10 @@ FILLS_ALLOWLIST: tuple[type[Exception], ...] = ()
 POSITIONS_ALLOWLIST: tuple[type[Exception], ...] = ()
 ACCOUNT_ALLOWLIST: tuple[type[Exception], ...] = ()
 ASSETS_ALLOWLIST: tuple[type[Exception], ...] = ()
+#: `cash_activities` (plan T183b, #1583) is read outside this wrapper — the
+#: reconciliation reads it from the broker directly — so it is allowlisted
+#: empty for the interface's sake and never classified by a call here.
+CASH_ACTIVITIES_ALLOWLIST: tuple[type[Exception], ...] = ()
 
 #: Each `Broker` method's constant, keyed by the method's own name (taken from the
 #: ABC, so a renamed method fails here, and the `fills` key is not a SQL literal).
@@ -333,6 +338,7 @@ ALLOWLISTS: Mapping[str, tuple[type[Exception], ...]] = MappingProxyType(
         Broker.positions.__name__: POSITIONS_ALLOWLIST,
         Broker.account.__name__: ACCOUNT_ALLOWLIST,
         Broker.assets.__name__: ASSETS_ALLOWLIST,
+        Broker.cash_activities.__name__: CASH_ACTIVITIES_ALLOWLIST,
     }
 )
 
