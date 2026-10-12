@@ -98,9 +98,10 @@ _BORROW_ASSET_IDS: dict[str, str] = {
     "renamed": "b0rr0w00-0000-4b0d-8000-000000000005",
     "reappeared": "b0rr0w00-0000-4b0d-8000-000000000006",
 }
-#: One fixture security per case, so a future resolver read has a symbol to
-#: map (the table itself stores no `security_id`: the symbol maps through the
-#: store resolver at the fetch day's session).
+#: One fixture symbol per case (the table stores no `security_id`). Not every
+#: one resolves to a fixture security at the fetch day's session (BNDX and TCKA
+#: do not in 2020); T171b's read returns the rows by symbol whether or not they
+#: resolve.
 _BORROW_SYMBOLS: dict[str, str] = {
     "unchanged": "BNDX",
     "flipped": "SPLT",

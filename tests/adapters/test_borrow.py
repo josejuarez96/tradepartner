@@ -22,6 +22,7 @@ from tradepartner.adapters.borrow import (
     US_EQUITY_CLASS,
     AssetSnapshot,
     BorrowStatus,
+    SnapshotOrderError,
     TruncatedSnapshotError,
     parse_assets,
     snapshot_rows,
@@ -580,8 +581,8 @@ def test_the_guard_is_not_tripped_by_a_store_with_nothing_present() -> None:
     latest = {"id-gone": _record("id-gone", "ZZZ", present=False)}
     rows = snapshot_rows(
         latest,
-        parse_assets([_asset("id-a", "AAA")], _FIRST).assets,
-        _FIRST,
+        parse_assets([_asset("id-a", "AAA")], _SECOND).assets,
+        _SECOND,
         max_vanished_share=0.0,
     )
     assert [(row.asset_id, row.present) for row in rows] == [("id-a", True)]
@@ -591,3 +592,26 @@ def test_the_guard_is_not_tripped_by_a_store_with_nothing_present() -> None:
 def test_the_guard_refuses_a_threshold_outside_zero_and_one(threshold: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         snapshot_rows({}, (), _FIRST, max_vanished_share=threshold)  # type: ignore[arg-type]
+
+
+# --- the order guards (code-review on PR #1557) ------------------------------
+
+
+def test_the_diff_refuses_an_asset_id_twice_in_one_snapshot() -> None:
+    assets = parse_assets([_asset("id-a", "AAA"), _asset("id-a", "AAB")], _FIRST).assets
+    with pytest.raises(SnapshotOrderError, match="twice"):
+        snapshot_rows({}, assets, _FIRST, max_vanished_share=_MAX_VANISHED_SHARE)
+
+
+@pytest.mark.parametrize("fetched_at", [_FIRST, _FIRST - timedelta(days=1)])
+def test_the_diff_refuses_a_fetch_at_or_before_a_stored_row(fetched_at: datetime) -> None:
+    stored = {"id-a": _record("id-a", "AAA", known_at=_FIRST, fetched_at=_FIRST)}
+    assets = parse_assets([_asset("id-a", "AAA", easy_to_borrow=False)], fetched_at).assets
+    with pytest.raises(SnapshotOrderError, match="not after"):
+        snapshot_rows(stored, assets, fetched_at, max_vanished_share=_MAX_VANISHED_SHARE)
+
+
+def test_the_order_guard_counts_a_vanished_row_too() -> None:
+    stored = {"id-a": _record("id-a", "AAA", present=False, known_at=_SECOND, fetched_at=_SECOND)}
+    with pytest.raises(SnapshotOrderError, match="not after"):
+        snapshot_rows(stored, [], _FIRST, max_vanished_share=_MAX_VANISHED_SHARE)

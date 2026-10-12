@@ -370,33 +370,33 @@ registry; #83 took version 2 first, so the registry is version 3):
   `PROVENANCE_VALUES` member), so the look-ahead harness truncates it and
   `health`'s common-column rules cover it; T169b takes it out of
   `registry.data_vintage`. Nothing writes it before T169d. A read-only
-   connection accepts a version-22 store: every read works but a `rates`
-   read, which fails on the missing table (the per-table loops skip an
-   absent table), and the next writable `init_schema` call migrates the
-   store.
+  connection accepts a version-22 store: every read works but a `rates`
+  read, which fails on the missing table (the per-table loops skip an
+  absent table), and the next writable `init_schema` call migrates the
+  store.
 - **Version 24** (#1506, data-foundation plan T171; the spec's "Amendment
   2026-10-11 (#1506)", ADR 0021): adds `borrow_status` (one row per Alpaca
-   `us_equity` asset per *change* of its tradability and borrow flags, from
-   one unfiltered `GET /v2/assets` a day; `known_at` = the fetch time).
-   Purely additive, like versions 21 and 23: the migration from any earlier
-   migratable version just creates the table (`init_schema`'s DDL pass,
-   `_BORROW_STATUS_TABLE_DDL`) and appends a version-24 row; no existing
-   table or row changes. UNIQUE `(asset_id, known_at)`: `asset_id` is
-   Alpaca's asset UUID, and a symbol may belong to more than one asset, so
-   the id is the key. `present` is TRUE on every row written from a payload
-   and FALSE on the one row written when an asset the store has is missing
-   from a snapshot (its other columns carried from its last row);
-   `borrow_status` is the payload's string verbatim, `''` when the field is
-   absent, never NULL. The table joins `TABLE_NAMES` and
-   `TABLE_PROVENANCE_VALUES` (`snapshot` only), so the look-ahead harness
-   truncates it and `health`'s common-column rules cover it; T171b takes it
-   out of `registry.data_vintage`. Nothing writes it before T171c. A
-   read-only connection accepts a version-23 store: every read works but a
-   `borrow_status` read, which fails on the missing table (the per-table
-   loops skip an absent table), and the next writable `init_schema` call
-   migrates the store.
+  `us_equity` asset per *change* of its tradability and borrow flags, from
+  one unfiltered `GET /v2/assets` a day; `known_at` = the fetch time).
+  Purely additive, like versions 21 and 23: the migration from any earlier
+  migratable version just creates the table (`init_schema`'s DDL pass,
+  `_BORROW_STATUS_TABLE_DDL`) and appends a version-24 row; no existing
+  table or row changes. UNIQUE `(asset_id, known_at)`: `asset_id` is
+  Alpaca's asset UUID, and a symbol may belong to more than one asset, so
+  the id is the key. `present` is TRUE on every row written from a payload
+  and FALSE on the one row written when an asset the store has is missing
+  from a snapshot (its other columns carried from its last row);
+  `borrow_status` is the payload's string verbatim, `''` when the field is
+  absent, never NULL. The table joins `TABLE_NAMES` and
+  `TABLE_PROVENANCE_VALUES` (`snapshot` only), so the look-ahead harness
+  truncates it and `health`'s common-column rules cover it; T171b takes it
+  out of `registry.data_vintage`. Nothing writes it before T171c. A
+  read-only connection accepts a version-23 store: every read works but a
+  `borrow_status` read, which fails on the missing table (the per-table
+  loops skip an absent table), and the next writable `init_schema` call
+  migrates the store.
 - **A later DDL change goes to version 25**, with its own migration and a
-   note here, never a silent edit of the DDL below.
+  note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
 `known_at`/`ingested_at`/`source`/`provenance` columns, and they are kept

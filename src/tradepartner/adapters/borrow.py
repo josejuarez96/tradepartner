@@ -90,6 +90,14 @@ _COMPARED_FIELDS: tuple[str, ...] = (
 )
 
 
+class SnapshotOrderError(ValueError):
+    """A snapshot that cannot be diffed as the next one: an `asset_id` twice
+    in it (two rows on one `(asset_id, known_at)`, no single state), or a
+    fetch time at or before a stored row's `known_at` (it would write history
+    earlier than rows already stored; ADR 0021 point 2). Refused before any
+    row is written."""
+
+
 class TruncatedSnapshotError(ValueError):
     """A snapshot whose vanished share exceeds `max_vanished_share`: the
     list came back partial or differently filtered, so writing its
@@ -195,9 +203,11 @@ def parse_assets(payload: Sequence[Mapping[str, object]], fetched_at: datetime) 
     """Parse one unfiltered assets response into `us_equity` records
     (module docstring).
 
-    `payload` is the response's list of asset mappings — the recorder's
-    `assets-*.json.gz` shape, and `TradingClient.get_all_assets()`'s
-    `Asset` objects once `dict`-ed as `alpaca_raw.assets_snapshot` does.
+    `payload` is the response's raw JSON list of asset mappings (the
+    recorder's `assets-*.json.gz` shape, field names as the API sends them:
+    `id`, `class`, `borrow_status`). Not alpaca-py's `Asset` model dict-ed:
+    that renames `class`, types `id` as a UUID and drops `borrow_status`, so
+    the daily ingest (T171c) must hand the raw list over.
     `fetched_at` is the clock reading after the response arrived, which
     stamps every row (an import passes the file's `fetch_finished_utc`): a
     naive datetime is refused here.
@@ -275,10 +285,27 @@ def snapshot_rows(
     absent from the snapshot stays vanished without writing another row.
 
     The rows are the snapshot's, in payload order, then the vanished ones in
-    `latest` order; each carries `known_at = fetched_at`.
+    `latest` order; each carries `known_at = fetched_at`. A snapshot with an
+    `asset_id` twice, or with `fetched_at` at or before any stored row's
+    `known_at`, raises `SnapshotOrderError`.
     """
     _check_vanished_share(max_vanished_share)
     stamp = _tz_aware(fetched_at, "fetched_at")
+    seen: set[str] = set()
+    for record in assets:
+        if record.asset_id in seen:
+            raise SnapshotOrderError(
+                f"asset_id {record.asset_id!r} appears twice in this snapshot: refused, "
+                "nothing written"
+            )
+        seen.add(record.asset_id)
+    later = [row.asset_id for row in latest.values() if row.known_at >= stamp]
+    if later:
+        raise SnapshotOrderError(
+            f"fetched_at {stamp.isoformat()} is not after the stored row of {len(later)} "
+            f"asset(s) (first: {later[0]!r}): a snapshot is diffed only after the latest "
+            "stored one, nothing written"
+        )
     stored_present = [row for row in latest.values() if row.present]
     in_payload = {record.asset_id for record in assets}
     vanished = [row for row in stored_present if row.asset_id not in in_payload]

@@ -93,6 +93,7 @@ _CSV_TABLES = (
     "corporate_actions",
     "facts",
     "statement_facts",
+    "rates",
     "borrow_status",
 )
 
