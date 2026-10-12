@@ -9,7 +9,10 @@ reported once, under the first rule it fails:
 2. `exchange`: the security's current listing at T's session is live and
    on one of `universe.exchanges`. The current listing is the one with the
    latest `valid_from` on or before the session (a ticker change or a
-   transfer supersedes the older row). It is live while `listed`, or while
+   transfer supersedes the older row). When the rows of one class share
+   that latest `valid_from` (filed on two exchanges, #1574), a row on a
+   venue in `universe.exchanges` wins, whatever order the names sort in.
+   It is live while `listed`, or while
    `transferred` up to its end session; a `delisted` listing (a Form 25
    known at `t`) is out from the filing's `known_at`, even while bars
    continue, so nothing enters a name on its way out.
@@ -212,13 +215,28 @@ def _current_listings(
     conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
 ) -> dict[str, dict[str, Any]]:
     """Per security, its listing row with the latest `valid_from` on or
-    before `session`, with `status` and `end_session` at `t`."""
+    before `session`, with `status` and `end_session` at `t`.
+
+    When the rows of one security share that latest `valid_from` (one class
+    filed on two exchanges, #1574), the tie goes to a row whose `exchange` is
+    in `universe.exchanges`, whatever order the names sort in; with no such
+    row, `listing_ends_as_of`'s frame order still decides the tie."""
+    exchanges = frozenset(settings.universe.exchanges)
     current: dict[str, dict[str, Any]] = {}
     for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         if row["valid_from"] > session:
             continue
         held = current.get(row["security_id"])
-        if held is None or row["valid_from"] > held["valid_from"]:
+        newer = held is None or row["valid_from"] > held["valid_from"]
+        # A same-day tie (#1574): prefer a venue on the universe's list over
+        # one off it, so the tie does not turn on how the names sort.
+        tie_to_universe = (
+            held is not None
+            and row["valid_from"] == held["valid_from"]
+            and row["exchange"] in exchanges
+            and held["exchange"] not in exchanges
+        )
+        if newer or tie_to_universe:
             current[row["security_id"]] = row
     return current
 
