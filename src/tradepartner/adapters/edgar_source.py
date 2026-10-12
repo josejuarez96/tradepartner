@@ -569,7 +569,8 @@ class EdgarFilingSource(FilingSource):
         # reached. Keep it apart from the cache key so a trailing API answer is
         # reused within one run but a newly seen filing forces a refresh.
         self._statement_requested: dict[str, str] = {}
-        self._statement_counted: set[str] = set()
+        self._statement_parse_counts: dict[str, tuple[int, int, int]] = {}
+        self._statement_read_counts: dict[str, tuple[int, int, int]] = {}
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -2414,11 +2415,11 @@ class EdgarFilingSource(FilingSource):
         previous = self._statement_missing.get(cik, set())
         self.statement_no_parsed_rows += len(missing) - len(previous)
         self._statement_missing[cik] = missing
-        if cik not in self._statement_counted:
-            self._statement_counted.add(cik)
-            self.statement_conflicts += len(conflicts)
-            self.statement_unstampable += unstampable
-            self.statement_malformed += late
+        old_conflicts, old_unstampable, old_late = self._statement_read_counts.get(cik, (0, 0, 0))
+        self.statement_conflicts += len(conflicts) - old_conflicts
+        self.statement_unstampable += unstampable - old_unstampable
+        self.statement_malformed += late - old_late
+        self._statement_read_counts[cik] = (len(conflicts), unstampable, late)
         listed = set(self.statement_conflict_keys)
         self.statement_conflict_keys.extend(c for c in conflicts if c not in listed)
         return records
@@ -2455,6 +2456,7 @@ class EdgarFilingSource(FilingSource):
         if cached is not None:
             self._statement_filled[cik] = key
             self._statement_requested[cik] = key
+            self._set_statement_parse_counts(cik, 0, 0, 0)
             return cached
         payload, complete, origin = self._company_facts_payload(cik, latest)
         return self._fill_statement_cache(cik, stamps, latest, payload, complete, origin)
@@ -2498,13 +2500,12 @@ class EdgarFilingSource(FilingSource):
         if parsed is None:
             entries = empty
             reached = latest if complete and payload is None else ""
+            non_usd, malformed, none = 0, 0, 0
         else:
             entries, stamped, carries = parsed
-            self.statement_non_usd += stamped.non_unit
-            self.statement_malformed += stamped.malformed
-            if not carries:
-                self.statement_none += 1
+            non_usd, malformed, none = stamped.non_unit, stamped.malformed, int(not carries)
             reached = latest if complete else _reached(payload, stamps, edgar.cover_page_forms)
+        self._set_statement_parse_counts(cik, non_usd, malformed, none)
         key = self._statement_key(reached)
         data = {
             "version": STATEMENT_VERSION,
@@ -2517,6 +2518,16 @@ class EdgarFilingSource(FilingSource):
         self._statement_filled[cik] = key
         self._statement_requested[cik] = self._statement_key(latest)
         return entries
+
+    def _set_statement_parse_counts(
+        self, cik: str, non_usd: int, malformed: int, none: int
+    ) -> None:
+        """Replace this CIK's parse contribution after a cache refresh."""
+        old_non_usd, old_malformed, old_none = self._statement_parse_counts.get(cik, (0, 0, 0))
+        self.statement_non_usd += non_usd - old_non_usd
+        self.statement_malformed += malformed - old_malformed
+        self.statement_none += none - old_none
+        self._statement_parse_counts[cik] = (non_usd, malformed, none)
 
     def _stamp_statement(
         self, cik: str, cached: StatementFactsParse, stamps: Mapping[str, SubmissionRecord]

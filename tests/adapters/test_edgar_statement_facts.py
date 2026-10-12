@@ -930,7 +930,7 @@ def test_facts_and_statement_facts_share_one_payload_read(tmp_path: Path) -> Non
 
 
 def _q1_q2_source(
-    tmp_path: Path, *, q2_statement: bool = True
+    tmp_path: Path, *, q2_statement: bool = True, skips: bool = False
 ) -> tuple[EdgarFilingSource, str, datetime]:
     """Read Q1 statements, then add a Q2 filing to the same source instance."""
     q1 = "0000123456-26-000001"
@@ -946,11 +946,28 @@ def _q1_q2_source(
             shares.append(entry(q2, "2026-06-30", 11, form="10-Q"))
             if q2_statement:
                 revenue.append(entry(q2, ("2026-04-01", "2026-06-30"), 120, form="10-Q"))
+        gaap: dict[str, Any] = {"Revenues": {"units": {"USD": revenue}}}
+        if skips:
+            gaap["GrossProfit"] = {
+                "units": {
+                    "EUR": [entry(q1, ("2026-01-01", "2026-03-31"), 4, form="10-Q")],
+                    "USD": (
+                        [
+                            entry(q2, ("2026-04-01", "2026-06-30"), 5, form="10-Q"),
+                            entry(q2, ("2026-04-01", "2026-06-30"), 6, form="10-Q"),
+                        ]
+                        if include_q2
+                        else []
+                    ),
+                }
+            }
+            if include_q2:
+                gaap["Assets"] = {"units": {"USD": [entry(q2, "2026-09-30", 90, form="10-Q")]}}
         return {
             "cik": int(CIK),
             "facts": {
                 "dei": {SHARES: {"units": {"shares": shares}}},
-                "us-gaap": {"Revenues": {"units": {"USD": revenue}}},
+                "us-gaap": gaap,
             },
         }
 
@@ -988,6 +1005,17 @@ def test_seen_q2_shares_without_statements_have_named_counter(tmp_path: Path) ->
     second.statement_facts(CIK)
     assert second.statement_no_parsed_rows == 1
     assert "statement_no_parsed_rows: 1" in StatementCounts().message(second)
+
+
+def test_refresh_replaces_per_cik_skip_counts(tmp_path: Path) -> None:
+    """Q1 parse skips count once; new Q2 conflicts and late rows count too."""
+    second, _, _ = _q1_q2_source(tmp_path, skips=True)
+    second.statement_facts(CIK)
+    assert (second.statement_non_usd, second.statement_conflicts, second.statement_malformed) == (
+        1,
+        1,
+        1,
+    )
 
 
 def test_a_payload_both_parsers_refuse_is_recorded_once(tmp_path: Path) -> None:
