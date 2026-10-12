@@ -287,6 +287,16 @@ def test_scrub_text_scrubs_authorization_and_apca_header_lines() -> None:
     assert count == 3
 
 
+def test_scrub_text_scrubs_fred_api_key_query_value() -> None:
+    scrubbed, count = scrub_text(
+        "https://api.stlouisfed.org/fred/series/observations?api_key=short-dummy&limit=1",
+        secrets=[],
+    )
+    assert scrubbed.endswith("?api_key=<scrubbed>&limit=1")
+    assert "short-dummy" not in scrubbed
+    assert count == 1
+
+
 def test_key_management_personnel_compensation_does_not_trip_the_walk_test(
     tmp_path: Path,
 ) -> None:

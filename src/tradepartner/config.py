@@ -33,6 +33,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -54,8 +55,31 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # `edgar.statement_tags`' default (spec amendment 2026-10-03, #660, decision
-# (a)): five canonical names, each an ordered list of fallbacks, every one the
+# (a)): canonical names, each an ordered list of fallbacks, every one the
 # concept itself, never a near relative.
+#
+# #1556 adds a financial-issuer revenue fact and the two constituents of its
+# one documented definition, under names that never touch `revenue` (and so
+# never touch `gross_profit`). `revenue_financial` is a financial issuer's one
+# documented revenue quantity from its own filing: it holds
+# **`us-gaap:RevenuesNetOfInterestExpense`** (the issuer's total revenue net of
+# interest expense, the concept itself) when the filing reports it, else the
+# sum of **net interest income (`us-gaap:InterestIncomeExpenseNet`) plus
+# noninterest income (`us-gaap:NoninterestIncome`)**. The sum is computed by the
+# ingest's derived-candidate rule (`ingest._derived_candidates`) whenever both
+# constituents are the stored vintages of **one filing and one period** (never
+# mixing filings), whatever `revenue` tag that filing carries, and
+# stored like any derived row: `basis = derived`, `xbrl_tag` the join of the
+# two source tags by the operator (`+`). A reported
+# `RevenuesNetOfInterestExpense` row is `basis = reported`. The constituents
+# are parsed and stored as filed; they are named here so the derivation can
+# read them from the same filing's records. Keeping this out of `revenue`
+# leaves non-financial issuers' `revenue` and every `gross_profit` byte-identical
+# to before and keeps every row point-in-time; a consumer wanting one revenue
+# series coalesces `revenue` and `revenue_financial` at read time, taking the
+# later `known_at` of the rows it reads. Gross profit
+# stays N/A for financials (no `cost_of_revenue`). IFRS issuers are out of
+# scope (#1556).
 _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
     "revenue": (
         "us-gaap:Revenues",
@@ -65,6 +89,8 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:SalesRevenueGoodsNet",
         "us-gaap:SalesRevenueServicesNet",
     ),
+    # #1556: a financial issuer's own revenue fact (see the comment above).
+    "revenue_financial": ("us-gaap:RevenuesNetOfInterestExpense",),
     "cost_of_revenue": (
         "us-gaap:CostOfRevenue",
         "us-gaap:CostOfGoodsAndServicesSold",
@@ -77,6 +103,9 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
         "us-gaap:NetCashProvidedByUsedInOperatingActivities",
         "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
     ),
+    # #1556: the constituents of the financial-revenue sum above.
+    "net_interest_income": ("us-gaap:InterestIncomeExpenseNet",),
+    "noninterest_income": ("us-gaap:NoninterestIncome",),
 }
 #: A CIK as the store keys it, and a lettered common-class member (#1169).
 _CIK = re.compile(r"\d{10}")
@@ -229,6 +258,29 @@ class IngestConfig(_ClosedConfig):
     # trail is itself truncated rather than crowding out the error text.
     max_where_frames: int = Field(default=8, gt=0)
     max_where_chars: int = Field(default=1500, gt=0)
+
+
+class RatesConfig(_ClosedConfig):
+    """FRED series and source-quality limits (data-foundation requirement 18)."""
+
+    series: list[str] = Field(default_factory=lambda: ["DTB3"], min_length=1)
+    max_stale_sessions: int = Field(default=3, ge=0)
+    refetch_days: int = Field(default=10, gt=0)
+    plausible_range_percent: list[float] = Field(default_factory=lambda: [-1.0, 25.0])
+
+    @field_validator("series")
+    @classmethod
+    def _valid_series(cls, value: list[str]) -> list[str]:
+        if any(not name.strip() for name in value) or len(set(value)) != len(value):
+            raise ValueError("rates.series must contain unique nonblank ids")
+        return value
+
+    @field_validator("plausible_range_percent")
+    @classmethod
+    def _valid_range(cls, value: list[float]) -> list[float]:
+        if len(value) != 2 or not all(math.isfinite(x) for x in value) or value[0] >= value[1]:
+            raise ValueError("rates.plausible_range_percent must be finite increasing bounds")
+        return value
 
 
 class EdgarConfig(BaseModel):
@@ -531,6 +583,13 @@ class AlpacaConfig(BaseModel):
     gaps between one company's share-count filings are 91 days at the median, 124 at the
     90th and 168 at the 99th percentile, so 180 marks a missed filing.
 
+    `max_catchup_sessions`: how many XNYS sessions a daily ingest run may fetch that the
+    store lacks before its expected session (#1572, from #1550), so a day a failed run
+    left out is caught up by the next one instead of leaving a hole that empties the
+    universe. Over it the run fails and names the `--backfill --since` command that
+    clears the hole, which is the right tool for a lapse of more than a couple of days;
+    `0` catches nothing up, so any missed session fails the run.
+
     Frozen and closed (T47, safety-reviewer): the `paper` guard below runs at
     construction, so an attribute assignment after the fact must be impossible too, and a
     misspelt broker fact (`quantity_decimals`) must fail rather than stay unset silently.
@@ -569,6 +628,13 @@ class AlpacaConfig(BaseModel):
     # claim 2b, S1). `alpaca_raw.daily_bars` caps a SIP request's end at now minus this;
     # 0 turns the cap off (a paid SIP subscription).
     sip_delay_minutes: int = Field(default=15, ge=0)
+    #: #1572 (from #1550): how many XNYS sessions a daily ingest run may fetch that the
+    #: store lacks before its expected session, so a day a failed run left out is caught
+    #: up by the next one instead of leaving a `prices_daily` hole that empties the
+    #: universe. Over it the daily run fails and names the `--backfill --since` command
+    #: that clears the hole, which is the right tool for a longer lapse; `0` catches
+    #: nothing up, so any missed session fails the run.
+    max_catchup_sessions: int = Field(default=5, ge=0)
     #: Security ids (`<cik>`, `<cik>:<class>` or a #820 successor `<cik>@<day>`)
     #: the owner accepted as genuine long-gap relistings (#943: MiMedx, Nasdaq
     #: 2019-03 to OTC to Nasdaq 2020-11): `ListingResolver` does not apply rule 7's
@@ -1864,6 +1930,7 @@ class Settings(BaseSettings):
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
+    rates: RatesConfig = Field(default_factory=RatesConfig)
     edgar: EdgarConfig = Field(default_factory=EdgarConfig)
     master: MasterConfig = Field(default_factory=MasterConfig)
     benchmarks: list[str] = Field(default_factory=lambda: ["SPY", "MTUM"])
@@ -1895,6 +1962,7 @@ class Settings(BaseSettings):
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
     sec_edgar_user_agent: SecretStr | None = Field(default=None)
+    fred_api_key: SecretStr | None = Field(default=None)
     # Phase 4 (spec req 2): the paper trading keys are their own variables and never
     # fall back to the data keys, so a live-capable key is never in the order path.
     alpaca_paper_api_key: SecretStr | None = Field(default=None)

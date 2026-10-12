@@ -110,6 +110,37 @@ def test_ingest_defaults() -> None:
     assert s.ingest.max_dark_share == pytest.approx(1.0)  # #796: off until measured
 
 
+def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    assert settings.fred_api_key is None
+    assert settings.rates.series == ["DTB3"]
+    assert settings.rates.max_stale_sessions == 3
+    assert settings.rates.refetch_days == 10
+    assert settings.rates.plausible_range_percent == [-1.0, 25.0]
+    monkeypatch.setenv("FRED_API_KEY", "dummy-secret")
+    monkeypatch.setenv("RATES__SERIES", '["DTB3", "DGS3MO"]')
+    configured = _settings()
+    assert configured.fred_api_key is not None
+    assert configured.fred_api_key.get_secret_value() == "dummy-secret"
+    assert configured.rates.series == ["DTB3", "DGS3MO"]
+
+
+@pytest.mark.parametrize(
+    "rates",
+    [
+        {"series": []},
+        {"series": ["DTB3", "DTB3"]},
+        {"max_stale_sessions": -1},
+        {"refetch_days": 0},
+        {"plausible_range_percent": [25.0, -1.0]},
+        {"plausible_range_percent": [float("nan"), 25.0]},
+    ],
+)
+def test_invalid_fred_rate_config_is_rejected(rates: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rates=rates)
+
+
 @pytest.mark.parametrize("value", [-0.1, 1.5, float("nan")])
 def test_max_dark_share_must_be_a_share(value: float) -> None:
     with pytest.raises(ValidationError):
@@ -215,6 +246,7 @@ def test_edgar_statement_facts_defaults() -> None:
             "us-gaap:SalesRevenueGoodsNet",
             "us-gaap:SalesRevenueServicesNet",
         ],
+        "revenue_financial": ["us-gaap:RevenuesNetOfInterestExpense"],
         "cost_of_revenue": [
             "us-gaap:CostOfRevenue",
             "us-gaap:CostOfGoodsAndServicesSold",
@@ -227,6 +259,8 @@ def test_edgar_statement_facts_defaults() -> None:
             "us-gaap:NetCashProvidedByUsedInOperatingActivities",
             "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
         ],
+        "net_interest_income": ["us-gaap:InterestIncomeExpenseNet"],
+        "noninterest_income": ["us-gaap:NoninterestIncome"],
     }
     assert s.edgar.statement_forms == ["10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "10-QT"]
     assert s.edgar.statement_units == ["USD"]

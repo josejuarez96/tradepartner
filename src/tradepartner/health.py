@@ -220,9 +220,12 @@ derived at `t`, as the data is read.
   blocks the first half; this restates both for a store's own confidence
   (the schema comment's words), the shape a store built by other code, or
   a future schema, could still break.
-- `statement_derived_matches_components`: every `basis = derived`
-  `gross_profit` row equals the difference of the two stored `revenue` and
-  `cost_of_revenue` rows sharing its `cik`, `period_end`, `period_days` and
+- `statement_derived_matches_components`: every `basis = derived` row equals
+  the same-filing components it was derived from, per the ingest's
+  `DERIVED_FACTS` table: `gross_profit` the difference of the two stored
+  `revenue` and `cost_of_revenue` rows, and `revenue_financial` (#1556) the
+  sum of the two stored `net_interest_income` and `noninterest_income` rows,
+  each sharing the derived row's `cik`, `period_end`, `period_days` and
   `filing_accession`, both present -- a missing component row fails it too.
   Cannot fail on correct data (spec "Health").
 - `statement_basis_allowed`: `statement_facts.basis` is in
@@ -294,7 +297,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import OK, SOURCES
+from tradepartner.ingest import DERIVED_FACTS, OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
@@ -428,9 +431,10 @@ _STATEMENT_DERIVED_SCHEMA: dict[str, Any] = {
     "period_end": pl.Date,
     "period_days": pl.Int64,
     "filing_accession": pl.Utf8,
+    "fact_name": pl.Utf8,
     "value": pl.Float64,
-    "revenue": pl.Float64,
-    "cost_of_revenue": pl.Float64,
+    "left_value": pl.Float64,
+    "right_value": pl.Float64,
 }
 _STATEMENT_BASIS_SCHEMA: dict[str, Any] = {"basis": pl.Utf8, "rows": pl.Int64}
 _GAP_SCHEMA: dict[str, Any] = {
@@ -2010,45 +2014,52 @@ def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
 
 def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
     """`statement_derived_matches_components` (module docstring): every
-    `basis = derived` `gross_profit` row must equal the difference of the
-    two stored `revenue` and `cost_of_revenue` rows sharing its `cik`,
-    `period_end`, `period_days` and `filing_accession`, both present (a
-    missing component row fails it too). Exact `DOUBLE` equality, no
-    tolerance: the ingest (T77b) derives the row by this same subtraction
-    at insert time (spec decision (e)), so a correct row's stored value
-    and this recomputation are bit-identical -- no config threshold is
-    needed, or would mean anything, for a check that cannot legitimately
-    differ by any amount on correct data."""
+    `basis = derived` row must equal the same-filing combination of the two
+    stored constituent rows in `ingest.DERIVED_FACTS` (`gross_profit` =
+    `revenue - cost_of_revenue`; `revenue_financial` (#1556) =
+    `net_interest_income + noninterest_income`), both present (a missing
+    component row fails it too). Exact `DOUBLE` equality, no tolerance: the
+    ingest derives the row by this same operation at insert time (spec
+    decision (e)), so a correct row's stored value and this recomputation are
+    bit-identical -- no config threshold is needed, or would mean anything, for
+    a check that cannot legitimately differ by any amount on correct data."""
     if "statement_facts" not in _present_tables(conn):
         return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
-    found = conn.execute(
-        """
-        SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,
-               r.value, c.value
-        FROM statement_facts d
-        LEFT JOIN statement_facts r
-          ON r.cik = d.cik AND r.period_end = d.period_end AND r.period_days = d.period_days
-         AND r.filing_accession = d.filing_accession AND r.fact_name = 'revenue'
-        LEFT JOIN statement_facts c
-          ON c.cik = d.cik AND c.period_end = d.period_end AND c.period_days = d.period_days
-         AND c.filing_accession = d.filing_accession AND c.fact_name = 'cost_of_revenue'
-        WHERE d.fact_name = 'gross_profit' AND d.basis = 'derived'
-          AND (r.value IS NULL OR c.value IS NULL OR d.value != (r.value - c.value))
-        ORDER BY d.cik, d.period_end, d.filing_accession
-        """
-    ).fetchall()
-    rows = [
-        {
-            "cik": cik,
-            "period_end": period_end,
-            "period_days": int(period_days),
-            "filing_accession": accession,
-            "value": value,
-            "revenue": revenue,
-            "cost_of_revenue": cost,
-        }
-        for cik, period_end, period_days, accession, value, revenue, cost in found
-    ]
+    rows: list[dict[str, Any]] = []
+    for fact_name, left_name, right_name, operator in DERIVED_FACTS:
+        if operator not in ("+", "-"):
+            raise ValueError(f"DERIVED_FACTS {fact_name}: unknown operator {operator!r}")
+        found = conn.execute(
+            f"""
+            SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,
+                   l.value, r.value
+            FROM statement_facts d
+            LEFT JOIN statement_facts l
+              ON l.cik = d.cik AND l.period_end = d.period_end AND l.period_days = d.period_days
+             AND l.filing_accession = d.filing_accession AND l.fact_name = ?
+            LEFT JOIN statement_facts r
+              ON r.cik = d.cik AND r.period_end = d.period_end AND r.period_days = d.period_days
+             AND r.filing_accession = d.filing_accession AND r.fact_name = ?
+            WHERE d.fact_name = ? AND d.basis = 'derived'
+              AND (l.value IS NULL OR r.value IS NULL
+                   OR d.value != (l.value {operator} r.value))
+            ORDER BY d.cik, d.period_end, d.filing_accession
+            """,
+            [left_name, right_name, fact_name],
+        ).fetchall()
+        rows.extend(
+            {
+                "cik": cik,
+                "period_end": period_end,
+                "period_days": int(period_days),
+                "filing_accession": accession,
+                "fact_name": fact_name,
+                "value": value,
+                "left_value": left,
+                "right_value": right,
+            }
+            for cik, period_end, period_days, accession, value, left, right in found
+        )
     return pl.DataFrame(rows, schema=_STATEMENT_DERIVED_SCHEMA)
 
 

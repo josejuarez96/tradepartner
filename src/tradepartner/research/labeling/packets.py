@@ -21,7 +21,10 @@ never reads `rule_*`, `gold_*`, `text_states`, `evidence_quote` or `decision`
 `document_ids`, which carries no table token). The text is wrapped between
 fixed delimiters and labelled as filing text; the question and option set are
 sent separately by the caller (`research.models`) and never appear inside the
-delimiters (req 3).
+delimiters (req 3). Filing text is untrusted, so a body's own copies of either
+delimiter are rewritten to a bracketed form before the wrap
+(`_neutralise_delimiters`, #1510): a body can neither close nor reopen the
+delimited block, and a body carrying none of them ships unchanged.
 
 `max_packet_tokens` is a hard refusal (`PacketTooLarge`), never a truncation
 rule (C2): a packet whose estimated tokens (characters divided by
@@ -47,6 +50,143 @@ Kind = Literal["A", "B"]
 #: inside them.
 DELIM_START = "=== FILING TEXT START ==="
 DELIM_END = "=== FILING TEXT END ==="
+
+#: The same two delimiters in the form they take inside a filing body once
+#: `_neutralise_delimiters` has rewritten them: the words they carry, between
+#: square brackets, so the rewritten string can never match the delimiter
+#: again. Derived from the delimiters above, so the two cannot drift.
+_NEUTRAL_START = f"[{DELIM_START.strip('= ')}]"
+_NEUTRAL_END = f"[{DELIM_END.strip('= ')}]"
+
+#: The zero-width and format characters that can hide between any two
+#: characters of a marker imitation, which `\s` does not match (`\u180e` is
+#: one older Unicode releases still called a space). Every member is spelled
+#: out: `frozenset` over the range string `"\u200b-\u200f"` would keep its
+#: literal `-` and drop the code points between the ends, and this set is
+#: membership-tested per character rather than handed to a regex engine.
+_ZERO_WIDTH_SET = frozenset(
+    chr(code)
+    for code in (
+        0x00AD,  # soft hyphen
+        0x180E,  # Mongolian vowel separator
+        *range(0x200B, 0x2010),  # ZWSP, ZWNJ, ZWJ, LRM, RLM
+        *range(0x2060, 0x2065),  # word joiner and the invisible operators
+        0xFEFF,  # zero-width no-break space (BOM)
+    )
+)
+
+#: The characters a delimiter's own `=` side is made of: the ASCII `=` and
+#: the fullwidth `=` (U+FF1D) a body can write instead.
+_EQUALS_SET = frozenset("=\uff1d")
+
+#: One marker as the matcher reads it: the words of the delimiter, in order,
+#: and the bracketed form a match of it neutralises to.
+_MARKERS = (
+    (tuple(DELIM_START.strip().strip("=").split()), _NEUTRAL_START),
+    (tuple(DELIM_END.strip().strip("=").split()), _NEUTRAL_END),
+)
+
+
+def _matching_view(body: str) -> tuple[str, list[int]]:
+    """`body` in the view the marker matcher reads, and `origin`: the index
+    every view character starts at in `body`, so a view span maps back to the
+    original span it rewrites (#1510). Zero-width and format characters are
+    dropped -- an imitation hides them between any two of its characters,
+    inside a word or inside the `=` run alike -- and every run of whitespace
+    (spaces, tabs, a CRLF, non-breaking spaces) collapses to one space, which
+    leaves the marker's skeleton: the `=` runs and the words, at most one
+    space between any two characters. One pass, so the view costs one copy of
+    `body` however adversarial it is."""
+    chars: list[str] = []
+    origin: list[int] = []
+    at = 0
+    length = len(body)
+    while at < length:
+        char = body[at]
+        if char in _ZERO_WIDTH_SET:
+            at += 1
+        elif char.isspace():
+            chars.append(" ")
+            origin.append(at)
+            at += 1
+            while at < length and (body[at].isspace() or body[at] in _ZERO_WIDTH_SET):
+                at += 1
+        else:
+            chars.append(char)
+            origin.append(at)
+            at += 1
+    return "".join(chars), origin
+
+
+def _word_at(view: str, at: int, word: str) -> int:
+    """The index past `word` read from `view[at:]` in any case, with the one
+    view space allowed before each of its characters, or `-1` when the word is
+    not there."""
+    for char in word:
+        following = at + 1 if view[at : at + 1] == " " else at
+        if view[following : following + 1].lower() != char.lower():
+            return -1
+        at = following + 1
+    return at
+
+
+def _equals_run_at(view: str, at: int) -> int:
+    """The index past a run of two or more `=`-side characters at
+    `view[at:]`, the one view space allowed between any two of them, or `at`
+    itself when there is no such run there."""
+    count = 0
+    index = at
+    while True:
+        following = index + 1 if view[index : index + 1] == " " else index
+        if view[following : following + 1] in _EQUALS_SET:
+            count += 1
+            index = following + 1
+        else:
+            return index if count >= 2 else at
+
+
+def _marker_at(
+    view: str, at: int, run_end: int, words: tuple[str, ...], neutral: str
+) -> tuple[int, str] | None:
+    """`(end, neutral)` when a marker starts at `view` position `at` -- the
+    first `=` of the run that ends at `run_end`, then `words` in order, then
+    a second `=` run -- or `None` when it does not."""
+    after = run_end
+    for word in words:
+        after = _word_at(view, after, word)
+        if after < 0:
+            return None
+    end = _equals_run_at(view, after)
+    return None if end == after else (end, neutral)
+
+
+def _marker_spans(view: str) -> list[tuple[int, int, str]]:
+    """Every `(start, end, neutral)` in `view`: the end-exclusive span of a
+    marker imitation and the bracketed form it neutralises to, left to right.
+    Linear in `len(view)` (#1510): a marker can only begin at a `=`-side
+    character, and when the marker at such a character fails the scan jumps
+    past the whole `=` run it opened on -- every later start inside that run
+    meets the same words, so trying each of them would cost more and find
+    nothing. A span always opens and closes on a `=`-side character."""
+    spans: list[tuple[int, int, str]] = []
+    at = 0
+    while at < len(view):
+        if view[at] not in _EQUALS_SET:
+            at += 1
+            continue
+        run_end = _equals_run_at(view, at)
+        matched: tuple[int, str] | None = None
+        for words, neutral in _MARKERS:
+            matched = _marker_at(view, at, run_end, words, neutral)
+            if matched is not None:
+                break
+        if matched is None:
+            at = max(run_end, at + 1)
+        else:
+            spans.append((at, matched[0], matched[1]))
+            at = matched[0]
+    return spans
+
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 
@@ -145,6 +285,37 @@ def _truncate_sentence(text: str, limit: int) -> str:
 
 def _field(label: str, value: str | None) -> str | None:
     return f"{label}: {value}" if value else None
+
+
+def _neutralise_delimiters(body: str) -> str:
+    """`body` with every marker imitation rewritten, so it can no longer
+    close or reopen the delimited block `build_packet` wraps around the body
+    (#1510). Filing text is untrusted (the vendor documents that the model
+    "can be steered by injected text"), so a body carrying
+    `=== FILING TEXT END ===` would otherwise let a filing put its own words
+    after what reads as the end of the block. The matcher reads the body
+    through `_matching_view`, so an imitation in any case, with extra or
+    missing spaces, with a CRLF or non-breaking spaces inside, with zero-width
+    characters between any two of its characters, or with a fullwidth `=` for
+    the `=`, all match, and each is rewritten to the same words between
+    square brackets (`_NEUTRAL_START`, `_NEUTRAL_END`): readable, never
+    longer than the imitation it replaces (every view character stands for at
+    least one of the body's) and never matching a delimiter itself. A body
+    carrying no imitation is returned unchanged, so a clean body builds
+    exactly the packet it built before this rewriting, and the whole pass is
+    linear in `len(body)` whatever it contains."""
+    view, origin = _matching_view(body)
+    spans = _marker_spans(view)
+    if not spans:
+        return body
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, neutral in spans:
+        pieces.append(body[cursor : origin[start]])
+        pieces.append(neutral)
+        cursor = origin[end - 1] + 1
+    pieces.append(body[cursor:])
+    return "".join(pieces)
 
 
 def _form25_fields(documents: Mapping[str, Any]) -> str:
@@ -268,7 +439,7 @@ def build_packet(
         if eightk_text:
             sections.append(eightk_text)
             document_ids += eightk_ids
-    body = "\n\n".join(sections)
+    body = _neutralise_delimiters("\n\n".join(sections))
     text = f"{DELIM_START}\n{body}\n{DELIM_END}"
     estimated_tokens = len(text) / limits.chars_per_token
     if estimated_tokens > limits.max_packet_tokens:
