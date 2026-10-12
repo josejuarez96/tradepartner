@@ -27,7 +27,6 @@ from conftest import version_4_store
 from tradepartner.store import journal, schema
 from tradepartner.store.journal import (
     ROW_TYPES,
-    AdjustmentRow,
     AlertRow,
     DecisionRow,
     FillRow,
@@ -405,52 +404,6 @@ def test_a_superseded_fill_is_hidden_by_the_accessor_and_counted_by_all_fill_ids
     live = fills_for(seeded, client_order_ids=["a"])
     assert [f.fill.fill_id for f in live] == [synthetic, real]
     assert all_fill_ids(seeded) == {"synthetic:a", "bf-a", "bf-a-late"}
-
-
-def test_booked_activity_ids_are_the_fee_cash_activity_ids(
-    conn: duckdb.DuckDBPyConnection,
-) -> None:
-    """#1583, T183: a booked `FEE` is keyed by its `broker_activity_id`; the reader
-    returns those ids per window, ignoring a row with no id and another window."""
-    append(
-        conn,
-        _sample(
-            AdjustmentRow,
-            adjustment_id=1,
-            window_id=1,
-            kind="fee_cash",
-            broker_activity_id="act-1",
-            cash=-0.01,
-        ),
-    )
-    append(
-        conn,
-        _sample(
-            AdjustmentRow,
-            adjustment_id=2,
-            window_id=1,
-            kind="fee_cash",
-            broker_activity_id="act-2",
-            cash=-0.02,
-        ),
-    )
-    append(
-        conn, _sample(AdjustmentRow, adjustment_id=3, window_id=1, kind="dividend_cash", cash=4.5)
-    )
-    append(
-        conn,
-        _sample(
-            AdjustmentRow,
-            adjustment_id=4,
-            window_id=2,
-            kind="fee_cash",
-            broker_activity_id="act-w2",
-            cash=-0.01,
-        ),
-    )
-    assert journal.booked_activity_ids(conn, 1) == {"act-1", "act-2"}
-    assert journal.booked_activity_ids(conn, 2) == {"act-w2"}
-    assert journal.booked_activity_ids(conn, 99) == set()
 
 
 def test_the_accessor_joins_side_and_security_and_filters(

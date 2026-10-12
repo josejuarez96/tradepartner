@@ -1279,22 +1279,6 @@ def adjustments_for(
     )
 
 
-def booked_activity_ids(conn: duckdb.DuckDBPyConnection, window_id: int) -> set[str]:
-    """The broker cash-activity ids the window has booked as `adjustments` rows
-    (#1583, T183): a `fee_cash` books one `FEE` by its `broker_activity_id`, so
-    this set is what the next reconciliation treats as already inside its base
-    (never booked twice). A window with no booked activity reads an empty set."""
-    require_journal(conn)
-    return {
-        str(row[0])
-        for row in conn.execute(
-            "SELECT DISTINCT broker_activity_id FROM adjustments "
-            "WHERE window_id = ? AND broker_activity_id IS NOT NULL",
-            [window_id],
-        ).fetchall()
-    }
-
-
 def reconciliations_for(conn: duckdb.DuckDBPyConnection, window_id: int) -> list[ReconciliationRow]:
     """The window's `reconciliations` rows."""
     return _select(conn, ReconciliationRow, "t.window_id = ?", [window_id])

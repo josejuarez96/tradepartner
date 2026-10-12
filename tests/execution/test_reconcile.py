@@ -34,8 +34,10 @@ from tradepartner.store.journal import FillRow, OrderedFill, OrderRow, PaperWind
 S = date(2026, 10, 7)
 PRIOR = date(2026, 10, 6)
 AT = datetime(2026, 10, 7, 13, 0, tzinfo=UTC)
-# Quantity tolerance 1e-6; cash tolerance 1.26 = 0.005 x 250 orders + 0.01 (ADR 0010
-# amendment 2026-10-10, #1290): the cash cases below step past it by whole dollars.
+# Quantity tolerance 1e-6; cash tolerance 0.01, the strict half-`cash` cent the
+# bound scales per fill (ADR 0010 amendment 2026-10-12, #1583/T183; it reverts
+# the #1290 whole-dollar 1.26 band): the cash cases below step past it by whole
+# dollars, except the bound and fee cases.
 FROZEN = RiskConfig()
 PREFIX = "tp"
 SYMBOLS = {"SEC_A": "AAA", "SEC_B": "BBB", "SEC_C": "CCC", "SEC_KID": "KID"}
@@ -1330,3 +1332,45 @@ def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
     six-figure cash balance compares exactly and is inclusive (#1583)."""
     assert _run(_ledger(100_008.90), _positions(), 100_008.89).status == "ok"
     assert _kinds(_run(_ledger(100_008.90), _positions(), 100_008.88)) == ["cash"]
+
+
+def test_a_dividend_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:
+    """The bound in the dividend comparison (#1583, Q7): a 0.09 cash gap whose
+    0.05 is a credited dividend leaves 0.04 of per-fill rounding, inside
+    0.01 x (1 + 10/2) = 0.06; the #1290 bare 0.01 would have mismatched it."""
+    result = _run(
+        _ledger(1_000.0, fills_since_base=10, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.09,
+        explanations=_explanations(dividends={"SEC_A": 0.05}),
+    )
+
+    assert result.status == "ok"
+    assert [a.kind for a in result.adjustments] == ["dividend_cash"]
+
+
+def test_an_ended_listing_beside_ten_fills_of_rounding_passes_at_the_scaled_bound() -> None:
+    """The bound in the ended-listing proceeds comparison (#1583, Q9): SEC_B
+    (1 share, reference $50, cap $51) is gone and its sale left $51.05, five cents
+    past the cap, inside the 0.06 ten-fill bound; the base 0.01 would not."""
+    result = _run(
+        _ledger(1_000.0, fills_since_base=10, SEC_A=10.0, SEC_B=1.0),
+        _positions(AAA=10.0),
+        1_051.05,
+        explanations=_explanations(ended={"SEC_B"}, reference_prices={"SEC_B": 50.0}),
+    )
+
+    assert _kinds(result) == []
+    assert [a.kind for a in result.adjustments if a.kind == "corporate_action_cash"]
+
+
+def test_a_cent_fee_exactly_at_the_bound_passes() -> None:
+    """A booked `fee_cash` of exactly one cent at the bound reconciles (Q13)."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        999.99,
+        explanations=_explanations(activities=(_activity("act-1", "FEE", S, -0.01),)),
+    )
+    assert result.status == "ok"
+    assert [a.broker_activity_id for a in result.adjustments] == ["act-1"]

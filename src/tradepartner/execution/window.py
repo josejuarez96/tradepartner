@@ -782,7 +782,13 @@ def start(
         # 1): every non-trade cash activity from the day before the window's New
         # York start date, read after `account()` so every fee inside
         # `starting_cash` the read can see is in the set.
-        activities = broker.cash_activities(today - timedelta(days=1))
+        try:
+            activities = broker.cash_activities(today - timedelta(days=1))
+        except Exception as exc:
+            raise StartRefusedError(
+                "activities_unavailable",
+                f"cash_activities() failed on the paper endpoint ({type(exc).__name__})",
+            ) from exc
         tolerance = settings.risk.reconcile_quantity_tolerance
 
         plan = _check_flat(

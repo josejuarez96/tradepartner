@@ -423,6 +423,52 @@ def test_paper_start_records_the_seen_activity_ids(
         assert opened is not None and opened.activities_seen_json == seen
 
 
+def test_paper_start_reads_account_before_cash_activities(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The read order is fixed at `paper start` too (#1583, item 1): the account
+    is read before the activity list, so a fee inside `starting_cash` the activity
+    read can see is in the seen-set."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+    fake = _fake(fixed_clock)
+
+    window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "b3")
+
+    methods = [call.method for call in fake.calls]
+    assert methods.index("account") < methods.index("cash_activities")
+
+
+def test_paper_start_wraps_a_cash_activities_failure_as_start_refused(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """#1583, Q16: a `cash_activities()` failure is wrapped as `StartRefusedError`
+    like an `account()` failure, so the endpoint name never reaches the owner."""
+    with open_for_write(journal_settings) as conn:
+        hyp = _register(conn, journal_settings, "b3", HOLDOUT_END_PAST, family="profitability")
+        _sign_off(conn, journal_settings, hyp, tmp_path)
+
+    class FailingActivitiesFake(FakeBroker):
+        def cash_activities(self, since: date) -> list[CashActivity]:  # type: ignore[override]
+            raise ValueError("boom")
+
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            journal_settings,
+            _connect(journal_settings),
+            FailingActivitiesFake(
+                clock=fixed_clock,
+                price_of=lambda _s: REFERENCE_PRICE,
+                auto_fill=False,
+                account_id=ACCOUNT_ID,
+            ),
+            fixed_clock,
+            "b3",
+        )
+    assert exc.value.reason == "activities_unavailable"
+
+
 #: The conftest clock (2026-10-01, a Thursday) is mid-week: the first week-end and the
 #: first session strictly after it are both Friday 2026-10-02.
 NEXT_WEEK_END = date(2026, 10, 2)

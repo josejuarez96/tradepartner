@@ -411,7 +411,15 @@ def compare(
     # ledger balances are six-figure: the difference is taken in `Decimal`, from
     # each balance's shortest form, so a whole-cent fee never leaves float residue.
     difference_decimal = Decimal(str(account.cash)) - Decimal(str(ledger.cash))
+    read_ids: set[str] = set()
     for activity in activities:
+        if activity.activity_id in read_ids:
+            # A broker fact is keyed by its id (spec item 2): an id listed twice
+            # in one read is a broker fault, never two facts to book.
+            raise ValueError(
+                f"cash activity id {activity.activity_id!r} is listed twice in one read"
+            )
+        read_ids.add(activity.activity_id)
         unexplained = _activity_mismatch(activity)
         if unexplained is not None:
             mismatches.append(unexplained)
@@ -463,7 +471,6 @@ def compare(
                 )
             )
 
-    difference = account.cash - ledger.cash
     dividends = {
         name: _finite(amount, f"dividend due on {name}")
         for name, amount in sorted(explanations.dividends.items())
@@ -510,8 +517,8 @@ def compare(
             explained += _dividend_adjustments(dividends)
     if not cash_ok:
         mismatches.append(Mismatch("cash", f"broker {account.cash}, ledger {ledger.cash}"))
-    elif abs(difference) > float(cash_bound) and deferring:
-        allowed.append(Allowed("cash within the open allowances", difference))
+    elif abs(difference_decimal) > cash_bound and deferring:
+        allowed.append(Allowed("cash within the open allowances", float(difference_decimal)))
 
     if deferring:
         for adjustment in [a for a in explained if a.kind == "spinoff_receipt"]:
