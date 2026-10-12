@@ -813,6 +813,22 @@ class UniverseConfig(_ClosedConfig):
         return value
 
 
+class HealthConfig(_ClosedConfig):
+    """Data-health thresholds (spec req 11), read only by `health`.
+
+    `min_session_rows_share` (#1575) is the share of the previous session's
+    `prices_daily` row count an XNYS session inside
+    `universe.min_history_months` must hold, up to the latest stored session,
+    for the `session_holes` rule to pass: a session with no row at all is
+    always a hole, whatever this share says. The bar count moves with
+    listings, delistings and ticker changes, so any positive value reports
+    sessions that merely lost names; the default `0.0` reports only an empty
+    session, which no listing change explains.
+    """
+
+    min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 class AdjustConfig(_ClosedConfig):
     """Price-adjustment rules for `store.asof.adjusted_prices_as_of`.
 
@@ -1939,6 +1955,9 @@ class Settings(BaseSettings):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
+    # Phase 2 (spec req 11), #1575: the `health` command's own thresholds. Last
+    # in the list so a new health key never shifts another section's position.
+    health: HealthConfig = Field(default_factory=HealthConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

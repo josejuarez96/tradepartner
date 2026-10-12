@@ -388,6 +388,7 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    SESSION_HOLES,
     CoverageReference,
     HealthReport,
     health_report,
@@ -637,6 +638,7 @@ def _print_report(report: HealthReport) -> None:
         f"gaps: {report.gaps.names_with_gaps} names, "
         f"{report.gaps.missing_sessions} missing sessions"
     )
+    _print_session_holes(report)
     gap = report.survivorship
     echo(
         f"survivorship gap: {gap.missing.height} names missing, "
@@ -728,6 +730,23 @@ def _print_coverage_reference(block: CoverageReference | None) -> None:
         )
     ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
     echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
+
+
+def _print_session_holes(report: HealthReport) -> None:
+    """#1575: the `session_holes` rule's findings, one line per hole session
+    with the row count that makes it one and the previous session's count.
+    Nothing is printed while the rule passes, and the rule itself is listed
+    with the others under `integrity`."""
+    check = next((c for c in report.integrity if c.rule == SESSION_HOLES), None)
+    if check is None or check.violations.is_empty():
+        return
+    echo = typer.echo
+    echo(f"session holes: {check.violations.height} in the universe history window")
+    for row in check.violations.iter_rows(named=True):
+        echo(
+            f"  {row['session']}: {row['rows']} rows "
+            f"(previous {row['previous_session']}: {row['previous_rows']})"
+        )
 
 
 def _export(conn: duckdb.DuckDBPyConnection, out_dir: Path) -> list[str]:
