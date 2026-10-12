@@ -34,6 +34,7 @@ explicitly, e.g. for an alternate environment or a test fixture.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Callable
@@ -235,6 +236,29 @@ class IngestConfig(_ClosedConfig):
     # trail is itself truncated rather than crowding out the error text.
     max_where_frames: int = Field(default=8, gt=0)
     max_where_chars: int = Field(default=1500, gt=0)
+
+
+class RatesConfig(_ClosedConfig):
+    """FRED series and source-quality limits (data-foundation requirement 18)."""
+
+    series: list[str] = Field(default_factory=lambda: ["DTB3"], min_length=1)
+    max_stale_sessions: int = Field(default=3, ge=0)
+    refetch_days: int = Field(default=10, gt=0)
+    plausible_range_percent: list[float] = Field(default_factory=lambda: [-1.0, 25.0])
+
+    @field_validator("series")
+    @classmethod
+    def _valid_series(cls, value: list[str]) -> list[str]:
+        if any(not name.strip() for name in value) or len(set(value)) != len(value):
+            raise ValueError("rates.series must contain unique nonblank ids")
+        return value
+
+    @field_validator("plausible_range_percent")
+    @classmethod
+    def _valid_range(cls, value: list[float]) -> list[float]:
+        if len(value) != 2 or not all(math.isfinite(x) for x in value) or value[0] >= value[1]:
+            raise ValueError("rates.plausible_range_percent must be finite increasing bounds")
+        return value
 
 
 class EdgarConfig(BaseModel):
@@ -1709,6 +1733,7 @@ class Settings(BaseSettings):
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
+    rates: RatesConfig = Field(default_factory=RatesConfig)
     edgar: EdgarConfig = Field(default_factory=EdgarConfig)
     master: MasterConfig = Field(default_factory=MasterConfig)
     benchmarks: list[str] = Field(default_factory=lambda: ["SPY", "MTUM"])
@@ -1736,6 +1761,7 @@ class Settings(BaseSettings):
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
     sec_edgar_user_agent: SecretStr | None = Field(default=None)
+    fred_api_key: SecretStr | None = Field(default=None)
     # Phase 4 (spec req 2): the paper trading keys are their own variables and never
     # fall back to the data keys, so a live-capable key is never in the order path.
     alpaca_paper_api_key: SecretStr | None = Field(default=None)
