@@ -190,7 +190,7 @@ derived at `t`, as the data is read.
   a future schema, could still break.
 - `statement_derived_matches_components`: every `basis = derived` row equals
   the same-filing components it was derived from, per the ingest's
-  `_DERIVED_FACTS` table: `gross_profit` the difference of the two stored
+  `DERIVED_FACTS` table: `gross_profit` the difference of the two stored
   `revenue` and `cost_of_revenue` rows, and `revenue_financial` (#1556) the
   sum of the two stored `net_interest_income` and `noninterest_income` rows,
   each sharing the derived row's `cik`, `period_end`, `period_days` and
@@ -240,7 +240,7 @@ from tradepartner.config import (
     parse_accepted_same_day_pair,
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
-from tradepartner.ingest import _DERIVED_FACTS, OK, SOURCES
+from tradepartner.ingest import DERIVED_FACTS, OK, SOURCES
 from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
@@ -1570,7 +1570,7 @@ def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
 def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
     """`statement_derived_matches_components` (module docstring): every
     `basis = derived` row must equal the same-filing combination of the two
-    stored constituent rows in `ingest._DERIVED_FACTS` (`gross_profit` =
+    stored constituent rows in `ingest.DERIVED_FACTS` (`gross_profit` =
     `revenue - cost_of_revenue`; `revenue_financial` (#1556) =
     `net_interest_income + noninterest_income`), both present (a missing
     component row fails it too). Exact `DOUBLE` equality, no tolerance: the
@@ -1581,7 +1581,7 @@ def _statement_derived_matches_components(conn: duckdb.DuckDBPyConnection) -> pl
     if "statement_facts" not in _present_tables(conn):
         return pl.DataFrame(schema=_STATEMENT_DERIVED_SCHEMA)
     rows: list[dict[str, Any]] = []
-    for fact_name, left_name, right_name, operator in _DERIVED_FACTS:
+    for fact_name, left_name, right_name, operator in DERIVED_FACTS:
         found = conn.execute(
             f"""
             SELECT d.cik, d.period_end, d.period_days, d.filing_accession, d.value,

@@ -1421,8 +1421,9 @@ NET_INTEREST_INCOME, NONINTEREST_INCOME = "net_interest_income", "noninterest_in
 #: rows from one filing and period; `gross_profit = revenue - cost_of_revenue`
 #: (spec decision (e), #660) and, for a financial issuer, `revenue_financial =
 #: net_interest_income + noninterest_income` (#1556). The target is dropped
-#: when the filing carries it reported.
-_DERIVED_FACTS: tuple[tuple[str, str, str, str], ...] = (
+#: when the filing carries it reported. Public so `health`'s
+#: `statement_derived_matches_components` checks the same table.
+DERIVED_FACTS: tuple[tuple[str, str, str, str], ...] = (
     (GROSS_PROFIT, REVENUE, COST_OF_REVENUE, "-"),
     (REVENUE_FINANCIAL, NET_INTEREST_INCOME, NONINTEREST_INCOME, "+"),
 )
@@ -1498,7 +1499,7 @@ def statement_fact_rows(
     (`accepted_at = None`) has `filed` on or before the carrier's (a same-day
     tie holds); `held` counts each holding entry once. After a filing's
     reported keys, each period it carries both constituents of a
-    `_DERIVED_FACTS` pair for, in one unit, whose stored vintages are both this
+    `DERIVED_FACTS` pair for, in one unit, whose stored vintages are both this
     filing's, and for which it carries no reported target and `conflicts`
     lists none, yields a `derived` candidate (the difference or sum, tags
     joined by the operator): `gross_profit` from `revenue` and
@@ -1591,7 +1592,7 @@ def _derived_candidates(
     ingested_at: datetime,
 ) -> list[Row]:
     """`filing`'s derived rows (`statement_fact_rows`), one per derivable
-    period of each `_DERIVED_FACTS` pair, each with a `_filed` entry for the
+    period of each `DERIVED_FACTS` pair, each with a `_filed` entry for the
     hold rule. `comparative` follows the Periods rule over the periods the
     filing can derive, per duration class and per fact; nothing is derived
     from constituents whose stored vintages are not both this filing's (the
@@ -1600,7 +1601,7 @@ def _derived_candidates(
     for record in filing:
         by_period[(record.period_end, record.period_days)][record.fact_name] = record
     out: list[Row] = []
-    for fact_name, left_name, right_name, operator in _DERIVED_FACTS:
+    for fact_name, left_name, right_name, operator in DERIVED_FACTS:
         pairs = {
             period: (facts[left_name], facts[right_name])
             for period, facts in by_period.items()
