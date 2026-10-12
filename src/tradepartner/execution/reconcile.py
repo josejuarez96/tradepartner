@@ -98,9 +98,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Protocol
 
-from tradepartner.adapters.broker import TERMINAL_STATUSES, Account, Order, Position
+from tradepartner.adapters.broker import (
+    TERMINAL_STATUSES,
+    Account,
+    CashActivity,
+    Order,
+    Position,
+)
 from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.risk import order_shape_violation
@@ -114,23 +119,6 @@ FILLS_LAGGING = "fills_lagging"
 _BUY = "buy"
 _SELL = "sell"
 _ID_SEPARATOR = "-"
-
-
-class CashActivityRow(Protocol):
-    """A broker non-trade cash activity as the booked-`FEE` rule reads it: the
-    structural type `Broker.cash_activities` returns (#1583, T183b's
-    `CashActivity`, spec item 1). Only the fields the ledger names are given; the
-    real row also carries `symbol` and `description`. It is read by attribute and
-    never constructed here, so the ledger depends only on the adapter's contract,
-    not its type."""
-
-    activity_id: str
-    activity_type: str
-    date: date
-    net_amount: float | None
-    status: str
-    symbol: str | None
-    description: str | None
 
 
 #: The non-trade activity types the ledger knows (spec 2026-10-12, item 2). A
@@ -188,7 +176,7 @@ class Explanations:
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
-    activities: tuple[CashActivityRow, ...] = ()
+    activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
     activity_seen_before: date | None = None
 
@@ -299,7 +287,7 @@ def _finite(value: float, what: str) -> float:
     return value
 
 
-def _inside_base(activity: CashActivityRow, explanations: Explanations) -> bool:
+def _inside_base(activity: CashActivity, explanations: Explanations) -> bool:
     """Whether a cash activity's id is already inside the base (#1583, T183):
     in a caller-applied seen-set, or — only when both the base's recorded set
     and the window's recorded set are null — dated strictly before the window's
@@ -310,7 +298,7 @@ def _inside_base(activity: CashActivityRow, explanations: Explanations) -> bool:
     return cut is not None and activity.date < cut
 
 
-def _activity_mismatch(activity: CashActivityRow) -> Mismatch | None:
+def _activity_mismatch(activity: CashActivity) -> Mismatch | None:
     """A mismatch of kind `unexplained_activity` for a read this reconciliation
     cannot place (#1583, T183), else None: a `FEE` or dividend row whose status
     is not `executed`, or a cash activity (non-null `net_amount`) of a type the

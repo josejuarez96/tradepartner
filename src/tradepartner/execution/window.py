@@ -781,11 +781,8 @@ def start(
         # The booked-`FEE` seen-set `paper start` records (#1583, T183, spec item
         # 1): every non-trade cash activity from the day before the window's New
         # York start date, read after `account()` so every fee inside
-        # `starting_cash` the read can see is in the set. `cash_activities` is the
-        # spec item-1 read (T183b), stubbed in tests.
-        activities = broker.cash_activities(  # type: ignore[attr-defined]
-            today - timedelta(days=1)
-        )
+        # `starting_cash` the read can see is in the set.
+        activities = broker.cash_activities(today - timedelta(days=1))
         tolerance = settings.risk.reconcile_quantity_tolerance
 
         plan = _check_flat(

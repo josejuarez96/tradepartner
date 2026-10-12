@@ -527,8 +527,7 @@ def reconcile_now(
     # The booked-`FEE` rule's input (#1583, T183, spec item 1): every non-trade
     # cash activity from the day before the window's New York start date, read
     # after `account()` so a fee inside `starting_cash` the read can see is seen.
-    # `cash_activities` is the spec item-1 read (T183b), stubbed in tests.
-    activities = broker.cash_activities(  # type: ignore[attr-defined]
+    activities = broker.cash_activities(
         window.started_at.astimezone(_NEW_YORK).date() - timedelta(days=1)
     )
     lagging = [
