@@ -15,6 +15,7 @@ import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,8 @@ C8_FIELDS = {
     "record_id",
     "run_id",
     "listing_end_id",
+    "arm",
+    "vendor",
     "passage_kind",
     "document_ids",
     "passage_sha256",
@@ -60,6 +63,7 @@ C8_FIELDS = {
     "output_tokens",
     "cost_usd",
     "price_snapshot",
+    "price_snapshot_output",
     "http_status",
     "latency_ms",
     "reason",
@@ -580,7 +584,7 @@ def test_call_order_with_and_without_an_eight_k(world: World) -> None:
         ("D02", "A"),
     ]
     assert records[0]["document_ids"] == ["D00", "8K-D00"]
-    labels = {lid: r["selected_option"] for lid, r in job.final_records(records).items()}
+    labels = {lid: r["selected_option"] for lid, r in job.jev_label_record(records).items()}
     assert labels == {"D00": MERGER, "D01": BANKRUPTCY, "D02": MERGER}
     assert world.result(result.run_id)["primary_value"] == pytest.approx(1.0)
 
@@ -712,7 +716,7 @@ def test_one_drift_flip_passes_and_the_batch_is_left_unfinished(world: World) ->
     assert world.result(result.run_id) == {"outcome": "unfinished"}
     assert len(batch_client.requests) == 3
     # every drift packet is its baseline record's passage, re-sent
-    baseline = job.final_records(_records(world.settings, baseline_run))
+    baseline = job.jev_label_record(_records(world.settings, baseline_run))
     sent = {sha256(r.state.encode()).hexdigest() for r in drift_client.requests}
     assert sent == {r["passage_sha256"] for r in baseline.values()}
     assert result.shortlist is not None
@@ -1152,3 +1156,179 @@ def test_a_pilot_runs_n_clusters_is_the_text_count(world: World) -> None:
         [spent.run_id],
     ).fetchone()
     assert row == (3, 5)
+
+
+# --- T174: the arms, the Jev label selector and the per-vendor spend -----------------------
+
+
+def _rec(
+    lid: str,
+    kind: str,
+    option: str | None,
+    *,
+    arm: str | None = "jev",
+    vendor: str | None = None,
+    reason: str = "ok",
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "listing_end_id": lid,
+        "passage_kind": kind,
+        "reason": reason,
+        "selected_option": option,
+        "probabilities": {} if option in (None, UNRESOLVED) else {option: 1.0},
+    }
+    if arm is not None:
+        record["arm"] = arm
+    if vendor is not None:
+        record["vendor"] = vendor
+    return record
+
+
+def test_jev_label_record_takes_bs_resolved_answer_then_as_whatever_the_file_order() -> None:
+    b_ok = _rec("L1", "B", MERGER)
+    a = _rec("L1", "A", BANKRUPTCY)
+    claude = _rec("L1", "B", BANKRUPTCY, arm="claude", vendor="anthropic")
+    for order in permutations([b_ok, a, claude]):
+        assert job.jev_label_record(order)["L1"] is b_ok
+    b_unresolved = _rec("L1", "B", UNRESOLVED)
+    assert job.jev_label_record([b_unresolved, a, claude])["L1"] is a
+    a_only = _rec("L2", "A", BANKRUPTCY)
+    assert job.jev_label_record([a_only, claude])["L2"] is a_only
+
+
+def test_a_record_without_an_arm_reads_as_jev_and_one_without_a_kind_as_a() -> None:
+    bare = {"listing_end_id": "L1", "reason": "ok", "selected_option": MERGER, "probabilities": {}}
+    claude = _rec("L1", "B", BANKRUPTCY, arm="claude", vendor="anthropic")
+    assert job.jev_label_record([claude, bare])["L1"] is bare
+    # only a Claude record: no Jev label at all
+    assert job.jev_label_record([claude]) == {}
+
+
+def test_disagreeing_claude_records_never_move_the_jev_readers() -> None:
+    rows = [
+        job._parsed(_gold_row("D00", NOW, MERGER)),
+        job._parsed(_gold_row("D01", NOW, BANKRUPTCY)),
+    ]
+    jev = [_rec("D00", "A", MERGER), _rec("D01", "A", MERGER)]
+    claude = [
+        _rec("D00", "A", BANKRUPTCY, arm="claude", vendor="anthropic"),
+        _rec("D01", "A", MERGER, arm="claude", vendor="anthropic"),
+    ]
+    plain_items = job.scored_items(rows, jev)
+    beside_items = job.scored_items(rows, jev + claude)
+    assert plain_items == beside_items
+    assert job.gold_metrics(plain_items) == job.gold_metrics(beside_items)
+    assert job.jev_label_record(jev) == job.jev_label_record(jev + claude)
+
+
+def test_spend_sums_splits_by_vendor_and_counts_both_under_the_two_forty_keys() -> None:
+    jev = {"cost_usd": 39.99, "known_at": NOW.isoformat(), "vendor": "typesafe"}
+    claude = {"cost_usd": 0.02, "known_at": NOW.isoformat(), "vendor": "anthropic"}
+    sums = job.spend_sums([jev, claude], NOW)
+    assert sums.cumulative_usd == pytest.approx(40.01)
+    assert sums.month_to_date_usd == pytest.approx(40.01)
+    assert sums.vendor_spend("typesafe").cumulative_usd == pytest.approx(39.99)
+    assert sums.vendor_spend("anthropic").cumulative_usd == pytest.approx(0.02)
+    # a record with no vendor reads as the typesafe vendor
+    assert job.spend_sums([{"cost_usd": 1.0, "known_at": NOW.isoformat()}], NOW).vendor_spend(
+        "typesafe"
+    ).cumulative_usd == pytest.approx(1.0)
+
+
+def _spend_settings(
+    settings: Settings, *, total: float = 40.0, month: float = 40.0, claude: float = 15.0
+) -> Settings:
+    claude_config = settings.research.claude.model_copy(update={"spend_ceiling_usd_total": claude})
+    research_config = settings.research.model_copy(
+        update={
+            "spend_ceiling_usd_total": total,
+            "spend_ceiling_usd_month": month,
+            "claude": claude_config,
+        }
+    )
+    return settings.model_copy(update={"research": research_config})
+
+
+def test_a_claude_call_is_refused_by_its_own_ceiling_inside_the_forty(settings: Settings) -> None:
+    configured = _spend_settings(settings, claude=15.0)
+    prior = [{"cost_usd": 14.99, "known_at": NOW.isoformat(), "vendor": "anthropic"}]
+    with pytest.raises(job.SpendRefused, match=r"spend ceiling: 0\.020000"):
+        job.spend_check(prior, 0.02, configured, vendor="anthropic", now=NOW)
+    kept = job.spend_check(prior, 0.01, configured, vendor="anthropic", now=NOW)
+    assert kept.vendor_spend("anthropic").cumulative_usd == pytest.approx(14.99)
+
+
+def test_a_claude_estimate_counts_under_the_forty_beside_jev(settings: Settings) -> None:
+    configured = _spend_settings(settings, total=40.0, month=40.0, claude=15.0)
+    jev = [{"cost_usd": 39.99, "known_at": NOW.isoformat(), "vendor": "typesafe"}]
+    with pytest.raises(job.SpendRefused, match=r"spend ceiling: 0\.020000"):
+        job.spend_check(jev, 0.02, configured, vendor="anthropic", now=NOW)
+    # the anthropic sum alone (zero) is inside its own ceiling; the $40 total is what refuses
+    sums = job.spend_sums(jev, NOW)
+    assert sums.vendor_spend("anthropic").cumulative_usd == 0.0
+    assert sums.cumulative_usd == pytest.approx(39.99)
+
+
+def test_a_claude_record_counts_in_the_forty_sums_but_not_the_jev_ceiling_alone(
+    settings: Settings,
+) -> None:
+    configured = _spend_settings(settings, total=0.03, month=0.03, claude=15.0)
+    claude = [{"cost_usd": 0.02, "known_at": NOW.isoformat(), "vendor": "anthropic"}]
+    sums = job.spend_check(claude, 0.0, configured, vendor="anthropic", now=NOW)
+    assert sums.cumulative_usd == pytest.approx(0.02)
+    with pytest.raises(job.SpendRefused):
+        job.spend_check(claude, 0.02, configured, vendor="typesafe", now=NOW)
+
+
+def test_a_claude_record_without_usage_keeps_its_full_worst_case(settings: Settings) -> None:
+    claude = settings.research.claude
+    worst = job.estimate_usd(
+        job.model_request(_A_PACKET, MODEL, DEFAULT_OPTION_SET),
+        settings.research.labeling,
+        claude=claude,
+    )
+    assert worst > claude.max_output_tokens * claude.price_usd_per_million_output_tokens / 1e6
+    no_usage = _response(reason="refused", http_status=200, input_tokens=None, output_tokens=None)
+    assert job.record_cost(no_usage, worst, 0.0, claude=claude) == worst
+    used = _response(input_tokens=1_000_000, output_tokens=1_000_000)
+    assert job.record_cost(used, worst, 0.0, claude=claude) == pytest.approx(
+        claude.price_usd_per_million_input_tokens + claude.price_usd_per_million_output_tokens
+    )
+
+
+def test_build_record_writes_jevs_arm_and_vendor_and_a_null_output_price(
+    world: World,
+) -> None:
+    record = job.build_record(
+        run_id=1,
+        sequence=1,
+        listing_end_id="L1",
+        packet=_A_PACKET,
+        response=_response(),
+        cost_usd=0.0,
+        settings=world.settings,
+    )
+    assert record["arm"] == "jev"
+    assert record["vendor"] == "typesafe"
+    assert record["price_snapshot_output"] is None
+
+
+def test_dry_run_reports_both_vendors_and_all_three_headrooms(world: World, tmp_path: Path) -> None:
+    frame_id = world.frame([_row("F1", datetime(2019, 1, 2, 15, tzinfo=UTC), eightk=True)])
+    datafiles.append_jsonl(
+        datafiles.inference_path(world.settings, 3),
+        [
+            {"cost_usd": 1.0, "known_at": NOW.isoformat(), "vendor": "typesafe"},
+            {"cost_usd": 0.5, "known_at": NOW.isoformat(), "vendor": "anthropic"},
+        ],
+    )
+    report = job.dry_run(
+        world.conn, world.settings, frame_id, tmp_path / "frame-1.parquet", now=NOW
+    )
+    assert report.typesafe_cumulative_usd == pytest.approx(1.0)
+    assert report.anthropic_cumulative_usd == pytest.approx(0.5)
+    assert report.headroom_total_usd == pytest.approx(38.5)
+    assert report.claude_estimate_usd > 0
+    lines = "\n".join(report.lines())
+    assert "jev (typesafe)" in lines and "claude (anthropic)" in lines
+    assert "claude headroom" in lines

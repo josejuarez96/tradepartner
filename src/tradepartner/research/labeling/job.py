@@ -72,7 +72,7 @@ import random
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -81,7 +81,12 @@ from typing import Any, Final
 import duckdb
 import polars as pl
 
-from tradepartner.config import ResearchLabelingConfig, Settings, secret_values
+from tradepartner.config import (
+    ResearchClaudeConfig,
+    ResearchLabelingConfig,
+    Settings,
+    secret_values,
+)
 from tradepartner.research import DatasetChanged, RunHandle, datafiles, load_dataset
 from tradepartner.research.gates import Flags, Reasons
 from tradepartner.research.labeling import crosswalk, scoring
@@ -112,6 +117,7 @@ from tradepartner.research.models import (
     ModelUnreachable,
     build_client,
     check_model_id,
+    claude_estimate_usd,
 )
 from tradepartner.store.research import (
     close_run,
@@ -135,6 +141,13 @@ DRIFT_PROBE_SIZE: Final = 20
 FRAME_SPLITS: Final = frozenset({"full", "prospective"})
 GOLD_SPLITS: Final = frozenset({"dev", "pilot"})
 REDACTED: Final = "[redacted]"
+
+#: The arms and the vendors their records name (spec "Amendment 2026-10-11 (#1504)"
+#: item 3). A record that carries no `arm` (one written before that build) is Jev's.
+JEV_ARM: Final = "jev"
+CLAUDE_ARM: Final = "claude"
+TYPESAFE_VENDOR: Final = "typesafe"
+ANTHROPIC_VENDOR: Final = "anthropic"
 
 SPEND_CEILING: Final = "spend ceiling"
 MODEL_ID_MISMATCH: Final = "model id mismatch"
@@ -172,23 +185,65 @@ class _Stop(Exception):
 
 
 @dataclass(frozen=True)
+class VendorSpend:
+    """One vendor's cumulative and month-to-date spend in USD (spec item 4)."""
+
+    cumulative_usd: float
+    month_to_date_usd: float
+
+
+@dataclass(frozen=True)
 class SpendSums:
-    """Cumulative and month-to-date spend in USD over inference records; `month` is
-    the UTC `(year, month)` the month-to-date sum is for."""
+    """Cumulative and month-to-date spend in USD over inference records, both vendors
+    together (the $40 of ADR 0013) and split by `vendor` (the Claude arm's ceiling
+    inside it); `month` is the UTC `(year, month)` the month-to-date sum is for."""
 
     cumulative_usd: float
     month_to_date_usd: float
     month: tuple[int, int]
+    vendors: Mapping[str, VendorSpend] = field(default_factory=dict)
 
-    def plus(self, cost_usd: float, known_at: datetime) -> SpendSums:
+    def plus(self, cost_usd: float, known_at: datetime, vendor: str = TYPESAFE_VENDOR) -> SpendSums:
         """These sums with one more record of `cost_usd` known at `known_at`. A record
         in a later month starts that month's sum (a batch that runs past midnight at
         a month's end); a record in an earlier month adds to the total only."""
         month = _month(known_at)
-        if month > self.month:
-            return SpendSums(self.cumulative_usd + cost_usd, cost_usd, month)
+        later = month > self.month
+        if later:
+            vendors = {
+                name: VendorSpend(spend.cumulative_usd, 0.0) for name, spend in self.vendors.items()
+            }
+            vendors[vendor] = VendorSpend(
+                self.vendor_spend(vendor).cumulative_usd + cost_usd, cost_usd
+            )
+            return SpendSums(self.cumulative_usd + cost_usd, cost_usd, month, vendors)
         same = cost_usd if month == self.month else 0.0
-        return SpendSums(self.cumulative_usd + cost_usd, self.month_to_date_usd + same, self.month)
+        previous = self.vendor_spend(vendor)
+        vendors = {
+            **self.vendors,
+            vendor: VendorSpend(
+                previous.cumulative_usd + cost_usd, previous.month_to_date_usd + same
+            ),
+        }
+        return SpendSums(
+            self.cumulative_usd + cost_usd, self.month_to_date_usd + same, self.month, vendors
+        )
+
+    def vendor_spend(self, name: str) -> VendorSpend:
+        """`name`'s sums, zero when no record of it was summed."""
+        return self.vendors.get(name, VendorSpend(0.0, 0.0))
+
+
+def _arm_of(record: Mapping[str, Any]) -> str:
+    """A record's arm: its `arm`, or Jev's when it carries none (spec item 3)."""
+    value = record.get("arm")
+    return value if isinstance(value, str) and value else JEV_ARM
+
+
+def _vendor_of(record: Mapping[str, Any]) -> str:
+    """A record's vendor: its `vendor`, or the typesafe vendor when it carries none."""
+    value = record.get("vendor")
+    return value if isinstance(value, str) and value else TYPESAFE_VENDOR
 
 
 def _month(value: datetime) -> tuple[int, int]:
@@ -227,23 +282,38 @@ def spend_records(settings: Settings) -> list[dict[str, Any]]:
 
 
 def spend_sums(records: Iterable[Mapping[str, Any]], now: datetime) -> SpendSums:
-    """Cumulative and month-to-date (the UTC month of `now`) spend over `records`."""
+    """Cumulative and month-to-date (the UTC month of `now`) spend over `records`,
+    both vendors together and split by `vendor` (spec item 4)."""
     month = _month(now)
     total = mtd = 0.0
+    vendors: dict[str, VendorSpend] = {}
     for record in records:
         cost = float(record["cost_usd"])
+        in_month = _month(_known_at(record["known_at"])) == month
         total += cost
-        mtd += cost if _month(_known_at(record["known_at"])) == month else 0.0
-    return SpendSums(total, mtd, month)
+        mtd += cost if in_month else 0.0
+        vendor = _vendor_of(record)
+        previous = vendors.get(vendor, VendorSpend(0.0, 0.0))
+        vendors[vendor] = VendorSpend(
+            previous.cumulative_usd + cost,
+            previous.month_to_date_usd + (cost if in_month else 0.0),
+        )
+    return SpendSums(total, mtd, month, vendors)
 
 
-def _check_sums(sums: SpendSums, estimate_usd: float, settings: Settings) -> None:
+def _check_sums(
+    sums: SpendSums, estimate_usd: float, settings: Settings, vendor: str = TYPESAFE_VENDOR
+) -> None:
     research = settings.research
     if (
         sums.cumulative_usd + estimate_usd > research.spend_ceiling_usd_total
         or sums.month_to_date_usd + estimate_usd > research.spend_ceiling_usd_month
     ):
         raise SpendRefused(f"{SPEND_CEILING}: {estimate_usd:.6f}")
+    if vendor == ANTHROPIC_VENDOR:
+        claude = sums.vendor_spend(ANTHROPIC_VENDOR)
+        if claude.cumulative_usd + estimate_usd > research.claude.spend_ceiling_usd_total:
+            raise SpendRefused(f"{SPEND_CEILING}: {estimate_usd:.6f}")
 
 
 def spend_check(
@@ -251,14 +321,17 @@ def spend_check(
     estimate_usd: float,
     settings: Settings,
     *,
+    vendor: str = TYPESAFE_VENDOR,
     now: datetime | None = None,
 ) -> SpendSums:
     """Refuse (`SpendRefused`, `spend ceiling: <estimate>`) when cumulative spend over
     `records` plus `estimate_usd` exceeds `research.spend_ceiling_usd_total`, or the
-    month-to-date spend plus it exceeds `research.spend_ceiling_usd_month` (C4).
-    Returns the sums it checked."""
+    month-to-date spend plus it exceeds `research.spend_ceiling_usd_month` (C4); for an
+    `anthropic` call also when the anthropic sum plus it exceeds
+    `research.claude.spend_ceiling_usd_total` (spec item 4). Returns the sums it
+    checked."""
     sums = spend_sums(records, now or datetime.now(UTC))
-    _check_sums(sums, estimate_usd, settings)
+    _check_sums(sums, estimate_usd, settings, vendor)
     return sums
 
 
@@ -269,17 +342,41 @@ def request_chars(request: ModelRequest) -> int:
     return len(request.state) + len(request.instructions) + criteria
 
 
-def estimate_usd(request: ModelRequest, labeling: ResearchLabelingConfig) -> float:
+def estimate_usd(
+    request: ModelRequest,
+    labeling: ResearchLabelingConfig,
+    *,
+    claude: ResearchClaudeConfig | None = None,
+) -> float:
     """The pre-call cost estimate: characters over `chars_per_token`, at the price
-    snapshot (C4)."""
+    snapshot (C4). With `claude`, the Claude arm's worst-case estimate at its own
+    prices: its input over its `chars_per_token` plus `max_output_tokens` at the
+    output price (spec item 4)."""
+    if claude is not None:
+        return claude_estimate_usd(request, claude)
     tokens = request_chars(request) / labeling.chars_per_token
     return tokens * labeling.price_usd_per_million_input_tokens / 1_000_000
 
 
-def record_cost(response: ModelResponse, estimate: float, price: float) -> float:
-    """A record's `cost_usd`: the returned input tokens at the price snapshot; a
-    timeout (sent, maybe billed) or a 200 whose body lacks the usage (billed) keeps
-    its estimate; any other refusal with no usage costs nothing."""
+def record_cost(
+    response: ModelResponse,
+    estimate: float,
+    price: float,
+    *,
+    claude: ResearchClaudeConfig | None = None,
+) -> float:
+    """A record's `cost_usd` (C8); with `claude`, the Claude arm's (spec item 3). Jev:
+    the returned input tokens at the price snapshot; a timeout (sent, maybe billed) or
+    a 200 whose body lacks the usage (billed) keeps its estimate; any other refusal
+    with no usage costs nothing. Claude: the returned input and output tokens at its two
+    prices, and a record with no returned usage keeps its full worst-case estimate."""
+    if claude is not None:
+        if response.input_tokens is None or response.output_tokens is None:
+            return estimate
+        return (
+            response.input_tokens * claude.price_usd_per_million_input_tokens
+            + response.output_tokens * claude.price_usd_per_million_output_tokens
+        ) / 1_000_000
     if response.input_tokens is not None:
         return response.input_tokens * price / 1_000_000
     return estimate if response.reason == "timeout" or response.http_status == 200 else 0.0
@@ -308,9 +405,14 @@ def build_record(
     response: ModelResponse,
     cost_usd: float,
     settings: Settings,
+    arm: str = JEV_ARM,
+    vendor: str = TYPESAFE_VENDOR,
+    price_snapshot_output: float | None = None,
 ) -> dict[str, Any]:
-    """C8's per-call record for one finished call. A timeout's `selected_option` is
-    `unresolved` (req 6 step 4); every other unanswered call's is null."""
+    """C8's per-call record for one finished call, with the arm's `arm` and `vendor`
+    and `price_snapshot_output` (null for Jev, whose output is free; spec item 3). A
+    timeout's `selected_option` is `unresolved` (req 6 step 4); every other unanswered
+    call's is null."""
     if response.known_at.tzinfo is None:
         raise ValueError("a model response's known_at must be tz-aware")
     selected = UNRESOLVED if response.reason == "timeout" else response.selected_option
@@ -318,6 +420,8 @@ def build_record(
         "record_id": f"{run_id}-{sequence}",
         "run_id": run_id,
         "listing_end_id": listing_end_id,
+        "arm": arm,
+        "vendor": vendor,
         "passage_kind": packet.kind,
         "document_ids": list(packet.document_ids),
         "passage_sha256": packet.sha256,
@@ -336,6 +440,7 @@ def build_record(
         "output_tokens": response.output_tokens,
         "cost_usd": cost_usd,
         "price_snapshot": settings.research.labeling.price_usd_per_million_input_tokens,
+        "price_snapshot_output": price_snapshot_output,
         "http_status": response.http_status,
         "latency_ms": response.latency_ms,
         "reason": response.reason,
@@ -430,13 +535,41 @@ def _packets_estimate(
     return sum(estimate_usd(model_request(p, "", option_set), labeling) for _, p in packets)
 
 
-def final_records(records: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
-    """The last record per listing end, in file order: the label is the last call's
-    answer (C2)."""
-    last: dict[str, Mapping[str, Any]] = {}
+def jev_label_record(records: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """The label record of each listing end under the registered treatment: among its
+    Jev records (`arm == "jev"`; a record without `arm` is read as Jev), B's where B ran
+    and resolved, else A's, whatever the file order and whatever records of another arm
+    sit beside them (spec item 6's selector; on a `full` batch, one packet, it is that
+    call). Claude records never become a label (spec item 3)."""
+    a: dict[str, Mapping[str, Any]] = {}
+    b: dict[str, Mapping[str, Any]] = {}
     for record in records:
-        last[str(record["listing_end_id"])] = record
-    return last
+        if _arm_of(record) != JEV_ARM:
+            continue
+        lid = str(record["listing_end_id"])
+        if record.get("passage_kind") == "B":
+            b[lid] = record
+        else:
+            a[lid] = record
+    chosen: dict[str, Mapping[str, Any]] = {}
+    for lid in set(a) | set(b):
+        b_record = b.get(lid)
+        if b_record is not None and _resolved(b_record):
+            chosen[lid] = b_record
+        elif lid in a:
+            chosen[lid] = a[lid]
+        elif b_record is not None:
+            chosen[lid] = b_record
+    return chosen
+
+
+def _resolved(record: Mapping[str, Any]) -> bool:
+    """A record whose call answered: `ok` with an option that is neither null nor
+    `unresolved` (so C2's cascade moved on from it)."""
+    return record.get("reason") == "ok" and record.get("selected_option") not in (
+        None,
+        UNRESOLVED,
+    )
 
 
 def _final_answer(record: Mapping[str, Any] | None) -> tuple[str | None, scoring.Reason]:
@@ -459,7 +592,7 @@ def batch_shortlist(
 ) -> crosswalk.Shortlist:
     """The shortlist of a frame batch (req 9) from its bound rows and its records:
     each row's final answer against its rule answer (the `rule_*` columns)."""
-    last = final_records(records)
+    last = jev_label_record(records)
     outcomes = []
     for row in rows:
         selected, reason = _final_answer(last.get(str(row["listing_end_id"])))
@@ -503,7 +636,7 @@ def scored_items(
     against the final answer, and a seed's pre-fix rule answer (`seeded_recall`,
     #1351). A labelled row without a `basis` (an export without the column) is
     refused by `ScoredItem`."""
-    last = final_records(records)
+    last = jev_label_record(records)
     items = []
     for row in rows:
         record = last.get(str(row["listing_end_id"]))
@@ -848,7 +981,7 @@ def _run_drift(
         rows = {str(r["listing_end_id"]): r for r in select_rows(load_dataset(handle))}
         baseline = {
             lid: record
-            for lid, record in final_records(datafiles.read_jsonl(baseline_path)).items()
+            for lid, record in jev_label_record(datafiles.read_jsonl(baseline_path)).items()
             if lid in rows and record["reason"] == "ok"
         }
         seed = get_registration(conn, DRIFT_SLUG).seed
@@ -949,7 +1082,7 @@ def _prepare_reversed_baseline(
     baseline_path = datafiles.inference_path(settings, baseline_run_id)
     if not baseline_path.is_file() or _file_sha256(baseline_path) != expected:
         raise ValueError(f"reversed baseline run {baseline_run_id} records changed")
-    records = final_records(datafiles.read_jsonl(baseline_path))
+    records = jev_label_record(datafiles.read_jsonl(baseline_path))
     comparable = 0
     for lid, record in records.items():
         if record["reason"] != "ok":
@@ -1350,7 +1483,8 @@ def _register_records(
 @dataclass(frozen=True)
 class DryRun:
     """`dry_run`'s report: the estimate over the export's first calls, the two spend
-    sums over every records file, and the headroom under each ceiling."""
+    sums over every records file (both vendors together and split by vendor) and the
+    headroom under each of the three ceilings, the Claude arm's included (spec item 4)."""
 
     n_rows: int
     n_requests: int
@@ -1359,6 +1493,10 @@ class DryRun:
     month_to_date_usd: float
     headroom_total_usd: float
     headroom_month_usd: float
+    typesafe_cumulative_usd: float
+    anthropic_cumulative_usd: float
+    claude_estimate_usd: float
+    headroom_claude_usd: float
 
     def lines(self) -> list[str]:
         """The report as printable lines."""
@@ -1367,6 +1505,10 @@ class DryRun:
             f"estimate: ${self.estimate_usd:.6f}",
             f"spend to date: ${self.cumulative_usd:.6f}, this month: ${self.month_to_date_usd:.6f}",
             f"headroom: total ${self.headroom_total_usd:.6f}, month ${self.headroom_month_usd:.6f}",
+            f"jev (typesafe) spend to date: ${self.typesafe_cumulative_usd:.6f}",
+            f"claude (anthropic) spend to date: ${self.anthropic_cumulative_usd:.6f}",
+            f"claude estimate (worst case): ${self.claude_estimate_usd:.6f}",
+            f"claude headroom: ${self.headroom_claude_usd:.6f}",
         ]
 
 
@@ -1382,10 +1524,11 @@ def dry_run(
     limit: int | None = None,
     now: datetime | None = None,
 ) -> DryRun:
-    """The estimate, the spend sums and the headroom (C4's `--dry-run`). Reads the
-    export at `export` (the path the caller was given), refused with `DatasetChanged`
-    unless its SHA-256 is dataset `dataset_id`'s; opens no run and calls nothing. The
-    estimate covers every row of the export, an upper bound for a split."""
+    """The estimate, the spend sums and the headroom (C4's `--dry-run`), for both
+    vendors (spec item 4). Reads the export at `export` (the path the caller was given),
+    refused with `DatasetChanged` unless its SHA-256 is dataset `dataset_id`'s; opens no
+    run and calls nothing. The estimate covers every row of the export, an upper bound
+    for a split."""
     record = get_dataset(conn, dataset_id)
     data = export.read_bytes()
     if sha256(data).hexdigest() != record.sha256:
@@ -1399,8 +1542,13 @@ def dry_run(
     labeling = settings.research.labeling
     packets = _first_packets(rows, option_set, packet_limits(labeling))
     estimate = _packets_estimate(packets, option_set, labeling)
+    claude_estimate = sum(
+        estimate_usd(model_request(p, "", option_set), labeling, claude=settings.research.claude)
+        for _, p in packets
+    )
     sums = spend_sums(spend_records(settings), now or datetime.now(UTC))
     research = settings.research
+    anthropic = sums.vendor_spend(ANTHROPIC_VENDOR).cumulative_usd
     return DryRun(
         n_rows=len(rows),
         n_requests=len(packets),
@@ -1409,4 +1557,8 @@ def dry_run(
         month_to_date_usd=sums.month_to_date_usd,
         headroom_total_usd=research.spend_ceiling_usd_total - sums.cumulative_usd,
         headroom_month_usd=research.spend_ceiling_usd_month - sums.month_to_date_usd,
+        typesafe_cumulative_usd=sums.vendor_spend(TYPESAFE_VENDOR).cumulative_usd,
+        anthropic_cumulative_usd=anthropic,
+        claude_estimate_usd=claude_estimate,
+        headroom_claude_usd=research.claude.spend_ceiling_usd_total - anthropic,
     )
