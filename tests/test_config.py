@@ -2193,6 +2193,11 @@ def test_sample_months_must_be_distinct_calendar_months(months: list[int]) -> No
         Settings(_env_file=None, coverage={"sample_months": months})
 
 
+def test_reference_names_must_not_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"reference_names": []})
+
+
 def test_coverage_section_refuses_an_unknown_key() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, coverage={"check_enable": True})

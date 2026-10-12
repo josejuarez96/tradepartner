@@ -778,7 +778,10 @@ def test_health_coverage_is_report_only_with_the_default_off(
     assert "coverage reference (report-only): 2 sample sessions" in result.output
     assert "  2019-12-31: 1 members; 30 of 30 reference names missing;" in result.output
     assert "  missing 2019-12-31 0000051143:IBM (-): no_security" in result.output
-    assert "report-only: coverage.check_enabled is off" in result.output
+    assert (
+        "  coverage_reference_names: 60 missing (report-only): coverage.check_enabled is off"
+        in (result.output)
+    )
 
 
 def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
@@ -793,7 +796,10 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     failed = _invoke(enforced, ["health", "--check"], clock=lambda: T_END)
     assert failed.exit_code == 1
     assert "health check failed: coverage_reference_names" in failed.output
-    assert "  coverage_reference_names: FAIL (2 rows)" in failed.output
+    assert "  coverage_reference_names: fail (2)" in failed.output
+    skipped = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert skipped.exit_code == 0, skipped.output
+    assert "coverage reference: not computed" in skipped.output
     assert (
         "  missing 2019-12-31 CIK0001000019:PRE9 (SEC_STATIC_PRE2019): "
         "rule exchange, not_listed" in failed.output

@@ -881,7 +881,9 @@ class CoverageConfig(_ClosedConfig):
     computes it on every run and `--check` fails `coverage_reference_names`
     while a reference name is missing."""
 
-    reference_names: list[str] = Field(default_factory=lambda: list(DEFAULT_REFERENCE_NAMES))
+    reference_names: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_REFERENCE_NAMES), min_length=1
+    )
     sample_months: list[int] = Field(default_factory=lambda: [6, 12], min_length=1)
     sample_from: date = date(2019, 12, 31)
     check_enabled: bool = False

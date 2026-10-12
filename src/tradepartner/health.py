@@ -125,7 +125,8 @@ here is this module's and is stated once:
   `late_known`, the securities whose current listing at S, from the rows
   known at `t` (`listing_ends_as_of` at `t`), covers S (listed; or ended on
   or after S; or a transfer with no end yet) while none of their rows
-  covering S has a live revision known at or before `close(S)`: names the
+  covering S is visible to a read at `close(S)` (its latest revision known
+  by then exists and is not a retraction, #859): names the
   store lists on S that no read at S could see, with their share of the
   names listed on S (every exchange code, `NONE` and `OTC` included); (c)
   the member count on S and, on the latest S only, the count of CIKs known
@@ -694,6 +695,21 @@ class CoverageReference:
         """Whether a reference name is missing on some sample session."""
         return not self.reference_missing.is_empty()
 
+    @property
+    def checked(self) -> bool:
+        """Whether some entry covered some sample session: with none, a block
+        with nothing missing checked nothing and is never a pass."""
+        return not self.samples.is_empty() and int(self.samples["references"].sum()) > 0
+
+    @property
+    def verdict(self) -> str:
+        """`pass`, `nothing checked`, `fail (<n>)` while `check_enabled`, or
+        `<n> missing (report-only)`: the one wording the CLI and page share."""
+        missing = self.reference_missing.height
+        if self.failed:
+            return f"fail ({missing})" if self.check_enabled else f"{missing} missing (report-only)"
+        return "pass" if self.checked else "nothing checked"
+
 
 @dataclass(frozen=True, eq=False)
 class IntegrityCheck:
@@ -986,16 +1002,18 @@ def _filing_events_report(
 def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date, ...]:
     """The coverage check's sample sessions at `t` (#1541): the last XNYS
     session of each `coverage.sample_months` month, from
-    `coverage.sample_from` to the last session completed at `t`, ascending."""
+    `coverage.sample_from` (or the calendar's first session, if later) to the
+    last session completed at `t`, ascending."""
     t = _validate_t(t)
     cfg = (settings if settings is not None else get_settings()).coverage
     last = last_completed_session(t)
     out: list[date] = []
-    year, month = cfg.sample_from.year, cfg.sample_from.month
+    first = max(cfg.sample_from, all_sessions()[0])  # never before the calendar
+    year, month = first.year, first.month
     while (year, month) <= (last.year, last.month):
         if month in cfg.sample_months:
             session = last_session_of_month(year, month)
-            if cfg.sample_from <= session <= last:
+            if first <= session <= last:
                 out.append(session)
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return tuple(out)
@@ -1026,21 +1044,34 @@ def _covers(row: dict[str, Any], session: date) -> bool:
     return bool(end >= session)
 
 
-def _first_known(
+_ListingKey = tuple[str, str, str, date]
+
+
+def _revisions(
     conn: duckdb.DuckDBPyConnection, t: datetime
-) -> dict[tuple[str, str, str, date], datetime]:
-    """Per listing key, the earliest `known_at` at or before `t` of a live
-    (not retraction) revision: when a read could first see the row."""
-    live = "AND NOT retracted" if has_retracted(conn, "listings") else ""
+) -> dict[_ListingKey, list[tuple[datetime, bool]]]:
+    """Per listing key, every revision known at `t` as `(known_at, live)`,
+    oldest first (`live` false for a retraction, #859)."""
+    live = "NOT retracted" if has_retracted(conn, "listings") else "TRUE"
     rows = conn.execute(
         f"""
-        SELECT security_id, ticker, exchange, valid_from, min(known_at)
-        FROM listings WHERE known_at <= ? {live}
-        GROUP BY security_id, ticker, exchange, valid_from
+        SELECT security_id, ticker, exchange, valid_from, known_at, {live}
+        FROM listings WHERE known_at <= ?
+        ORDER BY known_at
         """,
         [t],
     ).fetchall()
-    return {(sid, ticker, exchange, start): at for sid, ticker, exchange, start, at in rows}
+    out: dict[_ListingKey, list[tuple[datetime, bool]]] = defaultdict(list)
+    for sid, ticker, exchange, start, at, is_live in rows:
+        out[(sid, ticker, exchange, start)].append((at, bool(is_live)))
+    return out
+
+
+def _visible_at(revisions: list[tuple[datetime, bool]], close: datetime) -> bool:
+    """Whether a read at `close` sees the key: its latest revision known by
+    then exists and is not a retraction (`_latest_as_of`'s rule)."""
+    index = bisect_right([at for at, _ in revisions], close)
+    return index > 0 and revisions[index - 1][1]
 
 
 def _same_ticker(stored: str, reference: str) -> bool:
@@ -1119,12 +1150,15 @@ def _coverage_reference(
     rows_by_sid: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in listings.iter_rows(named=True):
         rows_by_sid[row["security_id"]].append(row)
-    first_known = _first_known(conn, t)
+    revisions = _revisions(conn, t)
+
+    def history(row: dict[str, Any]) -> list[tuple[datetime, bool]]:
+        return revisions.get(
+            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"]), []
+        )
 
     def known_by(row: dict[str, Any]) -> datetime | None:
-        return first_known.get(
-            (row["security_id"], row["ticker"], row["exchange"], row["valid_from"])
-        )
+        return next((at for at, is_live in history(row) if is_live), None)
 
     samples: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -1150,7 +1184,7 @@ def _coverage_reference(
         late_here = 0
         for sid in listed:
             seen = (
-                (at := known_by(row)) is not None and at <= close
+                _visible_at(history(row), close)
                 for row in rows_by_sid[sid]
                 if _covers(row, session)
             )

@@ -305,19 +305,18 @@ def _integrity_card(report: HealthReport) -> None:
 
 def coverage_badge(block: CoverageReference | None) -> tuple[str, theme.Status]:
     """`coverage_reference_names`' status chip: "not computed", a caution (never a
-    pass it did not check), until the block is computed; a missing reference name
-    is critical only while `coverage.check_enabled` is on, else a caution."""
+    pass it did not check), until the block is computed; "nothing checked" a
+    caution too; a missing reference name is critical only while
+    `coverage.check_enabled` is on, else a caution."""
     if block is None:
         return f"{COVERAGE_REFERENCE_NAMES}: not computed", "warning"
-    if not block.failed:
-        return f"{COVERAGE_REFERENCE_NAMES}: pass", "good"
-    missing = block.reference_missing.height
-    if block.check_enabled:
-        return f"{COVERAGE_REFERENCE_NAMES}: fail ({missing})", "critical"
-    return f"{COVERAGE_REFERENCE_NAMES}: {missing} missing (report-only)", "warning"
+    label = f"{COVERAGE_REFERENCE_NAMES}: {block.verdict}"
+    if block.failed and block.check_enabled:
+        return label, "critical"
+    return label, "good" if block.checked and not block.failed else "warning"
 
 
-def _coverage_card(report: HealthReport) -> None:
+def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
     """The coverage-reference card. Its button reruns the page, which then reads
     the button's state before loading the view (`render`)."""
     block = report.coverage_reference
@@ -329,6 +328,11 @@ def _coverage_card(report: HealthReport) -> None:
                 "Not computed: it reads the universe once per sample session "
                 "(`coverage.sample_months`)."
             )
+            if check_enabled:
+                theme.status_badge(
+                    "coverage.check_enabled is on: `health --check` enforces this check",
+                    "warning",
+                )
             return
         mode = "check" if block.check_enabled else "report-only"
         st.markdown(f"Mode: **{mode}** (`coverage.check_enabled`)")
@@ -472,5 +476,5 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _sources_card(view.report)
         _survivorship_card(view.report)
         _statement_card(view.report)
-        _coverage_card(view.report)
+        _coverage_card(view.report, settings.coverage.check_enabled)
     _tables(view.report)

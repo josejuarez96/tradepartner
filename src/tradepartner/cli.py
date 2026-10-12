@@ -699,12 +699,9 @@ def _coverage_verdict(block: CoverageReference | None) -> str:
     """`coverage_reference_names`' line: never a pass the block did not check."""
     if block is None:
         return "not computed (run with --coverage)"
-    missing = block.reference_missing.height
-    if not block.failed:
-        return "pass"
-    if block.check_enabled:
-        return f"FAIL ({missing} rows)"
-    return f"{missing} rows missing (report-only: coverage.check_enabled is off)"
+    if block.failed and not block.check_enabled:
+        return f"{block.verdict}: coverage.check_enabled is off"
+    return block.verdict
 
 
 def _print_coverage_reference(block: CoverageReference | None) -> None:
@@ -1944,14 +1941,16 @@ def make_app(
             ),
         ] = None,
         coverage: Annotated[
-            bool,
+            bool | None,
             typer.Option(
+                "--coverage/--no-coverage",
                 help=(
-                    "also run the coverage check against coverage.reference_names "
-                    "(one universe read per sample session)"
-                )
+                    "run (or skip) the coverage check against coverage.reference_names "
+                    "(one universe read per sample session); default: while "
+                    "coverage.check_enabled is on"
+                ),
             ),
-        ] = False,
+        ] = None,
     ) -> None:
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
@@ -1962,7 +1961,7 @@ def make_app(
         try:
             with open_read_only(s) as conn:
                 report = health_report(
-                    conn, t, s, jumps_before=cutoff, with_coverage_reference=coverage or None
+                    conn, t, s, jumps_before=cutoff, with_coverage_reference=coverage
                 )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None

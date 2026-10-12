@@ -2064,9 +2064,9 @@ S_2020 = date(2020, 6, 30)
 
 
 def _coverage_settings(*names: str, check_enabled: bool = False, **extra: Any) -> Settings:
-    return _settings(
-        coverage={"reference_names": list(names), "check_enabled": check_enabled, **extra}
-    )
+    """`coverage` with `names` as the reference list (the default list when none)."""
+    listed = {"reference_names": list(names)} if names else {}
+    return _settings(coverage={**listed, "check_enabled": check_enabled, **extra})
 
 
 def _missing_at(block: CoverageReference, session: date) -> list[dict[str, Any]]:
@@ -2275,3 +2275,66 @@ def test_coverage_reference_reads_only_rows_known_at_t(
         assert full.reference_missing.equals(cut.reference_missing), t
         assert full.late_known.equals(cut.late_known), t
         assert full.snapshot_ciks == cut.snapshot_ciks, t
+
+
+def test_a_row_retracted_before_s_and_restated_after_it_is_late_known(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A read at close(S) sees the key's latest revision then; a retraction
+    in force at S hides it, whatever an earlier or later revision says."""
+    row = {
+        "security_id": "SEC_STATIC_PRE2019",
+        "ticker": "PRE9",
+        "exchange": "NYSE",
+        "class_title": "Common Stock",
+        "valid_from": date(2019, 1, 2),
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    for known, retracted in (
+        (datetime(2018, 12, 3, 20, 30, tzinfo=UTC), False),
+        (datetime(2019, 11, 1, 20, 30, tzinfo=UTC), True),
+        (datetime(2020, 2, 3, 20, 30, tzinfo=UTC), False),
+    ):
+        insert_row(
+            fixture_store,
+            "listings",
+            {**row, "known_at": known, "ingested_at": known, "retracted": retracted},
+        )
+    block = coverage_reference(fixture_store, T_END, _coverage_settings(PRE9))
+    assert _late_at(block, S_2019) == ["SEC_STATIC_PRE2019"]
+    assert _late_at(block, S_2020) == []
+
+
+def test_a_block_that_checked_nothing_is_never_a_pass(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    no_sample = coverage_reference(
+        fixture_store, T_END, _coverage_settings(PRE9, sample_months=[7])
+    )
+    assert not no_sample.failed
+    assert not no_sample.checked
+    assert no_sample.verdict == "nothing checked"
+    out_of_window = coverage_reference(
+        fixture_store, T_END, _coverage_settings("CIK0001000019:PRE9:2021-01-04")
+    )
+    assert out_of_window.verdict == "nothing checked"
+    checked = coverage_reference(
+        fixture_store, T_END, _coverage_settings(f"{FRST_CIK}:FRST::2019-12-31")
+    )
+    assert checked.verdict == "pass"
+    assert (
+        coverage_reference(fixture_store, T_END, _coverage_settings(PRE9)).verdict
+        == "2 missing (report-only)"
+    )
+    enforced = coverage_reference(
+        fixture_store, T_END, _coverage_settings(PRE9, check_enabled=True)
+    )
+    assert enforced.verdict == "fail (2)"
+
+
+def test_a_sample_from_before_the_calendar_starts_at_the_calendars_first_session() -> None:
+    settings = _coverage_settings(sample_from=date(1900, 1, 1))
+    sessions = sample_sessions(T_END, settings)
+    assert sessions[0] >= all_sessions()[0]
+    assert sessions[-2:] == (S_2019, S_2020)
