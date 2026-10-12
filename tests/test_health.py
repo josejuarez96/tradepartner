@@ -322,7 +322,7 @@ def test_last_ingests_with_no_runs_lists_every_source_as_never(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     ingests = last_ingests(fixture_store, T_END)
-    assert [i.source for i in ingests] == ["edgar", "alpaca"]
+    assert [i.source for i in ingests] == ["edgar", "alpaca", "fred"]
     for status in ingests:
         assert status.last_ok_finished_at is None
         assert status.latest_status is None
@@ -341,7 +341,9 @@ def test_last_ingests_reports_last_ok_and_latest_run_per_source(
     _run(fixture_store, "a3", "alpaca", "ok", day2 + timedelta(days=1))
 
     at = day2 + timedelta(hours=1)
-    edgar, alpaca = last_ingests(fixture_store, at)
+    ingests = last_ingests(fixture_store, at)
+    assert [i.source for i in ingests] == ["edgar", "alpaca", "fred"]
+    edgar, alpaca, _ = ingests
     assert edgar.source == "edgar"
     assert edgar.last_ok_finished_at == day2 + timedelta(minutes=5)
     assert edgar.last_ok_cursor == "2020-06-30"
@@ -361,10 +363,14 @@ def test_last_ingests_ignores_a_run_not_finished_at_t(
     day2 = datetime(2020, 6, 30, 22, 0, tzinfo=UTC)
     _run(fixture_store, "a1", "alpaca", "ok", day1, cursor="2020-06-29")
     _run(fixture_store, "a2", "alpaca", "failed", day2, message="boom")
-    _, alpaca = last_ingests(fixture_store, day2 + timedelta(minutes=2))
+    ingests = last_ingests(fixture_store, day2 + timedelta(minutes=2))
+    assert [i.source for i in ingests] == ["edgar", "alpaca", "fred"]
+    alpaca = ingests[1]
     assert alpaca.latest_status == "ok"
     assert alpaca.last_ok_cursor == "2020-06-29"
-    _, alpaca = last_ingests(fixture_store, day2 + timedelta(minutes=5))
+    ingests = last_ingests(fixture_store, day2 + timedelta(minutes=5))
+    assert [i.source for i in ingests] == ["edgar", "alpaca", "fred"]
+    alpaca = ingests[1]
     assert alpaca.latest_status == "failed"
 
 
@@ -373,7 +379,7 @@ def test_last_ingests_keeps_an_unknown_source_after_the_known_ones(
 ) -> None:
     _run(fixture_store, "x1", "vendor_x", "ok", datetime(2020, 6, 29, 22, tzinfo=UTC))
     sources = [i.source for i in last_ingests(fixture_store, T_END)]
-    assert sources == ["edgar", "alpaca", "vendor_x"]
+    assert sources == ["edgar", "alpaca", "fred", "vendor_x"]
 
 
 # --- Coverage ---------------------------------------------------------------
