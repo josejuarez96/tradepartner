@@ -16,6 +16,18 @@ Two subcommands:
 - ``run``: the repair. Dry run by default: no request, no write, a JSON report
   of the counts and the SGML requests each step will make. ``--apply`` makes
   the requests and writes.
+- ``restamp-unrepaired`` (#1553): ``--from`` an earlier release's
+  ``<manifest>.unrepaired.csv.gz``; every listed record is re-read from its
+  own SGML header through step 4's per-filing path (`restamp_filing`), so its
+  stamp becomes the header's ``ACCEPTANCE-DATETIME`` (``sgml``, or ``kept``
+  when equal), never offset-adjusted. A header with no acceptance (pre-2003)
+  or that does not read, and a listed record with no stamp in its file, keep
+  the old stamp and are listed in this release's unrepaired file with the
+  reason. The record's current stamp in its file is the manifest's
+  ``old_stamp``. Dry run by default (the request count, no request, no
+  write); ``--apply`` refuses above ``--max-requests`` and otherwise works as
+  ``run`` does: the backup, the request journal, ``--resume``, the window
+  and read-instant refusals, the manifest and sidecars under ``--release``.
 
 **Inputs of ``run``, all frozen files.** ``--bulk-written`` (the export above),
 ``--classes`` (stampcheck's per-CIK classes, ``cik`` plus ``class`` or
@@ -681,6 +693,29 @@ def _sgml_row(
     return ManifestRow(cik, accession, old, answer, "sgml", f"{why}; SGML {answer.isoformat()}")
 
 
+def restamp_filing(
+    files: Mapping[str, StampsFile],
+    journal: Journal,
+    rows: dict[Key, ManifestRow],
+    errors: dict[Key, str],
+    key: Key,
+    why: str,
+) -> None:
+    """The per-filing path (step 4's, and ``restamp-unrepaired``'s): the
+    record's stamp becomes its own SGML acceptance, never offset-adjusted
+    (``rows`` gets an ``sgml`` or ``kept`` row); a header with no acceptance
+    puts its error in ``errors`` and drops any earlier row of the record."""
+    cik, accession = key
+    old = files[cik].stamps[accession]
+    assert old is not None
+    row = _sgml_row(journal, cik, accession, old, why)
+    if row is None:
+        errors[key] = str(journal.get(cik, accession))
+        rows.pop(key, None)
+    else:
+        rows[key] = row
+
+
 def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     """Steps 1 to 5 with requests through ``journal``. Raises `RepairStop`
     when the audit stop rule fires or a step does not fit under the cap."""
@@ -688,14 +723,7 @@ def execute(inputs: Inputs, plan: Plan, journal: Journal) -> Outcome:
     errors: dict[Key, str] = {}
 
     def restamp(cik: str, accession: str, why: str) -> None:
-        old = inputs.files[cik].stamps[accession]
-        assert old is not None
-        row = _sgml_row(journal, cik, accession, old, why)
-        if row is None:
-            errors[(cik, accession)] = str(journal.get(cik, accession))
-            rows.pop((cik, accession), None)
-        else:
-            rows[(cik, accession)] = row
+        restamp_filing(inputs.files, journal, rows, errors, (cik, accession), why)
 
     journal.budget(plan.step2, "step 2")
     for cik, accession in plan.step2:
@@ -1101,18 +1129,24 @@ def _late_api(args: argparse.Namespace) -> tuple[date, date] | None:
     return (start, end)
 
 
-def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
-    """The ``run`` subcommand; returns the JSON report."""
+@dataclass
+class Release:
+    """One named release's paths and window rule, as ``run`` and
+    ``restamp-unrepaired`` share them."""
+
+    live: Path
+    backup: Path
+    manifest: Path
+    precheck: Precheck | None
+    allowed: WindowRule | None
+
+
+def _open_release(args: argparse.Namespace, report: dict[str, Any]) -> Release:
+    """Check the release name, the backup against ``--apply``/``--resume``
+    and ``--window-earlier-ok``'s file; nothing is written."""
     if not _RELEASE.match(args.release):
         raise RepairStop(f"release name {args.release!r} must match {_RELEASE.pattern}")
-    universe = load_cik_list(args.universe_ciks) if args.universe_ciks else set()
-    if args.phase != "all" and not universe:
-        raise RepairStop(f"--phase {args.phase} needs --universe-ciks")
-    live = stamps_dir(args.cache_dir)
     backup = backup_dir(args.cache_dir, args.release)
-    manifest = manifest_path(args.cache_dir, args.release)
-    report: dict[str, Any] = {"release": args.release, "phase": args.phase, "apply": args.apply}
-
     if args.apply:
         if backup.exists() and not args.resume:
             raise RepairStop(f"backup {backup} exists; pick another --release or pass --resume")
@@ -1130,61 +1164,69 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
         allowed = in_window_change_allowed
         report["window_earlier_ok"] = str(precheck.path)
         report["window_earlier_ok_sha256"] = precheck.sha256
-    inputs = load_inputs(backup if args.apply and args.resume else live, args, universe)
-    plan = make_plan(inputs)
-    report.update(_plan_report(inputs, plan, args))
-    if not args.apply:
-        return report
-    if inputs.stored_without_stamp:
-        raise RepairStop(
-            f"{len(inputs.stored_without_stamp)} stored accession(s) have no record in their "
-            f"CIK's stamps file: {'; '.join(inputs.stored_without_stamp[:20])}"
-        )
-    if report["step2_over_limit"]:
-        raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
-    if report["requests_over_limit"]:
-        raise RepairStop(
-            f"the request floor ({report['requests_floor']}) exceeds --max-requests "
-            f"{args.max_requests}"
-        )
-    _refuse_window(plan.step1.values(), inputs.window_start, allowed)
-    if precheck is not None:
-        _refuse_instants(plan.step1.values(), precheck)
-    if not args.resume:
-        need = _dir_bytes(live)
-        free = shutil.disk_usage(live).free
-        if free < need * _FREE_SPACE_MARGIN:
-            raise RepairStop(f"disk has {free} bytes free, the backup needs {need} plus 10%")
-        partial = backup.with_name(f".{backup.name}.partial")
-        if partial.exists():
-            shutil.rmtree(partial)  # an earlier copy that never finished
-        shutil.copytree(live, partial)
-        partial.rename(backup)  # the backup name exists only once the copy is whole
-    journal = Journal(
-        _sidecar(manifest, ".requests.csv"), fetch or sgml_fetch(), cap=args.max_requests
+    return Release(
+        stamps_dir(args.cache_dir),
+        backup,
+        manifest_path(args.cache_dir, args.release),
+        precheck,
+        allowed,
     )
-    outcome = execute(inputs, plan, journal)
-    _refuse_window(outcome.rows.values(), inputs.window_start, allowed)
-    if precheck is not None:
-        _refuse_instants(outcome.rows.values(), precheck)
+
+
+def _make_backup(release: Release, args: argparse.Namespace) -> None:
+    """Copy the live stamps directory to the release's backup, unless
+    resuming; refuses without disk room."""
+    if args.resume:
+        return
+    live, backup = release.live, release.backup
+    need = _dir_bytes(live)
+    free = shutil.disk_usage(live).free
+    if free < need * _FREE_SPACE_MARGIN:
+        raise RepairStop(f"disk has {free} bytes free, the backup needs {need} plus 10%")
+    partial = backup.with_name(f".{backup.name}.partial")
+    if partial.exists():
+        shutil.rmtree(partial)  # an earlier copy that never finished
+    shutil.copytree(live, partial)
+    partial.rename(backup)  # the backup name exists only once the copy is whole
+
+
+def _journal(release: Release, args: argparse.Namespace, fetch: Fetch | None) -> Journal:
+    return Journal(
+        _sidecar(release.manifest, ".requests.csv"), fetch or sgml_fetch(), cap=args.max_requests
+    )
+
+
+def _write_release(
+    release: Release,
+    args: argparse.Namespace,
+    files: Mapping[str, StampsFile],
+    outcome: Outcome,
+    report: dict[str, Any],
+) -> None:
+    """The window and read-instant refusals, then the stamps files, the
+    manifest and its sidecars."""
+    _refuse_window(outcome.rows.values(), args.window_start, release.allowed)
+    if release.precheck is not None:
+        _refuse_instants(outcome.rows.values(), release.precheck)
         # A long run may pass New York midnight: the file must still be the
         # run's day when the moves are written (amendment (d), staleness).
         load_precheck(
-            precheck.path,
+            release.precheck.path,
             release=args.release,
             window_start=args.window_start,
             now=datetime.now(UTC),
         )
 
+    live, manifest = release.live, release.manifest
     changes: dict[str, dict[str, datetime]] = defaultdict(dict)
     for (cik, accession), row in outcome.rows.items():
         if row.changed:
             changes[cik][accession] = row.new_stamp
-    new_files = {cik: rewrite_file(inputs.files[cik], c) for cik, c in changes.items()}
+    new_files = {cik: rewrite_file(files[cik], c) for cik, c in changes.items()}
     moved = [
         cik
         for cik in sorted(new_files)
-        if _read_or_none(live / f"{cik}.json") not in (inputs.files[cik].raw, new_files[cik])
+        if _read_or_none(live / f"{cik}.json") not in (files[cik].raw, new_files[cik])
     ]
     if moved:
         raise RepairStop(
@@ -1205,6 +1247,180 @@ def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
     )
     report.update(outcome.counts, files_rewritten=len(new_files), manifest=str(manifest))
     report["sgml_error_list"] = outcome.sgml_errors
+
+
+def run(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
+    """The ``run`` subcommand; returns the JSON report."""
+    report: dict[str, Any] = {"release": args.release, "phase": args.phase, "apply": args.apply}
+    universe = load_cik_list(args.universe_ciks) if args.universe_ciks else set()
+    if args.phase != "all" and not universe:
+        raise RepairStop(f"--phase {args.phase} needs --universe-ciks")
+    release = _open_release(args, report)
+    inputs = load_inputs(
+        release.backup if args.apply and args.resume else release.live, args, universe
+    )
+    plan = make_plan(inputs)
+    report.update(_plan_report(inputs, plan, args))
+    if not args.apply:
+        return report
+    if inputs.stored_without_stamp:
+        raise RepairStop(
+            f"{len(inputs.stored_without_stamp)} stored accession(s) have no record in their "
+            f"CIK's stamps file: {'; '.join(inputs.stored_without_stamp[:20])}"
+        )
+    if report["step2_over_limit"]:
+        raise RepairStop(f"step 2 needs more than {args.max_step2_requests} requests")
+    if report["requests_over_limit"]:
+        raise RepairStop(
+            f"the request floor ({report['requests_floor']}) exceeds --max-requests "
+            f"{args.max_requests}"
+        )
+    _refuse_window(plan.step1.values(), inputs.window_start, release.allowed)
+    if release.precheck is not None:
+        _refuse_instants(plan.step1.values(), release.precheck)
+    _make_backup(release, args)
+    outcome = execute(inputs, plan, _journal(release, args, fetch))
+    _write_release(release, args, inputs.files, outcome, report)
+    return report
+
+
+# --- restamp-unrepaired (#1553) ---------------------------------------------
+
+
+def load_unrepaired(path: Path) -> list[ManifestRow]:
+    """The rows of an earlier release's ``<manifest>.unrepaired.csv.gz`` (or
+    a plain CSV), every one of method ``unrepaired``; `RepairStop` on any
+    other file (a manifest given by mistake)."""
+    try:
+        raw = path.read_bytes()
+        text = (gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw).decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text))
+        missing = [c for c in MANIFEST_COLUMNS if c not in (reader.fieldnames or ())]
+        if missing:
+            raise ValueError(f"lacks column(s) {', '.join(missing)}")
+        rows = [ManifestRow.from_record(r) for r in reader]
+    except (OSError, ValueError, EOFError, KeyError, TypeError) as exc:
+        raise RepairStop(f"--from {path}: not an unrepaired list: {exc}") from exc
+    other = sorted({r.method for r in rows} - {"unrepaired"})
+    if other:
+        raise RepairStop(
+            f"--from {path}: rows of method {', '.join(other)}; not an unrepaired list"
+        )
+    return rows
+
+
+@dataclass
+class UnrepairedPlan:
+    """``restamp-unrepaired``'s inputs and requests, before any request."""
+
+    files: dict[str, StampsFile]
+    keys: list[Key]
+    missing: list[ManifestRow]
+    stamp_differs: int
+
+    def report(self, window_start: date) -> dict[str, Any]:
+        """The dry run's counts; ``requests`` is the most the run makes."""
+        dated = [
+            f"{c} {a}"
+            for c, a in self.keys
+            if (st := self.files[c].stamps[a]) is not None and _ny_date(st) >= window_start
+        ]
+        return {
+            "listed": len(self.keys) + len(self.missing),
+            "listed_ciks": len({c for c, _ in self.keys} | {r.cik for r in self.missing}),
+            "requests": len(self.keys),
+            "requests_floor": len(self.keys),
+            "listed_without_stamp": len(self.missing),
+            "stamp_differs_from_list": self.stamp_differs,
+            "listed_in_window": len(dated),
+            "listed_in_window_list": dated,
+        }
+
+
+def plan_unrepaired(source: Path, listed: Sequence[ManifestRow]) -> UnrepairedPlan:
+    """Read the listed CIKs' stamps files from ``source``. A listed record
+    re-reads from the stamp its file holds now; one with no stamped record
+    there is kept as unrepaired."""
+    files: dict[str, StampsFile] = {}
+    for cik in sorted({r.cik for r in listed}):
+        parsed = read_stamps_file(source / f"{cik}.json") if _CIK.match(cik) else None
+        if parsed is not None:
+            files[cik] = parsed
+    keys: list[Key] = []
+    missing: list[ManifestRow] = []
+    differs = 0
+    seen: set[Key] = set()
+    for row in sorted(listed, key=lambda r: (r.cik, r.accession)):
+        key = (row.cik, row.accession)
+        if key in seen:
+            continue
+        seen.add(key)
+        stamp = files[row.cik].stamps.get(row.accession) if row.cik in files else None
+        if stamp is None:
+            missing.append(row)
+            continue
+        differs += stamp != row.old_stamp
+        keys.append(key)
+    return UnrepairedPlan(files, keys, missing, differs)
+
+
+def execute_unrepaired(plan: UnrepairedPlan, journal: Journal) -> Outcome:
+    """Each listed record through step 4's per-filing path; a header with no
+    acceptance (pre-2003) or that does not read keeps its stamp and is listed
+    again with its reason."""
+    rows: dict[Key, ManifestRow] = {}
+    errors: dict[Key, str] = {}
+    journal.budget(plan.keys, "restamp-unrepaired")
+    for key in plan.keys:
+        restamp_filing(plan.files, journal, rows, errors, key, "unrepaired list, filing by filing")
+    unrepaired = [
+        ManifestRow(r.cik, r.accession, r.old_stamp, r.old_stamp, "unrepaired", "no stamped record")
+        for r in plan.missing
+    ]
+    for cik, accession in sorted(errors):
+        stamp = plan.files[cik].stamps[accession]
+        assert stamp is not None
+        why = f"SGML gave no stamp: {errors[(cik, accession)]}"
+        unrepaired.append(ManifestRow(cik, accession, stamp, stamp, "unrepaired", why))
+    unrepaired.sort(key=lambda r: (r.cik, r.accession))
+    method_counts: dict[str, int] = defaultdict(int)
+    for row in rows.values():
+        method_counts[row.method] += 1
+    counts = {
+        "sgml": method_counts["sgml"],
+        "kept": method_counts["kept"],
+        "unrepaired": len(unrepaired),
+        "unrepaired_ciks": len({r.cik for r in unrepaired}),
+        "sgml_errors": len(errors),
+        "requests_made": journal.requests,
+        "requests_release": journal.lines,
+    }
+    listed = [f"{c} {a}: {e}" for (c, a), e in sorted(errors.items())]
+    return Outcome(rows, unrepaired, sorted({r.cik for r in unrepaired}), counts, listed)
+
+
+def run_unrepaired(args: argparse.Namespace, fetch: Fetch | None = None) -> dict[str, Any]:
+    """The ``restamp-unrepaired`` subcommand (#1553): every record of an
+    earlier release's unrepaired list takes its own SGML acceptance; returns
+    the JSON report. Dry run unless ``--apply``."""
+    report: dict[str, Any] = {
+        "release": args.release,
+        "mode": "restamp-unrepaired",
+        "from": str(args.source),
+        "apply": args.apply,
+    }
+    release = _open_release(args, report)
+    listed = load_unrepaired(args.source)
+    plan = plan_unrepaired(release.backup if args.apply and args.resume else release.live, listed)
+    report.update(plan.report(args.window_start))
+    report["requests_over_limit"] = len(plan.keys) > args.max_requests
+    if not args.apply:
+        return report
+    if report["requests_over_limit"]:
+        raise RepairStop(f"the {len(plan.keys)} requests exceed --max-requests {args.max_requests}")
+    _make_backup(release, args)
+    outcome = execute_unrepaired(plan, _journal(release, args, fetch))
+    _write_release(release, args, plan.files, outcome, report)
     return report
 
 
@@ -1236,6 +1452,17 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
     r.add_argument("--apply", action="store_true")
     r.add_argument("--resume", action="store_true")
+    u = sub.add_parser(
+        "restamp-unrepaired",
+        help="re-stamp an unrepaired list from SGML, filing by filing (dry run unless --apply)",
+    )
+    u.add_argument("--from", dest="source", type=Path, required=True, metavar="UNREPAIRED_CSV")
+    u.add_argument("--window-start", type=_date, required=True)
+    u.add_argument("--release", required=True)
+    u.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
+    u.add_argument("--window-earlier-ok", type=Path, default=None, metavar="PRECHECK_JSON")
+    u.add_argument("--apply", action="store_true")
+    u.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -1251,7 +1478,8 @@ def main(argv: Sequence[str] | None = None, *, fetch: Fetch | None = None) -> in
             n = export_bulk_written(args.cache_dir, args.out, day=args.day)
             print(json.dumps({"exported": n, "out": str(args.out)}))
             return 0
-        print(json.dumps(run(args, fetch), indent=2, sort_keys=True))
+        command = run_unrepaired if args.command == "restamp-unrepaired" else run
+        print(json.dumps(command(args, fetch), indent=2, sort_keys=True))
     except RepairStop as stop:
         print(f"repair_stamps: stopped: {stop}", file=sys.stderr)
         return 1
