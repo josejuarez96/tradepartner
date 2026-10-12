@@ -1374,8 +1374,6 @@ def test_no_rule_reads_the_universe_sic_key(fixture_store: duckdb.DuckDBPyConnec
             "universe": settings.universe.model_copy(update={"exclude_sic_ranges": ((4900, 4999),)})
         }
     )
-    from tradepartner.health import INTEGRITY_RULES
-
     assert "guarded_sic_default" not in INTEGRITY_RULES
     assert health_report(fixture_store, T_END, named).ok
 

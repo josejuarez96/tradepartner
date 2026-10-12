@@ -198,6 +198,40 @@ def test_utility_sic_is_admitted_under_the_default(
     assert "sector" not in u.exclusions["rule_name"].to_list()
 
 
+def test_a_rebalance_on_a_stored_utility_exclusion_still_excludes_the_name(
+    fixture_store: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """ADR 0006 amendment (#1540), property 1: a registration storing [[4900, 4999]]
+    loads under the live default `()` and the rebalance still drops SIC 4911."""
+    from tradepartner.backtest import hypothesis
+
+    _insert_utility_sic(fixture_store)
+    fixture = Path(__file__).parent / "fixtures" / "hypotheses" / "fixture-momentum.md"
+    stored = _settings(exclude_sic_ranges=[[4900, 4999]])
+    parsed = hypothesis.parse_file(fixture)
+    from tradepartner.store import registry
+
+    registry.register_hypothesis(
+        fixture_store,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=fixture.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=hypothesis.frozen_params(parsed, stored),
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=stored,
+    )
+    live = _settings()
+    assert live.universe.exclude_sic_ranges == ()
+    loaded = hypothesis.load_frozen(fixture_store, parsed.slug, settings=live)
+    u = universe_as_of(fixture_store, T_SPLIT_BETWEEN, loaded)
+    assert _excluded(u)["SEC_SPLIT_BETWEEN"] == (3, "sector", "sic:4911")
+
+
 def test_liquidity_rule_off_is_skipped_and_recorded(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
