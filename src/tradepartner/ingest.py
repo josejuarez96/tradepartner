@@ -936,6 +936,8 @@ def _source_counts(filings: FilingSource) -> str:
         ("fsn_reissue_undetected", "FSN re-issues unchecked"),
         ("fsn_incomplete_listings", "FSN incomplete listings"),
         ("cover_incomplete_listings", "cover incomplete listings"),  # #612: per-document
+        ("fsn_exchange_axis_mismatch", "FSN exchange-axis mismatches"),  # #1541
+        ("cover_exchange_axis_mismatch", "cover exchange-axis mismatches"),
         ("fsn_missing", "FSN missing"),  # T11d: older cover-form accessions not in FSN
         ("pre_xml_delistings", "pre-XML delistings"),
         ("unstamped_delistings", "unstamped delistings"),  # T11f

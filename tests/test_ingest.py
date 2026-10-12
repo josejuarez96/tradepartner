@@ -524,6 +524,24 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     assert counts in message
 
 
+def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: Settings) -> None:
+    """#1541 (T178): listings whose exchange-axis member names another venue
+    than their value are kept and counted on the run row, FSN and per
+    document, beside the incomplete listings."""
+
+    class Mismatched(FixtureFilingSource):
+        cover_incomplete_listings = 6
+        fsn_exchange_axis_mismatch = 7
+        cover_exchange_axis_mismatch = 8
+
+    message = _run(settings, filings=_filings(cls=Mismatched), source="edgar").runs[0].message
+    counts = (
+        "; cover incomplete listings: 6; FSN exchange-axis mismatches: 7; "
+        "cover exchange-axis mismatches: 8; missing"
+    )
+    assert counts in message
+
+
 def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settings) -> None:
     """T11f: a Form 25/25-NSE skipped pre-fetch (not XML)."""
 
