@@ -1703,7 +1703,11 @@ def _session_holes(
     if not found:
         return pl.DataFrame([], schema=_SESSION_HOLE_SCHEMA)
     counts = {day: int(n) for day, n in found}
-    first, latest = min(counts), max(counts)
+    # The store's own first bar known at `t`, read on its own: the window's
+    # bound would move `first` past empty sessions at the window's start.
+    stored = conn.execute("SELECT min(session) FROM prices_daily WHERE known_at <= ?", [t])
+    first = (stored.fetchone() or (min(counts),))[0]
+    latest = max(counts)
     share = settings.health.min_session_rows_share
     holes: list[dict[str, Any]] = []
     for day in window:

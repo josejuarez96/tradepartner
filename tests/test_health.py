@@ -26,7 +26,9 @@ from tradepartner.calendar import (
     all_sessions,
     last_completed_session,
     last_session_of_month,
+    previous_session,
     session_close,
+    sessions_in_month_window,
 )
 from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
@@ -786,6 +788,50 @@ def test_a_session_after_the_latest_stored_one_is_staleness_not_a_hole(
     assert SESSION_HOLES not in report.failures
     assert _holes(report).passed
     assert report.coverage.missing, "coverage, not the hole rule, reports the tail"
+
+
+def test_an_empty_first_session_of_the_window_is_a_hole_when_older_bars_exist(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """The window's own first session and the one before it both empty, with
+    older bars in the store: the first session is a hole (universe rule 6
+    over the same window fails every name), not "before the store's first
+    bar"."""
+    window = sessions_in_month_window(
+        last_completed_session(T_END), settings.universe.min_history_months
+    )
+    first, before = window[0], previous_session(window[0])
+    assert _rows_on(fixture_store, first) > 0 and _rows_on(fixture_store, before) > 0
+    fixture_store.execute("DELETE FROM prices_daily WHERE session IN (?, ?)", [first, before])
+    report = health_report(fixture_store, T_END, settings)
+    assert report.failures == (SESSION_HOLES,)
+    assert _holes(report).violations.to_dicts() == [
+        {"session": first, "rows": 0, "previous_session": before, "previous_rows": 0}
+    ]
+
+
+def test_bars_known_after_t_do_not_fill_a_hole_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """No look-ahead: a session whose bars a later backfill stored after `t`
+    was a hole at `t`, so `health` at `t` reports it."""
+    later = T_END + timedelta(days=30)
+    fixture_store.execute(
+        "UPDATE prices_daily SET known_at = ?, ingested_at = ? WHERE session = ?",
+        [later, later, HOLE_SESSION],
+    )
+    assert _rows_on(fixture_store, HOLE_SESSION) == BARS_PER_SESSION
+    report = health_report(fixture_store, T_END, settings)
+    assert report.failures == (SESSION_HOLES,)
+    assert _holes(report).violations.to_dicts() == [
+        {
+            "session": HOLE_SESSION,
+            "rows": 0,
+            "previous_session": BEFORE_HOLE_SESSION,
+            "previous_rows": BARS_PER_SESSION,
+        }
+    ]
+    assert health_report(fixture_store, later, settings).failures == ()
 
 
 def test_the_hole_window_comes_from_universe_min_history_months(
