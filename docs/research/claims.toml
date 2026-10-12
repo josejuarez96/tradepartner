@@ -2894,11 +2894,11 @@ note = "Why health never saw it: every check compared the store with itself. The
 
 [[claim]]
 id = "TP-4"
-statement = "First Republic Bank, Signature Bank and Cadence Bank filed their periodic reports with the FDIC or the Federal Reserve, not EDGAR: the store has no securities row for any of them (First Republic's CIK 0001132979 has none; the only Cadence row is the old holding company, Cadence Bancorporation, 0001614184), so two of the three 2023 bank failures are outside the universe on every session; SVB Financial Group (0000719739) is in the store with bars through 2023-03-09 and its 25-NSE row."
+statement = "The store has no securities row for First Republic Bank (its CIK 0001132979 has none), Signature Bank or Cadence Bank (the only Cadence row is the old holding company, Cadence Bancorporation, 0001614184), so no listing, bars or delisting for any of them: two of the three large 2023 bank failures, Signature and First Republic, are outside the universe on every session, while SVB Financial Group (0000719739), a holding company and SEC filer, is in the store with bars through 2023-03-09 and its 25-NSE row; Cadence Bank did not fail and is a hole in coverage of a surviving name."
 kind = "fact"
 grade = "UNGRADED"
-scope = "Read-only on the store copy taken before restamp-1382a, 2026-10-11; EDGAR cannot fill it, only a vendor or a hand seed"
-source = "docs/hypotheses/h1-momentum-12-1.md"
-section = "Known data holes (disclosure, 2026-10-11, #1541)"
+scope = "Read-only on the store copy taken before restamp-1382a, 2026-10-11; that bank-level registrants file under Exchange Act section 12(i) with their banking regulator rather than EDGAR is outside knowledge of the rule, not store evidence; how many universe-sized banks the class covers was not counted"
+source = "docs/research/2026-10-11-h1-known-data-holes.md"
+section = "Bank-level registrants are absent"
 bears_on = ["hyp:h1-momentum-12-1", "spec:data-foundation"]
-note = "Recorded as a known survivorship hole in H1's write-up (#1541 item 5); no pipeline. Qualifies HO-17 from the other side: the free EDGAR route also misses a class of delisted names, the bank-level registrants."
+note = "Recorded as a known hole in H1's write-up (#1541 item 5); no pipeline. The absence of the two failed names can only flatter a long-only book, by an unmeasured amount. Qualifies HO-17 from the other side: the free EDGAR route also misses a class of names, the bank-level registrants."
