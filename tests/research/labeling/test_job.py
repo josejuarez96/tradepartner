@@ -611,6 +611,10 @@ def test_a_gold_split_sends_both_packets_of_every_item_b_before_a(world: World) 
     labels = {lid: r["selected_option"] for lid, r in job.jev_label_record(records).items()}
     assert labels == {"D00": MERGER, "D01": BANKRUPTCY, "D02": UNRESOLVED}
     assert world.result(result.run_id)["primary_value"] == pytest.approx(1.0)
+    # #1534 item 1: the $40 is spent by Jev alone, so the anthropic vendor sum is zero
+    sums = job.spend_sums(job.spend_records(world.settings), NOW)
+    assert sums.vendor_spend(job.ANTHROPIC_VENDOR).cumulative_usd == 0.0
+    assert sums.cumulative_usd == pytest.approx(len(client.requests) * 1000 * 0.042 / 1_000_000)
 
 
 def test_a_frame_batch_keeps_c2s_cascade_after_a_resolved_b(world: World) -> None:
@@ -641,15 +645,19 @@ def test_a_frame_batch_keeps_c2s_cascade_after_a_resolved_b(world: World) -> Non
     ]
 
 
-def test_the_extra_a_call_is_spend_checked_and_recorded_before_the_stop(world: World) -> None:
-    """The extra A call of the gold-split call set is spend-checked like every Jev
-    call: it is written, and the mid-batch stop fires after the record that crosses."""
+def test_the_extra_a_call_is_spend_checked_and_refused_at_the_cap(world: World) -> None:
+    """#1534 item 5: the extra A call of the gold-split call set is spend-checked like
+    every Jev call, in its own name: the cap is set so B fits and A would exceed, so
+    the run stops at the A call -- `failed`, `spend ceiling` -- with B's record
+    written and the A packet never sent."""
     gold_id = world.gold(_dev(2, eightk=True), _pilot(1))
-    # 15,000 tokens a call at $0.042/M is $0.00063; the second record crosses $0.001.
+    # 15,000 tokens a call at $0.042/M bills $0.00063, so B's record alone sits under
+    # $0.00065 while B's bill plus A's estimate ($0.00066) crosses it; the pre-batch
+    # guard over the two first packets (about $0.00006) still opens the run.
     tight = world.settings.model_copy(
         update={
             "research": world.settings.research.model_copy(
-                update={"spend_ceiling_usd_total": 0.001, "spend_ceiling_usd_month": 0.001}
+                update={"spend_ceiling_usd_total": 0.00065, "spend_ceiling_usd_month": 0.00065}
             )
         }
     )
@@ -657,12 +665,9 @@ def test_the_extra_a_call_is_spend_checked_and_recorded_before_the_stop(world: W
     result = world.run(client, gold_id, "dev", settings=tight)
     assert (result.outcome, result.message) == ("failed", "spend ceiling")
     records = _records(tight, result.run_id)
-    assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [
-        ("D00", "B"),
-        ("D00", "A"),
-    ]
-    assert len(client.requests) == 2
-    assert sum(r["cost_usd"] for r in records) > 0.001
+    assert [(r["listing_end_id"], r["passage_kind"]) for r in records] == [("D00", "B")]
+    assert len(client.requests) == 1  # the A packet was never sent
+    assert world.result(result.run_id)["message"] == "spend ceiling"
 
 
 def test_every_record_carries_c8s_fields(world: World) -> None:
