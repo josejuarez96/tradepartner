@@ -3353,3 +3353,69 @@ def test_the_classification_rebuild_needs_the_edgar_source(
     with pytest.raises(ValueError, match="rebuild_classifications needs the edgar source"):
         _run(settings, source="alpaca", rebuild_classifications=True)
     assert read(_CLASS_SQL) == stored
+
+
+def _plant_classification(settings: Settings, security_id: str, at: datetime) -> None:
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "classifications",
+            {
+                "security_id": security_id,
+                "sic": None,
+                "security_type": "common",
+                "rule": "common_default",
+                "known_at": at,
+                "ingested_at": at,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+
+
+def test_the_rebuild_keeps_a_stored_security_the_build_does_not_derive(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """An owner-kept successor (#922) is a stored security of a covered CIK
+    that the build no longer derives: nothing would write its rows back."""
+    assert _run(settings, source="edgar").ok
+    at = datetime(2019, 1, 2, tzinfo=UTC)
+    successor = f"{ACME}@2018-01-01"
+    with open_for_write(settings) as conn:
+        insert_row(conn, "securities", {**_security("Old Acme", at, at), "security_id": successor})
+    _plant_classification(settings, successor, at)
+    assert _run(settings, source="edgar", rebuild_classifications=True).ok
+    assert read(f"SELECT count(*) FROM classifications WHERE security_id = '{successor}'") == [(1,)]
+
+
+class _QuarantinedAcme(FixtureFilingSource):
+    """A fixture source that reports ACME's filings as quarantined this run."""
+
+    def __init__(self, base: FixtureFilingSource) -> None:
+        super().__init__(
+            index=base._index,
+            snapshot=base._snapshot,
+            facts=base._facts,
+            headers=base._headers,
+            cover_pages=base._cover_pages,
+            delistings=base._delistings,
+        )
+        self._quarantined_this_run = {e.accession for e in base._index if e.cik == ACME}
+
+
+def test_the_rebuild_holds_a_cik_whose_filings_failed_this_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    assert _run(settings, source="edgar").ok
+    _stale_acme_row(settings, _acme_first_known(read))
+    stored = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
+    assert stored
+    result = _run(
+        settings,
+        filings=_QuarantinedAcme(_filings()),
+        source="edgar",
+        rebuild_classifications=True,
+    )
+    assert result.ok
+    after = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
+    assert all(row in after for row in stored)  # nothing deleted; the plain add may add

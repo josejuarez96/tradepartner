@@ -148,12 +148,13 @@ by `security_id` alone and a re-derive only ever adds a row at the run
 (`_add_rows`, "Filed rows"), so a changed rule reaches no read before the
 run. `rebuild_classifications` (CLI `ingest --source edgar
 --rebuild-classifications`) first deletes every `classifications` row of
-the securities the build covers (the build's own ids and every stored
-security of a covered CIK), in the EDGAR chunk's transaction, then writes
+the securities the build derives (a stored security it no longer derives,
+an owner-kept successor, and a CIK held for a refused restamp or failed
+filings keep their rows), in the EDGAR chunk's transaction, then writes
 the build's rows as they stand: each at the `known_at` the classification
-first became knowable (`store.classify` timing), never the run. A CIK the
-restamp refused keeps its stored rows. A dry run rolls it back. The count
-goes into the run message as `classifications_deleted: N`.
+first became knowable (`store.classify` timing), never the run. A dry
+run rolls it back. The count goes into the run message as
+`classifications_deleted: N`.
 """
 
 from __future__ import annotations
@@ -822,7 +823,7 @@ def _ingest_filings(
         skipped = frozenset()
     rebuilt = ""
     if rebuild_classifications:
-        deleted = _delete_classifications(conn, master, skipped)
+        deleted = _delete_classifications(conn, master, skipped, _unjudged_ciks(recorded).ciks)
         rebuilt = f"; classifications_deleted: {deleted}"
     added = 0
     for table, rows in (
@@ -874,20 +875,24 @@ def _ingest_filings(
 
 
 def _delete_classifications(
-    conn: duckdb.DuckDBPyConnection, master: MasterBuild, skipped: Container[str]
+    conn: duckdb.DuckDBPyConnection,
+    master: MasterBuild,
+    skipped: Container[str],
+    unjudged: Container[str],
 ) -> int:
-    """Delete the `classifications` rows of every security the build covers:
-    the build's own ids and every stored security of a CIK it derives, less
-    `skipped` (a restamp-refused CIK keeps its rows). Returns the count."""
-    held = {row["cik"] for row in master.securities if row["security_id"] in skipped}
-    ciks = sorted({row["cik"] for row in master.securities} - held)
-    stored = conn.execute(
-        "SELECT security_id FROM securities WHERE list_contains(?, cik)", [ciks]
-    ).fetchall()
-    ids = sorted(
-        {row["security_id"] for row in master.securities if row["cik"] not in held}
-        | {security_id for (security_id,) in stored}
-    )
+    """Delete the `classifications` rows of the securities the build derives,
+    less those of a CIK it cannot rewrite whole: one a restamp refused
+    (`skipped`) or one whose filings failed this run (`unjudged`, #859's
+    hold). A stored security the build no longer derives (an owner-kept
+    successor, #922) keeps its rows: nothing would write them back."""
+    held = {
+        row["cik"]
+        for row in master.securities
+        if row["security_id"] in skipped or row["cik"] in unjudged
+    }
+    ids = sorted({r["security_id"] for r in master.securities if r["cik"] not in held})
+    if not ids:
+        return 0
     deleted = conn.execute(
         "DELETE FROM classifications WHERE list_contains(?, security_id)", [ids]
     ).fetchone()
