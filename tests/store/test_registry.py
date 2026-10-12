@@ -1117,7 +1117,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
     def assert_classified() -> None:
         facts = set(schema.TABLE_NAMES) - {"ingestion_runs", "schema_version"}
         included = set(registry._TRIAL_FACT_TABLES)
-        excluded = {"rates"}
+        excluded = {"rates", "borrow_status"}  # borrow_status: #1506, T171
         assert included.isdisjoint(excluded)
         assert facts == included | excluded
 
