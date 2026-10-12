@@ -68,6 +68,7 @@ import dataclasses
 import fcntl
 import io
 import json
+import math
 import random
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -117,6 +118,7 @@ from tradepartner.research.models import (
     ModelUnreachable,
     build_client,
     check_model_id,
+    claude_call_cost_usd,
     claude_estimate_usd,
 )
 from tradepartner.store.research import (
@@ -146,8 +148,18 @@ REDACTED: Final = "[redacted]"
 #: item 3). A record that carries no `arm` (one written before that build) is Jev's.
 JEV_ARM: Final = "jev"
 CLAUDE_ARM: Final = "claude"
+#: T175's scoring slot for the Claude Code arm (#1534); billed to Anthropic too.
+CLAUDE_CODE_ARM: Final = "claude_code"
 TYPESAFE_VENDOR: Final = "typesafe"
 ANTHROPIC_VENDOR: Final = "anthropic"
+#: Each arm's vendor. A record's `vendor` is derived from its `arm`, never defaulted,
+#: so no record's spend can land under the wrong vendor's ceiling or under none.
+ARM_VENDORS: Final[Mapping[str, str]] = {
+    JEV_ARM: TYPESAFE_VENDOR,
+    CLAUDE_ARM: ANTHROPIC_VENDOR,
+    CLAUDE_CODE_ARM: ANTHROPIC_VENDOR,
+}
+VENDORS: Final = frozenset(ARM_VENDORS.values())
 
 SPEND_CEILING: Final = "spend ceiling"
 MODEL_ID_MISMATCH: Final = "model id mismatch"
@@ -203,10 +215,14 @@ class SpendSums:
     month: tuple[int, int]
     vendors: Mapping[str, VendorSpend] = field(default_factory=dict)
 
-    def plus(self, cost_usd: float, known_at: datetime, vendor: str = TYPESAFE_VENDOR) -> SpendSums:
-        """These sums with one more record of `cost_usd` known at `known_at`. A record
-        in a later month starts that month's sum (a batch that runs past midnight at
-        a month's end); a record in an earlier month adds to the total only."""
+    def plus(self, cost_usd: float, known_at: datetime, *, vendor: str) -> SpendSums:
+        """These sums with one more record of `cost_usd` known at `known_at`, billed by
+        `vendor` (required: no default vendor). A record in a later month starts that
+        month's sum (a batch that runs past midnight at a month's end); a record in an
+        earlier month adds to the total only. Raises `ValueError` for an unknown vendor
+        or a cost that is not finite or is negative."""
+        _require_vendor(vendor)
+        _require_cost(cost_usd)
         month = _month(known_at)
         later = month > self.month
         if later:
@@ -240,10 +256,59 @@ def _arm_of(record: Mapping[str, Any]) -> str:
     return value if isinstance(value, str) and value else JEV_ARM
 
 
+def vendor_of_arm(arm: str) -> str:
+    """The vendor that bills `arm` (`ARM_VENDORS`); raises `ValueError` for an unknown
+    arm."""
+    vendor = ARM_VENDORS.get(arm)
+    if vendor is None:
+        raise ValueError(f"unknown arm {arm!r}")
+    return vendor
+
+
+def _require_vendor(vendor: str) -> None:
+    if vendor not in VENDORS:
+        raise ValueError(f"unknown vendor {vendor!r}")
+
+
+def _require_cost(cost: float) -> None:
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError(f"cost_usd {cost!r} is not a finite non-negative number")
+
+
 def _vendor_of(record: Mapping[str, Any]) -> str:
-    """A record's vendor: its `vendor`, or the typesafe vendor when it carries none."""
-    value = record.get("vendor")
-    return value if isinstance(value, str) and value else TYPESAFE_VENDOR
+    """A record's vendor, checked against its arm: a record with no `vendor` takes its
+    arm's, and one with neither field is Jev's (typesafe), as records written before
+    spec item 3 are. Raises `UnexpectedInferenceFile` for an unknown arm, an unknown
+    vendor (case matters) or a vendor that is not its arm's."""
+    arm = record.get("arm", JEV_ARM)
+    expected = ARM_VENDORS.get(arm) if isinstance(arm, str) else None
+    if expected is None:
+        raise UnexpectedInferenceFile(f"{UNEXPECTED_FILE}: a record has unknown arm {arm!r}")
+    if "vendor" not in record:
+        return expected
+    vendor = record["vendor"]
+    if not isinstance(vendor, str) or vendor not in VENDORS:
+        raise UnexpectedInferenceFile(f"{UNEXPECTED_FILE}: a record has unknown vendor {vendor!r}")
+    if vendor != expected:
+        raise UnexpectedInferenceFile(
+            f"{UNEXPECTED_FILE}: a record's vendor {vendor!r} is not arm {arm!r}'s"
+        )
+    return str(vendor)
+
+
+def _cost_of(record: Mapping[str, Any]) -> float:
+    """A record's `cost_usd`; raises `UnexpectedInferenceFile` for one that is not a
+    finite non-negative number (a NaN would make every ceiling comparison false)."""
+    cost = record.get("cost_usd")
+    if not isinstance(cost, int | float) or isinstance(cost, bool):
+        raise UnexpectedInferenceFile(f"{UNEXPECTED_FILE}: a record has cost_usd {cost!r}")
+    try:
+        _require_cost(float(cost))
+    except ValueError:
+        raise UnexpectedInferenceFile(
+            f"{UNEXPECTED_FILE}: a record has cost_usd {cost!r}"
+        ) from None
+    return float(cost)
 
 
 def _month(value: datetime) -> tuple[int, int]:
@@ -272,7 +337,12 @@ def spend_records(settings: Settings) -> list[dict[str, Any]]:
                 _known_at(record.get("known_at"))
             except ValueError:
                 cost = None
-            if not isinstance(cost, int | float) or isinstance(cost, bool) or cost < 0:
+            if (
+                not isinstance(cost, int | float)
+                or isinstance(cost, bool)
+                or not math.isfinite(cost)
+                or cost < 0
+            ):
                 raise UnexpectedInferenceFile(
                     f"{UNEXPECTED_FILE}: {path.name} line {number} has no readable "
                     "cost_usd and known_at"
@@ -283,12 +353,14 @@ def spend_records(settings: Settings) -> list[dict[str, Any]]:
 
 def spend_sums(records: Iterable[Mapping[str, Any]], now: datetime) -> SpendSums:
     """Cumulative and month-to-date (the UTC month of `now`) spend over `records`,
-    both vendors together and split by `vendor` (spec item 4)."""
+    both vendors together and split by `vendor` (spec item 4). Raises
+    `UnexpectedInferenceFile` for a record whose `cost_usd` is not a finite
+    non-negative number, or whose vendor `_vendor_of` refuses."""
     month = _month(now)
     total = mtd = 0.0
     vendors: dict[str, VendorSpend] = {}
     for record in records:
-        cost = float(record["cost_usd"])
+        cost = _cost_of(record)
         in_month = _month(_known_at(record["known_at"])) == month
         total += cost
         mtd += cost if in_month else 0.0
@@ -301,9 +373,8 @@ def spend_sums(records: Iterable[Mapping[str, Any]], now: datetime) -> SpendSums
     return SpendSums(total, mtd, month, vendors)
 
 
-def _check_sums(
-    sums: SpendSums, estimate_usd: float, settings: Settings, vendor: str = TYPESAFE_VENDOR
-) -> None:
+def _check_sums(sums: SpendSums, estimate_usd: float, settings: Settings, *, vendor: str) -> None:
+    _require_vendor(vendor)
     research = settings.research
     if (
         sums.cumulative_usd + estimate_usd > research.spend_ceiling_usd_total
@@ -321,17 +392,18 @@ def spend_check(
     estimate_usd: float,
     settings: Settings,
     *,
-    vendor: str = TYPESAFE_VENDOR,
+    vendor: str,
     now: datetime | None = None,
 ) -> SpendSums:
     """Refuse (`SpendRefused`, `spend ceiling: <estimate>`) when cumulative spend over
     `records` plus `estimate_usd` exceeds `research.spend_ceiling_usd_total`, or the
     month-to-date spend plus it exceeds `research.spend_ceiling_usd_month` (C4); for an
     `anthropic` call also when the anthropic sum plus it exceeds
-    `research.claude.spend_ceiling_usd_total` (spec item 4). Returns the sums it
+    `research.claude.spend_ceiling_usd_total` (spec item 4). `vendor` is the call's
+    (required: no default vendor; `ValueError` for an unknown one). Returns the sums it
     checked."""
     sums = spend_sums(records, now or datetime.now(UTC))
-    _check_sums(sums, estimate_usd, settings, vendor)
+    _check_sums(sums, estimate_usd, settings, vendor=vendor)
     return sums
 
 
@@ -364,19 +436,20 @@ def record_cost(
     price: float,
     *,
     claude: ResearchClaudeConfig | None = None,
+    request: ModelRequest | None = None,
 ) -> float:
-    """A record's `cost_usd` (C8); with `claude`, the Claude arm's (spec item 3). Jev:
-    the returned input tokens at the price snapshot; a timeout (sent, maybe billed) or
-    a 200 whose body lacks the usage (billed) keeps its estimate; any other refusal
-    with no usage costs nothing. Claude: the returned input and output tokens at its two
-    prices, and a record with no returned usage keeps its full worst-case estimate."""
+    """A record's `cost_usd` (C8); with `claude` (and the call's `request`, required
+    with it), the Claude arm's (spec item 3). Jev: the returned input tokens at the
+    price snapshot; a timeout (sent, maybe billed) or a 200 whose body lacks the usage
+    (billed) keeps its estimate; any other refusal with no usage costs nothing.
+    Claude: `models.claude_call_cost_usd`, which charges the returned input and output
+    tokens at its two prices and, with no returned usage, recomputes the full
+    worst-case estimate itself (`estimate` is not used, so a Jev estimate passed in
+    cannot under-charge it)."""
     if claude is not None:
-        if response.input_tokens is None or response.output_tokens is None:
-            return estimate
-        return (
-            response.input_tokens * claude.price_usd_per_million_input_tokens
-            + response.output_tokens * claude.price_usd_per_million_output_tokens
-        ) / 1_000_000
+        if request is None:
+            raise ValueError("a Claude record's cost needs the call's request")
+        return claude_call_cost_usd(request, response, claude)
     if response.input_tokens is not None:
         return response.input_tokens * price / 1_000_000
     return estimate if response.reason == "timeout" or response.http_status == 200 else 0.0
@@ -406,13 +479,13 @@ def build_record(
     cost_usd: float,
     settings: Settings,
     arm: str = JEV_ARM,
-    vendor: str = TYPESAFE_VENDOR,
     price_snapshot_output: float | None = None,
 ) -> dict[str, Any]:
-    """C8's per-call record for one finished call, with the arm's `arm` and `vendor`
-    and `price_snapshot_output` (null for Jev, whose output is free; spec item 3). A
-    timeout's `selected_option` is `unresolved` (req 6 step 4); every other unanswered
-    call's is null."""
+    """C8's per-call record for one finished call, with its `arm`, the `vendor` derived
+    from it (`ARM_VENDORS`; `ValueError` for an unknown arm) and `price_snapshot_output`
+    (null for Jev, whose output is free; spec item 3). A timeout's `selected_option` is
+    `unresolved` (req 6 step 4); every other unanswered call's is null."""
+    vendor = vendor_of_arm(arm)
     if response.known_at.tzinfo is None:
         raise ValueError("a model response's known_at must be tz-aware")
     selected = UNRESOLVED if response.reason == "timeout" else response.selected_option
@@ -785,7 +858,7 @@ class _Caller:
             settings=self.settings,
         )
         datafiles.append_jsonl(self.records_path, [record])
-        self.sums = self.sums.plus(cost, response.known_at)
+        self.sums = self.sums.plus(cost, response.known_at, vendor=record["vendor"])
 
     def close(self) -> None:
         """Close the client's connection pool, if it has one."""
@@ -799,7 +872,7 @@ class _Caller:
         request = model_request(packet, self.model, self.option_set)
         estimate = estimate_usd(request, self.settings.research.labeling)
         try:
-            _check_sums(self.sums, estimate, self.settings)
+            _check_sums(self.sums, estimate, self.settings, vendor=TYPESAFE_VENDOR)
         except SpendRefused:
             raise _Stop(SPEND_CEILING) from None
         self.pacer.wait()
@@ -1193,7 +1266,7 @@ def _start_caller(
     estimate = _packets_estimate(packets, option_set, labeling)
     try:
         records = spend_records(settings)
-        sums = spend_check(records, estimate, settings, now=now)
+        sums = spend_check(records, estimate, settings, vendor=TYPESAFE_VENDOR, now=now)
     except (SpendRefused, UnexpectedInferenceFile) as exc:
         raise _Stop(str(exc)) from None
     return _Caller(
