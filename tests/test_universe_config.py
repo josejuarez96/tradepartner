@@ -10,8 +10,8 @@ SEC_SPLIT_BETWEEN's 17.70 close and SEC_DUAL_B's 27.08).
 
 Overrides go through both routes a caller has: an explicit `Settings`
 (the per-trial route, #102) and `UNIVERSE__*` environment variables read by
-`get_settings()` when `settings` is omitted. `exclude_sic_ranges` is
-guarded (ADR 0006): every override is refused.
+`get_settings()` when `settings` is omitted. `exclude_sic_ranges` defaults to
+none and takes any well-formed range (ADR 0006 amendment 2026-10-11, #1540).
 """
 
 from __future__ import annotations
@@ -42,8 +42,6 @@ SHARES_MOVE = (
 #: Default members at T_LATE: SEC_DUAL_A/B (one company, rank 1, NYSE),
 #: SEC_SPLIT_BETWEEN (rank 2, NYSE).
 DEFAULT_MEMBERS = {"SEC_DUAL_A", "SEC_DUAL_B", "SEC_SPLIT_BETWEEN"}
-
-GUARDED_KEYS = {"exclude_sic_ranges"}
 
 
 @dataclass(frozen=True)
@@ -76,6 +74,12 @@ CASES = [
         removed={sid: (2, "exchange:NYSE") for sid in DEFAULT_MEMBERS},
     ),
     # 17.70 < 20 <= 27.08, 56.66.
+    # Rule 3 (ADR 0006 amendment 2026-10-11): default none; a named range removes.
+    Case(
+        "exclude_sic_ranges",
+        [[7300, 7399]],
+        removed={sid: (3, "sic:7372") for sid in DEFAULT_MEMBERS},
+    ),
     Case("min_price", 20, removed={"SEC_SPLIT_BETWEEN": (4, "min_price")}),
     # SEC_DUAL_A's last-session dollar volume (~6.1M) is below 20M, its
     # 20-session median (~55M) above; the other members clear 20M either way.
@@ -177,7 +181,7 @@ HEALTH_ONLY_KEYS = {"accepted_same_day_pairs"}
 
 
 def test_every_universe_key_has_an_override_case() -> None:
-    covered = {case.key for case in CASES} | GUARDED_KEYS | HEALTH_ONLY_KEYS
+    covered = {case.key for case in CASES} | HEALTH_ONLY_KEYS
     assert covered == set(UniverseConfig.model_fields)
 
 
@@ -234,16 +238,20 @@ def test_universe_as_of_without_settings_reads_the_environment(
     _assert_case(before, after, case)
 
 
-@pytest.mark.parametrize("value", [[], [[4900, 4949]], [[4900, 4999], [6000, 6099]]])
-def test_guarded_sic_ranges_refuse_every_override(value: list[list[int]]) -> None:
-    with pytest.raises(ValidationError, match="guarded"):
-        _settings(exclude_sic_ranges=value)
+@pytest.mark.parametrize(
+    "value", [[[4900, 4999]], [[4900, 4949]], [[4900, 4999], [6000, 6099]], [[1, 2]]]
+)
+def test_sic_ranges_accept_every_well_formed_override(value: list[list[int]]) -> None:
+    got = _settings(exclude_sic_ranges=value).universe.exclude_sic_ranges
+    assert got == tuple(tuple(r) for r in value)
 
 
 @pytest.mark.usefixtures("_no_env")
-def test_guarded_sic_ranges_refuse_an_environment_carve_out(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_sic_ranges_accept_an_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UNIVERSE__EXCLUDE_SIC_RANGES", "[[4900, 4949]]")
-    with pytest.raises(ValidationError, match="guarded"):
-        get_settings()
+    assert get_settings().universe.exclude_sic_ranges == ((4900, 4949),)
+
+
+def test_sic_ranges_refuse_a_reversed_range() -> None:
+    with pytest.raises(ValidationError, match="start > end"):
+        _settings(exclude_sic_ranges=[[2, 1]])

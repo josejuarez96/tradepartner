@@ -13,8 +13,10 @@ reported once, under the first rule it fails:
    `transferred` up to its end session; a `delisted` listing (a Form 25
    known at `t`) is out from the filing's `known_at`, even while bars
    continue, so nothing enters a name on its way out.
-3. `sector`: the classification's SIC is outside every guarded
-   `universe.exclude_sic_ranges` range. A missing SIC passes.
+3. `sector`: the classification's SIC is outside every
+   `universe.exclude_sic_ranges` range. A missing SIC passes. A per-hypothesis
+   choice, default none (ADR 0006 amendment 2026-10-11, #1540): under the
+   default no row carries this reason.
 4. `price`: the raw close at the session is at least `universe.min_price`
    (spec "Level rules": raw close, never adjusted). A name with no bar at
    the session passes here and fails rule 6, so the gap report counts it

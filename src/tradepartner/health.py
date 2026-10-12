@@ -208,9 +208,6 @@ derived at `t`, as the data is read.
   `master.transfer_window_sessions` of `effective_on`, the same grace a
   genuine resumption gets. Zero rows hit this on the 2026-10-04 backfilled
   store.
-- `guarded_sic_default`: `universe.exclude_sic_ranges` equals the charter
-  value (ADR 0006). `Settings` refuses any other value, so this fails only on
-  settings built around the guard.
 - `underived_master_rows` (#859): the stored `securities` and `listings` rows
   the latest master check finished by `t` (an EDGAR ingest chunk or a
   `master-retract --apply`) found the current rules no longer derive, and
@@ -272,7 +269,6 @@ from tradepartner.calendar import (
     session_close,
 )
 from tradepartner.config import (
-    _GUARDED_EXCLUDE_SIC_RANGES,
     ReferenceName,
     Settings,
     get_settings,
@@ -319,7 +315,6 @@ BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
 NO_BARS_AFTER_DELISTING = "no_bars_after_delisting"
-GUARDED_SIC_DEFAULT = "guarded_sic_default"
 UNDERIVED_MASTER_ROWS = "underived_master_rows"
 STATEMENT_PERIOD_DAYS = "statement_period_days"
 STATEMENT_DERIVED_MATCHES_COMPONENTS = "statement_derived_matches_components"
@@ -342,7 +337,6 @@ INTEGRITY_RULES: tuple[str, ...] = (
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
     NO_BARS_AFTER_DELISTING,
-    GUARDED_SIC_DEFAULT,
     UNDERIVED_MASTER_ROWS,
     STATEMENT_PERIOD_DAYS,
     STATEMENT_DERIVED_MATCHES_COMPONENTS,
@@ -389,7 +383,6 @@ _AFTER_DELISTING_SCHEMA: dict[str, Any] = {
     "exchange": pl.Utf8,
     "effective_on": pl.Date,
 }
-_GUARD_SCHEMA: dict[str, Any] = {"setting": pl.Utf8, "value": pl.Utf8, "expected": pl.Utf8}
 _STATEMENT_PERIOD_SCHEMA: dict[str, Any] = {
     "cik": pl.Utf8,
     "fact_name": pl.Utf8,
@@ -1572,7 +1565,6 @@ def _integrity_checks(
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,
         NO_BARS_AFTER_DELISTING: _bars_after_delisting(conn, t, listings, window),
-        GUARDED_SIC_DEFAULT: _guarded_sic(settings),
         UNDERIVED_MASTER_ROWS: underived_as_of(conn, t),
         STATEMENT_PERIOD_DAYS: _statement_period_days(conn),
         STATEMENT_DERIVED_MATCHES_COMPONENTS: _statement_derived_matches_components(conn),
@@ -1896,20 +1888,6 @@ def _bars_after_delisting(
         )
     ]
     return pl.DataFrame(rows, schema=_AFTER_DELISTING_SCHEMA).sort("security_id", "session")
-
-
-def _guarded_sic(settings: Settings) -> pl.DataFrame:
-    actual = tuple(tuple(r) for r in settings.universe.exclude_sic_ranges)
-    rows: list[dict[str, Any]] = []
-    if actual != _GUARDED_EXCLUDE_SIC_RANGES:
-        rows.append(
-            {
-                "setting": "universe.exclude_sic_ranges",
-                "value": repr(actual),
-                "expected": repr(_GUARDED_EXCLUDE_SIC_RANGES),
-            }
-        )
-    return pl.DataFrame(rows, schema=_GUARD_SCHEMA)
 
 
 def _statement_period_days(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
