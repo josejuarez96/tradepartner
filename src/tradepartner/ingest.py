@@ -403,7 +403,9 @@ def ingest_rates(
             state.fetched = rates.observations(series, window, window)
             state.missing = rates.missing_values
             state.latest_returned = max(
-                state.fetched, key=lambda row: row.observation_date, default=None
+                state.fetched,
+                key=lambda row: (row.observation_date, row.vintage_date),
+                default=None,
             )
 
         def write(
@@ -433,9 +435,9 @@ def ingest_rates(
                 "ORDER BY observation_date, known_at",
                 [series],
             ).fetchall()
-            known = {(day, stamp) for day, _, stamp in stored_rows}
+            known_values = {(day, stamp): value for day, value, stamp in stored_rows}
             latest_values = {day: value for day, value, _ in stored_rows}
-            added = revisions = future = late = 0
+            added = revisions = future = late = collisions = 0
             state.through = max((day for day, _, _ in stored_rows), default=None)
             for record in state.fetched:
                 stamp = rate_known_at(record.vintage_date)
@@ -443,7 +445,11 @@ def ingest_rates(
                     future += 1
                     continue
                 key = (record.observation_date, stamp)
-                if key in known or latest_values.get(record.observation_date) == record.value:
+                if key in known_values:
+                    if known_values[key] != record.value:
+                        collisions += 1
+                    continue
+                if latest_values.get(record.observation_date) == record.value:
                     continue
                 if record.observation_date in latest_values:
                     revisions += 1
@@ -466,7 +472,7 @@ def ingest_rates(
                         "provenance": "release",
                     },
                 )
-                known.add(key)
+                known_values[key] = record.value
                 latest_values[record.observation_date] = record.value
                 state.through = max(
                     state.through or record.observation_date, record.observation_date
@@ -475,6 +481,7 @@ def ingest_rates(
             message = (
                 f"series={series}; rates_revisions={revisions}; rates_not_yet_known={future}; "
                 f"rates_missing_values={state.missing}; rates_late_rows={late}; "
+                f"rates_colliding_vintages={collisions}; "
                 f"latest_observation={state.latest_returned.observation_date}; "
                 f"latest_vintage={state.latest_returned.vintage_date}; stale_sessions={lag}"
             )
@@ -499,6 +506,18 @@ def ingest_rates(
         if run.status != OK:
             break
     return IngestResult(tuple(runs))
+
+
+def rates_seeded(settings: Settings) -> bool:
+    """Whether every configured series has a stored observation for daily ingest."""
+    if not Path(settings.store.path).exists():
+        return False
+    with _read(settings) as conn:
+        try:
+            rows = conn.execute("SELECT DISTINCT series FROM rates").fetchall()
+        except duckdb.CatalogException:
+            return False
+    return set(settings.rates.series) <= {str(row[0]) for row in rows}
 
 
 def ingest_session(
@@ -603,7 +622,12 @@ def ingest_session(
         runs.append(run)
         if run.status != OK:
             break
-    if source == "all" and rates is not None and all(run.status == OK for run in runs):
+    if (
+        source == "all"
+        and rates is not None
+        and all(run.status == OK for run in runs)
+        and rates_seeded(settings)
+    ):
         runs.extend(ingest_rates(settings, rates, clock=clock, dry_run=dry_run).runs)
     return IngestResult(tuple(runs))
 

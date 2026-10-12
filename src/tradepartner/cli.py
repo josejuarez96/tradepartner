@@ -404,6 +404,7 @@ from tradepartner.ingest import (
     ingest_rates,
     ingest_session,
     manifest_release,
+    rates_seeded,
     read_manifest,
 )
 from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
@@ -540,7 +541,7 @@ def _missing_secrets(settings: Settings, source: str) -> list[str]:
             missing.append("ALPACA_API_KEY")
         if _blank(settings.alpaca_api_secret):
             missing.append("ALPACA_API_SECRET")
-    if source in ("all", "fred") and _blank(settings.fred_api_key):
+    if source == "fred" and _blank(settings.fred_api_key):
         missing.append("FRED_API_KEY")
     return missing
 
@@ -1733,6 +1734,16 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
+        all_rates: RateSource | None = None
+        if source == "all":
+            if _blank(s.fred_api_key):
+                typer.echo("fred skipped: set FRED_API_KEY to enable rate ingest")
+            elif start is None and not rates_seeded(s):
+                typer.echo(
+                    "fred skipped: run ingest --source fred --backfill --since YYYY-MM-DD first"
+                )
+            else:
+                all_rates = rate_source(s)
         if source == "fred":
             result = ingest_rates(s, rate_source(s), since=start, clock=clock, dry_run=dry_run)
             _print_result(result)
@@ -1757,15 +1768,15 @@ def make_app(
             result = backfill(
                 s, prices=prices, filings=filings, since=start, source=source, clock=clock
             )
-            if source == "all" and result.ok:
-                fred = ingest_rates(s, rate_source(s), since=start, clock=clock)
+            if source == "all" and result.ok and all_rates is not None:
+                fred = ingest_rates(s, all_rates, since=start, clock=clock)
                 result = IngestResult(result.runs + fred.runs)
         else:
             result = ingest_session(
                 s,
                 prices=prices,
                 filings=filings,
-                rates=rate_source(s) if source == "all" else None,
+                rates=all_rates,
                 source=source,
                 clock=clock,
                 dry_run=dry_run,

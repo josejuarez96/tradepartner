@@ -111,6 +111,55 @@ def test_fred_cli_backfill_uses_injected_source(tmp_path: Path) -> None:
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (1,)
 
 
+def test_all_with_blank_fred_key_runs_legacy_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unset FRED key cannot stop the scheduled price ingest."""
+    settings = _settings(
+        tmp_path,
+        sec_edgar_user_agent=USER_AGENT,
+        alpaca_api_key="test-key-id",
+        alpaca_api_secret="test-key-secret",
+    )
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    result = _invoke(settings, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert session.calls and session.calls[0]["rates"] is None
+    assert "FRED_API_KEY" in result.output
+
+
+def test_all_without_seeded_rate_runs_legacy_sources(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """An unseeded rate series asks for backfill without failing all."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    result = _invoke(secrets_set, ["ingest"])
+    assert result.exit_code == 0, result.output
+    assert session.calls and session.calls[0]["rates"] is None
+    assert "--source fred --backfill" in result.output
+
+
+def test_all_backfill_appends_fred_run(
+    monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
+) -> None:
+    """The all-source backfill routes the configured FRED series too."""
+    legacy = _patched(monkeypatch, "backfill", _ok("edgar", "alpaca"))
+    rates = FixtureRateSource([RateObservation("DTB3", date(2020, 6, 29), 0.1, date(2020, 6, 30))])
+    result = _invoke(
+        secrets_set,
+        ["ingest", "--backfill", "--since", "2020-06-29"],
+        rate_source=lambda _settings: rates,
+        clock=lambda: datetime(2020, 7, 3, 22, tzinfo=UTC),
+    )
+    assert result.exit_code == 0, result.output
+    assert legacy.calls
+    assert "fred" in result.output
+    with duckdb.connect(str(secrets_set.store.path), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE source='fred'"
+        ).fetchone() == (1,)
+
+
 class _Recorder:
     """Stands in for `ingest_session`/`backfill`, recording its arguments."""
 
