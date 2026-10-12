@@ -583,6 +583,13 @@ class AlpacaConfig(BaseModel):
     gaps between one company's share-count filings are 91 days at the median, 124 at the
     90th and 168 at the 99th percentile, so 180 marks a missed filing.
 
+    `max_catchup_sessions`: how many XNYS sessions a daily ingest run may fetch that the
+    store lacks before its expected session (#1572, from #1550), so a day a failed run
+    left out is caught up by the next one instead of leaving a hole that empties the
+    universe. Over it the run fails and names the `--backfill --since` command that
+    clears the hole, which is the right tool for a lapse of more than a couple of days;
+    `0` catches nothing up, so any missed session fails the run.
+
     Frozen and closed (T47, safety-reviewer): the `paper` guard below runs at
     construction, so an attribute assignment after the fact must be impossible too, and a
     misspelt broker fact (`quantity_decimals`) must fail rather than stay unset silently.
@@ -621,6 +628,13 @@ class AlpacaConfig(BaseModel):
     # claim 2b, S1). `alpaca_raw.daily_bars` caps a SIP request's end at now minus this;
     # 0 turns the cap off (a paid SIP subscription).
     sip_delay_minutes: int = Field(default=15, ge=0)
+    #: #1572 (from #1550): how many XNYS sessions a daily ingest run may fetch that the
+    #: store lacks before its expected session, so a day a failed run left out is caught
+    #: up by the next one instead of leaving a `prices_daily` hole that empties the
+    #: universe. Over it the daily run fails and names the `--backfill --since` command
+    #: that clears the hole, which is the right tool for a longer lapse; `0` catches
+    #: nothing up, so any missed session fails the run.
+    max_catchup_sessions: int = Field(default=5, ge=0)
     #: Security ids (`<cik>`, `<cik>:<class>` or a #820 successor `<cik>@<day>`)
     #: the owner accepted as genuine long-gap relistings (#943: MiMedx, Nasdaq
     #: 2019-03 to OTC to Nasdaq 2020-11): `ListingResolver` does not apply rule 7's

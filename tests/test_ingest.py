@@ -11,7 +11,8 @@ import json
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Iterator, Sequence
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -46,6 +47,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
     bar_known_at,
 )
+from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings, secret_values
 from tradepartner.health import filing_event_counts, statement_counts
 from tradepartner.ingest import (
@@ -93,6 +95,8 @@ DUAL = "0000000002"  # Class A and Class B, NASDAQ
 SPY_TRUST = "0000884394"
 DUAL_B = f"{DUAL}:class-b-common-stock"
 SPY = "BENCH:SPY"
+#: Every security id the daily price run fetches.
+IDS = (ACME, DUAL, DUAL_B, SPY)
 
 SESSION = date(2019, 6, 28)  # a Friday
 NOW = datetime(2019, 6, 29, 2, 0, tzinfo=UTC)  # Friday 22:00 ET, after close + settle
@@ -184,8 +188,9 @@ class _Prices(PriceSource):
             raise RuntimeError("bars endpoint down")
         c = self.close
         return [
-            Bar(sid, start, c, c + 1, c - 1, c, 1_000_000, bar_known_at(start), "alpaca")
+            Bar(sid, day, c, c + 1, c - 1, c, 1_000_000, bar_known_at(day), "alpaca")
             for sid in sorted(security_ids)
+            for day in _sessions(start, end)
             if sid not in self.missing
         ]
 
@@ -1769,6 +1774,23 @@ def _bar(sid: str, session: date, ingested_at: datetime) -> dict[str, Any]:
     }
 
 
+def _sessions(first: date, last: date) -> list[date]:
+    """The XNYS sessions in `[first, last]`: the calendar, never weekdays."""
+    sessions = all_sessions()
+    return list(sessions[bisect_left(sessions, first) : bisect_right(sessions, last)])
+
+
+def _seed_prices(
+    settings: Settings, sessions: Sequence[date], ids: Iterable[str], at: datetime
+) -> None:
+    """A hole-free store (#1572): one `_bar` per `ids` name per session of
+    `sessions`, so a daily run for a later session has nothing to catch up."""
+    with open_for_write(settings) as conn:
+        for day in sessions:
+            for sid in ids:
+                insert_row(conn, "prices_daily", _bar(sid, day, at))
+
+
 def test_may_count_reads_bars_ingested_by_t_and_always_the_benchmarks(
     settings: Settings,
 ) -> None:
@@ -1805,13 +1827,21 @@ def _march_then_june(
     dark: frozenset[str] = frozenset({ACME}),
     bars: Sequence[dict[str, Any]] = (),
 ) -> SourceRun:
-    """Every name gets a bar at 2019-03-05; at 06-20 every name but `dark`
-    does (a loose run); the store gets `bars`; then the 06-28 run (previous
-    session never ingested, so every miss would count) fetches with
-    `prices`. A name in `dark` is 75 sessions dark at the reference
-    symbol's last bar (06-20). Returns the 06-28 price run."""
+    """Every name gets a bar at 2019-03-05; the sessions to 06-19 are seeded
+    for the names that keep trading (a name in `dark` goes dark at 03-05), so
+    the store is hole-free where #1572's catch-up requires it, and a name in
+    `dark` is 75 sessions dark at the reference symbol's last bar (06-20, the
+    06-20 run's own). The store gets `bars`; then the 06-28 run (previous
+    session never ingested, so every miss would count) fetches with `prices`,
+    catching up the un-ingested 06-21..06-27. Returns the 06-28 price run."""
     filings = _filings(fetched_at=MARCH_FILINGS)
     assert _run(settings, now=MARCH, filings=filings).ok
+    _seed_prices(
+        settings,
+        _sessions(date(2019, 3, 6), date(2019, 6, 19)),
+        [sid for sid in IDS if sid not in dark],
+        NOW,
+    )
     loose = _missing_share(settings, 0.5)
     assert _run(loose, _Prices(missing=set(dark)), now=JUNE_20, filings=filings).ok
     if bars:
@@ -1846,8 +1876,12 @@ def test_the_stale_listing_key_comes_from_gap_config(settings: Settings) -> None
 def test_a_lapse_in_ingests_makes_no_name_stale(settings: Settings) -> None:
     # Every name, the reference included, last traded 03-05: dark is counted
     # up to the reference's last bar, so ACME's miss at 06-28 still counts.
+    # #1572: the store is hole-free to 06-26 (the run catches up 06-27), so
+    # the reference's last bar stays 03-05 and the anchor is old, exactly the
+    # lapse this rule is blind to.
     filings = _filings(fetched_at=MARCH_FILINGS)
     assert _run(settings, now=MARCH, filings=filings).ok
+    _seed_prices(settings, _sessions(date(2019, 3, 6), date(2019, 6, 26)), {DUAL, DUAL_B}, NOW)
     run = _run(settings, _Prices(missing={ACME}), filings=filings).runs[-1]
     assert run.status == STALE and ACME in run.message
     assert STALE_LISTINGS not in run.message
@@ -1880,10 +1914,16 @@ def test_a_stale_listing_beside_a_dark_name_leaves_the_dark_denominator(
 ) -> None:
     # 06-27: DUB has no bar. 06-28: ACME (stale) and DUB (dark) have none.
     # The dark share is 1 of 3 (ACME on neither side), and ACME is not dark.
+    # #1572: the store is seeded hole-free through 06-26 for the names that
+    # keep trading, so each run has nothing to catch up and only the session
+    # it runs for is fetched.
     filings = _filings(fetched_at=MARCH_FILINGS)
     loose = _missing_share(settings, 0.5)
+    trading = [sid for sid in IDS if sid not in {ACME, DUAL_B}]
     assert _run(settings, now=MARCH, filings=filings).ok
+    _seed_prices(settings, _sessions(date(2019, 3, 6), date(2019, 6, 19)), trading, NOW)
     assert _run(loose, _Prices(missing={ACME}), now=JUNE_20, filings=filings).ok
+    _seed_prices(settings, _sessions(date(2019, 6, 21), date(2019, 6, 26)), trading, NOW)
     both = {ACME, DUAL_B}
     assert _run(loose, _Prices(missing=both), now=PREVIOUS, filings=filings).ok
     run = _run(_dark_limited(settings, 0.3), _Prices(missing=both), filings=filings).runs[-1]

@@ -40,6 +40,32 @@ message with its own count and left out of both shares and both sides
 (#1234); never a benchmark or the reference symbol. The backfill does not
 apply it.
 
+**Catch-up** (#1572, from #1550). A successful daily run leaves
+`prices_daily` holding every XNYS session from the store's first stored
+bar through the run's expected session, so a session a failed run left
+out (2026-10-08, the SIP 15-minute cap) is fetched by the next one
+instead of leaving a hole that empties the universe (#1550). Before its
+fetch the price side reads the store's stored sessions
+(`_missed_sessions`) and asks for every one it lacks, in contiguous runs,
+each session's bars stamped `bar_known_at` as every other bar is (no
+look-ahead) and each request still bounded by `alpaca_raw`'s 15-minute SIP
+window. The calendar, never weekdays, decides what a session is
+(`calendar.all_sessions`). A store missing more than
+`alpaca.max_catchup_sessions` sessions is a lapse this path must not paper
+over: the run is `_Stale`, names the missing sessions and the
+`ingest --source alpaca --backfill --since <first missed session>` command
+that clears them, and writes only its run row. So does a caught-up
+session that comes back thin: without the reference symbol's bar, or
+with more than `ingest.max_missing_share` of the names counted at the
+expected session (and holding a bar there) missing, since a thin session
+would count as stored and never be fetched again. A name delisted inside
+the gap is fetched for the missed sessions (its last bars), never for
+the expected one. The run message names how many sessions it caught up
+(`catch-up:`), so an operator can see the state of the hole in every run
+row. The dark and stale-listing checks stay at the expected session; a
+caught-up session's remaining per-name holes are the backfill's
+`--fill-holes`, not this path's.
+
 **Idempotent.** Builders and sources return full views; a row is written
 only if it changes what an as-of read returns:
 
@@ -164,6 +190,7 @@ import re
 import time
 import traceback
 import uuid
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
@@ -195,7 +222,9 @@ from tradepartner.adapters.stamp_repair import (
     in_window_change_allowed,
 )
 from tradepartner.calendar import (
+    all_sessions,
     last_completed_session,
+    next_session,
     previous_session,
 )
 from tradepartner.config import Settings, clean_message
@@ -2062,8 +2091,8 @@ def fact_rows(
 class _PriceFetch:
     """The daily price chunk's fetch pass, ready to write."""
 
-    session: date
     bars: tuple[Bar, ...]
+    runs: tuple[tuple[date, date], ...]
     actions: tuple[CorporateAction, ...]
     action_window: tuple[date, date]
     covered: tuple[date, date]
@@ -2089,6 +2118,8 @@ def _fetch_prices(
     static_only: set[str] = set()
     may_count: set[str] | None = None
     read_at = now
+    missed: list[date] = []
+    gap_only: set[str] = set()
     if Path(settings.store.path).exists():
         with _price_read(settings) as conn:
             # Read the store as of now, after the EDGAR chunk committed (its snapshot
@@ -2097,13 +2128,29 @@ def _fetch_prices(
             fetch, listed, static_only, may_count, reference = _price_names(
                 conn, read_at, session, settings
             )
+            missed = _missed_sessions(conn, settings, session)
+            if missed:
+                # #1572: a name delisted inside the gap is fetched for the missed
+                # sessions it still traded on (its last bars), never for `session`.
+                gap_only = _price_names(conn, read_at, missed[0], settings)[0] - fetch
     if reference is None:
         raise LookupError(f"reference symbol {symbol} has no live listing at {session}")
     ids = sorted(fetch)
-    bars = [bar for bar in prices.bars(ids, session, session) if bar.session == session]
-    action_window = (session.replace(day=1), session)
-    actions = prices.corporate_actions(ids, *action_window)
-    have = {bar.security_id for bar in bars}
+    every = sorted(fetch | gap_only)
+    # #1572: every session the run must leave stored, in contiguous runs, so one
+    # request asks for exactly the sessions it fetches and never a span of them.
+    runs = _fetch_runs([*missed, session])
+    bars: list[Bar] = []
+    for first, last in runs:
+        bars += [
+            bar
+            for bar in prices.bars(every if first < session else ids, first, last)
+            if first <= bar.session <= last
+            and not (bar.session == session and bar.security_id in gap_only)
+        ]
+    action_window = (runs[0][0].replace(day=1), session)
+    actions = prices.corporate_actions(every, *action_window)
+    have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
         stale_ids = _stale_listed(conn, read_at, session, listed - have, reference, settings)
@@ -2121,15 +2168,113 @@ def _fetch_prices(
         )
     if stale := _dark_stale(listed, reported, settings, f"for {session}"):
         raise _Stale(stale)
+    _check_caught_up(bars, missed, reference, set(counted) & have, limit)
     message = (
-        f"{len(bars)} bars and {len(actions)} actions for {len(ids)} names; "
-        f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}"
+        f"{len(bars)} bars and {len(actions)} actions for {len(every)} names; "
+        f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
+        f"{_catchup_note(missed)}"
     )
     if resolution := prices.resolution_summary():
         message += f"; {resolution}"
     return _PriceFetch(
-        session, tuple(bars), tuple(actions), action_window, covered, ingested_at, message
+        tuple(bars),
+        tuple(runs),
+        tuple(actions),
+        action_window,
+        covered,
+        ingested_at,
+        message,
     )
+
+
+def _check_caught_up(
+    bars: Sequence[Bar], missed: Sequence[date], reference: str, base: set[str], limit: float
+) -> None:
+    """Raise `_Stale` unless every `missed` session came back whole (#1572):
+    the reference symbol's bar, and no more than `limit` (`ingest.max_missing_share`)
+    of `base` (the counted names with a bar at the expected session) without
+    one. A thin caught-up session would count as stored and never be fetched
+    again, so the run fails naming it and the command that clears it."""
+    held: dict[date, set[str]] = defaultdict(set)
+    for bar in bars:
+        held[bar.session].add(bar.security_id)
+    thin = [
+        day
+        for day in missed
+        if reference not in held[day] or (base and len(base - held[day]) / len(base) > limit)
+    ]
+    if thin:
+        raise _Stale(
+            f"the missed sessions {', '.join(day.isoformat() for day in thin)} came back "
+            f"without the reference bar or over the {limit:.1%} missing share; run "
+            f"tradepartner ingest --source alpaca --backfill --since {thin[0].isoformat()}"
+        )
+
+
+def _stored_sessions(conn: duckdb.DuckDBPyConnection, session: date) -> set[date]:
+    """The `prices_daily` sessions at or before `session` holding a bar of any
+    security (#1572)."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT session FROM prices_daily WHERE session <= ?", [session]
+        ).fetchall()
+    }
+
+
+def _missed_sessions(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, session: date
+) -> list[date]:
+    """The XNYS sessions after the store's first stored bar and before
+    `session` that the store lacks, oldest first (#1572): what a daily run
+    must leave stored to report `ok`. Empty on a store with no prices at
+    all and on one complete through the previous session. The expected
+    session is not here: every run fetches it.
+
+    More than `alpaca.max_catchup_sessions` of them is a lapse this path
+    must not paper over: `_Stale` names them and the `--backfill --since`
+    command that clears them (`backfill.backfill`)."""
+    stored = _stored_sessions(conn, session)
+    if not stored:
+        return []
+    sessions = all_sessions()
+    span = sessions[bisect_right(sessions, min(stored)) : bisect_left(sessions, session)]
+    missed = [day for day in span if day not in stored]
+    bound = settings.alpaca.max_catchup_sessions
+    if len(missed) > bound:
+        raise _Stale(
+            f"{len(missed)} XNYS sessions from {missed[0].isoformat()} to "
+            f"{missed[-1].isoformat()} have no bar, over the {bound}-session catch-up "
+            f"bound (alpaca.max_catchup_sessions): "
+            f"{', '.join(day.isoformat() for day in missed[:10])}"
+            f"{f' and {len(missed) - 10} more' if len(missed) > 10 else ''}; "
+            f"run tradepartner ingest --source alpaca --backfill --since "
+            f"{missed[0].isoformat()}"
+        )
+    return missed
+
+
+def _fetch_runs(targets: Sequence[date]) -> list[tuple[date, date]]:
+    """`targets` (distinct XNYS sessions, ascending) as its contiguous runs:
+    one request per run asks for exactly the sessions it must leave stored
+    (#1572), never a span over stored ones."""
+    runs: list[tuple[date, date]] = []
+    for day in targets:
+        if runs and day == next_session(runs[-1][1]):
+            runs[-1] = (runs[-1][0], day)
+        else:
+            runs.append((day, day))
+    return runs
+
+
+def _catchup_note(missed: Sequence[date]) -> str:
+    """The run message's catch-up clause (#1572): the sessions this run
+    fetched that the store lacked, or that there were none, so the state of
+    the store's session coverage is visible in every run row."""
+    if not missed:
+        return "catch-up: none"
+    count = f"{len(missed)} session" if len(missed) == 1 else f"{len(missed)} sessions"
+    return f"catch-up: {count} ({', '.join(day.isoformat() for day in missed)})"
 
 
 @contextmanager
@@ -2148,16 +2293,18 @@ def _price_read(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
 
 def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tuple[int, str]:
     """The price chunk's write: the fetched bars and actions, nothing fetched."""
-    at, session = fetched.ingested_at, fetched.session
-    added = _add_rows(
-        conn,
-        "prices_daily",
-        [_bar_row(bar, at) for bar in fetched.bars],
-        ingested_at=at,
-        current=True,
-        where="AND session BETWEEN ? AND ?",
-        params=[session, session],
-    )
+    at = fetched.ingested_at
+    added = 0
+    for first, last in fetched.runs:
+        added += _add_rows(
+            conn,
+            "prices_daily",
+            [_bar_row(bar, at) for bar in fetched.bars if first <= bar.session <= last],
+            ingested_at=at,
+            current=True,
+            where="AND session BETWEEN ? AND ?",
+            params=[first, last],
+        )
     added += _add_actions(
         conn, fetched.actions, fetched.action_window, ingested_at=at, covered=fetched.covered
     )
