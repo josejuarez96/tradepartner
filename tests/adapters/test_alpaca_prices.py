@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -39,6 +40,7 @@ from tradepartner.adapters.prices import (
     announcement_date_known_at,
     bar_known_at,
 )
+from tradepartner.calendar import is_session, next_session
 from tradepartner.config import AlpacaConfig, Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
@@ -49,14 +51,29 @@ def _json(name: str) -> Any:
 
 
 def _listing(
-    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+    security_id: str,
+    ticker: str,
+    valid_from: date,
+    class_title: str | None = None,
+    provenance: str | None = None,
 ) -> dict[str, object]:
-    return {
+    row = {
         "security_id": security_id,
         "ticker": ticker,
         "valid_from": valid_from,
         "class_title": class_title,
     }
+    if provenance is not None:  # #1597: a listing read from a filing's own names
+        row["provenance"] = provenance
+    return row
+
+
+def _filing_name(
+    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+) -> dict[str, object]:
+    """A `listings` row read from a filing's own file names (#1597: a 10-K's
+    XBRL instance prefix, a Nasdaq Form 25's exhibit ticker)."""
+    return _listing(security_id, ticker, valid_from, class_title, "filing_name")
 
 
 START = date(2016, 1, 4)
@@ -3872,3 +3889,146 @@ class TestRule8Handover:
     def test_last_bar_needs_the_configured_window(self) -> None:
         with pytest.raises(ValueError, match="handover_sessions"):
             ListingResolver([], last_bar=lambda sid, start, before: None)
+
+
+class TestFilenameListingBackfill:
+    """#1597 (spec "Amendment 2026-10-12 (#1597)", plan T184f), the Resolution
+    line's last two clauses: no other security's resolution changes on any
+    session except the counted `filename_disputes`, and a colliding prefix (a
+    span whose `asof` payload runs past its end) is listed in
+    `filename_collisions` and stores nothing."""
+
+    OLD = "0000000001"  # the delister whose 10-K's instance prefix read its ticker
+    SUCCESSOR = "0000000002"  # the company that holds the ticker today
+
+    def test_a_filing_name_row_changes_no_resolution_on_its_own(self) -> None:
+        # A delister's own span: every session the merge base resolved
+        # elsewhere or to nobody stays, and the span's own sessions were
+        # nobody's before it, so nothing is lost to it.
+        listings = [
+            _listing("SEC_KEEP", "KEEP", START),
+            _filing_name(self.OLD, "KEG", START),
+            _filing_name(self.OLD, "KEG", date(2018, 1, 1)),  # the span runs on
+        ]
+        resolver = ListingResolver(listings)
+        assert resolver.report.filename_disputes == 0
+        assert resolver.resolve("KEG", date(2017, 6, 5)) == self.OLD
+        assert "0 sessions another security lost" in resolver.report.summary()
+
+    def test_a_claim_of_a_filing_name_row_counts_the_holders_lost_sessions(self) -> None:
+        # A wrong prefix that is another company's live symbol: the claimant's
+        # `filing_name` span shadows the holder (a rule-6 disputed claim), so
+        # the holder loses every session from the claimant's start to the
+        # run's day, and `filename_disputes` counts exactly those.
+        listings = [
+            _listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value"),
+            _filing_name(MGE, "MGEE", date(2026, 2, 27), "Common Stock, $1 Par Value"),
+        ]
+        resolver = ListingResolver(listings, _evidence(MGEE_FACTS))
+        assert resolver.resolve("MGEE", date(2026, 2, 26)) == MGEE
+        assert resolver.resolve("MGEE", RUN_DAY) is None
+        assert resolver.report.disputed_spans == 1
+        lost = len(list(_sessions(date(2026, 2, 27), RUN_DAY)))  # to the run's day
+        assert resolver.report.filename_disputes == lost
+        assert (
+            f"{lost} sessions another security lost to a filing_name span"
+            in resolver.report.summary()
+        )
+        # The count is the clause itself: every session whose owner moved to
+        # another security's loss, no other.
+        base = ListingResolver(
+            [row for row in listings if row.get("provenance") != "filing_name"],
+            _evidence(MGEE_FACTS),
+        )
+        changed = sum(
+            base._owner("MGEE", day) is not None
+            and resolver._owner("MGEE", day) != base._owner("MGEE", day)
+            for day in _sessions(date(2019, 8, 7), RUN_DAY)
+        )
+        assert changed == resolver.report.filename_disputes
+
+    def test_the_same_listings_without_the_filing_name_rows_count_nothing(self) -> None:
+        listings = [_listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value")]
+        assert ListingResolver(listings, _evidence(MGEE_FACTS)).report.filename_disputes == 0
+
+    def test_a_colliding_asof_payload_is_listed_and_nothing_is_stored(self) -> None:
+        # The wrong prefix serves the other company's bars under `asof`:
+        # bars on the span's own sessions and traded bars well past its end.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),  # a later row: the span ends there
+            _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
+        ]
+        served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}  # its own; then the other's
+        window = (date(2016, 6, 6), date(2017, 8, 2))
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
+            return {"feed": "sip", "bars": {"KEG": rows}}
+
+        resolver = ListingResolver(listings)
+        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        assert source.bars([self.OLD], *window) == []  # nothing of that payload for the span
+        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
+        line = source.resolution_summary()
+        assert "1 colliding filing_name span(s): 0000000001:KEG" in line
+        # The row past the span's end belongs to no span of the store and is
+        # reported unresolved; the span's own rows are stored for no one.
+        assert source.last_bars_report is not None
+        assert source.last_bars_report.unresolved == (("KEG", date(2017, 8, 1)),)
+
+    def test_bars_inside_the_transfer_window_after_the_end_are_no_collision(self) -> None:
+        # The zero-volume padding Alpaca serves after a delisting (#104), and
+        # traded bars within `master.transfer_window_sessions` of the end, are
+        # a stopped line, not another company: kept.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            served = {date(2016, 6, 7): 11.0, date(2017, 7, 5): 6.0}
+            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
+            rows.append(dict(_row(date(2017, 8, 1), 0.0), v=0, n=0))  # padding, no trade
+            return {"feed": "sip", "bars": {"KEG": rows}}
+
+        resolver = ListingResolver(listings)
+        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        bars = source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2))
+        assert [(b.session, b.close) for b in bars] == [(date(2016, 6, 7), 11.0)]
+        assert source.last_filename_collisions == ()
+
+    def test_a_collision_drops_only_its_own_span(self) -> None:
+        # A second security asked in the same `asof` request keeps its rows:
+        # nothing is stored for the colliding span, only the span.
+        other = "0000000003"
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+            _listing(other, "KEG", START),
+        ]
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}
+            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
+            return {"feed": "sip", "bars": {"KEG": rows}}
+
+        resolver = ListingResolver(listings)
+        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        bars = source.bars([self.OLD, other], date(2016, 6, 6), date(2017, 8, 2))
+        assert {b.security_id for b in bars} == {other}
+        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
+
+
+def _sessions(first: date, last: date) -> Iterator[date]:
+    """Every XNYS session in `[first, last]`, for a whole-resolution diff."""
+    day = first if is_session(first) else next_session(first)
+    while day <= last:
+        yield day
+        day = next_session(day)
