@@ -1641,11 +1641,38 @@ class TestCorporateActions:
             ],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
-        assert {(a.security_id, a.ratio_or_amount) for a in parsed.actions} == {
-            ("SCCO", 0.7),
-            ("PEER", 1.0073),
+        assert {(a.security_id, a.action_type, a.ratio_or_amount) for a in parsed.actions} == {
+            ("SCCO", ActionType.DIVIDEND, 0.7),
+            ("SCCO", ActionType.SPLIT, 1.0073),
+            ("PEER", ActionType.DIVIDEND, 1.0073),
         }
         assert parsed.stock_ratio_cash == 1
+        assert parsed.stock_dividends_stored == 1
+
+    def test_stock_dividend_is_one_split_like_action_with_stable_identity(self) -> None:
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        payload = {
+            "stock_dividends": [
+                {
+                    "symbol": "SCCO",
+                    "ex_date": "2024-05-07",
+                    "rate": 1.0104,
+                    "id": "alpaca-stock-id",
+                }
+            ]
+        }
+        first = parse_corporate_actions(payload, resolver.resolve)
+        second = parse_corporate_actions(payload, resolver.resolve)
+        assert first == second
+        assert first.stock_dividends_stored == 1
+        assert len(first.actions) == 1
+        [action] = first.actions
+        assert action.security_id == "SCCO"
+        assert action.action_type is ActionType.SPLIT
+        assert action.ratio_or_amount == 1.0104
+        assert action.ex_date == date(2024, 5, 7)
+        assert action.known_at == action_first_seen_known_at(date(2024, 5, 7))
+        assert action.source_action_id == "alpaca-stock-id"
 
     def test_ratio_like_cash_without_matching_stock_row_stays_cash(self) -> None:
         resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
@@ -1657,9 +1684,10 @@ class TestCorporateActions:
             "stock_dividends": [{"symbol": "SCCO", "ex_date": "2025-05-02", "rate": 1.0073}],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
-        assert [(a.ex_date, a.ratio_or_amount) for a in parsed.actions] == [
-            (date(2025, 2, 11), 1.0073),
-            (date(2025, 5, 2), 0.7),
+        assert [(a.action_type, a.ex_date, a.ratio_or_amount) for a in parsed.actions] == [
+            (ActionType.DIVIDEND, date(2025, 2, 11), 1.0073),
+            (ActionType.DIVIDEND, date(2025, 5, 2), 0.7),
+            (ActionType.SPLIT, date(2025, 5, 2), 1.0073),
         ]
         assert parsed.stock_ratio_cash == 0
 
@@ -1672,7 +1700,10 @@ class TestCorporateActions:
             },
             resolver.resolve,
         )
-        assert [a.ratio_or_amount for a in parsed.actions] == [1.0062]
+        assert [(a.action_type, a.ratio_or_amount) for a in parsed.actions] == [
+            (ActionType.DIVIDEND, 1.0062),
+            (ActionType.SPLIT, 1.0063),
+        ]
         assert parsed.stock_ratio_cash == 0
 
     def test_out_of_calendar_stock_row_is_counted_without_stopping_cash(self) -> None:
@@ -1721,7 +1752,8 @@ class TestCorporateActions:
             "stock_dividends": [{"symbol": "KO"}],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
-        assert parsed.unsupported == ("stock_dividends",)
+        assert parsed.unsupported == ()
+        assert parsed.stock_rows_unusable == 1
 
     def test_resolved_on_the_session_before_ex_date(self) -> None:
         # A ticker change on the ex-date: the action belongs to the security
@@ -2702,9 +2734,13 @@ class TestAlpacaPriceSource:
             settings=_settings(),
         )
         actions = source.corporate_actions(["SCCO"], date(2025, 2, 1), date(2025, 2, 28))
-        assert [(a.security_id, a.ratio_or_amount) for a in actions] == [("SCCO", 0.7)]
+        assert [(a.security_id, a.action_type, a.ratio_or_amount) for a in actions] == [
+            ("SCCO", ActionType.DIVIDEND, 0.7),
+            ("SCCO", ActionType.SPLIT, 1.0073),
+        ]
         assert "1 stock-ratio cash row(s) skipped" in source.resolution_summary()
         assert "1 stock-dividend row(s) unusable" in source.resolution_summary()
+        assert "1 stock-dividend row(s) stored as split" in source.resolution_summary()
 
     def test_new_actions_use_process_date_range_and_independent_request(self) -> None:
         calls: list[tuple[list[str], date, date]] = []

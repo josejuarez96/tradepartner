@@ -1628,6 +1628,7 @@ class ActionsParse:
     reused_symbols: tuple[str, ...] = ()
     stock_ratio_cash: int = 0
     stock_rows_unusable: int = 0
+    stock_dividends_stored: int = 0
 
 
 @_fail_closed
@@ -1662,10 +1663,11 @@ def parse_corporate_actions(
         return result if result is not None else lead(symbol, day) if lead is not None else None
 
     # Alpaca sometimes repeats a stock-dividend ratio in cash_dividends.
-    # Only a complete, resolved stock row is evidence to suppress cash;
-    # stock_dividends remains an unsupported category for storage.
+    # Only a complete, resolved stock row is evidence to suppress cash.
+    # A stock dividend is a share-ratio adjustment, just like a split.
     stock_rates: set[tuple[str, date, float]] = set()
     stock_rows_unusable = 0
+    stock_dividends_stored = 0
     stock_rows = payload.get("stock_dividends", [])
     if isinstance(stock_rows, list):
         for stock in stock_rows:
@@ -1676,18 +1678,33 @@ def parse_corporate_actions(
                 continue
             try:
                 stock_date = date.fromisoformat(stock["ex_date"])
-                stock_rate = _rate(stock, "rate", positive=False)
+                stock_rate = _rate(stock, "rate", positive=True)
                 stock_security = holder(stock["symbol"], previous_session(stock_date))
+                if stock_security is None:
+                    stock_rows_unusable += 1
+                    continue
+                stock_action = CorporateAction(
+                    security_id=stock_security,
+                    action_type=ActionType.SPLIT,
+                    ex_date=stock_date,
+                    ratio_or_amount=stock_rate,
+                    known_at=action_first_seen_known_at(stock_date),
+                    source=_ACTIONS_SOURCE,
+                    source_action_id=stock.get("id"),
+                )
             except (TypeError, ValueError, DateOutOfBounds):
                 stock_rows_unusable += 1
                 continue
-            if stock_security is not None:
-                stock_rates.add((stock_security, stock_date, stock_rate))
-            else:
-                stock_rows_unusable += 1
+            actions.append(stock_action)
+            stock_dividends_stored += 1
+            stock_rates.add((stock_security, stock_date, stock_rate))
     stock_ratio_cash = 0
 
     for category, rows in sorted(payload.items()):
+        if category == "stock_dividends":
+            if not isinstance(rows, list):
+                raise ValueError(f"category {category!r} is not a list")
+            continue
         if category in _SPLIT_CATEGORIES:
             action_type = ActionType.SPLIT
         elif category in _DIVIDEND_CATEGORIES:
@@ -1825,6 +1842,7 @@ def parse_corporate_actions(
         tuple(reused_symbols),
         stock_ratio_cash,
         stock_rows_unusable,
+        stock_dividends_stored,
     )
 
 
@@ -2097,6 +2115,11 @@ class AlpacaPriceSource(PriceSource):
                 line += (
                     f"; {self.last_actions_report.stock_rows_unusable} "
                     "stock-dividend row(s) unusable"
+                )
+            if self.last_actions_report.stock_dividends_stored:
+                line += (
+                    f"; {self.last_actions_report.stock_dividends_stored} "
+                    "stock-dividend row(s) stored as split"
                 )
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
