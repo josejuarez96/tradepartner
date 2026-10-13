@@ -212,7 +212,10 @@ _LISTING_PROVENANCES = ("filing", "snapshot", "snapshot_static", "filing_name")
 
 
 def _settings() -> Settings:
-    return Settings(_env_file=None)  # type: ignore[call-arg]
+    # The reference below implements the classification rules without T179's
+    # title fallback, so the comparison pins the switch off; the fallback's own
+    # cases live in test_classify.py's TestTitleFallback (T181 flipped the default).
+    return Settings(_env_file=None, edgar={"title_fallback": False})  # type: ignore[call-arg]
 
 
 def _cik(n: int) -> str:
