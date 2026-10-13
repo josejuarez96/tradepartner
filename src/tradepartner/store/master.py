@@ -971,6 +971,7 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
                 classes,
                 pages,
                 source.filename_listings(cik),
+                cik in getattr(source, "filename_incomplete_ciks", ()),
                 [item for item in index if item.cik == cik],
                 delistings.get(cik, ()),
                 filename_form25_accessions,
@@ -1013,6 +1014,7 @@ def _filename_rows(
     classes: Sequence[_Class],
     pages: Sequence[CoverPage],
     records: Sequence[FilenameListing],
+    incomplete: bool,
     index: Sequence[FilingIndexEntry],
     delistings: Sequence[DelistingFiling],
     form25_accessions: list[str],
@@ -1105,6 +1107,8 @@ def _filename_rows(
             continue
         if record.exchange is None:
             continue
+        if incomplete and result.verdict == "single_reading":
+            continue  # a partial answer proves no single reading (T184b)
         builder.listing(
             result.class_id or cik,
             record.ticker.upper(),

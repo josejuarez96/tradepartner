@@ -45,6 +45,7 @@ from tradepartner.store.master import (
     Succession,
     _refuse_separator,
     build_master,
+    first_session,
     primary_security_id,
     securities_as_of,
     write_master,
@@ -269,6 +270,48 @@ def test_filename_empty_early_cover_page_does_not_suppress_rows() -> None:
     on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
     rows = [r for r in on.listings if r["provenance"] == "filing_name"]
     assert [(r["ticker"], r["known_at"]) for r in rows] == [("EMPT", accepted)]
+
+
+class _PartialSource(FixtureFilingSource):
+    """A fixture source that reports its filename answers as partial (T184b)."""
+
+    filename_incomplete_ciks = frozenset({"0000000993"})
+
+
+def test_filename_incomplete_cik_derives_no_single_reading() -> None:
+    cik = "0000000993"
+    accepted = _at(2016, 3, 1)
+    kwargs = dict(
+        index=[FilingIndexEntry(cik, "Partial", "10-K", "annual", accepted)],
+        filename_listings=[
+            FilenameListing(
+                cik, "annual", "10-K", accepted, date(2016, 3, 1), "PART", "NYSE", None, None
+            )
+        ],
+    )
+    settings = _settings(edgar={"filename_listings": True})
+    whole = build_master(FixtureFilingSource(**kwargs), settings, ingested_at=INGESTED_AT)
+    assert [r["ticker"] for r in whole.listings if r["provenance"] == "filing_name"] == ["PART"]
+    partial = build_master(_PartialSource(**kwargs), settings, ingested_at=INGESTED_AT)
+    assert not [r for r in partial.listings if r["provenance"] == "filing_name"]
+
+
+def test_filename_form25_row_takes_the_first_session_not_the_recorded_date() -> None:
+    cik = "0000000992"
+    exit_at = _at(2018, 6, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Exit", "S-1", "s1", exit_at)],
+        delistings=[DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", "exit", exit_at)],
+        filename_listings=[
+            FilenameListing(
+                cik, "exit", "25-NSE", exit_at, date(2018, 6, 1), "EXIT", "NASDAQ", None, None
+            )
+        ],
+    )
+    settings = _settings(edgar={"filename_listings": True})
+    on = build_master(source, settings, ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["ticker"], r["valid_from"]) for r in rows] == [("EXIT", first_session(settings))]
 
 
 def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:

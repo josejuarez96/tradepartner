@@ -4211,3 +4211,14 @@ def test_the_rebuild_holds_a_cik_whose_filings_failed_this_run(
     assert result.ok
     after = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
     assert all(row in after for row in stored)  # nothing deleted; the plain add may add
+
+
+def test_recorded_source_keeps_the_partial_filename_ciks_after_the_freeze() -> None:
+    class Partial(FixtureFilingSource):
+        filename_incomplete_ciks = frozenset({"0000000993"})
+
+    recorded = _Recorded(Partial())
+    assert recorded.filename_listings("0000000993") == []
+    assert recorded.filename_listings("0000000994") == []
+    recorded.frozen = True
+    assert recorded.filename_incomplete_ciks == {"0000000993"}

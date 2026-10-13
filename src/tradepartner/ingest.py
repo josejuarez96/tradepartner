@@ -838,6 +838,8 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
+        self.filename_incomplete_ciks: set[str] = set()
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
@@ -867,7 +869,10 @@ class _Recorded(FilingSource):
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         """Record the CIK's filename evidence in the fetch pass, before the lock."""
-        return list(self._ask("filename_listings", cik))
+        records = list(self._ask("filename_listings", cik))
+        if cik in getattr(self._source, "filename_incomplete_ciks", ()):
+            self.filename_incomplete_ciks.add(cik)
+        return records
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         """Not memoized (#660, spec "Ingest"): the fetch pass's call fills
