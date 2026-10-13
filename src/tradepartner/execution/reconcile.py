@@ -72,6 +72,10 @@ difference an allowance absorbs is listed under `allowed`.
   listing the proceeds take the cash first, and the dividends are journaled
   beside them only when the cash exceeds the proceeds' cap (#400). A
   negative amount due raises `ValueError`.
+- A held name with an equal-amount dividend group the reviewed list does not
+  explain (`explanations.dividend_findings`, #1625) is an
+  `unexplained_dividend_group` mismatch whatever the cash shows: the caller
+  never sums such a group, and neither one payment nor two is assumed.
 
 The caller passes only spin-offs and dividends not yet journaled (ex or pay date
 after the window's last `ok` reconciliation). While any order is lagging or
@@ -115,6 +119,9 @@ OK = "ok"
 MISMATCH = "mismatch"
 PENDING_UNRESOLVED = "pending_unresolved"
 FILLS_LAGGING = "fills_lagging"
+#: The mismatch kind of an equal-amount dividend group the reviewed list does
+#: not explain on a held name (#1625, #1613).
+UNEXPLAINED_DIVIDEND_GROUP = "unexplained_dividend_group"
 
 _BUY = "buy"
 _SELL = "sell"
@@ -175,6 +182,10 @@ class Explanations:
     ended: frozenset[str] = frozenset()
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
+    #: Held names with an equal-amount dividend group the reviewed list does
+    #: not explain, each with its detail (#1625): never summed into
+    #: `dividends`, each an `unexplained_dividend_group` mismatch.
+    dividend_findings: Mapping[str, str] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
     activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
@@ -555,6 +566,16 @@ def compare(
             gap = broker.get(security_id, 0.0) - expected.get(security_id, 0.0)
             if abs(gap) > q_tol:
                 allowed.append(Allowed("quantity within the open allowances", gap, security_id))
+
+    for security_id, detail in sorted(explanations.dividend_findings.items()):
+        mismatches.append(
+            Mismatch(
+                kind=UNEXPLAINED_DIVIDEND_GROUP,
+                detail=detail,
+                security_id=security_id,
+                symbol=explanations.symbols.get(security_id),
+            )
+        )
 
     if mismatches:
         status = MISMATCH

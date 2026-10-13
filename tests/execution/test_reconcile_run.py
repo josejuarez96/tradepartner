@@ -41,6 +41,7 @@ from tradepartner.execution.reconcile_run import (
 )
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
+from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.journal import (
     AdjustmentRow,
     DecisionRow,
@@ -139,7 +140,12 @@ def _split(settings: Settings, security_id: str, ratio: float, known_at: datetim
 
 
 def _dividend(
-    settings: Settings, security_id: str, amount: float, known_at: datetime, ex_date: date = S
+    settings: Settings,
+    security_id: str,
+    amount: float,
+    known_at: datetime,
+    ex_date: date = S,
+    source_action_id: str = "",
 ) -> None:
     _fact(
         settings,
@@ -148,6 +154,7 @@ def _dividend(
         action_type="dividend",
         ex_date=ex_date,
         ratio_or_amount=amount,
+        source_action_id=source_action_id,
         known_at=known_at,
         ingested_at=known_at,
         source="alpaca",
@@ -1957,3 +1964,118 @@ def test_window_1_no_activity_twin_still_halts(
     fake.extra_cash = 8.88  # the broker is 100008.88, the ledger 100008.90, no read row
     with pytest.raises(ReconciliationError, match="cash"):
         _reconcile(journal_settings, fake, window, fixed_clock)
+
+
+# --- equal-amount dividend groups (#1625, #1613) -----------------------------
+
+
+def _listed(security_id: str, verdict: str, amount: float = 0.5) -> ReviewedGroup:
+    return ReviewedGroup(
+        security_id=security_id,
+        ex_date=S,
+        amount=amount,
+        verdict=verdict,  # type: ignore[arg-type]
+        retract_source_action_id="dup-b" if verdict == "duplicate" else "",
+        ticker="",
+        evidence="test",
+    )
+
+
+def _pair(settings: Settings, security_id: str, amount: float = 0.5) -> None:
+    for action_id in ("dup-a", "dup-b"):
+        _dividend(
+            settings, security_id, amount, CUT - timedelta(days=1), source_action_id=action_id
+        )
+
+
+def _explain_at_cut(settings: Settings, window: PaperWindowRow) -> Any:
+    with open_read_only(settings) as conn:
+        return explanations_as_of(
+            conn,
+            window,
+            S,
+            as_of=CUT,
+            settings=settings,
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reviewed", "due"),
+    [
+        ([], {MTUM: 2.0}),  # unlisted: flagged, never summed
+        ([_listed(SPY, "duplicate")], {SPY: 5.0, MTUM: 2.0}),  # pending: counted once
+        ([_listed(SPY, "distinct")], {SPY: 10.0, MTUM: 2.0}),  # two declared payments
+    ],
+)
+def test_an_equal_amount_pair_is_counted_by_the_reviewed_list(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+    reviewed: list[ReviewedGroup],
+    due: dict[str, float],
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: reviewed)
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0, (MTUM, "MTUM"): 4.0})
+    _pair(journal_settings, SPY)
+    _dividend(journal_settings, MTUM, 0.5, CUT - timedelta(days=1))  # a plain dividend
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == pytest.approx(due)
+    if reviewed:
+        assert found.dividend_findings == {}
+    else:
+        [(name, detail)] = found.dividend_findings.items()
+        assert name == SPY
+        assert "dup-a" in detail and "dup-b" in detail and str(S) in detail
+
+
+def test_an_unlisted_pair_on_a_held_name_is_a_data_mismatch_whatever_the_cash(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails closed: neither one payment nor two is assumed; the book halts on
+    a data finding the owner settles in the reviewed list."""
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _pair(journal_settings, SPY)
+    fake.extra_cash = 5.0  # the broker paid one
+    with pytest.raises(ReconciliationError, match="unexplained_dividend_group"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    (row,) = _rows(journal_settings, open_window)
+    assert row.status == MISMATCH
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_pending_duplicate_reconciles_on_one_payment(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [_listed(SPY, "duplicate")])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _pair(journal_settings, SPY)
+    fake.extra_cash = 5.0
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert result.status == OK
+    (adjustment,) = _adjustments(journal_settings, open_window)
+    assert (adjustment.kind, adjustment.cash) == ("dividend_cash", pytest.approx(5.0))
+
+
+def test_an_unlisted_pair_on_a_name_not_held_is_no_finding(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconcile_run, "reviewed_groups", lambda: [])
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _pair(journal_settings, MTUM)
+    found = _explain_at_cut(journal_settings, open_window)
+    assert found.dividends == {}
+    assert found.dividend_findings == {}

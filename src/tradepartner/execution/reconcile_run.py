@@ -59,7 +59,14 @@ as_of`:
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
-  ex-date after the cash base's session and on or before S. The base is the
+  ex-date after the cash base's session and on or before S. An
+  equal-amount group (one security, ex-date and amount under several live
+  ids, #1613) is read through the reviewed list
+  (`store.dividend_reviews`): a listed `duplicate` not yet repaired counts
+  once, a listed `distinct` or `unresolved` pair as stored, and any other
+  group on a held name is never summed but named in `dividend_findings`,
+  which `compare` reports as an `unexplained_dividend_group` mismatch
+  (#1625): a data finding, failing closed. The base is the
   window's latest `ok` reconciliation stated on or before S, or the window's
   start. The cash due is the amount per share times the ledger's holding at
   the session before the ex-date. A dividend the journal already holds as a
@@ -118,6 +125,11 @@ from tradepartner.execution.reconcile import (
 )
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
+from tradepartner.store.dividend_reviews import (
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
+)
 from tradepartner.store.journal import (
     AdjustmentRow,
     OrderedFill,
@@ -313,9 +325,19 @@ def _dividends(
     session: date,
     tolerance: float,
     through: date,
-) -> dict[str, float]:
+    reviewed: Sequence[ReviewedGroup],
+) -> tuple[dict[str, float], dict[str, str]]:
     """Cash due per name for dividends with ex-date in (base session, S], less
-    any the journal already holds as `dividend_cash` on or after the ex-date."""
+    any the journal already holds as `dividend_cash` on or after the ex-date,
+    and the held names with an equal-amount dividend group the reviewed list
+    does not explain (#1625, #1613), each with its detail.
+
+    Each `(security_id, ex_date, amount)` held by more than one live identity
+    is classed by `store.dividend_reviews.equal_amount_groups`: a listed
+    `duplicate` not yet repaired (`pending`) counts once (its retract id's row
+    is skipped); a listed `distinct` or `unresolved` pair counts as stored; any
+    other group (`violation`) is never summed and, on a held name, is a
+    finding, so the caller fails closed rather than guess one payment or two."""
     base = state.base(through)
     stated = base.at if base is not None else window.started_at
     after = stated.astimezone(_NEW_YORK).date()
@@ -328,9 +350,25 @@ def _dividends(
         & (pl.col("ex_date") > after)
         & (pl.col("ex_date") <= session)
     )
+    skipped: set[tuple[str, str]] = set()
+    unexplained: dict[tuple[str, date, float], str] = {}
+    for group in equal_amount_groups(rows, reviewed):
+        if group.group_class == "pending" and group.reviewed is not None:
+            skipped.add((group.security_id, group.reviewed.retract_source_action_id))
+        elif group.group_class == "violation":
+            ids = ", ".join(
+                f"{i.source_action_id} known {i.known_at.isoformat()}" for i in group.identities
+            )
+            unexplained[group.key] = (
+                f"{len(group.identities)} live dividend records of {group.amount!r} with "
+                f"ex-date {group.ex_date} ({ids}) that the reviewed list does not explain"
+            )
     due: dict[str, float] = defaultdict(float)
+    findings: dict[str, list[str]] = defaultdict(list)
     holdings: dict[date, Ledger] = {}
     for row in rows.iter_rows(named=True):
+        if (row["security_id"], row["source_action_id"]) in skipped:
+            continue
         if any(day >= row["ex_date"] for day in journaled.get(row["security_id"], ())):
             continue
         before = previous_session(row["ex_date"])
@@ -338,8 +376,16 @@ def _dividends(
             holdings[before] = _ledger(state, actions, window, before, tolerance)
         held = holdings[before].positions.get(row["security_id"], 0.0)
         if held > tolerance:
+            key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
+            if key in unexplained:
+                if unexplained[key] not in findings[row["security_id"]]:
+                    findings[row["security_id"]].append(unexplained[key])
+                continue
             due[row["security_id"]] += held * float(row["ratio_or_amount"])
-    return {name: amount for name, amount in sorted(due.items()) if amount > 0}
+    return (
+        {name: amount for name, amount in sorted(due.items()) if amount > 0},
+        {name: "; ".join(details) for name, details in sorted(findings.items())},
+    )
 
 
 def _explanations(
@@ -365,11 +411,15 @@ def _explanations(
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    dividends, findings = _dividends(
+        state, actions, window, session, tolerance, through, reviewed_groups()
+    )
     return Explanations(
         symbols=symbols,
         ended=ended,
         spinoffs={},
-        dividends=_dividends(state, actions, window, session, tolerance, through),
+        dividends=dividends,
+        dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
