@@ -2390,6 +2390,12 @@ def test_coverage_section_refuses_an_unknown_key() -> None:
         Settings(_env_file=None, coverage={"check_enable": True})
 
 
+def test_actions_backfill_floor_default_and_validation() -> None:
+    assert AlpacaConfig().actions_backfill_floor == date(2020, 6, 1)
+    with pytest.raises(ValidationError):
+        AlpacaConfig(actions_backfill_floor="not-a-date")
+
+
 # --- #1506 (T171c): the borrow-status snapshot -----------------------------------
 
 

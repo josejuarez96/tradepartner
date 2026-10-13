@@ -363,7 +363,7 @@ from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.fred_rates import FredRateSource
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
@@ -409,6 +409,7 @@ from tradepartner.ingest import (
     WindowEarlierOk,
     _read,
     import_assets,
+    ingest_actions_backfill,
     ingest_assets,
     ingest_rates,
     ingest_session,
@@ -537,6 +538,12 @@ class StorePriceSource(PriceSource):
     ) -> list[CorporateAction]:
         """`AlpacaPriceSource.corporate_actions` over the store's listings."""
         return self._source().corporate_actions(security_ids, start, end)
+
+    def symbol_changes(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[SymbolChange]:
+        """`AlpacaPriceSource.symbol_changes` over the store's listings."""
+        return self._source().symbol_changes(security_ids, start, end)
 
     def resolution_summary(self) -> str:
         """`AlpacaPriceSource.resolution_summary`, `""` before the first fetch."""
@@ -1663,6 +1670,13 @@ def make_app(
             bool, typer.Option("--backfill", help="backfill from --since, resuming")
         ] = False,
         since: Annotated[str | None, typer.Option(help="backfill start, YYYY-MM-DD")] = None,
+        actions_backfill: Annotated[
+            bool,
+            typer.Option("--actions-backfill", help="scan spin-offs and name changes by month"),
+        ] = False,
+        through: Annotated[
+            str | None, typer.Option("--through", help="last actions process date, YYYY-MM-DD")
+        ] = None,
         dry_run: Annotated[bool, typer.Option(help="roll every chunk back")] = False,
         fill_holes_: Annotated[
             bool,
@@ -1744,8 +1758,18 @@ def make_app(
             raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
         if source == ASSETS_SOURCE and backfill_:
             raise _fail(f"--source {ASSETS_SOURCE} has no backfill", USAGE_ERROR)
-        if backfill_ != (since is not None):
+        if actions_backfill:
+            if source != "alpaca" or backfill_ or fill_holes_:
+                raise _fail(
+                    "--actions-backfill needs --source alpaca without --backfill or --fill-holes",
+                    USAGE_ERROR,
+                )
+            if since is None:
+                raise _fail("--actions-backfill needs --since", USAGE_ERROR)
+        elif backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
+        if through is not None and not actions_backfill:
+            raise _fail("--through needs --actions-backfill", USAGE_ERROR)
         if fill_holes_ and not backfill_:
             raise _fail("--fill-holes needs --backfill and --since", USAGE_ERROR)
         if fill_holes_ and source != "alpaca":
@@ -1794,7 +1818,23 @@ def make_app(
                 start = date.fromisoformat(since)
             except ValueError:
                 raise _fail(f"--since must be YYYY-MM-DD, got {since!r}", USAGE_ERROR) from None
+        through_date: date | None = None
+        if through is not None:
+            try:
+                through_date = date.fromisoformat(through)
+            except ValueError:
+                raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         s = settings()
+        if actions_backfill:
+            assert start is not None
+            if start < s.alpaca.actions_backfill_floor:
+                raise _fail(
+                    f"--since before alpaca.actions_backfill_floor "
+                    f"{s.alpaca.actions_backfill_floor} is refused",
+                    USAGE_ERROR,
+                )
+            if through_date is not None and through_date < start:
+                raise _fail("--through must be on or after --since", USAGE_ERROR)
         if rebuild_statement_facts and not s.edgar.statement_facts_enabled:
             raise _fail(
                 "--rebuild-statement-facts needs edgar.statement_facts_enabled", USAGE_ERROR
@@ -1829,6 +1869,13 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
+        if actions_backfill:
+            assert start is not None
+            result = ingest_actions_backfill(
+                s, since=start, through=through_date, clock=clock, dry_run=dry_run
+            )
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
         all_rates: RateSource | None = None
         if source == "all":
             if _blank(s.fred_api_key):

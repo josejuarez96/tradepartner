@@ -2949,15 +2949,16 @@ class TestAlpacaPriceSource:
         )
         source = AlpacaPriceSource(resolver, fetch_actions=fetch, settings=_settings())
         actions = source.corporate_actions(["P", "C"], date(2020, 10, 1), date(2020, 10, 31))
-        assert actions == []
+        assert [(a.security_id, a.action_type.value, a.ex_date) for a in actions] == [
+            ("C", "spinoff", date(2020, 9, 29))
+        ]
         assert source.last_actions_report is not None
-        assert source.last_actions_report.actions == ()
         changes = source.symbol_changes(["P"], date(2020, 10, 1), date(2020, 10, 31))
         assert len(changes) == 1 and changes[0].security_id == "P"
         assert len(calls) == 2
         assert source.symbol_changes(["P"], date(2020, 9, 1), date(2020, 9, 30)) == []
 
-    def test_daily_actions_keep_only_splits_and_dividends(self) -> None:
+    def test_daily_actions_keep_spinoff_without_changing_splits_or_dividends(self) -> None:
         recorded = _Recorded()
 
         def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
@@ -2983,11 +2984,10 @@ class TestAlpacaPriceSource:
             ("SEC_AAPL", "dividend", date(2020, 8, 7)),
             ("SEC_AAPL", "split", date(2020, 8, 31)),
             ("SEC_MSFT", "dividend", date(2020, 8, 19)),
+            ("SEC_MSFT", "spinoff", date(2020, 8, 31)),
         ]
         assert source.last_actions_report is not None
-        assert all(
-            a.action_type is not ActionType.SPINOFF for a in source.last_actions_report.actions
-        )
+        assert any(a.action_type is ActionType.SPINOFF for a in source.last_actions_report.actions)
 
     def test_malformed_name_change_does_not_fail_daily_actions(self) -> None:
         recorded = _Recorded()
@@ -3003,6 +3003,11 @@ class TestAlpacaPriceSource:
             ("dividend", date(2020, 8, 7)),
             ("split", date(2020, 8, 31)),
         ]
+        # #1506: the daily run's own name-change request counts it, never raises.
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+        assert "malformed name_changes category skipped" in source.resolution_summary()
 
     def test_malformed_spinoff_does_not_fail_daily_split(self) -> None:
         def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
@@ -3023,6 +3028,65 @@ class TestAlpacaPriceSource:
         )
         actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
         assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("spin_offs",)
+        assert "malformed spin_offs category skipped" in source.resolution_summary()
+
+    @pytest.mark.parametrize(
+        "error", [ValueError("one id, two rows (#816)"), TypeError("page is not a dict")]
+    )
+    def test_a_failing_name_change_response_is_counted_not_raised(self, error: Exception) -> None:
+        # #1665 safety review: the name-change request itself (not only its
+        # parse) never fails the daily run that asked for it.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+
+    def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
+        # #1664 ruling (a): the split and dividend output is byte-identical
+        # with a spin-off in the payload, whatever ids the spin-off carries.
+        def run(with_spinoff: bool) -> tuple[list[CorporateAction], list[CorporateAction]]:
+            recorded = _Recorded()
+
+            def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+                payload: dict[str, object] = dict(recorded.actions(symbols, start, end))
+                if with_spinoff:
+                    payload["spin_offs"] = [
+                        _spinoff(
+                            source_symbol="AAPL",
+                            new_symbol="MSFT",
+                            ex_date="2020-08-31",
+                            process_date="2020-09-04",
+                        )
+                    ]
+                return payload
+
+            source = AlpacaPriceSource(
+                ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+            )
+            actions = source.corporate_actions(
+                ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+            )
+            assert source.last_actions_report is not None
+            others = [a for a in actions if a.action_type is not ActionType.SPINOFF]
+            reported = [
+                a
+                for a in source.last_actions_report.actions
+                if a.action_type is not ActionType.SPINOFF
+            ]
+            return others, reported
+
+        assert run(True) == run(False)
+        assert run(False)[0]  # the pin compares real rows
 
     def test_actions_processed_after_the_window_are_kept(self) -> None:
         # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.

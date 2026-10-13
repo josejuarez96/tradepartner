@@ -1839,6 +1839,56 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
     assert _invoke(settings, ["decision", "data-release", "import-file", str(path)]).exit_code == 2
 
 
+def test_actions_backfill_cli_validates_and_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.ingest import ACTIONS_FILLED
+
+    settings = _settings(tmp_path, alpaca_api_key="fake-key", alpaca_api_secret="fake-secret")
+    for args in (
+        ["ingest", "--source", "edgar", "--actions-backfill", "--since", "2020-06-01"],
+        ["ingest", "--source", "alpaca", "--actions-backfill", "--since", "2020-05-01"],
+        [
+            "ingest",
+            "--source",
+            "alpaca",
+            "--actions-backfill",
+            "--since",
+            "2020-06-01",
+            "--through",
+            "bad",
+        ],
+    ):
+        assert _invoke(settings, args).exit_code == 2
+    seen: dict[str, Any] = {}
+
+    def fake_actions(settings: Settings, **kwargs: Any) -> IngestResult:
+        seen.update(kwargs)
+        return IngestResult(
+            (SourceRun("alpaca", ACTIONS_FILLED, 0, "actions;through=2020-06-30", "ok"),)
+        )
+
+    monkeypatch.setattr(cli, "ingest_actions_backfill", fake_actions)
+    result = _invoke(
+        settings,
+        [
+            "ingest",
+            "--source",
+            "alpaca",
+            "--actions-backfill",
+            "--since",
+            "2020-06-01",
+            "--through",
+            "2020-06-30",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["since"] == date(2020, 6, 1)
+    assert seen["through"] == date(2020, 6, 30)
+    assert seen["dry_run"] is True
+
+
 # --- the borrow-status snapshot (#1506, T171c, T171e) --------------------------
 
 

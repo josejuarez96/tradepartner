@@ -71,11 +71,9 @@ as_of`:
   start. The cash due is the amount per share times the ledger's holding at
   the session before the ex-date. A dividend the journal already holds as a
   `dividend_cash` row dated on or after its ex-date is never offered again.
-- `spinoffs`: always empty. The store keeps only splits and cash dividends
-  (`adapters.alpaca_prices` reports spin-offs and does not store them), so
-  no row can name a spin-off child. A child the broker books is an
-  `unknown_symbol` or `broker_only_position` mismatch until the store can
-  hold one.
+- `spinoffs`: always empty until T48b records broker receipts, although
+  the store now holds spin-off actions. A child the broker books is an
+  `unknown_symbol` or `broker_only_position` mismatch until that task.
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
 

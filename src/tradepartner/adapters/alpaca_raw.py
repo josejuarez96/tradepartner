@@ -18,12 +18,12 @@ message if either is missing, before any network call.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
-from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
@@ -286,6 +286,24 @@ def corporate_actions(
             ]
         )
     )
+
+
+def corporate_actions_scan(
+    types: Sequence[CorporateActionsType],
+    start: date,
+    end: date,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Fully paged, symbol-less corporate-action scan over process dates."""
+    settings = settings or get_settings()
+    client = _corporate_actions_client(settings)
+    payload = client.get_corporate_actions(
+        CorporateActionsRequest(types=list(types), start=start, end=end, limit=None)
+    )
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+    return payload
 
 
 def assets_snapshot(

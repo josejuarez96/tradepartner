@@ -314,6 +314,17 @@ def test_passes_on_a_fixture_meeting_every_req_15_criterion(settings: Settings) 
         "override_reason",
     }
     assert all(line.passed for line in lines), lines
+    with open_for_write(settings) as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
+            ).fetchone()[0]
+            == 1
+        )
+        conn.execute("DELETE FROM corporate_actions WHERE action_type='spinoff'")
+    with open_read_only(settings) as conn:
+        without_spinoff = check(conn, settings)
+    assert lines == without_spinoff
 
 
 #: Three consecutive ISO-week ends (Fridays); the frozen clock, Tuesday 2026-12-15, is

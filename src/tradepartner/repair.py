@@ -77,7 +77,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from typing import Any
 
@@ -193,11 +193,12 @@ class Misattributed:
 
     bars: Mapping[Key, int]
     actions: Mapping[Key, int]
+    spinoffs: Mapping[Key, int] = field(default_factory=dict)
 
     @property
     def securities(self) -> tuple[str, ...]:
         """Every security with such a key, sorted."""
-        return tuple(sorted({sid for sid, _ in (*self.bars, *self.actions)}))
+        return tuple(sorted({sid for sid, _ in (*self.bars, *self.actions, *self.spinoffs)}))
 
 
 def misattributed(
@@ -225,6 +226,7 @@ class RepairResult:
     bar_keys_checked: int
     action_keys_checked: int
     dry_run: bool
+    unjudged_symbol_changes: int = 0
 
     @property
     def bar_rows(self) -> int:
@@ -234,7 +236,7 @@ class RepairResult:
     @property
     def action_rows(self) -> int:
         """Action rows found (deleted unless `dry_run`)."""
-        return sum(self.found.actions.values())
+        return sum(self.found.actions.values()) + sum(self.found.spinoffs.values())
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
@@ -245,8 +247,10 @@ class RepairResult:
         return (
             f"{verb} {self.bar_rows} bar rows ({len(self.found.bars)} of "
             f"{self.bar_keys_checked} keys) and {self.action_rows} action rows "
-            f"({len(self.found.actions)} of {self.action_keys_checked} keys) that the "
-            f"resolver no longer assigns to their security, on {len(named)} securities{shown}"
+            f"({len(self.found.actions) + len(self.found.spinoffs)} of "
+            f"{self.action_keys_checked} keys) that the "
+            f"resolver no longer assigns to their security, on {len(named)} securities{shown}; "
+            f"{self.unjudged_symbol_changes} symbol_changes rows unjudged"
         )
 
     def lines(self) -> list[str]:
@@ -258,8 +262,9 @@ class RepairResult:
             bars[sid].append(day)
             rows[sid] += n
         actions: dict[str, int] = defaultdict(int)
-        for (sid, _), n in self.found.actions.items():
-            actions[sid] += n
+        for found in (self.found.actions, self.found.spinoffs):
+            for (sid, _), n in found.items():
+                actions[sid] += n
         out = []
         for sid in self.found.securities:
             days = bars.get(sid, [])
@@ -278,12 +283,18 @@ class _Counted:
     set, streamed; `seen` counts them once iterated."""
 
     def __init__(
-        self, conn: duckdb.DuckDBPyConnection, table: str, day: str, sources: list[str]
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        table: str,
+        day: str,
+        sources: list[str],
+        action_types: Sequence[str] | None = None,
     ) -> None:
+        extra = " AND list_contains(?, action_type)" if action_types is not None else ""
         self._cursor = conn.execute(
             f"SELECT security_id, {day}, count(*) FROM {table} "
-            "WHERE list_contains(?, source) GROUP BY ALL",
-            [sources],
+            f"WHERE list_contains(?, source){extra} GROUP BY ALL",
+            [sources, *([list(action_types)] if action_types is not None else [])],
         )
         self.seen = 0
 
@@ -294,12 +305,28 @@ class _Counted:
                 yield str(sid), day, int(rows)
 
 
+def _delete_spinoffs(conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, date, str]]) -> int:
+    """Delete the `spinoff` rows from `ACTIONS_SOURCE` whose `(child, ex_date,
+    parent)` is in `keys`, never another parent's row of the same child and
+    day; the number deleted."""
+    if not keys:
+        return 0
+    before = _rows(conn, "corporate_actions")
+    conn.executemany(
+        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' "
+        "AND security_id = ? AND ex_date = ? AND source_action_id = ?",
+        [[ACTIONS_SOURCE, *key] for key in keys],
+    )
+    return before - _rows(conn, "corporate_actions")
+
+
 def _delete(
     conn: duckdb.DuckDBPyConnection,
     table: str,
     day: str,
     sources: list[str],
     keys: Iterable[Key],
+    action_types: Sequence[str] | None = None,
 ) -> int:
     """Delete every row of `table` from `sources` whose `(security_id,
     <day>)` is in `keys`; the number deleted."""
@@ -309,10 +336,11 @@ def _delete(
     conn.execute("CREATE OR REPLACE TEMP TABLE _repair_keys (security_id VARCHAR, day DATE)")
     conn.executemany("INSERT INTO _repair_keys VALUES (?, ?)", rows)
     before = _rows(conn, table)
+    extra = " AND list_contains(?, action_type)" if action_types is not None else ""
     conn.execute(
-        f"DELETE FROM {table} WHERE list_contains(?, source) AND (security_id, {day}) IN "
-        "(SELECT (security_id, day) FROM _repair_keys)",
-        [sources],
+        f"DELETE FROM {table} WHERE list_contains(?, source){extra} "
+        f"AND (security_id, {day}) IN (SELECT (security_id, day) FROM _repair_keys)",
+        [sources, *([list(action_types)] if action_types is not None else [])],
     )
     conn.execute("DROP TABLE _repair_keys")
     return before - _rows(conn, table)
@@ -371,13 +399,39 @@ def repair_resolution(
         resolver = store_resolver(conn, started, settings)
         bars = _Counted(conn, "prices_daily", "session", bar_sources)
         found_bars = misattributed(resolver, bars, ()).bars
-        actions = _Counted(conn, "corporate_actions", "ex_date", [ACTIONS_SOURCE])
-        found = Misattributed(found_bars, misattributed(resolver, (), actions).actions)
+        actions = _Counted(
+            conn,
+            "corporate_actions",
+            "ex_date",
+            [ACTIONS_SOURCE],
+            action_types=("split", "dividend"),
+        )
+        ordinary = misattributed(resolver, (), actions).actions
+        spin_rows = conn.execute(
+            "SELECT security_id, ex_date, source_action_id, count(*) "
+            "FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' GROUP BY ALL",
+            [ACTIONS_SOURCE],
+        ).fetchall()
+        spinoffs: dict[Key, int] = defaultdict(int)
+        bad_spins: list[tuple[str, date, str]] = []  # (child, ex_date, parent)
+        for child, ex_date, parent, count in spin_rows:
+            if not (
+                resolver.holds(parent, previous_session(ex_date), actions=True)
+                and resolver.holds(child, ex_date, actions=True)
+            ):
+                spinoffs[(child, ex_date)] += int(count)
+                bad_spins.append((child, ex_date, parent))
+        spinoffs = dict(spinoffs)
+        found = Misattributed(found_bars, ordinary, spinoffs)
+        unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
+        assert unjudged_row is not None
+        unjudged = int(unjudged_row[0])
         result = RepairResult(
             found=found,
             bar_keys_checked=bars.seen,
-            action_keys_checked=actions.seen,
+            action_keys_checked=actions.seen + len(spin_rows),
             dry_run=dry_run,
+            unjudged_symbol_changes=unjudged,
         )
         if not dry_run:
             if (result.bar_rows, result.action_rows) != expect:
@@ -387,7 +441,15 @@ def repair_resolution(
                 )
             deleted = (
                 _delete(conn, "prices_daily", "session", bar_sources, found.bars),
-                _delete(conn, "corporate_actions", "ex_date", [ACTIONS_SOURCE], found.actions),
+                _delete(
+                    conn,
+                    "corporate_actions",
+                    "ex_date",
+                    [ACTIONS_SOURCE],
+                    found.actions,
+                    action_types=("split", "dividend"),
+                )
+                + _delete_spinoffs(conn, bad_spins),
             )
             if deleted != (result.bar_rows, result.action_rows):  # never a partial repair
                 raise RuntimeError(

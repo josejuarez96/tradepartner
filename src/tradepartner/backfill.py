@@ -794,7 +794,10 @@ def _price_chunk(
                 where="AND session BETWEEN ? AND ?",
                 params=[first, last],
             )
-            added += _add_actions(conn, actions, window, ingested_at=ingested_at, covered=covered)
+            action_counts: dict[str, int] = {}
+            added += _add_actions(
+                conn, actions, window, ingested_at=ingested_at, covered=covered, stats=action_counts
+            )
             renamed = f" and {len(renames)} with a lead gap" if renames else ""
             # #1314 rule 8: a rule-8 hole whose refetch landed nothing on its window.
             landed = {
@@ -818,6 +821,8 @@ def _price_chunk(
             )
             if resolution := prices.resolution_summary():
                 message += f"; {resolution}"
+            for key, value in sorted(action_counts.items()):
+                message += f"; {key}={value}"
             run = outcome(done, added, message)
             _write_run(conn, run_id, started, clock(), run, mode)
         if fill and tally is not None:

@@ -1539,3 +1539,97 @@ def test_e_a_refetched_bar_lands_on_the_old_holder_and_moves_the_end(settings: S
         conn.execute("UPDATE prices_daily SET source = 'alpaca_sip'")
     again = fill_holes(taken, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
     assert all(not hole.handover for hole in again.holes)
+
+
+def test_month_backfill_stores_process_month_spinoff_and_skips_future_stamp(
+    settings: Settings,
+) -> None:
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    ex = date(2019, 4, 30)
+    process = date(2019, 5, 15)
+    action = CorporateAction(
+        ACME,
+        ActionType.SPINOFF,
+        ex,
+        0.25,
+        announcement_date_known_at(process),
+        "alpaca",
+        source_action_id=SPY,
+    )
+
+    class ProcessMonth(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", start, end))
+            return [action] if start <= process <= end and ACME in security_ids else []
+
+    result = _backfill(settings, ProcessMonth())
+    assert result.ok
+    assert _read(
+        settings,
+        "SELECT security_id, source_action_id, ex_date FROM corporate_actions "
+        "WHERE action_type='spinoff'",
+    ) == [(ACME, SPY, ex)]
+    again = _backfill(
+        settings,
+        ProcessMonth(),
+        since=date(2019, 5, 1),
+        now=NOW + timedelta(hours=1),
+        source="alpaca",
+    )
+    assert all(run.rows_added == 0 for run in again.runs)
+
+    future = CorporateAction(
+        ACME,
+        ActionType.SPINOFF,
+        ex,
+        0.25,
+        NOW + timedelta(days=1),
+        "alpaca",
+        source_action_id="future-parent",
+    )
+
+    class Future(ProcessMonth):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", start, end))
+            return [future] if start <= process <= end and ACME in security_ids else []
+
+    other_store = settings.store.model_copy(
+        update={"path": str(Path(settings.store.path).with_name("future.duckdb"))}
+    )
+    fresh = settings.model_copy(update={"store": other_store})
+    skipped = _backfill(fresh, Future(), since=date(2019, 5, 1), now=NOW + timedelta(hours=2))
+    assert skipped.ok
+    assert any("actions_not_yet_known=1" in run.message for run in skipped.runs)
+
+
+def test_fill_holes_counts_future_spinoff_without_storing_it(settings: Settings) -> None:
+    assert _backfill(settings, _History()).ok
+    _drop_bars(settings, ACME, MAY_WINDOW)
+    future = CorporateAction(
+        ACME,
+        ActionType.SPINOFF,
+        date(2019, 5, 15),
+        0.25,
+        LATER + timedelta(days=1),
+        "alpaca",
+        source_action_id=SPY,
+    )
+
+    class Future(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", start, end))
+            return [future] if ACME in security_ids and start <= future.ex_date <= end else []
+
+    result = fill_holes(settings, prices=Future(), since=SINCE, clock=lambda: LATER)
+    assert [run.status for run in result.runs] == [FILLED]
+    assert "actions_not_yet_known=1" in result.runs[0].message
+    assert _read(
+        settings, "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
+    ) == [(0,)]

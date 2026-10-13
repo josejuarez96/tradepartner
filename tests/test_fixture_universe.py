@@ -422,6 +422,15 @@ def test_first_seen_action_known_at_and_revision_rule() -> None:
                 f"{security_id} {action_type} {ex_date}: replacement not stamped at its ingest"
             )
             continue
+        if first["action_type"] == "spinoff":
+            # #1506: a spin-off is stamped by the date-only rule on its (unstored)
+            # `process_date`, so only the floor at the close before its ex-date holds.
+            assert first_known_at >= close_before_ex, (
+                f"{security_id} spinoff {ex_date}: first-seen known_at {first_known_at} "
+                f"is before the close before ex-date {close_before_ex}"
+            )
+            assert not first["announced_at"], f"{security_id}: spinoff carries announced_at"
+            continue
         announced = first["announced_at"]
         expected = datetime.fromisoformat(announced) if announced else close_before_ex
         assert first_known_at == expected, (

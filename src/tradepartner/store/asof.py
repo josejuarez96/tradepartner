@@ -603,6 +603,39 @@ def price_jumps_as_of(
     return pl.DataFrame(rows, schema=_JUMP_SCHEMA)
 
 
+def symbol_changes_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Latest name-change revision per action identity known at ``t``.
+
+    Identity follows the table's unique index: Alpaca's id when supplied,
+    otherwise security, old and new symbols, and process date. The filter
+    applies to security ids and the result includes every table column.
+    """
+    t = _validate_t(t)
+    params: list[Any] = [t]
+    security_filter = _security_filter(security_ids, params)
+    return conn.execute(
+        f"""
+        SELECT * EXCLUDE (_rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY security_id, source_action_id,
+                    CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN process_date ELSE NULL END
+                ORDER BY known_at DESC
+            ) AS _rn
+            FROM symbol_changes
+            WHERE known_at <= ? {security_filter}
+        ) WHERE _rn = 1
+        ORDER BY security_id, process_date, old_symbol
+        """,
+        params,
+    ).pl()
+
+
 def rates_as_of(
     conn: duckdb.DuckDBPyConnection, t: datetime, series: str | None = None
 ) -> pl.DataFrame:
