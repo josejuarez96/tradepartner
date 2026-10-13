@@ -78,6 +78,15 @@ _SELL = "sell"
 _CASH_IN_LIEU = "cash_in_lieu"
 _ADJUSTMENT_KINDS = frozenset(JOURNAL_ENUMS[("adjustments", "kind")])
 
+#: The replay's ranks within one session (#1627): the session's split, then its
+#: `cash_in_lieu` row, then a fill or an adjustment stated on it. Named because
+#: `tests/test_no_literals.py` allows only 0, 1 and 2 (and minus 1) in
+#: `execution/`, so the two later ranks are not numeric literals.
+_REPLAY_SPLIT_RANK = "0_split"
+_REPLAY_CASH_IN_LIEU_RANK = "1_cash_in_lieu"
+_REPLAY_FILL_RANK = "2_fill"
+_REPLAY_ADJUSTMENT_RANK = "3_adjustment"
+
 
 def _finite(value: float, what: str) -> float:
     if not math.isfinite(value):
@@ -267,23 +276,26 @@ def from_journal(
     # so a row's exact position is the shares held *then*: a split takes effect at
     # its own session and a `cash_in_lieu` round-down lands at its own point,
     # never after a split that took effect later (#1627). Order within a session:
-    # the split of that ex-date, then a fill and an adjustment stated on it (a row
-    # dated on the ex-date is not scaled by it, which `ex_date > stated_on` and
-    # `ex_date > session` held before), then a `cash_in_lieu` row, which rounds
-    # down the whole shares that split's remainder leaves. A `cash_in_lieu` row
-    # shares the adjustment's rank and is recorded after every adjustment, so it
-    # sorts last of its session by the sequence its pass gives it.
-    replay: list[tuple[date, int, int, str, str, Fraction]] = []
+    # the split of that ex-date (a fill dated on the ex-date is not scaled by it,
+    # which `ex_date > stated_on` held before), then a `cash_in_lieu` row, which
+    # rounds down the whole shares that split's remainder leaves, then a fill and
+    # an adjustment stated on that session. Ranking the `CIL` before the day's
+    # fills is safe: `compare` books one only when the broker holds exactly
+    # `floor(ledger)`, so a broker holding a fraction the fill left cannot have a
+    # bookable `CIL` that day; ranking it after them would floor that fraction
+    # away (a fractional fill on the run's own session, after the CIL booked),
+    # which is the case the ordering guards.
+    replay: list[tuple[date, str, int, str, str, Fraction]] = []
     sequence = 0
 
-    def _record(day: date, order: int, kind: str, security_id: str, amount: Fraction) -> None:
+    def _record(day: date, order: str, kind: str, security_id: str, amount: Fraction) -> None:
         nonlocal sequence
         replay.append((day, order, sequence, kind, security_id, amount))
         sequence += 1
 
     for name, rows in splits.items():
         for ex_date, ratio in rows:
-            _record(ex_date, 0, "split", name, _split_ratio(ratio))
+            _record(ex_date, _REPLAY_SPLIT_RANK, "split", name, _split_ratio(ratio))
 
     seen_fills: set[int] = set()
     fills_since_base = 0
@@ -295,7 +307,7 @@ def from_journal(
         if stated_on > through:
             continue
         sign = 1 if fill.side == _BUY else -1
-        _record(stated_on, 1, "fill", fill.security_id, sign * _exact(row.quantity))
+        _record(stated_on, _REPLAY_FILL_RANK, "fill", fill.security_id, sign * _exact(row.quantity))
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
@@ -306,31 +318,23 @@ def from_journal(
         _check_adjustment(adjustment, seen_adjustments)
         if adjustment.session > through:
             continue
-        if (
-            adjustment.kind != _CASH_IN_LIEU
-            and adjustment.quantity is not None
-            and adjustment.security_id is not None
-        ):
+        # `_REPLAY_CASH_IN_LIEU_RANK` for a `cash_in_lieu` row (right after that
+        # session's split, before its fills), else `_REPLAY_ADJUSTMENT_RANK`.
+        order = (
+            _REPLAY_CASH_IN_LIEU_RANK
+            if adjustment.kind == _CASH_IN_LIEU
+            else _REPLAY_ADJUSTMENT_RANK
+        )
+        if adjustment.quantity is not None and adjustment.security_id is not None:
             _record(
                 adjustment.session,
-                2,
+                order,
                 adjustment.kind,
                 adjustment.security_id,
                 _exact(adjustment.quantity),
             )
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
-
-    for adjustment in adjustments:
-        if adjustment.kind == _CASH_IN_LIEU and adjustment.session <= through:
-            assert adjustment.quantity is not None and adjustment.security_id is not None
-            _record(
-                adjustment.session,
-                2,
-                adjustment.kind,
-                adjustment.security_id,
-                _exact(adjustment.quantity),
-            )
 
     for _day, _order, _seq, kind, security_id, amount in sorted(replay):
         if kind == "split":

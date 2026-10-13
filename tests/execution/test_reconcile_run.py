@@ -871,6 +871,27 @@ def _bar(settings: Settings, security_id: str, close: float, known_at: datetime)
     )
 
 
+def _bar_at(
+    settings: Settings, security_id: str, session: date, close: float, known_at: datetime
+) -> None:
+    """A bar as of `known_at` (before `cut`), on any session."""
+    _fact(
+        settings,
+        "prices_daily",
+        security_id=security_id,
+        session=session,
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=1000,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="alpaca",
+        provenance="bar",
+    )
+
+
 def test_reference_prices_are_bars_known_at_close_of_the_previous_session(
     journal_settings: Settings, fake: BookedFake, open_window: PaperWindowRow
 ) -> None:
@@ -2171,18 +2192,22 @@ def test_a_second_stock_dividend_on_the_name_books_both(
     ]
 
 
-def test_a_fractional_fill_after_a_cash_in_lieu_is_not_rounded_down(
+def test_a_fractional_fill_on_the_cash_in_lieu_session_is_not_rounded_down(
     journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
-    """#1627 (fix 1): a fractional fill after the `cash_in_lieu` keeps its
-    fraction — the round-down rounds the whole shares held at its own point, not
-    the total position at `through`."""
+    """#1627 (fix 1, the ordering): the `cash_in_lieu` row is applied after that
+    session's split and **before** its fills, so a fractional fill on the CIL's
+    own session (the run's session S: the CIL books at step 4 and the rebalance's
+    fractional fill is stated later the same session, `alpaca.quantity_decimals=9`)
+    keeps its fraction — the round-down rounds the whole shares held at its own
+    point, not the total position at `through`. Ranking the CIL after the day's
+    fills floors this 0.5 away (`removes 0.8005 shares, not 0.3005...`)."""
     _stock_dividend_journal(
         journal_settings,
         open_window,
         4065.0,
         BOUGHT_AT,
-        later_fill=(0.5, PRICE, datetime(2026, 10, 2, 15, 0, tzinfo=UTC)),
+        later_fill=(0.5, PRICE, datetime(2026, 10, 1, 15, 0, tzinfo=UTC)),
     )
 
     with open_read_only(journal_settings) as conn:
@@ -2198,7 +2223,7 @@ def test_a_fractional_fill_after_a_cash_in_lieu_is_not_rounded_down(
             quantity_tolerance=1e-6,
         )
 
-    assert ledgers.positions["SEC_A"] == 4096.5  # 4096 whole + the later 0.5
+    assert ledgers.positions["SEC_A"] == 4096.5  # 4096 whole + the same-session 0.5
     assert round_down(ledgers.positions["SEC_A"], 0) == 4096
 
 
@@ -2236,6 +2261,102 @@ def test_a_stock_dividend_cash_in_lieu_is_booked_once_across_two_reconciles(
     assert [
         (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
     ] == [("cash_in_lieu", "act-cil")]
+
+
+def test_a_correct_cash_in_lieu_posted_late_uses_the_pre_ex_reference(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1627 (fix 2): the reference read is the close of `previous_session(ex_date)`,
+    not the close before the reconciliation's own session. The name is held from
+    2026-09-22, the ex-date is 2026-09-23 (bar 120.00 at 2026-09-22) and the CIL
+    posts at S, 2026-10-01 (bar 80.00 at 2026-09-30, the close before S): a
+    correct CIL at ratio 1.15 values the 0.75-share remainder at 120 / 1.15 and
+    reconciles. If `_stock_dividend_references` read `previous_session(S)`, it
+    would divide 80 instead and this CIL would be off by half and halt."""
+    run_id = _run(journal_settings, open_window)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-hold-1",
+        SPY,
+        "SPY",
+        4065.0,
+        at=datetime(2026, 9, 22, 14, 0, tzinfo=UTC),
+    )
+    fake.submit(OrderRequest("tp-hold-1", "SPY", Side.BUY, quantity=4065.0))
+    fake.simulate_fill("tp-hold-1")
+    _fact(
+        journal_settings,
+        "corporate_actions",
+        security_id=SPY,
+        action_type="split",
+        ex_date=date(2026, 9, 23),
+        ratio_or_amount=1.15,
+        known_at=CUT - timedelta(hours=1),
+        ingested_at=CUT - timedelta(hours=1),
+        source="alpaca",
+        provenance="action",
+    )
+    _bar_at(journal_settings, SPY, date(2026, 9, 22), 120.0, CUT - timedelta(hours=2))
+    _bar_at(journal_settings, SPY, date(2026, 9, 30), 80.0, CUT - timedelta(hours=1))
+    expected = 0.75 * (120.0 / 1.15)
+    fake.extra_quantity = {"SPY": 609.0}  # floor(4065 x 1.15) - 4065 = 4674 - 4065
+    fake.extra_cash = expected
+    fake.activities = [_CIL_ACTIVITY("act-cil", expected)]
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [
+        (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]
+
+
+def test_an_underpaid_cash_in_lieu_posted_late_halts(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1627 (fix 2): the same pre-ex reference decides, so a `CIL` paid at 85% of
+    the expected cash (0.75 x 120 / 1.15) at S is off beyond the relative
+    tolerance and halts, booking nothing."""
+    run_id = _run(journal_settings, open_window)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-hold-1",
+        SPY,
+        "SPY",
+        4065.0,
+        at=datetime(2026, 9, 22, 14, 0, tzinfo=UTC),
+    )
+    fake.submit(OrderRequest("tp-hold-1", "SPY", Side.BUY, quantity=4065.0))
+    fake.simulate_fill("tp-hold-1")
+    _fact(
+        journal_settings,
+        "corporate_actions",
+        security_id=SPY,
+        action_type="split",
+        ex_date=date(2026, 9, 23),
+        ratio_or_amount=1.15,
+        known_at=CUT - timedelta(hours=1),
+        ingested_at=CUT - timedelta(hours=1),
+        source="alpaca",
+        provenance="action",
+    )
+    _bar_at(journal_settings, SPY, date(2026, 9, 22), 120.0, CUT - timedelta(hours=2))
+    _bar_at(journal_settings, SPY, date(2026, 9, 30), 80.0, CUT - timedelta(hours=1))
+    expected = 0.75 * (120.0 / 1.15)
+    fake.extra_quantity = {"SPY": 609.0}
+    fake.extra_cash = expected * 0.85
+    fake.activities = [_CIL_ACTIVITY("act-cil", expected * 0.85)]
+
+    with pytest.raises(ReconciliationError):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
 
 
 def test_cash_within_the_open_allowances_carries_the_decimal_difference(
