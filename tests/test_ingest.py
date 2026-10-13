@@ -4730,3 +4730,29 @@ def test_import_stops_at_a_file_the_guard_refuses_with_its_failed_run_row(
     assert "assets-b.json.gz: TruncatedSnapshotError" in result.runs[-1].message
     assert [(r[0], r[1]) for r in _assets_runs(read)] == [(OK, "import"), (FAILED, "import")]
     assert {row[5] for row in _borrow_rows(read)} == {_REC[0]}
+
+
+def test_borrow_raw_keep_skips_a_refused_snapshot(settings: Settings, tmp_path: Path) -> None:
+    """Only a committed snapshot is kept: a payload the guard refuses is never
+    archived where a later `--import-dir` would stop on it."""
+    forty = [_asset(n, f"S{n}") for n in range(1, 41)]
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[forty, forty[5:]])
+    guarded = _borrow(settings, tmp_path)
+    assert ingest_module.ingest_assets(guarded, fake, clock=tick).ok
+    assert not ingest_module.ingest_assets(guarded, fake, clock=tick).ok
+    (kept,) = (tmp_path / "raw").iterdir()
+    assert kept.name == f"assets-{fake.finished[0]:%Y%m%dT%H%M%SZ}.json.gz"
+
+
+def test_import_dry_run_keeps_the_counts_before_a_failing_file(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _init_store(settings)
+    _three_files(tmp_path / "rec")  # the guard refuses the second file
+    dry = ingest_module.import_assets(
+        _borrow(settings, tmp_path), tmp_path / "rec", clock=_Tick(_IMPORT_NOW), dry_run=True
+    )
+    assert [(run.status, run.rows_added) for run in dry.runs] == [(OK, 5), (FAILED, 0)]
+    assert dry.runs[0].message.startswith("dry run: assets-c.json.gz")
+    assert read("SELECT count(*) FROM ingestion_runs") == [(0,)]

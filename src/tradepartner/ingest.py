@@ -3562,20 +3562,19 @@ def _ingest_assets(
     clock: Callable[[], datetime],
     dry_run: bool,
 ) -> SourceRun:
-    """One daily snapshot: one request (`fetch`, before the write lock), the
-    raw keep under `borrow.raw_dir` unless empty or a dry run, then one
+    """One daily snapshot: one request (`fetch`, before the write lock), one
     transaction with the diff's rows and one run row (cursor = the fetch
-    time). `ingested_at` is the run's clock read **after** the response, so
-    `known_at <= ingested_at` holds by construction (spec "the stamp"). A
-    failed request or a refusal writes only its failed run row."""
+    time), then, once committed `ok` and not a dry run, the raw keep under
+    `borrow.raw_dir` unless that is empty. `ingested_at` is the run's clock
+    read **after** the response, so `known_at <= ingested_at` holds by
+    construction (spec "the stamp"). A failed request or a refusal writes
+    only its failed run row and keeps no file."""
     state: dict[str, AssetsFetch] = {}
 
     def prepare() -> None:
         fetched = fetch()
         _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
         state["fetched"] = fetched
-        if settings.borrow.raw_dir and not dry_run:
-            keep_assets(settings.borrow.raw_dir, fetched)
 
     def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
         fetched = state["fetched"]
@@ -3589,7 +3588,24 @@ def _ingest_assets(
             return ""
         return ensure_tz_aware_utc(fetched.fetch_finished_utc, field_name="fetch").isoformat()
 
-    return _run_source(ASSETS_SOURCE, work, settings, now, clock, cursor, dry_run, prepare=prepare)
+    def keep() -> None:
+        # Only a committed `ok` snapshot is kept (`_run_source`'s after-commit
+        # hook): a refused payload is never archived for a later import to trip
+        # on, and a failed keep is noted in the result, never the stored rows.
+        if settings.borrow.raw_dir:
+            keep_assets(settings.borrow.raw_dir, state["fetched"])
+
+    return _run_source(
+        ASSETS_SOURCE,
+        work,
+        settings,
+        now,
+        clock,
+        cursor,
+        dry_run,
+        prepare=prepare,
+        after_commit=keep,
+    )
 
 
 def ingest_assets(
@@ -3642,7 +3658,7 @@ def _parse_instant(value: object, name: str) -> datetime:
 
 
 def scan_assets_dir(
-    directory: Path, now: datetime
+    directory: Path, now: datetime, settings: Settings
 ) -> tuple[list[AssetsFile], list[tuple[str, str]]]:
     """Every `ASSETS_FILE_GLOB` file in `directory`, checked and in ascending
     `fetch_finished_utc` (then name), and the refused ones as `(name,
@@ -3667,7 +3683,7 @@ def scan_assets_dir(
                     f"{now.isoformat()}: not yet known"
                 )
         except (OSError, EOFError, ValueError) as exc:  # JSON, gzip and clock errors
-            refused.append((path.name, f"{type(exc).__name__}: {exc}"))
+            refused.append((path.name, _clean(f"{type(exc).__name__}: {exc}", settings)))
             continue
         found.append(AssetsFile(path, started, finished))
     found.sort(key=lambda item: (item.fetch_finished_utc, item.path.name))
@@ -3719,7 +3735,7 @@ def import_assets(
     would write, and writes no run row.
     """
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
-    files, refused = scan_assets_dir(directory, now)
+    files, refused = scan_assets_dir(directory, now, settings)
     runs: list[SourceRun] = []
     skipped: list[str] = []
 
@@ -3747,9 +3763,9 @@ def import_assets(
         return run
 
     current: AssetsFile | None = None
+    dry: list[SourceRun] = []
     try:
         if dry_run:
-            dry: list[SourceRun] = []
             with open_for_write(settings) as conn:
                 init_schema(conn)
                 for current in files:
@@ -3763,10 +3779,7 @@ def import_assets(
             if run is not None:
                 runs.append(run)
     except _DryRun:
-        runs = [
-            SourceRun(r.source, r.status, r.rows_added, r.chunk_cursor, f"dry run: {r.message}")
-            for r in dry
-        ]
+        pass
     except StoreLockedError as exc:
         runs.append(SourceRun(ASSETS_SOURCE, LOCKED, 0, "", str(exc)))
     except Exception as exc:  # one file failed to apply: its run row, then stop
@@ -3774,9 +3787,14 @@ def import_assets(
         name = "" if current is None else f"{current.path.name}: "
         message = _with_frames(f"{name}{type(exc).__name__}: {exc}", exc, settings)
         failed = SourceRun(ASSETS_SOURCE, FAILED, 0, cursor, _clean(message, settings))
-        if not dry_run:
+        if not dry_run:  # a dry run keeps the counts before the failure (below)
             failed = _record_only(
                 settings, uuid.uuid4().hex, now, clock, failed, ASSETS_IMPORT_MODE
             )
         runs.append(failed)
+    if dry_run:
+        runs = [
+            SourceRun(r.source, r.status, r.rows_added, r.chunk_cursor, f"dry run: {r.message}")
+            for r in dry
+        ] + runs
     return AssetsImport(tuple(runs), tuple(skipped), tuple(refused))

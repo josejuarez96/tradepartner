@@ -1409,8 +1409,9 @@ def _borrow_report(
     if "ingestion_runs" in present:
         observed = conn.execute(
             "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
-            "WHERE source = ? AND status = ? AND TRY_CAST(chunk_cursor AS TIMESTAMPTZ) <= ?",
-            [ASSETS_SOURCE, OK, t],
+            "WHERE source = ? AND status = ? AND TRY_CAST(chunk_cursor AS TIMESTAMPTZ) <= ? "
+            "AND coalesce(finished_at, started_at) <= ?",
+            [ASSETS_SOURCE, OK, t, t],
         ).fetchone()
         observation = None if observed is None else observed[0]
         last = conn.execute(

@@ -1980,4 +1980,5 @@ def test_health_prints_the_borrow_block_and_its_warnings(
     assert result.exit_code == 0, result.output
     assert "borrow status: 10 rows, 6 assets; latest observation none" in result.output
     assert "last alpaca_assets run: never; none" in result.output
+    assert "None shortable" not in result.output
     assert "warning: borrow.enabled is off" in result.output

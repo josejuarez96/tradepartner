@@ -660,10 +660,14 @@ def _print_borrow(report: HealthReport) -> None:
     b = report.borrow
     observed = b.latest_observation.isoformat() if b.latest_observation else "none"
     known = b.latest_known_at.isoformat() if b.latest_known_at else "none"
+    at_it = (
+        f"; at it {b.shortable} shortable, {b.easy_to_borrow} easy_to_borrow (active)"
+        if b.latest_observation is not None
+        else ""
+    )
     typer.echo(
         f"borrow status: {b.rows} rows, {b.assets} assets; latest observation {observed}, "
-        f"latest known_at {known}; at it {b.shortable} shortable, "
-        f"{b.easy_to_borrow} easy_to_borrow (active)"
+        f"latest known_at {known}{at_it}"
     )
     counts = ", ".join(f"{k} {v}" for k, v in sorted(b.run_counts.items())) or "none"
     typer.echo(f"  last {ASSETS_SOURCE} run: {b.last_run_status or 'never'}; {counts}")
