@@ -2525,7 +2525,12 @@ def _fetch_prices(
     action_window = (runs[0][0].replace(day=1), session)
     actions = prices.corporate_actions(every, *action_window)
     action_summary = prices.resolution_summary()
-    changes = prices.symbol_changes(every, *action_window)
+    # A name change is asked for by `process_date` from one lag before the
+    # month (#1665 review): one processed on a month's last session is
+    # stamped the next session's close, so the next month's first run must
+    # still ask for it. Identity makes the overlap add nothing.
+    lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+    changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
     change_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
@@ -2551,9 +2556,12 @@ def _fetch_prices(
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
-    for resolution in (action_summary, change_summary):
-        if resolution and resolution not in message:
-            message += f"; {resolution}"
+    if action_summary:
+        message += f"; {action_summary}"
+    # The name-change call repeats the resolver's line; keep only its own parts.
+    seen = set(action_summary.split("; "))
+    if extra := [part for part in change_summary.split("; ") if part and part not in seen]:
+        message += f"; {'; '.join(extra)}"
     return _PriceFetch(
         tuple(bars),
         tuple(runs),

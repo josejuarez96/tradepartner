@@ -3030,6 +3030,25 @@ class TestAlpacaPriceSource:
         assert source.last_actions_report.malformed_categories == ("spin_offs",)
         assert "malformed spin_offs category skipped" in source.resolution_summary()
 
+    @pytest.mark.parametrize(
+        "error", [ValueError("one id, two rows (#816)"), TypeError("page is not a dict")]
+    )
+    def test_a_failing_name_change_response_is_counted_not_raised(self, error: Exception) -> None:
+        # #1665 safety review: the name-change request itself (not only its
+        # parse) never fails the daily run that asked for it.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+
     def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
         # #1664 ruling (a): the split and dividend output is byte-identical
         # with a spin-off in the payload, whatever ids the spin-off carries.

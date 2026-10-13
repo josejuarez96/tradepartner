@@ -2984,3 +2984,29 @@ def test_new_action_stamp_rules_fail_on_early_rows_and_pass_fixture(
     report = health_report(fixture_store, T_END, settings)
     for rule in (SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT):
         assert not next(check for check in report.integrity if check.rule == rule).passed
+
+
+def test_symbol_change_revision_passes_and_a_mis_stamped_first_row_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1665 review: a revision is stamped at its `ingested_at`, after the
+    identity's first row; only the first row carries the date-only stamp."""
+    from tradepartner.health import SYMBOL_CHANGE_KNOWN_AT
+
+    settings = _settings()
+    revised = datetime(2018, 11, 13, 21, 5, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO symbol_changes SELECT security_id, old_symbol, new_symbol, old_cusip, "
+        "'SYNTH-REVISED', process_date, source_action_id, ?, ?, source, provenance "
+        "FROM symbol_changes",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert next(c for c in report.integrity if c.rule == SYMBOL_CHANGE_KNOWN_AT).passed
+    fixture_store.execute(
+        "UPDATE symbol_changes SET ingested_at = ingested_at + INTERVAL 1 HOUR WHERE known_at = ?",
+        [revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    check = next(c for c in report.integrity if c.rule == SYMBOL_CHANGE_KNOWN_AT)
+    assert check.violations.height == 1

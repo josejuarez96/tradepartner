@@ -4373,6 +4373,49 @@ def test_daily_fixture_stores_spinoff_and_symbol_change_once(
         assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 1
 
 
+def test_daily_run_stores_a_name_change_processed_on_a_month_end(
+    fixture_store_path: Path,
+) -> None:
+    """#1665 review: a rename processed on a month's last session is stamped
+    at the next session's close, so the first run of the next month stores it."""
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+    from tradepartner.adapters.prices import SymbolChange, announcement_date_known_at
+
+    month_end = date(2018, 11, 30)
+    change = SymbolChange(
+        "SEC_TICKCHANGE",
+        "TCKB",
+        "TCKC",
+        "SYNTH-NEW",
+        "SYNTH-NEWER",
+        month_end,
+        announcement_date_known_at(month_end),
+        "alpaca",
+        "month-end-rename",
+    )
+
+    class MonthEnd(FixturePriceSource):
+        def symbol_changes(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[SymbolChange]:
+            found = super().symbol_changes(security_ids, start, end)
+            return [*found, change] if start <= month_end <= end else found
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = MonthEnd(Path(__file__).parent / "fixtures" / "universe")
+    on_the_day = _run(
+        settings, prices=prices, now=datetime(2018, 11, 30, 22, tzinfo=UTC), source="alpaca"
+    )
+    next_month = _run(
+        settings, prices=prices, now=datetime(2018, 12, 3, 22, tzinfo=UTC), source="alpaca"
+    )
+    assert on_the_day.ok and next_month.ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT known_at FROM symbol_changes WHERE source_action_id = 'month-end-rename'"
+        ).fetchall() == [(datetime(2018, 12, 3, 21, tzinfo=UTC),)]
+
+
 def test_actions_backfill_writes_one_filled_run_per_process_month(
     fixture_store_path: Path,
 ) -> None:

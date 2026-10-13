@@ -305,6 +305,21 @@ class _Counted:
                 yield str(sid), day, int(rows)
 
 
+def _delete_spinoffs(conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, date, str]]) -> int:
+    """Delete the `spinoff` rows from `ACTIONS_SOURCE` whose `(child, ex_date,
+    parent)` is in `keys`, never another parent's row of the same child and
+    day; the number deleted."""
+    if not keys:
+        return 0
+    before = _rows(conn, "corporate_actions")
+    conn.executemany(
+        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' "
+        "AND security_id = ? AND ex_date = ? AND source_action_id = ?",
+        [[ACTIONS_SOURCE, *key] for key in keys],
+    )
+    return before - _rows(conn, "corporate_actions")
+
+
 def _delete(
     conn: duckdb.DuckDBPyConnection,
     table: str,
@@ -397,13 +412,16 @@ def repair_resolution(
             "FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' GROUP BY ALL",
             [ACTIONS_SOURCE],
         ).fetchall()
-        spinoffs: dict[Key, int] = {}
+        spinoffs: dict[Key, int] = defaultdict(int)
+        bad_spins: list[tuple[str, date, str]] = []  # (child, ex_date, parent)
         for child, ex_date, parent, count in spin_rows:
             if not (
                 resolver.holds(parent, previous_session(ex_date), actions=True)
                 and resolver.holds(child, ex_date, actions=True)
             ):
-                spinoffs[(child, ex_date)] = int(count)
+                spinoffs[(child, ex_date)] += int(count)
+                bad_spins.append((child, ex_date, parent))
+        spinoffs = dict(spinoffs)
         found = Misattributed(found_bars, ordinary, spinoffs)
         unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
         assert unjudged_row is not None
@@ -431,14 +449,7 @@ def repair_resolution(
                     found.actions,
                     action_types=("split", "dividend"),
                 )
-                + _delete(
-                    conn,
-                    "corporate_actions",
-                    "ex_date",
-                    [ACTIONS_SOURCE],
-                    found.spinoffs,
-                    action_types=("spinoff",),
-                ),
+                + _delete_spinoffs(conn, bad_spins),
             )
             if deleted != (result.bar_rows, result.action_rows):  # never a partial repair
                 raise RuntimeError(

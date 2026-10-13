@@ -1992,15 +1992,33 @@ def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.Dat
                 bad_spin.append({"security_id": security_id, "known_at": stamp})
     bad_change: list[dict[str, Any]] = []
     if "symbol_changes" in tables:
+        # The first row of an identity (the table's identity index) is stamped
+        # by the date-only rule; a later row is a revision, stamped at its own
+        # `ingested_at` after the first (`ingest._add_symbol_changes`).
         rows = conn.execute(
-            "SELECT security_id, process_date, known_at FROM symbol_changes"
+            """
+            SELECT security_id, process_date, known_at, ingested_at,
+                ROW_NUMBER() OVER w AS rn, FIRST_VALUE(known_at) OVER w AS first_known
+            FROM symbol_changes
+            WINDOW w AS (
+                PARTITION BY security_id, source_action_id,
+                    CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN process_date ELSE NULL END
+                ORDER BY known_at
+            )
+            """
         ).fetchall()
-        for security_id, process_date, stamp in rows:
-            try:
-                expected = announcement_date_known_at(process_date)
-            except (ValueError, IndexError):
-                expected = None
-            if stamp != expected:
+        for security_id, process_date, stamp, ingested, rn, first_known in rows:
+            if rn == 1:
+                try:
+                    expected = announcement_date_known_at(process_date)
+                except (ValueError, IndexError):
+                    expected = None
+                ok = stamp == expected
+            else:
+                ok = stamp == ingested and stamp > first_known
+            if not ok:
                 bad_change.append({"security_id": security_id, "known_at": stamp})
     return {
         SPINOFF_KNOWN_AT_FLOOR: pl.DataFrame(bad_spin, schema=_ACTION_STAMP_SCHEMA),

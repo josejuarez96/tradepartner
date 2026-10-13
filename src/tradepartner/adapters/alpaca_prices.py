@@ -2616,8 +2616,8 @@ class AlpacaPriceSource(PriceSource):
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start - self._lag)
         if not symbols:
             return []
-        payload = self._fetch_name_changes(symbols, start, end)
         try:
+            payload = self._fetch_name_changes(symbols, start, end)
             parsed = parse_corporate_actions(
                 {"name_changes": payload.get("name_changes", [])},
                 self._resolver.resolve,
@@ -2626,8 +2626,9 @@ class AlpacaPriceSource(PriceSource):
                 process_end=end,
                 lag_days=self._lag.days,
             )
-        except ValueError:
-            # #1506: a malformed name change is counted on the report and
+        except (ValueError, TypeError, AttributeError):
+            # #1506: a malformed name-change response (a bad row, a non-dict
+            # page, one id returned differently by two batches) is counted on the report and
             # never fails the daily run that asked for it (its bars and
             # splits are already fetched); the actions backfill refuses it.
             self.last_actions_report = ActionsParse(

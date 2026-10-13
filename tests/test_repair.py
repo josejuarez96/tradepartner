@@ -1176,3 +1176,33 @@ def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
         "SELECT action_type, security_id FROM corporate_actions "
         "WHERE ex_date='2021-06-15' ORDER BY 1,2",
     ) == [("spinoff", child)]
+
+
+def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
+    store: Settings,
+) -> None:
+    """#1665 review: two parents' spin-offs of one child on one day are judged
+    and counted apart; only the one whose parent is not held is deleted."""
+    ex = date(2021, 6, 15)
+    child = "0000000003"
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", _listing(child, "CHILD", ex))
+        for parent in (LIVE, DEAD):
+            insert_row(
+                conn,
+                "corporate_actions",
+                {
+                    **_dividend(child, ex),
+                    "action_type": "spinoff",
+                    "ratio_or_amount": 0.25,
+                    "source_action_id": parent,
+                    "known_at": session_close(ex),
+                },
+            )
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dry.found.spinoffs == {(child, ex): 1}
+    repair_resolution(store, clock=lambda: RUN, expect=(dry.bar_rows, dry.action_rows), release=REL)
+    assert _rows(
+        store,
+        "SELECT source_action_id FROM corporate_actions WHERE action_type = 'spinoff'",
+    ) == [(LIVE,)]
