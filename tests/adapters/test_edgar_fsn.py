@@ -1427,3 +1427,209 @@ def test_fsn_and_the_cover_page_agree_on_the_ansys_shape() -> None:
         [_sub(adsh, "1013462", "10-Q")], [], txt, [_dim(dimh, segments)], exchange_axis=True
     ).records
     assert record.listings == cover.cover.listings
+
+
+# --- edgar.cover_split_contexts in parse_fsn (#1660, #1651 follow-up) ----------------
+
+_FIFTH_THIRD_PREF = (
+    "6.625% Fixed-to-Floating Rate Non-Cumulative Perpetual Preferred Stock, Series I"
+)
+#: (fixture, [(tag, value, dim.segments)]): the FSN rows each real filing's
+#: tagging produces (segments as FSN spells them: prefix and `Axis` dropped).
+_SPLIT_PATTERNS: dict[str, tuple[str, list[tuple[str, str, str]]]] = {
+    "fifth_third": (
+        "fifth_third_10q_2023q3.htm",
+        [
+            (
+                "Security12bTitle",
+                "Common Stock, Without Par Value",
+                "CapitalUnitsByClass=CommonStockWithoutParValueMember;",
+            ),
+            ("TradingSymbol", "FITB", "CapitalUnitsByClass=CommonStockWithoutParValueMember;"),
+            (
+                "SecurityExchangeName",
+                "NASDAQ",
+                "CapitalUnitsByClass=CommonStockWithoutParValueMember;",
+            ),
+            (
+                "Security12bTitle",
+                _FIFTH_THIRD_PREF,
+                "CapitalUnitsByClass=SeriesIPreferredStockMember;",
+            ),
+            ("TradingSymbol", "FITBI", "CapitalUnitsByClass=SeriesIPreferredStockMember;"),
+            ("SecurityExchangeName", "NASDAQ", "CapitalUnitsByClass=SeriesIPreferredStockMember;"),
+        ],
+    ),
+    "abbott": (
+        "abbott_10q_2020q3.htm",
+        [
+            ("Security12bTitle", "Common Shares, Without Par Value", ""),
+            ("TradingSymbol", "ABT", "EntityListingsExchange=XNYS;"),
+            ("SecurityExchangeName", "New York Stock Exchange", "EntityListingsExchange=XNYS;"),
+            (
+                "SecurityExchangeName",
+                "Chicago Stock Exchange, Inc.",
+                "EntityListingsExchange=XCHI;",
+            ),
+        ],
+    ),
+    "pg": (
+        "pg_10q_2023q3.htm",
+        [
+            (
+                "Security12bTitle",
+                "Common Stock, without Par Value",
+                "ClassOfStock=CommonStockMember;",
+            ),
+            ("TradingSymbol", "PG", "ClassOfStock=CommonStockMember;"),
+            (
+                "SecurityExchangeName",
+                "NYSE",
+                "ClassOfStock=CommonStockMember;EntityListingsExchange=XNYS;",
+            ),
+            ("Security12bTitle", "1.125% Notes due 2023", "ClassOfStock=A1.125due2023Domain;"),
+            ("TradingSymbol", "PG23A", "ClassOfStock=A1.125due2023Domain;"),
+            ("SecurityExchangeName", "NYSE", "ClassOfStock=A1.125due2023Domain;"),
+        ],
+    ),
+}
+
+
+def _split_fsn(pattern: str, *, on: bool, rows: list[tuple[str, str, str]] | None = None) -> Any:
+    adsh = "0000000001-23-000001"
+    dims: dict[str, str] = {}
+    txt = []
+    for tag, value, segments in rows if rows is not None else _SPLIT_PATTERNS[pattern][1]:
+        dimh = f"0x{len(dims) + 1:x}" if segments and segments not in dims.values() else ""
+        if segments:
+            dimh = next((h for h, s in dims.items() if s == segments), dimh)
+            dims[dimh] = segments
+        txt.append(
+            _txt(adsh, tag, value, dimh=dimh, dimn=str(segments.count("=")) if segments else "0")
+        )
+    return parse_fsn(
+        [_sub(adsh, "1", "10-Q")],
+        [],
+        txt,
+        [_dim(h, s) for h, s in dims.items()],
+        exchange_axis=True,
+        split_contexts=on,
+    )
+
+
+class TestParseFsnSplitContexts:
+    @pytest.mark.parametrize("pattern", sorted(_SPLIT_PATTERNS))
+    def test_the_fsn_rows_give_the_per_document_listings(self, pattern: str) -> None:
+        from tradepartner.adapters.edgar import parse_cover_page
+
+        name = _SPLIT_PATTERNS[pattern][0]
+        cover = parse_cover_page(
+            (EDGAR_FIXTURES / "cover_exchange_axis" / name).read_bytes(),
+            accession="0000000001-23-000001",
+            accepted_at=datetime(2023, 7, 30, 20, tzinfo=UTC),
+            exchange_axis=True,
+            split_contexts=True,
+        )
+        parsed = _split_fsn(pattern, on=True)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert record.listings == cover.cover.listings
+        assert record.incomplete_listings == cover.incomplete_listings == 0
+        assert record.exchange_axis_mismatch == cover.exchange_axis_mismatch
+
+    def test_the_three_filings_name_their_tickers(self) -> None:
+        got = {
+            p: [(i.ticker, i.exchange) for i in _split_fsn(p, on=True).records[0].listings]
+            for p in _SPLIT_PATTERNS
+        }
+        assert got == {
+            "fifth_third": [("FITB", "NASDAQ"), ("FITBI", "NASDAQ")],
+            "abbott": [("ABT", "NYSE"), ("ABT", "NYSE_CHICAGO")],
+            "pg": [("PG", "NYSE"), ("PG23A", "NYSE")],
+        }
+
+    @pytest.mark.parametrize(
+        ("pattern", "listed", "incomplete"),
+        [("fifth_third", [], 0), ("abbott", [], 1), ("pg", ["PG23A"], 1)],
+    )
+    def test_switch_off_is_todays_output(
+        self, pattern: str, listed: list[str], incomplete: int
+    ) -> None:
+        [record] = _split_fsn(pattern, on=False).records
+        assert [i.ticker for i in record.listings] == listed
+        assert record.incomplete_listings == incomplete
+        adsh = "0000000001-23-000001"
+        # the default (no keyword) is the same parse as the explicit off
+        assert _split_fsn(pattern, on=False).records[0] == _parse_default(pattern, adsh)
+
+    def test_capital_units_shares_stay_unread(self) -> None:
+        adsh = "0000000001-23-000001"
+        num = [
+            _num(adsh, SHARES_TAG, "5", "20230630", dimh="0x1", dimn="1"),
+            _num(adsh, SHARES_TAG, "7", "20230630"),
+        ]
+        dim = [_dim("0x1", "CapitalUnitsByClass=CommonStockWithoutParValueMember;")]
+        parsed = parse_fsn(
+            [_sub(adsh, "1", "10-Q")], num, [], dim, exchange_axis=True, split_contexts=True
+        )
+        [record] = parsed.records
+        assert record.shares == (FsnShare("", 7, date(2023, 6, 30)),)
+
+    def test_two_symbols_in_a_class_fall_back_to_one_listing_per_group(self) -> None:
+        rows = [
+            ("Security12bTitle", "Common", "ClassOfStock=CommonStockMember;"),
+            ("TradingSymbol", "AAA", "ClassOfStock=CommonStockMember;EntityListingsExchange=XNYS;"),
+            (
+                "SecurityExchangeName",
+                "NYSE",
+                "ClassOfStock=CommonStockMember;EntityListingsExchange=XNYS;",
+            ),
+            ("TradingSymbol", "BBB", "ClassOfStock=CommonStockMember;EntityListingsExchange=XNAS;"),
+            (
+                "SecurityExchangeName",
+                "NASDAQ",
+                "ClassOfStock=CommonStockMember;EntityListingsExchange=XNAS;",
+            ),
+        ]
+        [record] = _split_fsn("", on=True, rows=rows).records
+        assert record.listings == ()  # no symbol is carried onto a title it was not tagged with
+        assert record.incomplete_listings == 2
+
+    def test_both_class_axes_in_one_segment_are_excluded(self) -> None:
+        rows = [
+            ("Security12bTitle", "Common", "ClassOfStock=A;CapitalUnitsByClass=B;"),
+            ("TradingSymbol", "AAA", "ClassOfStock=A;CapitalUnitsByClass=B;"),
+            ("SecurityExchangeName", "NYSE", "ClassOfStock=A;CapitalUnitsByClass=B;"),
+        ]
+        [record] = _split_fsn("", on=True, rows=rows).records
+        assert record.listings == ()
+
+
+def _parse_default(pattern: str, adsh: str) -> Any:
+    dims: dict[str, str] = {}
+    txt = []
+    for tag, value, segments in _SPLIT_PATTERNS[pattern][1]:
+        if segments and segments not in dims.values():
+            dims[f"0x{len(dims) + 1:x}"] = segments
+        dimh = next((h for h, s in dims.items() if s == segments), "")
+        txt.append(
+            _txt(adsh, tag, value, dimh=dimh, dimn=str(segments.count("=")) if segments else "0")
+        )
+    return parse_fsn(
+        [_sub(adsh, "1", "10-Q")],
+        [],
+        txt,
+        [_dim(h, s) for h, s in dims.items()],
+        exchange_axis=True,
+    ).records[0]
+
+
+def test_an_undecodable_byte_in_a_capital_units_segment_fails_closed_only_with_the_switch() -> None:
+    adsh = "0000000001-23-000001"
+    dim = [_dim("0x1", "CapitalUnitsByClass=Common\ufffdMember;")]
+    txt = _listing_rows(adsh, "0x1", "Common", "AAA", "NYSE")
+    args = ([_sub(adsh, "1", "10-Q")], [], txt, dim)
+    parsed = parse_fsn(*args, split_contexts=True)
+    assert [f.accession for f in parsed.failures] == [adsh]
+    assert "undecodable byte" in parsed.failures[0].error
+    assert parse_fsn(*args).failures == ()  # today's parse drops the row

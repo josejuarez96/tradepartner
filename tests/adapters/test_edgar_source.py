@@ -997,6 +997,35 @@ def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path,
     assert source.cover_exchange_axis_mismatch == (1 if on else 0)
 
 
+@pytest.mark.parametrize("on", [False, True])
+def test_the_split_contexts_switch_reaches_the_fsn_extraction(tmp_path: Path, on: bool) -> None:
+    """#1660: Abbott 2020's tagging (title undimensioned, symbol and exchange on
+    the exchange-axis rows) lists ABT from FSN only with `cover_split_contexts`."""
+    from test_edgar_fsn import FSN_PAGE_URL, _dim, _fsn_zip_bytes, _fsn_zip_url, _sub, _txt
+
+    adsh = "0001104659-20-121336"
+    rows = [
+        ("Security12bTitle", "Common Shares, Without Par Value", "", "0"),
+        ("TradingSymbol", "ABT", "0x1", "1"),
+        ("SecurityExchangeName", "New York Stock Exchange", "0x1", "1"),
+    ]
+    txt = [_txt(adsh, tag, value, dimh=dimh, dimn=dimn) for tag, value, dimh, dimn in rows]
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, f'<html><body><a href="{_fsn_zip_url("2020q3")}">x</a></body></html>')
+    router.add(
+        _fsn_zip_url("2020q3"),
+        _fsn_zip_bytes(
+            [_sub(adsh, "1800", "10-Q")], [], txt, [_dim("0x1", "EntityListingsExchange=XNYS;")]
+        ),
+    )
+    settings = edgar_settings(tmp_path, fsn_first_year=2020, cover_split_contexts=on)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    source._ensure_fsn()
+    [record] = source._load_fsn_cache("0000001800").values()
+    assert [(i.ticker, i.exchange) for i in record.listings] == ([("ABT", "NYSE")] if on else [])
+
+
 # --- the FSN cache round-trips the symbol-only tag (#1624, T184) ------------
 
 
