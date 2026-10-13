@@ -2301,6 +2301,7 @@ def test_a_correct_cash_in_lieu_posted_late_uses_the_pre_ex_reference(
         provenance="action",
     )
     _bar_at(journal_settings, SPY, date(2026, 9, 22), 120.0, CUT - timedelta(hours=2))
+    _bar_at(journal_settings, SPY, date(2026, 9, 23), 91.0, CUT - timedelta(hours=2))
     _bar_at(journal_settings, SPY, date(2026, 9, 30), 80.0, CUT - timedelta(hours=1))
     expected = 0.75 * (120.0 / 1.15)
     fake.extra_quantity = {"SPY": 609.0}  # floor(4065 x 1.15) - 4065 = 4674 - 4065
@@ -2349,6 +2350,7 @@ def test_an_underpaid_cash_in_lieu_posted_late_halts(
         provenance="action",
     )
     _bar_at(journal_settings, SPY, date(2026, 9, 22), 120.0, CUT - timedelta(hours=2))
+    _bar_at(journal_settings, SPY, date(2026, 9, 23), 91.0, CUT - timedelta(hours=2))
     _bar_at(journal_settings, SPY, date(2026, 9, 30), 80.0, CUT - timedelta(hours=1))
     expected = 0.75 * (120.0 / 1.15)
     fake.extra_quantity = {"SPY": 609.0}
