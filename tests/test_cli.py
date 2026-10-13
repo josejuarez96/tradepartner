@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 from typer.testing import CliRunner
 
-from tradepartner import cli
+from tradepartner import cli, health
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.fixture_rates import FixtureRateSource
@@ -31,6 +31,7 @@ from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, SourceRun
 from tradepartner.store import journal, registry
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.schema import init_schema
 
 USER_AGENT = "Test Owner test-owner-ua@example.com"
@@ -1123,6 +1124,70 @@ def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     assert result.exit_code == 0, result.output  # a warning, not a failed rule
     assert "warning" in result.output.lower()
     assert "2 quarantined" in result.output
+
+
+def _equal_cash(conn: duckdb.DuckDBPyConnection, sid: str, action_id: str) -> None:
+    known = session_close(date(2020, 3, 13))
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": "dividend",
+            "ex_date": date(2020, 3, 16),
+            "ratio_or_amount": 0.37,
+            "announced_at": None,
+            "source_action_id": action_id,
+            "cancelled": False,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def test_health_lists_equal_amount_dividends_and_warns_on_pending(
+    tmp_path: Path, fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1613 (T186b): accepted and unresolved pairs are listed, a pending
+    duplicate is a warning and not a failure, an unlisted pair fails."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    assert "accepted equal-amount dividend pairs: 0" in plain.output
+    assert "unresolved equal-amount dividend pairs: 0" in plain.output
+    assert "pending repair" not in plain.output
+    with open_for_write(settings) as conn:
+        for sid in ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_TICKCHANGE", "SEC_TRANSFER"):
+            for action_id in ("a", "b"):
+                _equal_cash(conn, sid, f"{sid}-{action_id}")
+
+    def listed(sid: str, verdict: str) -> ReviewedGroup:
+        retract = f"{sid}-b" if verdict == "duplicate" else ""
+        return ReviewedGroup(sid, date(2020, 3, 16), 0.37, verdict, retract, "TCK", "test")  # type: ignore[arg-type]
+
+    reviewed = [
+        listed("SEC_DUAL_A", "distinct"),
+        listed("SEC_DUAL_B", "unresolved"),
+        listed("SEC_TICKCHANGE", "duplicate"),
+    ]
+    monkeypatch.setattr(health, "reviewed_groups", lambda: reviewed)
+    failing = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert failing.exit_code == 1  # SEC_TRANSFER's pair is listed nowhere
+    assert "health check failed: duplicate_dividends" in failing.output
+    assert "duplicate_dividends: FAIL (2 rows)" in failing.output
+    assert "accepted equal-amount dividend pairs: 1" in failing.output
+    assert "  SEC_DUAL_A@2020-03-16 TCK 0.37 (SEC_DUAL_A-a, SEC_DUAL_A-b)" in failing.output
+    assert "unresolved equal-amount dividend pairs: 1" in failing.output
+    assert "  SEC_DUAL_B@2020-03-16 TCK 0.37" in failing.output
+    assert "warning: 1 listed duplicate dividend keys are pending repair" in failing.output
+    monkeypatch.setattr(
+        health, "reviewed_groups", lambda: [*reviewed, listed("SEC_TRANSFER", "distinct")]
+    )
+    checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 0, checked.output  # pending is a warning, not a failure
+    assert "warning: 1 listed duplicate dividend keys are pending repair" in checked.output
 
 
 def test_health_does_not_warn_when_the_last_edgar_run_quarantined_nothing(

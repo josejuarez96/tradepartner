@@ -268,6 +268,20 @@ derived at `t`, as the data is read.
   there. This is the check that catches a one-day ingest outage the universe
   would otherwise turn into an empty universe: rule 6 requires a bar on
   every session of that window, so one missing session fails every name.
+- `duplicate_dividends` (#1613, T186b): per `(security_id, ex_date,
+  ratio_or_amount)` of the `dividend` rows live at `t`
+  (`live_actions_as_of`), the identities on it, classed against the
+  reviewed list (`store.dividend_reviews`, read at the edge so tests inject
+  one) by `equal_amount_groups`: a key with more than one identity that the
+  list does not hold, or a listed key with another identity count than the
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
+  fails, one row per identity with its `known_at`. `known_at` and the id
+  are never part of the key, and the rule has no date bound. The
+  `duplicate_dividends` block lists the accepted (`distinct`) and
+  unresolved keys, never hidden, and the pending ones (a listed `duplicate`
+  not repaired yet): a CLI warning, like the quarantined count, and not a
+  failure, so a known, listed repair waiting for its release never blocks
+  the paper shakedown's E.7.
 
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
@@ -313,7 +327,12 @@ from tradepartner.config import (
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
-from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
+from tradepartner.store.asof import (
+    _validate_t,
+    live_actions_as_of,
+    price_jumps_as_of,
+    statement_facts_as_of,
+)
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
@@ -322,6 +341,12 @@ from tradepartner.store.delistings import (
     _filing_session,
     _window,
     listing_ends_as_of,
+)
+from tradepartner.store.dividend_reviews import (
+    EqualAmountGroup,
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
 )
 from tradepartner.store.master import securities_as_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
@@ -370,6 +395,8 @@ SESSION_HOLES = "session_holes"
 RATE_KNOWN_AT = "rates_known_at_from_vintage"
 RATE_UNIQUE = "rates_unique"
 RATE_VALUE_FINITE = "rates_value_finite"
+#: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
+DUPLICATE_DIVIDENDS = "duplicate_dividends"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -393,6 +420,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     RATE_KNOWN_AT,
     RATE_UNIQUE,
     RATE_VALUE_FINITE,
+    DUPLICATE_DIVIDENDS,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -813,6 +841,73 @@ class IntegrityCheck:
         return self.violations.is_empty()
 
 
+_DUPLICATE_DIVIDENDS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "amount": pl.Float64,
+    "source_action_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "verdict": pl.Utf8,
+}
+
+
+@dataclass(frozen=True)
+class DuplicateDividends:
+    """Every equal-amount cash dividend key live at `t` and its class under
+    the reviewed list (`store.dividend_reviews.equal_amount_groups`; module
+    docstring, `duplicate_dividends`). Repaired keys are not kept."""
+
+    groups: tuple[EqualAmountGroup, ...]
+
+    def _of(self, group_class: str) -> tuple[EqualAmountGroup, ...]:
+        return tuple(g for g in self.groups if g.group_class == group_class)
+
+    @property
+    def accepted(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `distinct`: two declared payments of one amount."""
+        return self._of("accepted")
+
+    @property
+    def unresolved(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `unresolved`: the known gap, reported, never hidden."""
+        return self._of("unresolved")
+
+    @property
+    def pending(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `duplicate` still holding both ids: a repair not run yet
+        (or deferred by its `--to`). A CLI warning, not a failure."""
+        return self._of("pending")
+
+    @property
+    def violations(self) -> pl.DataFrame:
+        """One row per identity of every `violation` key: the key, the id,
+        its `known_at` and the listed verdict (null for an unlisted key)."""
+        rows = [
+            {
+                "security_id": g.security_id,
+                "ex_date": g.ex_date,
+                "amount": g.amount,
+                "source_action_id": i.source_action_id,
+                "known_at": ensure_tz_aware_utc(i.known_at, field_name="known_at"),
+                "verdict": None if g.reviewed is None else g.reviewed.verdict,
+            }
+            for g in self._of("violation")
+            for i in g.identities
+        ]
+        return pl.DataFrame(rows, schema=_DUPLICATE_DIVIDENDS_SCHEMA)
+
+
+def duplicate_dividends(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reviewed: Sequence[ReviewedGroup]
+) -> DuplicateDividends:
+    """The `duplicate_dividends` block at `t`: `equal_amount_groups` over the
+    `dividend` rows `live_actions_as_of(conn, t)` returns and `reviewed`
+    (the packaged list is read at the edge, `health_report`)."""
+    t = _validate_t(t)
+    groups = equal_amount_groups(live_actions_as_of(conn, t), reviewed)
+    return DuplicateDividends(tuple(g for g in groups if g.group_class != "repaired"))
+
+
 @dataclass(frozen=True, eq=False)
 class HealthReport:
     """Everything the health command and page show (module docstring)."""
@@ -834,6 +929,7 @@ class HealthReport:
     statement: StatementFacts
     filing_events: FilingEvents
     rates: RatesHealth
+    duplicate_dividends: DuplicateDividends
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
@@ -862,6 +958,7 @@ def health_report(
     *,
     jumps_before: date | None = None,
     with_coverage_reference: bool | None = None,
+    reviewed: Sequence[ReviewedGroup] | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
@@ -869,7 +966,9 @@ def health_report(
     `jumps_before` limits the price-jump list to sessions before it, and the
     shares-outlier list to `as_of_date`s before it. `with_coverage_reference`
     computes the `coverage_reference` block when true, never when false, and
-    when `None` (the default) only while `coverage.check_enabled` is on."""
+    when `None` (the default) only while `coverage.check_enabled` is on.
+    `reviewed` is the duplicate-dividend list, by default the packaged one
+    (`store.dividend_reviews.reviewed_groups`)."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -879,6 +978,7 @@ def health_report(
     classes = classifications_as_of(conn, t)
     overlaps, accepted_pairs = _overlapping_listings(listings, settings)
     ingests = last_ingests(conn, t)
+    dividends = duplicate_dividends(conn, t, reviewed_groups() if reviewed is None else reviewed)
     return HealthReport(
         t=t,
         session=session,
@@ -900,7 +1000,8 @@ def health_report(
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
-        integrity=_integrity_checks(conn, t, settings, listings, overlaps),
+        duplicate_dividends=dividends,
+        integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
         coverage_reference=(
             _coverage_reference(conn, t, settings, listings)
             if (
@@ -1705,13 +1806,18 @@ def _listed_without_bars(
 
 
 def integrity_checks(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    reviewed: Sequence[ReviewedGroup] | None = None,
 ) -> tuple[IntegrityCheck, ...]:
-    """Every rule in `INTEGRITY_RULES`, in that order (module docstring)."""
+    """Every rule in `INTEGRITY_RULES`, in that order (module docstring);
+    `reviewed` as in `health_report`."""
     t = _validate_t(t)
     listings = listing_ends_as_of(conn, t, settings)
     overlaps, _ = _overlapping_listings(listings, settings)
-    return _integrity_checks(conn, t, settings, listings, overlaps)
+    dividends = duplicate_dividends(conn, t, reviewed_groups() if reviewed is None else reviewed)
+    return _integrity_checks(conn, t, settings, listings, overlaps, dividends)
 
 
 def _integrity_checks(
@@ -1720,9 +1826,11 @@ def _integrity_checks(
     settings: Settings,
     listings: pl.DataFrame,
     overlaps: pl.DataFrame,
+    dividends: DuplicateDividends,
 ) -> tuple[IntegrityCheck, ...]:
     """`overlaps` is `_overlapping_listings`' violation frame for `listings`,
-    computed once by the caller, which also needs its accepted pairs."""
+    computed once by the caller, which also needs its accepted pairs;
+    `dividends` the `duplicate_dividends` block, likewise."""
     window = settings.master.transfer_window_sessions
     violations: dict[str, pl.DataFrame] = {
         KNOWN_AT_NOT_NULL: _count_per_table(conn, "known_at IS NULL"),
@@ -1740,6 +1848,7 @@ def _integrity_checks(
         **_filing_event_rules(conn, settings),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
+        DUPLICATE_DIVIDENDS: dividends.violations,
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 

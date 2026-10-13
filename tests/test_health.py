@@ -35,6 +35,7 @@ from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
     COVERAGE_REFERENCE_NAMES,
+    DUPLICATE_DIVIDENDS,
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
@@ -74,6 +75,7 @@ from tradepartner.health import (
     unclassifiable,
 )
 from tradepartner.store.db import configure_connection, insert_row
+from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
 
 T_END = session_close(date(2020, 6, 30))
@@ -2713,3 +2715,180 @@ def test_rates_staleness_is_read_from_an_aborted_stale_run(
     report = health_report(fixture_store, T_END, _settings())
     rate = next(item for item in report.rates.series if item.series == "DTB3")
     assert rate.stale_sessions == 17
+
+
+# --- duplicate_dividends (#1613, T186b) ---------------------------------------
+
+DIV_SID = "SEC_DUAL_A"
+DIV_EX = date(2020, 3, 16)
+DIV_KNOWN = session_close(date(2020, 3, 13))
+
+
+def _cash(
+    conn: duckdb.DuckDBPyConnection,
+    action_id: str,
+    *,
+    sid: str = DIV_SID,
+    ex_date: date = DIV_EX,
+    amount: float = 0.37,
+    known: datetime = DIV_KNOWN,
+    cancelled: bool = False,
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": "dividend",
+            "ex_date": ex_date,
+            "ratio_or_amount": amount,
+            "announced_at": None,
+            "source_action_id": action_id,
+            "cancelled": cancelled,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def _review(verdict: str, *, sid: str = DIV_SID, amount: float = 0.37) -> ReviewedGroup:
+    return ReviewedGroup(
+        security_id=sid,
+        ex_date=DIV_EX,
+        amount=amount,
+        verdict=verdict,  # type: ignore[arg-type]
+        retract_source_action_id="dd-b" if verdict == "duplicate" else "",
+        ticker="DUAL",
+        evidence="test",
+    )
+
+
+def _dividend_check(
+    conn: duckdb.DuckDBPyConnection, reviewed: list[ReviewedGroup]
+) -> tuple[set[str], pl.DataFrame, HealthReport]:
+    report = health_report(conn, T_END, _settings(), reviewed=reviewed)
+    check = next(c for c in report.integrity if c.rule == DUPLICATE_DIVIDENDS)
+    return _failed(report.integrity), check.violations, report
+
+
+def test_an_unlisted_equal_pair_fails_naming_the_key_ids_and_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    later = DIV_KNOWN + timedelta(days=3)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b", known=later)  # another known_at: still one key
+    failed, violations, report = _dividend_check(fixture_store, [])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert not report.ok
+    assert violations.to_dicts() == [
+        {
+            "security_id": DIV_SID,
+            "ex_date": DIV_EX,
+            "amount": 0.37,
+            "source_action_id": "dd-a",
+            "known_at": DIV_KNOWN,
+            "verdict": None,
+        },
+        {
+            "security_id": DIV_SID,
+            "ex_date": DIV_EX,
+            "amount": 0.37,
+            "source_action_id": "dd-b",
+            "known_at": later,
+            "verdict": None,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "block"),
+    [("distinct", "accepted"), ("unresolved", "unresolved"), ("duplicate", "pending")],
+)
+def test_a_listed_pair_passes_and_is_shown(
+    fixture_store: duckdb.DuckDBPyConnection, verdict: str, block: str
+) -> None:
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b")
+    failed, violations, report = _dividend_check(fixture_store, [_review(verdict)])
+    assert failed == set()
+    assert violations.is_empty()
+    assert report.ok  # the paper shakedown's E.7 reads `health_report(...).ok`
+    dividends = report.duplicate_dividends
+    shown = {name: getattr(dividends, name) for name in ("accepted", "unresolved", "pending")}
+    assert [(g.security_id, g.ex_date) for g in shown.pop(block)] == [(DIV_SID, DIV_EX)]
+    assert all(groups == () for groups in shown.values())
+
+
+def test_a_third_id_on_a_listed_key_fails(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    for action_id in ("dd-a", "dd-b", "dd-c"):
+        _cash(fixture_store, action_id)
+    failed, violations, _ = _dividend_check(fixture_store, [_review("distinct")])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert violations["source_action_id"].to_list() == ["dd-a", "dd-b", "dd-c"]
+    assert set(violations["verdict"]) == {"distinct"}
+
+
+def test_a_cancelled_or_superseded_revision_never_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    later = DIV_KNOWN + timedelta(days=1)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b")
+    _cash(fixture_store, "dd-b", known=later, cancelled=True)  # withdrawn
+    _cash(fixture_store, "dd-c", amount=0.40)
+    _cash(fixture_store, "dd-c", known=later)  # re-stated to the pair's amount ...
+    _cash(fixture_store, "dd-c", known=later + timedelta(days=1), amount=0.41)  # ... and away
+    failed, _, report = _dividend_check(fixture_store, [])
+    assert failed == set()
+    assert report.duplicate_dividends.groups == ()
+    # Before the withdrawal, at T, the pair is live: the rule reads as of T.
+    early = health_report(fixture_store, DIV_KNOWN, _settings(), reviewed=[])
+    assert DUPLICATE_DIVIDENDS in early.failures
+
+
+def test_a_repaired_duplicate_is_neither_shown_nor_failed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _cash(fixture_store, "dd-a")  # the kept id; dd-b was deleted by the release
+    failed, _, report = _dividend_check(fixture_store, [_review("duplicate")])
+    assert failed == set()
+    assert report.duplicate_dividends.groups == ()
+
+
+def test_the_fixture_store_passes_under_the_packaged_list(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The default list's keys are absent from the fixture store: not a violation."""
+    report = health_report(fixture_store, T_END, _settings())
+    assert DUPLICATE_DIVIDENDS not in report.failures
+    assert report.duplicate_dividends.groups == ()
+
+
+def test_a_pending_packaged_key_keeps_health_ok(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A listed duplicate still in the store (the eight rows `--to` defers)
+    keeps `health_report(...).ok`, which the paper shakedown's E.7 reads."""
+    [aiv] = [g for g in reviewed_groups() if g.ticker == "AIV" and g.ex_date == date(2020, 2, 13)]
+    known = session_close(date(2020, 2, 12))
+    _cash(
+        fixture_store,
+        "kept-id",
+        sid=aiv.security_id,
+        ex_date=aiv.ex_date,
+        amount=aiv.amount,
+        known=known,
+    )
+    _cash(
+        fixture_store,
+        aiv.retract_source_action_id,
+        sid=aiv.security_id,
+        ex_date=aiv.ex_date,
+        amount=aiv.amount,
+        known=known,
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.ok, report.failures
+    assert [g.security_id for g in report.duplicate_dividends.pending] == [aiv.security_id]
