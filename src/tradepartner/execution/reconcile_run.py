@@ -108,7 +108,7 @@ import polars as pl
 from pydantic import ValidationError
 
 from tradepartner.adapters.broker import Account, Broker, Order, Position
-from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
@@ -152,6 +152,7 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
 _DIVIDEND_CASH = "dividend_cash"
+_SPLIT = "split"
 _RISK_PREFIX = "risk."
 _FAULT_TYPE = ReconciliationError.__name__
 
@@ -388,6 +389,42 @@ def _dividends(
     )
 
 
+def _stock_dividends(
+    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+) -> dict[str, tuple[date, date, float]]:
+    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
+    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
+    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
+    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
+    window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
+    and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
+    `cash_in_lieu` adjustment only beside a name here and dated in
+    `[first_date, last_date]` (and a fractional remainder the broker credited as
+    whole shares plus cash); otherwise it is `unexplained_activity`."""
+    rows = actions.filter(
+        (pl.col("action_type") == _SPLIT)
+        & (pl.col("ratio_or_amount") > 1)
+        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ex_date") <= session)
+    )
+    latest: dict[str, tuple[date, float]] = {}
+    for row in rows.iter_rows(named=True):
+        ex_date = row["ex_date"]
+        current = latest.get(row["security_id"])
+        if current is None or ex_date > current[0]:
+            latest[row["security_id"]] = (ex_date, float(row["ratio_or_amount"]))
+    result: dict[str, tuple[date, date, float]] = {}
+    for name, (ex_date, ratio) in sorted(latest.items()):
+        last = ex_date
+        for _ in range(max_lag_sessions):
+            if last >= session:
+                break
+            last = next_session(last)
+        result[name] = (ex_date, last, ratio)
+    return result
+
+
 def _explanations(
     conn: duckdb.DuckDBPyConnection,
     state: _JournalState,
@@ -414,6 +451,12 @@ def _explanations(
     dividends, findings = _dividends(
         state, actions, window, session, tolerance, through, reviewed_groups()
     )
+    stock_dividends = _stock_dividends(
+        actions,
+        session,
+        settings.alpaca.stock_dividend_max_rate,
+        settings.alpaca.cash_in_lieu_max_lag_sessions,
+    )
     return Explanations(
         symbols=symbols,
         ended=ended,
@@ -421,9 +464,30 @@ def _explanations(
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
+        stock_dividends=stock_dividends,
+        stock_dividend_references=_stock_dividend_references(conn, cut, priced, stock_dividends),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
     )
+
+
+def _stock_dividend_references(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    priced: Sequence[str],
+    stock_dividends: Mapping[str, tuple[date, date, float]],
+) -> dict[str, float]:
+    """Each stock dividend's pre-ex reference (#1627): the raw close of the
+    name's latest bar on or before `previous_session(ex_date)`, known at `cut`.
+    Read for the ex-date, not the reconciliation session, so a `CIL` posted on
+    the payable date still divides the same pre-split close by the ratio; a name
+    the bars do not reach is left out, and its `CIL` halts there."""
+    references: dict[str, float] = {}
+    for name, (ex_date, _last_date, _ratio) in stock_dividends.items():
+        if name not in set(priced):
+            continue
+        references.update(_reference_prices(conn, cut, [name], previous_session(ex_date)))
+    return references
 
 
 def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:
