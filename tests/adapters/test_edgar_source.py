@@ -34,7 +34,7 @@ from edgar_transport import (
 
 from tradepartner.adapters import edgar_raw
 from tradepartner.adapters import edgar_source as edgar_source_module
-from tradepartner.adapters.edgar import UnstampedFiling, acceptance_times
+from tradepartner.adapters.edgar import FsnFiling, UnstampedFiling, acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
     COVER_VERSION,
@@ -44,7 +44,12 @@ from tradepartner.adapters.edgar_source import (
     SubmissionRecord,
     reduce_submissions,
 )
-from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
+from tradepartner.adapters.filings import (
+    CoverListing,
+    CoverPage,
+    DelistingFiling,
+    FilingIndexEntry,
+)
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
 
@@ -1171,7 +1176,11 @@ def test_filename_cache_holds_only_the_extract_and_a_rerun_makes_no_request(
     assert set(stored) == {"version", "cik", "records"}
     assert stored["records"][_FN_A]["name"] == "aapl"
     assert stored["records"][_FN_A]["pairs"][0][1] == "NASDAQ"
-    assert stored["records"][_FN_C] == {"name": None, "pairs": []}  # no instance, still cached
+    assert stored["records"][_FN_C] == {
+        "name": None,
+        "pairs": [],
+        "document_read": False,
+    }  # no instance, still cached
     assert max(len(json.dumps(r)) for r in stored["records"].values()) < 2000  # no document kept
     # No downloaded document anywhere under the cache directory.
     assert {p.suffix for p in (tmp_path / "cache").rglob("*") if p.is_file()} == {".json"}
@@ -1258,6 +1267,63 @@ def test_filename_failed_fetch_is_counted_cached_nowhere_and_asked_again(
     assert _FN_A in {e.accession for e in healed}
     asked = {u for u in router.urls[before:]}
     assert asked == {_fn_url(_FN_A, "index.json"), _fn_url(_FN_A, "doc.htm")}  # only the failed one
+
+
+def test_filename_dei_symbol_survives_the_real_fsn_cache_writer(tmp_path: Path) -> None:
+    """The tag reaches `FilenameListing.dei_symbol` through `_save_fsn_cache`,
+    not through a hand-written key: without the writer's `symbol_only` every
+    entry reads as "never recorded" and the filing's own tag is lost."""
+    source = _fn_source(tmp_path, _fn_router())
+    records = {
+        accession: FsnFiling(accession, _FN_CIK, "10-K", None, (), (), symbol_only=tags)
+        for accession, tags in ((_FN_A, ("AAPL",)), (_FN_B, ("ZEN",)))
+    }
+    records[_FN_COVER] = FsnFiling(
+        _FN_COVER, _FN_CIK, "10-Q", None, (CoverListing("Common Stock", "AAPL", "NASDAQ"),), ()
+    )
+    source._save_fsn_cache(_FN_CIK, records)
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert (listings[_FN_A].dei_symbol, listings[_FN_B].dei_symbol) == ("AAPL", "ZEN")
+    assert source.filename_fsn_no_symbol_only == 0
+
+
+def test_a_prefix_only_cache_entry_is_a_miss_for_a_ten_k_read(tmp_path: Path) -> None:
+    """An accession first cached as the first cover filing (prefix only) and
+    later asked as a 10-K is read again, not served with no 12(b) pairs."""
+    router = _fn_router()
+    source = _fn_source(tmp_path, router)
+    source._save_filename_cache(
+        _FN_CIK,
+        {_FN_A: edgar_source_module._FilenameExtract("aapl", (), False)},
+    )
+    listing = {e.accession: e for e in source.filename_listings(_FN_CIK)}[_FN_A]
+    assert listing.exchange == "NASDAQ"
+    assert _fn_url(_FN_A, "doc.htm") in router.urls
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert stored["records"][_FN_A]["document_read"] is True
+
+
+def test_filename_incomplete_ciks_names_a_partial_answer(tmp_path: Path) -> None:
+    router = _fn_router()
+    # The cold Form 25 has no delisting-cache entry: the answer is partial.
+    source = _fn_source(tmp_path, router)
+    source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+
+    # The same Form 25 as the exchange's copy of another company's: skipped, complete.
+    clean = _fn_source(tmp_path, router)
+    clean._save_delisting_cache(
+        _FN_25_COLD,
+        DelistingFiling(KLX, "25", "Common Stock", "NASDAQ", _FN_25_COLD, _FN_AT[_FN_25_COLD]),
+    )
+    clean.filename_listings(_FN_CIK)
+    assert clean.filename_incomplete_ciks == set()
+
+    # A failed fetch makes it partial again.
+    router.add(_fn_url(_FN_B, "index.json"), 404)
+    failing = _fn_source(tmp_path / "other", router)
+    failing.filename_listings(_FN_CIK)
+    assert failing.filename_incomplete_ciks == {_FN_CIK}
 
 
 class _CountedBody(httpx.SyncByteStream):

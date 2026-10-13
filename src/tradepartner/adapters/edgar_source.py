@@ -640,6 +640,11 @@ class EdgarFilingSource(FilingSource):
         # 10-Ks with no FSN entry at all (the tag cannot be known either).
         self.filename_fsn_missing = 0
         self._filename_counted: set[str] = set()
+        # CIKs whose last `filename_listings` answer is known to be partial: a
+        # reading failed, was quarantined, or a Form 25 was not in the
+        # delisting cache. A caller must not derive a "no other reading" verdict
+        # (`single_reading`) for such a CIK until a complete run.
+        self.filename_incomplete_ciks: set[str] = set()
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -1984,7 +1989,11 @@ class EdgarFilingSource(FilingSource):
 
     def filename_listings(self, cik: str) -> list[FilenameListing]:
         """`cik`'s filing-name readings (spec amendment 2026-10-12, #1597),
-        sorted by `accepted_at`, then accession, then ticker; `[]`, with no
+        sorted by `accepted_at`, then accession, then ticker. A CIK whose answer
+        is partial (a fetch failed or is quarantined, a Form 25 is not in the
+        delisting cache) is listed on `.filename_incomplete_ciks`; its
+        Form 25 `valid_from` is the acceptance session, which T184e replaces by
+        the security's first session (#974). `[]`, with no
         request and no cache file, while `edgar.filename_listings` is off.
 
         From the stamps (the submissions record, never refetched here): one
@@ -2086,6 +2095,7 @@ class EdgarFilingSource(FilingSource):
             cached = self._load_delisting_cache(record.accession)
             if cached is None:
                 counts.form25_uncached += 1
+                self.filename_incomplete_ciks.add(cik)
                 continue
             if cached.cik != cik:
                 continue  # the exchange's copy of a 25-NSE: the subject company keeps it
@@ -2152,18 +2162,23 @@ class EdgarFilingSource(FilingSource):
         returned; `None` when the fetch failed (counted by `_guarded`, no
         cache entry, asked again next run) or the accession is quarantined."""
         cached = cache.get(record.accession)
-        if cached is not None:
+        if cached is not None and (
+            not read_document or cached.name is None or cached.document_read
+        ):
             self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
             return cached
         if self._is_quarantined(record.accession):
             self._quarantined_this_run.add(record.accession)
             self.quarantined += 1
+            self.filename_incomplete_ciks.add(cik)
             return None
         fetch: Callable[[], _FilenameExtract] = partial(
             self._fetch_filename_extract, cik, record, read_document
         )
         extract = self._guarded(record.accession, record.form.removesuffix("/A"), fetch)
-        if extract is not None:
+        if extract is None:
+            self.filename_incomplete_ciks.add(cik)
+        else:
             cache[record.accession] = extract
             self._save_filename_cache(cik, cache)
         return extract
@@ -2176,10 +2191,10 @@ class EdgarFilingSource(FilingSource):
         )
         self.filename_index_fetches += 1
         if record.form in _DELISTING_FORMS:
-            return _FilenameExtract(form25_exhibit_ticker(names), ())
+            return _FilenameExtract(form25_exhibit_ticker(names), (), True)
         prefix = instance_prefix(names)
         if prefix is None or not read_document:
-            return _FilenameExtract(prefix, ())
+            return _FilenameExtract(prefix, (), False)
         cap = self._settings.edgar.filename_document_max_bytes
         # The root copy, never an `xsl.../` rendering of it (as `_fetch_cover_page`).
         document = re.sub(r"^xsl[^/]*/", "", record.primary_document)
@@ -2194,7 +2209,7 @@ class EdgarFilingSource(FilingSource):
         )
         self.filename_document_fetches += 1
         pairs = cover_12b_exchanges(head.decode("utf-8", "ignore"), max_bytes=cap)
-        return _FilenameExtract(prefix, pairs)
+        return _FilenameExtract(prefix, pairs, True)
 
     def _filename_cache_path(self, cik: str) -> Path:
         return self._cache / "filename" / f"v{FILENAME_VERSION}" / f"{cik}.json"
@@ -2208,6 +2223,7 @@ class EdgarFilingSource(FilingSource):
                 str(accession): _FilenameExtract(
                     None if entry["name"] is None else str(entry["name"]),
                     tuple((str(title), str(exchange)) for title, exchange in entry["pairs"]),
+                    entry.get("document_read") is True,
                 )
                 for accession, entry in data["records"].items()
             }
@@ -2219,7 +2235,11 @@ class EdgarFilingSource(FilingSource):
             "version": FILENAME_VERSION,
             "cik": cik,
             "records": {
-                accession: {"name": e.name, "pairs": [list(pair) for pair in e.pairs]}
+                accession: {
+                    "name": e.name,
+                    "pairs": [list(pair) for pair in e.pairs],
+                    "document_read": e.document_read,
+                }
                 for accession, e in cache.items()
             },
         }
@@ -3316,6 +3336,10 @@ class _FilenameExtract:
 
     name: str | None
     pairs: tuple[tuple[str, str], ...]
+    #: Whether the primary document was read for this entry. A cover filing's
+    #: entry (prefix only) is not a 10-K's: if the same accession is later
+    #: asked as a 10-K with an instance, the entry is a miss.
+    document_read: bool = False
 
 
 @dataclass
@@ -3344,8 +3368,7 @@ def _twelve_b_table_read(buffer: bytes) -> bool:
 
 def _session_of(instant: datetime) -> date:
     """The New York day of `instant`, advanced to the next trading session
-    (`store.master.session_of`, restated so the adapter keeps the calendar
-    module and not the master)."""
+    (`store.master.session_of`, restated here as the calendar's two calls)."""
     day = instant.astimezone(_EASTERN).date()
     return day if is_session(day) else next_session(day)
 
@@ -3775,7 +3798,29 @@ def _fsn_filing_to_json(filing: FsnFiling) -> dict[str, Any]:
         "sic": filing.sic,
         "listings": [[item.title, item.ticker, item.exchange] for item in filing.listings],
         "shares": [[s.class_member, s.value, s.as_of_date.isoformat()] for s in filing.shares],
+        # #1624: a `dei:TradingSymbol` that names no exchange, T184's reading
+        # of the filing. Without it a cached filing loses the tag, and a
+        # filename reading that asked for it would find none.
+        "symbol_only": list(filing.symbol_only),
     }
+
+
+def _fsn_symbol_only(data: Mapping[str, Any]) -> tuple[str, ...]:
+    """The symbol-only tags one cached FSN entry records (#1624).
+
+    A missing key is an entry written before #1624, which recorded none.
+    Anything else must be the list of strings the writer wrote: a cache file
+    is a file on disk, so a corrupt or hand-edited one that holds a string, a
+    dict or a list of something else is refused rather than read as the
+    letters of one symbol or as symbols that are not strings."""
+    recorded = data.get("symbol_only")
+    if recorded is None:
+        return ()
+    if not isinstance(recorded, list) or not all(isinstance(item, str) for item in recorded):
+        raise TypeError(
+            f"cached symbol_only must be a list of strings, got {type(recorded).__name__}"
+        )
+    return tuple(recorded)
 
 
 def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> FsnFiling:
@@ -3789,4 +3834,11 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
             FsnShare(member, value, date.fromisoformat(as_of))
             for member, value, as_of in data["shares"]
         ),
+        # An entry written before #1624 has no tag recorded (the field is
+        # T184's, and the cache kept only what its parser wrote). Reading it
+        # as none is right only for a cache nobody has asked the tag of: the
+        # release-time re-extraction (T184h's `FSN_VERSION` bump) rewrites
+        # every entry with the tag its filing carries. No bump here, because
+        # every reading this cache already served is unchanged by the field.
+        symbol_only=_fsn_symbol_only(data),
     )
