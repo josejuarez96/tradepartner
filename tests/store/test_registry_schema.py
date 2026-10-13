@@ -54,17 +54,17 @@ _PHASE3_REGISTRY = tuple(
 #: `corporate_actions` (rebuilt) and `schema_version` (appended to).
 #: Version 4 rebuilds `corporate_actions` and version 11 (#859) the
 #: retractable master tables (`tests/store/test_retraction_schema.py`).
-#: Every fact table the version-4 migration and every later one rebuilds, and
-#: so leaves outside the byte-identical comparison: #108's
-#: `corporate_actions` (its version-3 shape below), #859's retractable
-#: `securities` and `listings`, and #1597's `classifications` (version 25
-#: rebuilds it for `filing_name`, T184d, whose own test pins that).
 _UNTOUCHED_TABLES = tuple(
     name
     for name in schema.TABLE_NAMES
-    if name
-    not in ("corporate_actions", "schema_version", "classifications", *schema.RETRACTABLE_TABLES)
+    if name not in ("corporate_actions", "schema_version", *schema.RETRACTABLE_TABLES)
 )
+
+#: Tables an older migration than the one under test rebuilt, so only their
+#: rows are compared, never their DDL: #1597's `classifications` (version 25,
+#: T184d; `listings` is already outside `_UNTOUCHED_TABLES` as retractable,
+#: and `corporate_actions` is excluded whole, with its own test below).
+_ROWS_ONLY_TABLES = ("classifications",)
 
 _OLD_APPLIED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 
@@ -372,7 +372,13 @@ def test_migration_leaves_other_fact_tables_byte_identical(tmp_path: Path, versi
         after = _table_snapshot(conn, _UNTOUCHED_TABLES)
     finally:
         conn.close()
-    assert after == before
+    for table in _UNTOUCHED_TABLES:
+        if table in _ROWS_ONLY_TABLES:
+            # `classifications` is rebuilt for `filing_name` (#1597, T184d):
+            # its DDL changes, every row is byte-identical.
+            assert after[table][3:] == before[table][3:], table
+        else:
+            assert after[table] == before[table], table
 
 
 @pytest.mark.parametrize("version", [2, 3])

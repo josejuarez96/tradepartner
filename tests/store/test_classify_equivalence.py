@@ -85,9 +85,15 @@ def _reference_classify(
     if known:
         suffix_type = ticker_suffix_type(known[-1]["ticker"])
         if suffix_type is not None:
-            # #1597 (T184d): the row written carries the listing row's own
-            # provenance, as the implementation does.
-            return suffix_type, f"suffix_{suffix_type}", sic, known[-1]["provenance"]
+            # #1597 (T184d): only a `filing_name` listing row names itself;
+            # every other provenance keeps main's `snapshot_static`.
+            provenance = known[-1]["provenance"]
+            return (
+                suffix_type,
+                f"suffix_{suffix_type}",
+                sic,
+                "filing_name" if provenance == "filing_name" else "snapshot_static",
+            )
     if domestic:
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
@@ -200,8 +206,9 @@ _TITLES = (
 )
 _TICKERS = ("ABC", "ABC-WS", "ABCDW", "ABCDU", "ABC.U", "ABC-PA", "ABCDY", "BRK.B", "ABCDE")
 #: The provenances a `listings` row may carry (schema.TABLE_PROVENANCE_VALUES),
-#: drawn per scenario listing row so rule 7's written provenance varies.
-_LISTING_PROVENANCES = ("filing", "snapshot", "snapshot_static")
+#: drawn per scenario listing row so rule 7's written provenance varies: the
+#: `filing_name` branch (#1597, T184d) and main's `snapshot_static`.
+_LISTING_PROVENANCES = ("filing", "snapshot", "snapshot_static", "filing_name")
 
 
 def _settings() -> Settings:

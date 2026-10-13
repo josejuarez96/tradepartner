@@ -401,17 +401,17 @@ class TestRules:
 class TestFilingNameRows:
     """Rule 7 on a `filing_name` listing row (spec "Amendment 2026-10-12
     (#1597)", plan T184d): the row's ticker is read from a filing's own file
-    names, never from a tagged fact, so the suffix row it writes carries the
-    listing row's provenance instead of `snapshot_static`."""
+    names, never from a tagged fact, and that row alone names itself; every
+    other provenance on the suffix row behaves as it did on main."""
 
     CIK = "0000000110"  # a pre-2019 filer with one 10-K and no cover page
     KNOWN_AT = datetime(2016, 3, 1, 21, 30, tzinfo=UTC)  # that 10-K's acceptance
 
-    def _master(self) -> MasterBuild:
+    def _master(self, provenance: str) -> MasterBuild:
         """The master build a T184e write path would produce for the one
-        `filing_name` listing row (ticker `FNW-WS` read from the 10-K's
-        instance file name, `class_title` NULL), built by hand because no
-        fixture source carries filename listings yet."""
+        untitled listing row (ticker `FNW-WS`, `class_title` NULL) carrying
+        `provenance`, built by hand because no fixture source carries
+        filename listings yet."""
         security_id = primary_security_id(self.CIK)
         return MasterBuild(
             securities=(
@@ -436,45 +436,44 @@ class TestFilingNameRows:
                     "known_at": self.KNOWN_AT,
                     "ingested_at": INGESTED_AT,
                     "source": "edgar",
-                    "provenance": "filing_name",
+                    "provenance": provenance,
                 },
             ),
             unmatched_snapshot=(),
             missing_benchmarks=(),
         )
 
-    def _built(self) -> ClassificationBuild:
+    def _built(self, provenance: str) -> ClassificationBuild:
         source = FixtureFilingSource(
             index=[_filing(self.CIK, "10-K", _at(2015, 3, 2))],
             headers=[_header(self.CIK, "10-K", 7372, _at(2015, 3, 2))],
         )
-        return build_classifications(source, self._master(), _settings(), ingested_at=INGESTED_AT)
+        return build_classifications(
+            source, self._master(provenance), _settings(), ingested_at=INGESTED_AT
+        )
 
-    def test_the_suffix_row_carries_the_filing_name_provenance(self) -> None:
+    def test_a_filing_name_row_names_itself(self) -> None:
         # Before the 10-K the CIK is a domestic filer with no listing; from
         # the row's own `known_at` the suffix decides, as a snapshot ticker
-        # does, and the row written carries that listing's provenance.
+        # does, and the row written names that listing's provenance.
         security_id = primary_security_id(self.CIK)
-        assert _history(self._built(), security_id) == [
+        assert _history(self._built("filing_name"), security_id) == [
             ("common", "common_default", _at(2015, 3, 2)),
             ("warrant", "suffix_warrant", self.KNOWN_AT),
         ]
-        latest = _latest(self._built(), security_id)
+        latest = _latest(self._built("filing_name"), security_id)
         assert latest["provenance"] == "filing_name"
         assert latest["known_at"] == self.KNOWN_AT
 
-    def test_a_snapshot_row_of_the_same_ticker_keeps_snapshot_static(self) -> None:
-        """The same ticker from a snapshot still writes `snapshot_static`
-        (TestRules above): rule 7 writes the listing row's provenance, it
-        does not name `filing_name` on its own."""
-        source = FixtureFilingSource(
-            index=[_filing(self.CIK, "10-K", _at(2015, 3, 2))],
-            snapshot=[_snap(self.CIK, "FNW-WS")],
-        )
-        latest = _latest(_build(source), primary_security_id(self.CIK))
+    @pytest.mark.parametrize("provenance", ["filing", "snapshot", "snapshot_static"])
+    def test_every_other_provenance_keeps_main_s_row(self, provenance: str) -> None:
+        """A suffix row over any other listing provenance is what main
+        wrote: `snapshot_static`, at the same `known_at` (#1597 names only
+        the `filing_name` row)."""
+        latest = _latest(self._built(provenance), primary_security_id(self.CIK))
         assert (latest["security_type"], latest["rule"]) == ("warrant", "suffix_warrant")
         assert latest["provenance"] == "snapshot_static"
-        assert latest["known_at"] == FETCHED_AT
+        assert latest["known_at"] == self.KNOWN_AT
 
 
 class TestUnclassifiable:
