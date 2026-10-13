@@ -1747,6 +1747,10 @@ def test_paper_defaults() -> None:
     assert p.book_id == DEFAULT_BOOK_ID == "main"
     assert p.live_capital_reference == pytest.approx(100.0)
     assert p.min_override_reason_chars == 20
+    # Spec amendment 2026-10-12 (#1550, T188), open question 15 (a): only an empty
+    # universe is a collapse by the floor; a halving against the last plan by the drop.
+    assert p.min_universe_names == 1
+    assert p.max_universe_drop_fraction == pytest.approx(0.5)
 
 
 def test_paper_tracking_rule_residual_accepted_and_others_rejected() -> None:
@@ -1789,6 +1793,9 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
         {"book_id": "a:b"},
         {"live_capital_reference": 0.0},
         {"min_override_reason_chars": 0},
+        {"min_universe_names": 0},
+        {"max_universe_drop_fraction": -0.1},
+        {"max_universe_drop_fraction": 1.5},
         {"tracking_k": float("nan")},
         {"min_rebalance": 6},
     ],
@@ -1796,6 +1803,22 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
 def test_paper_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper=override)
+
+
+def test_paper_universe_collapse_keys_accept_their_bounds() -> None:
+    """`paper.max_universe_drop_fraction` is in [0, 1] (1.0 turns the drop rule off) and
+    `paper.min_universe_names` is at least 1 (#1550, T188)."""
+    for fraction in (0.0, 1.0):
+        paper = Settings(_env_file=None, paper={"max_universe_drop_fraction": fraction}).paper
+        assert paper.max_universe_drop_fraction == fraction
+    assert Settings(_env_file=None, paper={"min_universe_names": 1}).paper.min_universe_names == 1
+    # Refused by the bounds themselves, not as unknown keys.
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        Settings(_env_file=None, paper={"min_universe_names": 0})
+    with pytest.raises(ValidationError, match="less than or equal to 1"):
+        Settings(_env_file=None, paper={"max_universe_drop_fraction": 1.5})
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Settings(_env_file=None, paper={"max_universe_drop_fraction": -0.1})
 
 
 def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
@@ -1816,6 +1839,10 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
         "min_override_reason_chars",
     )
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
+    # The universe-collapse keys are read at run time, never frozen (#1550, T188), so
+    # the windows open before them are covered from the merge.
+    assert {"min_universe_names", "max_universe_drop_fraction"} <= set(PaperConfig.model_fields)
+    assert not {"min_universe_names", "max_universe_drop_fraction"} & set(FROZEN_PAPER_KEYS)
 
 
 def test_frozen_execution_keys_cover_fill_price() -> None:

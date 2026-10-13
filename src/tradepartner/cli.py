@@ -708,6 +708,7 @@ def _print_report(report: HealthReport) -> None:
     echo(f"accepted same-day pairs: {pairs.height}")
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
+    _print_duplicate_dividends(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
@@ -715,6 +716,21 @@ def _print_report(report: HealthReport) -> None:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+
+
+def _print_duplicate_dividends(report: HealthReport) -> None:
+    """The `duplicate_dividends` block's accepted and unresolved keys (#1613,
+    T186b), each shown, never hidden; the pending count is `health`'s warning."""
+    block = report.duplicate_dividends
+    for label, groups in (
+        ("accepted equal-amount dividend pairs", block.accepted),
+        ("unresolved equal-amount dividend pairs", block.unresolved),
+    ):
+        typer.echo(f"{label}: {len(groups)}")
+        for g in groups:
+            ticker = g.reviewed.ticker if g.reviewed is not None and g.reviewed.ticker else "-"
+            ids = ", ".join(i.source_action_id for i in g.identities)
+            typer.echo(f"  {g.security_id}@{g.ex_date} {ticker} {g.amount!r} ({ids})")
 
 
 def _coverage_verdict(block: CoverageReference | None) -> str:
@@ -2092,6 +2108,12 @@ def make_app(
                 f"warning: the last EDGAR run reports {count} quarantined accessions; "
                 "they get no further request until their failed_filings.json entries "
                 "are cleared",
+                err=True,
+            )
+        if pending := len(report.duplicate_dividends.pending):
+            typer.echo(
+                f"warning: {pending} listed duplicate dividend keys are pending repair "
+                "(`tradepartner repair-dividends`); each still counts its payment twice",
                 err=True,
             )
         if check and not report.ok:

@@ -72,6 +72,10 @@ difference an allowance absorbs is listed under `allowed`.
   listing the proceeds take the cash first, and the dividends are journaled
   beside them only when the cash exceeds the proceeds' cap (#400). A
   negative amount due raises `ValueError`.
+- A held name with an equal-amount dividend group the reviewed list does not
+  explain (`explanations.dividend_findings`, #1625) is an
+  `unexplained_dividend_group` mismatch whatever the cash shows: the caller
+  never sums such a group, and neither one payment nor two is assumed.
 
 The caller passes only spin-offs and dividends not yet journaled (ex or pay date
 after the window's last `ok` reconciliation). While any order is lagging or
@@ -115,6 +119,9 @@ OK = "ok"
 MISMATCH = "mismatch"
 PENDING_UNRESOLVED = "pending_unresolved"
 FILLS_LAGGING = "fills_lagging"
+#: The mismatch kind of an equal-amount dividend group the reviewed list does
+#: not explain on a held name (#1625, #1613).
+UNEXPLAINED_DIVIDEND_GROUP = "unexplained_dividend_group"
 
 _BUY = "buy"
 _SELL = "sell"
@@ -125,7 +132,8 @@ _ID_SEPARATOR = "-"
 #: `FEE` is booked as `fee_cash`; a dividend type is left to the store's dividend
 #: rule; a corporate-action type (and any row of null `net_amount`) is read and
 #: recorded but never booked and never a mismatch by itself; any other cash type
-#: is `unexplained_activity`.
+#: is `unexplained_activity` unless it is already inside the base (#1641: its
+#: cash is already in the cash the ledger starts from, so it is never a mismatch).
 _FEE = "FEE"
 _EXECUTED = "executed"
 _DIVIDEND_TYPES = frozenset(
@@ -175,6 +183,10 @@ class Explanations:
     ended: frozenset[str] = frozenset()
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
+    #: Held names with an equal-amount dividend group the reviewed list does
+    #: not explain, each with its detail (#1625): never summed into
+    #: `dividends`, each an `unexplained_dividend_group` mismatch.
+    dividend_findings: Mapping[str, str] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
     activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
@@ -298,14 +310,19 @@ def _inside_base(activity: CashActivity, explanations: Explanations) -> bool:
     return cut is not None and activity.date < cut
 
 
-def _activity_mismatch(activity: CashActivity) -> Mismatch | None:
+def _activity_mismatch(activity: CashActivity, inside_base: bool) -> Mismatch | None:
     """A mismatch of kind `unexplained_activity` for a read this reconciliation
     cannot place (#1583, T183), else None: a `FEE` or dividend row whose status
     is not `executed`, or a cash activity (non-null `net_amount`) of a type the
     rule does not know (`INT`, `JNLC`, ...). A corporate action (a known type or
     a null `net_amount`) is never a mismatch by itself; an `executed` `FEE` or
-    dividend row is left to booking / the store's dividend rule. The detail names
-    the type, the id, the date, the amount and the status."""
+    dividend row is left to booking / the store's dividend rule. An unknown cash
+    type already **inside the base** (`inside_base`, #1641) is never a mismatch
+    either, because its cash is already in the cash the ledger starts from (the
+    account's own funding `JNLC`, an interest row, ...); a `FEE`/dividend whose
+    `status` is not `executed` still halts even inside the base, since a booked
+    or recorded fact the broker later reverses is a real discrepancy. The detail
+    names the type, the id, the date, the amount and the status."""
     amount = "null" if activity.net_amount is None else activity.net_amount
     detail = (
         f"{activity.activity_type!r} activity {activity.activity_id!r} on {activity.date} "
@@ -315,6 +332,8 @@ def _activity_mismatch(activity: CashActivity) -> Mismatch | None:
     if kind == _FEE or kind in _DIVIDEND_TYPES:
         return None if activity.status == _EXECUTED else Mismatch("unexplained_activity", detail)
     if kind in _CORPORATE_ACTION_TYPES or activity.net_amount is None:
+        return None
+    if inside_base:
         return None
     return Mismatch("unexplained_activity", detail)
 
@@ -420,15 +439,18 @@ def compare(
                 f"cash activity id {activity.activity_id!r} is listed twice in one read"
             )
         read_ids.add(activity.activity_id)
-        unexplained = _activity_mismatch(activity)
+        # `_inside_base` before `_activity_mismatch` (#1641): an activity already
+        # in the ledger's base is already in the cash the ledger starts from, so an
+        # unknown cash type inside the base is never `unexplained_activity` (and a
+        # base `FEE` is never booked again). Every activity is still classified — a
+        # non-executed `FEE`/dividend inside the base still halts — and only an
+        # activity outside the base is booked.
+        inside_base = _inside_base(activity, explanations)
+        unexplained = _activity_mismatch(activity, inside_base)
         if unexplained is not None:
             mismatches.append(unexplained)
             continue
-        if (
-            activity.activity_type == _FEE
-            and activity.net_amount is not None
-            and not _inside_base(activity, explanations)
-        ):
+        if activity.activity_type == _FEE and activity.net_amount is not None and not inside_base:
             described = activity.description or ""
             fee_proposals.append(
                 ProposedAdjustment(
@@ -555,6 +577,16 @@ def compare(
             gap = broker.get(security_id, 0.0) - expected.get(security_id, 0.0)
             if abs(gap) > q_tol:
                 allowed.append(Allowed("quantity within the open allowances", gap, security_id))
+
+    for security_id, detail in sorted(explanations.dividend_findings.items()):
+        mismatches.append(
+            Mismatch(
+                kind=UNEXPLAINED_DIVIDEND_GROUP,
+                detail=detail,
+                security_id=security_id,
+                symbol=explanations.symbols.get(security_id),
+            )
+        )
 
     if mismatches:
         status = MISMATCH
