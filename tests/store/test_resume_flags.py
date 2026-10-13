@@ -156,6 +156,7 @@ def test_write_open_of_a_version_7_store_keeps_every_resume_row_without_the_flag
         25,
         26,
         27,
+        28,
     ]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
@@ -190,6 +191,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             25,
             26,
             27,
+            28,
         ]
 
 

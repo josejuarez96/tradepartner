@@ -432,22 +432,36 @@ registry; #83 took version 2 first, so the registry is version 3):
   store: no read depends on the `CHECK`, and the next writable
   `init_schema` call migrates the store. Nothing writes a `filing_name` row
   before T184e, behind `edgar.filename_listings` (default off).
-- **Version 27** (#1506, data-foundation plan T172b; the spec's "Amendment
+- **27. 2026-10-13 (#1627)**, paper-trading fix: the ledger books a stock
+  dividend's fractional-share cash in lieu. `adjustments.kind` gains
+  `cash_in_lieu`, a cash-only row (with the removed fractional `quantity`)
+  keyed by the broker `CIL` activity id in the existing
+  `broker_activity_id` column (`UNIQUE`, nullable), booked by reconciliation
+  when the broker's `CIL` net_amount matches the expected cash (fractional
+   remainder x the reference price) within a new `risk.cash_in_lieu_tolerance`
+  (relative), exactly as `fee_cash` is booked by id. The `kind` `CHECK` is
+  widened by the same staging rebuild of `adjustments` from its own DDL that
+  version 25 and version 26 used (`_migrate_cash_in_lieu_kind`), every row
+  kept and byte-identical (the `CHECK` only widens, so no stored row is
+  refused and none can be a `cash_in_lieu` yet), and a version-27 row is
+  appended. A read-only connection accepts a version-26 store: every read
+  works, and the next writable `init_schema` call migrates it.
+- **Version 28** (#1506, data-foundation plan T172b; the spec's "Amendment
   2026-10-11 (#1506)", spin-offs and name changes): adds `symbol_changes`
   (one row per Alpaca name change, `known_at` = the close of the first
   session strictly after its `process_date`). Purely additive, like versions
   21, 23 and 24: the migration from any earlier migratable version just
   creates the table and its identity index (`init_schema`'s DDL pass,
-  `_SYMBOL_CHANGES_TABLE_DDL`) and appends a version-27 row; no existing
+  `_SYMBOL_CHANGES_TABLE_DDL`) and appends a version-28 row; no existing
   table or row changes. The identity mirrors `corporate_actions_identity`:
   `(security_id, source_action_id)` when the id is non-empty, else
   `(security_id, old_symbol, new_symbol, process_date)`, each with
   `known_at`. The table joins `TABLE_NAMES` and `TABLE_PROVENANCE_VALUES`
   (`action` only); `registry.data_vintage` already leaves it out (T171b). A
-  read-only connection accepts a version-26 store: every read works but a
+  read-only connection accepts a version-27 store: every read works but a
   `symbol_changes` read, which fails on the missing table, and the next
   writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 28**, with its own migration and a
+- **A later DDL change goes to version 29**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -710,12 +724,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   DDL pass with the wider `CHECK` (`_FILING_NAME_TABLE_DDL`,
 #:   `_migrate_filing_name`), every row kept (module docstring, "Schema
 #:   versions").
-#: - 27 (#1506, data-foundation plan T172b): the `symbol_changes` table and
+#: - 28 (#1506, data-foundation plan T172b): the `symbol_changes` table and
 #:   its identity index, created by the DDL pass (`_SYMBOL_CHANGES_TABLE_DDL`);
 #:   no existing table changes (module docstring, "Schema versions").
-#: - A later DDL change goes to version 28, with its own migration and a
+#: - A later DDL change goes to version 29, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 27
+CURRENT_SCHEMA_VERSION = 28
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -834,10 +848,15 @@ _PRE_FEE_ACTIVITIES_VERSION = 24
 #: provenance `CHECK` and no `filing_name` row can exist there.
 _PRE_FILING_NAME_VERSION = 25
 
-#: The last version without `symbol_changes` (#1506, T172b, version 27):
+#: The last version without the `cash_in_lieu` adjustment kind (#1627,
+#: version 27): read-only connections serve every read, since no read
+#: depends on the `kind` `CHECK` and no `cash_in_lieu` row can exist there.
+_PRE_CASH_IN_LIEU_VERSION = 26
+
+#: The last version without `symbol_changes` (#1506, T172b, version 28):
 #: read-only connections serve every other read; a `symbol_changes` read
 #: there fails on the missing table, as a `borrow_status` read did at 23.
-_PRE_SYMBOL_CHANGES_VERSION = 26
+_PRE_SYMBOL_CHANGES_VERSION = 27
 
 
 class SchemaVersionError(RuntimeError):
@@ -1724,6 +1743,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "spinoff_receipt",
         "carried_residue",
         "fee_cash",
+        "cash_in_lieu",
     ),
     ("adjustments", "origin"): ("dust", "untradable"),
     ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
@@ -2683,6 +2703,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
@@ -2712,7 +2733,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (the booked-fee activity's `explanations_as_of` names one), which a
         # version-24 store lacks; version 25 every read (no `filing_name` row
         # can exist there, and no read depends on the provenance `CHECK`);
-        # version 26 every read but `symbol_changes`.
+        # version 26 every read; version 27 every read but `symbol_changes`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3016,6 +3037,37 @@ def _migrate_filing_name(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
         conn.execute(f"DROP TABLE {table}")
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
+def _migrate_cash_in_lieu_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 27 (module docstring, "Schema versions"; #1627): widen
+    `adjustments.kind` with `cash_in_lieu` so the ledger books a stock
+    dividend's fractional-share cash in lieu by its broker `CIL` activity id.
+    DuckDB cannot widen a `CHECK` in place, so rebuild `adjustments` with its
+    version-27 DDL (`_CREATE_ADJUSTMENTS`; the `broker_activity_id` column and
+    `fee_cash` already in it from versions 25 and 26), every row kept in
+    insertion order and byte-identical: the `CHECK` only widens, so no stored
+    row can be refused and none can be a `cash_in_lieu` yet. Idempotent: a
+    `kind` `CHECK` that already allows `cash_in_lieu` (a fresh store, or one
+    already migrated) is left alone, as `_migrate_filing_name` tests its
+    `provenance` `CHECK`. Runs inside `init_schema`'s transaction, after
+    `_migrate_filing_name` and `_migrate_fee_activities`."""
+    check = conn.execute(
+        "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+        "current_database() AND schema_name = current_schema() AND table_name = 'adjustments' "
+        "AND constraint_type = 'CHECK' AND constraint_column_names[1] = 'kind'",
+        [],
+    ).fetchone()
+    if check is not None and "'cash_in_lieu'" in (check[0] or ""):
+        return
+    conn.execute(
+        _CREATE_ADJUSTMENTS.replace(
+            "CREATE TABLE IF NOT EXISTS adjustments (", "CREATE TABLE adjustments_v27 (", 1
+        )
+    )
+    conn.execute("INSERT INTO adjustments_v27 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adjustments_v27 RENAME TO adjustments")
 
 
 def _add_nullable_int_columns(
@@ -3395,7 +3447,7 @@ def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 25 store to version 26.
+    version-2 to 26 store to version 27.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3408,6 +3460,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `adjustments` rebuilt with its version-27 DDL (the `kind` `CHECK` widened
+    with `cash_in_lieu`, every row kept, byte-identical; a version-2 to 26 store
+    gets a version-27 row; #1627); every store gets
     `listings` and `classifications` rebuilt with `filing_name` in their
     provenance `CHECK` (every row kept, byte-identical; a version-25 store
     gets a version-26 row; #1597, T184d); every store gets
@@ -3535,6 +3590,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
@@ -3603,6 +3659,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_operations_kinds(conn)
         if max_version is None or max_version <= _PRE_FEE_ACTIVITIES_VERSION:
             _migrate_fee_activities(conn)
+        if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
+            _migrate_cash_in_lieu_kind(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

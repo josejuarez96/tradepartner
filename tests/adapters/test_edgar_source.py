@@ -997,6 +997,35 @@ def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path,
     assert source.cover_exchange_axis_mismatch == (1 if on else 0)
 
 
+@pytest.mark.parametrize("on", [False, True])
+def test_the_split_contexts_switch_reaches_the_fsn_extraction(tmp_path: Path, on: bool) -> None:
+    """#1660: Abbott 2020's tagging (title undimensioned, symbol and exchange on
+    the exchange-axis rows) lists ABT from FSN only with `cover_split_contexts`."""
+    from test_edgar_fsn import FSN_PAGE_URL, _dim, _fsn_zip_bytes, _fsn_zip_url, _sub, _txt
+
+    adsh = "0001104659-20-121336"
+    rows = [
+        ("Security12bTitle", "Common Shares, Without Par Value", "", "0"),
+        ("TradingSymbol", "ABT", "0x1", "1"),
+        ("SecurityExchangeName", "New York Stock Exchange", "0x1", "1"),
+    ]
+    txt = [_txt(adsh, tag, value, dimh=dimh, dimn=dimn) for tag, value, dimh, dimn in rows]
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, f'<html><body><a href="{_fsn_zip_url("2020q3")}">x</a></body></html>')
+    router.add(
+        _fsn_zip_url("2020q3"),
+        _fsn_zip_bytes(
+            [_sub(adsh, "1800", "10-Q")], [], txt, [_dim("0x1", "EntityListingsExchange=XNYS;")]
+        ),
+    )
+    settings = edgar_settings(tmp_path, fsn_first_year=2020, cover_split_contexts=on)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    source._ensure_fsn()
+    [record] = source._load_fsn_cache("0000001800").values()
+    assert [(i.ticker, i.exchange) for i in record.listings] == ([("ABT", "NYSE")] if on else [])
+
+
 # --- the FSN cache round-trips the symbol-only tag (#1624, T184) ------------
 
 
@@ -1466,18 +1495,19 @@ def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> N
     assert source.filename_no_exchange >= 1
 
 
-def test_a_cached_v2_cover_page_is_no_longer_served(settings: Settings) -> None:
-    """T181 (#1541): the release bumps `COVER_VERSION` to 3 (and `FSN_VERSION`
-    to 3), so a per-document cover page cached under v2, parsed without the
-    exchange-axis listings, is never served: it is fetched and parsed again."""
-    assert (FSN_VERSION, COVER_VERSION) == (3, 3)
+def test_a_cached_v3_cover_page_is_no_longer_served(settings: Settings) -> None:
+    """T181 (#1541, #1651): the release bumps `COVER_VERSION` (and
+    `FSN_VERSION`) to 4 with `cover_split_contexts`, so a per-document cover
+    page cached under v3, parsed without the split-context reads, is never
+    served: it is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (4, 4)
     accession = "0000320193-24-000123"
-    old = Path(settings.edgar.cache_dir) / "cover" / "v2" / f"{accession}.json"
+    old = Path(settings.edgar.cache_dir) / "cover" / "v3" / f"{accession}.json"
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "accession": accession,
                 "cik": "0000320193",
                 "entity_cik": "0000320193",
