@@ -1632,6 +1632,7 @@ class EdgarFilingSource(FilingSource):
                 accession=accession,
                 accepted_at=accepted_at,
                 exchange_axis=self._settings.edgar.exchange_axis_listings,
+                split_contexts=self._settings.edgar.cover_split_contexts,
             )
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing

@@ -434,6 +434,11 @@ class EdgarConfig(BaseModel):
     # the `FSN_VERSION` and `COVER_VERSION` bumps: the caches are keyed by
     # those versions only, so a flip alone re-derives nothing already cached.
     exchange_axis_listings: bool = True  # flipped by the release `cover-listings-1541` (T181)
+    # #1651: the cover-page parser also reads `CapitalUnitsByClassAxis` as a
+    # class axis (Fifth Third) and merges a class's title, symbol and exchange
+    # tagged on several contexts of one class member (Abbott 2020, P&G 2023).
+    # Off until a release (as T181) flips it with the `COVER_VERSION` bump.
+    cover_split_contexts: bool = False
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
