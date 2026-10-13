@@ -36,6 +36,7 @@ from tradepartner.health import (
     BARS_ON_SESSIONS,
     COVERAGE_REFERENCE_NAMES,
     DUPLICATE_DIVIDENDS,
+    FILENAME_LISTING_VALID_FROM,
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
@@ -79,6 +80,33 @@ from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
 
 T_END = session_close(date(2020, 6, 30))
+
+
+def test_filename_health_counts_and_rejects_bad_10k_date(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2018, 9, 4, 20, 0, tzinfo=UTC)
+    row = {
+        "security_id": "SEC_STATIC_PRE2019",
+        "ticker": "FNAME",
+        "exchange": "NYSE",
+        "class_title": None,
+        "valid_from": date(2018, 9, 4),
+        "known_at": known,
+        "ingested_at": T_END,
+        "source": "edgar",
+        "provenance": "filing_name",
+    }
+    insert_row(fixture_store, "listings", row)
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.filename_listings.rows >= 1
+    assert FILENAME_LISTING_VALID_FROM not in report.failures
+    fixture_store.execute("DELETE FROM listings WHERE ticker = 'FNAME'")
+    insert_row(fixture_store, "listings", row | {"valid_from": date(2018, 9, 5)})
+    report = health_report(fixture_store, T_END, _settings())
+    assert FILENAME_LISTING_VALID_FROM in report.failures
+
+
 #: Close of 2018-10-25: after SEC_TRANSFER's Form 25, before its NASDAQ
 #: listing is known (fixture README), so it counts as delisted there.
 T_TRANSFER_PROBE = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)

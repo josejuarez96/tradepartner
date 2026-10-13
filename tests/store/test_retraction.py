@@ -80,6 +80,13 @@ def test_underived_is_every_stored_edgar_key_the_build_does_not_derive() -> None
     ]
 
 
+def test_underived_includes_filing_name_but_keeps_snapshot_out() -> None:
+    filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
+    snapshot = _listing("0001647088", "NEW") | {"provenance": "snapshot_static"}
+    found = underived(_build((), ()), [], [filename, snapshot])
+    assert [(item.table, item.row["ticker"]) for item in found] == [("listings", "OLD")]
+
+
 def test_a_successor_relisted_on_snapshot_evidence_is_never_judged() -> None:
     """Quant audit of #872, pass 2: a `<cik>@<date>` successor relisted from
     a companies snapshot has a `filing` securities row, yet exists only while

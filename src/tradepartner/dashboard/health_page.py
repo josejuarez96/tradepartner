@@ -400,6 +400,14 @@ def _data_card(report: HealthReport) -> None:
         )
         tables = ", ".join(f"{k} {v}" for k, v in sorted(static.by_table.items())) or "none"
         st.markdown(f"snapshot_static reliance: {static.count} ({tables})")
+        filename = report.filename_listings
+        st.markdown(
+            f"Filing-name listings: {filename.rows} rows · "
+            f"{filename.only_listing} securities rely only on them · "
+            f"{filename.no_bars.height} spans without traded bars"
+        )
+        if not filename.no_bars.is_empty():
+            st.dataframe(filename.no_bars, hide_index=True)
         rule = "on" if report.settings["liquidity_rule_enabled"] else "off"
         st.markdown(f"Liquidity rule: {rule} · Fill price: {report.settings['fill_price']}")
 

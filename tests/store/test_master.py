@@ -27,6 +27,7 @@ from tradepartner.adapters.filings import (
     CoverListing,
     CoverPage,
     DelistingFiling,
+    FilenameListing,
     FilingIndexEntry,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
@@ -209,6 +210,44 @@ def _source() -> FixtureFilingSource:
 
 def _settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **overrides)  # type: ignore[arg-type]
+
+
+def test_filename_rows_are_dated_at_acceptance_and_switch_is_off() -> None:
+    cik = "0000000998"
+    first = _at(2015, 3, 2, 22, 30)
+    cover = _at(2019, 3, 4)
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Filename Co", "10-K", first)],
+        cover_pages=[_cover(cik, cover, ("Common Stock", "FNCO", "NASDAQ"))],
+        filename_listings=[
+            FilenameListing(
+                cik,
+                "10k-1",
+                "10-K",
+                first,
+                date(2015, 3, 2),
+                "FNCO",
+                "NASDAQ",
+                "Common Stock",
+                "FNCO",
+            )
+        ],
+    )
+    off = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert not [r for r in off.listings if r["provenance"] == "filing_name"]
+
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert len(rows) == 1
+    assert rows[0]["security_id"] == cik
+    assert rows[0]["known_at"] == first
+    assert rows[0]["valid_from"] == date(2015, 3, 2)
+    with pytest.raises(ValueError, match="after ingested_at"):
+        build_master(
+            source,
+            _settings(edgar={"filename_listings": True}),
+            ingested_at=first - timedelta(seconds=1),
+        )
 
 
 def _new_store() -> duckdb.DuckDBPyConnection:

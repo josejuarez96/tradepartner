@@ -72,8 +72,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The source of every row the master builder derives.
 EDGAR = "edgar"
-#: The one provenance judged (module docstring).
+#: Provenances derived from full-history filing inputs (#1597).
 FILING = "filing"
+FILING_NAME = "filing_name"
 #: The status of a `master-retract --apply` run row: a master check, never a
 #: fresh ingest (health and execution read only `ok` runs as fresh).
 RETRACTED = "retracted"
@@ -132,7 +133,7 @@ def underived(
     listings: Iterable[Mapping[str, Any]],
     skip_ciks: frozenset[str] = frozenset(),
 ) -> tuple[Underived, ...]:
-    """The stored live EDGAR `filing` rows whose key `build` does not derive,
+    """The stored live EDGAR filing-derived rows the build does not derive,
     outside `skip_ciks` (module docstring), securities first, each table
     sorted by key. Pure."""
     stored_rows = {"securities": list(securities), "listings": list(listings)}
@@ -142,7 +143,7 @@ def underived(
     snapshot_evidenced = {
         row["security_id"]
         for row in stored_rows["listings"]
-        if "@" in row["security_id"] and row["provenance"] != FILING
+        if "@" in row["security_id"] and row["provenance"] not in {FILING, FILING_NAME}
     }
     found: list[Underived] = []
     for table, built in (("securities", build.securities), ("listings", build.listings)):
@@ -152,7 +153,7 @@ def underived(
             Underived(table, dict(row))
             for row in stored_rows[table]
             if row["source"] == EDGAR
-            and row["provenance"] == FILING
+            and row["provenance"] in ({FILING, FILING_NAME} if table == "listings" else {FILING})
             and cik_of(row["security_id"]) not in skip_ciks
             and row["security_id"] not in snapshot_evidenced
             and tuple(row[c] for c in columns) not in derived

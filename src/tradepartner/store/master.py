@@ -152,6 +152,7 @@ from tradepartner.adapters.filings import (
     CoverListing,
     CoverPage,
     DelistingFiling,
+    FilenameListing,
     FilingIndexEntry,
     FilingSource,
 )
@@ -159,6 +160,12 @@ from tradepartner.calendar import is_session, next_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.store.asof import _EXCHANGE_TZ, _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
+from tradepartner.store.filename_listings import (
+    ClassTicker,
+    IndependentReading,
+    confirm_filename_listings,
+    is_filename_listing_refused,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
@@ -195,6 +202,7 @@ class MasterBuild:
     successions: tuple[Succession, ...] = ()
     class_titles: tuple[ClassTitle, ...] = ()
     shown: tuple[ShownSpan, ...] = ()
+    filename_counts: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -914,7 +922,8 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
     issuer_forms = set(settings.master.issuer_forms)
     first: dict[str, FilingIndexEntry] = {}
     marks: dict[str, dict[str, list[datetime]]] = defaultdict(lambda: defaultdict(list))
-    for entry in source.filing_index():  # full history, never `since` (spec req 3)
+    index = source.filing_index()  # full history, never `since` (spec req 3)
+    for entry in index:
         if entry.form in _MARKER_FORMS:
             marks[entry.cik][entry.form].append(entry.accepted_at)
         if entry.form not in issuer_forms:
@@ -942,13 +951,26 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         delistings[filing.cik].append(filing)
 
     builder = _Builder(settings, ingested_at)
+    filename_counts: dict[str, int] = defaultdict(int)
     for cik in sorted(first):
         entry = first[cik]
         builder.security(primary_security_id(cik), cik, entry.company_name, entry.accepted_at)
         cik_marks = marks.get(cik, {})
+        pages = source.cover_pages(cik)
         classes = builder.cover_pages(
-            entry, source.cover_pages(cik), delistings.get(cik, ()), cik_marks, fetches.get(cik, ())
+            entry, pages, delistings.get(cik, ()), cik_marks, fetches.get(cik, ())
         )
+        if settings.edgar.filename_listings:
+            _filename_rows(
+                builder,
+                cik,
+                classes,
+                pages,
+                source.filename_listings(cik),
+                [item for item in index if item.cik == cik],
+                delistings.get(cik, ()),
+                filename_counts,
+            )
         builder.snapshot(classes, by_cik.pop(cik, []))
     for entries in by_cik.values():  # snapshot names with no issuer filing
         builder.unmatched.extend(entries)
@@ -975,7 +997,119 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
         successions=tuple(builder.successions),
         class_titles=tuple(builder.class_titles.values()),
         shown=tuple(builder.shown),
+        filename_counts=dict(filename_counts),
     )
+
+
+def _filename_rows(
+    builder: _Builder,
+    cik: str,
+    classes: Sequence[_Class],
+    pages: Sequence[CoverPage],
+    records: Sequence[FilenameListing],
+    index: Sequence[FilingIndexEntry],
+    delistings: Sequence[DelistingFiling],
+    counts: dict[str, int],
+) -> None:
+    """Derive 10-K names first, then Form 25 names only as a last resort."""
+    settings = builder.settings
+    first_page = min(pages, key=lambda p: (p.accepted_at, p.accession)) if pages else None
+    first_at = first_page.accepted_at if first_page is not None else None
+    first_prefix = next(
+        (
+            r.ticker
+            for r in records
+            if first_page is not None and r.accession == first_page.accession
+        ),
+        None,
+    )
+    class_by_ticker = {ticker: cls.security_id for cls in classes for ticker, _ in cls.pairs}
+    cover_readings = (
+        [
+            IndependentReading(
+                tuple(
+                    ClassTicker(item.ticker, class_by_ticker.get(item.ticker, cik))
+                    for item in first_page.listings
+                )
+            )
+        ]
+        if first_page is not None
+        else []
+    )
+    form25 = [r for r in records if r.form in {"25", "25-NSE"}]
+    form25_readings = [
+        IndependentReading((ClassTicker(r.ticker, class_by_ticker.get(r.ticker, cik)),))
+        for r in form25
+    ]
+    forms = frozenset(settings.edgar.filename_listing_forms)
+    since = settings.edgar.filename_listings_since
+    annual_index = [
+        item
+        for item in index
+        if item.form in forms
+        and item.accepted_at.date() >= since
+        and (first_at is None or item.accepted_at < first_at)
+    ]
+    annual = [r for r in records if r.form in forms and r.accepted_at.date() >= since]
+    counts["filename_10ks_read"] += len(annual_index)
+    accessions = {r.accession for r in annual}
+    counts["filename_no_instance"] += sum(item.accession not in accessions for item in annual_index)
+    counts["filename_no_exchange"] += sum(r.exchange is None for r in annual)
+    accepted = confirm_filename_listings(
+        annual,
+        cover_readings=cover_readings,
+        form25_readings=form25_readings,
+        first_cover_accepted_at=first_at,
+        first_cover_prefix=first_prefix,
+        primary_class_id=cik,
+        refused=settings.edgar.filename_listings_refused,
+        forms=forms,
+    )
+    for result in accepted:
+        record = result.filing
+        counts[f"filename_{result.verdict}"] += 1
+        if result.verdict.startswith("refused_"):
+            continue
+        if record.exchange is None:
+            continue
+        if not result.class_read:
+            counts["filename_class_unread"] += 1
+        builder.listing(
+            result.class_id or cik,
+            record.ticker.upper(),
+            record.exchange,
+            None,
+            session_of(record.accepted_at),
+            record.accepted_at,
+            provenance="filing_name",
+        )
+    for record in sorted(form25, key=lambda r: (r.accepted_at, r.accession)):
+        if record.exchange is None or is_filename_listing_refused(
+            cik, record.ticker, settings.edgar.filename_listings_refused
+        ):
+            continue
+        filing = next((f for f in delistings if f.accession == record.accession), None)
+        if filing is None:
+            continue
+        sid = class_by_ticker.get(record.ticker, cik)
+        if any(
+            r["security_id"] == sid
+            and r["ticker"] == record.ticker.upper()
+            and r["valid_from"] <= session_of(record.accepted_at)
+            and r["known_at"] <= record.accepted_at
+            for r in builder.listings
+        ):
+            continue
+        builder.listing(
+            sid,
+            record.ticker.upper(),
+            record.exchange,
+            None,
+            first_session(settings),
+            record.accepted_at,
+            provenance="filing_name",
+        )
+        counts["filename_form25_rows"] += 1
 
 
 def write_master(conn: duckdb.DuckDBPyConnection, build: MasterBuild) -> int:

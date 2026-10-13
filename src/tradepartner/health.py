@@ -329,8 +329,10 @@ from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
     _validate_t,
+    listings_as_of,
     live_actions_as_of,
     price_jumps_as_of,
+    prices_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
@@ -348,7 +350,7 @@ from tradepartner.store.dividend_reviews import (
     equal_amount_groups,
     reviewed_groups,
 )
-from tradepartner.store.master import securities_as_of
+from tradepartner.store.master import first_session, securities_as_of, session_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
@@ -373,6 +375,7 @@ KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
 SOURCE_NOT_NULL = "source_not_null"
 PROVENANCE_ALLOWED = "provenance_allowed"
+FILENAME_LISTING_VALID_FROM = "filename_listing_valid_from"
 BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
@@ -404,6 +407,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
     SOURCE_NOT_NULL,
     PROVENANCE_ALLOWED,
+    FILENAME_LISTING_VALID_FROM,
     BARS_ON_SESSIONS,
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
@@ -841,6 +845,24 @@ class IntegrityCheck:
         return self.violations.is_empty()
 
 
+_FILENAME_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "exchange": pl.Utf8,
+    "valid_from": pl.Date,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+@dataclass(frozen=True)
+class FilenameListings:
+    """Filing-name rows known at T and the names without a traded bar in span."""
+
+    rows: int
+    only_listing: int
+    no_bars: pl.DataFrame
+
+
 _DUPLICATE_DIVIDENDS_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "ex_date": pl.Date,
@@ -930,6 +952,7 @@ class HealthReport:
     filing_events: FilingEvents
     rates: RatesHealth
     duplicate_dividends: DuplicateDividends
+    filename_listings: FilenameListings
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
@@ -1001,6 +1024,7 @@ def health_report(
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
         duplicate_dividends=dividends,
+        filename_listings=_filename_listings(conn, t, listings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
         coverage_reference=(
             _coverage_reference(conn, t, settings, listings)
@@ -1012,6 +1036,58 @@ def health_report(
             else None
         ),
     )
+
+
+def _filename_listings(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> FilenameListings:
+    """Count filing-name reliance and spans without any traded bar at T."""
+    all_rows = list(listings.iter_rows(named=True))
+    named = [row for row in all_rows if row["provenance"] == "filing_name"]
+    kinds: dict[str, set[str]] = defaultdict(set)
+    for row in all_rows:
+        kinds[row["security_id"]].add(row["provenance"])
+    only = sum(kinds[sid] == {"filing_name"} for sid in kinds)
+    if not named:
+        return FilenameListings(0, only, pl.DataFrame([], schema=_FILENAME_SCHEMA))
+    bars = prices_as_of(conn, t, sorted({row["security_id"] for row in named}), traded_only=True)
+    sessions: dict[str, list[date]] = defaultdict(list)
+    for bar in bars.iter_rows(named=True):
+        sessions[bar["security_id"]].append(bar["session"])
+    no_bars = []
+    for row in named:
+        end = row["end_session"]
+        if not any(
+            row["valid_from"] <= day and (end is None or day <= end)
+            for day in sessions[row["security_id"]]
+        ):
+            no_bars.append({key: row[key] for key in _FILENAME_SCHEMA})
+    return FilenameListings(len(named), only, pl.DataFrame(no_bars, schema=_FILENAME_SCHEMA))
+
+
+def _filename_listing_valid_from(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+) -> pl.DataFrame:
+    """Check 10-K dates and Form 25's first-session last-resort dates."""
+    rows = listings_as_of(conn, t).filter(pl.col("provenance") == "filing_name")
+    if rows.is_empty():
+        return pl.DataFrame([], schema=_FILENAME_SCHEMA)
+    first = first_session(settings)
+    form25 = {
+        (sid, stamp)
+        for sid, stamp in conn.execute(
+            "SELECT security_id, known_at FROM delistings WHERE known_at <= ?", [t]
+        ).fetchall()
+    }
+    bad = []
+    for row in rows.iter_rows(named=True):
+        expected = session_of(row["known_at"])
+        is_form25 = row["valid_from"] == first and (row["security_id"], row["known_at"]) in form25
+        if (is_form25 and row["valid_from"] > expected) or (
+            not is_form25 and row["valid_from"] != expected
+        ):
+            bad.append({key: row[key] for key in _FILENAME_SCHEMA})
+    return pl.DataFrame(bad, schema=_FILENAME_SCHEMA)
 
 
 def _price_jumps(
@@ -1837,6 +1913,7 @@ def _integrity_checks(
         KNOWN_AT_NOT_AFTER_INGESTED_AT: _count_per_table(conn, "known_at > ingested_at"),
         SOURCE_NOT_NULL: _count_per_table(conn, "source IS NULL"),
         PROVENANCE_ALLOWED: _bad_provenance(conn),
+        FILENAME_LISTING_VALID_FROM: _filename_listing_valid_from(conn, t, settings),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,

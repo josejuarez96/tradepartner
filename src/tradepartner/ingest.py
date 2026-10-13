@@ -209,6 +209,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -864,6 +865,10 @@ class _Recorded(FilingSource):
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
 
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        """Record the CIK's filename evidence in the fetch pass, before the lock."""
+        return list(self._ask("filename_listings", cik))
+
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         """Not memoized (#660, spec "Ingest"): the fetch pass's call fills
         the adapter's per-CIK cache and this proxy records only that `cik`
@@ -1107,10 +1112,37 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}; "
+        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{_filename_counts(master, delistings, filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
+    """The #1597 verdict and Form 25 counts, omitted with the switch off."""
+    if not master.filename_counts:
+        return ""
+    counts = dict(master.filename_counts)
+    counts["filename_form25_unmatched"] = sum(
+        1 for row in delistings.unmatched if row.accepted_at.year < 2019
+    )
+    counts["filename_transfers_delisted"] = sum(
+        1
+        for row in delistings.delistings
+        if row["filed_at"].year < 2019
+        and any(
+            listing["security_id"] == row["security_id"]
+            and listing["exchange"] != row["exchange"]
+            and listing["known_at"] > row["filed_at"]
+            and listing["provenance"] == "filing_name"
+            for listing in master.listings
+        )
+    )
+    source = _unwrap(filings)
+    for key in ("filename_index_fetches", "filename_document_fetches"):
+        counts[key] = int(getattr(source, key, 0))
+    return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
 
 
 def _delete_classifications(

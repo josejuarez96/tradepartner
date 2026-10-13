@@ -33,6 +33,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -1467,6 +1468,30 @@ def test_the_edgar_run_applies_the_configured_overrides(settings: Settings) -> N
     *_, facts, unmatched = _build_filings(_filings(extra_facts=[class_a]), configured, NOW)
     assert (ACME, 7) in {(r["security_id"], r["value"]) for r in facts}
     assert class_a not in unmatched
+
+
+def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _filings()
+    asked: list[str] = []
+
+    def filename(cik: str) -> list[FilenameListing]:
+        asked.append(cik)
+        return []
+
+    monkeypatch.setattr(source, "filename_listings", filename)
+    off = _Recorded(source)
+    _prefetch(off, settings, dry_run=True)
+    assert asked == []
+    on_settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"filename_listings": True})}
+    )
+    on = _Recorded(source)
+    _prefetch(on, on_settings, dry_run=True)
+    assert asked == sorted({ACME, DUAL})
+    _build_filings(on, on_settings, NOW)
+    assert asked == sorted({ACME, DUAL})  # write phase uses recorded answers
 
 
 def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:
