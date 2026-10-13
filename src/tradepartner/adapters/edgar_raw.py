@@ -530,6 +530,104 @@ def filing_sgml_header(
     return response.text
 
 
+def _filing_url(cik: str, accession: str, filename: str) -> str:
+    """The Archives URL of one file in a filing's folder; `accession` is the
+    dashed form and `filename` already validated."""
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+        f"{accession.replace('-', '')}/{filename}"
+    )
+
+
+def filing_index(
+    cik: str,
+    accession: str,
+    *,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> list[str]:
+    """The file names a filing's `index.json` lists (#1597, T184b).
+
+    Only the names are returned, in the listing's order: the one thing the
+    filename readings take from the index. A payload that is not JSON, not
+    an object with a `directory.item` list, or holds an item with no string
+    `name` raises `ValueError` (a malformed index is a failure the caller
+    counts and retries, never an empty listing read as "no instance")."""
+    _validate_accession(accession)
+    settings = settings or get_settings()
+    response = _get(_filing_url(cik, accession, "index.json"), settings=settings, client=client)
+    try:
+        items = response.json()["directory"]["item"]
+        if not isinstance(items, list):
+            raise TypeError("directory.item is not a list")
+        names = [item["name"] for item in items]
+        if not all(isinstance(name, str) for name in names):
+            raise TypeError("an index item has no string name")
+    except (KeyError, TypeError, AttributeError) as error:  # JSONDecodeError is a ValueError
+        raise ValueError(f"malformed filing index.json for {accession}: {error!r}") from error
+    return names
+
+
+#: How much a streamed document must grow between two `stop_when` checks.
+_STOP_CHECK_BYTES = 64 * 1024
+
+
+def filing_document_head(
+    cik: str,
+    accession: str,
+    filename: str,
+    *,
+    max_bytes: int,
+    stop_when: Callable[[bytes], bool] | None = None,
+    settings: Settings | None = None,
+    client: httpx.Client | None = None,
+) -> bytes:
+    """The first `max_bytes` of one filing document, streamed (#1597, T184b).
+
+    The download itself stops: chunks are read only until the buffer holds
+    `max_bytes` or `stop_when(buffer)` is true (checked after each chunk),
+    and the connection is closed with the rest unread, so a 40 MB document
+    costs at most the cap plus one chunk. The bytes are returned in memory
+    and never written to disk. Behind the throttle, the `User-Agent` and
+    the module's retry policy, as every request here."""
+    if max_bytes <= 0:
+        raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+    _validate_accession(accession)
+    _validate_relative_filename(filename)
+    settings = settings or get_settings()
+    url = _filing_url(cik, accession, filename)
+    headers = {"User-Agent": _user_agent(settings)}
+    http_client = (
+        client if client is not None else _default_client(settings.edgar.request_timeout_seconds)
+    )
+    timeout = settings.edgar.request_timeout_seconds
+    min_interval_seconds = 1.0 / settings.edgar.requests_per_second
+    policy = _RetryPolicy(settings)
+    while True:
+        _LIMITER.wait(min_interval_seconds)
+        buffer = bytearray()
+        try:
+            with http_client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                if policy.retry_after_response(response):
+                    continue
+                checked = 0
+                for chunk in response.iter_bytes():
+                    buffer += chunk
+                    if len(buffer) >= max_bytes:
+                        break
+                    # The predicate rescans the buffer: ask it once per
+                    # `_STOP_CHECK_BYTES` of growth, not once per chunk.
+                    if stop_when is not None and len(buffer) - checked >= _STOP_CHECK_BYTES:
+                        checked = len(buffer)
+                        if stop_when(bytes(buffer)):
+                            break
+        except httpx.TransportError:
+            if policy.retry_after_transport_error():
+                continue
+            raise
+        return bytes(buffer[:max_bytes])
+
+
 def write_atomic(path: Path, data: bytes) -> None:
     """Write `data` to `path` through a temp file in the same directory and
     `os.replace`, so a reader never sees a half-written cache file."""
