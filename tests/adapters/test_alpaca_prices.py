@@ -1636,7 +1636,9 @@ class TestCorporateActions:
                 {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073, "id": "ratio"},
                 {"symbol": "PEER", "ex_date": "2025-02-11", "rate": 1.0073, "id": "real"},
             ],
-            "stock_dividends": [{"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073}],
+            "stock_dividends": [
+                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
+            ],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
         assert {(a.security_id, a.ratio_or_amount) for a in parsed.actions} == {
@@ -1660,6 +1662,30 @@ class TestCorporateActions:
             (date(2025, 5, 2), 0.7),
         ]
         assert parsed.stock_ratio_cash == 0
+
+    def test_nearby_stock_rate_does_not_suppress_cash(self) -> None:
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        parsed = parse_corporate_actions(
+            {
+                "cash_dividends": [{"symbol": "SCCO", "ex_date": "2024-11-06", "rate": 1.0062}],
+                "stock_dividends": [{"symbol": "SCCO", "ex_date": "2024-11-06", "rate": 1.0063}],
+            },
+            resolver.resolve,
+        )
+        assert [a.ratio_or_amount for a in parsed.actions] == [1.0062]
+        assert parsed.stock_ratio_cash == 0
+
+    def test_out_of_calendar_stock_row_is_counted_without_stopping_cash(self) -> None:
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        parsed = parse_corporate_actions(
+            {
+                "cash_dividends": [{"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 0.7}],
+                "stock_dividends": [{"symbol": "SCCO", "ex_date": "1900-01-01", "rate": 1.0073}],
+            },
+            resolver.resolve,
+        )
+        assert [a.ratio_or_amount for a in parsed.actions] == [0.7]
+        assert parsed.stock_rows_unusable == 1
 
     def test_source_action_id_is_alpacas_id(self, resolver: ListingResolver) -> None:
         parsed = parse_corporate_actions(_json("corporate_actions.json"), resolver.resolve)
@@ -2665,7 +2691,10 @@ class TestAlpacaPriceSource:
                 {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 0.7},
                 {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
             ],
-            "stock_dividends": [{"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073}],
+            "stock_dividends": [
+                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
+                {"symbol": "SCCO", "ex_date": "1900-01-01", "rate": 1.0073},
+            ],
         }
         source = AlpacaPriceSource(
             ListingResolver([_listing("SCCO", "SCCO", START)]),
@@ -2675,6 +2704,7 @@ class TestAlpacaPriceSource:
         actions = source.corporate_actions(["SCCO"], date(2025, 2, 1), date(2025, 2, 28))
         assert [(a.security_id, a.ratio_or_amount) for a in actions] == [("SCCO", 0.7)]
         assert "1 stock-ratio cash row(s) skipped" in source.resolution_summary()
+        assert "1 stock-dividend row(s) unusable" in source.resolution_summary()
 
     def test_new_actions_use_process_date_range_and_independent_request(self) -> None:
         calls: list[tuple[list[str], date, date]] = []

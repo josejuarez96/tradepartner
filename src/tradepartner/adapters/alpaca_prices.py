@@ -268,6 +268,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from exchange_calendars.errors import DateOutOfBounds
+
 from tradepartner.adapters.prices import (
     ActionType,
     Bar,
@@ -1625,6 +1627,7 @@ class ActionsParse:
     symbol_change_conflict: int = 0
     reused_symbols: tuple[str, ...] = ()
     stock_ratio_cash: int = 0
+    stock_rows_unusable: int = 0
 
 
 @_fail_closed
@@ -1662,21 +1665,26 @@ def parse_corporate_actions(
     # Only a complete, resolved stock row is evidence to suppress cash;
     # stock_dividends remains an unsupported category for storage.
     stock_rates: set[tuple[str, date, float]] = set()
+    stock_rows_unusable = 0
     stock_rows = payload.get("stock_dividends", [])
     if isinstance(stock_rows, list):
         for stock in stock_rows:
             if not isinstance(stock, Mapping) or not all(
                 field in stock for field in ("symbol", "ex_date", "rate")
             ):
+                stock_rows_unusable += 1
                 continue
             try:
                 stock_date = date.fromisoformat(stock["ex_date"])
                 stock_rate = _rate(stock, "rate", positive=False)
-            except (TypeError, ValueError):
+                stock_security = holder(stock["symbol"], previous_session(stock_date))
+            except (TypeError, ValueError, DateOutOfBounds):
+                stock_rows_unusable += 1
                 continue
-            stock_security = holder(stock["symbol"], previous_session(stock_date))
             if stock_security is not None:
                 stock_rates.add((stock_security, stock_date, stock_rate))
+            else:
+                stock_rows_unusable += 1
     stock_ratio_cash = 0
 
     for category, rows in sorted(payload.items()):
@@ -1816,6 +1824,7 @@ def parse_corporate_actions(
         conflict,
         tuple(reused_symbols),
         stock_ratio_cash,
+        stock_rows_unusable,
     )
 
 
@@ -2083,6 +2092,11 @@ class AlpacaPriceSource(PriceSource):
             if self.last_actions_report.stock_ratio_cash:
                 line += (
                     f"; {self.last_actions_report.stock_ratio_cash} stock-ratio cash row(s) skipped"
+                )
+            if self.last_actions_report.stock_rows_unusable:
+                line += (
+                    f"; {self.last_actions_report.stock_rows_unusable} "
+                    "stock-dividend row(s) unusable"
                 )
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
