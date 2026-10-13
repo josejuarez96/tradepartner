@@ -250,6 +250,27 @@ def test_filename_rows_are_dated_at_acceptance_and_switch_is_off() -> None:
         )
 
 
+def test_filename_empty_early_cover_page_does_not_suppress_rows() -> None:
+    """A pre-2019 cover page with no listings is no reading and ends no window."""
+    cik = "0000000994"
+    accepted = _at(2016, 3, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Emptycover", "10-K", "annual", accepted)],
+        cover_pages=[
+            _cover(cik, _at(2015, 6, 1)),
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "EMPT", "NYSE")),
+        ],
+        filename_listings=[
+            FilenameListing(
+                cik, "annual", "10-K", accepted, date(2016, 3, 1), "EMPT", "NYSE", None, None
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["ticker"], r["known_at"]) for r in rows] == [("EMPT", accepted)]
+
+
 def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
     annual_cik, fallback_cik = "0000000997", "0000000996"
     annual_at, exit_at = _at(2016, 3, 1), _at(2018, 6, 1)

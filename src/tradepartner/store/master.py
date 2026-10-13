@@ -1026,7 +1026,10 @@ def _filename_rows(
                 f"{record.accession}: accepted_at {record.accepted_at.isoformat()} "
                 "is after ingested_at"
             )
-    first_page = min(pages, key=lambda p: (p.accepted_at, p.accession)) if pages else None
+    named_pages = [p for p in pages if p.listings]  # an empty cover page is no reading
+    first_page = (
+        min(named_pages, key=lambda p: (p.accepted_at, p.accession)) if named_pages else None
+    )
     first_at = first_page.accepted_at if first_page is not None else None
     first_prefix = next(
         (
