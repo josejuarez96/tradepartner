@@ -85,7 +85,9 @@ def _reference_classify(
     if known:
         suffix_type = ticker_suffix_type(known[-1]["ticker"])
         if suffix_type is not None:
-            return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
+            # #1597 (T184d): the row written carries the listing row's own
+            # provenance, as the implementation does.
+            return suffix_type, f"suffix_{suffix_type}", sic, known[-1]["provenance"]
     if domestic:
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
@@ -197,6 +199,9 @@ _TITLES = (
     "Shares of Beneficial Interest",
 )
 _TICKERS = ("ABC", "ABC-WS", "ABCDW", "ABCDU", "ABC.U", "ABC-PA", "ABCDY", "BRK.B", "ABCDE")
+#: The provenances a `listings` row may carry (schema.TABLE_PROVENANCE_VALUES),
+#: drawn per scenario listing row so rule 7's written provenance varies.
+_LISTING_PROVENANCES = ("filing", "snapshot", "snapshot_static")
 
 
 def _settings() -> Settings:
@@ -253,6 +258,10 @@ def _scenario(seed: int, companies: int) -> tuple[FixtureFilingSource, MasterBui
                         "known_at": stamp(),
                         "class_title": rng.choice(_TITLES),
                         "ticker": rng.choice(_TICKERS),
+                        # The `listings` provenance `CHECK`'s allowed set, so
+                        # rule 7's row provenance varies as it does in a store
+                        # (#1597, T184d).
+                        "provenance": rng.choice(_LISTING_PROVENANCES),
                     }
                 )
     # A CIK with no evidence at all, and out-of-order input everywhere.

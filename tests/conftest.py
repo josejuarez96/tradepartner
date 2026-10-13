@@ -544,8 +544,11 @@ def version_4_store(path: Path) -> Path:
     simplification this function already makes for every other fact
     table's shape. `schema._FILING_EVENTS_TABLE_DDL` (version 21, #1358) is
     there for the same reason (`filing_events.csv`), as are
-    `schema._RATES_TABLE_DDL` (version 23, #1498; `rates.csv`) and
-    `schema._BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`)."""
+    `schema._RATES_TABLE_DDL` (version 23, #1498; `rates.csv`),
+    `schema._BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`)
+    and `schema._migrate_filing_name` (version 25, #1597; the
+    `filing_name` provenance `CHECK` the fixture listings and
+    classifications rows may carry)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -558,6 +561,7 @@ def version_4_store(path: Path) -> Path:
             + schema._BORROW_STATUS_TABLE_DDL
         ):
             conn.execute(ddl)
+        schema._migrate_filing_name(conn)
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (4, TIMESTAMPTZ "
             "'2026-09-26 12:00:00+00')"

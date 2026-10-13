@@ -149,8 +149,8 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
         conn.close()
 
 
-def test_current_schema_version_is_24() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 24
+def test_current_schema_version_is_25() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 25
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -226,6 +226,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (22,),
         (23,),
         (24,),
+        (25,),
     ]
 
 
@@ -262,7 +263,7 @@ def test_a_second_open_inserts_nothing_more(v14: duckdb.DuckDBPyConnection) -> N
     rows = _metric_rows(v14)
     schema.init_schema(v14)
     assert _metric_rows(v14) == rows
-    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (11,)
+    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (12,)
 
 
 def test_new_trials_after_the_migration_carry_no_detail_default(

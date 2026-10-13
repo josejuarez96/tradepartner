@@ -39,8 +39,10 @@ known at one instant:
    the first naming common), never for a title holding `%`; (d) a head
    naming only a class letter and shares is `title_common` when no
    non-equity word is anywhere in the title.
-7. A class with no titled listing: its latest snapshot ticker's suffix
-   (`suffix_<type>`, `provenance = snapshot_static`): after a separator,
+7. A class with no titled listing: its latest untitled listing ticker's
+   suffix (`suffix_<type>`, `provenance` = that listing row's own:
+   `snapshot_static` for a snapshot ticker, `filing_name` for a pre-2019
+   row read from a filing's file names, #1597): after a separator,
    `W`/`WS`/`WT` warrant, `U`/`UN`/`UT` unit, `R`/`RT`/`RI` right, `P`,
    `P?` or `PR?` preferred; a five-letter ticker with no separator ending
    in `W`, `U`, `R` (Nasdaq fifth-letter codes) or `Y` (ADR). A class
@@ -415,7 +417,10 @@ def _classify(
     if known is not None:
         suffix_type = ticker_suffix_type(known["ticker"])
         if suffix_type is not None:
-            return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
+            # The suffix row carries the listing row's provenance (#1597): a
+            # `filing_name` row (a ticker read from a filing's file names)
+            # never reads as `snapshot_static`, and a snapshot row still does.
+            return suffix_type, f"suffix_{suffix_type}", sic, known["provenance"]
     if state.domestic and not (title_fallback and sibling_common):
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
