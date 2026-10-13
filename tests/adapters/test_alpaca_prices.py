@@ -10,6 +10,7 @@ ticker.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
@@ -23,6 +24,7 @@ from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
     ListingResolver,
     RegistrantEvidence,
+    TickerSpan,
     _default_fetch_name_changes,
     alpaca_symbol,
     feed_source,
@@ -3994,7 +3996,7 @@ class TestFilenameListingBackfill:
             _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
         ]
         end = date(2017, 7, 3)
-        served = {date(2016, 6, 7): {}, date(2017, 8, 1): {}}  # its own; then the other's
+        served = {date(2016, 6, 7): {}, _nth_session_after(end, 6): {}}  # its own; then the other's
         source, seen = self._filing_name_source(listings, served, run_day=RUN_DAY)
         stored: list[tuple[str, date, float]] = []
         listed: list[tuple[str, ...]] = []
@@ -4065,6 +4067,68 @@ class TestFilenameListingBackfill:
         assert source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2)) == []
         assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
 
+    def test_two_colliding_tickers_on_one_symbol_each_keep_their_label(self) -> None:
+        # #1653: two master tickers of one security can share Alpaca's symbol
+        # `KEG`; the second used to overwrite the first in the plan, so the
+        # run row listed one of two colliding spans. The resolver folds such
+        # spellings itself today, so a resolver that hands both out stands in.
+        class Spelled(ListingResolver):
+            def symbols(self, *args: Any, **kwargs: Any) -> list[str]:
+                return ["KEG", "KEG*"]
+
+            def filing_name_spans(self, security_id: str, ticker: str) -> tuple[TickerSpan, ...]:
+                return tuple(
+                    dataclasses.replace(span, ticker=ticker)
+                    for span in super().filing_name_spans(security_id, "KEG")
+                )
+
+            def asof(self, security_id: str, ticker: str, offset_days: int) -> date | None:
+                return super().asof(security_id, "KEG", offset_days)
+
+            def since(self, security_id: str, ticker: str) -> date | None:
+                return super().since(security_id, "KEG")
+
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        served = {date(2016, 6, 7): {}, _nth_session_after(date(2017, 7, 3), 6): {}}
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            rows = [
+                dict(_row(d, 11.0), **f) for d, f in sorted(served.items()) if start <= d <= end
+            ]
+            return {"feed": "sip", "bars": {"KEG": rows}}
+
+        resolver = Spelled(listings, _evidence([], as_of=RUN_DAY))
+        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        assert source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2)) == []
+        assert sorted(source.last_filename_collisions) == [
+            f"{self.OLD}:KEG",
+            f"{self.OLD}:KEG*",
+        ]
+
+    def test_the_collision_probe_is_bounded_to_the_window_plus_a_margin(self) -> None:
+        # #1653: the probe asks the sessions after the span's end through
+        # `transfer_window_sessions + 1 + collision_probe_margin_sessions`,
+        # not on to the run's day; a bar just inside collides, one just
+        # outside is never fetched.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        reach = 5 + 1 + 10  # _settings() defaults: window 5, margin 10
+        for n, expected in ((reach, (f"{self.OLD}:KEG",)), (reach + 1, ())):
+            source, seen = self._filing_name_source(
+                listings, {date(2016, 6, 7): {}, _nth_session_after(end, n): {}}, run_day=RUN_DAY
+            )
+            source.bars([self.OLD], date(2016, 6, 6), date(2016, 6, 30))
+            assert source.last_filename_collisions == expected
+            assert len([c for c in seen if c[0] == _nth_session_after(end, 1)]) == 1
+
     def test_a_collision_drops_only_its_own_span(self) -> None:
         # The colliding span's own rows (inside its span, dated before the
         # successor's) are stored for no one, while the successor keeps the
@@ -4075,7 +4139,11 @@ class TestFilenameListingBackfill:
             _listing(self.OLD, "N/A", date(2017, 7, 3)),
             _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
         ]
-        served = {date(2016, 6, 7): {}, date(2017, 8, 1): {}, date(2019, 6, 3): {}}
+        served = {
+            date(2016, 6, 7): {},
+            _nth_session_after(date(2017, 7, 3), 6): {},
+            date(2019, 6, 3): {},
+        }
         source, _ = self._filing_name_source(listings, served, run_day=RUN_DAY)
         bars = source.bars([self.OLD, self.SUCCESSOR], date(2016, 6, 6), date(2019, 6, 4))
         assert [(b.security_id, b.session) for b in bars] == [(self.SUCCESSOR, date(2019, 6, 3))]

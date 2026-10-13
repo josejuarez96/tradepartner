@@ -4222,3 +4222,36 @@ def test_recorded_source_keeps_the_partial_filename_ciks_after_the_freeze() -> N
     assert recorded.filename_listings("0000000994") == []
     recorded.frozen = True
     assert recorded.filename_incomplete_ciks == {"0000000993"}
+
+
+def test_filename_form25_unmatched_counts_only_an_exchange_mismatch() -> None:
+    # #1662: an unmatched Form 25 of a CIK with an earlier `filing_name` row
+    # counts only when no such row is on its exchange; a warrant's, filed on
+    # the common's own exchange, is no mismatch.
+    from types import SimpleNamespace
+
+    cik = "0000012345"
+    master = SimpleNamespace(
+        filename_enabled=True,
+        filename_counts={},
+        filename_form25_accessions=("A-1", "A-2"),
+        listings=[
+            {
+                "security_id": cik,
+                "provenance": "filing_name",
+                "known_at": _at(2017, 3, 1),
+                "exchange": "NYSE",
+            }
+        ],
+    )
+
+    def form25(accession: str, exchange: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            cik=cik, accession=accession, accepted_at=_at(2018, 6, 1), exchange=exchange
+        )
+
+    delistings = SimpleNamespace(
+        unmatched=(form25("A-1", "NYSE"), form25("A-2", "NASDAQ")), delistings=()
+    )
+    text = ingest_module._filename_counts(master, delistings, SimpleNamespace())  # type: ignore[arg-type]
+    assert "filename_form25_unmatched: 1" in text

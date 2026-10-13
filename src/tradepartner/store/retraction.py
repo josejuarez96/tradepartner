@@ -147,6 +147,12 @@ def underived(
         for row in stored_rows["listings"]
         if "@" in row["security_id"] and row["provenance"] not in {FILING, FILING_NAME}
     }
+    # #1662: with `edgar.filename_listings` off the build reads no file names,
+    # so a stored `filing_name` row is not "no longer derived", only unread.
+    judged = {
+        "securities": {FILING},
+        "listings": {FILING, FILING_NAME} if build.filename_enabled else {FILING},
+    }
     found: list[Underived] = []
     for table, built in (("securities", build.securities), ("listings", build.listings)):
         columns = KEYS[table]
@@ -155,7 +161,7 @@ def underived(
             Underived(table, dict(row))
             for row in stored_rows[table]
             if row["source"] == EDGAR
-            and row["provenance"] in ({FILING, FILING_NAME} if table == "listings" else {FILING})
+            and row["provenance"] in judged[table]
             and cik_of(row["security_id"]) not in skip_ciks
             and row["security_id"] not in snapshot_evidenced
             and tuple(row[c] for c in columns) not in derived
