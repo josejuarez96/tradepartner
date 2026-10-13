@@ -282,6 +282,15 @@ def test_edgar_exchange_axis_listings_is_on_by_default_and_settable(
     assert Settings(_env_file=None).edgar.exchange_axis_listings is False
 
 
+def test_edgar_cover_split_contexts_is_off_by_default_and_settable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1651: off until a release flips it with the cover cache version."""
+    assert Settings(_env_file=None).edgar.cover_split_contexts is False
+    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "true")
+    assert Settings(_env_file=None).edgar.cover_split_contexts is True
+
+
 def test_edgar_filename_listings_are_off_by_default_and_settable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

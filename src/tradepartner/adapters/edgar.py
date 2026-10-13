@@ -77,6 +77,9 @@ _EASTERN = ZoneInfo("America/New_York")
 _DELISTING_FORMS = frozenset({"25", "25-NSE"})
 _SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 _CLASS_AXIS = "us-gaap:StatementClassOfStockAxis"
+#: The other us-gaap axis filers put a cover class on (Fifth Third, #1651):
+#: read as a class axis only under `edgar.cover_split_contexts`.
+_CAPITAL_UNITS_AXIS = "us-gaap:CapitalUnitsByClassAxis"
 #: The DEI taxonomy's "this class on this exchange" axis (#1541): its member
 #: is an ISO MIC (`exch:XNGS`). Read as a listing axis only under
 #: `edgar.exchange_axis_listings`; a grouping key, never the exchange's source.
@@ -831,7 +834,12 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
 
 @_fail_closed
 def parse_cover_page(
-    document: bytes, *, accession: str, accepted_at: datetime, exchange_axis: bool = False
+    document: bytes,
+    *,
+    accession: str,
+    accepted_at: datetime,
+    exchange_axis: bool = False,
+    split_contexts: bool = False,
 ) -> CoverPageParse:
     """The listed classes (`Security12bTitle`, `TradingSymbol`,
     `SecurityExchangeName`, grouped by context) and the
@@ -864,7 +872,20 @@ def parse_cover_page(
     A cover with no listing, shares or title fact at all (a registrant
     with no listed class that reports no share count) is an empty parse for
     the one CIK its `dei:EntityCentralIndexKey` names; with no such CIK it
-    raises."""
+    raises.
+
+    With `split_contexts` (`edgar.cover_split_contexts`, #1651), two tagging
+    patterns real issuers use are also read. (1) `us-gaap:CapitalUnitsByClassAxis`
+    is a class axis like `StatementClassOfStockAxis` (Fifth Third). (2) A class
+    whose listing facts sit in several contexts of one class member (Abbott
+    2020: the title on an undimensioned context, the symbol and exchange on
+    the XNYS context, a second exchange on the XCHI context; P&G 2023: title
+    and symbol on the class context, the exchange on a context that adds the
+    exchange axis) is one listing per distinct `SecurityExchangeName`, the
+    title and symbol being the class's own. The merge happens only when the
+    class's contexts name at most one title and one symbol; with two it falls
+    back to one listing per context, as with the switch off. Never a ticker
+    the filing does not tag."""
     accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
     dei = _dei_facts(document, accession)
     facts = dei.cover
@@ -881,8 +902,10 @@ def parse_cover_page(
         raise ValueError(f"{accession}: cover-page entity is not a CIK: {scheme!r} {entity!r}")
     cik = _cik(entity)
 
-    allowed = {_CLASS_AXIS, _EXCHANGE_AXIS} if exchange_axis else {_CLASS_AXIS}
+    class_axes = {_CLASS_AXIS, _CAPITAL_UNITS_AXIS} if split_contexts else {_CLASS_AXIS}
+    allowed = class_axes | ({_EXCHANGE_AXIS} if exchange_axis else set())
     classes: dict[str, dict[str, str]] = {}
+    class_of: dict[str, str] = {}
     exchange_members: dict[str, str] = {}
     shares: list[FactRecord] = []
     share_values: dict[tuple[str, str], list[tuple[float, bool]]] = {}
@@ -891,15 +914,17 @@ def parse_cover_page(
         if not context.get("id"):
             raise ValueError(f"{accession}: dei:{name} has no context")
         dimensions = context.get("dimensions") or {}
-        if set(dimensions) - allowed:
+        if set(dimensions) - allowed or len(class_axes & set(dimensions)) > 1:
             other.add(context["id"])
             continue
+        class_axis = next(iter(class_axes & set(dimensions)), _CLASS_AXIS)
         if name != _SHARES_CONCEPT:
             classes.setdefault(context["id"], {})[name] = value
+            class_of[context["id"]] = normalize_class_member(str(dimensions.get(class_axis, "")))
             if _EXCHANGE_AXIS in dimensions:
                 exchange_members[context["id"]] = str(dimensions[_EXCHANGE_AXIS])
         elif name == _SHARES_CONCEPT:
-            member = normalize_class_member(str(context.get("dimensions", {}).get(_CLASS_AXIS, "")))
+            member = normalize_class_member(str(dimensions.get(class_axis, "")))
             count = float(Decimal(value))
             if exchange_axis:
                 # #1541: an exchange-axis fact beside another fact of the same
@@ -929,11 +954,36 @@ def parse_cover_page(
                 )
             )
 
+    class_titles: dict[str, set[str]] = {}
+    class_symbols: dict[str, set[str]] = {}
+    class_has_exchange: set[str] = set()
+    for context_id, group in classes.items():
+        member = class_of[context_id]
+        if "Security12bTitle" in group:
+            class_titles.setdefault(member, set()).add(group["Security12bTitle"])
+        if "TradingSymbol" in group:
+            class_symbols.setdefault(member, set()).add(group["TradingSymbol"])
+        if "SecurityExchangeName" in group:
+            class_has_exchange.add(member)
+
     listings: list[CoverListing] = []
     incomplete = mismatched = 0
     for context_id, group in classes.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
+        member = class_of[context_id]
+        if (
+            split_contexts
+            and len(class_titles.get(member, ())) <= 1
+            and len(class_symbols.get(member, ())) <= 1
+        ):
+            # #1651: the class's title and symbol are the class's own, wherever
+            # its contexts put them; a context with no exchange of its own is
+            # covered by a sibling that has one.
+            [title, *_] = class_titles.get(member) or [title]
+            [symbol, *_] = class_symbols.get(member) or [symbol]
+            if exchange is None and member in class_has_exchange:
+                continue
         if symbol is None:
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
