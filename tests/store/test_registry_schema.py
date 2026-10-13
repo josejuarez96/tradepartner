@@ -61,7 +61,7 @@ _UNTOUCHED_TABLES = tuple(
 )
 
 #: Tables an older migration than the one under test rebuilt, so only their
-#: rows are compared, never their DDL: #1597's `classifications` (version 25,
+#: rows are compared, never their DDL: #1597's `classifications` (version 26,
 #: T184d; `listings` is already outside `_UNTOUCHED_TABLES` as retractable,
 #: and `corporate_actions` is excluded whole, with its own test below).
 _ROWS_ONLY_TABLES = ("classifications",)
