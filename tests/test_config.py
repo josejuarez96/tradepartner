@@ -1684,6 +1684,12 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
 
 
+def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
+    assert _settings().alpaca.cash_in_lieu_max_lag_sessions == 10
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"cash_in_lieu_max_lag_sessions": -1})
+
+
 @pytest.mark.parametrize(
     "field",
     [

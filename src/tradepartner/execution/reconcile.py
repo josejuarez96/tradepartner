@@ -197,10 +197,13 @@ class Explanations:
     reference_prices: Mapping[str, float] = field(default_factory=dict)
     #: Held `security_id`s with a stock dividend (#1627) stored as a `split` action
     #: (its ratio in `(1, alpaca.stock_dividend_max_rate]`), each with
-    #: `(ex_date, ratio)` and `ex_date <= S`: the broker credits whole shares plus
-    #: a `CIL` cash-in-lieu activity for the fractional remainder, so `compare`
-    #: books the `cash_in_lieu` adjustment against it.
-    stock_dividends: Mapping[str, tuple[date, float]] = field(default_factory=dict)
+    #: `(first_date, last_date, ratio)` and `ex_date <= S`: the ex-date, the last
+    #: session a `CIL` for it may post (`first_date` +
+    #: `alpaca.cash_in_lieu_max_lag_sessions`, the payable-date window), and the
+    #: ratio that values the fraction at the post-ex price. The broker credits
+    #: whole shares plus a `CIL` cash-in-lieu activity for the fractional
+    #: remainder, so `compare` books the `cash_in_lieu` adjustment against it.
+    stock_dividends: Mapping[str, tuple[date, date, float]] = field(default_factory=dict)
     activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
     activity_seen_before: date | None = None
@@ -366,28 +369,40 @@ def _place_cash_in_lieu(
     """Place a `CIL` cash-in-lieu activity for a held stock dividend (#1627): the
     book must hold the stock-dividend issuer, the broker must credit the whole
     shares (floor of the ledger's fractional expectation) and the CIL's
-    `net_amount` must match the expected cash (fractional remainder x the
-    reference price) within `tolerance` (`risk.cash_in_lieu_tolerance`, relative);
-    then the fractional remainder is removed as a `cash_in_lieu` adjustment
-    (`quantity` the removed fraction, `cash` the broker's amount, keyed by its
-    id). An unmatched CIL, or a CIL on a name with no stock dividend that
-    session, or one whose amount is off beyond the tolerance, is
-    `unexplained_activity` (#1583, T183)."""
+    `net_amount` must match the expected cash within `tolerance`
+    (`risk.cash_in_lieu_tolerance`, relative); then the fractional remainder is
+    removed as a `cash_in_lieu` adjustment (`quantity` the removed fraction,
+    `cash` the broker's amount, keyed by its id). The remainder is valued at the
+    post-ex price: the reference (close ≤ previous_session(S)) is a pre-ex price
+    per old share, so it is divided by the split's ratio to a post-ex price per
+    new share (fix #1627-6a). The CIL may post from the ex-date through
+    `alpaca.cash_in_lieu_max_lag_sessions` sessions later (`dividend[1]`), since
+    Alpaca pays cash in lieu on the payable date. An unmatched CIL (a non-executed
+    one is already classified by `_activity_mismatch`, so this never sees it), a
+    CIL outside the lag window or on a name with no stock dividend, a CIL whose
+    issuer has no reference price, or one whose amount is off beyond the tolerance
+    is `unexplained_activity` (#1583, T183)."""
     if activity.status != _EXECUTED or activity.net_amount is None:
-        return Mismatch(
-            "unexplained_activity",
-            f"CIL activity {activity.activity_id!r} is not an executed cash row "
-            f"(status {activity.status!r})",
-        ), None
+        # The read loop's `_activity_mismatch` already classifies a non-executed
+        # CIL (and never a mismatch for a null one); a second mismatch here would
+        # double-count it.
+        return None, None
     security_id = security_of.get(activity.symbol) if activity.symbol is not None else None
     dividend = explanations.stock_dividends.get(security_id) if security_id is not None else None
-    if security_id is None or dividend is None or dividend[0] != activity.date:
+    if security_id is None or dividend is None or not (dividend[0] <= activity.date <= dividend[1]):
         detail = (
             f"{activity.activity_type!r} activity {activity.activity_id!r} on {activity.date} "
             f"amount {activity.net_amount} status {activity.status!r}; no stock dividend "
             f"this session"
         )
         return Mismatch("unexplained_activity", detail), None
+    reference = explanations.reference_prices.get(security_id)
+    if reference is None:
+        return Mismatch(
+            "unexplained_activity",
+            f"CIL activity {activity.activity_id!r} on {activity.date} has no reference "
+            f"price for {security_id}",
+        ), None
     ledger_frac = expected.get(security_id, 0.0)
     broker_shares = broker.get(security_id, float("nan"))
     whole = float(math.floor(ledger_frac))
@@ -401,15 +416,15 @@ def _place_cash_in_lieu(
             f"credit (ledger {ledger_frac} fractional, broker {broker_shares})",
         ), None
     expected[security_id] = broker_shares
-    reference = explanations.reference_prices.get(security_id, 0.0)
-    expected_cash = removed * reference
+    expected_cash = removed * (reference / dividend[2])
     net = activity.net_amount
-    if not (abs(net - expected_cash) <= tolerance * expected_cash + 1e-9):
+    if not (abs(net - expected_cash) <= tolerance * expected_cash):
         expected[security_id] = ledger_frac
         return Mismatch(
             "unexplained_activity",
             f"CIL activity {activity.activity_id!r} on {activity.date} amount {net} is off "
-            f"the expected cash {expected_cash} of {removed} fractional share(s) at {reference}",
+            f"the expected cash {expected_cash} of {removed} fractional share(s) at "
+            f"{reference} / {dividend[2]}",
         ), None
     proposal = ProposedAdjustment(
         "cash_in_lieu",
@@ -659,6 +674,16 @@ def compare(
         # not inside its base, and books it once (#1583, T183).
         allowed += [
             Allowed("deferred fee", fee.cash, None) for fee in fee_proposals if fee.cash is not None
+        ]
+        # A booked `CIL` cash-in-lieu beside a lagging or pending order is likewise
+        # recorded here (and never journaled here): its cash is still subtracted
+        # from the difference and the position rounded to whole shares, but the id
+        # is not journaled, so the next `ok` reconciliation reads it, finds it not
+        # inside its base, and books it once (#1627).
+        allowed += [
+            Allowed("deferred cash in lieu", cil.cash, cil.security_id)
+            for cil in cil_proposals
+            if cil.cash is not None
         ]
         explained = []
 

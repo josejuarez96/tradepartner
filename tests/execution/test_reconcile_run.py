@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +40,7 @@ from tradepartner.execution.reconcile_run import (
     reconcile_command,
     reconcile_now,
 )
+from tradepartner.execution.risk import round_down
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.dividend_reviews import ReviewedGroup
@@ -789,7 +791,9 @@ def test_stock_dividends_picks_only_in_band_splits_before_the_session() -> None:
     """#1627: `_stock_dividends` seats a `CIL` beside a held stock dividend, so it
     must read a stock-only band: a `split` with `1 < ratio <= stock_dividend_max_rate`
     whose ex-date is at or before the session, and never a 2:1 split, a reverse
-    split, a non-split row, or a split whose ex-date has not passed."""
+    split, a non-split row, or a split whose ex-date has not passed. The result is
+    `(ex_date, last_acceptable_CIL_date, ratio)`; a zero lag keeps the window on
+    the ex-date."""
     actions = pl.DataFrame(
         {
             "security_id": ["A", "B", "C", "D", "E", "F"],
@@ -799,7 +803,10 @@ def test_stock_dividends_picks_only_in_band_splits_before_the_session() -> None:
         }
     )
 
-    assert reconcile_run._stock_dividends(actions, S, 1.25) == {"A": (S, 1.005), "C": (S, 1.20)}
+    assert reconcile_run._stock_dividends(actions, S, 1.25, 0) == {
+        "A": (S, S, 1.005),
+        "C": (S, S, 1.20),
+    }
 
 
 # --- review follow-ups: the cash base, dedupe, the reference cut, failures ----
@@ -1860,6 +1867,76 @@ def test_a_superseded_fill_is_hidden_and_not_counted_in_fills_since_base(
             quantity_tolerance=1e-6,
         )
     assert ledger.fills_since_base == 1  # the superseded row was never counted
+
+
+def test_a_booked_stock_dividend_cash_in_lieu_lands_exactly_on_the_whole_share(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1627 (qa fix 1): the booked fraction must not leave the ledger a sub-ulp
+    share below the whole. 4065 x 1.0085's #127 example generalised: 4065 shares x
+    a 1.0077 split is exactly 4096.3005, so the `CIL` books -0.30050000000028376
+    (the float remainder). Applying that float through `from_journal` gives
+    4095.9999999999995 and `round_down` 4095, stranding a share; the `cash_in_lieu`
+    snap floors the exact `Fraction` position to 4096, so `from_journal` gives
+    exactly 4096.0 and `round_down(..., 0) == 4096`. A second `from_journal` still
+    books nothing new (one `cash_in_lieu` row, idempotent)."""
+    run_id = _run(journal_settings, open_window)
+    at = BOUGHT_AT  # a whole session before the ex-date S, so the split applies
+    order = _order(
+        journal_settings, run_id, "tp-sd", "SEC_A", "AAA", 4065.0, events=(), fill=False, at=at
+    )
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-sd",
+            filled_at=at,
+            quantity=4065.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id="bf-sd",
+            source="broker_feed",
+            superseded_by=None,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _split(journal_settings, "SEC_A", 1.0077, CUT - timedelta(hours=1))  # ex_date = S
+    exact_fraction = Fraction(10077, 10000) * 4065
+    removed = float(exact_fraction) - 4096.0
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="cash_in_lieu",
+            security_id="SEC_A",
+            quantity=-removed,
+            cash=30.05,
+            broker_activity_id="act-cil",
+            known_at=fixed_clock(),
+            ingested_at=fixed_clock(),
+        ),
+    )
+
+    with open_read_only(journal_settings) as conn:
+        live = fills_for(conn, client_order_ids=["tp-sd"])
+        ledgers = from_journal(
+            live,
+            [order],
+            adjustments_for(conn, window_id=open_window.window_id),
+            live_actions_as_of(conn, fixed_clock()),
+            None,
+            open_window.starting_cash,
+            S,
+            window_id=open_window.window_id,
+            quantity_tolerance=1e-6,
+        )
+
+    assert ledgers.positions["SEC_A"] == 4096.0  # exactly, never 4095.9999999999995
+    assert round_down(ledgers.positions["SEC_A"], 0) == 4096
+    assert [
+        (row.kind, row.broker_activity_id) for row in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]  # booked once, never twice
 
 
 def test_cash_within_the_open_allowances_carries_the_decimal_difference(

@@ -285,6 +285,72 @@ def test_migrating_a_version_24_store_books_the_fee_columns_once_and_keeps_rows(
         conn.close()
 
 
+def _version_26_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 26 left it (main, T184d/#1597): every table at the
+    current shape but with `adjustments`' `kind` `CHECK` without `cash_in_lieu`
+    (the version-27 delta not yet applied), one `adjustments` row, and every
+    `schema_version` row set to 26. DuckDB cannot add a `CHECK` in place, so the
+    table is rebuilt through a staging copy that uses the live `CREATE TABLE`
+    with `cash_in_lieu` removed from the `kind` `CHECK` — the same widen this
+    version's migration reverses."""
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+        "quantity, cash, broker_activity_id, explanation_json, known_at, ingested_at) "
+        "VALUES (1, 1, ?, 'fee_cash', NULL, NULL, -0.01, 'act-9', '{}', ?, ?)",
+        [_NOW.date(), _NOW, _NOW],
+    )
+    ddl = conn.execute(
+        "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
+    ).fetchone()[0]
+    v26 = ddl.replace("CREATE TABLE adjustments(", "CREATE TABLE adj_v26(", 1).replace(
+        ", 'cash_in_lieu'", ""
+    )
+    conn.execute(v26)
+    conn.execute("INSERT INTO adj_v26 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adj_v26 RENAME TO adjustments")
+    conn.execute("UPDATE schema_version SET version = 26")
+
+
+def test_migrating_a_version_26_store_widens_the_kind_check_once_and_keeps_rows() -> None:
+    """The spec's "Migration identity" for version 27 (#1627): the `adjustments`
+    `kind` `CHECK` widens with `cash_in_lieu` and one version-27 row is appended,
+    while every pre-27 row is kept in insertion order and byte-identical. This is
+    the real production path (main is at version 26, T184d/#1597, with `fee_cash`
+    already booked); it must fail if `_migrate_cash_in_lieu_kind`'s body is a
+    no-op."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_26_store(conn)
+        before = conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall()
+
+        schema.init_schema(conn)
+
+        assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 27
+        ddl = conn.execute(
+            "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
+        ).fetchone()[0]
+        assert "'cash_in_lieu'" in ddl
+        # A `cash_in_lieu` row is accepted now, and a duplicate broker id refused.
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+            "quantity, cash, broker_activity_id, explanation_json, known_at, ingested_at) "
+            "VALUES (2, 1, ?, 'cash_in_lieu', 'SEC_A', -0.5, 50.0, 'act-cil', '{}', ?, ?)",
+            [_NOW.date(), _NOW, _NOW],
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO adjustments (adjustment_id, window_id, session, kind, cash, "
+                "broker_activity_id, known_at, ingested_at) "
+                "VALUES (3, 1, ?, 'fee_cash', -0.01, 'act-9', ?, ?)",
+                [_NOW.date(), _NOW, _NOW],
+            )
+    finally:
+        conn.close()
+
+
 def test_the_expansion_seam_table_lists_agree() -> None:
     """`journal.require_journal`'s guard and `schema._migrate_expansion_seams`
     must name the same eight tables (plan T132)."""

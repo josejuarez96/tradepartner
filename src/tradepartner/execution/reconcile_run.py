@@ -108,7 +108,7 @@ import polars as pl
 from pydantic import ValidationError
 
 from tradepartner.adapters.broker import Account, Broker, Order, Position
-from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
@@ -390,18 +390,21 @@ def _dividends(
 
 
 def _stock_dividends(
-    actions: pl.DataFrame, session: date, max_rate: float
-) -> dict[str, tuple[date, float]]:
+    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+) -> dict[str, tuple[date, date, float]]:
     """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
     a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
-    `#1618` (T186-family) stores one by — each mapped to `(ex_date, ratio)` for
-    its latest `ex_date <= session`. A `CIL` cash-in-lieu activity is reconciled
-    into a `cash_in_lieu` adjustment only beside one of these (and a fractional
-    remainder the broker credited as whole shares plus cash); otherwise it is
-    `unexplained_activity`."""
+    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
+    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
+    window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
+    and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
+    `cash_in_lieu` adjustment only beside a name here and dated in
+    `[first_date, last_date]` (and a fractional remainder the broker credited as
+    whole shares plus cash); otherwise it is `unexplained_activity`."""
     rows = actions.filter(
         (pl.col("action_type") == _SPLIT)
-        & (pl.col("ratio_or_amount") > 1.0)
+        & (pl.col("ratio_or_amount") > 1)
         & (pl.col("ratio_or_amount") <= max_rate)
         & (pl.col("ex_date") <= session)
     )
@@ -411,7 +414,15 @@ def _stock_dividends(
         current = latest.get(row["security_id"])
         if current is None or ex_date > current[0]:
             latest[row["security_id"]] = (ex_date, float(row["ratio_or_amount"]))
-    return {name: value for name, value in sorted(latest.items())}
+    result: dict[str, tuple[date, date, float]] = {}
+    for name, (ex_date, ratio) in sorted(latest.items()):
+        last = ex_date
+        for _ in range(max_lag_sessions):
+            if last >= session:
+                break
+            last = next_session(last)
+        result[name] = (ex_date, last, ratio)
+    return result
 
 
 def _explanations(
@@ -447,7 +458,12 @@ def _explanations(
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
-        stock_dividends=_stock_dividends(actions, session, settings.alpaca.stock_dividend_max_rate),
+        stock_dividends=_stock_dividends(
+            actions,
+            session,
+            settings.alpaca.stock_dividend_max_rate,
+            settings.alpaca.cash_in_lieu_max_lag_sessions,
+        ),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
     )

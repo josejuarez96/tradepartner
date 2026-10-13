@@ -676,6 +676,13 @@ class AlpacaConfig(BaseModel):
     #: not cash, and is skipped and counted. The 2016-2026 near echoes (CRESY, IRS, SBS)
     #: differ by at most 5e-6; #1617's 1.0062 vs 1.0063 stays cash.
     stock_dividend_echo_tolerance: float = Field(default=1e-5, ge=0)
+    #: #1627: a stock dividend's whole-share growth and its `CIL` (cash in lieu of
+    #: stock) activity can post on different sessions (Alpaca typically pays cash
+    #: in lieu on the payable date), so reconciliation accepts a `CIL` dated from
+    #: the ex-date through this many XNYS sessions after it, before the read goes
+    #: inert and halts. Live (an `alpaca.` key), not frozen — the whole-share and
+    #: cash checks still gate the booking.
+    cash_in_lieu_max_lag_sessions: int = Field(default=10, ge=0)
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.

@@ -75,6 +75,7 @@ _SPLIT = "split"
 _OK = "ok"
 _BUY = "buy"
 _SELL = "sell"
+_CASH_IN_LIEU = "cash_in_lieu"
 _ADJUSTMENT_KINDS = frozenset(JOURNAL_ENUMS[("adjustments", "kind")])
 
 
@@ -296,7 +297,23 @@ def from_journal(
             continue
         if adjustment.quantity is not None and adjustment.security_id is not None:
             factor = _split_factor(splits.get(adjustment.security_id, ()), adjustment.session)
-            positions[adjustment.security_id] += _exact(adjustment.quantity) * factor
+            if adjustment.kind == _CASH_IN_LIEU:
+                # #1627: the row removes a stock dividend's fractional remainder,
+                # so the issuer's exact `Fraction` position is floored to the whole
+                # share it leaves. Applying the float remainder instead leaves a
+                # sub-ulp share that a whole-share exit strands; the snap also lands
+                # the position exactly, never a float just below the whole. Fail
+                # closed if the stored quantity is not that remainder.
+                exact = positions.get(adjustment.security_id, Fraction(0))
+                remainder = float(exact - math.floor(exact))
+                if abs(remainder + adjustment.quantity) > quantity_tolerance:
+                    raise ValueError(
+                        f"cash_in_lieu for {adjustment.security_id} removes {remainder} "
+                        f"shares, not {-adjustment.quantity}"
+                    )
+                positions[adjustment.security_id] = Fraction(math.floor(exact))
+            else:
+                positions[adjustment.security_id] += _exact(adjustment.quantity) * factor
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
 
