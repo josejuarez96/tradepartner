@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import csv
+import shutil
 from datetime import date
+from pathlib import Path
 
 import duckdb
+import pytest
 
-from lookahead.broken_adapter import early_spinoff
+from lookahead.broken_adapter import UNIVERSE_DIR, early_spinoff
 from lookahead.harness import TruncatedStore, probe_timestamps
+from tradepartner.adapters.fixture_prices import FixtureContractError, FixturePriceSource
 from tradepartner.calendar import session_close
 from tradepartner.health import SPINOFF_KNOWN_AT_FLOOR, _new_action_stamp_rules
 from tradepartner.store.asof import live_actions_as_of, symbol_changes_as_of
@@ -50,3 +55,27 @@ def test_broken_adapter_early_spinoff_fails_stamp_rule(
         [action.known_at],
     )
     assert _new_action_stamp_rules(fixture_store)[SPINOFF_KNOWN_AT_FLOOR].height == 1
+
+
+def test_broken_adapter_early_spinoff_is_refused_by_the_fixture_contract(
+    tmp_path: Path,
+) -> None:
+    """The broken adapter's early spin-off, written into a copy of the
+    universe fixture, is refused by contract rule 2's per-type bound."""
+    early = early_spinoff().record
+    universe = tmp_path / "universe"
+    shutil.copytree(UNIVERSE_DIR, universe)
+    path = universe / "corporate_actions.csv"
+    with path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
+    spins = [row for row in rows if row["action_type"] == "spinoff"]
+    assert len(spins) == 1
+    spins[0]["known_at"] = early.known_at.isoformat()
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(FixtureContractError, match="spinoff"):
+        FixturePriceSource(universe)

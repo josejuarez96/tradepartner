@@ -609,6 +609,31 @@ def _write_fixture_dir(
     return fixtures
 
 
+class TestFixtureSymbolChangesAndSpinoff:
+    """T172b: the universe fixture's CSV-backed rename and its spin-off row."""
+
+    def test_the_fixture_rename_reads_from_symbol_changes_csv(
+        self, source: FixturePriceSource
+    ) -> None:
+        (change,) = source.symbol_changes(["SEC_TICKCHANGE"], FAR_PAST, FAR_FUTURE)
+        assert (change.old_symbol, change.new_symbol) == ("TCKA", "TCKB")
+        assert (change.old_cusip, change.new_cusip) == ("SYNTH-OLD", "SYNTH-NEW")
+        assert change.process_date == date(2018, 11, 7)
+        assert change.known_at == announcement_date_known_at(date(2018, 11, 7))
+        assert change.source_action_id == "fixture-rename-1"
+        assert source.symbol_changes(["SEC_TICKCHANGE"], FAR_PAST, date(2018, 11, 6)) == []
+
+    def test_the_fixture_spinoff_is_in_the_t64_convention(self, source: FixturePriceSource) -> None:
+        (spin,) = [
+            a
+            for a in source.corporate_actions(["SEC_SPLIT_PLAIN"], FAR_PAST, FAR_FUTURE)
+            if a.action_type is ActionType.SPINOFF
+        ]
+        assert (spin.security_id, spin.source_action_id) == ("SEC_SPLIT_PLAIN", "SEC_TICKCHANGE")
+        assert spin.ex_date == date(2018, 12, 13) and spin.announced_at is None
+        assert spin.known_at >= action_first_seen_known_at(spin.ex_date)
+
+
 class TestFixtureContract:
     def test_spinoff_stamp_at_or_after_ex_date_proxy(self, tmp_path: Path) -> None:
         row = _action_row(

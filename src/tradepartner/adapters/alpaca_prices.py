@@ -1868,6 +1868,9 @@ class ActionsParse:
     stock_rows_unusable: int = 0
     stock_dividends_stored: int = 0
     stock_rows_refused: tuple[str, ...] = ()  # "SYMBOL ex-date rate (why)"
+    #: #1506: 1 when the daily request's `spin_offs` category was malformed
+    #: and left out (`AlpacaPriceSource.corporate_actions`), else 0.
+    spinoffs_malformed: int = 0
 
 
 @_fail_closed
@@ -2515,6 +2518,8 @@ class AlpacaPriceSource(PriceSource):
                     f"; {self.last_actions_report.stock_dividends_stored} "
                     "stock-dividend row(s) stored as split"
                 )
+            if self.last_actions_report.spinoffs_malformed:
+                line += "; malformed spin_offs category skipped"
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
             if self.last_actions_report.symbol_change_reused:
@@ -2541,22 +2546,53 @@ class AlpacaPriceSource(PriceSource):
         if not symbols:
             return []
         # Alpaca's window is on process_date, which trails the ex-date.
+        fetched = self._fetch_actions(symbols, start - self._lag, end + self._lag)
         payload = {
             category: rows
-            for category, rows in self._fetch_actions(
-                symbols, start - self._lag, end + self._lag
-            ).items()
-            if category != "name_changes"
+            for category, rows in fetched.items()
+            if category not in ("name_changes", "spin_offs")
         }
+        lead = functools.partial(self._resolver.lead, actions=True)  # #974: no rename lead
         parsed = parse_corporate_actions(
             payload,
             self._resolver.resolve,
-            functools.partial(self._resolver.lead, actions=True),  # #974: no rename lead
+            lead,
             process_start=start - self._lag,
             process_end=end + self._lag,
             lag_days=self._lag.days,
             stock_rules=self._alpaca,
         )
+        # #1506 (T172b/c): spin-offs are parsed on their own, so the split and
+        # dividend parse above is the one main had, byte for byte, and a
+        # malformed spin-off row is counted on the report instead of failing
+        # the day's splits and dividends. A spin-off is kept by its
+        # process_date (the parser's range), whatever its ex-date.
+        spin_offs = fetched.get("spin_offs")
+        if spin_offs:
+            try:
+                spins = parse_corporate_actions(
+                    {"spin_offs": spin_offs},
+                    self._resolver.resolve,
+                    lead,
+                    process_start=start - self._lag,
+                    process_end=end + self._lag,
+                    lag_days=self._lag.days,
+                    stock_rules=self._alpaca,
+                )
+            except ValueError:
+                parsed = replace(parsed, spinoffs_malformed=1)
+            else:
+                parsed = replace(
+                    parsed,
+                    actions=tuple(
+                        sorted(
+                            parsed.actions + spins.actions,
+                            key=lambda a: (a.security_id, a.action_type.value, a.ex_date),
+                        )
+                    ),
+                    unresolved=parsed.unresolved + spins.unresolved,
+                    self_spinoff=spins.self_spinoff,
+                )
         self.last_actions_report = parsed
         return [
             a

@@ -3021,6 +3021,46 @@ class TestAlpacaPriceSource:
         )
         actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
         assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.spinoffs_malformed == 1
+        assert "malformed spin_offs category skipped" in source.resolution_summary()
+
+    def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
+        # #1664 ruling (a): the split and dividend output is byte-identical
+        # with a spin-off in the payload, whatever ids the spin-off carries.
+        def run(with_spinoff: bool) -> tuple[list[CorporateAction], list[CorporateAction]]:
+            recorded = _Recorded()
+
+            def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+                payload: dict[str, object] = dict(recorded.actions(symbols, start, end))
+                if with_spinoff:
+                    payload["spin_offs"] = [
+                        _spinoff(
+                            source_symbol="AAPL",
+                            new_symbol="MSFT",
+                            ex_date="2020-08-31",
+                            process_date="2020-09-04",
+                        )
+                    ]
+                return payload
+
+            source = AlpacaPriceSource(
+                ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+            )
+            actions = source.corporate_actions(
+                ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+            )
+            assert source.last_actions_report is not None
+            others = [a for a in actions if a.action_type is not ActionType.SPINOFF]
+            reported = [
+                a
+                for a in source.last_actions_report.actions
+                if a.action_type is not ActionType.SPINOFF
+            ]
+            return others, reported
+
+        assert run(True) == run(False)
+        assert run(False)[0]  # the pin compares real rows
 
     def test_actions_processed_after_the_window_are_kept(self) -> None:
         # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.

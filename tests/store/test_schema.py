@@ -1390,6 +1390,88 @@ def test_read_only_open_of_a_version_25_store_passes(tmp_path: Path) -> None:
         assert ro.execute("SELECT rule FROM classifications").fetchall() == [("common_default",)]
 
 
+# --- version 27 (#1506, T172b): the `symbol_changes` table ----------------
+
+
+def _version_26_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 26 left it: today's schema without
+    `symbol_changes` and a single version-26 row, holding a bar and a
+    `spinoff`-less action row."""
+    configure_connection(conn)
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO prices_daily VALUES ('S1', DATE '2020-01-02', 1, 1, 1, 1, 1, "
+        "TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
+        "'test', 'bar')"
+    )
+    conn.execute(
+        "INSERT INTO corporate_actions (security_id, action_type, ex_date, ratio_or_amount, "
+        "known_at, ingested_at, source, provenance) VALUES ('S1', 'split', DATE '2020-01-03', "
+        "2.0, TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
+        "'test', 'action')"
+    )
+    conn.execute("DROP TABLE symbol_changes")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (26, TIMESTAMPTZ "
+        "'2026-10-12 20:00:00+00')"
+    )
+
+
+def _indexes(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    return dict(conn.execute("SELECT index_name, sql FROM duckdb_indexes() ORDER BY 1").fetchall())
+
+
+def test_the_version_27_migration_adds_symbol_changes_and_nothing_else() -> None:
+    """From 26: `symbol_changes` and its identity index appear, empty and
+    shaped as a fresh store's; every other table's DDL, index and row is
+    unchanged; the versions go to [26, 27] and a second open adds nothing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_26_store(conn)
+        shape_before, indexes_before = _shape(conn), _indexes(conn)
+        tables_before = sorted(set(shape_before) - {"schema_version"})
+        rows_before = _all_rows(conn, tables_before)
+        assert "symbol_changes" not in shape_before
+        assert "symbol_changes_identity" not in indexes_before
+        assert sum(len(rows) for rows in rows_before.values()) >= 2
+        schema.init_schema(conn)
+        shape_after, indexes_after = _shape(conn), _indexes(conn)
+        assert set(shape_after) - set(shape_before) == {"symbol_changes"}
+        assert {t: shape_after[t] for t in shape_before} == shape_before
+        assert set(indexes_after) - set(indexes_before) == {"symbol_changes_identity"}
+        assert {i: indexes_after[i] for i in indexes_before} == indexes_before
+        assert _all_rows(conn, tables_before) == rows_before
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
+        assert _versions(conn) == [26, 27]
+        schema.init_schema(conn)
+        assert _versions(conn) == [26, 27]
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        assert shape_after["symbol_changes"] == _shape(fresh)["symbol_changes"]
+        assert (
+            indexes_after["symbol_changes_identity"] == _indexes(fresh)["symbol_changes_identity"]
+        )
+        fresh.close()
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_26_store_passes(tmp_path: Path) -> None:
+    """A read-only connection never migrates: a version-26 store passes,
+    `schema_version` stays at [26] and every other read works."""
+    path = tmp_path / "v26.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        _version_26_store(conn)
+    finally:
+        conn.close()
+    with duckdb.connect(str(path), read_only=True) as ro:
+        schema.init_schema(ro)
+        assert _versions(ro) == [26]
+        assert ro.execute("SELECT count(*) FROM corporate_actions").fetchone() == (1,)
+
+
 # --- version 13 (#720, #1033, T85d): profitability rebalance columns ----
 
 

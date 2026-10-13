@@ -432,7 +432,22 @@ registry; #83 took version 2 first, so the registry is version 3):
   store: no read depends on the `CHECK`, and the next writable
   `init_schema` call migrates the store. Nothing writes a `filing_name` row
   before T184e, behind `edgar.filename_listings` (default off).
-- **A later DDL change goes to version 27**, with its own migration and a
+- **Version 27** (#1506, data-foundation plan T172b; the spec's "Amendment
+  2026-10-11 (#1506)", spin-offs and name changes): adds `symbol_changes`
+  (one row per Alpaca name change, `known_at` = the close of the first
+  session strictly after its `process_date`). Purely additive, like versions
+  21, 23 and 24: the migration from any earlier migratable version just
+  creates the table and its identity index (`init_schema`'s DDL pass,
+  `_SYMBOL_CHANGES_TABLE_DDL`) and appends a version-27 row; no existing
+  table or row changes. The identity mirrors `corporate_actions_identity`:
+  `(security_id, source_action_id)` when the id is non-empty, else
+  `(security_id, old_symbol, new_symbol, process_date)`, each with
+  `known_at`. The table joins `TABLE_NAMES` and `TABLE_PROVENANCE_VALUES`
+  (`action` only); `registry.data_vintage` already leaves it out (T171b). A
+  read-only connection accepts a version-26 store: every read works but a
+  `symbol_changes` read, which fails on the missing table, and the next
+  writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 28**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -695,7 +710,10 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   DDL pass with the wider `CHECK` (`_FILING_NAME_TABLE_DDL`,
 #:   `_migrate_filing_name`), every row kept (module docstring, "Schema
 #:   versions").
-#: - A later DDL change goes to version 27, with its own migration and a
+#: - 27 (#1506, data-foundation plan T172b): the `symbol_changes` table and
+#:   its identity index, created by the DDL pass (`_SYMBOL_CHANGES_TABLE_DDL`);
+#:   no existing table changes (module docstring, "Schema versions").
+#: - A later DDL change goes to version 28, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
 CURRENT_SCHEMA_VERSION = 27
 
@@ -815,6 +833,11 @@ _PRE_FEE_ACTIVITIES_VERSION = 24
 #: connections serve every read, since no read depends on a table's
 #: provenance `CHECK` and no `filing_name` row can exist there.
 _PRE_FILING_NAME_VERSION = 25
+
+#: The last version without `symbol_changes` (#1506, T172b, version 27):
+#: read-only connections serve every other read; a `symbol_changes` read
+#: there fails on the missing table, as a `borrow_status` read did at 23.
+_PRE_SYMBOL_CHANGES_VERSION = 26
 
 
 class SchemaVersionError(RuntimeError):
@@ -2660,7 +2683,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
-        CURRENT_SCHEMA_VERSION - 1,
+        _PRE_SYMBOL_CHANGES_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2688,7 +2711,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `adjustments.broker_activity_id` and `paper_windows.activities_seen_json`
         # (the booked-fee activity's `explanations_as_of` names one), which a
         # version-24 store lacks; version 25 every read (no `filing_name` row
-        # can exist there, and no read depends on the provenance `CHECK`).
+        # can exist there, and no read depends on the provenance `CHECK`);
+        # version 26 every read but `symbol_changes`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3511,7 +3535,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
-        CURRENT_SCHEMA_VERSION - 1,
+        _PRE_SYMBOL_CHANGES_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
