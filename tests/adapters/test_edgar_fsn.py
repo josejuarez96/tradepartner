@@ -1622,3 +1622,14 @@ def _parse_default(pattern: str, adsh: str) -> Any:
         [_dim(h, s) for h, s in dims.items()],
         exchange_axis=True,
     ).records[0]
+
+
+def test_an_undecodable_byte_in_a_capital_units_segment_fails_closed_only_with_the_switch() -> None:
+    adsh = "0000000001-23-000001"
+    dim = [_dim("0x1", "CapitalUnitsByClass=Common\ufffdMember;")]
+    txt = _listing_rows(adsh, "0x1", "Common", "AAA", "NYSE")
+    args = ([_sub(adsh, "1", "10-Q")], [], txt, dim)
+    parsed = parse_fsn(*args, split_contexts=True)
+    assert [f.accession for f in parsed.failures] == [adsh]
+    assert "undecodable byte" in parsed.failures[0].error
+    assert parse_fsn(*args).failures == ()  # today's parse drops the row
