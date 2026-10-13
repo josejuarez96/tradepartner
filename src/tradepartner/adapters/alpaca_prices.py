@@ -195,8 +195,9 @@ spans on the run row, both off by default until T184e writes the rows:
   at `effective_on`, so no stored bar can show it; the raw payload can. For
   every `filing_name` span with an end that `bars` asks with `asof`,
   `_filing_name_collided` asks the symbol with the same `asof` over the
-  sessions after the span's end to the run's day (once per span per run,
-  cached, the horizon `ListingResolver.run_day`) and calls it a
+  sessions after the span's end through the window plus
+  `alpaca.collision_probe_margin_sessions`, never past the run's day (once
+  per span per run, cached), and calls it a
   **collision** when that holds a traded bar more than
   `master.transfer_window_sessions` XNYS sessions after the span's end. The
   verdict is the span's, not the request's — the backfill asks a month at a
@@ -675,8 +676,10 @@ def _sessions_after(end: date, session: date, cap: int) -> int:
     """XNYS sessions after `end` through `session`, the bar's own session
     counted and `end` itself not, counted up to `cap` (enough to tell a gap
     above a window): #1597's collision gap, the mirror of
-    `_sessions_between` with the bar counted, so a bar `cap - 1` sessions
-    after `end` is the first collision at a window of `cap - 2`."""
+    `_sessions_between` with the bar counted: the result reaches `cap` when
+    the bar is `cap` or more sessions after `end`, so called with
+    `cap = window + 1` the first collision is the bar `window + 1`
+    sessions after it."""
     count, day = 0, next_session(end)
     while day <= session and count < cap:
         count, day = count + 1, next_session(day)
@@ -2295,6 +2298,7 @@ class AlpacaPriceSource(PriceSource):
         self._alpaca = settings.alpaca
         self._transfer = settings.master.transfer_window_sessions
         self._asof_offset = settings.alpaca.asof_offset_days
+        self._probe_margin = settings.alpaca.collision_probe_margin_sessions
         self._asof_served: set[tuple[str, str]] = set()  # (security, symbol) asof found
         self._filename_collided: dict[tuple[str, str, date], bool] = {}  # (security, ticker, start)
         self._filename_reported: set[str] = set()  # labels already on a run row
@@ -2377,8 +2381,8 @@ class AlpacaPriceSource(PriceSource):
                     if span.end is not None
                     and self._filing_name_collided(security_id, ticker, symbol, span, day)
                 ]
-                if collided:
-                    filings[(security_id, symbol)] = collided
+                if collided:  # two master tickers can share one Alpaca symbol (#1653)
+                    filings.setdefault((security_id, symbol), []).extend(collided)
         fetched: list[Fetched] = []
         fallbacks: set[str] = set()
         collisions: list[str] = []
@@ -2449,21 +2453,26 @@ class AlpacaPriceSource(PriceSource):
 
         The verdict is the span's, never the request's: it is read once per
         `(security, ticker, span)` per run (cached like `_asof_served`) from
-        a fetch over the sessions after the span's end to the run's day,
-        every one known at the run. The backfill asks a month at a time, so
+        a fetch over the sessions after the span's end through the
+        window plus `alpaca.collision_probe_margin_sessions` (never past the
+        run's day), every one known at the run. The backfill asks a month at a time, so
         a month before the span's end holds no bar past that end while the
         wrong bars it reads are the other company's: only a probe past the
-        end sees them, and the run's day is the horizon so the verdict is
-        the same in every month."""
+        end sees them, and the horizon is the span's, not the request's, so
+        the verdict is the same in every month."""
         key = (security_id, ticker, span.start)
         if key not in self._filename_collided:
             assert span.end is not None  # its caller passes an ended span
             after = next_session(span.end)
+            reach = after  # the last session the rule can need, plus the margin (#1653)
+            for _ in range(self._transfer + self._probe_margin):
+                reach = next_session(reach)
+            horizon = min(reach, self._resolver.run_day)
             served: Iterable[Mapping[str, Any]] = ()
-            if after <= self._resolver.run_day:
-                served = self._fetch_bars([symbol], after, self._resolver.run_day, asof=asof)[
-                    "bars"
-                ].get(symbol, ())
+            if after <= horizon:
+                served = self._fetch_bars([symbol], after, horizon, asof=asof)["bars"].get(
+                    symbol, ()
+                )
             traded = tuple(_traded_sessions(served))
             self._filename_collided[key] = any(
                 _sessions_after(span.end, session, self._transfer + 1) >= self._transfer + 1
