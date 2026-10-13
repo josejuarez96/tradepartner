@@ -250,6 +250,124 @@ def test_filename_rows_are_dated_at_acceptance_and_switch_is_off() -> None:
         )
 
 
+def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
+    annual_cik, fallback_cik = "0000000997", "0000000996"
+    annual_at, exit_at = _at(2016, 3, 1), _at(2018, 6, 1)
+    annual = FilenameListing(
+        annual_cik,
+        "annual",
+        "10-K",
+        annual_at,
+        date(2016, 3, 1),
+        "ANN",
+        "NASDAQ",
+        "Common Stock",
+        None,
+    )
+    exhibits = [
+        FilenameListing(
+            cik, f"exit-{cik}", "25-NSE", exit_at, date(2016, 1, 4), ticker, "NASDAQ", None, None
+        )
+        for cik, ticker in ((annual_cik, "ANN"), (fallback_cik, "FALL"))
+    ]
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(annual_cik, "Annual", "10-K", "annual", annual_at),
+            FilingIndexEntry(fallback_cik, "Fallback", "S-1", "s1", annual_at),
+        ],
+        delistings=[
+            DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", f"exit-{cik}", exit_at)
+            for cik in (annual_cik, fallback_cik)
+        ],
+        filename_listings=[annual, *exhibits],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    named = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["security_id"], r["ticker"], r["known_at"]) for r in named] == [
+        (fallback_cik, "FALL", exit_at),
+        (annual_cik, "ANN", annual_at),
+    ]
+    assert build_delistings(source.delistings(), on, ingested_at=INGESTED_AT).unmatched == ()
+
+
+def test_filename_confirmation_uses_first_cover_filing_only() -> None:
+    cik = "0000000995"
+    accepted = _at(2016, 3, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Renamer", "10-K", "annual", accepted)],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "OLD", "NYSE")),
+            _cover(cik, _at(2021, 3, 1), ("Common Stock", "NEW", "NYSE")),
+        ],
+        filename_listings=[
+            FilenameListing(
+                cik,
+                "annual",
+                "10-K",
+                accepted,
+                date(2016, 3, 1),
+                "OLD",
+                "NYSE",
+                None,
+                None,
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert [
+        (r["ticker"], r["valid_from"]) for r in on.listings if r["provenance"] == "filing_name"
+    ] == [("OLD", date(2016, 3, 1))]
+    assert on.filename_counts["filename_confirmed"] == 1
+
+
+def test_filename_survivor_resolution_keeps_security_and_shortens_lead() -> None:
+    cik = "0000000994"
+    accepted = _at(2015, 3, 2)
+    cover = _at(2019, 3, 1)
+    record = FilenameListing(
+        cik,
+        "annual",
+        "10-K",
+        accepted,
+        date(2015, 3, 2),
+        "STAY",
+        "NYSE",
+        None,
+        "STAY",
+    )
+
+    def source(*, static: bool) -> FixtureFilingSource:
+        return FixtureFilingSource(
+            index=[FilingIndexEntry(cik, "Stay", "10-K", "annual", accepted)],
+            cover_pages=[_cover(cik, cover, ("Common Stock", "STAY", "NYSE"))],
+            snapshot=[_snap(cik, "Stay", "STAY", "NYSE")] if static else [],
+            filename_listings=[record],
+        )
+
+    off = _settings()
+    on = _settings(edgar={"filename_listings": True})
+    first = {cik: date(2016, 1, 4)}
+    sessions = [date(2016, 1, 4), date(2017, 6, 1), date(2019, 3, 4)]
+    for static in (False, True):
+        old = ListingResolver(
+            build_master(source(static=static), off, ingested_at=INGESTED_AT).listings,
+            first_sessions=first,
+        )
+        new = ListingResolver(
+            build_master(source(static=static), on, ingested_at=INGESTED_AT).listings,
+            first_sessions=first,
+        )
+        assert [old.resolve("STAY", day) or old.lead("STAY", day) for day in sessions] == [
+            cik
+        ] * len(sessions)
+        assert [new.resolve("STAY", day) or new.lead("STAY", day) for day in sessions] == [
+            cik
+        ] * len(sessions)
+        if not static:
+            assert old.first_span_lead(cik) is not None
+            assert new.first_span_lead(cik) is None
+
+
 def _new_store() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(":memory:")
     configure_connection(conn)

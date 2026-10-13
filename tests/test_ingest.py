@@ -1492,6 +1492,50 @@ def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
     assert asked == sorted({ACME, DUAL})
     _build_filings(on, on_settings, NOW)
     assert asked == sorted({ACME, DUAL})  # write phase uses recorded answers
+    from tradepartner.backtest import frozen, hypothesis
+
+    h1 = Path(__file__).resolve().parents[1] / "docs/hypotheses/h1-momentum-12-1.md"
+    parsed = hypothesis.parse_file(h1)
+    pinned = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    params = hypothesis.frozen_params(parsed, pinned)
+    assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (
+        "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"
+    )
+
+
+def test_filename_run_records_verdict_counts_and_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    base = _filings()
+    source = FixtureFilingSource(
+        index=base._index,
+        snapshot=base._snapshot,
+        facts=base._facts,
+        headers=base._headers,
+        cover_pages=base._cover_pages,
+        delistings=base._delistings,
+        filename_listings=[
+            FilenameListing(
+                ACME,
+                f"{ACME}-18-000001",
+                "10-K",
+                _at(2018, 3, 1),
+                date(2018, 3, 1),
+                "ACME",
+                "NYSE",
+                "Common Stock",
+                "ACME",
+            )
+        ],
+    )
+    on = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"filename_listings": True})}
+    )
+    run = _edgar(on, source)
+    assert "filename_confirmed: 1" in run.message
+    assert "filename_no_instance: 1" in run.message  # DUAL's 10-K has no instance
+    assert "filename_form25_unmatched: 0" in run.message
+    assert read("SELECT ticker FROM listings WHERE provenance = 'filing_name'") == [("ACME",)]
 
 
 def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:

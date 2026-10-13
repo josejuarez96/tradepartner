@@ -1121,11 +1121,33 @@ def _ingest_filings(
 
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
     """The #1597 verdict and Form 25 counts, omitted with the switch off."""
-    if not master.filename_counts:
+    if not master.filename_enabled:
         return ""
     counts = dict(master.filename_counts)
+    for key in (
+        "filename_10ks_read",
+        "filename_confirmed",
+        "filename_single_reading",
+        "filename_renamed",
+        "filename_refused_contradicted",
+        "filename_refused_owner",
+        "filename_no_instance",
+        "filename_no_exchange",
+        "filename_class_unread",
+        "filename_form25_rows",
+    ):
+        counts.setdefault(key, 0)
+    accessions = frozenset(master.filename_form25_accessions)
     counts["filename_form25_unmatched"] = sum(
-        1 for row in delistings.unmatched if row.accepted_at.year < 2019
+        1
+        for row in delistings.unmatched
+        if row.accession in accessions
+        or any(
+            listing["security_id"][:10] == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
     )
     counts["filename_transfers_delisted"] = sum(
         1

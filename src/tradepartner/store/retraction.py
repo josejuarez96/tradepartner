@@ -11,20 +11,22 @@ revision instead.
 
 - **Underived.** `underived(build, securities, listings, skip_ciks)` is
   pure: each stored live row (the latest revision per key as of the check,
-  not retracted) with `source = 'edgar'` and `provenance = 'filing'` whose
+  not retracted) with `source = 'edgar'` and `provenance = 'filing'`
+  (or `filing_name` for listings, #1597) whose
   key (`security_id` for `securities`; `security_id, ticker, exchange,
   valid_from` for `listings`) is not among `build`'s rows, and whose CIK is
   not in `skip_ciks`. Only EDGAR rows: the master builder derives nothing
   else, and a benchmark seeded from config (`backfill-benchmark`, #840) is
-  never its row to judge. Only `filing` rows: they come from full-history
-  inputs (the filing index, cover pages, Forms 25), so a build that lacks
-  one has changed its rules. A `snapshot` or `snapshot_static` row comes
+  never its row to judge. Filing-derived rows come from full-history
+  inputs (the filing index, cover pages, Forms 25 and filename evidence),
+  so a build that lacks one has changed its rules. A `snapshot` or
+  `snapshot_static` row comes
   from the companies snapshot, which lists only names trading today: a
   delisted or renamed name's snapshot row is legitimately absent from
   today's build, and retracting it would erase delisted history (quant
   audit of #872). Such rows are never judged; a false one needs another
   remedy. Nor is a successor id (`<cik>@<valid_from>`, #820) with a
-  stored non-`filing` listing, or any of its rows: one relisted on
+  stored non-filing-derived listing, or any of its rows: one relisted on
   snapshot evidence has a `filing` securities row, yet exists only while
   the snapshot names it. `skip_ciks` are CIKs whose filings failed or were skipped this
   run (`ingest._unjudged_ciks`): their rows are not judged either. A key

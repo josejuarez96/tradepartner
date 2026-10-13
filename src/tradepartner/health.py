@@ -329,7 +329,6 @@ from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
     _validate_t,
-    listings_as_of,
     live_actions_as_of,
     price_jumps_as_of,
     prices_as_of,
@@ -1065,24 +1064,16 @@ def _filename_listings(
     return FilenameListings(len(named), only, pl.DataFrame(no_bars, schema=_FILENAME_SCHEMA))
 
 
-def _filename_listing_valid_from(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
-) -> pl.DataFrame:
+def _filename_listing_valid_from(listings: pl.DataFrame, settings: Settings) -> pl.DataFrame:
     """Check 10-K dates and Form 25's first-session last-resort dates."""
-    rows = listings_as_of(conn, t).filter(pl.col("provenance") == "filing_name")
+    rows = listings.filter(pl.col("provenance") == "filing_name")
     if rows.is_empty():
         return pl.DataFrame([], schema=_FILENAME_SCHEMA)
     first = first_session(settings)
-    form25 = {
-        (sid, stamp)
-        for sid, stamp in conn.execute(
-            "SELECT security_id, known_at FROM delistings WHERE known_at <= ?", [t]
-        ).fetchall()
-    }
     bad = []
     for row in rows.iter_rows(named=True):
         expected = session_of(row["known_at"])
-        is_form25 = row["valid_from"] == first and (row["security_id"], row["known_at"]) in form25
+        is_form25 = row["valid_from"] == first
         if (is_form25 and row["valid_from"] > expected) or (
             not is_form25 and row["valid_from"] != expected
         ):
@@ -1913,7 +1904,7 @@ def _integrity_checks(
         KNOWN_AT_NOT_AFTER_INGESTED_AT: _count_per_table(conn, "known_at > ingested_at"),
         SOURCE_NOT_NULL: _count_per_table(conn, "source IS NULL"),
         PROVENANCE_ALLOWED: _bad_provenance(conn),
-        FILENAME_LISTING_VALID_FROM: _filename_listing_valid_from(conn, t, settings),
+        FILENAME_LISTING_VALID_FROM: _filename_listing_valid_from(listings, settings),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,

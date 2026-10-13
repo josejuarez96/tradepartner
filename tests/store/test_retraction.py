@@ -21,6 +21,7 @@ from tradepartner.store.retraction import (
     Underived,
     retraction,
     split_kept,
+    stored_underived,
     underived,
     write_retractions,
 )
@@ -84,6 +85,17 @@ def test_underived_includes_filing_name_but_keeps_snapshot_out() -> None:
     filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
     snapshot = _listing("0001647088", "NEW") | {"provenance": "snapshot_static"}
     found = underived(_build((), ()), [], [filename, snapshot])
+    assert [(item.table, item.row["ticker"]) for item in found] == [("listings", "OLD")]
+
+
+def test_master_retract_sees_stored_filename_row(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    security = _security("0001647088")
+    filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
+    insert_row(conn, "securities", security)
+    insert_row(conn, "listings", filename)
+    found = stored_underived(conn, _build((security,), ()), FIXED)
     assert [(item.table, item.row["ticker"]) for item in found] == [("listings", "OLD")]
 
 

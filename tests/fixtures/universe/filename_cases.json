@@ -1,0 +1,133 @@
+[
+  {
+    "case": "survivor_three_10ks",
+    "cik": "0000099991",
+    "cover": {
+      "accepted_at": "2019-03-01T20:30:00+00:00",
+      "exchange": "NYSE",
+      "ticker": "SURV"
+    },
+    "readings": [
+      {
+        "accepted_at": "2015-03-02T20:30:00+00:00",
+        "dei_symbol": "SURV",
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "SURV"
+      },
+      {
+        "accepted_at": "2016-03-01T20:30:00+00:00",
+        "dei_symbol": "SURV",
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "SURV"
+      },
+      {
+        "accepted_at": "2017-03-01T20:30:00+00:00",
+        "dei_symbol": "SURV",
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "SURV"
+      }
+    ]
+  },
+  {
+    "case": "nasdaq_delister",
+    "cik": "0000099992",
+    "form25": {
+      "accepted_at": "2018-06-01T20:30:00+00:00",
+      "effective_on": "2018-06-11",
+      "exchange": "NASDAQ"
+    },
+    "readings": [
+      {
+        "accepted_at": "2016-03-01T20:30:00+00:00",
+        "dei_symbol": null,
+        "exchange": "NASDAQ",
+        "form": "10-K",
+        "ticker": "NDEL"
+      },
+      {
+        "accepted_at": "2018-06-01T20:30:00+00:00",
+        "dei_symbol": null,
+        "exchange": "NASDAQ",
+        "form": "25-NSE",
+        "ticker": "NDEL"
+      }
+    ]
+  },
+  {
+    "case": "nasdaq_fallback",
+    "cik": "0000099993",
+    "form25": {
+      "accepted_at": "2018-06-01T20:30:00+00:00",
+      "effective_on": "2018-06-11",
+      "exchange": "NASDAQ"
+    },
+    "readings": [
+      {
+        "accepted_at": "2018-06-01T20:30:00+00:00",
+        "dei_symbol": null,
+        "exchange": "NASDAQ",
+        "form": "25-NSE",
+        "ticker": "FALL"
+      }
+    ]
+  },
+  {
+    "case": "nyse_single_reading",
+    "cik": "0000099994",
+    "readings": [
+      {
+        "accepted_at": "2016-03-01T20:30:00+00:00",
+        "dei_symbol": null,
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "NSNG"
+      }
+    ]
+  },
+  {
+    "case": "transfer",
+    "cik": "0000099995",
+    "form25": {
+      "accepted_at": "2018-06-01T20:30:00+00:00",
+      "effective_on": "2018-06-11",
+      "exchange": "NYSE"
+    },
+    "readings": [
+      {
+        "accepted_at": "2016-03-01T20:30:00+00:00",
+        "dei_symbol": "TRAN",
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "TRAN"
+      },
+      {
+        "accepted_at": "2018-12-03T20:30:00+00:00",
+        "dei_symbol": "TRAN",
+        "exchange": "NASDAQ",
+        "form": "10-K",
+        "ticker": "TRAN"
+      }
+    ]
+  },
+  {
+    "case": "unmatched_exchange",
+    "cik": "0000099996",
+    "form25": {
+      "accepted_at": "2018-06-01T20:30:00+00:00",
+      "effective_on": "2018-06-11",
+      "exchange": "NASDAQ"
+    },
+    "readings": [
+      {
+        "accepted_at": "2016-03-01T20:30:00+00:00",
+        "dei_symbol": "MISS",
+        "exchange": "NYSE",
+        "form": "10-K",
+        "ticker": "MISS"
+      }
+    ]
+  }
+]
