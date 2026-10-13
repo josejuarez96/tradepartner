@@ -1732,6 +1732,13 @@ class RiskConfig(BaseModel):
     max_broker_clock_skew_seconds: float = Field(default=60.0, ge=0)
     reconcile_quantity_tolerance: float = Field(default=1e-6, ge=0)
     reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
+    # #1627: the relative tolerance the reconciliation books a stock dividend's
+    # `CIL` (cash in lieu of stock) cash activity against the expected cash
+    # (fractional-remainder shares x the reference price). The broker values cash
+    # in lieu on the ex-date, below the pre-ex close the reference price carries,
+    # so a ~10% relative gap passes; a larger one halts the book, as any mismatch
+    # does. A fraction of the expected cash, in [0, 1].
+    cash_in_lieu_tolerance: float = Field(default=0.10, ge=0, le=1)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper

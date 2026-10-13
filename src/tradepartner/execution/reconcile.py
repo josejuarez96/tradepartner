@@ -130,12 +130,19 @@ _ID_SEPARATOR = "-"
 
 #: The non-trade activity types the ledger knows (spec 2026-10-12, item 2). A
 #: `FEE` is booked as `fee_cash`; a dividend type is left to the store's dividend
-#: rule; a corporate-action type (and any row of null `net_amount`) is read and
-#: recorded but never booked and never a mismatch by itself; any other cash type
-#: is `unexplained_activity` unless it is already inside the base (#1641: its
+#: rule; `CIL` (cash in lieu of stock, #1627) is booked as `cash_in_lieu` when the
+#: broker credits whole shares plus cash for a held stock dividend's fractional
+#: remainder; a corporate-action type (and any row of null `net_amount`) is read
+#: and recorded but never booked and never a mismatch by itself; any other cash
+#: type is `unexplained_activity` unless it is already inside the base (#1641: its
 #: cash is already in the cash the ledger starts from, so it is never a mismatch).
 _FEE = "FEE"
 _EXECUTED = "executed"
+#: `CIL` — cash the broker pays in lieu of a fractional share from a stock
+#: dividend (Alpaca `AccountActivityType.CIL` = "Cash in Lieu of Stock"; Trading
+#: API "Account activities" > "Activity types", docs.alpaca.markets, and the
+#: `alpaca.trading.enums.ActivityType.CIL` in alpaca-py, which docs cite).
+_CASH_IN_LIEU = "CIL"
 _DIVIDEND_TYPES = frozenset(
     {"DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTW", "DIVFEE", "DIVTXEX"}
 )
@@ -188,6 +195,12 @@ class Explanations:
     #: `dividends`, each an `unexplained_dividend_group` mismatch.
     dividend_findings: Mapping[str, str] = field(default_factory=dict)
     reference_prices: Mapping[str, float] = field(default_factory=dict)
+    #: Held `security_id`s with a stock dividend (#1627) stored as a `split` action
+    #: (its ratio in `(1, alpaca.stock_dividend_max_rate]`), each with
+    #: `(ex_date, ratio)` and `ex_date <= S`: the broker credits whole shares plus
+    #: a `CIL` cash-in-lieu activity for the fractional remainder, so `compare`
+    #: books the `cash_in_lieu` adjustment against it.
+    stock_dividends: Mapping[str, tuple[date, float]] = field(default_factory=dict)
     activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
     activity_seen_before: date | None = None
@@ -210,10 +223,13 @@ class ProposedAdjustment:
     `cash` deltas, as `execution.ledger` applies them.
 
     `security_id` and `quantity` are None for a cash-only row (a `dividend_cash`,
-    a `corporate_action_cash` proceeds share, a booked `fee_cash`). `broker_activity_id`
-    is the broker cash-activity id a booked `fee_cash` is keyed by (null for every
-    other kind); the store's `adjustments.broker_activity_id` is `UNIQUE`, so a
-    broker fact is booked once by id (#1583, T183)."""
+    a `corporate_action_cash` proceeds share, a booked `fee_cash`). A booked
+    `cash_in_lieu` (#1627) carries the stock-dividend `security_id`, the fractional
+    `quantity` it removes (negative), its `cash` and a `broker_activity_id`.
+    `broker_activity_id` is the broker cash-activity id a booked `fee_cash` (or a
+    `cash_in_lieu`) is keyed by (null for every other kind); the store's
+    `adjustments.broker_activity_id` is `UNIQUE`, so a broker fact is booked once
+    by id (#1583, T183)."""
 
     kind: str
     security_id: str | None
@@ -329,13 +345,81 @@ def _activity_mismatch(activity: CashActivity, inside_base: bool) -> Mismatch | 
         f"amount {amount} status {activity.status!r}"
     )
     kind = activity.activity_type
-    if kind == _FEE or kind in _DIVIDEND_TYPES:
+    if kind in (_FEE, _CASH_IN_LIEU) or kind in _DIVIDEND_TYPES:
         return None if activity.status == _EXECUTED else Mismatch("unexplained_activity", detail)
     if kind in _CORPORATE_ACTION_TYPES or activity.net_amount is None:
         return None
     if inside_base:
         return None
     return Mismatch("unexplained_activity", detail)
+
+
+def _place_cash_in_lieu(
+    activity: CashActivity,
+    explanations: Explanations,
+    expected: dict[str, float],
+    broker: dict[str, float],
+    security_of: Mapping[str, str],
+    q_tol: float,
+    tolerance: float,
+) -> tuple[Mismatch | None, ProposedAdjustment | None]:
+    """Place a `CIL` cash-in-lieu activity for a held stock dividend (#1627): the
+    book must hold the stock-dividend issuer, the broker must credit the whole
+    shares (floor of the ledger's fractional expectation) and the CIL's
+    `net_amount` must match the expected cash (fractional remainder x the
+    reference price) within `tolerance` (`risk.cash_in_lieu_tolerance`, relative);
+    then the fractional remainder is removed as a `cash_in_lieu` adjustment
+    (`quantity` the removed fraction, `cash` the broker's amount, keyed by its
+    id). An unmatched CIL, or a CIL on a name with no stock dividend that
+    session, or one whose amount is off beyond the tolerance, is
+    `unexplained_activity` (#1583, T183)."""
+    if activity.status != _EXECUTED or activity.net_amount is None:
+        return Mismatch(
+            "unexplained_activity",
+            f"CIL activity {activity.activity_id!r} is not an executed cash row "
+            f"(status {activity.status!r})",
+        ), None
+    security_id = security_of.get(activity.symbol) if activity.symbol is not None else None
+    dividend = explanations.stock_dividends.get(security_id) if security_id is not None else None
+    if security_id is None or dividend is None or dividend[0] != activity.date:
+        detail = (
+            f"{activity.activity_type!r} activity {activity.activity_id!r} on {activity.date} "
+            f"amount {activity.net_amount} status {activity.status!r}; no stock dividend "
+            f"this session"
+        )
+        return Mismatch("unexplained_activity", detail), None
+    ledger_frac = expected.get(security_id, 0.0)
+    broker_shares = broker.get(security_id, float("nan"))
+    whole = float(math.floor(ledger_frac))
+    removed = ledger_frac - broker_shares
+    # The broker credited the whole shares (floor of the ledger's split-applied
+    # expectation) and paid cash for the sub-share remainder.
+    if not (q_tol < removed < 1 + q_tol and abs(broker_shares - whole) <= q_tol):
+        return Mismatch(
+            "unexplained_activity",
+            f"CIL activity {activity.activity_id!r} on {activity.date} is not a whole-share "
+            f"credit (ledger {ledger_frac} fractional, broker {broker_shares})",
+        ), None
+    expected[security_id] = broker_shares
+    reference = explanations.reference_prices.get(security_id, 0.0)
+    expected_cash = removed * reference
+    net = activity.net_amount
+    if not (abs(net - expected_cash) <= tolerance * expected_cash + 1e-9):
+        expected[security_id] = ledger_frac
+        return Mismatch(
+            "unexplained_activity",
+            f"CIL activity {activity.activity_id!r} on {activity.date} amount {net} is off "
+            f"the expected cash {expected_cash} of {removed} fractional share(s) at {reference}",
+        ), None
+    proposal = ProposedAdjustment(
+        "cash_in_lieu",
+        security_id,
+        -removed,
+        net,
+        f"CIL: cash in lieu of {removed} fractional share(s)",
+        broker_activity_id=activity.activity_id,
+    )
+    return None, proposal
 
 
 def _cash_allows(band: _Band, difference: Decimal, bound: Decimal) -> bool:
@@ -365,6 +449,7 @@ def compare(
     `order_id_prefix` is `paper.order_id_prefix`."""
     q_tol = frozen.reconcile_quantity_tolerance
     cash_tol = frozen.reconcile_cash_tolerance
+    cash_in_lieu_tolerance = frozen.cash_in_lieu_tolerance
     buffer = frozen.whole_share_price_buffer
     cash_bound = _cash_bound(cash_tol, ledger.fills_since_base)
     _validate(ledger, positions, account, explanations)
@@ -469,6 +554,22 @@ def compare(
     for fee in fee_proposals:
         difference_decimal -= Decimal(str(fee.cash))
     explained.extend(fee_proposals)
+
+    # --- booked `CIL` cash-in-lieu activities for a held stock dividend (#1627) ---
+    cil_proposals: list[ProposedAdjustment] = []
+    for activity in activities:
+        if activity.activity_type != _CASH_IN_LIEU or _inside_base(activity, explanations):
+            continue
+        mismatch, proposal = _place_cash_in_lieu(
+            activity, explanations, expected, broker, security_of, q_tol, cash_in_lieu_tolerance
+        )
+        if mismatch is not None:
+            mismatches.append(mismatch)
+        if proposal is not None:
+            cil_proposals.append(proposal)
+    for cil in cil_proposals:
+        difference_decimal -= Decimal(str(cil.cash))
+    explained.extend(cil_proposals)
 
     removed = [
         name

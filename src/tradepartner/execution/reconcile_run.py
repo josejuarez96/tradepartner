@@ -152,6 +152,7 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
 _DIVIDEND_CASH = "dividend_cash"
+_SPLIT = "split"
 _RISK_PREFIX = "risk."
 _FAULT_TYPE = ReconciliationError.__name__
 
@@ -388,6 +389,31 @@ def _dividends(
     )
 
 
+def _stock_dividends(
+    actions: pl.DataFrame, session: date, max_rate: float
+) -> dict[str, tuple[date, float]]:
+    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
+    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
+    `#1618` (T186-family) stores one by — each mapped to `(ex_date, ratio)` for
+    its latest `ex_date <= session`. A `CIL` cash-in-lieu activity is reconciled
+    into a `cash_in_lieu` adjustment only beside one of these (and a fractional
+    remainder the broker credited as whole shares plus cash); otherwise it is
+    `unexplained_activity`."""
+    rows = actions.filter(
+        (pl.col("action_type") == _SPLIT)
+        & (pl.col("ratio_or_amount") > 1.0)
+        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ex_date") <= session)
+    )
+    latest: dict[str, tuple[date, float]] = {}
+    for row in rows.iter_rows(named=True):
+        ex_date = row["ex_date"]
+        current = latest.get(row["security_id"])
+        if current is None or ex_date > current[0]:
+            latest[row["security_id"]] = (ex_date, float(row["ratio_or_amount"]))
+    return {name: value for name, value in sorted(latest.items())}
+
+
 def _explanations(
     conn: duckdb.DuckDBPyConnection,
     state: _JournalState,
@@ -421,6 +447,7 @@ def _explanations(
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
+        stock_dividends=_stock_dividends(actions, session, settings.alpaca.stock_dividend_max_rate),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
     )

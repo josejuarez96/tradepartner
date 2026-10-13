@@ -1428,6 +1428,149 @@ def test_a_dividend_activity_is_recorded_but_never_booked_by_id() -> None:
     assert [r.activity_type for r in result.activities] == ["DIV"]
 
 
+# --- booked `CIL` cash-in-lieu activities for a held stock dividend (#1627) ----
+
+
+def _cil(activity_id: str, day: date, net_amount: float, status: str = "executed") -> CashActivity:
+    return CashActivity(
+        activity_id=activity_id,
+        activity_type="CIL",
+        date=day,
+        status=status,
+        net_amount=net_amount,
+        symbol="AAA",
+        description=None,
+    )
+
+
+def test_a_stock_dividend_cash_in_lieu_reconciles_with_no_halt() -> None:
+    """#1627: a book holding a stock-dividend issuer over the ex-date reconciles
+    with no halt. The ledger holds 100 x 1.005 = 100.5 shares after the split; the
+    broker credits floor(100.5) = 100 whole shares (the floor(shares x ratio) -
+    shares growth) plus a `CIL` cash-in-lieu for the 0.5 fractional share at 100.00
+    = 50.00. `compare` books one `cash_in_lieu` adjustment (quantity -0.5, cash the
+    broker's 50.00, keyed by its id) and rounds the expected position to 100, so
+    both position and cash reconcile `ok`."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_050.0,  # broker cash = ledger cash + the 50.00 paid in lieu
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, 1.005)},
+            reference_prices={"SEC_A": 100.0},
+            activities=(_cil("act-cil", S, 50.0),),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert _kinds(result) == []
+    assert [
+        (a.kind, a.cash, a.security_id, a.quantity, a.broker_activity_id)
+        for a in result.adjustments
+    ] == [("cash_in_lieu", 50.0, "SEC_A", -0.5, "act-cil")]
+    assert [r.activity_id for r in result.activities] == ["act-cil"]
+
+
+def test_a_cash_in_lieu_within_the_relative_tolerance_books_the_broker_amount() -> None:
+    """#1627: the tolerance is `risk.cash_in_lieu_tolerance` and relative (the
+    broker values cash in lieu on the ex-date, below the pre-ex reference), so a
+    `CIL` within ~10% of the expected 50.00 still books — and it books the
+    broker's exact amount by id, not the expected."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_046.00,  # the 46.00 the broker actually credited (8% under the reference)
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, 1.005)},
+            reference_prices={"SEC_A": 100.0},
+            activities=(_cil("act-cil", S, 46.0),),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert [(a.kind, a.cash, a.broker_activity_id) for a in result.adjustments] == [
+        ("cash_in_lieu", 46.0, "act-cil")
+    ]
+
+
+def test_a_stock_dividend_with_no_cash_in_lieu_halts_as_quantity() -> None:
+    """#1627: the whole-share growth with no `CIL` activity is a `quantity`
+    mismatch on the unbooked fractional share, so the book halts."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_000.0,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, 1.005)}, reference_prices={"SEC_A": 100.0}
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["quantity"]
+
+
+def test_a_cash_in_lieu_beyond_the_tolerance_halts() -> None:
+    """#1627: a `CIL` whose amount is off the expected cash beyond the tolerance
+    is `unexplained_activity` (nothing books it), and the book halts."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_040.0,  # a 40.00 in lieu, 20% below the expected 50.00
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, 1.005)},
+            reference_prices={"SEC_A": 100.0},
+            activities=(_cil("act-cil", S, 40.0),),
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert "unexplained_activity" in _kinds(result)
+    assert result.adjustments == ()
+
+
+def test_a_cash_in_lieu_on_a_name_with_no_stock_dividend_halts() -> None:
+    """#1627: a `CIL` on a held name with no stock dividend that session stays
+    `unexplained_activity`."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=10.0),
+        _positions(AAA=10.0),
+        1_000.0,
+        explanations=_explanations(activities=(_cil("act-cil", S, 5.0),)),
+    )
+
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["unexplained_activity"]
+    assert "no stock dividend" in result.mismatches[0].detail
+
+
+def test_a_cash_in_lieu_dated_off_the_ex_date_halts() -> None:
+    """#1627: a `CIL` whose date is not the stock dividend's ex-date is
+    `unexplained_activity` (the session does not match)."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.0),
+        _positions(AAA=100.0),
+        1_000.0,
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, 1.005)},
+            reference_prices={"SEC_A": 100.0},
+            activities=(_cil("act-cil", date(2026, 10, 6), 5.0),),
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["unexplained_activity"]
+    assert "no stock dividend" in result.mismatches[0].detail
+
+
+def test_an_issuer_with_no_stock_dividend_reconciles_unchanged() -> None:
+    """#1627: an issuer with no stock dividend (a plain growth, whole result) and
+    no `CIL` reconciles exactly as before."""
+    result = _run(_ledger(1_000.0, SEC_A=200.0), _positions(AAA=200.0), 1_000.0)
+
+    assert result.status == "ok"
+    assert result.adjustments == ()
+
+
 def test_exactly_one_cent_at_six_figures_passes_in_decimal() -> None:
     """The bound is computed in `Decimal`, so a whole-cent difference at a
     six-figure cash balance compares exactly and is inclusive (#1583)."""

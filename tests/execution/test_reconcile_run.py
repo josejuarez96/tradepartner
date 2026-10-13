@@ -785,6 +785,23 @@ def test_no_adapter_is_imported() -> None:
     assert "fake_broker" not in source and "alpaca_broker" not in source
 
 
+def test_stock_dividends_picks_only_in_band_splits_before_the_session() -> None:
+    """#1627: `_stock_dividends` seats a `CIL` beside a held stock dividend, so it
+    must read a stock-only band: a `split` with `1 < ratio <= stock_dividend_max_rate`
+    whose ex-date is at or before the session, and never a 2:1 split, a reverse
+    split, a non-split row, or a split whose ex-date has not passed."""
+    actions = pl.DataFrame(
+        {
+            "security_id": ["A", "B", "C", "D", "E", "F"],
+            "action_type": ["split", "split", "split", "split", "dividend", "split"],
+            "ex_date": [S, S, S, S, S, S + timedelta(days=1)],
+            "ratio_or_amount": [1.005, 2.0, 1.20, 0.5, 1.1, 1.10],
+        }
+    )
+
+    assert reconcile_run._stock_dividends(actions, S, 1.25) == {"A": (S, 1.005), "C": (S, 1.20)}
+
+
 # --- review follow-ups: the cash base, dedupe, the reference cut, failures ----
 
 SATURDAY = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # paper reconcile states Friday
