@@ -71,7 +71,13 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   revision. Both list the row counts on a dry run; a real run deletes only
   those counts, only inside the open data release named by `--release`
   (`docs/runbooks/data-releases.md`), and exits 1 on a refusal, 2 on a usage
-  error.
+  error. `tradepartner repair-dividends --release <name> [--to <session>]
+  [--dry-run | --expect-action-rows N]` runs `repair.retract_dividends`
+  (#1613, data-foundation plan T186) under the same rules: it deletes the
+  retract identity of every `duplicate` entry of the reviewed list
+  (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
+  the later ones deferred, and lists every stale entry (a dry run exits 1 on
+  any; a real run refuses).
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -407,7 +413,13 @@ from tradepartner.ingest import (
     rates_seeded,
     read_manifest,
 )
-from tradepartner.repair import RepairRefused, delete_bars, repair_resolution, store_resolver
+from tradepartner.repair import (
+    RepairRefused,
+    delete_bars,
+    repair_resolution,
+    retract_dividends,
+    store_resolver,
+)
 from tradepartner.research import EVERY_ROW_SPLITS, DatasetChanged, datafiles
 from tradepartner.research.experiment import (
     SPLITS,
@@ -1913,6 +1925,56 @@ def make_app(
         except ValueError as exc:
             raise _fail(f"refused: {exc}", USAGE_ERROR) from None
         typer.echo(result.summary())
+
+    @app.command("repair-dividends")
+    def repair_dividends(
+        release: Annotated[str, typer.Option(help="the open data release (checked on a real run)")],
+        to: Annotated[
+            str | None,
+            typer.Option(help="the last ex-date to repair; later entries are deferred"),
+        ] = None,
+        dry_run: Annotated[
+            bool, typer.Option(help="count what would be deleted and change nothing")
+        ] = False,
+        expect_action_rows: Annotated[
+            int | None, typer.Option(help="the dry run's action row count (required to delete)")
+        ] = None,
+    ) -> None:
+        """Delete the reviewed list's duplicate cash dividend rows (#1613)."""
+        last = _parse_day("--to", to)
+        expect: int | None = None
+        if not dry_run:
+            if expect_action_rows is None:
+                raise _fail(
+                    "run --dry-run first, then pass its count as --expect-action-rows",
+                    USAGE_ERROR,
+                )
+            if _blank_text(release):
+                raise _fail(
+                    "a repair writes only inside a data release: pass --release <name>",
+                    USAGE_ERROR,
+                )
+            expect = expect_action_rows
+        s = settings()
+        if (missing := _store_missing(s)) is not None:
+            raise missing
+        try:
+            result = retract_dividends(
+                s, to=last, clock=clock, dry_run=dry_run, expect=expect, release=release
+            )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {exc}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        typer.echo(result.summary())
+        for line in result.stale:
+            typer.echo(line)
+        if result.stale:
+            raise _fail(
+                f"{len(result.stale)} stale list entries: re-review them before a real run", 1
+            )
 
     @app.command("master-retract")
     def master_retract_(

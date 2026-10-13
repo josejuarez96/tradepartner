@@ -4,16 +4,18 @@ delisted security), in one recorded transaction."""
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import duckdb
+import polars as pl
 import pytest
 from typer.testing import CliRunner
 
 from tradepartner import cli, repair
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
+from tradepartner.health import last_ingests
 from tradepartner.repair import (
     REPAIR,
     REPAIRED,
@@ -23,8 +25,9 @@ from tradepartner.repair import (
     store_resolver,
 )
 from tradepartner.store import registry
-from tradepartner.store.asof import prices_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.retraction import retraction
 from tradepartner.store.schema import init_schema
 
@@ -807,3 +810,313 @@ def test_rule_8_waits_while_the_contaminated_bars_run_on_to_d(handed: Settings) 
     with duckdb.connect(handed.store.path, read_only=True) as conn:
         assert repair.last_bar(conn, RUN, TOPW, date(2020, 1, 2), TAKEN) == date(2020, 5, 29)
         assert store_resolver(conn, RUN, handed).handovers(TOPW) == ()
+
+
+# --- repair-dividends (#1613, T186) ---------------------------------------
+
+DUP, PAIR, OTHER = "0000000011", "0000000012", "0000000013"
+EX = date(2021, 6, 15)
+LATE = date(2021, 7, 15)
+KNOWN = session_close(previous_session(EX))
+
+
+def _cash(
+    sid: str,
+    action_id: str,
+    *,
+    ex_date: date = EX,
+    amount: float = 0.5,
+    known: datetime = KNOWN,
+    cancelled: bool = False,
+    action_type: str = "dividend",
+) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "action_type": action_type,
+        "ex_date": ex_date,
+        "ratio_or_amount": amount,
+        "announced_at": None,
+        "source_action_id": action_id,
+        "cancelled": cancelled,
+        "known_at": known,
+        "ingested_at": RUN,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+
+
+def _entry(
+    sid: str, verdict: str, *, ex_date: date = EX, amount: float = 0.5, retract: str = "b"
+) -> ReviewedGroup:
+    return ReviewedGroup(
+        security_id=sid,
+        ex_date=ex_date,
+        amount=amount,
+        verdict=verdict,  # type: ignore[arg-type]
+        retract_source_action_id=retract if verdict == "duplicate" else "",
+        ticker="",
+        evidence="test",
+    )
+
+
+#: DUP's pair on EX is one payment stored twice; PAIR's is two payments; DUP's
+#: LATE pair is after the `--to` bound used below.
+LIST = (
+    _entry(DUP, "duplicate"),
+    _entry(PAIR, "distinct"),
+    _entry(DUP, "duplicate", ex_date=LATE, retract="d"),
+)
+
+
+@pytest.fixture
+def dividends(settings: Settings) -> Settings:
+    """A duplicate group (DUP a/b on EX), a distinct pair (PAIR a/b), an
+    unrelated action (OTHER), a later duplicate group (DUP c/d on LATE), and
+    DUP's bars around EX."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _cash(DUP, "a"),
+            _cash(DUP, "b"),
+            _cash(PAIR, "a"),
+            _cash(PAIR, "b"),
+            _cash(OTHER, "a"),
+            _cash(DUP, "c", ex_date=LATE),
+            _cash(DUP, "d", ex_date=LATE),
+        ):
+            insert_row(conn, "corporate_actions", row)
+        for day in (date(2021, 6, 11), date(2021, 6, 14), EX):
+            insert_row(conn, "prices_daily", _bar(DUP, day, close=10.0))
+    _open_release(settings)
+    return settings
+
+
+def _retract(settings: Settings, **kwargs: Any) -> repair.DividendsRetracted:
+    args: dict[str, Any] = {"reviewed": LIST, "to": EX}
+    return repair.retract_dividends(settings, clock=lambda: RUN, **(args | kwargs))
+
+
+def _actions(settings: Settings) -> list[tuple[Any, ...]]:
+    return _rows(
+        settings,
+        "SELECT security_id, ex_date, source_action_id FROM corporate_actions "
+        "ORDER BY security_id, ex_date, source_action_id, known_at",
+    )
+
+
+ALL_ACTIONS = [
+    (DUP, EX, "a"),
+    (DUP, EX, "b"),
+    (DUP, LATE, "c"),
+    (DUP, LATE, "d"),
+    (PAIR, EX, "a"),
+    (PAIR, EX, "b"),
+    (OTHER, EX, "a"),
+]
+
+
+def test_a_dividend_dry_run_counts_and_changes_nothing(dividends: Settings) -> None:
+    result = _retract(dividends, dry_run=True)
+    assert (result.entries, result.identities, result.action_rows) == (2, 1, 1)
+    assert (result.deferred, result.already_repaired, result.stale) == (1, 0, ())
+    assert result.ex_dates == (EX,)
+    assert result.summary() == (
+        "would delete 1 duplicate dividend rows of 1 identities on 1 ex-dates "
+        f"{EX}..{EX}; entries 2 through {EX}, deferred 1, already repaired 0, stale 0"
+    )
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_dividend_repair_deletes_the_retract_identity_only(dividends: Settings) -> None:
+    result = _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == [row for row in ALL_ACTIONS if row != (DUP, EX, "b")]
+    [(source, status, mode, rows, message)] = _rows(
+        dividends, "SELECT source, status, mode, rows_added, message FROM ingestion_runs"
+    )
+    assert (source, status, mode, rows) == ("alpaca", REPAIRED, REPAIR, 0)
+    assert message == f"{result.summary()}; release {REL}"
+    assert message.startswith("deleted 1 duplicate dividend rows")
+    with duckdb.connect(dividends.store.path, read_only=True) as conn:
+        [ingest] = [i for i in last_ingests(conn, RUN) if i.source == "alpaca"]
+    assert ingest.last_ok_finished_at is None  # a repair is never an ok ingest
+    assert ingest.latest_status == REPAIRED
+
+
+def test_every_entry_without_a_bound(dividends: Settings) -> None:
+    result = _retract(dividends, to=None, dry_run=True)
+    assert (result.identities, result.deferred, result.ex_dates) == (2, 0, (EX, LATE))
+
+
+def test_after_the_repair_one_dividend_applies(dividends: Settings) -> None:
+    """`adjusted_prices_as_of` applies the payment once after its `known_at`
+    and not at all before it, as before the repair."""
+
+    def close_before_ex(t: datetime) -> float:
+        with duckdb.connect(dividends.store.path, read_only=True) as conn:
+            frame = adjusted_prices_as_of(conn, t, [DUP], include_dividends=True)
+        return float(frame.filter(pl.col("session") == date(2021, 6, 11))["close"][0])
+
+    early = session_close(date(2021, 6, 11)) + timedelta(minutes=1)  # before KNOWN
+    assert close_before_ex(RUN) == pytest.approx(10.0 * (1 - 0.5 / 10) ** 2)  # twice
+    assert close_before_ex(early) == 10.0
+    _retract(dividends, expect=1, release=REL)
+    assert close_before_ex(RUN) == pytest.approx(10.0 * (1 - 0.5 / 10))  # once
+    assert close_before_ex(early) == 10.0  # before the dividend is known: none
+
+
+def test_the_dividend_repair_refuses_and_deletes_nothing(dividends: Settings) -> None:
+    with pytest.raises(ValueError, match="dry run"):
+        _retract(dividends, release=REL)
+    with pytest.raises(ValueError, match="named data release"):
+        _retract(dividends, expect=1)
+    with pytest.raises(ValueError, match="not an XNYS session"):
+        _retract(dividends, to=date(2021, 6, 12), dry_run=True)
+    with pytest.raises(RepairRefused, match="not the expected 2"):
+        _retract(dividends, expect=2, release=REL)
+    with pytest.raises(RepairRefused, match="named 'other'"):
+        _retract(dividends, expect=1, release="other")
+    _close_release(dividends)
+    with pytest.raises(RepairRefused, match="no release is open"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+@pytest.mark.parametrize(
+    ("row", "why"),
+    [
+        # the vendor touched the retract identity after the review
+        (_cash(DUP, "b", known=RUN - timedelta(days=1)), "has 2 revisions"),
+        # the kept identity is gone: deleting b would remove the payment
+        (_cash(DUP, "a", known=RUN - timedelta(days=1), cancelled=True), "no other live"),
+        # a third identity on the key
+        (_cash(DUP, "e"), "2 other live identities"),
+    ],
+)
+def test_a_stale_entry_refuses_the_whole_run(
+    dividends: Settings, row: dict[str, Any], why: str
+) -> None:
+    with open_for_write(dividends) as conn:
+        insert_row(conn, "corporate_actions", row)
+    before = _actions(dividends)
+    dry = _retract(dividends, dry_run=True)
+    [line] = dry.stale
+    assert why in line and DUP in line
+    assert dry.summary().endswith("stale 1")
+    with pytest.raises(RepairRefused, match=rf"1 stale list entries(.|\n)*{why}"):
+        _retract(dividends, expect=dry.action_rows, release=REL)
+    assert _actions(dividends) == before
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+@pytest.mark.parametrize(
+    ("kept", "retracted", "why"),
+    [
+        # an earlier-known retract row: deleted, the payment leaves reads between the stamps
+        ({}, {"known": KNOWN - timedelta(days=1)}, "known at"),
+        ({}, {"amount": 0.51}, "not the listed key"),
+        ({}, {"ex_date": date(2021, 6, 16)}, "not the listed key"),
+        ({"amount": 0.51}, {}, "no other live"),
+    ],
+)
+def test_a_retract_row_that_differs_from_the_kept_row_is_stale(
+    settings: Settings, kept: dict[str, Any], retracted: dict[str, Any], why: str
+) -> None:
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "corporate_actions", _cash(DUP, "a", **kept))
+        insert_row(conn, "corporate_actions", _cash(DUP, "b", **retracted))
+    _open_release(settings)
+    dry = repair.retract_dividends(
+        settings, clock=lambda: RUN, dry_run=True, reviewed=[_entry(DUP, "duplicate")]
+    )
+    assert dry.identities == 0
+    [line] = dry.stale
+    assert why in line
+    with pytest.raises(RepairRefused, match="stale"):
+        repair.retract_dividends(
+            settings, clock=lambda: RUN, expect=0, release=REL, reviewed=[_entry(DUP, "duplicate")]
+        )
+    assert len(_actions(settings)) == 2
+
+
+def test_a_second_dividend_run_deletes_nothing_and_counts_already_repaired(
+    dividends: Settings,
+) -> None:
+    _retract(dividends, expect=1, release=REL)
+    again = _retract(dividends, dry_run=True)
+    assert (again.identities, again.action_rows, again.already_repaired) == (0, 0, 1)
+    assert again.stale == ()
+    second = _retract(dividends, expect=0, release=REL)
+    assert second.already_repaired == 1
+    assert len(_actions(dividends)) == len(ALL_ACTIONS) - 1
+
+
+def test_a_dividend_repair_that_misses_its_count_rolls_back(
+    dividends: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = repair._delete_identities
+    monkeypatch.setattr(repair, "_delete_identities", lambda *a, **k: real(*a, **k) - 1)
+    with pytest.raises(RuntimeError, match="rolled back"):
+        _retract(dividends, expect=1, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
+    assert _rows(dividends, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_repair_dividends_command(dividends: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(repair, "reviewed_groups", lambda: LIST)
+    app = cli.make_app(settings=lambda: dividends, clock=lambda: RUN)
+    runner = CliRunner()
+    base = ["repair-dividends", "--release", REL, "--to", str(EX)]
+    dry = runner.invoke(app, [*base, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert dry.output.startswith("would delete 1 duplicate dividend rows")
+    assert runner.invoke(app, ["repair-dividends", "--dry-run"]).exit_code == cli.USAGE_ERROR
+    assert runner.invoke(app, base).exit_code == cli.USAGE_ERROR  # no count
+    bad = runner.invoke(app, [*base[:-1], "2021-06-12", "--dry-run"])
+    assert bad.exit_code == cli.USAGE_ERROR
+    assert "not an XNYS session" in bad.output
+    other = runner.invoke(
+        app, ["repair-dividends", "--release", "other", "--expect-action-rows", "1"]
+    )
+    assert other.exit_code == 1
+    assert "repair refused: no open data release named 'other'" in other.output
+    assert _actions(dividends) == ALL_ACTIONS
+    done = runner.invoke(app, [*base, "--expect-action-rows", "1"])
+    assert done.exit_code == 0, done.output
+    assert done.output.startswith("deleted 1 duplicate dividend rows")
+    assert len(_actions(dividends)) == len(ALL_ACTIONS) - 1
+
+
+def test_the_command_exits_1_on_a_stale_dry_run(
+    dividends: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(repair, "reviewed_groups", lambda: LIST)
+    with open_for_write(dividends) as conn:
+        insert_row(conn, "corporate_actions", _cash(DUP, "e"))
+    app = cli.make_app(settings=lambda: dividends, clock=lambda: RUN)
+    dry = CliRunner().invoke(app, ["repair-dividends", "--release", REL, "--dry-run"])
+    assert dry.exit_code == 1
+    assert "stale 1" in dry.output and "2 other live identities" in dry.output
+
+
+@pytest.mark.parametrize(
+    ("entry", "why"),
+    [
+        # a mistyped retract id: both rows still live on the key
+        (_entry(DUP, "duplicate", retract="zz"), "no row and 2 live identities"),
+        # a mistyped security: nothing holds the key
+        (_entry("0000009999", "duplicate"), "no row and 0 live identities"),
+    ],
+)
+def test_an_absent_retract_id_is_already_repaired_only_beside_one_kept_row(
+    dividends: Settings, entry: ReviewedGroup, why: str
+) -> None:
+    dry = _retract(dividends, reviewed=[entry], dry_run=True)
+    assert dry.already_repaired == 0
+    [line] = dry.stale
+    assert why in line
+    with pytest.raises(RepairRefused, match="stale"):
+        _retract(dividends, reviewed=[entry], expect=0, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS
