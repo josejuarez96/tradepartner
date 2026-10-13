@@ -440,9 +440,11 @@ def compare(
             )
         read_ids.add(activity.activity_id)
         # `_inside_base` before `_activity_mismatch` (#1641): an activity already
-        # in the ledger's base is already in the cash the ledger starts from, so
-        # its type is never unexplained (and a base `FEE` is never booked again);
-        # only an activity outside the base is classified and booked.
+        # in the ledger's base is already in the cash the ledger starts from, so an
+        # unknown cash type inside the base is never `unexplained_activity` (and a
+        # base `FEE` is never booked again). Every activity is still classified — a
+        # non-executed `FEE`/dividend inside the base still halts — and only an
+        # activity outside the base is booked.
         inside_base = _inside_base(activity, explanations)
         unexplained = _activity_mismatch(activity, inside_base)
         if unexplained is not None:

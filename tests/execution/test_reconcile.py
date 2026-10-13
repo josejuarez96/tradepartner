@@ -1359,6 +1359,46 @@ def test_an_unknown_type_dated_on_the_start_date_is_still_unexplained() -> None:
     assert "JNLC" in result.mismatches[0].detail
 
 
+def test_a_nonexecuted_dividend_inside_the_base_still_halts() -> None:
+    """#1641 (safety-reviewer NIT 1): the status-integrity check is base-independent
+    for dividends too — a `DIV` whose `status` is not `executed` halts as
+    `unexplained_activity` even though its id is inside the base, so a later edit
+    that exempts in-base dividends cannot pass here."""
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_000.0,
+        explanations=_explanations(
+            activities=(_activity("act-div", "DIV", date(2026, 10, 9), 4.5, "canceled"),),
+            activity_seen_before=date(2026, 10, 10),
+        ),
+    )
+
+    assert _kinds(result) == ["unexplained_activity"]
+    assert result.adjustments == ()
+
+
+def test_an_in_base_deposit_without_the_cash_still_halts_as_cash() -> None:
+    """#1641 (safety-reviewer NIT 2): the in-base exemption is safe only because a
+    back-dated deposit is never booked and never widens the cash band. A deposit
+    whose id is inside the base (fallback) but whose amount is only in broker cash
+    still halts as `cash` — never `ok` — so the id can never be written into a
+    recorded set and laundered into the base later."""
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_500.0,  # broker cash is ledger cash + the $500 deposit
+        explanations=_explanations(
+            activities=(_activity("act-dep", "JNLC", date(2026, 10, 9), 500.0),),
+            activity_seen_before=date(2026, 10, 10),
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert _kinds(result) == ["cash"]
+    assert result.broker_cash is None  # never a re-base
+
+
 @pytest.mark.parametrize("activity_type", ["SSP", "MA", "REORG"])
 def test_a_corporate_action_row_is_recorded_and_never_a_mismatch(activity_type: str) -> None:
     result = _run(
