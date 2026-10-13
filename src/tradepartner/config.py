@@ -437,9 +437,9 @@ class EdgarConfig(BaseModel):
     # #1651, #1660: the cover-page parser and `parse_fsn` also read `CapitalUnitsByClassAxis` as a
     # class axis (Fifth Third) and merges a class's title, symbol and exchange
     # tagged on several contexts of one class member (Abbott 2020, P&G 2023).
-    # Off until a release (as T181) flips it with the `COVER_VERSION` and
-    # `FSN_VERSION` bumps.
-    cover_split_contexts: bool = False
+    # Flipped on by the release `cover-listings-1541` (T181) with the
+    # `COVER_VERSION` and `FSN_VERSION` bumps to 4.
+    cover_split_contexts: bool = True  # flipped by the release `cover-listings-1541` (T181)
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
