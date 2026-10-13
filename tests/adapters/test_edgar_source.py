@@ -997,6 +997,125 @@ def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path,
     assert source.cover_exchange_axis_mismatch == (1 if on else 0)
 
 
+# --- the FSN cache round-trips the symbol-only tag (#1624, T184) ------------
+
+
+def _symbol_only_zip() -> bytes:
+    """One FSN period with a complete listing, a symbol that names no
+    exchange (T184's symbol-only tag) and a filing-less group."""
+    from test_edgar_fsn import _dim, _fsn_zip_bytes, _sub, _txt
+
+    accession = "0001193125-19-000077"
+    complete, only = "0x1", "0x2"
+    txt = [
+        _txt(accession, "Security12bTitle", "Common Stock", dimh=complete, dimn="1"),
+        _txt(accession, "TradingSymbol", "ANSS", dimh=complete, dimn="1"),
+        _txt(accession, "SecurityExchangeName", "NASDAQ", dimh=complete, dimn="1"),
+        _txt(accession, "TradingSymbol", "ZEN", dimh=only, dimn="1"),  # no exchange
+    ]
+    return _fsn_zip_bytes(
+        [_sub(accession, "1013462", "10-Q")],
+        [],
+        txt,
+        [_dim(complete, "ClassOfStock=CommonClassA;"), _dim(only, "ClassOfStock=Units;")],
+    )
+
+
+def test_the_fsn_cache_round_trips_the_symbol_only_tag(tmp_path: Path) -> None:
+    """A filing parsed from a cached period must read back the symbol-only
+    tag its parse recorded (#1624): without the round-trip a reload finds
+    none, and a filename reading that asks for the tag would miss it."""
+    from test_edgar_fsn import FSN_PAGE_URL, _fsn_page_html, _fsn_zip_url
+
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, _fsn_page_html("2019q3"))
+    router.add(_fsn_zip_url("2019q3"), _symbol_only_zip())
+    settings = edgar_settings(tmp_path, fsn_first_year=2019)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    source._ensure_fsn()
+    parsed = source._load_fsn_cache(_ANSYS)
+    [record] = parsed.values()
+    assert record.symbol_only == ("ZEN",)
+    assert [(item.ticker, item.exchange) for item in record.listings] == [("ANSS", "NASDAQ")]
+
+    # A fresh source reads the same period back from the cache.
+    reopened = EdgarFilingSource(settings, client=router.client())
+    reopened._filing_index_ran = True
+    assert reopened._load_fsn_cache(_ANSYS) == parsed
+
+
+def test_a_cache_entry_written_before_the_field_reads_no_tag(tmp_path: Path) -> None:
+    """An entry laid out before #1624 (no `symbol_only` key) reloads with
+    none recorded: the cache kept what its own parser wrote, the release's
+    re-extraction rewrites it with the tag its filing carries, and no
+    reading this cache already served is changed by the field."""
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings)
+    path = source._fsn_cache_path(_ANSYS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    accession = "0001193125-19-000077"
+    path.write_text(
+        json.dumps(
+            {
+                "version": FSN_VERSION,
+                "cik": _ANSYS,
+                "records": {
+                    accession: {
+                        "form": "10-Q",
+                        "sic": 3711,
+                        "listings": [["Common Stock", "ANSS", "NASDAQ"]],
+                        "shares": [["", "12", "2019-06-30"]],
+                    }
+                },
+            }
+        )
+    )
+    [record] = source._load_fsn_cache(_ANSYS).values()
+    assert (record.accession, record.form) == (accession, "10-Q")
+    assert (record.symbol_only, record.incomplete_listings) == ((), 0)
+    assert [(item.ticker, item.exchange) for item in record.listings] == [("ANSS", "NASDAQ")]
+
+
+@pytest.mark.parametrize("recorded", ["ZEN", {"tag": "ZEN"}, ["ZEN", 7], [["ZEN"]]])
+def test_a_cache_entry_whose_symbol_only_is_not_strings_refuses_to_read(
+    tmp_path: Path, recorded: Any
+) -> None:
+    """safety-reviewer (#1624): the cache file is a file on disk. An entry
+    whose `symbol_only` is not the list of strings the writer wrote is
+    corrupt, and is refused rather than read as the letters of one symbol or
+    as symbols that are not strings — the loader's own answer for an
+    unreadable file, no records, and a named error when it is strict."""
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings)
+    path = source._fsn_cache_path(_ANSYS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    accession = "0001193125-19-000077"
+    path.write_text(
+        json.dumps(
+            {
+                "version": FSN_VERSION,
+                "cik": _ANSYS,
+                "records": {
+                    accession: {
+                        "form": "10-Q",
+                        "sic": 3711,
+                        "listings": [["Common Stock", "ANSS", "NASDAQ"]],
+                        "shares": [["", "12", "2019-06-30"]],
+                        "symbol_only": recorded,
+                    }
+                },
+            }
+        )
+    )
+    assert source._load_fsn_cache(_ANSYS) == {}
+    with pytest.raises(ValueError, match="unreadable"):
+        source._load_fsn_cache(_ANSYS, strict=True)
+
+
+# --- the release's cache versions (T181, #1541) -----------------------------
+
+
 # --- filing-name listings: the fetches and the per-CIK cache (T184b, #1597) ---
 
 _FN_CIK = APPLE
