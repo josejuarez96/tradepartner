@@ -51,6 +51,7 @@ FACT_TABLES: tuple[str, ...] = (
     "filing_events",
     "rates",
     "borrow_status",
+    "symbol_changes",
 )
 
 
@@ -155,6 +156,15 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "observation_date": date(2020, 1, 2),
             "value": 1.52,
             "vintage_date": date(2020, 1, 3),
+        }
+    elif table == "symbol_changes":
+        business = {
+            "security_id": "S1",
+            "old_symbol": "OLD",
+            "new_symbol": "NEW",
+            "old_cusip": "",
+            "new_cusip": "",
+            "process_date": date(2020, 1, 2),
         }
     elif table == "borrow_status":
         business = {
@@ -2171,4 +2181,41 @@ def test_one_id_has_one_row_per_known_at(fixture_store: duckdb.DuckDBPyConnectio
             fixture_store,
             "corporate_actions",
             {**row, "source_action_id": "A1", "ex_date": date(2020, 1, 9)},
+        )
+
+
+def test_symbol_changes_table_has_identity_and_action_provenance(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """T172b: an id and an id-less rename each have one row per stamp."""
+    assert "symbol_changes" in schema.TABLE_NAMES
+    stamp = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    base = {
+        "security_id": "S1",
+        "old_symbol": "OLD",
+        "new_symbol": "NEW",
+        "old_cusip": "OLD-CUSIP",
+        "new_cusip": "NEW-CUSIP",
+        "process_date": date(2020, 12, 1),
+        "source_action_id": "rename-1",
+        "known_at": stamp,
+        "ingested_at": stamp,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    insert_row(fixture_store, "symbol_changes", base)
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "symbol_changes", {**base, "process_date": date(2020, 12, 2)})
+    insert_row(fixture_store, "symbol_changes", {**base, "source_action_id": ""})
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            fixture_store,
+            "symbol_changes",
+            {**base, "source_action_id": "", "new_cusip": "DIFFERENT"},
+        )
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            fixture_store,
+            "symbol_changes",
+            {**base, "source_action_id": "another", "provenance": "snapshot"},
         )

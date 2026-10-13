@@ -2939,7 +2939,7 @@ def _outside(
         stored["ex_date"]
         for identity in ids
         for stored in history.get(identity, [])
-        if not first <= stored["ex_date"] <= last
+        if stored["action_type"] != "spinoff" and not first <= stored["ex_date"] <= last
     ]
 
 
@@ -3018,7 +3018,11 @@ def _add_actions(
     is not a withdrawal. An id-less key re-dated out of `window` is not
     seen, so both keys stay live; sources with ids (Alpaca) avoid that.
     """
-    rows = [_action_row(action, ingested_at) for action in actions]
+    rows = [
+        _action_row(action, ingested_at)
+        for action in actions
+        if not (action.action_type.value == "spinoff" and action.known_at > ingested_at)
+    ]
     history = _stored_actions(conn, rows, window)
     first, last = window
     lo, hi = covered or window

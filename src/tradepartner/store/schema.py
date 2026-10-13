@@ -549,6 +549,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "filing_events": ("filing",),
     "rates": ("release",),
     "borrow_status": ("snapshot",),
+    "symbol_changes": ("action",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -696,7 +697,7 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   versions").
 #: - A later DDL change goes to version 27, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 26
+CURRENT_SCHEMA_VERSION = 27
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -1123,6 +1124,33 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
 )
 """
 
+
+# T172b (#1506): rename facts, with the action identity convention.
+_CREATE_SYMBOL_CHANGES = f"""
+CREATE TABLE IF NOT EXISTS symbol_changes (
+    security_id VARCHAR NOT NULL,
+    old_symbol VARCHAR NOT NULL,
+    new_symbol VARCHAR NOT NULL,
+    old_cusip VARCHAR NOT NULL,
+    new_cusip VARCHAR NOT NULL,
+    process_date DATE NOT NULL,
+    source_action_id VARCHAR NOT NULL DEFAULT '',
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["symbol_changes"])},
+    UNIQUE (security_id, source_action_id, old_symbol, new_symbol, process_date, known_at)
+)
+"""
+
+_CREATE_SYMBOL_CHANGES_IDENTITY_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS symbol_changes_identity ON symbol_changes (
+    security_id,
+    source_action_id,
+    (CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END),
+    (CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END),
+    (CASE WHEN source_action_id = '' THEN CAST(process_date AS VARCHAR) ELSE '' END),
+    known_at
+)
+"""
+
 _CREATE_SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL,
@@ -1145,6 +1173,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "filing_events",
     "rates",
     "borrow_status",
+    "symbol_changes",
     "ingestion_runs",
     "schema_version",
 )
@@ -1194,6 +1223,11 @@ _RATES_TABLE_DDL: tuple[str, ...] = (_CREATE_RATES,)
 #: moves. Pinned by hash in `tests/store/test_schema.py`; a later edit of
 #: this DDL goes to the next schema version with its own migration.
 _BORROW_STATUS_TABLE_DDL: tuple[str, ...] = (_CREATE_BORROW_STATUS,)
+
+_SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_SYMBOL_CHANGES,
+    _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
+)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -2626,6 +2660,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        CURRENT_SCHEMA_VERSION - 1,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3476,6 +3511,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_BORROW_STATUS_VERSION,
         _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        CURRENT_SCHEMA_VERSION - 1,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3515,6 +3551,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _FILING_EVENTS_TABLE_DDL
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
+            + _SYMBOL_CHANGES_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

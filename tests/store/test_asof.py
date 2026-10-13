@@ -47,6 +47,7 @@ from tradepartner.store.asof import (
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
+    symbol_changes_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
 
@@ -2075,3 +2076,43 @@ class TestBorrowStatusAsOf:
         recorded an observation: the read still answers, with NULL."""
         rows = borrow_status_as_of(fixture_store, self._AFTER_ALL)
         assert rows["observed_at"].to_list() == [None] * rows.height
+
+
+def test_symbol_changes_as_of_revision_and_no_lookahead(
+    synthetic_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A rename first appears after its process date and revises at ingest."""
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    revised = first + timedelta(days=1)
+    row = {
+        "security_id": "S1",
+        "old_symbol": "OLD",
+        "new_symbol": "NEW",
+        "old_cusip": "A",
+        "new_cusip": "B",
+        "process_date": date(2020, 12, 1),
+        "source_action_id": "rename-1",
+        "known_at": first,
+        "ingested_at": first,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    insert_row(synthetic_store, "symbol_changes", row)
+    insert_row(
+        synthetic_store,
+        "symbol_changes",
+        {
+            **row,
+            "new_cusip": "C",
+            "known_at": revised,
+            "ingested_at": revised,
+        },
+    )
+    assert symbol_changes_as_of(synthetic_store, first - timedelta(microseconds=1)).is_empty()
+    assert _one(symbol_changes_as_of(synthetic_store, first), security_id="S1")["new_cusip"] == "B"
+    assert (
+        _one(symbol_changes_as_of(synthetic_store, revised), security_id="S1")["new_cusip"] == "C"
+    )
+    assert symbol_changes_as_of(synthetic_store, revised, security_ids=[]).is_empty()
+    with pytest.raises(TypeError, match="tz-aware datetime"):
+        symbol_changes_as_of(synthetic_store, date(2020, 12, 2))  # type: ignore[arg-type]

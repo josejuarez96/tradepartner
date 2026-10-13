@@ -381,3 +381,23 @@ def test_replaying_the_fixture_month_by_month_leaves_its_live_events(
 def _fixture_ids() -> list[tuple[str]]:
     with (UNIVERSE_DIR / "securities.csv").open() as handle:
         return [(line.split(",")[0],) for line in handle.readlines()[1:] if line.strip()]
+
+
+def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A process-date action is skipped before its stamp and stored once after."""
+    ex = date(2020, 9, 29)
+    stamp = datetime(2020, 10, 15, 20, tzinfo=UTC)
+    action = CorporateAction(
+        "CHILD", ActionType.SPINOFF, ex, 0.25, stamp, "alpaca", source_action_id="PARENT"
+    )
+    window = (date(2020, 10, 1), date(2020, 10, 31))
+    before = stamp - timedelta(microseconds=1)
+    assert _add_actions(conn, [action], window, ingested_at=before) == 0
+    assert _add_actions(conn, [action], window, ingested_at=stamp) == 1
+    assert _add_actions(conn, [action], window, ingested_at=stamp + timedelta(days=1)) == 0
+    assert conn.execute(
+        "SELECT security_id, source_action_id, known_at FROM corporate_actions "
+        "WHERE action_type = 'spinoff'"
+    ).fetchall() == [("CHILD", "PARENT", stamp)]

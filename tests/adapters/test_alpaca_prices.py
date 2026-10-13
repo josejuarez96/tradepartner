@@ -2947,15 +2947,16 @@ class TestAlpacaPriceSource:
         )
         source = AlpacaPriceSource(resolver, fetch_actions=fetch, settings=_settings())
         actions = source.corporate_actions(["P", "C"], date(2020, 10, 1), date(2020, 10, 31))
-        assert actions == []
+        assert [(a.security_id, a.action_type.value, a.ex_date) for a in actions] == [
+            ("C", "spinoff", date(2020, 9, 29))
+        ]
         assert source.last_actions_report is not None
-        assert source.last_actions_report.actions == ()
         changes = source.symbol_changes(["P"], date(2020, 10, 1), date(2020, 10, 31))
         assert len(changes) == 1 and changes[0].security_id == "P"
         assert len(calls) == 2
         assert source.symbol_changes(["P"], date(2020, 9, 1), date(2020, 9, 30)) == []
 
-    def test_daily_actions_keep_only_splits_and_dividends(self) -> None:
+    def test_daily_actions_keep_spinoff_without_changing_splits_or_dividends(self) -> None:
         recorded = _Recorded()
 
         def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
@@ -2981,11 +2982,10 @@ class TestAlpacaPriceSource:
             ("SEC_AAPL", "dividend", date(2020, 8, 7)),
             ("SEC_AAPL", "split", date(2020, 8, 31)),
             ("SEC_MSFT", "dividend", date(2020, 8, 19)),
+            ("SEC_MSFT", "spinoff", date(2020, 8, 31)),
         ]
         assert source.last_actions_report is not None
-        assert all(
-            a.action_type is not ActionType.SPINOFF for a in source.last_actions_report.actions
-        )
+        assert any(a.action_type is ActionType.SPINOFF for a in source.last_actions_report.actions)
 
     def test_malformed_name_change_does_not_fail_daily_actions(self) -> None:
         recorded = _Recorded()

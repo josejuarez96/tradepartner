@@ -2546,7 +2546,7 @@ class AlpacaPriceSource(PriceSource):
             for category, rows in self._fetch_actions(
                 symbols, start - self._lag, end + self._lag
             ).items()
-            if category not in ("name_changes", "spin_offs")
+            if category != "name_changes"
         }
         parsed = parse_corporate_actions(
             payload,
@@ -2562,8 +2562,13 @@ class AlpacaPriceSource(PriceSource):
             a
             for a in parsed.actions
             if a.security_id in ids
-            and a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
-            and start <= a.ex_date <= end
+            and (
+                a.action_type is ActionType.SPINOFF
+                or (
+                    a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
+                    and start <= a.ex_date <= end
+                )
+            )
         ]
 
     def symbol_changes(
