@@ -39,7 +39,7 @@ from tradepartner.adapters.prices import (
     announcement_date_known_at,
     bar_known_at,
 )
-from tradepartner.config import Settings
+from tradepartner.config import AlpacaConfig, Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
 
@@ -1637,7 +1637,7 @@ class TestCorporateActions:
                 {"symbol": "PEER", "ex_date": "2025-02-11", "rate": 1.0073, "id": "real"},
             ],
             "stock_dividends": [
-                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
+                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073, "id": "stock"},
             ],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
@@ -1681,7 +1681,9 @@ class TestCorporateActions:
                 {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
                 {"symbol": "SCCO", "ex_date": "2025-05-02", "rate": 0.7},
             ],
-            "stock_dividends": [{"symbol": "SCCO", "ex_date": "2025-05-02", "rate": 1.0073}],
+            "stock_dividends": [
+                {"symbol": "SCCO", "ex_date": "2025-05-02", "rate": 1.0073, "id": "stock"}
+            ],
         }
         parsed = parse_corporate_actions(payload, resolver.resolve)
         assert [(a.action_type, a.ex_date, a.ratio_or_amount) for a in parsed.actions] == [
@@ -1696,7 +1698,9 @@ class TestCorporateActions:
         parsed = parse_corporate_actions(
             {
                 "cash_dividends": [{"symbol": "SCCO", "ex_date": "2024-11-06", "rate": 1.0062}],
-                "stock_dividends": [{"symbol": "SCCO", "ex_date": "2024-11-06", "rate": 1.0063}],
+                "stock_dividends": [
+                    {"symbol": "SCCO", "ex_date": "2024-11-06", "rate": 1.0063, "id": "stock"}
+                ],
             },
             resolver.resolve,
         )
@@ -1705,6 +1709,152 @@ class TestCorporateActions:
             (ActionType.SPLIT, 1.0063),
         ]
         assert parsed.stock_ratio_cash == 0
+
+    @pytest.mark.parametrize("rate", [100, 0.05, 1.0, 1.25, 1.30])
+    def test_stock_rate_outside_bounds_is_refused_and_named(self, rate: float) -> None:
+        # #1618: a stock dividend is 1 < rate < alpaca.stock_dividend_max_rate (1.25);
+        # 0.05 would be a 20:1 reverse split, 100 a fake 100x history.
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        parsed = parse_corporate_actions(
+            {
+                "stock_dividends": [
+                    {"symbol": "SCCO", "ex_date": "2024-05-07", "rate": rate, "id": "s"}
+                ]
+            },
+            resolver.resolve,
+        )
+        assert parsed.actions == ()
+        assert parsed.stock_dividends_stored == 0
+        assert parsed.stock_rows_refused == (f"SCCO 2024-05-07 {float(rate)} (rate)",)
+
+    @pytest.mark.parametrize("split_day", ["2024-12-10", "2024-12-13", "2024-12-04"])
+    def test_split_paid_as_stock_dividend_adjusts_once(self, split_day: str) -> None:
+        # #1618, FBYD 2024-12-10: Alpaca lists a 6-for-5 split under forward_splits
+        # and as a 1.2 stock dividend; only the split is stored, the stock row is named.
+        resolver = ListingResolver([_listing("FBYD", "FBYD", START)])
+        parsed = parse_corporate_actions(
+            {
+                "forward_splits": [
+                    {
+                        "symbol": "FBYD",
+                        "ex_date": split_day,
+                        "old_rate": 5,
+                        "new_rate": 6,
+                        "id": "split-id",
+                    }
+                ],
+                "stock_dividends": [
+                    {"symbol": "FBYD", "ex_date": "2024-12-10", "rate": 1.2, "id": "stock-id"}
+                ],
+            },
+            resolver.resolve,
+        )
+        splits = [a for a in parsed.actions if a.action_type is ActionType.SPLIT]
+        assert [(a.source_action_id, a.ratio_or_amount) for a in splits] == [("split-id", 1.2)]
+        assert parsed.stock_rows_refused == ("FBYD 2024-12-10 1.2 (split nearby)",)
+
+    def test_split_beyond_the_window_does_not_refuse_the_stock_row(self) -> None:
+        resolver = ListingResolver([_listing("FBYD", "FBYD", START)])
+        payload = {
+            "forward_splits": [
+                {"symbol": "FBYD", "ex_date": "2024-12-18", "old_rate": 1, "new_rate": 2, "id": "a"}
+            ],
+            "stock_dividends": [
+                {"symbol": "FBYD", "ex_date": "2024-12-10", "rate": 1.2, "id": "b"}
+            ],
+        }
+        parsed = parse_corporate_actions(payload, resolver.resolve)
+        assert sorted(a.source_action_id or "" for a in parsed.actions) == ["a", "b"]
+        assert parsed.stock_rows_refused == ()
+        narrow = AlpacaConfig(stock_dividend_split_sessions=6)
+        parsed = parse_corporate_actions(payload, resolver.resolve, stock_rules=narrow)
+        assert [a.source_action_id for a in parsed.actions] == ["a"]
+
+    @pytest.mark.parametrize(
+        ("rows", "named"),
+        [
+            # no id: identity would be (security, split, ex-date), a real split's key
+            (
+                [{"symbol": "SCCO", "ex_date": "2024-05-07", "rate": 1.0104}],
+                ("SCCO 2024-05-07 1.0104 (no id)",),
+            ),
+            # two identical rows
+            (
+                [{"symbol": "SCCO", "ex_date": "2024-05-07", "rate": 1.0104, "id": "s"}] * 2,
+                ("SCCO 2024-05-07 1.0104 (repeated id)",) * 2,
+            ),
+            # an id another action uses
+            (
+                [{"symbol": "SCCO", "ex_date": "2024-05-07", "rate": 1.0104, "id": "cash"}],
+                ("SCCO 2024-05-07 1.0104 (id of another action)",),
+            ),
+        ],
+    )
+    def test_odd_stock_row_is_refused_not_a_payload_error(
+        self, rows: list[dict[str, object]], named: tuple[str, ...]
+    ) -> None:
+        # #1618: one odd stock row must never stop the nightly ingest.
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        parsed = parse_corporate_actions(
+            {
+                "cash_dividends": [
+                    {"symbol": "SCCO", "ex_date": "2024-05-20", "rate": 0.7, "id": "cash"}
+                ],
+                "stock_dividends": rows,
+            },
+            resolver.resolve,
+        )
+        assert [(a.action_type, a.ratio_or_amount) for a in parsed.actions] == [
+            (ActionType.DIVIDEND, 0.7)
+        ]
+        assert parsed.stock_rows_refused == named
+
+    def test_stock_and_split_without_ids_on_one_date_do_not_stop_the_parse(self) -> None:
+        resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
+        parsed = parse_corporate_actions(
+            {
+                "forward_splits": [
+                    {"symbol": "SCCO", "ex_date": "2024-05-07", "old_rate": 1, "new_rate": 2}
+                ],
+                "stock_dividends": [{"symbol": "SCCO", "ex_date": "2024-05-07", "rate": 1.0104}],
+            },
+            resolver.resolve,
+        )
+        assert [a.ratio_or_amount for a in parsed.actions] == [2.0]
+        assert len(parsed.stock_rows_refused) == 1
+
+    @pytest.mark.parametrize(
+        ("symbol", "ex_date", "stock_rate", "cash_amount"),
+        [
+            ("CRESY", "2023-05-10", 1.0220393981, 1.0220394),
+            ("CRESY", "2023-12-06", 1.00985, 1.0098549),
+            ("IRS", "2023-12-06", 1.01748, 1.0174785),
+            ("SBS", "2026-03-27", 1.00161, 1.0016098),
+        ],
+    )
+    def test_cash_row_near_a_stock_rate_is_the_ratio_echo(
+        self, symbol: str, ex_date: str, stock_rate: float, cash_amount: float
+    ) -> None:
+        # #1618: Alpaca's cash copy of a stock ratio differs by vendor rounding
+        # (#1617's exact match keeps it); it would book a ~$1/share fake dividend.
+        resolver = ListingResolver([_listing(symbol, symbol, START)])
+        parsed = parse_corporate_actions(
+            {
+                "cash_dividends": [
+                    {"symbol": symbol, "ex_date": ex_date, "rate": cash_amount, "id": "c"},
+                    {"symbol": symbol, "ex_date": ex_date, "rate": 0.05, "id": "real"},
+                ],
+                "stock_dividends": [
+                    {"symbol": symbol, "ex_date": ex_date, "rate": stock_rate, "id": "s"}
+                ],
+            },
+            resolver.resolve,
+        )
+        assert sorted((a.action_type.value, a.ratio_or_amount) for a in parsed.actions) == [
+            ("dividend", 0.05),
+            ("split", stock_rate),
+        ]
+        assert parsed.stock_ratio_cash == 1
 
     def test_out_of_calendar_stock_row_is_counted_without_stopping_cash(self) -> None:
         resolver = ListingResolver([_listing("SCCO", "SCCO", START)])
@@ -2724,8 +2874,9 @@ class TestAlpacaPriceSource:
                 {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
             ],
             "stock_dividends": [
-                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073},
+                {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073, "id": "stock"},
                 {"symbol": "SCCO", "ex_date": "1900-01-01", "rate": 1.0073},
+                {"symbol": "SCCO", "ex_date": "2025-02-12", "rate": 1.3, "id": "big"},
             ],
         }
         source = AlpacaPriceSource(
@@ -2741,6 +2892,23 @@ class TestAlpacaPriceSource:
         assert "1 stock-ratio cash row(s) skipped" in source.resolution_summary()
         assert "1 stock-dividend row(s) unusable" in source.resolution_summary()
         assert "1 stock-dividend row(s) stored as split" in source.resolution_summary()
+        # #1618: a refused row is named on the run row, never dropped silently.
+        assert (
+            "1 stock-dividend row(s) refused: SCCO 2025-02-12 1.3 (rate)"
+            in source.resolution_summary()
+        )
+
+    def test_stock_dividend_max_rate_comes_from_config(self) -> None:
+        payload = {
+            "stock_dividends": [{"symbol": "CIG", "ex_date": "2024-05-24", "rate": 1.3, "id": "s"}]
+        }
+        source = AlpacaPriceSource(
+            ListingResolver([_listing("CIG", "CIG", START)]),
+            fetch_actions=lambda symbols, start, end: payload,
+            settings=_settings(stock_dividend_max_rate=1.5),
+        )
+        actions = source.corporate_actions(["CIG"], date(2024, 5, 1), date(2024, 5, 31))
+        assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 1.3)]
 
     def test_new_actions_use_process_date_range_and_independent_request(self) -> None:
         calls: list[tuple[list[str], date, date]] = []
