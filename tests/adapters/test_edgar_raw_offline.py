@@ -1182,3 +1182,139 @@ def test_without_reuse_cached_the_bulk_file_is_requested_over_a_cached_one(
         settings=_settings(cache_dir=tmp_path), client=_mock_client(handler)
     )
     assert len(served) == 1 and path.read_bytes() == fresh
+
+
+# --- filing index and capped document read (T184b, #1597) -------------------
+
+_ACC = "0000320193-17-000070"
+
+
+def test_filing_index_returns_the_listed_names_in_order() -> None:
+    body = {"directory": {"item": [{"name": "a.htm"}, {"name": "aapl-20170930.xml"}]}}
+    client = _mock_client(lambda request: httpx.Response(200, json=body))
+    assert edgar_raw.filing_index("320193", _ACC, settings=_settings(), client=client) == [
+        "a.htm",
+        "aapl-20170930.xml",
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"<html>not json</html>",
+        b"{}",
+        b'{"directory": {}}',
+        b'{"directory": {"item": "a.htm"}}',
+        b'{"directory": {"item": [{"name": 3}]}}',
+        b'{"directory": {"item": [{"size": "1"}]}}',
+        b'{"directory": {"item": ["a.htm"]}}',
+        b"[]",
+    ],
+)
+def test_a_malformed_filing_index_raises_value_error(content: bytes) -> None:
+    client = _mock_client(lambda request: httpx.Response(200, content=content))
+    with pytest.raises(ValueError, match=r"index|JSON|Expecting"):
+        edgar_raw.filing_index("320193", _ACC, settings=_settings(), client=client)
+
+
+def test_filing_index_rejects_an_unsafe_accession_before_any_request() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.filing_index(
+            "320193", "../etc/passwd", settings=_settings(), client=_mock_client(handler)
+        )
+    assert calls == []
+
+
+class _CountingStream(httpx.SyncByteStream):
+    """A response body of `total` chunks that records how many were pulled."""
+
+    def __init__(self, chunk: bytes, total: int) -> None:
+        self._chunk = chunk
+        self._total = total
+        self.pulled = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self._total):
+            self.pulled += 1
+            yield self._chunk
+
+
+def test_the_document_download_stops_at_the_cap_and_never_reads_past_it() -> None:
+    stream = _CountingStream(b"x" * 1000, total=2_000)  # a 2 MB document
+    client = _mock_client(lambda request: httpx.Response(200, stream=stream))
+    head = edgar_raw.filing_document_head(
+        "320193", _ACC, "a10-k.htm", max_bytes=4500, settings=_settings(), client=client
+    )
+    assert head == b"x" * 4500
+    assert stream.pulled == 5  # the chunk that reached the cap, and none after it
+
+
+def test_the_document_download_stops_when_the_caller_is_done() -> None:
+    stream = _CountingStream(b"y" * 40_000, total=2_000)
+    client = _mock_client(lambda request: httpx.Response(200, stream=stream))
+    seen: list[int] = []
+
+    def done(buffer: bytes) -> bool:
+        seen.append(len(buffer))
+        return True
+
+    head = edgar_raw.filing_document_head(
+        "320193",
+        _ACC,
+        "a10-k.htm",
+        max_bytes=50_000_000,
+        stop_when=done,
+        settings=_settings(),
+        client=client,
+    )
+    # Asked once the buffer had grown 64 KiB (two 40 KB chunks), then no more.
+    assert seen == [80_000]
+    assert len(head) == 80_000
+    assert stream.pulled == 2
+
+
+def test_a_document_shorter_than_the_cap_is_read_whole() -> None:
+    client = _mock_client(lambda request: httpx.Response(200, content=b"short"))
+    head = edgar_raw.filing_document_head(
+        "320193", _ACC, "a10-k.htm", max_bytes=1000, settings=_settings(), client=client
+    )
+    assert head == b"short"
+
+
+def test_the_document_download_retries_a_503_and_raises_on_a_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(edgar_raw.time, "sleep", lambda seconds: None)
+    statuses = iter([503, 200])
+    client = _mock_client(lambda request: httpx.Response(next(statuses), content=b"body"))
+    head = edgar_raw.filing_document_head(
+        "320193", _ACC, "a10-k.htm", max_bytes=100, settings=_settings(), client=client
+    )
+    assert head == b"body"
+    with pytest.raises(httpx.HTTPStatusError):
+        edgar_raw.filing_document_head(
+            "320193",
+            _ACC,
+            "a10-k.htm",
+            max_bytes=100,
+            settings=_settings(),
+            client=_mock_client(lambda request: httpx.Response(404)),
+        )
+
+
+def test_the_document_download_rejects_an_unsafe_filename_and_a_zero_cap() -> None:
+    client = _mock_client(lambda request: httpx.Response(200, content=b"x"))
+    with pytest.raises(edgar_raw.InvalidFilingReferenceError):
+        edgar_raw.filing_document_head(
+            "320193", _ACC, "../x.htm", max_bytes=10, settings=_settings(), client=client
+        )
+    with pytest.raises(ValueError, match="max_bytes"):
+        edgar_raw.filing_document_head(
+            "320193", _ACC, "a.htm", max_bytes=0, settings=_settings(), client=client
+        )

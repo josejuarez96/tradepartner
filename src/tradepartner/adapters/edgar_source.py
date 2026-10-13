@@ -64,6 +64,20 @@ header's `ACCEPTANCE-DATETIME`; on a mismatch each takes its own header's
 acceptance, or stays unstamped this run when that header does not read
 (`_sgml_checked`).
 
+**Filing-name listings (T184b, #1597).** `filename_listings(cik)`, behind
+`edgar.filename_listings` (off: `[]`, no request, no cache file), reads a
+filing's own file names for the years before any cover page tags a
+listing: per 10-K in the window one `index.json` and, when it names an
+instance, one primary-document read streamed up to
+`edgar.filename_document_max_bytes` (or the 12(b) table); the first
+cover-page filing's index for its prefix; and each cached Form 25's index
+for its exhibit ticker. Only the extract (name, 12(b) class/exchange pairs)
+is kept, in `filename/v1/<cik>.json` keyed by accession; a document is
+never written to disk. A failed fetch goes through `_guarded` (counted, no
+cache entry, asked again next run). The counts are the `.filename_*`
+attributes. `FSN_VERSION` is unchanged: an FSN entry with no `symbol_only`
+field is counted on `.filename_fsn_no_symbol_only`, never read as "no tag".
+
 **Cover pages and headers (T11d).** `cover_pages` and `filing_headers` serve
 the FSN caches T11c built, each row re-stamped at read time from
 `_load_stamps(cik)`, never from FSN's own dates or a document's own
@@ -274,7 +288,7 @@ import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -295,7 +309,10 @@ from tradepartner.adapters.edgar import (
     StatementFactsParse,
     UnstampedFiling,
     acceptance_times,
+    cover_12b_exchanges,
     duration_class,
+    form25_exhibit_ticker,
+    instance_prefix,
     parse_company_facts,
     parse_company_tickers,
     parse_cover_page,
@@ -313,14 +330,17 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
     StatementFactRecord,
 )
+from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings, clean_message
 from tradepartner.health import clock_suspect
+from tradepartner.store.master import _is_plain_common
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The cache versions below each name a directory under `edgar.cache_dir`;
@@ -355,6 +375,9 @@ COVER_VERSION = 3
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
 DELISTING_VERSION = 1
+#: The filename-listing extract cache (`filename/v1/<cik>.json`, T184b, #1597):
+#: names, prefix and 12(b) class/exchange pairs only, never a document.
+FILENAME_VERSION = 1
 #: Bumped when the layout of `check_failures`'s full-list file changes (#884).
 FILING_FAILURES_LIST_VERSION = 1
 
@@ -599,6 +622,29 @@ class EdgarFilingSource(FilingSource):
         self._statement_requested: dict[str, str] = {}
         self._statement_parse_counts: dict[str, tuple[int, int, int]] = {}
         self._statement_read_counts: dict[str, tuple[int, int, int]] = {}
+        # T184b (#1597): the filename-listing fetch pass. `index`/`document`
+        # fetches are the requests this instance issued; the rest count each
+        # CIK's readings once per instance (`_filename_counted`).
+        self.filename_index_fetches = 0
+        self.filename_document_fetches = 0
+        self.filename_10ks_read = 0
+        self.filename_no_instance = 0
+        self.filename_no_exchange = 0
+        self.filename_form25_read = 0
+        self.filename_form25_no_exhibit = 0
+        self.filename_form25_uncached = 0
+        # 10-Ks whose FSN entry predates #1624 (no `symbol_only` field): their
+        # tag is unknown, not absent, so a prefix is never confirmed or
+        # contradicted by it. Loud by design (release step 3 reads it).
+        self.filename_fsn_no_symbol_only = 0
+        # 10-Ks with no FSN entry at all (the tag cannot be known either).
+        self.filename_fsn_missing = 0
+        self._filename_counted: set[str] = set()
+        # CIKs whose last `filename_listings` answer is known to be partial: a
+        # reading failed, was quarantined, or a Form 25 was not in the
+        # delisting cache. A caller must not derive a "no other reading" verdict
+        # (`single_reading`) for such a CIK until a complete run.
+        self.filename_incomplete_ciks: set[str] = set()
         # T11h: the failure policy.
         self.failed_filings = 0
         self.quarantined = 0
@@ -1632,6 +1678,7 @@ class EdgarFilingSource(FilingSource):
                 accession=accession,
                 accepted_at=accepted_at,
                 exchange_axis=self._settings.edgar.exchange_axis_listings,
+                split_contexts=self._settings.edgar.cover_split_contexts,
             )
         finally:
             path.unlink(missing_ok=True)  # the document is deleted after parsing
@@ -1938,6 +1985,283 @@ class EdgarFilingSource(FilingSource):
         edgar_raw.write_atomic(
             self._delisting_cache_path(accession), json.dumps(data).encode("utf-8")
         )
+
+    # --- filing-name listings (T184b, #1597) -----------------------------------
+
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        """`cik`'s filing-name readings (spec amendment 2026-10-12, #1597),
+        sorted by `accepted_at`, then accession, then ticker. A CIK whose answer
+        is partial (a fetch failed or is quarantined, a Form 25 is not in the
+        delisting cache) is listed on `.filename_incomplete_ciks`; its
+        Form 25 `valid_from` is the acceptance session, which T184e replaces by
+        the security's first session (#974). `[]`, with no
+        request and no cache file, while `edgar.filename_listings` is off.
+
+        From the stamps (the submissions record, never refetched here): one
+        reading per `edgar.filename_listing_forms` filing accepted on or
+        after `edgar.filename_listings_since` and before the CIK's first
+        cover-page filing; that first cover-page filing's own prefix (one
+        more `index.json`, its form as stamped, no exchange); and one
+        reading per cached Form 25 of the CIK whose exhibit file name
+        carries a ticker. A 10-K costs one `index.json` and, when the index
+        names an instance, one primary-document read capped at
+        `edgar.filename_document_max_bytes`; only the extract is cached
+        (`filename/v1/<cik>.json`, by accession) and an accession cached
+        costs no request. A fetch that fails (404, a malformed index) is the
+        existing failure policy's (`_guarded`): counted, no cache entry,
+        asked again next run, never a guessed ticker.
+
+        `dei_symbol` is the same filing's FSN tag (a symbol-only tag or a
+        listing's ticker; the one equal to the prefix when several), `None`
+        when it has none or when its FSN entry predates #1624 (counted on
+        `.filename_fsn_no_symbol_only`)."""
+        if not self._settings.edgar.filename_listings:
+            return []
+        _validate_cik(cik)
+        self._ensure_fsn()
+        edgar_settings = self._settings.edgar
+        stamps = self._load_stamps(cik)
+        cache = self._load_filename_cache(cik)
+        first_cover = self._first_cover_filing(cik, stamps)
+        first_cover_at = first_cover.accepted_at if first_cover is not None else None
+        since = datetime.combine(edgar_settings.filename_listings_since, time.min, tzinfo=_EASTERN)
+        forms = set(edgar_settings.filename_listing_forms)
+        fsn_cache = self._load_fsn_cache(cik)
+        fsn_tags = self._fsn_recorded_symbol_only(cik)
+        counts = _FilenameCounts()
+
+        listings: list[FilenameListing] = []
+        for record in stamps.values():
+            if record.accepted_at is None or record.form not in forms:
+                continue
+            if record.accepted_at < since or (
+                first_cover_at is not None and record.accepted_at >= first_cover_at
+            ):
+                continue
+            extract = self._filename_extract(cik, cache, record, read_document=True)
+            if extract is None:
+                continue
+            counts.read += 1
+            if extract.name is None:
+                counts.no_instance += 1
+                continue
+            title, exchange = _common_line(extract.pairs)
+            if exchange is None:
+                counts.no_exchange += 1
+            fsn_filing = fsn_cache.get(record.accession)
+            if fsn_filing is None:
+                counts.fsn_missing += 1
+            elif fsn_tags.get(record.accession) is None:
+                counts.fsn_no_symbol_only += 1
+            listings.append(
+                FilenameListing(
+                    cik=cik,
+                    accession=record.accession,
+                    form=record.form,
+                    accepted_at=record.accepted_at,
+                    valid_from=_session_of(record.accepted_at),
+                    ticker=extract.name,
+                    exchange=exchange,
+                    class_title=title,
+                    dei_symbol=_dei_symbol(
+                        extract.name, fsn_filing, fsn_tags.get(record.accession)
+                    ),
+                )
+            )
+
+        if first_cover is not None and first_cover.accepted_at is not None:
+            extract = self._filename_extract(cik, cache, first_cover, read_document=False)
+            if extract is not None and extract.name is not None:
+                listings.append(
+                    FilenameListing(
+                        cik=cik,
+                        accession=first_cover.accession,
+                        form=first_cover.form,
+                        accepted_at=first_cover.accepted_at,
+                        valid_from=_session_of(first_cover.accepted_at),
+                        ticker=extract.name,
+                        exchange=None,
+                        class_title=None,
+                        dei_symbol=None,
+                    )
+                )
+
+        for record in stamps.values():
+            if (
+                record.accepted_at is None
+                or record.form not in _DELISTING_FORMS
+                or record.accepted_at < since
+            ):
+                continue
+            cached = self._load_delisting_cache(record.accession)
+            if cached is None:
+                counts.form25_uncached += 1
+                self.filename_incomplete_ciks.add(cik)
+                continue
+            if cached.cik != cik:
+                continue  # the exchange's copy of a 25-NSE: the subject company keeps it
+            extract = self._filename_extract(cik, cache, record, read_document=False)
+            if extract is None:
+                continue
+            if extract.name is None:
+                counts.form25_no_exhibit += 1
+                continue
+            counts.form25_read += 1
+            listings.append(
+                FilenameListing(
+                    cik=cik,
+                    accession=record.accession,
+                    form=cached.form,
+                    accepted_at=record.accepted_at,
+                    valid_from=_session_of(record.accepted_at),
+                    ticker=extract.name,
+                    exchange=cached.exchange,
+                    class_title=cached.class_title,
+                    dei_symbol=None,
+                )
+            )
+
+        if cik not in self._filename_counted:
+            self._filename_counted.add(cik)
+            self.filename_10ks_read += counts.read
+            self.filename_no_instance += counts.no_instance
+            self.filename_no_exchange += counts.no_exchange
+            self.filename_form25_read += counts.form25_read
+            self.filename_form25_no_exhibit += counts.form25_no_exhibit
+            self.filename_form25_uncached += counts.form25_uncached
+            self.filename_fsn_no_symbol_only += counts.fsn_no_symbol_only
+            self.filename_fsn_missing += counts.fsn_missing
+        listings.sort(key=lambda e: (e.accepted_at, e.accession, e.ticker))
+        return listings
+
+    def _first_cover_filing(
+        self, cik: str, stamps: Mapping[str, SubmissionRecord]
+    ) -> SubmissionRecord | None:
+        """The stamped cover-page filing of `cik` with the earliest
+        acceptance that carries a listing (`_cover_sources`' precedence walk,
+        so a lag-window parse is the one `cover_pages` already makes)."""
+        first: SubmissionRecord | None = None
+        for record, payload in self._cover_sources(cik, stamps, count_missing=False):
+            if record.accepted_at is None or not payload.listings:
+                continue
+            if first is None or (record.accepted_at, record.accession) < (
+                first.accepted_at,
+                first.accession,
+            ):
+                first = record
+        return first
+
+    def _filename_extract(
+        self,
+        cik: str,
+        cache: dict[str, _FilenameExtract],
+        record: SubmissionRecord,
+        *,
+        read_document: bool,
+    ) -> _FilenameExtract | None:
+        """The cached extract of one accession, else fetched, cached and
+        returned; `None` when the fetch failed (counted by `_guarded`, no
+        cache entry, asked again next run) or the accession is quarantined."""
+        cached = cache.get(record.accession)
+        if cached is not None and (
+            not read_document or cached.name is None or cached.document_read
+        ):
+            self._per_document_attempted.add(record.accession)  # #610 policy 1: a cache hit
+            return cached
+        if self._is_quarantined(record.accession):
+            self._quarantined_this_run.add(record.accession)
+            self.quarantined += 1
+            self.filename_incomplete_ciks.add(cik)
+            return None
+        fetch: Callable[[], _FilenameExtract] = partial(
+            self._fetch_filename_extract, cik, record, read_document
+        )
+        extract = self._guarded(record.accession, record.form.removesuffix("/A"), fetch)
+        if extract is None:
+            self.filename_incomplete_ciks.add(cik)
+        else:
+            cache[record.accession] = extract
+            self._save_filename_cache(cik, cache)
+        return extract
+
+    def _fetch_filename_extract(
+        self, cik: str, record: SubmissionRecord, read_document: bool
+    ) -> _FilenameExtract:
+        names = edgar_raw.filing_index(
+            cik, record.accession, settings=self._settings, client=self._client
+        )
+        self.filename_index_fetches += 1
+        if record.form in _DELISTING_FORMS:
+            return _FilenameExtract(form25_exhibit_ticker(names), (), True)
+        prefix = instance_prefix(names)
+        if prefix is None or not read_document:
+            return _FilenameExtract(prefix, (), False)
+        cap = self._settings.edgar.filename_document_max_bytes
+        # The root copy, never an `xsl.../` rendering of it (as `_fetch_cover_page`).
+        document = re.sub(r"^xsl[^/]*/", "", record.primary_document)
+        head = edgar_raw.filing_document_head(
+            cik,
+            record.accession,
+            document,
+            max_bytes=cap,
+            stop_when=_twelve_b_table_read,
+            settings=self._settings,
+            client=self._client,
+        )
+        self.filename_document_fetches += 1
+        pairs = cover_12b_exchanges(head.decode("utf-8", "ignore"), max_bytes=cap)
+        return _FilenameExtract(prefix, pairs, True)
+
+    def _filename_cache_path(self, cik: str) -> Path:
+        return self._cache / "filename" / f"v{FILENAME_VERSION}" / f"{cik}.json"
+
+    def _load_filename_cache(self, cik: str) -> dict[str, _FilenameExtract]:
+        try:
+            data = json.loads(self._filename_cache_path(cik).read_bytes())
+            if data["version"] != FILENAME_VERSION or data["cik"] != cik:
+                raise ValueError("another version or CIK")
+            return {
+                str(accession): _FilenameExtract(
+                    None if entry["name"] is None else str(entry["name"]),
+                    tuple((str(title), str(exchange)) for title, exchange in entry["pairs"]),
+                    entry.get("document_read") is True,
+                )
+                for accession, entry in data["records"].items()
+            }
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return {}  # absent, truncated or another version: fetch again
+
+    def _save_filename_cache(self, cik: str, cache: Mapping[str, _FilenameExtract]) -> None:
+        data = {
+            "version": FILENAME_VERSION,
+            "cik": cik,
+            "records": {
+                accession: {
+                    "name": e.name,
+                    "pairs": [list(pair) for pair in e.pairs],
+                    "document_read": e.document_read,
+                }
+                for accession, e in cache.items()
+            },
+        }
+        edgar_raw.write_atomic(self._filename_cache_path(cik), json.dumps(data).encode("utf-8"))
+
+    def _fsn_recorded_symbol_only(self, cik: str) -> dict[str, tuple[str, ...] | None]:
+        """Per FSN accession of `cik`: the `symbol_only` tags its cache entry
+        records, or `None` when the entry never recorded the field (written
+        before #1624) or records something that is not a list of strings.
+        Read from the raw file: the entry loader reads a missing field as
+        no tag, and only the raw file tells "no tag" from "never recorded"."""
+        try:
+            records = json.loads(self._fsn_cache_path(cik).read_bytes())["records"]
+            found: dict[str, tuple[str, ...] | None] = {}
+            for accession, record in records.items():
+                recorded = record.get("symbol_only")
+                ok = isinstance(recorded, list) and all(isinstance(t, str) for t in recorded)
+                found[accession] = tuple(recorded) if ok else None
+            return found
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return {}
 
     # --- failure policy (T11h) -----------------------------------------------
 
@@ -3004,6 +3328,84 @@ def _facts_key(latest: str, wanted: set[str]) -> str:
     return f"{latest}|{','.join(sorted(wanted))}"
 
 
+@dataclass(frozen=True, slots=True)
+class _FilenameExtract:
+    """What one accession's filename fetch kept (T184b): `name` is a 10-K or
+    cover filing's instance prefix, or a Form 25's exhibit ticker (`None`
+    when its listing names none), and `pairs` the 10-K's Section 12(b)
+    `(class title, exchange)` pairs. Never a document."""
+
+    name: str | None
+    pairs: tuple[tuple[str, str], ...]
+    #: Whether the primary document was read for this entry. A cover filing's
+    #: entry (prefix only) is not a 10-K's: if the same accession is later
+    #: asked as a 10-K with an instance, the entry is a miss.
+    document_read: bool = False
+
+
+@dataclass
+class _FilenameCounts:
+    read: int = 0
+    no_instance: int = 0
+    no_exchange: int = 0
+    form25_read: int = 0
+    form25_no_exhibit: int = 0
+    form25_uncached: int = 0
+    fsn_no_symbol_only: int = 0
+    fsn_missing: int = 0
+
+
+_HEADING_12B_BYTES = re.compile(rb"section\s*12\s*\(\s*b\s*\)", re.IGNORECASE)
+_TABLE_CLOSE_BYTES = re.compile(rb"</\s*table", re.IGNORECASE)
+
+
+def _twelve_b_table_read(buffer: bytes) -> bool:
+    """Whether `buffer` holds a Section 12(b) heading and a table closing
+    after it: `cover_12b_exchanges` ends the block there, so no later byte
+    can change its answer and the download stops."""
+    heading = _HEADING_12B_BYTES.search(buffer)
+    return heading is not None and _TABLE_CLOSE_BYTES.search(buffer, heading.end()) is not None
+
+
+def _session_of(instant: datetime) -> date:
+    """The New York day of `instant`, advanced to the next trading session
+    (`store.master.session_of`, restated here as the calendar's two calls)."""
+    day = instant.astimezone(_EASTERN).date()
+    return day if is_session(day) else next_session(day)
+
+
+def _common_line(pairs: Sequence[tuple[str, str]]) -> tuple[str | None, str | None]:
+    """`(class title, exchange)` of the 12(b) line a row takes: the first
+    plain common class (`store.master`'s test), else the table's only line
+    when its title is blank; `(None, None)` otherwise, so a table of notes
+    and preferreds names no exchange for the common stock."""
+    for title, exchange in pairs:
+        if _is_plain_common(title):
+            return title, exchange
+    if len(pairs) == 1 and not pairs[0][0].strip():
+        return None, pairs[0][1]
+    return None, None
+
+
+def _dei_symbol(
+    prefix: str, filing: FsnFiling | None, symbol_only: Sequence[str] | None
+) -> str | None:
+    """The filing's own `dei:TradingSymbol` for the confirmation rule: the
+    tag equal to `prefix` when it has one, else the first tag sorted; `None`
+    when it has none, and when its FSN entry never recorded the symbol-only
+    field (`symbol_only` is `None`; counted by the caller, never read as "no
+    tag")."""
+    if filing is None or symbol_only is None:
+        return None
+    tags = sorted({*symbol_only, *(item.ticker for item in filing.listings)})
+    if not tags:
+        return None
+    for tag in tags:
+        if tag.strip().upper() == prefix.strip().upper():
+            return tag
+    return tags[0]
+
+
 _CIK_PATTERN = re.compile(r"\d{10}")
 
 
@@ -3397,7 +3799,29 @@ def _fsn_filing_to_json(filing: FsnFiling) -> dict[str, Any]:
         "sic": filing.sic,
         "listings": [[item.title, item.ticker, item.exchange] for item in filing.listings],
         "shares": [[s.class_member, s.value, s.as_of_date.isoformat()] for s in filing.shares],
+        # #1624: a `dei:TradingSymbol` that names no exchange, T184's reading
+        # of the filing. Without it a cached filing loses the tag, and a
+        # filename reading that asked for it would find none.
+        "symbol_only": list(filing.symbol_only),
     }
+
+
+def _fsn_symbol_only(data: Mapping[str, Any]) -> tuple[str, ...]:
+    """The symbol-only tags one cached FSN entry records (#1624).
+
+    A missing key is an entry written before #1624, which recorded none.
+    Anything else must be the list of strings the writer wrote: a cache file
+    is a file on disk, so a corrupt or hand-edited one that holds a string, a
+    dict or a list of something else is refused rather than read as the
+    letters of one symbol or as symbols that are not strings."""
+    recorded = data.get("symbol_only")
+    if recorded is None:
+        return ()
+    if not isinstance(recorded, list) or not all(isinstance(item, str) for item in recorded):
+        raise TypeError(
+            f"cached symbol_only must be a list of strings, got {type(recorded).__name__}"
+        )
+    return tuple(recorded)
 
 
 def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> FsnFiling:
@@ -3411,4 +3835,11 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
             FsnShare(member, value, date.fromisoformat(as_of))
             for member, value, as_of in data["shares"]
         ),
+        # An entry written before #1624 has no tag recorded (the field is
+        # T184's, and the cache kept only what its parser wrote). Reading it
+        # as none is right only for a cache nobody has asked the tag of: the
+        # release-time re-extraction (T184h's `FSN_VERSION` bump) rewrites
+        # every entry with the tag its filing carries. No bump here, because
+        # every reading this cache already served is unchanged by the field.
+        symbol_only=_fsn_symbol_only(data),
     )
