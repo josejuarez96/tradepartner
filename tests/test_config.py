@@ -2388,3 +2388,38 @@ def test_reference_names_must_not_be_empty() -> None:
 def test_coverage_section_refuses_an_unknown_key() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, coverage={"check_enable": True})
+
+
+# --- #1506 (T171c): the borrow-status snapshot -----------------------------------
+
+
+def test_borrow_defaults_keep_the_snapshot_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off until T171d flips it; the thresholds and the keep as the spec sets
+    them, the keep under the project root's `data/alpaca_assets`."""
+    borrow = _settings().borrow
+    assert borrow.enabled is False
+    assert borrow.max_stale_sessions == 2
+    assert borrow.max_vanished_share == pytest.approx(0.05)
+    raw = Path(borrow.raw_dir)
+    assert raw.is_absolute()
+    assert raw == Path(__file__).resolve().parents[1] / "data" / "alpaca_assets"
+    monkeypatch.setenv("BORROW__ENABLED", "true")
+    monkeypatch.setenv("BORROW__RAW_DIR", "")
+    configured = _settings().borrow
+    assert configured.enabled is True
+    assert configured.raw_dir == ""
+
+
+@pytest.mark.parametrize(
+    "borrow",
+    [
+        {"max_stale_sessions": -1},
+        {"max_vanished_share": -0.01},
+        {"max_vanished_share": 1.5},
+        {"max_vanished_share": float("nan")},
+        {"unknown_key": 1},
+    ],
+)
+def test_invalid_borrow_config_is_rejected(borrow: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, borrow=borrow)

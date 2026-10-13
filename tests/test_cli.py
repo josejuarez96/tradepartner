@@ -7,6 +7,7 @@ touches the network, the owner's store or a browser.
 
 from __future__ import annotations
 
+import gzip
 import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -20,7 +21,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tradepartner import cli, health
-from tradepartner.adapters import edgar_raw
+from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.fixture_rates import FixtureRateSource
 from tradepartner.adapters.prices import PriceSource
@@ -1836,3 +1837,147 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
     assert not_tables.exit_code == 2 and "must be a table" in not_tables.output
     path.write_text("[[release]\n", encoding="utf-8")
     assert _invoke(settings, ["decision", "data-release", "import-file", str(path)]).exit_code == 2
+
+
+# --- the borrow-status snapshot (#1506, T171c, T171e) --------------------------
+
+
+_ASSET = {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "class": "us_equity",
+    "symbol": "AAA",
+    "exchange": "NYSE",
+    "status": "active",
+    "tradable": True,
+    "marginable": True,
+    "shortable": True,
+    "easy_to_borrow": True,
+    "borrow_status": "easy_to_borrow",
+    "fractionable": True,
+}
+
+
+class _AssetsEdge:
+    """Stands in for `alpaca_raw.assets_all`, recording each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Settings, Any]] = []
+
+    def __call__(self, settings: Settings, clock: Any) -> alpaca_raw.AssetsFetch:
+        self.calls.append((settings, clock))
+        return alpaca_raw.AssetsFetch([_ASSET], NOW - timedelta(seconds=2), NOW)
+
+
+def _with_keep(settings: Settings, tmp_path: Path) -> Settings:
+    borrow = settings.borrow.model_copy(update={"raw_dir": str(tmp_path / "raw")})
+    return settings.model_copy(update={"borrow": borrow})
+
+
+def test_ingest_source_alpaca_assets_takes_one_snapshot_through_the_edge(
+    tmp_path: Path, secrets_set: Settings
+) -> None:
+    settings = _with_keep(secrets_set, tmp_path)
+    edge = _AssetsEdge()
+    result = _invoke(settings, ["ingest", "--source", "alpaca_assets"], assets_source=edge)
+    assert result.exit_code == 0, result.output
+    assert len(edge.calls) == 1 and edge.calls[0][0] is settings
+    assert "alpaca_assets: ok, 1 rows, cursor 2020-07-01T23:00:00+00:00" in result.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (1,)
+
+
+def test_ingest_source_alpaca_assets_needs_the_alpaca_keys(tmp_path: Path) -> None:
+    settings = _with_keep(_settings(tmp_path), tmp_path)
+    edge = _AssetsEdge()
+    result = _invoke(settings, ["ingest", "--source", "alpaca_assets"], assets_source=edge)
+    assert result.exit_code == 2
+    assert "ALPACA_API_KEY" in result.output
+    assert edge.calls == []
+
+
+def test_ingest_all_hands_the_session_the_assets_edge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, secrets_set: Settings
+) -> None:
+    """`--source all` passes the snapshot's fetch, bound to the settings and
+    clock; `ingest_session` decides from `borrow.enabled` whether to call it."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    edge = _AssetsEdge()
+    result = _invoke(secrets_set, ["ingest"], assets_source=edge)
+    assert result.exit_code == 0, result.output
+    assert edge.calls == []
+    fetched = session.calls[0]["assets"]()
+    assert fetched.assets == [_ASSET]
+    assert edge.calls[0][0] is secrets_set
+
+
+def test_ingest_import_dir_applies_the_files_with_no_request_and_no_secret(
+    tmp_path: Path,
+) -> None:
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    for name, finished in (
+        ("assets-1.json.gz", NOW - timedelta(days=2)),
+        ("assets-2.json.gz", NOW + timedelta(days=1)),
+    ):
+        with gzip.open(rec / name, "wt") as handle:
+            json.dump(
+                {
+                    "fetch_started_utc": (finished - timedelta(seconds=2)).isoformat(),
+                    "fetch_finished_utc": finished.isoformat(),
+                    "endpoint": "paper GET /v2/assets",
+                    "assets": [_ASSET],
+                },
+                handle,
+            )
+    settings = _with_keep(_settings(tmp_path), tmp_path)  # no Alpaca key at all
+    edge = _AssetsEdge()
+    args = ["ingest", "--source", "alpaca_assets", "--import-dir", str(rec)]
+    result = _invoke(settings, args, assets_source=edge)
+    assert edge.calls == []
+    assert result.exit_code == 1, result.output  # one file is from the future
+    assert "alpaca_assets import: 1 applied, 0 skipped" in result.output
+    assert "1 refused" in result.output
+    assert "refused assets-2.json.gz: SnapshotClockError" in result.output
+    again = _invoke(settings, args, assets_source=edge)
+    assert "0 applied, 1 skipped" in again.output
+    assert "skipped assets-1.json.gz" in again.output
+
+
+@pytest.mark.parametrize(
+    ("args", "why"),
+    [
+        (["--import-dir", "."], "--import-dir needs --source alpaca_assets"),
+        (
+            ["--source", "alpaca_assets", "--backfill", "--since", "2020-06-29"],
+            "has no backfill",
+        ),
+        (["--source", "alpaca_assets", "--rebuild-classifications"], "edgar source"),
+    ],
+)
+def test_ingest_refuses_borrow_flags_where_they_cannot_apply(
+    secrets_set: Settings, args: list[str], why: str
+) -> None:
+    edge = _AssetsEdge()
+    result = _invoke(secrets_set, ["ingest", *args], assets_source=edge)
+    assert result.exit_code == 2
+    assert why in result.output
+    assert edge.calls == []
+
+
+def test_ingest_import_dir_must_be_a_directory(tmp_path: Path) -> None:
+    settings = _with_keep(_settings(tmp_path), tmp_path)
+    args = ["ingest", "--source", "alpaca_assets", "--import-dir", str(tmp_path / "missing")]
+    result = _invoke(settings, args)
+    assert result.exit_code == 2
+    assert "is not a directory" in result.output
+
+
+def test_health_prints_the_borrow_block_and_its_warnings(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "borrow status: 10 rows, 6 assets; latest observation none" in result.output
+    assert "last alpaca_assets run: never; none" in result.output
+    assert "warning: borrow.enabled is off" in result.output

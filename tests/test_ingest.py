@@ -8,6 +8,7 @@ with a `FixtureFilingSource` of synthetic filings and `_Prices`, a stub
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import httpx
 import pytest
 
 from tradepartner import ingest as ingest_module
+from tradepartner.adapters.alpaca_raw import AssetsFetch
 from tradepartner.adapters.edgar import StatementConflict, parse_statement_facts
 from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.adapters.edgar_validation import InputValidationError, ValidationFailures
@@ -52,7 +54,7 @@ from tradepartner.adapters.prices import (
 )
 from tradepartner.adapters.rates import RateObservation, rate_known_at
 from tradepartner.calendar import all_sessions
-from tradepartner.config import Settings, secret_values
+from tradepartner.config import BorrowConfig, Settings, secret_values
 from tradepartner.health import filing_event_counts, statement_counts
 from tradepartner.ingest import (
     DARK,
@@ -84,6 +86,7 @@ from tradepartner.ingest import (
     statement_frame,
 )
 from tradepartner.store.asof import (
+    ASSETS_SOURCE,
     facts_as_of,
     live_actions_as_of,
     prices_as_of,
@@ -4222,3 +4225,508 @@ def test_recorded_source_keeps_the_partial_filename_ciks_after_the_freeze() -> N
     assert recorded.filename_listings("0000000994") == []
     recorded.frozen = True
     assert recorded.filename_incomplete_ciks == {"0000000993"}
+
+
+# --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
+#
+# Payloads are constructed in Alpaca's raw shape (`id`, `class`,
+# `borrow_status`); the request is a fake `assets` callable. Every borrow
+# settings object points `borrow.raw_dir` at the test's own directory (or
+# empties it), so no test writes the project's `data/alpaca_assets`.
+
+
+def _borrow(settings: Settings, tmp_path: Path, **borrow: Any) -> Settings:
+    """`settings` with `borrow.*` overridden and the raw keep under `tmp_path`."""
+    values = {"raw_dir": str(tmp_path / "raw"), **borrow}
+    return settings.model_copy(update={"borrow": BorrowConfig(**values)})
+
+
+def _asset(
+    number: int,
+    symbol: str,
+    *,
+    asset_class: str = "us_equity",
+    status: str = "active",
+    shortable: bool = True,
+    etb: bool = True,
+    borrow_status: str | None = "easy_to_borrow",
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "id": f"00000000-0000-4000-8000-{number:012d}",
+        "class": asset_class,
+        "symbol": symbol,
+        "exchange": "NYSE",
+        "status": status,
+        "tradable": True,
+        "marginable": True,
+        "shortable": shortable,
+        "easy_to_borrow": etb,
+        "fractionable": True,
+        "name": f"{symbol} Inc",
+    }
+    if borrow_status is not None:
+        entry["borrow_status"] = borrow_status
+    return entry
+
+
+def _aid(number: int) -> str:
+    return f"00000000-0000-4000-8000-{number:012d}"
+
+
+class _Tick:
+    """A strictly increasing fake clock: each reading one second later."""
+
+    def __init__(self, start: datetime = NOW) -> None:
+        self.now = start
+        self.readings: list[datetime] = []
+
+    def __call__(self) -> datetime:
+        self.now += timedelta(seconds=1)
+        self.readings.append(self.now)
+        return self.now
+
+
+@dataclass
+class _Assets:
+    """The fake request: reads `clock` before and after the "call", like
+    `alpaca_raw.assets_all`, and serves `payloads` in turn (the last one
+    again once they run out); `fail` raises instead, `reverse` returns the
+    finish reading before the start one, `future` adds that much to the
+    finish reading (a fetch time after the run's clock)."""
+
+    clock: Callable[[], datetime]
+    payloads: list[list[dict[str, Any]]]
+    fail: Exception | None = None
+    reverse: bool = False
+    future: timedelta | None = None
+    on_call: Callable[[], None] | None = None
+    calls: int = 0
+    finished: list[datetime] = field(default_factory=list)
+
+    def __call__(self) -> AssetsFetch:
+        started = self.clock()
+        self.calls += 1
+        if self.on_call is not None:
+            self.on_call()
+        if self.fail is not None:
+            raise self.fail
+        payload = self.payloads[min(self.calls, len(self.payloads)) - 1]
+        finished = self.clock()
+        if self.future is not None:
+            finished += self.future
+        self.finished.append(finished)
+        if self.reverse:
+            return AssetsFetch(payload, finished, started)
+        return AssetsFetch(payload, started, finished)
+
+
+def _init_store(settings: Settings) -> None:
+    """The store with its schema and nothing else, as the owner's exists."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+
+
+def _borrow_rows(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read(
+        "SELECT asset_id, symbol, easy_to_borrow, borrow_status, present, known_at "
+        "FROM borrow_status ORDER BY known_at, asset_id"
+    )
+
+
+def _assets_runs(read: Callable[[str], list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    return read(
+        "SELECT status, mode, rows_added, chunk_cursor, message FROM ingestion_runs "
+        f"WHERE source = '{ASSETS_SOURCE}' ORDER BY chunk_cursor, started_at"
+    )
+
+
+#: Snapshot one: unchanged, flips, vanishes, renamed, vanishes and returns;
+#: one crypto asset, counted and not stored.
+_SNAP_1 = [
+    _asset(1, "UNCH"),
+    _asset(2, "FLIP"),
+    _asset(3, "GONE"),
+    _asset(5, "OLDN"),
+    _asset(6, "BACK"),
+    _asset(9, "BTC/USD", asset_class="crypto"),
+]
+#: Snapshot two: FLIP goes hard to borrow, GONE and BACK vanish, NEWB is
+#: new, OLDN is renamed NEWN under the same id.
+_SNAP_2 = [
+    _asset(1, "UNCH"),
+    _asset(2, "FLIP", etb=False, borrow_status="hard_to_borrow"),
+    _asset(4, "NEWB"),
+    _asset(5, "NEWN"),
+    _asset(9, "BTC/USD", asset_class="crypto"),
+]
+#: Snapshot three: BACK returns with its old values.
+_SNAP_3 = [*_SNAP_2, _asset(6, "BACK")]
+
+
+def test_borrow_switch_off_makes_no_request_and_no_write_under_source_all(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """`borrow.enabled` is off by default: `--source all` asks nothing and
+    writes nothing for the snapshot, so the nightly ingest is unchanged."""
+    assert settings.borrow.enabled is False
+    off = _borrow(settings, tmp_path)  # the default switch, the keep in tmp
+    fake = _Assets(clock=lambda: NOW, payloads=[_SNAP_1])
+    result = _run(off, source="all", assets=fake)
+    assert result.ok
+    assert [run.source for run in result.runs] == ["edgar", "alpaca"]
+    assert fake.calls == 0
+    assert _assets_runs(read) == []
+    assert read("SELECT count(*) FROM borrow_status") == [(0,)]
+    assert not (tmp_path / "raw").exists()
+
+
+def test_borrow_enabled_runs_last_after_every_other_source_has_committed(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """On, the snapshot runs after `edgar`, `alpaca` and `fred`, each already
+    committed when its request is made."""
+    on = _borrow(settings, tmp_path, enabled=True)
+    old = RateObservation("DTB3", date(2019, 6, 26), 0.1, date(2019, 6, 26))
+    new = RateObservation("DTB3", date(2019, 6, 27), 0.2, date(2019, 6, 27))
+    ingest_module.ingest_rates(
+        on,
+        FixtureRateSource([old]),
+        since=old.observation_date,
+        clock=lambda: datetime(2019, 6, 28, 22, tzinfo=UTC),
+    )
+    seen: list[list[tuple[Any, ...]]] = []
+
+    def committed() -> None:
+        seen.append(read("SELECT source, status FROM ingestion_runs ORDER BY source"))
+
+    fake = _Assets(clock=lambda: NOW, payloads=[_SNAP_1], on_call=committed)
+    result = _run(on, source="all", assets=fake, rates=FixtureRateSource([new]))
+    assert result.ok, result.runs
+    assert [run.source for run in result.runs] == ["edgar", "alpaca", "fred", ASSETS_SOURCE]
+    assert fake.calls == 1
+    assert seen == [[("alpaca", OK), ("edgar", OK), ("fred", OK), ("fred", OK)]]
+    assert read("SELECT count(*) FROM borrow_status") == [(5,)]
+
+
+def test_borrow_failed_request_writes_only_its_failed_run_row(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """A failed assets request costs no bars: the earlier chunks stand, the
+    snapshot writes only its failed run row and the run exits non-zero."""
+    on = _borrow(settings, tmp_path, enabled=True)
+    fake = _Assets(clock=lambda: NOW, payloads=[], fail=RuntimeError("assets 503"))
+    result = _run(on, source="all", assets=fake)
+    assert [(r.source, r.status) for r in result.runs] == [
+        ("edgar", OK),
+        ("alpaca", OK),
+        (ASSETS_SOURCE, FAILED),
+    ]
+    assert result.exit_code == 1
+    assert "assets 503" in result.runs[-1].message
+    assert _counts(read)["prices_daily"] > 0
+    assert read("SELECT count(*) FROM borrow_status") == [(0,)]
+    assert [row[:3] for row in _assets_runs(read)] == [(FAILED, "session", 0)]
+    assert not (tmp_path / "raw").exists()
+
+
+def test_borrow_snapshot_stamps_known_at_after_the_call_and_ingested_at_after_it(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Under a strictly increasing clock, `known_at` is the reading taken
+    after the response and `ingested_at` a later reading; the run row's
+    cursor is the fetch time and its message the counts."""
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[_SNAP_1])
+    result = ingest_session(
+        _borrow(settings, tmp_path),
+        prices=_Prices(),
+        filings=_filings(),
+        source=ASSETS_SOURCE,
+        clock=tick,
+        assets=fake,
+    )
+    assert result.ok, result.runs
+    (finished,) = fake.finished
+    stamps = read("SELECT DISTINCT known_at, ingested_at, source, provenance FROM borrow_status")
+    assert len(stamps) == 1
+    known_at, ingested_at, source, provenance = stamps[0]
+    assert known_at == finished
+    assert ingested_at > known_at
+    assert tick.readings.index(ingested_at) > tick.readings.index(finished)
+    assert (source, provenance) == ("alpaca", "snapshot")
+    ((status, mode, rows, cursor, message),) = _assets_runs(read)
+    assert (status, mode, rows) == (OK, "session", 5)
+    assert datetime.fromisoformat(cursor) == finished
+    assert message == (
+        "borrow_assets=6; borrow_us_equity=5; borrow_new=5; borrow_changed=0; "
+        "borrow_vanished=0; borrow_other_class=1"
+    )
+
+
+def test_borrow_snapshots_write_the_diff_rows(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Three snapshots write one row per new, changed, vanished or returned
+    asset and none for an unchanged one; every snapshot writes its run row."""
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[_SNAP_1, _SNAP_2, _SNAP_3, _SNAP_3])
+    loose = _borrow(settings, tmp_path, max_vanished_share=0.5)  # two of five vanish
+    for _ in range(4):
+        assert ingest_module.ingest_assets(loose, fake, clock=tick).ok
+    first, second, third, fourth = fake.finished
+    assert _borrow_rows(read) == [
+        (_aid(1), "UNCH", True, "easy_to_borrow", True, first),
+        (_aid(2), "FLIP", True, "easy_to_borrow", True, first),
+        (_aid(3), "GONE", True, "easy_to_borrow", True, first),
+        (_aid(5), "OLDN", True, "easy_to_borrow", True, first),
+        (_aid(6), "BACK", True, "easy_to_borrow", True, first),
+        (_aid(2), "FLIP", False, "hard_to_borrow", True, second),
+        (_aid(3), "GONE", True, "easy_to_borrow", False, second),
+        (_aid(4), "NEWB", True, "easy_to_borrow", True, second),
+        (_aid(5), "NEWN", True, "easy_to_borrow", True, second),
+        (_aid(6), "BACK", True, "easy_to_borrow", False, second),
+        (_aid(6), "BACK", True, "easy_to_borrow", True, third),
+    ]
+    runs = _assets_runs(read)
+    assert [(r[0], r[2]) for r in runs] == [(OK, 5), (OK, 5), (OK, 1), (OK, 0)]
+    assert [datetime.fromisoformat(r[3]) for r in runs] == [first, second, third, fourth]
+    assert "borrow_new=1; borrow_changed=2; borrow_vanished=2" in runs[1][4]
+    assert "borrow_new=0; borrow_changed=1; borrow_vanished=0" in runs[2][4]
+
+
+def test_borrow_dry_run_writes_nothing(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _init_store(settings)
+    fake = _Assets(clock=_Tick(), payloads=[_SNAP_1])
+    result = ingest_module.ingest_assets(
+        _borrow(settings, tmp_path), fake, clock=_Tick(), dry_run=True
+    )
+    assert result.ok
+    (run,) = result.runs
+    assert run.rows_added == 5
+    assert run.message.startswith("dry run: borrow_assets=6")
+    assert read("SELECT count(*) FROM borrow_status") == [(0,)]
+    assert read("SELECT count(*) FROM ingestion_runs") == [(0,)]
+    assert not (tmp_path / "raw").exists()
+
+
+def test_borrow_vanished_share_guard_refuses_with_a_failed_run_row(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """Two of forty vanished (0.05) is a snapshot; three (0.075) is a
+    truncated list: refused, only its failed run row written."""
+    forty = [_asset(n, f"S{n}") for n in range(1, 41)]
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[forty, forty[2:], forty[5:]])
+    guarded = _borrow(settings, tmp_path)
+    assert ingest_module.ingest_assets(guarded, fake, clock=tick).ok
+    assert ingest_module.ingest_assets(guarded, fake, clock=tick).ok
+    before = _borrow_rows(read)
+    assert len(before) == 42
+    refused = ingest_module.ingest_assets(guarded, fake, clock=tick)
+    assert refused.exit_code == 1
+    assert refused.runs[0].status == FAILED
+    assert "TruncatedSnapshotError" in refused.runs[0].message
+    assert _borrow_rows(read) == before
+    assert [r[0] for r in _assets_runs(read)] == [OK, OK, FAILED]
+
+
+@pytest.mark.parametrize(
+    ("reverse", "future", "why"),
+    [
+        (True, None, "is before fetch_started_utc"),
+        (False, timedelta(hours=1), "not yet known"),
+    ],
+)
+def test_borrow_snapshot_with_unusable_clocks_is_refused(
+    settings: Settings,
+    tmp_path: Path,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    reverse: bool,
+    future: timedelta | None,
+    why: str,
+) -> None:
+    """A finish reading before the start one, or a fetch time after the
+    run's clock, is refused with a failed run row, never clamped."""
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[_SNAP_1], reverse=reverse, future=future)
+    result = ingest_module.ingest_assets(_borrow(settings, tmp_path), fake, clock=tick)
+    assert result.runs[0].status == FAILED
+    assert "SnapshotClockError" in result.runs[0].message and why in result.runs[0].message
+    assert read("SELECT count(*) FROM borrow_status") == [(0,)]
+    assert [r[0] for r in _assets_runs(read)] == [FAILED]
+
+
+def test_borrow_raw_keep_writes_the_recorders_file_and_an_empty_dir_writes_none(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The daily payload is kept in the recorder's file shape under
+    `borrow.raw_dir`, which `--import-dir` reads back; empty keeps nothing."""
+    tick = _Tick()
+    fake = _Assets(clock=tick, payloads=[_SNAP_1])
+    assert ingest_module.ingest_assets(_borrow(settings, tmp_path), fake, clock=tick).ok
+    (kept,) = (tmp_path / "raw").iterdir()
+    (finished,) = fake.finished
+    assert kept.name == f"assets-{finished:%Y%m%dT%H%M%SZ}.json.gz"
+    with gzip.open(kept, "rt", encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert set(document) == {"fetch_started_utc", "fetch_finished_utc", "endpoint", "assets"}
+    assert datetime.fromisoformat(document["fetch_finished_utc"]) == finished
+    assert document["endpoint"] == "paper GET /v2/assets"
+    assert document["assets"] == _SNAP_1
+    other = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "other.duckdb"), "lock_retry_seconds": 1},
+    )
+    imported = ingest_module.import_assets(
+        _borrow(other, tmp_path / "unused"), tmp_path / "raw", clock=_Tick(finished)
+    )
+    assert imported.ok and [run.rows_added for run in imported.runs] == [5]
+
+    off = _borrow(settings, tmp_path, raw_dir="")
+    assert ingest_module.ingest_assets(off, _Assets(clock=tick, payloads=[_SNAP_1]), clock=tick).ok
+    assert len(list((tmp_path / "raw").iterdir())) == 1
+
+
+def _record(
+    directory: Path,
+    name: str,
+    finished: datetime,
+    assets: list[dict[str, Any]],
+    *,
+    started: datetime | None = None,
+    endpoint: str = "paper GET /v2/assets",
+) -> Path:
+    """One file in the scratch recorder's shape (`snap.py`)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    with gzip.open(path, "wt") as handle:
+        json.dump(
+            {
+                "fetch_started_utc": (started or finished - timedelta(seconds=2)).isoformat(),
+                "fetch_finished_utc": finished.isoformat(),
+                "endpoint": endpoint,
+                "assets": assets,
+            },
+            handle,
+        )
+    return path
+
+
+#: Three recorder fetches, a day apart, before the import's clock.
+_REC = (
+    datetime(2026, 10, 11, 8, 9, 54, tzinfo=UTC),
+    datetime(2026, 10, 12, 8, 10, 2, tzinfo=UTC),
+    datetime(2026, 10, 13, 8, 9, 58, tzinfo=UTC),
+)
+_IMPORT_NOW = datetime(2026, 10, 13, 22, 0, tzinfo=UTC)
+
+
+def _three_files(directory: Path) -> None:
+    """The three snapshots, named so name order is the reverse of fetch
+    order: the import must sort by `fetch_finished_utc`."""
+    _record(directory, "assets-c.json.gz", _REC[0], _SNAP_1)
+    _record(directory, "assets-b.json.gz", _REC[1], _SNAP_2)
+    _record(directory, "assets-a.json.gz", _REC[2], _SNAP_3)
+
+
+def test_import_applies_files_in_fetch_order_and_a_rerun_adds_nothing(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    loose = _borrow(settings, tmp_path, max_vanished_share=0.5)
+    _three_files(tmp_path / "rec")
+    first = ingest_module.import_assets(loose, tmp_path / "rec", clock=_Tick(_IMPORT_NOW))
+    assert first.ok and first.exit_code == 0
+    assert [run.rows_added for run in first.runs] == [5, 5, 1]
+    assert [datetime.fromisoformat(run.chunk_cursor) for run in first.runs] == list(_REC)
+    assert first.skipped == () and first.refused == ()
+    assert [row[5] for row in _borrow_rows(read)] == [_REC[0]] * 5 + [_REC[1]] * 5 + [_REC[2]]
+    assert read("SELECT min(ingested_at) > max(known_at) FROM borrow_status") == [(True,)]
+    runs = _assets_runs(read)
+    assert [(r[0], r[1]) for r in runs] == [(OK, "import")] * 3
+    assert runs[0][4].startswith("assets-c.json.gz: borrow_assets=6")
+
+    again = ingest_module.import_assets(loose, tmp_path / "rec", clock=_Tick(_IMPORT_NOW))
+    assert again.ok and again.runs == ()
+    assert sorted(again.skipped) == ["assets-a.json.gz", "assets-b.json.gz", "assets-c.json.gz"]
+    assert read("SELECT count(*) FROM borrow_status") == [(11,)]
+    assert len(_assets_runs(read)) == 3
+
+
+def test_import_skips_a_file_at_or_before_the_latest_run_cursor(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The quiet-day ordering case: a daily run that changed nothing still
+    moves the latest observation past the table's latest `known_at`, so a
+    file recorded before it is skipped, never applied as the latest."""
+    loose = _borrow(settings, tmp_path, max_vanished_share=0.5)
+    _record(tmp_path / "rec", "assets-1.json.gz", _REC[0], _SNAP_1)
+    assert ingest_module.import_assets(loose, tmp_path / "rec", clock=_Tick(_IMPORT_NOW)).ok
+    daily = _Tick(_REC[2])
+    assert ingest_module.ingest_assets(
+        loose, _Assets(clock=daily, payloads=[_SNAP_1]), clock=daily
+    ).ok
+    rows = _borrow_rows(read)
+    assert {row[5] for row in rows} == {_REC[0]}  # the daily run changed nothing
+    _record(tmp_path / "rec", "assets-2.json.gz", _REC[1], _SNAP_2)  # earlier than it
+    late = ingest_module.import_assets(loose, tmp_path / "rec", clock=_Tick(_IMPORT_NOW))
+    assert late.ok and late.runs == ()
+    assert sorted(late.skipped) == ["assets-1.json.gz", "assets-2.json.gz"]
+    assert _borrow_rows(read) == rows
+
+
+def test_import_refuses_and_counts_unusable_files_and_applies_the_rest(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    rec = tmp_path / "rec"
+    _record(rec, "assets-good.json.gz", _REC[0], _SNAP_1)
+    _record(rec, "assets-future.json.gz", _IMPORT_NOW + timedelta(hours=1), _SNAP_2)
+    _record(rec, "assets-reversed.json.gz", _REC[1], _SNAP_2, started=_REC[1] + timedelta(1))
+    _record(rec, "assets-filtered.json.gz", _REC[2], _SNAP_2, endpoint="GET /v2/assets?x=1")
+    (rec / "assets-junk.json.gz").write_bytes(b"not gzip")
+    result = ingest_module.import_assets(_borrow(settings, tmp_path), rec, clock=_Tick(_IMPORT_NOW))
+    assert result.exit_code == 1
+    assert [run.rows_added for run in result.runs] == [5]
+    refused = dict(result.refused)
+    assert sorted(refused) == [
+        "assets-filtered.json.gz",
+        "assets-future.json.gz",
+        "assets-junk.json.gz",
+        "assets-reversed.json.gz",
+    ]
+    assert "not yet known" in refused["assets-future.json.gz"]
+    assert "is before fetch_started_utc" in refused["assets-reversed.json.gz"]
+    assert {row[5] for row in _borrow_rows(read)} == {_REC[0]}
+
+
+def test_import_dry_run_counts_every_file_and_writes_nothing(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    _init_store(settings)
+    loose = _borrow(settings, tmp_path, max_vanished_share=0.5)
+    _three_files(tmp_path / "rec")
+    dry = ingest_module.import_assets(
+        loose, tmp_path / "rec", clock=_Tick(_IMPORT_NOW), dry_run=True
+    )
+    assert dry.ok
+    assert [run.rows_added for run in dry.runs] == [5, 5, 1]  # each over the one before
+    assert all(run.message.startswith("dry run: assets-") for run in dry.runs)
+    assert read("SELECT count(*) FROM borrow_status") == [(0,)]
+    assert read("SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_import_stops_at_a_file_the_guard_refuses_with_its_failed_run_row(
+    settings: Settings, tmp_path: Path, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """The truncation guard holds on the import too: the earlier files stay
+    committed, the refused one writes its failed run row, the rest wait."""
+    _three_files(tmp_path / "rec")  # snapshot two vanishes two of five
+    result = ingest_module.import_assets(
+        _borrow(settings, tmp_path), tmp_path / "rec", clock=_Tick(_IMPORT_NOW)
+    )
+    assert result.exit_code == 1
+    assert [(run.status, run.rows_added) for run in result.runs] == [(OK, 5), (FAILED, 0)]
+    assert "assets-b.json.gz: TruncatedSnapshotError" in result.runs[-1].message
+    assert [(r[0], r[1]) for r in _assets_runs(read)] == [(OK, "import"), (FAILED, "import")]
+    assert {row[5] for row in _borrow_rows(read)} == {_REC[0]}
