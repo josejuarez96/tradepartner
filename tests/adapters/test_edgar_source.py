@@ -35,6 +35,8 @@ from edgar_transport import (
 from tradepartner.adapters.edgar import UnstampedFiling, acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
+    COVER_VERSION,
+    FSN_VERSION,
     STAMPS_LAYOUT,
     EdgarFilingSource,
     SubmissionRecord,
@@ -986,3 +988,27 @@ def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path,
         [("ANSS", "NASDAQ")] if on else []
     )
     assert source.cover_exchange_axis_mismatch == (1 if on else 0)
+
+
+def test_a_cached_v2_cover_page_is_no_longer_served(settings: Settings) -> None:
+    """T181 (#1541): the release bumps `COVER_VERSION` to 3 (and `FSN_VERSION`
+    to 3), so a per-document cover page cached under v2, parsed without the
+    exchange-axis listings, is never served: it is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (3, 3)
+    accession = "0000320193-24-000123"
+    old = Path(settings.edgar.cache_dir) / "cover" / "v2" / f"{accession}.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "accession": accession,
+                "cik": "0000320193",
+                "entity_cik": "0000320193",
+                "listings": [],
+                "facts": [],
+            }
+        )
+    )
+    source = _source(settings, EdgarRouter())
+    assert source._load_cover_cache(accession) is None
