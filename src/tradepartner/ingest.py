@@ -181,11 +181,26 @@ the build's rows as they stand: each at the `known_at` the classification
 first became knowable (`store.classify` timing), never the run. A dry
 run rolls it back. The count goes into the run message as
 `classifications_deleted: N`.
+
+**Borrow status** (#1506, plan T171c; ADR 0021). Source `alpaca_assets`:
+one unfiltered `GET /v2/assets` (`alpaca_raw.assets_all`) before the lock,
+the payload kept under `borrow.raw_dir` unless that is empty, then one
+transaction with the rows `adapters.borrow.snapshot_rows` returns and one
+`ok` run row whose cursor is the fetch time and whose message carries the
+`borrow_*` counts. `known_at` is the clock reading after the response and
+`ingested_at` a later reading, so `known_at <= ingested_at` holds. No
+staleness rule: the request succeeds, or only the failed run row is written.
+Under `--source all` it runs last and only while `borrow.enabled` is on.
+`import_assets` (`--import-dir`) applies the recorder's files the same way,
+with no request, skipping any file at or before the latest observation (the
+newest `ok` run cursor).
 """
 
 from __future__ import annotations
 
 import csv
+import gzip
+import json
 import re
 import time
 import traceback
@@ -203,6 +218,13 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pyarrow as pa
 
+from tradepartner.adapters.alpaca_raw import ASSETS_ENDPOINT, ASSETS_REQUEST, AssetsFetch
+from tradepartner.adapters.borrow import (
+    BorrowStatus,
+    SnapshotOrderError,
+    parse_assets,
+    snapshot_rows,
+)
 from tradepartner.adapters.edgar import StatementConflict, duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
@@ -231,7 +253,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
-from tradepartner.store.asof import _validate_t
+from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -560,10 +582,12 @@ def ingest_session(
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
+    assets: Callable[[], AssetsFetch] | None = None,
 ) -> IngestResult:
-    """Ingest the expected session from `source` (`edgar`, `alpaca` or
-    `all`); see the module docstring. `clock` gives the run's instant, used
-    for the expected session, `ingested_at` and the run row's times. A dry
+    """Ingest the expected session from `source` (`edgar`, `alpaca`, `fred`,
+    `alpaca_assets` or `all`); see the module docstring. `clock` gives the
+    run's instant, used for the expected session, `ingested_at` and the run
+    row's times (the snapshot's `ingested_at` is a later reading). A dry
     run rolls every chunk back and writes no run row.
     `rebuild_statement_facts` (#660) deletes and re-ingests `statement_facts`
     in the EDGAR chunk's transaction; it needs the switch on and the EDGAR
@@ -579,13 +603,30 @@ def ingest_session(
     `edgar`. `on_restamp` receives its `RestampResult` (after a dry run too,
     though nothing is kept). `restamp_window_ok` (#1497, T166e) is the
     pre-check that lets in-window corrections move (`restamp_from_manifest`);
-    it needs `restamp`."""
+    it needs `restamp`.
+    `assets` (#1506, T171c) makes the borrow snapshot's one request
+    (`alpaca_raw.assets_all`). `source="alpaca_assets"` runs only the
+    snapshot, whatever `borrow.enabled` says (`ValueError` without `assets`).
+    Under `all` the snapshot runs **last**, after every other source has
+    committed `ok`, and only while `borrow.enabled` is on and `assets` is
+    given (the CLI always gives it): off, no request is made and nothing is
+    written for it."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
     if restamp_window_ok is not None and restamp is None:
         raise ValueError("restamp_window_ok needs restamp")
-    if source not in ("all", *SOURCES):
-        raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
+    if source not in ("all", *SOURCES, ASSETS_SOURCE):
+        raise ValueError(
+            f"source must be 'all' or one of {(*SOURCES, ASSETS_SOURCE)}, got {source!r}"
+        )
+    if source == ASSETS_SOURCE:
+        if assets is None:
+            raise ValueError(f"the {ASSETS_SOURCE} source needs an assets fetch")
+        if rebuild_statement_facts or rebuild_filing_events or rebuild_classifications:
+            raise ValueError("the rebuild flags need the edgar source")
+        return ingest_assets(settings, assets, clock=clock, dry_run=dry_run)
+    # Under `all`: last, only while the switch is on (the CLI always passes the fetch).
+    snapshot = assets if source == "all" and settings.borrow.enabled else None
     if source == "fred":
         if rates is None:
             raise ValueError("fred source requires a RateSource")
@@ -654,6 +695,8 @@ def ingest_session(
         and rates_seeded(settings)
     ):
         runs.extend(ingest_rates(settings, rates, clock=clock, dry_run=dry_run).runs)
+    if snapshot is not None and all(run.status == OK for run in runs):
+        runs.append(_ingest_assets(settings, snapshot, now, clock, dry_run))
     return IngestResult(tuple(runs))
 
 
@@ -3324,3 +3367,443 @@ def _filed(
             raise ValueError(f"revision at {ingested_at.isoformat()} would be back-dated")
         added.append({**final, "known_at": ingested_at, "ingested_at": ingested_at})
     return added
+
+
+# --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
+
+#: `ingestion_runs.mode` of a run row `import_assets` writes, one per applied
+#: file; the daily snapshot's run row has `MODE`. Both are observations: the
+#: latest observation is the newest `ok` `ASSETS_SOURCE` cursor of any mode.
+ASSETS_IMPORT_MODE = "import"
+
+#: The files `--import-dir` reads and the daily keep writes: the scratch
+#: recorder's name, `assets-<fetch_finished_utc %Y%m%dT%H%M%SZ>.json.gz`.
+ASSETS_FILE_GLOB = "assets-*.json.gz"
+
+#: The keys of one recorded or kept assets file (the recorder's shape).
+_ASSETS_FILE_KEYS: tuple[str, ...] = (
+    "fetch_started_utc",
+    "fetch_finished_utc",
+    "endpoint",
+    "assets",
+)
+
+#: `borrow_status`' columns, in schema order (the bulk insert's frame).
+_BORROW_COLUMNS: tuple[str, ...] = (
+    "asset_id",
+    "symbol",
+    "exchange",
+    "status",
+    "tradable",
+    "marginable",
+    "shortable",
+    "easy_to_borrow",
+    "borrow_status",
+    "fractionable",
+    "present",
+    "known_at",
+    "ingested_at",
+    "source",
+    "provenance",
+)
+
+#: The `borrow_status` row's `source` and `provenance` (spec "Borrow status:
+#: the table": a current-only endpoint, `known_at` = fetch time).
+_BORROW_SOURCE = "alpaca"
+_BORROW_PROVENANCE = "snapshot"
+
+
+class SnapshotClockError(ValueError):
+    """A snapshot whose clocks cannot stamp it: a fetch that finished before
+    it started, a naive reading, or a fetch time after the run's clock (not
+    yet known). Refused and counted, never clamped (spec "Borrow status: the
+    stamp")."""
+
+
+def _snapshot_clocks(started: object, finished: object) -> tuple[datetime, datetime]:
+    """The two readings as tz-aware UTC, or `SnapshotClockError`: a naive or
+    non-datetime reading, or `finished` before `started`."""
+    readings: list[datetime] = []
+    for name, value in (("fetch_started_utc", started), ("fetch_finished_utc", finished)):
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise SnapshotClockError(f"{name} must be a tz-aware datetime, got {value!r}")
+        readings.append(ensure_tz_aware_utc(value, field_name=name))
+    if readings[1] < readings[0]:
+        raise SnapshotClockError(
+            f"fetch_finished_utc {readings[1].isoformat()} is before fetch_started_utc "
+            f"{readings[0].isoformat()}: refused, never clamped"
+        )
+    return readings[0], readings[1]
+
+
+def latest_assets_observation(conn: duckdb.DuckDBPyConnection) -> datetime | None:
+    """The newest `ok` `ASSETS_SOURCE` run cursor (the latest observation,
+    spec "rows record change"), or `None` when no snapshot was recorded. Never
+    the table's `MAX(known_at)`, which on a quiet day lags the last snapshot.
+    The cursor is compared as a timestamp, as `store.asof` reads it."""
+    row = conn.execute(
+        "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
+        "WHERE source = ? AND status = ?",
+        [ASSETS_SOURCE, OK],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return ensure_tz_aware_utc(row[0], field_name="observation")
+
+
+def _latest_borrow_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, BorrowStatus]:
+    """The latest stored row per `asset_id` (vanished rows included), as
+    `snapshot_rows` diffs against."""
+    stored = conn.execute(
+        f"SELECT {', '.join(_BORROW_COLUMNS[:12])} FROM borrow_status "
+        "QUALIFY row_number() OVER (PARTITION BY asset_id ORDER BY known_at DESC) = 1"
+    ).fetchall()
+    latest: dict[str, BorrowStatus] = {}
+    for row in stored:
+        values = dict(zip(_BORROW_COLUMNS[:12], row, strict=True))
+        latest[values["asset_id"]] = BorrowStatus(**values, fetched_at=values["known_at"])
+    return latest
+
+
+def _insert_borrow_rows(
+    conn: duckdb.DuckDBPyConnection, rows: Sequence[BorrowStatus], ingested_at: datetime
+) -> None:
+    """Insert `rows` into `borrow_status` in one statement, each stamped
+    `ingested_at`, `source = alpaca`, `provenance = snapshot`."""
+    if not rows:
+        return
+    records = [
+        {
+            **{column: getattr(row, column) for column in _BORROW_COLUMNS[:12]},
+            "ingested_at": ingested_at,
+            "source": _BORROW_SOURCE,
+            "provenance": _BORROW_PROVENANCE,
+        }
+        for row in rows
+    ]
+    frame = pa.table({column: [record[column] for record in records] for column in _BORROW_COLUMNS})
+    for column in ("known_at", "ingested_at"):
+        kind = frame.schema.field(column).type
+        if not pa.types.is_timestamp(kind) or kind.tz is None:
+            raise TypeError(f"borrow_status.{column} must be tz-aware timestamps, got {kind}")
+    conn.register("_borrow_rows", frame)
+    try:
+        conn.execute("INSERT INTO borrow_status BY NAME SELECT * FROM _borrow_rows")
+    finally:
+        conn.unregister("_borrow_rows")
+
+
+def _write_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    payload: Sequence[Mapping[str, object]],
+    fetched_at: datetime,
+    ingested_at: datetime,
+    settings: Settings,
+) -> tuple[int, str]:
+    """Diff one snapshot against the store and write its rows (spec "rows
+    record change"); returns the rows written and the run message's counts.
+
+    Refuses, before any write: a fetch time after `ingested_at` (not yet
+    known: `known_at <= ingested_at` must hold), a fetch time at or before
+    the latest observation (an older state would read as the latest), and,
+    through `snapshot_rows`, a repeated `asset_id`, a fetch time not after a
+    stored row and a vanished share over `borrow.max_vanished_share`.
+    """
+    if fetched_at > ingested_at:
+        raise SnapshotClockError(
+            f"fetch time {fetched_at.isoformat()} is after the run's clock "
+            f"{ingested_at.isoformat()}: not yet known, refused"
+        )
+    observed = latest_assets_observation(conn)
+    if observed is not None and fetched_at <= observed:
+        raise SnapshotOrderError(
+            f"fetch time {fetched_at.isoformat()} is at or before the latest observation "
+            f"{observed.isoformat()}: an older state would read as the latest, refused"
+        )
+    snapshot = parse_assets(payload, fetched_at)
+    latest = _latest_borrow_rows(conn)
+    rows = snapshot_rows(
+        latest,
+        snapshot.assets,
+        fetched_at,
+        max_vanished_share=settings.borrow.max_vanished_share,
+    )
+    _insert_borrow_rows(conn, rows, ingested_at)
+    new = sum(row.present and row.asset_id not in latest for row in rows)
+    vanished = sum(not row.present for row in rows)
+    message = (
+        f"borrow_assets={snapshot.total}; borrow_us_equity={snapshot.us_equity}; "
+        f"borrow_new={new}; borrow_changed={len(rows) - new - vanished}; "
+        f"borrow_vanished={vanished}; borrow_other_class={snapshot.other_class}"
+    )
+    return len(rows), message
+
+
+def keep_assets(raw_dir: str, fetched: AssetsFetch) -> Path:
+    """Write `fetched` under `raw_dir` in the recorder's file shape (gzipped
+    JSON with both clock readings, the endpoint and the raw list), named by
+    its finish time, through a temporary file renamed into place, so an
+    interrupted write leaves no file `--import-dir` would read."""
+    started, finished = _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+    directory = Path(raw_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"assets-{finished:%Y%m%dT%H%M%SZ}.json.gz"
+    partial = directory / f".{path.name}.{uuid.uuid4().hex}.partial"
+    document = {
+        "fetch_started_utc": started.isoformat(),
+        "fetch_finished_utc": finished.isoformat(),
+        "endpoint": ASSETS_ENDPOINT,
+        "assets": fetched.assets,
+    }
+    try:
+        with gzip.open(partial, "wt", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+    return path
+
+
+def _ingest_assets(
+    settings: Settings,
+    fetch: Callable[[], AssetsFetch],
+    now: datetime,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+) -> SourceRun:
+    """One daily snapshot: one request (`fetch`, before the write lock), one
+    transaction with the diff's rows and one run row (cursor = the fetch
+    time), then, once committed `ok` and not a dry run, the raw keep under
+    `borrow.raw_dir` unless that is empty. `ingested_at` is the run's clock
+    read **after** the response, so `known_at <= ingested_at` holds by
+    construction (spec "the stamp"). A failed request or a refusal writes
+    only its failed run row and keeps no file."""
+    state: dict[str, AssetsFetch] = {}
+
+    def prepare() -> None:
+        fetched = fetch()
+        _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+        state["fetched"] = fetched
+
+    def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        fetched = state["fetched"]
+        _, finished = _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+        ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+        return _write_snapshot(conn, fetched.assets, finished, ingested_at, settings)
+
+    def cursor() -> str:
+        fetched = state.get("fetched")
+        if fetched is None:
+            return ""
+        return ensure_tz_aware_utc(fetched.fetch_finished_utc, field_name="fetch").isoformat()
+
+    def keep() -> None:
+        # Only a committed `ok` snapshot is kept (`_run_source`'s after-commit
+        # hook): a refused payload is never archived for a later import to trip
+        # on, and a failed keep is noted in the result, never the stored rows.
+        if settings.borrow.raw_dir:
+            keep_assets(settings.borrow.raw_dir, state["fetched"])
+
+    return _run_source(
+        ASSETS_SOURCE,
+        work,
+        settings,
+        now,
+        clock,
+        cursor,
+        dry_run,
+        prepare=prepare,
+        after_commit=keep,
+    )
+
+
+def ingest_assets(
+    settings: Settings,
+    assets: Callable[[], AssetsFetch],
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> IngestResult:
+    """`ingest --source alpaca_assets`: one daily snapshot (`_ingest_assets`),
+    whatever `borrow.enabled` says; `assets` makes the one request."""
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    return IngestResult((_ingest_assets(settings, assets, now, clock, dry_run),))
+
+
+@dataclass(frozen=True)
+class AssetsFile:
+    """One recorded assets file's header, checked: its path and the two
+    clock readings (the payload is read again when the file is applied, so
+    a long directory is never held in memory at once)."""
+
+    path: Path
+    fetch_started_utc: datetime
+    fetch_finished_utc: datetime
+
+
+def _read_assets_file(path: Path) -> dict[str, Any]:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"expected a JSON object, got {type(document).__name__}")
+    missing = [key for key in _ASSETS_FILE_KEYS if key not in document]
+    if missing:
+        raise ValueError(f"missing key(s) {', '.join(missing)}")
+    if not isinstance(document["assets"], list):
+        raise ValueError("assets is not a list")
+    endpoint = document["endpoint"]
+    if not isinstance(endpoint, str) or not endpoint.endswith(ASSETS_REQUEST):
+        raise ValueError(f"endpoint {endpoint!r} is not an unfiltered {ASSETS_REQUEST}")
+    return document
+
+
+def _parse_instant(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise SnapshotClockError(f"{name} must be an ISO-8601 string, got {value!r}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise SnapshotClockError(f"{name} is not ISO-8601: {value!r}") from None
+
+
+def scan_assets_dir(
+    directory: Path, now: datetime, settings: Settings
+) -> tuple[list[AssetsFile], list[tuple[str, str]]]:
+    """Every `ASSETS_FILE_GLOB` file in `directory`, checked and in ascending
+    `fetch_finished_utc` (then name), and the refused ones as `(name,
+    reason)`: unreadable or not the recorder's shape, a naive or reversed
+    clock pair, or a fetch time after `now`, the import run's clock."""
+    if not directory.is_dir():
+        raise NotADirectoryError(f"{directory} is not a directory")
+    found: list[AssetsFile] = []
+    refused: list[tuple[str, str]] = []
+    for path in sorted(directory.glob(ASSETS_FILE_GLOB)):
+        if not path.is_file():
+            continue
+        try:
+            document = _read_assets_file(path)
+            started, finished = _snapshot_clocks(
+                _parse_instant(document["fetch_started_utc"], "fetch_started_utc"),
+                _parse_instant(document["fetch_finished_utc"], "fetch_finished_utc"),
+            )
+            if finished > now:
+                raise SnapshotClockError(
+                    f"fetch_finished_utc {finished.isoformat()} is after the run's clock "
+                    f"{now.isoformat()}: not yet known"
+                )
+        except (OSError, EOFError, ValueError) as exc:  # JSON, gzip and clock errors
+            refused.append((path.name, _clean(f"{type(exc).__name__}: {exc}", settings)))
+            continue
+        found.append(AssetsFile(path, started, finished))
+    found.sort(key=lambda item: (item.fetch_finished_utc, item.path.name))
+    return found, refused
+
+
+@dataclass(frozen=True)
+class AssetsImport:
+    """What `import_assets` did: one run per applied file (each `ok`, or the
+    `failed`/`locked` one that stopped the import), the files skipped as at
+    or before the latest observation, and the files refused with why."""
+
+    runs: tuple[SourceRun, ...]
+    skipped: tuple[str, ...]
+    refused: tuple[tuple[str, str], ...]
+
+    @property
+    def ok(self) -> bool:
+        """True when every run is `ok` and no file was refused."""
+        return all(run.status == OK for run in self.runs) and not self.refused
+
+    @property
+    def exit_code(self) -> int:
+        """0 when `ok`, else 1: a refused file is the owner's to look at."""
+        return 0 if self.ok else 1
+
+
+def import_assets(
+    settings: Settings,
+    directory: Path,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> AssetsImport:
+    """Apply the recorder's assets files in `directory` as snapshots (spec
+    "source, ingest and import"), with no request.
+
+    Files are taken in ascending `fetch_finished_utc`; each is stamped at its
+    own `fetch_finished_utc` (`ingested_at` = the clock when it is applied)
+    through the daily path's parser, guard and diff, and writes one `ok` run
+    row (mode `ASSETS_IMPORT_MODE`, cursor = its fetch time) in a transaction
+    of its own. A file at or before the latest observation is skipped and
+    counted, so a re-run adds nothing and a file recorded before a later
+    daily run never overwrites it. A refused file (`scan_assets_dir`) is
+    counted and the rest still apply. A file that fails to apply (the
+    truncation guard, a malformed asset) gets a failed run row and stops the
+    import; the files before it stay committed. A dry run applies every file
+    in one transaction, rolled back, so its counts are what a real import
+    would write, and writes no run row.
+    """
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    files, refused = scan_assets_dir(directory, now, settings)
+    runs: list[SourceRun] = []
+    skipped: list[str] = []
+
+    def apply(conn: duckdb.DuckDBPyConnection, item: AssetsFile) -> SourceRun | None:
+        observed = latest_assets_observation(conn)
+        if observed is not None and item.fetch_finished_utc <= observed:
+            skipped.append(item.path.name)
+            return None
+        started = ensure_tz_aware_utc(clock(), field_name="clock()")
+        rows, counts = _write_snapshot(
+            conn,
+            _read_assets_file(item.path)["assets"],
+            item.fetch_finished_utc,
+            started,
+            settings,
+        )
+        run = SourceRun(
+            ASSETS_SOURCE,
+            OK,
+            rows,
+            item.fetch_finished_utc.isoformat(),
+            _clean(f"{item.path.name}: {counts}", settings),
+        )
+        _write_run(conn, uuid.uuid4().hex, started, clock(), run, ASSETS_IMPORT_MODE)
+        return run
+
+    current: AssetsFile | None = None
+    dry: list[SourceRun] = []
+    try:
+        if dry_run:
+            with open_for_write(settings) as conn:
+                init_schema(conn)
+                for current in files:
+                    if (run := apply(conn, current)) is not None:
+                        dry.append(run)
+                raise _DryRun(0, "")
+        for current in files:
+            with open_for_write(settings) as conn:
+                init_schema(conn)
+                run = apply(conn, current)
+            if run is not None:
+                runs.append(run)
+    except _DryRun:
+        pass
+    except StoreLockedError as exc:
+        runs.append(SourceRun(ASSETS_SOURCE, LOCKED, 0, "", str(exc)))
+    except Exception as exc:  # one file failed to apply: its run row, then stop
+        cursor = "" if current is None else current.fetch_finished_utc.isoformat()
+        name = "" if current is None else f"{current.path.name}: "
+        message = _with_frames(f"{name}{type(exc).__name__}: {exc}", exc, settings)
+        failed = SourceRun(ASSETS_SOURCE, FAILED, 0, cursor, _clean(message, settings))
+        if not dry_run:  # a dry run keeps the counts before the failure (below)
+            failed = _record_only(
+                settings, uuid.uuid4().hex, now, clock, failed, ASSETS_IMPORT_MODE
+            )
+        runs.append(failed)
+    if dry_run:
+        runs = [
+            SourceRun(r.source, r.status, r.rows_added, r.chunk_cursor, f"dry run: {r.message}")
+            for r in dry
+        ] + runs
+    return AssetsImport(tuple(runs), tuple(skipped), tuple(refused))

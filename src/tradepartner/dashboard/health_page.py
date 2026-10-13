@@ -9,7 +9,10 @@ checks as status chips, per-source ingest status, survivorship gap,
 unclassifiable and `snapshot_static` reliance, settings, statement facts
 (issue 660, T77c: the switch's state, coverage and derived share while it
 is on, the last EDGAR run's `statement_*` counts and a warning badge while
-`statement_vintage_late > 0`), the coverage check against the named
+`statement_vintage_late > 0`), the borrow-status block (issue 1506,
+T171e: the switch, rows, the latest observation, the shortable and ETB
+counts at it, the last run and the stale and switch warnings), the coverage
+check against the named
 reference (issue 1541, T180: "not computed" until the viewer presses its
 button, since it costs one universe read per sample session; never computed
 on a refresh, whatever `coverage.check_enabled` says)); and the gap,
@@ -463,6 +466,31 @@ def _rates_card(report: HealthReport) -> None:
         )
 
 
+def _borrow_card(report: HealthReport) -> None:
+    """The borrow-status block (issue 1506, T171e): rows, assets, the latest
+    observation (the run cursor) and `known_at`, the shortable and ETB counts
+    at it, the last run's counts, and each warning as a badge."""
+    borrow = report.borrow
+    with st.container(border=True):
+        st.subheader("Borrow status")
+        state = "on" if borrow.enabled else "off"
+        st.markdown(f"Switch (`borrow.enabled`): **{state}**")
+        st.markdown(f"{borrow.rows} rows · {borrow.assets} assets")
+        st.caption(
+            f"Latest observation {header.when(borrow.latest_observation)} · "
+            f"latest known at {header.when(borrow.latest_known_at)}"
+        )
+        if borrow.latest_observation is not None:
+            st.markdown(
+                f"At the latest observation: {borrow.shortable} shortable, "
+                f"{borrow.easy_to_borrow} easy to borrow (active assets)"
+            )
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(borrow.run_counts.items()))
+        st.caption(f"Last snapshot run: {borrow.last_run_status or 'never'}; {counts or 'none'}")
+        for warning in borrow.warnings:
+            theme.status_badge(warning, "warning")
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -508,5 +536,6 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _survivorship_card(view.report)
         _statement_card(view.report)
         _rates_card(view.report)
+        _borrow_card(view.report)
         _coverage_card(view.report, settings.coverage.check_enabled)
     _tables(view.report)

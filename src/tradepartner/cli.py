@@ -403,10 +403,13 @@ from tradepartner.health import (
 )
 from tradepartner.ingest import (
     SOURCES,
+    AssetsImport,
     IngestResult,
     RestampResult,
     WindowEarlierOk,
     _read,
+    import_assets,
+    ingest_assets,
     ingest_rates,
     ingest_session,
     manifest_release,
@@ -451,6 +454,7 @@ from tradepartner.store import (
     research,
     schema,
 )
+from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import (
     StoreLockedError,
     open_for_write,
@@ -548,7 +552,7 @@ def _missing_secrets(settings: Settings, source: str) -> list[str]:
     missing: list[str] = []
     if source in ("all", "edgar") and _blank(settings.sec_edgar_user_agent):
         missing.append("SEC_EDGAR_USER_AGENT")
-    if source in ("all", "alpaca"):
+    if source in ("all", "alpaca", ASSETS_SOURCE):
         if _blank(settings.alpaca_api_key):
             missing.append("ALPACA_API_KEY")
         if _blank(settings.alpaca_api_secret):
@@ -569,6 +573,21 @@ def _print_result(result: IngestResult) -> None:
             f"{run.source}: {run.status}, {run.rows_added} rows, "
             f"cursor {run.chunk_cursor}: {run.message}"
         )
+
+
+def _print_import(result: AssetsImport) -> None:
+    """An `--import-dir` run: each applied file's run line, then the counts
+    and one line per refused file (each is the owner's to look at)."""
+    _print_result(IngestResult(result.runs))
+    applied = sum(run.status == "ok" for run in result.runs)
+    typer.echo(
+        f"{ASSETS_SOURCE} import: {applied} applied, {len(result.skipped)} skipped "
+        f"(at or before the latest observation), {len(result.refused)} refused"
+    )
+    for name in result.skipped:
+        typer.echo(f"skipped {name}")
+    for name, why in result.refused:
+        typer.echo(f"refused {name}: {why}")
 
 
 def _print_restamp(result: RestampResult, *, committed: bool) -> None:
@@ -633,6 +652,27 @@ def _quarantined(report: HealthReport) -> int:
             found = _QUARANTINED.findall(status.latest_message)
             return int(found[-1]) if found else 0
     return 0
+
+
+def _print_borrow(report: HealthReport) -> None:
+    """The borrow block (#1506, T171e): counts, the latest observation, the
+    shortable and ETB counts at it, the last run, then each warning."""
+    b = report.borrow
+    observed = b.latest_observation.isoformat() if b.latest_observation else "none"
+    known = b.latest_known_at.isoformat() if b.latest_known_at else "none"
+    at_it = (
+        f"; at it {b.shortable} shortable, {b.easy_to_borrow} easy_to_borrow (active)"
+        if b.latest_observation is not None
+        else ""
+    )
+    typer.echo(
+        f"borrow status: {b.rows} rows, {b.assets} assets; latest observation {observed}, "
+        f"latest known_at {known}{at_it}"
+    )
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(b.run_counts.items())) or "none"
+    typer.echo(f"  last {ASSETS_SOURCE} run: {b.last_run_status or 'never'}; {counts}")
+    for warning in b.warnings:
+        typer.echo(f"  warning: {warning}")
 
 
 def _print_report(report: HealthReport) -> None:
@@ -709,6 +749,7 @@ def _print_report(report: HealthReport) -> None:
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     _print_duplicate_dividends(report)
+    _print_borrow(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
@@ -1600,6 +1641,9 @@ def make_app(
     edgar_client: httpx.Client | None = None,
     price_source: Callable[[Settings], PriceSource] | None = None,
     rate_source: Callable[[Settings], RateSource] = lambda s: FredRateSource(settings=s),
+    assets_source: Callable[[Settings, Clock], alpaca_raw.AssetsFetch] = (
+        lambda s, c: alpaca_raw.assets_all(s, clock=c)
+    ),
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
@@ -1612,7 +1656,8 @@ def make_app(
     @app.command()
     def ingest(
         source: Annotated[
-            str, typer.Option(help="alpaca, edgar, fred or all", show_default=True)
+            str,
+            typer.Option(help="alpaca, edgar, fred, alpaca_assets or all", show_default=True),
         ] = "all",
         backfill_: Annotated[
             bool, typer.Option("--backfill", help="backfill from --since, resuming")
@@ -1678,12 +1723,27 @@ def make_app(
                 ),
             ),
         ] = None,
+        import_dir: Annotated[
+            Path | None,
+            typer.Option(
+                "--import-dir",
+                help=(
+                    "apply the recorder's assets-*.json.gz files as borrow snapshots, "
+                    "no request (#1506); with --source alpaca_assets"
+                ),
+            ),
+        ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
-        if source not in ("all", *SOURCES):
+        if source not in ("all", *SOURCES, ASSETS_SOURCE):
             raise _fail(
-                f"--source must be all, {' or '.join(SOURCES)}; got {source!r}", USAGE_ERROR
+                f"--source must be all, {' or '.join((*SOURCES, ASSETS_SOURCE))}; got {source!r}",
+                USAGE_ERROR,
             )
+        if import_dir is not None and source != ASSETS_SOURCE:
+            raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
+        if source == ASSETS_SOURCE and backfill_:
+            raise _fail(f"--source {ASSETS_SOURCE} has no backfill", USAGE_ERROR)
         if backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
         if fill_holes_ and not backfill_:
@@ -1698,7 +1758,7 @@ def make_app(
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
         ):
-            if given and (backfill_ or source in ("alpaca", "fred")):
+            if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE)):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
@@ -1755,6 +1815,13 @@ def make_app(
                 )
                 _print_holes(listed)
                 raise typer.Exit(listed.exit_code)
+        if import_dir is not None:  # no request: no secret needed
+            try:
+                imported = import_assets(s, import_dir, clock=clock, dry_run=dry_run)
+            except NotADirectoryError as exc:
+                raise _fail(f"--import-dir: {exc}", USAGE_ERROR) from None
+            _print_import(imported)
+            raise typer.Exit(imported.exit_code)
         missing = _missing_secrets(s, source)
         if missing:
             raise _fail(
@@ -1774,6 +1841,10 @@ def make_app(
                 all_rates = rate_source(s)
         if source == "fred":
             result = ingest_rates(s, rate_source(s), since=start, clock=clock, dry_run=dry_run)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
+        if source == ASSETS_SOURCE:
+            result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
             _print_result(result)
             raise typer.Exit(result.exit_code)
         filings = EdgarFilingSource(
@@ -1814,6 +1885,7 @@ def make_app(
                 restamp=restamp,
                 on_restamp=restamped.append,
                 restamp_window_ok=window_ok,
+                assets=lambda: assets_source(s, clock),
             )
         _print_result(result)
         for done in restamped:

@@ -526,3 +526,49 @@ def test_rates_card_shows_fixture_and_fred_attribution(
         "This product uses the FRED® API but is not endorsed or certified "
         "by the Federal Reserve Bank of St. Louis." in text
     )
+
+
+# --- Borrow status (#1506, T171e) ---------------------------------------------
+
+
+def test_borrow_card_shows_the_block_and_the_switch_warning(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    """The fixture's borrow rows, the latest observation from the run cursor,
+    the shortable and ETB counts at it, the last run's counts, and the
+    switch warning as a badge while `borrow.enabled` is off."""
+    _write(
+        store_path,
+        "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', 'alpaca_assets', 'session', 1, ?, ?)",
+        [
+            "borrow-1",
+            FINISHED - timedelta(hours=2),
+            FINISHED - timedelta(hours=2),
+            "2020-06-30T21:00:00+00:00",
+            "borrow_new=0; borrow_changed=1; borrow_vanished=1",
+        ],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Borrow status" in text
+    assert "Switch (`borrow.enabled`): **off**" in text
+    assert "11 rows · 6 assets" in text
+    assert "Latest observation 2020-06-30 21:00 UTC · latest known at 2020-06-30 21:00 UTC" in text
+    assert "At the latest observation: 5 shortable, 4 easy to borrow (active assets)" in text
+    assert "Last snapshot run: ok; changed 1, new 0, rows_added 1, vanished 1" in text
+    assert any("borrow.enabled is off" in str(m.value) for m in at.markdown)
+
+
+def test_borrow_card_with_no_observation_and_the_switch_on(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("BORROW__ENABLED", "true")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Switch (`borrow.enabled`): **on**" in text
+    assert "Latest observation never" in text
+    assert "At the latest observation" not in text
+    assert "Last snapshot run: never; none" in text
+    assert any("no borrow snapshot observed" in str(m.value) for m in at.markdown)

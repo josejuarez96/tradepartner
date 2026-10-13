@@ -145,6 +145,14 @@ def _default_edgar_cache_dir() -> str:
     return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
 
 
+def _default_alpaca_assets_dir() -> str:
+    """`data/alpaca_assets` (the borrow snapshot's raw keep, #1506 spec open
+    question 17), anchored to the project root like `edgar.cache_dir`, so a
+    scheduled run from another working directory keeps its files beside the
+    store; gitignored by `data/*`."""
+    return str(Path(__file__).resolve().parents[2] / "data" / "alpaca_assets")
+
+
 def _default_research_data_dir() -> str:
     """`data/research` (the research store, research-labeling spec Definitions and
     ADR 0013 point 3), anchored to the project root like `edgar.cache_dir`, so a
@@ -903,6 +911,30 @@ class HealthConfig(_ClosedConfig):
     """
 
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class BorrowConfig(_ClosedConfig):
+    """The borrow-status snapshot (data-foundation spec req 19, amendment
+    2026-10-11 #1506; ADR 0021): the daily `GET /v2/assets` ingest
+    (`ingest --source alpaca_assets`) and its health block.
+
+    `enabled` puts the snapshot last under `ingest --source all`; off, that
+    run makes no assets request and writes nothing for it (an explicit
+    `--source alpaca_assets` runs either way; T171d flips the default once the
+    import and the first daily run have passed). `max_stale_sessions` is how
+    many XNYS sessions the latest observation may trail the last completed
+    session before `health` warns. `max_vanished_share` is the truncation
+    guard: a snapshot that would mark more than this share of the stored
+    present assets as vanished is refused with a failed run row and no table
+    write. `raw_dir` (default `data/alpaca_assets` under the project root)
+    keeps each daily payload gzipped in the recorder's file shape
+    (`--import-dir` reads the same shape); empty turns the keep off.
+    """
+
+    enabled: bool = False
+    max_stale_sessions: int = Field(default=2, ge=0)
+    max_vanished_share: float = Field(default=0.05, ge=0.0, le=1.0)
+    raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
 
 
 class AdjustConfig(_ClosedConfig):
@@ -2053,6 +2085,8 @@ class Settings(BaseSettings):
     # Phase 2 (spec req 11), #1575: the `health` command's own thresholds. Last
     # in the list so a new health key never shifts another section's position.
     health: HealthConfig = Field(default_factory=HealthConfig)
+    # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
+    borrow: BorrowConfig = Field(default_factory=BorrowConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
