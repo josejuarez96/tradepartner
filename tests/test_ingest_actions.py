@@ -401,3 +401,22 @@ def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
         "SELECT security_id, source_action_id, known_at FROM corporate_actions "
         "WHERE action_type = 'spinoff'"
     ).fetchall() == [("CHILD", "PARENT", stamp)]
+
+
+def test_symbol_change_revision_is_stamped_at_ingest(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    from tradepartner.adapters.prices import SymbolChange
+    from tradepartner.ingest import _add_symbol_changes
+
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    row = SymbolChange("S1", "OLD", "NEW", "A", "B", date(2020, 12, 1), first, "alpaca", "rename-1")
+    assert _add_symbol_changes(conn, [row], ingested_at=first - timedelta(microseconds=1)) == 0
+    assert _add_symbol_changes(conn, [row], ingested_at=first) == 1
+    assert _add_symbol_changes(conn, [row], ingested_at=first + timedelta(days=1)) == 0
+    changed = replace(row, new_cusip="C")
+    revised = first + timedelta(days=2)
+    assert _add_symbol_changes(conn, [changed], ingested_at=revised) == 1
+    assert conn.execute(
+        "SELECT new_cusip, known_at FROM symbol_changes ORDER BY known_at"
+    ).fetchall() == [("B", first), ("C", revised)]

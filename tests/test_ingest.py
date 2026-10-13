@@ -4222,3 +4222,244 @@ def test_recorded_source_keeps_the_partial_filename_ciks_after_the_freeze() -> N
     assert recorded.filename_listings("0000000994") == []
     recorded.frozen = True
     assert recorded.filename_incomplete_ciks == {"0000000993"}
+
+
+def test_actions_backfill_floor_dry_run_and_idempotent_month(
+    fixture_store_path: Path,
+) -> None:
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    calls: list[tuple[tuple[CorporateActionsType, ...], date, date]] = []
+
+    def scan(types: Sequence[CorporateActionsType], start: date, end: date) -> dict[str, Any]:
+        calls.append((tuple(types), start, end))
+        return {
+            "spin_offs": [
+                {
+                    "source_symbol": "SPY",
+                    "new_symbol": "MTUM",
+                    "ex_date": "2020-06-15",
+                    "process_date": "2020-06-16",
+                    "source_rate": 4,
+                    "new_rate": 1,
+                }
+            ],
+            "name_changes": [
+                {
+                    "id": "rename-2020-1",
+                    "old_symbol": "SPY",
+                    "new_symbol": "SPYNEW",
+                    "old_cusip": "OLD",
+                    "new_cusip": "NEW",
+                    "process_date": "2020-06-16",
+                }
+            ],
+        }
+
+    now = datetime(2020, 7, 2, 20, tzinfo=UTC)
+    with pytest.raises(ValueError, match="2020-06-01"):
+        ingest_actions_backfill(
+            settings,
+            since=date(2020, 5, 1),
+            through=date(2020, 5, 31),
+            clock=lambda: now,
+            scan=scan,
+        )
+    assert calls == []
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        before = conn.execute(
+            "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
+        ).fetchone()[0]
+    dry = ingest_actions_backfill(
+        settings,
+        since=date(2020, 6, 1),
+        through=date(2020, 6, 30),
+        clock=lambda: now,
+        scan=scan,
+        dry_run=True,
+    )
+    assert dry.runs[0].rows_added == 2
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
+            ).fetchone()[0]
+            == before
+        )
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM symbol_changes WHERE source_action_id='rename-2020-1'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT count(*) FROM ingestion_runs WHERE mode='actions'").fetchone()[0]
+            == 0
+        )
+    first = ingest_actions_backfill(
+        settings, since=date(2020, 6, 1), through=date(2020, 6, 30), clock=lambda: now, scan=scan
+    )
+    second = ingest_actions_backfill(
+        settings, since=date(2020, 6, 1), through=date(2020, 6, 30), clock=lambda: now, scan=scan
+    )
+    assert first.runs[0].rows_added == 2 and second.runs[0].rows_added == 0
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM corporate_actions WHERE action_type='spinoff'"
+            ).fetchone()[0]
+            == before + 1
+        )
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM ingestion_runs WHERE mode='actions' AND status='filled'"
+            ).fetchone()[0]
+            == 2
+        )
+        assert conn.execute(
+            "SELECT security_id, old_symbol, new_symbol FROM symbol_changes "
+            "WHERE source_action_id='rename-2020-1'"
+        ).fetchall() == [("SEC_SPY", "SPY", "SPYNEW")]
+    assert (
+        calls
+        == [
+            (
+                (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE),
+                date(2020, 6, 1),
+                date(2020, 6, 30),
+            )
+        ]
+        * 3
+    )
+
+
+def test_daily_fixture_stores_spinoff_and_symbol_change_once(
+    fixture_store_path: Path,
+) -> None:
+    from tradepartner.adapters.fixture_prices import FixturePriceSource
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    prices = FixturePriceSource(Path(__file__).parent / "fixtures" / "universe")
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute("DELETE FROM corporate_actions WHERE action_type = 'spinoff'")
+        conn.execute("DELETE FROM symbol_changes")
+    rename_at = datetime(2018, 11, 8, 22, tzinfo=UTC)
+    spin_at = datetime(2018, 12, 14, 22, tzinfo=UTC)
+    rename = _run(settings, prices=prices, now=rename_at, source="alpaca")
+    spin = _run(settings, prices=prices, now=spin_at, source="alpaca")
+    assert rename.ok and spin.ok, (rename.runs, spin.runs)
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute("SELECT security_id, known_at FROM symbol_changes").fetchall() == [
+            ("SEC_TICKCHANGE", datetime(2018, 11, 8, 21, tzinfo=UTC))
+        ]
+        assert conn.execute(
+            "SELECT security_id, source_action_id, known_at FROM corporate_actions "
+            "WHERE action_type = 'spinoff'"
+        ).fetchall() == [
+            ("SEC_SPLIT_PLAIN", "SEC_TICKCHANGE", datetime(2018, 12, 14, 21, tzinfo=UTC))
+        ]
+    again = _run(settings, prices=prices, now=spin_at, source="alpaca")
+    assert again.ok
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM corporate_actions WHERE action_type = 'spinoff'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone()[0] == 1
+
+
+def test_actions_backfill_writes_one_filled_run_per_process_month(
+    fixture_store_path: Path,
+) -> None:
+    from tradepartner.backfill import _resume_from
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    scanned: list[tuple[date, date]] = []
+
+    def scan(_types: Sequence[Any], first: date, last: date) -> dict[str, Any]:
+        scanned.append((first, last))
+        return {"spin_offs": [], "name_changes": []}
+
+    result = ingest_actions_backfill(
+        settings,
+        since=date(2020, 6, 1),
+        through=date(2020, 8, 17),
+        clock=lambda: datetime(2020, 9, 1, 21, tzinfo=UTC),
+        scan=scan,
+    )
+    assert result.ok and [run.status for run in result.runs] == ["filled"] * 3
+    assert scanned == [
+        (date(2020, 6, 1), date(2020, 6, 30)),
+        (date(2020, 7, 1), date(2020, 7, 31)),
+        (date(2020, 8, 1), date(2020, 8, 17)),
+    ]
+    assert _resume_from(settings, date(2020, 6, 1)) == date(2020, 6, 1)
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT mode, status, rows_added FROM ingestion_runs ORDER BY chunk_cursor"
+            ).fetchall()
+            == [("actions", "filled", 0)] * 3
+        )
+
+
+def test_actions_backfill_retries_unresolved_child_with_original_stamp(
+    fixture_store_path: Path,
+) -> None:
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    payload = {
+        "spin_offs": [
+            {
+                "source_symbol": "SPY",
+                "new_symbol": "LATECHILD",
+                "ex_date": "2020-06-15",
+                "process_date": "2020-06-16",
+                "source_rate": 4,
+                "new_rate": 1,
+            }
+        ],
+        "name_changes": [],
+    }
+    now = datetime(2020, 7, 2, 21, tzinfo=UTC)
+
+    def scan(_types: Sequence[Any], _first: date, _last: date) -> dict[str, Any]:
+        return payload
+
+    def run() -> IngestResult:
+        return ingest_actions_backfill(
+            settings,
+            since=date(2020, 6, 1),
+            through=date(2020, 6, 30),
+            clock=lambda: now,
+            scan=scan,
+        )
+
+    first = run()
+    assert first.ok and first.runs[0].rows_added == 0
+    assert "actions_unresolved=1" in first.runs[0].message
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, class_title, "
+            "valid_from, known_at, ingested_at, source, provenance) "
+            "VALUES ('SEC_SPLIT_PLAIN', 'LATECHILD', 'NYSE', 'Common Stock', "
+            "DATE '2020-06-15', TIMESTAMPTZ '2020-06-01 20:00:00+00', "
+            "TIMESTAMPTZ '2020-06-01 20:00:00+00', 'fixture', 'snapshot_static')"
+        )
+    second = run()
+    assert second.ok and second.runs[0].rows_added == 1
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert conn.execute(
+            "SELECT security_id, source_action_id, known_at FROM corporate_actions "
+            "WHERE action_type='spinoff' AND ex_date=DATE '2020-06-15'"
+        ).fetchall() == [
+            ("SEC_SPLIT_PLAIN", "SEC_SPY", announcement_date_known_at(date(2020, 6, 16)))
+        ]

@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pytest
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
@@ -424,3 +424,53 @@ def test_session_bounds_never_end_after_the_last_session() -> None:
         )
         assert capped <= session_end
         assert capped <= now - timedelta(minutes=15)
+
+
+def test_actions_scan_is_symbol_less_and_uncapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from alpaca.data.enums import CorporateActionsType
+
+    requests: list[CorporateActionsRequest] = []
+
+    def fake_get(
+        self: CorporateActionsClient, request_params: CorporateActionsRequest
+    ) -> dict[str, Any]:
+        requests.append(request_params)
+        return {"spin_offs": [], "name_changes": []}
+
+    monkeypatch.setattr(CorporateActionsClient, "get_corporate_actions", fake_get)
+    alpaca_raw.corporate_actions_scan(
+        [CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE],
+        date(2020, 6, 1),
+        date(2020, 6, 30),
+        settings=_settings(),
+    )
+    assert len(requests) == 1
+    fields = requests[0].to_request_fields()
+    assert "symbols" not in fields and "limit" not in fields
+    assert requests[0].types == [CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE]
+
+
+def test_symbol_less_actions_scan_follows_sdk_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pages: list[str | None] = []
+
+    def fake_get(self: CorporateActionsClient, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        assert path == "/corporate-actions"
+        assert "symbols" not in data
+        pages.append(data.get("page_token"))
+        token = data.get("page_token")
+        return {
+            "corporate_actions": {"spin_offs": [{"id": "second" if token else "first"}]},
+            "next_page_token": None if token else "page-2",
+        }
+
+    monkeypatch.setattr(CorporateActionsClient, "get", fake_get)
+    result = alpaca_raw.corporate_actions_scan(
+        [CorporateActionsType.SPIN_OFF],
+        date(2020, 6, 1),
+        date(2020, 6, 30),
+        settings=_settings(),
+    )
+    assert pages == [None, "page-2"]
+    assert [row["id"] for row in result["spin_offs"]] == ["first", "second"]

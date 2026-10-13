@@ -26,6 +26,7 @@ from tradepartner.adapters.broker import (
     Side,
 )
 from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
 from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
@@ -914,7 +915,8 @@ def test_accepts_spinoff_child_of_a_residue(
     # The module's documented convention: a `spinoff` corporate_actions row
     # keyed by the child, with `source_action_id` naming the parent.
     ex_date = (stop_at + timedelta(days=2)).date()
-    known_at = stop_at + timedelta(days=5)
+    process_date = (stop_at + timedelta(days=4)).date()
+    known_at = announcement_date_known_at(process_date)
     _insert_action(
         settings,
         security_id=CHILD,
@@ -1277,7 +1279,7 @@ def test_refuses_spinoff_quantity_mismatch(
         action_type="spinoff",
         ex_date=(stop_at + timedelta(days=2)).date(),
         ratio_or_amount=0.2,
-        known_at=stop_at + timedelta(days=5),
+        known_at=announcement_date_known_at((stop_at + timedelta(days=4)).date()),
         source_action_id=SPY,
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)

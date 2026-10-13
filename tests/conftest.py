@@ -559,6 +559,7 @@ def version_4_store(path: Path) -> Path:
             + schema._FILING_EVENTS_TABLE_DDL
             + schema._RATES_TABLE_DDL
             + schema._BORROW_STATUS_TABLE_DDL
+            + schema._SYMBOL_CHANGES_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)

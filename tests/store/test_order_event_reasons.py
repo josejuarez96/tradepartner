@@ -200,6 +200,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
         24,
         25,
         26,
+        27,
     ]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
@@ -256,6 +257,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             24,
             25,
             26,
+            27,
         ]
 
 
@@ -378,7 +380,28 @@ def test_write_open_of_a_version_8_store_migrates_to_9_and_keeps_every_row(
     assert overrides_after == overrides_before
     assert [row[0] for row in overrides_after] == [3, 1, 2]
     assert order_ids == [(None,)] * 3
-    assert versions == [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+    assert versions == [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+    ]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -410,6 +433,7 @@ def test_a_version_8_store_reopens_at_current_without_another_version_row(tmp_pa
             24,
             25,
             26,
+            27,
         ]
 
 

@@ -309,6 +309,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
+from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.calendar import (
     all_sessions,
@@ -397,6 +398,8 @@ SESSION_HOLES = "session_holes"
 RATE_KNOWN_AT = "rates_known_at_from_vintage"
 RATE_UNIQUE = "rates_unique"
 RATE_VALUE_FINITE = "rates_value_finite"
+SPINOFF_KNOWN_AT_FLOOR = "spinoff_known_at_floor"
+SYMBOL_CHANGE_KNOWN_AT = "symbol_changes_known_at_from_process_date"
 #: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
 
@@ -423,6 +426,8 @@ INTEGRITY_RULES: tuple[str, ...] = (
     RATE_KNOWN_AT,
     RATE_UNIQUE,
     RATE_VALUE_FINITE,
+    SPINOFF_KNOWN_AT_FLOOR,
+    SYMBOL_CHANGE_KNOWN_AT,
     DUPLICATE_DIVIDENDS,
 )
 
@@ -1916,6 +1921,7 @@ def _integrity_checks(
         **_filing_event_rules(conn, settings),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
+        **_new_action_stamp_rules(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
@@ -1959,6 +1965,46 @@ def _rate_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
         RATE_KNOWN_AT: pl.DataFrame(bad_stamp, schema=_RATE_RULE_SCHEMA),
         RATE_UNIQUE: pl.DataFrame(duplicates, schema=_RATE_RULE_SCHEMA),
         RATE_VALUE_FINITE: pl.DataFrame(bad_value, schema=_RATE_RULE_SCHEMA),
+    }
+
+
+_ACTION_STAMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Reject spin-offs before their ex-date proxy and mis-stamped renames."""
+    tables = _present_tables(conn)
+    bad_spin: list[dict[str, Any]] = []
+    if "corporate_actions" in tables:
+        rows = conn.execute(
+            "SELECT security_id, ex_date, known_at FROM corporate_actions "
+            "WHERE action_type = 'spinoff'"
+        ).fetchall()
+        for security_id, ex_date, stamp in rows:
+            try:
+                floor = session_close(previous_session(ex_date))
+            except (ValueError, IndexError):
+                floor = None
+            if floor is None or stamp < floor:
+                bad_spin.append({"security_id": security_id, "known_at": stamp})
+    bad_change: list[dict[str, Any]] = []
+    if "symbol_changes" in tables:
+        rows = conn.execute(
+            "SELECT security_id, process_date, known_at FROM symbol_changes"
+        ).fetchall()
+        for security_id, process_date, stamp in rows:
+            try:
+                expected = announcement_date_known_at(process_date)
+            except (ValueError, IndexError):
+                expected = None
+            if stamp != expected:
+                bad_change.append({"security_id": security_id, "known_at": stamp})
+    return {
+        SPINOFF_KNOWN_AT_FLOOR: pl.DataFrame(bad_spin, schema=_ACTION_STAMP_SCHEMA),
+        SYMBOL_CHANGE_KNOWN_AT: pl.DataFrame(bad_change, schema=_ACTION_STAMP_SCHEMA),
     }
 
 

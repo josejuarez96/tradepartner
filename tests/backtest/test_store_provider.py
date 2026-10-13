@@ -455,6 +455,11 @@ def test_late_dividends(store: Store) -> None:
         late = provider.late_dividends(T_FEB, T_MAR, ids)
         not_yet = provider.late_dividends(T_JAN, T_FEB, ids)
         other_ids = provider.late_dividends(T_FEB, T_MAR, ["SEC_DIV_REVISED"])
+        spinoff_window = provider.late_dividends(
+            session_close(date(2018, 12, 13)),
+            session_close(date(2018, 12, 14)),
+            ["SEC_SPLIT_PLAIN"],
+        )
     # First known 2019-03-05 for an ex-date before 2019-02-28. The revised
     # dividend was first known before T_FEB, so its revision is not late,
     # and SEC_DUAL_B's goes ex after 2019-02-28, so it is not late either.
@@ -462,7 +467,7 @@ def test_late_dividends(store: Store) -> None:
         ("SEC_DUAL_A", date(2019, 1, 15), 0.05)
     ]
     assert late["known_at"].to_list() == [datetime(2019, 3, 5, 21, 0, tzinfo=UTC)]
-    assert not_yet.is_empty() and other_ids.is_empty()
+    assert not_yet.is_empty() and other_ids.is_empty() and spinoff_window.is_empty()
 
 
 def test_static_listing_count(store: Store) -> None:

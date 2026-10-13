@@ -719,7 +719,7 @@ def test_known_at_after_ingested_at_fails_its_rule(
     loose = _unconstrained(fixture_store)
     loose.execute(
         "UPDATE corporate_actions SET ingested_at = known_at - INTERVAL 1 DAY "
-        "WHERE security_id = 'SEC_SPLIT_PLAIN'"
+        "WHERE security_id = 'SEC_SPLIT_PLAIN' AND action_type = 'split'"
     )
     checks = integrity_checks(loose, T_END, _settings())
     assert _failed(checks) == {KNOWN_AT_NOT_AFTER_INGESTED_AT}
@@ -2962,3 +2962,25 @@ def test_a_pending_packaged_key_keeps_health_ok(
     report = health_report(fixture_store, T_END, _settings())
     assert report.ok, report.failures
     assert [g.security_id for g in report.duplicate_dividends.pending] == [aiv.security_id]
+
+
+def test_new_action_stamp_rules_fail_on_early_rows_and_pass_fixture(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    from tradepartner.health import SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT
+
+    settings = _settings()
+    report = health_report(fixture_store, T_END, settings)
+    for rule in (SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT):
+        assert next(check for check in report.integrity if check.rule == rule).passed
+
+    fixture_store.execute(
+        "UPDATE corporate_actions SET known_at = TIMESTAMPTZ '2018-12-10 21:00:00+00' "
+        "WHERE action_type = 'spinoff'"
+    )
+    fixture_store.execute(
+        "UPDATE symbol_changes SET known_at = TIMESTAMPTZ '2018-11-07 21:00:00+00'"
+    )
+    report = health_report(fixture_store, T_END, settings)
+    for rule in (SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT):
+        assert not next(check for check in report.integrity if check.rule == rule).passed

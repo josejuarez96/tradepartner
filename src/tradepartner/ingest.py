@@ -196,6 +196,7 @@ from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Se
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -216,7 +217,7 @@ from tradepartner.adapters.filings import (
     FilingSource,
     StatementFactRecord,
 )
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateObservation, RateSource, rate_known_at
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
@@ -267,6 +268,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
+ACTIONS_FILLED = "filled"
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -324,7 +326,7 @@ class IngestResult:
 
     @property
     def ok(self) -> bool:
-        return all(run.status == OK for run in self.runs)
+        return all(run.status in (OK, ACTIONS_FILLED) for run in self.runs)
 
     @property
     def exit_code(self) -> int:
@@ -657,6 +659,102 @@ def ingest_session(
     return IngestResult(tuple(runs))
 
 
+def ingest_actions_backfill(
+    settings: Settings,
+    *,
+    since: date,
+    through: date | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    scan: Callable[[Sequence[Any], date, date], Mapping[str, Any]] | None = None,
+) -> IngestResult:
+    """Scan spin-offs and name changes by process-date month, without symbols.
+
+    Each month is an independent source chunk in mode ``actions``. A dry run
+    fetches and reports each month while rolling its fact writes and run row
+    back. The ordinary backfill resume cursor ignores this mode and status.
+    """
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters import alpaca_raw
+    from tradepartner.adapters.alpaca_prices import parse_corporate_actions
+    from tradepartner.backfill import month_windows
+    from tradepartner.repair import store_resolver
+
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError("since must be a date")
+    if since < settings.alpaca.actions_backfill_floor:
+        raise ValueError(
+            f"actions backfill starts at {settings.alpaca.actions_backfill_floor}; "
+            "earlier symbol-less coverage is unknown"
+        )
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    through = through or now.astimezone(_NEW_YORK).date()
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
+    types = (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE)
+
+    def run_month(first: date, last: date) -> SourceRun:
+        prepared: dict[str, Any] = {}
+
+        def prepare() -> None:
+            with _read(settings) as conn:
+                resolver = store_resolver(conn, now, settings)
+            payload = fetch(types, first, last)
+            prepared["parsed"] = parse_corporate_actions(
+                payload,
+                resolver.resolve,
+                partial(resolver.lead, actions=True),
+                process_start=first,
+                process_end=last,
+                lag_days=settings.alpaca.actions_process_lag_days,
+                stock_rules=settings.alpaca,
+            )
+
+        def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+            parsed = prepared["parsed"]
+            stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+            counts: dict[str, int] = {}
+            added = _add_actions(
+                conn, parsed.actions, (first, last), ingested_at=stamp, stats=counts
+            )
+            added += _add_symbol_changes(
+                conn, parsed.symbol_changes, ingested_at=stamp, stats=counts
+            )
+            counts["actions_unresolved"] = len(parsed.unresolved)
+            counts["actions_self_spinoff"] = parsed.self_spinoff
+            counts["symbol_change_reused"] = parsed.symbol_change_reused
+            counts["symbol_change_conflict"] = parsed.symbol_change_conflict
+            message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            return (
+                added,
+                f"{first}..{last}: {len(parsed.actions)} spin-off action(s), "
+                f"{len(parsed.symbol_changes)} name change(s); {message}",
+            )
+
+        return _run_source(
+            "alpaca",
+            write,
+            settings,
+            now,
+            clock,
+            f"actions;since={since};through={last}",
+            dry_run,
+            mode="actions",
+            prepare=prepare,
+            success_status=ACTIONS_FILLED,
+        )
+
+    runs: list[SourceRun] = []
+    for first, last in month_windows(since, through):
+        run = run_month(first, last)
+        runs.append(run)
+        if run.status != ACTIONS_FILLED:
+            break
+    return IngestResult(tuple(runs))
+
+
 def _run_source(
     name: str,
     work: Callable[[duckdb.DuckDBPyConnection, str], tuple[int, str]],
@@ -668,6 +766,7 @@ def _run_source(
     mode: str = MODE,
     prepare: Callable[[], object] | None = None,
     after_commit: Callable[[], None] | None = None,
+    success_status: str = OK,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
     `work` (given the run row's id) inside one write transaction with the
@@ -690,10 +789,10 @@ def _run_source(
             rows, message = work(conn, run_id)
             if dry_run:
                 raise _DryRun(rows, message)
-            run = outcome(OK, rows, message)
+            run = outcome(success_status, rows, message)
             _write_run(conn, run_id, now, clock(), run, mode)
     except _DryRun as dry:
-        return outcome(OK, dry.rows, f"dry run: {dry}")
+        return outcome(success_status, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
@@ -2368,6 +2467,7 @@ class _PriceFetch:
     bars: tuple[Bar, ...]
     runs: tuple[tuple[date, date], ...]
     actions: tuple[CorporateAction, ...]
+    symbol_changes: tuple[SymbolChange, ...]
     action_window: tuple[date, date]
     covered: tuple[date, date]
     ingested_at: datetime
@@ -2424,6 +2524,9 @@ def _fetch_prices(
         ]
     action_window = (runs[0][0].replace(day=1), session)
     actions = prices.corporate_actions(every, *action_window)
+    action_summary = prices.resolution_summary()
+    changes = prices.symbol_changes(every, *action_window)
+    change_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
@@ -2448,12 +2551,14 @@ def _fetch_prices(
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
-    if resolution := prices.resolution_summary():
-        message += f"; {resolution}"
+    for resolution in (action_summary, change_summary):
+        if resolution and resolution not in message:
+            message += f"; {resolution}"
     return _PriceFetch(
         tuple(bars),
         tuple(runs),
         tuple(actions),
+        tuple(changes),
         action_window,
         covered,
         ingested_at,
@@ -2579,10 +2684,18 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
             where="AND session BETWEEN ? AND ?",
             params=[first, last],
         )
+    stats: dict[str, int] = {}
     added += _add_actions(
-        conn, fetched.actions, fetched.action_window, ingested_at=at, covered=fetched.covered
+        conn,
+        fetched.actions,
+        fetched.action_window,
+        ingested_at=at,
+        covered=fetched.covered,
+        stats=stats,
     )
-    return added, fetched.message
+    added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
+    counts = "; ".join(f"{key}={value}" for key, value in sorted(stats.items()))
+    return added, fetched.message + (f"; {counts}" if counts else "")
 
 
 @contextmanager
@@ -2993,6 +3106,7 @@ def _add_actions(
     *,
     ingested_at: datetime,
     covered: tuple[date, date] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> int:
     """Write `actions` (from `_replay_actions`, covering ex-dates in
     `covered`, default `window`) by identity; return the rows added.
@@ -3018,11 +3132,13 @@ def _add_actions(
     is not a withdrawal. An id-less key re-dated out of `window` is not
     seen, so both keys stay live; sources with ids (Alpaca) avoid that.
     """
-    rows = [
-        _action_row(action, ingested_at)
-        for action in actions
-        if not (action.action_type.value == "spinoff" and action.known_at > ingested_at)
-    ]
+    rows = []
+    for action in actions:
+        if action.action_type.value == "spinoff" and action.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        rows.append(_action_row(action, ingested_at))
     history = _stored_actions(conn, rows, window)
     first, last = window
     lo, hi = covered or window
@@ -3109,6 +3225,70 @@ def _add_actions(
             )
         insert_row(conn, "corporate_actions", new)
     return len(new_rows)
+
+
+def _symbol_change_row(change: SymbolChange, ingested_at: datetime) -> Row:
+    return {
+        "security_id": change.security_id,
+        "old_symbol": change.old_symbol,
+        "new_symbol": change.new_symbol,
+        "old_cusip": change.old_cusip,
+        "new_cusip": change.new_cusip,
+        "process_date": change.process_date,
+        "source_action_id": change.source_action_id,
+        "known_at": change.known_at,
+        "ingested_at": ingested_at,
+        "source": change.source,
+        "provenance": "action",
+    }
+
+
+def _symbol_change_identity(row: Mapping[str, Any]) -> _Identity:
+    if row["source_action_id"]:
+        return (row["security_id"], "source_action_id", row["source_action_id"])
+    return (row["security_id"], row["old_symbol"], row["new_symbol"], row["process_date"])
+
+
+def _add_symbol_changes(
+    conn: duckdb.DuckDBPyConnection,
+    changes: Sequence[SymbolChange],
+    *,
+    ingested_at: datetime,
+    stats: dict[str, int] | None = None,
+) -> int:
+    """Write only newly knowable name changes and revisions of their identity."""
+    ids = sorted({change.security_id for change in changes})
+    if not ids:
+        return 0
+    cursor = conn.execute("SELECT * FROM symbol_changes WHERE list_contains(?, security_id)", [ids])
+    names = [column[0] for column in cursor.description]
+    history: dict[_Identity, list[Row]] = defaultdict(list)
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        history[_symbol_change_identity(row)].append(row)
+    for rows in history.values():
+        rows.sort(key=lambda row: row["known_at"])
+    incoming: dict[_Identity, Row] = {}
+    for change in sorted(changes, key=lambda c: c.known_at):
+        if change.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        row = _symbol_change_row(change, ingested_at)
+        incoming[_symbol_change_identity(row)] = row
+    fields = ("old_symbol", "new_symbol", "old_cusip", "new_cusip", "process_date")
+    added = 0
+    for identity, row in incoming.items():
+        revisions = _current(
+            row,
+            history.get(identity, []),
+            ingested_at,
+            lambda a, b: all(a[field] == b[field] for field in fields),
+        )
+        for revision in revisions:
+            insert_row(conn, "symbol_changes", revision)
+            added += 1
+    return added
 
 
 # --- writing only what changes an as-of read --------------------------------

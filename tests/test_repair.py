@@ -1120,3 +1120,59 @@ def test_an_absent_retract_id_is_already_repaired_only_beside_one_kept_row(
     with pytest.raises(RepairRefused, match="stale"):
         _retract(dividends, reviewed=[entry], expect=0, release=REL)
     assert _actions(dividends) == ALL_ACTIONS
+
+
+def test_repair_judges_spinoff_parent_and_child_separately_from_dividend(
+    store: Settings,
+) -> None:
+    ex = date(2021, 6, 15)
+    child = "0000000003"
+    with open_for_write(store) as conn:
+        insert_row(conn, "listings", _listing(child, "CHILD", ex))
+        valid = {
+            **_dividend(child, ex),
+            "action_type": "spinoff",
+            "ratio_or_amount": 0.25,
+            "source_action_id": LIVE,
+            "known_at": session_close(ex),
+        }
+        bad = {
+            **_dividend(DEAD, ex),
+            "action_type": "spinoff",
+            "ratio_or_amount": 0.25,
+            "source_action_id": LIVE,
+            "known_at": session_close(ex),
+        }
+        insert_row(conn, "corporate_actions", valid)
+        insert_row(conn, "corporate_actions", bad)
+        insert_row(conn, "corporate_actions", _dividend(child, ex))
+        insert_row(
+            conn,
+            "symbol_changes",
+            {
+                "security_id": child,
+                "old_symbol": "OLD",
+                "new_symbol": "NEW",
+                "old_cusip": "",
+                "new_cusip": "",
+                "process_date": ex,
+                "source_action_id": "rename-1",
+                "known_at": session_close(ex),
+                "ingested_at": session_close(ex),
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+    dry = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert dry.found.spinoffs == {(DEAD, ex): 1}
+    assert dry.unjudged_symbol_changes == 1
+    assert "1 symbol_changes rows unjudged" in dry.summary()
+    assert (child, ex) in dry.found.actions
+    assert (child, ex) not in dry.found.spinoffs
+    assert dry.action_rows == 3  # one existing bad dividend, one same-day, one spin-off
+    repair_resolution(store, clock=lambda: RUN, expect=(dry.bar_rows, dry.action_rows), release=REL)
+    assert _rows(
+        store,
+        "SELECT action_type, security_id FROM corporate_actions "
+        "WHERE ex_date='2021-06-15' ORDER BY 1,2",
+    ) == [("spinoff", child)]

@@ -44,12 +44,15 @@ from tradepartner.store.asof import (
     facts_as_of,
     filing_events_as_of,
     listings_as_of,
+    live_actions_as_of,
+    price_jumps_as_of,
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
     symbol_changes_as_of,
 )
 from tradepartner.store.db import configure_connection, insert_row
+from tradepartner.universe import universe_as_of
 
 
 def _one(df: pl.DataFrame, **match: object) -> dict[str, object]:
@@ -2116,3 +2119,31 @@ def test_symbol_changes_as_of_revision_and_no_lookahead(
     assert symbol_changes_as_of(synthetic_store, revised, security_ids=[]).is_empty()
     with pytest.raises(TypeError, match="tz-aware datetime"):
         symbol_changes_as_of(synthetic_store, date(2020, 12, 2))  # type: ignore[arg-type]
+
+
+def test_spinoff_row_does_not_change_existing_action_consumers(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The paper-window reader may see spin-offs; other action readers stay pinned."""
+    t = datetime(2020, 1, 2, 21, tzinfo=UTC)
+    settings = Settings(_env_file=None)
+
+    def frame() -> tuple[pl.DataFrame, ...]:
+        return (
+            adjusted_prices_as_of(fixture_store, t, settings=settings),
+            adjusted_prices_as_of(fixture_store, t, settings=settings, include_dividends=True),
+            dropped_dividends_as_of(fixture_store, t, settings=settings),
+            price_jumps_as_of(fixture_store, t, settings=settings),
+        )
+
+    present = frame()
+    universe_present = universe_as_of(fixture_store, t, settings)
+    assert (
+        live_actions_as_of(fixture_store, t).filter(pl.col("action_type") == "spinoff").height == 1
+    )
+    fixture_store.execute("DELETE FROM corporate_actions WHERE action_type = 'spinoff'")
+    absent = frame()
+    universe_absent = universe_as_of(fixture_store, t, settings)
+    assert all(a.equals(b) for a, b in zip(present, absent, strict=True))
+    assert universe_present.members.equals(universe_absent.members)
+    assert universe_present.exclusions.equals(universe_absent.exclusions)

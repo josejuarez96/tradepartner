@@ -629,6 +629,17 @@ def test_residue_term_hand_computed_and_split_adjusted() -> None:
         _window(tracking_rule="raw"), trial, journal, split_actions, _no_price, split_closes, None
     )
     assert split_result.periods[0].residue_term == pytest.approx(expected)
+    spinoff_actions = _action(A, "spinoff", date(2026, 10, 15), 0.25, _utc(T1))
+    spinoff_result = compare_periods(
+        _window(tracking_rule="raw"),
+        trial,
+        journal,
+        spinoff_actions,
+        _no_price,
+        closes,
+        None,
+    )
+    assert spinoff_result == result
 
 
 def test_residue_term_no_look_ahead_on_later_decision() -> None:

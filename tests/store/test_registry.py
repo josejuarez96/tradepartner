@@ -1237,8 +1237,7 @@ def test_a_borrow_status_row_and_a_spinoff_move_no_trial_vintage(
     moves on both, as the spec says it must."""
     cutoffs = _fixture_cutoffs(fixture_store)
     before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
-    with_symbol_changes = _tables(fixture_store)
-    assert "symbol_changes" not in with_symbol_changes
+    assert "symbol_changes" in _tables(fixture_store)
     _borrow_status_row(fixture_store, ingested_at=_LATE_INGEST)
     _action(
         fixture_store,
@@ -1247,14 +1246,26 @@ def test_a_borrow_status_row_and_a_spinoff_move_no_trial_vintage(
         known_at=_PIN_KNOWN,
         ingested_at=_LATE_INGEST,
     )
+    insert_row(
+        fixture_store,
+        "symbol_changes",
+        {
+            "security_id": "SEC_TICKCHANGE",
+            "old_symbol": "TCKA",
+            "new_symbol": "TCKB",
+            "old_cusip": "",
+            "new_cusip": "",
+            "process_date": date(2018, 11, 7),
+            "source_action_id": "rename-pin",
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
     assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
     for cutoff in cutoffs:
         assert registry.data_vintage(fixture_store, cutoff) == before[cutoff], cutoff
-    # `symbol_changes` is the amendment's other new table and the fixture
-    # store has no such table until T172b lands one: that task pins the same
-    # rule for its rows. The name is already out of `_TRIAL_FACT_TABLES`
-    # (the classification test above), so its rows cannot move a vintage
-    # either.
 
 
 def test_a_split_and_a_bar_still_move_the_trial_vintage(
@@ -1274,6 +1285,23 @@ def test_a_split_and_a_bar_still_move_the_trial_vintage(
         ingested_at=_LATE_INGEST,
     )
     _price(fixture_store, "SEC_BAR_PINNED", _PIN_KNOWN, _LATE_INGEST)
+    insert_row(
+        fixture_store,
+        "symbol_changes",
+        {
+            "security_id": "SEC_TICKCHANGE",
+            "old_symbol": "TCKA",
+            "new_symbol": "TCKB",
+            "old_cusip": "",
+            "new_cusip": "",
+            "process_date": date(2018, 11, 7),
+            "source_action_id": "rename-pin",
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
     assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
     for cutoff in cutoffs:
         vintage = registry.data_vintage(fixture_store, cutoff)

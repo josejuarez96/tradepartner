@@ -2375,3 +2375,9 @@ def test_reference_names_must_not_be_empty() -> None:
 def test_coverage_section_refuses_an_unknown_key() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, coverage={"check_enable": True})
+
+
+def test_actions_backfill_floor_default_and_validation() -> None:
+    assert AlpacaConfig().actions_backfill_floor == date(2020, 6, 1)
+    with pytest.raises(ValidationError):
+        AlpacaConfig(actions_backfill_floor="not-a-date")

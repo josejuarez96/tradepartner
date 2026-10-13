@@ -192,7 +192,11 @@ class TestCorporateActions:
     def test_plain_split_uses_the_close_before_ex_date_proxy(
         self, source: FixturePriceSource
     ) -> None:
-        (split,) = source.corporate_actions(["SEC_SPLIT_PLAIN"], FAR_PAST, FAR_FUTURE)
+        (split,) = [
+            action
+            for action in source.corporate_actions(["SEC_SPLIT_PLAIN"], FAR_PAST, FAR_FUTURE)
+            if action.action_type is ActionType.SPLIT
+        ]
         assert split.action_type is ActionType.SPLIT
         assert split.ex_date == date(2018, 12, 13)
         assert split.ratio_or_amount == pytest.approx(2.0)
@@ -232,6 +236,7 @@ class TestCorporateActions:
         both = source.corporate_actions(ids, date(2018, 6, 25), date(2018, 12, 13))
         assert [(a.security_id, a.ex_date) for a in both] == [
             ("SEC_MTUM", date(2018, 6, 25)),
+            ("SEC_SPLIT_PLAIN", date(2018, 12, 13)),
             ("SEC_SPLIT_PLAIN", date(2018, 12, 13)),
             ("SEC_SPY", date(2018, 6, 25)),
         ]

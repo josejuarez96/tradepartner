@@ -650,6 +650,7 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    actions_backfill_floor: date = date(2020, 6, 1)
     registrant_quiet_days: int = Field(default=180, ge=1)
     # #843: how far before a rename's first cover-page row the new ticker may fill the
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
