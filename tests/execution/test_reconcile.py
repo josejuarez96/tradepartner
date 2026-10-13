@@ -1451,6 +1451,8 @@ def _cil(
 # (#1627-6a).
 _CIL_RATIO = 1.20
 _CIL_REFERENCE = 120.0
+_CIL_EX_DATE = date(2026, 10, 1)
+_CIL_PAYABLE = date(2026, 10, 8)  # five XNYS sessions after the ex-date
 
 
 def test_a_stock_dividend_cash_in_lieu_reconciles_with_no_halt() -> None:
@@ -1467,7 +1469,7 @@ def test_a_stock_dividend_cash_in_lieu_reconciles_with_no_halt() -> None:
         1_050.0,  # broker cash = ledger cash + the 50.00 paid in lieu
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 50.0),),
         ),
     )
@@ -1491,7 +1493,7 @@ def test_a_cash_in_lieu_within_the_relative_tolerance_books_the_broker_amount() 
         1_046.00,  # the 46.00 the broker actually credited
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 46.0),),
         ),
     )
@@ -1512,7 +1514,7 @@ def test_a_cash_in_lieu_posts_within_the_lag_window_and_books() -> None:
         1_050.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (date(2026, 10, 6), S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 50.0),),  # dated one session after ex-date
         ),
     )
@@ -1530,7 +1532,7 @@ def test_a_cash_in_lieu_beyond_the_lag_window_halts() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (date(2026, 10, 6), date(2026, 10, 6), _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 5.0),),  # 2026-10-07, past last = 2026-10-06
         ),
     )
@@ -1549,7 +1551,7 @@ def test_a_cash_in_lieu_before_the_ex_date_halts() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", date(2026, 10, 6), 5.0),),
         ),
     )
@@ -1568,7 +1570,7 @@ def test_a_stock_dividend_with_no_cash_in_lieu_halts_as_quantity() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
         ),
     )
 
@@ -1586,7 +1588,7 @@ def test_a_cash_in_lieu_beyond_the_tolerance_halts() -> None:
         1_040.0,  # a 40.00 in lieu, 20% below the expected 50.00
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 40.0),),
         ),
     )
@@ -1605,7 +1607,7 @@ def test_a_cash_in_lieu_with_no_reference_price_halts() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={},  # no bar for the name
+            stock_dividend_references={},  # no bar for the name
             activities=(_cil("act-cil", S, 50.0),),
         ),
     )
@@ -1618,7 +1620,7 @@ def test_a_cash_in_lieu_with_no_reference_price_halts() -> None:
 
 @pytest.mark.parametrize("broker_shares", [99.0, 101.0])
 def test_a_cash_in_lieu_that_is_not_a_whole_share_credit_halts(broker_shares: float) -> None:
-    """#1627 (safety guard 397): a `CIL` beside a broker quantity that is not the
+    """#1627 (safety guard): a `CIL` beside a broker quantity that is not the
     floor of the ledger's fractional expectation halts — the whole-share guard
     stops rounding from masking a lost share. 99 strands one below the floor of
     100.5; 101 is a share above it."""
@@ -1628,10 +1630,70 @@ def test_a_cash_in_lieu_that_is_not_a_whole_share_credit_halts(broker_shares: fl
         1_000.0 + abs(100.5 - broker_shares) * (_CIL_REFERENCE / _CIL_RATIO),
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(
                 _cil("act-cil", S, abs(100.5 - broker_shares) * (_CIL_REFERENCE / _CIL_RATIO)),
             ),
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert "unexplained_activity" in _kinds(result)
+    assert result.adjustments == ()
+
+
+def test_a_cash_in_lieu_beside_a_whole_ledger_one_share_short_halts() -> None:
+    """#1627 (safety guard `abs(broker_shares - whole) <= q_tol`): a ledger that is
+    already whole (100, so `q_tol < removed < 1 + q_tol` still admits `removed`)
+    with the broker one share short (99) plus a `CIL` must halt on the whole-share
+    guard. Deleting that guard alone lets a -1.0 share "cash in lieu" book."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.0),
+        _positions(AAA=99.0),
+        1_000.0 + (_CIL_REFERENCE / _CIL_RATIO),
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
+            activities=(_cil("act-cil", S, _CIL_REFERENCE / _CIL_RATIO),),
+        ),
+    )
+
+    assert result.status == "mismatch"
+    assert "unexplained_activity" in _kinds(result)
+    assert result.adjustments == ()
+
+
+def test_a_correct_cash_in_lieu_five_sessions_after_the_ex_date_reconciles() -> None:
+    """#1627 (fix 2): the valuation uses the pre-ex close of the ex-date, not the
+    close before the reconciliation's own session, so a `CIL` posted on the
+    payable date (five sessions after the ex-date, here) values the same
+    remainder and reconciles. Ratio 1.15, so the post-ex price is 120 / 1.15."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_000.0 + 0.5 * (120.0 / 1.15),
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (_CIL_EX_DATE, _CIL_PAYABLE, 1.15)},
+            stock_dividend_references={"SEC_A": 120.0},
+            activities=(_cil("act-cil", _CIL_PAYABLE, 0.5 * (120.0 / 1.15)),),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert [(a.kind, a.security_id) for a in result.adjustments] == [("cash_in_lieu", "SEC_A")]
+
+
+def test_an_underpaid_cash_in_lieu_five_sessions_after_the_ex_date_halts() -> None:
+    """#1627 (fix 2): the same pre-ex valuation decides, so a `CIL` paid short on
+    the payable date is off the expected cash and halts."""
+    result = _run(
+        _ledger(1_000.0, SEC_A=100.5),
+        _positions(AAA=100.0),
+        1_000.0 + 0.5 * (120.0 / 1.15) * 0.5,  # half the in lieu it owed
+        explanations=_explanations(
+            stock_dividends={"SEC_A": (_CIL_EX_DATE, _CIL_PAYABLE, 1.15)},
+            stock_dividend_references={"SEC_A": 120.0},
+            activities=(_cil("act-cil", _CIL_PAYABLE, 0.5 * (120.0 / 1.15) * 0.5),),
         ),
     )
 
@@ -1650,7 +1712,7 @@ def test_a_second_cash_in_lieu_on_one_name_halts_and_books_nothing() -> None:
         1_050.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-1", S, 50.0), _cil("act-2", S, 50.0)),
         ),
     )
@@ -1671,7 +1733,7 @@ def test_a_cash_in_lieu_already_in_the_base_books_nothing() -> None:
         1_050.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 50.0),),
             seen_activity_ids=frozenset({"act-cil"}),
         ),
@@ -1692,7 +1754,7 @@ def test_a_cash_in_lieu_whose_name_has_no_stock_dividend_halts() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_B": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE, "SEC_B": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE, "SEC_B": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 5.0),),  # symbol AAA -> SEC_A, no SEC_A dividend
         ),
     )
@@ -1712,7 +1774,7 @@ def test_a_nonexecuted_cash_in_lieu_is_one_mismatch_not_two() -> None:
         1_000.0,
         explanations=_explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 50.0, "canceled"),),
         ),
     )
@@ -1733,7 +1795,7 @@ def test_a_stock_dividend_tolerance_is_the_frozen_on_not_the_default() -> None:
         _account(1_046.0),
         _explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 46.0),),
         ),
         WINDOW,
@@ -1750,7 +1812,7 @@ def test_a_stock_dividend_tolerance_is_the_frozen_on_not_the_default() -> None:
         _account(1_046.0),
         _explanations(
             stock_dividends={"SEC_A": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_A": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_A": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 46.0),),
         ),
         WINDOW,
@@ -1773,7 +1835,7 @@ def test_a_cash_in_lieu_beside_a_lagging_order_is_a_deferred_allowed() -> None:
         journal_open=[_lagging_buy(5.0, 2.0)],
         explanations=_explanations(
             stock_dividends={"SEC_B": (S, S, _CIL_RATIO)},
-            reference_prices={"SEC_B": _CIL_REFERENCE},
+            stock_dividend_references={"SEC_B": _CIL_REFERENCE},
             activities=(_cil("act-cil", S, 50.0, symbol="BBB"),),
         ),
     )

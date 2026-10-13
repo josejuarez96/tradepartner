@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -57,6 +59,7 @@ from tradepartner.store.journal import (
     append,
     fills_for,
     kill_switch_events_for,
+    orders_for,
     reconciliations_for,
 )
 
@@ -1298,6 +1301,20 @@ def _fee(activity_id: str, day: date, net: float, status: str = "executed") -> C
     )
 
 
+def _CIL_ACTIVITY(activity_id: str, net: float) -> CashActivity:
+    """A `CIL` (cash in lieu of stock) for SPY on the ex-date, `status` executed
+    (#1627)."""
+    return CashActivity(
+        activity_id=activity_id,
+        activity_type="CIL",
+        date=S,
+        status="executed",
+        net_amount=net,
+        symbol="SPY",
+        description="cash in lieu of stock",
+    )
+
+
 def test_two_fee_rows_are_booked_once_by_their_id(
     journal_settings: Settings,
     fake: BookedFake,
@@ -1937,6 +1954,288 @@ def test_a_booked_stock_dividend_cash_in_lieu_lands_exactly_on_the_whole_share(
     assert [
         (row.kind, row.broker_activity_id) for row in _adjustments(journal_settings, open_window)
     ] == [("cash_in_lieu", "act-cil")]  # booked once, never twice
+
+
+def _stock_dividend_journal(
+    settings: Settings,
+    window: PaperWindowRow,
+    quantity: float,
+    at: datetime,
+    extra_splits: Sequence[tuple[date, float]] = (),
+    later_fill: tuple[date, float, float] | None = None,
+) -> None:
+    """A buy of `quantity` shares at `at`, a stored 1.0077 stock dividend with
+    ex_date S (#1627), any `extra_splits` of `(ex_date, ratio)` after it, and an
+    optional `later_fill` of `(quantity, price, filled_at)` after the ex-date."""
+    run_id = _run(settings, window)
+    _order(settings, run_id, "tp-sd", "SEC_A", "AAA", quantity, events=(), fill=False, at=at)
+    _append(
+        settings,
+        FillRow(
+            client_order_id="tp-sd",
+            filled_at=at,
+            quantity=quantity,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id="bf-sd",
+            source="broker_feed",
+            superseded_by=None,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _split(settings, "SEC_A", 1.0077, CUT - timedelta(hours=1))
+    for ex_date, ratio in extra_splits:
+        _fact(
+            settings,
+            "corporate_actions",
+            security_id="SEC_A",
+            action_type="split",
+            ex_date=ex_date,
+            ratio_or_amount=ratio,
+            known_at=CUT - timedelta(hours=1),
+            ingested_at=CUT - timedelta(hours=1),
+            source="alpaca",
+            provenance="action",
+        )
+    if later_fill is not None:
+        fill_quantity, fill_price, fill_at = later_fill
+        _order(
+            settings,
+            run_id,
+            "tp-late",
+            "SEC_A",
+            "AAA",
+            fill_quantity,
+            events=(),
+            fill=False,
+            at=fill_at,
+        )
+        _append(
+            settings,
+            FillRow(
+                client_order_id="tp-late",
+                filled_at=fill_at,
+                quantity=fill_quantity,
+                price=fill_price,
+                price_implied=False,
+                broker_fill_id="bf-late",
+                source="broker_feed",
+                superseded_by=None,
+                known_at=fill_at,
+                ingested_at=fill_at,
+            ),
+        )
+    _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="cash_in_lieu",
+            security_id="SEC_A",
+            quantity=-float(
+                Fraction(10077, 10000) * quantity - math.floor(Fraction(10077, 10000) * quantity)
+            ),
+            cash=30.05,
+            broker_activity_id="act-cil",
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def test_a_cash_in_lieu_rounds_down_before_a_later_split_on_the_name(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1627 (fix 1): the round-down lands at the `cash_in_lieu` row's own point,
+    so a later split acts on the whole shares it left. 4065 x 1.0077 = 4096.3005
+    floors to 4096, and a later 2:1 split leaves 8192, not 8192.601."""
+    _stock_dividend_journal(
+        journal_settings, open_window, 4065.0, BOUGHT_AT, extra_splits=[(date(2026, 10, 15), 2.0)]
+    )
+
+    with open_read_only(journal_settings) as conn:
+        ledgers = from_journal(
+            fills_for(conn),
+            orders_for(conn, window_id=open_window.window_id),
+            adjustments_for(conn, window_id=open_window.window_id),
+            live_actions_as_of(conn, fixed_clock()),
+            None,
+            open_window.starting_cash,
+            date(2026, 10, 15),
+            window_id=open_window.window_id,
+            quantity_tolerance=1e-6,
+        )
+
+    assert ledgers.positions["SEC_A"] == 8192.0
+    assert round_down(ledgers.positions["SEC_A"], 0) == 8192
+
+
+def test_a_second_stock_dividend_on_the_name_books_both(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1627 (fix 1, safety's 111.3): a second stock dividend on the same name books
+    its own `cash_in_lieu` and both round-downs land, each at its own ex-date."""
+    run_id = _run(journal_settings, open_window)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-sd",
+        "SEC_A",
+        "AAA",
+        4065.0,
+        events=(),
+        fill=False,
+        at=BOUGHT_AT,
+    )
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-sd",
+            filled_at=BOUGHT_AT,
+            quantity=4065.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id="bf-sd",
+            source="broker_feed",
+            superseded_by=None,
+            known_at=BOUGHT_AT,
+            ingested_at=BOUGHT_AT,
+        ),
+    )
+    _split(journal_settings, "SEC_A", 1.0077, CUT - timedelta(hours=1))
+    _fact(
+        journal_settings,
+        "corporate_actions",
+        security_id="SEC_A",
+        action_type="split",
+        ex_date=date(2026, 10, 20),
+        ratio_or_amount=1.0235,
+        known_at=CUT - timedelta(hours=1),
+        ingested_at=CUT - timedelta(hours=1),
+        source="alpaca",
+        provenance="action",
+    )
+    # the fraction the first dividend removes (0.3005), then the second: the
+    # round-down's 4096 whole x 1.0235 = 4192.256, so 0.256.
+    first = Fraction(10077, 10000) * 4065
+    second = Fraction(math.floor(first)) * Fraction(10235, 10000)
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=S,
+            kind="cash_in_lieu",
+            security_id="SEC_A",
+            quantity=-float(first - math.floor(first)),
+            cash=30.05,
+            broker_activity_id="act-1",
+            known_at=BOUGHT_AT,
+            ingested_at=BOUGHT_AT,
+        ),
+    )
+    _append(
+        journal_settings,
+        AdjustmentRow(
+            window_id=open_window.window_id,  # type: ignore[arg-type]
+            session=date(2026, 10, 20),
+            kind="cash_in_lieu",
+            security_id="SEC_A",
+            quantity=-float(second - math.floor(second)),
+            cash=90.5,
+            broker_activity_id="act-2",
+            known_at=BOUGHT_AT,
+            ingested_at=BOUGHT_AT,
+        ),
+    )
+
+    with open_read_only(journal_settings) as conn:
+        ledgers = from_journal(
+            fills_for(conn),
+            orders_for(conn, window_id=open_window.window_id),
+            adjustments_for(conn, window_id=open_window.window_id),
+            live_actions_as_of(conn, fixed_clock()),
+            None,
+            open_window.starting_cash,
+            date(2026, 10, 20),
+            window_id=open_window.window_id,
+            quantity_tolerance=1e-6,
+        )
+
+    assert ledgers.positions["SEC_A"] == float(math.floor(second))
+    assert [
+        (row.kind, row.broker_activity_id) for row in _adjustments(journal_settings, open_window)
+    ] == [
+        ("cash_in_lieu", "act-1"),
+        ("cash_in_lieu", "act-2"),
+    ]
+
+
+def test_a_fractional_fill_after_a_cash_in_lieu_is_not_rounded_down(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """#1627 (fix 1): a fractional fill after the `cash_in_lieu` keeps its
+    fraction — the round-down rounds the whole shares held at its own point, not
+    the total position at `through`."""
+    _stock_dividend_journal(
+        journal_settings,
+        open_window,
+        4065.0,
+        BOUGHT_AT,
+        later_fill=(0.5, PRICE, datetime(2026, 10, 2, 15, 0, tzinfo=UTC)),
+    )
+
+    with open_read_only(journal_settings) as conn:
+        ledgers = from_journal(
+            fills_for(conn),
+            orders_for(conn, window_id=open_window.window_id),
+            adjustments_for(conn, window_id=open_window.window_id),
+            live_actions_as_of(conn, fixed_clock()),
+            None,
+            open_window.starting_cash,
+            date(2026, 10, 5),
+            window_id=open_window.window_id,
+            quantity_tolerance=1e-6,
+        )
+
+    assert ledgers.positions["SEC_A"] == 4096.5  # 4096 whole + the later 0.5
+    assert round_down(ledgers.positions["SEC_A"], 0) == 4096
+
+
+def test_a_stock_dividend_cash_in_lieu_is_booked_once_across_two_reconciles(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1627 (fix 4): the `cash_in_lieu` books once by its broker id, like a
+    `fee_cash`. 4065 x 1.0077 = 4096.3005, so the broker holds floor = 4096 and
+    the `CIL` is worth 0.3005 x (the pre-ex close 100 / 1.0077). A second
+    reconciliation reads the same id — now inside the recorded set — and books
+    nothing more, so the journal holds exactly one row."""
+    reference = _reference(journal_settings, SPY)
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 4065.0})
+    _split(journal_settings, SPY, 1.0077, CUT - timedelta(hours=1))
+    in_lieu = 0.3005 * (reference / 1.0077)
+    fake.extra_quantity = {"SPY": 31.0}  # 4096 whole, the floor of 4096.3005
+    fake.extra_cash = in_lieu
+    fake.activities = [_CIL_ACTIVITY("act-cil", in_lieu)]
+
+    first = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert first.status == OK
+    assert [
+        (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]
+
+    fixed_clock.advance(minutes=5)
+    second = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert second.status == OK
+    assert second.adjustments == ()  # never booked twice
+    assert [
+        (a.kind, a.broker_activity_id) for a in _adjustments(journal_settings, open_window)
+    ] == [("cash_in_lieu", "act-cil")]
 
 
 def test_cash_within_the_open_allowances_carries_the_decimal_difference(

@@ -451,6 +451,12 @@ def _explanations(
     dividends, findings = _dividends(
         state, actions, window, session, tolerance, through, reviewed_groups()
     )
+    stock_dividends = _stock_dividends(
+        actions,
+        session,
+        settings.alpaca.stock_dividend_max_rate,
+        settings.alpaca.cash_in_lieu_max_lag_sessions,
+    )
     return Explanations(
         symbols=symbols,
         ended=ended,
@@ -458,15 +464,30 @@ def _explanations(
         dividends=dividends,
         dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
-        stock_dividends=_stock_dividends(
-            actions,
-            session,
-            settings.alpaca.stock_dividend_max_rate,
-            settings.alpaca.cash_in_lieu_max_lag_sessions,
-        ),
+        stock_dividends=stock_dividends,
+        stock_dividend_references=_stock_dividend_references(conn, cut, priced, stock_dividends),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
     )
+
+
+def _stock_dividend_references(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    priced: Sequence[str],
+    stock_dividends: Mapping[str, tuple[date, date, float]],
+) -> dict[str, float]:
+    """Each stock dividend's pre-ex reference (#1627): the raw close of the
+    name's latest bar on or before `previous_session(ex_date)`, known at `cut`.
+    Read for the ex-date, not the reconciliation session, so a `CIL` posted on
+    the payable date still divides the same pre-split close by the ratio; a name
+    the bars do not reach is left out, and its `CIL` halts there."""
+    references: dict[str, float] = {}
+    for name, (ex_date, _last_date, _ratio) in stock_dividends.items():
+        if name not in set(priced):
+            continue
+        references.update(_reference_prices(conn, cut, [name], previous_session(ex_date)))
+    return references
 
 
 def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:

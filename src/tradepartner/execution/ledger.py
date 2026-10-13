@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from fractions import Fraction
@@ -144,16 +144,6 @@ def _splits_by_security(
                 raise ValueError(f"split of {row['security_id']} has ratio {ratio}")
             splits[row["security_id"]].append((row["ex_date"], ratio))
     return splits
-
-
-def _split_factor(splits: Iterable[tuple[date, float]], stated_on: date) -> Fraction:
-    """The exact product of the ratios of splits that took effect after
-    `stated_on` (`_split_ratio`)."""
-    factor = Fraction(1)
-    for ex_date, ratio in splits:
-        if stated_on < ex_date:
-            factor *= _split_ratio(ratio)
-    return factor
 
 
 def _split_ratio(ratio: float) -> Fraction:
@@ -273,6 +263,28 @@ def from_journal(
     # leaves no float residue, with or without a split (#1296).
     positions: dict[str, Fraction] = defaultdict(Fraction)
 
+    # The rows are replayed in session order, not fills-then-adjustment deltas,
+    # so a row's exact position is the shares held *then*: a split takes effect at
+    # its own session and a `cash_in_lieu` round-down lands at its own point,
+    # never after a split that took effect later (#1627). Order within a session:
+    # the split of that ex-date, then a fill and an adjustment stated on it (a row
+    # dated on the ex-date is not scaled by it, which `ex_date > stated_on` and
+    # `ex_date > session` held before), then a `cash_in_lieu` row, which rounds
+    # down the whole shares that split's remainder leaves. A `cash_in_lieu` row
+    # shares the adjustment's rank and is recorded after every adjustment, so it
+    # sorts last of its session by the sequence its pass gives it.
+    replay: list[tuple[date, int, int, str, str, Fraction]] = []
+    sequence = 0
+
+    def _record(day: date, order: int, kind: str, security_id: str, amount: Fraction) -> None:
+        nonlocal sequence
+        replay.append((day, order, sequence, kind, security_id, amount))
+        sequence += 1
+
+    for name, rows in splits.items():
+        for ex_date, ratio in rows:
+            _record(ex_date, 0, "split", name, _split_ratio(ratio))
+
     seen_fills: set[int] = set()
     fills_since_base = 0
     for fill in fills:
@@ -283,8 +295,7 @@ def from_journal(
         if stated_on > through:
             continue
         sign = 1 if fill.side == _BUY else -1
-        factor = _split_factor(splits.get(fill.security_id, ()), stated_on)
-        positions[fill.security_id] += sign * _exact(row.quantity) * factor
+        _record(stated_on, 1, "fill", fill.security_id, sign * _exact(row.quantity))
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
@@ -295,27 +306,54 @@ def from_journal(
         _check_adjustment(adjustment, seen_adjustments)
         if adjustment.session > through:
             continue
-        if adjustment.quantity is not None and adjustment.security_id is not None:
-            factor = _split_factor(splits.get(adjustment.security_id, ()), adjustment.session)
-            if adjustment.kind == _CASH_IN_LIEU:
-                # #1627: the row removes a stock dividend's fractional remainder,
-                # so the issuer's exact `Fraction` position is floored to the whole
-                # share it leaves. Applying the float remainder instead leaves a
-                # sub-ulp share that a whole-share exit strands; the snap also lands
-                # the position exactly, never a float just below the whole. Fail
-                # closed if the stored quantity is not that remainder.
-                exact = positions.get(adjustment.security_id, Fraction(0))
-                remainder = float(exact - math.floor(exact))
-                if abs(remainder + adjustment.quantity) > quantity_tolerance:
-                    raise ValueError(
-                        f"cash_in_lieu for {adjustment.security_id} removes {remainder} "
-                        f"shares, not {-adjustment.quantity}"
-                    )
-                positions[adjustment.security_id] = Fraction(math.floor(exact))
-            else:
-                positions[adjustment.security_id] += _exact(adjustment.quantity) * factor
+        if (
+            adjustment.kind != _CASH_IN_LIEU
+            and adjustment.quantity is not None
+            and adjustment.security_id is not None
+        ):
+            _record(
+                adjustment.session,
+                2,
+                adjustment.kind,
+                adjustment.security_id,
+                _exact(adjustment.quantity),
+            )
         if adjustment.cash is not None and after_base(adjustment.known_at):
             cash += adjustment.cash
+
+    for adjustment in adjustments:
+        if adjustment.kind == _CASH_IN_LIEU and adjustment.session <= through:
+            assert adjustment.quantity is not None and adjustment.security_id is not None
+            _record(
+                adjustment.session,
+                2,
+                adjustment.kind,
+                adjustment.security_id,
+                _exact(adjustment.quantity),
+            )
+
+    for _day, _order, _seq, kind, security_id, amount in sorted(replay):
+        if kind == "split":
+            positions[security_id] *= amount
+        elif kind == _CASH_IN_LIEU:
+            # #1627: the row removes a stock dividend's fractional remainder at
+            # its own point in the replay, so the issuer's exact `Fraction`
+            # position is rounded down to the whole shares the broker credited
+            # (a later split, a second stock dividend, or a fractional fill after
+            # it act on the whole, never on the remainder). Applying the float
+            # remainder instead leaves a sub-ulp share a whole-share exit
+            # strands. Fail closed if the stored quantity is not the remainder
+            # then removed.
+            exact = positions[security_id]
+            whole = math.floor(exact)
+            if abs(float(exact - whole) + float(amount)) > quantity_tolerance:
+                raise ValueError(
+                    f"cash_in_lieu for {security_id} removes {float(exact - whole)} "
+                    f"shares, not {float(-amount)}"
+                )
+            positions[security_id] = Fraction(whole)
+        else:
+            positions[security_id] += amount
 
     held = {name: float(q) for name, q in positions.items() if abs(q) > _exact(quantity_tolerance)}
     return Ledger(positions=held, cash=cash, through=through, fills_since_base=fills_since_base)

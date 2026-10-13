@@ -204,6 +204,14 @@ class Explanations:
     #: whole shares plus a `CIL` cash-in-lieu activity for the fractional
     #: remainder, so `compare` books the `cash_in_lieu` adjustment against it.
     stock_dividends: Mapping[str, tuple[date, date, float]] = field(default_factory=dict)
+    #: The pre-ex reference for each name in `stock_dividends` (#1627): the raw
+    #: close of its latest bar on or before `previous_session(ex_date)`, which is
+    #: the pre-split price the broker's cash in lieu fractionalizes. It is read
+    #: explicitly for the ex-date, never the close before the reconciliation
+    #: session, so the valuation is the same whatever the reconciliation date
+    #: (a `CIL` posted on the payable date divides the same reference by the
+    #: ratio). A name with no bar here has no reference and its `CIL` halts.
+    stock_dividend_references: Mapping[str, float] = field(default_factory=dict)
     activities: tuple[CashActivity, ...] = ()
     seen_activity_ids: frozenset[str] = frozenset()
     activity_seen_before: date | None = None
@@ -373,9 +381,10 @@ def _place_cash_in_lieu(
     (`risk.cash_in_lieu_tolerance`, relative); then the fractional remainder is
     removed as a `cash_in_lieu` adjustment (`quantity` the removed fraction,
     `cash` the broker's amount, keyed by its id). The remainder is valued at the
-    post-ex price: the reference (close ≤ previous_session(S)) is a pre-ex price
-    per old share, so it is divided by the split's ratio to a post-ex price per
-    new share (fix #1627-6a). The CIL may post from the ex-date through
+    post-ex price: the pre-ex reference (`Explanations.stock_dividend_references`,
+    the close of the latest bar on or before `previous_session(ex_date)`, per old
+    share) divided by the split's ratio, once, whatever the reconciliation date
+    (fix #1627-6a). The CIL may post from the ex-date through
     `alpaca.cash_in_lieu_max_lag_sessions` sessions later (`dividend[1]`), since
     Alpaca pays cash in lieu on the payable date. An unmatched CIL (a non-executed
     one is already classified by `_activity_mismatch`, so this never sees it), a
@@ -396,7 +405,7 @@ def _place_cash_in_lieu(
             f"this session"
         )
         return Mismatch("unexplained_activity", detail), None
-    reference = explanations.reference_prices.get(security_id)
+    reference = explanations.stock_dividend_references.get(security_id)
     if reference is None:
         return Mismatch(
             "unexplained_activity",
