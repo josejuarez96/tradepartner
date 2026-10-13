@@ -424,7 +424,7 @@ class EdgarConfig(BaseModel):
     # issuer-name-first titles, class-letter shares). Off, every classification
     # is as before; the release's own PR (T181) flips it with the cache
     # version bumps, so a nightly ingest after a plain merge changes nothing.
-    title_fallback: bool = False
+    title_fallback: bool = True  # flipped by the release `cover-listings-1541` (T181)
     event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["8-K", "8-K/A"], min_length=1
     )
@@ -433,7 +433,7 @@ class EdgarConfig(BaseModel):
     # context. Off until the owner's release (T181) flips it together with
     # the `FSN_VERSION` and `COVER_VERSION` bumps: the caches are keyed by
     # those versions only, so a flip alone re-derives nothing already cached.
-    exchange_axis_listings: bool = False
+    exchange_axis_listings: bool = True  # flipped by the release `cover-listings-1541` (T181)
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
