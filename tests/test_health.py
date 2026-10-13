@@ -150,6 +150,55 @@ def test_filename_health_reports_untraded_form25_last_resort(
     assert FILENAME_LISTING_VALID_FROM not in report.failures
 
 
+def test_filename_only_listing_counts_the_listing_live_at_t_not_all_history(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #1662: a security with a filed row earlier and a filing_name row as its
+    # live listing relies on the filing name at T; one whose filing_name row
+    # is the older one and a filed row the live one does not.
+    settings = _settings()
+    known = datetime(2018, 6, 1, 20, 30, tzinfo=UTC)
+    for cik, first, second in (
+        ("0000099991", "filing", "filing_name"),
+        ("0000099992", "filing_name", "filing"),
+    ):
+        insert_row(
+            fixture_store,
+            "securities",
+            {
+                "security_id": cik,
+                "cik": cik,
+                "name": "Mixed",
+                "benchmark": False,
+                "known_at": known,
+                "ingested_at": T_END,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for ticker, provenance, valid_from in (
+            ("MIXA", first, date(2018, 6, 1)),
+            ("MIXB", second, date(2019, 6, 3)),
+        ):
+            insert_row(
+                fixture_store,
+                "listings",
+                {
+                    "security_id": cik,
+                    "ticker": ticker,
+                    "exchange": "NASDAQ",
+                    "class_title": None,
+                    "valid_from": valid_from,
+                    "known_at": datetime.combine(valid_from, datetime.min.time(), tzinfo=UTC),
+                    "ingested_at": T_END,
+                    "source": "edgar",
+                    "provenance": provenance,
+                },
+            )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.filename_listings.only_listing == 1
+
+
 #: Close of 2018-10-25: after SEC_TRANSFER's Form 25, before its NASDAQ
 #: listing is known (fixture README), so it counts as delisted there.
 T_TRANSFER_PROBE = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)

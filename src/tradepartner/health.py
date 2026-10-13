@@ -1098,13 +1098,12 @@ def health_report(
 def _filename_listings(
     conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
 ) -> FilenameListings:
-    """Count filing-name reliance and spans without any traded bar at T."""
+    """Count securities whose listing live at T is a filing-name row, and spans
+    without any traded bar at T."""
     all_rows = list(listings.iter_rows(named=True))
     named = [row for row in all_rows if row["provenance"] == "filing_name"]
-    kinds: dict[str, set[str]] = defaultdict(set)
-    for row in all_rows:
-        kinds[row["security_id"]].add(row["provenance"])
-    only = sum(kinds[sid] == {"filing_name"} for sid in kinds)
+    live = _current_from(listings, last_completed_session(t)).values()  # #1662: live at T
+    only = sum(row["provenance"] == "filing_name" for row in live)
     if not named:
         return FilenameListings(0, only, pl.DataFrame([], schema=_FILENAME_SCHEMA))
     bars = prices_as_of(conn, t, sorted({row["security_id"] for row in named}), traded_only=True)

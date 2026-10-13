@@ -674,6 +674,11 @@ class AlpacaConfig(BaseModel):
     # reused symbol names the old company, not today's holder. 7 is the offset the
     # 2026-10-08 read-only check verified on all 511 reused-ticker segments (#1314).
     asof_offset_days: int = Field(default=7, ge=0)
+    #: #1653: the collision probe of a `filing_name` span asks the sessions after the
+    #: span's end through `master.transfer_window_sessions + 1` plus this many more, not
+    #: on to the run's day: the first bar past the window shows a live other company, and
+    #: the margin covers a thin symbol that trades only now and then.
+    collision_probe_margin_sessions: int = Field(default=10, ge=0)
     #: #1618: an Alpaca `stock_dividends` row is stored as a `split` of its `rate` only
     #: when `1 < rate <` this. 25% is the exchange line above which a stock distribution
     #: is handled as a split; the 2016-2026 universe fetch's 140 stock rows run
