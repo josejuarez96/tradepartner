@@ -879,6 +879,14 @@ def _price_every_symbol(env: Env, session: date) -> None:
         env.prices[ticker] = float(close)
 
 
+def _no_drop_rule(env: Env) -> None:
+    """`paper.max_universe_drop_fraction=1.0` for a window whose later rebalance loses
+    most of the fixture's handful of names (T188, #1550: named in its PR, the one
+    settings override the plan allows instead of editing the fixture)."""
+    paper = env.settings.paper.model_copy(update={"max_universe_drop_fraction": 1.0})
+    env.settings = env.settings.model_copy(update={"paper": paper})
+
+
 def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -900,6 +908,7 @@ def test_a_cent_rounding_fake_stays_within_the_reconcile_cash_tolerance(
         ),
         tmp_path=tmp_path,
     )
+    _no_drop_rule(env)
     monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake(round_cash_to_cent=True)
     # WNDX delists partway through the window (last bar 2019-06-24): the
@@ -1004,6 +1013,7 @@ def test_a_mid_window_delisting_is_marked_at_its_last_close_then_force_exited(
         ),
         tmp_path=tmp_path,
     )
+    _no_drop_rule(env)
     monkeypatch.setattr(env, "price_at", lambda session: _price_every_symbol(env, session))
     env.new_fake()
     env.fake.set_asset("WNDX", UNTRADABLE, from_session=date(2019, 6, 25))

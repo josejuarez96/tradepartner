@@ -19,6 +19,7 @@ SYSTEM_FAULTS = (
     "KillSwitchEngagedError",
     "LimitBreachError",
     "AcknowledgementTimeoutError",
+    "UniverseCollapseError",
 )
 
 

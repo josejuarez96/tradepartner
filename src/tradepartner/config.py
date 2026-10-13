@@ -1767,6 +1767,12 @@ class PaperConfig(BaseModel):
     `min_rebalances` is the per-cadence table (ADR 0017 part C): an entry for every
     `Cadence`, each above zero; `paper start` freezes the window's cadence's entry as
     the scalar `paper.min_rebalances` (`execution.window._frozen_params`).
+    `min_universe_names` (at least 1) and `max_universe_drop_fraction` (in [0, 1]; 1.0
+    turns the drop rule off) are the universe-collapse halt's two keys (spec req 7 step
+    6, amendment 2026-10-12, #1550; `execution.planning.universe_collapse`): a plan with
+    fewer members than the first, or fewer than `p x (1 - fraction)` against the
+    window's last plan of `p` members, halts the run. Both are read at run time and are
+    not in `FROZEN_PAPER_KEYS`, so windows opened before them are covered.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1787,6 +1793,8 @@ class PaperConfig(BaseModel):
     order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
     live_capital_reference: float = Field(default=100.0, gt=0)
     min_override_reason_chars: int = Field(default=20, ge=1)
+    min_universe_names: int = Field(default=1, ge=1)
+    max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
 
     @field_validator("min_rebalances")
     @classmethod

@@ -28,6 +28,7 @@ __all__ = [
     "SkipCapError",
     "StaleDataError",
     "SystemFaultError",
+    "UniverseCollapseError",
 ]
 
 
@@ -65,6 +66,15 @@ class LimitBreachError(SystemFaultError):
 class AcknowledgementTimeoutError(SystemFaultError):
     """A submitted order was neither acknowledged nor terminal within
     `paper.accept_wait_seconds`."""
+
+
+class UniverseCollapseError(SystemFaultError):
+    """The paper plan's universe at close(T_i) has collapsed (Phase 4 spec req 7
+    step 6, amendment 2026-10-12, #1550): fewer members than
+    `paper.min_universe_names`, or, against the window's last plan of `p` members,
+    fewer than `p x (1 - paper.max_universe_drop_fraction)`; or a journaled plan
+    under the floor would be re-used. Raised before any decision is built, so the
+    halt path engages the switch with nothing to cancel and nothing submitted."""
 
 
 class StaleDataError(Exception):
