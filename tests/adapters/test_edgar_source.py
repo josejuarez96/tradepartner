@@ -1495,18 +1495,19 @@ def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> N
     assert source.filename_no_exchange >= 1
 
 
-def test_a_cached_v2_cover_page_is_no_longer_served(settings: Settings) -> None:
-    """T181 (#1541): the release bumps `COVER_VERSION` to 3 (and `FSN_VERSION`
-    to 3), so a per-document cover page cached under v2, parsed without the
-    exchange-axis listings, is never served: it is fetched and parsed again."""
-    assert (FSN_VERSION, COVER_VERSION) == (3, 3)
+def test_a_cached_v3_cover_page_is_no_longer_served(settings: Settings) -> None:
+    """T181 (#1541, #1651): the release bumps `COVER_VERSION` (and
+    `FSN_VERSION`) to 4 with `cover_split_contexts`, so a per-document cover
+    page cached under v3, parsed without the split-context reads, is never
+    served: it is fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (4, 4)
     accession = "0000320193-24-000123"
-    old = Path(settings.edgar.cache_dir) / "cover" / "v2" / f"{accession}.json"
+    old = Path(settings.edgar.cache_dir) / "cover" / "v3" / f"{accession}.json"
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "accession": accession,
                 "cik": "0000320193",
                 "entity_cik": "0000320193",
