@@ -52,8 +52,13 @@ def _listing(sid: str = SID, ticker: str = "WSC", **extra: Any) -> dict[str, Any
     } | _common(**extra)
 
 
-def _build(securities: tuple[dict[str, Any], ...], listings: tuple[dict[str, Any], ...]) -> Any:
-    return MasterBuild(securities, listings, (), ())
+def _build(
+    securities: tuple[dict[str, Any], ...],
+    listings: tuple[dict[str, Any], ...],
+    *,
+    filename: bool = False,
+) -> Any:
+    return MasterBuild(securities, listings, (), (), filename_enabled=filename)
 
 
 @pytest.fixture
@@ -84,8 +89,16 @@ def test_underived_is_every_stored_edgar_key_the_build_does_not_derive() -> None
 def test_underived_includes_filing_name_but_keeps_snapshot_out() -> None:
     filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
     snapshot = _listing("0001647088", "NEW") | {"provenance": "snapshot_static"}
-    found = underived(_build((), ()), [], [filename, snapshot])
+    found = underived(_build((), (), filename=True), [], [filename, snapshot])
     assert [(item.table, item.row["ticker"]) for item in found] == [("listings", "OLD")]
+
+
+def test_filing_name_rows_are_never_judged_while_the_switch_is_off() -> None:
+    # #1662: `edgar.filename_listings` off reads no file names; the stored
+    # rows are not "no longer derived", so nothing is proposed for them.
+    filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
+    assert underived(_build((), ()), [], [filename]) == ()
+    assert len(underived(_build((), (), filename=True), [], [filename])) == 1
 
 
 def test_master_retract_sees_stored_filename_row(
@@ -95,7 +108,7 @@ def test_master_retract_sees_stored_filename_row(
     filename = _listing("0001647088", "OLD") | {"provenance": "filing_name"}
     insert_row(conn, "securities", security)
     insert_row(conn, "listings", filename)
-    found = stored_underived(conn, _build((security,), ()), FIXED)
+    found = stored_underived(conn, _build((security,), (), filename=True), FIXED)
     assert [(item.table, item.row["ticker"]) for item in found] == [("listings", "OLD")]
 
 

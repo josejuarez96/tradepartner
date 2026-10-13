@@ -1045,7 +1045,9 @@ def _filename_rows(
     first_page_classes = {
         (row["ticker"], row["exchange"]): row["security_id"]
         for row in builder.listings
-        if first_page is not None and row["known_at"] == first_page.accepted_at
+        if first_page is not None
+        and row["known_at"] == first_page.accepted_at
+        and row["security_id"][:10] == cik  # #1662: no other CIK's same-second row
     }
     cover_readings = (
         [

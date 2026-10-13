@@ -1842,3 +1842,39 @@ class TestListingEvidenceAfterForm25:
             forms=(("15-12B", _at(2020, 10, 1)), ("8-A12B", _at(2020, 10, 27))),
         )
         assert [s.security_id for s in build.successions] == [f"{cik}@2020-11-05"]
+
+
+def test_filename_first_page_classes_match_the_cik_not_only_the_second() -> None:
+    # #1662: two CIKs' first cover pages accepted in the same second: the
+    # second CIK's class map held the first's row too, so the first's id was
+    # counted as a class its own 10-Ks never read.
+    first_cik, second_cik = "0000000981", "0000000982"
+    annual, page = _at(2016, 3, 1), _at(2019, 3, 4)
+    listings = [  # only the second CIK has a 10-K read
+        FilenameListing(
+            second_cik,
+            "annual",
+            "10-K",
+            annual,
+            date(2016, 3, 1),
+            "BBB",
+            "NYSE",
+            "Common Stock",
+            None,
+        )
+    ]
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(cik, "Same Second", "10-K", "annual", annual)
+            for cik in (first_cik, second_cik)
+        ],
+        cover_pages=[
+            _cover(first_cik, page, ("Common Stock", "AAA", "NYSE")),
+            _cover(second_cik, page, ("Common Stock", "BBB", "NYSE")),
+        ],
+        filename_listings=listings,
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert (
+        on.filename_counts["filename_class_unread"] == 1
+    )  # the first CIK's own class, nothing of the second's

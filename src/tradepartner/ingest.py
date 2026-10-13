@@ -1142,15 +1142,24 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
         "filename_form25_rows",
     ):
         counts.setdefault(key, 0)
-    accessions = frozenset(master.filename_form25_accessions)
+    # #1662: an exchange mismatch only — a Form 25 of a CIK with an earlier
+    # `filing_name` row, none of that CIK's on the Form 25's exchange (a 12(b)
+    # text read differently). One on a listed exchange that names another class
+    # (a warrant) is no mismatch.
     counts["filename_form25_unmatched"] = sum(
         1
         for row in delistings.unmatched
-        if row.accession in accessions
-        or any(
+        if any(
             listing["security_id"][:10] == row.cik
             and listing["provenance"] == "filing_name"
             and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
+        and not any(
+            listing["security_id"][:10] == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            and listing["exchange"] == row.exchange
             for listing in master.listings
         )
     )
