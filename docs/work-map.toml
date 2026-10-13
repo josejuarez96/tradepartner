@@ -1219,3 +1219,16 @@ unblocks = ["task:T184h"]
 [task.T184h]
 what = "The owner's release pre2019-listings-1597: the switch flip and FSN bump, the fetch pass with its stop rules, the rows, the asof backfill with fill-holes, the collisions moved to the deny-list and withdrawn, health, and the before/after universe and gap evidence from 2017-01 to 2019-06."
 why = "Puts the 2016-2018 universe in the store under one named release with a backup, so the next sweeps have two more practice years (#1597)."
+
+[task.T186]
+what = "The committed reviewed list of the 183 equal-amount dividend groups (duplicate, distinct, unresolved, with the id to retract and the evidence), its loader, and repair-dividends: a dry-run-guarded delete of every revision of each retracted identity inside a named release."
+why = "A duplicate vendor record has no known_at at which it was right, so a delete under a release is the only fix that stops AIV 2020-11 reading 50 points too high in every backtest (#1613)."
+unblocks = ["task:T186c"]
+
+[task.T186b]
+what = "The duplicate_dividends health rule: every live same-security, same-ex-date, same-amount dividend group under two ids that the reviewed list does not mark distinct or unresolved fails --check; the accepted and unresolved keys are listed."
+why = "No feed field separates a duplicate from a real equal pair, so new groups must surface for review instead of being double-counted quietly (#1613)."
+
+[task.T186c]
+what = "The owner's release dupdiv-1613: the backup, the dry run, the delete of 169 identities, health --check green, the index test's AIV and TDG months recomputed, the sweeps rerun."
+why = "Puts the repaired dividends in the store under one named release with a backup, before the next sweep reads them (#1613)."
