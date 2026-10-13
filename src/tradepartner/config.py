@@ -660,6 +660,22 @@ class AlpacaConfig(BaseModel):
     # reused symbol names the old company, not today's holder. 7 is the offset the
     # 2026-10-08 read-only check verified on all 511 reused-ticker segments (#1314).
     asof_offset_days: int = Field(default=7, ge=0)
+    #: #1618: an Alpaca `stock_dividends` row is stored as a `split` of its `rate` only
+    #: when `1 < rate <` this. 25% is the exchange line above which a stock distribution
+    #: is handled as a split; the 2016-2026 universe fetch's 140 stock rows run
+    #: 1.001..1.5 and the five at or over 1.25 (CIG, DIT, MOVE, RJF, RUBI) are refused
+    #: and named on the run row, never stored.
+    stock_dividend_max_rate: float = Field(default=1.25, gt=1)
+    #: #1618: a stock-dividend row whose security (or symbol) has a forward or reverse
+    #: split within this many XNYS sessions of its ex-date is refused and named, so a
+    #: split paid as a stock dividend (FBYD 2024-12-10, 1.2 in both categories) is
+    #: adjusted once, by the split.
+    stock_dividend_split_sessions: int = Field(default=5, ge=0)
+    #: #1618: a same-date `cash_dividends` row whose amount is within this of a stock
+    #: row's rate (and `1 < amount < stock_dividend_max_rate`) is that ratio repeated,
+    #: not cash, and is skipped and counted. The 2016-2026 near echoes (CRESY, IRS, SBS)
+    #: differ by at most 5e-6; #1617's 1.0062 vs 1.0063 stays cash.
+    stock_dividend_echo_tolerance: float = Field(default=1e-5, ge=0)
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
