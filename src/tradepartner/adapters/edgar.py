@@ -1328,6 +1328,9 @@ _FSN_CLASS_AXIS = "ClassOfStock"
 #: and `Axis` dropped), pinned from a real row (2025_10 `dim.tsv`, #1541):
 #: `0x1dc0af108c94fa3ada3018ad13966aeb  EntityListingsExchange=XNAS;`
 _FSN_EXCHANGE_AXIS = "EntityListingsExchange"
+#: `us-gaap:CapitalUnitsByClassAxis` as FSN spells it (prefix and `Axis`
+#: dropped): a class axis only under `edgar.cover_split_contexts` (#1651).
+_FSN_CAPITAL_UNITS_AXIS = "CapitalUnitsByClass"
 
 
 @dataclass(frozen=True)
@@ -1424,10 +1427,14 @@ def _fsn_spaced_title(first: str, second: str) -> str:
     return max(candidates, key=lambda t: (len(t), t))
 
 
-def _fsn_segments(raw: str, *, exchange_axis: bool = False) -> dict[str, str] | None:
+def _fsn_segments(
+    raw: str, *, exchange_axis: bool = False, split_contexts: bool = False
+) -> dict[str, str] | None:
     """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
     member}`, or `None` if it names any axis other than `ClassOfStock` (and,
-    with `exchange_axis`, `EntityListingsExchange`, #1541)."""
+    with `exchange_axis`, `EntityListingsExchange`, #1541; with
+    `split_contexts`, `CapitalUnitsByClass`, #1651, but never both class
+    axes at once)."""
     pairs: dict[str, str] = {}
     for part in raw.split(";"):
         part = part.strip()
@@ -1435,8 +1442,9 @@ def _fsn_segments(raw: str, *, exchange_axis: bool = False) -> dict[str, str] | 
             continue
         axis, _, member = part.partition("=")
         pairs[axis.strip()] = member.strip()
-    allowed = {_FSN_CLASS_AXIS, _FSN_EXCHANGE_AXIS} if exchange_axis else {_FSN_CLASS_AXIS}
-    if set(pairs) - allowed:
+    class_axes = {_FSN_CLASS_AXIS, _FSN_CAPITAL_UNITS_AXIS} if split_contexts else {_FSN_CLASS_AXIS}
+    allowed = class_axes | ({_FSN_EXCHANGE_AXIS} if exchange_axis else set())
+    if set(pairs) - allowed or len(class_axes & set(pairs)) > 1:
         return None
     return pairs
 
@@ -1453,7 +1461,11 @@ def _fsn_is_coreg(row: Mapping[str, str]) -> bool:
 
 
 def _fsn_class_member(
-    row: Mapping[str, str], dim_segments: Mapping[str, str], *, exchange_axis: bool = False
+    row: Mapping[str, str],
+    dim_segments: Mapping[str, str],
+    *,
+    exchange_axis: bool = False,
+    split_contexts: bool = False,
 ) -> tuple[str, str] | None:
     """The row's (class member, exchange member): `("", "")` when `dimn` is
     `0` (undimensioned), or `None` when the row should be excluded (an axis
@@ -1471,16 +1483,22 @@ def _fsn_class_member(
     # #1541): beside the axis key it would read as another axis and drop the
     # class silently, so the accession fails instead.
     guarded = (_FSN_CLASS_AXIS, _FSN_EXCHANGE_AXIS) if exchange_axis else (_FSN_CLASS_AXIS,)
+    if split_contexts:
+        guarded = (*guarded, _FSN_CAPITAL_UNITS_AXIS)
     if "\ufffd" in segments_raw and any(axis in segments_raw for axis in guarded):
         raise ValueError(
             f"{row.get('adsh', '')}: undecodable byte or embedded tab in "
             f"segments {segments_raw[:60]!r}"
         )
-    segments = _fsn_segments(segments_raw, exchange_axis=exchange_axis)
+    segments = _fsn_segments(
+        segments_raw, exchange_axis=exchange_axis, split_contexts=split_contexts
+    )
     if segments is None:
         return None
     return (
-        normalize_class_member(segments.get(_FSN_CLASS_AXIS, "")),
+        normalize_class_member(
+            segments.get(_FSN_CLASS_AXIS, "") or segments.get(_FSN_CAPITAL_UNITS_AXIS, "")
+        ),
         segments.get(_FSN_EXCHANGE_AXIS, ""),
     )
 
@@ -1493,6 +1511,7 @@ def _parse_one_fsn_filing(
     txt_rows: Sequence[Mapping[str, str]],
     dim_segments: Mapping[str, str],
     exchange_axis: bool = False,
+    split_contexts: bool = False,
 ) -> FsnFiling:
     raw_cik = str(sub_row["cik"]).strip()
     if not re.fullmatch(r"\d{1,10}", raw_cik):  # it names a cache file downstream
@@ -1510,7 +1529,9 @@ def _parse_one_fsn_filing(
         tag = row.get("tag")
         if tag not in _FSN_LISTING_TAGS or _fsn_is_coreg(row):
             continue
-        dims = _fsn_class_member(row, dim_segments, exchange_axis=exchange_axis)
+        dims = _fsn_class_member(
+            row, dim_segments, exchange_axis=exchange_axis, split_contexts=split_contexts
+        )
         if dims is None:
             continue
         member = dims[0]
@@ -1530,9 +1551,31 @@ def _parse_one_fsn_filing(
     listings: list[CoverListing] = []
     incomplete = mismatched = 0
     symbol_only: set[str] = set()
-    for (_, exchange_member), group in groups.items():
+    class_titles: dict[str, set[str]] = {}
+    class_symbols: dict[str, set[str]] = {}
+    class_has_exchange: set[str] = set()
+    for (class_key, _), group in groups.items():
+        if "Security12bTitle" in group:
+            class_titles.setdefault(class_key, set()).add(group["Security12bTitle"])
+        if "TradingSymbol" in group:
+            class_symbols.setdefault(class_key, set()).add(group["TradingSymbol"])
+        if "SecurityExchangeName" in group:
+            class_has_exchange.add(class_key)
+    for (class_key, exchange_member), group in groups.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
+        if (
+            split_contexts
+            and len(class_titles.get(class_key, ())) <= 1
+            and len(class_symbols.get(class_key, ())) <= 1
+        ):
+            # #1651, as parse_cover_page: the class's title and symbol are its
+            # own wherever its rows put them; a group with no exchange of its
+            # own is covered by a sibling that has one.
+            [title, *_] = class_titles.get(class_key) or [title]
+            [symbol, *_] = class_symbols.get(class_key) or [symbol]
+            if exchange is None and class_key in class_has_exchange:
+                continue
         if symbol is None:
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
@@ -1543,7 +1586,10 @@ def _parse_one_fsn_filing(
         code = normalize_exchange(exchange)
         if exchange_member and _exchange_axis_mismatch(exchange_member, code):
             mismatched += 1  # counted; the value wins (#1541 open question 1)
-        listings.append(CoverListing(restore_class_letter_space(title), symbol, code))
+        listing = CoverListing(restore_class_letter_space(title), symbol, code)
+        if split_contexts and listing in listings:
+            continue  # one listing per distinct exchange (#1651)
+        listings.append(listing)
 
     # member -> ddate -> value. A filing may report its share count at several
     # ddates (a prior year-end beside the cover date, #609 F1): every ddate is
@@ -1552,9 +1598,15 @@ def _parse_one_fsn_filing(
     for row in num_rows:
         if row.get("tag") != _SHARES_CONCEPT or _fsn_is_coreg(row):
             continue
-        dims = _fsn_class_member(row, dim_segments, exchange_axis=exchange_axis)
+        dims = _fsn_class_member(
+            row, dim_segments, exchange_axis=exchange_axis, split_contexts=split_contexts
+        )
         if dims is None:
             continue
+        if split_contexts and _FSN_CAPITAL_UNITS_AXIS in dim_segments.get(
+            (row.get("dimh") or "").strip(), ""
+        ):
+            continue  # #1651: shares on this axis stay unread, as parse_cover_page
         member = dims[0]  # an exchange-axis count is its class's (#1541)
         raw_value = row.get("value")
         if raw_value is None or not str(raw_value).strip():
@@ -1587,6 +1639,7 @@ def parse_fsn(
     dim: Iterable[Mapping[str, str]],
     *,
     exchange_axis: bool = False,
+    split_contexts: bool = False,
 ) -> FsnParse:
     """One unstamped record per accession in `sub`, from one FSN period's
     members. A `num`/`txt` row carrying a non-null `coreg`, or naming any
@@ -1602,7 +1655,13 @@ def parse_fsn(
     naming another venue is counted in `exchange_axis_mismatch`), a shares
     row keeps its class member, and an undecodable byte in an exchange
     segment fails the accession. With it off (the default) the parse is
-    today's."""
+    today's.
+
+    With `split_contexts` (`edgar.cover_split_contexts`, #1651) `parse_fsn`
+    reads what `parse_cover_page` reads under it: `CapitalUnitsByClass` is a
+    class axis (its shares rows stay unread), and a class's title, symbol and
+    exchange are merged across its (class, exchange) groups when the class
+    names at most one title and one symbol, else one listing per group."""
     dim_segments = {str(row["dimhash"]): str(row["segments"]) for row in dim}
     num_by_adsh: dict[str, list[Mapping[str, str]]] = {}
     for row in num:
@@ -1624,6 +1683,7 @@ def parse_fsn(
                     txt_by_adsh.get(accession, []),
                     dim_segments,
                     exchange_axis,
+                    split_contexts,
                 )
             )
         except ValueError as error:

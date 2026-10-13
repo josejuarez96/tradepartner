@@ -1389,6 +1389,7 @@ class EdgarFilingSource(FilingSource):
                 txt_rows,
                 dim_rows,
                 exchange_axis=self._settings.edgar.exchange_axis_listings,
+                split_contexts=self._settings.edgar.cover_split_contexts,
             )
         except _FSN_PARSE_ERRORS as error:
             # #578: the period is absent for this run (no manifest, so the
