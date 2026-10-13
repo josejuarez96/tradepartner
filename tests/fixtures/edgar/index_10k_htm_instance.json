@@ -1,0 +1,602 @@
+{
+ "directory": {
+  "item": [
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "0000320193-19-000119-index-headers.html",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "0000320193-19-000119-index.html",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "0000320193-19-000119.txt",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "0000320193-19-000119-xbrl.zip",
+    "size": "447501",
+    "type": "compressed.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-k20199282019.htm",
+    "size": "2714096",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-k20199282019_htm.xml",
+    "size": "2774010",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit10152019.htm",
+    "size": "50665",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit10162019.htm",
+    "size": "68558",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit2112019.htm",
+    "size": "10756",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit2312019.htm",
+    "size": "8071",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit3112019.htm",
+    "size": "15675",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit3122019.htm",
+    "size": "15711",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit3212019.htm",
+    "size": "15195",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "a10-kexhibit412019.htm",
+    "size": "140694",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "aapl-20190928.xsd",
+    "size": "56071",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "aapl-20190928_cal.xml",
+    "size": "123668",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "aapl-20190928_def.xml",
+    "size": "306363",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "aapl-20190928_lab.xml",
+    "size": "878875",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "aapl-20190928_pre.xml",
+    "size": "520951",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "chart-06f17b4ddd9352dc8dc.jpg",
+    "size": "79662",
+    "type": "image2.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "FilingSummary.xml",
+    "size": "46440",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "Financial_Report.xlsx",
+    "size": "105396",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "g66145g66i38.jpg",
+    "size": "10963",
+    "type": "image2.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "MetaLinks.json",
+    "size": "764768",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R1.htm",
+    "size": "83455",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R10.htm",
+    "size": "341349",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R11.htm",
+    "size": "37467",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R12.htm",
+    "size": "114605",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R13.htm",
+    "size": "104491",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R14.htm",
+    "size": "18936",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R15.htm",
+    "size": "72509",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R16.htm",
+    "size": "60653",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R17.htm",
+    "size": "44433",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R18.htm",
+    "size": "89286",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R19.htm",
+    "size": "58652",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R2.htm",
+    "size": "50903",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R20.htm",
+    "size": "79013",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R21.htm",
+    "size": "28030",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R22.htm",
+    "size": "25922",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R23.htm",
+    "size": "328328",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R24.htm",
+    "size": "40652",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R25.htm",
+    "size": "109587",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R26.htm",
+    "size": "103093",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R27.htm",
+    "size": "20598",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R28.htm",
+    "size": "73656",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R29.htm",
+    "size": "47336",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R3.htm",
+    "size": "36518",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R30.htm",
+    "size": "35437",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R31.htm",
+    "size": "91376",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R32.htm",
+    "size": "58652",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R33.htm",
+    "size": "38386",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R34.htm",
+    "size": "26844",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R35.htm",
+    "size": "6791",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R36.htm",
+    "size": "12932",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R37.htm",
+    "size": "10931",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R38.htm",
+    "size": "24722",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R39.htm",
+    "size": "74167",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R4.htm",
+    "size": "79572",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R40.htm",
+    "size": "52399",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R41.htm",
+    "size": "20243",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R42.htm",
+    "size": "15815",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R43.htm",
+    "size": "29026",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R44.htm",
+    "size": "28402",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R45.htm",
+    "size": "13836",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R46.htm",
+    "size": "16971",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R47.htm",
+    "size": "9303",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R48.htm",
+    "size": "11923",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R49.htm",
+    "size": "30661",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R5.htm",
+    "size": "10792",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R50.htm",
+    "size": "36163",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R51.htm",
+    "size": "25482",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R52.htm",
+    "size": "33227",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R53.htm",
+    "size": "16394",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R54.htm",
+    "size": "22520",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R55.htm",
+    "size": "16306",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R56.htm",
+    "size": "39698",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R57.htm",
+    "size": "20494",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R58.htm",
+    "size": "16740",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R59.htm",
+    "size": "13476",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R6.htm",
+    "size": "41915",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R60.htm",
+    "size": "26467",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R61.htm",
+    "size": "51168",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R62.htm",
+    "size": "55609",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R63.htm",
+    "size": "29627",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R64.htm",
+    "size": "7477",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R65.htm",
+    "size": "9538",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R66.htm",
+    "size": "18997",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R67.htm",
+    "size": "19534",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R68.htm",
+    "size": "17495",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R69.htm",
+    "size": "28041",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R7.htm",
+    "size": "93580",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R70.htm",
+    "size": "16203",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R71.htm",
+    "size": "16202",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R72.htm",
+    "size": "10788",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R73.htm",
+    "size": "24035",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R8.htm",
+    "size": "46262",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "R9.htm",
+    "size": "35880",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "report.css",
+    "size": "2767",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2019-10-30 18:12:36",
+    "name": "Show.js",
+    "size": "1085",
+    "type": "text.gif"
+   }
+  ],
+  "name": "/Archives/edgar/data/320193/000032019319000119",
+  "parent-dir": "/Archives/edgar/data/320193"
+ }
+}

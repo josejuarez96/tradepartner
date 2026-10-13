@@ -1,0 +1,608 @@
+{
+ "directory": {
+  "item": [
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "0000320193-17-000070-index-headers.html",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "0000320193-17-000070-index.html",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "0000320193-17-000070.txt",
+    "size": "",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "0000320193-17-000070-xbrl.zip",
+    "size": "321099",
+    "type": "compressed.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-k20179302017.htm",
+    "size": "2683826",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-k9_chartx38133a04.jpg",
+    "size": "86504",
+    "type": "image2.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit10202017.htm",
+    "size": "55162",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit10212017.htm",
+    "size": "74980",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit1082017.htm",
+    "size": "113401",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit1212017.htm",
+    "size": "46644",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit2112017.htm",
+    "size": "7134",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit2312017.htm",
+    "size": "9978",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit3112017.htm",
+    "size": "14313",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit3122017.htm",
+    "size": "14349",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "a10-kexhibit3212017.htm",
+    "size": "12490",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930.xml",
+    "size": "3842300",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930.xsd",
+    "size": "67121",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930_cal.xml",
+    "size": "123854",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930_def.xml",
+    "size": "283190",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930_lab.xml",
+    "size": "930710",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "aapl-20170930_pre.xml",
+    "size": "533289",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "FilingSummary.xml",
+    "size": "46516",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "Financial_Report.xlsx",
+    "size": "118875",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "g66145g66i07.jpg",
+    "size": "10963",
+    "type": "image2.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R1.htm",
+    "size": "30005",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R10.htm",
+    "size": "363833",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R11.htm",
+    "size": "40815",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R12.htm",
+    "size": "37400",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R13.htm",
+    "size": "122848",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R14.htm",
+    "size": "357145",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R15.htm",
+    "size": "92345",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R16.htm",
+    "size": "71249",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R17.htm",
+    "size": "72491",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R18.htm",
+    "size": "46504",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R19.htm",
+    "size": "118872",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R2.htm",
+    "size": "46335",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R20.htm",
+    "size": "65139",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R21.htm",
+    "size": "105991",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R22.htm",
+    "size": "30323",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R23.htm",
+    "size": "347881",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R24.htm",
+    "size": "43785",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R25.htm",
+    "size": "38574",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R26.htm",
+    "size": "116508",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R27.htm",
+    "size": "355300",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R28.htm",
+    "size": "92396",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R29.htm",
+    "size": "71969",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R3.htm",
+    "size": "34273",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R30.htm",
+    "size": "55855",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R31.htm",
+    "size": "38257",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R32.htm",
+    "size": "124109",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R33.htm",
+    "size": "64990",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R34.htm",
+    "size": "30131",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R35.htm",
+    "size": "23987",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R36.htm",
+    "size": "84400",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R37.htm",
+    "size": "56428",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R38.htm",
+    "size": "28970",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R39.htm",
+    "size": "27041",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R4.htm",
+    "size": "15593",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R40.htm",
+    "size": "13465",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R41.htm",
+    "size": "16994",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R42.htm",
+    "size": "9069",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R43.htm",
+    "size": "11291",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R44.htm",
+    "size": "14699",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R45.htm",
+    "size": "7766",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R46.htm",
+    "size": "17747",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R47.htm",
+    "size": "32183",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R48.htm",
+    "size": "42131",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R49.htm",
+    "size": "22894",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R5.htm",
+    "size": "80776",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R50.htm",
+    "size": "31886",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R51.htm",
+    "size": "16132",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R52.htm",
+    "size": "22236",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R53.htm",
+    "size": "16224",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R54.htm",
+    "size": "179930",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R55.htm",
+    "size": "20238",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R56.htm",
+    "size": "7976",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R57.htm",
+    "size": "5899",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R58.htm",
+    "size": "44413",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R59.htm",
+    "size": "15545",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R6.htm",
+    "size": "13153",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R60.htm",
+    "size": "33527",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R61.htm",
+    "size": "31619",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R62.htm",
+    "size": "72708",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R63.htm",
+    "size": "30002",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R64.htm",
+    "size": "12810",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R65.htm",
+    "size": "9548",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R66.htm",
+    "size": "20628",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R67.htm",
+    "size": "19452",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R68.htm",
+    "size": "17518",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R69.htm",
+    "size": "27292",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R7.htm",
+    "size": "46911",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R70.htm",
+    "size": "16243",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R71.htm",
+    "size": "15561",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R72.htm",
+    "size": "10827",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R73.htm",
+    "size": "23800",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R74.htm",
+    "size": "20602",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R8.htm",
+    "size": "91137",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "R9.htm",
+    "size": "70320",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "report.css",
+    "size": "2767",
+    "type": "text.gif"
+   },
+   {
+    "last-modified": "2017-11-03 08:01:37",
+    "name": "Show.js",
+    "size": "1410",
+    "type": "text.gif"
+   }
+  ],
+  "name": "/Archives/edgar/data/320193/000032019317000070",
+  "parent-dir": "/Archives/edgar/data/320193"
+ }
+}

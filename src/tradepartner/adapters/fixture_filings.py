@@ -18,6 +18,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -47,6 +48,7 @@ class FixtureFilingSource(FilingSource):
         delistings: Iterable[DelistingFiling] = (),
         statement_facts: Iterable[StatementFactRecord] = (),
         filing_events: Iterable[FilingEvent] = (),
+        filename_listings: Iterable[FilenameListing] = (),
     ) -> None:
         self._index = sorted(index, key=lambda e: (e.accepted_at, e.accession, e.cik))
         self._snapshot = sorted(snapshot, key=lambda e: (e.fetched_at, e.cik, e.ticker))
@@ -56,6 +58,9 @@ class FixtureFilingSource(FilingSource):
         self._delistings = sorted(delistings, key=lambda e: (e.accepted_at, e.accession))
         self._filing_events = sorted(
             filing_events, key=lambda e: (e.accepted_at, e.accession, e.cik)
+        )
+        self._filename_listings = sorted(
+            filename_listings, key=lambda e: (e.accepted_at, e.accession, e.ticker)
         )
         # Not filtered by `known_by`/`known_ats` below: those two methods
         # exist for the master's write-path look-ahead tests (module
@@ -103,6 +108,7 @@ class FixtureFilingSource(FilingSource):
             cover_pages=[e for e in self._cover_pages if e.accepted_at <= t],
             delistings=[e for e in self._delistings if e.accepted_at <= t],
             filing_events=[e for e in self._filing_events if e.accepted_at <= t],
+            filename_listings=[e for e in self._filename_listings if e.accepted_at <= t],
         )
 
     def known_ats(self) -> list[datetime]:
@@ -114,6 +120,7 @@ class FixtureFilingSource(FilingSource):
         stamps |= {e.accepted_at for e in self._cover_pages}
         stamps |= {e.accepted_at for e in self._delistings}
         stamps |= {e.accepted_at for e in self._filing_events}
+        stamps |= {e.accepted_at for e in self._filename_listings}
         return sorted(stamps)
 
     def filing_index(self, since: datetime | None = None) -> list[FilingIndexEntry]:
@@ -139,3 +146,6 @@ class FixtureFilingSource(FilingSource):
 
     def filing_events(self, cik: str) -> list[FilingEvent]:
         return [e for e in self._filing_events if e.cik == cik]
+
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        return [e for e in self._filename_listings if e.cik == cik]
