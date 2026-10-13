@@ -206,14 +206,19 @@ class TestCover12bExchanges:
 
     def test_a_table_after_front_matter_reads_up_to_the_cap(self) -> None:
         """The 12(b) table sits 115 KB into the document: inside
-        `filename_document_max_bytes` it reads, and at a cap that cuts before
-        it nothing does — the read stops at the table or at the cap."""
+        `filename_document_max_bytes` it reads, at a cap that cuts before it
+        nothing does, and a cap that holds the whole document reads exactly
+        what a wider one does — the read stops at the table or at the cap."""
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
-        assert len(text.encode("utf-8")) > 115_000
+        document_bytes = len(text.encode("utf-8"))
+        assert document_bytes > 115_000
         assert cover_12b_exchanges(text, max_bytes=200_000)[0][1] == "NASDAQ"
         assert cover_12b_exchanges(text, max_bytes=100_000) == ()
-        assert cover_12b_exchanges(text, max_bytes=4_000_000) == cover_12b_exchanges(
+        assert cover_12b_exchanges(text, max_bytes=document_bytes) == cover_12b_exchanges(
             text, max_bytes=4_000_000
+        )
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == cover_12b_exchanges(
+            text, max_bytes=document_bytes * 2
         )
 
     def test_a_12g_only_document_reads_no_exchange(self) -> None:
