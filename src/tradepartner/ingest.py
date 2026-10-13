@@ -203,7 +203,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pyarrow as pa
 
-from tradepartner.adapters.edgar import duration_class
+from tradepartner.adapters.edgar import StatementConflict, duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -1932,17 +1932,21 @@ def _derived_candidates(
 
 class _ConflictIndex:
     """The source's `statement_conflict_keys` as `ConflictKey`s, indexed as
-    the list grows (each per-CIK read restores its CIK's entries; a source
-    without the attribute has none)."""
+    the list grows (each per-CIK read restores its CIK's entries, assigning a
+    fresh list when the read changed them -- #1566: a shrink alone missed an
+    equal-length restore; a source without the attribute has none)."""
 
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._keys: set[ConflictKey] = set()
+        self._listed: Sequence[StatementConflict] = ()
         self._seen = 0
 
     def keys(self) -> set[ConflictKey]:
         listed = getattr(self._source, "statement_conflict_keys", ())
-        if len(listed) < self._seen:  # the list was replaced or cleared: re-index
+        if listed is not self._listed or len(listed) < self._seen:
+            # a fresh list (a per-CIK read restored its entries) or a shorter one:
+            # index from the start again
             self._keys.clear()
             self._seen = 0
         for conflict in listed[self._seen :]:
@@ -1950,6 +1954,7 @@ class _ConflictIndex:
                 (conflict.accession, conflict.fact_name, conflict.period_end, conflict.period_days)
             )
         self._seen = len(listed)
+        self._listed = listed
         return self._keys
 
 
