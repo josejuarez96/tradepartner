@@ -3393,6 +3393,10 @@ def _fsn_filing_to_json(filing: FsnFiling) -> dict[str, Any]:
         "sic": filing.sic,
         "listings": [[item.title, item.ticker, item.exchange] for item in filing.listings],
         "shares": [[s.class_member, s.value, s.as_of_date.isoformat()] for s in filing.shares],
+        # #1624: a `dei:TradingSymbol` that names no exchange, T184's reading
+        # of the filing. Without it a cached filing loses the tag, and a
+        # filename reading that asked for it would find none.
+        "symbol_only": list(filing.symbol_only),
     }
 
 
@@ -3407,4 +3411,11 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
             FsnShare(member, value, date.fromisoformat(as_of))
             for member, value, as_of in data["shares"]
         ),
+        # An entry written before #1624 has no tag recorded (the field is
+        # T184's, and the cache kept only what its parser wrote). Reading it
+        # as none is right only for a cache nobody has asked the tag of: the
+        # release-time re-extraction (T184h's `FSN_VERSION` bump) rewrites
+        # every entry with the tag its filing carries. No bump here, because
+        # every reading this cache already served is unchanged by the field.
+        symbol_only=tuple(data.get("symbol_only") or ()),
     )

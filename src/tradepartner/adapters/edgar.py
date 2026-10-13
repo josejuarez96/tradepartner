@@ -1187,7 +1187,7 @@ def _cover_12b_marks(text: str) -> str:
     return html.unescape(re.sub(r"(?is)<[^<>]*>", "", marks)).replace("\xa0", " ")
 
 
-def cover_12b_exchanges(text: str, *, max_bytes: int | None) -> tuple[tuple[str, str], ...]:
+def cover_12b_exchanges(text: str, *, max_bytes: int) -> tuple[tuple[str, str], ...]:
     """The classes and exchanges a primary document's Section 12(b) table
     names (#1597, spec amendment 2026-10-12): `(class title, exchange
     code)` pairs in document order, each exchange read by the same
@@ -1198,15 +1198,16 @@ def cover_12b_exchanges(text: str, *, max_bytes: int | None) -> tuple[tuple[str,
     no exchange and one with no table inside `max_bytes` all return `()`;
     the fetch layer (T184b) counts that as `no_exchange` rather than
     writing a row. `max_bytes` is `edgar.filename_document_max_bytes` and
-    is not optional: the read stops at the table, or at the cap, so a
-    heading whose table starts beyond it reads nothing, and a caller that
-    forgets the argument fails rather than reading a document unbounded.
+    is required: the read stops at the table, or at the cap, so a heading
+    whose table starts beyond it reads nothing, and a caller that forgets
+    the cap asks for one rather than reading a document unbounded. There
+    is deliberately no way to read the whole document.
     """
-    body = text
-    if max_bytes is not None:
-        # Character slices before bytes: every character is at least one
-        # byte, so the cap bounds the work as well as the read.
-        body = text[:max_bytes].encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    if not isinstance(max_bytes, int) or max_bytes < 0:
+        raise TypeError(f"max_bytes must be a non-negative int of bytes, got {max_bytes!r}")
+    # Character slices before bytes: every character is at least one byte,
+    # so the cap bounds the work as well as the read.
+    body = text[:max_bytes].encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
     marks = _cover_12b_marks(body)
     heading = _12B_HEADING.search(marks)
     if heading is None:
