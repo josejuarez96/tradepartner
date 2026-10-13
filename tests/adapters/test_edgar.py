@@ -1106,3 +1106,25 @@ class TestCoverPageSplitContexts:
             ("Class A", "AAA"),
             ("Class B", "BBB"),
         ]
+
+    def test_shares_on_the_capital_units_axis_stay_unread_and_duplicates_collapse(self) -> None:
+        contexts = (
+            _context("A", {_CAPITAL_UNITS: "fitb:CommonMember"})
+            + _context("B", {_CAPITAL_UNITS: "fitb:CommonMember", _EXCH: "exch:XNAS"})
+            + _context("S", {_CAPITAL_UNITS: "fitb:CommonMember"}, instant=True)
+        )
+        facts = (
+            _listing_facts("A", "Common", "AAA", "NASDAQ")
+            + _nn("SecurityExchangeName", "B", "NASDAQ")
+            + _shares("S", "5")
+        )
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000092122-24-000001",
+            accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+            exchange_axis=True,
+            split_contexts=True,
+        )
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [("AAA", "NASDAQ")]
+        assert parsed.facts == ()
+        assert parsed.other_contexts == ("S",)

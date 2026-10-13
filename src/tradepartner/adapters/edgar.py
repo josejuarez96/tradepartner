@@ -917,6 +917,9 @@ def parse_cover_page(
         if set(dimensions) - allowed or len(class_axes & set(dimensions)) > 1:
             other.add(context["id"])
             continue
+        if name == _SHARES_CONCEPT and _CAPITAL_UNITS_AXIS in dimensions:
+            other.add(context["id"])  # #1651: shares on this axis stay unread, as today
+            continue
         class_axis = next(iter(class_axes & set(dimensions)), _CLASS_AXIS)
         if name != _SHARES_CONCEPT:
             classes.setdefault(context["id"], {})[name] = value
@@ -993,7 +996,10 @@ def parse_cover_page(
         axis_member = exchange_members.get(context_id)
         if axis_member is not None and _exchange_axis_mismatch(axis_member, code):
             mismatched += 1  # counted; the value wins (#1541 open question 1)
-        listings.append(CoverListing(title, symbol, code))
+        listing = CoverListing(title, symbol, code)
+        if split_contexts and listing in listings:
+            continue  # one listing per distinct exchange (#1651)
+        listings.append(listing)
     return CoverPageParse(
         CoverPage(cik, accession, accepted_at, tuple(listings)),
         tuple(shares),
