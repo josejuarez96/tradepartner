@@ -1868,9 +1868,10 @@ class ActionsParse:
     stock_rows_unusable: int = 0
     stock_dividends_stored: int = 0
     stock_rows_refused: tuple[str, ...] = ()  # "SYMBOL ex-date rate (why)"
-    #: #1506: 1 when the daily request's `spin_offs` category was malformed
-    #: and left out (`AlpacaPriceSource.corporate_actions`), else 0.
-    spinoffs_malformed: int = 0
+    #: #1506: the daily request's `spin_offs` or `name_changes` category when
+    #: it was malformed and left out (`AlpacaPriceSource.corporate_actions`,
+    #: `.symbol_changes`), so it never fails the day's other rows.
+    malformed_categories: tuple[str, ...] = ()
 
 
 @_fail_closed
@@ -2518,8 +2519,8 @@ class AlpacaPriceSource(PriceSource):
                     f"; {self.last_actions_report.stock_dividends_stored} "
                     "stock-dividend row(s) stored as split"
                 )
-            if self.last_actions_report.spinoffs_malformed:
-                line += "; malformed spin_offs category skipped"
+            if malformed := self.last_actions_report.malformed_categories:
+                line += f"; malformed {', '.join(malformed)} category skipped"
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
             if self.last_actions_report.symbol_change_reused:
@@ -2580,7 +2581,7 @@ class AlpacaPriceSource(PriceSource):
                     stock_rules=self._alpaca,
                 )
             except ValueError:
-                parsed = replace(parsed, spinoffs_malformed=1)
+                parsed = replace(parsed, malformed_categories=("spin_offs",))
             else:
                 parsed = replace(
                     parsed,
@@ -2616,13 +2617,22 @@ class AlpacaPriceSource(PriceSource):
         if not symbols:
             return []
         payload = self._fetch_name_changes(symbols, start, end)
-        parsed = parse_corporate_actions(
-            {"name_changes": payload.get("name_changes", [])},
-            self._resolver.resolve,
-            functools.partial(self._resolver.lead, actions=True),
-            process_start=start,
-            process_end=end,
-            lag_days=self._lag.days,
-        )
+        try:
+            parsed = parse_corporate_actions(
+                {"name_changes": payload.get("name_changes", [])},
+                self._resolver.resolve,
+                functools.partial(self._resolver.lead, actions=True),
+                process_start=start,
+                process_end=end,
+                lag_days=self._lag.days,
+            )
+        except ValueError:
+            # #1506: a malformed name change is counted on the report and
+            # never fails the daily run that asked for it (its bars and
+            # splits are already fetched); the actions backfill refuses it.
+            self.last_actions_report = ActionsParse(
+                (), (), (), malformed_categories=("name_changes",)
+            )
+            return []
         self.last_actions_report = parsed
         return [change for change in parsed.symbol_changes if change.security_id in ids]

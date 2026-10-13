@@ -387,14 +387,20 @@ def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     """A process-date action is skipped before its stamp and stored once after."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    # Ex-date 09-29, processed 10-14: the stamp is the 10-15 close.
     ex = date(2020, 9, 29)
-    stamp = datetime(2020, 10, 15, 20, tzinfo=UTC)
+    stamp = announcement_date_known_at(date(2020, 10, 14))
+    assert stamp == datetime(2020, 10, 15, 20, tzinfo=UTC)
     action = CorporateAction(
         "CHILD", ActionType.SPINOFF, ex, 0.25, stamp, "alpaca", source_action_id="PARENT"
     )
     window = (date(2020, 10, 1), date(2020, 10, 31))
-    before = stamp - timedelta(microseconds=1)
-    assert _add_actions(conn, [action], window, ingested_at=before) == 0
+    stats: dict[str, int] = {}
+    october_14_run = datetime(2020, 10, 14, 22, tzinfo=UTC)
+    assert _add_actions(conn, [action], window, ingested_at=october_14_run, stats=stats) == 0
+    assert stats == {"actions_not_yet_known": 1}  # skipped and counted, never raised
     assert _add_actions(conn, [action], window, ingested_at=stamp) == 1
     assert _add_actions(conn, [action], window, ingested_at=stamp + timedelta(days=1)) == 0
     assert conn.execute(

@@ -3001,6 +3001,11 @@ class TestAlpacaPriceSource:
             ("dividend", date(2020, 8, 7)),
             ("split", date(2020, 8, 31)),
         ]
+        # #1506: the daily run's own name-change request counts it, never raises.
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+        assert "malformed name_changes category skipped" in source.resolution_summary()
 
     def test_malformed_spinoff_does_not_fail_daily_split(self) -> None:
         def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
@@ -3022,7 +3027,7 @@ class TestAlpacaPriceSource:
         actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
         assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
         assert source.last_actions_report is not None
-        assert source.last_actions_report.spinoffs_malformed == 1
+        assert source.last_actions_report.malformed_categories == ("spin_offs",)
         assert "malformed spin_offs category skipped" in source.resolution_summary()
 
     def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
