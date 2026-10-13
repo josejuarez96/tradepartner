@@ -182,3 +182,13 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001959455,2026-08-21,0.22,duplicate,f0ec1f75-c508-469f-8a3c-f5122ae85d4a,HSHP,raw records differ by sub type only
 0001383414,2026-09-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
 0001737924,2026-09-30,0.02,duplicate,97f29711-9861-4d3a-9107-73ae7e23f5c2,NCDL,one supplemental beside a separate regular: https://www.ncdl.com/news/press-releases/detail/149/nuveen-churchill-direct-lending-corp-announces-second-quarter-2026-results
+0000006769,2021-01-21,0.025,duplicate,e0d5f90c-787c-48aa-b7ff-a8d22f5a0589,APA,raw records differ by cusip only
+0001232582,2019-06-27,0.06,duplicate,e6a56b02-5eb9-4b62-bff6-d9c1268bd9b0,AHT,raw records differ by cusip only
+0001465740,2021-12-28,0.17,duplicate,235ac1b7-f0c8-4c2e-b4ac-7cbd85c78327,TWO,raw records differ by cusip only
+0001465740,2022-04-01,0.17,duplicate,c2e59c6a-d91d-4221-a76e-da33bf7e7324,TWO,raw records differ by cusip only
+0001465740,2022-07-01,0.17,duplicate,47a883d7-969e-4f43-a819-429d97a8297f,TWO,raw records differ by cusip only
+0001465740,2022-09-30,0.17,duplicate,bc386690-e1da-415f-a2fd-ddd411c360da,TWO,raw records differ by cusip only
+0001496048,2019-08-29,0.33,duplicate,91e163b8-33df-495a-9742-78a348c07eb6,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
+0001496048,2019-11-27,0.33,duplicate,70fb9c80-db66-4c7f-bbea-6fe458d9ba73,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
+0001496048,2020-02-27,0.3325,duplicate,fd1db0ac-43a5-4c23-ba50-5aca3529891f,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
+0001514281,2019-06-27,0.5,duplicate,88cc3d07-5c7d-4cc7-9938-01e731b705b2,MITT,raw records differ by cusip only
