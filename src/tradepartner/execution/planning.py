@@ -29,13 +29,26 @@ else None (also before the window's first rebalance session, #649).
    the same connection, so it sees the uncommitted trial row; the second
    `assets` read, for the targets not held; `plan.decisions_from`; then the
    `signals`, `decisions` and `paper_plans` rows; then the trial's `ok`
-   result with no statistics, and the commit. The plan line asks for every
+   result with no statistics, and the commit. Between `engine.plan` and the
+   second `assets` read sits the universe-collapse check (below). The plan line asks for every
    read before the transaction; the engine's reads cannot be, since the
    provider refuses a handle whose trial row does not exist, so they sit
    inside it. What the line protects still holds: a fault in any read rolls
    back only this step's uncommitted rows, never the halt rows the wrapper
    writes on its own connection, and no partial decision set is ever
    committed.
+
+**The universe-collapse halt** (spec req 7 step 6, amendment 2026-10-12,
+#1550; plan T188). Immediately after `engine.plan` returns, before the second
+`assets` read and before any decision, `universe_collapse` compares the plan's
+`n_universe` with the live `paper.min_universe_names` and, against
+`universe_baseline` (the `n_universe` of the window's own latest earlier
+`paper_plans` row, reset to none after a `released` kill-switch row later than
+that plan that releases a `UniverseCollapseError` engagement), with the live
+`paper.max_universe_drop_fraction`; a collapse raises `UniverseCollapseError`
+inside the transaction. On the `reused` answer, a `paper_plans` row for T_i
+whose `n_universe` is under `paper.min_universe_names` is never re-used: the
+same fault is raised, naming the row, before anything else is read.
 
 **Exits.** A failure of the plan trial itself (the registry's open or
 result, the provider's construction, the tracking-window rule, or
@@ -45,8 +58,10 @@ result, the provider's construction, the tracking-window rule, or
 path, never the halt path. A `SystemFaultError` or `StaleDataError` raised
 inside the step, and any exception of `assets_read` whatever its type (that
 read goes through the wrapper's classification, so a halt is under way), is
-re-raised unchanged. Every exit rolls the transaction back first, so it leaves
-no trial, `signals`, `decisions` or `paper_plans` row.
+re-raised unchanged. `UniverseCollapseError`, a `SystemFaultError`, takes the
+halt path on both of its raises (the new plan and the `reused` row). Every exit
+rolls the transaction back first, so it leaves no trial, `signals`, `decisions`
+or `paper_plans` row.
 
 This module imports no adapter (the `assets` reads go through `assets_read`),
 calls no broker and reads no clock: rows are stamped with `now`, the run's
@@ -81,7 +96,7 @@ from tradepartner.backtest.schedule import fill_session, read_time, rebalance_se
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, is_session, previous_session, session_close
 from tradepartner.config import PAPER_FAMILIES, Cadence, HypothesisFamily, RiskConfig, Settings
-from tradepartner.errors import StaleDataError, SystemFaultError
+from tradepartner.errors import StaleDataError, SystemFaultError, UniverseCollapseError
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.plan import (
     AssetFlags,
@@ -100,6 +115,7 @@ from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     DecisionRow,
     JournalRow,
+    KillSwitchRow,
     PaperPlanRow,
     PaperRunRow,
     PaperWindowRow,
@@ -117,6 +133,8 @@ __all__ = [
     "plan_rebalance",
     "rebalance_kind",
     "reference_prices",
+    "universe_baseline",
+    "universe_collapse",
 ]
 
 RebalanceKind = Literal["rebalance", "catch_up"]
@@ -133,6 +151,13 @@ _FORCED_EXIT = "forced_exit"
 _RUN_BY = "paper run"
 _MAX_CATCH_UP_KEY = "paper.max_catch_up_sessions"
 _LIVE_STATES = frozenset({State.OPEN, State.IN_FLIGHT})
+_ENGAGED = "engaged"
+_RELEASED = "released"
+_COLLAPSE_FAULT = UniverseCollapseError.__name__
+_REMEDY = (
+    "run `tradepartner health --check`, then `tradepartner ingest --source alpaca "
+    "--backfill --since <session>` when its `session_holes` rule names one"
+)
 _NEW_YORK = ZoneInfo("America/New_York")
 
 
@@ -256,6 +281,78 @@ def rebalance_kind(
         window, runs, rebalance_events, session, max_catch_up_sessions, cadence=cadence
     )
     return None if due is None else due[0]
+
+
+# --- the universe-collapse halt (#1550, T188) --------------------------------------------
+
+
+def universe_collapse(n_universe: int, baseline: int | None, settings: Settings) -> str | None:
+    """Why a plan of `n_universe` members is a collapsed universe, or None (module
+    docstring). Collapsed when `n_universe` is under the live
+    `paper.min_universe_names`, or when `baseline` (the window's last plan's
+    `n_universe`, `universe_baseline`) is above zero and `n_universe` is under
+    `baseline x (1 - paper.max_universe_drop_fraction)`, the product taken once in
+    floating point and compared with `<`. The message names `n_universe`, the
+    baseline, the key that fired with its value, and the remedy."""
+    paper = settings.paper
+    floor = paper.min_universe_names
+    if n_universe < floor:
+        return (
+            f"the universe has {n_universe} names, under paper.min_universe_names={floor} "
+            f"(last plan: {baseline if baseline is not None else 'none'}); {_REMEDY}"
+        )
+    if baseline is not None and baseline > 0:
+        fraction = paper.max_universe_drop_fraction
+        bound = baseline * (1 - fraction)
+        if n_universe < bound:
+            return (
+                f"the universe has {n_universe} names, under {bound:g}, a drop of more than "
+                f"paper.max_universe_drop_fraction={fraction:g} from the window's last plan "
+                f"of {baseline} names; {_REMEDY}"
+            )
+    return None
+
+
+def universe_baseline(
+    plans: Sequence[PaperPlanRow], kill_switch_rows: Sequence[KillSwitchRow]
+) -> int | None:
+    """The drop rule's baseline (module docstring): the `n_universe` of the latest
+    of `plans` by `rebalance_session`, or None when there is none or when the latest
+    `released` row of `kill_switch_rows` (write order, `event_id`, as
+    `switch.derive` reads them) is later than that plan's `known_at` and releases an
+    engagement whose `fault_type` is `UniverseCollapseError`: an `engaged` row after
+    the release before it. `plans` are one window's rows earlier than T_i and
+    `kill_switch_rows` the same window's; the caller reads both for that window."""
+    if not plans:
+        return None
+    latest = max(plans, key=lambda p: p.rebalance_session)
+    rows = sorted(kill_switch_rows, key=lambda r: (r.event_id is None, r.event_id or 0))
+    released_at = [i for i, r in enumerate(rows) if r.state == _RELEASED]
+    if released_at:
+        last = released_at[-1]
+        previous = released_at[-2] if len(released_at) > 1 else -1
+        released = rows[previous + 1 : last]
+        if rows[last].at > latest.known_at and any(
+            r.state == _ENGAGED and r.fault_type == _COLLAPSE_FAULT for r in released
+        ):
+            return None
+    return latest.n_universe
+
+
+def _check_universe(
+    conn: duckdb.DuckDBPyConnection,
+    window: PaperWindowRow,
+    window_id: int,
+    t_i: date,
+    n_universe: int,
+    settings: Settings,
+) -> None:
+    """Raise `UniverseCollapseError` when the plan at close(T_i) has collapsed."""
+    earlier = [p for p in store_journal.plans_for(conn, window_id) if p.rebalance_session < t_i]
+    baseline = universe_baseline(earlier, store_journal.kill_switch_events_for(conn, window_id))
+    why = universe_collapse(n_universe, baseline, settings)
+    if why is not None:
+        raise UniverseCollapseError(f"book {window.book_id}, rebalance {t_i}: {why}")
 
 
 # --- reads -----------------------------------------------------------------------------
@@ -648,7 +745,16 @@ def plan_rebalance(
     ]
     if journaled or planned:
         # Keyed on the plan row too, so a committed plan with no decision is
-        # never planned again.
+        # never planned again. A row under the floor is never re-used (T188).
+        floor = settings.paper.min_universe_names
+        for row in planned:
+            if row.n_universe < floor:
+                raise UniverseCollapseError(
+                    f"book {window.book_id}, rebalance {t_i}: the journaled paper_plans row "
+                    f"(run {row.run_id}, plan trial {row.plan_trial_id}) has {row.n_universe} "
+                    f"names, under paper.min_universe_names={floor}, and is not re-used; "
+                    f"{_REMEDY}"
+                )
         return PlanOutcome(t_i, "reused", tuple(d.decision for d in journaled))
     if lagging:
         return PlanOutcome(t_i, "lagging")
@@ -662,6 +768,7 @@ def plan_rebalance(
             ),
             "engine.plan",
         )
+        _check_universe(conn, window, window.window_id, t_i, plan.n_universe, settings)
         held = set(reads.held_assets)
         new = sorted(set(plan.targets) - held)
         assets = {**reads.held_assets, **_assets(assets_read, _symbols(conn, session, new))}

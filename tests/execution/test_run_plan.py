@@ -26,7 +26,9 @@ from tradepartner.backtest import engine
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.calendar import previous_session
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
+from tradepartner.errors import UniverseCollapseError
 from tradepartner.execution import planning
+from tradepartner.execution import resume as resume_module
 from tradepartner.execution import run as run_module
 from tradepartner.execution.planning import PlanTrialError
 from tradepartner.execution.run import RunOutcome, StepContext, tracking_run
@@ -37,6 +39,7 @@ from tradepartner.store.journal import (
     FillRow,
     OrderEventRow,
     OrderRow,
+    PaperPlanRow,
     PaperRunResultRow,
     PaperRunRow,
     PaperWindowRow,
@@ -670,3 +673,114 @@ def test_at_daily_a_pending_rebalance_lapses_on_the_next_fill_session_which_plan
     ((planned,),) = daily_env.query("SELECT rebalance_session FROM paper_plans")
     assert planned == t_1
     assert daily_env.query("SELECT DISTINCT session FROM orders") == [(f_1,)]
+
+
+# --- the universe-collapse halt (spec amendment 2026-10-12, #1550; T188) --------------
+
+#: A session inside every member's `universe.min_history_months` lookback at close(T_0).
+LOOKBACK_SESSION = date(2019, 4, 15)
+
+
+def _hole(env: Env) -> None:
+    """Remove every bar of `LOOKBACK_SESSION` on the copy, kept aside: rule 6
+    (`history`) then fails every name, the 2026-10-08 case."""
+    with open_for_write(env.settings) as conn:
+        conn.execute(
+            "CREATE TABLE hole_bars AS SELECT * FROM prices_daily WHERE session = ?",
+            [LOOKBACK_SESSION],
+        )
+        conn.execute("DELETE FROM prices_daily WHERE session = ?", [LOOKBACK_SESSION])
+
+
+def _repair(env: Env) -> None:
+    with open_for_write(env.settings) as conn:
+        conn.execute("INSERT INTO prices_daily SELECT * FROM hole_bars")
+        conn.execute("DROP TABLE hole_bars")
+
+
+def test_a_collapsed_universe_halts_before_any_decision_and_resume_then_plans(
+    env: Env,
+) -> None:
+    """Through the real `engine.plan`: with a lookback session's bars gone the universe
+    at close(T_0) is empty, and the F_0 run halts on `UniverseCollapseError`: the
+    `engaged` row with its fault type, the `halted` alert naming the book, T_0, `0` and
+    the key, the `halted` result, no trial, signal, decision or plan row, no `assets`
+    read and no `submit`; T_0 stays pending. After the repair and the owner's resume,
+    the catch-up run plans and trades T_0."""
+    before = env.counts()
+    _hole(env)
+    with pytest.raises(UniverseCollapseError):
+        env.run(at(F_0))
+    run_id = env.latest_run()
+    assert env.kind(run_id) == "rebalance"
+    assert env.result(run_id)[:2] == ("halted", "UniverseCollapseError")
+    assert env.engaged() == [("fault", "UniverseCollapseError", run_id)]
+    assert "halted" in env.alerts(run_id)
+    ((message,),) = env.query(
+        "SELECT message FROM alerts WHERE run_id = ? AND kind = 'halted'", [run_id]
+    )
+    assert "book main" in message and str(T_0) in message
+    assert "0 names" in message and "paper.min_universe_names=1" in message
+    assert env.counts() == before
+    assert [c.method for c in env.fake.calls if c.method in ("assets", "submit")] == []
+    assert env.rebalance_events() == []
+
+    _repair(env)
+    env.clock.now = at(F_0, 20, 0)  # the owner looks after the halt
+    released = resume_module.resume(
+        env.settings,
+        env.connect,
+        env.fake,
+        env.clock,
+        "store repaired after the universe collapse",
+        False,
+        accept_rejections=False,
+    )
+    assert released.status == "released", released
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(nxt.run_id)
+    assert nxt.kind == "catch_up"
+    ((n_universe,),) = env.query("SELECT n_universe FROM paper_plans")
+    assert n_universe > 0
+    assert env.submits() == len(TARGETS)
+    assert env.rebalance_events() == [(T_0, "executed", None, nxt.run_id)]
+
+
+def test_another_windows_plan_is_not_the_runs_baseline(env: Env) -> None:
+    """A `daily` book's plan row of 1,000 names sits in the store; the `main` window's
+    first plan is checked by the floor alone and trades as before."""
+    window = env.window
+    assert window is not None
+    stamp = at(T_0, 13, 0)
+    (other_id,) = env.append(
+        replace(window, window_id=None, book_id="daily", known_at=stamp, ingested_at=stamp)
+    )
+    assert other_id is not None
+    (other_run,) = env.append(
+        PaperRunRow(
+            window_id=other_id,
+            session=T_0,
+            kind="rebalance",
+            started_at=stamp,
+            invoked_by="tty",
+            code_version="test",
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+    assert other_run is not None
+    env.append(
+        PaperPlanRow(
+            run_id=other_run,
+            plan_trial_id=0,
+            rebalance_session=date(2019, 3, 29),
+            n_universe=1000,
+            n_targets=0,
+            n_orders_below_min_at_live_capital=0,
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    assert env.submits() == len(TARGETS)
