@@ -132,7 +132,8 @@ _ID_SEPARATOR = "-"
 #: `FEE` is booked as `fee_cash`; a dividend type is left to the store's dividend
 #: rule; a corporate-action type (and any row of null `net_amount`) is read and
 #: recorded but never booked and never a mismatch by itself; any other cash type
-#: is `unexplained_activity`.
+#: is `unexplained_activity` unless it is already inside the base (#1641: its
+#: cash is already in the cash the ledger starts from, so it is never a mismatch).
 _FEE = "FEE"
 _EXECUTED = "executed"
 _DIVIDEND_TYPES = frozenset(
@@ -309,14 +310,19 @@ def _inside_base(activity: CashActivity, explanations: Explanations) -> bool:
     return cut is not None and activity.date < cut
 
 
-def _activity_mismatch(activity: CashActivity) -> Mismatch | None:
+def _activity_mismatch(activity: CashActivity, inside_base: bool) -> Mismatch | None:
     """A mismatch of kind `unexplained_activity` for a read this reconciliation
     cannot place (#1583, T183), else None: a `FEE` or dividend row whose status
     is not `executed`, or a cash activity (non-null `net_amount`) of a type the
     rule does not know (`INT`, `JNLC`, ...). A corporate action (a known type or
     a null `net_amount`) is never a mismatch by itself; an `executed` `FEE` or
-    dividend row is left to booking / the store's dividend rule. The detail names
-    the type, the id, the date, the amount and the status."""
+    dividend row is left to booking / the store's dividend rule. An unknown cash
+    type already **inside the base** (`inside_base`, #1641) is never a mismatch
+    either, because its cash is already in the cash the ledger starts from (the
+    account's own funding `JNLC`, an interest row, ...); a `FEE`/dividend whose
+    `status` is not `executed` still halts even inside the base, since a booked
+    or recorded fact the broker later reverses is a real discrepancy. The detail
+    names the type, the id, the date, the amount and the status."""
     amount = "null" if activity.net_amount is None else activity.net_amount
     detail = (
         f"{activity.activity_type!r} activity {activity.activity_id!r} on {activity.date} "
@@ -326,6 +332,8 @@ def _activity_mismatch(activity: CashActivity) -> Mismatch | None:
     if kind == _FEE or kind in _DIVIDEND_TYPES:
         return None if activity.status == _EXECUTED else Mismatch("unexplained_activity", detail)
     if kind in _CORPORATE_ACTION_TYPES or activity.net_amount is None:
+        return None
+    if inside_base:
         return None
     return Mismatch("unexplained_activity", detail)
 
@@ -431,15 +439,16 @@ def compare(
                 f"cash activity id {activity.activity_id!r} is listed twice in one read"
             )
         read_ids.add(activity.activity_id)
-        unexplained = _activity_mismatch(activity)
+        # `_inside_base` before `_activity_mismatch` (#1641): an activity already
+        # in the ledger's base is already in the cash the ledger starts from, so
+        # its type is never unexplained (and a base `FEE` is never booked again);
+        # only an activity outside the base is classified and booked.
+        inside_base = _inside_base(activity, explanations)
+        unexplained = _activity_mismatch(activity, inside_base)
         if unexplained is not None:
             mismatches.append(unexplained)
             continue
-        if (
-            activity.activity_type == _FEE
-            and activity.net_amount is not None
-            and not _inside_base(activity, explanations)
-        ):
+        if activity.activity_type == _FEE and activity.net_amount is not None and not inside_base:
             described = activity.description or ""
             fee_proposals.append(
                 ProposedAdjustment(

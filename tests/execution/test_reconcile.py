@@ -1298,6 +1298,67 @@ def test_a_journaled_fee_the_broker_corrected_is_a_mismatch() -> None:
     assert result.adjustments == ()
 
 
+def test_an_activity_inside_the_base_is_never_unexplained() -> None:
+    """#1641: an activity already inside the base is never a mismatch, whatever
+    its type. The daily book's own $100,000 funding `JNLC`, dated the day before
+    the window's start date under the fallback (null recorded sets), is already
+    in the cash the ledger starts from, so it reconciles `ok` (recorded on the
+    row, never flagged). Before the fix `_activity_mismatch` ran before
+    `_inside_base` and halted on it."""
+    result = _run(
+        _ledger(100_000.0),
+        _positions(),
+        100_000.0,
+        explanations=_explanations(
+            activities=(
+                _activity("20261009000000000::cd4b3757", "JNLC", date(2026, 10, 9), 100_000.0),
+            ),
+            activity_seen_before=date(2026, 10, 10),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert _kinds(result) == []
+    assert result.adjustments == ()
+    assert [r.activity_id for r in result.activities] == ["20261009000000000::cd4b3757"]
+
+
+def test_an_unknown_type_inside_a_seen_set_is_never_unexplained() -> None:
+    """#1641: the same holds by the seen-set route, not only the fallback: an
+    `INT` a base recorded is inside the base and never a mismatch, because its
+    effect is already in the ledger's cash."""
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_000.0,
+        explanations=_explanations(
+            activities=(_activity("act-int", "INT", S, 0.01),),
+            seen_activity_ids=frozenset({"act-int"}),
+        ),
+    )
+
+    assert result.status == "ok"
+    assert _kinds(result) == []
+
+
+def test_an_unknown_type_dated_on_the_start_date_is_still_unexplained() -> None:
+    """#1641: the fallback cut is strict, so an unknown-type activity dated on the
+    window's New York start date (not strictly before it) is not inside the base
+    and stays `unexplained_activity`."""
+    result = _run(
+        _ledger(1_000.0),
+        _positions(),
+        1_000.0,
+        explanations=_explanations(
+            activities=(_activity("act-on", "JNLC", date(2026, 10, 10), 25.0),),
+            activity_seen_before=date(2026, 10, 10),
+        ),
+    )
+
+    assert _kinds(result) == ["unexplained_activity"]
+    assert "JNLC" in result.mismatches[0].detail
+
+
 @pytest.mark.parametrize("activity_type", ["SSP", "MA", "REORG"])
 def test_a_corporate_action_row_is_recorded_and_never_a_mismatch(activity_type: str) -> None:
     result = _run(
