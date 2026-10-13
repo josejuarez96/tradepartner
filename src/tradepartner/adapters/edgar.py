@@ -1203,7 +1203,7 @@ def cover_12b_exchanges(text: str, *, max_bytes: int) -> tuple[tuple[str, str], 
     the cap asks for one rather than reading a document unbounded. There
     is deliberately no way to read the whole document.
     """
-    if not isinstance(max_bytes, int) or max_bytes < 0:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise TypeError(f"max_bytes must be a non-negative int of bytes, got {max_bytes!r}")
     # Character slices before bytes: every character is at least one byte,
     # so the cap bounds the work as well as the read.

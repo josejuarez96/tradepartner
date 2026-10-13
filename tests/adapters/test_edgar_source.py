@@ -1067,3 +1067,39 @@ def test_a_cache_entry_written_before_the_field_reads_no_tag(tmp_path: Path) -> 
     assert (record.accession, record.form) == (accession, "10-Q")
     assert (record.symbol_only, record.incomplete_listings) == ((), 0)
     assert [(item.ticker, item.exchange) for item in record.listings] == [("ANSS", "NASDAQ")]
+
+
+@pytest.mark.parametrize("recorded", ["ZEN", {"tag": "ZEN"}, ["ZEN", 7], [["ZEN"]]])
+def test_a_cache_entry_whose_symbol_only_is_not_strings_refuses_to_read(
+    tmp_path: Path, recorded: Any
+) -> None:
+    """safety-reviewer (#1624): the cache file is a file on disk. An entry
+    whose `symbol_only` is not the list of strings the writer wrote is
+    corrupt, and is refused rather than read as the letters of one symbol or
+    as symbols that are not strings — the loader's own answer for an
+    unreadable file, no records, and a named error when it is strict."""
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings)
+    path = source._fsn_cache_path(_ANSYS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    accession = "0001193125-19-000077"
+    path.write_text(
+        json.dumps(
+            {
+                "version": FSN_VERSION,
+                "cik": _ANSYS,
+                "records": {
+                    accession: {
+                        "form": "10-Q",
+                        "sic": 3711,
+                        "listings": [["Common Stock", "ANSS", "NASDAQ"]],
+                        "shares": [["", "12", "2019-06-30"]],
+                        "symbol_only": recorded,
+                    }
+                },
+            }
+        )
+    )
+    assert source._load_fsn_cache(_ANSYS) == {}
+    with pytest.raises(ValueError, match="unreadable"):
+        source._load_fsn_cache(_ANSYS, strict=True)

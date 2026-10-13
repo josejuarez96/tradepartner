@@ -348,12 +348,17 @@ class TestCover12bExchanges:
     def test_there_is_no_uncapped_read(self) -> None:
         """#1624 (quant-auditor nit): the cap is required and is an int, so
         no call site can read a primary document unbounded — not even by
-        passing `None`, which the reader used to take as \"the whole
-        document\"."""
+        passing `None`, which the reader used to take as "the whole
+        document". A `bool` is an `int`, so `True` (one byte) is a mistake,
+        not a cap."""
         with pytest.raises(TypeError):
             cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=None)  # type: ignore[arg-type]
         with pytest.raises(TypeError):
             cover_12b_exchanges("Section 12(b) of the Act:")  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=True)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=-1)
 
     def test_the_read_stays_linear_on_unclosed_tags(self) -> None:
         """safety-reviewer (T184): the text is filer-written, so a pattern

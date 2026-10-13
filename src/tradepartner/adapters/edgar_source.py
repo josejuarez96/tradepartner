@@ -3400,6 +3400,24 @@ def _fsn_filing_to_json(filing: FsnFiling) -> dict[str, Any]:
     }
 
 
+def _fsn_symbol_only(data: Mapping[str, Any]) -> tuple[str, ...]:
+    """The symbol-only tags one cached FSN entry records (#1624).
+
+    A missing key is an entry written before #1624, which recorded none.
+    Anything else must be the list of strings the writer wrote: a cache file
+    is a file on disk, so a corrupt or hand-edited one that holds a string, a
+    dict or a list of something else is refused rather than read as the
+    letters of one symbol or as symbols that are not strings."""
+    recorded = data.get("symbol_only")
+    if recorded is None:
+        return ()
+    if not isinstance(recorded, list) or not all(isinstance(item, str) for item in recorded):
+        raise TypeError(
+            f"cached symbol_only must be a list of strings, got {type(recorded).__name__}"
+        )
+    return tuple(recorded)
+
+
 def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> FsnFiling:
     return FsnFiling(
         accession=accession,
@@ -3417,5 +3435,5 @@ def _fsn_filing_from_json(accession: str, cik: str, data: Mapping[str, Any]) -> 
         # release-time re-extraction (T184h's `FSN_VERSION` bump) rewrites
         # every entry with the tag its filing carries. No bump here, because
         # every reading this cache already served is unchanged by the field.
-        symbol_only=tuple(data.get("symbol_only") or ()),
+        symbol_only=_fsn_symbol_only(data),
     )
