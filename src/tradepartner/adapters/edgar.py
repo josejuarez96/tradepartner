@@ -1137,18 +1137,24 @@ def _cover_12b_marks(text: str) -> str:
     """`text` with every other tag dropped, each `</td>`/`</th>`, `</tr>` and
     `</table>` replaced by its structural marker and every other block or
     line tag by a line break, entities unescaped. A cell holding several
-    stacked classes keeps one class per line, so the stacked shape reads."""
+    stacked classes keeps one class per line, so the stacked shape reads.
+
+    The two patterns that can start anywhere stop at the next `<`
+    (`<table`, and the catch-all that drops the tags no marker names): the
+    text is filer-written, and a tag pattern free to scan past a `<` costs
+    the document's whole length at every unclosed `<` it meets, which makes
+    one mangled 4 MB document quadratic in its own length. The others name
+    their tag outright, so their scan stops at the tag's first character."""
     marks = re.sub(r"(?is)</\s*(td|th)\s*>", _CELL_END, text)
     marks = re.sub(r"(?is)</\s*tr\s*>", _ROW_END, marks)
     marks = re.sub(r"(?is)<\s*/\s*table\s*>", _TABLE_END, marks)
-    marks = re.sub(r"(?is)<table\b[^>]*>?", "\n", marks)
+    marks = re.sub(r"(?is)<table\b[^<>]*>?", "\n", marks)
     marks = re.sub(r"(?is)<br\s*/?>", "\n", marks)
     marks = re.sub(r"(?is)</\s*(div|p|li)\s*>", "\n", marks)
-    marks = re.sub(r"(?is)<[^>]+>", "", marks)
-    return html.unescape(marks).replace("\xa0", " ")
+    return html.unescape(re.sub(r"(?is)<[^<>]*>", "", marks)).replace("\xa0", " ")
 
 
-def cover_12b_exchanges(text: str, *, max_bytes: int | None = None) -> tuple[tuple[str, str], ...]:
+def cover_12b_exchanges(text: str, *, max_bytes: int | None) -> tuple[tuple[str, str], ...]:
     """The classes and exchanges a primary document's Section 12(b) table
     names (#1597, spec amendment 2026-10-12): `(class title, exchange
     code)` pairs in document order, each exchange read by the same
@@ -1158,11 +1164,16 @@ def cover_12b_exchanges(text: str, *, max_bytes: int | None = None) -> tuple[tup
     A document with no 12(b) heading (12(g) only), one whose table names
     no exchange and one with no table inside `max_bytes` all return `()`;
     the fetch layer (T184b) counts that as `no_exchange` rather than
-    writing a row. `max_bytes` is `edgar.filename_document_max_bytes`:
-    the read stops at the table, or at the cap, so a heading whose table
-    starts beyond it reads nothing.
+    writing a row. `max_bytes` is `edgar.filename_document_max_bytes` and
+    is not optional: the read stops at the table, or at the cap, so a
+    heading whose table starts beyond it reads nothing, and a caller that
+    forgets the argument fails rather than reading a document unbounded.
     """
-    body = text if max_bytes is None else text.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    body = text
+    if max_bytes is not None:
+        # Character slices before bytes: every character is at least one
+        # byte, so the cap bounds the work as well as the read.
+        body = text[:max_bytes].encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
     marks = _cover_12b_marks(body)
     heading = _12B_HEADING.search(marks)
     if heading is None:

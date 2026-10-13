@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -141,7 +142,7 @@ class TestCover12bExchanges:
         `normalize_exchange`'s exact-name table does not carry, so that row
         reads no exchange rather than a names-nothing slug."""
         text = _document("filing_dual_exchange_d360924d10ka.htm.gz")
-        assert cover_12b_exchanges(text) == (
+        assert cover_12b_exchanges(text, max_bytes=None) == (
             ("Common Stock, par value $0.001 per share", "NASDAQ"),
         )
 
@@ -152,7 +153,7 @@ class TestCover12bExchanges:
         Which line a row takes is the caller's rule (T184b); the reader
         gives both, the common class's first."""
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
-        assert cover_12b_exchanges(text) == (
+        assert cover_12b_exchanges(text, max_bytes=None) == (
             ("Common Shares, $0.01 par value per share", "NASDAQ"),
             ("Series A Preferred Stock, $0.01 par value per share", "NYSE"),
             ("Series B Preferred Stock, $0.01 par value per share", "NYSE"),
@@ -166,20 +167,25 @@ class TestCover12bExchanges:
         assert len(text.encode("utf-8")) > 115_000
         assert cover_12b_exchanges(text, max_bytes=200_000)[0][1] == "NASDAQ"
         assert cover_12b_exchanges(text, max_bytes=100_000) == ()
-        assert cover_12b_exchanges(text) == cover_12b_exchanges(text, max_bytes=4_000_000)
+        assert cover_12b_exchanges(text, max_bytes=None) == cover_12b_exchanges(
+            text, max_bytes=4_000_000
+        )
 
     def test_a_12g_only_document_reads_no_exchange(self) -> None:
         """Chineseinvestors' 10-K/A registers under Section 12(g): there is
         no 12(b) heading at all, so no row is read (counted `no_exchange`
         by T184b)."""
         text = _document("filing_12g_only_chineseinvestors_10ka-053116.htm.gz")
-        assert cover_12b_exchanges(text) == ()
+        assert cover_12b_exchanges(text, max_bytes=None) == ()
 
     def test_a_heading_with_no_table_reads_no_exchange(self) -> None:
         """Royale Energy's 10-K/A writes the 12(b) heading and then a 12(g)
         block, with no table at all: the block ends at the next registration
         section and nothing is read."""
-        assert cover_12b_exchanges(_document("filing_no_table_re04041710ka.htm.gz")) == ()
+        assert (
+            cover_12b_exchanges(_document("filing_no_table_re04041710ka.htm.gz"), max_bytes=None)
+            == ()
+        )
 
     @pytest.mark.parametrize(
         ("text", "expected"),
@@ -242,7 +248,7 @@ class TestCover12bExchanges:
     def test_the_four_text_shapes_the_reader_stops_at(
         self, text: str, expected: tuple[tuple[str, str], ...]
     ) -> None:
-        assert cover_12b_exchanges(text) == expected
+        assert cover_12b_exchanges(text, max_bytes=None) == expected
 
     def test_the_read_cap_is_honoured_when_it_is_set(self) -> None:
         """`max_bytes` bounds the read itself: without it the deep table
@@ -250,3 +256,16 @@ class TestCover12bExchanges:
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
         assert cover_12b_exchanges(text, max_bytes=None) != ()
         assert cover_12b_exchanges(text, max_bytes=0) == ()
+
+    def test_the_read_stays_linear_on_unclosed_tags(self) -> None:
+        """safety-reviewer (T184): the text is filer-written, so a pattern
+        that scans to the end of the document on every `<` it does not close
+        makes a document at the cap quadratic in its own length. One million
+        unclosed tags at the cap's default size must read in well under a
+        second, and a document that is one long tag must not read a venue."""
+        crafted = "<" * 1_000_000
+        started = time.monotonic()
+        assert cover_12b_exchanges(crafted, max_bytes=4_000_000) == ()
+        assert time.monotonic() - started < 10.0
+        for broken in ("</ td </td", "<br " * 1_000):
+            assert cover_12b_exchanges(broken, max_bytes=4_000_000) == ()
