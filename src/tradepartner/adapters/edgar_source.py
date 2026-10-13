@@ -340,13 +340,17 @@ STATEMENT_VERSION = 1
 #: Bumped when a parser change must re-extract every cached FSN period.
 #: Separate from `PARSER_VERSION`, which stays the per-CIK stamps' key: a
 #: bump here re-downloads every period's zip (the PR states that cost).
-FSN_VERSION = 2  # 2: #609 (latest ddate per member, NULL shares, title whitespace)
+#: 2: #609 (latest ddate per member, NULL shares, title whitespace);
+#: 3: #1541 (exchange-axis listings, the release `cover-listings-1541`, T181).
+FSN_VERSION = 3
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
 #: #615's nil-with-text refusal is no bump: a cached parse that skipped such
 #: a fact keeps it until the next bump re-parses it.
-COVER_VERSION = 2  # 2: #609 (nil facts skipped, incomplete listings skipped and counted)
+#: 2: #609 (nil facts skipped, incomplete listings skipped and counted);
+#: 3: #1541 (exchange-axis listings, the release `cover-listings-1541`, T181).
+COVER_VERSION = 3
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
