@@ -34,6 +34,7 @@ from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
+    BORROW_STATUS_UNIQUE,
     COVERAGE_REFERENCE_NAMES,
     DUPLICATE_DIVIDENDS,
     FILENAME_LISTING_VALID_FROM,
@@ -3070,3 +3071,186 @@ def test_symbol_change_revision_passes_and_a_mis_stamped_first_row_fails(
     report = health_report(fixture_store, T_END, settings)
     check = next(c for c in report.integrity if c.rule == SYMBOL_CHANGE_KNOWN_AT)
     assert check.violations.height == 1
+
+
+# --- Borrow status (#1506, T171e) ---------------------------------------------
+
+#: The fixture's three snapshots (`borrow_status.csv`), each a session's
+#: 21:00Z, an hour after the close: the `ok` run rows the ingest would have
+#: written for them, cursor = the fetch time.
+BORROW_SNAPSHOTS = (
+    datetime(2020, 6, 26, 21, 0, tzinfo=UTC),
+    datetime(2020, 6, 29, 21, 0, tzinfo=UTC),
+    datetime(2020, 6, 30, 21, 0, tzinfo=UTC),
+)
+#: After the third snapshot: every fixture borrow row is known.
+T_BORROW = session_close(date(2020, 6, 30)) + timedelta(hours=3)
+
+
+def _assets_run(
+    conn: duckdb.DuckDBPyConnection,
+    cursor: datetime,
+    *,
+    status: str = "ok",
+    message: str = "borrow_assets=7; borrow_us_equity=6; borrow_new=1; borrow_changed=2; "
+    "borrow_vanished=1; borrow_other_class=1",
+    rows: int = 4,
+) -> None:
+    insert_row(
+        conn,
+        "ingestion_runs",
+        {
+            "run_id": f"assets-{cursor.isoformat()}-{status}",
+            "started_at": cursor - timedelta(minutes=1),
+            "finished_at": cursor + timedelta(minutes=1),
+            "status": status,
+            "source": "alpaca_assets",
+            "mode": "session",
+            "rows_added": rows,
+            "chunk_cursor": cursor.isoformat(),
+            "message": message,
+        },
+    )
+
+
+@pytest.fixture
+def observed_store(fixture_store: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
+    for cursor in BORROW_SNAPSHOTS:
+        _assets_run(fixture_store, cursor)
+    return fixture_store
+
+
+def test_borrow_block_counts_on_the_fixture(observed_store: duckdb.DuckDBPyConnection) -> None:
+    """Rows, assets, the latest observation and `known_at`, the last run's
+    counts, and the shortable and ETB counts among active assets at the
+    latest observation (SPLT went hard to borrow, DUALA vanished)."""
+    borrow = health_report(observed_store, T_BORROW, _settings()).borrow
+    assert (borrow.rows, borrow.assets) == (11, 6)
+    assert borrow.latest_observation == BORROW_SNAPSHOTS[-1]
+    assert borrow.latest_known_at == BORROW_SNAPSHOTS[-1]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 4)
+    assert borrow.last_run_status == "ok"
+    assert borrow.run_counts == {
+        "assets": 7,
+        "us_equity": 6,
+        "new": 1,
+        "changed": 2,
+        "vanished": 1,
+        "other_class": 1,
+        "rows_added": 4,
+    }
+    assert borrow.stale_sessions == 0
+
+
+def test_borrow_block_reads_the_observation_from_the_run_cursor(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A quiet day writes no row but an `ok` run: the latest observation is
+    that run's cursor, later than the table's latest `known_at`; a failed run
+    is never an observation, though it is the last run."""
+    quiet = datetime(2020, 7, 1, 21, 0, tzinfo=UTC)
+    _assets_run(observed_store, quiet, message="borrow_new=0", rows=0)
+    _assets_run(
+        observed_store,
+        datetime(2020, 7, 2, 21, 0, tzinfo=UTC),
+        status="failed",
+        message="RuntimeError: assets 503",
+        rows=0,
+    )
+    t = session_close(date(2020, 7, 2)) + timedelta(hours=3)
+    borrow = health_report(observed_store, t, _settings()).borrow
+    assert borrow.latest_observation == quiet
+    assert borrow.latest_known_at == BORROW_SNAPSHOTS[-1]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 4)
+    assert borrow.last_run_status == "failed"
+    assert borrow.run_counts == {"rows_added": 0}
+
+
+def test_borrow_block_counts_only_rows_and_runs_known_at_t(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """At the close of 2020-06-29, before that day's snapshot, the block is
+    the 06-26 snapshot's: five rows, all easy to borrow."""
+    borrow = health_report(observed_store, session_close(date(2020, 6, 29)), _settings()).borrow
+    assert (borrow.rows, borrow.assets) == (5, 5)
+    assert borrow.latest_observation == BORROW_SNAPSHOTS[0]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 5)
+
+
+@pytest.mark.parametrize(
+    ("last_session", "stale", "warned"),
+    [
+        (date(2020, 7, 2), 2, False),  # max_stale_sessions sessions after: no warning
+        (date(2020, 7, 6), 3, True),  # one more (2020-07-03 was a holiday)
+    ],
+)
+def test_borrow_stale_warning_after_max_stale_sessions(
+    observed_store: duckdb.DuckDBPyConnection, last_session: date, stale: int, warned: bool
+) -> None:
+    settings = _settings(borrow={"enabled": True})
+    assert settings.borrow.max_stale_sessions == 2
+    t = session_close(last_session) + timedelta(hours=3)
+    report = health_report(observed_store, t, settings)
+    assert report.borrow.stale_sessions == stale
+    assert any("sessions old; maximum 2" in w for w in report.borrow.warnings) is warned
+    assert report.ok  # a warning, never a failure
+
+
+def test_borrow_stale_threshold_comes_from_config(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    t = session_close(date(2020, 7, 6)) + timedelta(hours=3)
+    settings = _settings(borrow={"enabled": True, "max_stale_sessions": 3})
+    assert health_report(observed_store, t, settings).borrow.warnings == ()
+
+
+def test_borrow_switch_warning(
+    fixture_store: duckdb.DuckDBPyConnection, observed_store: duckdb.DuckDBPyConnection
+) -> None:
+    off = health_report(observed_store, T_BORROW, _settings()).borrow
+    assert off.enabled is False
+    assert any("borrow.enabled is off" in w for w in off.warnings)
+    on = health_report(observed_store, T_BORROW, _settings(borrow={"enabled": True})).borrow
+    assert on.warnings == ()
+
+
+def test_borrow_with_the_switch_on_and_no_observation_warns(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    borrow = health_report(fixture_store, T_BORROW, _settings(borrow={"enabled": True})).borrow
+    assert borrow.latest_observation is None
+    assert (borrow.shortable, borrow.easy_to_borrow, borrow.stale_sessions) == (None, None, None)
+    assert borrow.warnings == ("no borrow snapshot observed",)
+
+
+def test_borrow_check_passes_on_the_fixture(observed_store: duckdb.DuckDBPyConnection) -> None:
+    report = health_report(observed_store, T_BORROW, _settings())
+    assert report.ok, report.failures
+    assert next(c for c in report.integrity if c.rule == BORROW_STATUS_UNIQUE).passed
+
+
+def test_borrow_check_fails_on_a_bar_provenance_row(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`provenance = snapshot` on every row: the common rule names the table."""
+    loose_store.execute(
+        "UPDATE borrow_status SET provenance = 'bar' "
+        "WHERE symbol = 'BNDX' AND known_at = '2020-06-26 21:00:00+00'"
+    )
+    violations = _only_failure(loose_store, PROVENANCE_ALLOWED, _settings())
+    assert violations.rows(named=True) == [
+        {"table": "borrow_status", "provenance": "bar", "rows": 1}
+    ]
+
+
+def test_borrow_check_fails_on_a_duplicate_asset_and_known_at(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    loose_store.execute(
+        "INSERT INTO borrow_status SELECT * FROM borrow_status "
+        "WHERE symbol = 'SPLT' AND NOT easy_to_borrow"
+    )
+    violations = _only_failure(loose_store, BORROW_STATUS_UNIQUE, _settings())
+    assert violations.rows() == [
+        ("b0rr0w00-0000-4b0d-8000-000000000002", datetime(2020, 6, 29, 21, 0, tzinfo=UTC), 2)
+    ]

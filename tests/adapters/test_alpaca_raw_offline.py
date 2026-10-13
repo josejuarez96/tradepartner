@@ -16,6 +16,7 @@ from alpaca.data.enums import CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
+from alpaca.trading.client import TradingClient
 
 from tradepartner.adapters import alpaca_raw
 from tradepartner.config import Settings
@@ -474,3 +475,74 @@ def test_symbol_less_actions_scan_follows_sdk_pages(
     )
     assert pages == [None, "page-2"]
     assert [row["id"] for row in result["spin_offs"]] == ["first", "second"]
+
+
+# --- #1506 (T171c): the unfiltered assets list for the borrow snapshot ---------
+
+
+def test_assets_all_sends_one_unfiltered_request_between_two_clock_readings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`get_all_assets()` with no filter (the recorder's request, ADR 0021
+    point 3); the raw list comes back unchanged with a reading before the
+    request and one after the response."""
+    events: list[str] = []
+    payload = [{"id": "a-1", "class": "us_equity", "symbol": "AAA", "borrow_status": "x"}]
+
+    def fake_get_all_assets(self: TradingClient, *args: Any, **kwargs: Any) -> Any:
+        events.append("request")
+        assert (args, kwargs) == ((), {})
+        return payload
+
+    readings = iter(
+        [datetime(2026, 10, 13, 22, 0, tzinfo=UTC), datetime(2026, 10, 13, 22, 0, 3, tzinfo=UTC)]
+    )
+
+    def clock() -> datetime:
+        events.append("clock")
+        return next(readings)
+
+    monkeypatch.setattr(TradingClient, "get_all_assets", fake_get_all_assets)
+    fetched = alpaca_raw.assets_all(_settings(), clock=clock)
+    assert events == ["clock", "request", "clock"]
+    assert fetched.assets is payload
+    assert fetched.fetch_started_utc == datetime(2026, 10, 13, 22, 0, tzinfo=UTC)
+    assert fetched.fetch_finished_utc == datetime(2026, 10, 13, 22, 0, 3, tzinfo=UTC)
+
+
+def test_assets_all_goes_through_the_paper_trading_client_with_the_data_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[TradingClient] = []
+    original = alpaca_raw._trading_client
+
+    def spy(settings: Settings) -> TradingClient:
+        client = original(settings)
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(alpaca_raw, "_trading_client", spy)
+    monkeypatch.setattr(TradingClient, "get_all_assets", lambda self: [])
+    alpaca_raw.assets_all(_settings(), clock=lambda: datetime(2026, 10, 13, tzinfo=UTC))
+    (client,) = built
+    assert client._use_raw_data is True
+    assert "paper-api" in client._base_url
+
+
+def test_assets_all_checks_credentials_before_any_reading_or_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no request without credentials")
+
+    monkeypatch.setattr(TradingClient, "get_all_assets", never)
+    with pytest.raises(alpaca_raw.AlpacaCredentialsError):
+        alpaca_raw.assets_all(_settings(api_key=None), clock=never)
+
+
+def test_assets_all_refuses_a_payload_that_is_not_the_raw_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TradingClient, "get_all_assets", lambda self: {"assets": []})
+    with pytest.raises(TypeError, match="raw assets list"):
+        alpaca_raw.assets_all(_settings(), clock=lambda: datetime(2026, 10, 13, tzinfo=UTC))

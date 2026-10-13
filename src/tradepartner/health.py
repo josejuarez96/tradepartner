@@ -282,6 +282,22 @@ derived at `t`, as the data is read.
   not repaired yet): a CLI warning, like the quarantined count, and not a
   failure, so a known, listed repair waiting for its release never blocks
   the paper shakedown's E.7.
+- `borrow_status_unique` (#1506, T171e): no two `borrow_status` rows share
+  `(asset_id, known_at)`. The schema's `UNIQUE` already blocks it; the rule
+  restates it for a store built by other code. The four common-column rules
+  above also cover `borrow_status`, `provenance_allowed` holding it to
+  `snapshot`.
+
+**Borrow status** (`BorrowHealth`, #1506, T171e; ADR 0021): the table's row
+count and distinct assets known at `t`, the latest observation (the newest
+`ok` `alpaca_assets` run cursor at or before `t`, never the table's latest
+`known_at`, which lags it on a quiet day) and that latest `known_at`, the
+last run's `borrow_*` counts, and at the latest observation the `shortable`
+and `easy_to_borrow` counts among `active` assets (the table holds only
+`us_equity` ones). Two report-only warnings: the latest observation is more
+than `borrow.max_stale_sessions` sessions before `session` (the sessions
+after the one completed at the observation, through `session`), or none was
+recorded while `borrow.enabled` is on; and `borrow.enabled` is off.
 
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
@@ -329,7 +345,9 @@ from tradepartner.config import (
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
+    ASSETS_SOURCE,
     _validate_t,
+    borrow_status_as_of,
     live_actions_as_of,
     price_jumps_as_of,
     prices_as_of,
@@ -402,6 +420,8 @@ SPINOFF_KNOWN_AT_FLOOR = "spinoff_known_at_floor"
 SYMBOL_CHANGE_KNOWN_AT = "symbol_changes_known_at_from_process_date"
 #: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
+#: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
+BORROW_STATUS_UNIQUE = "borrow_status_unique"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -429,6 +449,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     SPINOFF_KNOWN_AT_FLOOR,
     SYMBOL_CHANGE_KNOWN_AT,
     DUPLICATE_DIVIDENDS,
+    BORROW_STATUS_UNIQUE,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -795,6 +816,41 @@ class RatesHealth:
     series: tuple[RateSeriesHealth, ...]
 
 
+@dataclass(frozen=True)
+class BorrowHealth:
+    """The borrow-status block (module docstring, "Borrow status").
+    `shortable` and `easy_to_borrow` are `None` with no observation;
+    `stale_sessions` too."""
+
+    enabled: bool
+    rows: int
+    assets: int
+    latest_observation: datetime | None
+    latest_known_at: datetime | None
+    last_run_status: str | None
+    run_counts: dict[str, int]
+    shortable: int | None
+    easy_to_borrow: int | None
+    stale_sessions: int | None
+    max_stale_sessions: int
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """Report-only warnings; none is an integrity failure."""
+        out: list[str] = []
+        if not self.enabled:
+            out.append("borrow.enabled is off: `ingest --source all` takes no snapshot")
+        if self.latest_observation is None:
+            if self.enabled:
+                out.append("no borrow snapshot observed")
+        elif self.stale_sessions is not None and self.stale_sessions > self.max_stale_sessions:
+            out.append(
+                f"latest observation {self.latest_observation.isoformat()} is "
+                f"{self.stale_sessions} sessions old; maximum {self.max_stale_sessions}"
+            )
+        return tuple(out)
+
+
 @dataclass(frozen=True, eq=False)
 class CoverageReference:
     """The coverage check against a named reference at `t` (#1541; module
@@ -955,6 +1011,7 @@ class HealthReport:
     statement: StatementFacts
     filing_events: FilingEvents
     rates: RatesHealth
+    borrow: BorrowHealth
     duplicate_dividends: DuplicateDividends
     filename_listings: FilenameListings
     integrity: tuple[IntegrityCheck, ...]
@@ -1027,6 +1084,7 @@ def health_report(
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
+        borrow=_borrow_report(conn, t, session, settings),
         duplicate_dividends=dividends,
         filename_listings=_filename_listings(conn, t, listings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
@@ -1330,6 +1388,72 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
             )
         )
     return RatesHealth(tuple(result))
+
+
+_BORROW_COUNT = re.compile(r"\bborrow_(\w+)=(\d+)\b")
+
+
+def _borrow_report(
+    conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
+) -> BorrowHealth:
+    """The borrow block at `t` (module docstring, "Borrow status")."""
+    present = _present_tables(conn)
+    rows = assets = 0
+    latest_known_at: datetime | None = None
+    if "borrow_status" in present:
+        found = conn.execute(
+            "SELECT count(*), count(DISTINCT asset_id), max(known_at) FROM borrow_status "
+            "WHERE known_at <= ?",
+            [t],
+        ).fetchone()
+        if found is not None:
+            rows, assets, latest_known_at = int(found[0]), int(found[1]), found[2]
+    observation: datetime | None = None
+    last: tuple[Any, ...] | None = None
+    if "ingestion_runs" in present:
+        observed = conn.execute(
+            "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
+            "WHERE source = ? AND status = ? AND TRY_CAST(chunk_cursor AS TIMESTAMPTZ) <= ? "
+            "AND coalesce(finished_at, started_at) <= ?",
+            [ASSETS_SOURCE, OK, t, t],
+        ).fetchone()
+        observation = None if observed is None else observed[0]
+        last = conn.execute(
+            "SELECT status, rows_added, message FROM ingestion_runs "
+            "WHERE source = ? AND coalesce(finished_at, started_at) <= ? "
+            "ORDER BY coalesce(finished_at, started_at) DESC, run_id DESC LIMIT 1",
+            [ASSETS_SOURCE, t],
+        ).fetchone()
+    counts: dict[str, int] = {}
+    if last is not None:
+        counts = {name: int(value) for name, value in _BORROW_COUNT.findall(last[2] or "")}
+        counts["rows_added"] = int(last[1] or 0)
+    shortable = easy = stale = None
+    if observation is not None:
+        observation = ensure_tz_aware_utc(observation, field_name="observation")
+        if "borrow_status" in present:
+            frame = borrow_status_as_of(conn, observation).filter(pl.col("status") == "active")
+            shortable = int(frame["shortable"].sum())
+            easy = int(frame["easy_to_borrow"].sum())
+        sessions = all_sessions()
+        stale = max(
+            0,
+            bisect_right(sessions, session)
+            - bisect_right(sessions, last_completed_session(observation)),
+        )
+    return BorrowHealth(
+        enabled=settings.borrow.enabled,
+        rows=rows,
+        assets=assets,
+        latest_observation=observation,
+        latest_known_at=latest_known_at,
+        last_run_status=None if last is None else str(last[0]),
+        run_counts=counts,
+        shortable=shortable,
+        easy_to_borrow=easy,
+        stale_sessions=stale,
+        max_stale_sessions=settings.borrow.max_stale_sessions,
+    )
 
 
 def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date, ...]:
@@ -1922,6 +2046,7 @@ def _integrity_checks(
         **_rate_rules(conn),
         **_new_action_stamp_rules(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
+        BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -2028,6 +2153,28 @@ def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.Dat
         SPINOFF_KNOWN_AT_FLOOR: pl.DataFrame(bad_spin, schema=_ACTION_STAMP_SCHEMA),
         SYMBOL_CHANGE_KNOWN_AT: pl.DataFrame(bad_change, schema=_ACTION_STAMP_SCHEMA),
     }
+
+
+_BORROW_KEY_SCHEMA: dict[str, Any] = {
+    "asset_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "rows": pl.Int64,
+}
+
+
+def _borrow_duplicates(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """One row per `(asset_id, known_at)` held by more than one
+    `borrow_status` row, with how many."""
+    if "borrow_status" not in _present_tables(conn):
+        return pl.DataFrame(schema=_BORROW_KEY_SCHEMA)
+    found = conn.execute(
+        "SELECT asset_id, known_at, count(*) FROM borrow_status "
+        "GROUP BY asset_id, known_at HAVING count(*) > 1 ORDER BY asset_id, known_at"
+    ).fetchall()
+    return pl.DataFrame(
+        [{"asset_id": a, "known_at": k, "rows": int(n)} for a, k, n in found],
+        schema=_BORROW_KEY_SCHEMA,
+    )
 
 
 def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:
