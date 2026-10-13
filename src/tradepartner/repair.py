@@ -57,6 +57,17 @@ bars: a contaminated revision left in place would stay visible to every
 as-of read before the refetch. A delete is not a revision: no row is
 written to `prices_daily` or `corporate_actions`, so an as-of read at any T
 afterwards simply lacks the rows (the look-ahead rules are unchanged).
+
+`retract_dividends` (`tradepartner repair-dividends`, #1613, T186) deletes
+the second record of one cash dividend stored twice: for every `duplicate`
+entry of the reviewed list (`store.dividend_reviews`) with an ex-date on or
+before `--to`, every row of the identity `(security_id,
+retract_source_action_id)`, an Alpaca dividend, and nothing else. A
+duplicate has no `known_at` at which it was right, and a `cancelled`
+revision would leave every earlier as-of read counting the payment twice,
+so it is a delete under the same rules as `delete_bars`; it refuses the
+whole run on any stale entry (the vendor touched it, or the kept row
+differs or is gone), so the list is never half-applied.
 """
 
 from __future__ import annotations
@@ -64,12 +75,14 @@ from __future__ import annotations
 import functools
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
+from typing import Any
 
 import duckdb
+import polars as pl
 
 from tradepartner.adapters.alpaca_prices import (
     ACTIONS_SOURCE,
@@ -80,9 +93,10 @@ from tradepartner.adapters.alpaca_prices import (
 from tradepartner.calendar import is_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _read, _write_run
-from tradepartner.store.asof import facts_as_of, listings_as_of
+from tradepartner.store.asof import facts_as_of, listings_as_of, live_actions_as_of
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
 from tradepartner.store.master import first_session, session_of
 from tradepartner.store.registry import open_release
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -527,3 +541,218 @@ def delete_bars(
             run = SourceRun("alpaca", REPAIRED, 0, "", message)
             _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
     return result
+
+
+@dataclass(frozen=True)
+class DividendsRetracted:
+    """What `retract_dividends` found for the reviewed list's `duplicate`
+    entries and, unless `dry_run`, deleted (`BarsDeleted`'s shape)."""
+
+    #: The `--to` bound (None: every entry).
+    to: date | None
+    #: The list's `duplicate` entries.
+    entries: int
+    #: Entries on or before `to` whose retract identity still has its row.
+    identities: int
+    #: The rows those identities hold (one each, or the entry is stale).
+    action_rows: int
+    #: Entries after `to`: counted, untouched.
+    deferred: int
+    #: Entries whose retract identity has no row at all.
+    already_repaired: int
+    #: One line per stale entry (refuses a real run).
+    stale: tuple[str, ...]
+    #: The distinct ex-dates of the rows found.
+    ex_dates: tuple[date, ...]
+    dry_run: bool
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would delete" if self.dry_run else "deleted"
+        span = (
+            f" on {len(self.ex_dates)} ex-dates {self.ex_dates[0]}..{self.ex_dates[-1]}"
+            if self.ex_dates
+            else ""
+        )
+        bound = f" through {self.to}" if self.to is not None else ""
+        return (
+            f"{verb} {self.action_rows} duplicate dividend rows of {self.identities} identities"
+            f"{span}; entries {self.entries}{bound}, deferred {self.deferred}, "
+            f"already repaired {self.already_repaired}, stale {len(self.stale)}"
+        )
+
+
+def _stale_reason(
+    retract_rows: list[tuple[Any, ...]],
+    partners: list[tuple[Any, ...]],
+    entry: ReviewedGroup,
+) -> str | None:
+    """Why one entry may not be retracted, or None (spec amendment
+    2026-10-12, "The repair"). `retract_rows` are every row of the retract
+    identity as `(source, action_type, ex_date, ratio_or_amount, known_at,
+    cancelled)`; `partners` the other live dividend identities of the
+    security on the entry's ex-date and amount as `(source_action_id,
+    known_at)`."""
+    if len(retract_rows) > 1:
+        return f"the retract identity has {len(retract_rows)} revisions"
+    source, action_type, ex_date, amount, known_at, cancelled = retract_rows[0]
+    if source != ACTIONS_SOURCE or action_type != "dividend" or cancelled:
+        return f"the retract row is a {source} {action_type} (cancelled {cancelled})"
+    if ex_date != entry.ex_date or amount != entry.amount:
+        return f"the retract row is {ex_date} {amount!r}, not the listed key"
+    if not partners:
+        return "no other live dividend row shares its ex-date and amount"
+    if len(partners) > 1:
+        return f"{len(partners)} other live identities share its key, not the one reviewed"
+    [(kept, kept_known)] = partners
+    if kept_known != known_at:
+        return f"the retract row is known at {known_at}, the kept {kept} at {kept_known}"
+    return None
+
+
+def retract_dividends(
+    settings: Settings,
+    *,
+    to: date | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    expect: int | None = None,
+    release: str | None = None,
+    reviewed: Sequence[ReviewedGroup] | None = None,
+) -> DividendsRetracted:
+    """Delete the retract identity of every `duplicate` entry of the
+    reviewed list (`reviewed`, default `store.dividend_reviews.
+    reviewed_groups()`) with an ex-date on or before `to` (default: every
+    entry; a later one is counted `deferred`), every row of `(security_id,
+    retract_source_action_id)` with `source = ACTIONS_SOURCE` and
+    `action_type = dividend` and nothing else, in one transaction, and record
+    the run (spec amendment 2026-10-12, #1613); with `dry_run`, count them on
+    a read-only connection and change nothing.
+
+    An entry whose retract identity has no row is `already_repaired` when
+    exactly one other live dividend identity holds its key, and stale
+    otherwise (a mistyped id or security, or a reissued record). An
+    entry is stale (`_stale_reason`) when that identity has more than one
+    revision, when its row's ex-date or amount differs from the entry's key
+    or its `known_at` from the kept identity's live row, or when no single
+    other live dividend row of the security shares its ex-date and amount; a
+    dry run lists the stale entries, a real run refuses on any. A real run
+    deletes only the dry run's row count (`expect`) and only inside the open
+    data release `release`; anything else raises `RepairRefused` before
+    anything is deleted. `to` that is not an XNYS session raises
+    `ValueError`. Raises `StoreLockedError` like ingest when the store stays
+    locked."""
+    if to is not None and not is_session(to):
+        raise ValueError(f"--to {to.isoformat()} is not an XNYS session")
+    if not dry_run and expect is None:
+        raise ValueError("a repair deletes only the counts of a dry run: pass expect")
+    if not dry_run and release is None:
+        raise ValueError("a repair writes only inside a named data release: pass release")
+    entries = [
+        g for g in (reviewed_groups() if reviewed is None else reviewed) if g.verdict == DUPLICATE
+    ]
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
+        _read(settings) if dry_run else open_for_write(settings)
+    )
+    with opened as conn:
+        if release is not None and not dry_run and (why := release_refusal(conn, release)):
+            raise RepairRefused(f"{why}; nothing deleted")
+        live = live_actions_as_of(conn, started, sorted({e.security_id for e in entries}))
+        live = live.filter(pl.col("action_type") == "dividend")
+        deferred = already = 0
+        found: list[ReviewedGroup] = []
+        stale: list[str] = []
+        for entry in entries:
+            if to is not None and entry.ex_date > to:
+                deferred += 1
+                continue
+            retract_rows = conn.execute(
+                "SELECT source, action_type, ex_date, ratio_or_amount, known_at, cancelled "
+                "FROM corporate_actions WHERE security_id = ? AND source_action_id = ?",
+                [entry.security_id, entry.retract_source_action_id],
+            ).fetchall()
+            partners = (
+                live.filter(
+                    (pl.col("security_id") == entry.security_id)
+                    & (pl.col("ex_date") == entry.ex_date)
+                    & (pl.col("ratio_or_amount") == entry.amount)
+                    & (pl.col("source_action_id") != entry.retract_source_action_id)
+                )
+                .select("source_action_id", "known_at")
+                .rows()
+            )
+            stale_why: str | None
+            if not retract_rows:
+                if len(partners) == 1:
+                    already += 1
+                    continue
+                stale_why = (
+                    f"the retract identity has no row and {len(partners)} live identities "
+                    "hold the key, not the one kept"
+                )
+            else:
+                stale_why = _stale_reason(retract_rows, partners, entry)
+            if stale_why is not None:
+                stale.append(
+                    f"  {entry.security_id} {entry.ex_date} {entry.amount!r} "
+                    f"{entry.retract_source_action_id} ({entry.ticker or 'no ticker'}): {stale_why}"
+                )
+                continue
+            found.append(entry)
+        result = DividendsRetracted(
+            to=to,
+            entries=len(entries),
+            identities=len(found),
+            action_rows=len(found),
+            deferred=deferred,
+            already_repaired=already,
+            stale=tuple(stale),
+            ex_dates=tuple(sorted({e.ex_date for e in found})),
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            if stale:
+                raise RepairRefused(
+                    f"{len(stale)} stale list entries; nothing deleted, re-review them on "
+                    "#1613:\n" + "\n".join(stale)
+                )
+            if result.action_rows != expect:
+                raise RepairRefused(
+                    f"found {result.action_rows} action rows, not the expected {expect}; "
+                    "nothing deleted, run --dry-run again"
+                )
+            deleted = _delete_identities(
+                conn, [(e.security_id, e.retract_source_action_id) for e in found]
+            )
+            if deleted != result.action_rows:  # never a partial repair
+                raise RuntimeError(
+                    f"repair deleted {deleted} rows where it counted {result.action_rows}; "
+                    "rolled back"
+                )
+            message = f"{result.summary()}; release {release}"
+            run = SourceRun("alpaca", REPAIRED, 0, "", message)
+            _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result
+
+
+def _delete_identities(
+    conn: duckdb.DuckDBPyConnection, identities: Sequence[tuple[str, str]]
+) -> int:
+    """Delete every `ACTIONS_SOURCE` dividend row whose `(security_id,
+    source_action_id)` is in `identities`; the number deleted."""
+    if not identities:
+        return 0
+    conn.execute(
+        "CREATE OR REPLACE TEMP TABLE _retract_ids (security_id VARCHAR, source_action_id VARCHAR)"
+    )
+    conn.executemany("INSERT INTO _retract_ids VALUES (?, ?)", [list(i) for i in identities])
+    before = _rows(conn, "corporate_actions")
+    conn.execute(
+        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'dividend' "
+        "AND (security_id, source_action_id) IN (SELECT (security_id, source_action_id) "
+        "FROM _retract_ids)",
+        [ACTIONS_SOURCE],
+    )
+    conn.execute("DROP TABLE _retract_ids")
+    return before - _rows(conn, "corporate_actions")
