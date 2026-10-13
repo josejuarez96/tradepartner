@@ -93,6 +93,11 @@ class Ledger:
     positions: Mapping[str, float]
     cash: float
     through: date
+    #: Fills whose cash this ledger applied since its base (strictly after the
+    #: base's row, stated on or before `through`); a ledger built by hand is 0.
+    #: The cash-bound multiplier (`risk.reconcile_cash_tolerance` x (1 + this/2),
+    #: #1583, T183) scales the whole-dollar rounding each fill can leave.
+    fills_since_base: int = 0
 
     @property
     def short_names(self) -> tuple[str, ...]:
@@ -268,6 +273,7 @@ def from_journal(
     positions: dict[str, Fraction] = defaultdict(Fraction)
 
     seen_fills: set[int] = set()
+    fills_since_base = 0
     for fill in fills:
         _check_window("fill", fill.window_id, window_id)
         _check_fill(fill, by_id, seen_fills)
@@ -280,6 +286,7 @@ def from_journal(
         positions[fill.security_id] += sign * _exact(row.quantity) * factor
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
+            fills_since_base += 1
 
     seen_adjustments: set[int] = set()
     for adjustment in adjustments:
@@ -294,4 +301,4 @@ def from_journal(
             cash += adjustment.cash
 
     held = {name: float(q) for name, q in positions.items() if abs(q) > _exact(quantity_tolerance)}
-    return Ledger(positions=held, cash=cash, through=through)
+    return Ledger(positions=held, cash=cash, through=through, fills_since_base=fills_since_base)

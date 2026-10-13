@@ -24,15 +24,22 @@ that call's estimate again and stops the run (`failed`, `spend ceiling`) when it
 would cross either ceiling. Calls are paced at `research.labeling.requests_per_second`
 and follow `packets.next_kind` (`B` first where the row has an 8-K, `A` after a `B`
 that came back `unresolved` or where none exists); the listing end's label is the
-last call's answer. One record per call (C8) is appended through `datafiles` as it
+last call's answer. **On a gold split** (`dev`, `pilot`) the call set is the 2026-10-11
+amendment's (#1534): `B` first, then `A` always -- `A` alone where no 8-K exists --
+each call paced and spend-checked like every other, so the evidence ladder's E1 and
+E2 are both observable on the gold items; the label is still `jev_label_record`'s
+cascade choice, so the extra `A` records move no reader of the label. One record per
+call (C8) is appended through `datafiles` as it
 comes back, its `raw_request` and `raw_response` passed through the secret
 substitution of `config.clean_message` at full length (never its truncation or its
 control-character pass). The batch stops on the first reply whose model id differs
 from the one requested (`failed`, `model id mismatch`), after writing that reply's
 record. A timeout after send is recorded `unresolved` / `timeout` and never re-sent.
 At the end the records are registered as a `departure-reason-inferences` version; a
-gold split (`dev`, `pilot`) is scored (`scoring`) and its result written, and a frame
-batch computes the shortlist (`crosswalk.shortlist`), writes it once to
+gold split (`dev`, `pilot`) is scored (`scoring`) and its result written -- with the
+Jev-only `arms` key (`gold_metrics`) holding the ladder, E0, the hybrids and the
+within-arm comparisons -- and a frame batch computes the shortlist
+(`crosswalk.shortlist`), writes it once to
 `datafiles.shortlist_path` (`shortlists/departure-reason/<run_id>.json`: the seed,
 sample size, cap, the records' SHA-256 and dataset id, and the items in acceptance
 order with their stratum, sampling rate and `deferred` flag), which is where the
@@ -98,6 +105,7 @@ from tradepartner.research.labeling.packets import (
     PacketLimits,
     PacketTooLarge,
     build_packet,
+    has_eightk,
     next_kind,
 )
 from tradepartner.research.labeling.questions import (
@@ -702,14 +710,49 @@ def _pre_fix_rule_answer(row: Mapping[str, Any]) -> crosswalk.RuleAnswer | None:
     )
 
 
+def _arm_call(record: Mapping[str, Any]) -> scoring.ArmCall:
+    """One Jev record as an `ArmCall` for the evidence ladder (#1534 item 5): its
+    `reason` and `stop_reason` mapped straight from the record -- the `malformed`-free
+    mapping, since a Jev record is a vendor call, never a comparison answer file line,
+    so no stop reason is invented for it. A record whose `passage_kind` is not `B`
+    reads as `A`, as `jev_label_record` reads it."""
+    return scoring.ArmCall(
+        arm=JEV_ARM,
+        kind="B" if record.get("passage_kind") == "B" else "A",
+        option=record["selected_option"],
+        reason=record["reason"],
+        stop_reason=record.get("stop_reason"),
+        input_tokens=record.get("input_tokens") or 0,
+        output_tokens=record.get("output_tokens") or 0,
+        cost_usd=record.get("cost_usd") or 0.0,
+        latency_ms=record.get("latency_ms") or 0.0,
+    )
+
+
+def _jev_calls(records: Iterable[Mapping[str, Any]]) -> dict[str, tuple[scoring.ArmCall, ...]]:
+    """Each listing end's Jev records as `ArmCall`s, in file order: one per record
+    (`arm = jev`), so the ladder reads both packets of a gold item (records of another
+    arm are none in a real run, and none are ever read here)."""
+    calls: dict[str, list[scoring.ArmCall]] = {}
+    for record in records:
+        if _arm_of(record) != JEV_ARM:
+            continue
+        calls.setdefault(str(record["listing_end_id"]), []).append(_arm_call(record))
+    return {lid: tuple(items) for lid, items in calls.items()}
+
+
 def scored_items(
     rows: Sequence[Mapping[str, Any]], records: Iterable[Mapping[str, Any]]
 ) -> list[scoring.ScoredItem]:
     """One `ScoredItem` per gold row: the owner's labels and their `basis` (#1492)
     against the final answer, and a seed's pre-fix rule answer (`seeded_recall`,
     #1351). A labelled row without a `basis` (an export without the column) is
-    refused by `ScoredItem`."""
+    refused by `ScoredItem`. The row also carries every Jev call made on it as
+    `calls` and whether it has an 8-K (`has_eightk`), which only the ladder, the
+    router and the comparisons read (#1534 item 5; no label or bar does)."""
+    records = list(records)
     last = jev_label_record(records)
+    calls_of = _jev_calls(records)
     items = []
     for row in rows:
         record = last.get(str(row["listing_end_id"]))
@@ -731,9 +774,37 @@ def scored_items(
                 in_random_draw=True if in_draw is None else bool(in_draw),
                 pre_fix_rule_answer=_pre_fix_rule_answer(row) if is_seed else None,
                 basis=row.get("basis"),
+                calls=calls_of.get(str(row["listing_end_id"]), ()),
+                has_eightk=has_eightk(row),
             )
         )
     return items
+
+
+def _arms_report(items: Sequence[scoring.ScoredItem]) -> dict[str, Any]:
+    """The Jev-only `arms` key of a gold run's result (spec "Amendment 2026-10-11
+    (#1534)" item 5): `ladder_table`'s Jev lines, E0 (`e0_report`), Jev's hybrids
+    (`hybrid_router` per level and set) and Jev's within-arm and level-against-hybrid
+    comparisons (`paired_comparisons`), every figure from those functions on the same
+    items. No `claude_code` line: that arm is a read-only comparison run outside this
+    job on the `pilot` run's records, so the run's records hold none of its calls and
+    the functions report Jev's lines alone. Reported, never gating: nothing here
+    enters the primary, the per-option gate or any bar."""
+    jev: scoring.Arm = "jev"
+    hybrids: list[dict[str, Any]] = []
+    for set_name in ("text", "text_eightk"):
+        for level in scoring.LADDER_LEVELS:
+            hybrids.append(
+                dataclasses.asdict(scoring.hybrid_router(items, jev, level, set_name=set_name))
+            )
+    return {
+        "ladder_table": [dataclasses.asdict(row) for row in scoring.ladder_table(items)],
+        "e0": dataclasses.asdict(scoring.e0_report(items)),
+        "hybrid_router": hybrids,
+        "paired_comparisons": [
+            dataclasses.asdict(comparison) for comparison in scoring.paired_comparisons(items)
+        ],
+    }
 
 
 def gold_metrics(
@@ -744,7 +815,9 @@ def gold_metrics(
     the primary bar (whose `n` is the result row's `n_clusters`), the worst case,
     the per-option gate, the calibration and the `rule_provision` arm on the
     headline (`text`) set only; `exchange_rule` and `provision` each scored apart;
-    the shares and the seeds over every item."""
+    the shares and the seeds over every item; and the Jev-only `arms` key of #1534
+    item 5 (`_arms_report`), which is the one key this adds and which no other
+    metric reads."""
     headline = scoring.headline_items(items)
     primary = scoring.class_accuracy(headline)
     usable = [
@@ -798,6 +871,7 @@ def gold_metrics(
         "agreement_by_probability_bin": [
             dataclasses.asdict(row) for row in scoring.agreement_by_probability_bin(agreement)
         ],
+        "arms": _arms_report(items),
     }
     return primary, metrics
 
@@ -895,9 +969,16 @@ class _Caller:
         return response
 
 
-def _label_row(caller: _Caller, row: Mapping[str, Any], limits: PacketLimits) -> list[str]:
-    """Send `row`'s calls in C2's order; return the kinds whose packet was over the
-    cap (refused, never sent; the next kind follows as after an `unresolved`)."""
+def _label_row(
+    caller: _Caller, row: Mapping[str, Any], limits: PacketLimits, *, gold: bool
+) -> list[str]:
+    """Send `row`'s calls and return the kinds whose packet was over the cap
+    (refused, never sent; the next kind follows as after an `unresolved`). C2's order
+    on a frame batch: `B` first, `A` after a `B` that came back `unresolved`. The
+    gold-split call set of #1534 item 5 (`gold`): `B` first, then `A` always -- `A`
+    alone where no 8-K exists -- so the ladder's E1 and E2 are both observable on
+    every gold item. Both orders pace and spend-check every call through
+    `caller.call`."""
     refused: list[str] = []
     listing_end_id = str(row["listing_end_id"])
     kind: Kind | None = next_kind(row, None)
@@ -910,7 +991,9 @@ def _label_row(caller: _Caller, row: Mapping[str, Any], limits: PacketLimits) ->
             continue
         response = caller.call(listing_end_id, packet)
         answered = response.selected_option if response.reason == "ok" else None
-        kind = next_kind(row, Answer(kind, answered or UNRESOLVED))
+        # #1534 item 5: on a gold split A always follows B, resolved or not; anywhere
+        # else C2's cascade decides (A only after a B that came back `unresolved`).
+        kind = "A" if gold and kind == "B" else next_kind(row, Answer(kind, answered or UNRESOLVED))
     return refused
 
 
@@ -1453,7 +1536,10 @@ def _label_batch(
     refused: list[str] = []
     try:
         for row in rows:
-            refused += [f"{row['listing_end_id']}:{k}" for k in _label_row(caller, row, limits)]
+            refused += [
+                f"{row['listing_end_id']}:{k}"
+                for k in _label_row(caller, row, limits, gold=handle.split in GOLD_SPLITS)
+            ]
     finally:
         caller.close()
     path = caller.records_path

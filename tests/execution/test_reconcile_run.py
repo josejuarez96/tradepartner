@@ -6,18 +6,20 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
 import polars as pl
 import pytest
 
-from tradepartner.adapters.broker import Account, OrderRequest, Position, Side
+from tradepartner.adapters.broker import Account, CashActivity, OrderRequest, Position, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
-from tradepartner.calendar import session_close
+from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import reconcile_run, switch
+from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.reconcile import (
     FILLS_LAGGING,
@@ -27,14 +29,17 @@ from tradepartner.execution.reconcile import (
     Explanations,
 )
 from tradepartner.execution.reconcile_run import (
+    _NEW_YORK,
     NoWindowError,
+    _journal_state,
+    _ledger,
     command_session,
     explanations_as_of,
     frozen_risk,
     reconcile_command,
     reconcile_now,
 )
-from tradepartner.store.asof import prices_as_of
+from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
@@ -47,6 +52,7 @@ from tradepartner.store.journal import (
     ReconciliationRow,
     adjustments_for,
     append,
+    fills_for,
     kill_switch_events_for,
     reconciliations_for,
 )
@@ -1244,3 +1250,710 @@ def test_reconcile_for_a_book_with_no_window_is_no_window(
             book_id="b",
         )
     assert fake.calls == ()
+
+
+# --- booked `FEE` cash activities by observation (2026-10-12, item 6; T183) ------
+
+
+def _fee(activity_id: str, day: date, net: float, status: str = "executed") -> CashActivity:
+    return CashActivity(
+        activity_id=activity_id,
+        activity_type="FEE",
+        date=day,
+        status=status,
+        net_amount=net,
+        symbol="SPY",
+        description="SEC fee",
+    )
+
+
+def test_two_fee_rows_are_booked_once_by_their_id(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The window-1 shape: the broker charged two cents the ledger lacks, each a
+    dated `FEE` row; they are booked once, keyed by id, on the fee's own date,
+    and a second reconciliation books nothing more."""
+    fake.activities = [_fee("f1", S, -0.01), _fee("f2", S, -0.01)]
+    fake.extra_cash = -0.02  # the broker charged two cents the ledger lacks
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    booked = _adjustments(journal_settings, open_window)
+    assert [(a.kind, a.cash, a.broker_activity_id, a.session) for a in booked] == [
+        ("fee_cash", -0.01, "f1", S),
+        ("fee_cash", -0.01, "f2", S),
+    ]
+    fixed_clock.advance(minutes=5)
+    again = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert again.status == OK and again.adjustments == ()
+    assert len(_adjustments(journal_settings, open_window)) == 2
+
+
+def test_the_same_gap_with_no_activity_still_halts_as_cash(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A `FEE` is booked by observation, never inferred from the difference: the
+    -0.02 with no activity read is still a `cash` mismatch."""
+    fake.extra_cash = -0.02  # the broker charged two cents the ledger lacks
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_an_unknown_cash_activity_halts_the_window_as_unexplained_activity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    fake.activities = [
+        CashActivity(
+            activity_id="i-1",
+            activity_type="INT",
+            date=S,
+            status="executed",
+            net_amount=-0.5,
+        )
+    ]
+    with pytest.raises(ReconciliationError, match="unexplained_activity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+
+def test_under_the_fallback_a_fee_dated_on_the_start_date_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Null sets (no ok base, no `activities_seen_json`): a `FEE` dated on the
+    window's New York start date is booked; an earlier one is inside the base."""
+    fake.activities = [_fee("old", date(2026, 9, 28), -0.02), _fee("on", date(2026, 9, 29), -0.01)]
+    fake.extra_cash = -0.01  # only the start-date fee is a real gap
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["on"]
+
+
+def test_a_fee_beside_a_pending_order_is_deferred_fee_not_journaled(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """Beside an open allowance the `FEE` is subtracted and listed under
+    `allowed` as `deferred fee`, but never journaled (#1583, T183)."""
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-pend", MTUM, "MTUM", 3.0, events=("pending",), fill=False)
+    fake.submit(OrderRequest("tp-pend", "MTUM", Side.BUY, quantity=3.0))
+    fake.activities = [_fee("f1", S, -0.01)]
+    fake.extra_cash = -0.01
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+    assert result.status == PENDING_UNRESOLVED
+    assert ("deferred fee", -0.01, None) in [
+        (a.reason, a.difference, a.security_id) for a in result.allowed
+    ]
+    assert result.adjustments == ()
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_reconcile_reads_account_before_cash_activities(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The read order is fixed (#1583): `account()` is read before
+    `cash_activities(since)`, so the read race has one shape."""
+    _reconcile(journal_settings, fake, open_window, fixed_clock)
+    methods = [call.method for call in fake.calls]
+    assert methods.index("account") < methods.index("cash_activities")
+
+
+def test_a_fee_the_activity_read_lists_but_the_account_has_not_charged_halts_once(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """The read race to the spec's letter (#1583): `account()` is read first, so a
+    fee posting between the two reads is in the second activities read but not in
+    `account().cash`; booking it leaves a +0.02 gap that halts as `cash`, and the
+    next reconciliation (which reads the charged cash too) books it and passes."""
+    fake.activities = [_fee("f1", S, -0.02)]  # the read sees it; `account()` does not
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    fake.extra_cash = -0.02  # now the broker cash reflects the fee too
+    fixed_clock.advance(minutes=5)
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["f1"]
+
+
+# --- the seen-set sources end to end (#1583, item 6; Q2-Q4, S2) -----------------
+
+
+def _ok_base(
+    settings: Settings,
+    window: PaperWindowRow,
+    *,
+    at: datetime,
+    broker_cash: float,
+    activity_ids: tuple[str, ...] = (),
+    recorded: bool = True,
+) -> None:
+    """Journal an `ok` reconciliation at `at` re-basing the cash to `broker_cash`;
+    `recorded` False writes a pre-T183 row with no `activities` set (null)."""
+    payload: dict[str, object] = {"mismatches": [], "lagging": [], "pending": []}
+    if recorded:
+        payload["activities"] = [
+            {"activity_id": i, "activity_type": "FEE", "status": "executed"} for i in activity_ids
+        ]
+    _append(
+        settings,
+        ReconciliationRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            at=at,
+            status="ok",
+            broker_cash=broker_cash,
+            mismatches_json=json.dumps(payload, sort_keys=True),
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def _day_before(day: date) -> date:
+    return previous_session(day)
+
+
+def test_a_fee_dated_before_an_ok_base_but_posted_after_it_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(a) A `FEE` dated D that posts after an `ok` reconciliation dated D+1 is not
+    in the base's recorded set (the base did not see it), so it is booked next
+    even though its date precedes the base's: the base's set decides, not the date."""
+    base_at = session_close(_day_before(S))
+    _ok_base(
+        journal_settings, open_window, at=base_at, broker_cash=100_000.0, activity_ids=("other",)
+    )
+    fake.activities = [_fee("f1", _day_before(S), -0.02)]  # dated before the base, posted after
+    fake.extra_cash = -0.02
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["f1"]
+
+
+def test_a_fee_the_base_recorded_is_never_booked_again_whatever_its_date(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(b) An id in the base's recorded set was in its `broker_cash`: never booked,
+    whatever the date attached to it in the live read."""
+    base_at = session_close(_day_before(S))
+    _ok_base(journal_settings, open_window, at=base_at, broker_cash=100_000.0, activity_ids=("f1",))
+    fake.activities = [_fee("f1", S, -0.02)]  # a later date, the same id
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert result.adjustments == ()
+
+
+def test_a_start_set_fee_is_not_booked_but_a_later_same_day_one_is(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(c, d) `paper start` records the ids it read into `activities_seen_json`;
+    such a fee is never booked, but one of the same start date posted after
+    `paper start` (not in the set) is booked."""
+    start = open_window.started_at.astimezone(_NEW_YORK).date()
+    window = replace(open_window, activities_seen_json=json.dumps(["f-prestart"]))
+    fake.activities = [
+        _fee("f-prestart", start, -0.01),  # recorded at paper start
+        _fee("f-poststart", start, -0.02),  # posted after, same start date
+    ]
+    fake.extra_cash = -0.02  # only the post-start fee is a real gap
+
+    result = _reconcile(journal_settings, fake, window, fixed_clock)
+
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["f-poststart"]
+
+
+def test_under_the_fallback_a_fee_after_a_pre_t183_ok_row_is_booked(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(e) A pre-T183 `ok` row has no recorded set, so the date fallback governs: a
+    `FEE` dated D (on or after the window's start) that posts after a pre-T183
+    ok row dated D+1 is still booked."""
+    start = open_window.started_at.astimezone(_NEW_YORK).date()
+    later = _day_before(S)
+    _ok_base(
+        journal_settings,
+        open_window,
+        at=session_close(later),
+        broker_cash=100_000.0,
+        recorded=False,  # a pre-T183 row: null set
+    )
+    fake.activities = [_fee("f1", start, -0.02)]  # dated the start, posted after the ok row
+    fake.extra_cash = -0.02
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert [a.broker_activity_id for a in result.adjustments] == ["f1"]
+
+
+def test_a_booked_fee_is_not_rebooked_when_the_base_is_older_than_the_booking(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(f) A booked id is never re-booked even when `base(through)` picks an `ok`
+    row older than the booking and the booking is the only guard: the base's
+    recorded set names a different id, so the journaled `broker_activity_id`
+    alone keeps the booked fee from counting twice (it is what mutation M3, dropping
+    the booked-id set, would break)."""
+    _ok_base(
+        journal_settings,
+        open_window,
+        at=session_close(_day_before(S)),
+        broker_cash=100_000.0,
+        activity_ids=("other",),  # the base recorded a different id; only the booking knows f1
+    )
+    _journal_fee(
+        journal_settings, open_window, "f1", S, -0.02, at=fixed_clock() - timedelta(minutes=5)
+    )
+    fake.activities = [_fee("f1", S, -0.02)]
+    fake.extra_cash = -0.02  # the broker cash already reflects the booked fee
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert result.adjustments == ()  # already journaled, and the ledger already holds it
+
+
+def _journal_fee(
+    settings: Settings,
+    window: PaperWindowRow,
+    activity_id: str,
+    session: date,
+    net: float,
+    *,
+    at: datetime,
+) -> None:
+    _append(
+        settings,
+        AdjustmentRow(
+            window_id=window.window_id,  # type: ignore[arg-type]
+            session=session,
+            kind="fee_cash",
+            cash=net,
+            broker_activity_id=activity_id,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+
+
+def test_a_fee_dated_before_the_reconciliation_keeps_its_own_session(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(item 6, Q6) A booked `fee_cash` is stated on its own activity date, not the
+    reconciliation session."""
+    fee_day = _day_before(S)
+    fake.activities = [_fee("f1", fee_day, -0.02)]
+    fake.extra_cash = -0.02
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    (row,) = _adjustments(journal_settings, open_window)
+    assert row.session == fee_day  # its own date, one or more days before S
+
+
+def test_a_booked_fee_the_fake_then_cancels_is_unexplained_activity(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(item 6, S4) A fee the ledger booked, whose status the broker later corrects,
+    halts as `unexplained_activity`, naming the row and its id."""
+    fake.activities = [_fee("f1", S, -0.02)]
+    fake.extra_cash = -0.02
+    first = _reconcile(journal_settings, fake, open_window, fixed_clock)
+    assert first.status == OK
+    fixed_clock.advance(minutes=5)
+    fake.activities = [_fee("f1", S, -0.02, status="canceled")]
+
+    with pytest.raises(ReconciliationError, match="unexplained_activity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    (row,) = _rows(journal_settings, open_window)[-1:]
+    detail = json.loads(row.mismatches_json)["mismatches"][0]
+    assert detail["kind"] == "unexplained_activity"
+    assert "f1" in detail["detail"]
+
+
+def _journal_fill(
+    settings: Settings, client_order_id: str, quantity: float, *, at: datetime, accept: bool = True
+) -> None:
+    """Journal the terminal event and fill for an order the test already journaled
+    (a `pending` order is settled by an `accepted` event and its fill)."""
+    rows: list[object] = []
+    if accept:
+        rows.append(
+            OrderEventRow(
+                client_order_id=client_order_id, status="accepted", known_at=at, ingested_at=at
+            )
+        )
+    rows.append(
+        FillRow(
+            client_order_id=client_order_id,
+            filled_at=at,
+            quantity=quantity,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id=f"fill-{client_order_id}",
+            source="broker_feed",
+            known_at=at,
+            ingested_at=at,
+        )
+    )
+    _append(settings, *rows)
+
+
+def test_a_dividend_row_with_a_matching_corporate_action_is_dividend_cash_without_a_fee_id(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A `DIV` activity is read and recorded, never booked by id (#1583, Q7); the
+    cash it stands for is explained by the store's dividend rule as a `dividend_cash`
+    whose `broker_activity_id` is null."""
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _dividend(journal_settings, SPY, 0.5, CUT - timedelta(days=1))  # 0.5 x 10 = 5.0 due
+    fake.activities = [
+        CashActivity(
+            activity_id="d-1", activity_type="DIV", date=S, status="executed", net_amount=5.0
+        )
+    ]
+    fake.extra_cash = 5.0  # the broker credited the dividend
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+    assert result.status == OK
+    (booked,) = _adjustments(journal_settings, open_window)
+    assert booked.kind == "dividend_cash"
+    assert booked.broker_activity_id is None  # dividends are never keyed by an activity id
+    assert [r.activity_type for r in result.activities] == ["DIV"]
+
+
+def test_a_dividend_row_without_a_matching_corporate_action_is_a_cash_mismatch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """A `DIV` activity the store has no dividend for does not explain the cash: the
+    broker paid it but the journal cannot, so it is a `cash` mismatch."""
+    run_id = _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.activities = [
+        CashActivity(
+            activity_id="d-1", activity_type="DIV", date=S, status="executed", net_amount=5.0
+        )
+    ]
+    fake.extra_cash = 5.0  # credited, but no corporate_action backs it
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+
+def test_a_deferred_fee_is_booked_by_the_next_ok_reconciliation_once(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(item 6, Q8) A `FEE` beside an open allowance is `deferred fee`, never
+    journaled; the next reconciliation without the allowance books it exactly
+    once."""
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-pend", MTUM, "MTUM", 3.0, events=("pending",), fill=False)
+    fake.submit(OrderRequest("tp-pend", "MTUM", Side.BUY, quantity=3.0))
+    fake.activities = [_fee("f1", S, -0.02)]
+    fake.extra_cash = -0.02
+
+    deferred = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+    assert deferred.status == PENDING_UNRESOLVED
+    assert ("deferred fee", -0.02, None) in [
+        (a.reason, a.difference, a.security_id) for a in deferred.allowed
+    ]
+    assert _adjustments(journal_settings, open_window) == []
+
+    # settle the pending order (journal + fill it) and reconcile again: one fee_cash
+    fixed_clock.advance(minutes=5)  # past the deferred reconciliation's stamp
+    _journal_fill(journal_settings, "tp-pend", 3.0, at=fixed_clock())
+    fake.apply("tp-pend", PartialFill(3.0, PRICE))
+    fake.extra_cash = -0.02  # the settled buy is already in the fake's cash; only the fee extra
+    settled = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+    assert settled.status == OK
+    booked = _adjustments(journal_settings, open_window)
+    assert [a.broker_activity_id for a in booked if a.kind == "fee_cash"] == ["f1"]
+
+
+def test_a_fee_beside_a_lagging_order_is_deferred_then_booked_once(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """(item 6) The lagging-order twin: a `FEE` beside a fill that lags is deferred,
+    then booked once by the next `ok`."""
+    run_id = _run(journal_settings, open_window)
+    at = fixed_clock() - timedelta(minutes=30)
+    _order(
+        journal_settings,
+        run_id,
+        "tp-lag",
+        SPY,
+        "SPY",
+        5.0,
+        events=("pending", "accepted"),
+        fill=False,
+        at=at,
+    )
+    fake.submit(OrderRequest("tp-lag", "SPY", Side.BUY, quantity=5.0))
+    fake.apply("tp-lag", PartialFill(2.0, PRICE))  # booked at the broker, not journaled
+    fake.activities = [_fee("f1", S, -0.02)]
+    fake.extra_cash = -0.02
+
+    deferred = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+    assert deferred.status is not None
+    assert deferred.lagging_ids == ("tp-lag",)
+    assert ("deferred fee", -0.02, None) in [
+        (a.reason, a.difference, a.security_id) for a in deferred.allowed
+    ]
+    assert _adjustments(journal_settings, open_window) == []
+
+    # close the lag: journal the fill past the deferred stamp and let the broker match
+    fixed_clock.advance(minutes=5)
+    _journal_fill(journal_settings, "tp-lag", 2.0, at=fixed_clock(), accept=False)
+    fake.extra_cash = -0.02  # the 2-share buy is already in the fake's cash; only the fee extra
+    settled = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+    assert settled.status == OK
+    assert [a.broker_activity_id for a in _adjustments(journal_settings, open_window)] == ["f1"]
+
+
+def test_a_superseded_fill_is_hidden_and_not_counted_in_fills_since_base(
+    journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock
+) -> None:
+    """(item 6, Q11/S-NIT4) A superseded fill is hidden by the accessor, so it never
+    enters `fills_since_base`: the ledger is read from `fills_for`, which drops the
+    superseded row and counts only the live one."""
+    run_id = _run(journal_settings, open_window)
+    at = fixed_clock() - timedelta(minutes=30)
+    order = _order(
+        journal_settings,
+        run_id,
+        "tp-b",
+        SPY,
+        "SPY",
+        4.0,
+        events=("pending", "accepted"),
+        fill=False,
+        at=at,
+    )
+    (survivor,) = _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-b",
+            filled_at=at,
+            quantity=4.0,
+            price=PRICE,
+            price_implied=True,
+            broker_fill_id="bf-pristine",
+            source="broker_status",
+            superseded_by=None,
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    _append(
+        journal_settings,
+        FillRow(
+            client_order_id="tp-b",
+            filled_at=at,
+            quantity=4.0,
+            price=PRICE,
+            price_implied=False,
+            broker_fill_id="bf-old",
+            source="broker_feed",
+            superseded_by=survivor,  # hidden by the accessor
+            known_at=at,
+            ingested_at=at,
+        ),
+    )
+    with open_read_only(journal_settings) as conn:
+        live = fills_for(conn, client_order_ids=["tp-b"])
+        assert [f.fill.fill_id for f in live] == [survivor]
+        ledger = from_journal(
+            live,
+            [order],
+            (),
+            live_actions_as_of(conn, fixed_clock()),
+            None,
+            open_window.starting_cash,
+            S,
+            window_id=open_window.window_id,
+            quantity_tolerance=1e-6,
+        )
+    assert ledger.fills_since_base == 1  # the superseded row was never counted
+
+
+def test_cash_within_the_open_allowances_carries_the_decimal_difference(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """S-NIT1: the `cash within the open allowances` record carries the Decimal-derived
+    difference; reverting to the pre-fee float gap leaves residue at a six-figure
+    balance (100000.10 vs 100000.00 -> 0.1, never 0.09999999999404023)."""
+    run_id = _run(journal_settings, open_window)
+    _order(journal_settings, run_id, "tp-pend", MTUM, "MTUM", 3.0, events=("pending",), fill=False)
+    fake.submit(OrderRequest("tp-pend", "MTUM", Side.BUY, quantity=3.0))
+    fake.extra_cash = -0.1  # a $0.10 gap inside the open allowance, at a six-figure balance
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock, run_id=run_id)
+
+    by_reason = {a.reason: a.difference for a in result.allowed}
+    assert "cash within the open allowances" in by_reason
+    assert (
+        by_reason["cash within the open allowances"] == -0.1
+    )  # Decimal-derived, not the float residue
+
+
+# --- the window-1 case to item 6's letter (Q5, S3) ----------------------------
+
+
+def _window_1_row(window_id: int | None, started_at: datetime) -> PaperWindowRow:
+    row = PaperWindowRow(
+        hypothesis_id=1,
+        first_rebalance_session=date(2026, 9, 30),
+        account_id="PA1",
+        starting_cash=100_008.90,
+        starting_equity=100_008.90,
+        code_version="t",
+        started_at=started_at,
+        frozen_json="{}",
+        frozen_sha256="0" * 64,
+        known_at=started_at,
+        ingested_at=started_at,
+    )
+    return replace(row, window_id=window_id)
+
+
+def test_window_1_resume_books_its_two_start_date_fees_under_the_fallback(
+    journal_settings: Settings,
+    fake: BookedFake,
+    fixed_clock: FixedClock,
+) -> None:
+    """Item 6's window-1 shape (Q5, S3): a window opened with `starting_cash`
+    100008.90 and a null seen-set, a pre-T183 `ok` base (no recorded `activities`)
+    that day, two `FEE` rows dated the start day, broker 100008.88, key 0.01, zero
+    fills. Both are booked `fee_cash` once with the reconciliation's `known_at`.
+    Dates are fitted to the fixture session S (2026-10-01); the balances, the key
+    and the zero-fill ledger are item 6's exact figures."""
+    started_at = datetime(2026, 9, 30, 14, 0, tzinfo=UTC)
+    window_id = _append(journal_settings, _window_1_row(None, started_at))[0]
+    window = _window_1_row(window_id, started_at)
+    start = date(2026, 9, 30)  # the window's New York start date
+    # a pre-T183 ok base that day: broker 100008.90, no recorded activities
+    _append(
+        journal_settings,
+        ReconciliationRow(
+            window_id=window_id,  # type: ignore[arg-type]
+            at=datetime(2026, 10, 1, 10, 0, tzinfo=UTC),
+            status="ok",
+            broker_cash=100_008.90,
+            mismatches_json=json.dumps({"mismatches": [], "lagging": [], "pending": []}),
+            known_at=datetime(2026, 10, 1, 10, 0, tzinfo=UTC),
+            ingested_at=datetime(2026, 10, 1, 10, 0, tzinfo=UTC),
+        ),
+    )
+    fake.activities = [_fee("f-1", start, -0.01), _fee("f-2", start, -0.01)]
+    fake.extra_cash = 8.88  # the fake's baseline is 100000.00; the broker is at 100008.88
+
+    result = _reconcile(journal_settings, fake, window, fixed_clock)
+
+    assert result.status == OK
+    booked = _adjustments(journal_settings, window)
+    assert [(a.kind, a.cash, a.broker_activity_id, a.session) for a in booked] == [
+        ("fee_cash", -0.01, "f-1", start),
+        ("fee_cash", -0.01, "f-2", start),
+    ]
+    recon_known = _rows(journal_settings, window)[-1].known_at
+    assert all(a.known_at == recon_known for a in booked)
+    payload = json.loads(result.mismatches_json)
+    assert {a["activity_id"] for a in payload["activities"]} == {"f-1", "f-2"}
+
+    # a second read journals nothing and the ledger cash is now 100008.88
+    fixed_clock.advance(minutes=5)
+    again = _reconcile(journal_settings, fake, window, fixed_clock)
+    assert again.status == OK and again.adjustments == ()
+    assert len(_adjustments(journal_settings, window)) == 2
+    # the second-read ledger is 100008.88 exactly: the reconcile re-based on the ok
+    # row and the two fees it already holds (known at that base) are not re-applied
+    with open_read_only(journal_settings) as conn:
+        state = _journal_state(conn, window.window_id, fixed_clock())
+        ledger = _ledger(
+            state,
+            live_actions_as_of(conn, fixed_clock()),
+            window,
+            S,
+            FROZEN.reconcile_quantity_tolerance,
+        )
+    assert Decimal(repr(ledger.cash)) == Decimal("100008.88")
+
+
+def test_window_1_no_activity_twin_still_halts(
+    journal_settings: Settings, fake: BookedFake, fixed_clock: FixedClock
+) -> None:
+    """Item 6's window-1 twin (Q5): the same -0.02 with no activity read is still a
+    `cash` mismatch, never inferred from the difference."""
+    window_id = _append(
+        journal_settings, _window_1_row(None, datetime(2026, 9, 30, 14, 0, tzinfo=UTC))
+    )[0]
+    window = _window_1_row(window_id, datetime(2026, 9, 30, 14, 0, tzinfo=UTC))
+    fake.activities = []
+    fake.extra_cash = 8.88  # the broker is 100008.88, the ledger 100008.90, no read row
+    with pytest.raises(ReconciliationError, match="cash"):
+        _reconcile(journal_settings, fake, window, fixed_clock)

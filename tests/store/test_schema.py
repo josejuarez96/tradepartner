@@ -611,7 +611,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (25,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (26,)
     finally:
         conn.close()
 
@@ -760,9 +760,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -924,9 +924,10 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
     """From 22: `rates` appears, empty and shaped as a fresh store's; every
     other table's DDL and every row are unchanged; the versions go to [22, 23]
     and a second open adds nothing. The same open takes version 24's
-    `borrow_status` step (#1506, T171) and version 25's provenance widening
-    (#1597, T184d), so the store ends at [22, 23, 24, 25]:
-    those migrations have their own test below."""
+    `borrow_status` step (#1506, T171), version 25's `adjustments` fee columns
+    (#1583, T183) and version 26's provenance widening (#1597, T184d), so
+    the store ends at [22, 23, 24, 25, 26]: those migrations have their own
+    test below."""
     conn = duckdb.connect(":memory:")
     try:
         _version_22_store(conn)
@@ -941,9 +942,9 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
-        assert _versions(conn) == [22, 23, 24, 25]
+        assert _versions(conn) == [22, 23, 24, 25, 26]
         schema.init_schema(conn)
-        assert _versions(conn) == [22, 23, 24, 25]
+        assert _versions(conn) == [22, 23, 24, 25, 26]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["rates"] == _shape(fresh)["rates"]
@@ -1103,8 +1104,8 @@ def _version_23_store(conn: duckdb.DuckDBPyConnection) -> None:
 def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
     """From 23: `borrow_status` appears, empty and shaped as a fresh store's;
     every other table's DDL and every row are unchanged; the versions go to
-    [23, 24] and a second open adds nothing (the same open takes version 25's
-    provenance widening, #1597, T184d, which its own test covers). The
+    [23, 24, 25] and a second open adds nothing (the same open takes version
+    26's provenance widening, #1597, T184d, which its own test covers). The
     migration is purely additive (ADR 0021's reversible table): no existing
     row moves."""
     conn = duckdb.connect(":memory:")
@@ -1121,9 +1122,9 @@ def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (0,)
-        assert _versions(conn) == [23, 24, 25]
+        assert _versions(conn) == [23, 24, 25, 26]
         schema.init_schema(conn)
-        assert _versions(conn) == [23, 24, 25]
+        assert _versions(conn) == [23, 24, 25, 26]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["borrow_status"] == _shape(fresh)["borrow_status"]
@@ -1192,16 +1193,16 @@ def test_the_fixture_store_holds_the_six_borrow_cases(
     assert renamed == [("TCKA",), ("TCKB",)]
 
 
-# --- version 25 (#1597, T184d): `filing_name` in the two master tables' sets
+# --- version 26 (#1597, T184d): `filing_name` in the two master tables' sets
 
 
-def _version_24_store(conn: duckdb.DuckDBPyConnection) -> None:
-    """A store as version 24 (#1506, T171) left it: every DDL tuple, the
-    unconditional post-DDL steps (`retracted`, the nullable registry
-    columns, the period columns) and one row in each of `listings`,
-    `classifications` and `prices_daily`, with both master tables still
-    refusing `filing_name` in their provenance `CHECK`, and a single
-    version-24 row."""
+def _version_25_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 25 (#1583, T183) left it: every DDL tuple, the
+    unconditional post-DDL steps (`retracted`, the booked `FEE` activity
+    columns, the nullable registry columns, the period columns) and one row
+    in each of `listings`, `classifications` and `prices_daily`, with both
+    master tables still refusing `filing_name` in their provenance `CHECK`,
+    and a single version-25 row."""
     configure_connection(conn)
     for ddl in (
         schema._TABLE_DDL
@@ -1217,6 +1218,7 @@ def _version_24_store(conn: duckdb.DuckDBPyConnection) -> None:
     ):
         conn.execute(ddl)
     schema._migrate_retracted(conn)
+    schema._migrate_fee_activities(conn)
     schema._migrate_n_research(conn)
     schema._migrate_profitability_rebalance_counts(conn)
     schema._relax_no_history_count(conn)
@@ -1238,20 +1240,20 @@ def _version_24_store(conn: duckdb.DuckDBPyConnection) -> None:
     )
     conn.execute("DELETE FROM schema_version")
     conn.execute(
-        "INSERT INTO schema_version (version, applied_at) VALUES (24, TIMESTAMPTZ "
+        "INSERT INTO schema_version (version, applied_at) VALUES (25, TIMESTAMPTZ "
         "'2026-10-12 20:00:00+00')"
     )
 
 
-def test_the_version_25_migration_widens_the_two_allowed_sets_and_keeps_every_row() -> None:
-    """From 24: `listings` and `classifications` are rebuilt with the wider
+def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_row() -> None:
+    """From 25: `listings` and `classifications` are rebuilt with the wider
     provenance `CHECK` and no other table changes at all; every row is kept
     byte-identical (the `CHECK` only widens, so nothing stored can be
-    refused), the versions go to [24, 25], a second open adds nothing, and
+    refused), the versions go to [25, 26], a second open adds nothing, and
     the two rebuilt tables are the fresh store's."""
     conn = duckdb.connect(":memory:")
     try:
-        _version_24_store(conn)
+        _version_25_store(conn)
         shape_before = _shape(conn)
         tables_before = sorted(set(shape_before) - {"schema_version"})
         rows_before = _all_rows(conn, tables_before)
@@ -1264,9 +1266,9 @@ def test_the_version_25_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "classifications",
         }
         assert _all_rows(conn, tables_before) == rows_before
-        assert _versions(conn) == [24, 25]
+        assert _versions(conn) == [25, 26]
         schema.init_schema(conn)
-        assert _versions(conn) == [24, 25]
+        assert _versions(conn) == [25, 26]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         for table in ("listings", "classifications"):
@@ -1276,7 +1278,7 @@ def test_the_version_25_migration_widens_the_two_allowed_sets_and_keeps_every_ro
         conn.close()
 
 
-def test_a_version_24_store_refuses_filing_name_and_a_migrated_one_accepts_it() -> None:
+def test_a_version_25_store_refuses_filing_name_and_a_migrated_one_accepts_it() -> None:
     """The value is new to both allowed sets: a store at the previous
     version refuses a `filing_name` row in either master table (the merge
     base's behaviour, since the pinned `_TABLE_DDL` still builds the
@@ -1294,7 +1296,7 @@ def test_a_version_24_store_refuses_filing_name_and_a_migrated_one_accepts_it() 
     )
     conn = duckdb.connect(":memory:")
     try:
-        _version_24_store(conn)
+        _version_25_store(conn)
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(f"INSERT INTO listings VALUES ({listing}, FALSE)")
         with pytest.raises(duckdb.ConstraintException):
@@ -1360,20 +1362,20 @@ def test_the_pinned_table_ddl_keeps_the_version_4_provenance_check() -> None:
     assert "retracted" not in schema._FILING_NAME_TABLE_DDL["classifications"]
 
 
-def test_read_only_open_of_a_version_24_store_passes(tmp_path: Path) -> None:
-    """A read-only connection never migrates: a version-24 store passes
-    (`_check_read_only` accepts it), `schema_version` stays at [24], the
+def test_read_only_open_of_a_version_25_store_passes(tmp_path: Path) -> None:
+    """A read-only connection never migrates: a version-25 store passes
+    (`_check_read_only` accepts it), `schema_version` stays at [25], the
     two master tables keep the narrow set and every read works, since no
     read depends on a table's provenance `CHECK`."""
     path = tmp_path / "v24.duckdb"
     conn = duckdb.connect(str(path))
     try:
-        _version_24_store(conn)
+        _version_25_store(conn)
     finally:
         conn.close()
     with duckdb.connect(str(path), read_only=True) as ro:
         schema.init_schema(ro)
-        assert _versions(ro) == [24]
+        assert _versions(ro) == [25]
         assert ro.execute("SELECT ticker FROM listings").fetchall() == [("TST",)]
         assert ro.execute("SELECT rule FROM classifications").fetchall() == [("common_default",)]
 
@@ -1463,7 +1465,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (25,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (26,)
     finally:
         conn.close()
 
@@ -1585,7 +1587,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -2082,10 +2084,11 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `signals.reason` prefix `CHECK` (#1153, T127) is version 14; the period keys
     (#1179, T97) are version 15; the lab migration (#1195, T113) is version 16;
     the ADR 0015 expansion seams (#1258, T132) are version 17; #1498's `rates`
-    (T169) is version 23; #1506's `borrow_status` (T171) is version 24;
-    #1597's `filing_name` in the two master tables' allowed sets (T184d) is
-    version 25."""
-    assert schema.CURRENT_SCHEMA_VERSION == 25
+    (T169) is version 23; #1506's `borrow_status` (T171) is version 24; the
+    fee cash activity columns (#1583, T183) are version 25; #1597's
+    `filing_name` in the two master tables' allowed sets (T184d) is version
+    26."""
+    assert schema.CURRENT_SCHEMA_VERSION == 26
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
