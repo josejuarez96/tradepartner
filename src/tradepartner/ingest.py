@@ -209,6 +209,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -837,6 +838,8 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
+        self.filename_incomplete_ciks: set[str] = set()
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
@@ -863,6 +866,13 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        """Record the CIK's filename evidence in the fetch pass, before the lock."""
+        records = list(self._ask("filename_listings", cik))
+        if cik in getattr(self._source, "filename_incomplete_ciks", ()):
+            self.filename_incomplete_ciks.add(cik)
+        return records
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         """Not memoized (#660, spec "Ingest"): the fetch pass's call fills
@@ -1107,10 +1117,59 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}; "
+        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{_filename_counts(master, delistings, filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
+    """The #1597 verdict and Form 25 counts, omitted with the switch off."""
+    if not master.filename_enabled:
+        return ""
+    counts = dict(master.filename_counts)
+    for key in (
+        "filename_10ks_read",
+        "filename_confirmed",
+        "filename_single_reading",
+        "filename_renamed",
+        "filename_refused_contradicted",
+        "filename_refused_owner",
+        "filename_no_instance",
+        "filename_no_exchange",
+        "filename_class_unread",
+        "filename_form25_rows",
+    ):
+        counts.setdefault(key, 0)
+    accessions = frozenset(master.filename_form25_accessions)
+    counts["filename_form25_unmatched"] = sum(
+        1
+        for row in delistings.unmatched
+        if row.accession in accessions
+        or any(
+            listing["security_id"][:10] == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
+    )
+    counts["filename_transfers_delisted"] = sum(
+        1
+        for row in delistings.delistings
+        if row["filed_at"].year < 2019
+        and any(
+            listing["security_id"] == row["security_id"]
+            and listing["exchange"] != row["exchange"]
+            and listing["known_at"] > row["filed_at"]
+            and listing["provenance"] == "filing_name"
+            for listing in master.listings
+        )
+    )
+    source = _unwrap(filings)
+    for key in ("filename_index_fetches", "filename_document_fetches"):
+        counts[key] = int(getattr(source, key, 0))
+    return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
 
 
 def _delete_classifications(

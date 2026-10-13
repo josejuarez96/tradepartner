@@ -980,3 +980,151 @@ class TestCoverPageExchangeAxisOff:
             )
 
         assert parse(True) == parse(False)
+
+
+# --- #1651: `edgar.cover_split_contexts` (CapitalUnitsByClassAxis; a class split over contexts) ---
+
+_CAPITAL_UNITS = "us-gaap:CapitalUnitsByClassAxis"
+
+
+def _split(name: str, *, on: bool) -> Any:
+    return parse_cover_page(
+        (SHAPES / name).read_bytes(),
+        accession="0000000001-23-000001",
+        accepted_at=_ACCEPTED,
+        exchange_axis=True,
+        split_contexts=on,
+    )
+
+
+class TestCoverPageSplitContexts:
+    """The three real tagging patterns the exchange axis alone still misses."""
+
+    @pytest.mark.parametrize("name", ["fifth_third_10q_2023q3.htm", "fifth_third_10q_2020q3.htm"])
+    def test_capital_units_axis_is_a_class_axis(self, name: str) -> None:
+        """Fifth Third tags each class on `CapitalUnitsByClassAxis`."""
+        parsed = _split(name, on=True)
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("FITB", "NASDAQ"),
+            ("FITBI", "NASDAQ"),
+        ]
+        assert parsed.other_contexts == ()
+        assert [f.class_member for f in parsed.facts] == [""]
+
+    def test_abbott_2020_title_symbol_and_exchanges_on_different_contexts(self) -> None:
+        parsed = _split("abbott_10q_2020q3.htm", on=True)
+        assert [(i.title, i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("Common Shares, Without Par Value", "ABT", "NYSE"),
+            ("Common Shares, Without Par Value", "ABT", "NYSE_CHICAGO"),
+        ]
+        assert parsed.incomplete_listings == 0
+        assert parsed.exchange_axis_mismatch == 0
+
+    def test_pg_2023_common_comes_out_beside_the_note(self) -> None:
+        parsed = _split("pg_10q_2023q3.htm", on=True)
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("PG", "NYSE"),
+            ("PG23A", "NYSE"),
+        ]
+        assert parsed.incomplete_listings == 0
+        assert [f.value for f in parsed.facts] == [2_356_886_211]
+
+    @pytest.mark.parametrize(
+        ("name", "listed", "other", "incomplete"),
+        [
+            ("fifth_third_10q_2023q3.htm", [], ("c-2", "c-3"), 0),
+            ("abbott_10q_2020q3.htm", [], (), 1),
+            ("pg_10q_2023q3.htm", [("PG23A", "NYSE")], (), 1),
+        ],
+    )
+    def test_switch_off_is_todays_output(
+        self,
+        name: str,
+        listed: list[tuple[str, str]],
+        other: tuple[str, ...],
+        incomplete: int,
+    ) -> None:
+        parsed = _split(name, on=False)
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == listed
+        assert parsed.other_contexts == other
+        assert parsed.incomplete_listings == incomplete
+        assert parsed == parse_cover_page(
+            (SHAPES / name).read_bytes(),
+            accession="0000000001-23-000001",
+            accepted_at=_ACCEPTED,
+            exchange_axis=True,
+        )  # the default is off
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "abbott_10q_2019q2.htm",
+            "abbvie_10q_2019q2.htm",
+            "ansys_10q_2019q2.htm",
+            "ibm_10q_2019q2.htm",
+            "mmm_10q_2019q2.htm",
+            "pg_10k_2019.htm",
+            "pg_10k_2019_common_only.htm",
+        ],
+    )
+    def test_shapes_already_read_are_unchanged_with_the_switch_on(self, name: str) -> None:
+        assert _split(name, on=True) == _split(name, on=False)
+
+    def test_two_titles_in_one_class_fall_back_to_one_listing_per_context(self) -> None:
+        """No merge when the class's contexts disagree: a symbol is never
+        carried onto another security's title."""
+        contexts = _context("A", {_EXCH: "exch:XNYS"}) + _context("B", {_EXCH: "exch:XNAS"})
+        facts = (
+            _listing_facts("A", "Common Stock", "AAA", "NYSE")
+            + _nn("Security12bTitle", "B", "Notes due 2030")
+            + _nn("SecurityExchangeName", "B", "NASDAQ")
+        )
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000092122-24-000001",
+            accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+            exchange_axis=True,
+            split_contexts=True,
+        )
+        assert [(i.title, i.ticker) for i in parsed.cover.listings] == [("Common Stock", "AAA")]
+        assert parsed.incomplete_listings == 0  # B has a title but no symbol: a note
+
+    def test_two_classes_keep_their_own_symbols(self) -> None:
+        contexts = _context("A", {_CLASS_AXIS_NAME: "us-gaap:CommonClassAMember"}) + _context(
+            "B", {_CLASS_AXIS_NAME: "us-gaap:CommonClassBMember"}
+        )
+        facts = _listing_facts("A", "Class A", "AAA", "NYSE") + _listing_facts(
+            "B", "Class B", "BBB", "NYSE"
+        )
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000092122-24-000001",
+            accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+            split_contexts=True,
+        )
+        assert [(i.title, i.ticker) for i in parsed.cover.listings] == [
+            ("Class A", "AAA"),
+            ("Class B", "BBB"),
+        ]
+
+    def test_shares_on_the_capital_units_axis_stay_unread_and_duplicates_collapse(self) -> None:
+        contexts = (
+            _context("A", {_CAPITAL_UNITS: "fitb:CommonMember"})
+            + _context("B", {_CAPITAL_UNITS: "fitb:CommonMember", _EXCH: "exch:XNAS"})
+            + _context("S", {_CAPITAL_UNITS: "fitb:CommonMember"}, instant=True)
+        )
+        facts = (
+            _listing_facts("A", "Common", "AAA", "NASDAQ")
+            + _nn("SecurityExchangeName", "B", "NASDAQ")
+            + _shares("S", "5")
+        )
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000092122-24-000001",
+            accepted_at=datetime(2024, 2, 1, 21, 0, tzinfo=UTC),
+            exchange_axis=True,
+            split_contexts=True,
+        )
+        assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [("AAA", "NASDAQ")]
+        assert parsed.facts == ()
+        assert parsed.other_contexts == ("S",)

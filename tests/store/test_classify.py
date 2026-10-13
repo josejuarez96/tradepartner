@@ -804,8 +804,9 @@ class TestTitleFallback:
         assert history[-1][:2] == ("unclassifiable", "no_rule_matched")
         assert history[-1][2] == _at(2021, 3, 1)
 
-    def test_switch_off_is_the_same_as_the_default(self) -> None:
-        explicit, _ = _fallback_build(False)
+    def test_switch_on_is_the_same_as_the_default(self) -> None:
+        # T181 (#1541): the release flipped the default to on.
+        explicit, _ = _fallback_build(True)
         source = _fallback_source()
         settings = _settings()
         master = build_master(source, settings, ingested_at=INGESTED_AT)

@@ -247,10 +247,19 @@ def test_a_lag_window_parse_carries_its_incomplete_listings_into_cache_and_count
     real_parse = edgar_source.parse_cover_page
 
     def parse_with_two_skipped(
-        document: bytes, *, accession: str, accepted_at: datetime, exchange_axis: bool = False
+        document: bytes,
+        *,
+        accession: str,
+        accepted_at: datetime,
+        exchange_axis: bool = False,
+        split_contexts: bool = False,
     ) -> CoverPageParse:
         parsed = real_parse(
-            document, accession=accession, accepted_at=accepted_at, exchange_axis=exchange_axis
+            document,
+            accession=accession,
+            accepted_at=accepted_at,
+            exchange_axis=exchange_axis,
+            split_contexts=split_contexts,
         )
         return dataclasses.replace(parsed, incomplete_listings=2)
 

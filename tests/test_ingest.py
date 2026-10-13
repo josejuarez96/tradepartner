@@ -33,6 +33,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -1467,6 +1468,74 @@ def test_the_edgar_run_applies_the_configured_overrides(settings: Settings) -> N
     *_, facts, unmatched = _build_filings(_filings(extra_facts=[class_a]), configured, NOW)
     assert (ACME, 7) in {(r["security_id"], r["value"]) for r in facts}
     assert class_a not in unmatched
+
+
+def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _filings()
+    asked: list[str] = []
+
+    def filename(cik: str) -> list[FilenameListing]:
+        asked.append(cik)
+        return []
+
+    monkeypatch.setattr(source, "filename_listings", filename)
+    off = _Recorded(source)
+    _prefetch(off, settings, dry_run=True)
+    assert asked == []
+    on_settings = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"filename_listings": True})}
+    )
+    on = _Recorded(source)
+    _prefetch(on, on_settings, dry_run=True)
+    assert asked == sorted({ACME, DUAL})
+    _build_filings(on, on_settings, NOW)
+    assert asked == sorted({ACME, DUAL})  # write phase uses recorded answers
+    from tradepartner.backtest import frozen, hypothesis
+
+    h1 = Path(__file__).resolve().parents[1] / "docs/hypotheses/h1-momentum-12-1.md"
+    parsed = hypothesis.parse_file(h1)
+    pinned = Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]})
+    params = hypothesis.frozen_params(parsed, pinned)
+    assert frozen.fingerprint("momentum", params, parsed.in_sample_start) == (
+        "534917a58a4f8c5dfe17330b3e2d06faf38111de553fd467886a06c147f609a4"
+    )
+
+
+def test_filename_run_records_verdict_counts_and_rows(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    base = _filings()
+    source = FixtureFilingSource(
+        index=base._index,
+        snapshot=base._snapshot,
+        facts=base._facts,
+        headers=base._headers,
+        cover_pages=base._cover_pages,
+        delistings=base._delistings,
+        filename_listings=[
+            FilenameListing(
+                ACME,
+                f"{ACME}-18-000001",
+                "10-K",
+                _at(2018, 3, 1),
+                date(2018, 3, 1),
+                "ACME",
+                "NYSE",
+                "Common Stock",
+                "ACME",
+            )
+        ],
+    )
+    on = settings.model_copy(
+        update={"edgar": settings.edgar.model_copy(update={"filename_listings": True})}
+    )
+    run = _edgar(on, source)
+    assert "filename_confirmed: 1" in run.message
+    assert "filename_no_instance: 1" in run.message  # DUAL's 10-K has no instance
+    assert "filename_form25_unmatched: 0" in run.message
+    assert read("SELECT ticker FROM listings WHERE provenance = 'filing_name'") == [("ACME",)]
 
 
 def test_shares_after_new_equity_go_to_the_successor(settings: Settings) -> None:
@@ -4142,3 +4211,14 @@ def test_the_rebuild_holds_a_cik_whose_filings_failed_this_run(
     assert result.ok
     after = read(f"SELECT * FROM classifications WHERE security_id = '{ACME}'")
     assert all(row in after for row in stored)  # nothing deleted; the plain add may add
+
+
+def test_recorded_source_keeps_the_partial_filename_ciks_after_the_freeze() -> None:
+    class Partial(FixtureFilingSource):
+        filename_incomplete_ciks = frozenset({"0000000993"})
+
+    recorded = _Recorded(Partial())
+    assert recorded.filename_listings("0000000993") == []
+    assert recorded.filename_listings("0000000994") == []
+    recorded.frozen = True
+    assert recorded.filename_incomplete_ciks == {"0000000993"}

@@ -96,6 +96,12 @@ def _text(at: AppTest) -> str:
     return "\n".join(str(p) for p in parts)
 
 
+def test_page_shows_filename_listing_block(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    assert "Filing-name listings" in _text(_app(monkeypatch, store_path))
+
+
 def _connect(store_path: Path) -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(str(store_path), read_only=True)
     configure_connection(conn)
