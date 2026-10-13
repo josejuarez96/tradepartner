@@ -32,6 +32,7 @@ import duckdb
 import polars as pl
 import pytest
 
+from tradepartner.adapters.alpaca_prices import parse_corporate_actions
 from tradepartner.calendar import next_session
 from tradepartner.config import AdjustConfig, Settings
 from tradepartner.store import schema
@@ -240,6 +241,65 @@ class TestPricesAsOf:
 
 
 class TestAdjustedPricesAsOf:
+    def test_alpaca_stock_dividend_adjusts_scco_total_return_only(
+        self, synthetic_store: duckdb.DuckDBPyConnection
+    ) -> None:
+        before, ex_date = date(2025, 2, 10), date(2025, 2, 11)
+        for security_id in ("SCCO", "PEER"):
+            _bar(
+                synthetic_store,
+                security_id,
+                before,
+                100.0,
+                known_at=datetime(2025, 2, 10, 21, tzinfo=UTC),
+            )
+            _bar(
+                synthetic_store,
+                security_id,
+                ex_date,
+                99.0,
+                known_at=datetime(2025, 2, 11, 21, tzinfo=UTC),
+            )
+        parsed = parse_corporate_actions(
+            {
+                "cash_dividends": [
+                    {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 0.7, "id": "cash"},
+                    {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073, "id": "fake-cash"},
+                ],
+                "stock_dividends": [
+                    {"symbol": "SCCO", "ex_date": "2025-02-11", "rate": 1.0073, "id": "stock"}
+                ],
+            },
+            lambda symbol, day: symbol,
+        )
+        assert parsed.stock_ratio_cash == 1
+        assert parsed.stock_dividends_stored == 1
+        for action in parsed.actions:
+            insert_row(
+                synthetic_store,
+                "corporate_actions",
+                {
+                    "security_id": action.security_id,
+                    "action_type": action.action_type.value,
+                    "ex_date": action.ex_date,
+                    "ratio_or_amount": action.ratio_or_amount,
+                    "source_action_id": action.source_action_id,
+                    "known_at": action.known_at,
+                    "ingested_at": datetime(2025, 2, 12, 21, tzinfo=UTC),
+                    "source": action.source,
+                    "provenance": "action",
+                },
+            )
+        t = datetime(2025, 2, 12, 21, tzinfo=UTC)
+        adjusted = adjusted_prices_as_of(synthetic_store, t, include_dividends=True)
+        scco_before = float(_one(adjusted, security_id="SCCO", session=before)["close"])
+        scco_after = float(_one(adjusted, security_id="SCCO", session=ex_date)["close"])
+        assert scco_before == pytest.approx(100.0 / 1.0073 * (1.0 - 0.7 / 100.0))
+        assert scco_after / scco_before - 1.0 == pytest.approx(
+            99.0 / (100.0 / 1.0073 * (1.0 - 0.7 / 100.0)) - 1.0
+        )
+        assert _one(adjusted, security_id="PEER", session=before)["close"] == 100.0
+
     def test_backfilled_2018_split_adjusts_2017_prices(
         self, fixture_store: duckdb.DuckDBPyConnection
     ) -> None:

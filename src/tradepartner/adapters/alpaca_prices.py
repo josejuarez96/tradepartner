@@ -261,7 +261,7 @@ from __future__ import annotations
 import functools
 import itertools
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -283,7 +283,7 @@ from tradepartner.adapters.prices import (
     check_request,
 )
 from tradepartner.calendar import is_session, next_session, previous_session
-from tradepartner.config import Settings, get_settings
+from tradepartner.config import AlpacaConfig, Settings, get_settings
 from tradepartner.store.classify import EQUITY, listing_kind
 from tradepartner.store.delistings import DELISTED
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -1628,6 +1628,8 @@ class ActionsParse:
     reused_symbols: tuple[str, ...] = ()
     stock_ratio_cash: int = 0
     stock_rows_unusable: int = 0
+    stock_dividends_stored: int = 0
+    stock_rows_refused: tuple[str, ...] = ()  # "SYMBOL ex-date rate (why)"
 
 
 @_fail_closed
@@ -1639,6 +1641,7 @@ def parse_corporate_actions(
     process_start: date | None = None,
     process_end: date | None = None,
     lag_days: int = 90,
+    stock_rules: AlpacaConfig | None = None,
 ) -> ActionsParse:
     """Splits, dividends, spin-offs and name changes from an actions
     payload, on the first-seen proxy, resolved on the last session before
@@ -1649,7 +1652,18 @@ def parse_corporate_actions(
     With `lead` (`ListingResolver.lead` with `actions=True`, #974), a row
     `resolve` leaves out goes to `lead(symbol, session)` on that same
     session (a split under a first span's ticker before its first cover
-    page); otherwise it stays unresolved."""
+    page); otherwise it stays unresolved.
+
+    A `stock_dividends` row is a `split` of its `rate` (#1618), stored
+    only when it has an id no other row uses, `1 < rate <
+    stock_dividend_max_rate`, and its security has no split within
+    `stock_dividend_split_sessions` of its ex-date (`stock_rules`,
+    default `AlpacaConfig()`); any other is refused and named in
+    `stock_rows_refused`, never an error for the payload. A same-date
+    cash row repeating a stock rate (exactly, #1617, or within
+    `stock_dividend_echo_tolerance` with `1 < amount < max`) is skipped
+    and counted in `stock_ratio_cash`."""
+    rules = stock_rules if stock_rules is not None else AlpacaConfig()
     actions: list[CorporateAction] = []
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
@@ -1661,11 +1675,32 @@ def parse_corporate_actions(
         result = resolve(symbol, day)
         return result if result is not None else lead(symbol, day) if lead is not None else None
 
+    # Split ex-dates by resolved security and by symbol, so a split paid as
+    # a stock dividend (listed in both categories) is adjusted once (#1618).
+    # A malformed split row is left to the main loop, which raises for it.
+    split_days: dict[tuple[str, str], set[date]] = defaultdict(set)
+    for category in sorted(_SPLIT_CATEGORIES):
+        split_rows = payload.get(category)
+        if not isinstance(split_rows, list):
+            continue
+        for row in split_rows:
+            try:
+                split_day = date.fromisoformat(row["ex_date"])
+                split_days[("symbol", row["symbol"])].add(split_day)
+                split_holder = holder(row["symbol"], previous_session(split_day))
+            except (KeyError, TypeError, ValueError, DateOutOfBounds):
+                continue
+            if split_holder is not None:
+                split_days[("security", split_holder)].add(split_day)
+
     # Alpaca sometimes repeats a stock-dividend ratio in cash_dividends.
-    # Only a complete, resolved stock row is evidence to suppress cash;
-    # stock_dividends remains an unsupported category for storage.
-    stock_rates: set[tuple[str, date, float]] = set()
+    # Only a complete, resolved stock row is evidence to suppress cash.
+    # A stock dividend is a share-ratio adjustment, just like a split.
+    stock_rates: dict[tuple[str, date], set[float]] = defaultdict(set)
     stock_rows_unusable = 0
+    stock_dividends_stored = 0
+    stock_candidates: list[tuple[CorporateAction, str]] = []
+    stock_refused: list[str] = []
     stock_rows = payload.get("stock_dividends", [])
     if isinstance(stock_rows, list):
         for stock in stock_rows:
@@ -1678,16 +1713,55 @@ def parse_corporate_actions(
                 stock_date = date.fromisoformat(stock["ex_date"])
                 stock_rate = _rate(stock, "rate", positive=False)
                 stock_security = holder(stock["symbol"], previous_session(stock_date))
+                if stock_security is None:
+                    stock_rows_unusable += 1
+                    continue
+                stock_rates[(stock_security, stock_date)].add(stock_rate)
+                label = f"{stock['symbol']} {stock_date.isoformat()} {stock_rate}"
+                if not 1 < stock_rate < rules.stock_dividend_max_rate:
+                    stock_refused.append(f"{label} (rate)")
+                    continue
+                low = high = stock_date
+                for _ in range(rules.stock_dividend_split_sessions):
+                    low, high = previous_session(low), next_session(high)
+                if any(
+                    low <= day <= high
+                    for key in (("security", stock_security), ("symbol", stock["symbol"]))
+                    for day in split_days.get(key, ())
+                ):
+                    stock_refused.append(f"{label} (split nearby)")
+                    continue
+                if stock.get("id") is None:
+                    stock_refused.append(f"{label} (no id)")
+                    continue
+                stock_action = CorporateAction(
+                    security_id=stock_security,
+                    action_type=ActionType.SPLIT,
+                    ex_date=stock_date,
+                    ratio_or_amount=stock_rate,
+                    known_at=action_first_seen_known_at(stock_date),
+                    source=_ACTIONS_SOURCE,
+                    source_action_id=stock["id"],
+                )
             except (TypeError, ValueError, DateOutOfBounds):
                 stock_rows_unusable += 1
                 continue
-            if stock_security is not None:
-                stock_rates.add((stock_security, stock_date, stock_rate))
-            else:
-                stock_rows_unusable += 1
+            stock_candidates.append((stock_action, label))
+
+    def stock_echo(security_id: str, ex_date: date, amount: float) -> bool:
+        rates = stock_rates.get((security_id, ex_date), set())
+        return amount in rates or (
+            1 < amount < rules.stock_dividend_max_rate
+            and any(abs(amount - rate) <= rules.stock_dividend_echo_tolerance for rate in rates)
+        )
+
     stock_ratio_cash = 0
 
     for category, rows in sorted(payload.items()):
+        if category == "stock_dividends":
+            if not isinstance(rows, list):
+                raise ValueError(f"category {category!r} is not a list")
+            continue
         if category in _SPLIT_CATEGORIES:
             action_type = ActionType.SPLIT
         elif category in _DIVIDEND_CATEGORIES:
@@ -1796,7 +1870,7 @@ def parse_corporate_actions(
                 )
             else:
                 value = _rate(row, "rate", positive=False)
-                if (resolved_id, ex_date, value) in stock_rates:
+                if stock_echo(resolved_id, ex_date, value):
                     stock_ratio_cash += 1
                     continue
             actions.append(
@@ -1810,6 +1884,18 @@ def parse_corporate_actions(
                     source_action_id=row.get("id"),
                 )
             )
+    # A stock row's id must be its own: one shared with another stock row or
+    # any other action is refused, never a payload-wide `ValueError` (#1618).
+    other_ids = {a.source_action_id for a in actions if a.source_action_id is not None}
+    stock_ids = Counter(a.source_action_id for a, _ in stock_candidates)
+    for stock_action, label in stock_candidates:
+        if stock_ids[stock_action.source_action_id] > 1:
+            stock_refused.append(f"{label} (repeated id)")
+        elif stock_action.source_action_id in other_ids:
+            stock_refused.append(f"{label} (id of another action)")
+        else:
+            actions.append(stock_action)
+            stock_dividends_stored += 1
     actions.sort(key=lambda a: (a.security_id, a.action_type.value, a.ex_date))
     _require_unique([a.key for a in actions], "action")
     symbol_changes.sort(key=lambda c: (c.security_id, c.process_date, c.old_symbol))
@@ -1825,6 +1911,8 @@ def parse_corporate_actions(
         tuple(reused_symbols),
         stock_ratio_cash,
         stock_rows_unusable,
+        stock_dividends_stored,
+        tuple(stock_refused),
     )
 
 
@@ -1962,6 +2050,7 @@ class AlpacaPriceSource(PriceSource):
             else functools.partial(_default_fetch_name_changes, settings=settings)
         )
         self._lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+        self._alpaca = settings.alpaca
         self._asof_offset = settings.alpaca.asof_offset_days
         self._asof_served: set[tuple[str, str]] = set()  # (security, symbol) asof found
         self.last_bars_report: BarsParse | None = None
@@ -2098,6 +2187,13 @@ class AlpacaPriceSource(PriceSource):
                     f"; {self.last_actions_report.stock_rows_unusable} "
                     "stock-dividend row(s) unusable"
                 )
+            if refused := self.last_actions_report.stock_rows_refused:
+                line += f"; {len(refused)} stock-dividend row(s) refused: {', '.join(refused)}"
+            if self.last_actions_report.stock_dividends_stored:
+                line += (
+                    f"; {self.last_actions_report.stock_dividends_stored} "
+                    "stock-dividend row(s) stored as split"
+                )
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
             if self.last_actions_report.symbol_change_reused:
@@ -2138,6 +2234,7 @@ class AlpacaPriceSource(PriceSource):
             process_start=start - self._lag,
             process_end=end + self._lag,
             lag_days=self._lag.days,
+            stock_rules=self._alpaca,
         )
         self.last_actions_report = parsed
         return [

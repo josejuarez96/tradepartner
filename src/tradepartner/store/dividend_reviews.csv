@@ -1,0 +1,184 @@
+security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
+0001232582,2019-09-27,0.06,duplicate,728549e1-3f15-4ff1-a1f3-6a78ae6c0d0b,AHT,raw records differ by cusip only
+0001514281,2019-09-27,0.45,duplicate,da17a3f6-2dbf-4db6-a11a-458c6497ad97,MITT,raw records differ by cusip only
+0001514281,2019-12-30,0.45,duplicate,eb3663d2-2df4-4ccd-b5d5-a5b32e7fa6a1,MITT,raw records differ by cusip only
+0000922864,2020-02-13,0.41,duplicate,a8c8565c-5162-4c6e-8a25-88fe634c548c,AIV,raw records differ by cusip only
+0001163739,2020-03-11,0.01,duplicate,ee9d67eb-103b-4871-b82e-c2aee13efa52,NBR,raw records differ by cusip only
+0001508655,2020-04-14,0.25,duplicate,3ed8caa5-6d26-4bfb-8c40-e341b965db21,TSLX,raw records differ by cusip only
+0000761648,2020-05-07,0.01,duplicate,84e39b3a-522a-4a05-b69a-3db2d9cae973,CDR,raw records differ by cusip only
+0000023795,2020-05-08,0.25,duplicate,c824b776-12b8-46d0-b9f1-7f30a90ea6bd,CTO,raw records differ by cusip only
+0000081955,2020-05-12,1.62,duplicate,f0df56df-4366-4ed0-b5f0-1b2b481de9d0,RAND,raw records differ by cusip only
+0000922864,2020-05-14,0.41,duplicate,8009b714-a31c-46d8-bbc8-9328ec4fe68a,AIV,raw records differ by cusip only
+0001690666,2020-05-19,0.2,duplicate,a62396fb-846a-431d-b1f6-16b5ecfe65e0,XPER,raw records differ by cusip only
+0000912767,2020-05-29,0.125,duplicate,d23b9944-3778-4ec6-9cb8-7ca673ce7eb3,UFPI,raw records differ by cusip only
+0000904163,2020-06-04,0.82,duplicate,d7b98edb-e1b8-4c1c-8fa9-de76281b81c6,ANAT,raw records differ by cusip only
+0001508655,2020-06-12,0.25,duplicate,c5de96e3-68ee-4f7d-a70d-60da3286c081,TSLX,raw records differ by cusip only
+0001508655,2020-06-12,0.41,duplicate,ba77c9bc-a7b4-453f-8b30-794e91f5cf8b,TSLX,raw records differ by cusip only
+0000059255,2020-06-15,0.08,duplicate,eff3c815-be04-40b1-b1f5-eca754bfdfe9,VHI,raw records differ by cusip only
+0001166663,2020-06-19,0.075,duplicate,c39fa51d-01c9-45be-915b-504d068a32fa,TNP,raw records differ by cusip only
+0000761648,2020-08-07,0.01,duplicate,8863769c-b671-45d5-a7eb-545dfb66b681,CDR,raw records differ by cusip only
+0000922864,2020-08-13,0.41,duplicate,a56e7ca3-3858-48ac-a856-bfe8a162eaec,AIV,raw records differ by cusip only
+0000706688,2020-09-16,0.04,duplicate,4a2c21fa-22aa-4602-8ffc-f84e5ff92d48,AAN,raw records differ by cusip only
+0000041719,2020-10-02,0.135,duplicate,cd8f6b2a-43af-4e76-90b1-f9db88e7d02f,GLT,raw records differ by cusip only
+0001040971,2020-10-29,0.295,duplicate,538c6d86-c6fe-4cd2-aa18-f36597d16d99,SLG,raw records differ by cusip only
+0001481241,2020-10-29,0.01,duplicate,b6ff8e8f-7275-4a7a-b78e-dc00c5078621,PSHG,raw records differ by cusip only
+0000922864,2020-11-03,8.2,duplicate,ec5a712d-f182-4138-97d3-01a9c66a2107,AIV,raw records differ by cusip only
+0000761648,2020-11-09,0.01,duplicate,f9ade5e7-1946-4db8-9b78-7472730247eb,CDR,raw records differ by cusip only
+0001778114,2020-11-10,0.10833,duplicate,f7e0f058-dedd-41c0-813c-f07f479488bc,AIO,raw records differ by cusip only
+0001040971,2020-11-27,0.295,duplicate,71648ac1-431f-47b5-a26f-1c0e7d921077,SLG,raw records differ by cusip only
+0000097517,2020-12-10,10.0,duplicate,ab71eb9f-3323-46a2-9650-43c15fc8d794,TPL,raw records differ by cusip only
+0001636289,2020-12-10,0.167,duplicate,fa0197fb-85ac-4570-8f35-cb1ad5b0e09a,ACV,raw records differ by cusip only
+0001778114,2020-12-10,0.10833,duplicate,ec92779d-443e-4f0d-b2e6-e8fa444cc7b6,AIO,raw records differ by cusip only
+0001040971,2020-12-14,2.0,duplicate,eda3364e-7fd6-4ee7-b243-10d2669e8bb9,SLG,raw records differ by cusip only
+0001260563,2020-12-18,0.225,duplicate,d4a0626d-ba56-4d46-b15f-2f0ad1956160,NFJ,raw records differ by cusip only
+0001383441,2020-12-18,0.38,duplicate,882dcd46-3601-43d7-a6b4-f2f54616c39c,NIE,raw records differ by cusip only
+0001636289,2020-12-18,0.37615,duplicate,a39f6da6-7e43-424e-a9cb-85bba19ad3a4,ACV,raw records differ by cusip only
+0001778114,2020-12-18,1.15583,duplicate,9f36948b-3e10-41c2-9ede-2b719b47970d,AIO,raw records differ by cusip only
+0001424182,2020-12-30,0.25,duplicate,bab899bd-dbb9-4687-9384-fb60dd344bf4,BNL,raw records differ by cusip only
+0001507385,2020-12-30,0.385,duplicate,d5656ffa-d6b1-4415-ad49-b701091ba30d,VER,raw records differ by cusip only
+0001514281,2020-12-30,0.03,duplicate,3fd20096-b5f6-46e6-ba45-d6f42e9639cc,MITT,raw records differ by cusip only
+0000034903,2020-12-31,1.06,duplicate,94795066-229c-4350-ba2e-2240e24427c5,FRT,raw records differ by cusip only
+0001636289,2021-01-13,0.167,duplicate,bc06a7e9-bff9-44fc-9133-60d7e931c318,ACV,raw records differ by cusip only
+0001778114,2021-01-13,0.125,duplicate,ac55ea27-2239-4448-9775-3add67f16690,AIO,raw records differ by cusip only
+0001040971,2021-01-28,0.3033,duplicate,efe06968-14bb-4eb2-99af-05cc92a5d9e9,SLG,raw records differ by cusip only
+0001474903,2021-02-17,0.1,duplicate,cf6f0b72-f56c-4302-bf39-6ddf0fa4eb70,BGSF,raw records differ by cusip only
+0001823608,2021-02-18,0.08,duplicate,c419726d-3609-44c6-a928-10a77468402c,AMAL,raw records differ by cusip only
+0001040971,2021-02-25,0.3033,duplicate,699a883e-ef77-4e06-ad01-5096c292519e,SLG,raw records differ by cusip only
+0000034903,2021-03-15,1.06,duplicate,6176b68f-c70f-4d40-9ebe-1266aeecf1e5,FRT,raw records differ by cusip only
+0001040971,2021-03-30,0.3033,duplicate,528bc6ee-02aa-4a53-afa5-589af3677677,SLG,raw records differ by cusip only
+0001424182,2021-03-30,0.25,duplicate,d40b34a9-9928-46f2-a202-b79e5f04dae7,BNL,raw records differ by cusip only
+0001514281,2021-03-31,0.06,duplicate,f34ca174-4a65-4fcd-a02d-02aa5a2d19ac,MITT,raw records differ by cusip only
+0001058057,2021-04-08,0.06,duplicate,ca889417-b74a-4464-9340-51dab337123d,MRVL,raw records differ by cusip only
+0001847398,2021-04-08,0.03,duplicate,40d4b6bb-5527-437a-9339-73feef13604d,NECB,raw records differ by cusip only
+0001040971,2021-04-29,0.3033,duplicate,ea19186f-3794-46a8-a592-8ef093ca41cf,SLG,raw records differ by cusip only
+0001137789,2021-05-11,0.67,unresolved,,STX,Alpaca no longer returns either id; only the issuer record settles it (#1613 Q25)
+0001413898,2021-05-13,0.04,duplicate,b48977ca-6659-414b-8992-91ef07b714a4,AHC,raw records differ by cusip only
+0001372807,2021-05-18,0.06,unresolved,,,"no listing at the ex-date (#1597 listing gap), so no raw pair"
+0001040971,2021-05-27,0.3033,duplicate,8dfac438-2df5-4d5f-b816-88398a9fdd49,SLG,raw records differ by cusip only
+0000357301,2021-06-03,0.068125,duplicate,54013fa1-443f-4e5f-bd19-716fd4d5bdb8,TRST,raw records differ by cusip only
+0000357301,2021-06-03,0.340625,duplicate,90856a1b-3590-4838-aeb2-ac9b9bef584c,TRST,raw records differ by cusip only
+0000034903,2021-06-21,1.06,duplicate,7f8ca688-8b25-407a-9db6-004cd66151a1,FRT,raw records differ by cusip only
+0000016875,2021-06-24,0.1515334,duplicate,c8f9cbe8-488a-4e51-8e18-e9186a5679d7,CP,raw records differ by cusip only
+0000040545,2021-06-25,0.01,duplicate,aa385e97-f373-40b6-b286-ce499d61b977,GE,raw records differ by cusip only
+0001040971,2021-06-29,0.3033,duplicate,4df53bb2-9cc0-402b-afa8-1f84f912e690,SLG,raw records differ by cusip only
+0001043219,2021-06-29,0.22,duplicate,e3db1108-ec2c-4486-b668-2bd6eb44796f,NLY,raw records differ by cusip only
+0001514281,2021-06-29,0.07,duplicate,fa3d085e-f522-4d24-95d9-5cf1190303d2,MITT,raw records differ by cusip only
+0001040971,2021-07-29,0.3033,duplicate,a4879057-05e9-4964-82bb-5ccf05c0b8e7,SLG,raw records differ by cusip only
+0001372807,2021-08-16,0.06,unresolved,,,"no listing at the ex-date (#1597 listing gap), so no raw pair"
+0001040971,2021-08-30,0.3033,duplicate,d987c966-3ddd-4b30-b130-3eba3805236d,SLG,raw records differ by cusip only
+0000034903,2021-09-21,1.07,duplicate,fabf6851-a30c-4750-9253-e8c1aa078473,FRT,raw records differ by cusip only
+0000016875,2021-09-23,0.153585,duplicate,a5d6f8f8-6ad2-437a-aea7-82c3bbdd0c5c,CP,raw records differ by cusip only
+0001040971,2021-09-29,0.3033,duplicate,57cd0c7a-d51c-4803-b971-41f5e157b781,SLG,raw records differ by cusip only
+0001043219,2021-09-29,0.22,duplicate,89563da0-fdd4-4772-b9b8-bb1d9d4fbfb9,NLY,raw records differ by cusip only
+0001040971,2021-10-28,0.3033,duplicate,89f0e5e1-2467-4f0c-8af2-8377c5f6f079,SLG,raw records differ by cusip only
+0000016875,2021-12-30,0.1493945,duplicate,716627d7-54f1-4ba4-95b3-fb1aa70efce2,CP,raw records differ by cusip only
+0001043219,2021-12-30,0.22,duplicate,d4838d32-ba2f-4086-b596-d30e5c64ebc4,NLY,raw records differ by cusip only
+0001059142,2021-12-30,0.19,duplicate,8ac20342-bbc3-4eed-aa9c-09d3f0aef578,ATAX,raw records differ by cusip only
+0000034903,2021-12-31,1.07,duplicate,9f5878ca-f069-4c84-b820-7d80e44acf26,FRT,raw records differ by cusip only
+0000826020,2022-01-07,0.048,duplicate,e4de139c-1533-4d0e-b0cf-2d3fff0e0966,BRW,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-01-20,0.1491,duplicate,bb8bf45f-a8e0-4ac0-964c-bd2fee10aeaf,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-01-20,0.0594,duplicate,8f3ea283-c91b-4f6f-9f68-7a20b03877e8,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-01-20,0.0642,duplicate,7926163b-266f-4f67-8a76-84483d9a7a47,SLVO,raw records differ by cusip only
+0001040971,2022-01-28,0.3108,duplicate,d5b7acbc-6fb6-40ca-86e7-61a21c3f6f2c,SLG,raw records differ by cusip only
+0000826020,2022-02-08,0.048,duplicate,de402b87-efff-4a6a-b7c8-8b7946662b34,BRW,raw records differ by cusip only
+0000832327,2022-02-14,0.0344,duplicate,7dd051fb-aaa0-4c11-89df-a23d307c637e,BKT,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-02-18,0.1704,duplicate,f54d895f-bd12-4006-b597-bbf5218403fa,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-02-18,0.0602,duplicate,8bd4f4f8-adeb-43f6-a23d-849b57d3f767,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-02-18,0.0568,duplicate,eb4e31ca-0f4e-47c9-be16-0229047da0c2,SLVO,raw records differ by cusip only
+0000826020,2022-03-08,0.048,duplicate,73a7e26e-8924-4b0e-bdc3-523bf80eff3a,BRW,raw records differ by cusip only
+0000832327,2022-03-14,0.0344,duplicate,a924ced9-cb7e-4d88-8895-a93a772f7255,BKT,raw records differ by cusip only
+0001414932,2022-03-14,0.16,duplicate,d4946c0b-5087-4e14-af1a-f6770238c8ce,OCSL,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-03-21,0.1115,duplicate,5d917d1e-3bd5-4846-a63b-8bd4a8063e6e,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-03-21,0.0815,duplicate,6390f0bb-5ca5-4cb8-a348-d8682d4ad28c,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-03-21,0.0616,duplicate,f03e0bb1-e058-4496-9879-64f38d247bbc,SLVO,raw records differ by cusip only
+0000016875,2022-03-24,0.148763,duplicate,a62b3f7f-cccd-427d-9932-cb9e8887595e,CP,raw records differ by cusip only
+0001043219,2022-03-30,0.22,duplicate,d33540f9-039a-4c14-9041-a75002d30490,NLY,raw records differ by cusip only
+0000826020,2022-04-08,0.047,duplicate,dc047a1a-9eca-435e-9b38-e9ab48bdab3c,BRW,raw records differ by cusip only
+0000832327,2022-04-13,0.0344,duplicate,7bf0ea5f-bba6-4bb0-b9a6-e3606240e570,BKT,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-04-19,0.1963,duplicate,c8bdd788-6990-4fc8-9d11-0395b54f7cbe,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-04-19,0.1603,duplicate,321f5ef9-b37b-45e0-9caf-050e3033992c,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-04-19,0.1349,duplicate,dba8a2c4-c321-4261-8477-83deb7e2c519,SLVO,raw records differ by cusip only
+0000832327,2022-05-13,0.0344,duplicate,cbc3f57b-904e-4e25-9a0f-f951ab985d2d,BKT,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-05-19,0.2277,duplicate,b75e3864-cece-4608-b510-58e4da61ee01,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-05-19,0.1086,duplicate,cf33fe68-385d-47d8-8d9a-8f53a7a23c8a,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-05-19,0.0629,duplicate,b9e0777b-d573-4a35-8bcc-40539ebd5372,SLVO,raw records differ by cusip only
+0000832327,2022-06-14,0.0294,duplicate,7c5fb613-b10f-41ec-ab8f-cd60be1ef203,BKT,raw records differ by cusip only
+0001414932,2022-06-14,0.165,duplicate,ee581880-87a2-4863-b031-b351b690dc06,OCSL,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-06-21,0.2529,duplicate,b6386811-00c6-4caf-a208-221d5a258ede,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-06-21,0.0529,duplicate,8508e652-3f60-493e-90a5-f7faf898af96,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-06-21,0.0466,duplicate,64078840-16b6-4f26-8ebe-fedb66ca48d6,SLVO,raw records differ by cusip only
+0000016875,2022-06-23,0.1477392,duplicate,c6b0c015-ca4b-492b-b5e0-71ddff66eb69,CP,raw records differ by cusip only
+0001043219,2022-06-29,0.22,duplicate,fb766d59-c6e7-44a8-b027-9e328bd1805d,NLY,raw records differ by cusip only
+0000832327,2022-07-14,0.0294,duplicate,73cd8763-fb8b-45b2-be1a-60d1ed71a890,BKT,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-07-19,0.1695,duplicate,c0d5174a-a91e-411f-af9a-044738c7ea1f,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-07-19,0.0733,duplicate,fafb4da5-0203-4e1f-83af-b7cf366304d5,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-07-19,0.0327,duplicate,57c81a29-3ffe-4e12-8678-e906e94077a7,SLVO,raw records differ by cusip only
+0000832327,2022-08-12,0.0294,duplicate,d4104320-1594-48b1-9016-6b8c2e299707,BKT,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-08-19,0.0943,duplicate,d5ba071d-8ed9-4a61-9e40-8e070550bfae,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-08-19,0.0341,duplicate,c061c33a-69a1-49f9-95e5-0f5ff9578cda,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-08-19,0.0275,duplicate,9b768e03-3745-432a-a9ee-d1c86d070c4a,SLVO,raw records differ by cusip only
+0000832327,2022-09-14,0.0294,duplicate,fc65cbc8-9e83-4e31-b5e5-f196ef97fbb4,BKT,raw records differ by cusip only
+0001414932,2022-09-14,0.17,duplicate,aa928e51-436d-4d18-bb53-3caa5f94d6ea,OCSL,raw records differ by cusip only
+0000913290,2022-09-15,0.15,duplicate,ede9dedc-edbc-424b-b5e2-ce7994e02210,FRO,raw records differ by cusip only
+0001053092:credit-suisse-x-links-crude-oil-shares-covered-call-etns-due-april-24,2022-09-20,0.1265,duplicate,f102f1d0-d7ea-4c9d-9c06-2ee2b6bec074,USOI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-gold-shares-covered-call-etns-due-february-2,2022-09-20,0.0553,duplicate,f23fff19-6a31-4567-bd9d-5a8d7a3ea3d3,GLDI,raw records differ by cusip only
+0001053092:credit-suisse-x-links-silver-shares-covered-call-etns-due-april-21,2022-09-20,0.0344,duplicate,909df310-d821-40ff-a936-1b7e06aa24fe,SLVO,raw records differ by cusip only
+0000016875,2022-09-29,0.1392911,duplicate,e775374f-778a-4e87-b4dc-9561b0cec057,CP,raw records differ by cusip only
+0001043219,2022-09-29,0.88,duplicate,906b2906-bb7f-4c8c-aff0-361aa6f34cfb,NLY,raw records differ by cusip only
+0000832327,2022-10-13,0.0294,duplicate,d94b4361-2d0c-41f8-ba6d-a601c78414ca,BKT,raw records differ by cusip only
+0001414932,2022-12-14,0.32,duplicate,fa8cf6d7-fe28-4c6b-bf38-a3c546c1cfd1,OCSL,raw records differ by cusip only
+0000016875,2022-12-29,0.1424234,duplicate,f3b26a93-356c-4a3f-a179-46ee9542259b,CP,raw records differ by cusip only
+0001428205,2023-01-13,0.1,duplicate,c7f2a256-4b1e-4f7a-9c1c-e161bfe8e91a,ARR,raw records differ by cusip only
+0001311370,2023-02-10,0.5,duplicate,76e78dcb-f457-43db-9cf0-956eb023dbdb,LAZ,"raw records differ by cusip, foreign only"
+0001428205,2023-02-14,0.1,duplicate,7ed1a910-e236-4f62-98f7-b461f9c56f39,ARR,raw records differ by cusip only
+0001144519,2023-02-15,0.625,duplicate,e246252f-9175-48bb-8122-9dd2c1397444,BG,raw records differ by cusip only
+0001602065,2023-03-02,0.24,duplicate,d14efe87-f7c5-4677-8e1e-06bf1242ff2e,VNOM,raw records differ by cusip only
+0001602065,2023-03-02,0.25,duplicate,8b067856-d026-4dfd-a680-96e14fbe6c58,VNOM,raw records differ by cusip only
+0001707925,2023-03-13,1.275,duplicate,aea26e13-6bdd-420f-a819-3d5e9f76db16,LIN,raw records differ by cusip only
+0001428205,2023-03-14,0.08,duplicate,a056fd92-d8b7-4203-8f59-9590ac71af29,ARR,raw records differ by cusip only
+0001816007,2023-04-05,0.046,duplicate,6638ab20-b8dd-4a34-9a02-13c1c6ba912a,LU,raw records differ by cusip only
+0001428205,2023-04-14,0.08,duplicate,fd70db37-69e3-475b-a323-85fab525d1c1,ARR,raw records differ by cusip only
+0001602065,2023-05-10,0.08,duplicate,72f397c7-af8a-43b4-a1f6-b9dd207bdebd,VNOM,raw records differ by cusip only
+0001602065,2023-05-10,0.25,duplicate,a251e94f-1455-4ae9-94d4-bceffc2a37bf,VNOM,raw records differ by cusip only
+0001428205,2023-05-12,0.08,duplicate,5c188e1d-199c-4d2b-9059-8546eee09103,ARR,raw records differ by cusip only
+0000769218,2023-05-26,0.109196,duplicate,fc848c20-5424-4b54-b6a4-a83f4d35bb27,AEG,raw records differ by cusip only
+0001428205,2023-06-14,0.08,duplicate,476acc4d-957b-4873-b876-49777e6933c9,ARR,raw records differ by cusip only
+0001428205,2023-07-14,0.08,duplicate,9c7fac08-6938-4461-b5d9-1c59b01a2f15,ARR,raw records differ by cusip only
+0001311370,2023-08-04,0.5,duplicate,be8bc133-3253-46ee-aa65-c5a179e27be3,LAZ,"raw records differ by cusip, foreign only"
+0001428205,2023-08-14,0.08,duplicate,f72d56f9-5176-4db8-9f71-8e74deb1ebea,ARR,raw records differ by cusip only
+0001144519,2023-08-17,0.6625,duplicate,fb6f2bcb-5195-4e8e-90a6-dabb8a985afe,BG,raw records differ by cusip only
+0000769218,2023-08-29,0.128585,duplicate,c95b9a5d-e50a-464d-a34d-e06561917166,AEG,raw records differ by cusip only
+0001428205,2023-09-14,0.08,duplicate,4c7cb9cc-4cdd-43b9-83ba-e2eeee415a7e,ARR,raw records differ by cusip only
+0001311370,2023-11-03,0.5,duplicate,71d9fcb6-0a97-40cb-b7d6-134cc724dba1,LAZ,"raw records differ by cusip, foreign only"
+0001486159@2021-03-08,2023-11-13,1.25,distinct,,CHRD,base plus variable: https://ir.chordenergy.com/2023-11-01-Chord-Energy-Reports-Strong-Third-Quarter-2023-Financial-and-Operating-Results-and-Increases-Share-Repurchase-Authorization-to-750MM
+0001708441,2023-12-13,5.608,duplicate,d8337a2e-1d03-449d-be4c-bc485b3c492e,GEHI,"raw records differ by special, payable date, process date only"
+0000072903,2024-06-14,0.5475,duplicate,fbeda605-1cd1-48ba-ad66-4e2b0d6d9cb7,XEL,one $0.5475 declared (raw records differ by pay date): https://investors.xcelenergy.com/news-events/news-releases/news-details/2024/Xcel-Energy-Inc.-Board-Declares-Dividend-on-Common-Stock/default.aspx
+0001449792,2024-12-17,1.5,duplicate,90cfc94b-77b8-4f4b-8bf5-76e483983b07,PPSI,"raw records differ by special, payable date, process date only"
+0001486298,2024-12-23,0.108,distinct,,BSL,December and January distributions sharing an ex-date: https://www.blackstone.com/fund/bsl-blackstone-senior-floating-rate-2027-term-fund/
+0001504234,2024-12-23,0.097,distinct,,BGX,December and January distributions sharing an ex-date: https://www.blackstone.com/fund/bgx-blackstone-long-short-credit-income-fund/
+0000037472,2024-12-27,0.17,duplicate,162b16d2-13a1-4791-b2b5-bf16c159a438,FLXS,"raw records differ by payable date, record date, process date only"
+0001675033,2024-12-31,0.05,duplicate,987aafe7-3403-4397-a423-b05cbb21554c,GECC,one special distribution: https://www.greatelmcc.com/investor-relations/investor-news/news-details/2024/Great-Elm-Capital-Corp.-GECC-Declares-0.05-Per-Common-Share-Special-Cash-Distribution-and-Approves-First-Quarter-2025-Distribution-of-0.37-Per-Common-Share/default.aspx
+0001096056,2025-01-27,0.13,duplicate,854cdcb8-a61f-4214-8edf-4bab0e247f21,LXFR,raw records identical but the id
+0000037996,2025-02-18,0.15,distinct,,F,regular plus supplemental: https://ford2022rd.q4web.com/files/doc_financials/2024/q4/Ford-2024-Q4-5PM-Earnings-Call-Transcript.pdf
+0001805284,2025-03-20,0.8,duplicate,9ed64143-051c-44d4-9ddd-c6b766831f1f,RKT,raw records differ by process date only
+0001816723,2025-05-05,0.001478,duplicate,16a02bc6-0be4-4356-8887-b0302b67b665,GRFX,raw records identical but the id
+0000715579,2025-05-30,0.34,duplicate,a6a01332-c2ef-40f4-9e58-d227c803f00a,ACNB,"raw records differ by payable date, process date only"
+0001776909,2025-06-13,0.1,duplicate,ae9f020f-ac75-41dc-bb67-eb8b9ffa7ae7,CURI,one special payment: https://investors.curiositystream.com/curiositystream-reaffirms-special-one-time-cash-dividend-of-0-10-per-share/
+0001564180,2025-07-28,0.026,duplicate,df35439a-75bf-41d3-bcf7-bbd5d64d55f6,KNOP,raw records identical but the id
+0001805651:class-a-common-stock,2025-08-15,0.2,distinct,,MKTW,regular plus special: https://investors.marketwise.com/static-files/0f672834-dee3-4ec4-b724-f7c12909b035
+0001372807,2025-08-18,0.49,duplicate,71404df4-ab8a-4813-8e78-27970d31fff5,PTMN,"raw records differ by special, process date only"
+0001260221,2025-09-02,90.0,duplicate,f9d7d660-bfba-4668-a5d4-9086fa9aefe9,TDG,one $90 special declared (raw records differ by special): https://transdigmgroupinc.gcs-web.com/news-releases/news-release-details/transdigm-group-declares-special-cash-dividend-9000-share-and/
+0001805651:class-a-common-stock,2025-11-14,0.2,distinct,,MKTW,regular plus special: https://investors.marketwise.com/static-files/0f672834-dee3-4ec4-b724-f7c12909b035
+0001878057,2026-02-02,0.25,duplicate,f3f46e45-4457-456d-ad0a-ec51b7a689b4,SGHC,"raw records differ by foreign, process date only"
+0001973832,2026-03-13,0.125,duplicate,bf7eb002-fcb2-458b-9b9c-37780ca71f20,AU,raw records differ by foreign only
+0001973832,2026-03-13,1.605,duplicate,b9a9c417-fef5-43d6-b91c-7500ba18635a,AU,raw records differ by foreign only
+0001805651:class-a-common-stock,2026-03-18,0.2,duplicate,88361561-8a03-4a0b-a674-92cfd875b437,MKTW,one $0.20 special beside a $0.25 regular: https://investors.marketwise.com/news-releases/news-release-details/marketwise-reports-net-revenue-834-million-and-net-income-140/
+0001383414,2026-04-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0001383414,2026-05-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0000069891,2026-07-13,3.25,duplicate,2c2c37af-e110-46c6-8781-779bf59a8313,FIZZ,"raw records differ by special, process date only"
+0001383414,2026-07-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0001383414,2026-08-14,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0002035989,2026-08-18,0.11,duplicate,fc0ea498-d89f-4e78-a51c-e2dce12d2f0f,AMRZ,raw records differ by sub type only
+0001959455,2026-08-21,0.22,duplicate,f0ec1f75-c508-469f-8a3c-f5122ae85d4a,HSHP,raw records differ by sub type only
+0001383414,2026-09-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0001737924,2026-09-30,0.02,duplicate,97f29711-9861-4d3a-9107-73ae7e23f5c2,NCDL,one supplemental beside a separate regular: https://www.ncdl.com/news/press-releases/detail/149/nuveen-churchill-direct-lending-corp-announces-second-quarter-2026-results

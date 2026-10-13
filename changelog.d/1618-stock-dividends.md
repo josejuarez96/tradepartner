@@ -1,0 +1,3 @@
+- Stock dividends enter the split adjustment path as guarded share ratios (rate cap, no split nearby, own id); refused rows are named on the run row; SCCO and universe-wide repair candidates documented for the owner release.
+### Fixed
+- Store Alpaca stock_dividends as split-like share-ratio actions with point-in-time stamps and stable source IDs, only when 1 < rate < `alpaca.stock_dividend_max_rate` (1.25), with no split within `alpaca.stock_dividend_split_sessions` sessions and an id of their own; a refused row is named on the run row, never a payload error; a cash row repeating a stock ratio exactly or within `alpaca.stock_dividend_echo_tolerance` is skipped (#1618).
