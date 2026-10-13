@@ -4010,6 +4010,26 @@ class TestFilenameListingBackfill:
         assert len(probes) == 1  # one probe fetch for the span, not one per month
         assert probes[0][1] == START + timedelta(days=7)  # asked at the span's own asof day
 
+    def test_a_clean_span_stores_normally_month_by_month_with_one_probe(self) -> None:
+        # No bar past the window after the end: every month stores its rows,
+        # nothing is listed, and the probe is read once for the whole run.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        source, seen = self._filing_name_source(
+            listings,
+            {date(2016, 6, 7): {}, date(2017, 6, 6): {}, _nth_session_after(end, 5): {}},
+            run_day=RUN_DAY,
+        )
+        stored = []
+        for first, last in _months(date(2016, 6, 1), date(2017, 8, 31)):
+            stored += [b.session for b in source.bars([self.OLD], first, last)]
+            assert source.last_filename_collisions == ()
+        assert date(2016, 6, 7) in stored and date(2017, 6, 6) in stored
+        assert len([call for call in seen if call[0] == _nth_session_after(end, 1)]) == 1
+
     def test_bars_up_to_the_transfer_window_after_the_end_are_no_collision(self) -> None:
         # A wrong prefix is proven by a bar more than
         # `master.transfer_window_sessions` sessions after the span's end;
