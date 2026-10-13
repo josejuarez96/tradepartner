@@ -159,7 +159,10 @@ first call per CIK per instance counts `.statement_conflicts`,
 `.statement_unstampable` and, on `.statement_malformed`, the kept-form
 records and conflicts that end after their acceptance date (so a late
 stamp's drops are counted, #1060), and lists the conflicts once on
-`.statement_conflict_keys`; a parse counts `.statement_non_usd`, the
+`.statement_conflict_keys` -- each read restoring what that CIK lists, so a
+conflict a same-run refresh resolves leaves the list and the keys the ingest
+reads are the final read's, never the union of the run's reads (#1566); a
+parse counts `.statement_non_usd`, the
 stamp-free malformed entries on `.statement_malformed` (a non-finite value,
 a start on or after the end) and `.statement_none` (a payload carrying
 none of the configured tags), so a cross-run cache hit adds zero to those
@@ -568,6 +571,11 @@ class EdgarFilingSource(FilingSource):
         # T77a (#660): plain counts set by the fetch pass (module docstring),
         # and the conflicts withheld, each listed once.
         self.statement_conflict_keys: list[StatementConflict] = []
+        # #1566: what each CIK's reads currently list on `statement_conflict_keys`,
+        # so a read restores its CIK's keys as it restores its counts (a conflict
+        # a same-run refresh resolves leaves the list) instead of accumulating
+        # the union of the run's reads.
+        self._statement_conflict_keys: dict[str, tuple[StatementConflict, ...]] = {}
         self.statement_conflicts = 0
         self.statement_non_usd = 0
         self.statement_malformed = 0
@@ -2467,8 +2475,17 @@ class EdgarFilingSource(FilingSource):
         self.statement_unstampable += unstampable - old_unstampable
         self.statement_malformed += late - old_late
         self._statement_read_counts[cik] = (len(conflicts), unstampable, late)
-        listed = set(self.statement_conflict_keys)
-        self.statement_conflict_keys.extend(c for c in conflicts if c not in listed)
+        # #1566: the read restores what this CIK lists exactly as it restores this
+        # CIK's counts above -- the keys the ingest reads are the final read's, so
+        # a conflict a same-run refresh resolved no longer withholds the derived
+        # gross profit its accession would otherwise carry.
+        previous_keys = self._statement_conflict_keys.get(cik, ())
+        if set(previous_keys) != set(conflicts):
+            listed = set(self.statement_conflict_keys)
+            listed.difference_update(previous_keys)
+            listed.update(conflicts)
+            self.statement_conflict_keys = list(listed)
+            self._statement_conflict_keys[cik] = tuple(conflicts)
         return records
 
     def _statement_cache_path(self, cik: str) -> Path:

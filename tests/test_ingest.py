@@ -13,7 +13,7 @@ import subprocess
 import sys
 import textwrap
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -3316,8 +3316,10 @@ def test_an_industrial_payload_keeps_its_reported_revenue() -> None:
 
 class _StatementSource(FixtureFilingSource):
     """A fixture source answering `statement_facts` as the adapter does:
-    `conflicts` restored onto `statement_conflict_keys` on every read, the
-    adapter's counts as plain attributes, and every call logged."""
+    each read restores its CIK's conflicts onto `statement_conflict_keys`
+    (#1566: the read replaces what that CIK listed, never the union of the
+    run's reads), the adapter's counts as plain attributes, and every call
+    logged."""
 
     def __init__(
         self,
@@ -3325,6 +3327,7 @@ class _StatementSource(FixtureFilingSource):
         *,
         conflicts: Sequence[StatementConflict] = (),
         unstampable: int = 0,
+        refreshed: Mapping[str, Sequence[StatementConflict]] | None = None,
     ) -> None:
         base = _filings()
         super().__init__(
@@ -3337,15 +3340,33 @@ class _StatementSource(FixtureFilingSource):
             statement_facts=records,
         )
         self._conflicts = list(conflicts)
+        # #1566: the same-run refresh -- the write phase's read answers a CIK from
+        # the conflicts its refreshed cache carries (a moved stamp, a re-parse),
+        # which may differ from what the fetch pass's read listed for it.
+        self._refreshed = {cik: list(items) for cik, items in (refreshed or {}).items()}
+        self._reads: dict[str, int] = {}
+        self._listed: dict[str, tuple[StatementConflict, ...]] = {}
         self.statement_conflict_keys: list[StatementConflict] = []
-        self.statement_conflicts = len(conflicts)
+        self.statement_conflicts = 0
         self.statement_unstampable = unstampable
         self.calls: list[str] = []
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         self.calls.append(cik)
-        listed = set(self.statement_conflict_keys)
-        self.statement_conflict_keys.extend(c for c in self._conflicts if c not in listed)
+        self._reads[cik] = self._reads.get(cik, 0) + 1
+        # every read lists only the read CIK's own conflicts, as the adapter's
+        # parse of that CIK's payload does
+        own = [c for c in self._conflicts if c.accession.startswith(f"{cik}-")]
+        conflicts = self._refreshed[cik] if self._reads[cik] > 1 and cik in self._refreshed else own
+        previous = self._listed.get(cik, ())
+        self._listed[cik] = tuple(conflicts)
+        if set(previous) != set(conflicts):
+            listed = set(self.statement_conflict_keys)
+            listed.difference_update(previous)
+            listed.update(conflicts)
+            self.statement_conflict_keys = list(listed)
+        # the count follows each CIK's latest read, as the adapter's delta does
+        self.statement_conflicts = sum(len(items) for items in self._listed.values())
         return super().statement_facts(cik)
 
 
@@ -3458,6 +3479,74 @@ def test_a_conflict_withheld_gross_profit_stays_empty_across_runs_until_clean(
     _edgar(on, _StatementSource(clean, conflicts=[conflict]))
     gross = [r for r in _statement_rows(read) if r[0] == "gross_profit"]
     assert gross == [("gross_profit", FY18[1], 41, F2, "reported", AT2)]
+
+
+def test_the_conflict_index_re_reads_a_restored_list() -> None:
+    """#1566: a per-CIK read restores its CIK's entries by assigning a fresh list,
+    so the index re-reads it. A shrink alone missed an equal-length restore, and
+    the stale key went on withholding the derived gross profit of its accession."""
+    source = _StatementSource([])
+    first = StatementConflict(F1, "gross_profit", *FY18, (40.0, 41.0))
+    second = StatementConflict(F2, "gross_profit", *FY18, (41.0, 42.0))
+    third = StatementConflict(F3, "gross_profit", *FY18, (42.0, 43.0))
+
+    def key(conflict: StatementConflict) -> ConflictKey:
+        return (
+            conflict.accession,
+            conflict.fact_name,
+            conflict.period_end,
+            conflict.period_days,
+        )
+
+    source.statement_conflict_keys = [first, second]
+    index = ingest_module._ConflictIndex(source)
+    assert index.keys() == {key(first), key(second)}
+    source.statement_conflict_keys = [first]  # the second CIK's read restored its entries
+    assert index.keys() == {key(first)}
+    # a fresh entry of the same length is the case a shrink alone missed
+    source.statement_conflict_keys = [second, third]
+    assert index.keys() == {key(second), key(third)}
+
+
+def test_a_resolved_conflict_stops_suppressing_the_derived_gross_profit(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#1566: after the same-run refresh (the write phase's read of each CIK) the
+    keys the ingest uses are the final payload's conflicts. ACME's gross-profit
+    conflict is resolved, so its derived row stands; DUAL's conflict moves to
+    another period, so DUAL's derived row stands too -- a fetch-pass key the
+    refresh resolved would withhold both."""
+    on = _switched(settings)
+    dual = f"{DUAL}-19-000201"
+    source = _StatementSource(
+        [
+            *_components(F1, AT1),
+            _sf("revenue", 100, dual, AT1, cik=DUAL),
+            _sf("cost_of_revenue", 60, dual, AT1, cik=DUAL),
+        ],
+        conflicts=[
+            StatementConflict(F1, "gross_profit", *FY18, (40.0, 41.0)),
+            StatementConflict(dual, "gross_profit", *FY18, (40.0, 41.0)),
+        ],
+        refreshed={
+            ACME: (),  # resolved by the write phase's read
+            DUAL: [StatementConflict(dual, "gross_profit", *FY17, (40.0, 41.0))],
+        },
+    )
+    run = _edgar(on, source)
+    assert source.calls == [ACME, DUAL, ACME, DUAL]  # the fetch pass, then the write phase
+    assert statement_counts(run.message)["derived"] == 2
+    assert read(
+        "SELECT fact_name, period_end, value, filing_accession, basis FROM statement_facts "
+        "ORDER BY fact_name, filing_accession"
+    ) == [
+        ("cost_of_revenue", FY18[1], 60.0, F1, "reported"),
+        ("cost_of_revenue", FY18[1], 60.0, dual, "reported"),
+        ("gross_profit", FY18[1], 40.0, F1, "derived"),
+        ("gross_profit", FY18[1], 40.0, dual, "derived"),
+        ("revenue", FY18[1], 100.0, F1, "reported"),
+        ("revenue", FY18[1], 100.0, dual, "reported"),
+    ]
 
 
 def test_switch_off_asks_nothing_and_adds_no_row(

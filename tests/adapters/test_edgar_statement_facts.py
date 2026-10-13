@@ -771,7 +771,7 @@ def test_second_call_in_a_run_reads_the_cache_file_with_no_request(tmp_path: Pat
     [assets] = [r for r in first if r.fact_name == "total_assets"]
     assert assets.accepted_at == STAMPS[K2022][1] and assets.form == "10-K"
 
-    source.statement_conflict_keys.clear()  # the write phase's read restores the list
+    # the write phase's read restores the list from the same-run cache file
     assert source.statement_facts(CIK) == first
     assert source.requests == 1
     assert source.statement_conflict_keys == [conflict]
@@ -784,6 +784,31 @@ def test_second_call_in_a_run_reads_the_cache_file_with_no_request(tmp_path: Pat
     with pytest.raises(RuntimeError, match="filled this run"):
         source.statement_facts(CIK)
     assert source.requests == 1
+
+
+def test_a_same_run_refresh_leaves_no_resolved_conflict_key(tmp_path: Path) -> None:
+    """#1566: the write phase's read restores what this CIK lists exactly as it
+    restores its counts, so a conflict the refreshed stamps resolve (a moved
+    acceptance drops it at read time) leaves `statement_conflict_keys`: the keys
+    are the final read's, never the union of the run's reads, and a key that
+    disappeared goes on withholding the derived gross profit its accession would
+    otherwise carry."""
+    settings = _settings(tmp_path)
+    source = _adapter(settings, _router(**{f"c{CIK}": _conflicted()}))
+    _stamps(source, CIK, STAMPS)
+    source.statement_facts(CIK)
+    conflict = StatementConflict(K2022, "revenue", date(2022, 1, 1), date(2022, 12, 31), (300, 301))
+    assert source.statement_conflict_keys == [conflict]
+    assert source.statement_conflicts == 1
+    # the same-run refresh: K2022's stamp arrives moved, before the period's end,
+    # so this read (the cache file of this run, no second request) drops the entry
+    # and the conflict with it
+    _stamps(source, CIK, {K2022: ("10-K", datetime(2022, 6, 1, 12, tzinfo=UTC))})
+    refreshed = source.statement_facts(CIK)
+    assert source.requests == 1
+    assert refreshed  # LATE's unstamped entry still arrives, for the hold rule
+    assert source.statement_conflicts == 0  # the count follows the final read
+    assert source.statement_conflict_keys == []  # #1566: and so do the keys
 
 
 def test_a_late_stamp_applies_on_the_next_read_with_no_request(tmp_path: Path) -> None:
@@ -818,6 +843,8 @@ def test_a_late_stamp_applies_on_the_next_read_with_no_request(tmp_path: Path) -
     assert (after.accession, after.form, after.accepted_at) == (LATE, "10-Q", LATE_ACCEPTED)
     assert after.period_end == date(2021, 12, 31)  # 2022-09-30 ends after acceptance
     assert after.comparative is False  # the dropped entry sets no latest end
+    assert source.statement_conflicts == 0
+    assert source.statement_conflict_keys == []  # #1566: the keys follow the read
 
     fresh = _adapter(settings, EdgarRouter())  # the next run: a cache hit
     assert fresh.statement_facts(CIK) == [after]
