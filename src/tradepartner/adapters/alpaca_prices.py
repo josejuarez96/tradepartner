@@ -192,18 +192,26 @@ spans on the run row, both off by default until T184e writes the rows:
 
 - a **collision**: a wrong prefix that is another company's live symbol
   returns that company's bars under `asof`. Rule 7 ends the delister's span
-  at `effective_on`, so no stored bar can show it; the raw payload can. So
-  for every `filing_name` span with an end that `bars` asks with `asof`, a
-  payload holding traded bars more than
-  `master.transfer_window_sessions` XNYS sessions after the span's end is a
-  collision: the span is listed on the run row (`filename_collisions`, each
-  as `<security_id>:<ticker>` for `edgar.filename_listings_refused`) and
-  nothing of that payload is stored for the span;
+  at `effective_on`, so no stored bar can show it; the raw payload can. For
+  every `filing_name` span with an end that `bars` asks with `asof`,
+  `_filing_name_collided` asks the symbol with the same `asof` over the
+  sessions after the span's end to the run's day (once per span per run,
+  cached, the horizon `ListingResolver.run_day`) and calls it a
+  **collision** when that holds a traded bar more than
+  `master.transfer_window_sessions` XNYS sessions after the span's end. The
+  verdict is the span's, not the request's — the backfill asks a month at a
+  time, so a month before the span's end holds no bar past it — and a
+  colliding span stores nothing of any payload, in every request that
+  touches it. It is listed on the run row (`filename_collisions`, once per
+  run, each as `<security_id>:<ticker>` for
+  `edgar.filename_listings_refused`);
 - a **dispute**: a new span can change a third security's resolution (a
   rule-6 claim, a contested span, rule 8's span lag, a #974 lead refused for
-  the reuse). `ResolverReport.filename_disputes` counts the sessions another
-  security loses, session by session against the resolution the same
-  listings give without the `filing_name` rows, up to the run's day.
+  the reuse, or a rename whose other side the span takes).
+  `ResolverReport.filename_disputes` counts the sessions another security
+  loses, session by session on every ticker the renames reach in either
+  direction, against the resolution the same listings give without the
+  `filing_name` rows, up to the run's day.
 
 `ListingResolver.report` counts every listing and span left out by these
 rules; `AlpacaPriceSource.resolution_summary` puts it on the run row.
@@ -659,6 +667,18 @@ def _sessions_in(first: date, last: date) -> int:
     (#1597: the disputed sessions of one resolution change)."""
     count, day = 0, first if is_session(first) else next_session(first)
     while day < last:
+        count, day = count + 1, next_session(day)
+    return count
+
+
+def _sessions_after(end: date, session: date, cap: int) -> int:
+    """XNYS sessions after `end` through `session`, the bar's own session
+    counted and `end` itself not, counted up to `cap` (enough to tell a gap
+    above a window): #1597's collision gap, the mirror of
+    `_sessions_between` with the bar counted, so a bar `cap - 1` sessions
+    after `end` is the first collision at a window of `cap - 2`."""
+    count, day = 0, next_session(end)
+    while day <= session and count < cap:
         count, day = count + 1, next_session(day)
     return count
 
@@ -1171,25 +1191,35 @@ class ListingResolver:
             for span in group
             if span.filing_name
         }
+        # A rename answers on both of its tickers' resolutions, so the
+        # comparison reaches both ends of every rename whose old ticker a
+        # `filing_name` span takes: the renamer's sessions under the new
+        # ticker are a lead's, and taking the old ticker refuses it (#1597).
+        # A lead is filed under its new ticker, so the other end is found by
+        # every rename incident on the ticker.
         involved: set[str] = set()
         queue = sorted(tickers)
-        while queue:  # a rename lead answers on the old ticker's resolution too
+        while queue:
             ticker = queue.pop()
             if ticker in involved:
                 continue
             involved.add(ticker)
             queue.extend(
-                lead.old
-                for lead in (*self._leads.get(ticker, ()), *base._leads.get(ticker, ()))
-                if lead.old not in involved
+                {
+                    other
+                    for leads in (self._leads, base._leads)
+                    for group in leads.values()
+                    for lead in group
+                    if ticker in (lead.old, lead.new)
+                    for other in (lead.old, lead.new)
+                }
+                - involved
             )
         days: set[date] = set()
         for ticker in involved:
             days |= self._resolution_days(ticker)
             days |= base._resolution_days(ticker)
-        horizon = (
-            evidence.as_of if evidence is not None else datetime.now(UTC).date()
-        ) + timedelta(days=1)
+        horizon = self.run_day + timedelta(days=1)
         disputes = 0
         # The run's day closes the last interval, where an open-ended span's
         # resolution runs on to it.
@@ -1197,7 +1227,7 @@ class ListingResolver:
             if first >= horizon:
                 break
             last = min(following, horizon)
-            for ticker in tickers:
+            for ticker in involved:
                 mine = self._owner(ticker, first)
                 theirs = base._owner(ticker, first)
                 if mine != theirs and theirs is not None:
@@ -1229,6 +1259,14 @@ class ListingResolver:
         security a backfill bar under `ticker` on `session` belongs to)."""
         owner = self.resolve(ticker, session)
         return owner if owner is not None else self.lead(ticker, session)
+
+    @property
+    def run_day(self) -> date:
+        """The day this resolver reads bars to (#1597): the evidence's
+        `as_of` — the run's day, everything known at it — or today's with
+        no evidence. The dispute count's horizon and the collision probe's
+        horizon are both this day."""
+        return self._evidence.as_of if self._evidence is not None else datetime.now(UTC).date()
 
     def filing_name_spans(self, security_id: str, ticker: str) -> tuple[TickerSpan, ...]:
         """`security_id`'s assigned spans of `ticker` every one of whose
@@ -2254,11 +2292,13 @@ class AlpacaPriceSource(PriceSource):
         self._transfer = settings.master.transfer_window_sessions
         self._asof_offset = settings.alpaca.asof_offset_days
         self._asof_served: set[tuple[str, str]] = set()  # (security, symbol) asof found
+        self._filename_collided: dict[tuple[str, str, date], bool] = {}  # (security, ticker, start)
+        self._filename_reported: set[str] = set()  # labels already on a run row
         self.last_bars_report: BarsParse | None = None
         self.last_actions_report: ActionsParse | None = None
         self.last_excluded_symbols: tuple[str, ...] = ()
-        self.last_asof_fallbacks: tuple[str, ...] = ()
         self.last_filename_collisions: tuple[str, ...] = ()
+        self.last_asof_fallbacks: tuple[str, ...] = ()
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -2297,8 +2337,8 @@ class AlpacaPriceSource(PriceSource):
         per `asof` day, and keeps only the rows on its own sessions. A
         symbol Alpaca names for no company at that `asof` falls back to
         the request without one (`last_asof_fallbacks`). A `filing_name`
-        span whose `asof` payload shows a collision (#1597) keeps nothing:
-        `last_filename_collisions` lists it for the run row."""
+        span that collides (#1597) keeps nothing in any request that
+        touches it: `last_filename_collisions` lists it once per run."""
         self.last_bars_report = None
         self.last_asof_fallbacks = ()
         self.last_filename_collisions = ()
@@ -2308,9 +2348,7 @@ class AlpacaPriceSource(PriceSource):
         plain: dict[str, set[str]] = defaultdict(set)  # symbol -> ids asked without asof
         dated: dict[date, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
         since: dict[tuple[str, str], date] = {}
-        filings: dict[tuple[str, str], set[str]] = defaultdict(
-            set
-        )  # (security, symbol) -> master tickers with an ended filing_name span
+        filings: dict[tuple[str, str], list[str]] = {}  # (security, symbol) -> collided tickers
         for security_id in sorted(ids):
             for ticker in self._resolver.symbols(
                 security_id, start, end, handovers=self._fill_handovers
@@ -2325,21 +2363,29 @@ class AlpacaPriceSource(PriceSource):
                 dated[day][symbol].add(security_id)
                 first = self._resolver.since(security_id, ticker) or start
                 since[(security_id, symbol)] = min(first, start)
-                filings[(security_id, symbol)] |= {
+                # #1597: the verdict is read per span, once per run, from the
+                # sessions after the span's end, so a request sliced to a
+                # month before that end sees the same verdict as one holding
+                # it (the backfill asks one month at a time).
+                collided = [
                     span.ticker
                     for span in self._resolver.filing_name_spans(security_id, ticker)
                     if span.end is not None
-                }
+                    and self._filing_name_collided(security_id, ticker, symbol, span, day)
+                ]
+                if collided:
+                    filings[(security_id, symbol)] = collided
         fetched: list[Fetched] = []
         fallbacks: set[str] = set()
         collisions: list[str] = []
         for day, owners in sorted(dated.items()):
             payload = self._fetch_bars(sorted(owners), start, end, asof=day)
-            for security_id, symbol, ticker in self._filing_name_collisions(
-                owners, payload, filings
-            ):
+            for security_id, symbol, ticker in self._filing_name_collisions(owners, filings):
                 owners[symbol].discard(security_id)  # nothing of it stored for the span
-                collisions.append(f"{security_id}:{ticker}")
+                label = f"{security_id}:{ticker}"
+                if label not in self._filename_reported:
+                    self._filename_reported.add(label)  # counted once per run, on its first drop
+                    collisions.append(label)
             fetched.append((payload, owners, self._resolve))
             for symbol, asked in owners.items():
                 for security_id in asked:
@@ -2386,37 +2432,56 @@ class AlpacaPriceSource(PriceSource):
             self._asof_served.add(key)
         return key in self._asof_served
 
-    @_fail_closed  # the payload is read before `_own_rows`' and `parse_bars`' own checks
+    @_fail_closed  # the probe's payload is read before `parse_bars`' own checks
+    def _filing_name_collided(
+        self, security_id: str, ticker: str, symbol: str, span: TickerSpan, asof: date
+    ) -> bool:
+        """True when `span` — a `filing_name` span with an end asked with
+        `asof` — **collides** (#1597; spec "Collisions, the done-test for a
+        written row"): the symbol asked with `asof` serves a traded bar more
+        than `master.transfer_window_sessions` XNYS sessions after the
+        span's end, so the prefix read from the filing's own names is
+        another company's live symbol, serving that company's bars.
+
+        The verdict is the span's, never the request's: it is read once per
+        `(security, ticker, span)` per run (cached like `_asof_served`) from
+        a fetch over the sessions after the span's end to the run's day,
+        every one known at the run. The backfill asks a month at a time, so
+        a month before the span's end holds no bar past that end while the
+        wrong bars it reads are the other company's: only a probe past the
+        end sees them, and the run's day is the horizon so the verdict is
+        the same in every month."""
+        key = (security_id, ticker, span.start)
+        if key not in self._filename_collided:
+            assert span.end is not None  # its caller passes an ended span
+            after = next_session(span.end)
+            served: Iterable[Mapping[str, Any]] = ()
+            if after <= self._resolver.run_day:
+                served = self._fetch_bars([symbol], after, self._resolver.run_day, asof=asof)[
+                    "bars"
+                ].get(symbol, ())
+            traded = tuple(_traded_sessions(served))
+            self._filename_collided[key] = any(
+                _sessions_after(span.end, session, self._transfer + 1) >= self._transfer + 1
+                for session in traded
+            )
+        return self._filename_collided[key]
+
     def _filing_name_collisions(
-        self,
-        owners: Mapping[str, set[str]],
-        payload: Mapping[str, Any],
-        listings: Mapping[tuple[str, str], set[str]],
+        self, owners: Mapping[str, set[str]], listings: Mapping[tuple[str, str], Sequence[str]]
     ) -> list[tuple[str, str, str]]:
         """`(security_id, symbol, ticker)` of every colliding `filing_name`
-        span in one `asof` payload (#1597; spec "Collisions, the
-        done-test for a written row"): a span with an end asked with `asof`
-        whose payload holds a traded bar more than
-        `master.transfer_window_sessions` XNYS sessions after that end -- a
-        wrong prefix that is another company's live symbol, serving that
-        company's bars. `listings` carries each asked `(security, symbol)`
-        pair's master tickers with an ended `filing_name` span."""
-        bars = payload.get("bars", {})
+        span among this `asof` request's owners (#1597):
+
+        `listings` carries each asked `(security, symbol)` pair's master
+        tickers `_filing_name_collided` judged colliding; nothing of a
+        colliding span's payload is stored for it, in this request and in
+        every later one that touches the span."""
         collided: list[tuple[str, str, str]] = []
         for (security_id, symbol), tickers in sorted(listings.items()):
             if security_id not in owners.get(symbol, ()):
                 continue
-            traded = {session: None for session in _traded_sessions(bars.get(symbol, ()))}
-            for ticker in sorted(tickers):
-                for span in self._resolver.filing_name_spans(security_id, ticker):
-                    if span.end is None:
-                        continue
-                    if any(
-                        _sessions_between(span.end, session, self._transfer + 1) > self._transfer
-                        for session in traded
-                    ):
-                        collided.append((security_id, symbol, ticker))
-                        break
+            collided.extend((security_id, symbol, ticker) for ticker in tickers)
         return collided
 
     def resolution_summary(self) -> str:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -3955,56 +3955,95 @@ class TestFilenameListingBackfill:
         listings = [_listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value")]
         assert ListingResolver(listings, _evidence(MGEE_FACTS)).report.filename_disputes == 0
 
-    def test_a_colliding_asof_payload_is_listed_and_nothing_is_stored(self) -> None:
-        # The wrong prefix serves the other company's bars under `asof`:
-        # bars on the span's own sessions and traded bars well past its end.
+    def _filing_name_source(
+        self,
+        listings: list[dict[str, object]],
+        rows: Mapping[date, Mapping[str, Any]],
+        *,
+        run_day: date,
+    ) -> tuple[AlpacaPriceSource, list[tuple[date, date | None]]]:
+        """A source over a resolver run on `run_day`, a fake Alpaca serving
+        `rows` (session -> extra row fields: a trade, or `{"v": 0, "n": 0}`
+        for #104's zero-volume padding) on every request, and every
+        request's `(start, asof)`, so a test can count the collision probes
+        the run makes."""
+        seen: list[tuple[date, date | None]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            seen.append((start, asof))
+            served = [
+                dict(_row(d, 11.0), **fields)
+                for d, fields in sorted(rows.items())
+                if start <= d <= end
+            ]
+            return {"feed": "sip", "bars": {"KEG": served}}
+
+        resolver = ListingResolver(listings, _evidence([], as_of=run_day))
+        return AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings()), seen
+
+    def test_a_colliding_span_stores_nothing_in_any_month(self) -> None:
+        # The BLOCKER (#1597): the backfill asks one month at a time, so a
+        # month before the span's end holds no bar past it. The verdict is
+        # read once per span per run, from the sessions after the end, so
+        # every month that touches the span stores nothing for it.
         listings = [
             _filing_name(self.OLD, "KEG", START),
             _listing(self.OLD, "N/A", date(2017, 7, 3)),  # a later row: the span ends there
             _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
         ]
-        served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}  # its own; then the other's
-        window = (date(2016, 6, 6), date(2017, 8, 2))
+        end = date(2017, 7, 3)
+        served = {date(2016, 6, 7): {}, date(2017, 8, 1): {}}  # its own; then the other's
+        source, seen = self._filing_name_source(listings, served, run_day=RUN_DAY)
+        stored: list[tuple[str, date, float]] = []
+        listed: list[tuple[str, ...]] = []
+        for first, last in _months(date(2016, 6, 1), date(2017, 8, 31)):
+            stored += [
+                (b.security_id, b.session, b.close) for b in source.bars([self.OLD], first, last)
+            ]
+            listed.append(source.last_filename_collisions)
+        assert stored == []  # nothing in any month
+        assert listed[0] == (f"{self.OLD}:KEG",)  # counted once, on the first month's row
+        assert all(call == () for call in listed[1:])
+        probes = [call for call in seen if call[0] == _nth_session_after(end, 1)]
+        assert len(probes) == 1  # one probe fetch for the span, not one per month
+        assert probes[0][1] == START + timedelta(days=7)  # asked at the span's own asof day
 
-        def fetch(
-            symbols: list[str], start: date, end: date, *, asof: date | None = None
-        ) -> dict[str, Any]:
-            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
-            return {"feed": "sip", "bars": {"KEG": rows}}
-
-        resolver = ListingResolver(listings)
-        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
-        assert source.bars([self.OLD], *window) == []  # nothing of that payload for the span
-        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
-        line = source.resolution_summary()
-        assert "1 colliding filing_name span(s): 0000000001:KEG" in line
-        # The row past the span's end belongs to no span of the store and is
-        # reported unresolved; the span's own rows are stored for no one.
-        assert source.last_bars_report is not None
-        assert source.last_bars_report.unresolved == (("KEG", date(2017, 8, 1)),)
-
-    def test_bars_inside_the_transfer_window_after_the_end_are_no_collision(self) -> None:
-        # The zero-volume padding Alpaca serves after a delisting (#104), and
-        # traded bars within `master.transfer_window_sessions` of the end, are
-        # a stopped line, not another company: kept.
+    def test_bars_up_to_the_transfer_window_after_the_end_are_no_collision(self) -> None:
+        # A wrong prefix is proven by a bar more than
+        # `master.transfer_window_sessions` sessions after the span's end;
+        # a bar on the window-th one (the 5th session after it here) is a
+        # stopped line, and #104's zero-volume padding is no trade at all.
         listings = [
             _filing_name(self.OLD, "KEG", START),
             _listing(self.OLD, "N/A", date(2017, 7, 3)),
         ]
-
-        def fetch(
-            symbols: list[str], start: date, end: date, *, asof: date | None = None
-        ) -> dict[str, Any]:
-            served = {date(2016, 6, 7): 11.0, date(2017, 7, 5): 6.0}
-            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
-            rows.append(dict(_row(date(2017, 8, 1), 0.0), v=0, n=0))  # padding, no trade
-            return {"feed": "sip", "bars": {"KEG": rows}}
-
-        resolver = ListingResolver(listings)
-        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        end = date(2017, 7, 3)
+        inside = _nth_session_after(end, 5)  # exactly `transfer_window_sessions`
+        source, _ = self._filing_name_source(
+            listings,
+            {date(2016, 6, 7): {}, inside: {}, _nth_session_after(end, 9): {"v": 0, "n": 0}},
+            run_day=RUN_DAY,
+        )
         bars = source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2))
         assert [(b.session, b.close) for b in bars] == [(date(2016, 6, 7), 11.0)]
         assert source.last_filename_collisions == ()
+
+    def test_a_bar_on_the_window_plus_first_session_after_the_end_collides(self) -> None:
+        # The rule's threshold: the (window + 1)-th session after the span's
+        # end already holds another company's bar.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        outside = _nth_session_after(end, 6)
+        source, _ = self._filing_name_source(
+            listings, {date(2016, 6, 7): {}, outside: {}}, run_day=RUN_DAY
+        )
+        assert source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2)) == []
+        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
 
     def test_a_collision_drops_only_its_own_span(self) -> None:
         # The colliding span's own rows (inside its span, dated before the
@@ -4016,22 +4055,42 @@ class TestFilenameListingBackfill:
             _listing(self.OLD, "N/A", date(2017, 7, 3)),
             _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
         ]
-        served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}  # its own; then nobody's
-
-        def fetch(
-            symbols: list[str], start: date, end: date, *, asof: date | None = None
-        ) -> dict[str, Any]:
-            rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
-            rows.append(_row(date(2019, 6, 3), 7.0))  # the successor's own, after its span starts
-            return {"feed": "sip", "bars": {"KEG": rows}}
-
-        resolver = ListingResolver(listings)
-        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        served = {date(2016, 6, 7): {}, date(2017, 8, 1): {}, date(2019, 6, 3): {}}
+        source, _ = self._filing_name_source(listings, served, run_day=RUN_DAY)
         bars = source.bars([self.OLD, self.SUCCESSOR], date(2016, 6, 6), date(2019, 6, 4))
-        assert [(b.security_id, b.session, b.close) for b in bars] == [
-            (self.SUCCESSOR, date(2019, 6, 3), 7.0)  # the rows its own span covers
-        ]
+        assert [(b.security_id, b.session) for b in bars] == [(self.SUCCESSOR, date(2019, 6, 3))]
         assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
+
+    def test_a_rename_counts_the_sessions_of_both_its_tickers(self) -> None:
+        # A rename whose old ticker a `filing_name` span takes loses the old
+        # ticker's sessions to the span (or its shadow) and the new ticker's
+        # lead sessions to nobody: both tickers' sessions are counted.
+        renamer = self.OLD
+        listings = [
+            _listing(renamer, "OLDT", START, "Common Stock"),
+            _listing(renamer, "NEWT", date(2019, 6, 3), "Common Stock"),
+            _filing_name(self.SUCCESSOR, "OLDT", date(2018, 3, 1), "Common Stock"),
+        ]
+        resolver = ListingResolver(
+            listings,
+            _evidence([_shares(renamer, date(2018, 2, 20), 12345, date(2018, 3, 1))]),
+            rename_lead_days=45,
+        )
+        base = ListingResolver(
+            [row for row in listings if row.get("provenance") != "filing_name"],
+            _evidence([_shares(renamer, date(2018, 2, 20), 12345, date(2018, 3, 1))]),
+            rename_lead_days=45,
+        )
+
+        def lost(ticker: str) -> int:
+            return sum(
+                base._owner(ticker, day) is not None
+                and resolver._owner(ticker, day) != base._owner(ticker, day)
+                for day in _sessions(START, RUN_DAY)
+            )
+
+        assert lost("OLDT") > 0 and lost("NEWT") > 0  # the new ticker's lead is refused too
+        assert resolver.report.filename_disputes == lost("OLDT") + lost("NEWT")
 
 
 def _sessions(first: date, last: date) -> Iterator[date]:
@@ -4040,3 +4099,24 @@ def _sessions(first: date, last: date) -> Iterator[date]:
     while day <= last:
         yield day
         day = next_session(day)
+
+
+def _nth_session_after(end: date, n: int) -> date:
+    """The `n`-th XNYS session strictly after `end` (#1597: `n = 1` is the
+    session after a span's exclusive end, so a bar on the
+    `transfer_window_sessions + 1`-th one collides)."""
+    day = next_session(end)
+    for _ in range(n - 1):
+        day = next_session(day)
+    return day
+
+
+def _months(first: date, last: date) -> Iterator[tuple[date, date]]:
+    """Every month's `[first day, last day]` chunk covering `[first, last]`
+    (#1597: how `backfill._price_chunk` asks a source, one month at a time)."""
+    day = date(first.year, first.month, 1)
+    while day <= last:
+        after = date(day.year + (day.month == 12), day.month % 12 + 1, 1)
+        month_end = after - timedelta(days=1)
+        yield max(first, day), min(last, month_end)
+        day = after
