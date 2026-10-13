@@ -60,6 +60,8 @@ from tradepartner.health import (
     STATIC,
     CoverageReference,
     HealthReport,
+    _bars_after_delisting,
+    _overlapping_listings,
     bar_gaps,
     clock_suspect,
     coverage,
@@ -77,6 +79,7 @@ from tradepartner.health import (
     unclassifiable,
 )
 from tradepartner.store.db import configure_connection, insert_row
+from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
 from tradepartner.store.master import first_session
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
@@ -1733,10 +1736,18 @@ def test_as_of_metrics_invariant_under_truncation(
         assert unclassifiable(fixture_store, t) == unclassifiable(cut, t), t
         # The two integrity rules derived at `t` as the listings are read
         # (module docstring), not merely read off stored rows (#827).
-        full_checks = {c.rule: c for c in integrity_checks(fixture_store, t, settings)}
-        cut_checks = {c.rule: c for c in integrity_checks(cut, t, settings)}
-        for rule in (NON_OVERLAPPING_LISTINGS, NO_BARS_AFTER_DELISTING):
-            assert full_checks[rule].violations.equals(cut_checks[rule].violations), (rule, t)
+        # Only these two are computed (via the same helpers `integrity_checks`
+        # uses): the rest of `integrity_checks` is not asserted here, and
+        # its rate rules cost seconds per call at ~1,900 probes (#1669).
+        window = settings.master.transfer_window_sessions
+        full_listings = listing_ends_as_of(fixture_store, t, settings)
+        cut_listings = listing_ends_as_of(cut, t, settings)
+        full_overlaps, _ = _overlapping_listings(full_listings, settings)
+        cut_overlaps, _ = _overlapping_listings(cut_listings, settings)
+        assert full_overlaps.equals(cut_overlaps), (NON_OVERLAPPING_LISTINGS, t)
+        full_after = _bars_after_delisting(fixture_store, t, full_listings, window)
+        cut_after = _bars_after_delisting(cut, t, cut_listings, window)
+        assert full_after.equals(cut_after), (NO_BARS_AFTER_DELISTING, t)
 
 
 # --- Owner-accepted same-day pairs (#855) -----------------------------------

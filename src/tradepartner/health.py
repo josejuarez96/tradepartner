@@ -2065,12 +2065,17 @@ def _rate_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
     bad_value: list[dict[str, Any]] = []
     seen: set[tuple[str, date, datetime]] = set()
     duplicates: list[dict[str, Any]] = []
+    # `rate_known_at` is a pure function of the vintage date and walks the
+    # calendar; many rows share a vintage, so compute each once per call.
+    stamps: dict[date | None, datetime | None] = {}
     for series, day, value, vintage, stamp in rows:
         key = {"series": series, "observation_date": day, "known_at": stamp}
-        try:
-            correct = rate_known_at(vintage) if vintage is not None else None
-        except (ValueError, IndexError):
-            correct = None
+        if vintage not in stamps:
+            try:
+                stamps[vintage] = rate_known_at(vintage) if vintage is not None else None
+            except (ValueError, IndexError):
+                stamps[vintage] = None
+        correct = stamps[vintage]
         if stamp != correct:
             bad_stamp.append(key)
         if value is None or not math.isfinite(value):
