@@ -1687,6 +1687,16 @@ def test_risk_defaults_match_adr_0010() -> None:
     # 1.26 whole-dollar band (#1290) to the strict half-`cash` cent, scaled per
     # fill in `reconcile` and no longer tied to `max_orders_per_run`.
     assert r.reconcile_cash_tolerance == pytest.approx(0.01)
+    # #1627: the relative tolerance a stock dividend's `CIL` cash-in-lieu is booked
+    # against (fractional remainder x the reference price); the ex-date valuation
+    # sits below the pre-ex close, so ~10% passes and more halts.
+    assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
+
+
+def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
+    assert _settings().alpaca.cash_in_lieu_max_lag_sessions == 10
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"cash_in_lieu_max_lag_sessions": -1})
 
 
 @pytest.mark.parametrize(
@@ -1698,6 +1708,7 @@ def test_risk_defaults_match_adr_0010() -> None:
         "max_drawdown",
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
+        "cash_in_lieu_tolerance",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
@@ -1725,6 +1736,7 @@ def test_risk_max_fill_lag_sessions_at_least_one(value: int) -> None:
         {"max_broker_clock_skew_seconds": -1.0},
         {"reconcile_quantity_tolerance": -1e-6},
         {"reconcile_cash_tolerance": float("inf")},
+        {"cash_in_lieu_tolerance": float("inf")},
         {"max_position_weigth": 0.05},
     ],
 )
