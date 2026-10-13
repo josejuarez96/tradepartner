@@ -629,7 +629,9 @@ def retract_dividends(
     the run (spec amendment 2026-10-12, #1613); with `dry_run`, count them on
     a read-only connection and change nothing.
 
-    An entry whose retract identity has no row is `already_repaired`. An
+    An entry whose retract identity has no row is `already_repaired` when
+    exactly one other live dividend identity holds its key, and stale
+    otherwise (a mistyped id or security, or a reissued record). An
     entry is stale (`_stale_reason`) when that identity has more than one
     revision, when its row's ex-date or amount differs from the entry's key
     or its `known_at` from the kept identity's live row, or when no single
@@ -670,9 +672,6 @@ def retract_dividends(
                 "FROM corporate_actions WHERE security_id = ? AND source_action_id = ?",
                 [entry.security_id, entry.retract_source_action_id],
             ).fetchall()
-            if not retract_rows:
-                already += 1
-                continue
             partners = (
                 live.filter(
                     (pl.col("security_id") == entry.security_id)
@@ -683,10 +682,21 @@ def retract_dividends(
                 .select("source_action_id", "known_at")
                 .rows()
             )
-            if (why := _stale_reason(retract_rows, partners, entry)) is not None:
+            stale_why: str | None
+            if not retract_rows:
+                if len(partners) == 1:
+                    already += 1
+                    continue
+                stale_why = (
+                    f"the retract identity has no row and {len(partners)} live identities "
+                    "hold the key, not the one kept"
+                )
+            else:
+                stale_why = _stale_reason(retract_rows, partners, entry)
+            if stale_why is not None:
                 stale.append(
                     f"  {entry.security_id} {entry.ex_date} {entry.amount!r} "
-                    f"{entry.retract_source_action_id} ({entry.ticker or 'no ticker'}): {why}"
+                    f"{entry.retract_source_action_id} ({entry.ticker or 'no ticker'}): {stale_why}"
                 )
                 continue
             found.append(entry)

@@ -187,6 +187,9 @@ def test_equal_amount_groups_classes_every_key() -> None:
         ("THR", DAY, 0.25, "b", T1),
         ("THR", DAY, 0.25, "c", T1),
         ("LEG", DAY, 0.25, "a", T1),  # one leg of a distinct pair gone: violation
+        ("NEW", DAY, 0.25, "a", T1),  # duplicate reissued under a new id: violation
+        ("NEW", DAY, 0.25, "c", T1),
+        ("KEPT", DAY, 0.25, "b", T1),  # duplicate whose kept id is gone: violation
         ("AMT", DAY, 0.25, "a", T1),  # another amount is another key
         ("AMT", DAY, 0.26, "b", T1),
     )
@@ -197,13 +200,17 @@ def test_equal_amount_groups_classes_every_key() -> None:
         _listed("REP", "duplicate"),
         _listed("THR", "distinct"),
         _listed("LEG", "distinct"),
+        _listed("NEW", "duplicate"),
+        _listed("KEPT", "duplicate"),
         _listed("GONE", "duplicate"),  # a store that never held it: not returned
     ]
     groups = equal_amount_groups(live, reviewed)
     assert [(g.security_id, g.group_class, len(g.identities)) for g in groups] == [
         ("DIS", "accepted", 2),
         ("DUP", "pending", 2),
+        ("KEPT", "violation", 1),
         ("LEG", "violation", 1),
+        ("NEW", "violation", 2),
         ("REP", "repaired", 1),
         ("THR", "violation", 3),
         ("UNL", "violation", 2),

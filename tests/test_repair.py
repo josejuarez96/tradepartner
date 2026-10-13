@@ -1099,3 +1099,24 @@ def test_the_command_exits_1_on_a_stale_dry_run(
     dry = CliRunner().invoke(app, ["repair-dividends", "--release", REL, "--dry-run"])
     assert dry.exit_code == 1
     assert "stale 1" in dry.output and "2 other live identities" in dry.output
+
+
+@pytest.mark.parametrize(
+    ("entry", "why"),
+    [
+        # a mistyped retract id: both rows still live on the key
+        (_entry(DUP, "duplicate", retract="zz"), "no row and 2 live identities"),
+        # a mistyped security: nothing holds the key
+        (_entry("0000009999", "duplicate"), "no row and 0 live identities"),
+    ],
+)
+def test_an_absent_retract_id_is_already_repaired_only_beside_one_kept_row(
+    dividends: Settings, entry: ReviewedGroup, why: str
+) -> None:
+    dry = _retract(dividends, reviewed=[entry], dry_run=True)
+    assert dry.already_repaired == 0
+    [line] = dry.stale
+    assert why in line
+    with pytest.raises(RepairRefused, match="stale"):
+        _retract(dividends, reviewed=[entry], expect=0, release=REL)
+    assert _actions(dividends) == ALL_ACTIONS

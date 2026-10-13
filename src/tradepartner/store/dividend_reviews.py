@@ -218,7 +218,11 @@ def equal_amount_groups(
       `unresolved`, or `pending` (`duplicate`: not repaired yet);
     - a listed `duplicate` with one identity: `repaired`;
     - listed with any other count of at least one: `violation` (a third
-      record, or one leg of a real pair gone).
+      record, or one leg of a real pair gone);
+    - a listed `duplicate` whose two identities lack the retract id, or
+      whose one identity is the retract id: `violation` (the vendor
+      reissued a record, or the kept one is gone), never pending or
+      repaired.
 
     A key with one identity that is not listed, and a listed key with none
     (a store that never held it), are not returned. Sorted by key."""
@@ -243,6 +247,10 @@ def equal_amount_groups(
             group_class = "violation"
         elif count == 0:
             continue
+        elif group.verdict == DUPLICATE and (
+            (count == REVIEWED_IDENTITIES) != (group.retract_source_action_id in found)
+        ):
+            group_class = "violation"  # the reviewed ids changed, or the kept one is gone
         elif count == REVIEWED_IDENTITIES:
             group_class = _LISTED_CLASS[group.verdict]
         elif count == 1 and group.verdict == DUPLICATE:
