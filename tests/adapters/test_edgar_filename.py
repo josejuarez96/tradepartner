@@ -143,7 +143,7 @@ class TestCover12bExchanges:
         takes is the caller's rule (T184b); the reader gives both, the
         common class's first."""
         text = _document("filing_dual_exchange_d360924d10ka.htm.gz")
-        assert cover_12b_exchanges(text, max_bytes=None) == (
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == (
             ("Common Stock, par value $0.001 per share", "NASDAQ"),
             ("6.25% Senior Notes due 2025", "NYSE"),
         )
@@ -155,7 +155,7 @@ class TestCover12bExchanges:
         Which line a row takes is the caller's rule (T184b); the reader
         gives both, the common class's first."""
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
-        assert cover_12b_exchanges(text, max_bytes=None) == (
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == (
             ("Common Shares, $0.01 par value per share", "NASDAQ"),
             ("Series A Preferred Stock, $0.01 par value per share", "NYSE"),
             ("Series B Preferred Stock, $0.01 par value per share", "NYSE"),
@@ -206,14 +206,19 @@ class TestCover12bExchanges:
 
     def test_a_table_after_front_matter_reads_up_to_the_cap(self) -> None:
         """The 12(b) table sits 115 KB into the document: inside
-        `filename_document_max_bytes` it reads, and at a cap that cuts before
-        it nothing does — the read stops at the table or at the cap."""
+        `filename_document_max_bytes` it reads, at a cap that cuts before it
+        nothing does, and a cap that holds the whole document reads exactly
+        what a wider one does — the read stops at the table or at the cap."""
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
-        assert len(text.encode("utf-8")) > 115_000
+        document_bytes = len(text.encode("utf-8"))
+        assert document_bytes > 115_000
         assert cover_12b_exchanges(text, max_bytes=200_000)[0][1] == "NASDAQ"
         assert cover_12b_exchanges(text, max_bytes=100_000) == ()
-        assert cover_12b_exchanges(text, max_bytes=None) == cover_12b_exchanges(
+        assert cover_12b_exchanges(text, max_bytes=document_bytes) == cover_12b_exchanges(
             text, max_bytes=4_000_000
+        )
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == cover_12b_exchanges(
+            text, max_bytes=document_bytes * 2
         )
 
     def test_a_12g_only_document_reads_no_exchange(self) -> None:
@@ -221,14 +226,16 @@ class TestCover12bExchanges:
         no 12(b) heading at all, so no row is read (counted `no_exchange`
         by T184b)."""
         text = _document("filing_12g_only_chineseinvestors_10ka-053116.htm.gz")
-        assert cover_12b_exchanges(text, max_bytes=None) == ()
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == ()
 
     def test_a_heading_with_no_table_reads_no_exchange(self) -> None:
         """Royale Energy's 10-K/A writes the 12(b) heading and then a 12(g)
         block, with no table at all: the block ends at the next registration
         section and nothing is read."""
         assert (
-            cover_12b_exchanges(_document("filing_no_table_re04041710ka.htm.gz"), max_bytes=None)
+            cover_12b_exchanges(
+                _document("filing_no_table_re04041710ka.htm.gz"), max_bytes=4_000_000
+            )
             == ()
         )
 
@@ -334,14 +341,29 @@ class TestCover12bExchanges:
     def test_the_four_text_shapes_the_reader_stops_at(
         self, text: str, expected: tuple[tuple[str, str], ...]
     ) -> None:
-        assert cover_12b_exchanges(text, max_bytes=None) == expected
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) == expected
 
     def test_the_read_cap_is_honoured_when_it_is_set(self) -> None:
-        """`max_bytes` bounds the read itself: without it the deep table
-        below the cap would read."""
+        """`max_bytes` bounds the read itself: the deep table reads at the
+        cap's default size, and a cap that cuts before it reads nothing."""
         text = (FIXTURES / "cover_12b_two_exchanges.htm").read_text()
-        assert cover_12b_exchanges(text, max_bytes=None) != ()
+        assert cover_12b_exchanges(text, max_bytes=4_000_000) != ()
         assert cover_12b_exchanges(text, max_bytes=0) == ()
+
+    def test_there_is_no_uncapped_read(self) -> None:
+        """#1624 (quant-auditor nit): the cap is required and is an int, so
+        no call site can read a primary document unbounded — not even by
+        passing `None`, which the reader used to take as "the whole
+        document". A `bool` is an `int`, so `True` (one byte) is a mistake,
+        not a cap."""
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=None)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:")  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=True)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            cover_12b_exchanges("Section 12(b) of the Act:", max_bytes=-1)
 
     def test_the_read_stays_linear_on_unclosed_tags(self) -> None:
         """safety-reviewer (T184): the text is filer-written, so a pattern
