@@ -310,6 +310,51 @@ class TestParseFsn:
         assert [item.ticker for item in record.listings] == ["GOOD"]
         assert (record.incomplete_listings, record.sic, len(record.shares)) == (1, 7372, 1)
 
+    def test_a_symbol_with_no_exchange_is_kept_as_a_symbol_only_tag(self) -> None:
+        """#1597 (spec amendment 2026-10-12): the same filing keeps its
+        `dei:TradingSymbol` values that name no exchange as symbol-only tags,
+        for a filename-listing reading to confirm against. The listing and
+        the incomplete count are unchanged: such a tag never becomes a
+        `filing` listing row."""
+        accession = "0000000006-25-000001"
+        sub = [_sub(accession, "6", "10-K")]
+        txt = [
+            _txt(accession, "Security12bTitle", "Common Stock", dimh="0xa", dimn="1"),
+            _txt(accession, "TradingSymbol", "ONLY", dimh="0xa", dimn="1"),
+            _txt(accession, "Security12bTitle", "Common Stock, no par", dimh="0xc", dimn="1"),
+            _txt(accession, "TradingSymbol", "ALSO", dimh="0xc", dimn="1"),
+            _txt(accession, "Security12bTitle", "Common Stock, no par", dimh="0xd", dimn="1"),
+            _txt(accession, "TradingSymbol", "ALSO", dimh="0xd", dimn="1"),
+            _txt(accession, "SecurityExchangeName", "NYSE", dimh="0xd", dimn="1"),
+        ]
+        dim = [
+            _dim("0xa", "ClassOfStock=CommonClassA;"),
+            _dim("0xc", "ClassOfStock=CommonClassB;"),
+            _dim("0xd", "ClassOfStock=CommonClassC;"),
+        ]
+        parsed = parse_fsn(sub, [], txt, dim)
+        [record] = parsed.records
+        assert parsed.failures == ()
+        # Only the group with an exchange is a listing; the two without one
+        # are counted and kept as their symbols, sorted and deduplicated.
+        assert [item.ticker for item in record.listings] == ["ALSO"]
+        assert (record.incomplete_listings, record.symbol_only) == (2, ("ALSO", "ONLY"))
+
+    def test_a_filing_without_a_symbol_only_tag_reads_none(self) -> None:
+        """A filing whose listings are all complete has no symbol-only tag,
+        and one with no symbol at all (notes only) has none either."""
+        accession = "0000000007-25-000001"
+        sub = [_sub(accession, "7", "10-K")]
+        complete = [
+            _txt(accession, "Security12bTitle", "Common Stock"),
+            _txt(accession, "TradingSymbol", "FULL"),
+            _txt(accession, "SecurityExchangeName", "NASDAQ"),
+        ]
+        notes_only = [_txt(accession, "Security12bTitle", "1.000% Notes due 2027")]
+        for txt in (complete, notes_only):
+            [record] = parse_fsn(sub, [], txt, []).records
+            assert record.symbol_only == ()
+
     def test_two_different_values_for_one_fact_fail_that_accession(self) -> None:
         """Fail closed like `parse_cover_page`: never keep whichever came last."""
         good, bad = "0000000008-25-000001", "0000000009-25-000001"

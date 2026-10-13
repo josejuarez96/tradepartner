@@ -282,6 +282,67 @@ def test_edgar_exchange_axis_listings_is_off_by_default_and_settable(
     assert Settings(_env_file=None).edgar.exchange_axis_listings is True
 
 
+def test_edgar_filename_listings_are_off_by_default_and_settable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1597 (T184): off until the real-store run has passed and the
+    amendment's open questions 22 to 24 are answered (T184h's gate)."""
+    s = Settings(_env_file=None)
+    assert s.edgar.filename_listings is False
+    assert s.edgar.filename_listings_since == date(2015, 1, 1)
+    assert s.edgar.filename_listing_forms == ["10-K", "10-KT"]
+    assert s.edgar.filename_document_max_bytes == 4_000_000
+    assert s.edgar.filename_listings_refused == []
+    monkeypatch.setenv("EDGAR__FILENAME_LISTINGS", "true")
+    monkeypatch.setenv("EDGAR__FILENAME_LISTINGS_SINCE", "2013-06-30")
+    monkeypatch.setenv("EDGAR__FILENAME_LISTING_FORMS", '["10-K"]')
+    monkeypatch.setenv("EDGAR__FILENAME_DOCUMENT_MAX_BYTES", "1048576")
+    monkeypatch.setenv("EDGAR__FILENAME_LISTINGS_REFUSED", '["0000320193:AAPL"]')
+    s = Settings(_env_file=None)
+    assert s.edgar.filename_listings is True
+    assert s.edgar.filename_listings_since == date(2013, 6, 30)
+    assert s.edgar.filename_listing_forms == ["10-K"]
+    assert s.edgar.filename_document_max_bytes == 1_048_576
+    assert s.edgar.filename_listings_refused == ["0000320193:AAPL"]
+
+
+@pytest.mark.parametrize("forms", [[], [""], [" "]])
+def test_edgar_filename_listing_forms_is_never_empty(forms: list[str]) -> None:
+    """An empty list, or an empty form, would read no filing name at all."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"filename_listing_forms": forms})
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+def test_edgar_filename_document_max_bytes_is_positive(max_bytes: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, edgar={"filename_document_max_bytes": max_bytes})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "0000320193",
+        "aapl:AAPL",
+        "0000320193:",
+        "0000320193:AAPL:extra",
+        "0000320193:aap l",
+    ],
+)
+def test_edgar_filename_listings_refused_fails_closed_on_a_malformed_entry(entry: str) -> None:
+    """Every entry is `CIK:TICKER` (#1597): a typo must refuse the config,
+    never leave a live name derived silently."""
+    with pytest.raises(ValidationError, match="filename_listings_refused"):
+        Settings(_env_file=None, edgar={"filename_listings_refused": [entry]})
+
+
+def test_edgar_filename_listings_refused_accepts_a_class_share_ticker() -> None:
+    s = Settings(
+        _env_file=None, edgar={"filename_listings_refused": ["0001652044:GOOGL", "0001652044:GOOG"]}
+    )
+    assert s.edgar.filename_listings_refused == ["0001652044:GOOGL", "0001652044:GOOG"]
+
+
 def test_edgar_title_fallback_is_off_by_default_and_reads_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

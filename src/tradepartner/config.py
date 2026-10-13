@@ -111,6 +111,9 @@ _STATEMENT_TAGS: dict[str, tuple[str, ...]] = {
 _CIK = re.compile(r"\d{10}")
 _CLASS_MEMBER = re.compile(r"CommonClass[A-Z]")
 _QUALIFIED_TAG = re.compile(r"[A-Za-z][A-Za-z0-9-]*:[A-Za-z_][A-Za-z0-9_]*")
+#: An `edgar.filename_listings_refused` entry (#1597): the CIK, then the
+#: ticker derived no more for it.
+_REFUSED_FILENAME = re.compile(r"\d{10}:[A-Z0-9][A-Z0-9.\-/]*")
 
 # Shared zero-padded 24h HH:MM pattern used by both the config validator and
 # `backtest/quiet.py`'s runtime check.
@@ -444,6 +447,45 @@ class EdgarConfig(BaseModel):
             "0001837686": "CommonClassA",  # VMEO
         }
     )
+    # T184 (#1597, spec amendment 2026-10-12): pre-2019 listings read from a
+    # filing's own file names and its primary document's text. While the switch
+    # is off the EDGAR `FilingSource` answers `filename_listings` as it does
+    # today (no answer: T184b owns the fetch, T184c the confirmation rule,
+    # T184e the write), makes no request and writes no cache entry, and the
+    # store changes nothing. It stays off until the real-store run has passed
+    # and #1597's open questions 22 to 24 are answered (T184h's gate).
+    filename_listings: bool = False
+    # The oldest year read: the amendment's rows are a 10-K's own, and the
+    # window starts at FSN's 2015 so no reading is asked for a filing the
+    # FSN data sets do not cover.
+    filename_listings_since: date = date(2015, 1, 1)
+    # The annual-report forms read (10-Qs are out of scope per the
+    # amendment). Never empty: an empty one would silently read nothing.
+    filename_listing_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=lambda: ["10-K", "10-KT"], min_length=1
+    )
+    # The primary document's read cap for a 10-K's Section 12(b) table: the
+    # read stops at the table or here, whichever comes first (#1597), so a
+    # filing whose table is never written costs one bounded read.
+    filename_document_max_bytes: int = Field(default=4_000_000, gt=0)
+    # (CIK, ticker) spans whose `filing_name` rows the run derives no more
+    # and `master-retract --release` withdraws: the amendment's rule for a
+    # collision the Alpaca backfill counted. Default empty. A malformed
+    # entry (not `CIK:TICKER`) refuses the config, so a typo never leaves a
+    # live name derived silently.
+    filename_listings_refused: list[str] = Field(default_factory=list)
+
+    @field_validator("filename_listings_refused")
+    @classmethod
+    def _check_filename_listings_refused(cls, value: list[str]) -> list[str]:
+        """Every entry is `CIK:TICKER` (#1597: owner-listed, never inferred)."""
+        for entry in value:
+            if not _REFUSED_FILENAME.fullmatch(entry):
+                raise ValueError(
+                    "edgar.filename_listings_refused: an entry is not `CIK:TICKER` "
+                    f"(got {len(entry)} characters)"
+                )
+        return value
 
     @field_validator("class_member_overrides")
     @classmethod

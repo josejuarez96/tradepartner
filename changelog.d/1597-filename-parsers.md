@@ -1,0 +1,3 @@
+- #1597 T184: the filing-name listing parsers, the `FilenameListing` record and the five config keys (off by default)
+### Added
+- Filing-name listings (#1597, T184): the pure parsers for a 10-K's XBRL instance file-name prefix, a Nasdaq Form 25's exhibit ticker and its Section 12(b) class and exchange; `FsnFiling.symbol_only` keeps a `dei:TradingSymbol` that names no exchange; `FilingSource.filename_listings` (not abstract, the EDGAR answer is T184b's); `edgar.filename_listings`, `edgar.filename_listings_since`, `edgar.filename_listing_forms`, `edgar.filename_document_max_bytes` and `edgar.filename_listings_refused`, all off by default.

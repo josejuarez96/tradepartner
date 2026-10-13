@@ -47,6 +47,7 @@ Fact names are the XBRL concept's local name
 from __future__ import annotations
 
 import functools
+import html
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -996,6 +997,198 @@ def parse_delisting(
     )
 
 
+# --- filing-name listings (T184, #1597, spec amendment 2026-10-12) -----------
+#
+# A security's name as its own filing spells it, for the years before any
+# cover page tags it: the XBRL instance document's file-name prefix of a
+# 10-K, a Nasdaq Form 25's exhibit file name, and the Section 12(b) table
+# in a 10-K's primary document. This section holds the pure parsers only.
+# T184b's fetch layer answers the requests, keeps the extract (names,
+# prefix, class/exchange pairs) in a per-CIK cache and stamps it; T184c's
+# rule confirms a reading against the same filing's cover page before the
+# store may write a row. Switched by `edgar.filename_listings` (off by
+# default), so nothing here runs in an ordinary ingest.
+
+#: An XBRL instance document's file name, as a filing's `index.json` lists
+#: it: the Filer Manual's `<prefix>-YYYYMMDD>.xml`, the same name in a
+#: `_htm` spelling, or a primary-document-derived `<prefix>_htm.xml`
+#: instance. A linkbase (`_cal`, `_def`, `_lab`, `_pre`) is never an
+#: instance, and neither is any other `<...>.xml` of the submission.
+_INSTANCE_DATED = re.compile(r"^(?P<prefix>\S+)-(?P<date>\d{8})(?P<variant>_[A-Za-z0-9]+)?\.xml\Z")
+_INSTANCE_UNDATED = re.compile(r"^(?P<prefix>\S+)_htm\.xml\Z")
+#: The variant suffixes an instance carries: `_htm` (the primary document
+#: is the inline XBRL one). The linkbase suffixes are never one of these.
+_INSTANCE_VARIANTS = frozenset({"htm"})
+
+#: The Nasdaq Form 25 exhibit file names carrying the subject company's
+#: ticker (#1597: 464 of 467 Nasdaq notices carry one). A notice whose
+#: listing names neither (`ruleprovisionnotice.htm`, every NYSE-family
+#: notice) reads no ticker.
+_FORM25_TICKER_SUFFIXES = (
+    re.compile(r"^(?P<ticker>[^-]+)-form25\.txt\Z", re.IGNORECASE),
+    re.compile(r"^(?P<ticker>.+)delistreason\.txt\Z", re.IGNORECASE),
+)
+
+#: The Section 12(b) heading of a cover page, in any of its spellings
+#: ("Securities registered pursuant to Section 12(b) of the Act:").
+_12B_HEADING = re.compile(r"section\s*12\s*\(\s*b\s*\)", re.IGNORECASE)
+#: The Section 12(g) heading, which always follows the 12(b) block of a
+#: standard cover page and ends it.
+_12G_HEADING = re.compile(r"section\s*12\s*\(\s*g\s*\)", re.IGNORECASE)
+#: Markers standing in for the table structure while the cover page's text
+#: is reduced to rows and cells: a `</td>`/`</th>` ends a cell, a `</tr>`
+#: ends a row and a `</table>` ends the table. ASCII control characters
+#: cannot occur in a document's text, so no cell or heading can be confused
+#: with one; a `<table>` and a `<br>` are plain line breaks (a table starts
+#: a line, and a marker left in a cell's text would read as a class title).
+_CELL_END = "\x00"
+_ROW_END = "\x01"
+_TABLE_END = "\x02"
+#: A table's heading and rows, as `</td>`/`</th>`-separated cells; the
+#: no-table spelling writes the same columns after runs of spaces.
+_ROW_END_PATTERN = re.compile(re.escape(_ROW_END))
+_CELL_END_PATTERN = re.compile(re.escape(_CELL_END))
+_SPACE_COLUMNS = re.compile(r"\s{2,}")
+#: A blank line in the reduced text, which ends a heading's block when no
+#: table follows it.
+_BLANK_LINE = re.compile(r"\n[^\S\n]*\n")
+
+
+def _instance_prefix_of(name: str) -> str | None:
+    """`name`'s instance prefix when `name` is an XBRL instance document."""
+    match = _INSTANCE_DATED.match(name)
+    if match is not None:
+        variant = (match["variant"] or "").lstrip("_")
+        return match["prefix"] if not variant or variant in _INSTANCE_VARIANTS else None
+    undated = _INSTANCE_UNDATED.match(name)
+    return undated["prefix"] if undated is not None else None
+
+
+def instance_prefix(names: Iterable[str]) -> str | None:
+    """The XBRL instance document's file-name prefix in a filing's
+    `index.json` listing (#1597, spec amendment 2026-10-12).
+
+    Ticker or abbreviation for a filer that names the instance after its
+    ticker (`jci-20160630.xml` -> `jci`); a primary-document-derived name
+    otherwise (`a10-k20199282019_htm.xml`), which amendment #844's symbol
+    rule then reads or refuses. `None` when the listing names no instance
+    document, and when two names are instances of **different** prefixes
+    (a combined filing: which registrant's prefix a listing belongs to is
+    never guessed).
+    """
+    prefixes = {p for name in names if (p := _instance_prefix_of(name.strip())) is not None}
+    return prefixes.pop() if len(prefixes) == 1 else None
+
+
+def form25_exhibit_ticker(names: Iterable[str]) -> str | None:
+    """The ticker a Form 25's exhibit file names carry (#1597): Nasdaq's
+    `<ticker>-form25.txt` or `<ticker>delistreason.txt`.
+
+    `None` when the listing names no such exhibit (every NYSE-family
+    notice, whose `ruleprovisionnotice.htm` carries none) and when two of
+    them name different tickers."""
+    tickers: set[str] = set()
+    for name in names:
+        stripped = name.strip()
+        for suffix in _FORM25_TICKER_SUFFIXES:
+            match = suffix.match(stripped)
+            if match is not None:
+                tickers.add(match["ticker"])
+    return tickers.pop() if len(tickers) == 1 else None
+
+
+def _cover_12b_code(cell: str) -> str | None:
+    """The exchange code a 12(b) cell names, or `None` when it names none.
+
+    A header cell, a `None`/`N/A` cell and a venue outside `_EXCHANGES`
+    (its slug) all name no exchange, so a row's blank or unknown cell
+    drops the row instead of writing a names-nothing exchange."""
+    code = normalize_exchange(cell.strip())
+    return code if code in _EXCHANGE_CODES else None
+
+
+def _cover_12b_row(row: str) -> tuple[tuple[str, str], ...]:
+    """One table row's `(class title, exchange)` pairs, in document order.
+
+    The exchange cell is the last filled cell and the class cell the first,
+    so a row written as `(title, symbol, exchange)`, as
+    `(title, exchange)` or with the titles and exchanges stacked in two
+    cells all read. A row naming no exchange (a header row, a `None`
+    cell) reads nothing."""
+    cells = [cell for cell in _CELL_END_PATTERN.split(row) if cell.strip()]
+    if len(cells) >= 2:
+        titles = [line.strip() for line in cells[0].splitlines() if line.strip()]
+        pairs: list[tuple[str, str]] = []
+        for line in cells[-1].splitlines():
+            code = _cover_12b_code(line)
+            if code is not None:
+                pairs.append((titles[len(pairs)] if len(pairs) < len(titles) else "", code))
+        return tuple(pairs)
+    for line in row.splitlines():
+        parts = [part for part in _SPACE_COLUMNS.split(line.strip()) if part]
+        if len(parts) >= 2:
+            code = _cover_12b_code(parts[-1])
+            if code is not None:
+                return ((parts[0], code),)
+    return ()
+
+
+def _cover_12b_marks(text: str) -> str:
+    """`text` with every other tag dropped, each `</td>`/`</th>`, `</tr>` and
+    `</table>` replaced by its structural marker and every other block or
+    line tag by a line break, entities unescaped. A cell holding several
+    stacked classes keeps one class per line, so the stacked shape reads."""
+    marks = re.sub(r"(?is)</\s*(td|th)\s*>", _CELL_END, text)
+    marks = re.sub(r"(?is)</\s*tr\s*>", _ROW_END, marks)
+    marks = re.sub(r"(?is)<\s*/\s*table\s*>", _TABLE_END, marks)
+    marks = re.sub(r"(?is)<table\b[^>]*>?", "\n", marks)
+    marks = re.sub(r"(?is)<br\s*/?>", "\n", marks)
+    marks = re.sub(r"(?is)</\s*(div|p|li)\s*>", "\n", marks)
+    marks = re.sub(r"(?is)<[^>]+>", "", marks)
+    return html.unescape(marks).replace("\xa0", " ")
+
+
+def cover_12b_exchanges(text: str, *, max_bytes: int | None = None) -> tuple[tuple[str, str], ...]:
+    """The classes and exchanges a primary document's Section 12(b) table
+    names (#1597, spec amendment 2026-10-12): `(class title, exchange
+    code)` pairs in document order, each exchange read by the same
+    `normalize_exchange` the cover pages and Forms 25 use, so a Form 25
+    reading matches it.
+
+    A document with no 12(b) heading (12(g) only), one whose table names
+    no exchange and one with no table inside `max_bytes` all return `()`;
+    the fetch layer (T184b) counts that as `no_exchange` rather than
+    writing a row. `max_bytes` is `edgar.filename_document_max_bytes`:
+    the read stops at the table, or at the cap, so a heading whose table
+    starts beyond it reads nothing.
+    """
+    body = text if max_bytes is None else text.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    marks = _cover_12b_marks(body)
+    heading = _12B_HEADING.search(marks)
+    if heading is None:
+        return ()
+    # The heading is a label on its own line: the block is what follows it,
+    # so a heading sharing a line or a row with the table below never reads
+    # its own text as a class title.
+    line_end = marks.find("\n", heading.end())
+    block = marks[len(marks) if line_end == -1 else line_end + 1 :]
+    table_end = block.find(_TABLE_END)
+    if table_end == -1:
+        # No table follows: the block stands as text, and ends at the next
+        # registration section or at a blank line, never further.
+        twelve_g = _12G_HEADING.search(block)
+        blank = _BLANK_LINE.search(block)
+        ends = (twelve_g.start() if twelve_g else -1, blank.start() if blank else -1)
+        for end in (table_end, *ends):
+            if end != -1:
+                block = block[:end]
+                break
+    else:
+        twelve_g = _12G_HEADING.search(block[:table_end])
+        block = block[: twelve_g.start() if twelve_g else table_end]
+    return tuple(pair for row in _ROW_END_PATTERN.split(block) for pair in _cover_12b_row(row))
+
+
 # --- SEC Financial Statement and Notes data sets (T11c) ---------------------
 #
 # `sub.tsv`, `num.tsv`, `txt.tsv` and `dim.tsv` of one FSN period zip, read
@@ -1050,6 +1243,12 @@ class FsnFiling:
     #: than their `SecurityExchangeName` (#1541): counted, the value written.
     #: Always 0 unless parsed with `exchange_axis=True`.
     exchange_axis_mismatch: int = 0
+    #: `dei:TradingSymbol` values reported with no `SecurityExchangeName`
+    #: (#1597, spec amendment 2026-10-12): the same filing's symbol-only
+    #: tag, kept for a filename-listing reading to confirm against. Such a
+    #: tag never becomes a `filing` listing row and never changes
+    #: `listings` or `incomplete_listings`.
+    symbol_only: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1207,6 +1406,7 @@ def _parse_one_fsn_filing(
 
     listings: list[CoverListing] = []
     incomplete = mismatched = 0
+    symbol_only: set[str] = set()
     for (_, exchange_member), group in groups.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
@@ -1214,6 +1414,8 @@ def _parse_one_fsn_filing(
             continue  # notes and other classes with no trading symbol
         if title is None or exchange is None:
             incomplete += 1  # skipped and counted, not a failure (owner, #224)
+            if exchange is None:
+                symbol_only.add(symbol)  # the symbol-only tag (#1597), never a row
             continue
         code = normalize_exchange(exchange)
         if exchange_member and _exchange_axis_mismatch(exchange_member, code):
@@ -1242,7 +1444,17 @@ def _parse_one_fsn_filing(
             )
     shares = tuple(FsnShare(m, values[max(values)], max(values)) for m, values in dated.items())
 
-    return FsnFiling(accession, cik, form, sic, tuple(listings), shares, incomplete, mismatched)
+    return FsnFiling(
+        accession,
+        cik,
+        form,
+        sic,
+        tuple(listings),
+        shares,
+        incomplete,
+        mismatched,
+        tuple(sorted(symbol_only)),
+    )
 
 
 def parse_fsn(
