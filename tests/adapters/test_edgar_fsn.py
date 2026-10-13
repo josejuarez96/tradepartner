@@ -355,6 +355,21 @@ class TestParseFsn:
             [record] = parse_fsn(sub, [], txt, []).records
             assert record.symbol_only == ()
 
+    def test_a_tagged_symbol_with_an_exchange_but_no_title_is_not_symbol_only(self) -> None:
+        """A group with a symbol and an exchange but no title is an incomplete
+        listing like any other, and its symbol is no symbol-only tag: the tag
+        is a symbol that names no exchange (#1597)."""
+        accession = "0000000008-25-000001"
+        sub = [_sub(accession, "8", "10-K")]
+        txt = [
+            _txt(accession, "TradingSymbol", "FULL", dimh="0xa", dimn="1"),
+            _txt(accession, "SecurityExchangeName", "NASDAQ", dimh="0xa", dimn="1"),
+        ]
+        dim = [_dim("0xa", "ClassOfStock=CommonClassA;")]
+        parsed = parse_fsn(sub, [], txt, dim)
+        [record] = parsed.records
+        assert (record.incomplete_listings, record.symbol_only, record.listings) == (1, (), ())
+
     def test_two_different_values_for_one_fact_fail_that_accession(self) -> None:
         """Fail closed like `parse_cover_page`: never keep whichever came last."""
         good, bad = "0000000008-25-000001", "0000000009-25-000001"

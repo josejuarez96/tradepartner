@@ -135,15 +135,17 @@ class TestForm25ExhibitTicker:
 
 
 class TestCover12bExchanges:
-    def test_one_exchange_reads_the_class_and_the_venue(self) -> None:
+    def test_the_recorded_two_venue_table_reads_both_classes(self) -> None:
         """PennantPark's 10-K/A names its common stock on Nasdaq and its
-        senior notes on the New York Stock Exchange: the common class's line
-        reads, and the notes' `The New York Stock Exchange` is a spelling
-        `normalize_exchange`'s exact-name table does not carry, so that row
-        reads no exchange rather than a names-nothing slug."""
+        senior notes on the New York Stock Exchange, each as its own
+        filer's spelling: `The NASDAQ Stock Market LLC` and `The New York
+        Stock Exchange`, the article and all. Both read. Which line a row
+        takes is the caller's rule (T184b); the reader gives both, the
+        common class's first."""
         text = _document("filing_dual_exchange_d360924d10ka.htm.gz")
         assert cover_12b_exchanges(text, max_bytes=None) == (
             ("Common Stock, par value $0.001 per share", "NASDAQ"),
+            ("6.25% Senior Notes due 2025", "NYSE"),
         )
 
     def test_two_classes_on_two_exchanges_read_both_lines(self) -> None:
@@ -158,6 +160,49 @@ class TestCover12bExchanges:
             ("Series A Preferred Stock, $0.01 par value per share", "NYSE"),
             ("Series B Preferred Stock, $0.01 par value per share", "NYSE"),
         )
+
+    @pytest.mark.parametrize(
+        ("spelling", "expected"),
+        [
+            # The spellings a filer writes itself, which `_EXCHANGES`'
+            # exact-name table does not carry (quant-auditor, T184): the
+            # article the dei codes and the Form 25 notices drop, and
+            # Nasdaq's own tier names for its one listing venue.
+            ("The New York Stock Exchange", "NYSE"),
+            ("New York Stock Exchange LLC", "NYSE"),
+            ("THE NASDAQ STOCK MARKET", "NASDAQ"),
+            ("The NASDAQ Stock Market LLC", "NASDAQ"),
+            ("The NASDAQ Global Select Market", "NASDAQ"),
+            ("NASDAQ Global Select Market", "NASDAQ"),
+            ("The NASDAQ Global Market", "NASDAQ"),
+            ("NASDAQ Capital Market", "NASDAQ"),
+            ("NASDAQ National Market", "NASDAQ"),
+            ("The NASDAQ Stock Market LLC (NASDAQ Global Select Market)", "NASDAQ"),
+            ("NYSE MKT LLC", "NYSE_AMERICAN"),
+            # The cover page and the Form 25 spelling is already exact.
+            ("New York Stock Exchange", "NYSE"),
+            ("Nasdaq Stock Market LLC", "NASDAQ"),
+            # A header cell, a none cell and a venue no code carries.
+            ("Name of each exchange on which registered", None),
+            ("None", None),
+            ("N/A", None),
+            ("Not applicable", None),
+            ("The Tokyo Stock Exchange", None),
+        ],
+    )
+    def test_a_tables_venue_spelling_reads_its_code(
+        self, spelling: str, expected: str | None
+    ) -> None:
+        """The exchange is read from the table as the filer spells it, so
+        `The New York Stock Exchange` and `The NASDAQ Global Select Market`
+        read what a Form 25 names, not a slug."""
+        text = (
+            "Securities registered pursuant to Section 12(b) of the Act:\n"
+            "<table><tr><td>Common Stock, $0.01 par value</td><td></td>"
+            f"<td>{spelling}</td></tr></table>"
+        )
+        pairs = cover_12b_exchanges(text, max_bytes=4_000_000)
+        assert [code for _, code in pairs] == ([expected] if expected else [])
 
     def test_a_table_after_front_matter_reads_up_to_the_cap(self) -> None:
         """The 12(b) table sits 115 KB into the document: inside
@@ -241,6 +286,47 @@ class TestCover12bExchanges:
             (
                 "Securities registered pursuant to Section 12(b) of the Act:\n\n\n"
                 "Common Stock    Nasdaq Stock Market LLC",
+                (),
+            ),
+            # A heading written inside the table's own first row, on one
+            # source line (minified HTML): the block starts at the end of
+            # that row, so the table's own row reads and the table after the
+            # 12(g) block never does.
+            (
+                "<table><tr><td>Securities registered pursuant to "
+                "Section 12(b) of the Act:</td></tr>"
+                "<tr><td>Common Stock</td><td>New York Stock Exchange</td></tr></table>"
+                "<p>Securities registered pursuant to Section 12(g) of the Act: None</p>"
+                "<table><tr><td>x</td><td>Nasdaq</td></tr></table>",
+                (("Common Stock", "NYSE"),),
+            ),
+            # The 12(g) section's own table names a venue: it is the 12(g)
+            # block's, never this heading's, so nothing is read. Removing the
+            # 12(g) bound makes this read the row of that later table.
+            (
+                "Securities registered pursuant to Section 12(b) of the Act:\n\n\n"
+                "Securities registered pursuant to Section 12(g) of the Act:\n"
+                "<table><tr><td>Common Stock</td><td>Nasdaq Stock Market LLC</td></tr></table>",
+                (),
+            ),
+            # A cover page that registers nothing under 12(b) says so on the
+            # heading's own line ("Section 12(b) of the Act: None"): its block
+            # ends where it says none, and the table below is another
+            # section's, however close or far it sits.
+            (
+                "Securities registered pursuant to Section 12(b) of the Act: None\n"
+                "Indicate by check mark whether the registrant is a large accelerated filer\n"
+                "<table><tr><td>Indicate by check mark</td>"
+                "<td>Nasdaq Stock Market LLC</td></tr></table>",
+                (),
+            ),
+            # The same statement at the end of a two-line heading, with the
+            # 12(g) block after it.
+            (
+                "Securities registered pursuant to Section 12(b)\n"
+                "of the Act: None\n"
+                "Securities registered pursuant to Section 12(g) of the Act:\n"
+                "<table><tr><td>Common Stock</td><td>Nasdaq Stock Market LLC</td></tr></table>",
                 (),
             ),
         ],

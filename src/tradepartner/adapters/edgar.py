@@ -1035,6 +1035,29 @@ _12B_HEADING = re.compile(r"section\s*12\s*\(\s*b\s*\)", re.IGNORECASE)
 #: The Section 12(g) heading, which always follows the 12(b) block of a
 #: standard cover page and ends it.
 _12G_HEADING = re.compile(r"section\s*12\s*\(\s*g\s*\)", re.IGNORECASE)
+#: What a cover page writes for a section that registers no security at
+#: all: "Securities registered pursuant to Section 12(b) of the Act: None".
+#: A heading that says so has no table to read -- the table below it belongs
+#: to the section after it, and its venue would name the wrong exchange.
+_NONE_STATEMENT = re.compile(
+    r"(?:\A|[:\s])(?:none|n/?a|not\s+applicable)[.,;]?(?:\s|\Z)", re.IGNORECASE
+)
+#: Venue spellings an untagged Section 12(b) table writes that
+#: `_EXCHANGES`' exact-name table does not carry (#1597): the article the
+#: dei `SecurityExchangeName` codes and the Form 25 notices drop, and
+#: Nasdaq's own tier names for its one listing venue. Applied here, before
+#: `normalize_exchange`, so the cover pages and the Forms 25 keep reading
+#: `_EXCHANGES` alone and their rows move with nothing.
+_COVER_12B_LEADING_ARTICLE = re.compile(r"\ATHE\s+", re.IGNORECASE)
+_COVER_12B_TRAILING_PARENTHETICAL = re.compile(r"\s*\([^()]*\)\s*\Z")
+_COVER_12B_NASDAQ_TIERS = frozenset(
+    {
+        "NASDAQ GLOBAL SELECT MARKET",
+        "NASDAQ GLOBAL MARKET",
+        "NASDAQ CAPITAL MARKET",
+        "NASDAQ NATIONAL MARKET",
+    }
+)
 #: Markers standing in for the table structure while the cover page's text
 #: is reduced to rows and cells: a `</td>`/`</th>` ends a cell, a `</tr>`
 #: ends a row and a `</table>` ends the table. ASCII control characters
@@ -1097,14 +1120,24 @@ def form25_exhibit_ticker(names: Iterable[str]) -> str | None:
     return tickers.pop() if len(tickers) == 1 else None
 
 
-def _cover_12b_code(cell: str) -> str | None:
-    """The exchange code a 12(b) cell names, or `None` when it names none.
+def _cover_12b_code(name: str) -> str | None:
+    """The exchange code one 12(b) cell names, or `None` when it names none.
 
     A header cell, a `None`/`N/A` cell and a venue outside `_EXCHANGES`
-    (its slug) all name no exchange, so a row's blank or unknown cell
-    drops the row instead of writing a names-nothing exchange."""
-    code = normalize_exchange(cell.strip())
-    return code if code in _EXCHANGE_CODES else None
+    (its slug) all name no exchange, so a row's blank or unknown cell drops
+    the row instead of writing a names-nothing exchange. The spelling of a
+    venue is the filer's own, so a leading article and Nasdaq's tier names
+    (with or without the tier written in parentheses beside the venue) are
+    mapped before `normalize_exchange`, whose table stays as the cover
+    pages and the Forms 25 read it."""
+    for reading in (name, _COVER_12B_TRAILING_PARENTHETICAL.sub("", name)):
+        article_dropped = _COVER_12B_LEADING_ARTICLE.sub("", reading.strip())
+        if article_dropped.upper() in _COVER_12B_NASDAQ_TIERS:
+            article_dropped = "NASDAQ STOCK MARKET"
+        code = normalize_exchange(article_dropped)
+        if code in _EXCHANGE_CODES:
+            return code
+    return None
 
 
 def _cover_12b_row(row: str) -> tuple[tuple[str, str], ...]:
@@ -1178,26 +1211,49 @@ def cover_12b_exchanges(text: str, *, max_bytes: int | None) -> tuple[tuple[str,
     heading = _12B_HEADING.search(marks)
     if heading is None:
         return ()
-    # The heading is a label on its own line: the block is what follows it,
-    # so a heading sharing a line or a row with the table below never reads
-    # its own text as a class title.
-    line_end = marks.find("\n", heading.end())
-    block = marks[len(marks) if line_end == -1 else line_end + 1 :]
+    from_here = heading.end()
+    # The heading is a label: its block starts at the end of the row, the
+    # cell or the line it shares with the table below, so a heading written
+    # inside the table's own first row never reads as a class title and the
+    # table's own first row still does.
+    breaks = [
+        position
+        for position in (
+            marks.find("\n", from_here),
+            marks.find(_CELL_END, from_here),
+            marks.find(_ROW_END, from_here),
+        )
+        if position != -1
+    ]
+    # What the heading's own line or cell says next: a cover page that
+    # registers nothing under 12(b) writes none there, and its block ends
+    # before it starts. The table below belongs to another section and its
+    # venue would name the wrong exchange.
+    if _NONE_STATEMENT.search(marks[from_here : min(breaks)] if breaks else ""):
+        return ()
+    if not breaks:
+        return ()
+    block_start = min(breaks) + 1
+    block = marks[block_start:]
+    ends = []
     table_end = block.find(_TABLE_END)
+    if table_end != -1:
+        ends.append(table_end)
+    twelve_g = _12G_HEADING.search(marks, from_here)
+    if twelve_g is not None:
+        ends.append(twelve_g.start() - block_start)
     if table_end == -1:
-        # No table follows: the block stands as text, and ends at the next
-        # registration section or at a blank line, never further.
-        twelve_g = _12G_HEADING.search(block)
+        # No table follows, or the heading's block is written as text: it
+        # ends at the next registration section or at a blank line, never
+        # further into the document.
         blank = _BLANK_LINE.search(block)
-        ends = (twelve_g.start() if twelve_g else -1, blank.start() if blank else -1)
-        for end in (table_end, *ends):
-            if end != -1:
-                block = block[:end]
-                break
-    else:
-        twelve_g = _12G_HEADING.search(block[:table_end])
-        block = block[: twelve_g.start() if twelve_g else table_end]
-    return tuple(pair for row in _ROW_END_PATTERN.split(block) for pair in _cover_12b_row(row))
+        if blank is not None:
+            ends.append(blank.start())
+    return tuple(
+        pair
+        for row in _ROW_END_PATTERN.split(block[: min(ends)] if ends else block)
+        for pair in _cover_12b_row(row)
+    )
 
 
 # --- SEC Financial Statement and Notes data sets (T11c) ---------------------

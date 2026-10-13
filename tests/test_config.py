@@ -332,7 +332,7 @@ def test_edgar_filename_document_max_bytes_is_positive(max_bytes: int) -> None:
 def test_edgar_filename_listings_refused_fails_closed_on_a_malformed_entry(entry: str) -> None:
     """Every entry is `CIK:TICKER` (#1597): a typo must refuse the config,
     never leave a live name derived silently."""
-    with pytest.raises(ValidationError, match="filename_listings_refused"):
+    with pytest.raises(ValidationError, match="not `CIK:TICKER`"):
         Settings(_env_file=None, edgar={"filename_listings_refused": [entry]})
 
 
