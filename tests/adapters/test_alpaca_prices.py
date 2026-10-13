@@ -3934,6 +3934,10 @@ class TestFilenameListingBackfill:
             f"{lost} sessions another security lost to a filing_name span"
             in resolver.report.summary()
         )
+        # The store passes a generator (`repair.store_resolver`), and the
+        # dispute diff re-reads the rows: the count must survive one.
+        once = ListingResolver(iter(listings), _evidence(MGEE_FACTS))
+        assert once.report.filename_disputes == lost
         # The count is the clause itself: every session whose owner moved to
         # another security's loss, no other.
         base = ListingResolver(
@@ -4003,26 +4007,30 @@ class TestFilenameListingBackfill:
         assert source.last_filename_collisions == ()
 
     def test_a_collision_drops_only_its_own_span(self) -> None:
-        # A second security asked in the same `asof` request keeps its rows:
-        # nothing is stored for the colliding span, only the span.
-        other = "0000000003"
+        # The colliding span's own rows (inside its span, dated before the
+        # successor's) are stored for no one, while the successor keeps the
+        # rows its own span covers: nothing is stored for the colliding span,
+        # only the span.
         listings = [
             _filing_name(self.OLD, "KEG", START),
             _listing(self.OLD, "N/A", date(2017, 7, 3)),
-            _listing(other, "KEG", START),
+            _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
         ]
+        served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}  # its own; then nobody's
 
         def fetch(
             symbols: list[str], start: date, end: date, *, asof: date | None = None
         ) -> dict[str, Any]:
-            served = {date(2016, 6, 7): 11.0, date(2017, 8, 1): 6.0}
             rows = [_row(d, close) for d, close in sorted(served.items()) if start <= d <= end]
+            rows.append(_row(date(2019, 6, 3), 7.0))  # the successor's own, after its span starts
             return {"feed": "sip", "bars": {"KEG": rows}}
 
         resolver = ListingResolver(listings)
         source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
-        bars = source.bars([self.OLD, other], date(2016, 6, 6), date(2017, 8, 2))
-        assert {b.security_id for b in bars} == {other}
+        bars = source.bars([self.OLD, self.SUCCESSOR], date(2016, 6, 6), date(2019, 6, 4))
+        assert [(b.security_id, b.session, b.close) for b in bars] == [
+            (self.SUCCESSOR, date(2019, 6, 3), 7.0)  # the rows its own span covers
+        ]
         assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
 
 

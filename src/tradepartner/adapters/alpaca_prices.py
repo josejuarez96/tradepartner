@@ -757,6 +757,11 @@ class ListingResolver:
         last_bar: LastBar | None = None,
         handover_sessions: int | None = None,
     ) -> None:
+        # `listings` is read twice more below (#1597: the `filing_name`
+        # count's guard and the merge-base resolver), and the store passes a
+        # generator (`repair.store_resolver`), so it is materialised once
+        # here rather than exhausted on the first pass.
+        listings = list(listings)
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
         by_security: dict[str, list[_Row]] = defaultdict(list)
@@ -2381,6 +2386,7 @@ class AlpacaPriceSource(PriceSource):
             self._asof_served.add(key)
         return key in self._asof_served
 
+    @_fail_closed  # the payload is read before `_own_rows`' and `parse_bars`' own checks
     def _filing_name_collisions(
         self,
         owners: Mapping[str, set[str]],
