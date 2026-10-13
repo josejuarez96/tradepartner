@@ -119,6 +119,7 @@ class PaperWindowRow:
     frozen_json: str
     frozen_sha256: str
     book_id: str = DEFAULT_BOOK_ID
+    activities_seen_json: str | None = None
     known_at: datetime
     ingested_at: datetime
 
@@ -457,6 +458,7 @@ class AdjustmentRow:
     cash: float | None = None
     explanation_json: str | None = None
     book_id: str = DEFAULT_BOOK_ID
+    broker_activity_id: str | None = None
     known_at: datetime
     ingested_at: datetime
 

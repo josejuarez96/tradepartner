@@ -71,6 +71,7 @@ for it at the cut; filled past it, the name gets an exit).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
@@ -1155,3 +1156,76 @@ def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
             assert seen(store.at(result.known_at)) == (1, 1, [])
         finally:
             store.close()
+
+
+def test_a_booked_fee_and_a_recorded_set_journaled_after_the_cut_are_not_seen() -> None:
+    """#1583, Q10/S6: the booked-`FEE` seen-set is journal-cut at `as_of`. A `fee_cash`
+    booked and an `ok` row carrying a recorded `activities` set, both known after
+    close(S-1), are not seen by a run on S (the `seen_activity_ids` and the
+    `activity_seen_before` fallback agree across the cut)."""
+    settings = _settings()
+    started_at = datetime(S_PREV.year, S_PREV.month, S_PREV.day, 14, 0, tzinfo=UTC)
+    window = PaperWindowRow(
+        hypothesis_id=1,
+        first_rebalance_session=S_PREV,
+        account_id="PA1",
+        starting_cash=1_000.0,
+        starting_equity=1_000.0,
+        code_version="t",
+        started_at=started_at,
+        frozen_json="{}",
+        frozen_sha256="x",
+        known_at=started_at,
+        ingested_at=started_at,
+    )
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        window = replace(window, window_id=append(conn, window))
+        after = CUT + LATE
+        append(
+            conn,
+            AdjustmentRow(
+                window_id=window.window_id,  # type: ignore[arg-type]
+                session=S_PREV,
+                kind="fee_cash",
+                cash=-0.02,
+                broker_activity_id="f-late",
+                known_at=after,
+                ingested_at=after,
+            ),
+        )
+        append(
+            conn,
+            ReconciliationRow(
+                window_id=window.window_id,  # type: ignore[arg-type]
+                at=after,
+                status="ok",
+                broker_cash=1_000.0,
+                mismatches_json=json.dumps(
+                    {
+                        "activities": [
+                            {"activity_id": "f-late", "activity_type": "FEE", "status": "executed"}
+                        ]
+                    }
+                ),
+                known_at=after,
+                ingested_at=after,
+            ),
+        )
+        at_cut = reconcile_run.explanations_as_of(
+            conn, window, S, as_of=CUT, settings=settings, quantity_tolerance=TOLERANCE
+        )
+        at_later = reconcile_run.explanations_as_of(
+            conn, window, S, as_of=LATER, settings=settings, quantity_tolerance=TOLERANCE
+        )
+        # At the cut neither the booked fee nor the late recorded set is known, so
+        # the date fallback governs.
+        assert "f-late" not in at_cut.seen_activity_ids
+        assert at_cut.activity_seen_before == started_at.astimezone(reconcile_run._NEW_YORK).date()
+        # Past the cut both are known: the late `ok` row's recorded set governs (no
+        # fallback) and holds the booked fee's id.
+        assert "f-late" in at_later.seen_activity_ids
+        assert at_later.activity_seen_before is None
+    finally:
+        conn.close()
