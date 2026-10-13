@@ -432,6 +432,29 @@ def _statement_card(report: HealthReport) -> None:
             theme.status_badge(f"statement_vintage_late: {statement.vintage_late}", "warning")
 
 
+def _rates_card(report: HealthReport) -> None:
+    """Show each rate series' coverage, recent ingest and quality warnings."""
+    with st.container(border=True):
+        st.subheader("Rates")
+        for item in report.rates.series:
+            st.markdown(f"**{item.series}**: {item.rows} rows; {item.revised_keys} revised keys")
+            st.caption(
+                f"Latest observation {item.latest_observation_date or '-'} · "
+                f"vintage {item.latest_vintage_date or '-'} · "
+                f"known at {header.when(item.latest_known_at)} · "
+                f"longest gap {item.longest_gap_sessions} XNYS sessions"
+            )
+            counts = ", ".join(f"{name} {value}" for name, value in sorted(item.run_counts.items()))
+            stale = "n/a" if item.stale_sessions is None else str(item.stale_sessions)
+            st.caption(f"Last FRED run: {counts or 'none'}; stale sessions {stale}")
+            for warning in item.warnings:
+                theme.status_badge(f"{item.series}: {warning}", "warning")
+        st.caption(
+            "This product uses the FRED® API but is not endorsed or certified "
+            "by the Federal Reserve Bank of St. Louis."
+        )
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -476,5 +499,6 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _sources_card(view.report)
         _survivorship_card(view.report)
         _statement_card(view.report)
+        _rates_card(view.report)
         _coverage_card(view.report, settings.coverage.check_enabled)
     _tables(view.report)

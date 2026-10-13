@@ -398,6 +398,54 @@ def test_before_the_first_reconciliation_cash_starts_from_starting_cash() -> Non
     assert ledger.cash == pytest.approx(2000.0 - 500.0 - 100.0 + 180.0)
 
 
+def test_fills_since_base_counts_the_fills_that_moved_cash() -> None:
+    """#1583, T183: `Ledger.fills_since_base` is how many fills moved the cash,
+    the multiplier the cash bound is built from."""
+    buy_later = _order(A, "buy", D8, attempt=2)
+    fills = [*FILLS, _fill(buy_later, 2, 30.0, fill_id=4)]  # known D8 21:00, after the base
+    ledger = _ledger(
+        fills, [*ORDERS, buy_later], reconciliation=_reconciliation(600.0, _utc(D5, 22))
+    )
+    # the D1 and D5 fills are inside the base (D5 22:00); only the D8 buy since it.
+    assert ledger.fills_since_base == 1
+    # A starting-cash base: every stated fill moved the cash.
+    assert _ledger(FILLS, ORDERS).fills_since_base == 3
+
+
+def test_fills_since_base_ignores_fills_stated_after_through() -> None:
+    """A fill stated after `through` is not applied, so it does not count (the
+    accessor hides a superseded fill the same way, so `from_journal` never sees
+    one)."""
+    buy_d9 = _order(A, "buy", D9, attempt=3)
+    fills = [*FILLS, _fill(buy_d9, 1, 30.0, fill_id=4)]
+    ledger = _ledger(
+        fills,
+        [*ORDERS, buy_d9],
+        reconciliation=_reconciliation(600.0, _utc(D5, 22)),
+        through=D8,
+    )
+    assert ledger.fills_since_base == 0
+
+
+def test_a_ledger_built_by_hand_has_no_fills_since_its_base() -> None:
+    assert Ledger(positions={}, cash=0.0, through=D9).fills_since_base == 0
+
+
+def test_a_fill_known_at_the_base_instant_is_not_since_the_base() -> None:
+    """The cash base keys on `known_at` strictly after the base's (#1583, Q11): a
+    fill known at exactly the instant the base row carries neither moves the cash
+    nor counts in `fills_since_base`."""
+    at = _utc(D5, 21)
+    buy_after = _order(A, "buy", D8, attempt=2)
+    # one fill known AFTER the base (counts), one EXACTLY at the base (does not)
+    fills = [
+        _fill(buy_after, 1, 30.0, fill_id=3, known_at=at),
+        _fill(buy_after, 2, 30.0, fill_id=4, known_at=_utc(D8, 21)),
+    ]
+    ledger = _ledger(fills, [*ORDERS, buy_after], reconciliation=_reconciliation(600.0, at))
+    assert ledger.fills_since_base == 1  # only the fill known strictly after the base
+
+
 def test_a_reconciliation_that_is_not_ok_is_refused() -> None:
     with pytest.raises(ValueError, match="ok"):
         _ledger(

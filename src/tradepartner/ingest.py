@@ -203,7 +203,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pyarrow as pa
 
-from tradepartner.adapters.edgar import duration_class
+from tradepartner.adapters.edgar import StatementConflict, duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -431,27 +431,52 @@ def ingest_rates(
                     f"{settings.rates.max_stale_sessions}"
                 )
             stored_rows = conn.execute(
-                "SELECT observation_date, value, known_at FROM rates WHERE series = ? "
-                "ORDER BY observation_date, known_at",
+                "SELECT observation_date, value, known_at, vintage_date FROM rates "
+                "WHERE series = ? ORDER BY observation_date, known_at",
                 [series],
             ).fetchall()
-            known_values = {(day, stamp): value for day, value, stamp in stored_rows}
-            latest_values = {day: value for day, value, _ in stored_rows}
+            known_values = {
+                (day, stamp): (value, vintage) for day, value, stamp, vintage in stored_rows
+            }
             added = revisions = future = late = collisions = 0
-            state.through = max((day for day, _, _ in stored_rows), default=None)
+            state.through = max((day for day, _, _, _ in stored_rows), default=None)
+            by_stamp: dict[tuple[date, datetime], RateObservation] = {}
             for record in state.fetched:
+                key = (record.observation_date, rate_known_at(record.vintage_date))
+                previous = by_stamp.get(key)
+                if previous is not None and previous.value != record.value:
+                    collisions += 1
+                if previous is None or record.vintage_date > previous.vintage_date:
+                    by_stamp[key] = record
+            for record in sorted(
+                by_stamp.values(),
+                key=lambda row: (
+                    row.observation_date,
+                    rate_known_at(row.vintage_date),
+                    row.vintage_date,
+                ),
+            ):
                 stamp = rate_known_at(record.vintage_date)
                 if stamp > now:
                     future += 1
                     continue
                 key = (record.observation_date, stamp)
-                if key in known_values:
-                    if known_values[key] != record.value:
+                existing = known_values.get(key)
+                if existing is not None:
+                    if existing[0] != record.value:
                         collisions += 1
                     continue
-                if latest_values.get(record.observation_date) == record.value:
+                in_effect = max(
+                    (
+                        (known_stamp, value)
+                        for (day, known_stamp), (value, _) in known_values.items()
+                        if day == record.observation_date and known_stamp <= stamp
+                    ),
+                    default=None,
+                )
+                if in_effect is not None and in_effect[1] == record.value:
                     continue
-                if record.observation_date in latest_values:
+                if any(day == record.observation_date for day, _ in known_values):
                     revisions += 1
                 stamp_lag = max(
                     0, bisect_right(sessions, expected) - bisect_right(sessions, stamp.date())
@@ -472,8 +497,7 @@ def ingest_rates(
                         "provenance": "release",
                     },
                 )
-                known_values[key] = record.value
-                latest_values[record.observation_date] = record.value
+                known_values[key] = (record.value, record.vintage_date)
                 state.through = max(
                     state.through or record.observation_date, record.observation_date
                 )
@@ -1908,17 +1932,21 @@ def _derived_candidates(
 
 class _ConflictIndex:
     """The source's `statement_conflict_keys` as `ConflictKey`s, indexed as
-    the list grows (each per-CIK read restores its CIK's entries; a source
-    without the attribute has none)."""
+    the list grows (each per-CIK read restores its CIK's entries, assigning a
+    fresh list when the read changed them -- #1566: a shrink alone missed an
+    equal-length restore; a source without the attribute has none)."""
 
     def __init__(self, source: FilingSource) -> None:
         self._source = source
         self._keys: set[ConflictKey] = set()
+        self._listed: Sequence[StatementConflict] = ()
         self._seen = 0
 
     def keys(self) -> set[ConflictKey]:
         listed = getattr(self._source, "statement_conflict_keys", ())
-        if len(listed) < self._seen:  # the list was replaced or cleared: re-index
+        if listed is not self._listed or len(listed) < self._seen:
+            # a fresh list (a per-CIK read restored its entries) or a shorter one:
+            # index from the start again
             self._keys.clear()
             self._seen = 0
         for conflict in listed[self._seen :]:
@@ -1926,6 +1954,7 @@ class _ConflictIndex:
                 (conflict.accession, conflict.fact_name, conflict.period_end, conflict.period_days)
             )
         self._seen = len(listed)
+        self._listed = listed
         return self._keys
 
 

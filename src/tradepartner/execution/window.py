@@ -778,6 +778,17 @@ def start(
         _refuse_account_in_use(account.account_id, other_accounts)
         open_orders = broker.open_orders()
         positions = broker.positions()
+        # The booked-`FEE` seen-set `paper start` records (#1583, T183, spec item
+        # 1): every non-trade cash activity from the day before the window's New
+        # York start date, read after `account()` so every fee inside
+        # `starting_cash` the read can see is in the set.
+        try:
+            activities = broker.cash_activities(today - timedelta(days=1))
+        except Exception as exc:
+            raise StartRefusedError(
+                "activities_unavailable",
+                f"cash_activities() failed on the paper endpoint ({type(exc).__name__})",
+            ) from exc
         tolerance = settings.risk.reconcile_quantity_tolerance
 
         plan = _check_flat(
@@ -811,6 +822,10 @@ def start(
             frozen_json=frozen_json,
             frozen_sha256=frozen_sha256,
             book_id=book,
+            # Every activity id `paper start` read, so a `FEE` dated on or before
+            # the start is inside the base and never booked; it is a DB column,
+            # not part of `frozen_json` or its hash (#1583, T183).
+            activities_seen_json=json.dumps(sorted({a.activity_id for a in activities})),
             known_at=now,
             ingested_at=now,
         )

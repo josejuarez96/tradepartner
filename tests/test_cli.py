@@ -862,6 +862,23 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert checked.exit_code == 0, checked.output
 
 
+def test_health_check_enforces_rate_stamp_and_passes_fixture(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """The rates stamp rule is enforced by the CLI's --check exit code."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    passing = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert passing.exit_code == 0, passing.output
+    with open_for_write(settings) as conn:
+        conn.execute(
+            "UPDATE rates SET known_at = known_at - INTERVAL '1 hour' "
+            "WHERE observation_date = '2020-06-26'"
+        )
+    failed = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "rates_known_at_from_vintage" in failed.output
+
+
 def test_health_reports_the_coverage_block_not_computed_by_default(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:
