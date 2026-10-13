@@ -2,6 +2,8 @@
 
 from datetime import UTC, date, datetime
 
+import pytest
+
 from tradepartner.adapters.filings import FilenameListing
 from tradepartner.store.filename_listings import (
     ClassTicker,
@@ -150,3 +152,41 @@ def test_deny_list_applies_to_form25_exhibit_too() -> None:
 def test_filing_at_first_cover_acceptance_is_outside_window() -> None:
     cover_at = datetime(2016, 3, 1, tzinfo=UTC)
     assert decide(filing("ABC", 2016), first_cover_at=cover_at) == ()
+
+
+def test_earlier_prefix_does_not_rescue_later_different_prefix() -> None:
+    result = decide(
+        filing("HRI", 2016),
+        filing("HTZ", 2017),
+        cover=(reading(("HRI", "class-a")),),
+    )
+    assert result[1].verdict == "refused_contradicted"
+
+
+def test_rename_must_match_every_differing_independent_reading() -> None:
+    result = decide(
+        filing("ABC", 2016),
+        filing("XYZ", 2017),
+        cover=(reading(("XYZ", "class-x")),),
+        exhibits=(reading(("QRS", "class-q")),),
+    )
+    assert result[0].verdict == "refused_contradicted"
+
+
+def test_same_ticker_on_two_classes_fails_closed() -> None:
+    with pytest.raises(ValueError, match="conflicting class assignment for ABC"):
+        decide(
+            filing("ABC", 2016),
+            cover=(reading(("ABC", "class-a")),),
+            exhibits=(reading(("ABC", "class-b")),),
+        )
+
+
+def test_first_cover_filing_alone_confirms_precover_fb() -> None:
+    result = decide(
+        filing("FB", 2016),
+        filing("FB", 2017),
+        cover=(reading(("FB", "class-fb")),),
+        cover_prefix="FB",
+    )
+    assert [item.verdict for item in result] == ["confirmed", "confirmed"]

@@ -74,6 +74,10 @@ def confirm_filename_listings(
     security's 10-K readings, including their own ``dei_symbol`` tags. Cover
     and exhibit readings may name several classes each; the first cover
     filing's *instance prefix* is a later prefix, not an independent reading.
+    The caller passes only the CIK's first cover-page filing as
+    ``cover_readings``; later cover pages cannot contradict a pre-cover
+    prefix. A ticker assigned to two class ids fails closed because the rule
+    cannot choose which security receives the listing.
     The result is sorted by acceptance and accession, independent of input
     order. A refused verdict has no class assignment because it writes no row.
     """
