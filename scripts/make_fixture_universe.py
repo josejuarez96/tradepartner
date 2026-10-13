@@ -46,6 +46,7 @@ raw EDGAR/Alpaca payloads, so it owns no adapter or schema logic itself.
 from __future__ import annotations
 
 import csv
+import json
 import random
 import sys
 from dataclasses import dataclass, field
@@ -2890,6 +2891,92 @@ def write_fixtures(output_dir: Path) -> None:
         rows.rate_readme_cases,
         rows.borrow_readme_cases,
     )
+    (output_dir / "filename_cases.json").write_text(
+        json.dumps(_filename_cases(), indent=2, sort_keys=True) + "\n"
+    )
+
+
+def _filename_cases() -> list[dict[str, object]]:
+    """Isolated #1597 adapter inputs; the existing store CSVs stay pinned."""
+
+    def reading(
+        form: str, day: str, ticker: str, exchange: str | None, tag: str | None = None
+    ) -> dict[str, object]:
+        return {
+            "form": form,
+            "accepted_at": f"{day}T20:30:00+00:00",
+            "ticker": ticker,
+            "exchange": exchange,
+            "dei_symbol": tag,
+        }
+
+    return [
+        {
+            "case": "survivor_three_10ks",
+            "cik": "0000099991",
+            "readings": [
+                reading("10-K", "2015-03-02", "SURV", "NYSE", "SURV"),
+                reading("10-K", "2016-03-01", "SURV", "NYSE", "SURV"),
+                reading("10-K", "2017-03-01", "SURV", "NYSE", "SURV"),
+            ],
+            "cover": {
+                "accepted_at": "2019-03-01T20:30:00+00:00",
+                "ticker": "SURV",
+                "exchange": "NYSE",
+            },
+        },
+        {
+            "case": "nasdaq_delister",
+            "cik": "0000099992",
+            "readings": [
+                reading("10-K", "2016-03-01", "NDEL", "NASDAQ"),
+                reading("25-NSE", "2018-06-01", "NDEL", "NASDAQ"),
+            ],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "nasdaq_fallback",
+            "cik": "0000099993",
+            "readings": [reading("25-NSE", "2018-06-01", "FALL", "NASDAQ")],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "nyse_single_reading",
+            "cik": "0000099994",
+            "readings": [reading("10-K", "2016-03-01", "NSNG", "NYSE")],
+        },
+        {
+            "case": "transfer",
+            "cik": "0000099995",
+            "readings": [
+                reading("10-K", "2016-03-01", "TRAN", "NYSE", "TRAN"),
+                reading("10-K", "2018-12-03", "TRAN", "NASDAQ", "TRAN"),
+            ],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NYSE",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "unmatched_exchange",
+            "cik": "0000099996",
+            "readings": [reading("10-K", "2016-03-01", "MISS", "NYSE", "MISS")],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+    ]
 
 
 def main(argv: list[str]) -> int:
