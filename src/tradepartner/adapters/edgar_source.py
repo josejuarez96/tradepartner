@@ -2480,12 +2480,17 @@ class EdgarFilingSource(FilingSource):
         # a conflict a same-run refresh resolved no longer withholds the derived
         # gross profit its accession would otherwise carry.
         previous_keys = self._statement_conflict_keys.get(cik, ())
+        self._statement_conflict_keys[cik] = tuple(conflicts)
         if set(previous_keys) != set(conflicts):
-            listed = set(self.statement_conflict_keys)
-            listed.difference_update(previous_keys)
-            listed.update(conflicts)
-            self.statement_conflict_keys = list(listed)
-            self._statement_conflict_keys[cik] = tuple(conflicts)
+            # #1566: the run's list is rebuilt from the per-CIK map, so a key two
+            # CIKs list stays while either CIK's final read carries it -- the
+            # refresh that resolves it for one must not drop it for the other,
+            # whose withheld key it still is -- in first-read order.
+            self.statement_conflict_keys = list(
+                dict.fromkeys(
+                    key for keys in self._statement_conflict_keys.values() for key in keys
+                )
+            )
         return records
 
     def _statement_cache_path(self, cik: str) -> Path:

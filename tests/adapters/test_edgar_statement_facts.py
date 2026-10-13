@@ -790,8 +790,8 @@ def test_a_same_run_refresh_leaves_no_resolved_conflict_key(tmp_path: Path) -> N
     """#1566: the write phase's read restores what this CIK lists exactly as it
     restores its counts, so a conflict the refreshed stamps resolve (a moved
     acceptance drops it at read time) leaves `statement_conflict_keys`: the keys
-    are the final read's, never the union of the run's reads, and a key that
-    disappeared goes on withholding the derived gross profit its accession would
+    are the final read's, never the union of the run's reads, so a key that
+    disappeared no longer withholds the derived gross profit its accession would
     otherwise carry."""
     settings = _settings(tmp_path)
     source = _adapter(settings, _router(**{f"c{CIK}": _conflicted()}))
@@ -809,6 +809,53 @@ def test_a_same_run_refresh_leaves_no_resolved_conflict_key(tmp_path: Path) -> N
     assert refreshed  # LATE's unstamped entry still arrives, for the hold rule
     assert source.statement_conflicts == 0  # the count follows the final read
     assert source.statement_conflict_keys == []  # #1566: and so do the keys
+
+
+def test_a_key_two_ciks_list_survives_one_ciks_refresh(tmp_path: Path) -> None:
+    """#1566: the run's list is rebuilt from the per-CIK map, so a key two CIKs'
+    payloads carry stays while either CIK's final read lists it. The refresh that
+    resolves it for one CIK does not drop it for the other, whose final payload
+    still withholds the derived gross profit of that accession (failing open
+    would write the row)."""
+    shared = "0000123456-23-000002"  # an accession both payloads carry
+
+    def conflicted_body(cik: str) -> dict[str, Any]:
+        return _company(
+            cik,
+            {
+                "Revenues": {
+                    "USD": [
+                        entry(shared, FY2022, 300, filed="2023-02-24"),
+                        entry(shared, FY2022, 301, filed="2023-02-24"),  # the shared key
+                    ]
+                },
+                "Assets": {"USD": [entry(K2022, "2022-12-31", 900, filed="2023-02-24")]},
+            },
+        )
+
+    other = "0000654321"
+    stamps = {shared: ("10-K", datetime(2023, 2, 24, 21, 30, tzinfo=UTC))}
+    settings = _settings(tmp_path)
+    source = _adapter(
+        settings,
+        _router(**{f"c{CIK}": conflicted_body(CIK), f"c{other}": conflicted_body(other)}),
+    )
+    _stamps(source, CIK, stamps)
+    _stamps(source, other, stamps)
+    source.statement_facts(CIK)
+    source.statement_facts(other)
+    conflict = StatementConflict(
+        shared, "revenue", date(2022, 1, 1), date(2022, 12, 31), (300, 301)
+    )
+    assert source.statement_conflict_keys == [conflict]  # listed once for both CIKs
+    assert source.statement_conflicts == 2  # one per CIK's read
+    # CIK's refresh: its stamp moves before the period's end, so its read resolves
+    # the conflict; the other CIK's final read still carries it, so the key stays
+    _stamps(source, CIK, {shared: ("10-K", datetime(2022, 6, 1, 12, tzinfo=UTC))})
+    source.statement_facts(CIK)
+    assert source.requests == 2  # one per CIK, the refresh reads the cache file
+    assert source.statement_conflicts == 1
+    assert source.statement_conflict_keys == [conflict]
 
 
 def test_a_late_stamp_applies_on_the_next_read_with_no_request(tmp_path: Path) -> None:

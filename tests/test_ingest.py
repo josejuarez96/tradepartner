@@ -3361,10 +3361,11 @@ class _StatementSource(FixtureFilingSource):
         previous = self._listed.get(cik, ())
         self._listed[cik] = tuple(conflicts)
         if set(previous) != set(conflicts):
-            listed = set(self.statement_conflict_keys)
-            listed.difference_update(previous)
-            listed.update(conflicts)
-            self.statement_conflict_keys = list(listed)
+            # mirror the adapter's #1566 rebuild: the run's list comes from the
+            # per-CIK map, so a key two CIKs list stays while either CIK carries it
+            self.statement_conflict_keys = list(
+                dict.fromkeys(key for keys in self._listed.values() for key in keys)
+            )
         # the count follows each CIK's latest read, as the adapter's delta does
         self.statement_conflicts = sum(len(items) for items in self._listed.values())
         return super().statement_facts(cik)
