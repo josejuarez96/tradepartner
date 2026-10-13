@@ -506,3 +506,17 @@ def test_palettes_follow_the_design_standard() -> None:
     assert light.series == ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
     assert dark.series == ("#3987e5", "#d95926", "#199e70", "#c98500")
     assert (light.critical, light.critical_bg) == ("#b23f36", "#f7dedb")
+
+
+def test_rates_card_shows_fixture_and_fred_attribution(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    text = _text(at)
+    assert "Rates" in text
+    assert "DTB3" in text
+    assert "revised keys" in text
+    assert (
+        "This product uses the FRED® API but is not endorsed or certified "
+        "by the Federal Reserve Bank of St. Louis." in text
+    )
