@@ -246,6 +246,48 @@ class FilingEvent:
         _utc(self, "accepted_at")
 
 
+@dataclass(frozen=True)
+class FilenameListing:
+    """One listing name read from a filing's own files (amendment 2026-10-12,
+    #1597): a 10-K's XBRL instance file-name prefix, its Section 12(b)
+    table's class and exchange, and a Nasdaq Form 25's exhibit ticker — the
+    listing evidence a filing carries before any cover page tags it.
+
+    `ticker` is the prefix as the filing spells it, not a symbol: amendment
+    #844's symbol rule reads it (or refuses it), and the store writes only a
+    name that rule accepts. `exchange` is the same code `normalize_exchange`
+    gives a cover page or a Form 25, so a Form 25 reading matches it; it is
+    `None` when the filing names no exchange (a 10-K with no Section 12(b)
+    table, or a table naming none).
+
+    `valid_from` is the session the row's span would start on (the
+    acceptance's New York date for a 10-K; the security's first session by
+    #974's rule for a Form 25), and `accepted_at` the filing's own stamped
+    SEC acceptance — never the read time. `class_title` names the class the
+    reading belongs to, `dei_symbol` the same filing's own
+    `dei:TradingSymbol`, both `None` when the filing states neither; the
+    confirmation rule (T184c) compares them against `ticker`.
+    """
+
+    cik: str
+    accession: str
+    form: str
+    accepted_at: datetime
+    valid_from: date
+    ticker: str
+    exchange: str | None
+    class_title: str | None
+    dei_symbol: str | None
+
+    def __post_init__(self) -> None:
+        _check_cik(self.cik)
+        if not isinstance(self.ticker, str) or not self.ticker.strip():
+            raise ValueError("ticker must be a non-blank string, the filing's own prefix")
+        _utc(self, "accepted_at")
+        if not isinstance(self.valid_from, date) or isinstance(self.valid_from, datetime):
+            raise TypeError(f"valid_from must be a date, got {self.valid_from!r}")
+
+
 class FilingSource(abc.ABC):
     """Filing data, as parsed records (spec "Interfaces").
 
@@ -309,4 +351,22 @@ class FilingSource(abc.ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not answer filing_events yet (#1358: the EDGAR "
             "answer is T164c, the ingest proxy T164e)"
+        )
+
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        """Listing names read from `cik`'s filings (amendment 2026-10-12,
+        #1597): one `FilenameListing` per reading a filing of `cik` carries,
+        sorted by `accepted_at`, then accession, then `ticker`.
+
+        Not abstract, for the same reason as `filing_events`: the EDGAR
+        adapter's answer is T184b's, the confirmation rule T184c's and the
+        write T184e's, and the security master asks this only while
+        `edgar.filename_listings` is on (default off), so an adapter
+        without an answer refuses loudly here rather than answering an
+        empty list. Every record's `accepted_at` is a filing's own
+        acceptance, never the read time, so a store built from it carries
+        no look-ahead beyond the filings themselves."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not answer filename_listings yet (#1597: the EDGAR "
+            "answer is T184b, the confirmation rule T184c, the write T184e)"
         )

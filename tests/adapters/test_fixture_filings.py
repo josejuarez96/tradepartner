@@ -15,6 +15,7 @@ from tradepartner.adapters.filings import (
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
@@ -416,3 +417,105 @@ def test_an_adapter_without_an_answer_refuses_filing_events() -> None:
 
     with pytest.raises(NotImplementedError, match="filing_events"):
         _Bare().filing_events(CIK)
+
+
+# --- filing-name listings (#1597, T184) -------------------------------------
+
+
+def _fixture_listings() -> list[FilenameListing]:
+    """Three readings for three CIKs: a 10-K prefix whose exchange the
+    filing's Section 12(b) table names, one with no exchange at all, and a
+    Form 25-NSE exhibit ticker."""
+    return [
+        FilenameListing(
+            cik="0001000011",
+            accession="0001000011-17-000001",
+            form="10-K",
+            accepted_at=datetime(2017, 3, 1, 20, 30, tzinfo=UTC),
+            valid_from=date(2017, 3, 1),
+            ticker="AMD",
+            exchange="NASDAQ",
+            class_title="Common Stock, $0.01 par value",
+            dei_symbol=None,
+        ),
+        FilenameListing(
+            cik="0001000011",
+            accession="0001000011-18-000001",
+            form="10-K",
+            accepted_at=datetime(2018, 3, 1, 20, 30, tzinfo=UTC),
+            valid_from=date(2018, 3, 1),
+            ticker="MIND",
+            exchange=None,
+            class_title=None,
+            dei_symbol="MIND",
+        ),
+        FilenameListing(
+            cik=OTHER,
+            accession="0000789019-17-000002",
+            form="25-NSE",
+            accepted_at=datetime(2017, 11, 1, 20, 30, tzinfo=UTC),
+            valid_from=date(2017, 11, 2),
+            ticker="spdc",
+            exchange="NASDAQ",
+            class_title="Common Stock, $0.01 par value per share",
+            dei_symbol=None,
+        ),
+    ]
+
+
+def test_filename_listing_keeps_the_filings_own_stamp_and_valid_from() -> None:
+    listing = _fixture_listings()[0]
+    assert (listing.cik, listing.ticker, listing.exchange) == ("0001000011", "AMD", "NASDAQ")
+    assert (listing.accepted_at, listing.valid_from) == (T1.replace(year=2017), date(2017, 3, 1))
+    # The same ticker on two filings is two records, never one.
+    assert [listing.accession for listing in _fixture_listings()[:2]] == [
+        "0001000011-17-000001",
+        "0001000011-18-000001",
+    ]
+
+
+def test_filename_listing_refuses_a_blank_prefix_and_a_bad_cik() -> None:
+    stamp = datetime(2017, 3, 1, 20, 30, tzinfo=UTC)
+    naive = datetime(2017, 3, 1, 20, 30)  # noqa: DTZ001
+    with pytest.raises(ValueError):
+        FilenameListing(CIK, "a1", "10-K", stamp, date(2017, 3, 1), "", "NASDAQ", None, None)
+    with pytest.raises(ValueError):
+        FilenameListing("320193", "a1", "10-K", stamp, date(2017, 3, 1), "AAPL", None, None, None)
+    with pytest.raises(ValueError):
+        FilenameListing(CIK, "a1", "10-K", naive, date(2017, 3, 1), "AAPL", None, None, None)
+    # A datetime is a `date`, so `valid_from` must be checked against it:
+    # it is the session a span starts on, never an instant.
+    with pytest.raises(TypeError):
+        FilenameListing(CIK, "a1", "10-K", stamp, naive, "AAPL", None, None, None)
+
+
+def test_the_fixture_source_answers_filename_listings_per_cik_and_sorted() -> None:
+    listings = _fixture_listings()
+    source = FixtureFilingSource(filename_listings=[listings[2], listings[1], listings[0]])
+    assert source.filename_listings("0001000011") == [listings[0], listings[1]]
+    assert [listing.ticker for listing in source.filename_listings(OTHER)] == ["spdc"]
+    assert source.filename_listings(CIK) == []
+
+
+def test_known_by_keeps_only_filename_listings_knowable_at_t() -> None:
+    listings = _fixture_listings()
+    source = FixtureFilingSource(filename_listings=listings)
+    second = listings[1].accepted_at
+    at_second = source.known_by(second).filename_listings("0001000011")
+    assert [listing.ticker for listing in at_second] == ["AMD", "MIND"]
+    earlier = second - timedelta(seconds=1)
+    before = source.known_by(earlier).filename_listings("0001000011")
+    assert [listing.ticker for listing in before] == ["AMD"]
+    assert second in source.known_ats()
+
+
+def test_an_adapter_without_an_answer_refuses_filename_listings() -> None:
+    """The question is not abstract (the EDGAR answer is T184b's, the
+    confirmation rule T184c's): an adapter that does not answer it raises
+    rather than answering an empty list."""
+
+    class _Bare(FixtureFilingSource):
+        filename_listings = FilingSource.filename_listings
+
+    with pytest.raises(NotImplementedError, match="filename_listings"):
+        _Bare().filename_listings(CIK)
