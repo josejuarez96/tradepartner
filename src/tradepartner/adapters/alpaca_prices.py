@@ -74,7 +74,13 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
   history under its new symbol as well (#104), so rows under that ticker
   on the old holder's dates may be the renamed company's. They resolve to
-  nothing and are reported, never assigned; `contested_spans` lists them;
+  nothing and are reported, never assigned; `contested_spans` lists them.
+  Only a span still live when the renamer's span starts is contested
+  (#1696): a span that ended before it (Paramount's `PARA`, delisted in
+  2025, then Banzai's `BNZI -> PARA` in 2026) is asked with `asof` inside
+  its own span (**Asof per span**), and a row is kept only from the
+  request made for the security it resolves to, so today's holder's
+  copied history never fills it;
 - across companies, a span that starts while another company's span of
   the ticker is live (the holder) is a **claim** unless the holder has
   left by the claimant's start (#793). `RegistrantEvidence` (from the
@@ -208,8 +214,12 @@ window's end asks whether Alpaca knows the company at all: if it does, the
 empty window stands (the company had stopped trading, a span that ends
 late); if not (DAVE, AMCI, MBC, STRN, SMLR in #1314 and #1311), the symbol
 falls back to the request without `asof`, as before the fix, and is named
-on `resolution_summary`. The `asof` day only picks the company; a bar's
-`known_at` stays its session's close.
+on `resolution_summary`. Never for a span that a later renamer of another
+company took the ticker after (#1696, `ListingResolver.renamed_after`):
+without `asof` Alpaca serves the renamer's copied history there, the rows
+the contested rule kept out before it was made time-aware; such a symbol
+stores nothing and is named on `resolution_summary` too. The `asof` day
+only picks the company; a bar's `known_at` stays its session's close.
 
 **Filing-name spans (#1597).** A listing row read from a filing's own file
 names (`provenance = 'filing_name'`, `store.master`) is a filing row of its
@@ -1026,6 +1036,7 @@ class ListingResolver:
             if any(
                 other.security_id != span.security_id
                 and other.start > span.start
+                and (span.end is None or other.start < span.end)  # #1696: overlapping only
                 and self._renamed_into(other)
                 for other in (*spans, *(d for d in duplicated if d.ticker == span.ticker))
             )
@@ -1498,6 +1509,24 @@ class ListingResolver:
         ):
             return _CO_REGISTRANT, until
         return _DISPUTED, until
+
+    def renamed_after(self, security_id: str, ticker: str) -> bool:
+        """True when another security arrived at `ticker` through a rename
+        after one of `security_id`'s assigned spans of it started (#1696):
+        a span the contested rule no longer covers once it ended first, so
+        a request without `asof` would serve the renamer's history there."""
+        own = [
+            span
+            for span in self._by_security.get(security_id, [])
+            if span.ticker == ticker and self._assigned(span)
+        ]
+        return any(
+            other.security_id != security_id
+            and other.start > span.start
+            and self._renamed_into(other)
+            for span in own
+            for other in self._by_ticker.get(ticker, [])
+        )
 
     def _renamed_into(self, span: TickerSpan) -> bool:
         """True if `span`'s security traded under another ticker before it."""
@@ -2509,6 +2538,7 @@ class AlpacaPriceSource(PriceSource):
         self.last_excluded_symbols: tuple[str, ...] = ()
         self.last_filename_collisions: tuple[str, ...] = ()
         self.last_asof_fallbacks: tuple[str, ...] = ()
+        self.last_asof_refused: tuple[str, ...] = ()  # #1696: no fallback after a renamer
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -2551,6 +2581,7 @@ class AlpacaPriceSource(PriceSource):
         touches it: `last_filename_collisions` lists it once per run."""
         self.last_bars_report = None
         self.last_asof_fallbacks = ()
+        self.last_asof_refused = ()
         self.last_filename_collisions = ()
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
@@ -2587,6 +2618,7 @@ class AlpacaPriceSource(PriceSource):
                     filings.setdefault((security_id, symbol), []).extend(collided)
         fetched: list[Fetched] = []
         fallbacks: set[str] = set()
+        refused: set[str] = set()
         collisions: list[str] = []
         for day, owners in sorted(dated.items()):
             payload = self._fetch_bars(sorted(owners), start, end, asof=day)
@@ -2603,6 +2635,9 @@ class AlpacaPriceSource(PriceSource):
                         security_id, symbol, since[(security_id, symbol)], end, day
                     ):
                         continue
+                    if self._resolver.renamed_after(security_id, symbol):
+                        refused.add(symbol)  # #1696: the renamer's copies, never its own
+                        continue
                     plain[symbol].add(security_id)
                     fallbacks.add(symbol)
         if plain:
@@ -2611,6 +2646,7 @@ class AlpacaPriceSource(PriceSource):
                 (self._fetch_bars(sorted(plain), start, end), plain, self._resolver.resolve)
             )
         self.last_asof_fallbacks = tuple(sorted(fallbacks))
+        self.last_asof_refused = tuple(sorted(refused))
         self.last_filename_collisions = tuple(collisions)
         payload, decided = _own_rows(fetched, self._resolver.lead)
 
@@ -2709,6 +2745,12 @@ class AlpacaPriceSource(PriceSource):
         if self.last_asof_fallbacks:
             named = ", ".join(self.last_asof_fallbacks)
             line += f"; {len(self.last_asof_fallbacks)} symbol(s) asked without asof: {named}"
+        if self.last_asof_refused:
+            named = ", ".join(self.last_asof_refused)
+            line += (
+                f"; {len(self.last_asof_refused)} symbol(s) unknown at asof and taken "
+                f"by a later renamer, nothing stored: {named}"
+            )
         if self.last_filename_collisions:
             named = ", ".join(self.last_filename_collisions)
             line += f"; {len(self.last_filename_collisions)} colliding filing_name span(s): {named}"

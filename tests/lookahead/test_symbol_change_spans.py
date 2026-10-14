@@ -68,3 +68,47 @@ def test_a_change_known_after_t_bounds_nothing_at_t(settings: Settings) -> None:
     assert known.resolve("PKI", day) is None
     assert known.resolve("RVTY", day) == PKI
     assert known.report.symbol_changes_followed == 1
+
+
+def _listing_row(sid: str, ticker: str, valid_from: date, known: datetime) -> dict[str, object]:
+    return {
+        "security_id": sid,
+        "ticker": ticker,
+        "exchange": "NASDAQ",
+        "class_title": "Class B Common Stock",
+        "valid_from": valid_from,
+        "known_at": known,
+        "ingested_at": known,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def test_a_later_rename_never_changes_an_earlier_read(settings: Settings) -> None:
+    """#1696: a rename into a ticker known only later (Banzai's BNZI -> PARA,
+    2026) never changes how the resolver read the ticker's earlier, ended
+    span (Paramount's PARA) before that rename was known, nor after."""
+    paramount, banzai = "0000813828:class-b-common-stock", "0001826011:class-a-common-stock"
+    early = datetime(2025, 9, 2, 21, tzinfo=UTC)
+    late = datetime(2026, 8, 14, 21, tzinfo=UTC)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        for row in (
+            _listing_row(
+                paramount, "VIAC", date(2020, 2, 20), datetime(2020, 2, 20, 21, tzinfo=UTC)
+            ),
+            _listing_row(paramount, "PARA", date(2022, 5, 3), datetime(2022, 5, 3, 21, tzinfo=UTC)),
+            _listing_row(paramount, "N/A", date(2025, 8, 17), early),
+            _listing_row(banzai, "BNZI", date(2024, 4, 1), datetime(2024, 4, 1, 21, tzinfo=UTC)),
+            _listing_row(banzai, "PARA", date(2026, 8, 7), late),
+        ):
+            insert_row(conn, "listings", row)
+    days = [date(2022, 5, 3), date(2023, 6, 1), date(2025, 8, 15)]
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        before = store_resolver(conn, late - timedelta(seconds=1), settings)
+        after = store_resolver(conn, late, settings)
+    assert after.resolve("PARA", date(2026, 9, 1)) == banzai  # the rename is known
+    assert before.resolve("PARA", date(2026, 9, 1)) is None
+    for day in days:
+        assert before.resolve("PARA", day) == paramount
+        assert after.resolve("PARA", day) == before.resolve("PARA", day)

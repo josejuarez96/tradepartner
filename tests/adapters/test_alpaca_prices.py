@@ -2380,7 +2380,7 @@ class TestRenameLead:
                 _listing(sid, "OLD", START, "Common Stock"),
                 _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
                 _listing(other, "XO", START, "Common Stock"),
-                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+                _listing(other, "OLD", date(2022, 6, 20), "Common Stock"),  # live: #1696
             ],
             rename_lead_days=400,
         )
@@ -2599,7 +2599,7 @@ class TestFirstSpanLead:
                 _listing(sid, "OLD", START, "Common Stock"),
                 _listing(sid, "NEWT", date(2022, 7, 1), "Common Stock"),
                 _listing(other, "XO", START, "Common Stock"),
-                _listing(other, "OLD", date(2023, 1, 3), "Common Stock"),
+                _listing(other, "OLD", date(2022, 6, 20), "Common Stock"),  # live: #1696
             ],
             rename_lead_days=400,
             first_sessions={sid: self.FIRST, other: self.FIRST},
@@ -3518,7 +3518,7 @@ class TestAlpacaSymbols:
         for spelling in ("META", "META ", "meta"):
             listings = [
                 _listing("SEC_X", spelling, START),
-                _listing("SEC_X", "XNEW", date(2020, 9, 1)),
+                _listing("SEC_X", "XNEW", date(2020, 11, 2)),  # live at the rename (#1696)
                 _listing("SEC_FB", "FB", START),
                 _listing("SEC_FB", "META", date(2020, 10, 1)),
             ]
@@ -3872,6 +3872,29 @@ class TestAsofPerSpan:
         assert all(call[3] is not None for call in alpaca.calls)
         assert source.bars([self.OLD], late[0], late[-1]) == []  # served once: no new probe
         assert len(alpaca.calls) == 3
+
+    def test_no_fallback_for_a_span_a_later_renamer_took_the_ticker_after(self) -> None:
+        # #1696: OLD's VAL span ended before NEW renamed into VAL, so it is
+        # not contested; when asof names no company, a request without asof
+        # would serve NEW's copied history on OLD's dates: nothing is stored.
+        listings = [
+            _listing(self.OLD, "VAL", self.SPAN),
+            _listing(self.OLD, "N/A", date(2017, 12, 1)),  # OLD's VAL span ends
+            _listing(self.NEW, "VALX", self.SPAN),
+            _listing(self.NEW, "VAL", self.TAKEN),  # a rename into VAL
+        ]
+        alpaca = self._alpaca()
+        del alpaca.holders[("VAL", self.SPAN)]
+        source = self._source(alpaca, listings)
+        assert source._resolver.contested_spans == ()
+        assert source.bars([self.OLD], self.DAYS[0], self.DAYS[-1]) == []
+        assert all(call[3] is not None for call in alpaca.calls)  # never asked without asof
+        assert "1 symbol(s) unknown at asof and taken by a later renamer" in (
+            source.resolution_summary()
+        )
+        alpaca.holders[("VAL", self.SPAN)] = "valspar"  # Alpaca knows it: its own bars
+        bars = self._source(alpaca, listings).bars([self.OLD], self.DAYS[0], self.DAYS[-1])
+        assert [(b.security_id, b.close) for b in bars] == [(self.OLD, 110.0)] * 3
 
     def test_the_resolver_names_no_asof_for_the_latest_open_span(self) -> None:
         resolver = ListingResolver(self.LISTINGS)
@@ -4593,3 +4616,52 @@ class TestSymbolChangesBoundSpans:
         assert resolver.resolve("RVT.B", self.RENAME) == self.PKI
         spans = [s for s in resolver._by_security[self.PKI] if s.ticker == "RVT.B"]
         assert [(s.start, s.end) for s in spans] == [(self.RENAME, None)]  # one span
+
+
+class TestContestIsTimeAware:
+    """#1696 (#1682 E2, PARA): a later rename into a ticker contests only a
+    span still live when the renamer's span starts."""
+
+    PARAMOUNT = "0000813828:class-b-common-stock"
+    BANZAI = "0001826011:class-a-common-stock"
+    TITLE = "Class B Common Stock"
+
+    def _listings(self, end: date | None = date(2025, 8, 17)) -> list[dict[str, object]]:
+        rows = [
+            _listing(self.PARAMOUNT, "VIAC", date(2020, 2, 20), self.TITLE),
+            _listing(self.PARAMOUNT, "PARA", date(2022, 5, 3), self.TITLE),
+            _listing(self.BANZAI, "BNZI", date(2024, 4, 1), "Class A common stock"),
+            _listing(self.BANZAI, "PARA", date(2026, 8, 7), "Class A common stock"),
+        ]
+        if end is not None:  # Paramount's PARA span ends (the 2025 delisting)
+            rows.append(_listing(self.PARAMOUNT, "N/A", end, self.TITLE))
+        return rows
+
+    def test_an_ended_span_is_not_contested_by_a_later_rename(self) -> None:
+        resolver = ListingResolver(self._listings())
+        assert resolver.contested_spans == ()
+        assert resolver.resolve("PARA", date(2023, 6, 1)) == self.PARAMOUNT
+        assert resolver.resolve("PARA", date(2025, 9, 2)) is None  # between the two
+        assert resolver.resolve("PARA", date(2026, 9, 1)) == self.BANZAI
+        assert resolver.renamed_after(self.PARAMOUNT, "PARA")
+        assert not resolver.renamed_after(self.BANZAI, "PARA")
+        assert resolver.asof(self.PARAMOUNT, "PARA", 7) == date(2022, 5, 10)
+
+    def test_a_span_live_at_the_rename_stays_contested(self) -> None:
+        resolver = ListingResolver(self._listings(end=None))
+        [span] = resolver.contested_spans
+        assert (span.security_id, span.ticker) == (self.PARAMOUNT, "PARA")
+        assert resolver.resolve("PARA", date(2023, 6, 1)) is None
+
+    def test_a_span_ending_after_the_rename_starts_stays_contested(self) -> None:
+        resolver = ListingResolver(self._listings(end=date(2026, 9, 1)))
+        assert len(resolver.contested_spans) == 1
+        assert resolver.resolve("PARA", date(2023, 6, 1)) is None
+
+    def test_the_rename_lead_and_the_change_now_reach_paramount(self) -> None:
+        change = _change(self.PARAMOUNT, "VIAC", "PARA", date(2022, 2, 17))
+        resolver = ListingResolver(self._listings(), rename_lead_days=400, symbol_changes=[change])
+        assert resolver.report.symbol_changes_followed == 1
+        assert resolver.report.symbol_changes_refused == 0
+        assert resolver.resolve("PARA", date(2022, 2, 17)) == self.PARAMOUNT
+        assert resolver.resolve("VIAC", date(2022, 2, 17)) is None
