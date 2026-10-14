@@ -1831,10 +1831,34 @@ class TestRealSplitContextShapes:
         ("Common Stock Purchase Warrants", False),
         ("Preferred Share Purchase Rights", False),
         ("Units, each consisting of one share of Class A common stock and one-half warrant", False),
+        ("Units, each comprising one share and one right", False),
+        ("Units comprised of one share and one warrant", False),
+        ("Units, consisting of one share of Class A common stock and one warrant", False),
+        ("Each Unit consisting of one share and one-third of one warrant", False),
+        ("Units", False),
+        # reviewers' common-with-rights forms (#1701): the clause is not the head
+        ("Common Stock and Preferred Share Purchase Rights", True),
+        ("Common Stock and Rights to Purchase Series A Preferred", True),
+        ("Ordinary Shares and Rights", True),
+        ("Class A Common Stock with voting rights", True),
+        ("Common Shares of Beneficial Interest and Rights", True),
+        ("Common Stock\nand Rights", True),
+        ("Class A common stock included as part of the units, each consisting of one share", True),
     ],
 )
 def test_joinable_title(title: str, joinable: bool) -> None:
     assert joinable_title(title) is joinable
+
+
+def test_joinable_title_is_linear_on_a_long_title() -> None:
+    """A filer's title is untrusted input: 100 KB of repeated unit words
+    reads in well under a second (safety review on #1701)."""
+    import time
+
+    for title in ("unit " * 20_000, "Units each consisting " * 5_000, "a" * 100_000):
+        started = time.perf_counter()
+        joinable_title(title)
+        assert time.perf_counter() - started < 0.5
 
 
 @pytest.mark.parametrize(
