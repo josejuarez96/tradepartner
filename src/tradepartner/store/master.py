@@ -639,6 +639,14 @@ class _Builder:
                     and _cannot_be_primary(item.title)
                 ):
                     cls = None
+                if (
+                    cls is not None
+                    and not _cannot_be_primary(item.title)
+                    and not any(c.security_id == primary_security_id(cik) for c in classes)
+                    and cls.pair_titles
+                    and all(_cannot_be_primary(title) for title in cls.pair_titles.values())
+                ):
+                    cls = None  # a reused ticker must not give equity the debt class id
                 if cls is None:
                     cls = self._new_class(first, item, classes, known_at)
                 relisted = False

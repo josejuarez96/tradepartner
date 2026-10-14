@@ -909,6 +909,22 @@ def test_debt_title_cannot_match_an_existing_primary_by_ticker() -> None:
     ]
 
 
+def test_later_common_does_not_match_first_debt_class_by_ticker() -> None:
+    cik = "0001324424"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("2.500% Senior Notes", "SAME", "NYSE")),
+            _cover(cik, _at(2020, 3, 2), ("Common Stock", "SAME", "NYSE")),
+        ],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert [(r["class_title"], r["security_id"]) for r in build.listings] == [
+        ("2.500% Senior Notes", f"{cik}:2-500pct-senior-notes"),
+        ("Common Stock", cik),
+    ]
+
+
 @pytest.mark.parametrize(
     "title",
     [
