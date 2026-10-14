@@ -19,8 +19,9 @@ class), else by a ticker it currently trades under, and no class takes two
 items of one page unless it is the same ticker on a second exchange. Title
 first means two classes that swap tickers keep their own ids. The primary
 is the first eligible common-equity class (`_COMMON_WORDS`) on the earliest cover
-page, else its first eligible class. Debt, derivative-style units, warrants
-and rights use a derived class id even when shown first; any other unmatched class becomes
+page, else its first eligible class. A debt, derivative-style unit, warrant
+or right first shown under a ticker different from the companies snapshot's
+ticker uses a derived class id; any other unmatched class becomes
 `<cik>:<title-slug>`, with a `securities` row known at the cover page that
 first names it. A class whose ticker and title both change on one cover
 page is read as a new class: a documented limit, not a guess.
@@ -356,10 +357,31 @@ def _numbered_id(base: str, taken: Collection[str]) -> str:
 
 #: Title words that mark a common-equity class, preferred as a CIK's primary.
 _COMMON_WORDS = ("common", "ordinary", "capital stock")
-#: Debt and derivative-style cover titles cannot claim a CIK's equity primary (#1680).
-#: Keep the list explicit: LP/common units and depositary or preferred shares stay eligible.
-_NON_PRIMARY_TITLE_PATTERNS = (
-    re.compile(r"\b(?:notes?|debentures?|bonds?|warrants?|rights?)\b"),
+#: Head nouns and derivative-style unit shapes that cannot claim an equity
+#: primary when a different companies-snapshot ticker identifies that equity (#1680).
+#: LP/common units and depositary or preferred shares stay eligible.
+_NON_PRIMARY_HEAD_NOUNS = frozenset(
+    {
+        "note",
+        "notes",
+        "debenture",
+        "debentures",
+        "bond",
+        "bonds",
+        "warrant",
+        "warrants",
+        "right",
+        "rights",
+    }
+)
+_TITLE_HEAD_NOUN = re.compile(
+    r"\b(?:notes?|debentures?|bonds?|warrants?|rights?|common|ordinary|shares?|stock|depositary)\b"
+)
+_TITLE_HEAD_END = re.compile(
+    r"[,()]|\b(?:including|together with|associated|representing|attached|included)\b",
+    re.IGNORECASE,
+)
+_NON_PRIMARY_UNIT_PATTERNS = (
     re.compile(r"\b(?:corporate|equity) units?\b"),
     re.compile(r"\bunits?\b.*\beach consisting\b.*\b(?:note|contract)\b"),
 )
@@ -377,7 +399,11 @@ def _is_common(title: str) -> bool:
 
 def _cannot_be_primary(title: str) -> bool:
     words = " ".join(re.sub(r"[^a-z0-9]+", " ", title.lower()).split())
-    return any(pattern.search(words) for pattern in _NON_PRIMARY_TITLE_PATTERNS)
+    if any(pattern.search(words) for pattern in _NON_PRIMARY_UNIT_PATTERNS):
+        return True
+    head = _TITLE_HEAD_END.split(title, maxsplit=1)[0].lower()
+    noun = _TITLE_HEAD_NOUN.search(head)
+    return noun is not None and noun.group() in _NON_PRIMARY_HEAD_NOUNS
 
 
 def _session_on_or_after(day: date) -> date:
@@ -610,6 +636,7 @@ class _Builder:
         `fetches` its companies-snapshot entries (every fetch)."""
         cik = first.cik
         marks = marks or {}
+        snapshot_tickers = {entry.ticker for entry in fetches}
         classes: list[_Class] = []
         open_spans: dict[str, int] = {}  # security_id -> its span on the previous page
         # Form 25s, 8-K12Bs and snapshot fetches in time order (in that order on a tie).
@@ -628,27 +655,13 @@ class _Builder:
             claimed: dict[str, str] = {}  # security_id -> ticker it took on this page
             starts: dict[tuple[str, str], date] = {}  # (security_id, exchange) -> row start
             items = list(page.listings)
-            if not classes:  # Prefer common on the first page; debt/derivatives stay separate.
+            if not classes:  # Prefer common on the first page.
                 items.sort(key=lambda item: not _is_common(item.title))
             for item in items:
                 live = [c for c in classes if not c.retired]
                 cls = _match(live, item, claimed)
-                if (
-                    cls is not None
-                    and cls.security_id == primary_security_id(cik)
-                    and _cannot_be_primary(item.title)
-                ):
-                    cls = None
-                if (
-                    cls is not None
-                    and not _cannot_be_primary(item.title)
-                    and not any(c.security_id == primary_security_id(cik) for c in classes)
-                    and cls.pair_titles
-                    and all(_cannot_be_primary(title) for title in cls.pair_titles.values())
-                ):
-                    cls = None  # a reused ticker must not give equity the debt class id
                 if cls is None:
-                    cls = self._new_class(first, item, classes, known_at)
+                    cls = self._new_class(first, item, classes, known_at, snapshot_tickers)
                 relisted = False
                 stop = cls.ended.get(item.exchange)
                 if stop is not None and (cls.security_id, item.exchange) not in starts:
@@ -824,11 +837,18 @@ class _Builder:
         return cls
 
     def _new_class(
-        self, first: FilingIndexEntry, item: CoverListing, classes: list[_Class], known_at: datetime
+        self,
+        first: FilingIndexEntry,
+        item: CoverListing,
+        classes: list[_Class],
+        known_at: datetime,
+        snapshot_tickers: set[str],
     ) -> _Class:
-        if not any(
-            c.security_id == primary_security_id(first.cik) for c in classes
-        ) and not _cannot_be_primary(item.title):
+        if not any(c.security_id == primary_security_id(first.cik) for c in classes) and not (
+            snapshot_tickers
+            and item.ticker not in snapshot_tickers
+            and _cannot_be_primary(item.title)
+        ):
             cls = _Class(primary_security_id(first.cik), first.accepted_at)
         else:
             slug = re.sub(r"[^a-z0-9]+", "-", _norm_title(item.title).replace("%", "pct"))

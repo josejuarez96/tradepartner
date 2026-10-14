@@ -893,7 +893,7 @@ def test_first_notes_cover_item_leaves_primary_for_later_snapshot() -> None:
     assert by_ticker["EXPE"] == cik
 
 
-def test_debt_title_cannot_match_an_existing_primary_by_ticker() -> None:
+def test_later_debt_title_keeps_existing_primary_match() -> None:
     cik = "0001324424"
     source = FixtureFilingSource(
         index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
@@ -905,24 +905,47 @@ def test_debt_title_cannot_match_an_existing_primary_by_ticker() -> None:
     build = build_master(source, _settings(), ingested_at=INGESTED_AT)
     assert [(r["class_title"], r["security_id"]) for r in build.listings] == [
         ("Common Stock", cik),
-        ("2.500% Senior Notes", f"{cik}:2-500pct-senior-notes"),
     ]
+    assert ClassTitle(cik, "2.500% Senior Notes", _at(2020, 3, 2)) in build.class_titles
 
 
-def test_later_common_does_not_match_first_debt_class_by_ticker() -> None:
+def test_first_debt_title_without_snapshot_keeps_primary() -> None:
     cik = "0001324424"
     source = FixtureFilingSource(
         index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
-        cover_pages=[
-            _cover(cik, _at(2019, 3, 1), ("2.500% Senior Notes", "SAME", "NYSE")),
-            _cover(cik, _at(2020, 3, 2), ("Common Stock", "SAME", "NYSE")),
-        ],
+        cover_pages=[_cover(cik, _at(2019, 3, 1), ("2.500% Senior Notes", "SAME", "NYSE"))],
     )
     build = build_master(source, _settings(), ingested_at=INGESTED_AT)
-    assert [(r["class_title"], r["security_id"]) for r in build.listings] == [
-        ("2.500% Senior Notes", f"{cik}:2-500pct-senior-notes"),
-        ("Common Stock", cik),
-    ]
+    assert [r["security_id"] for r in build.listings if r["provenance"] == "filing"] == [cik]
+
+
+def test_first_warrant_title_with_same_snapshot_ticker_keeps_primary() -> None:
+    cik = "0001462223"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("Common Stock Purchase Warrants", "RCRT", "NYSE"))
+        ],
+        snapshot=[_snap(cik, "TICKER CO", "RCRT", "NYSE", _at(2020, 3, 2))],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert [r["security_id"] for r in build.listings if r["provenance"] == "filing"] == [cik]
+
+
+def test_later_common_retitled_with_associated_rights_keeps_primary() -> None:
+    cik = "0001324424"
+    title = "Common Stock, $0.01 par value, and associated Preferred Stock Purchase Rights"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "EQ", "NYSE")),
+            _cover(cik, _at(2020, 3, 2), (title, "EQ", "NYSE")),
+        ],
+        snapshot=[_snap(cik, "TICKER CO", "EQ", "NYSE", _at(2021, 3, 2))],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert [r["security_id"] for r in build.listings if r["provenance"] == "filing"] == [cik]
+    assert ClassTitle(cik, title, _at(2020, 3, 2)) in build.class_titles
 
 
 @pytest.mark.parametrize(
@@ -935,6 +958,10 @@ def test_later_common_does_not_match_first_debt_class_by_ticker() -> None:
         "Shares of Beneficial Interest",
         "Series A Preferred Stock",
         "Depositary Shares, each representing a Preferred Share",
+        "Common Stock, $0.01 par value (including Preferred Share Purchase Rights)",
+        "Common shares (including common share purchase rights)",
+        "American Depositary Shares, each representing the right to receive one Ordinary Share",
+        "Class A ordinary shares, including one attached contingent right",
     ],
 )
 def test_first_equity_cover_item_keeps_primary(title: str) -> None:
@@ -942,9 +969,10 @@ def test_first_equity_cover_item_keeps_primary(title: str) -> None:
     source = FixtureFilingSource(
         index=[_filing(cik, "Equity Co", "10-K", _at(2018, 3, 1))],
         cover_pages=[_cover(cik, _at(2019, 3, 1), (title, "EQ", "NYSE"))],
+        snapshot=[_snap(cik, "EQUITY CO", "OTHER", "NYSE", _at(2020, 3, 2))],
     )
     build = build_master(source, _settings(), ingested_at=INGESTED_AT)
-    assert [row["security_id"] for row in build.listings] == [cik]
+    assert [row["security_id"] for row in build.listings if row["ticker"] == "EQ"] == [cik]
 
 
 class TestClassTitles:

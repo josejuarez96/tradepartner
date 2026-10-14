@@ -13,7 +13,8 @@ its own class id. With the switch on, each common is a member at
 `close(2021-06-30)` from a `filing` row known at its 2019 acceptance, and
 none is listed before it (no look-ahead).
 
-P&G's lone note page through 2022-10-19 leaves the primary unlisted. A
+P&G's lone note page through 2022-10-19, derived with the 2026 snapshot,
+leaves the primary unlisted at historical probes. A
 re-ingest with exchange-axis cover parsing adds the common to the primary,
 and the note remains on its own class id; `master-retract` has no stale
 PG25 row on the primary to withdraw (#1680).
@@ -312,7 +313,7 @@ PG_PAGES = (
     ("pg_10k_2019.htm", _at(2022, 10, 19)),
     ("pg_10k_2019.htm", _at(2023, 4, 19)),
 )
-FIRST_RUN = datetime(2022, 10, 20, 12, 0, tzinfo=UTC)
+FIRST_RUN = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
 RETRACT_AT = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 T_2023 = session_close(date(2023, 6, 30))
 
@@ -321,7 +322,7 @@ def test_pg_never_reads_as_its_note_on_the_primary(settings: Settings) -> None:
     """A lone note on the first parsed page never creates a stale PG25 row
     on P&G's primary. A later exchange-axis common arrives at its own
     acceptance, and no retraction of a primary PG25 row is needed."""
-    _ingest(settings, _source(False, names=[PG], pg_pages=PG_PAGES, until=FIRST_RUN), FIRST_RUN)
+    _ingest(settings, _source(False, names=[PG], pg_pages=PG_PAGES[:3]), FIRST_RUN)
     with _read(settings) as conn:
         assert PG not in _current_listings(conn, T_2023, T_2023.date(), settings)
     assert _current(settings, f"{PG}:1-375pct-notes-due-2025", T_2023)["ticker"] == "PG25"
