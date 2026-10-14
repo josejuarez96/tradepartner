@@ -350,13 +350,11 @@ script over the real ones.
 from __future__ import annotations
 
 import dataclasses
-import functools
 import json
 import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -921,8 +919,11 @@ def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLo
     when cut short), parsed for that CIK, each read once; a 404 or 410, or a
     header longer than both, is a `ValueError`."""
 
-    @functools.cache
+    read: dict[tuple[str, str], FilingHeader] = {}
+
     def lookup(cik: str, accession: str) -> FilingHeader:
+        if (cik, accession) in read:
+            return read[(cik, accession)]
         text = ""
         for size in (settings.edgar.header_bytes, settings.edgar.stamp_header_bytes):
             try:
@@ -941,7 +942,8 @@ def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLo
                 f"{accession}'s SGML header is longer than edgar.stamp_header_bytes "
                 f"({settings.edgar.stamp_header_bytes}); raise it and run again"
             )
-        return parse_sgml_header(text, cik)
+        header = read[(cik, accession)] = parse_sgml_header(text, cik)
+        return header
 
     return lookup
 
@@ -2193,11 +2195,8 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
-        opened: AbstractContextManager[duckdb.DuckDBPyConnection] = (
-            _read(s) if dry_run else open_for_write(s)
-        )
         try:
-            with opened as conn:
+            with _read(s) if dry_run else open_for_write(s) as conn:
                 result = delete_master_rows(
                     conn,
                     rows,
