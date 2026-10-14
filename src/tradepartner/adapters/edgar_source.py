@@ -671,6 +671,7 @@ class EdgarFilingSource(FilingSource):
         self.stamp_check_unread_ciks = 0
         self.stamps_from_sgml = 0
         self.stamps_sgml_unread = 0
+        self.stamps_sgml_overlong = 0
         # #599: a payload with `facts` but no `cik` (SEC ships this shape for
         # a few CIKs, identically from the zip and the API): identified by
         # the CIK it was requested under, not treated as absent.
@@ -888,7 +889,8 @@ class EdgarFilingSource(FilingSource):
                 return checked
             for record in stamped:
                 del checked[record.accession]
-            self.stamps_sgml_unread += len(stamped)
+                reason = headers.get(record.accession)
+                self._count_sgml_miss(reason if isinstance(reason, _HeaderMiss) else None)
             return checked
         if agrees:
             return checked
@@ -903,17 +905,25 @@ class EdgarFilingSource(FilingSource):
                 self.stamps_from_sgml += 1
             else:
                 del checked[record.accession]
-                self.stamps_sgml_unread += 1
+                self._count_sgml_miss(truth)
         return checked
+
+    def _count_sgml_miss(self, reason: _HeaderMiss | None) -> None:
+        """Count a skipped stamp by whether its own header exceeded the cap."""
+        if reason is _HeaderMiss.OVERLONG:
+            self.stamps_sgml_overlong += 1
+        else:
+            self.stamps_sgml_unread += 1
 
     def _header_acceptance(self, cik: str, accession: str) -> datetime | _HeaderMiss:
         """`accession`'s SGML acceptance (UTC), or why it is missing: a 404/410
-        or an unparseable header (`UNREAD`), or a header with no acceptance
+        or an unparseable header (`UNREAD`), a header longer than
+        `edgar.stamp_header_bytes` (`OVERLONG`), or a header with no acceptance
         (`NO_ACCEPTANCE`). A header cut before `</SEC-HEADER>` is asked once
         more with `edgar.stamp_header_bytes`. Any other HTTP error, and a
         tripped path-safety guard, propagate."""
         sizes = (self._settings.edgar.header_bytes, self._settings.edgar.stamp_header_bytes)
-        for size in sizes:
+        for attempt, size in enumerate(sizes):
             try:
                 text = edgar_raw.filing_sgml_header(
                     cik, accession, header_bytes=size, settings=self._settings, client=self._client
@@ -928,6 +938,12 @@ class EdgarFilingSource(FilingSource):
             except SgmlNoAcceptanceError:
                 return _HeaderMiss.NO_ACCEPTANCE
             except SgmlTruncatedError:
+                if attempt == len(sizes) - 1:
+                    return (
+                        _HeaderMiss.OVERLONG
+                        if len(text.encode("utf-8")) >= size
+                        else _HeaderMiss.UNREAD
+                    )
                 continue
             except ValueError:
                 return _HeaderMiss.UNREAD
@@ -3255,6 +3271,7 @@ class _HeaderMiss(enum.Enum):
     """Why `_header_acceptance` has no acceptance (#1494)."""
 
     UNREAD = "unread"
+    OVERLONG = "overlong"
     NO_ACCEPTANCE = "no acceptance"
 
 
