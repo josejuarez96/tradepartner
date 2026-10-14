@@ -363,8 +363,9 @@ STATEMENT_VERSION = 1
 #: 2: #609 (latest ddate per member, NULL shares, title whitespace);
 #: 3: #1541 (exchange-axis listings, the release `cover-listings-1541`, T181);
 #: 4: #1651/#1660 (`cover_split_contexts`, same release);
-#: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release).
-FSN_VERSION = 5
+#: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
+#: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
+FSN_VERSION = 6
 #: Bumped when `parse_cover_page` changes and every per-document cover-page
 #: parse (T11d) must be re-fetched and re-parsed. Deleting `edgar.cache_dir`
 #: or bumping this switches a per-document accession back to its FSN row.
@@ -373,8 +374,9 @@ FSN_VERSION = 5
 #: 2: #609 (nil facts skipped, incomplete listings skipped and counted);
 #: 3: #1541 (exchange-axis listings, the release `cover-listings-1541`, T181);
 #: 4: #1651/#1660 (`cover_split_contexts`, same release);
-#: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release).
-COVER_VERSION = 5
+#: 5: #1675 (split contexts keep each class's symbol; quotes stripped; same release);
+#: 6: `cover_split_contexts` backed out (owner, same release, pending #1682).
+COVER_VERSION = 6
 #: As `COVER_VERSION`, for per-document `parse_sgml_header` results (T11d).
 HEADER_VERSION = 1
 #: As `COVER_VERSION`, for per-document `parse_delisting` results (T11f).
