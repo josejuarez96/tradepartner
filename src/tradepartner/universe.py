@@ -328,7 +328,7 @@ def _member_letter(member: str) -> str | None:
 
 def _title_letter(title: str) -> str | None:
     match = _TITLE_LETTER.search(title.lower())
-    return (match.group(1) or match.group(2)).upper() if match else None
+    return next(g for g in match.groups() if g).upper() if match else None
 
 
 def _title_words(title: str) -> set[str]:
