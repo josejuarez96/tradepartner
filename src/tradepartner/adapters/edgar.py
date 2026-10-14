@@ -831,6 +831,8 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
             raise ValueError(f"{accession}: dei:{name}: {issue}")
         context = fact.context or {}
         value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
+        if name == "TradingSymbol" and not value:
+            continue  # quote-only text is no symbol, never an empty ticker
         key = (name, str(context.get("id", "")))
         if key in seen:
             if seen[key] != value:
@@ -932,8 +934,8 @@ def parse_cover_page(
         if set(dimensions) - allowed or len(class_axes & set(dimensions)) > 1:
             other.add(context["id"])
             continue
-        if name == _SHARES_CONCEPT and _CAPITAL_UNITS_AXIS in dimensions:
-            other.add(context["id"])  # #1651: shares on this axis stay unread, as today
+        if name == _SHARES_CONCEPT and class_axes.intersection(dimensions.keys()) - {_CLASS_AXIS}:
+            other.add(context["id"])  # these axes' share counts are not common totals
             continue
         class_axis = next(iter(class_axes & set(dimensions)), _CLASS_AXIS)
         if name != _SHARES_CONCEPT:
@@ -1567,9 +1569,12 @@ def _parse_one_fsn_filing(
         if dims is None:
             continue
         member = dims[1]
-        group, value = groups.setdefault(dims, {}), row.get("value") or ""
+        value = row.get("value") or ""
         if tag == "TradingSymbol":
             value = _trading_symbol(value)
+            if not value:
+                continue  # quote-only text is no symbol, never an empty ticker
+        group = groups.setdefault(dims, {})
         if "\ufffd" in value:  # an invalid byte or a tab `_fsn_rows` replaced (#455, #498)
             raise ValueError(
                 f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
@@ -1639,10 +1644,11 @@ def _parse_one_fsn_filing(
         )
         if dims is None:
             continue
-        if split_contexts and _FSN_CAPITAL_UNITS_AXIS in dim_segments.get(
-            (row.get("dimh") or "").strip(), ""
+        if split_contexts and dims[0] in (
+            _FSN_CAPITAL_UNITS_AXIS,
+            _FSN_EQUITY_COMPONENTS_AXIS,
         ):
-            continue  # #1651: shares on this axis stay unread, as parse_cover_page
+            continue  # these axes' share counts are not common totals
         member = dims[1]  # an exchange-axis count is its class's (#1541)
         raw_value = row.get("value")
         if raw_value is None or not str(raw_value).strip():
@@ -1695,7 +1701,7 @@ def parse_fsn(
 
     With `split_contexts` (`edgar.cover_split_contexts`, #1651) `parse_fsn`
     reads what `parse_cover_page` reads under it: `CapitalUnitsByClass` and
-    `StatementEquityComponents` are class axes (capital units shares rows stay
+    `StatementEquityComponents` are class axes (shares rows on both stay
     unread), and a class's title, symbol and
     exchange are merged across its (class, exchange) groups when the class
     names at most one title and one symbol, else one listing per group."""

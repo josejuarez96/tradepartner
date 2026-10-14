@@ -1038,6 +1038,28 @@ class TestCoverPageSplitContexts:
         )
         assert [i.ticker for i in parsed.cover.listings] == ["CNA"]
 
+    def test_quote_only_symbol_is_not_a_listing(self) -> None:
+        contexts = _context("A", {_CLASS_AXIS_NAME: "us-gaap:CommonStockMember"})
+        parsed = parse_cover_page(
+            _ixbrl(contexts, _listing_facts("A", "Common Stock", '"""', "NYSE")),
+            accession="0000021175-20-000114",
+            accepted_at=_ACCEPTED,
+            split_contexts=True,
+        )
+        assert parsed.cover.listings == ()
+
+    def test_equity_components_preferred_shares_do_not_replace_common_total(self) -> None:
+        contexts = _context("P", {_EQUITY_COMPONENTS: "us-gaap:PreferredStockMember"}, instant=True)
+        contexts += _context("U", instant=True)
+        parsed = parse_cover_page(
+            _ixbrl(contexts, _shares("P", "100") + _shares("U", "392217046")),
+            accession="0001111711-21-000018",
+            accepted_at=_ACCEPTED,
+            split_contexts=True,
+        )
+        assert [(fact.class_member, fact.value) for fact in parsed.facts] == [("", 392_217_046)]
+        assert parsed.other_contexts == ("P",)
+
     @pytest.mark.parametrize("name", ["fifth_third_10q_2023q3.htm", "fifth_third_10q_2020q3.htm"])
     def test_capital_units_axis_is_a_class_axis(self, name: str) -> None:
         """Fifth Third tags each class on `CapitalUnitsByClassAxis`."""

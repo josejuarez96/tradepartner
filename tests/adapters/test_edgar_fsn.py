@@ -1562,6 +1562,27 @@ class TestParseFsnSplitContexts:
         [record] = _split_fsn("", on=True, rows=rows).records
         assert [i.ticker for i in record.listings] == ["CNA"]
 
+    def test_quote_only_symbol_is_not_a_listing(self) -> None:
+        rows = [
+            ("Security12bTitle", "Common Stock", ""),
+            ("TradingSymbol", '"""', ""),
+            ("SecurityExchangeName", "NYSE", ""),
+        ]
+        [record] = _split_fsn("", on=True, rows=rows).records
+        assert record.listings == ()
+
+    def test_equity_components_preferred_shares_do_not_replace_common_total(self) -> None:
+        adsh = "0001111711-21-000018"
+        num = [
+            _num(adsh, SHARES_TAG, "100", "20210331", dimh="0x1", dimn="1"),
+            _num(adsh, SHARES_TAG, "392217046", "20210331"),
+        ]
+        dim = [_dim("0x1", "StatementEquityComponents=PreferredStock;")]
+        parsed = parse_fsn([_sub(adsh, "1111711", "10-Q")], num, [], dim, split_contexts=True)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert record.shares == (FsnShare("", 392_217_046, date(2021, 3, 31)),)
+
     @pytest.mark.parametrize("pattern", sorted(_SPLIT_PATTERNS))
     def test_the_fsn_rows_give_the_per_document_listings(self, pattern: str) -> None:
         from tradepartner.adapters.edgar import parse_cover_page
