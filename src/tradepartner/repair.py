@@ -93,7 +93,12 @@ from tradepartner.adapters.alpaca_prices import (
 from tradepartner.calendar import is_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _read, _write_run
-from tradepartner.store.asof import facts_as_of, listings_as_of, live_actions_as_of
+from tradepartner.store.asof import (
+    facts_as_of,
+    listings_as_of,
+    live_actions_as_of,
+    symbol_changes_as_of,
+)
 from tradepartner.store.db import open_for_write, utc_now
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
@@ -117,8 +122,10 @@ def store_resolver(
     known at `at`, with the `registrant_evidence` of the facts and listing
     ends known then (#793) and `at`'s day as the run's day, and
     `alpaca.rename_lead_days` (#843) and `alpaca.accepted_relistings`
-    (#943); and, while `alpaca.first_span_lead` is on (#974), each
-    security's first session (`first_sessions`)."""
+    (#943); while `alpaca.first_span_lead` is on (#974), each security's
+    first session (`first_sessions`); and the `symbol_changes` known at
+    `at` (#1696, `symbol_changes_as_of`), followed where the listings lag
+    them."""
     at = ensure_tz_aware_utc(at, field_name="at")
     evidence = registrant_evidence(
         facts_as_of(conn, at).iter_rows(named=True),
@@ -139,6 +146,7 @@ def store_resolver(
         else None,
         last_bar=functools.partial(last_bar, conn, at),
         handover_sessions=settings.master.transfer_window_sessions,
+        symbol_changes=symbol_changes_as_of(conn, at).iter_rows(named=True),
     )
 
 

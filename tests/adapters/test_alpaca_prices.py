@@ -4411,3 +4411,185 @@ def _months(first: date, last: date) -> Iterator[tuple[date, date]]:
         month_end = after - timedelta(days=1)
         yield max(first, day), min(last, month_end)
         day = after
+
+
+def _change(security_id: str, old: str, new: str, process_date: date) -> dict[str, object]:
+    """A stored `symbol_changes` row as `store.asof.symbol_changes_as_of`
+    returns it (the columns the resolver reads)."""
+    return {
+        "security_id": security_id,
+        "old_symbol": old,
+        "new_symbol": new,
+        "process_date": process_date,
+    }
+
+
+class TestSymbolChangesBoundSpans:
+    """#1696 (#1682 lever E2): a stored name change bounds the old and new
+    symbols' spans when the listing rows lag it."""
+
+    PKI = "0000031791"  # PerkinElmer -> Revvity: no listing row names RVTY
+    CHK = "0000895126"  # Chesapeake -> Expand Energy: EXE's first cover page 19 months on
+    TITLE = "Common Stock"
+    RENAME = date(2023, 5, 16)
+
+    def _pki(self) -> list[dict[str, object]]:
+        return [_listing(self.PKI, "PKI", date(2019, 8, 6), self.TITLE)]
+
+    def test_the_change_ends_the_old_span_and_starts_the_new_one(self) -> None:
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        resolver = ListingResolver(self._pki(), symbol_changes=[change])
+        before = date(2023, 5, 15)
+        assert resolver.resolve("PKI", before) == self.PKI
+        assert resolver.resolve("RVTY", before) is None
+        for day in (self.RENAME, date(2024, 6, 3), date(2026, 9, 30)):
+            assert resolver.resolve("PKI", day) is None
+            assert resolver.resolve("RVTY", day) == self.PKI
+            assert resolver.holds(self.PKI, day)
+        assert resolver.symbols(self.PKI, date(2023, 5, 1), date(2023, 5, 31)) == ["PKI", "RVTY"]
+        assert resolver.report.symbol_changes_followed == 1
+        assert resolver.report.symbol_changes_unmatched == 0
+
+    def test_without_the_change_the_old_span_runs_on(self) -> None:
+        resolver = ListingResolver(self._pki())
+        assert resolver.resolve("PKI", date(2024, 6, 3)) == self.PKI
+        assert resolver.resolve("RVTY", date(2024, 6, 3)) is None
+
+    def test_the_new_symbols_bars_land_from_the_change(self) -> None:
+        # Alpaca serves PKI nothing after the change and RVTY from it on.
+        days = [date(2023, 5, 12), date(2023, 5, 15), self.RENAME, date(2023, 5, 17)]
+        payload = {
+            "feed": "sip",
+            "bars": {
+                "PKI": [_row(d, 120.0) for d in days[:2]],
+                "RVTY": [_row(d, 120.0) for d in days],  # Alpaca's copied history too
+            },
+        }
+        followed = ListingResolver(
+            self._pki(), symbol_changes=[_change(self.PKI, "PKI", "RVTY", self.RENAME)]
+        )
+        parsed = parse_bars(payload, followed.resolve, followed.lead)
+        assert [b.session for b in parsed.bars if b.security_id == self.PKI] == days
+        assert all(b.known_at == bar_known_at(b.session) for b in parsed.bars)
+        plain = ListingResolver(self._pki())
+        parsed = parse_bars(payload, plain.resolve, plain.lead)
+        assert [b.session for b in parsed.bars] == days[:2]  # the hole the census found
+
+    def test_a_lagging_cover_page_joins_the_span_the_change_starts(self) -> None:
+        listings = [
+            _listing(self.CHK, "CHK", date(2021, 3, 1), self.TITLE),
+            _listing(self.CHK, "CHK", date(2025, 2, 18), self.TITLE),  # a late 10-K's old ticker
+            _listing(self.CHK, "EXE", date(2026, 4, 28), self.TITLE),
+        ]
+        change = _change(self.CHK, "CHK", "EXE", date(2024, 10, 1))
+        resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
+        for day in (date(2024, 10, 1), date(2025, 2, 18), date(2025, 3, 21), date(2026, 5, 1)):
+            assert resolver.resolve("EXE", day) == self.CHK
+            assert resolver.resolve("CHK", day) is None
+        assert resolver.resolve("CHK", date(2024, 9, 30)) == self.CHK
+        # Without it the lead reaches back 400 days from the cover page only.
+        plain = ListingResolver(listings, rename_lead_days=400)
+        assert plain.resolve("EXE", date(2025, 3, 21)) is None
+        assert plain.lead("EXE", date(2025, 3, 21)) is None
+        assert plain.resolve("CHK", date(2025, 3, 21)) == self.CHK
+
+    def test_a_later_return_to_the_old_ticker_is_kept(self) -> None:
+        # Fiserv: FISV -> FI on 2023-06-07, back to FISV in 2026.
+        fiserv = "0000798354"
+        listings = [
+            _listing(fiserv, "FISV", date(2019, 7, 26), self.TITLE),
+            _listing(fiserv, "FI", date(2023, 7, 27), self.TITLE),
+            _listing(fiserv, "FISV", date(2026, 2, 19), self.TITLE),
+        ]
+        change = _change(fiserv, "FISV", "FI", date(2023, 6, 7))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.resolve("FI", date(2023, 6, 7)) == fiserv
+        assert resolver.resolve("FISV", date(2023, 6, 7)) is None
+        assert resolver.resolve("FI", date(2026, 2, 18)) == fiserv
+        assert resolver.resolve("FISV", date(2026, 2, 19)) == fiserv
+        assert resolver.resolve("FI", date(2026, 2, 19)) is None
+
+    def test_a_cusip_change_bounds_nothing(self) -> None:
+        listings = self._pki()
+        same = _change(self.PKI, "PKI", "PKI", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[same])
+        assert resolver.resolve("PKI", date(2024, 6, 3)) == self.PKI
+        assert resolver.report.symbol_changes_followed == 0
+        assert resolver.report.symbol_changes_unmatched == 0
+
+    def test_a_change_the_listings_already_show_needs_nothing(self) -> None:
+        listings = [
+            _listing(self.PKI, "PKI", date(2019, 8, 6), self.TITLE),
+            _listing(self.PKI, "RVTY", date(2023, 5, 10), self.TITLE),  # the cover page leads
+        ]
+        on_day = [*self._pki(), _listing(self.PKI, "RVTY", self.RENAME, self.TITLE)]
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        for rows in (listings, on_day):
+            resolver = ListingResolver(rows, symbol_changes=[change])
+            plain = ListingResolver(rows)
+            for day in _sessions(date(2023, 5, 1), date(2023, 6, 30)):
+                for ticker in ("PKI", "RVTY"):
+                    assert resolver.resolve(ticker, day) == plain.resolve(ticker, day)
+            assert resolver.report.symbol_changes_followed == 0
+            assert resolver.report.symbol_changes_unmatched == 0
+
+    def test_a_change_matching_no_listing_is_counted_and_never_followed(self) -> None:
+        other = "0000000099"
+        changes = [
+            _change(self.PKI, "ABC", "RVTY", self.RENAME),  # the listings never say ABC
+            _change(self.PKI, "PKI", "RVTY", date(2019, 1, 2)),  # before any row
+            _change(other, "XYZ", "NEW", self.RENAME),  # no listing row at all
+        ]
+        resolver = ListingResolver(self._pki(), symbol_changes=changes)
+        assert resolver.resolve("PKI", date(2024, 6, 3)) == self.PKI
+        assert resolver.resolve("RVTY", date(2024, 6, 3)) is None
+        assert resolver.resolve("NEW", date(2024, 6, 3)) is None
+        assert resolver.report.symbol_changes_followed == 0
+        assert resolver.report.symbol_changes_unmatched == 3
+        assert "3 matching no listing" in resolver.report.summary()
+
+    def test_a_non_equity_row_before_the_change_is_no_match(self) -> None:
+        listings = [_listing(self.PKI, "PKI", date(2019, 8, 6), "5.0% Notes due 2029")]
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.resolve("RVTY", date(2024, 6, 3)) is None
+        assert resolver.report.symbol_changes_unmatched == 1
+
+    def test_the_new_span_follows_the_other_rules(self) -> None:
+        # Another company holds RVTY when the change lands: the reuse rule
+        # (the newer span wins) applies to the change's span as to a row's.
+        holder = "0000000077"
+        listings = [*self._pki(), _listing(holder, "RVTY", date(2020, 1, 2), self.TITLE)]
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.resolve("RVTY", date(2023, 5, 15)) is None  # contested by the rename
+        assert resolver.resolve("RVTY", self.RENAME) == self.PKI
+
+    def test_a_change_the_rules_then_deny_is_refused_and_the_listings_stand(self) -> None:
+        # Another company lists RVTY on the change's day (a rule-4 tie): the
+        # followed change would leave PKI's bars to no one from that day on,
+        # so it is refused and the resolver is the listings' alone.
+        other = "0000000077"
+        listings = [*self._pki(), _listing(other, "RVTY", self.RENAME, self.TITLE)]
+        change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        plain = ListingResolver(listings)
+        for day in _sessions(date(2023, 5, 1), date(2023, 7, 31)):
+            for ticker in ("PKI", "RVTY"):
+                assert resolver.resolve(ticker, day) == plain.resolve(ticker, day)
+            assert resolver.holds(self.PKI, day) == plain.holds(self.PKI, day)
+        assert resolver.resolve("PKI", date(2023, 6, 1)) == self.PKI
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_followed == 0
+        assert "1 refused" in resolver.report.summary()
+
+    def test_the_symbol_is_read_in_alpacas_form(self) -> None:
+        listings = [
+            _listing(self.PKI, "PKI", date(2019, 8, 6), self.TITLE),
+            _listing(self.PKI, "RVT-B", date(2023, 8, 1), self.TITLE),
+        ]
+        change = _change(self.PKI, "PKI", "RVT.B", self.RENAME)
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.resolve("RVT.B", self.RENAME) == self.PKI
+        spans = [s for s in resolver._by_security[self.PKI] if s.ticker == "RVT.B"]
+        assert [(s.start, s.end) for s in spans] == [(self.RENAME, None)]  # one span

@@ -1206,3 +1206,36 @@ def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
         store,
         "SELECT source_action_id FROM corporate_actions WHERE action_type = 'spinoff'",
     ) == [(LIVE,)]
+
+
+def _symbol_change(sid: str, old: str, new: str, process: date, known: datetime) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "old_symbol": old,
+        "new_symbol": new,
+        "old_cusip": "714046109",
+        "new_cusip": "714046109",
+        "process_date": process,
+        "source_action_id": f"{old}-{new}",
+        "known_at": known,
+        "ingested_at": known,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+
+
+def test_the_store_resolver_follows_a_stored_symbol_change(settings: Settings) -> None:
+    """#1696: `store_resolver` reads the `symbol_changes` known at the run,
+    so a rename the listings never show (PKI -> RVTY) bounds both spans."""
+    pki, rename = "0000031791", date(2023, 5, 16)
+    known = session_close(rename)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "listings", _listing(pki, "PKI", date(2019, 8, 6)))
+        insert_row(conn, "symbol_changes", _symbol_change(pki, "PKI", "RVTY", rename, known))
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, settings)
+    assert resolver.resolve("RVTY", rename) == pki
+    assert resolver.resolve("PKI", rename) is None
+    assert resolver.resolve("PKI", previous_session(rename)) == pki
+    assert resolver.report.symbol_changes_followed == 1
