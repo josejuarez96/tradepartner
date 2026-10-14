@@ -1875,6 +1875,12 @@ class ActionsParse:
     #: it was malformed and left out (`AlpacaPriceSource.corporate_actions`,
     #: `.symbol_changes`), so it never fails the day's other rows.
     malformed_categories: tuple[str, ...] = ()
+    #: #1673: spin-off rows replaced by a later distribution from the same
+    #: parent to the same child in the same payload (a revision, spec
+    #: "Spin-offs"), and spin-offs whose parent and child were both not in
+    #: the request (`AlpacaPriceSource.corporate_actions`), dropped.
+    spinoff_superseded: int = 0
+    spinoffs_unrequested: int = 0
 
 
 @_fail_closed
@@ -1907,13 +1913,24 @@ def parse_corporate_actions(
     `stock_rows_refused`, never an error for the payload. A same-date
     cash row repeating a stock rate (exactly, #1617, or within
     `stock_dividend_echo_tolerance` with `1 < amount < max`) is skipped
-    and counted in `stock_ratio_cash`."""
+    and counted in `stock_ratio_cash`.
+
+    Two `spin_offs` rows of one identity (child, parent) are one record
+    (#1673): a second distribution from the same parent to the same child
+    is a revision of the first (spec "Spin-offs"), so the row with the
+    later `(process_date, ex_date)` is kept, at its own stamp, and the
+    other counted in `spinoff_superseded`; an identical repeat is kept
+    once; two differing rows with the same process date and ex-date have
+    no order and raise `ValueError`."""
     rules = stock_rules if stock_rules is not None else AlpacaConfig()
     actions: list[CorporateAction] = []
     unresolved: list[tuple[str, date]] = []
     unsupported: list[str] = []
     symbol_changes: list[SymbolChange] = []
-    self_spinoff = reused = conflict = 0
+    self_spinoff = reused = conflict = superseded = 0
+    # (child, parent) -> ((process_date, ex_date), action): the latest
+    # distribution of each spin-off identity (#1673).
+    spins: dict[tuple[str, str], tuple[tuple[date, date], CorporateAction]] = {}
     reused_symbols: list[str] = []
 
     def holder(symbol: str, day: date) -> str | None:
@@ -2044,17 +2061,29 @@ def parse_corporate_actions(
                     if parent == child:
                         self_spinoff += 1
                         continue
-                    actions.append(
-                        CorporateAction(
-                            security_id=child,
-                            action_type=ActionType.SPINOFF,
-                            ex_date=ex_date,
-                            ratio_or_amount=ratio,
-                            known_at=announcement_date_known_at(process_date),
-                            source=_ACTIONS_SOURCE,
-                            source_action_id=parent,
-                        )
+                    spin = CorporateAction(
+                        security_id=child,
+                        action_type=ActionType.SPINOFF,
+                        ex_date=ex_date,
+                        ratio_or_amount=ratio,
+                        known_at=announcement_date_known_at(process_date),
+                        source=_ACTIONS_SOURCE,
+                        source_action_id=parent,
                     )
+                    order = (process_date, ex_date)
+                    held = spins.get((child, parent))
+                    if held is None:
+                        spins[(child, parent)] = (order, spin)
+                    elif held[0] == order:
+                        if not held[1].same_values(spin):
+                            raise ValueError(
+                                f"payload repeats the spin-off {(child, parent)} on "
+                                f"{process_date} with differing values"
+                            )
+                    else:
+                        superseded += 1
+                        if order > held[0]:
+                            spins[(child, parent)] = (order, spin)
                 else:
                     old = row["old_symbol"]
                     new = row["new_symbol"]
@@ -2129,6 +2158,7 @@ def parse_corporate_actions(
                     source_action_id=row.get("id"),
                 )
             )
+    actions.extend(spin for _, spin in spins.values())
     # A stock row's id must be its own: one shared with another stock row or
     # any other action is refused, never a payload-wide `ValueError` (#1618).
     other_ids = {a.source_action_id for a in actions if a.source_action_id is not None}
@@ -2158,6 +2188,7 @@ def parse_corporate_actions(
         stock_rows_unusable,
         stock_dividends_stored,
         tuple(stock_refused),
+        spinoff_superseded=superseded,
     )
 
 
@@ -2532,6 +2563,16 @@ class AlpacaPriceSource(PriceSource):
                 line += f"; malformed {', '.join(malformed)} category skipped"
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
+            if self.last_actions_report.spinoff_superseded:
+                line += (
+                    f"; {self.last_actions_report.spinoff_superseded} spin-off row(s) "
+                    "superseded by a later distribution"
+                )
+            if self.last_actions_report.spinoffs_unrequested:
+                line += (
+                    f"; {self.last_actions_report.spinoffs_unrequested} spin-off(s) of "
+                    "unrequested securities dropped"
+                )
             if self.last_actions_report.symbol_change_reused:
                 named = ", ".join(self.last_actions_report.reused_symbols)
                 line += (
@@ -2602,20 +2643,28 @@ class AlpacaPriceSource(PriceSource):
                     ),
                     unresolved=parsed.unresolved + spins.unresolved,
                     self_spinoff=spins.self_spinoff,
+                    spinoff_superseded=spins.spinoff_superseded,
                 )
-        self.last_actions_report = parsed
-        return [
-            a
-            for a in parsed.actions
-            if a.security_id in ids
-            and (
-                a.action_type is ActionType.SPINOFF
-                or (
-                    a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
-                    and start <= a.ex_date <= end
-                )
-            )
-        ]
+        # #1673: a spin-off is kept when its child or its parent (the
+        # `source_action_id`, T64 convention) was requested, so a partial
+        # request (a backfill or replay subset) asking for the parent alone
+        # keeps it; one of neither is dropped and counted.
+        kept: list[CorporateAction] = []
+        unrequested = 0
+        for a in parsed.actions:
+            if a.action_type is ActionType.SPINOFF:
+                if a.security_id in ids or a.source_action_id in ids:
+                    kept.append(a)
+                else:
+                    unrequested += 1
+            elif (
+                a.security_id in ids
+                and a.action_type in (ActionType.SPLIT, ActionType.DIVIDEND)
+                and start <= a.ex_date <= end
+            ):
+                kept.append(a)
+        self.last_actions_report = replace(parsed, spinoffs_unrequested=unrequested)
+        return kept
 
     def symbol_changes(
         self, security_ids: Sequence[str], start: date, end: date

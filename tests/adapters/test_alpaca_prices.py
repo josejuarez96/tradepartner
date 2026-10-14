@@ -2075,6 +2075,78 @@ class TestNewActions:
         with pytest.raises(ValueError):
             parse_corporate_actions({"spin_offs": [_spinoff(**{field: value})]}, resolver.resolve)
 
+    def test_second_distribution_is_a_revision_of_the_first(self) -> None:
+        # #1673 (2), spec "Spin-offs": a second distribution from the same
+        # parent to the same child is a revision of the first, so the later
+        # processed row wins (its own stamp) and the payload is not refused.
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 1))]
+        )
+        first = _spinoff(id="a", ex_date="2020-09-29", process_date="2020-10-16")
+        second = _spinoff(
+            id="b", ex_date="2020-11-30", process_date="2020-12-04", new_rate=3, source_rate=4
+        )
+        for rows in ([first, second], [second, first]):
+            parsed = parse_corporate_actions({"spin_offs": rows}, resolver.resolve)
+            [action] = parsed.actions
+            assert (action.security_id, action.source_action_id) == ("C", "P")
+            assert action.ex_date == date(2020, 11, 30)
+            assert action.ratio_or_amount == 0.75
+            assert action.known_at == announcement_date_known_at(date(2020, 12, 4))
+            assert parsed.spinoff_superseded == 1
+
+    def test_repeated_identical_spinoff_row_is_one_record(self) -> None:
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        parsed = parse_corporate_actions({"spin_offs": [_spinoff(), _spinoff()]}, resolver.resolve)
+        [action] = parsed.actions
+        assert action.ratio_or_amount == 0.5
+        assert parsed.spinoff_superseded == 0
+
+    def test_two_spinoff_rows_with_no_order_still_raise(self) -> None:
+        # Same process date and ex-date, different ratio: neither is the
+        # "second" distribution, so the payload stays malformed.
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        with pytest.raises(ValueError, match="spin-off"):
+            parse_corporate_actions(
+                {"spin_offs": [_spinoff(), _spinoff(new_rate=3)]}, resolver.resolve
+            )
+
+    def test_daily_actions_keep_a_revised_spinoff(self) -> None:
+        # #1673 (2): two distributions in one daily payload no longer skip
+        # the whole spin_offs category as malformed.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-03",
+                        process_date="2020-08-05",
+                    ),
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    ),
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(
+            ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+        )
+        assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_MSFT", date(2020, 8, 31))]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ()
+        assert "1 spin-off row(s) superseded" in source.resolution_summary()
+
     def test_spinoff_record_rejects_nonpositive_ratio(self) -> None:
         assert (
             CorporateAction(
@@ -3050,6 +3122,55 @@ class TestAlpacaPriceSource:
         assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
         assert source.last_actions_report is not None
         assert source.last_actions_report.malformed_categories == ("name_changes",)
+
+    def test_spinoff_is_kept_when_only_its_parent_is_requested(self) -> None:
+        # #1673 (1): a partial request (backfill, replay subset) that asks
+        # for the parent alone still returns the parent's spin-off.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    )
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert [(a.security_id, a.action_type, a.source_action_id) for a in actions] == [
+            ("SEC_MSFT", ActionType.SPINOFF, "SEC_AAPL")
+        ]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.spinoffs_unrequested == 0
+        assert "spin-off(s) of unrequested" not in source.resolution_summary()
+
+    def test_spinoff_of_neither_requested_security_is_counted(self) -> None:
+        # #1673 (1): a spin-off whose parent and child were both not asked
+        # for is not returned, and is counted on the run report.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    )
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        assert source.corporate_actions(["SEC_KO"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.spinoffs_unrequested == 1
+        assert "1 spin-off(s) of unrequested securities dropped" in source.resolution_summary()
 
     def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
         # #1664 ruling (a): the split and dividend output is byte-identical
