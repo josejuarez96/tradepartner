@@ -1,0 +1,10 @@
+adsh	tag	dimh	dimn	coreg	value
+0001111711-21-000018	Security12bTitle	0x67850a845c93068ab03fbf83c85f7a0d	1		Common Stock, par value $0.01 per share
+0001111711-21-000018	Security12bTitle	0xa3df9a875bd8f9ab69adffc7a4a14c55	1		Series A Corporate Units
+0001111711-21-000018	Security12bTitle	0xb1f539ffdf27da5acc4aec901435c727	1		Depositary Shares, each representing a 1/1,000th ownership interest in a share of 6.50% Series B
+0001111711-21-000018	SecurityExchangeName	0x67850a845c93068ab03fbf83c85f7a0d	1		NYSE
+0001111711-21-000018	SecurityExchangeName	0xa3df9a875bd8f9ab69adffc7a4a14c55	1		NYSE
+0001111711-21-000018	SecurityExchangeName	0xb1f539ffdf27da5acc4aec901435c727	1		NYSE
+0001111711-21-000018	TradingSymbol	0x67850a845c93068ab03fbf83c85f7a0d	1		NI
+0001111711-21-000018	TradingSymbol	0xa3df9a875bd8f9ab69adffc7a4a14c55	1		NIMC
+0001111711-21-000018	TradingSymbol	0xb1f539ffdf27da5acc4aec901435c727	1		NI PR B

@@ -87,6 +87,45 @@ _EQUITY_COMPONENTS_AXIS = "us-gaap:StatementEquityComponentsAxis"
 #: is an ISO MIC (`exch:XNGS`). Read as a listing axis only under
 #: `edgar.exchange_axis_listings`; a grouping key, never the exchange's source.
 _EXCHANGE_AXIS = "dei:EntityListingsExchangeAxis"
+#: Where a title's head instrument phrase ends (#1682 T193): the first `,`
+#: or `(`, or a clause that names what the instrument carries or represents
+#: ("Common Stock, $0.01 par value, and associated Preferred Stock Purchase
+#: Rights", "American Depositary Shares, each representing ...").
+_TITLE_HEAD_END = re.compile(
+    r"[,(;]|\s(?:including|together with|and (?:the )?associated|with associated"
+    r"|each representing|representing|attached|included)\b",
+    re.IGNORECASE,
+)
+#: A head instrument the split-context join never carries a symbol or
+#: exchange onto (#1682 T193, #1675): debt (notes, debentures, bonds, ETNs,
+#: debt securities), an equity or purchase-contract unit (NiSource's "Series
+#: A Corporate Units", "Tangible Equity Units"), a warrant or a right.
+#: A limited partnership's "Common Units" is equity and is not matched.
+_UNJOINED_HEAD = re.compile(
+    r"\b(?:notes?|debentures?|bonds?|etns?|debt securities"
+    r"|(?:corporate|equity|tangible equity|purchase contract|stock purchase|income"
+    r"|premium income|prides)\s+units?"
+    r"|warrants?|rights?)\b",
+    re.IGNORECASE,
+)
+#: A unit made of several instruments ("Units, each consisting of one share
+#: ... and one warrant"), read on the whole title: never a join target.
+_COMPOSITE_UNIT = re.compile(r"\bunits?\b.*\beach consisting\b", re.IGNORECASE)
+
+
+def joinable_title(title: str) -> bool:
+    """Whether the split-context join (`edgar.cover_split_contexts`) may
+    carry a symbol or exchange from a sibling context onto a class titled
+    `title` (#1682 T193). `False` for a title whose head instrument phrase
+    (cut at the first `,`, `(` or carried-clause word) names debt, an
+    equity or purchase-contract unit, a warrant or a right, and for a
+    composite unit ("Units, each consisting of ..."): such a class is read
+    one context at a time, as with the switch off, so the join never puts
+    another class's ticker on it. Pure."""
+    head = _TITLE_HEAD_END.split(title, maxsplit=1)[0]
+    return not (_UNJOINED_HEAD.search(head) or _COMPOSITE_UNIT.search(title))
+
+
 _CIK_SCHEME = "http://www.sec.gov/CIK"
 _CIK_CONCEPT = "EntityCentralIndexKey"
 _COVER_CONCEPTS = frozenset(
@@ -898,7 +937,15 @@ def parse_cover_page(
     title and symbol being the class's own. The merge happens only when the
     class's contexts name at most one title and one symbol; with two it falls
     back to one listing per context, as with the switch off. Never a ticker
-    the filing does not tag."""
+    the filing does not tag.
+
+    The join stays inside one class (#1682 T193, #1675): one class-axis
+    member on one axis, or the contexts with no class-axis member at all
+    (the undimensioned context and its exchange-axis siblings). A fact in a
+    context with another member, or on another axis, is another class and
+    never joins; and a class whose title names debt, an equity or
+    purchase-contract unit, a warrant or a right (`joinable_title`) is read
+    one context at a time, as with the switch off."""
     accepted_at = ensure_tz_aware_utc(accepted_at, field_name="accepted_at")
     dei = _dei_facts(document, accession)
     facts = dei.cover
@@ -999,6 +1046,7 @@ def parse_cover_page(
             split_contexts
             and len(class_titles.get(class_key, ())) <= 1
             and len(class_symbols.get(class_key, ())) <= 1
+            and all(joinable_title(t) for t in class_titles.get(class_key, ()))
         ):
             # #1651: the class's title and symbol are the class's own, wherever
             # its contexts put them; a context with no exchange of its own is
@@ -1352,7 +1400,10 @@ _FSN_EXCHANGE_AXIS = "EntityListingsExchange"
 #: `us-gaap:CapitalUnitsByClassAxis` as FSN spells it (prefix and `Axis`
 #: dropped): a class axis only under `edgar.cover_split_contexts` (#1651).
 _FSN_CAPITAL_UNITS_AXIS = "CapitalUnitsByClass"
-_FSN_EQUITY_COMPONENTS_AXIS = "StatementEquityComponents"
+#: `us-gaap:StatementEquityComponentsAxis` as FSN spells it: FSN drops the
+#: `Statement` prefix as it does for `ClassOfStock`, pinned from NiSource's
+#: real 2021q2 rows (`EquityComponents=CommonStock;`, #1682 T193).
+_FSN_EQUITY_COMPONENTS_AXIS = "EquityComponents"
 
 
 @dataclass(frozen=True)
@@ -1455,7 +1506,7 @@ def _fsn_segments(
     """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
     member}`, or `None` if it names any axis other than `ClassOfStock` (and,
     with `exchange_axis`, `EntityListingsExchange`, #1541; with
-    `split_contexts`, `CapitalUnitsByClass` and `StatementEquityComponents`,
+    `split_contexts`, `CapitalUnitsByClass` and `EquityComponents`,
     but never two class
     axes at once)."""
     pairs: dict[str, str] = {}
@@ -1609,6 +1660,7 @@ def _parse_one_fsn_filing(
             split_contexts
             and len(class_titles.get(class_key, ())) <= 1
             and len(class_symbols.get(class_key, ())) <= 1
+            and all(joinable_title(t) for t in class_titles.get(class_key, ()))
         ):
             # #1651, as parse_cover_page: the class's title and symbol are its
             # own wherever its rows put them; a group with no exchange of its
@@ -1701,10 +1753,13 @@ def parse_fsn(
 
     With `split_contexts` (`edgar.cover_split_contexts`, #1651) `parse_fsn`
     reads what `parse_cover_page` reads under it: `CapitalUnitsByClass` and
-    `StatementEquityComponents` are class axes (shares rows on both stay
+    `EquityComponents` are class axes (shares rows on both stay
     unread), and a class's title, symbol and
     exchange are merged across its (class, exchange) groups when the class
-    names at most one title and one symbol, else one listing per group."""
+    names at most one title and one symbol and that title is
+    `joinable_title` (#1682 T193), else one listing per group. FSN spells
+    the equity-components axis `EquityComponents` (its `Statement` prefix
+    dropped, as for `ClassOfStock`)."""
     dim_segments = {str(row["dimhash"]): str(row["segments"]) for row in dim}
     num_by_adsh: dict[str, list[Mapping[str, str]]] = {}
     for row in num:
