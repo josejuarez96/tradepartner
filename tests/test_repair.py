@@ -4,7 +4,9 @@ delisted security), in one recorded transaction."""
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -13,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tradepartner import cli, repair
+from tradepartner.adapters.filings import FilingHeader
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.health import last_ingests
@@ -1206,3 +1209,319 @@ def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
         store,
         "SELECT source_action_id FROM corporate_actions WHERE action_type = 'spinoff'",
     ) == [(LIVE,)]
+
+
+# --- T191 (#1682 lever B): the reviewed delete of never-true master rows ---
+
+VZ = "0000732712"
+NOTE_TITLE = "2.375% Notes due 2022"
+COMMON_KNOWN = datetime(2019, 8, 8, 17, 4, 24, tzinfo=UTC)
+NOTE_KNOWN = datetime(2019, 10, 30, 16, 18, 19, tzinfo=UTC)
+FORM25_AT = datetime(2020, 6, 15, 20, 43, 22, tzinfo=UTC)
+TENQ, FORM25 = "0000732712-19-000063", "0000876661-20-000505"
+RETRACTED_AT = datetime(2026, 10, 13, 18, 51, tzinfo=UTC)
+DELETE_RUN = datetime(2026, 10, 15, 14, tzinfo=UTC)
+
+
+def _master_listing(
+    ticker: str, valid_from: date, title: str | None, known: datetime, **extra: Any
+) -> dict[str, Any]:
+    return {
+        "security_id": VZ,
+        "ticker": ticker,
+        "exchange": "NYSE",
+        "class_title": title,
+        "valid_from": valid_from,
+        "known_at": known,
+        "ingested_at": extra.pop("ingested_at", RUN),
+        "source": "edgar",
+        "provenance": extra.pop("provenance", "filing"),
+        **extra,
+    }
+
+
+@pytest.fixture
+def vz(settings: Settings) -> Settings:
+    """Verizon's primary as #1682 found it: the common, the 2.375% note's
+    listing (and the #859 retraction stamped at its run), the note's 25-NSE
+    on the primary, a snapshot row; a release open."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "securities", _security(VZ, datetime(2015, 2, 23, tzinfo=UTC), "VZ"))
+        for row in (
+            _master_listing("VZ", date(2019, 8, 8), "Common Stock, par value $0.10", COMMON_KNOWN),
+            _master_listing("VZ22A", date(2019, 10, 30), NOTE_TITLE, NOTE_KNOWN),
+            _master_listing(
+                "VZ22A",
+                date(2019, 10, 30),
+                NOTE_TITLE,
+                RETRACTED_AT,
+                ingested_at=RETRACTED_AT,
+                retracted=True,
+            ),
+            _master_listing(
+                "VZ",
+                date(1994, 1, 21),
+                None,
+                RETRACTED_AT,
+                ingested_at=RETRACTED_AT,
+                provenance="snapshot_static",
+            ),
+        ):
+            insert_row(conn, "listings", row)
+        insert_row(conn, "delistings", _note_delisting())
+    _open_release(settings)
+    return settings
+
+
+def _note_delisting() -> dict[str, Any]:
+    return {
+        "security_id": VZ,
+        "form": "25-NSE",
+        "class_title": NOTE_TITLE,
+        "exchange": "NYSE",
+        "filed_at": FORM25_AT,
+        "effective_on": date(2020, 6, 25),
+        "known_at": FORM25_AT,
+        "ingested_at": RUN,
+        "source": "edgar",
+        "provenance": "filing",
+    }
+
+
+def _note_manifest() -> list[repair.MasterRowKey]:
+    note = {"table": "listings", "security_id": VZ, "exchange": "NYSE", "class_title": NOTE_TITLE}
+    note_key = {"ticker": "VZ22A", "valid_from": date(2019, 10, 30)}
+    return [
+        repair.MasterRowKey(**note, **note_key, known_at=NOTE_KNOWN, accession=TENQ),
+        repair.MasterRowKey(**note, **note_key, known_at=RETRACTED_AT, accession=TENQ),
+        repair.MasterRowKey(
+            table="delistings",
+            security_id=VZ,
+            exchange="NYSE",
+            class_title=NOTE_TITLE,
+            form="25-NSE",
+            filed_at=FORM25_AT,
+            known_at=FORM25_AT,
+            accession=FORM25,
+        ),
+    ]
+
+
+def _headers(accepted: dict[str, datetime] | None = None, cik: str = VZ) -> repair.HeaderLookup:
+    """SGML headers naming `cik`: the 10-Q and the 25-NSE at their true acceptance."""
+    stamps = {TENQ: NOTE_KNOWN, FORM25: FORM25_AT, **(accepted or {})}
+
+    def lookup(asked: str, accession: str) -> FilingHeader:
+        if asked != cik or accession not in stamps:
+            raise ValueError(f"SGML header names no issuer {asked!r}")
+        return FilingHeader(asked, accession, "10-Q", 4813, stamps[accession])
+
+    return lookup
+
+
+def _delete_master(
+    settings: Settings,
+    manifest: list[repair.MasterRowKey] | None = None,
+    *,
+    dry_run: bool = False,
+    release: str = REL,
+    headers: repair.HeaderLookup | None = None,
+) -> repair.MasterRowsDeleted:
+    opened = repair._read(settings) if dry_run else open_for_write(settings)
+    with opened as conn:
+        return repair.delete_master_rows(
+            conn,
+            _note_manifest() if manifest is None else manifest,
+            release,
+            dry_run=dry_run,
+            headers=headers or _headers(),
+            clock=lambda: DELETE_RUN,
+        )
+
+
+def _master_rows(settings: Settings) -> list[tuple[Any, ...]]:
+    return _rows(
+        settings,
+        "SELECT 'listings', ticker, known_at FROM listings UNION ALL "
+        "SELECT 'delistings', class_title, known_at FROM delistings ORDER BY ALL",
+    )
+
+
+def test_a_master_dry_run_lists_every_row_and_changes_nothing(vz: Settings) -> None:
+    before = _master_rows(vz)
+    result = _delete_master(vz, dry_run=True)
+    assert (result.listings, result.delistings, result.refused) == (2, 1, ())
+    assert result.summary() == (
+        f"would delete 2 listings and 1 delistings rows of 3 manifest rows; refused 0; "
+        f"release {REL}"
+    )
+    assert [line.split(" known_at")[0] for line in result.found] == [
+        f"  listings {VZ} VZ22A NYSE 2019-10-30 {NOTE_TITLE!r}",
+        f"  listings {VZ} VZ22A NYSE 2019-10-30 {NOTE_TITLE!r}",
+        f"  delistings {VZ} 25-NSE {NOTE_TITLE!r} NYSE {FORM25_AT.isoformat()}",
+    ]
+    assert _master_rows(vz) == before
+    assert _rows(vz, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_the_delete_removes_only_the_manifest_rows_and_records_the_run(vz: Settings) -> None:
+    result = _delete_master(vz)
+    assert not result.dry_run and result.summary().startswith("deleted 2 listings and 1 ")
+    assert _master_rows(vz) == [
+        ("listings", "VZ", COMMON_KNOWN),
+        ("listings", "VZ", RETRACTED_AT),
+    ]
+    runs = _rows(vz, "SELECT source, mode, status, message FROM ingestion_runs")
+    assert runs == [("edgar", repair.REPAIR, repair.REPAIRED, result.summary())]
+
+
+@pytest.mark.parametrize(
+    ("manifest", "headers", "reason"),
+    [
+        # The 10-Q was accepted after the row's known_at: later knowledge.
+        (
+            None,
+            _headers({TENQ: NOTE_KNOWN + timedelta(seconds=1)}),
+            "was accepted at 2019-10-30T16:18:20+00:00, after the row's known_at",
+        ),
+        # The filing names another company: not the security's CIK's.
+        (None, _headers(cik="0000000001"), f"is not CIK {VZ}'s filing"),
+        # The retraction stays behind: a key leaves whole or not at all.
+        (_note_manifest()[::2], None, "another revision of this key is not in the manifest"),
+        # A snapshot row has no filing behind it.
+        (
+            [
+                repair.MasterRowKey(
+                    table="listings",
+                    security_id=VZ,
+                    ticker="VZ",
+                    exchange="NYSE",
+                    valid_from=date(1994, 1, 21),
+                    class_title=None,
+                    known_at=RETRACTED_AT,
+                    accession=TENQ,
+                )
+            ],
+            None,
+            "the stored row is edgar snapshot_static",
+        ),
+        # A typo'd stamp matches no stored row.
+        (
+            [dataclasses.replace(_note_manifest()[2], known_at=FORM25_AT + timedelta(hours=4))],
+            None,
+            "no stored row has this key and known_at",
+        ),
+    ],
+)
+def test_a_refused_row_is_listed_and_the_real_run_deletes_nothing(
+    vz: Settings,
+    manifest: list[repair.MasterRowKey] | None,
+    headers: repair.HeaderLookup | None,
+    reason: str,
+) -> None:
+    before = _master_rows(vz)
+    dry = _delete_master(vz, manifest, dry_run=True, headers=headers)
+    assert dry.refused and all(reason in line for line in dry.refused), dry.refused
+    with pytest.raises(RepairRefused, match="nothing deleted"):
+        _delete_master(vz, manifest, headers=headers)
+    assert _master_rows(vz) == before
+    assert _rows(vz, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def test_a_master_delete_writes_only_inside_the_open_release_of_its_name(vz: Settings) -> None:
+    with pytest.raises(ValueError, match="names its data release"):
+        _delete_master(vz, release=" ")
+    with pytest.raises(RepairRefused, match=f"'other' \\(release {REL!r} is open\\)"):
+        _delete_master(vz, release="other")
+    _close_release(vz)
+    with pytest.raises(RepairRefused, match="no release is open"):
+        _delete_master(vz)
+    assert len(_master_rows(vz)) == 5
+    assert _delete_master(vz, dry_run=True).refused == ()  # a dry run needs no open release
+
+
+def _open_paper_window(settings: Settings, started_at: datetime) -> None:
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "paper_windows",
+            {
+                "window_id": 1,
+                "hypothesis_id": 1,
+                "first_rebalance_session": date(2026, 10, 30),
+                "account_id": "paper",
+                "starting_cash": 100_000.0,
+                "starting_equity": 100_000.0,
+                "code_version": "test",
+                "started_at": started_at,
+                "frozen_json": "{}",
+                "frozen_sha256": "0" * 64,
+                "known_at": started_at,
+                "ingested_at": started_at,
+            },
+        )
+
+
+def test_an_open_paper_window_that_read_a_row_refuses_the_delete(vz: Settings) -> None:
+    # Its started_at is a read instant after every row's known_at.
+    _open_paper_window(vz, datetime(2026, 10, 14, 14, tzinfo=UTC))
+    dry = _delete_master(vz, dry_run=True)
+    assert len(dry.refused) == 3
+    assert all("an open paper window (first session 2026-10-14) read it" in r for r in dry.refused)
+    with pytest.raises(RepairRefused, match="3 of 3 manifest rows refused"):
+        _delete_master(vz)
+    assert len(_master_rows(vz)) == 5
+
+
+def test_a_row_known_inside_an_open_window_is_refused(vz: Settings) -> None:
+    # A window started before the retraction's stamp: the retraction row was
+    # known inside it (no paper run has read it yet: no instant after it).
+    _open_paper_window(vz, datetime(2026, 10, 12, 14, tzinfo=UTC))
+    dry = _delete_master(vz, dry_run=True)
+    retraction = [r for r in dry.refused if RETRACTED_AT.isoformat() in r]
+    assert len(retraction) == 1
+    assert "known inside the open paper window (first session 2026-10-12)" in retraction[0]
+
+
+def test_a_delete_that_misses_its_count_rolls_the_master_back(
+    vz: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(repair, "_delete_master_row", lambda conn, row: 0)
+    with pytest.raises(RuntimeError, match="rolled back"):
+        _delete_master(vz)
+    assert len(_master_rows(vz)) == 5
+    assert _rows(vz, "SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+def _manifest_file(tmp_path: Path, rows: list[str]) -> Path:
+    path = tmp_path / "manifest.csv"
+    path.write_text("\n".join([",".join(repair.MASTER_MANIFEST_COLUMNS), *rows]) + "\n")
+    return path
+
+
+NOTE_CSV = f"listings,{VZ},VZ22A,NYSE,2019-10-30,,{NOTE_TITLE},,{NOTE_KNOWN.isoformat()},{TENQ}"
+
+
+def test_the_manifest_reads_both_tables_and_refuses_a_malformed_file(tmp_path: Path) -> None:
+    form25 = (
+        f"delistings,{VZ},,NYSE,,25-NSE,{NOTE_TITLE},{FORM25_AT.isoformat()},"
+        f"{FORM25_AT.isoformat()},{FORM25}"
+    )
+    assert repair.read_master_manifest(_manifest_file(tmp_path, [NOTE_CSV, form25])) == [
+        _note_manifest()[0],
+        _note_manifest()[2],
+    ]
+    for rows, error in (
+        ([NOTE_CSV, NOTE_CSV], "line 3: listed twice"),
+        ([NOTE_CSV.replace("+00:00", "")], "naive"),
+        ([NOTE_CSV.replace(",VZ22A,", ",,")], "needs ticker and valid_from"),
+        ([form25.replace(",25-NSE,", ",,")], "needs form, class_title and filed_at"),
+        ([NOTE_CSV.replace("listings,", "securities,", 1)], "is not one of"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            repair.read_master_manifest(_manifest_file(tmp_path, rows))
+    bad = tmp_path / "bad.csv"
+    bad.write_text("table,security_id\n")
+    with pytest.raises(ValueError, match="the header must be"):
+        repair.read_master_manifest(bad)
