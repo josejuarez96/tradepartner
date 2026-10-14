@@ -861,35 +861,35 @@ what = "A short Zones section in research-program.md: development data is permis
 why = "The #1301 decisions and ADR 0016 are rules agents must follow; a page they read every session beats a record they have to find."
 
 [task.T144]
-what = "Owner-gated spike: the USD 69 one-month Sharadar overlap test, read-only on a store copy, with pass/fail numbers written before the purchase (identity, delisted completeness, raw closes, actions, fundamentals timing) and a pre-2016 depth report."
+what = "Not run: the owner decided no vendor on #1682 (2026-10-14, ADR 0022). Owner-gated spike: the USD 69 one-month Sharadar overlap test, read-only on a store copy, with pass/fail numbers written before the purchase (identity, delisted completeness, raw closes, actions, fundamentals timing) and a pre-2016 depth report."
 why = "Turns every vendor claim into a measurement on our own store and decides the USD 499/yr question with numbers rather than on the vendor's word."
 
 [task.T145]
-what = "The vendor and budget ADR amending ADR 0009, decided only from T144's numbers: buy or not, and if buying the fill-only rule, the stamping rule, the crosswalk first, synthetic fixtures only and the deletion clause for backups and exports."
+what = "Decided no vendor on #1682 without T144 (ADR 0022). The vendor and budget ADR amending ADR 0009, decided only from T144's numbers: buy or not, and if buying the fill-only rule, the stamping rule, the crosswalk first, synthetic fixtures only and the deletion clause for backups and exports."
 why = "A vendor enters only through a new ADR and a plan amendment (ADR 0009); this is the gate everything paid stands behind."
 
 [task.T146]
-what = "Only if buying: the identity crosswalk table and builder, security_id to the vendor's permanent id by CIK and CUSIP, never by ticker."
+what = "Not building: no vendor (#1682, ADR 0022). Only if buying: the identity crosswalk table and builder, security_id to the vendor's permanent id by CIK and CUSIP, never by ticker."
 why = "Matching vendor rows by ticker is the #1314 mistake again; the crosswalk is the first table a vendor adapter needs."
 
 [task.T147]
-what = "Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures; the per-row quality column stays deferred until this lands."
+what = "Not building: no vendor (#1682, ADR 0022). Only if buying: the Sharadar PriceSource adapter for SEP bars and actions, fill-only, on synthetic fixtures; the per-row quality column stays deferred until this lands."
 why = "Fills history before 2016 and the delisted tails Alpaca lacks without changing a stored Alpaca row or a registered trial."
 
 [task.T148]
-what = "Only if buying: a listing-history source for the vendor's dated ticker spans, listing and delisting dates, stamped per the vendor ADR."
+what = "Not building: no vendor (#1682, ADR 0022). Only if buying: a listing-history source for the vendor's dated ticker spans, listing and delisting dates, stamped per the vendor ADR."
 why = "Before 2019 the point-in-time universe is empty because cover-page tagging did not exist; vendor listing history is what makes an earlier universe possible."
 
 [task.T149]
-what = "Only if buying: health counts and the data-health page block for vendor-filled rows and vendor-stamped listing dates."
+what = "Not building: no vendor (#1682, ADR 0022). Only if buying: health counts and the data-health page block for vendor-filled rows and vendor-stamped listing dates."
 why = "Reliance on a vendor's assembled dates is counted on the health page the way snapshot_static reliance is."
 
 [task.T149b]
-what = "Owner, only if buying: the vendor backfill on the real store under a release name, with the gap metric at every 2017 to 2019 rebalance and a non-empty universe from the first vendor year as evidence."
+what = "Not building: no vendor (#1682, ADR 0022). Owner, only if buying: the vendor backfill on the real store under a release name, with the gap metric at every 2017 to 2019 rebalance and a non-empty universe from the first vendor year as evidence."
 why = "The build is proven only on the owner's store; the release row names the state every later trial reads."
 
 [task.T150]
-what = "The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
+what = "Not building: no vendor (#1682, ADR 0022). The re-split on the longer history: long-history families register as children of today's families with the SR* mark carried, the boundary re-set by a recorded owner decision, walk-forward specified then."
 why = "Only with longer history does more than one exam slice exist; registering the new families as children keeps every trial counted, as charter principle 2 requires."
 
 [task.T151]
@@ -1237,14 +1237,14 @@ why = "Puts the repaired dividends in the store under one named release with a b
 [issue.1682]
 what = "The owner's decision on the security master after T181: keep patching the EDGAR-inferred master, or key securities on a vendor or FIGI; decided no vendor on 2026-10-14, with the free S&P 500 answer key as a check and the root causes fixed in lever order."
 why = "Identity defects were being patched one name at a time; the answer key showed 2,232 index member-months lost to eleven fixable causes, which a vendor would not have touched."
-unblocks = ["adr:0022", "task:T189", "task:T190", "task:T191", "task:T192", "task:T193", "task:T194", "task:T195", "task:T196"]
+unblocks = ["adr:0022", "task:T189", "task:T189b", "task:T189c", "task:T190", "task:T190b", "task:T190c", "task:T191", "task:T192", "task:T193", "task:T194", "task:T195", "task:T196", "task:T197", "task:T198", "task:T184h"]
 
 [adr.0022]
 what = "No vendor security master: identity stays SEC filings plus Alpaca, the free index history and OpenFIGI's current type are check-only health blocks, and the identity defects are fixed root cause by root cause under censuses and named releases."
 why = "Records the owner's 2026-10-14 decision that closes the #1303 vendor route (T144 not run, T146 to T150 not built) at USD 0, so the next sittings go to fixes we can test (#1682)."
 
 [task.T189]
-what = "The committed S&P 500 membership intervals at a pinned commit, their loader and the pure ticker-to-security matcher."
+what = "The committed S&P 500 membership intervals at a pinned commit (MIT, provenance quoted), their loader and the pure ticker-to-security matcher with the unresolved outcome."
 why = "The one free outside list that flags every failure type of the universe at once; a check only, never a source (#1682)."
 unblocks = ["task:T189b"]
 
@@ -1255,17 +1255,26 @@ unblocks = ["task:T197", "task:T198"]
 
 [task.T189c]
 what = "The OpenFIGI types cross-check: the paced client under the owner's key, the parse, the dated openfigi_types table, the ingest source and the health block of type disagreements."
-why = "The one free outside view on what kind of instrument a ticker is, stored at its fetch time so it never back-dates and never enters a trial (#1682)."
-unblocks = ["task:T198"]
+why = "The one free outside view on what kind of instrument a ticker is, stored at its fetch time so it never back-dates and never enters a trial; the orchestrator's addition, kept small and gating nothing (#1682)."
 
 [task.T190]
-what = "Shares facts by rule: the class-member link from the cover page's class axis, the ambiguity rule, and jumps explained by a stored action; census first (Codex census 2 on #1682)."
-why = "The largest lever: 525 index member-months lost to stale, ambiguous or missing shares on 18 names, and the per-name override list retired (#1682)."
+what = "Shares facts by rule, as of t: the class-member link from the stored member and class title, the ambiguity rule, and jumps explained by an action known at t; the census is Codex census 2 on #1682."
+why = "The largest lever: 324 of the 525 index member-months lost to missing or ambiguous per-class shares on 8 names, and the per-name override list retired (#1682)."
+unblocks = ["task:T198"]
+
+[task.T190b]
+what = "A tiny pre-trading seed fact (1, 100, 1,000 shares) is no baseline for the plausibility rule, so the true facts already stored are accepted; the failing test first."
+why = "59 index member-months on 7 names (AMCR, CTVA, FOXA, LIN, PSKY, SW, VTRS) are a plain defect in shares_as_of, not missing data (#1682, Codex census 2)."
+unblocks = ["task:T198"]
+
+[task.T190c]
+what = "The per-period cover shares fact for filers whose context shape the FSN and cover parsers drop (IBKR, SPG, WBD and 11 non-index names), read under the cache bump of rederive-1682; census of the shape first."
+why = "142 index member-months read a shares count from 2009 to 2022 while every later 10-Q states the fresh one; extraction coverage, not a single repair (#1682, Codex census 2)."
 unblocks = ["task:T198"]
 
 [task.T191]
-what = "Listing-row restatements under a manifest: a re-stamp to the named filing's acceptance (the rows known 2026-10-03) and a retraction at a false row's own known_at (a note on the common's id); census first (Codex census 1 on #1682)."
-why = "468 member-months on 90 names read as unlisted before 2026-10-03 and Verizon reads delisted since 2020; only a time the evidence was public may be written (#1682)."
+what = "The reviewed delete of master rows that were never true (a note's listing or its Form 25 on the common's id), from a manifest naming the filing that shows it, under a named release with the open-window guard; census first."
+why = "Verizon reads delisted since 2020 and P&G's primary id reads a note, 98 member-months; a retraction at the row's own known_at cannot be stored, so the #1613 delete rule applies (#1682)."
 unblocks = ["task:T197"]
 
 [task.T192]
