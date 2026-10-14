@@ -767,6 +767,8 @@ def ingest_actions_backfill(
             )
             counts["actions_unresolved"] = len(parsed.unresolved)
             counts["actions_self_spinoff"] = parsed.self_spinoff
+            counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
+            counts["actions_spinoff_unordered"] = len(parsed.spinoff_unordered)
             counts["symbol_change_reused"] = parsed.symbol_change_reused
             counts["symbol_change_conflict"] = parsed.symbol_change_conflict
             message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))

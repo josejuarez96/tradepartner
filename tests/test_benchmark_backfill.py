@@ -96,6 +96,48 @@ def test_seeds_the_missing_benchmark_and_backfills_its_bars(settings: Settings) 
     assert ids == {"MTUM": MTUM}
 
 
+def test_a_spinoff_of_the_benchmark_as_parent_is_kept(settings: Settings) -> None:
+    # #1673 (1): `corporate_actions` returns a spin-off when its parent (the
+    # `source_action_id`) is requested; the benchmark chunk keeps it too.
+    ex = date(2019, 6, 20)
+    spin = CorporateAction(
+        "CHILD_SEC",
+        ActionType.SPINOFF,
+        ex,
+        0.5,
+        action_first_seen_known_at(ex),
+        "x",
+        source_action_id=MTUM,
+    )
+    other = CorporateAction(
+        "CHILD_SEC",
+        ActionType.SPINOFF,
+        ex,
+        0.5,
+        action_first_seen_known_at(ex),
+        "x",
+        source_action_id="SOMEONE_ELSE",
+    )
+
+    class _ParentAware(_History):
+        def corporate_actions(
+            self, security_ids: Sequence[str], start: date, end: date
+        ) -> list[CorporateAction]:
+            self.calls.append(("actions", start, end))
+            return [
+                a
+                for a in self.actions
+                if (a.security_id in security_ids or a.source_action_id in security_ids)
+                and start <= a.ex_date <= end
+            ] + [other]
+
+    result = _run(settings, _ParentAware(actions=[spin]))
+    assert result.ok
+    assert _read(
+        settings, "SELECT security_id, action_type, source_action_id FROM corporate_actions"
+    ) == [("CHILD_SEC", "spinoff", MTUM)]
+
+
 def test_a_repeat_finds_the_seeded_security_and_adds_nothing(settings: Settings) -> None:
     _run(settings, _History())
     again = _run(settings, _History(), seed=None, clock=lambda: NOW + timedelta(hours=1))

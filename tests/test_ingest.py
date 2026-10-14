@@ -4511,6 +4511,65 @@ def test_actions_backfill_retries_unresolved_child_with_original_stamp(
         ]
 
 
+def test_actions_backfill_stores_a_known_distribution_behind_an_unknown_revision(
+    fixture_store_path: Path,
+) -> None:
+    # #1673 (2): two distributions of one (child, parent) in one month are
+    # revisions, not a malformed payload; a later one not yet knowable at
+    # the run never hides the earlier one that is, and the next run revises.
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.ingest import ingest_actions_backfill
+
+    settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, class_title, "
+            "valid_from, known_at, ingested_at, source, provenance) "
+            "VALUES ('SEC_SPLIT_PLAIN', 'LATECHILD', 'NYSE', 'Common Stock', "
+            "DATE '2020-06-15', TIMESTAMPTZ '2020-06-01 20:00:00+00', "
+            "TIMESTAMPTZ '2020-06-01 20:00:00+00', 'fixture', 'snapshot_static')"
+        )
+    row = {"source_symbol": "SPY", "new_symbol": "LATECHILD", "source_rate": 4, "new_rate": 1}
+    payload = {
+        "spin_offs": [
+            {**row, "ex_date": "2020-06-22", "process_date": "2020-06-29", "new_rate": 3},
+            {**row, "ex_date": "2020-06-15", "process_date": "2020-06-16"},
+        ],
+        "name_changes": [],
+    }
+
+    def run(now: datetime) -> IngestResult:
+        return ingest_actions_backfill(
+            settings,
+            since=date(2020, 6, 1),
+            through=date(2020, 6, 30),
+            clock=lambda: now,
+            scan=lambda _types, _first, _last: payload,
+        )
+
+    query = (
+        "SELECT ex_date, ratio_or_amount, known_at FROM corporate_actions "
+        "WHERE action_type='spinoff' AND security_id='SEC_SPLIT_PLAIN' "
+        "AND source_action_id='SEC_SPY' ORDER BY known_at"
+    )
+    first = run(datetime(2020, 6, 26, 21, tzinfo=UTC))
+    assert first.ok and first.runs[0].rows_added == 1
+    assert "actions_spinoff_revisions=1" in first.runs[0].message
+    assert "actions_not_yet_known=1" in first.runs[0].message
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert [(d, r, k.astimezone(UTC)) for d, r, k in conn.execute(query).fetchall()] == [
+            (date(2020, 6, 15), 0.25, announcement_date_known_at(date(2020, 6, 16)))
+        ]
+    later = datetime(2020, 7, 2, 21, tzinfo=UTC)
+    second = run(later)
+    assert second.ok and second.runs[0].rows_added == 1
+    with duckdb.connect(str(fixture_store_path)) as conn:
+        assert [(d, r, k.astimezone(UTC)) for d, r, k in conn.execute(query).fetchall()] == [
+            (date(2020, 6, 15), 0.25, announcement_date_known_at(date(2020, 6, 16))),
+            (date(2020, 6, 22), 0.75, later),
+        ]
+
+
 def test_filename_form25_unmatched_counts_only_an_exchange_mismatch() -> None:
     # #1662: an unmatched Form 25 of a CIK with an earlier `filing_name` row
     # counts only when no such row is on its exchange; a warrant's, filed on

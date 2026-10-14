@@ -141,7 +141,7 @@ import duckdb
 
 from tradepartner.adapters.alpaca_prices import ListingResolver, alpaca_symbol
 from tradepartner.adapters.filings import FilingSource
-from tradepartner.adapters.prices import PriceSource
+from tradepartner.adapters.prices import ActionType, PriceSource
 from tradepartner.calendar import is_session, next_session
 from tradepartner.config import Settings
 from tradepartner.ingest import (
@@ -1135,7 +1135,14 @@ def _benchmark_chunk(
             for b in prices.bars(ids, first, last)
             if b.security_id == security_id and first <= b.session <= last
         ]
-        actions = [a for a in prices.corporate_actions(ids, first, last) if a.security_id in ids]
+        # #1673: a spin-off is the benchmark's when it is the child or the
+        # parent (`source_action_id`), as `corporate_actions` returns it.
+        actions = [
+            a
+            for a in prices.corporate_actions(ids, first, last)
+            if a.security_id in ids
+            or (a.action_type is ActionType.SPINOFF and a.source_action_id in ids)
+        ]
         with _read(settings) as conn:
             plan = _replay_plan(conn, actions, window)
         actions, covered = _replay_actions(prices, actions, window, plan)
