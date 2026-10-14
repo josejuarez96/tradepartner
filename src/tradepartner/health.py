@@ -326,6 +326,7 @@ EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 
 from __future__ import annotations
 
+import csv
 import math
 import re
 from bisect import bisect_left, bisect_right
@@ -392,8 +393,8 @@ from tradepartner.store.dividend_reviews import (
 from tradepartner.store.index_members import (
     UNRESOLVED,
     IndexMembers,
-    IndexMembersError,
     load_index_members,
+    normalize_ticker,
     resolve,
 )
 from tradepartner.store.master import first_session, securities_as_of, session_of
@@ -950,11 +951,13 @@ class IndexMembersCheck:
 
     @property
     def failed(self) -> bool:
-        """While `max_missing` is set: the key could not be loaded, or some
-        sample session's misses exceed it. Never while it is unset."""
+        """While `max_missing` is set: the key could not be loaded, it
+        checked nothing (every sample session beyond it, or none covered), or
+        some sample session's misses exceed it; a gate never passes on a check
+        it did not make. Never while it is unset."""
         if self.max_missing is None:
             return False
-        return self.error is not None or self.worst > self.max_missing
+        return not self.checked or self.worst > self.max_missing
 
     @property
     def verdict(self) -> str:
@@ -965,7 +968,7 @@ class IndexMembersCheck:
             gate = "fail" if self.failed else "report-only"
             return f"key unavailable ({self.error}): {gate}"
         if not self.checked:
-            return "nothing checked"
+            return "nothing checked: fail" if self.failed else "nothing checked"
         head = f"{self.worst} max missing per session"
         if self.max_missing is None:
             return f"{head} (report-only)"
@@ -1740,8 +1743,24 @@ def _load_key(index_key: IndexMembers | None) -> tuple[IndexMembers | None, str 
         return load_index_members(), None
     except FileNotFoundError:
         return None, "file absent"
-    except IndexMembersError as exc:
-        return None, str(exc)
+    except (OSError, ValueError, csv.Error) as exc:
+        # IndexMembersError and UnicodeDecodeError are ValueErrors.
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _key_listings(listings: pl.DataFrame, key: IndexMembers) -> pl.DataFrame:
+    """Every listing row of the securities with some row carrying a key
+    ticker (`normalize_ticker`): all `resolve` needs, every row of each kept
+    so a row's span still ends at its security's next row. Taken once per
+    block, not per sample session."""
+    wanted = {normalize_ticker(i.ticker) for i in key.intervals}
+    carried = {
+        ticker
+        for ticker in listings["ticker"].drop_nulls().unique().to_list()
+        if normalize_ticker(ticker) in wanted
+    }
+    sids = listings.filter(pl.col("ticker").is_in(sorted(carried)))["security_id"].unique()
+    return listings.filter(pl.col("security_id").is_in(sids.to_list()))
 
 
 def _index_session(
@@ -1813,6 +1832,7 @@ def _coverage_reference(
 ) -> CoverageReference:
     refs = settings.coverage.references()
     key, key_error = _load_key(index_key) if settings.coverage.index_members else (None, None)
+    key_listings = _key_listings(listings, key) if key is not None else listings
     index_samples: list[dict[str, Any]] = []
     index_hits: list[dict[str, Any]] = []
     index_misses: list[dict[str, Any]] = []
@@ -1854,7 +1874,7 @@ def _coverage_reference(
         missing.extend(found)
         if key is not None:
             sample, hit_rows, miss_rows = _index_session(
-                key, session, listings, set(universe.members["security_id"]), exclusions
+                key, session, key_listings, set(universe.members["security_id"]), exclusions
             )
             index_samples.append(sample)
             index_hits.extend(hit_rows)

@@ -3347,6 +3347,23 @@ def test_sessions_after_the_keys_last_row_are_beyond_the_key_and_count_nothing(
     assert index.worst == 2
 
 
+def test_a_set_threshold_never_passes_a_key_that_checked_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    stale = _key(*_KEY.intervals, through=date(2019, 6, 28))
+    report = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=100), index_key=stale
+    )
+    assert report.coverage_reference is not None
+    index = _index(report.coverage_reference)
+    assert index.samples["beyond_key"].to_list() == [True, True]
+    assert not index.checked
+    assert index.verdict == "nothing checked: fail"
+    assert report.failures == (INDEX_MEMBERS_MISSING,)
+    unset = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), stale))
+    assert (unset.failed, unset.verdict) == (False, "nothing checked")
+
+
 def test_index_members_missing_fails_only_while_the_threshold_is_set_and_exceeded(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
@@ -3375,7 +3392,9 @@ def test_index_members_missing_fails_only_while_the_threshold_is_set_and_exceede
     ("error", "why"),
     [
         (FileNotFoundError("index_members"), "file absent"),
-        (IndexMembersError("header None"), "header None"),
+        (IndexMembersError("header None"), "IndexMembersError: header None"),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"), "UnicodeDecodeError: "),
+        (PermissionError("denied"), "PermissionError: denied"),
     ],
 )
 def test_an_unloadable_key_is_reported_and_fails_only_under_a_threshold(
@@ -3391,9 +3410,10 @@ def test_an_unloadable_key_is_reported_and_fails_only_under_a_threshold(
     report = health_report(fixture_store, T_END, _coverage_settings(), with_coverage_reference=True)
     assert report.coverage_reference is not None
     index = _index(report.coverage_reference)
-    assert (index.commit, index.error) == (None, why)
+    assert index.commit is None and index.error is not None
+    assert index.error.startswith(why)
     assert index.samples.is_empty() and not index.checked
-    assert index.verdict == f"key unavailable ({why}): report-only"
+    assert index.verdict == f"key unavailable ({index.error}): report-only"
     assert report.ok
     gated = health_report(fixture_store, T_END, _coverage_settings(index_max_missing=0))
     assert gated.failures == (INDEX_MEMBERS_MISSING,)

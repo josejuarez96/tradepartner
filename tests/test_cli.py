@@ -2063,7 +2063,11 @@ def test_health_coverage_prints_the_index_lines_with_the_reports_sha(
     )
     assert summary.endswith("max missing per session (report-only)")
     [buckets] = [line for line in lines if line.startswith("  index misses by bucket: ")]
-    assert "unresolved " in buckets and "AAPL" in buckets
+    assert (
+        "unresolved 1010 member-sessions, 517 names (" in buckets
+        and " member-sessions, " in buckets
+        and "AAPL" in buckets
+    )
     assert "  index_members_missing: " in result.output
     plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
     assert "  index_members_missing: not computed (run with --coverage)" in plain.output

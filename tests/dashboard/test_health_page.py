@@ -609,3 +609,14 @@ def test_the_index_badge_is_critical_only_when_the_block_fails(store_path: Path)
         "critical",
     )
     assert health_page.index_badge(view(index_max_missing=10_000))[1] == "good"
+
+
+def test_the_not_computed_card_warns_while_the_index_threshold_is_set(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("COVERAGE__INDEX_MAX_MISSING", "5")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Not computed" in text
+    assert f"`health --check` enforces {INDEX_MEMBERS_MISSING}" in text

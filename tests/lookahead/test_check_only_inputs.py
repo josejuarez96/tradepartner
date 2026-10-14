@@ -60,6 +60,8 @@ _NAMING = (
     re.compile(r"index_members\.(csv|py)\b"),
     re.compile(r"store[./]index_members\b"),
     re.compile(r"from\s+tradepartner\.store\s+import\s+\(?[^)]*?\bindex_members\b", re.S),
+    re.compile(r"[\"']index_members[\"']"),
+    re.compile(r"\b(?:FROM|JOIN)\s+index_members\b", re.I),
 )
 
 Variant = Literal["present", "absent", "emptied"]
@@ -117,6 +119,8 @@ def test_the_source_scan_finds_no_reader_outside_health_and_the_loader() -> None
         'PATH = "src/tradepartner/store/index_members.csv"\n',
         "SQL = \"SELECT * FROM read_csv('index_members.csv')\"\n",
         'mod = importlib.import_module("tradepartner.store.index_members")\n',
+        'name = "index_members"\n',
+        'SQL = "SELECT ticker FROM index_members"\n',
     ],
 )
 def test_the_source_scan_has_teeth(text: str) -> None:
@@ -130,7 +134,7 @@ def test_a_config_key_or_report_field_of_that_name_is_not_an_offence() -> None:
 
 
 @contextmanager
-def _served(variant: Variant, root: Path) -> Iterator[None]:
+def _served(variant: Variant, root: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """`importlib.resources.files("tradepartner.store")` served from a temp
     copy of the package's data files with the key `variant`, the audit armed."""
     real = Path(tradepartner.store.__file__).parent
@@ -148,24 +152,24 @@ def _served(variant: Variant, root: Path) -> Iterator[None]:
     def files(anchor: Any) -> Any:
         return data if anchor == "tradepartner.store" else original(anchor)
 
-    importlib.resources.files = files  # type: ignore[assignment]
-    _OPENS.clear()
-    _ARMED[0] = True
-    try:
-        yield
-    finally:
-        _ARMED[0] = False
-        importlib.resources.files = original
+    with monkeypatch.context() as patch:
+        patch.setattr(importlib.resources, "files", files)
+        _OPENS.clear()
+        _ARMED[0] = True
+        try:
+            yield
+        finally:
+            _ARMED[0] = False
 
 
-def test_the_variants_are_what_they_say(tmp_path: Path) -> None:
+def test_the_variants_are_what_they_say(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Liveness: the loader sees each variant, and the audit sees its open."""
-    with _served("present", tmp_path):
+    with _served("present", tmp_path, monkeypatch):
         assert load_index_members().commit == "a2430f2af0c79ddf0748e91de11bdeb1616ab5a7"
         assert _OPENS
-    with _served("absent", tmp_path), pytest.raises(FileNotFoundError):
+    with _served("absent", tmp_path, monkeypatch), pytest.raises(FileNotFoundError):
         load_index_members()
-    with _served("emptied", tmp_path), pytest.raises(ValueError, match="comment line"):
+    with _served("emptied", tmp_path, monkeypatch), pytest.raises(ValueError, match="comment line"):
         load_index_members()
 
 
@@ -248,7 +252,7 @@ def test_the_run_is_byte_identical_with_the_key_present_absent_and_emptied(
     for variant in VARIANTS:
         work = tmp_path / name / variant
         store = _new_store(work / "store.duckdb")
-        with _served(variant, tmp_path / "served" / name):
+        with _served(variant, tmp_path / "served" / name, monkeypatch):
             outputs[variant] = RUNS[name](store, work)
             assert _OPENS == [], f"{name} opened the key: {_OPENS}"
     assert outputs["present"] == outputs["absent"] == outputs["emptied"]

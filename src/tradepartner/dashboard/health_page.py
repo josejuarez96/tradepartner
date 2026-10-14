@@ -321,7 +321,7 @@ def coverage_badge(block: CoverageReference | None) -> tuple[str, theme.Status]:
     return label, "good" if block.checked and not block.failed else "warning"
 
 
-def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
+def _coverage_card(report: HealthReport, check_enabled: bool, index_gated: bool = False) -> None:
     """The coverage-reference card. Its button reruns the page, which then reads
     the button's state before loading the view (`render`)."""
     block = report.coverage_reference
@@ -336,6 +336,12 @@ def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
             if check_enabled:
                 theme.status_badge(
                     "coverage.check_enabled is on: `health --check` enforces this check",
+                    "warning",
+                )
+            if index_gated:
+                theme.status_badge(
+                    "coverage.index_max_missing is set: `health --check` enforces "
+                    f"{INDEX_MEMBERS_MISSING}",
                     "warning",
                 )
             return
@@ -572,5 +578,9 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _statement_card(view.report)
         _rates_card(view.report)
         _borrow_card(view.report)
-        _coverage_card(view.report, settings.coverage.check_enabled)
+        _coverage_card(
+            view.report,
+            settings.coverage.check_enabled,
+            index_gated=settings.coverage.index_max_missing is not None,
+        )
     _tables(view.report)

@@ -851,7 +851,8 @@ def _print_index_members(index: IndexMembersCheck | None) -> None:
     for row in index.misses.iter_rows(named=True):
         buckets[row["bucket"]].append(row["ticker"])
     parts = [
-        f"{bucket} {len(names)} ({', '.join(sorted(set(names)))})"
+        f"{bucket} {len(names)} member-sessions, {len(set(names))} names "
+        f"({', '.join(sorted(set(names)))})"
         for bucket, names in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))
     ]
     echo(f"  index misses by bucket: {'; '.join(parts) if parts else 'none'}")
@@ -2241,8 +2242,9 @@ def make_app(
                 "--coverage/--no-coverage",
                 help=(
                     "run (or skip) the coverage check against coverage.reference_names "
-                    "(one universe read per sample session); default: while "
-                    "coverage.check_enabled is on"
+                    "and the index answer key (one universe read per sample session); "
+                    "default: while coverage.check_enabled is on or "
+                    "coverage.index_max_missing is set"
                 ),
             ),
         ] = None,
