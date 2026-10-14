@@ -23,6 +23,7 @@ from edgar_transport import EdgarRouter, edgar_settings
 from tradepartner.adapters.edgar import UnstampedFiling, sgml_acceptance
 from tradepartner.adapters.edgar_source import EdgarFilingSource, SubmissionRecord
 from tradepartner.config import Settings
+from tradepartner.ingest import _source_counts
 
 CIK = "0001811210"
 CLOCK = datetime(2026, 10, 11, 12, tzinfo=UTC)
@@ -178,6 +179,7 @@ def test_a_stamp_whose_header_does_not_read_is_left_out_not_unstampable(
     assert missing not in stamps
     assert missing not in _cached(settings)
     assert source.stamps_sgml_unread == 1
+    assert source.stamps_sgml_overlong == 0
     assert {a: stamps[a].accepted_at for a, _, _ in FILINGS[:2]} == {
         a: at for a, _, at in FILINGS[:2]
     }
@@ -278,3 +280,33 @@ def test_a_header_cut_by_the_first_range_is_asked_again_longer(settings: Setting
     _, stamps = _stamp(settings, router)
     assert stamps[accession].accepted_at == at
     assert _header_requests(router).count(_header_url(accession)) == 2
+
+
+def test_a_header_longer_than_the_stamp_cap_has_its_own_counter(settings: Settings) -> None:
+    """A header beyond both configured ranges is not classified as a 404."""
+    edgar = settings.edgar.model_copy(update={"header_bytes": 128, "stamp_header_bytes": 256})
+    settings = settings.model_copy(update={"edgar": edgar})
+    accession, form, at = FILINGS[0]
+    full = _header(accession, form, at).replace("</SEC-HEADER>", "X" * 300 + "</SEC-HEADER>")
+
+    def ranged(request: httpx.Request) -> httpx.Response:
+        last = int(request.headers["Range"].removeprefix("bytes=0-"))
+        return httpx.Response(206, content=full[: last + 1].encode())
+
+    router = _router(SHIFTED)
+    router.add(_header_url(accession), ranged)
+    source, stamps = _stamp(settings, router)
+    assert accession not in stamps
+    assert source.stamps_sgml_overlong == 1
+    assert source.stamps_sgml_unread == 0
+    assert "stamps with overlong SGML headers: 1" in _source_counts(source)
+    assert _header_requests(router).count(_header_url(accession)) == 2
+
+
+def test_a_short_unclosed_header_is_unread_not_overlong(settings: Settings) -> None:
+    accession, _, _ = FILINGS[0]
+    router = _router(SHIFTED, {accession: "<SEC-HEADER>unfinished"})
+    source, stamps = _stamp(settings, router)
+    assert accession not in stamps
+    assert source.stamps_sgml_unread == 1
+    assert source.stamps_sgml_overlong == 0
