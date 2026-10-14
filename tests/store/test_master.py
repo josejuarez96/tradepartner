@@ -850,6 +850,87 @@ class TestNoLookAhead:
             partial.close()
 
 
+@pytest.mark.parametrize(
+    ("title", "ticker", "slug"),
+    [
+        ("Series A Corporate Units", "NIMC", "series-a-corporate-units"),
+        ("2.500% Senior Notes due 2022", "EXPE22", "2-500pct-senior-notes-due-2022"),
+        ("6% Debentures due 2030", "DB30", "6pct-debentures-due-2030"),
+        ("3% Bonds due 2030", "BD30", "3pct-bonds-due-2030"),
+        ("Equity Units, each consisting of a note and purchase contract", "EQUT", "equity-units"),
+        ("Warrants to purchase Common Stock", "WRT", "warrants-to-purchase-common-stock"),
+        ("Rights to purchase Common Stock", "RGT", "rights-to-purchase-common-stock"),
+    ],
+)
+def test_first_non_equity_cover_item_leaves_primary_for_later_common(
+    title: str, ticker: str, slug: str
+) -> None:
+    cik = "0001111711"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Unit Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(cik, _at(2021, 5, 5), (title, ticker, "NYSE")),
+            _cover(cik, _at(2022, 5, 5), ("Common Stock", "NI", "NYSE")),
+        ],
+        snapshot=[_snap(cik, "UNIT CO", "NI", "NYSE", _at(2020, 1, 2))],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    by_ticker = {row["ticker"]: row["security_id"] for row in build.listings}
+    assert by_ticker[ticker] == f"{cik}:{slug}"
+    assert by_ticker["NI"] == cik
+
+
+def test_first_notes_cover_item_leaves_primary_for_later_snapshot() -> None:
+    cik = "0001324424"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Notes Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[_cover(cik, _at(2019, 7, 25), ("2.500% Senior Notes", "EXPE22", "NYSE"))],
+        snapshot=[_snap(cik, "NOTES CO", "EXPE", "NASDAQ", _at(2020, 1, 2))],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    by_ticker = {row["ticker"]: row["security_id"] for row in build.listings}
+    assert by_ticker["EXPE22"] == f"{cik}:2-500pct-senior-notes"
+    assert by_ticker["EXPE"] == cik
+
+
+def test_debt_title_cannot_match_an_existing_primary_by_ticker() -> None:
+    cik = "0001324424"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Ticker Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "SAME", "NYSE")),
+            _cover(cik, _at(2020, 3, 2), ("2.500% Senior Notes", "SAME", "NYSE")),
+        ],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert [(r["class_title"], r["security_id"]) for r in build.listings] == [
+        ("Common Stock", cik),
+        ("2.500% Senior Notes", f"{cik}:2-500pct-senior-notes"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "American Depositary Shares",
+        "American Depositary Receipts",
+        "Limited Partnership Units",
+        "Common Units",
+        "Shares of Beneficial Interest",
+        "Series A Preferred Stock",
+        "Depositary Shares, each representing a Preferred Share",
+    ],
+)
+def test_first_equity_cover_item_keeps_primary(title: str) -> None:
+    cik = "0001654795"
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Equity Co", "10-K", _at(2018, 3, 1))],
+        cover_pages=[_cover(cik, _at(2019, 3, 1), (title, "EQ", "NYSE"))],
+    )
+    build = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert [row["security_id"] for row in build.listings] == [cik]
+
+
 class TestClassTitles:
     """#1166: a later cover page that retitles a class under the same pair
     adds no listing row, but its title is kept, known at that page."""
