@@ -1836,6 +1836,9 @@ class TestRealSplitContextShapes:
         ("Units, consisting of one share of Class A common stock and one warrant", False),
         ("Each Unit consisting of one share and one-third of one warrant", False),
         ("Units", False),
+        ("One share of Class A common stock and one-half of one redeemable warrant", False),
+        ("Common Stock and Warrants", False),
+        ("Class A Common Stock with one Warrant attached", False),
         # reviewers' common-with-rights forms (#1701): the clause is not the head
         ("Common Stock and Preferred Share Purchase Rights", True),
         ("Common Stock and Rights to Purchase Series A Preferred", True),

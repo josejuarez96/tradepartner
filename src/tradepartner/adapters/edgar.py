@@ -115,17 +115,30 @@ _UNJOINED_HEAD = re.compile(
 )
 
 
+#: After a joining `and`/`with`: a second instrument that is a warrant or a unit.
+_JOINED_WARRANT_OR_UNIT = re.compile(r"\b(?:warrants?|units?)\b", re.IGNORECASE)
+
+
 def joinable_title(title: str) -> bool:
     """Whether the split-context join (`edgar.cover_split_contexts`) may
     carry a symbol or exchange from a sibling context onto a class titled
     `title` (#1682 T193). `False` when the title's head instrument phrase
     (cut at the first `,`, `(`, `;`, joining `and`/`with` or carried-clause
     word) names debt, an equity or purchase-contract unit, a bare unit of
-    several instruments, a warrant or a right: such a class is read one
+    several instruments, a warrant or a right, or when a joining `and`/`with`
+    adds a warrant or unit to the share: such a class is read one
     context at a time, as with the switch off, so the join never puts
     another class's ticker on it. Pure."""
-    head = _TITLE_HEAD_END.split(title, maxsplit=1)[0]
-    return _UNJOINED_HEAD.search(head) is None
+    cut = _TITLE_HEAD_END.search(title)
+    head = title if cut is None else title[: cut.start()]
+    if _UNJOINED_HEAD.search(head) is not None:
+        return False
+    # A joining `and`/`with` names a second instrument: a rights clause stays
+    # joinable, a warrant or unit beside the share ("Common Stock and
+    # Warrants", a SPAC's "One share ... and one-half of one warrant") never.
+    if cut is None or cut.group().strip().lower() not in ("and", "with"):
+        return True
+    return _JOINED_WARRANT_OR_UNIT.search(title, cut.end()) is None
 
 
 _CIK_SCHEME = "http://www.sec.gov/CIK"
