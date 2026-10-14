@@ -345,6 +345,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
@@ -396,9 +397,11 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     SESSION_HOLES,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     health_report,
 )
 from tradepartner.ingest import (
@@ -764,6 +767,7 @@ def _print_report(report: HealthReport) -> None:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+    echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
 
 
 def _print_duplicate_dividends(report: HealthReport) -> None:
@@ -790,6 +794,15 @@ def _coverage_verdict(block: CoverageReference | None) -> str:
     return block.verdict
 
 
+def _index_verdict(block: CoverageReference | None) -> str:
+    """`index_members_missing`' line: never a pass the block did not check."""
+    if block is None:
+        return "not computed (run with --coverage)"
+    if block.index_members is None:
+        return "off (coverage.index_members)"
+    return block.index_members.verdict
+
+
 def _print_coverage_reference(block: CoverageReference | None) -> None:
     echo = typer.echo
     if block is None:
@@ -812,6 +825,36 @@ def _print_coverage_reference(block: CoverageReference | None) -> None:
         )
     ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
     echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
+    _print_index_members(block.index_members)
+
+
+def _print_index_members(index: IndexMembersCheck | None) -> None:
+    """The answer-key check's two lines (#1682, T189b): the key's SHA from the
+    report, the per-session counts, then the misses by bucket with their names."""
+    echo = typer.echo
+    if index is None:
+        echo("  index members: off (coverage.index_members)")
+        return
+    if index.error is not None:
+        echo(f"  index members: {index.verdict}")
+        return
+    counted = index.samples.filter(~pl.col("beyond_key"))
+    beyond = index.samples.height - counted.height
+    hits, members = int(counted["hits"].sum()), int(counted["members"].sum())
+    share = f"{hits / members:.1%}" if members else "n/a"
+    echo(
+        f"  index members (key {index.commit} through {index.through}): "
+        f"{counted.height} sessions checked, {beyond} beyond the key; "
+        f"{hits} of {members} hits ({share}); {index.verdict}"
+    )
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for row in index.misses.iter_rows(named=True):
+        buckets[row["bucket"]].append(row["ticker"])
+    parts = [
+        f"{bucket} {len(names)} ({', '.join(sorted(set(names)))})"
+        for bucket, names in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+    echo(f"  index misses by bucket: {'; '.join(parts) if parts else 'none'}")
 
 
 def _print_session_holes(report: HealthReport) -> None:
@@ -2207,9 +2250,10 @@ def make_app(
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
-        if check and coverage is False and s.coverage.check_enabled:
+        if check and coverage is False and s.coverage.computed_by_default:
             raise _fail(
-                "--no-coverage cannot be used with --check while coverage.check_enabled is on",
+                "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+                "or coverage.index_max_missing is set",
                 1,
             )
         if (missing := _store_missing(s)) is not None:

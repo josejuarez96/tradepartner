@@ -42,6 +42,7 @@ from tradepartner.health import (
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
     FILING_EVENTS_UNIQUE,
+    INDEX_MEMBERS_MISSING,
     INTEGRITY_RULES,
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
     KNOWN_AT_NOT_NULL,
@@ -60,6 +61,7 @@ from tradepartner.health import (
     STATIC,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     _bars_after_delisting,
     _overlapping_listings,
     bar_gaps,
@@ -81,6 +83,7 @@ from tradepartner.health import (
 from tradepartner.store.db import configure_connection, insert_row
 from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
+from tradepartner.store.index_members import IndexInterval, IndexMembers, IndexMembersError
 from tradepartner.store.master import first_session
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
 
@@ -3254,3 +3257,173 @@ def test_borrow_check_fails_on_a_duplicate_asset_and_known_at(
     assert violations.rows() == [
         ("b0rr0w00-0000-4b0d-8000-000000000002", datetime(2020, 6, 29, 21, 0, tzinfo=UTC), 2)
     ]
+
+
+# --- the index answer key in the coverage block (#1682, T189b) -----------------------
+
+
+def _key(*intervals: IndexInterval, through: date = date(2026, 8, 18)) -> IndexMembers:
+    return IndexMembers(
+        source="test",
+        commit="f" * 40,
+        through=through,
+        derived=date(2026, 10, 14),
+        intervals=intervals,
+    )
+
+
+#: FRST a member on 2019-12-31 and excluded (stale shares) on 2020-06-30; PRE9
+#: excluded (not listed); NOPE carried by no listing row; LATE not in the
+#: index on either sample session.
+_KEY = _key(
+    IndexInterval("FRST", date(2010, 1, 4), None),
+    IndexInterval("PRE9", date(2010, 1, 4), None),
+    IndexInterval("NOPE", date(2010, 1, 4), None),
+    IndexInterval("LATE", date(2020, 7, 1), None),
+)
+
+
+def _index(block: CoverageReference) -> IndexMembersCheck:
+    assert block.index_members is not None
+    return block.index_members
+
+
+def test_the_index_block_counts_hits_by_security_and_names_each_miss(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), _KEY))
+    assert (index.commit, index.through, index.error) == ("f" * 40, date(2026, 8, 18), None)
+    assert index.samples.to_dicts() == [
+        {
+            "session": S_2019,
+            "beyond_key": False,
+            "members": 3,
+            "hits": 1,
+            "misses": 2,
+            "unresolved": 1,
+            "hit_share": 1 / 3,
+        },
+        {
+            "session": S_2020,
+            "beyond_key": False,
+            "members": 3,
+            "hits": 0,
+            "misses": 3,
+            "unresolved": 1,
+            "hit_share": 0.0,
+        },
+    ]
+    assert index.hits.to_dicts() == [
+        {"session": S_2019, "ticker": "FRST", "security_id": "SEC_FACTS_RESTATED"}
+    ]
+    misses = {(r["session"], r["ticker"]): r for r in index.misses.to_dicts()}
+    assert misses[(S_2019, "PRE9")]["security_id"] == "SEC_STATIC_PRE2019"
+    assert misses[(S_2019, "PRE9")]["bucket"] == "exchange:not_listed"
+    assert misses[(S_2019, "NOPE")]["bucket"] == "unresolved"
+    assert misses[(S_2019, "NOPE")]["security_id"] is None
+    assert misses[(S_2020, "FRST")]["bucket"] == "shares:stale_shares"
+    assert (S_2019, "LATE") not in misses and (S_2020, "LATE") not in misses
+    assert index.worst == 3
+    assert index.verdict == "3 max missing per session (report-only)"
+
+
+def test_sessions_after_the_keys_last_row_are_beyond_the_key_and_count_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    key = _key(*_KEY.intervals, through=date(2020, 1, 31))
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), key))
+    rows = index.samples.to_dicts()
+    assert [r["beyond_key"] for r in rows] == [False, True]
+    assert rows[1] | {"session": None} == {
+        "session": None,
+        "beyond_key": True,
+        "members": 0,
+        "hits": 0,
+        "misses": 0,
+        "unresolved": 0,
+        "hit_share": None,
+    }
+    assert set(index.misses["session"].to_list()) == {S_2019}
+    assert index.worst == 2
+
+
+def test_index_members_missing_fails_only_while_the_threshold_is_set_and_exceeded(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    unset = health_report(
+        fixture_store, T_END, _coverage_settings(), with_coverage_reference=True, index_key=_KEY
+    )
+    assert INDEX_MEMBERS_MISSING not in unset.failures
+    assert unset.ok
+    # Setting the threshold computes the block on every run, unasked.
+    tight = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=2), index_key=_KEY
+    )
+    assert tight.coverage_reference is not None
+    assert tight.failures == (INDEX_MEMBERS_MISSING,)
+    assert _index(tight.coverage_reference).verdict == "3 max missing per session: fail (max 2)"
+    loose = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=3), index_key=_KEY
+    )
+    assert loose.ok, loose.failures
+    assert loose.coverage_reference is not None
+    assert _index(loose.coverage_reference).verdict == "3 max missing per session: pass (max 3)"
+    assert INDEX_MEMBERS_MISSING not in INTEGRITY_RULES
+
+
+@pytest.mark.parametrize(
+    ("error", "why"),
+    [
+        (FileNotFoundError("index_members"), "file absent"),
+        (IndexMembersError("header None"), "header None"),
+    ],
+)
+def test_an_unloadable_key_is_reported_and_fails_only_under_a_threshold(
+    fixture_store: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    why: str,
+) -> None:
+    def broken() -> IndexMembers:
+        raise error
+
+    monkeypatch.setattr(health, "load_index_members", broken)
+    report = health_report(fixture_store, T_END, _coverage_settings(), with_coverage_reference=True)
+    assert report.coverage_reference is not None
+    index = _index(report.coverage_reference)
+    assert (index.commit, index.error) == (None, why)
+    assert index.samples.is_empty() and not index.checked
+    assert index.verdict == f"key unavailable ({why}): report-only"
+    assert report.ok
+    gated = health_report(fixture_store, T_END, _coverage_settings(index_max_missing=0))
+    assert gated.failures == (INDEX_MEMBERS_MISSING,)
+
+
+def test_the_packaged_key_is_the_default(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings()))
+    assert index.commit == "a2430f2af0c79ddf0748e91de11bdeb1616ab5a7"
+    assert index.through == date(2026, 8, 18)
+    assert index.samples["members"].to_list() == [505, 505]
+
+
+def test_with_index_members_off_the_key_is_not_read(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse() -> IndexMembers:
+        raise AssertionError("the key was read")
+
+    monkeypatch.setattr(health, "load_index_members", refuse)
+    block = coverage_reference(fixture_store, T_END, _coverage_settings(index_members=False))
+    assert block.index_members is None
+
+
+def test_the_index_block_reads_only_rows_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    settings = _coverage_settings()
+    for t in (T_END, datetime(2020, 1, 15, 14, 0, tzinfo=UTC), session_close(S_2019)):
+        full = _index(coverage_reference(fixture_store, t, settings, _KEY))
+        cut = _index(coverage_reference(truncated.at(t), t, settings, _KEY))
+        assert full.samples.equals(cut.samples), t
+        assert full.hits.equals(cut.hits), t
+        assert full.misses.equals(cut.misses), t

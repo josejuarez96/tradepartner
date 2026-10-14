@@ -926,7 +926,8 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     refused = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
     assert refused.exit_code == 1
     assert refused.output.strip() == (
-        "--no-coverage cannot be used with --check while coverage.check_enabled is on"
+        "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+        "or coverage.index_max_missing is set"
     )
     skipped = _invoke(enforced, ["health", "--no-coverage"], clock=lambda: T_END)
     assert skipped.exit_code == 0, skipped.output
@@ -2044,3 +2045,42 @@ def test_health_prints_the_borrow_block_and_its_warnings(
     assert "last alpaca_assets run: never; none" in result.output
     assert "None shortable" not in result.output
     assert "warning: borrow.enabled is off" in result.output
+
+
+def test_health_coverage_prints_the_index_lines_with_the_reports_sha(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1682, T189b: two lines under the coverage block (the key's SHA, the
+    counts, then the misses by bucket) and the rule's verdict, report-only."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [summary] = [line for line in lines if line.startswith("  index members (key ")]
+    assert summary.startswith(
+        "  index members (key a2430f2af0c79ddf0748e91de11bdeb1616ab5a7 through 2026-08-18): "
+        "2 sessions checked, 0 beyond the key; 0 of 1010 hits (0.0%); "
+    )
+    assert summary.endswith("max missing per session (report-only)")
+    [buckets] = [line for line in lines if line.startswith("  index misses by bucket: ")]
+    assert "unresolved " in buckets and "AAPL" in buckets
+    assert "  index_members_missing: " in result.output
+    plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert "  index_members_missing: not computed (run with --coverage)" in plain.output
+
+
+def test_health_check_fails_index_members_missing_once_the_threshold_is_set(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    gated = _settings(tmp_path, store=fixture_store_path, coverage={"index_max_missing": 0})
+    failed = _invoke(gated, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "health check failed: index_members_missing" in failed.output
+    assert ": fail (max 0)" in failed.output
+    refused = _invoke(gated, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert refused.exit_code == 1
+    assert "coverage.index_max_missing is set" in refused.output
+    off = _settings(tmp_path, store=fixture_store_path, coverage={"index_members": False})
+    result = _invoke(off, ["health", "--coverage"], clock=lambda: T_END)
+    assert "  index members: off (coverage.index_members)" in result.output
+    assert "  index_members_missing: off (coverage.index_members)" in result.output

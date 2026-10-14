@@ -65,8 +65,10 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     health_report,
 )
 from tradepartner.repair import REPAIRED
@@ -351,6 +353,39 @@ def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
         if not block.late_known.is_empty():
             st.markdown(f"Late-known listings ({block.late_known.height})")
             st.dataframe(block.late_known, hide_index=True)
+        _index_members_table(block.index_members)
+
+
+def _index_members_table(index: IndexMembersCheck | None) -> None:
+    """The card's second table (issue 1682, T189b): the S&P 500 answer key per
+    sample session, from the report (the key's SHA included), then its misses.
+    A check only: the key is never a universe or a signal."""
+    if index is None:
+        st.caption("S&P 500 answer key: off (`coverage.index_members`)")
+        return
+    label, tone = index_badge(index)
+    st.markdown("S&P 500 answer key (a check only, never a source)")
+    theme.status_badge(label, tone)
+    if index.error is not None:
+        return
+    st.caption(f"Key commit `{index.commit}`, last dated row {index.through}")
+    st.dataframe(index.samples, hide_index=True)
+    if not index.misses.is_empty():
+        st.markdown(f"Answer-key misses ({index.misses.height})")
+        st.dataframe(index.misses, hide_index=True)
+
+
+def index_badge(index: IndexMembersCheck) -> tuple[str, theme.Status]:
+    """`index_members_missing`' chip: critical only when the block fails
+    (`coverage.index_max_missing` set and exceeded); good when checked and
+    within the threshold; else a caution (report-only misses, nothing checked,
+    or the key unavailable)."""
+    label = f"{INDEX_MEMBERS_MISSING}: {index.verdict}"
+    if index.failed:
+        return label, "critical"
+    if index.max_missing is not None and index.checked:
+        return label, "good"
+    return label, "good" if index.checked and index.misses.is_empty() else "warning"
 
 
 def _sources_card(report: HealthReport) -> None:
