@@ -2158,13 +2158,24 @@ def test_delete_master_rows_refuses_later_evidence_and_another_cik(
     args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
     for client, reason in (
         (_edgar_headers("20191030121820")[0], "after the row's known_at"),
-        (_edgar_headers("20191030121819", cik="0000000001")[0], f"is not CIK {_VZ}'s filing"),
+        (
+            _edgar_headers("20191030121819", cik="0000000001")[0],
+            f"does not read as CIK {_VZ}'s filing",
+        ),
     ):
         for extra in (["--dry-run"], []):
             result = _invoke(settings, [*args, *extra], edgar_client=client)
             assert result.exit_code == 1, result.output
             assert reason in result.output
         assert _stored_tickers(settings) == ["VZ", "VZ22A"]
+    other = manifest.parent / "other.csv"
+    other.write_text(manifest.read_text().replace(_TENQ, "0000732712-19-000064"))
+    gone = _invoke(
+        settings,
+        ["delete-master-rows", "--manifest", str(other), "--release", _MASTER_RELEASE],
+        edgar_client=_edgar_headers("20191030121819")[0],
+    )
+    assert gone.exit_code == 1 and "EDGAR has no 0000732712-19-000064" in gone.output
 
 
 def test_delete_master_rows_usage_errors(

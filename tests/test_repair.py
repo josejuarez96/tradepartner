@@ -1386,7 +1386,7 @@ def test_the_delete_removes_only_the_manifest_rows_and_records_the_run(vz: Setti
             "was accepted at 2019-10-30T16:18:20+00:00, after the row's known_at",
         ),
         # The filing names another company: not the security's CIK's.
-        (None, _headers(cik="0000000001"), f"is not CIK {VZ}'s filing"),
+        (None, _headers(cik="0000000001"), f"does not read as CIK {VZ}'s filing"),
         # The retraction stays behind: a key leaves whole or not at all.
         (_note_manifest()[::2], None, "another revision of this key is not in the manifest"),
         # A snapshot row has no filing behind it.
@@ -1514,6 +1514,7 @@ def test_the_manifest_reads_both_tables_and_refuses_a_malformed_file(tmp_path: P
     ]
     for rows, error in (
         ([NOTE_CSV, NOTE_CSV], "line 3: listed twice"),
+        ([NOTE_CSV, NOTE_CSV.replace(TENQ, FORM25)], "line 3: listed twice"),
         ([NOTE_CSV.replace("+00:00", "")], "naive"),
         ([NOTE_CSV.replace(",VZ22A,", ",,")], "needs ticker and valid_from"),
         ([form25.replace(",25-NSE,", ",,")], "needs form, class_title and filed_at"),

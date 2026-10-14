@@ -941,6 +941,7 @@ def read_master_manifest(path: Path) -> list[MasterRowKey]:
                 f"not {','.join(reader.fieldnames or ())}"
             )
         rows: list[MasterRowKey] = []
+        seen: set[tuple[object, ...]] = set()
         for line, record in enumerate(reader, start=2):
             try:
                 valid_from = _optional(record, "valid_from")
@@ -959,8 +960,10 @@ def read_master_manifest(path: Path) -> list[MasterRowKey]:
                 )
             except (TypeError, ValueError) as error:
                 raise ValueError(f"{path.name} line {line}: {error}") from None
-            if row in rows:
+            key = (row.table, *_key(row), row.known_at)
+            if key in seen:
                 raise ValueError(f"{path.name} line {line}: listed twice: {row.label()}")
+            seen.add(key)
             rows.append(row)
     return rows
 
@@ -1063,7 +1066,7 @@ def _master_row_refusal(
     try:
         header = headers(cik, row.accession)
     except ValueError as error:
-        return f"{row.accession} is not CIK {cik}'s filing: {error}"
+        return f"{row.accession} does not read as CIK {cik}'s filing: {error}"
     if header.cik != cik or header.accession != row.accession:
         return f"{row.accession}'s header names {header.cik} {header.accession}, not CIK {cik}"
     if header.accepted_at > row.known_at:
@@ -1083,22 +1086,16 @@ def _master_row_refusal(
     return None
 
 
+def _key(row: MasterRowKey) -> tuple[object, ...]:
+    """`row`'s stored key without `known_at`: the table's UNIQUE columns."""
+    if row.table == "listings":
+        return (row.security_id, row.ticker, row.exchange, row.valid_from)
+    return (row.security_id, row.form, row.class_title, row.exchange, row.filed_at)
+
+
 def _same_key(a: MasterRowKey, b: MasterRowKey) -> bool:
     """True when `a` and `b` are revisions of one stored key."""
-    if a.table == "listings":
-        return (a.security_id, a.ticker, a.exchange, a.valid_from) == (
-            b.security_id,
-            b.ticker,
-            b.exchange,
-            b.valid_from,
-        )
-    return (a.security_id, a.form, a.class_title, a.exchange, a.filed_at) == (
-        b.security_id,
-        b.form,
-        b.class_title,
-        b.exchange,
-        b.filed_at,
-    )
+    return a.table == b.table and _key(a) == _key(b)
 
 
 def _delete_master_row(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> int:

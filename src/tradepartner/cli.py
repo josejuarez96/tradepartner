@@ -350,6 +350,7 @@ script over the real ones.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import re
 import subprocess
@@ -917,8 +918,10 @@ def _parse_day(flag: str, value: str | None) -> date | None:
 def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLookup:
     """`repair.HeaderLookup` over EDGAR: the filing's SGML header under the
     CIK's archive path (`edgar.header_bytes`, then `edgar.stamp_header_bytes`
-    when cut short), parsed for that CIK; a 404 or 410 is a `ValueError`."""
+    when cut short), parsed for that CIK, each read once; a 404 or 410, or a
+    header longer than both, is a `ValueError`."""
 
+    @functools.cache
     def lookup(cik: str, accession: str) -> FilingHeader:
         text = ""
         for size in (settings.edgar.header_bytes, settings.edgar.stamp_header_bytes):
@@ -933,6 +936,11 @@ def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLo
                 raise
             if "</SEC-HEADER>" in text:
                 break
+        if "</SEC-HEADER>" not in text:
+            raise ValueError(
+                f"{accession}'s SGML header is longer than edgar.stamp_header_bytes "
+                f"({settings.edgar.stamp_header_bytes}); raise it and run again"
+            )
         return parse_sgml_header(text, cik)
 
     return lookup
@@ -2202,6 +2210,10 @@ def make_app(
             raise _fail(f"store busy: {exc}", 1) from None
         except RepairRefused as exc:
             raise _fail(f"repair refused: {_scrubbed(str(exc), s)}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {_scrubbed(str(exc), s)}", USAGE_ERROR) from None
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise _fail(f"nothing deleted (rolled back): {_scrubbed(str(exc), s)}", 1) from None
         typer.echo(result.summary())
         for line in result.found:
             typer.echo(line)
