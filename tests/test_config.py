@@ -282,14 +282,14 @@ def test_edgar_exchange_axis_listings_is_on_by_default_and_settable(
     assert Settings(_env_file=None).edgar.exchange_axis_listings is False
 
 
-def test_edgar_cover_split_contexts_is_on_by_default_and_settable(
+def test_edgar_cover_split_contexts_is_off_by_default_and_settable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1651: the release `cover-listings-1541` (T181) flipped it on with the
-    cover and FSN cache versions at 4."""
-    assert Settings(_env_file=None).edgar.cover_split_contexts is True
-    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "false")
+    """#1651: backed out by the owner in the release `cover-listings-1541`
+    (T181, 2026-10-14, cache versions 6) pending #1682."""
     assert Settings(_env_file=None).edgar.cover_split_contexts is False
+    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "true")
+    assert Settings(_env_file=None).edgar.cover_split_contexts is True
 
 
 def test_edgar_filename_listings_are_off_by_default_and_settable(
