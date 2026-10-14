@@ -314,6 +314,11 @@ def _spinoff(conn: duckdb.DuckDBPyConnection, child: str, ex_date: date, known: 
         # on "Common Stock" is the ingest override's case, T190d).
         ("CommonClassA", "Common Stock", False),
         ("CommonClassA", "Class B Common Stock", False),
+        # A Series letter is a class letter, a "non-" prefix one word.
+        ("SeriesBCommonStock", "Series A common stock", False),
+        ("SeriesBCommonStock", "Series B common stock", True),
+        ("NonVotingCommonStock", "Class B Common Stock (non-voting)", True),
+        ("NonVotingCommonStock", "Common Stock", False),
         ("", "Common Stock", False),
     ],
 )
@@ -389,49 +394,37 @@ def test_a_spinoff_outside_the_span_explains_nothing(
     assert pick.outliers["explained"].to_list() == [False]
 
 
-def test_a_jump_explained_by_a_new_common_class_of_the_cik_is_accepted(
+def test_a_new_common_class_of_the_cik_explains_nothing(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
-    # A reorganisation into new equity: another common class of the same CIK
-    # first known between the baseline and the jump.
+    # The master dates a class by its first cover page, not by a
+    # reorganisation: a sibling class first known inside the span never
+    # explains a 1,000x fact (#1703 review).
     cik = fixture_store.execute(
         "SELECT cik FROM securities WHERE security_id = ?", [SID]
     ).fetchone()
     assert cik is not None
     born = _known(date(2019, 4, 1))
-    insert_row(
-        fixture_store,
-        "securities",
-        {
-            "security_id": f"{SID}:class-b",
-            "cik": cik[0],
-            "name": "Split Between Filing Co",
-            "benchmark": False,
-            "known_at": born,
-            "ingested_at": born,
-            "source": "edgar",
-            "provenance": "filing",
-        },
-    )
-    insert_row(
-        fixture_store,
-        "classifications",
-        {
-            "security_id": f"{SID}:class-b",
-            "sic": "7372",
-            "security_type": "common",
-            "rule": "common_default",
-            "known_at": born,
-            "ingested_at": born,
-            "source": "edgar",
-            "provenance": "filing",
-        },
-    )
-    jump = date(2019, 5, 31)
-    _fact(fixture_store, SID, jump, MOVED * 1000, _known(date(2019, 6, 3)))
+    for table, row in (
+        ("securities", {"cik": cik[0], "name": "Split Between Filing Co", "benchmark": False}),
+        ("classifications", {"sic": "7372", "security_type": "common", "rule": "common_default"}),
+    ):
+        insert_row(
+            fixture_store,
+            table,
+            {
+                "security_id": f"{SID}:class-b",
+                **row,
+                "known_at": born,
+                "ingested_at": born,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    _fact(fixture_store, SID, date(2019, 5, 31), MOVED * 1000, _known(date(2019, 6, 3)))
     pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
-    assert pick.shares[SID] == (jump, MOVED * 1000)
-    assert pick.outliers["explained"].to_list() == [True]
+    assert pick.shares[SID] == (date(2018, 10, 29), 5_000_000)
+    assert pick.outliers["explained"].to_list() == [False]
 
 
 # --- No look-ahead ------------------------------------------------------------

@@ -1260,12 +1260,12 @@ why = "The one free outside view on what kind of instrument a ticker is, stored 
 [task.T190]
 what = "Shares facts by rule, as of t: the class-member link from the stored member and class title, the ambiguity rule, and jumps explained by an action known at t; the census is Codex census 2 on #1682 and the census on #1698."
 why = "165 index member-months on 5 names lost to two class rows on one date (ARES, HRL, PWR, SCHW, TAP); the 159 per-class-absent months have no stored row and moved to T190d (#1698)."
-unblocks = ["task:T198"]
+unblocks = ["task:T190b", "task:T190d", "task:T198"]
 
 [task.T190b]
 what = "A tiny pre-trading seed fact (1, 100, 1,000 shares) is no baseline for the plausibility rule, so the true facts already stored are accepted; the failing test first."
 why = "59 index member-months on 7 names (AMCR, CTVA, FOXA, LIN, PSKY, SW, VTRS) are a plain defect in shares_as_of, not missing data (#1682, Codex census 2)."
-unblocks = ["task:T198"]
+unblocks = ["task:T190d"]
 
 [task.T190c]
 what = "The per-period cover shares fact for filers whose context shape the FSN and cover parsers drop (IBKR, SPG, WBD and 11 non-index names), read under the cache bump of rederive-1682; census of the shape first."
@@ -1273,7 +1273,7 @@ why = "142 index member-months read a shares count from 2009 to 2022 while every
 unblocks = ["task:T198"]
 
 [task.T190d]
-what = "The per-class shares link at ingest: fact_rows links a two-common-class CIK's facts to the class its member names by rule, as of the fact's filing, instead of dropping them as unmatched; rows land in rederive-1682; census first."
+what = "The per-class shares link at ingest, behind edgar.class_member_link: fact_rows links a two-common-class CIK's facts to the class its member names by rule, as of the fact's filing, instead of dropping them as unmatched; the switch flips in rederive-1682; census first."
 why = "159 index member-months on 3 names (BF.B, FOX, MKC) whose second class's count is filed but never stored, so no read-time rule can reach it (#1698); the per-name override list is judged against the rule."
 unblocks = ["task:T198"]
 

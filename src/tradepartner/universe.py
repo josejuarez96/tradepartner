@@ -61,8 +61,7 @@ reported once, under the first rule it fails:
    name out for good. An out-of-line fact is *explained*, and accepted as
    the new baseline, when an event known at `t` lies between its baseline's
    `as_of_date` and its own (#1682, T190): a `spinoff` action whose child is
-   this security, or a `securities` row of a common class of the same CIK
-   first known in that span (a reorganisation into new equity).
+   this security.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -99,7 +98,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import cache
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
@@ -163,8 +161,9 @@ _MEMBER_SCHEMA: dict[str, Any] = {
 #: comes first). `reanchored` is true on the fact that re-anchored the
 #: baseline (#853); it keeps `accepted` false (the owner did not accept it), so
 #: health's review list still shows it. `explained` is true on a fact accepted
-#: as the new baseline because a spin-off or a new common class known at `t`
-#: lies between it and its baseline (T190); it also keeps `accepted` false.
+#: as the new baseline because a spin-off known at `t` (this security its
+#: child) lies between it and its baseline (T190); it also keeps `accepted`
+#: false, so health's review list still shows it.
 SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -310,9 +309,9 @@ class SharesPick:
 
 
 #: A class member naming its class by letter (`CommonClassB`,
-#: `ClassBExchangeableShares`); `ClassUndefined` names none. The same pattern
-#: as ingest's `fact_rows` (#1169).
-_MEMBER_LETTER = re.compile(r"Class([A-Z])(?![a-z])")
+#: `ClassBExchangeableShares`, `SeriesBCommonStock`); `ClassUndefined` names
+#: none. Ingest's `fact_rows` reads `Class<letter>` only (#1169).
+_MEMBER_LETTER = re.compile(r"(?:Class|Series)([A-Z])(?![a-z])")
 #: A title naming its class by letter ("Class B Common Stock", "Series C
 #: common stock"; ingest's `_TITLE_CLASS`, #1166), on the lower-cased title.
 _TITLE_LETTER = re.compile(r"\bclass ([a-z])\b|^\s*series ([a-z])\b")
@@ -320,8 +319,6 @@ _TITLE_LETTER = re.compile(r"\bclass ([a-z])\b|^\s*series ([a-z])\b")
 _NEUTRAL_MEMBER_WORDS = frozenset(
     {"common", "stock", "class", "share", "shares", "ordinary", "undefined", "member"}
 )
-#: The time zone a `known_at` instant is read in to date it (EDGAR's).
-_EASTERN = ZoneInfo("America/New_York")
 
 
 def _member_letter(member: str) -> str | None:
@@ -335,8 +332,23 @@ def _title_letter(title: str) -> str | None:
 
 
 def _title_words(title: str) -> set[str]:
-    folded = title.lower().replace("non-voting", "nonvoting").replace("non voting", "nonvoting")
+    """The title's lower-case words, "non-voting" and "non voting" read as
+    one word "nonvoting" (any `non` prefix joins its word)."""
+    folded = re.sub(r"\bnon[\s-]+", "non", title.lower())
     return set(re.findall(r"[a-z]+", folded))
+
+
+def _member_words(member: str) -> set[str]:
+    """The member's camel-case words, lower case, a `Non` joined to the word
+    after it (`NonVotingCommonStock` -> nonvoting, common, stock)."""
+    words = [w.lower() for w in re.findall(r"[A-Z][a-z]+|[a-z]+", member)]
+    out: list[str] = []
+    for word in words:
+        if out and out[-1] == "non":
+            out[-1] = "non" + word
+        else:
+            out.append(word)
+    return set(out)
 
 
 def member_links_title(member: str, title: str) -> bool:
@@ -353,8 +365,8 @@ def member_links_title(member: str, title: str) -> bool:
     links nothing. Pure: no per-name list."""
     if not member:
         return False
-    words = {w.lower() for w in re.findall(r"[A-Z][a-z]+|[a-z]+", member)}
-    qualifiers = {w for w in words if w not in _NEUTRAL_MEMBER_WORDS and len(w) > 1}
+    qualifiers = {w for w in _member_words(member) if w not in _NEUTRAL_MEMBER_WORDS | {"series"}}
+    qualifiers = {w for w in qualifiers if len(w) > 1}
     if not qualifiers <= _title_words(title):
         return False
     letter, title_letter = _member_letter(member), _title_letter(title)
@@ -406,42 +418,6 @@ def _class_titles(
     return out
 
 
-@dataclass(frozen=True)
-class _Classes:
-    """Every live `securities` row at `t`: its CIK, and per CIK the classes
-    classified `common` at `t` with the Eastern date their first row became
-    known (T190's explained jump)."""
-
-    cik_of: dict[str, str]
-    common_by_cik: dict[str, list[tuple[str, date]]]
-
-
-def _classes_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> _Classes:
-    """`_Classes` from the `securities` and `classifications` rows known at
-    `t`: live rows only (`securities_as_of`), each dated by the earliest
-    `known_at` of its id at or before `t`."""
-    common = set(
-        classifications_as_of(conn, t)
-        .filter(pl.col("security_type") == "common")["security_id"]
-        .to_list()
-    )
-    first = dict(
-        conn.execute(
-            "SELECT security_id, MIN(known_at) FROM securities WHERE known_at <= ? "
-            "GROUP BY security_id",
-            [t],
-        ).fetchall()
-    )
-    cik_of: dict[str, str] = {}
-    by_cik: dict[str, list[tuple[str, date]]] = defaultdict(list)
-    for row in securities_as_of(conn, t).iter_rows(named=True):
-        sid = row["security_id"]
-        cik_of[sid] = row["cik"]
-        if sid in common:
-            by_cik[row["cik"]].append((sid, first[sid].astimezone(_EASTERN).date()))
-    return _Classes(cik_of, dict(by_cik))
-
-
 def shares_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -473,17 +449,17 @@ def shares_as_of(
     still holding two different values is ambiguous and skipped by the walk.
 
     Explained jump (T190): an out-of-line fact that no owner entry accepts is
-    accepted as the new baseline, flagged `explained`, when an event known at
-    `t` is dated after its baseline's `as_of_date` and on or before its own:
-    a `spinoff` action whose child is this security (by `ex_date`), or a live
-    `securities` row of another class of the same CIK classified `common` at
-    `t` (by the Eastern date of its `known_at`). An event known after `t`
-    explains nothing at `t`.
+    accepted as the new baseline, flagged `explained`, when a `spinoff`
+    action known at `t` whose child is this security has its `ex_date` after
+    the baseline's `as_of_date` and on or before the fact's own (a child's
+    count moves from its pre-distribution seed to the distributed count). A
+    spin-off known after `t` explains nothing at `t`. A security row is not
+    read as an explanation: the master dates a class by its first cover page,
+    not by a reorganisation, so it would explain mis-scaled facts (#1703).
 
     The latest date decides: ambiguous, its own value when accepted, else
-    the last accepted fact. Only facts, splits, actions, listings,
-    securities and classifications known at `t` are read, never a later
-    filing.
+    the last accepted fact. Only facts, splits, spin-offs, listings and
+    securities known at `t` are read, never a later filing.
     """
     cfg = settings.universe
     accepted_list = {parse_accepted_shares_fact(e) for e in cfg.accepted_shares_facts}
@@ -500,20 +476,11 @@ def shares_as_of(
         elif action["action_type"] == "spinoff":
             spinoffs[action["security_id"]].append(action["ex_date"])
     titles = _class_titles(conn, t, sorted(rows))
-    classes: _Classes | None = None
 
     def explained(sid: str, after: date, through: date) -> bool:
-        """An event known at `t` dated in `(after, through]` explains a jump."""
-        nonlocal classes
-        if any(after < ex_date <= through for ex_date in spinoffs.get(sid, [])):
-            return True
-        if classes is None:  # read once, only when some jump needs it
-            classes = _classes_at(conn, t)
-        cik = classes.cik_of.get(sid)
-        return any(
-            other != sid and after < known <= through
-            for other, known in classes.common_by_cik.get(cik or "", [])
-        )
+        """A spin-off known at `t` with `sid` as its child, its `ex_date` in
+        `(after, through]`, explains a jump."""
+        return any(after < ex_date <= through for ex_date in spinoffs.get(sid, []))
 
     shares: dict[str, tuple[date, float]] = {}
     ambiguous: set[str] = set()
