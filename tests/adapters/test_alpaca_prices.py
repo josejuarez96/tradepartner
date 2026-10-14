@@ -2077,8 +2077,9 @@ class TestNewActions:
 
     def test_second_distribution_is_a_revision_of_the_first(self) -> None:
         # #1673 (2), spec "Spin-offs": a second distribution from the same
-        # parent to the same child is a revision of the first, so the later
-        # processed row wins (its own stamp) and the payload is not refused.
+        # parent to the same child is a revision of the first: both records
+        # come back, oldest first, each at its own stamp, so the writer's
+        # revision rule picks the one known at its run.
         resolver = ListingResolver(
             [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 1))]
         )
@@ -2088,12 +2089,14 @@ class TestNewActions:
         )
         for rows in ([first, second], [second, first]):
             parsed = parse_corporate_actions({"spin_offs": rows}, resolver.resolve)
-            [action] = parsed.actions
-            assert (action.security_id, action.source_action_id) == ("C", "P")
-            assert action.ex_date == date(2020, 11, 30)
-            assert action.ratio_or_amount == 0.75
-            assert action.known_at == announcement_date_known_at(date(2020, 12, 4))
-            assert parsed.spinoff_superseded == 1
+            assert [
+                (a.security_id, a.source_action_id, a.ex_date, a.ratio_or_amount, a.known_at)
+                for a in parsed.actions
+            ] == [
+                ("C", "P", date(2020, 9, 29), 0.5, announcement_date_known_at(date(2020, 10, 16))),
+                ("C", "P", date(2020, 11, 30), 0.75, announcement_date_known_at(date(2020, 12, 4))),
+            ]
+            assert parsed.spinoff_revisions == 1
 
     def test_repeated_identical_spinoff_row_is_one_record(self) -> None:
         resolver = ListingResolver(
@@ -2102,18 +2105,30 @@ class TestNewActions:
         parsed = parse_corporate_actions({"spin_offs": [_spinoff(), _spinoff()]}, resolver.resolve)
         [action] = parsed.actions
         assert action.ratio_or_amount == 0.5
-        assert parsed.spinoff_superseded == 0
+        assert parsed.spinoff_revisions == 0
 
-    def test_two_spinoff_rows_with_no_order_still_raise(self) -> None:
-        # Same process date and ex-date, different ratio: neither is the
-        # "second" distribution, so the payload stays malformed.
+    @pytest.mark.parametrize(
+        "differing", [{"new_rate": 3}, {"ex_date": "2020-10-01"}], ids=["ratio", "ex_date"]
+    )
+    def test_differing_rows_on_one_process_date_are_left_out_and_named(
+        self, differing: dict[str, object]
+    ) -> None:
+        # Two differing rows with one process date share one stamp: neither
+        # is the "second" distribution, so that identity is left out and
+        # named, whatever the row order, and other spin-offs are kept.
         resolver = ListingResolver(
-            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+            [
+                _listing("P", "PARENT", START),
+                _listing("C", "CHILD", date(2020, 9, 1)),
+                _listing("D", "KIDB", date(2020, 9, 1)),
+            ]
         )
-        with pytest.raises(ValueError, match="spin-off"):
-            parse_corporate_actions(
-                {"spin_offs": [_spinoff(), _spinoff(new_rate=3)]}, resolver.resolve
-            )
+        a, b, other = _spinoff(), _spinoff(**differing), _spinoff(new_symbol="KIDB")
+        later = _spinoff(ex_date="2020-11-30", process_date="2020-12-04")
+        for rows in ([a, b, later, other], [later, other, b, a], [b, a, a, other]):
+            parsed = parse_corporate_actions({"spin_offs": rows}, resolver.resolve)
+            assert [(x.security_id, x.source_action_id) for x in parsed.actions] == [("D", "P")]
+            assert parsed.spinoff_unordered == ("PARENT->CHILD 2020-10-16",)
 
     def test_daily_actions_keep_a_revised_spinoff(self) -> None:
         # #1673 (2): two distributions in one daily payload no longer skip
@@ -2142,10 +2157,13 @@ class TestNewActions:
         actions = source.corporate_actions(
             ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
         )
-        assert [(a.security_id, a.ex_date) for a in actions] == [("SEC_MSFT", date(2020, 8, 31))]
+        assert [(a.security_id, a.ex_date) for a in actions] == [
+            ("SEC_MSFT", date(2020, 8, 3)),
+            ("SEC_MSFT", date(2020, 8, 31)),
+        ]
         assert source.last_actions_report is not None
         assert source.last_actions_report.malformed_categories == ()
-        assert "1 spin-off row(s) superseded" in source.resolution_summary()
+        assert "1 spin-off revision(s) in one payload" in source.resolution_summary()
 
     def test_spinoff_record_rejects_nonpositive_ratio(self) -> None:
         assert (
