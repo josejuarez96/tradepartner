@@ -78,6 +78,15 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner delete-master-rows --manifest <csv> --release <name>
+  [--dry-run]` runs `repair.delete_master_rows` (#1682 lever B,
+  data-foundation plan T191): it deletes the reviewed manifest's never-true
+  `listings` and `delistings` rows, each refused unless its accession's SGML
+  header (fetched from EDGAR; needs the user agent) names the security's CIK
+  and was accepted no later than the row's `known_at`, and every row an open
+  paper window read. Refused without a release name; a dry run lists the rows
+  found and refused (exit 1 on any refused), a real run deletes only a
+  manifest with none refused, inside the open release named.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -359,10 +368,12 @@ import httpx
 import polars as pl
 import typer
 
-from tradepartner.adapters import alpaca_raw
+from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
+from tradepartner.adapters.edgar import parse_sgml_header
 from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateSource
@@ -421,8 +432,11 @@ from tradepartner.ingest import (
     read_manifest,
 )
 from tradepartner.repair import (
+    HeaderLookup,
     RepairRefused,
     delete_bars,
+    delete_master_rows,
+    read_master_manifest,
     repair_resolution,
     retract_dividends,
     store_resolver,
@@ -941,6 +955,41 @@ def _parse_day(flag: str, value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+
+
+def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLookup:
+    """`repair.HeaderLookup` over EDGAR: the filing's SGML header under the
+    CIK's archive path (`edgar.header_bytes`, then `edgar.stamp_header_bytes`
+    when cut short), parsed for that CIK, each read once; a 404 or 410, or a
+    header longer than both, is a `ValueError`."""
+
+    read: dict[tuple[str, str], FilingHeader] = {}
+
+    def lookup(cik: str, accession: str) -> FilingHeader:
+        if (cik, accession) in read:
+            return read[(cik, accession)]
+        text = ""
+        for size in (settings.edgar.header_bytes, settings.edgar.stamp_header_bytes):
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=settings, client=client
+                )
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in (404, 410):
+                    raise ValueError(f"EDGAR has no {accession} under CIK {cik} ({code})") from None
+                raise
+            if "</SEC-HEADER>" in text:
+                break
+        if "</SEC-HEADER>" not in text:
+            raise ValueError(
+                f"{accession}'s SGML header is longer than edgar.stamp_header_bytes "
+                f"({settings.edgar.stamp_header_bytes}); raise it and run again"
+            )
+        header = read[(cik, accession)] = parse_sgml_header(text, cik)
+        return header
+
+    return lookup
 
 
 def _blank_text(value: str | None) -> bool:
@@ -2154,6 +2203,68 @@ def make_app(
             raise _fail(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
+
+    @app.command("delete-master-rows")
+    def delete_master_rows_(
+        manifest: Annotated[
+            Path, typer.Option(help="the reviewed manifest CSV (repair.MASTER_MANIFEST_COLUMNS)")
+        ],
+        release: Annotated[
+            str, typer.Option(help="the data release (open, on a real run); always required")
+        ],
+        dry_run: Annotated[
+            bool, typer.Option(help="check and list the rows and change nothing")
+        ] = False,
+    ) -> None:
+        """Delete a reviewed manifest's never-true listings and delistings rows (#1682)."""
+        if _blank_text(release):
+            raise _fail(
+                "a master-row delete names its data release: pass --release <name>", USAGE_ERROR
+            )
+        try:
+            rows = read_master_manifest(manifest)
+        except OSError as exc:
+            raise _fail(f"cannot read the manifest: {exc}", USAGE_ERROR) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        if not rows:
+            raise _fail(f"refused: {manifest.name} lists no rows", USAGE_ERROR)
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        try:
+            with _read(s) if dry_run else open_for_write(s) as conn:
+                result = delete_master_rows(
+                    conn,
+                    rows,
+                    release,
+                    dry_run=dry_run,
+                    headers=_filing_headers(s, edgar_client),
+                    clock=clock,
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {_scrubbed(str(exc), s)}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {_scrubbed(str(exc), s)}", USAGE_ERROR) from None
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise _fail(f"nothing deleted (rolled back): {_scrubbed(str(exc), s)}", 1) from None
+        typer.echo(result.summary())
+        for line in result.found:
+            typer.echo(line)
+        if result.refused:
+            typer.echo("refused:")
+            for line in result.refused:
+                typer.echo(_scrubbed(line, s))
+            raise _fail(f"{len(result.refused)} manifest rows refused: fix the manifest", 1)
 
     @app.command("master-retract")
     def master_retract_(

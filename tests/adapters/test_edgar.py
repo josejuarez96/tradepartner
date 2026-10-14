@@ -1188,3 +1188,51 @@ class TestCoverPageSplitContexts:
         assert [(i.ticker, i.exchange) for i in parsed.cover.listings] == [("AAA", "NASDAQ")]
         assert parsed.facts == ()
         assert parsed.other_contexts == ("S",)
+
+
+# --- T193 (#1682, #1675): the join stays inside one class ---------------------------
+
+
+@pytest.mark.parametrize(
+    "title", ["Series A Corporate Units", "1.375% Notes due 2025", "Warrants to purchase"]
+)
+def test_a_unit_note_or_warrant_class_is_never_joined(title: str) -> None:
+    """The title on the class member's context, the symbol and exchange on
+    the member's exchange-axis context: joined for a common (the P&G shape),
+    never for a unit, note or warrant, which reads one context at a time as
+    with the switch off."""
+    member = {_CLASS_AXIS_NAME: "us-gaap:SomeMember"}
+    contexts = _context("A", member) + _context("B", {**member, _EXCH: "exch:XNYS"})
+
+    def parse(first_title: str) -> Any:
+        facts = (
+            _nn("Security12bTitle", "A", first_title)
+            + _nn("TradingSymbol", "B", "XYZ")
+            + _nn("SecurityExchangeName", "B", "NYSE")
+        )
+        return parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000000001-23-000001",
+            accepted_at=_ACCEPTED,
+            exchange_axis=True,
+            split_contexts=True,
+        )
+
+    unit = parse(title)
+    assert unit.cover.listings == ()
+    assert unit.incomplete_listings == 1
+    common = parse("Common Stock")
+    assert [(i.title, i.ticker) for i in common.cover.listings] == [("Common Stock", "XYZ")]
+
+
+def test_nisource_units_ticker_never_joins_the_common_title() -> None:
+    """#1675's done-when in the cover parser: NiSource's common on
+    `StatementEquityComponentsAxis` and its units on
+    `CapitalUnitsByClassAxis`, with the units' symbol and exchange on a
+    context of their own member: `NIMC` is only ever the units' ticker."""
+    parsed = _split("nisource_10q_2021q1.htm", on=True)
+    by_ticker = {i.ticker: i.title for i in parsed.cover.listings}
+    assert by_ticker == {
+        "NI": "Common Stock, par value $0.01 per share",
+        "NIMC": "Series A Corporate Units",
+    }
