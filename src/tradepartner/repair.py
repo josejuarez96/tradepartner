@@ -146,8 +146,18 @@ def store_resolver(
         else None,
         last_bar=functools.partial(last_bar, conn, at),
         handover_sessions=settings.master.transfer_window_sessions,
-        symbol_changes=symbol_changes_as_of(conn, at).iter_rows(named=True),
+        symbol_changes=_symbol_changes(conn, at),
     )
+
+
+def _symbol_changes(conn: duckdb.DuckDBPyConnection, at: datetime) -> list[dict[str, Any]]:
+    """The `symbol_changes` rows known at `at` (#1696); none on a store
+    before schema 28, which has no such table (a read-only connection
+    cannot migrate it)."""
+    tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    if "symbol_changes" not in tables:
+        return []
+    return list(symbol_changes_as_of(conn, at).iter_rows(named=True))
 
 
 def last_bar(

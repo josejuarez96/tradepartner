@@ -1239,3 +1239,16 @@ def test_the_store_resolver_follows_a_stored_symbol_change(settings: Settings) -
     assert resolver.resolve("PKI", rename) is None
     assert resolver.resolve("PKI", previous_session(rename)) == pki
     assert resolver.report.symbol_changes_followed == 1
+
+
+def test_the_store_resolver_reads_no_changes_before_schema_28(settings: Settings) -> None:
+    """#1696 (code-review): a store without the `symbol_changes` table (before
+    schema 28, read-only so not migrated) builds its resolver as before."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "listings", _listing("0000031791", "PKI", date(2019, 8, 6)))
+        conn.execute("DROP TABLE symbol_changes")
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, settings)
+    assert resolver.resolve("PKI", date(2024, 6, 3)) == "0000031791"
+    assert resolver.report.symbol_changes_followed == 0

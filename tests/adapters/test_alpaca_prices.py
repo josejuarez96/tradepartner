@@ -4578,15 +4578,18 @@ class TestSymbolChangesBoundSpans:
         assert resolver.resolve("RVTY", date(2024, 6, 3)) is None
         assert resolver.report.symbol_changes_unmatched == 1
 
-    def test_the_new_span_follows_the_other_rules(self) -> None:
-        # Another company holds RVTY when the change lands: the reuse rule
-        # (the newer span wins) applies to the change's span as to a row's.
+    def test_a_change_taking_another_companys_live_ticker_is_refused(self) -> None:
+        # Another company still holds RVTY by its listings when the change
+        # lands: following it would take that company's sessions (and contest
+        # its span), so the change is refused and the listings stand.
         holder = "0000000077"
         listings = [*self._pki(), _listing(holder, "RVTY", date(2020, 1, 2), self.TITLE)]
         change = _change(self.PKI, "PKI", "RVTY", self.RENAME)
         resolver = ListingResolver(listings, symbol_changes=[change])
-        assert resolver.resolve("RVTY", date(2023, 5, 15)) is None  # contested by the rename
-        assert resolver.resolve("RVTY", self.RENAME) == self.PKI
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.resolve("RVTY", date(2023, 5, 15)) == holder
+        assert resolver.resolve("RVTY", self.RENAME) == holder
+        assert resolver.resolve("PKI", self.RENAME) == self.PKI
 
     def test_a_change_the_rules_then_deny_is_refused_and_the_listings_stand(self) -> None:
         # Another company lists RVTY on the change's day (a rule-4 tie): the
@@ -4605,6 +4608,39 @@ class TestSymbolChangesBoundSpans:
         assert resolver.report.symbol_changes_refused == 1
         assert resolver.report.symbol_changes_followed == 0
         assert "1 refused" in resolver.report.summary()
+
+    def test_a_change_taking_a_sibling_classs_ticker_is_refused(self) -> None:
+        # quant-auditor on #1706: MSW -> PMA stored on the bare CIK while its
+        # Class A id already lists PMA; following it handed the class id's
+        # PMA sessions to the bare id.
+        bare, klass = "0001956166", "0001956166:class-a-ordinary-shares"
+        listings = [
+            _listing(bare, "MSW", date(2025, 1, 2), "Ordinary shares"),
+            _listing(klass, "PMA", date(2026, 8, 14), "Class A ordinary shares"),
+        ]
+        change = _change(bare, "MSW", "PMA", date(2026, 7, 9))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        plain = ListingResolver(listings)
+        for day in _sessions(date(2026, 7, 1), date(2026, 10, 9)):
+            for ticker in ("MSW", "PMA"):
+                assert resolver.resolve(ticker, day) == plain.resolve(ticker, day)
+        assert resolver.resolve("PMA", date(2026, 9, 1)) == klass
+        assert resolver.report.symbol_changes_refused == 1
+        assert resolver.report.symbol_changes_followed == 0
+
+    def test_the_match_reads_the_last_equity_row(self) -> None:
+        # A non-equity row after the common's (code-review on #1706) is no
+        # reason to call the change unmatched.
+        listings = [
+            _listing(self.CHK, "CHK", date(2021, 3, 1), self.TITLE),
+            _listing(self.CHK, "CHKEW", date(2023, 8, 1), "Warrants"),
+        ]
+        change = _change(self.CHK, "CHK", "EXE", date(2024, 10, 1))
+        resolver = ListingResolver(listings, symbol_changes=[change])
+        assert resolver.report.symbol_changes_followed == 1
+        assert resolver.report.symbol_changes_unmatched == 0
+        for day in (date(2024, 10, 1), date(2026, 1, 5)):
+            assert resolver.resolve("EXE", day) == self.CHK
 
     def test_the_symbol_is_read_in_alpacas_form(self) -> None:
         listings = [
@@ -4655,6 +4691,50 @@ class TestContestIsTimeAware:
 
     def test_a_span_ending_after_the_rename_starts_stays_contested(self) -> None:
         resolver = ListingResolver(self._listings(end=date(2026, 9, 1)))
+        assert len(resolver.contested_spans) == 1
+        assert resolver.resolve("PARA", date(2023, 6, 1)) is None
+
+    def test_a_freed_span_takes_no_corporate_action(self) -> None:
+        # quant-auditor on #1706: actions are fetched without asof, so a
+        # renamer's own actions may come back under PARA on Paramount's
+        # dates; Paramount's PARA span takes none, as while contested.
+        resolver = ListingResolver(self._listings())
+        day = date(2023, 6, 1)
+        assert resolver.resolve_action("PARA", day) is None
+        assert resolver.holds(self.PARAMOUNT, day)
+        assert not resolver.holds(self.PARAMOUNT, day, actions=True)
+        assert resolver.resolve_action("PARA", date(2026, 9, 1)) == self.BANZAI
+        assert resolver.resolve_action("VIAC", date(2021, 6, 1)) == self.PARAMOUNT
+        payload = {
+            "cash_dividends": [
+                {
+                    "id": "div-1",
+                    "symbol": "PARA",
+                    "rate": 0.05,
+                    "ex_date": "2023-06-14",
+                    "process_date": "2023-06-14",
+                    "record_date": "2023-06-14",
+                    "payable_date": "2023-07-03",
+                    "special": False,
+                    "foreign": False,
+                    "cusip": "92556H206",
+                }
+            ]
+        }
+        parsed = parse_corporate_actions(payload, resolver.resolve_action)
+        assert parsed.actions == ()
+        assert parsed.unresolved == (("PARA", date(2023, 6, 14)),)
+
+    def test_a_span_cut_by_a_hand_over_is_judged_on_its_listed_end(self) -> None:
+        # code-review on #1706: rule 8 cuts Paramount's open span after its
+        # last bar; the span as listed is live when Banzai renames into PARA,
+        # so it stays contested.
+        resolver = ListingResolver(
+            self._listings(end=None),
+            last_bar=lambda sid, start, before: date(2025, 8, 6) if sid == self.PARAMOUNT else None,
+            handover_sessions=5,
+        )
+        assert resolver.handovers(self.PARAMOUNT)
         assert len(resolver.contested_spans) == 1
         assert resolver.resolve("PARA", date(2023, 6, 1)) is None
 
