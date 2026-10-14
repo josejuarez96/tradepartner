@@ -1518,6 +1518,50 @@ def _split_fsn(pattern: str, *, on: bool, rows: list[tuple[str, str, str]] | Non
 
 
 class TestParseFsnSplitContexts:
+    def test_nisource_common_and_equity_units_keep_their_own_symbols(self) -> None:
+        rows = [
+            (
+                "Security12bTitle",
+                "Common Stock, par value $0.01 per share",
+                "StatementEquityComponents=CommonStock;",
+            ),
+            ("TradingSymbol", "NI", "StatementEquityComponents=CommonStock;"),
+            ("SecurityExchangeName", "NYSE", "StatementEquityComponents=CommonStock;"),
+            (
+                "Security12bTitle",
+                "Series A Corporate Units",
+                "CapitalUnitsByClass=SeriesACorporateUnits;",
+            ),
+            ("TradingSymbol", "NIMC", "CapitalUnitsByClass=SeriesACorporateUnits;"),
+            ("SecurityExchangeName", "NYSE", "CapitalUnitsByClass=SeriesACorporateUnits;"),
+        ]
+        parsed = _split_fsn("", on=True, rows=rows)
+        assert parsed.failures == ()
+        [record] = parsed.records
+        assert [(i.title, i.ticker, i.exchange) for i in record.listings] == [
+            ("Common Stock, par value $0.01 per share", "NI", "NYSE"),
+            ("Series A Corporate Units", "NIMC", "NYSE"),
+        ]
+
+    def test_same_member_name_on_two_axes_does_not_merge(self) -> None:
+        rows = [
+            ("Security12bTitle", "Common Stock", "StatementEquityComponents=CommonStock;"),
+            ("TradingSymbol", "NIMC", "CapitalUnitsByClass=CommonStock;"),
+            ("SecurityExchangeName", "NYSE", "CapitalUnitsByClass=CommonStock;"),
+        ]
+        [record] = _split_fsn("", on=True, rows=rows).records
+        assert record.listings == ()
+        assert record.incomplete_listings == 1
+
+    def test_surrounding_symbol_quotes_are_removed(self) -> None:
+        rows = [
+            ("Security12bTitle", "Common Stock", ""),
+            ("TradingSymbol", '"""CNA"""', ""),
+            ("SecurityExchangeName", "NYSE", ""),
+        ]
+        [record] = _split_fsn("", on=True, rows=rows).records
+        assert [i.ticker for i in record.listings] == ["CNA"]
+
     @pytest.mark.parametrize("pattern", sorted(_SPLIT_PATTERNS))
     def test_the_fsn_rows_give_the_per_document_listings(self, pattern: str) -> None:
         from tradepartner.adapters.edgar import parse_cover_page

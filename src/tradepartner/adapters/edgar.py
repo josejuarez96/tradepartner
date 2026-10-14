@@ -80,6 +80,9 @@ _CLASS_AXIS = "us-gaap:StatementClassOfStockAxis"
 #: The other us-gaap axis filers put a cover class on (Fifth Third, #1651):
 #: read as a class axis only under `edgar.cover_split_contexts`.
 _CAPITAL_UNITS_AXIS = "us-gaap:CapitalUnitsByClassAxis"
+#: NiSource's 2021 cover tags common and preferred stock on this axis while
+#: its equity units use CapitalUnitsByClassAxis (#1675).
+_EQUITY_COMPONENTS_AXIS = "us-gaap:StatementEquityComponentsAxis"
 #: The DEI taxonomy's "this class on this exchange" axis (#1541): its member
 #: is an ISO MIC (`exch:XNGS`). Read as a listing axis only under
 #: `edgar.exchange_axis_listings`; a grouping key, never the exchange's source.
@@ -126,6 +129,11 @@ def normalize_class_member(raw: str) -> str:
     `Member` are already stripped) are one name. Pure; `""` stays `""`."""
     value = raw.split(":", 1)[-1] if ":" in raw else raw
     return value.removesuffix("Member")
+
+
+def _trading_symbol(raw: str) -> str:
+    """Remove surrounding quote characters from a DEI trading symbol."""
+    return raw.strip().strip("\"'")
 
 
 def _parse_utc(text: str) -> datetime:
@@ -822,13 +830,14 @@ def _dei_facts(document: bytes, accession: str) -> _DeiFacts:
         if issue:
             raise ValueError(f"{accession}: dei:{name}: {issue}")
         context = fact.context or {}
+        value = _trading_symbol(str(fact.value)) if name == "TradingSymbol" else fact.value
         key = (name, str(context.get("id", "")))
         if key in seen:
-            if seen[key] != fact.value:
+            if seen[key] != value:
                 raise ValueError(f"{accession}: dei:{name} has two values in context {key[1]!r}")
             continue
-        seen[key] = fact.value
-        out.append((name, fact.value, context))
+        seen[key] = value
+        out.append((name, value, context))
     return _DeiFacts(out, ciks)
 
 
@@ -876,7 +885,9 @@ def parse_cover_page(
 
     With `split_contexts` (`edgar.cover_split_contexts`, #1651), two tagging
     patterns real issuers use are also read. (1) `us-gaap:CapitalUnitsByClassAxis`
-    is a class axis like `StatementClassOfStockAxis` (Fifth Third). (2) A class
+    and `us-gaap:StatementEquityComponentsAxis` are class axes like
+    `StatementClassOfStockAxis` (Fifth Third, NiSource). The axis and member
+    together identify a class, so facts on different axes never merge. (2) A class
     whose listing facts sit in several contexts of one class member (Abbott
     2020: the title on an undimensioned context, the symbol and exchange on
     the XNYS context, a second exchange on the XCHI context; P&G 2023: title
@@ -902,10 +913,14 @@ def parse_cover_page(
         raise ValueError(f"{accession}: cover-page entity is not a CIK: {scheme!r} {entity!r}")
     cik = _cik(entity)
 
-    class_axes = {_CLASS_AXIS, _CAPITAL_UNITS_AXIS} if split_contexts else {_CLASS_AXIS}
+    class_axes = (
+        {_CLASS_AXIS, _CAPITAL_UNITS_AXIS, _EQUITY_COMPONENTS_AXIS}
+        if split_contexts
+        else {_CLASS_AXIS}
+    )
     allowed = class_axes | ({_EXCHANGE_AXIS} if exchange_axis else set())
     classes: dict[str, dict[str, str]] = {}
-    class_of: dict[str, str] = {}
+    class_of: dict[str, tuple[str, str]] = {}
     exchange_members: dict[str, str] = {}
     shares: list[FactRecord] = []
     share_values: dict[tuple[str, str], list[tuple[float, bool]]] = {}
@@ -923,7 +938,10 @@ def parse_cover_page(
         class_axis = next(iter(class_axes & set(dimensions)), _CLASS_AXIS)
         if name != _SHARES_CONCEPT:
             classes.setdefault(context["id"], {})[name] = value
-            class_of[context["id"]] = normalize_class_member(str(dimensions.get(class_axis, "")))
+            class_of[context["id"]] = (
+                class_axis if class_axis in dimensions else "",
+                normalize_class_member(str(dimensions.get(class_axis, ""))),
+            )
             if _EXCHANGE_AXIS in dimensions:
                 exchange_members[context["id"]] = str(dimensions[_EXCHANGE_AXIS])
         elif name == _SHARES_CONCEPT:
@@ -957,35 +975,35 @@ def parse_cover_page(
                 )
             )
 
-    class_titles: dict[str, set[str]] = {}
-    class_symbols: dict[str, set[str]] = {}
-    class_has_exchange: set[str] = set()
+    class_titles: dict[tuple[str, str], set[str]] = {}
+    class_symbols: dict[tuple[str, str], set[str]] = {}
+    class_has_exchange: set[tuple[str, str]] = set()
     for context_id, group in classes.items():
-        member = class_of[context_id]
+        class_key = class_of[context_id]
         if "Security12bTitle" in group:
-            class_titles.setdefault(member, set()).add(group["Security12bTitle"])
+            class_titles.setdefault(class_key, set()).add(group["Security12bTitle"])
         if "TradingSymbol" in group:
-            class_symbols.setdefault(member, set()).add(group["TradingSymbol"])
+            class_symbols.setdefault(class_key, set()).add(group["TradingSymbol"])
         if "SecurityExchangeName" in group:
-            class_has_exchange.add(member)
+            class_has_exchange.add(class_key)
 
     listings: list[CoverListing] = []
     incomplete = mismatched = 0
     for context_id, group in classes.items():
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
-        member = class_of[context_id]
+        class_key = class_of[context_id]
         if (
             split_contexts
-            and len(class_titles.get(member, ())) <= 1
-            and len(class_symbols.get(member, ())) <= 1
+            and len(class_titles.get(class_key, ())) <= 1
+            and len(class_symbols.get(class_key, ())) <= 1
         ):
             # #1651: the class's title and symbol are the class's own, wherever
             # its contexts put them; a context with no exchange of its own is
             # covered by a sibling that has one.
-            [title, *_] = class_titles.get(member) or [title]
-            [symbol, *_] = class_symbols.get(member) or [symbol]
-            if exchange is None and member in class_has_exchange:
+            [title, *_] = class_titles.get(class_key) or [title]
+            [symbol, *_] = class_symbols.get(class_key) or [symbol]
+            if exchange is None and class_key in class_has_exchange:
                 continue
         if symbol is None:
             continue  # notes and other classes with no trading symbol
@@ -1332,6 +1350,7 @@ _FSN_EXCHANGE_AXIS = "EntityListingsExchange"
 #: `us-gaap:CapitalUnitsByClassAxis` as FSN spells it (prefix and `Axis`
 #: dropped): a class axis only under `edgar.cover_split_contexts` (#1651).
 _FSN_CAPITAL_UNITS_AXIS = "CapitalUnitsByClass"
+_FSN_EQUITY_COMPONENTS_AXIS = "StatementEquityComponents"
 
 
 @dataclass(frozen=True)
@@ -1434,7 +1453,8 @@ def _fsn_segments(
     """`dim.segments` (e.g. `"ClassOfStock=CommonClassA;"`) to `{axis:
     member}`, or `None` if it names any axis other than `ClassOfStock` (and,
     with `exchange_axis`, `EntityListingsExchange`, #1541; with
-    `split_contexts`, `CapitalUnitsByClass`, #1651, but never both class
+    `split_contexts`, `CapitalUnitsByClass` and `StatementEquityComponents`,
+    but never two class
     axes at once)."""
     pairs: dict[str, str] = {}
     for part in raw.split(";"):
@@ -1443,7 +1463,11 @@ def _fsn_segments(
             continue
         axis, _, member = part.partition("=")
         pairs[axis.strip()] = member.strip()
-    class_axes = {_FSN_CLASS_AXIS, _FSN_CAPITAL_UNITS_AXIS} if split_contexts else {_FSN_CLASS_AXIS}
+    class_axes = (
+        {_FSN_CLASS_AXIS, _FSN_CAPITAL_UNITS_AXIS, _FSN_EQUITY_COMPONENTS_AXIS}
+        if split_contexts
+        else {_FSN_CLASS_AXIS}
+    )
     allowed = class_axes | ({_FSN_EXCHANGE_AXIS} if exchange_axis else set())
     if set(pairs) - allowed or len(class_axes & set(pairs)) > 1:
         return None
@@ -1467,15 +1491,15 @@ def _fsn_class_member(
     *,
     exchange_axis: bool = False,
     split_contexts: bool = False,
-) -> tuple[str, str] | None:
-    """The row's (class member, exchange member): `("", "")` when `dimn` is
+) -> tuple[str, str, str] | None:
+    """The row's (class axis, class member, exchange member): empty when `dimn` is
     `0` (undimensioned), or `None` when the row should be excluded (an axis
     outside the allowed set, or a `dimh` with no matching `dim.tsv` row).
     The exchange member is `""` unless `exchange_axis` (#1541) lets an
     `EntityListingsExchange` segment in."""
     dimn = (row.get("dimn") or "0").strip()
     if dimn in ("", "0"):
-        return "", ""
+        return "", "", ""
     segments_raw = dim_segments.get((row.get("dimh") or "").strip())
     if segments_raw is None:
         return None
@@ -1485,7 +1509,7 @@ def _fsn_class_member(
     # class silently, so the accession fails instead.
     guarded = (_FSN_CLASS_AXIS, _FSN_EXCHANGE_AXIS) if exchange_axis else (_FSN_CLASS_AXIS,)
     if split_contexts:
-        guarded = (*guarded, _FSN_CAPITAL_UNITS_AXIS)
+        guarded = (*guarded, _FSN_CAPITAL_UNITS_AXIS, _FSN_EQUITY_COMPONENTS_AXIS)
     if "\ufffd" in segments_raw and any(axis in segments_raw for axis in guarded):
         raise ValueError(
             f"{row.get('adsh', '')}: undecodable byte or embedded tab in "
@@ -1496,10 +1520,17 @@ def _fsn_class_member(
     )
     if segments is None:
         return None
-    return (
-        normalize_class_member(
-            segments.get(_FSN_CLASS_AXIS, "") or segments.get(_FSN_CAPITAL_UNITS_AXIS, "")
+    axis = next(
+        (
+            axis
+            for axis in (_FSN_CLASS_AXIS, _FSN_CAPITAL_UNITS_AXIS, _FSN_EQUITY_COMPONENTS_AXIS)
+            if axis in segments
         ),
+        "",
+    )
+    return (
+        axis,
+        normalize_class_member(segments.get(axis, "")),
         segments.get(_FSN_EXCHANGE_AXIS, ""),
     )
 
@@ -1522,10 +1553,10 @@ def _parse_one_fsn_filing(
     sic_raw = (sub_row.get("sic") or "").strip()
     sic = int(sic_raw) if sic_raw else None
 
-    # Keyed by (class member, exchange member) (#1541): one class on two
+    # Keyed by (class axis, member, exchange member) (#1541, #1675): one class on two
     # exchanges is two groups, never two values for `SecurityExchangeName`.
     # Without `exchange_axis` the exchange member is always "".
-    groups: dict[tuple[str, str], dict[str, str]] = {}
+    groups: dict[tuple[str, str, str], dict[str, str]] = {}
     for row in txt_rows:
         tag = row.get("tag")
         if tag not in _FSN_LISTING_TAGS or _fsn_is_coreg(row):
@@ -1535,8 +1566,10 @@ def _parse_one_fsn_filing(
         )
         if dims is None:
             continue
-        member = dims[0]
+        member = dims[1]
         group, value = groups.setdefault(dims, {}), row.get("value") or ""
+        if tag == "TradingSymbol":
+            value = _trading_symbol(value)
         if "\ufffd" in value:  # an invalid byte or a tab `_fsn_rows` replaced (#455, #498)
             raise ValueError(
                 f"{accession}: undecodable byte or embedded tab in {tag} ({member or 'no class'})"
@@ -1552,17 +1585,19 @@ def _parse_one_fsn_filing(
     listings: list[CoverListing] = []
     incomplete = mismatched = 0
     symbol_only: set[str] = set()
-    class_titles: dict[str, set[str]] = {}
-    class_symbols: dict[str, set[str]] = {}
-    class_has_exchange: set[str] = set()
-    for (class_key, _), group in groups.items():
+    class_titles: dict[tuple[str, str], set[str]] = {}
+    class_symbols: dict[tuple[str, str], set[str]] = {}
+    class_has_exchange: set[tuple[str, str]] = set()
+    for (axis, member, _), group in groups.items():
+        class_key = (axis, member)
         if "Security12bTitle" in group:
             class_titles.setdefault(class_key, set()).add(group["Security12bTitle"])
         if "TradingSymbol" in group:
             class_symbols.setdefault(class_key, set()).add(group["TradingSymbol"])
         if "SecurityExchangeName" in group:
             class_has_exchange.add(class_key)
-    for (class_key, exchange_member), group in groups.items():
+    for (axis, member, exchange_member), group in groups.items():
+        class_key = (axis, member)
         title, symbol = group.get("Security12bTitle"), group.get("TradingSymbol")
         exchange = group.get("SecurityExchangeName")
         if (
@@ -1608,7 +1643,7 @@ def _parse_one_fsn_filing(
             (row.get("dimh") or "").strip(), ""
         ):
             continue  # #1651: shares on this axis stay unread, as parse_cover_page
-        member = dims[0]  # an exchange-axis count is its class's (#1541)
+        member = dims[1]  # an exchange-axis count is its class's (#1541)
         raw_value = row.get("value")
         if raw_value is None or not str(raw_value).strip():
             continue  # FSN's NULL: an `xsi:nil` fact reports no count (#609 F3)
@@ -1659,8 +1694,9 @@ def parse_fsn(
     today's.
 
     With `split_contexts` (`edgar.cover_split_contexts`, #1651) `parse_fsn`
-    reads what `parse_cover_page` reads under it: `CapitalUnitsByClass` is a
-    class axis (its shares rows stay unread), and a class's title, symbol and
+    reads what `parse_cover_page` reads under it: `CapitalUnitsByClass` and
+    `StatementEquityComponents` are class axes (capital units shares rows stay
+    unread), and a class's title, symbol and
     exchange are merged across its (class, exchange) groups when the class
     names at most one title and one symbol, else one listing per group."""
     dim_segments = {str(row["dimhash"]): str(row["segments"]) for row in dim}

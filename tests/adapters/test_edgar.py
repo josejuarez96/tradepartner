@@ -985,6 +985,7 @@ class TestCoverPageExchangeAxisOff:
 # --- #1651: `edgar.cover_split_contexts` (CapitalUnitsByClassAxis; a class split over contexts) ---
 
 _CAPITAL_UNITS = "us-gaap:CapitalUnitsByClassAxis"
+_EQUITY_COMPONENTS = "us-gaap:StatementEquityComponentsAxis"
 
 
 def _split(name: str, *, on: bool) -> Any:
@@ -999,6 +1000,43 @@ def _split(name: str, *, on: bool) -> Any:
 
 class TestCoverPageSplitContexts:
     """The three real tagging patterns the exchange axis alone still misses."""
+
+    def test_nisource_common_and_equity_units_keep_their_own_symbols(self) -> None:
+        parsed = _split("nisource_10q_2021q1.htm", on=True)
+        assert [(i.title, i.ticker, i.exchange) for i in parsed.cover.listings] == [
+            ("Common Stock, par value $0.01 per share", "NI", "NYSE"),
+            ("Series A Corporate Units", "NIMC", "NYSE"),
+        ]
+        assert parsed.incomplete_listings == 0
+
+    def test_same_member_name_on_two_axes_does_not_merge(self) -> None:
+        contexts = _context("A", {_EQUITY_COMPONENTS: "us-gaap:CommonStockMember"}) + _context(
+            "B", {_CAPITAL_UNITS: "nix:CommonStockMember"}
+        )
+        facts = (
+            _nn("Security12bTitle", "A", "Common Stock")
+            + _nn("TradingSymbol", "B", "NIMC")
+            + _nn("SecurityExchangeName", "B", "NYSE")
+        )
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0001111711-21-000018",
+            accepted_at=_ACCEPTED,
+            split_contexts=True,
+        )
+        assert parsed.cover.listings == ()
+        assert parsed.incomplete_listings == 1
+
+    def test_surrounding_symbol_quotes_are_removed(self) -> None:
+        contexts = _context("A", {_CLASS_AXIS_NAME: "us-gaap:CommonStockMember"})
+        facts = _listing_facts("A", "Common Stock", '"""CNA"""', "NYSE")
+        parsed = parse_cover_page(
+            _ixbrl(contexts, facts),
+            accession="0000021175-20-000114",
+            accepted_at=_ACCEPTED,
+            split_contexts=True,
+        )
+        assert [i.ticker for i in parsed.cover.listings] == ["CNA"]
 
     @pytest.mark.parametrize("name", ["fifth_third_10q_2023q3.htm", "fifth_third_10q_2020q3.htm"])
     def test_capital_units_axis_is_a_class_axis(self, name: str) -> None:
