@@ -8,16 +8,15 @@ chunk, given synthetic bars and shares over 2020 to 2021, and read with
 `universe_as_of` (the spec amendment's "Master and universe" acceptance).
 The four names whose common is tagged only by exchange have no `filing`
 listing with the switch off, only the companies snapshot's (known
-2026-10-04), so every earlier read sees them `not_listed`; P&G's first class
-read is its note. With the switch on, each common is a member at
+2026-10-04), so every earlier read sees them `not_listed`; P&G's note has
+its own class id. With the switch on, each common is a member at
 `close(2021-06-30)` from a `filing` row known at its 2019 acceptance, and
 none is listed before it (no look-ahead).
 
-"The residual" case: a store built with the merge-base rules through
-2022-10-19 (P&G's note on the primary id) and re-ingested with the new rules
-still reads the note on the primary id at `close(2023-06-30)`; the stored
-note row is underived and `master-retract` withdraws it at its run, never
-back-dated (#859; spec open question 4).
+P&G's lone note page through 2022-10-19 leaves the primary unlisted. A
+re-ingest with exchange-axis cover parsing adds the common to the primary,
+and the note remains on its own class id; `master-retract` has no stale
+PG25 row on the primary to withdraw (#1680).
 """
 
 from __future__ import annotations
@@ -45,10 +44,8 @@ from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Settings
 from tradepartner.ingest import ingest_session
 from tradepartner.retract import master_retract
-from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of
 from tradepartner.store.db import open_for_write
-from tradepartner.store.schema import init_schema
 from tradepartner.universe import _current_listings, universe_as_of
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "edgar" / "cover_exchange_axis"
@@ -236,13 +233,12 @@ def _current(settings: Settings, security_id: str, t: datetime) -> dict[str, Any
 # --- master and universe -------------------------------------------------------
 
 
-def test_with_the_switch_off_the_names_stay_out_as_on_the_merge_base(
+def test_with_the_switch_off_the_names_stay_out(
     settings: Settings,
 ) -> None:
     """Today's rules, pinned: the four exchange-tagged commons have only the
     snapshot listing (known 2026-10-04), so at `close(2021-06-30)` they are
-    rule 2 `not_listed`; P&G's primary id carries its undimensioned note, so
-    it fails rule 1 as `debt`."""
+    rule 2 `not_listed`; P&G's note is a separate debt class."""
     _store(settings, on=False)
     assert _members(settings, T_2021) == set()
     assert _excluded(settings, T_2021) == {
@@ -250,9 +246,12 @@ def test_with_the_switch_off_the_names_stay_out_as_on_the_merge_base(
         ABBV: (2, "exchange", "not_listed"),
         ABT: (2, "exchange", "not_listed"),
         MMM: (2, "exchange", "not_listed"),
-        PG: (1, "security_type", "debt"),
+        PG: (2, "exchange", "not_listed"),
+        f"{PG}:1-375pct-notes-due-2025": (1, "security_type", "debt"),
     }
-    assert [row[:3] for row in _filing_listings(settings, RUN)] == [(PG, "PG25", "NYSE")]
+    assert [row[:3] for row in _filing_listings(settings, RUN)] == [
+        (f"{PG}:1-375pct-notes-due-2025", "PG25", "NYSE")
+    ]
 
 
 def test_with_the_switch_on_the_five_commons_are_members_from_their_filing_rows(
@@ -303,7 +302,7 @@ def test_the_listing_rows_read_at_t_are_those_a_store_built_at_t_holds(
     assert len(_filing_listings(settings, T_2021)) == 8  # 5 commons, ABBV's second, 2 notes
 
 
-# --- the residual (P&G's note on the primary id) ------------------------------
+# --- P&G's note stays off the primary id --------------------------------------
 
 #: P&G's covers: the common tagged only by exchange from 2019, a note
 #: (undimensioned) listed beside it from 2022-10-19.
@@ -316,47 +315,34 @@ PG_PAGES = (
 FIRST_RUN = datetime(2022, 10, 20, 12, 0, tzinfo=UTC)
 RETRACT_AT = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 T_2023 = session_close(date(2023, 6, 30))
-NOTE_KEY = (PG, "PG25", "NYSE", date(2022, 10, 19))
 
 
-def test_the_residual_pg_reads_as_its_note_until_the_retraction(settings: Settings) -> None:
-    """Built with today's rules through 2022-10-19, P&G's primary id carries
-    the note; re-ingested with the switch on, the common is derived on the
-    primary id from 2019 (known at that acceptance) and the note on its
-    class id, but the stored note row on the primary id stays until
-    `master-retract` withdraws it, stamped at its run (#859). So at
-    `close(2023-06-30)` the primary id still reads as the note (the latest
-    `valid_from`): the documented residual, spec open question 4."""
+def test_pg_never_reads_as_its_note_on_the_primary(settings: Settings) -> None:
+    """A lone note on the first parsed page never creates a stale PG25 row
+    on P&G's primary. A later exchange-axis common arrives at its own
+    acceptance, and no retraction of a primary PG25 row is needed."""
     _ingest(settings, _source(False, names=[PG], pg_pages=PG_PAGES, until=FIRST_RUN), FIRST_RUN)
-    assert _current(settings, PG, T_2023)["ticker"] == "PG25"
+    with _read(settings) as conn:
+        assert PG not in _current_listings(conn, T_2023, T_2023.date(), settings)
+    assert _current(settings, f"{PG}:1-375pct-notes-due-2025", T_2023)["ticker"] == "PG25"
 
     source = _source(True, names=[PG], pg_pages=PG_PAGES)
     _ingest(settings, source, RUN)
-    assert _current(settings, PG, T_2023)["ticker"] == "PG25"
+    assert _current(settings, PG, T_2023)["ticker"] == "PG"
     common = _current(settings, PG, session_close(date(2021, 6, 30)))
     assert (common["ticker"], common["known_at"]) == ("PG", PG_PAGES[0][1])
 
-    with open_for_write(settings) as conn:
-        init_schema(conn)
-        registry.open_data_release(conn, conn, name="t178", backup_path="b.duckdb", reason="#1541")
     dry = master_retract(settings, filings=source, clock=lambda: RETRACT_AT)
-    assert [(u.table, u.key) for u in dry.found] == [("listings", NOTE_KEY)]
-    master_retract(
-        settings,
-        filings=source,
-        clock=lambda: RETRACT_AT,
-        dry_run=False,
-        expect=(dry.rows, dry.digest),
-        release="t178",
+    assert not any(
+        u.table == "listings" and u.key[0] == PG and u.key[1] == "PG25" for u in dry.found
     )
-    # never back-dated: every read before the run still sees the note
-    assert _current(settings, PG, T_2023)["ticker"] == "PG25"
-    assert _current(settings, PG, session_close(date(2026, 10, 2)))["ticker"] == "PG25"
-    after = _current(settings, PG, session_close(date(2026, 10, 6)))
-    assert after["ticker"] == "PG"
+    assert _current(settings, PG, session_close(date(2026, 10, 2)))["ticker"] == "PG"
     with _read(settings) as conn:
-        assert conn.execute(
-            "SELECT known_at, retracted FROM listings WHERE security_id = ? AND ticker = ? "
-            "ORDER BY known_at",
-            [PG, "PG25"],
-        ).fetchall() == [(_at(2022, 10, 19), False), (RETRACT_AT, True)]
+        assert (
+            conn.execute(
+                "SELECT known_at, retracted FROM listings WHERE security_id = ? AND ticker = ? "
+                "ORDER BY known_at",
+                [PG, "PG25"],
+            ).fetchall()
+            == []
+        )
