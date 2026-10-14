@@ -2207,6 +2207,11 @@ def make_app(
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
+        if check and coverage is False and s.coverage.check_enabled:
+            raise _fail(
+                "--no-coverage cannot be used with --check while coverage.check_enabled is on",
+                1,
+            )
         if (missing := _store_missing(s)) is not None:
             raise missing
         t = ensure_tz_aware_utc(clock(), field_name="clock()")

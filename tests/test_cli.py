@@ -923,7 +923,12 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     assert failed.exit_code == 1
     assert "health check failed: coverage_reference_names" in failed.output
     assert "  coverage_reference_names: fail (2)" in failed.output
-    skipped = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    refused = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert refused.exit_code == 1
+    assert refused.output.strip() == (
+        "--no-coverage cannot be used with --check while coverage.check_enabled is on"
+    )
+    skipped = _invoke(enforced, ["health", "--no-coverage"], clock=lambda: T_END)
     assert skipped.exit_code == 0, skipped.output
     assert "coverage reference: not computed" in skipped.output
     assert (
@@ -935,6 +940,13 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     )
     plain = _invoke(report_only, ["health", "--coverage", "--check"], clock=lambda: T_END)
     assert plain.exit_code == 0, plain.output
+    off_skipped_check = _invoke(
+        report_only, ["health", "--no-coverage", "--check"], clock=lambda: T_END
+    )
+    assert off_skipped_check.exit_code == 0, off_skipped_check.output
+    assert "coverage reference: not computed" in off_skipped_check.output
+    off_skipped_plain = _invoke(report_only, ["health", "--no-coverage"], clock=lambda: T_END)
+    assert off_skipped_plain.exit_code == 0, off_skipped_plain.output
     listed = _settings(
         tmp_path,
         store=fixture_store_path,
