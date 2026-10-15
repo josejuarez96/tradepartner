@@ -25,7 +25,9 @@ from tradepartner.config import Settings
 from tradepartner.dashboard import app, health_page, theme
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     INTEGRITY_RULES,
+    IndexMembersCheck,
     coverage,
     health_report,
 )
@@ -572,3 +574,49 @@ def test_borrow_card_with_no_observation_and_the_switch_on(
     assert "At the latest observation" not in text
     assert "Last snapshot run: never; none" in text
     assert any("no borrow snapshot observed" in str(m.value) for m in at.markdown)
+
+
+# --- the answer-key table (#1682, T189b) ---------------------------------------
+
+
+def test_the_coverage_card_shows_the_answer_key_table_from_the_report(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    at.button(key=health_page.COVERAGE_BUTTON_KEY).click().run()
+    assert not at.exception
+    text = _text(at)
+    assert "S&P 500 answer key (a check only, never a source)" in text
+    assert "Key commit `a2430f2af0c79ddf0748e91de11bdeb1616ab5a7`" in text
+    assert "Answer-key misses (" in text
+    assert "index_members_missing: " in text
+
+
+def test_the_index_badge_is_critical_only_when_the_block_fails(store_path: Path) -> None:
+    def view(**coverage: Any) -> IndexMembersCheck:
+        settings = Settings(_env_file=None, store={"path": str(store_path)}, coverage=coverage)
+        with _connect(store_path) as conn:
+            block = health_page.load_health_view(
+                conn, T, settings, WINDOW, with_coverage_reference=True
+            ).report.coverage_reference
+        assert block is not None and block.index_members is not None
+        return block.index_members
+
+    report_only = view()
+    assert health_page.index_badge(report_only)[1] == "warning"
+    assert health_page.index_badge(view(index_max_missing=0)) == (
+        f"{INDEX_MEMBERS_MISSING}: {report_only.worst} max missing per session: fail (max 0)",
+        "critical",
+    )
+    assert health_page.index_badge(view(index_max_missing=10_000))[1] == "good"
+
+
+def test_the_not_computed_card_warns_while_the_index_threshold_is_set(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("COVERAGE__INDEX_MAX_MISSING", "5")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Not computed" in text
+    assert f"`health --check` enforces {INDEX_MEMBERS_MISSING}" in text
