@@ -12,7 +12,13 @@ reported once, under the first rule it fails:
    transfer supersedes the older row). When the rows of one class share
    that latest `valid_from` (filed on two exchanges, #1574), a row on a
    venue in `universe.exchanges` wins, whatever order the names sort in.
-   It is live while `listed`, or while
+   A newer row on a real venue that is not on the list (`NYSE_CHICAGO`,
+   `NYSETX`: a secondary quote of the same class, #1682 lever A) does not
+   hide a listing that is still live on a venue in `universe.exchanges`:
+   the security passes while any of its rows at or before the session is
+   live on that list. A newer row on `OTC`, `NONE` or no name is a move off
+   the exchange and still fails, and a listing ended by its own Form 25 is
+   not live. It is live while `listed`, or while
    `transferred` up to its end session; a `delisted` listing (a Form 25
    known at `t`) is out from the filing's `known_at`, even while bars
    continue, so nothing enters a name on its way out.
@@ -211,6 +217,22 @@ def _last_sessions(session: date, count: int) -> frozenset[date]:
     return frozenset(out)
 
 
+#: Exchange values that name no venue: a newer row on one is a move off the
+#: exchange, never a secondary quote (same set as `delistings._OFF_EXCHANGE`).
+_NO_VENUE = frozenset({"", "NONE", "OTC"})
+
+
+def _is_live(row: dict[str, Any], session: date) -> bool:
+    """Whether a listing row (with `status` and `end_session`) is live at `session`."""
+    if row["status"] == LISTED:
+        return True
+    return (
+        row["status"] == TRANSFERRED
+        and row["end_session"] is not None
+        and (row["end_session"] >= session)
+    )
+
+
 def _current_listings(
     conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
 ) -> dict[str, dict[str, Any]]:
@@ -220,12 +242,19 @@ def _current_listings(
     When the rows of one security share that latest `valid_from` (one class
     filed on two exchanges, #1574), the tie goes to a row whose `exchange` is
     in `universe.exchanges`, whatever order the names sort in; with no such
-    row, `listing_ends_as_of`'s frame order still decides the tie."""
+    row, `listing_ends_as_of`'s frame order still decides the tie.
+
+    Each listing also carries `on_listed_exchange` (T196, #1682 lever A):
+    whether any row of the security at or before `session`, whatever its
+    `valid_from`, is live at `session` on a venue in `universe.exchanges`."""
     exchanges = frozenset(settings.universe.exchanges)
     current: dict[str, dict[str, Any]] = {}
+    on_list: set[str] = set()
     for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         if row["valid_from"] > session:
             continue
+        if row["exchange"] in exchanges and _is_live(row, session):
+            on_list.add(row["security_id"])
         held = current.get(row["security_id"])
         newer = held is None or row["valid_from"] > held["valid_from"]
         # A same-day tie (#1574): prefer a venue on the universe's list over
@@ -238,7 +267,7 @@ def _current_listings(
         )
         if newer or tie_to_universe:
             current[row["security_id"]] = row
-    return current
+    return {sid: {**row, "on_listed_exchange": sid in on_list} for sid, row in current.items()}
 
 
 def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: list[str]) -> str:
@@ -253,6 +282,9 @@ def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: li
     if status not in (LISTED, TRANSFERRED):
         return f"status:{status}"
     if listing["exchange"] not in exchanges:
+        # A secondary quote on a real venue does not hide a live listing on the list.
+        if listing["on_listed_exchange"] and listing["exchange"] not in _NO_VENUE:
+            return ""
         return f"exchange:{listing['exchange']}"
     return ""
 
