@@ -1078,7 +1078,15 @@ class CoverageConfig(_ClosedConfig):
     `check_enabled`: off, the block is computed only on request (`health
     --coverage`, the page's button) and never fails `--check`; on, `health`
     computes it on every run and `--check` fails `coverage_reference_names`
-    while a reference name is missing."""
+    while a reference name is missing.
+
+    `index_members` (#1682, T189b): the block also checks the S&P 500 answer
+    key (plan T189's committed list, a check only, never a source) on each
+    sample session. `index_max_missing`: unset (the default), the key's
+    misses are reported and fail nothing; set, `health` computes the block on
+    every run and `--check` fails `index_members_missing` while some sample
+    session's misses exceed it (open question 30). Setting it with
+    `index_members` off is refused: a gate that cannot run."""
 
     reference_names: list[str] = Field(
         default_factory=lambda: list(DEFAULT_REFERENCE_NAMES), min_length=1
@@ -1086,6 +1094,20 @@ class CoverageConfig(_ClosedConfig):
     sample_months: list[int] = Field(default_factory=lambda: [6, 12], min_length=1)
     sample_from: date = date(2019, 12, 31)
     check_enabled: bool = False
+    index_members: bool = True
+    index_max_missing: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check_index_gate(self) -> CoverageConfig:
+        if self.index_max_missing is not None and not self.index_members:
+            raise ValueError("coverage.index_max_missing needs coverage.index_members on")
+        return self
+
+    @property
+    def computed_by_default(self) -> bool:
+        """Whether `health` computes the block on every run: while
+        `check_enabled` is on or `index_max_missing` is set."""
+        return self.check_enabled or self.index_max_missing is not None
 
     @field_validator("reference_names")
     @classmethod
