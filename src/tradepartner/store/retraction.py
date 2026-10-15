@@ -11,20 +11,22 @@ revision instead.
 
 - **Underived.** `underived(build, securities, listings, skip_ciks)` is
   pure: each stored live row (the latest revision per key as of the check,
-  not retracted) with `source = 'edgar'` and `provenance = 'filing'` whose
+  not retracted) with `source = 'edgar'` and `provenance = 'filing'`
+  (or `filing_name` for listings, #1597) whose
   key (`security_id` for `securities`; `security_id, ticker, exchange,
   valid_from` for `listings`) is not among `build`'s rows, and whose CIK is
   not in `skip_ciks`. Only EDGAR rows: the master builder derives nothing
   else, and a benchmark seeded from config (`backfill-benchmark`, #840) is
-  never its row to judge. Only `filing` rows: they come from full-history
-  inputs (the filing index, cover pages, Forms 25), so a build that lacks
-  one has changed its rules. A `snapshot` or `snapshot_static` row comes
+  never its row to judge. Filing-derived rows come from full-history
+  inputs (the filing index, cover pages, Forms 25 and filename evidence),
+  so a build that lacks one has changed its rules. A `snapshot` or
+  `snapshot_static` row comes
   from the companies snapshot, which lists only names trading today: a
   delisted or renamed name's snapshot row is legitimately absent from
   today's build, and retracting it would erase delisted history (quant
   audit of #872). Such rows are never judged; a false one needs another
   remedy. Nor is a successor id (`<cik>@<valid_from>`, #820) with a
-  stored non-`filing` listing, or any of its rows: one relisted on
+  stored non-filing-derived listing, or any of its rows: one relisted on
   snapshot evidence has a `filing` securities row, yet exists only while
   the snapshot names it. `skip_ciks` are CIKs whose filings failed or were skipped this
   run (`ingest._unjudged_ciks`): their rows are not judged either. A key
@@ -72,8 +74,9 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The source of every row the master builder derives.
 EDGAR = "edgar"
-#: The one provenance judged (module docstring).
+#: Provenances derived from full-history filing inputs (#1597).
 FILING = "filing"
+FILING_NAME = "filing_name"
 #: The status of a `master-retract --apply` run row: a master check, never a
 #: fresh ingest (health and execution read only `ok` runs as fresh).
 RETRACTED = "retracted"
@@ -132,7 +135,7 @@ def underived(
     listings: Iterable[Mapping[str, Any]],
     skip_ciks: frozenset[str] = frozenset(),
 ) -> tuple[Underived, ...]:
-    """The stored live EDGAR `filing` rows whose key `build` does not derive,
+    """The stored live EDGAR filing-derived rows the build does not derive,
     outside `skip_ciks` (module docstring), securities first, each table
     sorted by key. Pure."""
     stored_rows = {"securities": list(securities), "listings": list(listings)}
@@ -142,7 +145,13 @@ def underived(
     snapshot_evidenced = {
         row["security_id"]
         for row in stored_rows["listings"]
-        if "@" in row["security_id"] and row["provenance"] != FILING
+        if "@" in row["security_id"] and row["provenance"] not in {FILING, FILING_NAME}
+    }
+    # #1662: with `edgar.filename_listings` off the build reads no file names,
+    # so a stored `filing_name` row is not "no longer derived", only unread.
+    judged = {
+        "securities": {FILING},
+        "listings": {FILING, FILING_NAME} if build.filename_enabled else {FILING},
     }
     found: list[Underived] = []
     for table, built in (("securities", build.securities), ("listings", build.listings)):
@@ -152,7 +161,7 @@ def underived(
             Underived(table, dict(row))
             for row in stored_rows[table]
             if row["source"] == EDGAR
-            and row["provenance"] == FILING
+            and row["provenance"] in judged[table]
             and cik_of(row["security_id"]) not in skip_ciks
             and row["security_id"] not in snapshot_evidenced
             and tuple(row[c] for c in columns) not in derived

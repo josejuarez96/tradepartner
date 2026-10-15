@@ -78,6 +78,15 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner delete-master-rows --manifest <csv> --release <name>
+  [--dry-run]` runs `repair.delete_master_rows` (#1682 lever B,
+  data-foundation plan T191): it deletes the reviewed manifest's never-true
+  `listings` and `delistings` rows, each refused unless its accession's SGML
+  header (fetched from EDGAR; needs the user agent) names the security's CIK
+  and was accepted no later than the row's `known_at`, and every row an open
+  paper window read. Refused without a release name; a dry run lists the rows
+  found and refused (exit 1 on any refused), a real run deletes only a
+  manifest with none refused, inside the open release named.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -345,6 +354,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
@@ -358,12 +368,14 @@ import httpx
 import polars as pl
 import typer
 
-from tradepartner.adapters import alpaca_raw
+from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
+from tradepartner.adapters.edgar import parse_sgml_header
 from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.fred_rates import FredRateSource
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateSource
 from tradepartner.adapters.stamp_repair import ManifestRow
 from tradepartner.backfill import BenchmarkSeed, HoleFill, backfill, backfill_benchmark, fill_holes
@@ -396,17 +408,23 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     SESSION_HOLES,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     health_report,
 )
 from tradepartner.ingest import (
     SOURCES,
+    AssetsImport,
     IngestResult,
     RestampResult,
     WindowEarlierOk,
     _read,
+    import_assets,
+    ingest_actions_backfill,
+    ingest_assets,
     ingest_rates,
     ingest_session,
     manifest_release,
@@ -414,8 +432,11 @@ from tradepartner.ingest import (
     read_manifest,
 )
 from tradepartner.repair import (
+    HeaderLookup,
     RepairRefused,
     delete_bars,
+    delete_master_rows,
+    read_master_manifest,
     repair_resolution,
     retract_dividends,
     store_resolver,
@@ -451,6 +472,7 @@ from tradepartner.store import (
     research,
     schema,
 )
+from tradepartner.store.asof import ASSETS_SOURCE
 from tradepartner.store.db import (
     StoreLockedError,
     open_for_write,
@@ -534,6 +556,12 @@ class StorePriceSource(PriceSource):
         """`AlpacaPriceSource.corporate_actions` over the store's listings."""
         return self._source().corporate_actions(security_ids, start, end)
 
+    def symbol_changes(
+        self, security_ids: Sequence[str], start: date, end: date
+    ) -> list[SymbolChange]:
+        """`AlpacaPriceSource.symbol_changes` over the store's listings."""
+        return self._source().symbol_changes(security_ids, start, end)
+
     def resolution_summary(self) -> str:
         """`AlpacaPriceSource.resolution_summary`, `""` before the first fetch."""
         return "" if self._inner is None else self._inner.resolution_summary()
@@ -548,7 +576,7 @@ def _missing_secrets(settings: Settings, source: str) -> list[str]:
     missing: list[str] = []
     if source in ("all", "edgar") and _blank(settings.sec_edgar_user_agent):
         missing.append("SEC_EDGAR_USER_AGENT")
-    if source in ("all", "alpaca"):
+    if source in ("all", "alpaca", ASSETS_SOURCE):
         if _blank(settings.alpaca_api_key):
             missing.append("ALPACA_API_KEY")
         if _blank(settings.alpaca_api_secret):
@@ -569,6 +597,21 @@ def _print_result(result: IngestResult) -> None:
             f"{run.source}: {run.status}, {run.rows_added} rows, "
             f"cursor {run.chunk_cursor}: {run.message}"
         )
+
+
+def _print_import(result: AssetsImport) -> None:
+    """An `--import-dir` run: each applied file's run line, then the counts
+    and one line per refused file (each is the owner's to look at)."""
+    _print_result(IngestResult(result.runs))
+    applied = sum(run.status == "ok" for run in result.runs)
+    typer.echo(
+        f"{ASSETS_SOURCE} import: {applied} applied, {len(result.skipped)} skipped "
+        f"(at or before the latest observation), {len(result.refused)} refused"
+    )
+    for name in result.skipped:
+        typer.echo(f"skipped {name}")
+    for name, why in result.refused:
+        typer.echo(f"refused {name}: {why}")
 
 
 def _print_restamp(result: RestampResult, *, committed: bool) -> None:
@@ -633,6 +676,27 @@ def _quarantined(report: HealthReport) -> int:
             found = _QUARANTINED.findall(status.latest_message)
             return int(found[-1]) if found else 0
     return 0
+
+
+def _print_borrow(report: HealthReport) -> None:
+    """The borrow block (#1506, T171e): counts, the latest observation, the
+    shortable and ETB counts at it, the last run, then each warning."""
+    b = report.borrow
+    observed = b.latest_observation.isoformat() if b.latest_observation else "none"
+    known = b.latest_known_at.isoformat() if b.latest_known_at else "none"
+    at_it = (
+        f"; at it {b.shortable} shortable, {b.easy_to_borrow} easy_to_borrow (active)"
+        if b.latest_observation is not None
+        else ""
+    )
+    typer.echo(
+        f"borrow status: {b.rows} rows, {b.assets} assets; latest observation {observed}, "
+        f"latest known_at {known}{at_it}"
+    )
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(b.run_counts.items())) or "none"
+    typer.echo(f"  last {ASSETS_SOURCE} run: {b.last_run_status or 'never'}; {counts}")
+    for warning in b.warnings:
+        typer.echo(f"  warning: {warning}")
 
 
 def _print_report(report: HealthReport) -> None:
@@ -708,6 +772,8 @@ def _print_report(report: HealthReport) -> None:
     echo(f"accepted same-day pairs: {pairs.height}")
     for row in pairs.iter_rows(named=True):
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
+    _print_duplicate_dividends(report)
+    _print_borrow(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
@@ -715,6 +781,22 @@ def _print_report(report: HealthReport) -> None:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+    echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
+
+
+def _print_duplicate_dividends(report: HealthReport) -> None:
+    """The `duplicate_dividends` block's accepted and unresolved keys (#1613,
+    T186b), each shown, never hidden; the pending count is `health`'s warning."""
+    block = report.duplicate_dividends
+    for label, groups in (
+        ("accepted equal-amount dividend pairs", block.accepted),
+        ("unresolved equal-amount dividend pairs", block.unresolved),
+    ):
+        typer.echo(f"{label}: {len(groups)}")
+        for g in groups:
+            ticker = g.reviewed.ticker if g.reviewed is not None and g.reviewed.ticker else "-"
+            ids = ", ".join(i.source_action_id for i in g.identities)
+            typer.echo(f"  {g.security_id}@{g.ex_date} {ticker} {g.amount!r} ({ids})")
 
 
 def _coverage_verdict(block: CoverageReference | None) -> str:
@@ -724,6 +806,15 @@ def _coverage_verdict(block: CoverageReference | None) -> str:
     if block.failed and not block.check_enabled:
         return f"{block.verdict}: coverage.check_enabled is off"
     return block.verdict
+
+
+def _index_verdict(block: CoverageReference | None) -> str:
+    """`index_members_missing`' line: never a pass the block did not check."""
+    if block is None:
+        return "not computed (run with --coverage)"
+    if block.index_members is None:
+        return "off (coverage.index_members)"
+    return block.index_members.verdict
 
 
 def _print_coverage_reference(block: CoverageReference | None) -> None:
@@ -748,6 +839,37 @@ def _print_coverage_reference(block: CoverageReference | None) -> None:
         )
     ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
     echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
+    _print_index_members(block.index_members)
+
+
+def _print_index_members(index: IndexMembersCheck | None) -> None:
+    """The answer-key check's two lines (#1682, T189b): the key's SHA from the
+    report, the per-session counts, then the misses by bucket with their names."""
+    echo = typer.echo
+    if index is None:
+        echo("  index members: off (coverage.index_members)")
+        return
+    if index.error is not None:
+        echo(f"  index members: {index.verdict}")
+        return
+    counted = index.samples.filter(~pl.col("beyond_key"))
+    beyond = index.samples.height - counted.height
+    hits, members = int(counted["hits"].sum()), int(counted["members"].sum())
+    share = f"{hits / members:.1%}" if members else "n/a"
+    echo(
+        f"  index members (key {index.commit} through {index.through}): "
+        f"{counted.height} sessions checked, {beyond} beyond the key; "
+        f"{hits} of {members} hits ({share}); {index.verdict}"
+    )
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for row in index.misses.iter_rows(named=True):
+        buckets[row["bucket"]].append(row["ticker"])
+    parts = [
+        f"{bucket} {len(names)} member-sessions, {len(set(names))} names "
+        f"({', '.join(sorted(set(names)))})"
+        for bucket, names in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+    echo(f"  index misses by bucket: {'; '.join(parts) if parts else 'none'}")
 
 
 def _print_session_holes(report: HealthReport) -> None:
@@ -833,6 +955,41 @@ def _parse_day(flag: str, value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+
+
+def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLookup:
+    """`repair.HeaderLookup` over EDGAR: the filing's SGML header under the
+    CIK's archive path (`edgar.header_bytes`, then `edgar.stamp_header_bytes`
+    when cut short), parsed for that CIK, each read once; a 404 or 410, or a
+    header longer than both, is a `ValueError`."""
+
+    read: dict[tuple[str, str], FilingHeader] = {}
+
+    def lookup(cik: str, accession: str) -> FilingHeader:
+        if (cik, accession) in read:
+            return read[(cik, accession)]
+        text = ""
+        for size in (settings.edgar.header_bytes, settings.edgar.stamp_header_bytes):
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=settings, client=client
+                )
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in (404, 410):
+                    raise ValueError(f"EDGAR has no {accession} under CIK {cik} ({code})") from None
+                raise
+            if "</SEC-HEADER>" in text:
+                break
+        if "</SEC-HEADER>" not in text:
+            raise ValueError(
+                f"{accession}'s SGML header is longer than edgar.stamp_header_bytes "
+                f"({settings.edgar.stamp_header_bytes}); raise it and run again"
+            )
+        header = read[(cik, accession)] = parse_sgml_header(text, cik)
+        return header
+
+    return lookup
 
 
 def _blank_text(value: str | None) -> bool:
@@ -1584,6 +1741,9 @@ def make_app(
     edgar_client: httpx.Client | None = None,
     price_source: Callable[[Settings], PriceSource] | None = None,
     rate_source: Callable[[Settings], RateSource] = lambda s: FredRateSource(settings=s),
+    assets_source: Callable[[Settings, Clock], alpaca_raw.AssetsFetch] = (
+        lambda s, c: alpaca_raw.assets_all(s, clock=c)
+    ),
     launcher: Launcher = subprocess.call,
     parse_export: Callable[[Path], list[BrokerLotRow]] = parse_broker_export,
     sweep_clock: lab.Clock | None = None,
@@ -1596,12 +1756,20 @@ def make_app(
     @app.command()
     def ingest(
         source: Annotated[
-            str, typer.Option(help="alpaca, edgar, fred or all", show_default=True)
+            str,
+            typer.Option(help="alpaca, edgar, fred, alpaca_assets or all", show_default=True),
         ] = "all",
         backfill_: Annotated[
             bool, typer.Option("--backfill", help="backfill from --since, resuming")
         ] = False,
         since: Annotated[str | None, typer.Option(help="backfill start, YYYY-MM-DD")] = None,
+        actions_backfill: Annotated[
+            bool,
+            typer.Option("--actions-backfill", help="scan spin-offs and name changes by month"),
+        ] = False,
+        through: Annotated[
+            str | None, typer.Option("--through", help="last actions process date, YYYY-MM-DD")
+        ] = None,
         dry_run: Annotated[bool, typer.Option(help="roll every chunk back")] = False,
         fill_holes_: Annotated[
             bool,
@@ -1662,14 +1830,39 @@ def make_app(
                 ),
             ),
         ] = None,
+        import_dir: Annotated[
+            Path | None,
+            typer.Option(
+                "--import-dir",
+                help=(
+                    "apply the recorder's assets-*.json.gz files as borrow snapshots, "
+                    "no request (#1506); with --source alpaca_assets"
+                ),
+            ),
+        ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
-        if source not in ("all", *SOURCES):
+        if source not in ("all", *SOURCES, ASSETS_SOURCE):
             raise _fail(
-                f"--source must be all, {' or '.join(SOURCES)}; got {source!r}", USAGE_ERROR
+                f"--source must be all, {' or '.join((*SOURCES, ASSETS_SOURCE))}; got {source!r}",
+                USAGE_ERROR,
             )
-        if backfill_ != (since is not None):
+        if import_dir is not None and source != ASSETS_SOURCE:
+            raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
+        if source == ASSETS_SOURCE and backfill_:
+            raise _fail(f"--source {ASSETS_SOURCE} has no backfill", USAGE_ERROR)
+        if actions_backfill:
+            if source != "alpaca" or backfill_ or fill_holes_:
+                raise _fail(
+                    "--actions-backfill needs --source alpaca without --backfill or --fill-holes",
+                    USAGE_ERROR,
+                )
+            if since is None:
+                raise _fail("--actions-backfill needs --since", USAGE_ERROR)
+        elif backfill_ != (since is not None):
             raise _fail("--backfill and --since go together", USAGE_ERROR)
+        if through is not None and not actions_backfill:
+            raise _fail("--through needs --actions-backfill", USAGE_ERROR)
         if fill_holes_ and not backfill_:
             raise _fail("--fill-holes needs --backfill and --since", USAGE_ERROR)
         if fill_holes_ and source != "alpaca":
@@ -1682,7 +1875,7 @@ def make_app(
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
         ):
-            if given and (backfill_ or source in ("alpaca", "fred")):
+            if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE)):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
@@ -1718,7 +1911,23 @@ def make_app(
                 start = date.fromisoformat(since)
             except ValueError:
                 raise _fail(f"--since must be YYYY-MM-DD, got {since!r}", USAGE_ERROR) from None
+        through_date: date | None = None
+        if through is not None:
+            try:
+                through_date = date.fromisoformat(through)
+            except ValueError:
+                raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         s = settings()
+        if actions_backfill:
+            assert start is not None
+            if start < s.alpaca.actions_backfill_floor:
+                raise _fail(
+                    f"--since before alpaca.actions_backfill_floor "
+                    f"{s.alpaca.actions_backfill_floor} is refused",
+                    USAGE_ERROR,
+                )
+            if through_date is not None and through_date < start:
+                raise _fail("--through must be on or after --since", USAGE_ERROR)
         if rebuild_statement_facts and not s.edgar.statement_facts_enabled:
             raise _fail(
                 "--rebuild-statement-facts needs edgar.statement_facts_enabled", USAGE_ERROR
@@ -1739,6 +1948,13 @@ def make_app(
                 )
                 _print_holes(listed)
                 raise typer.Exit(listed.exit_code)
+        if import_dir is not None:  # no request: no secret needed
+            try:
+                imported = import_assets(s, import_dir, clock=clock, dry_run=dry_run)
+            except NotADirectoryError as exc:
+                raise _fail(f"--import-dir: {exc}", USAGE_ERROR) from None
+            _print_import(imported)
+            raise typer.Exit(imported.exit_code)
         missing = _missing_secrets(s, source)
         if missing:
             raise _fail(
@@ -1746,6 +1962,13 @@ def make_app(
                 "Set them in .env (see .env.example).",
                 USAGE_ERROR,
             )
+        if actions_backfill:
+            assert start is not None
+            result = ingest_actions_backfill(
+                s, since=start, through=through_date, clock=clock, dry_run=dry_run
+            )
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
         all_rates: RateSource | None = None
         if source == "all":
             if _blank(s.fred_api_key):
@@ -1758,6 +1981,10 @@ def make_app(
                 all_rates = rate_source(s)
         if source == "fred":
             result = ingest_rates(s, rate_source(s), since=start, clock=clock, dry_run=dry_run)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
+        if source == ASSETS_SOURCE:
+            result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
             _print_result(result)
             raise typer.Exit(result.exit_code)
         filings = EdgarFilingSource(
@@ -1798,6 +2025,7 @@ def make_app(
                 restamp=restamp,
                 on_restamp=restamped.append,
                 restamp_window_ok=window_ok,
+                assets=lambda: assets_source(s, clock),
             )
         _print_result(result)
         for done in restamped:
@@ -1976,6 +2204,68 @@ def make_app(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
 
+    @app.command("delete-master-rows")
+    def delete_master_rows_(
+        manifest: Annotated[
+            Path, typer.Option(help="the reviewed manifest CSV (repair.MASTER_MANIFEST_COLUMNS)")
+        ],
+        release: Annotated[
+            str, typer.Option(help="the data release (open, on a real run); always required")
+        ],
+        dry_run: Annotated[
+            bool, typer.Option(help="check and list the rows and change nothing")
+        ] = False,
+    ) -> None:
+        """Delete a reviewed manifest's never-true listings and delistings rows (#1682)."""
+        if _blank_text(release):
+            raise _fail(
+                "a master-row delete names its data release: pass --release <name>", USAGE_ERROR
+            )
+        try:
+            rows = read_master_manifest(manifest)
+        except OSError as exc:
+            raise _fail(f"cannot read the manifest: {exc}", USAGE_ERROR) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        if not rows:
+            raise _fail(f"refused: {manifest.name} lists no rows", USAGE_ERROR)
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        try:
+            with _read(s) if dry_run else open_for_write(s) as conn:
+                result = delete_master_rows(
+                    conn,
+                    rows,
+                    release,
+                    dry_run=dry_run,
+                    headers=_filing_headers(s, edgar_client),
+                    clock=clock,
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {_scrubbed(str(exc), s)}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {_scrubbed(str(exc), s)}", USAGE_ERROR) from None
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise _fail(f"nothing deleted (rolled back): {_scrubbed(str(exc), s)}", 1) from None
+        typer.echo(result.summary())
+        for line in result.found:
+            typer.echo(line)
+        if result.refused:
+            typer.echo("refused:")
+            for line in result.refused:
+                typer.echo(_scrubbed(line, s))
+            raise _fail(f"{len(result.refused)} manifest rows refused: fix the manifest", 1)
+
     @app.command("master-retract")
     def master_retract_(
         apply: Annotated[
@@ -2063,8 +2353,9 @@ def make_app(
                 "--coverage/--no-coverage",
                 help=(
                     "run (or skip) the coverage check against coverage.reference_names "
-                    "(one universe read per sample session); default: while "
-                    "coverage.check_enabled is on"
+                    "and the index answer key (one universe read per sample session); "
+                    "default: while coverage.check_enabled is on or "
+                    "coverage.index_max_missing is set"
                 ),
             ),
         ] = None,
@@ -2072,6 +2363,12 @@ def make_app(
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
+        if check and coverage is False and s.coverage.computed_by_default:
+            raise _fail(
+                "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+                "or coverage.index_max_missing is set",
+                1,
+            )
         if (missing := _store_missing(s)) is not None:
             raise missing
         t = ensure_tz_aware_utc(clock(), field_name="clock()")
@@ -2092,6 +2389,12 @@ def make_app(
                 f"warning: the last EDGAR run reports {count} quarantined accessions; "
                 "they get no further request until their failed_filings.json entries "
                 "are cleared",
+                err=True,
+            )
+        if pending := len(report.duplicate_dividends.pending):
+            typer.echo(
+                f"warning: {pending} listed duplicate dividend keys are pending repair "
+                "(`tradepartner repair-dividends`); each still counts its payment twice",
                 err=True,
             )
         if check and not report.ok:

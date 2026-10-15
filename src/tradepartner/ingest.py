@@ -181,11 +181,26 @@ the build's rows as they stand: each at the `known_at` the classification
 first became knowable (`store.classify` timing), never the run. A dry
 run rolls it back. The count goes into the run message as
 `classifications_deleted: N`.
+
+**Borrow status** (#1506, plan T171c; ADR 0021). Source `alpaca_assets`:
+one unfiltered `GET /v2/assets` (`alpaca_raw.assets_all`) before the lock,
+the payload kept under `borrow.raw_dir` unless that is empty, then one
+transaction with the rows `adapters.borrow.snapshot_rows` returns and one
+`ok` run row whose cursor is the fetch time and whose message carries the
+`borrow_*` counts. `known_at` is the clock reading after the response and
+`ingested_at` a later reading, so `known_at <= ingested_at` holds. No
+staleness rule: the request succeeds, or only the failed run row is written.
+Under `--source all` it runs last and only while `borrow.enabled` is on.
+`import_assets` (`--import-dir`) applies the recorder's files the same way,
+with no request, skipping any file at or before the latest observation (the
+newest `ok` run cursor).
 """
 
 from __future__ import annotations
 
 import csv
+import gzip
+import json
 import re
 import time
 import traceback
@@ -196,6 +211,7 @@ from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Se
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -203,19 +219,27 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pyarrow as pa
 
+from tradepartner.adapters.alpaca_raw import ASSETS_ENDPOINT, ASSETS_REQUEST, AssetsFetch
+from tradepartner.adapters.borrow import (
+    BorrowStatus,
+    SnapshotOrderError,
+    parse_assets,
+    snapshot_rows,
+)
 from tradepartner.adapters.edgar import StatementConflict, duration_class
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
     DelistingFiling,
     FactRecord,
+    FilenameListing,
     FilingEvent,
     FilingHeader,
     FilingIndexEntry,
     FilingSource,
     StatementFactRecord,
 )
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource
+from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateObservation, RateSource, rate_known_at
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
@@ -230,7 +254,7 @@ from tradepartner.calendar import (
 )
 from tradepartner.config import Settings, clean_message
 from tradepartner.gap import stale_listings_at
-from tradepartner.store.asof import _validate_t
+from tradepartner.store.asof import ASSETS_SOURCE, _validate_t
 from tradepartner.store.classify import (
     ClassificationBuild,
     build_classifications,
@@ -266,6 +290,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
+ACTIONS_FILLED = "filled"
 MODE = "session"
 #: The price side's `ingestion_runs.source`. Its `MODE` runs alone count as
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
@@ -323,7 +348,7 @@ class IngestResult:
 
     @property
     def ok(self) -> bool:
-        return all(run.status == OK for run in self.runs)
+        return all(run.status in (OK, ACTIONS_FILLED) for run in self.runs)
 
     @property
     def exit_code(self) -> int:
@@ -559,10 +584,12 @@ def ingest_session(
     restamp: Sequence[ManifestRow] | None = None,
     on_restamp: Callable[[RestampResult], None] | None = None,
     restamp_window_ok: WindowEarlierOk | None = None,
+    assets: Callable[[], AssetsFetch] | None = None,
 ) -> IngestResult:
-    """Ingest the expected session from `source` (`edgar`, `alpaca` or
-    `all`); see the module docstring. `clock` gives the run's instant, used
-    for the expected session, `ingested_at` and the run row's times. A dry
+    """Ingest the expected session from `source` (`edgar`, `alpaca`, `fred`,
+    `alpaca_assets` or `all`); see the module docstring. `clock` gives the
+    run's instant, used for the expected session, `ingested_at` and the run
+    row's times (the snapshot's `ingested_at` is a later reading). A dry
     run rolls every chunk back and writes no run row.
     `rebuild_statement_facts` (#660) deletes and re-ingests `statement_facts`
     in the EDGAR chunk's transaction; it needs the switch on and the EDGAR
@@ -578,13 +605,30 @@ def ingest_session(
     `edgar`. `on_restamp` receives its `RestampResult` (after a dry run too,
     though nothing is kept). `restamp_window_ok` (#1497, T166e) is the
     pre-check that lets in-window corrections move (`restamp_from_manifest`);
-    it needs `restamp`."""
+    it needs `restamp`.
+    `assets` (#1506, T171c) makes the borrow snapshot's one request
+    (`alpaca_raw.assets_all`). `source="alpaca_assets"` runs only the
+    snapshot, whatever `borrow.enabled` says (`ValueError` without `assets`).
+    Under `all` the snapshot runs **last**, after every other source has
+    committed `ok`, and only while `borrow.enabled` is on and `assets` is
+    given (the CLI always gives it): off, no request is made and nothing is
+    written for it."""
     if restamp is not None and source != "edgar":
         raise ValueError("restamp needs the edgar source")
     if restamp_window_ok is not None and restamp is None:
         raise ValueError("restamp_window_ok needs restamp")
-    if source not in ("all", *SOURCES):
-        raise ValueError(f"source must be 'all' or one of {SOURCES}, got {source!r}")
+    if source not in ("all", *SOURCES, ASSETS_SOURCE):
+        raise ValueError(
+            f"source must be 'all' or one of {(*SOURCES, ASSETS_SOURCE)}, got {source!r}"
+        )
+    if source == ASSETS_SOURCE:
+        if assets is None:
+            raise ValueError(f"the {ASSETS_SOURCE} source needs an assets fetch")
+        if rebuild_statement_facts or rebuild_filing_events or rebuild_classifications:
+            raise ValueError("the rebuild flags need the edgar source")
+        return ingest_assets(settings, assets, clock=clock, dry_run=dry_run)
+    # Under `all`: last, only while the switch is on (the CLI always passes the fetch).
+    snapshot = assets if source == "all" and settings.borrow.enabled else None
     if source == "fred":
         if rates is None:
             raise ValueError("fred source requires a RateSource")
@@ -653,6 +697,106 @@ def ingest_session(
         and rates_seeded(settings)
     ):
         runs.extend(ingest_rates(settings, rates, clock=clock, dry_run=dry_run).runs)
+    if snapshot is not None and all(run.status == OK for run in runs):
+        runs.append(_ingest_assets(settings, snapshot, now, clock, dry_run))
+    return IngestResult(tuple(runs))
+
+
+def ingest_actions_backfill(
+    settings: Settings,
+    *,
+    since: date,
+    through: date | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    scan: Callable[[Sequence[Any], date, date], Mapping[str, Any]] | None = None,
+) -> IngestResult:
+    """Scan spin-offs and name changes by process-date month, without symbols.
+
+    Each month is an independent source chunk in mode ``actions``. A dry run
+    fetches and reports each month while rolling its fact writes and run row
+    back. The ordinary backfill resume cursor ignores this mode and status.
+    """
+    from alpaca.data.enums import CorporateActionsType
+
+    from tradepartner.adapters import alpaca_raw
+    from tradepartner.adapters.alpaca_prices import parse_corporate_actions
+    from tradepartner.backfill import month_windows
+    from tradepartner.repair import store_resolver
+
+    if isinstance(since, datetime) or not isinstance(since, date):
+        raise TypeError("since must be a date")
+    if since < settings.alpaca.actions_backfill_floor:
+        raise ValueError(
+            f"actions backfill starts at {settings.alpaca.actions_backfill_floor}; "
+            "earlier symbol-less coverage is unknown"
+        )
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    through = through or now.astimezone(_NEW_YORK).date()
+    if isinstance(through, datetime) or not isinstance(through, date) or through < since:
+        raise ValueError("through must be a date on or after since")
+    fetch = scan or partial(alpaca_raw.corporate_actions_scan, settings=settings)
+    types = (CorporateActionsType.SPIN_OFF, CorporateActionsType.NAME_CHANGE)
+
+    def run_month(first: date, last: date) -> SourceRun:
+        prepared: dict[str, Any] = {}
+
+        def prepare() -> None:
+            with _read(settings) as conn:
+                resolver = store_resolver(conn, now, settings)
+            payload = fetch(types, first, last)
+            prepared["parsed"] = parse_corporate_actions(
+                payload,
+                resolver.resolve,
+                partial(resolver.lead, actions=True),
+                process_start=first,
+                process_end=last,
+                lag_days=settings.alpaca.actions_process_lag_days,
+                stock_rules=settings.alpaca,
+            )
+
+        def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+            parsed = prepared["parsed"]
+            stamp = ensure_tz_aware_utc(clock(), field_name="clock()")
+            counts: dict[str, int] = {}
+            added = _add_actions(
+                conn, parsed.actions, (first, last), ingested_at=stamp, stats=counts
+            )
+            added += _add_symbol_changes(
+                conn, parsed.symbol_changes, ingested_at=stamp, stats=counts
+            )
+            counts["actions_unresolved"] = len(parsed.unresolved)
+            counts["actions_self_spinoff"] = parsed.self_spinoff
+            counts["actions_spinoff_revisions"] = parsed.spinoff_revisions
+            counts["actions_spinoff_unordered"] = len(parsed.spinoff_unordered)
+            counts["symbol_change_reused"] = parsed.symbol_change_reused
+            counts["symbol_change_conflict"] = parsed.symbol_change_conflict
+            message = "; ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            return (
+                added,
+                f"{first}..{last}: {len(parsed.actions)} spin-off action(s), "
+                f"{len(parsed.symbol_changes)} name change(s); {message}",
+            )
+
+        return _run_source(
+            "alpaca",
+            write,
+            settings,
+            now,
+            clock,
+            f"actions;since={since};through={last}",
+            dry_run,
+            mode="actions",
+            prepare=prepare,
+            success_status=ACTIONS_FILLED,
+        )
+
+    runs: list[SourceRun] = []
+    for first, last in month_windows(since, through):
+        run = run_month(first, last)
+        runs.append(run)
+        if run.status != ACTIONS_FILLED:
+            break
     return IngestResult(tuple(runs))
 
 
@@ -667,6 +811,7 @@ def _run_source(
     mode: str = MODE,
     prepare: Callable[[], object] | None = None,
     after_commit: Callable[[], None] | None = None,
+    success_status: str = OK,
 ) -> SourceRun:
     """One chunk: `prepare` (fetching, no store connection open), then
     `work` (given the run row's id) inside one write transaction with the
@@ -689,10 +834,10 @@ def _run_source(
             rows, message = work(conn, run_id)
             if dry_run:
                 raise _DryRun(rows, message)
-            run = outcome(OK, rows, message)
+            run = outcome(success_status, rows, message)
             _write_run(conn, run_id, now, clock(), run, mode)
     except _DryRun as dry:
-        return outcome(OK, dry.rows, f"dry run: {dry}")
+        return outcome(success_status, dry.rows, f"dry run: {dry}")
     except StoreLockedError as exc:
         return outcome(LOCKED, 0, str(exc))
     except _Stale as exc:
@@ -837,6 +982,8 @@ class _Recorded(FilingSource):
         self._statement_filled: set[str] = set()  # #660: which CIKs, never the records
         self._events_asked: set[str] = set()  # #1358: which CIKs, never the records
         self.frozen = False
+        #: CIKs whose filename answer is partial (#1597, T184b), read at the fetch pass.
+        self.filename_incomplete_ciks: set[str] = set()
 
     def _ask(self, method: str, *args: Any) -> Any:
         key = (method, *(tuple(a) if isinstance(a, list) else a for a in args))
@@ -863,6 +1010,13 @@ class _Recorded(FilingSource):
 
     def delistings(self, since: datetime | None = None) -> list[DelistingFiling]:
         return list(self._ask("delistings", since))
+
+    def filename_listings(self, cik: str) -> list[FilenameListing]:
+        """Record the CIK's filename evidence in the fetch pass, before the lock."""
+        records = list(self._ask("filename_listings", cik))
+        if cik in getattr(self._source, "filename_incomplete_ciks", ()):
+            self.filename_incomplete_ciks.add(cik)
+        return records
 
     def statement_facts(self, cik: str) -> list[StatementFactRecord]:
         """Not memoized (#660, spec "Ingest"): the fetch pass's call fills
@@ -1107,10 +1261,68 @@ def _ingest_filings(
     message = (
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
-        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}; "
+        f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
+        f"{_filename_counts(master, delistings, filings)}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:
+    """The #1597 verdict and Form 25 counts, omitted with the switch off."""
+    if not master.filename_enabled:
+        return ""
+    counts = dict(master.filename_counts)
+    for key in (
+        "filename_10ks_read",
+        "filename_confirmed",
+        "filename_single_reading",
+        "filename_renamed",
+        "filename_refused_contradicted",
+        "filename_refused_owner",
+        "filename_no_instance",
+        "filename_no_exchange",
+        "filename_class_unread",
+        "filename_form25_rows",
+    ):
+        counts.setdefault(key, 0)
+    # #1662: an exchange mismatch only — a Form 25 of a CIK with an earlier
+    # `filing_name` row, none of that CIK's on the Form 25's exchange (a 12(b)
+    # text read differently). One on a listed exchange that names another class
+    # (a warrant) is no mismatch.
+    counts["filename_form25_unmatched"] = sum(
+        1
+        for row in delistings.unmatched
+        if any(
+            listing["security_id"][:10] == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            for listing in master.listings
+        )
+        and not any(
+            listing["security_id"][:10] == row.cik
+            and listing["provenance"] == "filing_name"
+            and listing["known_at"] <= row.accepted_at
+            and listing["exchange"] == row.exchange
+            for listing in master.listings
+        )
+    )
+    counts["filename_transfers_delisted"] = sum(
+        1
+        for row in delistings.delistings
+        if row["filed_at"].year < 2019
+        and any(
+            listing["security_id"] == row["security_id"]
+            and listing["exchange"] != row["exchange"]
+            and listing["known_at"] > row["filed_at"]
+            and listing["provenance"] == "filing_name"
+            for listing in master.listings
+        )
+    )
+    source = _unwrap(filings)
+    for key in ("filename_index_fetches", "filename_document_fetches"):
+        counts[key] = int(getattr(source, key, 0))
+    return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
 
 
 def _delete_classifications(
@@ -1190,6 +1402,7 @@ def _source_counts(filings: FilingSource) -> str:
         ("stamp_check_mismatched_ciks", "CIKs stamped from SGML"),  # #1494
         ("stamps_from_sgml", "stamps from SGML"),
         ("stamps_sgml_unread", "stamps unread in SGML"),
+        ("stamps_sgml_overlong", "stamps with overlong SGML headers"),
         ("stamp_check_unread_ciks", "CIKs stamped unchecked"),
         ("facts_bulk_keyless", "keyless bulk facts"),  # #599: facts but no `cik`
         ("facts_api_keyless", "keyless API facts"),
@@ -2309,6 +2522,7 @@ class _PriceFetch:
     bars: tuple[Bar, ...]
     runs: tuple[tuple[date, date], ...]
     actions: tuple[CorporateAction, ...]
+    symbol_changes: tuple[SymbolChange, ...]
     action_window: tuple[date, date]
     covered: tuple[date, date]
     ingested_at: datetime
@@ -2365,6 +2579,14 @@ def _fetch_prices(
         ]
     action_window = (runs[0][0].replace(day=1), session)
     actions = prices.corporate_actions(every, *action_window)
+    action_summary = prices.resolution_summary()
+    # A name change is asked for by `process_date` from one lag before the
+    # month (#1665 review): one processed on a month's last session is
+    # stamped the next session's close, so the next month's first run must
+    # still ask for it. Identity makes the overlap add nothing.
+    lag = timedelta(days=settings.alpaca.actions_process_lag_days)
+    changes = prices.symbol_changes(every, action_window[0] - lag, action_window[1])
+    change_summary = prices.resolution_summary()
     have = {bar.security_id for bar in bars if bar.session == session}
     with _price_read(settings) as conn:
         plan = _replay_plan(conn, actions, action_window)
@@ -2389,12 +2611,17 @@ def _fetch_prices(
         f"{len(missing)} of {len(counted)} listed names missing{_reported_note(reported)}; "
         f"{_catchup_note(missed)}"
     )
-    if resolution := prices.resolution_summary():
-        message += f"; {resolution}"
+    if action_summary:
+        message += f"; {action_summary}"
+    # The name-change call repeats the resolver's line; keep only its own parts.
+    seen = set(action_summary.split("; "))
+    if extra := [part for part in change_summary.split("; ") if part and part not in seen]:
+        message += f"; {'; '.join(extra)}"
     return _PriceFetch(
         tuple(bars),
         tuple(runs),
         tuple(actions),
+        tuple(changes),
         action_window,
         covered,
         ingested_at,
@@ -2520,10 +2747,18 @@ def _write_prices(conn: duckdb.DuckDBPyConnection, fetched: _PriceFetch) -> tupl
             where="AND session BETWEEN ? AND ?",
             params=[first, last],
         )
+    stats: dict[str, int] = {}
     added += _add_actions(
-        conn, fetched.actions, fetched.action_window, ingested_at=at, covered=fetched.covered
+        conn,
+        fetched.actions,
+        fetched.action_window,
+        ingested_at=at,
+        covered=fetched.covered,
+        stats=stats,
     )
-    return added, fetched.message
+    added += _add_symbol_changes(conn, fetched.symbol_changes, ingested_at=at, stats=stats)
+    counts = "; ".join(f"{key}={value}" for key, value in sorted(stats.items()))
+    return added, fetched.message + (f"; {counts}" if counts else "")
 
 
 @contextmanager
@@ -2880,7 +3115,7 @@ def _outside(
         stored["ex_date"]
         for identity in ids
         for stored in history.get(identity, [])
-        if not first <= stored["ex_date"] <= last
+        if stored["action_type"] != "spinoff" and not first <= stored["ex_date"] <= last
     ]
 
 
@@ -2934,6 +3169,7 @@ def _add_actions(
     *,
     ingested_at: datetime,
     covered: tuple[date, date] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> int:
     """Write `actions` (from `_replay_actions`, covering ex-dates in
     `covered`, default `window`) by identity; return the rows added.
@@ -2959,7 +3195,13 @@ def _add_actions(
     is not a withdrawal. An id-less key re-dated out of `window` is not
     seen, so both keys stay live; sources with ids (Alpaca) avoid that.
     """
-    rows = [_action_row(action, ingested_at) for action in actions]
+    rows = []
+    for action in actions:
+        if action.action_type.value == "spinoff" and action.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        rows.append(_action_row(action, ingested_at))
     history = _stored_actions(conn, rows, window)
     first, last = window
     lo, hi = covered or window
@@ -3046,6 +3288,70 @@ def _add_actions(
             )
         insert_row(conn, "corporate_actions", new)
     return len(new_rows)
+
+
+def _symbol_change_row(change: SymbolChange, ingested_at: datetime) -> Row:
+    return {
+        "security_id": change.security_id,
+        "old_symbol": change.old_symbol,
+        "new_symbol": change.new_symbol,
+        "old_cusip": change.old_cusip,
+        "new_cusip": change.new_cusip,
+        "process_date": change.process_date,
+        "source_action_id": change.source_action_id,
+        "known_at": change.known_at,
+        "ingested_at": ingested_at,
+        "source": change.source,
+        "provenance": "action",
+    }
+
+
+def _symbol_change_identity(row: Mapping[str, Any]) -> _Identity:
+    if row["source_action_id"]:
+        return (row["security_id"], "source_action_id", row["source_action_id"])
+    return (row["security_id"], row["old_symbol"], row["new_symbol"], row["process_date"])
+
+
+def _add_symbol_changes(
+    conn: duckdb.DuckDBPyConnection,
+    changes: Sequence[SymbolChange],
+    *,
+    ingested_at: datetime,
+    stats: dict[str, int] | None = None,
+) -> int:
+    """Write only newly knowable name changes and revisions of their identity."""
+    ids = sorted({change.security_id for change in changes})
+    if not ids:
+        return 0
+    cursor = conn.execute("SELECT * FROM symbol_changes WHERE list_contains(?, security_id)", [ids])
+    names = [column[0] for column in cursor.description]
+    history: dict[_Identity, list[Row]] = defaultdict(list)
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        history[_symbol_change_identity(row)].append(row)
+    for rows in history.values():
+        rows.sort(key=lambda row: row["known_at"])
+    incoming: dict[_Identity, Row] = {}
+    for change in sorted(changes, key=lambda c: c.known_at):
+        if change.known_at > ingested_at:
+            if stats is not None:
+                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+            continue
+        row = _symbol_change_row(change, ingested_at)
+        incoming[_symbol_change_identity(row)] = row
+    fields = ("old_symbol", "new_symbol", "old_cusip", "new_cusip", "process_date")
+    added = 0
+    for identity, row in incoming.items():
+        revisions = _current(
+            row,
+            history.get(identity, []),
+            ingested_at,
+            lambda a, b: all(a[field] == b[field] for field in fields),
+        )
+        for revision in revisions:
+            insert_row(conn, "symbol_changes", revision)
+            added += 1
+    return added
 
 
 # --- writing only what changes an as-of read --------------------------------
@@ -3256,3 +3562,443 @@ def _filed(
             raise ValueError(f"revision at {ingested_at.isoformat()} would be back-dated")
         added.append({**final, "known_at": ingested_at, "ingested_at": ingested_at})
     return added
+
+
+# --- the borrow-status snapshot (#1506, T171c; ADR 0021) --------------------
+
+#: `ingestion_runs.mode` of a run row `import_assets` writes, one per applied
+#: file; the daily snapshot's run row has `MODE`. Both are observations: the
+#: latest observation is the newest `ok` `ASSETS_SOURCE` cursor of any mode.
+ASSETS_IMPORT_MODE = "import"
+
+#: The files `--import-dir` reads and the daily keep writes: the scratch
+#: recorder's name, `assets-<fetch_finished_utc %Y%m%dT%H%M%SZ>.json.gz`.
+ASSETS_FILE_GLOB = "assets-*.json.gz"
+
+#: The keys of one recorded or kept assets file (the recorder's shape).
+_ASSETS_FILE_KEYS: tuple[str, ...] = (
+    "fetch_started_utc",
+    "fetch_finished_utc",
+    "endpoint",
+    "assets",
+)
+
+#: `borrow_status`' columns, in schema order (the bulk insert's frame).
+_BORROW_COLUMNS: tuple[str, ...] = (
+    "asset_id",
+    "symbol",
+    "exchange",
+    "status",
+    "tradable",
+    "marginable",
+    "shortable",
+    "easy_to_borrow",
+    "borrow_status",
+    "fractionable",
+    "present",
+    "known_at",
+    "ingested_at",
+    "source",
+    "provenance",
+)
+
+#: The `borrow_status` row's `source` and `provenance` (spec "Borrow status:
+#: the table": a current-only endpoint, `known_at` = fetch time).
+_BORROW_SOURCE = "alpaca"
+_BORROW_PROVENANCE = "snapshot"
+
+
+class SnapshotClockError(ValueError):
+    """A snapshot whose clocks cannot stamp it: a fetch that finished before
+    it started, a naive reading, or a fetch time after the run's clock (not
+    yet known). Refused and counted, never clamped (spec "Borrow status: the
+    stamp")."""
+
+
+def _snapshot_clocks(started: object, finished: object) -> tuple[datetime, datetime]:
+    """The two readings as tz-aware UTC, or `SnapshotClockError`: a naive or
+    non-datetime reading, or `finished` before `started`."""
+    readings: list[datetime] = []
+    for name, value in (("fetch_started_utc", started), ("fetch_finished_utc", finished)):
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise SnapshotClockError(f"{name} must be a tz-aware datetime, got {value!r}")
+        readings.append(ensure_tz_aware_utc(value, field_name=name))
+    if readings[1] < readings[0]:
+        raise SnapshotClockError(
+            f"fetch_finished_utc {readings[1].isoformat()} is before fetch_started_utc "
+            f"{readings[0].isoformat()}: refused, never clamped"
+        )
+    return readings[0], readings[1]
+
+
+def latest_assets_observation(conn: duckdb.DuckDBPyConnection) -> datetime | None:
+    """The newest `ok` `ASSETS_SOURCE` run cursor (the latest observation,
+    spec "rows record change"), or `None` when no snapshot was recorded. Never
+    the table's `MAX(known_at)`, which on a quiet day lags the last snapshot.
+    The cursor is compared as a timestamp, as `store.asof` reads it."""
+    row = conn.execute(
+        "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
+        "WHERE source = ? AND status = ?",
+        [ASSETS_SOURCE, OK],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return ensure_tz_aware_utc(row[0], field_name="observation")
+
+
+def _latest_borrow_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, BorrowStatus]:
+    """The latest stored row per `asset_id` (vanished rows included), as
+    `snapshot_rows` diffs against."""
+    stored = conn.execute(
+        f"SELECT {', '.join(_BORROW_COLUMNS[:12])} FROM borrow_status "
+        "QUALIFY row_number() OVER (PARTITION BY asset_id ORDER BY known_at DESC) = 1"
+    ).fetchall()
+    latest: dict[str, BorrowStatus] = {}
+    for row in stored:
+        values = dict(zip(_BORROW_COLUMNS[:12], row, strict=True))
+        latest[values["asset_id"]] = BorrowStatus(**values, fetched_at=values["known_at"])
+    return latest
+
+
+def _insert_borrow_rows(
+    conn: duckdb.DuckDBPyConnection, rows: Sequence[BorrowStatus], ingested_at: datetime
+) -> None:
+    """Insert `rows` into `borrow_status` in one statement, each stamped
+    `ingested_at`, `source = alpaca`, `provenance = snapshot`."""
+    if not rows:
+        return
+    records = [
+        {
+            **{column: getattr(row, column) for column in _BORROW_COLUMNS[:12]},
+            "ingested_at": ingested_at,
+            "source": _BORROW_SOURCE,
+            "provenance": _BORROW_PROVENANCE,
+        }
+        for row in rows
+    ]
+    frame = pa.table({column: [record[column] for record in records] for column in _BORROW_COLUMNS})
+    for column in ("known_at", "ingested_at"):
+        kind = frame.schema.field(column).type
+        if not pa.types.is_timestamp(kind) or kind.tz is None:
+            raise TypeError(f"borrow_status.{column} must be tz-aware timestamps, got {kind}")
+    conn.register("_borrow_rows", frame)
+    try:
+        conn.execute("INSERT INTO borrow_status BY NAME SELECT * FROM _borrow_rows")
+    finally:
+        conn.unregister("_borrow_rows")
+
+
+def _write_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    payload: Sequence[Mapping[str, object]],
+    fetched_at: datetime,
+    ingested_at: datetime,
+    settings: Settings,
+) -> tuple[int, str]:
+    """Diff one snapshot against the store and write its rows (spec "rows
+    record change"); returns the rows written and the run message's counts.
+
+    Refuses, before any write: a fetch time after `ingested_at` (not yet
+    known: `known_at <= ingested_at` must hold), a fetch time at or before
+    the latest observation (an older state would read as the latest), and,
+    through `snapshot_rows`, a repeated `asset_id`, a fetch time not after a
+    stored row and a vanished share over `borrow.max_vanished_share`.
+    """
+    if fetched_at > ingested_at:
+        raise SnapshotClockError(
+            f"fetch time {fetched_at.isoformat()} is after the run's clock "
+            f"{ingested_at.isoformat()}: not yet known, refused"
+        )
+    observed = latest_assets_observation(conn)
+    if observed is not None and fetched_at <= observed:
+        raise SnapshotOrderError(
+            f"fetch time {fetched_at.isoformat()} is at or before the latest observation "
+            f"{observed.isoformat()}: an older state would read as the latest, refused"
+        )
+    snapshot = parse_assets(payload, fetched_at)
+    latest = _latest_borrow_rows(conn)
+    rows = snapshot_rows(
+        latest,
+        snapshot.assets,
+        fetched_at,
+        max_vanished_share=settings.borrow.max_vanished_share,
+    )
+    _insert_borrow_rows(conn, rows, ingested_at)
+    new = sum(row.present and row.asset_id not in latest for row in rows)
+    vanished = sum(not row.present for row in rows)
+    message = (
+        f"borrow_assets={snapshot.total}; borrow_us_equity={snapshot.us_equity}; "
+        f"borrow_new={new}; borrow_changed={len(rows) - new - vanished}; "
+        f"borrow_vanished={vanished}; borrow_other_class={snapshot.other_class}"
+    )
+    return len(rows), message
+
+
+def keep_assets(raw_dir: str, fetched: AssetsFetch) -> Path:
+    """Write `fetched` under `raw_dir` in the recorder's file shape (gzipped
+    JSON with both clock readings, the endpoint and the raw list), named by
+    its finish time, through a temporary file renamed into place, so an
+    interrupted write leaves no file `--import-dir` would read."""
+    started, finished = _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+    directory = Path(raw_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"assets-{finished:%Y%m%dT%H%M%SZ}.json.gz"
+    partial = directory / f".{path.name}.{uuid.uuid4().hex}.partial"
+    document = {
+        "fetch_started_utc": started.isoformat(),
+        "fetch_finished_utc": finished.isoformat(),
+        "endpoint": ASSETS_ENDPOINT,
+        "assets": fetched.assets,
+    }
+    try:
+        with gzip.open(partial, "wt", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+    return path
+
+
+def _ingest_assets(
+    settings: Settings,
+    fetch: Callable[[], AssetsFetch],
+    now: datetime,
+    clock: Callable[[], datetime],
+    dry_run: bool,
+) -> SourceRun:
+    """One daily snapshot: one request (`fetch`, before the write lock), one
+    transaction with the diff's rows and one run row (cursor = the fetch
+    time), then, once committed `ok` and not a dry run, the raw keep under
+    `borrow.raw_dir` unless that is empty. `ingested_at` is the run's clock
+    read **after** the response, so `known_at <= ingested_at` holds by
+    construction (spec "the stamp"). A failed request or a refusal writes
+    only its failed run row and keeps no file."""
+    state: dict[str, AssetsFetch] = {}
+
+    def prepare() -> None:
+        fetched = fetch()
+        _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+        state["fetched"] = fetched
+
+    def work(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        fetched = state["fetched"]
+        _, finished = _snapshot_clocks(fetched.fetch_started_utc, fetched.fetch_finished_utc)
+        ingested_at = ensure_tz_aware_utc(clock(), field_name="clock()")
+        return _write_snapshot(conn, fetched.assets, finished, ingested_at, settings)
+
+    def cursor() -> str:
+        fetched = state.get("fetched")
+        if fetched is None:
+            return ""
+        return ensure_tz_aware_utc(fetched.fetch_finished_utc, field_name="fetch").isoformat()
+
+    def keep() -> None:
+        # Only a committed `ok` snapshot is kept (`_run_source`'s after-commit
+        # hook): a refused payload is never archived for a later import to trip
+        # on, and a failed keep is noted in the result, never the stored rows.
+        if settings.borrow.raw_dir:
+            keep_assets(settings.borrow.raw_dir, state["fetched"])
+
+    return _run_source(
+        ASSETS_SOURCE,
+        work,
+        settings,
+        now,
+        clock,
+        cursor,
+        dry_run,
+        prepare=prepare,
+        after_commit=keep,
+    )
+
+
+def ingest_assets(
+    settings: Settings,
+    assets: Callable[[], AssetsFetch],
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> IngestResult:
+    """`ingest --source alpaca_assets`: one daily snapshot (`_ingest_assets`),
+    whatever `borrow.enabled` says; `assets` makes the one request."""
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    return IngestResult((_ingest_assets(settings, assets, now, clock, dry_run),))
+
+
+@dataclass(frozen=True)
+class AssetsFile:
+    """One recorded assets file's header, checked: its path and the two
+    clock readings (the payload is read again when the file is applied, so
+    a long directory is never held in memory at once)."""
+
+    path: Path
+    fetch_started_utc: datetime
+    fetch_finished_utc: datetime
+
+
+def _read_assets_file(path: Path) -> dict[str, Any]:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"expected a JSON object, got {type(document).__name__}")
+    missing = [key for key in _ASSETS_FILE_KEYS if key not in document]
+    if missing:
+        raise ValueError(f"missing key(s) {', '.join(missing)}")
+    if not isinstance(document["assets"], list):
+        raise ValueError("assets is not a list")
+    endpoint = document["endpoint"]
+    if not isinstance(endpoint, str) or not endpoint.endswith(ASSETS_REQUEST):
+        raise ValueError(f"endpoint {endpoint!r} is not an unfiltered {ASSETS_REQUEST}")
+    return document
+
+
+def _parse_instant(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise SnapshotClockError(f"{name} must be an ISO-8601 string, got {value!r}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise SnapshotClockError(f"{name} is not ISO-8601: {value!r}") from None
+
+
+def scan_assets_dir(
+    directory: Path, now: datetime, settings: Settings
+) -> tuple[list[AssetsFile], list[tuple[str, str]]]:
+    """Every `ASSETS_FILE_GLOB` file in `directory`, checked and in ascending
+    `fetch_finished_utc` (then name), and the refused ones as `(name,
+    reason)`: unreadable or not the recorder's shape, a naive or reversed
+    clock pair, or a fetch time after `now`, the import run's clock."""
+    if not directory.is_dir():
+        raise NotADirectoryError(f"{directory} is not a directory")
+    found: list[AssetsFile] = []
+    refused: list[tuple[str, str]] = []
+    for path in sorted(directory.glob(ASSETS_FILE_GLOB)):
+        if not path.is_file():
+            continue
+        try:
+            document = _read_assets_file(path)
+            started, finished = _snapshot_clocks(
+                _parse_instant(document["fetch_started_utc"], "fetch_started_utc"),
+                _parse_instant(document["fetch_finished_utc"], "fetch_finished_utc"),
+            )
+            if finished > now:
+                raise SnapshotClockError(
+                    f"fetch_finished_utc {finished.isoformat()} is after the run's clock "
+                    f"{now.isoformat()}: not yet known"
+                )
+        except (OSError, EOFError, ValueError) as exc:  # JSON, gzip and clock errors
+            refused.append((path.name, _clean(f"{type(exc).__name__}: {exc}", settings)))
+            continue
+        found.append(AssetsFile(path, started, finished))
+    found.sort(key=lambda item: (item.fetch_finished_utc, item.path.name))
+    return found, refused
+
+
+@dataclass(frozen=True)
+class AssetsImport:
+    """What `import_assets` did: one run per applied file (each `ok`, or the
+    `failed`/`locked` one that stopped the import), the files skipped as at
+    or before the latest observation, and the files refused with why."""
+
+    runs: tuple[SourceRun, ...]
+    skipped: tuple[str, ...]
+    refused: tuple[tuple[str, str], ...]
+
+    @property
+    def ok(self) -> bool:
+        """True when every run is `ok` and no file was refused."""
+        return all(run.status == OK for run in self.runs) and not self.refused
+
+    @property
+    def exit_code(self) -> int:
+        """0 when `ok`, else 1: a refused file is the owner's to look at."""
+        return 0 if self.ok else 1
+
+
+def import_assets(
+    settings: Settings,
+    directory: Path,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+) -> AssetsImport:
+    """Apply the recorder's assets files in `directory` as snapshots (spec
+    "source, ingest and import"), with no request.
+
+    Files are taken in ascending `fetch_finished_utc`; each is stamped at its
+    own `fetch_finished_utc` (`ingested_at` = the clock when it is applied)
+    through the daily path's parser, guard and diff, and writes one `ok` run
+    row (mode `ASSETS_IMPORT_MODE`, cursor = its fetch time) in a transaction
+    of its own. A file at or before the latest observation is skipped and
+    counted, so a re-run adds nothing and a file recorded before a later
+    daily run never overwrites it. A refused file (`scan_assets_dir`) is
+    counted and the rest still apply. A file that fails to apply (the
+    truncation guard, a malformed asset) gets a failed run row and stops the
+    import; the files before it stay committed. A dry run applies every file
+    in one transaction, rolled back, so its counts are what a real import
+    would write, and writes no run row.
+    """
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    files, refused = scan_assets_dir(directory, now, settings)
+    runs: list[SourceRun] = []
+    skipped: list[str] = []
+
+    def apply(conn: duckdb.DuckDBPyConnection, item: AssetsFile) -> SourceRun | None:
+        observed = latest_assets_observation(conn)
+        if observed is not None and item.fetch_finished_utc <= observed:
+            skipped.append(item.path.name)
+            return None
+        started = ensure_tz_aware_utc(clock(), field_name="clock()")
+        rows, counts = _write_snapshot(
+            conn,
+            _read_assets_file(item.path)["assets"],
+            item.fetch_finished_utc,
+            started,
+            settings,
+        )
+        run = SourceRun(
+            ASSETS_SOURCE,
+            OK,
+            rows,
+            item.fetch_finished_utc.isoformat(),
+            _clean(f"{item.path.name}: {counts}", settings),
+        )
+        _write_run(conn, uuid.uuid4().hex, started, clock(), run, ASSETS_IMPORT_MODE)
+        return run
+
+    current: AssetsFile | None = None
+    dry: list[SourceRun] = []
+    try:
+        if dry_run:
+            with open_for_write(settings) as conn:
+                init_schema(conn)
+                for current in files:
+                    if (run := apply(conn, current)) is not None:
+                        dry.append(run)
+                raise _DryRun(0, "")
+        for current in files:
+            with open_for_write(settings) as conn:
+                init_schema(conn)
+                run = apply(conn, current)
+            if run is not None:
+                runs.append(run)
+    except _DryRun:
+        pass
+    except StoreLockedError as exc:
+        runs.append(SourceRun(ASSETS_SOURCE, LOCKED, 0, "", str(exc)))
+    except Exception as exc:  # one file failed to apply: its run row, then stop
+        cursor = "" if current is None else current.fetch_finished_utc.isoformat()
+        name = "" if current is None else f"{current.path.name}: "
+        message = _with_frames(f"{name}{type(exc).__name__}: {exc}", exc, settings)
+        failed = SourceRun(ASSETS_SOURCE, FAILED, 0, cursor, _clean(message, settings))
+        if not dry_run:  # a dry run keeps the counts before the failure (below)
+            failed = _record_only(
+                settings, uuid.uuid4().hex, now, clock, failed, ASSETS_IMPORT_MODE
+            )
+        runs.append(failed)
+    if dry_run:
+        runs = [
+            SourceRun(r.source, r.status, r.rows_added, r.chunk_cursor, f"dry run: {r.message}")
+            for r in dry
+        ] + runs
+    return AssetsImport(tuple(runs), tuple(skipped), tuple(refused))

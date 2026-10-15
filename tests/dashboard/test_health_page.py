@@ -25,7 +25,9 @@ from tradepartner.config import Settings
 from tradepartner.dashboard import app, health_page, theme
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     INTEGRITY_RULES,
+    IndexMembersCheck,
     coverage,
     health_report,
 )
@@ -94,6 +96,12 @@ def _text(at: AppTest) -> str:
     parts += [f"{m.label} {m.value}" for m in at.metric]
     parts += [e.value for kind in (at.info, at.warning, at.error, at.success) for e in kind]
     return "\n".join(str(p) for p in parts)
+
+
+def test_page_shows_filename_listing_block(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    assert "Filing-name listings" in _text(_app(monkeypatch, store_path))
 
 
 def _connect(store_path: Path) -> duckdb.DuckDBPyConnection:
@@ -520,3 +528,95 @@ def test_rates_card_shows_fixture_and_fred_attribution(
         "This product uses the FRED® API but is not endorsed or certified "
         "by the Federal Reserve Bank of St. Louis." in text
     )
+
+
+# --- Borrow status (#1506, T171e) ---------------------------------------------
+
+
+def test_borrow_card_shows_the_block_and_the_switch_warning(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    """The fixture's borrow rows, the latest observation from the run cursor,
+    the shortable and ETB counts at it, the last run's counts, and the
+    switch warning as a badge while `borrow.enabled` is off."""
+    _write(
+        store_path,
+        "INSERT INTO ingestion_runs VALUES (?, ?, ?, 'ok', 'alpaca_assets', 'session', 1, ?, ?)",
+        [
+            "borrow-1",
+            FINISHED - timedelta(hours=2),
+            FINISHED - timedelta(hours=2),
+            "2020-06-30T21:00:00+00:00",
+            "borrow_new=0; borrow_changed=1; borrow_vanished=1",
+        ],
+    )
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Borrow status" in text
+    assert "Switch (`borrow.enabled`): **off**" in text
+    assert "11 rows · 6 assets" in text
+    assert "Latest observation 2020-06-30 21:00 UTC · latest known at 2020-06-30 21:00 UTC" in text
+    assert "At the latest observation: 5 shortable, 4 easy to borrow (active assets)" in text
+    assert "Last snapshot run: ok; changed 1, new 0, rows_added 1, vanished 1" in text
+    assert any("borrow.enabled is off" in str(m.value) for m in at.markdown)
+
+
+def test_borrow_card_with_no_observation_and_the_switch_on(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("BORROW__ENABLED", "true")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Switch (`borrow.enabled`): **on**" in text
+    assert "Latest observation never" in text
+    assert "At the latest observation" not in text
+    assert "Last snapshot run: never; none" in text
+    assert any("no borrow snapshot observed" in str(m.value) for m in at.markdown)
+
+
+# --- the answer-key table (#1682, T189b) ---------------------------------------
+
+
+def test_the_coverage_card_shows_the_answer_key_table_from_the_report(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    at = _app(monkeypatch, store_path)
+    at.button(key=health_page.COVERAGE_BUTTON_KEY).click().run()
+    assert not at.exception
+    text = _text(at)
+    assert "S&P 500 answer key (a check only, never a source)" in text
+    assert "Key commit `a2430f2af0c79ddf0748e91de11bdeb1616ab5a7`" in text
+    assert "Answer-key misses (" in text
+    assert "index_members_missing: " in text
+
+
+def test_the_index_badge_is_critical_only_when_the_block_fails(store_path: Path) -> None:
+    def view(**coverage: Any) -> IndexMembersCheck:
+        settings = Settings(_env_file=None, store={"path": str(store_path)}, coverage=coverage)
+        with _connect(store_path) as conn:
+            block = health_page.load_health_view(
+                conn, T, settings, WINDOW, with_coverage_reference=True
+            ).report.coverage_reference
+        assert block is not None and block.index_members is not None
+        return block.index_members
+
+    report_only = view()
+    assert health_page.index_badge(report_only)[1] == "warning"
+    assert health_page.index_badge(view(index_max_missing=0)) == (
+        f"{INDEX_MEMBERS_MISSING}: {report_only.worst} max missing per session: fail (max 0)",
+        "critical",
+    )
+    assert health_page.index_badge(view(index_max_missing=10_000))[1] == "good"
+
+
+def test_the_not_computed_card_warns_while_the_index_threshold_is_set(
+    monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> None:
+    monkeypatch.setenv("COVERAGE__INDEX_MAX_MISSING", "5")
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    text = _text(at)
+    assert "Not computed" in text
+    assert f"`health --check` enforces {INDEX_MEMBERS_MISSING}" in text

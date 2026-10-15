@@ -32,15 +32,24 @@ from edgar_transport import (
     load,
 )
 
-from tradepartner.adapters.edgar import UnstampedFiling, acceptance_times
+from tradepartner.adapters import edgar_raw
+from tradepartner.adapters import edgar_source as edgar_source_module
+from tradepartner.adapters.edgar import FsnFiling, UnstampedFiling, acceptance_times
 from tradepartner.adapters.edgar_raw import EdgarCredentialsError
 from tradepartner.adapters.edgar_source import (
+    COVER_VERSION,
+    FSN_VERSION,
     STAMPS_LAYOUT,
     EdgarFilingSource,
     SubmissionRecord,
     reduce_submissions,
 )
-from tradepartner.adapters.filings import CoverPage, DelistingFiling, FilingIndexEntry
+from tradepartner.adapters.filings import (
+    CoverListing,
+    CoverPage,
+    DelistingFiling,
+    FilingIndexEntry,
+)
 from tradepartner.config import Settings
 from tradepartner.store.master import build_master
 
@@ -986,3 +995,526 @@ def test_the_switch_reaches_the_per_document_parse_and_its_count(tmp_path: Path,
         [("ANSS", "NASDAQ")] if on else []
     )
     assert source.cover_exchange_axis_mismatch == (1 if on else 0)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_the_split_contexts_switch_reaches_the_fsn_extraction(tmp_path: Path, on: bool) -> None:
+    """#1660: Abbott 2020's tagging (title undimensioned, symbol and exchange on
+    the exchange-axis rows) lists ABT from FSN only with `cover_split_contexts`."""
+    from test_edgar_fsn import FSN_PAGE_URL, _dim, _fsn_zip_bytes, _fsn_zip_url, _sub, _txt
+
+    adsh = "0001104659-20-121336"
+    rows = [
+        ("Security12bTitle", "Common Shares, Without Par Value", "", "0"),
+        ("TradingSymbol", "ABT", "0x1", "1"),
+        ("SecurityExchangeName", "New York Stock Exchange", "0x1", "1"),
+    ]
+    txt = [_txt(adsh, tag, value, dimh=dimh, dimn=dimn) for tag, value, dimh, dimn in rows]
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, f'<html><body><a href="{_fsn_zip_url("2020q3")}">x</a></body></html>')
+    router.add(
+        _fsn_zip_url("2020q3"),
+        _fsn_zip_bytes(
+            [_sub(adsh, "1800", "10-Q")], [], txt, [_dim("0x1", "EntityListingsExchange=XNYS;")]
+        ),
+    )
+    settings = edgar_settings(tmp_path, fsn_first_year=2020, cover_split_contexts=on)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    source._ensure_fsn()
+    [record] = source._load_fsn_cache("0000001800").values()
+    assert [(i.ticker, i.exchange) for i in record.listings] == ([("ABT", "NYSE")] if on else [])
+
+
+# --- the FSN cache round-trips the symbol-only tag (#1624, T184) ------------
+
+
+def _symbol_only_zip() -> bytes:
+    """One FSN period with a complete listing, a symbol that names no
+    exchange (T184's symbol-only tag) and a filing-less group."""
+    from test_edgar_fsn import _dim, _fsn_zip_bytes, _sub, _txt
+
+    accession = "0001193125-19-000077"
+    complete, only = "0x1", "0x2"
+    txt = [
+        _txt(accession, "Security12bTitle", "Common Stock", dimh=complete, dimn="1"),
+        _txt(accession, "TradingSymbol", "ANSS", dimh=complete, dimn="1"),
+        _txt(accession, "SecurityExchangeName", "NASDAQ", dimh=complete, dimn="1"),
+        _txt(accession, "TradingSymbol", "ZEN", dimh=only, dimn="1"),  # no exchange
+    ]
+    return _fsn_zip_bytes(
+        [_sub(accession, "1013462", "10-Q")],
+        [],
+        txt,
+        [_dim(complete, "ClassOfStock=CommonClassA;"), _dim(only, "ClassOfStock=Units;")],
+    )
+
+
+def test_the_fsn_cache_round_trips_the_symbol_only_tag(tmp_path: Path) -> None:
+    """A filing parsed from a cached period must read back the symbol-only
+    tag its parse recorded (#1624): without the round-trip a reload finds
+    none, and a filename reading that asks for the tag would miss it."""
+    from test_edgar_fsn import FSN_PAGE_URL, _fsn_page_html, _fsn_zip_url
+
+    router = EdgarRouter()
+    router.add(FSN_PAGE_URL, _fsn_page_html("2019q3"))
+    router.add(_fsn_zip_url("2019q3"), _symbol_only_zip())
+    settings = edgar_settings(tmp_path, fsn_first_year=2019)
+    source = EdgarFilingSource(settings, client=router.client())
+    source._filing_index_ran = True
+    source._ensure_fsn()
+    parsed = source._load_fsn_cache(_ANSYS)
+    [record] = parsed.values()
+    assert record.symbol_only == ("ZEN",)
+    assert [(item.ticker, item.exchange) for item in record.listings] == [("ANSS", "NASDAQ")]
+
+    # A fresh source reads the same period back from the cache.
+    reopened = EdgarFilingSource(settings, client=router.client())
+    reopened._filing_index_ran = True
+    assert reopened._load_fsn_cache(_ANSYS) == parsed
+
+
+def test_a_cache_entry_written_before_the_field_reads_no_tag(tmp_path: Path) -> None:
+    """An entry laid out before #1624 (no `symbol_only` key) reloads with
+    none recorded: the cache kept what its own parser wrote, the release's
+    re-extraction rewrites it with the tag its filing carries, and no
+    reading this cache already served is changed by the field."""
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings)
+    path = source._fsn_cache_path(_ANSYS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    accession = "0001193125-19-000077"
+    path.write_text(
+        json.dumps(
+            {
+                "version": FSN_VERSION,
+                "cik": _ANSYS,
+                "records": {
+                    accession: {
+                        "form": "10-Q",
+                        "sic": 3711,
+                        "listings": [["Common Stock", "ANSS", "NASDAQ"]],
+                        "shares": [["", "12", "2019-06-30"]],
+                    }
+                },
+            }
+        )
+    )
+    [record] = source._load_fsn_cache(_ANSYS).values()
+    assert (record.accession, record.form) == (accession, "10-Q")
+    assert (record.symbol_only, record.incomplete_listings) == ((), 0)
+    assert [(item.ticker, item.exchange) for item in record.listings] == [("ANSS", "NASDAQ")]
+
+
+@pytest.mark.parametrize("recorded", ["ZEN", {"tag": "ZEN"}, ["ZEN", 7], [["ZEN"]]])
+def test_a_cache_entry_whose_symbol_only_is_not_strings_refuses_to_read(
+    tmp_path: Path, recorded: Any
+) -> None:
+    """safety-reviewer (#1624): the cache file is a file on disk. An entry
+    whose `symbol_only` is not the list of strings the writer wrote is
+    corrupt, and is refused rather than read as the letters of one symbol or
+    as symbols that are not strings — the loader's own answer for an
+    unreadable file, no records, and a named error when it is strict."""
+    settings = edgar_settings(tmp_path)
+    source = EdgarFilingSource(settings)
+    path = source._fsn_cache_path(_ANSYS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    accession = "0001193125-19-000077"
+    path.write_text(
+        json.dumps(
+            {
+                "version": FSN_VERSION,
+                "cik": _ANSYS,
+                "records": {
+                    accession: {
+                        "form": "10-Q",
+                        "sic": 3711,
+                        "listings": [["Common Stock", "ANSS", "NASDAQ"]],
+                        "shares": [["", "12", "2019-06-30"]],
+                        "symbol_only": recorded,
+                    }
+                },
+            }
+        )
+    )
+    assert source._load_fsn_cache(_ANSYS) == {}
+    with pytest.raises(ValueError, match="unreadable"):
+        source._load_fsn_cache(_ANSYS, strict=True)
+
+
+# --- the release's cache versions (T181, #1541) -----------------------------
+
+
+# --- filing-name listings: the fetches and the per-CIK cache (T184b, #1597) ---
+
+_FN_CIK = APPLE
+_FN_A, _FN_B, _FN_C = "0000320193-16-000010", "0000320193-17-000020", "0000320193-18-000030"
+_FN_BEFORE = "0000320193-14-000005"  # a 10-K before filename_listings_since
+_FN_AFTER = "0000320193-19-000050"  # a 10-K after the first cover page
+_FN_COVER = "0000320193-19-000040"  # the first cover-page filing (a 10-Q)
+_FN_25_NASDAQ, _FN_25_NYSE, _FN_25_COLD = (
+    "0001354457-18-000500",
+    "0001354457-18-000501",
+    "0001354457-18-000502",
+)
+_FN_AT = {
+    _FN_BEFORE: datetime(2014, 10, 1, 20, 0, tzinfo=UTC),
+    _FN_A: datetime(2016, 10, 26, 20, 5, tzinfo=UTC),
+    _FN_B: datetime(2017, 11, 3, 20, 5, tzinfo=UTC),
+    _FN_C: datetime(2018, 11, 5, 21, 5, tzinfo=UTC),
+    _FN_25_NASDAQ: datetime(2018, 12, 3, 14, 0, tzinfo=UTC),
+    _FN_25_NYSE: datetime(2018, 12, 4, 14, 0, tzinfo=UTC),
+    _FN_25_COLD: datetime(2018, 12, 5, 14, 0, tzinfo=UTC),
+    _FN_COVER: datetime(2019, 8, 1, 20, 0, tzinfo=UTC),
+    _FN_AFTER: datetime(2019, 11, 1, 20, 0, tzinfo=UTC),
+}
+_FN_FORM = {
+    _FN_25_NASDAQ: "25-NSE",
+    _FN_25_NYSE: "25-NSE",
+    _FN_25_COLD: "25",
+    _FN_COVER: "10-Q",
+}
+
+
+def _fn_url(accession: str, name: str, cik: str = _FN_CIK) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{name}"
+
+
+def _fn_router() -> EdgarRouter:
+    """Index and document routes for the synthetic CIK: A reads the plain
+    instance and a NASDAQ table, B the `_htm` instance and the two-venue
+    table, C has no instance (and so no document route: asking is a failure),
+    the first cover filing and the NASDAQ Form 25 their recorded indexes.
+    The before/after 10-Ks and the cold Form 25 have no route at all."""
+    router = EdgarRouter()
+    router.add(
+        _fn_url(_FN_A, "index.json"), (FIXTURES / "index_10k_plain_instance.json").read_bytes()
+    )
+    router.add(
+        _fn_url(_FN_A, "doc.htm"),
+        gzip.decompress((FIXTURES / "filing_plain_issuer_aapl-20250927.htm.gz").read_bytes()),
+    )
+    router.add(
+        _fn_url(_FN_B, "index.json"), (FIXTURES / "index_10k_htm_instance.json").read_bytes()
+    )
+    router.add(
+        _fn_url(_FN_B, "doc.htm"),
+        gzip.decompress((FIXTURES / "filing_dual_exchange_d360924d10ka.htm.gz").read_bytes()),
+    )
+    router.add(_fn_url(_FN_C, "index.json"), (FIXTURES / "index_10k_no_instance.json").read_bytes())
+    router.add(
+        _fn_url(_FN_COVER, "index.json"), (FIXTURES / "index_10k_htm_instance.json").read_bytes()
+    )
+    router.add(
+        _fn_url(_FN_25_NASDAQ, "index.json"), (FIXTURES / "index_25nse_nasdaq.json").read_bytes()
+    )
+    router.add(
+        _fn_url(_FN_25_NYSE, "index.json"), (FIXTURES / "index_25nse_nyse.json").read_bytes()
+    )
+    return router
+
+
+def _fn_source(
+    tmp_path: Path, router: EdgarRouter, *, on: bool = True, **edgar: Any
+) -> EdgarFilingSource:
+    """A source over the synthetic CIK's stamps, FSN cache and delisting
+    cache, written straight into `tmp_path / "cache"` (the fetch pass that
+    fills them is other tasks'); a second source over the same directory is a
+    re-run."""
+    settings = edgar_settings(tmp_path / "cache", filename_listings=on, **edgar)
+    source = EdgarFilingSource(settings, client=router.client(), clock=lambda: CLOCK)
+    source._fsn_ready = True
+    source._fsn_loaded_periods = ("2019q3",)
+    if source._load_stamps(_FN_CIK):
+        return source
+    records = {
+        accession: SubmissionRecord(
+            accession, _FN_FORM.get(accession, "10-K"), "doc.htm", False, accepted_at
+        )
+        for accession, accepted_at in _FN_AT.items()
+    }
+    source._save_stamps(_FN_CIK, records)
+    own_listing = [["Common Stock", "AAPL", "NASDAQ"]]
+    fsn = {
+        # A tags its own symbol; B's entry predates #1624 (no symbol_only key).
+        _FN_A: {"form": "10-K", "sic": None, "listings": [], "shares": [], "symbol_only": ["AAPL"]},
+        _FN_B: {"form": "10-K", "sic": None, "listings": [], "shares": []},
+        _FN_COVER: {"form": "10-Q", "sic": None, "listings": own_listing, "shares": []},
+    }
+    edgar_raw.write_atomic(
+        source._fsn_cache_path(_FN_CIK),
+        json.dumps(
+            {"version": edgar_source_module.FSN_VERSION, "cik": _FN_CIK, "records": fsn}
+        ).encode(),
+    )
+    for accession in (_FN_25_NASDAQ, _FN_25_NYSE):
+        source._save_delisting_cache(
+            accession,
+            DelistingFiling(
+                _FN_CIK,
+                "25-NSE",
+                "Common Stock, $0.01 par value per share",
+                "NASDAQ",
+                accession,
+                _FN_AT[accession],
+                date(2018, 12, 13),
+            ),
+        )
+    return source
+
+
+def _fn_keys(listings: list[Any]) -> list[tuple[str, str, str, str | None, str | None]]:
+    return [(e.accession, e.form, e.ticker, e.exchange, e.dei_symbol) for e in listings]
+
+
+def test_filename_listings_reads_the_window_from_the_extract_and_the_stamps(
+    tmp_path: Path,
+) -> None:
+    router = _fn_router()
+    source = _fn_source(tmp_path, router)
+    listings = source.filename_listings(_FN_CIK)
+
+    assert _fn_keys(listings) == [
+        (_FN_A, "10-K", "aapl", "NASDAQ", "AAPL"),
+        (_FN_B, "10-K", "a10-k20199282019", "NASDAQ", None),
+        (_FN_25_NASDAQ, "25-NSE", "spdc", "NASDAQ", None),
+        (_FN_COVER, "10-Q", "a10-k20199282019", None, None),
+    ]
+    # accepted_at is the filing's own stamp; valid_from its New York session.
+    by_accession = {e.accession: e for e in listings}
+    assert by_accession[_FN_A].accepted_at == _FN_AT[_FN_A]
+    assert by_accession[_FN_A].valid_from == date(2016, 10, 26)
+    assert by_accession[_FN_B].valid_from == date(2017, 11, 3)
+    assert by_accession[_FN_A].class_title.startswith("Common Stock")  # type: ignore[union-attr]
+    assert by_accession[_FN_25_NASDAQ].class_title == "Common Stock, $0.01 par value per share"
+    # The window: the 2014 10-K (before `since`), the one after the first
+    # cover page, the NYSE exhibit (no ticker) and the uncached Form 25 are out.
+    assert _FN_BEFORE not in by_accession and _FN_AFTER not in by_accession
+    assert _FN_25_NYSE not in by_accession and _FN_25_COLD not in by_accession
+    assert (
+        source.filename_10ks_read,
+        source.filename_no_instance,
+        source.filename_no_exchange,
+        source.filename_form25_read,
+        source.filename_form25_no_exhibit,
+        source.filename_form25_uncached,
+    ) == (3, 1, 0, 1, 1, 1)
+    assert (source.filename_index_fetches, source.filename_document_fetches) == (6, 2)
+    # One index per accession read, one document per 10-K with an instance.
+    urls = [u for u in router.urls if "/Archives/" in u]
+    assert sorted(urls) == sorted(
+        [
+            _fn_url(a, "index.json")
+            for a in (_FN_A, _FN_B, _FN_C, _FN_COVER, _FN_25_NASDAQ, _FN_25_NYSE)
+        ]
+        + [_fn_url(_FN_A, "doc.htm"), _fn_url(_FN_B, "doc.htm")]
+    )
+
+
+def test_filename_cache_holds_only_the_extract_and_a_rerun_makes_no_request(
+    tmp_path: Path,
+) -> None:
+    router = _fn_router()
+    first = _fn_source(tmp_path, router).filename_listings(_FN_CIK)
+    asked = len(router.urls)
+
+    cache_dir = tmp_path / "cache" / "filename" / "v1"
+    assert [p.name for p in cache_dir.iterdir()] == [f"{_FN_CIK}.json"]
+    stored = json.loads((cache_dir / f"{_FN_CIK}.json").read_text())
+    assert set(stored) == {"version", "cik", "records"}
+    assert stored["records"][_FN_A]["name"] == "aapl"
+    assert stored["records"][_FN_A]["pairs"][0][1] == "NASDAQ"
+    assert stored["records"][_FN_C] == {
+        "name": None,
+        "pairs": [],
+        "document_read": False,
+    }  # no instance, still cached
+    assert max(len(json.dumps(r)) for r in stored["records"].values()) < 2000  # no document kept
+    # No downloaded document anywhere under the cache directory.
+    assert {p.suffix for p in (tmp_path / "cache").rglob("*") if p.is_file()} == {".json"}
+
+    again = _fn_source(tmp_path, router)
+    assert again.filename_listings(_FN_CIK) == first
+    assert len(router.urls) == asked
+    assert (again.filename_index_fetches, again.filename_document_fetches) == (0, 0)
+    assert again.filename_10ks_read == 3  # the readings are counted, the fetches are not
+
+
+def test_filename_switch_off_makes_no_request_and_writes_no_cache(tmp_path: Path) -> None:
+    router = _fn_router()
+    source = _fn_source(tmp_path, router, on=False)
+    assert source.filename_listings(_FN_CIK) == []
+    assert router.urls == []
+    assert not (tmp_path / "cache" / "filename").exists()
+    assert source.filename_index_fetches == 0
+
+
+def test_filename_fsn_entry_without_symbol_only_is_counted_not_read_as_no_tag(
+    tmp_path: Path,
+) -> None:
+    source = _fn_source(tmp_path, _fn_router())
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_A].dei_symbol == "AAPL"  # recorded and equal to the prefix's case
+    assert listings[_FN_B].dei_symbol is None  # B's entry never recorded the field
+    assert source.filename_fsn_no_symbol_only == 1  # B, named, never silent
+    assert source.filename_fsn_missing == 0
+
+
+def test_filename_tag_that_names_another_symbol_is_the_filings_dei_symbol(
+    tmp_path: Path,
+) -> None:
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    data["records"][_FN_B]["symbol_only"] = ["ZEN"]
+    path.write_text(json.dumps(data))
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert listings[_FN_B].dei_symbol == "ZEN"
+    assert source.filename_fsn_no_symbol_only == 0
+
+
+def test_filename_ten_k_missing_from_fsn_is_counted_apart(tmp_path: Path) -> None:
+    source = _fn_source(tmp_path, _fn_router())
+    path = source._fsn_cache_path(_FN_CIK)
+    data = json.loads(path.read_text())
+    del data["records"][_FN_B]
+    path.write_text(json.dumps(data))
+    source.filename_listings(_FN_CIK)
+    assert (source.filename_fsn_missing, source.filename_fsn_no_symbol_only) == (1, 0)
+
+
+@pytest.mark.parametrize("broken", ["index_404", "index_malformed", "document_404"])
+def test_filename_failed_fetch_is_counted_cached_nowhere_and_asked_again(
+    tmp_path: Path, broken: str
+) -> None:
+    router = _fn_router()
+    if broken == "index_404":
+        router.add(_fn_url(_FN_A, "index.json"), 404)
+    elif broken == "index_malformed":
+        router.add(_fn_url(_FN_A, "index.json"), b'{"directory": {"item": "oops"}}')
+    else:
+        router.add(_fn_url(_FN_A, "doc.htm"), 404)
+    source = _fn_source(tmp_path, router)
+    listings = source.filename_listings(_FN_CIK)
+
+    assert _FN_A not in {e.accession for e in listings}  # never a guessed ticker
+    assert {_FN_B, _FN_25_NASDAQ, _FN_COVER} <= {e.accession for e in listings}
+    assert source.failed_filings == 1
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert _FN_A not in stored["records"]
+
+    router.add(
+        _fn_url(_FN_A, "index.json"), (FIXTURES / "index_10k_plain_instance.json").read_bytes()
+    )
+    router.add(
+        _fn_url(_FN_A, "doc.htm"),
+        gzip.decompress((FIXTURES / "filing_plain_issuer_aapl-20250927.htm.gz").read_bytes()),
+    )
+    before = len(router.urls)
+    healed = _fn_source(tmp_path, router).filename_listings(_FN_CIK)
+    assert _FN_A in {e.accession for e in healed}
+    asked = {u for u in router.urls[before:]}
+    assert asked == {_fn_url(_FN_A, "index.json"), _fn_url(_FN_A, "doc.htm")}  # only the failed one
+
+
+def test_filename_dei_symbol_survives_the_real_fsn_cache_writer(tmp_path: Path) -> None:
+    """The tag reaches `FilenameListing.dei_symbol` through `_save_fsn_cache`,
+    not through a hand-written key: without the writer's `symbol_only` every
+    entry reads as "never recorded" and the filing's own tag is lost."""
+    source = _fn_source(tmp_path, _fn_router())
+    records = {
+        accession: FsnFiling(accession, _FN_CIK, "10-K", None, (), (), symbol_only=tags)
+        for accession, tags in ((_FN_A, ("AAPL",)), (_FN_B, ("ZEN",)))
+    }
+    records[_FN_COVER] = FsnFiling(
+        _FN_COVER, _FN_CIK, "10-Q", None, (CoverListing("Common Stock", "AAPL", "NASDAQ"),), ()
+    )
+    source._save_fsn_cache(_FN_CIK, records)
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert (listings[_FN_A].dei_symbol, listings[_FN_B].dei_symbol) == ("AAPL", "ZEN")
+    assert source.filename_fsn_no_symbol_only == 0
+
+
+def test_a_prefix_only_cache_entry_is_a_miss_for_a_ten_k_read(tmp_path: Path) -> None:
+    """An accession first cached as the first cover filing (prefix only) and
+    later asked as a 10-K is read again, not served with no 12(b) pairs."""
+    router = _fn_router()
+    source = _fn_source(tmp_path, router)
+    source._save_filename_cache(
+        _FN_CIK,
+        {_FN_A: edgar_source_module._FilenameExtract("aapl", (), False)},
+    )
+    listing = {e.accession: e for e in source.filename_listings(_FN_CIK)}[_FN_A]
+    assert listing.exchange == "NASDAQ"
+    assert _fn_url(_FN_A, "doc.htm") in router.urls
+    stored = json.loads((tmp_path / "cache" / "filename" / "v1" / f"{_FN_CIK}.json").read_text())
+    assert stored["records"][_FN_A]["document_read"] is True
+
+
+def test_filename_incomplete_ciks_names_a_partial_answer(tmp_path: Path) -> None:
+    router = _fn_router()
+    # The cold Form 25 has no delisting-cache entry: the answer is partial.
+    source = _fn_source(tmp_path, router)
+    source.filename_listings(_FN_CIK)
+    assert source.filename_incomplete_ciks == {_FN_CIK}
+
+    # The same Form 25 as the exchange's copy of another company's: skipped, complete.
+    clean = _fn_source(tmp_path, router)
+    clean._save_delisting_cache(
+        _FN_25_COLD,
+        DelistingFiling(KLX, "25", "Common Stock", "NASDAQ", _FN_25_COLD, _FN_AT[_FN_25_COLD]),
+    )
+    clean.filename_listings(_FN_CIK)
+    assert clean.filename_incomplete_ciks == set()
+
+    # A failed fetch makes it partial again.
+    router.add(_fn_url(_FN_B, "index.json"), 404)
+    failing = _fn_source(tmp_path / "other", router)
+    failing.filename_listings(_FN_CIK)
+    assert failing.filename_incomplete_ciks == {_FN_CIK}
+
+
+class _CountedBody(httpx.SyncByteStream):
+    def __init__(self, chunk: bytes, total: int) -> None:
+        self._chunk, self._total, self.pulled = chunk, total, 0
+
+    def __iter__(self) -> Any:
+        for _ in range(self._total):
+            self.pulled += 1
+            yield self._chunk
+
+
+def test_filename_document_read_stops_at_the_configured_cap(tmp_path: Path) -> None:
+    router = _fn_router()
+    body = _CountedBody(b"<p>front matter with no table</p>" * 30, total=2_000)
+    router.add(_fn_url(_FN_A, "doc.htm"), lambda request: httpx.Response(200, stream=body))
+    source = _fn_source(tmp_path, router, filename_document_max_bytes=5000)
+    listings = {e.accession: e for e in source.filename_listings(_FN_CIK)}
+    assert body.pulled <= 6  # ~1 KB chunks against a 5 KB cap, not 100,000
+    assert listings[_FN_A].exchange is None  # the table was never reached: no exchange
+    assert source.filename_no_exchange >= 1
+
+
+def test_a_cached_v5_cover_page_is_no_longer_served(settings: Settings) -> None:
+    """T181 (#1541): the owner backed `cover_split_contexts` out in the same
+    release and the caches go to version 6, so a per-document cover page
+    cached under v5, parsed with the switch on, is never served: it is
+    fetched and parsed again."""
+    assert (FSN_VERSION, COVER_VERSION) == (6, 6)
+    accession = "0000320193-24-000123"
+    old = Path(settings.edgar.cache_dir) / "cover" / "v5" / f"{accession}.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(
+        json.dumps(
+            {
+                "version": 5,
+                "accession": accession,
+                "cik": "0000320193",
+                "entity_cik": "0000320193",
+                "listings": [],
+                "facts": [],
+            }
+        )
+    )
+    source = _source(settings, EdgarRouter())
+    assert source._load_cover_cache(accession) is None

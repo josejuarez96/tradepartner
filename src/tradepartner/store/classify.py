@@ -15,7 +15,11 @@ known at one instant:
 2. `fund_form`: the issuer has filed an investment-company form
    (N-CSR, N-CSRS, N-PORT / NPORT-P, 485BPOS, N-2): `fund`.
 3. `f6_depositary`: the CIK has filed an F-6 (depositary receipts):
-   `depositary`.
+   `depositary`, except under `edgar.title_fallback` for a class with a
+   plain-common title (no depositary, ADS or ADR word anywhere in it;
+   "Registered Shares" and "Ordinary Shares" count) of an issuer whose
+   latest status form is domestic (T194, #1682 lever H): that class falls
+   through to rules 5 and 6.
 4. `foreign_form`: the issuer's latest status form (below) is foreign:
    `foreign`.
 5. `sic_6770`: the latest filing header's SIC is 6770 (blank checks):
@@ -39,8 +43,10 @@ known at one instant:
    the first naming common), never for a title holding `%`; (d) a head
    naming only a class letter and shares is `title_common` when no
    non-equity word is anywhere in the title.
-7. A class with no titled listing: its latest snapshot ticker's suffix
-   (`suffix_<type>`, `provenance = snapshot_static`): after a separator,
+7. A class with no titled listing: its latest untitled listing ticker's
+   suffix (`suffix_<type>`, `provenance = snapshot_static`, or
+   `filing_name` when that ticker came from a filing's own file names,
+   #1597): after a separator,
    `W`/`WS`/`WT` warrant, `U`/`UN`/`UT` unit, `R`/`RT`/`RI` right, `P`,
    `P?` or `PR?` preferred; a five-letter ticker with no separator ending
    in `W`, `U`, `R` (Nasdaq fifth-letter codes) or `Y` (ADR). A class
@@ -196,7 +202,7 @@ def _title_type(title: str, title_fallback: bool = False) -> tuple[str, str]:
         for word, security_type in _TITLE_TYPES:
             if re.search(rf"\b{word}", norm):
                 return security_type, f"title_{security_type}"
-    if _is_common(title):
+    if _is_common(title, whole_words=title_fallback):
         return COMMON, "title_common"
     if title_fallback:
         return _title_fallback_type(title, norm)
@@ -211,13 +217,29 @@ def _title_fallback_type(title: str, head: str) -> tuple[str, str]:
             security_type = _word_type(segment)
             if security_type is not None:
                 return security_type, f"title_{security_type}"
-        if any(_is_common(segment) for segment in segments):
+        if any(_is_common(segment, whole_words=True) for segment in segments):
             return COMMON, "title_common"
     if _CLASS_SHARES.match(head):
         whole = _whole(title)
         if _word_type(whole) is None and _NON_EQUITY_TITLE.search(whole) is None:
             return COMMON, "title_common"
     return UNCLASSIFIABLE, "title_unrecognized"
+
+
+#: Words anywhere in a title that tie its shares to a depositary programme.
+_DEPOSITARY_ANYWHERE = re.compile(r"\bdeposit[ao]ry\b|\badss?\b|\badrs?\b")
+
+
+def is_plain_common_title(title: str | None) -> bool:
+    """True when `title` is a common-equity title (as `_title_type` reads it
+    under the fallback) with no depositary, ADS or ADR word anywhere in it, so
+    an ADR's underlying shares ("Ordinary Shares ... only in connection with
+    ADSs") stay depositary or foreign."""
+    if title is None or is_placeholder_title(title):
+        return False
+    if _DEPOSITARY_ANYWHERE.search(_whole(title)) is not None:
+        return False
+    return _title_type(title, True) == (COMMON, "title_common")
 
 
 def ticker_suffix_type(ticker: str) -> str | None:
@@ -403,7 +425,13 @@ def _classify(
         return "etf", "benchmark_config", sic, benchmark["provenance"]
     if state.fund:
         return "fund", "fund_form", sic, "filing"
-    if state.f6:
+    # T194 (#1682 lever H, owner decision b): under the fallback a titled
+    # plain-common class of an issuer whose latest status form is domestic is
+    # common though the CIK once filed an F-6 (IVZ, CRH); an issuer still
+    # filing only foreign forms keeps the issuer rules (its ordinary-share
+    # class is the ADS's underlying, so a real ADR never becomes common).
+    plain = title_fallback and titled is not None and is_plain_common_title(titled["class_title"])
+    if state.f6 and not (plain and state.domestic is True):
         return "depositary", "f6_depositary", sic, "filing"
     if state.domestic is False:
         return "foreign", "foreign_form", sic, "filing"
@@ -415,7 +443,16 @@ def _classify(
     if known is not None:
         suffix_type = ticker_suffix_type(known["ticker"])
         if suffix_type is not None:
-            return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
+            # #1597: only a `filing_name` listing row (a ticker read from a
+            # filing's own file names) names itself; every other provenance
+            # keeps the `snapshot_static` row this rule has always written.
+            listing_provenance = known["provenance"]
+            return (
+                suffix_type,
+                f"suffix_{suffix_type}",
+                sic,
+                listing_provenance if listing_provenance == "filing_name" else "snapshot_static",
+            )
     if state.domestic and not (title_fallback and sibling_common):
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"

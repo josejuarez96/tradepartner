@@ -34,11 +34,15 @@ from tradepartner.config import Settings, parse_accepted_same_day_pair
 from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
+    BORROW_STATUS_UNIQUE,
     COVERAGE_REFERENCE_NAMES,
+    DUPLICATE_DIVIDENDS,
+    FILENAME_LISTING_VALID_FROM,
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
     FILING_EVENTS_KNOWN_AT_IS_ACCEPTED_AT,
     FILING_EVENTS_UNIQUE,
+    INDEX_MEMBERS_MISSING,
     INTEGRITY_RULES,
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
     KNOWN_AT_NOT_NULL,
@@ -57,6 +61,9 @@ from tradepartner.health import (
     STATIC,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
+    _bars_after_delisting,
+    _overlapping_listings,
     bar_gaps,
     clock_suspect,
     coverage,
@@ -74,9 +81,130 @@ from tradepartner.health import (
     unclassifiable,
 )
 from tradepartner.store.db import configure_connection, insert_row
+from tradepartner.store.delistings import listing_ends_as_of
+from tradepartner.store.dividend_reviews import ReviewedGroup, reviewed_groups
+from tradepartner.store.index_members import IndexInterval, IndexMembers, IndexMembersError
+from tradepartner.store.master import first_session
 from tradepartner.store.schema import TABLE_NAMES, TABLE_PROVENANCE_VALUES
 
 T_END = session_close(date(2020, 6, 30))
+
+
+def test_filename_health_counts_and_rejects_bad_10k_date(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    known = datetime(2018, 9, 4, 20, 0, tzinfo=UTC)
+    row = {
+        "security_id": "SEC_STATIC_PRE2019",
+        "ticker": "FNAME",
+        "exchange": "NYSE",
+        "class_title": None,
+        "valid_from": date(2018, 9, 4),
+        "known_at": known,
+        "ingested_at": T_END,
+        "source": "edgar",
+        "provenance": "filing_name",
+    }
+    insert_row(fixture_store, "listings", row)
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.filename_listings.rows >= 1
+    assert FILENAME_LISTING_VALID_FROM not in report.failures
+    fixture_store.execute("DELETE FROM listings WHERE ticker = 'FNAME'")
+    insert_row(fixture_store, "listings", row | {"valid_from": date(2018, 9, 5)})
+    report = health_report(fixture_store, T_END, _settings())
+    assert FILENAME_LISTING_VALID_FROM in report.failures
+
+
+def test_filename_health_reports_untraded_form25_last_resort(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    settings = _settings()
+    cik = "0000099998"
+    known = datetime(2018, 6, 1, 20, 30, tzinfo=UTC)
+    insert_row(
+        fixture_store,
+        "securities",
+        {
+            "security_id": cik,
+            "cik": cik,
+            "name": "Fallback",
+            "benchmark": False,
+            "known_at": known,
+            "ingested_at": T_END,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    insert_row(
+        fixture_store,
+        "listings",
+        {
+            "security_id": cik,
+            "ticker": "FALL",
+            "exchange": "NASDAQ",
+            "class_title": None,
+            "valid_from": first_session(settings),
+            "known_at": known,
+            "ingested_at": T_END,
+            "source": "edgar",
+            "provenance": "filing_name",
+        },
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.filename_listings.only_listing == 1
+    assert cik in report.filename_listings.no_bars["security_id"].to_list()
+    assert FILENAME_LISTING_VALID_FROM not in report.failures
+
+
+def test_filename_only_listing_counts_the_listing_live_at_t_not_all_history(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #1662: a security with a filed row earlier and a filing_name row as its
+    # live listing relies on the filing name at T; one whose filing_name row
+    # is the older one and a filed row the live one does not.
+    settings = _settings()
+    known = datetime(2018, 6, 1, 20, 30, tzinfo=UTC)
+    for cik, first, second in (
+        ("0000099991", "filing", "filing_name"),
+        ("0000099992", "filing_name", "filing"),
+    ):
+        insert_row(
+            fixture_store,
+            "securities",
+            {
+                "security_id": cik,
+                "cik": cik,
+                "name": "Mixed",
+                "benchmark": False,
+                "known_at": known,
+                "ingested_at": T_END,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for ticker, provenance, valid_from in (
+            ("MIXA", first, date(2018, 6, 1)),
+            ("MIXB", second, date(2019, 6, 3)),
+        ):
+            insert_row(
+                fixture_store,
+                "listings",
+                {
+                    "security_id": cik,
+                    "ticker": ticker,
+                    "exchange": "NASDAQ",
+                    "class_title": None,
+                    "valid_from": valid_from,
+                    "known_at": datetime.combine(valid_from, datetime.min.time(), tzinfo=UTC),
+                    "ingested_at": T_END,
+                    "source": "edgar",
+                    "provenance": provenance,
+                },
+            )
+    report = health_report(fixture_store, T_END, settings)
+    assert report.filename_listings.only_listing == 1
+
+
 #: Close of 2018-10-25: after SEC_TRANSFER's Form 25, before its NASDAQ
 #: listing is known (fixture README), so it counts as delisted there.
 T_TRANSFER_PROBE = datetime(2018, 10, 25, 20, 0, tzinfo=UTC)
@@ -647,7 +775,7 @@ def test_known_at_after_ingested_at_fails_its_rule(
     loose = _unconstrained(fixture_store)
     loose.execute(
         "UPDATE corporate_actions SET ingested_at = known_at - INTERVAL 1 DAY "
-        "WHERE security_id = 'SEC_SPLIT_PLAIN'"
+        "WHERE security_id = 'SEC_SPLIT_PLAIN' AND action_type = 'split'"
     )
     checks = integrity_checks(loose, T_END, _settings())
     assert _failed(checks) == {KNOWN_AT_NOT_AFTER_INGESTED_AT}
@@ -1611,10 +1739,18 @@ def test_as_of_metrics_invariant_under_truncation(
         assert unclassifiable(fixture_store, t) == unclassifiable(cut, t), t
         # The two integrity rules derived at `t` as the listings are read
         # (module docstring), not merely read off stored rows (#827).
-        full_checks = {c.rule: c for c in integrity_checks(fixture_store, t, settings)}
-        cut_checks = {c.rule: c for c in integrity_checks(cut, t, settings)}
-        for rule in (NON_OVERLAPPING_LISTINGS, NO_BARS_AFTER_DELISTING):
-            assert full_checks[rule].violations.equals(cut_checks[rule].violations), (rule, t)
+        # Only these two are computed (via the same helpers `integrity_checks`
+        # uses): the rest of `integrity_checks` is not asserted here, and
+        # its rate rules cost seconds per call at ~1,900 probes (#1669).
+        window = settings.master.transfer_window_sessions
+        full_listings = listing_ends_as_of(fixture_store, t, settings)
+        cut_listings = listing_ends_as_of(cut, t, settings)
+        full_overlaps, _ = _overlapping_listings(full_listings, settings)
+        cut_overlaps, _ = _overlapping_listings(cut_listings, settings)
+        assert full_overlaps.equals(cut_overlaps), (NON_OVERLAPPING_LISTINGS, t)
+        full_after = _bars_after_delisting(fixture_store, t, full_listings, window)
+        cut_after = _bars_after_delisting(cut, t, cut_listings, window)
+        assert full_after.equals(cut_after), (NO_BARS_AFTER_DELISTING, t)
 
 
 # --- Owner-accepted same-day pairs (#855) -----------------------------------
@@ -2713,3 +2849,601 @@ def test_rates_staleness_is_read_from_an_aborted_stale_run(
     report = health_report(fixture_store, T_END, _settings())
     rate = next(item for item in report.rates.series if item.series == "DTB3")
     assert rate.stale_sessions == 17
+
+
+# --- duplicate_dividends (#1613, T186b) ---------------------------------------
+
+DIV_SID = "SEC_DUAL_A"
+DIV_EX = date(2020, 3, 16)
+DIV_KNOWN = session_close(date(2020, 3, 13))
+
+
+def _cash(
+    conn: duckdb.DuckDBPyConnection,
+    action_id: str,
+    *,
+    sid: str = DIV_SID,
+    ex_date: date = DIV_EX,
+    amount: float = 0.37,
+    known: datetime = DIV_KNOWN,
+    cancelled: bool = False,
+) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": "dividend",
+            "ex_date": ex_date,
+            "ratio_or_amount": amount,
+            "announced_at": None,
+            "source_action_id": action_id,
+            "cancelled": cancelled,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def _review(verdict: str, *, sid: str = DIV_SID, amount: float = 0.37) -> ReviewedGroup:
+    return ReviewedGroup(
+        security_id=sid,
+        ex_date=DIV_EX,
+        amount=amount,
+        verdict=verdict,  # type: ignore[arg-type]
+        retract_source_action_id="dd-b" if verdict == "duplicate" else "",
+        ticker="DUAL",
+        evidence="test",
+    )
+
+
+def _dividend_check(
+    conn: duckdb.DuckDBPyConnection, reviewed: list[ReviewedGroup]
+) -> tuple[set[str], pl.DataFrame, HealthReport]:
+    report = health_report(conn, T_END, _settings(), reviewed=reviewed)
+    check = next(c for c in report.integrity if c.rule == DUPLICATE_DIVIDENDS)
+    return _failed(report.integrity), check.violations, report
+
+
+def test_an_unlisted_equal_pair_fails_naming_the_key_ids_and_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    later = DIV_KNOWN + timedelta(days=3)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b", known=later)  # another known_at: still one key
+    failed, violations, report = _dividend_check(fixture_store, [])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert not report.ok
+    assert violations.to_dicts() == [
+        {
+            "security_id": DIV_SID,
+            "ex_date": DIV_EX,
+            "amount": 0.37,
+            "source_action_id": "dd-a",
+            "known_at": DIV_KNOWN,
+            "verdict": None,
+        },
+        {
+            "security_id": DIV_SID,
+            "ex_date": DIV_EX,
+            "amount": 0.37,
+            "source_action_id": "dd-b",
+            "known_at": later,
+            "verdict": None,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "block"),
+    [("distinct", "accepted"), ("unresolved", "unresolved"), ("duplicate", "pending")],
+)
+def test_a_listed_pair_passes_and_is_shown(
+    fixture_store: duckdb.DuckDBPyConnection, verdict: str, block: str
+) -> None:
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b")
+    failed, violations, report = _dividend_check(fixture_store, [_review(verdict)])
+    assert failed == set()
+    assert violations.is_empty()
+    assert report.ok  # the paper shakedown's E.7 reads `health_report(...).ok`
+    dividends = report.duplicate_dividends
+    shown = {name: getattr(dividends, name) for name in ("accepted", "unresolved", "pending")}
+    assert [(g.security_id, g.ex_date) for g in shown.pop(block)] == [(DIV_SID, DIV_EX)]
+    assert all(groups == () for groups in shown.values())
+
+
+def test_a_third_id_on_a_listed_key_fails(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    for action_id in ("dd-a", "dd-b", "dd-c"):
+        _cash(fixture_store, action_id)
+    failed, violations, _ = _dividend_check(fixture_store, [_review("distinct")])
+    assert failed == {DUPLICATE_DIVIDENDS}
+    assert violations["source_action_id"].to_list() == ["dd-a", "dd-b", "dd-c"]
+    assert set(violations["verdict"]) == {"distinct"}
+
+
+def test_a_cancelled_or_superseded_revision_never_counts(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    later = DIV_KNOWN + timedelta(days=1)
+    _cash(fixture_store, "dd-a")
+    _cash(fixture_store, "dd-b")
+    _cash(fixture_store, "dd-b", known=later, cancelled=True)  # withdrawn
+    _cash(fixture_store, "dd-c", amount=0.40)
+    _cash(fixture_store, "dd-c", known=later)  # re-stated to the pair's amount ...
+    _cash(fixture_store, "dd-c", known=later + timedelta(days=1), amount=0.41)  # ... and away
+    failed, _, report = _dividend_check(fixture_store, [])
+    assert failed == set()
+    assert report.duplicate_dividends.groups == ()
+    # Before the withdrawal, at T, the pair is live: the rule reads as of T.
+    early = health_report(fixture_store, DIV_KNOWN, _settings(), reviewed=[])
+    assert DUPLICATE_DIVIDENDS in early.failures
+
+
+def test_a_repaired_duplicate_is_neither_shown_nor_failed(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _cash(fixture_store, "dd-a")  # the kept id; dd-b was deleted by the release
+    failed, _, report = _dividend_check(fixture_store, [_review("duplicate")])
+    assert failed == set()
+    assert report.duplicate_dividends.groups == ()
+
+
+def test_the_fixture_store_passes_under_the_packaged_list(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The default list's keys are absent from the fixture store: not a violation."""
+    report = health_report(fixture_store, T_END, _settings())
+    assert DUPLICATE_DIVIDENDS not in report.failures
+    assert report.duplicate_dividends.groups == ()
+
+
+def test_a_pending_packaged_key_keeps_health_ok(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A listed duplicate still in the store (the eight rows `--to` defers)
+    keeps `health_report(...).ok`, which the paper shakedown's E.7 reads."""
+    [aiv] = [g for g in reviewed_groups() if g.ticker == "AIV" and g.ex_date == date(2020, 2, 13)]
+    known = session_close(date(2020, 2, 12))
+    _cash(
+        fixture_store,
+        "kept-id",
+        sid=aiv.security_id,
+        ex_date=aiv.ex_date,
+        amount=aiv.amount,
+        known=known,
+    )
+    _cash(
+        fixture_store,
+        aiv.retract_source_action_id,
+        sid=aiv.security_id,
+        ex_date=aiv.ex_date,
+        amount=aiv.amount,
+        known=known,
+    )
+    report = health_report(fixture_store, T_END, _settings())
+    assert report.ok, report.failures
+    assert [g.security_id for g in report.duplicate_dividends.pending] == [aiv.security_id]
+
+
+def test_new_action_stamp_rules_fail_on_early_rows_and_pass_fixture(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    from tradepartner.health import SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT
+
+    settings = _settings()
+    report = health_report(fixture_store, T_END, settings)
+    for rule in (SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT):
+        assert next(check for check in report.integrity if check.rule == rule).passed
+
+    fixture_store.execute(
+        "UPDATE corporate_actions SET known_at = TIMESTAMPTZ '2018-12-10 21:00:00+00' "
+        "WHERE action_type = 'spinoff'"
+    )
+    fixture_store.execute(
+        "UPDATE symbol_changes SET known_at = TIMESTAMPTZ '2018-11-07 21:00:00+00'"
+    )
+    report = health_report(fixture_store, T_END, settings)
+    for rule in (SPINOFF_KNOWN_AT_FLOOR, SYMBOL_CHANGE_KNOWN_AT):
+        assert not next(check for check in report.integrity if check.rule == rule).passed
+
+
+def test_symbol_change_revision_passes_and_a_mis_stamped_first_row_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1665 review: a revision is stamped at its `ingested_at`, after the
+    identity's first row; only the first row carries the date-only stamp."""
+    from tradepartner.health import SYMBOL_CHANGE_KNOWN_AT
+
+    settings = _settings()
+    revised = datetime(2018, 11, 13, 21, 5, tzinfo=UTC)
+    fixture_store.execute(
+        "INSERT INTO symbol_changes SELECT security_id, old_symbol, new_symbol, old_cusip, "
+        "'SYNTH-REVISED', process_date, source_action_id, ?, ?, source, provenance "
+        "FROM symbol_changes",
+        [revised, revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    assert next(c for c in report.integrity if c.rule == SYMBOL_CHANGE_KNOWN_AT).passed
+    fixture_store.execute(
+        "UPDATE symbol_changes SET ingested_at = ingested_at + INTERVAL 1 HOUR WHERE known_at = ?",
+        [revised],
+    )
+    report = health_report(fixture_store, T_END, settings)
+    check = next(c for c in report.integrity if c.rule == SYMBOL_CHANGE_KNOWN_AT)
+    assert check.violations.height == 1
+
+
+# --- Borrow status (#1506, T171e) ---------------------------------------------
+
+#: The fixture's three snapshots (`borrow_status.csv`), each a session's
+#: 21:00Z, an hour after the close: the `ok` run rows the ingest would have
+#: written for them, cursor = the fetch time.
+BORROW_SNAPSHOTS = (
+    datetime(2020, 6, 26, 21, 0, tzinfo=UTC),
+    datetime(2020, 6, 29, 21, 0, tzinfo=UTC),
+    datetime(2020, 6, 30, 21, 0, tzinfo=UTC),
+)
+#: After the third snapshot: every fixture borrow row is known.
+T_BORROW = session_close(date(2020, 6, 30)) + timedelta(hours=3)
+
+
+def _assets_run(
+    conn: duckdb.DuckDBPyConnection,
+    cursor: datetime,
+    *,
+    status: str = "ok",
+    message: str = "borrow_assets=7; borrow_us_equity=6; borrow_new=1; borrow_changed=2; "
+    "borrow_vanished=1; borrow_other_class=1",
+    rows: int = 4,
+) -> None:
+    insert_row(
+        conn,
+        "ingestion_runs",
+        {
+            "run_id": f"assets-{cursor.isoformat()}-{status}",
+            "started_at": cursor - timedelta(minutes=1),
+            "finished_at": cursor + timedelta(minutes=1),
+            "status": status,
+            "source": "alpaca_assets",
+            "mode": "session",
+            "rows_added": rows,
+            "chunk_cursor": cursor.isoformat(),
+            "message": message,
+        },
+    )
+
+
+@pytest.fixture
+def observed_store(fixture_store: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
+    for cursor in BORROW_SNAPSHOTS:
+        _assets_run(fixture_store, cursor)
+    return fixture_store
+
+
+def test_borrow_block_counts_on_the_fixture(observed_store: duckdb.DuckDBPyConnection) -> None:
+    """Rows, assets, the latest observation and `known_at`, the last run's
+    counts, and the shortable and ETB counts among active assets at the
+    latest observation (SPLT went hard to borrow, DUALA vanished)."""
+    borrow = health_report(observed_store, T_BORROW, _settings()).borrow
+    assert (borrow.rows, borrow.assets) == (11, 6)
+    assert borrow.latest_observation == BORROW_SNAPSHOTS[-1]
+    assert borrow.latest_known_at == BORROW_SNAPSHOTS[-1]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 4)
+    assert borrow.last_run_status == "ok"
+    assert borrow.run_counts == {
+        "assets": 7,
+        "us_equity": 6,
+        "new": 1,
+        "changed": 2,
+        "vanished": 1,
+        "other_class": 1,
+        "rows_added": 4,
+    }
+    assert borrow.stale_sessions == 0
+
+
+def test_borrow_block_reads_the_observation_from_the_run_cursor(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A quiet day writes no row but an `ok` run: the latest observation is
+    that run's cursor, later than the table's latest `known_at`; a failed run
+    is never an observation, though it is the last run."""
+    quiet = datetime(2020, 7, 1, 21, 0, tzinfo=UTC)
+    _assets_run(observed_store, quiet, message="borrow_new=0", rows=0)
+    _assets_run(
+        observed_store,
+        datetime(2020, 7, 2, 21, 0, tzinfo=UTC),
+        status="failed",
+        message="RuntimeError: assets 503",
+        rows=0,
+    )
+    t = session_close(date(2020, 7, 2)) + timedelta(hours=3)
+    borrow = health_report(observed_store, t, _settings()).borrow
+    assert borrow.latest_observation == quiet
+    assert borrow.latest_known_at == BORROW_SNAPSHOTS[-1]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 4)
+    assert borrow.last_run_status == "failed"
+    assert borrow.run_counts == {"rows_added": 0}
+
+
+def test_borrow_block_counts_only_rows_and_runs_known_at_t(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """At the close of 2020-06-29, before that day's snapshot, the block is
+    the 06-26 snapshot's: five rows, all easy to borrow."""
+    borrow = health_report(observed_store, session_close(date(2020, 6, 29)), _settings()).borrow
+    assert (borrow.rows, borrow.assets) == (5, 5)
+    assert borrow.latest_observation == BORROW_SNAPSHOTS[0]
+    assert (borrow.shortable, borrow.easy_to_borrow) == (5, 5)
+
+
+@pytest.mark.parametrize(
+    ("last_session", "stale", "warned"),
+    [
+        (date(2020, 7, 2), 2, False),  # max_stale_sessions sessions after: no warning
+        (date(2020, 7, 6), 3, True),  # one more (2020-07-03 was a holiday)
+    ],
+)
+def test_borrow_stale_warning_after_max_stale_sessions(
+    observed_store: duckdb.DuckDBPyConnection, last_session: date, stale: int, warned: bool
+) -> None:
+    settings = _settings(borrow={"enabled": True})
+    assert settings.borrow.max_stale_sessions == 2
+    t = session_close(last_session) + timedelta(hours=3)
+    report = health_report(observed_store, t, settings)
+    assert report.borrow.stale_sessions == stale
+    assert any("sessions old; maximum 2" in w for w in report.borrow.warnings) is warned
+    assert report.ok  # a warning, never a failure
+
+
+def test_borrow_stale_threshold_comes_from_config(
+    observed_store: duckdb.DuckDBPyConnection,
+) -> None:
+    t = session_close(date(2020, 7, 6)) + timedelta(hours=3)
+    settings = _settings(borrow={"enabled": True, "max_stale_sessions": 3})
+    assert health_report(observed_store, t, settings).borrow.warnings == ()
+
+
+def test_borrow_switch_warning(
+    fixture_store: duckdb.DuckDBPyConnection, observed_store: duckdb.DuckDBPyConnection
+) -> None:
+    off = health_report(observed_store, T_BORROW, _settings()).borrow
+    assert off.enabled is False
+    assert any("borrow.enabled is off" in w for w in off.warnings)
+    on = health_report(observed_store, T_BORROW, _settings(borrow={"enabled": True})).borrow
+    assert on.warnings == ()
+
+
+def test_borrow_with_the_switch_on_and_no_observation_warns(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    borrow = health_report(fixture_store, T_BORROW, _settings(borrow={"enabled": True})).borrow
+    assert borrow.latest_observation is None
+    assert (borrow.shortable, borrow.easy_to_borrow, borrow.stale_sessions) == (None, None, None)
+    assert borrow.warnings == ("no borrow snapshot observed",)
+
+
+def test_borrow_check_passes_on_the_fixture(observed_store: duckdb.DuckDBPyConnection) -> None:
+    report = health_report(observed_store, T_BORROW, _settings())
+    assert report.ok, report.failures
+    assert next(c for c in report.integrity if c.rule == BORROW_STATUS_UNIQUE).passed
+
+
+def test_borrow_check_fails_on_a_bar_provenance_row(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """`provenance = snapshot` on every row: the common rule names the table."""
+    loose_store.execute(
+        "UPDATE borrow_status SET provenance = 'bar' "
+        "WHERE symbol = 'BNDX' AND known_at = '2020-06-26 21:00:00+00'"
+    )
+    violations = _only_failure(loose_store, PROVENANCE_ALLOWED, _settings())
+    assert violations.rows(named=True) == [
+        {"table": "borrow_status", "provenance": "bar", "rows": 1}
+    ]
+
+
+def test_borrow_check_fails_on_a_duplicate_asset_and_known_at(
+    loose_store: duckdb.DuckDBPyConnection,
+) -> None:
+    loose_store.execute(
+        "INSERT INTO borrow_status SELECT * FROM borrow_status "
+        "WHERE symbol = 'SPLT' AND NOT easy_to_borrow"
+    )
+    violations = _only_failure(loose_store, BORROW_STATUS_UNIQUE, _settings())
+    assert violations.rows() == [
+        ("b0rr0w00-0000-4b0d-8000-000000000002", datetime(2020, 6, 29, 21, 0, tzinfo=UTC), 2)
+    ]
+
+
+# --- the index answer key in the coverage block (#1682, T189b) -----------------------
+
+
+def _key(*intervals: IndexInterval, through: date = date(2026, 8, 18)) -> IndexMembers:
+    return IndexMembers(
+        source="test",
+        commit="f" * 40,
+        through=through,
+        derived=date(2026, 10, 14),
+        intervals=intervals,
+    )
+
+
+#: FRST a member on 2019-12-31 and excluded (stale shares) on 2020-06-30; PRE9
+#: excluded (not listed); NOPE carried by no listing row; LATE not in the
+#: index on either sample session.
+_KEY = _key(
+    IndexInterval("FRST", date(2010, 1, 4), None),
+    IndexInterval("PRE9", date(2010, 1, 4), None),
+    IndexInterval("NOPE", date(2010, 1, 4), None),
+    IndexInterval("LATE", date(2020, 7, 1), None),
+)
+
+
+def _index(block: CoverageReference) -> IndexMembersCheck:
+    assert block.index_members is not None
+    return block.index_members
+
+
+def test_the_index_block_counts_hits_by_security_and_names_each_miss(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), _KEY))
+    assert (index.commit, index.through, index.error) == ("f" * 40, date(2026, 8, 18), None)
+    assert index.samples.to_dicts() == [
+        {
+            "session": S_2019,
+            "beyond_key": False,
+            "members": 3,
+            "hits": 1,
+            "misses": 2,
+            "unresolved": 1,
+            "hit_share": 1 / 3,
+        },
+        {
+            "session": S_2020,
+            "beyond_key": False,
+            "members": 3,
+            "hits": 0,
+            "misses": 3,
+            "unresolved": 1,
+            "hit_share": 0.0,
+        },
+    ]
+    assert index.hits.to_dicts() == [
+        {"session": S_2019, "ticker": "FRST", "security_id": "SEC_FACTS_RESTATED"}
+    ]
+    misses = {(r["session"], r["ticker"]): r for r in index.misses.to_dicts()}
+    assert misses[(S_2019, "PRE9")]["security_id"] == "SEC_STATIC_PRE2019"
+    assert misses[(S_2019, "PRE9")]["bucket"] == "exchange:not_listed"
+    assert misses[(S_2019, "NOPE")]["bucket"] == "unresolved"
+    assert misses[(S_2019, "NOPE")]["security_id"] is None
+    assert misses[(S_2020, "FRST")]["bucket"] == "shares:stale_shares"
+    assert (S_2019, "LATE") not in misses and (S_2020, "LATE") not in misses
+    assert index.worst == 3
+    assert index.verdict == "3 max missing per session (report-only)"
+
+
+def test_sessions_after_the_keys_last_row_are_beyond_the_key_and_count_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    key = _key(*_KEY.intervals, through=date(2020, 1, 31))
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), key))
+    rows = index.samples.to_dicts()
+    assert [r["beyond_key"] for r in rows] == [False, True]
+    assert rows[1] | {"session": None} == {
+        "session": None,
+        "beyond_key": True,
+        "members": 0,
+        "hits": 0,
+        "misses": 0,
+        "unresolved": 0,
+        "hit_share": None,
+    }
+    assert set(index.misses["session"].to_list()) == {S_2019}
+    assert index.worst == 2
+
+
+def test_a_set_threshold_never_passes_a_key_that_checked_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    stale = _key(*_KEY.intervals, through=date(2019, 6, 28))
+    report = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=100), index_key=stale
+    )
+    assert report.coverage_reference is not None
+    index = _index(report.coverage_reference)
+    assert index.samples["beyond_key"].to_list() == [True, True]
+    assert not index.checked
+    assert index.verdict == "nothing checked: fail"
+    assert report.failures == (INDEX_MEMBERS_MISSING,)
+    unset = _index(coverage_reference(fixture_store, T_END, _coverage_settings(), stale))
+    assert (unset.failed, unset.verdict) == (False, "nothing checked")
+
+
+def test_index_members_missing_fails_only_while_the_threshold_is_set_and_exceeded(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    unset = health_report(
+        fixture_store, T_END, _coverage_settings(), with_coverage_reference=True, index_key=_KEY
+    )
+    assert INDEX_MEMBERS_MISSING not in unset.failures
+    assert unset.ok
+    # Setting the threshold computes the block on every run, unasked.
+    tight = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=2), index_key=_KEY
+    )
+    assert tight.coverage_reference is not None
+    assert tight.failures == (INDEX_MEMBERS_MISSING,)
+    assert _index(tight.coverage_reference).verdict == "3 max missing per session: fail (max 2)"
+    loose = health_report(
+        fixture_store, T_END, _coverage_settings(index_max_missing=3), index_key=_KEY
+    )
+    assert loose.ok, loose.failures
+    assert loose.coverage_reference is not None
+    assert _index(loose.coverage_reference).verdict == "3 max missing per session: pass (max 3)"
+    assert INDEX_MEMBERS_MISSING not in INTEGRITY_RULES
+
+
+@pytest.mark.parametrize(
+    ("error", "why"),
+    [
+        (FileNotFoundError("index_members"), "file absent"),
+        (IndexMembersError("header None"), "IndexMembersError: header None"),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"), "UnicodeDecodeError: "),
+        (PermissionError("denied"), "PermissionError: denied"),
+    ],
+)
+def test_an_unloadable_key_is_reported_and_fails_only_under_a_threshold(
+    fixture_store: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    why: str,
+) -> None:
+    def broken() -> IndexMembers:
+        raise error
+
+    monkeypatch.setattr(health, "load_index_members", broken)
+    report = health_report(fixture_store, T_END, _coverage_settings(), with_coverage_reference=True)
+    assert report.coverage_reference is not None
+    index = _index(report.coverage_reference)
+    assert index.commit is None and index.error is not None
+    assert index.error.startswith(why)
+    assert index.samples.is_empty() and not index.checked
+    assert index.verdict == f"key unavailable ({index.error}): report-only"
+    assert report.ok
+    gated = health_report(fixture_store, T_END, _coverage_settings(index_max_missing=0))
+    assert gated.failures == (INDEX_MEMBERS_MISSING,)
+
+
+def test_the_packaged_key_is_the_default(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    index = _index(coverage_reference(fixture_store, T_END, _coverage_settings()))
+    assert index.commit == "a2430f2af0c79ddf0748e91de11bdeb1616ab5a7"
+    assert index.through == date(2026, 8, 18)
+    assert index.samples["members"].to_list() == [505, 505]
+
+
+def test_with_index_members_off_the_key_is_not_read(
+    fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse() -> IndexMembers:
+        raise AssertionError("the key was read")
+
+    monkeypatch.setattr(health, "load_index_members", refuse)
+    block = coverage_reference(fixture_store, T_END, _coverage_settings(index_members=False))
+    assert block.index_members is None
+
+
+def test_the_index_block_reads_only_rows_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    settings = _coverage_settings()
+    for t in (T_END, datetime(2020, 1, 15, 14, 0, tzinfo=UTC), session_close(S_2019)):
+        full = _index(coverage_reference(fixture_store, t, settings, _KEY))
+        cut = _index(coverage_reference(truncated.at(t), t, settings, _KEY))
+        assert full.samples.equals(cut.samples), t
+        assert full.hits.equals(cut.hits), t
+        assert full.misses.equals(cut.misses), t

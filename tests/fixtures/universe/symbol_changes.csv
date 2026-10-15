@@ -1,0 +1,2 @@
+security_id,old_symbol,new_symbol,old_cusip,new_cusip,process_date,source_action_id,known_at,ingested_at,source,provenance
+SEC_TICKCHANGE,TCKA,TCKB,SYNTH-OLD,SYNTH-NEW,2018-11-07,fixture-rename-1,2018-11-08T21:00:00+00:00,2018-11-08T21:10:00+00:00,alpaca,action

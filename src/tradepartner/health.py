@@ -152,6 +152,27 @@ here is this module's and is stated once:
   `check_enabled` is on; otherwise `coverage_reference` is `None`, "not
   computed", never a pass.
 
+  The block's `index_members` (#1682, T189b; `IndexMembersCheck`) is the
+  S&P 500 answer key (`store.index_members`, T189) as a second reference, on
+  the same sample sessions, while `coverage.index_members` is on (the
+  default). **A check only**: S&P membership is a committee's after-the-fact
+  selection, so this module is the key's one reader outside its loader, and
+  no universe, signal, backtest, paper or research read touches it
+  (`tests/lookahead/test_check_only_inputs.py`). On each sample session S up
+  to the key's last dated row, every key interval covering S is resolved to
+  a security through the listing rows known at `t` (`index_members.resolve`)
+  and is a hit when that security is a member of `universe_as_of(close(S))`,
+  by `security_id`, so a second class's own miss counts; a miss carries the
+  universe's exclusion (`rule_name:reason`), `unresolved` (no listing row
+  carries the ticker) or `not_considered`. A session after the key's last
+  dated row is flagged `beyond_key` and counts nothing. The block reports the
+  key's commit SHA, the hit share per session, and the misses with their
+  names. The rule `index_members_missing` is in `HealthReport.failures` only
+  while `coverage.index_max_missing` is set and some session's misses exceed
+  it, or the key cannot be loaded; unset (the default), it reports and fails
+  nothing. Setting the threshold also makes `health` compute the block on
+  every run.
+
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
 `HealthReport.ok` is true when every rule passes; `health --check` exits
@@ -268,6 +289,36 @@ derived at `t`, as the data is read.
   there. This is the check that catches a one-day ingest outage the universe
   would otherwise turn into an empty universe: rule 6 requires a bar on
   every session of that window, so one missing session fails every name.
+- `duplicate_dividends` (#1613, T186b): per `(security_id, ex_date,
+  ratio_or_amount)` of the `dividend` rows live at `t`
+  (`live_actions_as_of`), the identities on it, classed against the
+  reviewed list (`store.dividend_reviews`, read at the edge so tests inject
+  one) by `equal_amount_groups`: a key with more than one identity that the
+  list does not hold, or a listed key with another identity count than the
+  two reviewed (a third record; a lost leg; a duplicate whose ids changed),
+  fails, one row per identity with its `known_at`. `known_at` and the id
+  are never part of the key, and the rule has no date bound. The
+  `duplicate_dividends` block lists the accepted (`distinct`) and
+  unresolved keys, never hidden, and the pending ones (a listed `duplicate`
+  not repaired yet): a CLI warning, like the quarantined count, and not a
+  failure, so a known, listed repair waiting for its release never blocks
+  the paper shakedown's E.7.
+- `borrow_status_unique` (#1506, T171e): no two `borrow_status` rows share
+  `(asset_id, known_at)`. The schema's `UNIQUE` already blocks it; the rule
+  restates it for a store built by other code. The four common-column rules
+  above also cover `borrow_status`, `provenance_allowed` holding it to
+  `snapshot`.
+
+**Borrow status** (`BorrowHealth`, #1506, T171e; ADR 0021): the table's row
+count and distinct assets known at `t`, the latest observation (the newest
+`ok` `alpaca_assets` run cursor at or before `t`, never the table's latest
+`known_at`, which lags it on a quiet day) and that latest `known_at`, the
+last run's `borrow_*` counts, and at the latest observation the `shortable`
+and `easy_to_borrow` counts among `active` assets (the table holds only
+`us_equity` ones). Two report-only warnings: the latest observation is more
+than `borrow.max_stale_sessions` sessions before `session` (the sessions
+after the one completed at the observation, through `session`), or none was
+recorded while `borrow.enabled` is on; and `borrow.enabled` is off.
 
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
@@ -275,6 +326,7 @@ EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 
 from __future__ import annotations
 
+import csv
 import math
 import re
 from bisect import bisect_left, bisect_right
@@ -295,6 +347,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
+from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.calendar import (
     all_sessions,
@@ -313,7 +366,15 @@ from tradepartner.config import (
 )
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
-from tradepartner.store.asof import _validate_t, price_jumps_as_of, statement_facts_as_of
+from tradepartner.store.asof import (
+    ASSETS_SOURCE,
+    _validate_t,
+    borrow_status_as_of,
+    live_actions_as_of,
+    price_jumps_as_of,
+    prices_as_of,
+    statement_facts_as_of,
+)
 from tradepartner.store.classify import EQUITY, UNCLASSIFIABLE, classifications_as_of, listing_kind
 from tradepartner.store.delistings import (
     DELISTED,
@@ -323,7 +384,20 @@ from tradepartner.store.delistings import (
     _window,
     listing_ends_as_of,
 )
-from tradepartner.store.master import securities_as_of
+from tradepartner.store.dividend_reviews import (
+    EqualAmountGroup,
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
+)
+from tradepartner.store.index_members import (
+    UNRESOLVED,
+    IndexMembers,
+    load_index_members,
+    normalize_ticker,
+    resolve,
+)
+from tradepartner.store.master import first_session, securities_as_of, session_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
@@ -348,6 +422,7 @@ KNOWN_AT_NOT_NULL = "known_at_not_null"
 KNOWN_AT_NOT_AFTER_INGESTED_AT = "known_at_le_ingested_at"
 SOURCE_NOT_NULL = "source_not_null"
 PROVENANCE_ALLOWED = "provenance_allowed"
+FILENAME_LISTING_VALID_FROM = "filename_listing_valid_from"
 BARS_ON_SESSIONS = "bars_on_sessions"
 NO_DUPLICATE_BARS = "no_duplicate_bars"
 NON_OVERLAPPING_LISTINGS = "non_overlapping_listings"
@@ -363,6 +438,9 @@ FILING_EVENTS_UNIQUE = "filing_events_unique"
 #: The coverage check's rule (#1541): reported from the `coverage_reference`
 #: block, never from `INTEGRITY_RULES` (module docstring).
 COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
+#: The index answer key's rule (#1682, T189b): reported from the
+#: `coverage_reference` block's `index_members`, never from `INTEGRITY_RULES`.
+INDEX_MEMBERS_MISSING = "index_members_missing"
 #: The session-hole rule (#1575): an XNYS session in the universe history
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
@@ -370,6 +448,12 @@ SESSION_HOLES = "session_holes"
 RATE_KNOWN_AT = "rates_known_at_from_vintage"
 RATE_UNIQUE = "rates_unique"
 RATE_VALUE_FINITE = "rates_value_finite"
+SPINOFF_KNOWN_AT_FLOOR = "spinoff_known_at_floor"
+SYMBOL_CHANGE_KNOWN_AT = "symbol_changes_known_at_from_process_date"
+#: The duplicate-dividends rule (#1613, T186b): `duplicate_dividends`.
+DUPLICATE_DIVIDENDS = "duplicate_dividends"
+#: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
+BORROW_STATUS_UNIQUE = "borrow_status_unique"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -377,6 +461,7 @@ INTEGRITY_RULES: tuple[str, ...] = (
     KNOWN_AT_NOT_AFTER_INGESTED_AT,
     SOURCE_NOT_NULL,
     PROVENANCE_ALLOWED,
+    FILENAME_LISTING_VALID_FROM,
     BARS_ON_SESSIONS,
     NO_DUPLICATE_BARS,
     NON_OVERLAPPING_LISTINGS,
@@ -393,6 +478,10 @@ INTEGRITY_RULES: tuple[str, ...] = (
     RATE_KNOWN_AT,
     RATE_UNIQUE,
     RATE_VALUE_FINITE,
+    SPINOFF_KNOWN_AT_FLOOR,
+    SYMBOL_CHANGE_KNOWN_AT,
+    DUPLICATE_DIVIDENDS,
+    BORROW_STATUS_UNIQUE,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -759,6 +848,133 @@ class RatesHealth:
     series: tuple[RateSeriesHealth, ...]
 
 
+@dataclass(frozen=True)
+class BorrowHealth:
+    """The borrow-status block (module docstring, "Borrow status").
+    `shortable` and `easy_to_borrow` are `None` with no observation;
+    `stale_sessions` too."""
+
+    enabled: bool
+    rows: int
+    assets: int
+    latest_observation: datetime | None
+    latest_known_at: datetime | None
+    last_run_status: str | None
+    run_counts: dict[str, int]
+    shortable: int | None
+    easy_to_borrow: int | None
+    stale_sessions: int | None
+    max_stale_sessions: int
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """Report-only warnings; none is an integrity failure."""
+        out: list[str] = []
+        if not self.enabled:
+            out.append("borrow.enabled is off: `ingest --source all` takes no snapshot")
+        if self.latest_observation is None:
+            if self.enabled:
+                out.append("no borrow snapshot observed")
+        elif self.stale_sessions is not None and self.stale_sessions > self.max_stale_sessions:
+            out.append(
+                f"latest observation {self.latest_observation.isoformat()} is "
+                f"{self.stale_sessions} sessions old; maximum {self.max_stale_sessions}"
+            )
+        return tuple(out)
+
+
+_INDEX_SAMPLE_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "beyond_key": pl.Boolean,
+    "members": pl.Int64,
+    "hits": pl.Int64,
+    "misses": pl.Int64,
+    "unresolved": pl.Int64,
+    "hit_share": pl.Float64,
+}
+_INDEX_HIT_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "ticker": pl.Utf8,
+    "security_id": pl.Utf8,
+}
+_INDEX_MISS_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "ticker": pl.Utf8,
+    "security_id": pl.Utf8,
+    "outcome": pl.Utf8,
+    "rule_name": pl.Utf8,
+    "reason": pl.Utf8,
+    "bucket": pl.Utf8,
+}
+#: A resolved security the universe neither admits nor excludes (no
+#: `securities` row at the session's close, say).
+NOT_CONSIDERED = "not_considered"
+
+
+@dataclass(frozen=True, eq=False)
+class IndexMembersCheck:
+    """The S&P 500 answer key against the universe on each sample session
+    (#1682, T189b; module docstring). A check only: the key is never a
+    universe, signal, filter or feature.
+
+    `commit` and `through` are the key's pinned source SHA and last dated
+    row (None when it could not be loaded, `error` saying why). `samples`:
+    one row per sample session, `beyond_key` true after `through` (nothing
+    resolved or counted there), `members` the key's intervals covering it,
+    `hits` the ones whose resolved security is a universe member, `misses`
+    the rest, `unresolved` the misses no listing row carries, `hit_share`
+    hits over members (None beyond the key or with no members). `hits`: one
+    row per hit `(session, ticker, security_id)`. `misses`: one row per miss
+    with the resolution outcome, the universe's exclusion for the resolved
+    security and its `bucket` (`rule_name:reason`, `unresolved` or
+    `not_considered`). `max_missing` is `coverage.index_max_missing` as the
+    block was computed: only while it is set does the block fail."""
+
+    commit: str | None
+    through: date | None
+    error: str | None
+    max_missing: int | None
+    samples: pl.DataFrame
+    hits: pl.DataFrame
+    misses: pl.DataFrame
+
+    @property
+    def worst(self) -> int:
+        """The most misses on one sample session inside the key (0 for none)."""
+        counted = self.samples.filter(~pl.col("beyond_key"))
+        return 0 if counted.is_empty() else int(counted["misses"].max())  # type: ignore[arg-type]
+
+    @property
+    def checked(self) -> bool:
+        """Whether some key interval covered some sample session inside the key."""
+        return self.error is None and int(self.samples["members"].sum()) > 0
+
+    @property
+    def failed(self) -> bool:
+        """While `max_missing` is set: the key could not be loaded, it
+        checked nothing (every sample session beyond it, or none covered), or
+        some sample session's misses exceed it; a gate never passes on a check
+        it did not make. Never while it is unset."""
+        if self.max_missing is None:
+            return False
+        return not self.checked or self.worst > self.max_missing
+
+    @property
+    def verdict(self) -> str:
+        """The one wording the CLI and page share: `key unavailable (...)`,
+        `nothing checked`, then `<n> max missing per session` with
+        `report-only`, `pass (max <m>)` or `fail (max <m>)`."""
+        if self.error is not None:
+            gate = "fail" if self.failed else "report-only"
+            return f"key unavailable ({self.error}): {gate}"
+        if not self.checked:
+            return "nothing checked: fail" if self.failed else "nothing checked"
+        head = f"{self.worst} max missing per session"
+        if self.max_missing is None:
+            return f"{head} (report-only)"
+        return f"{head}: {'fail' if self.failed else 'pass'} (max {self.max_missing})"
+
+
 @dataclass(frozen=True, eq=False)
 class CoverageReference:
     """The coverage check against a named reference at `t` (#1541; module
@@ -778,6 +994,8 @@ class CoverageReference:
     late_known: pl.DataFrame
     snapshot_ciks: int
     member_ratio: float | None
+    #: The answer-key check; None while `coverage.index_members` is off.
+    index_members: IndexMembersCheck | None = None
 
     @property
     def failed(self) -> bool:
@@ -813,6 +1031,91 @@ class IntegrityCheck:
         return self.violations.is_empty()
 
 
+_FILENAME_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "exchange": pl.Utf8,
+    "valid_from": pl.Date,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+@dataclass(frozen=True)
+class FilenameListings:
+    """Filing-name rows known at T and the names without a traded bar in span."""
+
+    rows: int
+    only_listing: int
+    no_bars: pl.DataFrame
+
+
+_DUPLICATE_DIVIDENDS_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "amount": pl.Float64,
+    "source_action_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "verdict": pl.Utf8,
+}
+
+
+@dataclass(frozen=True)
+class DuplicateDividends:
+    """Every equal-amount cash dividend key live at `t` and its class under
+    the reviewed list (`store.dividend_reviews.equal_amount_groups`; module
+    docstring, `duplicate_dividends`). Repaired keys are not kept."""
+
+    groups: tuple[EqualAmountGroup, ...]
+
+    def _of(self, group_class: str) -> tuple[EqualAmountGroup, ...]:
+        return tuple(g for g in self.groups if g.group_class == group_class)
+
+    @property
+    def accepted(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `distinct`: two declared payments of one amount."""
+        return self._of("accepted")
+
+    @property
+    def unresolved(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `unresolved`: the known gap, reported, never hidden."""
+        return self._of("unresolved")
+
+    @property
+    def pending(self) -> tuple[EqualAmountGroup, ...]:
+        """Listed `duplicate` still holding both ids: a repair not run yet
+        (or deferred by its `--to`). A CLI warning, not a failure."""
+        return self._of("pending")
+
+    @property
+    def violations(self) -> pl.DataFrame:
+        """One row per identity of every `violation` key: the key, the id,
+        its `known_at` and the listed verdict (null for an unlisted key)."""
+        rows = [
+            {
+                "security_id": g.security_id,
+                "ex_date": g.ex_date,
+                "amount": g.amount,
+                "source_action_id": i.source_action_id,
+                "known_at": ensure_tz_aware_utc(i.known_at, field_name="known_at"),
+                "verdict": None if g.reviewed is None else g.reviewed.verdict,
+            }
+            for g in self._of("violation")
+            for i in g.identities
+        ]
+        return pl.DataFrame(rows, schema=_DUPLICATE_DIVIDENDS_SCHEMA)
+
+
+def duplicate_dividends(
+    conn: duckdb.DuckDBPyConnection, t: datetime, reviewed: Sequence[ReviewedGroup]
+) -> DuplicateDividends:
+    """The `duplicate_dividends` block at `t`: `equal_amount_groups` over the
+    `dividend` rows `live_actions_as_of(conn, t)` returns and `reviewed`
+    (the packaged list is read at the edge, `health_report`)."""
+    t = _validate_t(t)
+    groups = equal_amount_groups(live_actions_as_of(conn, t), reviewed)
+    return DuplicateDividends(tuple(g for g in groups if g.group_class != "repaired"))
+
+
 @dataclass(frozen=True, eq=False)
 class HealthReport:
     """Everything the health command and page show (module docstring)."""
@@ -834,6 +1137,9 @@ class HealthReport:
     statement: StatementFacts
     filing_events: FilingEvents
     rates: RatesHealth
+    borrow: BorrowHealth
+    duplicate_dividends: DuplicateDividends
+    filename_listings: FilenameListings
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
@@ -842,11 +1148,16 @@ class HealthReport:
     def failures(self) -> tuple[str, ...]:
         """The failing integrity rules, in `INTEGRITY_RULES` order, then
         `coverage_reference_names` when the block was computed with
-        `coverage.check_enabled` on and a reference name is missing."""
+        `coverage.check_enabled` on and a reference name is missing, then
+        `index_members_missing` when the block's answer-key check failed
+        (`IndexMembersCheck.failed`: only while `coverage.index_max_missing`
+        is set)."""
         failed = tuple(check.rule for check in self.integrity if not check.passed)
         block = self.coverage_reference
         if block is not None and block.check_enabled and block.failed:
             failed += (COVERAGE_REFERENCE_NAMES,)
+        if block is not None and block.index_members is not None and block.index_members.failed:
+            failed += (INDEX_MEMBERS_MISSING,)
         return failed
 
     @property
@@ -862,6 +1173,8 @@ def health_report(
     *,
     jumps_before: date | None = None,
     with_coverage_reference: bool | None = None,
+    reviewed: Sequence[ReviewedGroup] | None = None,
+    index_key: IndexMembers | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
@@ -869,7 +1182,11 @@ def health_report(
     `jumps_before` limits the price-jump list to sessions before it, and the
     shares-outlier list to `as_of_date`s before it. `with_coverage_reference`
     computes the `coverage_reference` block when true, never when false, and
-    when `None` (the default) only while `coverage.check_enabled` is on."""
+    when `None` (the default) only while `coverage.check_enabled` is on or
+    `coverage.index_max_missing` is set. `reviewed` is the duplicate-dividend
+    list, by default the packaged one (`store.dividend_reviews.reviewed_groups`).
+    `index_key` is the answer key, by default the packaged one
+    (`store.index_members.load_index_members`)."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -879,6 +1196,7 @@ def health_report(
     classes = classifications_as_of(conn, t)
     overlaps, accepted_pairs = _overlapping_listings(listings, settings)
     ingests = last_ingests(conn, t)
+    dividends = duplicate_dividends(conn, t, reviewed_groups() if reviewed is None else reviewed)
     return HealthReport(
         t=t,
         session=session,
@@ -900,17 +1218,63 @@ def health_report(
         statement=_statement_facts_report(conn, t, settings, ingests),
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
-        integrity=_integrity_checks(conn, t, settings, listings, overlaps),
+        borrow=_borrow_report(conn, t, session, settings),
+        duplicate_dividends=dividends,
+        filename_listings=_filename_listings(conn, t, listings),
+        integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
         coverage_reference=(
-            _coverage_reference(conn, t, settings, listings)
+            _coverage_reference(conn, t, settings, listings, index_key)
             if (
-                settings.coverage.check_enabled
+                settings.coverage.computed_by_default
                 if with_coverage_reference is None
                 else with_coverage_reference
             )
             else None
         ),
     )
+
+
+def _filename_listings(
+    conn: duckdb.DuckDBPyConnection, t: datetime, listings: pl.DataFrame
+) -> FilenameListings:
+    """Count securities whose listing live at T is a filing-name row, and spans
+    without any traded bar at T."""
+    all_rows = list(listings.iter_rows(named=True))
+    named = [row for row in all_rows if row["provenance"] == "filing_name"]
+    live = _current_from(listings, last_completed_session(t)).values()  # #1662: live at T
+    only = sum(row["provenance"] == "filing_name" for row in live)
+    if not named:
+        return FilenameListings(0, only, pl.DataFrame([], schema=_FILENAME_SCHEMA))
+    bars = prices_as_of(conn, t, sorted({row["security_id"] for row in named}), traded_only=True)
+    sessions: dict[str, list[date]] = defaultdict(list)
+    for bar in bars.iter_rows(named=True):
+        sessions[bar["security_id"]].append(bar["session"])
+    no_bars = []
+    for row in named:
+        end = row["end_session"]
+        if not any(
+            row["valid_from"] <= day and (end is None or day <= end)
+            for day in sessions[row["security_id"]]
+        ):
+            no_bars.append({key: row[key] for key in _FILENAME_SCHEMA})
+    return FilenameListings(len(named), only, pl.DataFrame(no_bars, schema=_FILENAME_SCHEMA))
+
+
+def _filename_listing_valid_from(listings: pl.DataFrame, settings: Settings) -> pl.DataFrame:
+    """Check 10-K dates and Form 25's first-session last-resort dates."""
+    rows = listings.filter(pl.col("provenance") == "filing_name")
+    if rows.is_empty():
+        return pl.DataFrame([], schema=_FILENAME_SCHEMA)
+    first = first_session(settings)
+    bad = []
+    for row in rows.iter_rows(named=True):
+        expected = session_of(row["known_at"])
+        is_form25 = row["valid_from"] == first
+        if (is_form25 and row["valid_from"] > expected) or (
+            not is_form25 and row["valid_from"] != expected
+        ):
+            bad.append({key: row[key] for key in _FILENAME_SCHEMA})
+    return pl.DataFrame(bad, schema=_FILENAME_SCHEMA)
 
 
 def _price_jumps(
@@ -1160,6 +1524,72 @@ def _rates_report(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settin
     return RatesHealth(tuple(result))
 
 
+_BORROW_COUNT = re.compile(r"\bborrow_(\w+)=(\d+)\b")
+
+
+def _borrow_report(
+    conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
+) -> BorrowHealth:
+    """The borrow block at `t` (module docstring, "Borrow status")."""
+    present = _present_tables(conn)
+    rows = assets = 0
+    latest_known_at: datetime | None = None
+    if "borrow_status" in present:
+        found = conn.execute(
+            "SELECT count(*), count(DISTINCT asset_id), max(known_at) FROM borrow_status "
+            "WHERE known_at <= ?",
+            [t],
+        ).fetchone()
+        if found is not None:
+            rows, assets, latest_known_at = int(found[0]), int(found[1]), found[2]
+    observation: datetime | None = None
+    last: tuple[Any, ...] | None = None
+    if "ingestion_runs" in present:
+        observed = conn.execute(
+            "SELECT max(TRY_CAST(chunk_cursor AS TIMESTAMPTZ)) FROM ingestion_runs "
+            "WHERE source = ? AND status = ? AND TRY_CAST(chunk_cursor AS TIMESTAMPTZ) <= ? "
+            "AND coalesce(finished_at, started_at) <= ?",
+            [ASSETS_SOURCE, OK, t, t],
+        ).fetchone()
+        observation = None if observed is None else observed[0]
+        last = conn.execute(
+            "SELECT status, rows_added, message FROM ingestion_runs "
+            "WHERE source = ? AND coalesce(finished_at, started_at) <= ? "
+            "ORDER BY coalesce(finished_at, started_at) DESC, run_id DESC LIMIT 1",
+            [ASSETS_SOURCE, t],
+        ).fetchone()
+    counts: dict[str, int] = {}
+    if last is not None:
+        counts = {name: int(value) for name, value in _BORROW_COUNT.findall(last[2] or "")}
+        counts["rows_added"] = int(last[1] or 0)
+    shortable = easy = stale = None
+    if observation is not None:
+        observation = ensure_tz_aware_utc(observation, field_name="observation")
+        if "borrow_status" in present:
+            frame = borrow_status_as_of(conn, observation).filter(pl.col("status") == "active")
+            shortable = int(frame["shortable"].sum())
+            easy = int(frame["easy_to_borrow"].sum())
+        sessions = all_sessions()
+        stale = max(
+            0,
+            bisect_right(sessions, session)
+            - bisect_right(sessions, last_completed_session(observation)),
+        )
+    return BorrowHealth(
+        enabled=settings.borrow.enabled,
+        rows=rows,
+        assets=assets,
+        latest_observation=observation,
+        latest_known_at=latest_known_at,
+        last_run_status=None if last is None else str(last[0]),
+        run_counts=counts,
+        shortable=shortable,
+        easy_to_borrow=easy,
+        stale_sessions=stale,
+        max_stale_sessions=settings.borrow.max_stale_sessions,
+    )
+
+
 def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date, ...]:
     """The coverage check's sample sessions at `t` (#1541): the last XNYS
     session of each `coverage.sample_months` month, from
@@ -1181,14 +1611,18 @@ def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date
 
 
 def coverage_reference(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings | None = None,
+    index_key: IndexMembers | None = None,
 ) -> CoverageReference:
     """The coverage check against the named reference at `t` (#1541; module
     docstring), computed whatever `coverage.check_enabled` says: one
-    `universe_as_of` per sample session, so callers ask for it on demand."""
+    `universe_as_of` per sample session, so callers ask for it on demand.
+    `index_key` is the answer key (#1682), by default the packaged one."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
-    return _coverage_reference(conn, t, settings, listing_ends_as_of(conn, t, settings))
+    return _coverage_reference(conn, t, settings, listing_ends_as_of(conn, t, settings), index_key)
 
 
 def _covers(row: dict[str, Any], session: date) -> bool:
@@ -1300,10 +1734,108 @@ def _reference_exclusion(
     }
 
 
+def _load_key(index_key: IndexMembers | None) -> tuple[IndexMembers | None, str | None]:
+    """The answer key and None, or None and why it could not be loaded (an
+    absent, emptied or malformed packaged file is reported, never raised)."""
+    if index_key is not None:
+        return index_key, None
+    try:
+        return load_index_members(), None
+    except FileNotFoundError:
+        return None, "file absent"
+    except (OSError, ValueError, csv.Error) as exc:
+        # IndexMembersError and UnicodeDecodeError are ValueErrors.
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _key_listings(listings: pl.DataFrame, key: IndexMembers) -> pl.DataFrame:
+    """Every listing row of the securities with some row carrying a key
+    ticker (`normalize_ticker`): all `resolve` needs, every row of each kept
+    so a row's span still ends at its security's next row. Taken once per
+    block, not per sample session."""
+    wanted = {normalize_ticker(i.ticker) for i in key.intervals}
+    carried = {
+        ticker
+        for ticker in listings["ticker"].drop_nulls().unique().to_list()
+        if normalize_ticker(ticker) in wanted
+    }
+    sids = listings.filter(pl.col("ticker").is_in(sorted(carried)))["security_id"].unique()
+    return listings.filter(pl.col("security_id").is_in(sids.to_list()))
+
+
+def _index_session(
+    key: IndexMembers,
+    session: date,
+    listings: pl.DataFrame,
+    member_ids: set[str],
+    exclusions: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """One sample session of the answer-key check: its `samples` row, hits
+    and misses (`IndexMembersCheck`). A hit is the resolved security being a
+    member, by `security_id`, so a second class's own miss counts."""
+    if session > key.through:
+        row = {
+            "session": session,
+            "beyond_key": True,
+            "members": 0,
+            "hits": 0,
+            "misses": 0,
+            "unresolved": 0,
+            "hit_share": None,
+        }
+        return row, [], []
+    hits: list[dict[str, Any]] = []
+    misses: list[dict[str, Any]] = []
+    for res in resolve(key.intervals, session, listings):
+        sid = res.security_id
+        if sid is not None and sid in member_ids:
+            hits.append({"session": session, "ticker": res.ticker, "security_id": sid})
+            continue
+        found = exclusions.get(sid) if sid is not None else None
+        if sid is None:
+            rule_name, reason, bucket = None, None, UNRESOLVED
+        elif found is None:
+            rule_name, reason, bucket = None, None, NOT_CONSIDERED
+        else:
+            rule_name, reason = found["rule_name"], found["reason"]
+            bucket = f"{rule_name}:{reason}"
+        misses.append(
+            {
+                "session": session,
+                "ticker": res.ticker,
+                "security_id": sid,
+                "outcome": res.outcome,
+                "rule_name": rule_name,
+                "reason": reason,
+                "bucket": bucket,
+            }
+        )
+    members = len(hits) + len(misses)
+    row = {
+        "session": session,
+        "beyond_key": False,
+        "members": members,
+        "hits": len(hits),
+        "misses": len(misses),
+        "unresolved": sum(m["bucket"] == UNRESOLVED for m in misses),
+        "hit_share": len(hits) / members if members else None,
+    }
+    return row, hits, misses
+
+
 def _coverage_reference(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    listings: pl.DataFrame,
+    index_key: IndexMembers | None = None,
 ) -> CoverageReference:
     refs = settings.coverage.references()
+    key, key_error = _load_key(index_key) if settings.coverage.index_members else (None, None)
+    key_listings = _key_listings(listings, key) if key is not None else listings
+    index_samples: list[dict[str, Any]] = []
+    index_hits: list[dict[str, Any]] = []
+    index_misses: list[dict[str, Any]] = []
     cik_of = {
         r["security_id"]: r["cik"]
         for r in securities_as_of(conn, t).select("security_id", "cik").iter_rows(named=True)
@@ -1340,6 +1872,13 @@ def _coverage_reference(
             is not None
         ]
         missing.extend(found)
+        if key is not None:
+            sample, hit_rows, miss_rows = _index_session(
+                key, session, key_listings, set(universe.members["security_id"]), exclusions
+            )
+            index_samples.append(sample)
+            index_hits.extend(hit_rows)
+            index_misses.extend(miss_rows)
         current = _current_from(listings, session)
         listed = sorted(sid for sid, row in current.items() if _covers(row, session))
         late_here = 0
@@ -1393,6 +1932,19 @@ def _coverage_reference(
         snapshot_ciks=snapshot_ciks,
         member_ratio=(
             latest_members / snapshot_ciks if latest_members is not None and snapshot_ciks else None
+        ),
+        index_members=(
+            IndexMembersCheck(
+                commit=None if key is None else key.commit,
+                through=None if key is None else key.through,
+                error=key_error,
+                max_missing=settings.coverage.index_max_missing,
+                samples=pl.DataFrame(index_samples, schema=_INDEX_SAMPLE_SCHEMA),
+                hits=pl.DataFrame(index_hits, schema=_INDEX_HIT_SCHEMA),
+                misses=pl.DataFrame(index_misses, schema=_INDEX_MISS_SCHEMA),
+            )
+            if settings.coverage.index_members
+            else None
         ),
     )
 
@@ -1705,13 +2257,18 @@ def _listed_without_bars(
 
 
 def integrity_checks(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    reviewed: Sequence[ReviewedGroup] | None = None,
 ) -> tuple[IntegrityCheck, ...]:
-    """Every rule in `INTEGRITY_RULES`, in that order (module docstring)."""
+    """Every rule in `INTEGRITY_RULES`, in that order (module docstring);
+    `reviewed` as in `health_report`."""
     t = _validate_t(t)
     listings = listing_ends_as_of(conn, t, settings)
     overlaps, _ = _overlapping_listings(listings, settings)
-    return _integrity_checks(conn, t, settings, listings, overlaps)
+    dividends = duplicate_dividends(conn, t, reviewed_groups() if reviewed is None else reviewed)
+    return _integrity_checks(conn, t, settings, listings, overlaps, dividends)
 
 
 def _integrity_checks(
@@ -1720,15 +2277,18 @@ def _integrity_checks(
     settings: Settings,
     listings: pl.DataFrame,
     overlaps: pl.DataFrame,
+    dividends: DuplicateDividends,
 ) -> tuple[IntegrityCheck, ...]:
     """`overlaps` is `_overlapping_listings`' violation frame for `listings`,
-    computed once by the caller, which also needs its accepted pairs."""
+    computed once by the caller, which also needs its accepted pairs;
+    `dividends` the `duplicate_dividends` block, likewise."""
     window = settings.master.transfer_window_sessions
     violations: dict[str, pl.DataFrame] = {
         KNOWN_AT_NOT_NULL: _count_per_table(conn, "known_at IS NULL"),
         KNOWN_AT_NOT_AFTER_INGESTED_AT: _count_per_table(conn, "known_at > ingested_at"),
         SOURCE_NOT_NULL: _count_per_table(conn, "source IS NULL"),
         PROVENANCE_ALLOWED: _bad_provenance(conn),
+        FILENAME_LISTING_VALID_FROM: _filename_listing_valid_from(listings, settings),
         BARS_ON_SESSIONS: _bars_off_sessions(conn),
         NO_DUPLICATE_BARS: _duplicate_bars(conn),
         NON_OVERLAPPING_LISTINGS: overlaps,
@@ -1740,6 +2300,9 @@ def _integrity_checks(
         **_filing_event_rules(conn, settings),
         SESSION_HOLES: _session_holes(conn, t, settings),
         **_rate_rules(conn),
+        **_new_action_stamp_rules(conn),
+        DUPLICATE_DIVIDENDS: dividends.violations,
+        BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 
@@ -1764,12 +2327,17 @@ def _rate_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
     bad_value: list[dict[str, Any]] = []
     seen: set[tuple[str, date, datetime]] = set()
     duplicates: list[dict[str, Any]] = []
+    # `rate_known_at` is a pure function of the vintage date and walks the
+    # calendar; many rows share a vintage, so compute each once per call.
+    stamps: dict[date | None, datetime | None] = {}
     for series, day, value, vintage, stamp in rows:
         key = {"series": series, "observation_date": day, "known_at": stamp}
-        try:
-            correct = rate_known_at(vintage) if vintage is not None else None
-        except (ValueError, IndexError):
-            correct = None
+        if vintage not in stamps:
+            try:
+                stamps[vintage] = rate_known_at(vintage) if vintage is not None else None
+            except (ValueError, IndexError):
+                stamps[vintage] = None
+        correct = stamps[vintage]
         if stamp != correct:
             bad_stamp.append(key)
         if value is None or not math.isfinite(value):
@@ -1783,6 +2351,86 @@ def _rate_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
         RATE_UNIQUE: pl.DataFrame(duplicates, schema=_RATE_RULE_SCHEMA),
         RATE_VALUE_FINITE: pl.DataFrame(bad_value, schema=_RATE_RULE_SCHEMA),
     }
+
+
+_ACTION_STAMP_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.DataFrame]:
+    """Reject spin-offs before their ex-date proxy and mis-stamped renames."""
+    tables = _present_tables(conn)
+    bad_spin: list[dict[str, Any]] = []
+    if "corporate_actions" in tables:
+        rows = conn.execute(
+            "SELECT security_id, ex_date, known_at FROM corporate_actions "
+            "WHERE action_type = 'spinoff'"
+        ).fetchall()
+        for security_id, ex_date, stamp in rows:
+            try:
+                floor = session_close(previous_session(ex_date))
+            except (ValueError, IndexError):
+                floor = None
+            if floor is None or stamp < floor:
+                bad_spin.append({"security_id": security_id, "known_at": stamp})
+    bad_change: list[dict[str, Any]] = []
+    if "symbol_changes" in tables:
+        # The first row of an identity (the table's identity index) is stamped
+        # by the date-only rule; a later row is a revision, stamped at its own
+        # `ingested_at` after the first (`ingest._add_symbol_changes`).
+        rows = conn.execute(
+            """
+            SELECT security_id, process_date, known_at, ingested_at,
+                ROW_NUMBER() OVER w AS rn, FIRST_VALUE(known_at) OVER w AS first_known
+            FROM symbol_changes
+            WINDOW w AS (
+                PARTITION BY security_id, source_action_id,
+                    CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END,
+                    CASE WHEN source_action_id = '' THEN process_date ELSE NULL END
+                ORDER BY known_at
+            )
+            """
+        ).fetchall()
+        for security_id, process_date, stamp, ingested, rn, first_known in rows:
+            if rn == 1:
+                try:
+                    expected = announcement_date_known_at(process_date)
+                except (ValueError, IndexError):
+                    expected = None
+                ok = stamp == expected
+            else:
+                ok = stamp == ingested and stamp > first_known
+            if not ok:
+                bad_change.append({"security_id": security_id, "known_at": stamp})
+    return {
+        SPINOFF_KNOWN_AT_FLOOR: pl.DataFrame(bad_spin, schema=_ACTION_STAMP_SCHEMA),
+        SYMBOL_CHANGE_KNOWN_AT: pl.DataFrame(bad_change, schema=_ACTION_STAMP_SCHEMA),
+    }
+
+
+_BORROW_KEY_SCHEMA: dict[str, Any] = {
+    "asset_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "rows": pl.Int64,
+}
+
+
+def _borrow_duplicates(conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+    """One row per `(asset_id, known_at)` held by more than one
+    `borrow_status` row, with how many."""
+    if "borrow_status" not in _present_tables(conn):
+        return pl.DataFrame(schema=_BORROW_KEY_SCHEMA)
+    found = conn.execute(
+        "SELECT asset_id, known_at, count(*) FROM borrow_status "
+        "GROUP BY asset_id, known_at HAVING count(*) > 1 ORDER BY asset_id, known_at"
+    ).fetchall()
+    return pl.DataFrame(
+        [{"asset_id": a, "known_at": k, "rows": int(n)} for a, k, n in found],
+        schema=_BORROW_KEY_SCHEMA,
+    )
 
 
 def _present_tables(conn: duckdb.DuckDBPyConnection) -> set[str]:

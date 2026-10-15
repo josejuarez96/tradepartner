@@ -33,7 +33,14 @@ from tradepartner.backtest.schedule import fill_session, read_time
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import next_session, previous_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, RiskConfig, Settings
-from tradepartner.errors import ClockError, LimitBreachError, StaleDataError
+from tradepartner.errors import (
+    ClockError,
+    LimitBreachError,
+    ReconciliationError,
+    StaleDataError,
+    SystemFaultError,
+    UniverseCollapseError,
+)
 from tradepartner.execution import planning, reconcile_run, wrapper
 from tradepartner.execution import window as window_module
 from tradepartner.execution.planning import (
@@ -42,6 +49,8 @@ from tradepartner.execution.planning import (
     frozen_max_catch_up_sessions,
     plan_rebalance,
     rebalance_kind,
+    universe_baseline,
+    universe_collapse,
 )
 from tradepartner.store import journal, registry
 from tradepartner.store.db import configure_connection
@@ -50,6 +59,7 @@ from tradepartner.store.journal import (
     DecisionEventRow,
     DecisionRow,
     JournalRow,
+    KillSwitchRow,
     OrderEventRow,
     OrderRow,
     OverrideRow,
@@ -1023,6 +1033,7 @@ def test_a_naive_now_is_refused(env: Env) -> None:
 
 
 def test_a_plan_row_with_no_decision_is_reused_too(env: Env) -> None:
+    # A whole universe with no target (#366 Q6 (a)); an empty one is a collapse (T188).
     stamp = _utc(F_I, 12)
     journal.append(
         env.conn,
@@ -1030,7 +1041,7 @@ def test_a_plan_row_with_no_decision_is_reused_too(env: Env) -> None:
             run_id=env.run.run_id,  # type: ignore[arg-type]
             plan_trial_id=0,
             rebalance_session=T_I,
-            n_universe=0,
+            n_universe=6,
             n_targets=0,
             n_orders_below_min_at_live_capital=0,
             known_at=stamp,
@@ -1040,6 +1051,233 @@ def test_a_plan_row_with_no_decision_is_reused_too(env: Env) -> None:
     counts = env.counts()
     outcome = env.plan(assets_read=_raising(RuntimeError))
     assert (outcome.status, outcome.decisions) == ("reused", ())
+    assert env.counts() == counts
+
+
+# --- the universe-collapse halt (spec amendment 2026-10-12, #1550; T188) -----------------
+
+#: The fixture universe at close(T_i): six members (module docstring).
+N_AT_T_I = 6
+EARLIER = date(2019, 3, 29)
+
+
+def _paper(**paper: Any) -> Settings:
+    return Settings(_env_file=None, paper=paper)
+
+
+def _plan_row(run_id: int, rebalance: date, n_universe: int, known_at: datetime) -> PaperPlanRow:
+    return PaperPlanRow(
+        run_id=run_id,
+        plan_trial_id=0,
+        rebalance_session=rebalance,
+        n_universe=n_universe,
+        n_targets=0,
+        n_orders_below_min_at_live_capital=0,
+        known_at=known_at,
+        ingested_at=known_at,
+    )
+
+
+def _switch_row(
+    event_id: int, state: str, at: datetime, fault_type: str | None = None
+) -> KillSwitchRow:
+    return KillSwitchRow(
+        event_id=event_id,
+        window_id=1,
+        at=at,
+        state=state,
+        source="fault" if state == "engaged" else "owner",
+        fault_type=fault_type,
+        known_at=at,
+        ingested_at=at,
+    )
+
+
+def test_universe_collapse_by_the_floor_names_the_key_and_the_remedy() -> None:
+    message = universe_collapse(0, None, _paper())
+    assert message is not None
+    assert "paper.min_universe_names=1" in message
+    assert "0 names" in message
+    assert "tradepartner health --check" in message
+    assert "ingest --source alpaca --backfill --since" in message
+    assert universe_collapse(1, None, _paper()) is None
+    floor = _paper(min_universe_names=5)
+    assert universe_collapse(4, None, floor) is not None
+    assert universe_collapse(5, None, floor) is None
+    # The floor fires whatever the baseline.
+    assert universe_collapse(4, 4, floor) is not None
+
+
+def test_universe_collapse_by_the_drop_names_the_baseline_and_the_key() -> None:
+    message = universe_collapse(49, 100, _paper())
+    assert message is not None
+    assert "paper.max_universe_drop_fraction=0.5" in message
+    assert "49 names" in message and "100" in message
+    # Exactly at the bound (100 x (1 - 0.5) = 50, an exact product) is no collapse.
+    assert universe_collapse(50, 100, _paper()) is None
+    assert universe_collapse(1, 1000, _paper(max_universe_drop_fraction=1.0)) is None
+    assert universe_collapse(99, 100, _paper(max_universe_drop_fraction=0.0)) is not None
+    # No baseline, or a baseline of zero names: the floor alone.
+    assert universe_collapse(1, None, _paper()) is None
+    assert universe_collapse(1, 0, _paper()) is None
+
+
+def test_universe_baseline_is_the_latest_earlier_plan_by_rebalance_session() -> None:
+    late, early = _utc(date(2019, 4, 2), 12), _utc(date(2019, 3, 1), 12)
+    assert universe_baseline([], []) is None
+    plans = [_plan_row(1, date(2019, 3, 29), 100, late), _plan_row(1, date(2019, 2, 28), 7, early)]
+    assert universe_baseline(plans, []) == 100
+
+
+@pytest.mark.parametrize(
+    ("released_fault", "released_after_plan", "expected"),
+    [
+        pytest.param(UniverseCollapseError.__name__, True, None, id="collapse-release-resets"),
+        pytest.param(ReconciliationError.__name__, True, 100, id="other-release-keeps"),
+        pytest.param(UniverseCollapseError.__name__, False, 100, id="release-before-plan-keeps"),
+    ],
+)
+def test_universe_baseline_resets_only_after_a_release_of_a_collapse(
+    released_fault: str, released_after_plan: bool, expected: int | None
+) -> None:
+    planned = _utc(date(2019, 4, 1), 12)
+    release = planned + timedelta(hours=1 if released_after_plan else -1)
+    plans = [_plan_row(1, EARLIER, 100, planned)]
+    rows = [
+        _switch_row(1, "engaged", release - timedelta(minutes=5), released_fault),
+        _switch_row(2, "released", release),
+    ]
+    assert universe_baseline(plans, rows) == expected
+
+
+def test_universe_baseline_reads_only_the_latest_release() -> None:
+    """A collapse released, then another fault released: the latest release releases
+    no collapse, so the baseline stands."""
+    planned = _utc(date(2019, 4, 1), 12)
+    rows = [
+        _switch_row(1, "engaged", planned + timedelta(hours=1), UniverseCollapseError.__name__),
+        _switch_row(2, "released", planned + timedelta(hours=2)),
+        _switch_row(3, "engaged", planned + timedelta(hours=3), ReconciliationError.__name__),
+        _switch_row(4, "released", planned + timedelta(hours=4)),
+    ]
+    assert universe_baseline([_plan_row(1, EARLIER, 100, planned)], rows) == 100
+    assert universe_baseline([_plan_row(1, EARLIER, 100, planned)], rows[:2]) is None
+
+
+def test_universe_collapse_error_is_a_system_fault() -> None:
+    assert issubclass(UniverseCollapseError, SystemFaultError)
+    assert not issubclass(UniverseCollapseError, ValueError)
+
+
+def _seed_earlier_plan(env: Env, n_universe: int) -> datetime:
+    """A plan row of the window for a rebalance before T_i with `n_universe` names."""
+    run = env.run_on(date(2019, 4, 1))
+    stamp = run.known_at
+    journal.append(env.conn, _plan_row(run.run_id, EARLIER, n_universe, stamp))  # type: ignore[arg-type]
+    return stamp
+
+
+def _target_reads(reads: AssetsRead) -> list[list[str]]:
+    """The `assets` reads after the held names' read: the targets' (the second read)."""
+    return reads.calls[1:]
+
+
+def test_a_plan_under_the_floor_halts_before_any_decision_with_no_row(env: Env) -> None:
+    env.settings = Settings(
+        _env_file=None,
+        store={"path": str(env.settings.store.path)},
+        paper={"live_capital_reference": LIVE_CAPITAL, "min_universe_names": N_AT_T_I + 1},
+    )
+    counts = env.counts()
+    reads = AssetsRead()
+    with pytest.raises(UniverseCollapseError) as caught:
+        env.plan(assets_read=reads)
+    message = str(caught.value)
+    assert "book main" in message and str(T_I) in message
+    assert f"{N_AT_T_I} names" in message
+    assert f"paper.min_universe_names={N_AT_T_I + 1}" in message
+    assert _target_reads(reads) == []  # no second `assets` read
+    assert env.counts() == counts  # the trial and every row rolled back
+
+
+def test_a_drop_below_the_bound_halts_naming_the_drop_and_the_baseline(env: Env) -> None:
+    # 13 x 0.5 = 6.5: six names is under it.
+    _seed_earlier_plan(env, 2 * N_AT_T_I + 1)
+    counts = env.counts()
+    reads = AssetsRead()
+    with pytest.raises(UniverseCollapseError) as caught:
+        env.plan(assets_read=reads)
+    message = str(caught.value)
+    assert "paper.max_universe_drop_fraction=0.5" in message
+    assert f"{2 * N_AT_T_I + 1}" in message and f"{N_AT_T_I} names" in message
+    assert _target_reads(reads) == []
+    assert env.counts() == counts
+
+
+def test_a_plan_at_the_bound_plans_as_without_the_guard(env: Env) -> None:
+    """12 x 0.5 = 6 exactly: six names plans, with the decisions of a plan with no
+    baseline."""
+    _seed_earlier_plan(env, 2 * N_AT_T_I)
+    at_bound = env.plan()
+    assert at_bound.status == "planned"
+    view = _view(at_bound)
+    assert view == _view(_replan(env))  # `_replan` drops the seeded row too
+
+
+def test_another_windows_plan_is_never_the_baseline(env: Env) -> None:
+    start = _utc(T_I, 13)
+    other = replace(env.window, window_id=None, book_id="daily", known_at=start, ingested_at=start)
+    other_id = journal.append(env.conn, other)
+    run = replace(env.run, run_id=None, window_id=other_id)  # type: ignore[arg-type]
+    run_id = journal.append(env.conn, run)
+    journal.append(env.conn, _plan_row(run_id, EARLIER, 1000, start))  # type: ignore[arg-type]
+    assert env.plan().status == "planned"
+
+
+@pytest.mark.parametrize(
+    ("fault_type", "halts"),
+    [
+        pytest.param(UniverseCollapseError.__name__, False, id="collapse-released"),
+        pytest.param(ReconciliationError.__name__, True, id="other-released"),
+    ],
+)
+def test_after_a_collapse_release_the_floor_alone_checks_the_next_plan(
+    env: Env, fault_type: str, halts: bool
+) -> None:
+    planned = _seed_earlier_plan(env, 1000)
+    for state, minutes in (("engaged", 10), ("released", 20)):
+        at = planned + timedelta(minutes=minutes)
+        journal.append(
+            env.conn,
+            KillSwitchRow(
+                window_id=env.window.window_id,  # type: ignore[arg-type]
+                at=at,
+                state=state,
+                source="fault" if state == "engaged" else "owner",
+                fault_type=fault_type if state == "engaged" else None,
+                known_at=at,
+                ingested_at=at,
+            ),
+        )
+    if halts:
+        with pytest.raises(UniverseCollapseError):
+            env.plan()
+    else:
+        outcome = env.plan()
+        assert outcome.status == "planned"
+        rows = journal.plans_for(env.conn, env.window.window_id)  # type: ignore[arg-type]
+        assert [r.n_universe for r in rows if r.rebalance_session == T_I] == [N_AT_T_I]
+
+
+def test_a_journaled_plan_row_under_the_floor_is_never_reused(env: Env) -> None:
+    stamp = _utc(F_I, 12)
+    journal.append(env.conn, _plan_row(env.run.run_id, T_I, 0, stamp))  # type: ignore[arg-type]
+    counts = env.counts()
+    with pytest.raises(UniverseCollapseError) as caught:
+        env.plan(assets_read=_raising(RuntimeError))
+    message = str(caught.value)
+    assert "book main" in message and str(T_I) in message
+    assert "paper_plans" in message and "0 names" in message
     assert env.counts() == counts
 
 

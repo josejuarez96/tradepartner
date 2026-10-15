@@ -145,6 +145,14 @@ def _default_edgar_cache_dir() -> str:
     return str(Path(__file__).resolve().parents[2] / "data" / "edgar_cache")
 
 
+def _default_alpaca_assets_dir() -> str:
+    """`data/alpaca_assets` (the borrow snapshot's raw keep, #1506 spec open
+    question 17), anchored to the project root like `edgar.cache_dir`, so a
+    scheduled run from another working directory keeps its files beside the
+    store; gitignored by `data/*`."""
+    return str(Path(__file__).resolve().parents[2] / "data" / "alpaca_assets")
+
+
 def _default_research_data_dir() -> str:
     """`data/research` (the research store, research-labeling spec Definitions and
     ADR 0013 point 3), anchored to the project root like `edgar.cache_dir`, so a
@@ -424,7 +432,7 @@ class EdgarConfig(BaseModel):
     # issuer-name-first titles, class-letter shares). Off, every classification
     # is as before; the release's own PR (T181) flips it with the cache
     # version bumps, so a nightly ingest after a plain merge changes nothing.
-    title_fallback: bool = False
+    title_fallback: bool = True  # flipped by the release `cover-listings-1541` (T181)
     event_forms: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
         default_factory=lambda: ["8-K", "8-K/A"], min_length=1
     )
@@ -433,7 +441,14 @@ class EdgarConfig(BaseModel):
     # context. Off until the owner's release (T181) flips it together with
     # the `FSN_VERSION` and `COVER_VERSION` bumps: the caches are keyed by
     # those versions only, so a flip alone re-derives nothing already cached.
-    exchange_axis_listings: bool = False
+    exchange_axis_listings: bool = True  # flipped by the release `cover-listings-1541` (T181)
+    # #1651, #1660: the cover-page parser and `parse_fsn` also read `CapitalUnitsByClassAxis` as a
+    # class axis (Fifth Third) and merges a class's title, symbol and exchange
+    # tagged on several contexts of one class member (Abbott 2020, P&G 2023).
+    # Flipped on by the release `cover-listings-1541` (T181) at cache version 4,
+    # then backed out by the owner in the same release (2026-10-14, cache
+    # version 6): its class identities wait on the security-master review (#1682).
+    cover_split_contexts: bool = False
     # #1169 (owner decision 2026-10-07, option 3): per CIK, the class member
     # (`CommonClass<letter>`) whose shares facts go to the CIK's one common
     # class although no title of that class names the letter. Owner-reviewed,
@@ -645,6 +660,7 @@ class AlpacaConfig(BaseModel):
 
     historical_feed: Literal["sip", "iex"] = "sip"
     actions_process_lag_days: int = Field(default=90, ge=0)
+    actions_backfill_floor: date = date(2020, 6, 1)
     registrant_quiet_days: int = Field(default=180, ge=1)
     # #843: how far before a rename's first cover-page row the new ticker may fill the
     # renamed company's bar hole (`ListingResolver.lead`). The 2016-2026 store's longest
@@ -660,6 +676,11 @@ class AlpacaConfig(BaseModel):
     # reused symbol names the old company, not today's holder. 7 is the offset the
     # 2026-10-08 read-only check verified on all 511 reused-ticker segments (#1314).
     asof_offset_days: int = Field(default=7, ge=0)
+    #: #1653: the collision probe of a `filing_name` span asks the sessions after the
+    #: span's end through `master.transfer_window_sessions + 1` plus this many more, not
+    #: on to the run's day: the first bar past the window shows a live other company, and
+    #: the margin covers a thin symbol that trades only now and then.
+    collision_probe_margin_sessions: int = Field(default=10, ge=0)
     #: #1618: an Alpaca `stock_dividends` row is stored as a `split` of its `rate` only
     #: when `1 < rate <` this. 25% is the exchange line above which a stock distribution
     #: is handled as a split; the 2016-2026 universe fetch's 140 stock rows run
@@ -676,6 +697,13 @@ class AlpacaConfig(BaseModel):
     #: not cash, and is skipped and counted. The 2016-2026 near echoes (CRESY, IRS, SBS)
     #: differ by at most 5e-6; #1617's 1.0062 vs 1.0063 stays cash.
     stock_dividend_echo_tolerance: float = Field(default=1e-5, ge=0)
+    #: #1627: a stock dividend's whole-share growth and its `CIL` (cash in lieu of
+    #: stock) activity can post on different sessions (Alpaca typically pays cash
+    #: in lieu on the payable date), so reconciliation accepts a `CIL` dated from
+    #: the ex-date through this many XNYS sessions after it, before the read goes
+    #: inert and halts. Live (an `alpaca.` key), not frozen — the whole-share and
+    #: cash checks still gate the booking.
+    cash_in_lieu_max_lag_sessions: int = Field(default=10, ge=0)
     # Most symbols per bars or corporate-actions GET (#789). alpaca-py comma-joins the
     # list into the query string; an unbatched 9,500-symbol request got HTTP 414 from
     # Alpaca's nginx (2026-10-04 probe), while 2,956 symbols (~15,000 chars) worked.
@@ -887,6 +915,30 @@ class HealthConfig(_ClosedConfig):
     min_session_rows_share: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class BorrowConfig(_ClosedConfig):
+    """The borrow-status snapshot (data-foundation spec req 19, amendment
+    2026-10-11 #1506; ADR 0021): the daily `GET /v2/assets` ingest
+    (`ingest --source alpaca_assets`) and its health block.
+
+    `enabled` puts the snapshot last under `ingest --source all`; off, that
+    run makes no assets request and writes nothing for it (an explicit
+    `--source alpaca_assets` runs either way; T171d flips the default once the
+    import and the first daily run have passed). `max_stale_sessions` is how
+    many XNYS sessions the latest observation may trail the last completed
+    session before `health` warns. `max_vanished_share` is the truncation
+    guard: a snapshot that would mark more than this share of the stored
+    present assets as vanished is refused with a failed run row and no table
+    write. `raw_dir` (default `data/alpaca_assets` under the project root)
+    keeps each daily payload gzipped in the recorder's file shape
+    (`--import-dir` reads the same shape); empty turns the keep off.
+    """
+
+    enabled: bool = False
+    max_stale_sessions: int = Field(default=2, ge=0)
+    max_vanished_share: float = Field(default=0.05, ge=0.0, le=1.0)
+    raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
+
+
 class AdjustConfig(_ClosedConfig):
     """Price-adjustment rules for `store.asof.adjusted_prices_as_of`.
 
@@ -1026,7 +1078,15 @@ class CoverageConfig(_ClosedConfig):
     `check_enabled`: off, the block is computed only on request (`health
     --coverage`, the page's button) and never fails `--check`; on, `health`
     computes it on every run and `--check` fails `coverage_reference_names`
-    while a reference name is missing."""
+    while a reference name is missing.
+
+    `index_members` (#1682, T189b): the block also checks the S&P 500 answer
+    key (plan T189's committed list, a check only, never a source) on each
+    sample session. `index_max_missing`: unset (the default), the key's
+    misses are reported and fail nothing; set, `health` computes the block on
+    every run and `--check` fails `index_members_missing` while some sample
+    session's misses exceed it (open question 30). Setting it with
+    `index_members` off is refused: a gate that cannot run."""
 
     reference_names: list[str] = Field(
         default_factory=lambda: list(DEFAULT_REFERENCE_NAMES), min_length=1
@@ -1034,6 +1094,20 @@ class CoverageConfig(_ClosedConfig):
     sample_months: list[int] = Field(default_factory=lambda: [6, 12], min_length=1)
     sample_from: date = date(2019, 12, 31)
     check_enabled: bool = False
+    index_members: bool = True
+    index_max_missing: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check_index_gate(self) -> CoverageConfig:
+        if self.index_max_missing is not None and not self.index_members:
+            raise ValueError("coverage.index_max_missing needs coverage.index_members on")
+        return self
+
+    @property
+    def computed_by_default(self) -> bool:
+        """Whether `health` computes the block on every run: while
+        `check_enabled` is on or `index_max_missing` is set."""
+        return self.check_enabled or self.index_max_missing is not None
 
     @field_validator("reference_names")
     @classmethod
@@ -1732,6 +1806,13 @@ class RiskConfig(BaseModel):
     max_broker_clock_skew_seconds: float = Field(default=60.0, ge=0)
     reconcile_quantity_tolerance: float = Field(default=1e-6, ge=0)
     reconcile_cash_tolerance: float = Field(default=0.01, ge=0)
+    # #1627: the relative tolerance the reconciliation books a stock dividend's
+    # `CIL` (cash in lieu of stock) cash activity against the expected cash
+    # (fractional-remainder shares x the reference price). The broker values cash
+    # in lieu on the ex-date, below the pre-ex close the reference price carries,
+    # so a ~10% relative gap passes; a larger one halts the book, as any mismatch
+    # does. A fraction of the expected cash, in [0, 1].
+    cash_in_lieu_tolerance: float = Field(default=0.10, ge=0, le=1)
 
 
 # `paper.min_rebalances` per cadence (ADR 0017 part C and open question 2, the paper
@@ -1767,6 +1848,12 @@ class PaperConfig(BaseModel):
     `min_rebalances` is the per-cadence table (ADR 0017 part C): an entry for every
     `Cadence`, each above zero; `paper start` freezes the window's cadence's entry as
     the scalar `paper.min_rebalances` (`execution.window._frozen_params`).
+    `min_universe_names` (at least 1) and `max_universe_drop_fraction` (in [0, 1]; 1.0
+    turns the drop rule off) are the universe-collapse halt's two keys (spec req 7 step
+    6, amendment 2026-10-12, #1550; `execution.planning.universe_collapse`): a plan with
+    fewer members than the first, or fewer than `p x (1 - fraction)` against the
+    window's last plan of `p` members, halts the run. Both are read at run time and are
+    not in `FROZEN_PAPER_KEYS`, so windows opened before them are covered.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1787,6 +1874,8 @@ class PaperConfig(BaseModel):
     order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
     live_capital_reference: float = Field(default=100.0, gt=0)
     min_override_reason_chars: int = Field(default=20, ge=1)
+    min_universe_names: int = Field(default=1, ge=1)
+    max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
 
     @field_validator("min_rebalances")
     @classmethod
@@ -2020,6 +2109,8 @@ class Settings(BaseSettings):
     # Phase 2 (spec req 11), #1575: the `health` command's own thresholds. Last
     # in the list so a new health key never shifts another section's position.
     health: HealthConfig = Field(default_factory=HealthConfig)
+    # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
+    borrow: BorrowConfig = Field(default_factory=BorrowConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)

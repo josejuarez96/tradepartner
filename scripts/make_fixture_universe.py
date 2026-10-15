@@ -5,9 +5,10 @@ override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
 `statement_facts.csv`, `filing_events.csv` (#1358), `rates.csv` (#1498),
-`borrow_status.csv` (#1506), plus `README.md` mapping every spec req 13 case,
-every statement-facts case (#660), every filing-events case (#1358), every rates
-case (#1498) and every borrow-status case (#1506), to the rows that exercise it.
+`borrow_status.csv` and `symbol_changes.csv` (#1506), plus `README.md` mapping
+every spec req 13 case, every statement-facts case (#660), every filing-events
+case (#1358), every rates case (#1498) and every borrow-status case (#1506), to
+the rows that exercise it.
 
 `statement_facts.csv` rows are **DB-table-level** rows, like every other
 CSV here (as if the as-yet-unbuilt T77/T77a/T77b parser and ingest had
@@ -46,6 +47,7 @@ raw EDGAR/Alpaca payloads, so it owns no adapter or schema logic itself.
 from __future__ import annotations
 
 import csv
+import json
 import random
 import sys
 from dataclasses import dataclass, field
@@ -198,6 +200,19 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "announced_at",
         "source_action_id",
         "cancelled",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
+    "symbol_changes": (
+        "security_id",
+        "old_symbol",
+        "new_symbol",
+        "old_cusip",
+        "new_cusip",
+        "process_date",
+        "source_action_id",
         "known_at",
         "ingested_at",
         "source",
@@ -379,6 +394,7 @@ class Rows:
     delistings: list[dict[str, object]] = field(default_factory=list)
     prices_daily: list[dict[str, object]] = field(default_factory=list)
     corporate_actions: list[dict[str, object]] = field(default_factory=list)
+    symbol_changes: list[dict[str, object]] = field(default_factory=list)
     facts: list[dict[str, object]] = field(default_factory=list)
     statement_facts: list[dict[str, object]] = field(default_factory=list)
     filing_events: list[dict[str, object]] = field(default_factory=list)
@@ -1155,6 +1171,37 @@ def _same_company_ticker_change(rows: Rows) -> None:
         "TCKA -> TCKB",
         f"TCKA from {start}, TCKB from {change_session}; bars through {_FIXTURE_END}",
         "n/a",
+    )
+
+
+def _spin_and_name_change(rows: Rows) -> None:
+    """T172b: one real-shaped action of each new kind without new universe names."""
+    spin_ex = date(2018, 12, 13)
+    spin_stamp = session_close(next_session(spin_ex))
+    rows.action(
+        "SEC_SPLIT_PLAIN",
+        "spinoff",
+        spin_ex,
+        0.25,
+        known_at=spin_stamp,
+        source_action_id="SEC_TICKCHANGE",
+    )
+    rename_day = date(2018, 11, 7)
+    rename_stamp = session_close(next_session(rename_day))
+    rows.symbol_changes.append(
+        {
+            "security_id": "SEC_TICKCHANGE",
+            "old_symbol": "TCKA",
+            "new_symbol": "TCKB",
+            "old_cusip": "SYNTH-OLD",
+            "new_cusip": "SYNTH-NEW",
+            "process_date": rename_day,
+            "source_action_id": "fixture-rename-1",
+            "known_at": rename_stamp,
+            "ingested_at": rename_stamp + timedelta(minutes=10),
+            "source": _SOURCE_ALPACA,
+            "provenance": "action",
+        }
     )
 
 
@@ -2635,12 +2682,17 @@ def _format_cell(value: object) -> str:
 
 
 def _write_csv(
-    path: Path, table: str, records: list[dict[str, object]], sort_key: tuple[str, ...]
+    path: Path,
+    table: str,
+    records: list[dict[str, object]],
+    sort_key: tuple[str, ...],
+    *,
+    lineterminator: str = "\r\n",
 ) -> None:
     columns = _TABLE_COLUMNS[table]
     ordered = sorted(records, key=lambda r: tuple(_format_cell(r[k]) for k in sort_key))
     with path.open("w", newline="") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator=lineterminator)
         writer.writerow(columns)
         for record in ordered:
             writer.writerow(_format_cell(record[c]) for c in columns)
@@ -2789,6 +2841,7 @@ def build_rows() -> Rows:
     _dual_class(rows)
     _exchange_transfer(rows)
     _same_company_ticker_change(rows)
+    _spin_and_name_change(rows)
     _reused_ticker(rows)
     _plain_split(rows)
     _split_between_filing_and_t(rows)
@@ -2851,6 +2904,14 @@ def write_fixtures(output_dir: Path) -> None:
         "corporate_actions",
         rows.corporate_actions,
         ("security_id", "action_type", "ex_date", "source_action_id", "known_at"),
+        lineterminator="\n",
+    )
+    _write_csv(
+        output_dir / "symbol_changes.csv",
+        "symbol_changes",
+        rows.symbol_changes,
+        ("security_id", "process_date", "old_symbol", "known_at"),
+        lineterminator="\n",
     )
     _write_csv(
         output_dir / "facts.csv",
@@ -2890,6 +2951,92 @@ def write_fixtures(output_dir: Path) -> None:
         rows.rate_readme_cases,
         rows.borrow_readme_cases,
     )
+    (output_dir / "filename_cases.json").write_text(
+        json.dumps(_filename_cases(), indent=2, sort_keys=True) + "\n"
+    )
+
+
+def _filename_cases() -> list[dict[str, object]]:
+    """Isolated #1597 adapter inputs; the existing store CSVs stay pinned."""
+
+    def reading(
+        form: str, day: str, ticker: str, exchange: str | None, tag: str | None = None
+    ) -> dict[str, object]:
+        return {
+            "form": form,
+            "accepted_at": f"{day}T20:30:00+00:00",
+            "ticker": ticker,
+            "exchange": exchange,
+            "dei_symbol": tag,
+        }
+
+    return [
+        {
+            "case": "survivor_three_10ks",
+            "cik": "0000099991",
+            "readings": [
+                reading("10-K", "2015-03-02", "SURV", "NYSE", "SURV"),
+                reading("10-K", "2016-03-01", "SURV", "NYSE", "SURV"),
+                reading("10-K", "2017-03-01", "SURV", "NYSE", "SURV"),
+            ],
+            "cover": {
+                "accepted_at": "2019-03-01T20:30:00+00:00",
+                "ticker": "SURV",
+                "exchange": "NYSE",
+            },
+        },
+        {
+            "case": "nasdaq_delister",
+            "cik": "0000099992",
+            "readings": [
+                reading("10-K", "2016-03-01", "NDEL", "NASDAQ"),
+                reading("25-NSE", "2018-06-01", "NDEL", "NASDAQ"),
+            ],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "nasdaq_fallback",
+            "cik": "0000099993",
+            "readings": [reading("25-NSE", "2018-06-01", "FALL", "NASDAQ")],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "nyse_single_reading",
+            "cik": "0000099994",
+            "readings": [reading("10-K", "2016-03-01", "NSNG", "NYSE")],
+        },
+        {
+            "case": "transfer",
+            "cik": "0000099995",
+            "readings": [
+                reading("10-K", "2016-03-01", "TRAN", "NYSE", "TRAN"),
+                reading("10-K", "2018-12-03", "TRAN", "NASDAQ", "TRAN"),
+            ],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NYSE",
+                "effective_on": "2018-06-11",
+            },
+        },
+        {
+            "case": "unmatched_exchange",
+            "cik": "0000099996",
+            "readings": [reading("10-K", "2016-03-01", "MISS", "NYSE", "MISS")],
+            "form25": {
+                "accepted_at": "2018-06-01T20:30:00+00:00",
+                "exchange": "NASDAQ",
+                "effective_on": "2018-06-11",
+            },
+        },
+    ]
 
 
 def main(argv: list[str]) -> int:

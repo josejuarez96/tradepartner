@@ -7,6 +7,7 @@ touches the network, the owner's store or a browser.
 
 from __future__ import annotations
 
+import gzip
 import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -19,8 +20,8 @@ import pyarrow.parquet as pq
 import pytest
 from typer.testing import CliRunner
 
-from tradepartner import cli
-from tradepartner.adapters import edgar_raw
+from tradepartner import cli, health
+from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.edgar_source import EdgarFilingSource
 from tradepartner.adapters.fixture_rates import FixtureRateSource
 from tradepartner.adapters.prices import PriceSource
@@ -31,6 +32,7 @@ from tradepartner.config import Settings
 from tradepartner.ingest import FAILED, OK, STALE, IngestResult, RestampResult, SourceRun
 from tradepartner.store import journal, registry
 from tradepartner.store.db import insert_row, open_for_write
+from tradepartner.store.dividend_reviews import ReviewedGroup
 from tradepartner.store.schema import init_schema
 
 USER_AGENT = "Test Owner test-owner-ua@example.com"
@@ -921,7 +923,13 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     assert failed.exit_code == 1
     assert "health check failed: coverage_reference_names" in failed.output
     assert "  coverage_reference_names: fail (2)" in failed.output
-    skipped = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    refused = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert refused.exit_code == 1
+    assert refused.output.strip() == (
+        "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+        "or coverage.index_max_missing is set"
+    )
+    skipped = _invoke(enforced, ["health", "--no-coverage"], clock=lambda: T_END)
     assert skipped.exit_code == 0, skipped.output
     assert "coverage reference: not computed" in skipped.output
     assert (
@@ -933,6 +941,13 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     )
     plain = _invoke(report_only, ["health", "--coverage", "--check"], clock=lambda: T_END)
     assert plain.exit_code == 0, plain.output
+    off_skipped_check = _invoke(
+        report_only, ["health", "--no-coverage", "--check"], clock=lambda: T_END
+    )
+    assert off_skipped_check.exit_code == 0, off_skipped_check.output
+    assert "coverage reference: not computed" in off_skipped_check.output
+    off_skipped_plain = _invoke(report_only, ["health", "--no-coverage"], clock=lambda: T_END)
+    assert off_skipped_plain.exit_code == 0, off_skipped_plain.output
     listed = _settings(
         tmp_path,
         store=fixture_store_path,
@@ -1123,6 +1138,70 @@ def test_health_warns_when_the_last_edgar_run_reports_quarantined_accessions(
     assert result.exit_code == 0, result.output  # a warning, not a failed rule
     assert "warning" in result.output.lower()
     assert "2 quarantined" in result.output
+
+
+def _equal_cash(conn: duckdb.DuckDBPyConnection, sid: str, action_id: str) -> None:
+    known = session_close(date(2020, 3, 13))
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": sid,
+            "action_type": "dividend",
+            "ex_date": date(2020, 3, 16),
+            "ratio_or_amount": 0.37,
+            "announced_at": None,
+            "source_action_id": action_id,
+            "cancelled": False,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+def test_health_lists_equal_amount_dividends_and_warns_on_pending(
+    tmp_path: Path, fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1613 (T186b): accepted and unresolved pairs are listed, a pending
+    duplicate is a warning and not a failure, an unlisted pair fails."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    assert "accepted equal-amount dividend pairs: 0" in plain.output
+    assert "unresolved equal-amount dividend pairs: 0" in plain.output
+    assert "pending repair" not in plain.output
+    with open_for_write(settings) as conn:
+        for sid in ("SEC_DUAL_A", "SEC_DUAL_B", "SEC_TICKCHANGE", "SEC_TRANSFER"):
+            for action_id in ("a", "b"):
+                _equal_cash(conn, sid, f"{sid}-{action_id}")
+
+    def listed(sid: str, verdict: str) -> ReviewedGroup:
+        retract = f"{sid}-b" if verdict == "duplicate" else ""
+        return ReviewedGroup(sid, date(2020, 3, 16), 0.37, verdict, retract, "TCK", "test")  # type: ignore[arg-type]
+
+    reviewed = [
+        listed("SEC_DUAL_A", "distinct"),
+        listed("SEC_DUAL_B", "unresolved"),
+        listed("SEC_TICKCHANGE", "duplicate"),
+    ]
+    monkeypatch.setattr(health, "reviewed_groups", lambda: reviewed)
+    failing = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert failing.exit_code == 1  # SEC_TRANSFER's pair is listed nowhere
+    assert "health check failed: duplicate_dividends" in failing.output
+    assert "duplicate_dividends: FAIL (2 rows)" in failing.output
+    assert "accepted equal-amount dividend pairs: 1" in failing.output
+    assert "  SEC_DUAL_A@2020-03-16 TCK 0.37 (SEC_DUAL_A-a, SEC_DUAL_A-b)" in failing.output
+    assert "unresolved equal-amount dividend pairs: 1" in failing.output
+    assert "  SEC_DUAL_B@2020-03-16 TCK 0.37" in failing.output
+    assert "warning: 1 listed duplicate dividend keys are pending repair" in failing.output
+    monkeypatch.setattr(
+        health, "reviewed_groups", lambda: [*reviewed, listed("SEC_TRANSFER", "distinct")]
+    )
+    checked = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert checked.exit_code == 0, checked.output  # pending is a warning, not a failure
+    assert "warning: 1 listed duplicate dividend keys are pending repair" in checked.output
 
 
 def test_health_does_not_warn_when_the_last_edgar_run_quarantined_nothing(
@@ -1771,3 +1850,394 @@ def test_data_release_import_reads_the_file_once(tmp_path: Path) -> None:
     assert not_tables.exit_code == 2 and "must be a table" in not_tables.output
     path.write_text("[[release]\n", encoding="utf-8")
     assert _invoke(settings, ["decision", "data-release", "import-file", str(path)]).exit_code == 2
+
+
+def test_actions_backfill_cli_validates_and_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.ingest import ACTIONS_FILLED
+
+    settings = _settings(tmp_path, alpaca_api_key="fake-key", alpaca_api_secret="fake-secret")
+    for args in (
+        ["ingest", "--source", "edgar", "--actions-backfill", "--since", "2020-06-01"],
+        ["ingest", "--source", "alpaca", "--actions-backfill", "--since", "2020-05-01"],
+        [
+            "ingest",
+            "--source",
+            "alpaca",
+            "--actions-backfill",
+            "--since",
+            "2020-06-01",
+            "--through",
+            "bad",
+        ],
+    ):
+        assert _invoke(settings, args).exit_code == 2
+    seen: dict[str, Any] = {}
+
+    def fake_actions(settings: Settings, **kwargs: Any) -> IngestResult:
+        seen.update(kwargs)
+        return IngestResult(
+            (SourceRun("alpaca", ACTIONS_FILLED, 0, "actions;through=2020-06-30", "ok"),)
+        )
+
+    monkeypatch.setattr(cli, "ingest_actions_backfill", fake_actions)
+    result = _invoke(
+        settings,
+        [
+            "ingest",
+            "--source",
+            "alpaca",
+            "--actions-backfill",
+            "--since",
+            "2020-06-01",
+            "--through",
+            "2020-06-30",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["since"] == date(2020, 6, 1)
+    assert seen["through"] == date(2020, 6, 30)
+    assert seen["dry_run"] is True
+
+
+# --- the borrow-status snapshot (#1506, T171c, T171e) --------------------------
+
+
+_ASSET = {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "class": "us_equity",
+    "symbol": "AAA",
+    "exchange": "NYSE",
+    "status": "active",
+    "tradable": True,
+    "marginable": True,
+    "shortable": True,
+    "easy_to_borrow": True,
+    "borrow_status": "easy_to_borrow",
+    "fractionable": True,
+}
+
+
+class _AssetsEdge:
+    """Stands in for `alpaca_raw.assets_all`, recording each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Settings, Any]] = []
+
+    def __call__(self, settings: Settings, clock: Any) -> alpaca_raw.AssetsFetch:
+        self.calls.append((settings, clock))
+        return alpaca_raw.AssetsFetch([_ASSET], NOW - timedelta(seconds=2), NOW)
+
+
+def _with_keep(settings: Settings, tmp_path: Path) -> Settings:
+    borrow = settings.borrow.model_copy(update={"raw_dir": str(tmp_path / "raw")})
+    return settings.model_copy(update={"borrow": borrow})
+
+
+def test_ingest_source_alpaca_assets_takes_one_snapshot_through_the_edge(
+    tmp_path: Path, secrets_set: Settings
+) -> None:
+    settings = _with_keep(secrets_set, tmp_path)
+    edge = _AssetsEdge()
+    result = _invoke(settings, ["ingest", "--source", "alpaca_assets"], assets_source=edge)
+    assert result.exit_code == 0, result.output
+    assert len(edge.calls) == 1 and edge.calls[0][0] is settings
+    assert "alpaca_assets: ok, 1 rows, cursor 2020-07-01T23:00:00+00:00" in result.output
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (1,)
+
+
+def test_ingest_source_alpaca_assets_needs_the_alpaca_keys(tmp_path: Path) -> None:
+    settings = _with_keep(_settings(tmp_path), tmp_path)
+    edge = _AssetsEdge()
+    result = _invoke(settings, ["ingest", "--source", "alpaca_assets"], assets_source=edge)
+    assert result.exit_code == 2
+    assert "ALPACA_API_KEY" in result.output
+    assert edge.calls == []
+
+
+def test_ingest_all_hands_the_session_the_assets_edge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, secrets_set: Settings
+) -> None:
+    """`--source all` passes the snapshot's fetch, bound to the settings and
+    clock; `ingest_session` decides from `borrow.enabled` whether to call it."""
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    edge = _AssetsEdge()
+    result = _invoke(secrets_set, ["ingest"], assets_source=edge)
+    assert result.exit_code == 0, result.output
+    assert edge.calls == []
+    fetched = session.calls[0]["assets"]()
+    assert fetched.assets == [_ASSET]
+    assert edge.calls[0][0] is secrets_set
+
+
+def test_ingest_import_dir_applies_the_files_with_no_request_and_no_secret(
+    tmp_path: Path,
+) -> None:
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    for name, finished in (
+        ("assets-1.json.gz", NOW - timedelta(days=2)),
+        ("assets-2.json.gz", NOW + timedelta(days=1)),
+    ):
+        with gzip.open(rec / name, "wt") as handle:
+            json.dump(
+                {
+                    "fetch_started_utc": (finished - timedelta(seconds=2)).isoformat(),
+                    "fetch_finished_utc": finished.isoformat(),
+                    "endpoint": "paper GET /v2/assets",
+                    "assets": [_ASSET],
+                },
+                handle,
+            )
+    settings = _with_keep(_settings(tmp_path), tmp_path)  # no Alpaca key at all
+    edge = _AssetsEdge()
+    args = ["ingest", "--source", "alpaca_assets", "--import-dir", str(rec)]
+    result = _invoke(settings, args, assets_source=edge)
+    assert edge.calls == []
+    assert result.exit_code == 1, result.output  # one file is from the future
+    assert "alpaca_assets import: 1 applied, 0 skipped" in result.output
+    assert "1 refused" in result.output
+    assert "refused assets-2.json.gz: SnapshotClockError" in result.output
+    again = _invoke(settings, args, assets_source=edge)
+    assert "0 applied, 1 skipped" in again.output
+    assert "skipped assets-1.json.gz" in again.output
+
+
+@pytest.mark.parametrize(
+    ("args", "why"),
+    [
+        (["--import-dir", "."], "--import-dir needs --source alpaca_assets"),
+        (
+            ["--source", "alpaca_assets", "--backfill", "--since", "2020-06-29"],
+            "has no backfill",
+        ),
+        (["--source", "alpaca_assets", "--rebuild-classifications"], "edgar source"),
+    ],
+)
+def test_ingest_refuses_borrow_flags_where_they_cannot_apply(
+    secrets_set: Settings, args: list[str], why: str
+) -> None:
+    edge = _AssetsEdge()
+    result = _invoke(secrets_set, ["ingest", *args], assets_source=edge)
+    assert result.exit_code == 2
+    assert why in result.output
+    assert edge.calls == []
+
+
+def test_ingest_import_dir_must_be_a_directory(tmp_path: Path) -> None:
+    settings = _with_keep(_settings(tmp_path), tmp_path)
+    args = ["ingest", "--source", "alpaca_assets", "--import-dir", str(tmp_path / "missing")]
+    result = _invoke(settings, args)
+    assert result.exit_code == 2
+    assert "is not a directory" in result.output
+
+
+def test_health_prints_the_borrow_block_and_its_warnings(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    assert "borrow status: 10 rows, 6 assets; latest observation none" in result.output
+    assert "last alpaca_assets run: never; none" in result.output
+    assert "None shortable" not in result.output
+    assert "warning: borrow.enabled is off" in result.output
+
+
+def test_health_coverage_prints_the_index_lines_with_the_reports_sha(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1682, T189b: two lines under the coverage block (the key's SHA, the
+    counts, then the misses by bucket) and the rule's verdict, report-only."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [summary] = [line for line in lines if line.startswith("  index members (key ")]
+    assert summary.startswith(
+        "  index members (key a2430f2af0c79ddf0748e91de11bdeb1616ab5a7 through 2026-08-18): "
+        "2 sessions checked, 0 beyond the key; 0 of 1010 hits (0.0%); "
+    )
+    assert summary.endswith("max missing per session (report-only)")
+    [buckets] = [line for line in lines if line.startswith("  index misses by bucket: ")]
+    assert (
+        "unresolved 1010 member-sessions, 517 names (" in buckets
+        and " member-sessions, " in buckets
+        and "AAPL" in buckets
+    )
+    assert "  index_members_missing: " in result.output
+    plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert "  index_members_missing: not computed (run with --coverage)" in plain.output
+
+
+def test_health_check_fails_index_members_missing_once_the_threshold_is_set(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    gated = _settings(tmp_path, store=fixture_store_path, coverage={"index_max_missing": 0})
+    failed = _invoke(gated, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "health check failed: index_members_missing" in failed.output
+    assert ": fail (max 0)" in failed.output
+    refused = _invoke(gated, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert refused.exit_code == 1
+    assert "coverage.index_max_missing is set" in refused.output
+    off = _settings(tmp_path, store=fixture_store_path, coverage={"index_members": False})
+    result = _invoke(off, ["health", "--coverage"], clock=lambda: T_END)
+    assert "  index members: off (coverage.index_members)" in result.output
+    assert "  index_members_missing: off (coverage.index_members)" in result.output
+
+
+# --- T191 (#1682 lever B): delete-master-rows ---
+
+_VZ = "0000732712"
+_NOTE = "2.375% Notes due 2022"
+_NOTE_KNOWN = datetime(2019, 10, 30, 16, 18, 19, tzinfo=UTC)
+_TENQ = "0000732712-19-000063"
+_MASTER_RELEASE = "restate-test"
+
+
+def _sgml(accession: str, accepted_eastern: str, cik: str) -> str:
+    return (
+        f"<SEC-DOCUMENT>{accession}.txt : 20191030\n<SEC-HEADER>{accession}.hdr.sgml\n"
+        f"<ACCEPTANCE-DATETIME>{accepted_eastern}\nACCESSION NUMBER:\t\t{accession}\n"
+        "CONFORMED SUBMISSION TYPE:\t10-Q\nFILER:\n\tCOMPANY DATA:\n"
+        f"\t\tCENTRAL INDEX KEY:\t\t\t{cik}\n"
+        "\t\tSTANDARD INDUSTRIAL CLASSIFICATION:\tTELEPHONE COMMUNICATIONS [4813]\n"
+        "</SEC-HEADER>\n"
+    )
+
+
+@pytest.fixture
+def master_store(secrets_set: Settings, tmp_path: Path) -> tuple[Settings, Path]:
+    """Verizon's primary with the common and the note's listing; a release
+    open; a manifest naming the note's row with its 10-Q."""
+    with open_for_write(secrets_set) as conn:
+        init_schema(conn)
+        common = datetime(2019, 8, 8, 17, 4, 24, tzinfo=UTC)
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": _VZ,
+                "cik": _VZ,
+                "name": "VZ",
+                "known_at": common,
+                "ingested_at": NOW,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for ticker, title, known in (("VZ", "Common Stock", common), ("VZ22A", _NOTE, _NOTE_KNOWN)):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    "security_id": _VZ,
+                    "ticker": ticker,
+                    "exchange": "NYSE",
+                    "class_title": title,
+                    "valid_from": known.date(),
+                    "known_at": known,
+                    "ingested_at": datetime(2026, 10, 4, tzinfo=UTC),
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+        registry.open_data_release(
+            conn, conn, name=_MASTER_RELEASE, backup_path="b.duckdb", reason="#1682"
+        )
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "table,security_id,ticker,exchange,valid_from,form,class_title,filed_at,known_at,"
+        f"accession\nlistings,{_VZ},VZ22A,NYSE,2019-10-30,,{_NOTE},,{_NOTE_KNOWN.isoformat()},"
+        f"{_TENQ}\n"
+    )
+    return secrets_set, manifest
+
+
+def _edgar_headers(accepted_eastern: str, cik: str = _VZ) -> tuple[httpx.Client, list[str]]:
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        if (
+            request.url.path
+            == f"/Archives/edgar/data/{int(_VZ)}/{_TENQ.replace('-', '')}/{_TENQ}.txt"
+        ):
+            return httpx.Response(206, text=_sgml(_TENQ, accepted_eastern, cik))
+        return httpx.Response(404)
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), asked
+
+
+def _stored_tickers(settings: Settings) -> list[str]:
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        return [
+            r[0] for r in conn.execute("SELECT ticker FROM listings ORDER BY ticker").fetchall()
+        ]
+
+
+def test_delete_master_rows_dry_run_then_delete(master_store: tuple[Settings, Path]) -> None:
+    settings, manifest = master_store
+    client, asked = _edgar_headers("20191030121819")  # 12:18:19 New York = the row's stamp
+    args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
+    dry = _invoke(settings, [*args, "--dry-run"], edgar_client=client)
+    assert dry.exit_code == 0, dry.output
+    assert dry.output.startswith("would delete 1 listings and 0 delistings rows of 1 manifest")
+    assert f"listings {_VZ} VZ22A NYSE 2019-10-30" in dry.output
+    assert asked and _stored_tickers(settings) == ["VZ", "VZ22A"]
+    done = _invoke(settings, args, edgar_client=client)
+    assert done.exit_code == 0, done.output
+    assert done.output.startswith("deleted 1 listings")
+    assert _stored_tickers(settings) == ["VZ"]
+
+
+def test_delete_master_rows_refuses_later_evidence_and_another_cik(
+    master_store: tuple[Settings, Path],
+) -> None:
+    settings, manifest = master_store
+    args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
+    for client, reason in (
+        (_edgar_headers("20191030121820")[0], "after the row's known_at"),
+        (
+            _edgar_headers("20191030121819", cik="0000000001")[0],
+            f"does not read as CIK {_VZ}'s filing",
+        ),
+    ):
+        for extra in (["--dry-run"], []):
+            result = _invoke(settings, [*args, *extra], edgar_client=client)
+            assert result.exit_code == 1, result.output
+            assert reason in result.output
+        assert _stored_tickers(settings) == ["VZ", "VZ22A"]
+    other = manifest.parent / "other.csv"
+    other.write_text(manifest.read_text().replace(_TENQ, "0000732712-19-000064"))
+    gone = _invoke(
+        settings,
+        ["delete-master-rows", "--manifest", str(other), "--release", _MASTER_RELEASE],
+        edgar_client=_edgar_headers("20191030121819")[0],
+    )
+    assert gone.exit_code == 1 and "EDGAR has no 0000732712-19-000064" in gone.output
+
+
+def test_delete_master_rows_usage_errors(
+    master_store: tuple[Settings, Path], tmp_path: Path
+) -> None:
+    settings, manifest = master_store
+    client, _ = _edgar_headers("20191030121819")
+    base = ["delete-master-rows", "--manifest", str(manifest)]
+    assert _invoke(settings, base, edgar_client=client).exit_code == cli.USAGE_ERROR
+    blank = _invoke(settings, [*base, "--release", " "], edgar_client=client)
+    assert blank.exit_code == cli.USAGE_ERROR and "--release <name>" in blank.output
+    other = _invoke(settings, [*base, "--release", "other"], edgar_client=client)
+    assert other.exit_code == 1 and "no open data release named 'other'" in other.output
+    empty = tmp_path / "empty.csv"
+    empty.write_text(manifest.read_text().splitlines()[0] + "\n")
+    no_rows = _invoke(settings, [*base[:2], str(empty), "--release", _MASTER_RELEASE])
+    assert no_rows.exit_code == cli.USAGE_ERROR and "lists no rows" in no_rows.output
+    no_agent = settings.model_copy(update={"sec_edgar_user_agent": None})
+    missing = _invoke(no_agent, [*base, "--release", _MASTER_RELEASE, "--dry-run"])
+    assert missing.exit_code == cli.USAGE_ERROR and "SEC_EDGAR_USER_AGENT" in missing.output
+    assert _stored_tickers(settings) == ["VZ", "VZ22A"]

@@ -16,6 +16,7 @@ import duckdb
 import pytest
 from conftest import version_4_store
 
+from tradepartner.adapters.alpaca_prices import parse_corporate_actions
 from tradepartner.adapters.broker import (
     Account,
     CashActivity,
@@ -26,13 +27,15 @@ from tradepartner.adapters.broker import (
     Side,
 )
 from tradepartner.adapters.fake_broker import FakeBroker
+from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settings
 from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
+from tradepartner.ingest import _action_row
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
-from tradepartner.store.db import open_for_write, open_read_only
+from tradepartner.store.db import insert_row, open_for_write, open_read_only
 from tradepartner.store.journal import (
     PaperWindowRow,
     PaperWindowStopRow,
@@ -914,7 +917,8 @@ def test_accepts_spinoff_child_of_a_residue(
     # The module's documented convention: a `spinoff` corporate_actions row
     # keyed by the child, with `source_action_id` naming the parent.
     ex_date = (stop_at + timedelta(days=2)).date()
-    known_at = stop_at + timedelta(days=5)
+    process_date = (stop_at + timedelta(days=4)).date()
+    known_at = announcement_date_known_at(process_date)
     _insert_action(
         settings,
         security_id=CHILD,
@@ -1259,6 +1263,84 @@ def test_accepts_a_delisted_residue_s_removal(
     assert [a for a in adjustments if a.security_id == delisted] == []
 
 
+def _real_shaped_spinoff(settings: Settings, stop_at: datetime) -> date:
+    """Write the spin-off row exactly as the writers do (#1506, T172c): an
+    Alpaca-shaped `spin_offs` payload through `parse_corporate_actions`,
+    stored by `ingest._action_row` (child as `security_id`, the parent in
+    `source_action_id`, `announced_at` NULL, source `alpaca`, stamped at the
+    close after `process_date`). One parent share gives 0.2 child shares."""
+    ex_date = (stop_at + timedelta(days=2)).date()
+    process_date = (stop_at + timedelta(days=4)).date()
+    tickers = {"SPY": SPY, "SPLT": CHILD}
+    payload = {
+        "spin_offs": [
+            {
+                "id": "alpaca-spin",
+                "source_symbol": "SPY",
+                "source_cusip": "78462F103",
+                "source_rate": 5,
+                "new_symbol": "SPLT",
+                "new_cusip": "000000000",
+                "new_rate": 1,
+                "process_date": process_date.isoformat(),
+                "ex_date": ex_date.isoformat(),
+            }
+        ]
+    }
+    parsed = parse_corporate_actions(payload, lambda symbol, _day: tickers.get(symbol))
+    (action,) = parsed.actions
+    assert action.known_at == announcement_date_known_at(process_date)
+    row = _action_row(action, action.known_at)
+    assert (row["security_id"], row["source_action_id"], row["announced_at"]) == (CHILD, SPY, None)
+    assert row["ratio_or_amount"] == pytest.approx(0.2)
+    with open_for_write(settings) as conn:
+        insert_row(conn, "corporate_actions", row)
+    return ex_date
+
+
+def test_accepts_a_residue_explained_by_a_real_shaped_spinoff_row(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """T172b: the row the writers store explains the child position as the
+    convention's hand-written rows do, and journals one receipt."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings, ready_hypothesis, at=stop_at, residues={SPY: (10.0, "dust")}
+    )
+    ex_date = _real_shaped_spinoff(journal_settings, stop_at)
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 10.0
+    fake.extra_quantity["SPLT"] = 2.0  # 10 * 0.2
+    result = window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert result.window.window_id is not None
+    with open_read_only(journal_settings) as conn:
+        adjustments = adjustments_for(conn, window_id=result.window.window_id)
+    receipts = [a for a in adjustments if a.kind == "spinoff_receipt"]
+    assert [(r.security_id, r.quantity, r.session) for r in receipts] == [(CHILD, 2.0, ex_date)]
+
+
+def test_refuses_a_child_position_below_the_expected_quantity(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """T172b: a child position below parent x ratio (the fraction paid as cash
+    in lieu) is not explained by the spin-off: refused, never accepted."""
+    stop_at = fixed_clock() - timedelta(days=10)
+    _write_closed_window(
+        journal_settings, ready_hypothesis, at=stop_at, residues={SPY: (11.0, "dust")}
+    )
+    _real_shaped_spinoff(journal_settings, stop_at)
+    fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)
+    fake.extra_quantity["SPY"] = 11.0
+    fake.extra_quantity["SPLT"] = 2.0  # 11 * 0.2 = 2.2: 0.2 paid as cash in lieu
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(journal_settings, _connect(journal_settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "not_flat"
+
+
 def test_refuses_spinoff_quantity_mismatch(
     journal_settings: Settings,
     fixed_clock: FixedClock,
@@ -1277,7 +1359,7 @@ def test_refuses_spinoff_quantity_mismatch(
         action_type="spinoff",
         ex_date=(stop_at + timedelta(days=2)).date(),
         ratio_or_amount=0.2,
-        known_at=stop_at + timedelta(days=5),
+        known_at=announcement_date_known_at((stop_at + timedelta(days=4)).date()),
         source_action_id=SPY,
     )
     fake = BookedFake(clock=fixed_clock, price_of=lambda _s: REFERENCE_PRICE, account_id=ACCOUNT_ID)

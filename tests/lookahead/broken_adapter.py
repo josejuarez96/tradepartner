@@ -392,3 +392,13 @@ def broken_rate(violation: RateStampViolation) -> StampedRate:
         else _RATE_RECORD.vintage_date
     )
     return StampedRate(_RATE_RECORD, session_close(stamp_date))
+
+
+def early_spinoff(universe_dir: Path = UNIVERSE_DIR) -> Ingested:
+    """A fixture spin-off with a stamp before its ex-date proxy (T172b)."""
+    for item in _clean_history(universe_dir):
+        action = item.record
+        if isinstance(action, CorporateAction) and action.action_type is ActionType.SPINOFF:
+            early = action_first_seen_known_at(action.ex_date) - timedelta(days=1)
+            return Ingested(replace(action, known_at=early), item.ingested_at)
+    raise AssertionError("the fixture has no spin-off")

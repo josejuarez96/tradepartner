@@ -273,13 +273,23 @@ def test_edgar_filing_events_defaults() -> None:
     assert s.edgar.event_forms == ["8-K", "8-K/A"]
 
 
-def test_edgar_exchange_axis_listings_is_off_by_default_and_settable(
+def test_edgar_exchange_axis_listings_is_on_by_default_and_settable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1541 (T178): off until the owner's release (T181) flips it."""
-    assert Settings(_env_file=None).edgar.exchange_axis_listings is False
-    monkeypatch.setenv("EDGAR__EXCHANGE_AXIS_LISTINGS", "true")
+    """#1541 (T178): on since the owner's release `cover-listings-1541` (T181)."""
     assert Settings(_env_file=None).edgar.exchange_axis_listings is True
+    monkeypatch.setenv("EDGAR__EXCHANGE_AXIS_LISTINGS", "false")
+    assert Settings(_env_file=None).edgar.exchange_axis_listings is False
+
+
+def test_edgar_cover_split_contexts_is_off_by_default_and_settable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1651: backed out by the owner in the release `cover-listings-1541`
+    (T181, 2026-10-14, cache versions 6) pending #1682."""
+    assert Settings(_env_file=None).edgar.cover_split_contexts is False
+    monkeypatch.setenv("EDGAR__COVER_SPLIT_CONTEXTS", "true")
+    assert Settings(_env_file=None).edgar.cover_split_contexts is True
 
 
 def test_edgar_filename_listings_are_off_by_default_and_settable(
@@ -343,13 +353,13 @@ def test_edgar_filename_listings_refused_accepts_a_class_share_ticker() -> None:
     assert s.edgar.filename_listings_refused == ["0001652044:GOOGL", "0001652044:GOOG"]
 
 
-def test_edgar_title_fallback_is_off_by_default_and_reads_the_environment(
+def test_edgar_title_fallback_is_on_by_default_and_reads_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T179 (#1541): the title fallback switch is off until the release."""
-    assert Settings(_env_file=None).edgar.title_fallback is False
-    monkeypatch.setenv("EDGAR__TITLE_FALLBACK", "true")
+    """T179 (#1541): the title fallback switch is on since the release (T181)."""
     assert Settings(_env_file=None).edgar.title_fallback is True
+    monkeypatch.setenv("EDGAR__TITLE_FALLBACK", "false")
+    assert Settings(_env_file=None).edgar.title_fallback is False
 
 
 def test_edgar_filing_events_keys_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1678,6 +1688,16 @@ def test_risk_defaults_match_adr_0010() -> None:
     # 1.26 whole-dollar band (#1290) to the strict half-`cash` cent, scaled per
     # fill in `reconcile` and no longer tied to `max_orders_per_run`.
     assert r.reconcile_cash_tolerance == pytest.approx(0.01)
+    # #1627: the relative tolerance a stock dividend's `CIL` cash-in-lieu is booked
+    # against (fractional remainder x the reference price); the ex-date valuation
+    # sits below the pre-ex close, so ~10% passes and more halts.
+    assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
+
+
+def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
+    assert _settings().alpaca.cash_in_lieu_max_lag_sessions == 10
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, alpaca={"cash_in_lieu_max_lag_sessions": -1})
 
 
 @pytest.mark.parametrize(
@@ -1689,6 +1709,7 @@ def test_risk_defaults_match_adr_0010() -> None:
         "max_drawdown",
         "whole_share_price_buffer",
         "max_unspent_cash_fraction",
+        "cash_in_lieu_tolerance",
     ],
 )
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
@@ -1716,6 +1737,7 @@ def test_risk_max_fill_lag_sessions_at_least_one(value: int) -> None:
         {"max_broker_clock_skew_seconds": -1.0},
         {"reconcile_quantity_tolerance": -1e-6},
         {"reconcile_cash_tolerance": float("inf")},
+        {"cash_in_lieu_tolerance": float("inf")},
         {"max_position_weigth": 0.05},
     ],
 )
@@ -1747,6 +1769,10 @@ def test_paper_defaults() -> None:
     assert p.book_id == DEFAULT_BOOK_ID == "main"
     assert p.live_capital_reference == pytest.approx(100.0)
     assert p.min_override_reason_chars == 20
+    # Spec amendment 2026-10-12 (#1550, T188), open question 15 (a): only an empty
+    # universe is a collapse by the floor; a halving against the last plan by the drop.
+    assert p.min_universe_names == 1
+    assert p.max_universe_drop_fraction == pytest.approx(0.5)
 
 
 def test_paper_tracking_rule_residual_accepted_and_others_rejected() -> None:
@@ -1789,6 +1815,9 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
         {"book_id": "a:b"},
         {"live_capital_reference": 0.0},
         {"min_override_reason_chars": 0},
+        {"min_universe_names": 0},
+        {"max_universe_drop_fraction": -0.1},
+        {"max_universe_drop_fraction": 1.5},
         {"tracking_k": float("nan")},
         {"min_rebalance": 6},
     ],
@@ -1796,6 +1825,22 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
 def test_paper_rejects_nonsense_and_unknown_keys(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper=override)
+
+
+def test_paper_universe_collapse_keys_accept_their_bounds() -> None:
+    """`paper.max_universe_drop_fraction` is in [0, 1] (1.0 turns the drop rule off) and
+    `paper.min_universe_names` is at least 1 (#1550, T188)."""
+    for fraction in (0.0, 1.0):
+        paper = Settings(_env_file=None, paper={"max_universe_drop_fraction": fraction}).paper
+        assert paper.max_universe_drop_fraction == fraction
+    assert Settings(_env_file=None, paper={"min_universe_names": 1}).paper.min_universe_names == 1
+    # Refused by the bounds themselves, not as unknown keys.
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        Settings(_env_file=None, paper={"min_universe_names": 0})
+    with pytest.raises(ValidationError, match="less than or equal to 1"):
+        Settings(_env_file=None, paper={"max_universe_drop_fraction": 1.5})
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Settings(_env_file=None, paper={"max_universe_drop_fraction": -0.1})
 
 
 def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
@@ -1816,6 +1861,10 @@ def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
         "min_override_reason_chars",
     )
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
+    # The universe-collapse keys are read at run time, never frozen (#1550, T188), so
+    # the windows open before them are covered from the merge.
+    assert {"min_universe_names", "max_universe_drop_fraction"} <= set(PaperConfig.model_fields)
+    assert not {"min_universe_names", "max_universe_drop_fraction"} & set(FROZEN_PAPER_KEYS)
 
 
 def test_frozen_execution_keys_cover_fill_price() -> None:
@@ -2339,3 +2388,68 @@ def test_reference_names_must_not_be_empty() -> None:
 def test_coverage_section_refuses_an_unknown_key() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, coverage={"check_enable": True})
+
+
+def test_actions_backfill_floor_default_and_validation() -> None:
+    assert AlpacaConfig().actions_backfill_floor == date(2020, 6, 1)
+    with pytest.raises(ValidationError):
+        AlpacaConfig(actions_backfill_floor="not-a-date")
+
+
+# --- #1506 (T171c): the borrow-status snapshot -----------------------------------
+
+
+def test_borrow_defaults_keep_the_snapshot_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off until T171d flips it; the thresholds and the keep as the spec sets
+    them, the keep under the project root's `data/alpaca_assets`."""
+    borrow = _settings().borrow
+    assert borrow.enabled is False
+    assert borrow.max_stale_sessions == 2
+    assert borrow.max_vanished_share == pytest.approx(0.05)
+    raw = Path(borrow.raw_dir)
+    assert raw.is_absolute()
+    assert raw == Path(__file__).resolve().parents[1] / "data" / "alpaca_assets"
+    monkeypatch.setenv("BORROW__ENABLED", "true")
+    monkeypatch.setenv("BORROW__RAW_DIR", "")
+    configured = _settings().borrow
+    assert configured.enabled is True
+    assert configured.raw_dir == ""
+
+
+@pytest.mark.parametrize(
+    "borrow",
+    [
+        {"max_stale_sessions": -1},
+        {"max_vanished_share": -0.01},
+        {"max_vanished_share": 1.5},
+        {"max_vanished_share": float("nan")},
+        {"unknown_key": 1},
+    ],
+)
+def test_invalid_borrow_config_is_rejected(borrow: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, borrow=borrow)
+
+
+# --- coverage: the index answer key (#1682, T189b) -----------------------------
+
+
+def test_the_index_keys_default_to_on_and_report_only() -> None:
+    cfg = Settings(_env_file=None).coverage
+    assert cfg.index_members is True
+    assert cfg.index_max_missing is None
+    assert cfg.computed_by_default is False
+
+
+def test_a_set_index_threshold_computes_the_block_by_default() -> None:
+    assert Settings(_env_file=None, coverage={"index_max_missing": 0}).coverage.computed_by_default
+    assert Settings(_env_file=None, coverage={"check_enabled": True}).coverage.computed_by_default
+
+
+def test_the_index_threshold_refuses_a_negative_count_and_needs_the_check_on() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"index_max_missing": -1})
+    with pytest.raises(ValidationError, match=r"needs coverage\.index_members on"):
+        Settings(_env_file=None, coverage={"index_members": False, "index_max_missing": 5})
+    off = Settings(_env_file=None, coverage={"index_members": False}).coverage
+    assert off.index_members is False

@@ -84,11 +84,11 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """183 groups at the amendment (2026-10-12): a later edit is deliberate."""
+    """193 groups (183 at the amendment, 10 added by #1666): a later edit is deliberate."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 169, "distinct": 11, "unresolved": 3}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 179, "distinct": 11, "unresolved": 3}
     assert all(g.evidence for g in groups)
-    assert min(g.ex_date for g in groups) == date(2019, 9, 27)
+    assert min(g.ex_date for g in groups) == date(2019, 6, 27)
     assert max(g.ex_date for g in groups) == date(2026, 9, 30)
 
 
@@ -131,7 +131,7 @@ def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
         for g in export
     }
     duplicates = [g for g in reviewed_groups() if g.verdict == "duplicate"]
-    assert len(duplicates) == 169
+    assert len(duplicates) == 179
     for group in duplicates:
         pair = ids[group.key]
         assert len(pair) == 2

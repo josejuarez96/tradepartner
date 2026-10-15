@@ -85,7 +85,15 @@ def _reference_classify(
     if known:
         suffix_type = ticker_suffix_type(known[-1]["ticker"])
         if suffix_type is not None:
-            return suffix_type, f"suffix_{suffix_type}", sic, "snapshot_static"
+            # #1597 (T184d): only a `filing_name` listing row names itself;
+            # every other provenance keeps main's `snapshot_static`.
+            provenance = known[-1]["provenance"]
+            return (
+                suffix_type,
+                f"suffix_{suffix_type}",
+                sic,
+                "filing_name" if provenance == "filing_name" else "snapshot_static",
+            )
     if domestic:
         return COMMON, "common_default", sic, "filing"
     return UNCLASSIFIABLE, "no_rule_matched", sic, "filing"
@@ -197,10 +205,17 @@ _TITLES = (
     "Shares of Beneficial Interest",
 )
 _TICKERS = ("ABC", "ABC-WS", "ABCDW", "ABCDU", "ABC.U", "ABC-PA", "ABCDY", "BRK.B", "ABCDE")
+#: The provenances a `listings` row may carry (schema.TABLE_PROVENANCE_VALUES),
+#: drawn per scenario listing row so rule 7's written provenance varies: the
+#: `filing_name` branch (#1597, T184d) and main's `snapshot_static`.
+_LISTING_PROVENANCES = ("filing", "snapshot", "snapshot_static", "filing_name")
 
 
 def _settings() -> Settings:
-    return Settings(_env_file=None)  # type: ignore[call-arg]
+    # The reference below implements the classification rules without T179's
+    # title fallback, so the comparison pins the switch off; the fallback's own
+    # cases live in test_classify.py's TestTitleFallback (T181 flipped the default).
+    return Settings(_env_file=None, edgar={"title_fallback": False})  # type: ignore[call-arg]
 
 
 def _cik(n: int) -> str:
@@ -253,6 +268,10 @@ def _scenario(seed: int, companies: int) -> tuple[FixtureFilingSource, MasterBui
                         "known_at": stamp(),
                         "class_title": rng.choice(_TITLES),
                         "ticker": rng.choice(_TICKERS),
+                        # The `listings` provenance `CHECK`'s allowed set, so
+                        # rule 7's row provenance varies as it does in a store
+                        # (#1597, T184d).
+                        "provenance": rng.choice(_LISTING_PROVENANCES),
                     }
                 )
     # A CIK with no evidence at all, and out-of-order input everywhere.

@@ -381,3 +381,48 @@ def test_replaying_the_fixture_month_by_month_leaves_its_live_events(
 def _fixture_ids() -> list[tuple[str]]:
     with (UNIVERSE_DIR / "securities.csv").open() as handle:
         return [(line.split(",")[0],) for line in handle.readlines()[1:] if line.strip()]
+
+
+def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """A process-date action is skipped before its stamp and stored once after."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    # Ex-date 09-29, processed 10-14: the stamp is the 10-15 close.
+    ex = date(2020, 9, 29)
+    stamp = announcement_date_known_at(date(2020, 10, 14))
+    assert stamp == datetime(2020, 10, 15, 20, tzinfo=UTC)
+    action = CorporateAction(
+        "CHILD", ActionType.SPINOFF, ex, 0.25, stamp, "alpaca", source_action_id="PARENT"
+    )
+    window = (date(2020, 10, 1), date(2020, 10, 31))
+    stats: dict[str, int] = {}
+    october_14_run = datetime(2020, 10, 14, 22, tzinfo=UTC)
+    assert _add_actions(conn, [action], window, ingested_at=october_14_run, stats=stats) == 0
+    assert stats == {"actions_not_yet_known": 1}  # skipped and counted, never raised
+    assert _add_actions(conn, [action], window, ingested_at=stamp) == 1
+    assert _add_actions(conn, [action], window, ingested_at=stamp + timedelta(days=1)) == 0
+    assert conn.execute(
+        "SELECT security_id, source_action_id, known_at FROM corporate_actions "
+        "WHERE action_type = 'spinoff'"
+    ).fetchall() == [("CHILD", "PARENT", stamp)]
+
+
+def test_symbol_change_revision_is_stamped_at_ingest(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    from tradepartner.adapters.prices import SymbolChange
+    from tradepartner.ingest import _add_symbol_changes
+
+    first = datetime(2020, 12, 2, 21, tzinfo=UTC)
+    row = SymbolChange("S1", "OLD", "NEW", "A", "B", date(2020, 12, 1), first, "alpaca", "rename-1")
+    assert _add_symbol_changes(conn, [row], ingested_at=first - timedelta(microseconds=1)) == 0
+    assert _add_symbol_changes(conn, [row], ingested_at=first) == 1
+    assert _add_symbol_changes(conn, [row], ingested_at=first + timedelta(days=1)) == 0
+    changed = replace(row, new_cusip="C")
+    revised = first + timedelta(days=2)
+    assert _add_symbol_changes(conn, [changed], ingested_at=revised) == 1
+    assert conn.execute(
+        "SELECT new_cusip, known_at FROM symbol_changes ORDER BY known_at"
+    ).fetchall() == [("B", first), ("C", revised)]

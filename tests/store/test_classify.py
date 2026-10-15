@@ -38,6 +38,7 @@ from tradepartner.store.classify import (
     build_classifications,
     classifications_as_of,
     is_placeholder_title,
+    is_plain_common_title,
     listing_kind,
     write_classifications,
 )
@@ -398,6 +399,84 @@ class TestRules:
             assert row["known_at"] == FETCHED_AT
 
 
+class TestFilingNameRows:
+    """Rule 7 on a `filing_name` listing row (spec "Amendment 2026-10-12
+    (#1597)", plan T184d): the row's ticker is read from a filing's own file
+    names, never from a tagged fact, and that row alone names itself; every
+    other provenance on the suffix row behaves as it did on main."""
+
+    CIK = "0000000110"  # a pre-2019 filer with one 10-K and no cover page
+    KNOWN_AT = datetime(2016, 3, 1, 21, 30, tzinfo=UTC)  # that 10-K's acceptance
+
+    def _master(self, provenance: str) -> MasterBuild:
+        """The master build a T184e write path would produce for the one
+        untitled listing row (ticker `FNW-WS`, `class_title` NULL) carrying
+        `provenance`, built by hand because no fixture source carries
+        filename listings yet."""
+        security_id = primary_security_id(self.CIK)
+        return MasterBuild(
+            securities=(
+                {
+                    "security_id": security_id,
+                    "cik": self.CIK,
+                    "name": "Filing Name Co",
+                    "benchmark": False,
+                    "known_at": _at(2015, 3, 2),
+                    "ingested_at": INGESTED_AT,
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            ),
+            listings=(
+                {
+                    "security_id": security_id,
+                    "ticker": "FNW-WS",
+                    "exchange": "NYSE",
+                    "class_title": None,
+                    "valid_from": date(2016, 3, 1),
+                    "known_at": self.KNOWN_AT,
+                    "ingested_at": INGESTED_AT,
+                    "source": "edgar",
+                    "provenance": provenance,
+                },
+            ),
+            unmatched_snapshot=(),
+            missing_benchmarks=(),
+        )
+
+    def _built(self, provenance: str) -> ClassificationBuild:
+        source = FixtureFilingSource(
+            index=[_filing(self.CIK, "10-K", _at(2015, 3, 2))],
+            headers=[_header(self.CIK, "10-K", 7372, _at(2015, 3, 2))],
+        )
+        return build_classifications(
+            source, self._master(provenance), _settings(), ingested_at=INGESTED_AT
+        )
+
+    def test_a_filing_name_row_names_itself(self) -> None:
+        # Before the 10-K the CIK is a domestic filer with no listing; from
+        # the row's own `known_at` the suffix decides, as a snapshot ticker
+        # does, and the row written names that listing's provenance.
+        security_id = primary_security_id(self.CIK)
+        assert _history(self._built("filing_name"), security_id) == [
+            ("common", "common_default", _at(2015, 3, 2)),
+            ("warrant", "suffix_warrant", self.KNOWN_AT),
+        ]
+        latest = _latest(self._built("filing_name"), security_id)
+        assert latest["provenance"] == "filing_name"
+        assert latest["known_at"] == self.KNOWN_AT
+
+    @pytest.mark.parametrize("provenance", ["filing", "snapshot", "snapshot_static"])
+    def test_every_other_provenance_keeps_main_s_row(self, provenance: str) -> None:
+        """A suffix row over any other listing provenance is what main
+        wrote: `snapshot_static`, at the same `known_at` (#1597 names only
+        the `filing_name` row)."""
+        latest = _latest(self._built(provenance), primary_security_id(self.CIK))
+        assert (latest["security_type"], latest["rule"]) == ("warrant", "suffix_warrant")
+        assert latest["provenance"] == "snapshot_static"
+        assert latest["known_at"] == self.KNOWN_AT
+
+
 class TestUnclassifiable:
     def test_no_rule_matched(self, built: ClassificationBuild) -> None:
         assert _history(built, primary_security_id(BARE)) == [
@@ -726,8 +805,9 @@ class TestTitleFallback:
         assert history[-1][:2] == ("unclassifiable", "no_rule_matched")
         assert history[-1][2] == _at(2021, 3, 1)
 
-    def test_switch_off_is_the_same_as_the_default(self) -> None:
-        explicit, _ = _fallback_build(False)
+    def test_switch_on_is_the_same_as_the_default(self) -> None:
+        # T181 (#1541): the release flipped the default to on.
+        explicit, _ = _fallback_build(True)
         source = _fallback_source()
         settings = _settings()
         master = build_master(source, settings, ingested_at=INGESTED_AT)
@@ -807,3 +887,88 @@ def test_shares_of_a_shockwave_shaped_issuer_continue_after_its_titled_listing()
         landed[on] = ([r["value"] for r in rows], [u.accession for u in unmatched])
     assert landed[False] == ([1.0], ["a2", "a3"])
     assert landed[True] == ([1.0, 2.0, 3.0], [])
+
+
+# --- T194 (#1682 lever H): a plain-common title of a domestic filer beats F-6 ---
+
+REDOM = "0000000191"  # F-6 in 2007, 10-K from 2009, a "Common stock" cover (IVZ)
+SWISS = "0000000192"  # 10-K filer, "Registered Shares" cover (GRMN, BG)
+LIVE_ADR = "0000000193"  # 20-F filer, F-6, a "Class A ordinary shares*" cover (NIO)
+ADS_TITLE = "0000000194"  # 10-K filer after an F-6, cover titled as depositary shares
+ADS_UNDER = "0000000195"  # 10-K filer after an F-6, "Ordinary Shares ... only for ADSs"
+
+
+def _t194_source() -> FixtureFilingSource:
+    return FixtureFilingSource(
+        index=[
+            _filing(REDOM, "F-6", _at(2007, 2, 1)),
+            _filing(REDOM, "10-K", _at(2009, 3, 1)),
+            _filing(SWISS, "10-K", _at(2010, 3, 1)),
+            _filing(LIVE_ADR, "20-F", _at(2016, 4, 1)),
+            _filing(LIVE_ADR, "F-6", _at(2017, 6, 1)),
+            _filing(ADS_TITLE, "F-6", _at(2007, 2, 1)),
+            _filing(ADS_TITLE, "10-K", _at(2009, 3, 1)),
+            _filing(ADS_UNDER, "F-6", _at(2007, 2, 1)),
+            _filing(ADS_UNDER, "10-K", _at(2009, 3, 1)),
+        ],
+        cover_pages=[
+            _cover(REDOM, _at(2019, 3, 4), ("Common stock, $.20 par value", "RDM", "NYSE")),
+            _cover(
+                SWISS, _at(2019, 3, 4), ("Registered Shares, CHF 0.10 par value", "SWS", "NYSE")
+            ),
+            _cover(
+                LIVE_ADR,
+                _at(2020, 4, 1),
+                ("Class A ordinary shares, par value $0.1*", "ADR", "NYSE"),
+            ),
+            _cover(ADS_TITLE, _at(2019, 3, 4), ("American Depositary Shares", "ADT", "NYSE")),
+            _cover(
+                ADS_UNDER,
+                _at(2019, 3, 4),
+                ("Ordinary Shares, not for trading, only in connection with ADSs", "ADU", "NYSE"),
+            ),
+        ],
+    )
+
+
+def _t194(on: bool) -> tuple[ClassificationBuild, MasterBuild]:
+    source = _t194_source()
+    settings = _settings(edgar={"title_fallback": on})
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    return build_classifications(source, master, settings, ingested_at=INGESTED_AT), master
+
+
+class TestPlainCommonBeatsF6:
+    def test_a_domestic_filers_plain_common_title_beats_its_old_f6(self) -> None:
+        on, _ = _t194(True)
+        off, _ = _t194(False)
+        sid = primary_security_id(REDOM)
+        assert _latest_type(on, sid) == ("common", "title_common")
+        assert _latest_type(off, sid) == ("depositary", "f6_depositary")
+
+    def test_the_f6_still_types_the_class_before_the_cover_page(self) -> None:
+        on, _ = _t194(True)
+        assert _history(on, primary_security_id(REDOM))[0][:2] == ("depositary", "f6_depositary")
+
+    def test_registered_shares_is_common_only_under_the_fallback(self) -> None:
+        on, _ = _t194(True)
+        off, _ = _t194(False)
+        sid = primary_security_id(SWISS)
+        assert _latest_type(on, sid) == ("common", "title_common")
+        assert _latest_type(off, sid) == ("unclassifiable", "title_unrecognized")
+
+    def test_a_real_adr_issuer_filing_foreign_forms_stays_depositary(self) -> None:
+        on, _ = _t194(True)
+        assert _latest_type(on, primary_security_id(LIVE_ADR)) == ("depositary", "f6_depositary")
+
+    @pytest.mark.parametrize("cik", [ADS_TITLE, ADS_UNDER])
+    def test_a_depositary_word_in_the_title_keeps_the_f6_rule(self, cik: str) -> None:
+        on, _ = _t194(True)
+        assert _latest_type(on, primary_security_id(cik)) == ("depositary", "f6_depositary")
+
+    def test_title_helpers(self) -> None:
+        assert _title_type("Registered Shares, CHF 0.10", True) == ("common", "title_common")
+        assert _title_type("Registered Shares", False)[0] == "unclassifiable"
+        assert is_plain_common_title("Ordinary Shares")
+        assert not is_plain_common_title("Ordinary shares, only for American Depositary Shares")
+        assert not is_plain_common_title(None)

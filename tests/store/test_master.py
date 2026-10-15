@@ -27,6 +27,7 @@ from tradepartner.adapters.filings import (
     CoverListing,
     CoverPage,
     DelistingFiling,
+    FilenameListing,
     FilingIndexEntry,
 )
 from tradepartner.adapters.fixture_filings import FixtureFilingSource
@@ -44,6 +45,7 @@ from tradepartner.store.master import (
     Succession,
     _refuse_separator,
     build_master,
+    first_session,
     primary_security_id,
     securities_as_of,
     write_master,
@@ -209,6 +211,225 @@ def _source() -> FixtureFilingSource:
 
 def _settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **overrides)  # type: ignore[arg-type]
+
+
+def test_filename_rows_are_dated_at_acceptance_and_switch_is_off() -> None:
+    cik = "0000000998"
+    first = _at(2015, 3, 2, 22, 30)
+    cover = _at(2019, 3, 4)
+    source = FixtureFilingSource(
+        index=[_filing(cik, "Filename Co", "10-K", first)],
+        cover_pages=[_cover(cik, cover, ("Common Stock", "FNCO", "NASDAQ"))],
+        filename_listings=[
+            FilenameListing(
+                cik,
+                "10k-1",
+                "10-K",
+                first,
+                date(2015, 3, 2),
+                "FNCO",
+                "NASDAQ",
+                "Common Stock",
+                "FNCO",
+            )
+        ],
+    )
+    off = build_master(source, _settings(), ingested_at=INGESTED_AT)
+    assert not [r for r in off.listings if r["provenance"] == "filing_name"]
+
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert len(rows) == 1
+    assert rows[0]["security_id"] == cik
+    assert rows[0]["known_at"] == first
+    assert rows[0]["valid_from"] == date(2015, 3, 2)
+    with pytest.raises(ValueError, match="after ingested_at"):
+        build_master(
+            source,
+            _settings(edgar={"filename_listings": True}),
+            ingested_at=first - timedelta(seconds=1),
+        )
+
+
+def test_filename_empty_early_cover_page_does_not_suppress_rows() -> None:
+    """A pre-2019 cover page with no listings is no reading and ends no window."""
+    cik = "0000000994"
+    accepted = _at(2016, 3, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Emptycover", "10-K", "annual", accepted)],
+        cover_pages=[
+            _cover(cik, _at(2015, 6, 1)),
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "EMPT", "NYSE")),
+        ],
+        filename_listings=[
+            FilenameListing(
+                cik, "annual", "10-K", accepted, date(2016, 3, 1), "EMPT", "NYSE", None, None
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["ticker"], r["known_at"]) for r in rows] == [("EMPT", accepted)]
+
+
+class _PartialSource(FixtureFilingSource):
+    """A fixture source that reports its filename answers as partial (T184b)."""
+
+    filename_incomplete_ciks = frozenset({"0000000993"})
+
+
+def test_filename_incomplete_cik_derives_no_single_reading() -> None:
+    cik = "0000000993"
+    accepted = _at(2016, 3, 1)
+    kwargs = dict(
+        index=[FilingIndexEntry(cik, "Partial", "10-K", "annual", accepted)],
+        filename_listings=[
+            FilenameListing(
+                cik, "annual", "10-K", accepted, date(2016, 3, 1), "PART", "NYSE", None, None
+            )
+        ],
+    )
+    settings = _settings(edgar={"filename_listings": True})
+    whole = build_master(FixtureFilingSource(**kwargs), settings, ingested_at=INGESTED_AT)
+    assert [r["ticker"] for r in whole.listings if r["provenance"] == "filing_name"] == ["PART"]
+    partial = build_master(_PartialSource(**kwargs), settings, ingested_at=INGESTED_AT)
+    assert not [r for r in partial.listings if r["provenance"] == "filing_name"]
+
+
+def test_filename_form25_row_takes_the_first_session_not_the_recorded_date() -> None:
+    cik = "0000000992"
+    exit_at = _at(2018, 6, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Exit", "S-1", "s1", exit_at)],
+        delistings=[DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", "exit", exit_at)],
+        filename_listings=[
+            FilenameListing(
+                cik, "exit", "25-NSE", exit_at, date(2018, 6, 1), "EXIT", "NASDAQ", None, None
+            )
+        ],
+    )
+    settings = _settings(edgar={"filename_listings": True})
+    on = build_master(source, settings, ingested_at=INGESTED_AT)
+    rows = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["ticker"], r["valid_from"]) for r in rows] == [("EXIT", first_session(settings))]
+
+
+def test_filename_form25_is_last_resort_and_makes_delisting_resolve() -> None:
+    annual_cik, fallback_cik = "0000000997", "0000000996"
+    annual_at, exit_at = _at(2016, 3, 1), _at(2018, 6, 1)
+    annual = FilenameListing(
+        annual_cik,
+        "annual",
+        "10-K",
+        annual_at,
+        date(2016, 3, 1),
+        "ANN",
+        "NASDAQ",
+        "Common Stock",
+        None,
+    )
+    exhibits = [
+        FilenameListing(
+            cik, f"exit-{cik}", "25-NSE", exit_at, date(2016, 1, 4), ticker, "NASDAQ", None, None
+        )
+        for cik, ticker in ((annual_cik, "ANN"), (fallback_cik, "FALL"))
+    ]
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(annual_cik, "Annual", "10-K", "annual", annual_at),
+            FilingIndexEntry(fallback_cik, "Fallback", "S-1", "s1", annual_at),
+        ],
+        delistings=[
+            DelistingFiling(cik, "25-NSE", "Common Stock", "NASDAQ", f"exit-{cik}", exit_at)
+            for cik in (annual_cik, fallback_cik)
+        ],
+        filename_listings=[annual, *exhibits],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    named = [r for r in on.listings if r["provenance"] == "filing_name"]
+    assert [(r["security_id"], r["ticker"], r["known_at"]) for r in named] == [
+        (fallback_cik, "FALL", exit_at),
+        (annual_cik, "ANN", annual_at),
+    ]
+    assert build_delistings(source.delistings(), on, ingested_at=INGESTED_AT).unmatched == ()
+
+
+def test_filename_confirmation_uses_first_cover_filing_only() -> None:
+    cik = "0000000995"
+    accepted = _at(2016, 3, 1)
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Renamer", "10-K", "annual", accepted)],
+        cover_pages=[
+            _cover(cik, _at(2019, 3, 1), ("Common Stock", "OLD", "NYSE")),
+            _cover(cik, _at(2021, 3, 1), ("Common Stock", "NEW", "NYSE")),
+        ],
+        filename_listings=[
+            FilenameListing(
+                cik,
+                "annual",
+                "10-K",
+                accepted,
+                date(2016, 3, 1),
+                "OLD",
+                "NYSE",
+                None,
+                None,
+            )
+        ],
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert [
+        (r["ticker"], r["valid_from"]) for r in on.listings if r["provenance"] == "filing_name"
+    ] == [("OLD", date(2016, 3, 1))]
+    assert on.filename_counts["filename_confirmed"] == 1
+
+
+def test_filename_survivor_resolution_keeps_security_and_shortens_lead() -> None:
+    cik = "0000000994"
+    accepted = _at(2015, 3, 2)
+    cover = _at(2019, 3, 1)
+    record = FilenameListing(
+        cik,
+        "annual",
+        "10-K",
+        accepted,
+        date(2015, 3, 2),
+        "STAY",
+        "NYSE",
+        None,
+        "STAY",
+    )
+
+    def source(*, static: bool) -> FixtureFilingSource:
+        return FixtureFilingSource(
+            index=[FilingIndexEntry(cik, "Stay", "10-K", "annual", accepted)],
+            cover_pages=[_cover(cik, cover, ("Common Stock", "STAY", "NYSE"))],
+            snapshot=[_snap(cik, "Stay", "STAY", "NYSE")] if static else [],
+            filename_listings=[record],
+        )
+
+    off = _settings()
+    on = _settings(edgar={"filename_listings": True})
+    first = {cik: date(2016, 1, 4)}
+    sessions = [date(2016, 1, 4), date(2017, 6, 1), date(2019, 3, 4)]
+    for static in (False, True):
+        old = ListingResolver(
+            build_master(source(static=static), off, ingested_at=INGESTED_AT).listings,
+            first_sessions=first,
+        )
+        new = ListingResolver(
+            build_master(source(static=static), on, ingested_at=INGESTED_AT).listings,
+            first_sessions=first,
+        )
+        assert [old.resolve("STAY", day) or old.lead("STAY", day) for day in sessions] == [
+            cik
+        ] * len(sessions)
+        assert [new.resolve("STAY", day) or new.lead("STAY", day) for day in sessions] == [
+            cik
+        ] * len(sessions)
+        if not static:
+            assert old.first_span_lead(cik) is not None
+            assert new.first_span_lead(cik) is None
 
 
 def _new_store() -> duckdb.DuckDBPyConnection:
@@ -1621,3 +1842,63 @@ class TestListingEvidenceAfterForm25:
             forms=(("15-12B", _at(2020, 10, 1)), ("8-A12B", _at(2020, 10, 27))),
         )
         assert [s.security_id for s in build.successions] == [f"{cik}@2020-11-05"]
+
+
+def test_filename_first_page_classes_match_the_cik_not_only_the_second() -> None:
+    # #1662: two CIKs' first cover pages accepted in the same second: the
+    # second CIK's class map held the first's row too, so the first's id was
+    # counted as a class its own 10-Ks never read.
+    first_cik, second_cik = "0000000981", "0000000982"
+    annual, page = _at(2016, 3, 1), _at(2019, 3, 4)
+    listings = [  # only the second CIK has a 10-K read
+        FilenameListing(
+            second_cik,
+            "annual",
+            "10-K",
+            annual,
+            date(2016, 3, 1),
+            "BBB",
+            "NYSE",
+            "Common Stock",
+            None,
+        )
+    ]
+    source = FixtureFilingSource(
+        index=[
+            FilingIndexEntry(cik, "Same Second", "10-K", "annual", annual)
+            for cik in (first_cik, second_cik)
+        ],
+        cover_pages=[
+            _cover(first_cik, page, ("Common Stock", "AAA", "NYSE")),
+            _cover(second_cik, page, ("Common Stock", "BBB", "NYSE")),
+        ],
+        filename_listings=listings,
+    )
+    on = build_master(source, _settings(edgar={"filename_listings": True}), ingested_at=INGESTED_AT)
+    assert (
+        on.filename_counts["filename_class_unread"] == 1
+    )  # the first CIK's own class, nothing of the second's
+
+
+def test_registered_shares_class_is_the_primary_under_the_fallback() -> None:
+    # T194: the page lists a preferred first; "Registered Shares" is the common.
+    cik = "0000000983"
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Swiss AG", "10-K", f"{cik}-1", _at(2016, 3, 1))],
+        cover_pages=[
+            _cover(
+                cik,
+                _at(2019, 3, 4),
+                ("6% Series A Preferred Shares", "SWP", "NYSE"),
+                ("Registered Shares, CHF 0.10 par value", "SWS", "NYSE"),
+            )
+        ],
+    )
+    first: dict[bool, str] = {}
+    for on in (True, False):
+        built = build_master(
+            source, _settings(edgar={"title_fallback": on}), ingested_at=INGESTED_AT
+        )
+        primary = primary_security_id(cik)
+        first[on] = next(r["ticker"] for r in built.listings if r["security_id"] == primary)
+    assert first == {True: "SWS", False: "SWP"}

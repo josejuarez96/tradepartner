@@ -18,11 +18,12 @@ message if either is missing, before any network call.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
-from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.enums import Adjustment, CorporateActionsType, DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import CorporateActionsRequest, StockBarsRequest
@@ -287,6 +288,24 @@ def corporate_actions(
     )
 
 
+def corporate_actions_scan(
+    types: Sequence[CorporateActionsType],
+    start: date,
+    end: date,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Fully paged, symbol-less corporate-action scan over process dates."""
+    settings = settings or get_settings()
+    client = _corporate_actions_client(settings)
+    payload = client.get_corporate_actions(
+        CorporateActionsRequest(types=list(types), start=start, end=end, limit=None)
+    )
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected a raw dict payload, got {type(payload).__name__}")
+    return payload
+
+
 def assets_snapshot(
     symbols: list[str],
     *,
@@ -305,3 +324,56 @@ def assets_snapshot(
         raw_asset = client.get_asset(symbol)
         snapshot.append(dict(raw_asset))
     return snapshot
+
+
+#: What the kept and recorded assets files name as their request (the
+#: recorder's `endpoint` field; `ingest --import-dir` checks it ends with
+#: `ASSETS_REQUEST`): the trading client is built `paper=True`.
+ASSETS_ENDPOINT = "paper GET /v2/assets"
+ASSETS_REQUEST = "GET /v2/assets"
+
+
+@dataclass(frozen=True)
+class AssetsFetch:
+    """One unfiltered `GET /v2/assets` response and the two clock readings
+    around it (data-foundation spec, amendment 2026-10-11 #1506, "source,
+    ingest and import"; ADR 0021 point 2). `assets` is the raw JSON list as
+    the API sent it (`id`, `class`, `borrow_status` under those names);
+    `fetch_finished_utc`, read after the response arrived, is the only
+    `known_at` the ingest may stamp. The readings are kept as the clock gave
+    them: the ingest, not this client, refuses a naive or reversed pair."""
+
+    assets: list[dict[str, Any]]
+    fetch_started_utc: datetime
+    fetch_finished_utc: datetime
+
+
+def assets_all(
+    settings: Settings | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> AssetsFetch:
+    """Every asset Alpaca lists, from one `TradingClient.get_all_assets()`
+    with **no** filter (no status, class, exchange or attribute), exactly the
+    request the scratch recorder makes, so a snapshot is never a differently
+    filtered list (ADR 0021 point 3). Through `_trading_client`: the data key
+    pair, `paper=True` (spec open question 21), `raw_data=True`.
+
+    `clock` (default the wall clock) is read once just before the request
+    and once after the response, and both readings are returned with the
+    raw list; credentials are checked before either reading, so a missing
+    key makes no request and reads no clock.
+    """
+    settings = settings or get_settings()
+    client = _trading_client(settings)
+    now = clock or (lambda: datetime.now(UTC))
+    started = now()
+    raw: Any = client.get_all_assets()
+    finished = now()
+    if not isinstance(raw, list):  # raw_data=True returns the JSON list
+        raise TypeError(f"expected the raw assets list, got {type(raw).__name__}")
+    return AssetsFetch(
+        assets=raw,
+        fetch_started_utc=started,
+        fetch_finished_utc=finished,
+    )

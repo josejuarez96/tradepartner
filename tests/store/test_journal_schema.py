@@ -159,9 +159,11 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_25() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 25
+def test_current_schema_version_is_28() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 28
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
+    assert schema._PRE_FILING_NAME_VERSION == 25
+    assert schema._PRE_CASH_IN_LIEU_VERSION == 26
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
 
 
@@ -277,7 +279,74 @@ def test_migrating_a_version_24_store_books_the_fee_columns_once_and_keeps_rows(
             "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
         ).fetchone()[0]
         assert "'fee_cash'" in ddl
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 25
+        assert "'cash_in_lieu'" in ddl  # the same init pass runs the version-27 widen
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 28
+    finally:
+        conn.close()
+
+
+def _version_26_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 26 left it (main, T184d/#1597): every table at the
+    current shape but with `adjustments`' `kind` `CHECK` without `cash_in_lieu`
+    (the version-27 delta not yet applied), one `adjustments` row, and every
+    `schema_version` row set to 26. DuckDB cannot add a `CHECK` in place, so the
+    table is rebuilt through a staging copy that uses the live `CREATE TABLE`
+    with `cash_in_lieu` removed from the `kind` `CHECK` — the same widen this
+    version's migration reverses."""
+    schema.init_schema(conn)
+    conn.execute(
+        "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+        "quantity, cash, broker_activity_id, explanation_json, known_at, ingested_at) "
+        "VALUES (1, 1, ?, 'fee_cash', NULL, NULL, -0.01, 'act-9', '{}', ?, ?)",
+        [_NOW.date(), _NOW, _NOW],
+    )
+    ddl = conn.execute(
+        "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
+    ).fetchone()[0]
+    v26 = ddl.replace("CREATE TABLE adjustments(", "CREATE TABLE adj_v26(", 1).replace(
+        ", 'cash_in_lieu'", ""
+    )
+    conn.execute(v26)
+    conn.execute("INSERT INTO adj_v26 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adj_v26 RENAME TO adjustments")
+    conn.execute("UPDATE schema_version SET version = 26")
+
+
+def test_migrating_a_version_26_store_widens_the_kind_check_once_and_keeps_rows() -> None:
+    """The spec's "Migration identity" for version 27 (#1627): the `adjustments`
+    `kind` `CHECK` widens with `cash_in_lieu` and one version-27 row is appended,
+    while every pre-27 row is kept in insertion order and byte-identical. This is
+    the real production path (main is at version 26, T184d/#1597, with `fee_cash`
+    already booked); it must fail if `_migrate_cash_in_lieu_kind`'s body is a
+    no-op."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_26_store(conn)
+        before = conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall()
+
+        schema.init_schema(conn)
+
+        assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 28
+        ddl = conn.execute(
+            "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
+        ).fetchone()[0]
+        assert "'cash_in_lieu'" in ddl
+        # A `cash_in_lieu` row is accepted now, and a duplicate broker id refused.
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, session, kind, security_id, "
+            "quantity, cash, broker_activity_id, explanation_json, known_at, ingested_at) "
+            "VALUES (2, 1, ?, 'cash_in_lieu', 'SEC_A', -0.5, 50.0, 'act-cil', '{}', ?, ?)",
+            [_NOW.date(), _NOW, _NOW],
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO adjustments (adjustment_id, window_id, session, kind, cash, "
+                "broker_activity_id, known_at, ingested_at) "
+                "VALUES (3, 1, ?, 'fee_cash', -0.01, 'act-9', ?, ?)",
+                [_NOW.date(), _NOW, _NOW],
+            )
     finally:
         conn.close()
 
@@ -304,7 +373,7 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 
 def test_fresh_init_creates_the_journal_at_version_17(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [25]
+    assert _versions(journal) == [28]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -368,6 +437,9 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         23,
         24,
         25,
+        26,
+        27,
+        28,
     ]
     # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
@@ -417,6 +489,9 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
             23,
             24,
             25,
+            26,
+            27,
+            28,
         ]
 
 
@@ -564,7 +639,7 @@ def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns(
             for table, columns in old_columns.items()
         }
         schema.init_schema(conn)
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
             (1, "main")
         ]
@@ -633,7 +708,7 @@ def test_a_version_16_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
     finally:
         conn.close()
 
@@ -790,7 +865,7 @@ def test_migrating_a_version_18_store_keeps_every_alert_and_books_it_main() -> N
         before = conn.execute(select).fetchall()
         assert [row[0] for row in before] == [3, 1, 4]
         schema.init_schema(conn)
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         assert conn.execute(select).fetchall() == before
         assert conn.execute("SELECT alert_id, book_id FROM alerts ORDER BY rowid").fetchall() == [
             (3, "main"),
@@ -846,7 +921,7 @@ def test_a_version_18_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
     finally:
         conn.close()
 
@@ -889,7 +964,7 @@ def test_a_version_4_store_gets_alerts_book_id_directly(v4_path: Path) -> None:
     with duckdb.connect(str(v4_path)) as conn:
         schema.init_schema(conn)
         assert _columns(conn, "alerts")["book_id"] is False  # NOT NULL
-        assert _versions(conn)[-1] == 25
+        assert _versions(conn)[-1] == 28
 
 
 def test_default_book_id_is_a_nonempty_word() -> None:

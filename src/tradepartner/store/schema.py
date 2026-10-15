@@ -10,7 +10,10 @@ ever gets `bar` rows; `corporate_actions` only `action`; `facts` and
 sources: shares outstanding and delistings both name a filing as the only
 source); `securities`, `listings` and `classifications` allow `filing`,
 `snapshot` and `snapshot_static` (the master table sources different
-columns of these three from filings vs. snapshots). `ingestion_runs` is
+columns of these three from filings vs. snapshots), and `listings` and
+`classifications` also allow `filing_name` (version 26, #1597: a ticker
+read from a filing's own file names rather than a tagged fact).
+`ingestion_runs` is
 not a fact table — it records ingest job status, not a point-in-time fact
 — so it has none of the four common columns and no provenance concept.
 
@@ -409,7 +412,56 @@ registry; #83 took version 2 first, so the registry is version 3):
   additive `ALTER` for `activities_seen_json`), on every store, and it
   appends a version-25 row. A read-only connection accepts a version-24
   store: every read works but a reading of the two version-25 columns.
-  A later DDL change goes to version 26, with its own migration and a
+- **26** (#1597, data-foundation plan T184d; the spec's "Amendment
+  2026-10-12 (#1597)"): `listings` and `classifications` allow
+  `provenance = 'filing_name'`, a ticker read from a filing's own file names
+  (a 10-K's XBRL instance file-name prefix, a Nasdaq Form 25's exhibit file
+  name) rather than from a tagged fact, `known_at` = that filing's
+  acceptance; classification rule 7 then writes the listing row's own
+  provenance on its `suffix_*` row, never `snapshot_static` for a
+  `filing_name` one (`store.classify`). The value is a `CHECK` constraint of
+  the two tables and DuckDB cannot widen a `CHECK` in place, so the
+  migration rebuilds both tables with the wider set (`_migrate_filing_name`,
+  from `_FILING_NAME_TABLE_DDL`), every row kept in insertion order and
+  byte-identical: the `CHECK` only widens, so no stored row can be refused
+  and every as-of read returns what it did before. `_TABLE_DDL` keeps its
+  version-4 pin (its hash in `test_journal_schema.py`), so a fresh store's
+  two tables come from the DDL pass with the version-4 set and are rebuilt
+  empty, exactly as version 11 rebuilt them with `retracted`
+  (`_RETRACTION_TABLE_DDL`). A read-only connection accepts a version-25
+  store: no read depends on the `CHECK`, and the next writable
+  `init_schema` call migrates the store. Nothing writes a `filing_name` row
+  before T184e, behind `edgar.filename_listings` (default off).
+- **27. 2026-10-13 (#1627)**, paper-trading fix: the ledger books a stock
+  dividend's fractional-share cash in lieu. `adjustments.kind` gains
+  `cash_in_lieu`, a cash-only row (with the removed fractional `quantity`)
+  keyed by the broker `CIL` activity id in the existing
+  `broker_activity_id` column (`UNIQUE`, nullable), booked by reconciliation
+  when the broker's `CIL` net_amount matches the expected cash (fractional
+   remainder x the reference price) within a new `risk.cash_in_lieu_tolerance`
+  (relative), exactly as `fee_cash` is booked by id. The `kind` `CHECK` is
+  widened by the same staging rebuild of `adjustments` from its own DDL that
+  version 25 and version 26 used (`_migrate_cash_in_lieu_kind`), every row
+  kept and byte-identical (the `CHECK` only widens, so no stored row is
+  refused and none can be a `cash_in_lieu` yet), and a version-27 row is
+  appended. A read-only connection accepts a version-26 store: every read
+  works, and the next writable `init_schema` call migrates it.
+- **Version 28** (#1506, data-foundation plan T172b; the spec's "Amendment
+  2026-10-11 (#1506)", spin-offs and name changes): adds `symbol_changes`
+  (one row per Alpaca name change, `known_at` = the close of the first
+  session strictly after its `process_date`). Purely additive, like versions
+  21, 23 and 24: the migration from any earlier migratable version just
+  creates the table and its identity index (`init_schema`'s DDL pass,
+  `_SYMBOL_CHANGES_TABLE_DDL`) and appends a version-28 row; no existing
+  table or row changes. The identity mirrors `corporate_actions_identity`:
+  `(security_id, source_action_id)` when the id is non-empty, else
+  `(security_id, old_symbol, new_symbol, process_date)`, each with
+  `known_at`. The table joins `TABLE_NAMES` and `TABLE_PROVENANCE_VALUES`
+  (`action` only); `registry.data_vintage` already leaves it out (T171b). A
+  read-only connection accepts a version-27 store: every read works but a
+  `symbol_changes` read, which fails on the missing table, and the next
+  writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 29**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -495,7 +547,19 @@ PROVENANCE_VALUES: tuple[str, ...] = (
     "snapshot",
     "snapshot_static",
     "release",
+    "filing_name",
 )
+
+#: The provenance `CHECK` set of `_TABLE_DDL`'s three master tables at their
+#: version-4 shape (spec "Data / interfaces" > Master column sources):
+#: frozen with that tuple's hash pin (`test_journal_schema.py`, quant-auditor
+#: review of #660/T76, PR #729). `listings` and `classifications` gained
+#: `filing_name` at version 26 (#1597, T184d) by a rebuild after the DDL
+#: pass (`_FILING_NAME_TABLE_DDL`, `_migrate_filing_name`), exactly as the two
+#: tables gained `retracted` at version 11 (`_RETRACTION_TABLE_DDL`), so the
+#: pinned DDL text never moves: `TABLE_PROVENANCE_VALUES` below is the live
+#: set, this one the set the pinned DDL still creates.
+_V4_MASTER_PROVENANCE: tuple[str, ...] = ("filing", "snapshot", "snapshot_static")
 
 #: The provenance values each fact table's CHECK constraint allows, per
 #: the "Data / interfaces" master column-sources table. Exposed (not just
@@ -503,9 +567,9 @@ PROVENANCE_VALUES: tuple[str, ...] = (
 #: never carry a provenance from outside its own set" without duplicating
 #: the mapping.
 TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
-    "securities": ("filing", "snapshot", "snapshot_static"),
-    "listings": ("filing", "snapshot", "snapshot_static"),
-    "classifications": ("filing", "snapshot", "snapshot_static"),
+    "securities": _V4_MASTER_PROVENANCE,
+    "listings": (*_V4_MASTER_PROVENANCE, "filing_name"),
+    "classifications": (*_V4_MASTER_PROVENANCE, "filing_name"),
     "delistings": ("filing",),
     "prices_daily": ("bar",),
     "corporate_actions": ("action",),
@@ -514,6 +578,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "filing_events": ("filing",),
     "rates": ("release",),
     "borrow_status": ("snapshot",),
+    "symbol_changes": ("action",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -652,9 +717,19 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   never part of `frozen_json` or its hash). The `kind` `CHECK` is rebuilt as
 #:   version 20 rebuilt `owner_decisions` (`_migrate_fee_activities`, a staging
 #:   rebuild that keeps every row; module docstring, "Schema versions").
-#: - A later DDL change goes to version 26, with its own migration and a
+#: - 26 (#1597, data-foundation plan T184d): `listings` and `classifications`
+#:   allow `filing_name`, a ticker read from a filing's own file names
+#:   (`TABLE_PROVENANCE_VALUES`). The pinned `_TABLE_DDL` keeps the version-4
+#:   set (`_V4_MASTER_PROVENANCE`), so the two tables are rebuilt after the
+#:   DDL pass with the wider `CHECK` (`_FILING_NAME_TABLE_DDL`,
+#:   `_migrate_filing_name`), every row kept (module docstring, "Schema
+#:   versions").
+#: - 28 (#1506, data-foundation plan T172b): the `symbol_changes` table and
+#:   its identity index, created by the DDL pass (`_SYMBOL_CHANGES_TABLE_DDL`);
+#:   no existing table changes (module docstring, "Schema versions").
+#: - A later DDL change goes to version 29, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 25
+CURRENT_SCHEMA_VERSION = 28
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -767,6 +842,22 @@ _PRE_BORROW_STATUS_VERSION = 23
 #: as a `borrow_status` read failed on the missing table at version 23.
 _PRE_FEE_ACTIVITIES_VERSION = 24
 
+#: The last version without `filing_name` in the `listings` and
+#: `classifications` allowed sets (#1597, T184d, version 26): read-only
+#: connections serve every read, since no read depends on a table's
+#: provenance `CHECK` and no `filing_name` row can exist there.
+_PRE_FILING_NAME_VERSION = 25
+
+#: The last version without the `cash_in_lieu` adjustment kind (#1627,
+#: version 27): read-only connections serve every read, since no read
+#: depends on the `kind` `CHECK` and no `cash_in_lieu` row can exist there.
+_PRE_CASH_IN_LIEU_VERSION = 26
+
+#: The last version without `symbol_changes` (#1506, T172b, version 28):
+#: read-only connections serve every other read; a `symbol_changes` read
+#: there fails on the missing table, as a `borrow_status` read did at 23.
+_PRE_SYMBOL_CHANGES_VERSION = 27
+
 
 class SchemaVersionError(RuntimeError):
     """The store's `schema_version` table records a version this code has
@@ -811,7 +902,7 @@ CREATE TABLE IF NOT EXISTS securities (
     cik VARCHAR NOT NULL,
     name VARCHAR NOT NULL,
     benchmark BOOLEAN NOT NULL DEFAULT FALSE,
-    {_common_fact_columns(TABLE_PROVENANCE_VALUES["securities"])},
+    {_common_fact_columns(_V4_MASTER_PROVENANCE)},
     UNIQUE (security_id, known_at)
 )
 """
@@ -823,7 +914,7 @@ CREATE TABLE IF NOT EXISTS listings (
     exchange VARCHAR NOT NULL,
     class_title VARCHAR,
     valid_from DATE NOT NULL,
-    {_common_fact_columns(TABLE_PROVENANCE_VALUES["listings"])},
+    {_common_fact_columns(_V4_MASTER_PROVENANCE)},
     UNIQUE (security_id, ticker, exchange, valid_from, known_at)
 )
 """
@@ -834,7 +925,7 @@ CREATE TABLE IF NOT EXISTS classifications (
     sic INTEGER,
     security_type VARCHAR NOT NULL,
     rule VARCHAR NOT NULL,
-    {_common_fact_columns(TABLE_PROVENANCE_VALUES["classifications"])},
+    {_common_fact_columns(_V4_MASTER_PROVENANCE)},
     UNIQUE (security_id, rule, known_at)
 )
 """
@@ -1075,6 +1166,33 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
 )
 """
 
+
+# T172b (#1506): rename facts, with the action identity convention.
+_CREATE_SYMBOL_CHANGES = f"""
+CREATE TABLE IF NOT EXISTS symbol_changes (
+    security_id VARCHAR NOT NULL,
+    old_symbol VARCHAR NOT NULL,
+    new_symbol VARCHAR NOT NULL,
+    old_cusip VARCHAR NOT NULL,
+    new_cusip VARCHAR NOT NULL,
+    process_date DATE NOT NULL,
+    source_action_id VARCHAR NOT NULL DEFAULT '',
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["symbol_changes"])},
+    UNIQUE (security_id, source_action_id, old_symbol, new_symbol, process_date, known_at)
+)
+"""
+
+_CREATE_SYMBOL_CHANGES_IDENTITY_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS symbol_changes_identity ON symbol_changes (
+    security_id,
+    source_action_id,
+    (CASE WHEN source_action_id = '' THEN old_symbol ELSE '' END),
+    (CASE WHEN source_action_id = '' THEN new_symbol ELSE '' END),
+    (CASE WHEN source_action_id = '' THEN CAST(process_date AS VARCHAR) ELSE '' END),
+    known_at
+)
+"""
+
 _CREATE_SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL,
@@ -1097,6 +1215,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "filing_events",
     "rates",
     "borrow_status",
+    "symbol_changes",
     "ingestion_runs",
     "schema_version",
 )
@@ -1147,6 +1266,11 @@ _RATES_TABLE_DDL: tuple[str, ...] = (_CREATE_RATES,)
 #: this DDL goes to the next schema version with its own migration.
 _BORROW_STATUS_TABLE_DDL: tuple[str, ...] = (_CREATE_BORROW_STATUS,)
 
+_SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
+    _CREATE_SYMBOL_CHANGES,
+    _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
+)
+
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
 RETRACTABLE_TABLES: tuple[str, ...] = ("securities", "listings")
@@ -1163,6 +1287,26 @@ _RETRACTION_TABLE_DDL: dict[str, str] = {
         1,
     )
     for table, ddl in (("securities", _CREATE_SECURITIES), ("listings", _CREATE_LISTINGS))
+}
+
+#: The version-26 `listings` and `classifications` (#1597, T184d; spec
+#: "Amendment 2026-10-12 (#1597)"): each table's pinned version-4 DDL —
+#: `listings`'s as version 11 left it, so it already carries `retracted` —
+#: with `filing_name` added to the provenance `CHECK`, so a store migrating
+#: from any earlier version ends at one shape whichever step rebuilds last.
+#: `_migrate_filing_name` rebuilds the two tables from these after the DDL
+#: pass and `_migrate_retracted`, every row kept in insertion order and
+#: byte-identical (the `CHECK` only widens, so no stored row can be refused).
+_FILING_NAME_TABLE_DDL: dict[str, str] = {
+    table: ddl.replace(
+        _common_fact_columns(_V4_MASTER_PROVENANCE),
+        _common_fact_columns(TABLE_PROVENANCE_VALUES[table]),
+        1,
+    )
+    for table, ddl in (
+        ("listings", _RETRACTION_TABLE_DDL["listings"]),
+        ("classifications", _CREATE_CLASSIFICATIONS),
+    )
 }
 
 
@@ -1599,6 +1743,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "spinoff_receipt",
         "carried_residue",
         "fee_cash",
+        "cash_in_lieu",
     ),
     ("adjustments", "origin"): ("dust", "untradable"),
     ("reconciliations", "status"): ("ok", "mismatch", "pending_unresolved", "fills_lagging"),
@@ -2556,7 +2701,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPERATIONS_BOOK_VERSION,
         _PRE_RATES_VERSION,
         _PRE_BORROW_STATUS_VERSION,
+        _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        _PRE_CASH_IN_LIEU_VERSION,
+        _PRE_SYMBOL_CHANGES_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2583,7 +2731,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `borrow_status`; version 24 every read but the two version-25 columns
         # `adjustments.broker_activity_id` and `paper_windows.activities_seen_json`
         # (the booked-fee activity's `explanations_as_of` names one), which a
-        # version-24 store lacks.
+        # version-24 store lacks; version 25 every read (no `filing_name` row
+        # can exist there, and no read depends on the provenance `CHECK`);
+        # version 26 every read; version 27 every read but `symbol_changes`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -2853,6 +3003,71 @@ def _migrate_retracted(conn: duckdb.DuckDBPyConnection) -> None:
         )
         conn.execute(f"DROP TABLE {table}")
         conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
+def _migrate_filing_name(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild `listings` and `classifications` with their version-26 DDL
+    (`_FILING_NAME_TABLE_DDL`; module docstring, "Schema versions", #1597,
+    T184d): the pinned version-4 shape plus `filing_name` in the provenance
+    `CHECK`, so the store accepts a listing or classification row whose
+    ticker was read from a filing's own file names rather than a tagged
+    fact (spec "Amendment 2026-10-12 (#1597)"). Every row is kept in
+    insertion order and byte-identical: the `CHECK` only widens, so no
+    stored row can be refused and every as-of read returns what it did
+    before. A fresh store's two tables come from `_TABLE_DDL` (the
+    version-4 shape, `listings`'s with `retracted` from
+    `_migrate_retracted`) and are rebuilt empty, as that migration rebuilds
+    them. Idempotent: a table whose provenance `CHECK` already allows
+    `filing_name` is left alone, as `_migrate_retracted` tests `retracted`.
+    Runs inside `init_schema`'s transaction, after `_migrate_retracted`, so
+    `listings` already carries `retracted` when it is rebuilt."""
+    for table, ddl in _FILING_NAME_TABLE_DDL.items():
+        check = conn.execute(
+            "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+            "current_database() AND schema_name = current_schema() AND table_name = ? "
+            "AND constraint_type = 'CHECK' AND constraint_column_names[1] = 'provenance'",
+            [table],
+        ).fetchone()
+        if check is not None and "'filing_name'" in (check[0] or ""):
+            continue
+        staging = f"{table}_v25"
+        conn.execute(
+            ddl.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
+def _migrate_cash_in_lieu_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 27 (module docstring, "Schema versions"; #1627): widen
+    `adjustments.kind` with `cash_in_lieu` so the ledger books a stock
+    dividend's fractional-share cash in lieu by its broker `CIL` activity id.
+    DuckDB cannot widen a `CHECK` in place, so rebuild `adjustments` with its
+    version-27 DDL (`_CREATE_ADJUSTMENTS`; the `broker_activity_id` column and
+    `fee_cash` already in it from versions 25 and 26), every row kept in
+    insertion order and byte-identical: the `CHECK` only widens, so no stored
+    row can be refused and none can be a `cash_in_lieu` yet. Idempotent: a
+    `kind` `CHECK` that already allows `cash_in_lieu` (a fresh store, or one
+    already migrated) is left alone, as `_migrate_filing_name` tests its
+    `provenance` `CHECK`. Runs inside `init_schema`'s transaction, after
+    `_migrate_filing_name` and `_migrate_fee_activities`."""
+    check = conn.execute(
+        "SELECT constraint_text FROM duckdb_constraints() WHERE database_name = "
+        "current_database() AND schema_name = current_schema() AND table_name = 'adjustments' "
+        "AND constraint_type = 'CHECK' AND constraint_column_names[1] = 'kind'",
+        [],
+    ).fetchone()
+    if check is not None and "'cash_in_lieu'" in (check[0] or ""):
+        return
+    conn.execute(
+        _CREATE_ADJUSTMENTS.replace(
+            "CREATE TABLE IF NOT EXISTS adjustments (", "CREATE TABLE adjustments_v27 (", 1
+        )
+    )
+    conn.execute("INSERT INTO adjustments_v27 BY NAME SELECT * FROM adjustments ORDER BY rowid")
+    conn.execute("DROP TABLE adjustments")
+    conn.execute("ALTER TABLE adjustments_v27 RENAME TO adjustments")
 
 
 def _add_nullable_int_columns(
@@ -3232,7 +3447,7 @@ def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 24 store to version 25.
+    version-2 to 26 store to version 27.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3245,6 +3460,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `adjustments` rebuilt with its version-27 DDL (the `kind` `CHECK` widened
+    with `cash_in_lieu`, every row kept, byte-identical; a version-2 to 26 store
+    gets a version-27 row; #1627); every store gets
+    `listings` and `classifications` rebuilt with `filing_name` in their
+    provenance `CHECK` (every row kept, byte-identical; a version-25 store
+    gets a version-26 row; #1597, T184d); every store gets
     `borrow_status` created where it lacks it (purely additive; a version-23
     store gets a version-24 row; #1506, T171); every store gets `rates`
     created where it lacks it (purely additive; a version-22 store gets a
@@ -3307,7 +3528,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-25, version-24 (every read
+    On a read-only connection no DDL runs: a version-26, 25 (every read; the
+    provenance `CHECK` only widens), 24 (every read
     but the two version-25 columns `adjustments.broker_activity_id` and
     `paper_windows.activities_seen_json`), 23 (every read but
     `borrow_status`, missing there), 22 (every read but
@@ -3366,7 +3588,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPERATIONS_BOOK_VERSION,
         _PRE_RATES_VERSION,
         _PRE_BORROW_STATUS_VERSION,
+        _PRE_FILING_NAME_VERSION,
         _PRE_FEE_ACTIVITIES_VERSION,
+        _PRE_CASH_IN_LIEU_VERSION,
+        _PRE_SYMBOL_CHANGES_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3406,9 +3631,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _FILING_EVENTS_TABLE_DDL
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
+            + _SYMBOL_CHANGES_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
+        _migrate_filing_name(conn)
         _migrate_n_research(conn)
         _migrate_profitability_rebalance_counts(conn)
         _relax_no_history_count(conn)
@@ -3432,6 +3659,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_operations_kinds(conn)
         if max_version is None or max_version <= _PRE_FEE_ACTIVITIES_VERSION:
             _migrate_fee_activities(conn)
+        if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
+            _migrate_cash_in_lieu_kind(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

@@ -60,6 +60,12 @@ _UNTOUCHED_TABLES = tuple(
     if name not in ("corporate_actions", "schema_version", *schema.RETRACTABLE_TABLES)
 )
 
+#: Tables an older migration than the one under test rebuilt, so only their
+#: rows are compared, never their DDL: #1597's `classifications` (version 26,
+#: T184d; `listings` is already outside `_UNTOUCHED_TABLES` as retractable,
+#: and `corporate_actions` is excluded whole, with its own test below).
+_ROWS_ONLY_TABLES = ("classifications",)
+
 _OLD_APPLIED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 
 #: `corporate_actions` as versions 2 and 3 created it (#83), frozen here:
@@ -111,6 +117,7 @@ def _make_old_store(path: Path, version: int) -> None:
             + schema._FILING_EVENTS_TABLE_DDL
             + schema._RATES_TABLE_DDL
             + schema._BORROW_STATUS_TABLE_DDL
+            + schema._SYMBOL_CHANGES_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:
@@ -222,11 +229,11 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
     assert set(schema.REGISTRY_TABLE_NAMES) & set(schema.TABLE_NAMES) == set()
 
 
-def test_current_schema_version_is_24() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 25
+def test_current_schema_version_is_26() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 28
 
 
-def test_fresh_init_creates_every_table_at_version_24() -> None:
+def test_fresh_init_creates_every_table_at_version_26() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     assert _table_names(conn) == (
@@ -237,14 +244,14 @@ def test_fresh_init_creates_every_table_at_version_24() -> None:
         | set(schema.RESEARCH_TABLE_NAMES)
         | {schema.REBALANCE_COUNTS_TABLE_NAME}
     )
-    assert [version for version, _ in _versions(conn)] == [25]
+    assert [version for version, _ in _versions(conn)] == [28]
 
 
 def test_fresh_init_twice_keeps_one_version_row() -> None:
     conn = duckdb.connect(":memory:")
     schema.init_schema(conn)
     schema.init_schema(conn)
-    assert [version for version, _ in _versions(conn)] == [25]
+    assert [version for version, _ in _versions(conn)] == [28]
 
 
 def test_registry_tables_carry_no_fact_columns() -> None:
@@ -264,7 +271,7 @@ def test_registry_tables_carry_no_fact_columns() -> None:
         assert columns.isdisjoint({"known_at", "ingested_at", "provenance"}), table
 
 
-def test_write_open_of_version_2_store_migrates_to_version_24(version_2_store: Path) -> None:
+def test_write_open_of_version_2_store_migrates_to_version_25(version_2_store: Path) -> None:
     conn = duckdb.connect(str(version_2_store))
     try:
         assert _table_names(conn).isdisjoint(_PHASE3_REGISTRY)
@@ -298,13 +305,16 @@ def test_write_open_of_version_2_store_migrates_to_version_24(version_2_store: P
         23,
         24,
         25,
+        26,
+        27,
+        28,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
     assert versions[3][1] == versions[2][1] == versions[1][1]
 
 
-def test_write_open_of_version_3_store_migrates_to_version_24(version_3_store: Path) -> None:
+def test_write_open_of_version_3_store_migrates_to_version_25(version_3_store: Path) -> None:
     conn = duckdb.connect(str(version_3_store))
     try:
         # Version 12 (#926) adds `trial_results.n_research`; version 13
@@ -349,6 +359,9 @@ def test_write_open_of_version_3_store_migrates_to_version_24(version_3_store: P
         23,
         24,
         25,
+        26,
+        27,
+        28,
     ]
     assert versions[0][1] == _OLD_APPLIED_AT
     assert versions[1][1] > _OLD_APPLIED_AT
@@ -366,7 +379,13 @@ def test_migration_leaves_other_fact_tables_byte_identical(tmp_path: Path, versi
         after = _table_snapshot(conn, _UNTOUCHED_TABLES)
     finally:
         conn.close()
-    assert after == before
+    for table in _UNTOUCHED_TABLES:
+        if table in _ROWS_ONLY_TABLES:
+            # `classifications` is rebuilt for `filing_name` (#1597, T184d):
+            # its DDL changes, every row is byte-identical.
+            assert after[table][3:] == before[table][3:], table
+        else:
+            assert after[table] == before[table], table
 
 
 @pytest.mark.parametrize("version", [2, 3])
@@ -510,7 +529,7 @@ def test_read_only_open_of_version_21_store_passes(tmp_path: Path) -> None:
     conn = duckdb.connect(str(path), read_only=True)
     try:
         schema.init_schema(conn)
-        assert [version for version, _ in _versions(conn)] == [25]
+        assert [version for version, _ in _versions(conn)] == [28]
     finally:
         conn.close()
 
@@ -755,7 +774,7 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         )
         assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
         assert conn.execute("SELECT development_boundary FROM trials").fetchall() == [(None,)]
-        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24, 25]
+        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         for decision_id, kind in enumerate(lab_schema.RELEASE_DECISION_KINDS, start=10):
             conn.execute(
                 "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -776,7 +795,7 @@ def test_migrating_a_version_17_store_keeps_every_row(tmp_path: Path, lab: bool)
         rows, check = _every_row(conn), _kind_check(conn)
         schema.init_schema(conn)
         assert (_every_row(conn), _kind_check(conn)) == (rows, check)
-        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24, 25]
+        assert [v for v, _ in _versions(conn)] == [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 
 
 def test_a_failed_version_18_migration_leaves_the_store_at_17(

@@ -59,16 +59,21 @@ as_of`:
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
-  ex-date after the cash base's session and on or before S. The base is the
+  ex-date after the cash base's session and on or before S. An
+  equal-amount group (one security, ex-date and amount under several live
+  ids, #1613) is read through the reviewed list
+  (`store.dividend_reviews`): a listed `duplicate` not yet repaired counts
+  once, a listed `distinct` or `unresolved` pair as stored, and any other
+  group on a held name is never summed but named in `dividend_findings`,
+  which `compare` reports as an `unexplained_dividend_group` mismatch
+  (#1625): a data finding, failing closed. The base is the
   window's latest `ok` reconciliation stated on or before S, or the window's
   start. The cash due is the amount per share times the ledger's holding at
   the session before the ex-date. A dividend the journal already holds as a
   `dividend_cash` row dated on or after its ex-date is never offered again.
-- `spinoffs`: always empty. The store keeps only splits and cash dividends
-  (`adapters.alpaca_prices` reports spin-offs and does not store them), so
-  no row can name a spin-off child. A child the broker books is an
-  `unknown_symbol` or `broker_only_position` mismatch until the store can
-  hold one.
+- `spinoffs`: always empty until T48b records broker receipts, although
+  the store now holds spin-off actions. A child the broker books is an
+  `unknown_symbol` or `broker_only_position` mismatch until that task.
 - `reference_prices`: the raw close of the latest bar at or before S-1 per
   name, which bounds an ended name's proceeds and a pending order's reach.
 
@@ -101,7 +106,7 @@ import polars as pl
 from pydantic import ValidationError
 
 from tradepartner.adapters.broker import Account, Broker, Order, Position
-from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
 from tradepartner.execution import switch
@@ -118,6 +123,11 @@ from tradepartner.execution.reconcile import (
 )
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
+from tradepartner.store.dividend_reviews import (
+    ReviewedGroup,
+    equal_amount_groups,
+    reviewed_groups,
+)
 from tradepartner.store.journal import (
     AdjustmentRow,
     OrderedFill,
@@ -140,6 +150,7 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 _NEW_YORK = ZoneInfo("America/New_York")
 _DIVIDEND = "dividend"
 _DIVIDEND_CASH = "dividend_cash"
+_SPLIT = "split"
 _RISK_PREFIX = "risk."
 _FAULT_TYPE = ReconciliationError.__name__
 
@@ -313,9 +324,19 @@ def _dividends(
     session: date,
     tolerance: float,
     through: date,
-) -> dict[str, float]:
+    reviewed: Sequence[ReviewedGroup],
+) -> tuple[dict[str, float], dict[str, str]]:
     """Cash due per name for dividends with ex-date in (base session, S], less
-    any the journal already holds as `dividend_cash` on or after the ex-date."""
+    any the journal already holds as `dividend_cash` on or after the ex-date,
+    and the held names with an equal-amount dividend group the reviewed list
+    does not explain (#1625, #1613), each with its detail.
+
+    Each `(security_id, ex_date, amount)` held by more than one live identity
+    is classed by `store.dividend_reviews.equal_amount_groups`: a listed
+    `duplicate` not yet repaired (`pending`) counts once (its retract id's row
+    is skipped); a listed `distinct` or `unresolved` pair counts as stored; any
+    other group (`violation`) is never summed and, on a held name, is a
+    finding, so the caller fails closed rather than guess one payment or two."""
     base = state.base(through)
     stated = base.at if base is not None else window.started_at
     after = stated.astimezone(_NEW_YORK).date()
@@ -328,9 +349,25 @@ def _dividends(
         & (pl.col("ex_date") > after)
         & (pl.col("ex_date") <= session)
     )
+    skipped: set[tuple[str, str]] = set()
+    unexplained: dict[tuple[str, date, float], str] = {}
+    for group in equal_amount_groups(rows, reviewed):
+        if group.group_class == "pending" and group.reviewed is not None:
+            skipped.add((group.security_id, group.reviewed.retract_source_action_id))
+        elif group.group_class == "violation":
+            ids = ", ".join(
+                f"{i.source_action_id} known {i.known_at.isoformat()}" for i in group.identities
+            )
+            unexplained[group.key] = (
+                f"{len(group.identities)} live dividend records of {group.amount!r} with "
+                f"ex-date {group.ex_date} ({ids}) that the reviewed list does not explain"
+            )
     due: dict[str, float] = defaultdict(float)
+    findings: dict[str, list[str]] = defaultdict(list)
     holdings: dict[date, Ledger] = {}
     for row in rows.iter_rows(named=True):
+        if (row["security_id"], row["source_action_id"]) in skipped:
+            continue
         if any(day >= row["ex_date"] for day in journaled.get(row["security_id"], ())):
             continue
         before = previous_session(row["ex_date"])
@@ -338,8 +375,52 @@ def _dividends(
             holdings[before] = _ledger(state, actions, window, before, tolerance)
         held = holdings[before].positions.get(row["security_id"], 0.0)
         if held > tolerance:
+            key = (row["security_id"], row["ex_date"], float(row["ratio_or_amount"]))
+            if key in unexplained:
+                if unexplained[key] not in findings[row["security_id"]]:
+                    findings[row["security_id"]].append(unexplained[key])
+                continue
             due[row["security_id"]] += held * float(row["ratio_or_amount"])
-    return {name: amount for name, amount in sorted(due.items()) if amount > 0}
+    return (
+        {name: amount for name, amount in sorted(due.items()) if amount > 0},
+        {name: "; ".join(details) for name, details in sorted(findings.items())},
+    )
+
+
+def _stock_dividends(
+    actions: pl.DataFrame, session: date, max_rate: float, max_lag_sessions: int
+) -> dict[str, tuple[date, date, float]]:
+    """`security_id`s with a stock dividend stored as a `SPLIT` action (#1627):
+    a ratio in `(1, max_rate]` — the same `alpaca.stock_dividend_max_rate` guard
+    `#1618` (T186-family) stores one by — each mapped to `(first_date, last_date,
+    ratio)`: the name's latest `ex_date <= session`, that ex-date advanced up to
+    `max_lag_sessions` XNYS sessions (the `alpaca.cash_in_lieu_max_lag_sessions`
+    window Alpaca pays cash in lieu on, the payable date), clamped to `session`,
+    and its ratio. A `CIL` cash-in-lieu activity is reconciled into a
+    `cash_in_lieu` adjustment only beside a name here and dated in
+    `[first_date, last_date]` (and a fractional remainder the broker credited as
+    whole shares plus cash); otherwise it is `unexplained_activity`."""
+    rows = actions.filter(
+        (pl.col("action_type") == _SPLIT)
+        & (pl.col("ratio_or_amount") > 1)
+        & (pl.col("ratio_or_amount") <= max_rate)
+        & (pl.col("ex_date") <= session)
+    )
+    latest: dict[str, tuple[date, float]] = {}
+    for row in rows.iter_rows(named=True):
+        ex_date = row["ex_date"]
+        current = latest.get(row["security_id"])
+        if current is None or ex_date > current[0]:
+            latest[row["security_id"]] = (ex_date, float(row["ratio_or_amount"]))
+    result: dict[str, tuple[date, date, float]] = {}
+    for name, (ex_date, ratio) in sorted(latest.items()):
+        last = ex_date
+        for _ in range(max_lag_sessions):
+            if last >= session:
+                break
+            last = next_session(last)
+        result[name] = (ex_date, last, ratio)
+    return result
 
 
 def _explanations(
@@ -365,15 +446,46 @@ def _explanations(
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
+    dividends, findings = _dividends(
+        state, actions, window, session, tolerance, through, reviewed_groups()
+    )
+    stock_dividends = _stock_dividends(
+        actions,
+        session,
+        settings.alpaca.stock_dividend_max_rate,
+        settings.alpaca.cash_in_lieu_max_lag_sessions,
+    )
     return Explanations(
         symbols=symbols,
         ended=ended,
         spinoffs={},
-        dividends=_dividends(state, actions, window, session, tolerance, through),
+        dividends=dividends,
+        dividend_findings=findings,
         reference_prices=_reference_prices(conn, cut, priced, previous_session(session)),
+        stock_dividends=stock_dividends,
+        stock_dividend_references=_stock_dividend_references(conn, cut, priced, stock_dividends),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
     )
+
+
+def _stock_dividend_references(
+    conn: duckdb.DuckDBPyConnection,
+    cut: datetime,
+    priced: Sequence[str],
+    stock_dividends: Mapping[str, tuple[date, date, float]],
+) -> dict[str, float]:
+    """Each stock dividend's pre-ex reference (#1627): the raw close of the
+    name's latest bar on or before `previous_session(ex_date)`, known at `cut`.
+    Read for the ex-date, not the reconciliation session, so a `CIL` posted on
+    the payable date still divides the same pre-split close by the ratio; a name
+    the bars do not reach is left out, and its `CIL` halts there."""
+    references: dict[str, float] = {}
+    for name, (ex_date, _last_date, _ratio) in stock_dividends.items():
+        if name not in set(priced):
+            continue
+        references.update(_reference_prices(conn, cut, [name], previous_session(ex_date)))
+    return references
 
 
 def _recorded_activity_ids(base: ReconciliationRow | None) -> set[str] | None:

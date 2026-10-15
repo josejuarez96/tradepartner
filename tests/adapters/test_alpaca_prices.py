@@ -10,7 +10,9 @@ ticker.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
+from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -22,6 +24,7 @@ from tradepartner.adapters.alpaca_prices import (
     AlpacaPriceSource,
     ListingResolver,
     RegistrantEvidence,
+    TickerSpan,
     _default_fetch_name_changes,
     alpaca_symbol,
     feed_source,
@@ -39,6 +42,7 @@ from tradepartner.adapters.prices import (
     announcement_date_known_at,
     bar_known_at,
 )
+from tradepartner.calendar import is_session, next_session
 from tradepartner.config import AlpacaConfig, Settings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "alpaca"
@@ -49,14 +53,29 @@ def _json(name: str) -> Any:
 
 
 def _listing(
-    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+    security_id: str,
+    ticker: str,
+    valid_from: date,
+    class_title: str | None = None,
+    provenance: str | None = None,
 ) -> dict[str, object]:
-    return {
+    row = {
         "security_id": security_id,
         "ticker": ticker,
         "valid_from": valid_from,
         "class_title": class_title,
     }
+    if provenance is not None:  # #1597: a listing read from a filing's own names
+        row["provenance"] = provenance
+    return row
+
+
+def _filing_name(
+    security_id: str, ticker: str, valid_from: date, class_title: str | None = None
+) -> dict[str, object]:
+    """A `listings` row read from a filing's own file names (#1597: a 10-K's
+    XBRL instance prefix, a Nasdaq Form 25's exhibit ticker)."""
+    return _listing(security_id, ticker, valid_from, class_title, "filing_name")
 
 
 START = date(2016, 1, 4)
@@ -2056,6 +2075,96 @@ class TestNewActions:
         with pytest.raises(ValueError):
             parse_corporate_actions({"spin_offs": [_spinoff(**{field: value})]}, resolver.resolve)
 
+    def test_second_distribution_is_a_revision_of_the_first(self) -> None:
+        # #1673 (2), spec "Spin-offs": a second distribution from the same
+        # parent to the same child is a revision of the first: both records
+        # come back, oldest first, each at its own stamp, so the writer's
+        # revision rule picks the one known at its run.
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 1))]
+        )
+        first = _spinoff(id="a", ex_date="2020-09-29", process_date="2020-10-16")
+        second = _spinoff(
+            id="b", ex_date="2020-11-30", process_date="2020-12-04", new_rate=3, source_rate=4
+        )
+        for rows in ([first, second], [second, first]):
+            parsed = parse_corporate_actions({"spin_offs": rows}, resolver.resolve)
+            assert [
+                (a.security_id, a.source_action_id, a.ex_date, a.ratio_or_amount, a.known_at)
+                for a in parsed.actions
+            ] == [
+                ("C", "P", date(2020, 9, 29), 0.5, announcement_date_known_at(date(2020, 10, 16))),
+                ("C", "P", date(2020, 11, 30), 0.75, announcement_date_known_at(date(2020, 12, 4))),
+            ]
+            assert parsed.spinoff_revisions == 1
+
+    def test_repeated_identical_spinoff_row_is_one_record(self) -> None:
+        resolver = ListingResolver(
+            [_listing("P", "PARENT", START), _listing("C", "CHILD", date(2020, 9, 29))]
+        )
+        parsed = parse_corporate_actions({"spin_offs": [_spinoff(), _spinoff()]}, resolver.resolve)
+        [action] = parsed.actions
+        assert action.ratio_or_amount == 0.5
+        assert parsed.spinoff_revisions == 0
+
+    @pytest.mark.parametrize(
+        "differing", [{"new_rate": 3}, {"ex_date": "2020-10-01"}], ids=["ratio", "ex_date"]
+    )
+    def test_differing_rows_on_one_process_date_are_left_out_and_named(
+        self, differing: dict[str, object]
+    ) -> None:
+        # Two differing rows with one process date share one stamp: neither
+        # is the "second" distribution, so that identity is left out and
+        # named, whatever the row order, and other spin-offs are kept.
+        resolver = ListingResolver(
+            [
+                _listing("P", "PARENT", START),
+                _listing("C", "CHILD", date(2020, 9, 1)),
+                _listing("D", "KIDB", date(2020, 9, 1)),
+            ]
+        )
+        a, b, other = _spinoff(), _spinoff(**differing), _spinoff(new_symbol="KIDB")
+        later = _spinoff(ex_date="2020-11-30", process_date="2020-12-04")
+        for rows in ([a, b, later, other], [later, other, b, a], [b, a, a, other]):
+            parsed = parse_corporate_actions({"spin_offs": rows}, resolver.resolve)
+            assert [(x.security_id, x.source_action_id) for x in parsed.actions] == [("D", "P")]
+            assert parsed.spinoff_unordered == ("PARENT->CHILD 2020-10-16",)
+
+    def test_daily_actions_keep_a_revised_spinoff(self) -> None:
+        # #1673 (2): two distributions in one daily payload no longer skip
+        # the whole spin_offs category as malformed.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-03",
+                        process_date="2020-08-05",
+                    ),
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    ),
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(
+            ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+        )
+        assert [(a.security_id, a.ex_date) for a in actions] == [
+            ("SEC_MSFT", date(2020, 8, 3)),
+            ("SEC_MSFT", date(2020, 8, 31)),
+        ]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ()
+        assert "1 spin-off revision(s) in one payload" in source.resolution_summary()
+
     def test_spinoff_record_rejects_nonpositive_ratio(self) -> None:
         assert (
             CorporateAction(
@@ -2930,15 +3039,16 @@ class TestAlpacaPriceSource:
         )
         source = AlpacaPriceSource(resolver, fetch_actions=fetch, settings=_settings())
         actions = source.corporate_actions(["P", "C"], date(2020, 10, 1), date(2020, 10, 31))
-        assert actions == []
+        assert [(a.security_id, a.action_type.value, a.ex_date) for a in actions] == [
+            ("C", "spinoff", date(2020, 9, 29))
+        ]
         assert source.last_actions_report is not None
-        assert source.last_actions_report.actions == ()
         changes = source.symbol_changes(["P"], date(2020, 10, 1), date(2020, 10, 31))
         assert len(changes) == 1 and changes[0].security_id == "P"
         assert len(calls) == 2
         assert source.symbol_changes(["P"], date(2020, 9, 1), date(2020, 9, 30)) == []
 
-    def test_daily_actions_keep_only_splits_and_dividends(self) -> None:
+    def test_daily_actions_keep_spinoff_without_changing_splits_or_dividends(self) -> None:
         recorded = _Recorded()
 
         def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
@@ -2964,11 +3074,10 @@ class TestAlpacaPriceSource:
             ("SEC_AAPL", "dividend", date(2020, 8, 7)),
             ("SEC_AAPL", "split", date(2020, 8, 31)),
             ("SEC_MSFT", "dividend", date(2020, 8, 19)),
+            ("SEC_MSFT", "spinoff", date(2020, 8, 31)),
         ]
         assert source.last_actions_report is not None
-        assert all(
-            a.action_type is not ActionType.SPINOFF for a in source.last_actions_report.actions
-        )
+        assert any(a.action_type is ActionType.SPINOFF for a in source.last_actions_report.actions)
 
     def test_malformed_name_change_does_not_fail_daily_actions(self) -> None:
         recorded = _Recorded()
@@ -2984,6 +3093,11 @@ class TestAlpacaPriceSource:
             ("dividend", date(2020, 8, 7)),
             ("split", date(2020, 8, 31)),
         ]
+        # #1506: the daily run's own name-change request counts it, never raises.
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+        assert "malformed name_changes category skipped" in source.resolution_summary()
 
     def test_malformed_spinoff_does_not_fail_daily_split(self) -> None:
         def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
@@ -3004,6 +3118,114 @@ class TestAlpacaPriceSource:
         )
         actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
         assert [(a.action_type, a.ratio_or_amount) for a in actions] == [(ActionType.SPLIT, 4.0)]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("spin_offs",)
+        assert "malformed spin_offs category skipped" in source.resolution_summary()
+
+    @pytest.mark.parametrize(
+        "error", [ValueError("one id, two rows (#816)"), TypeError("page is not a dict")]
+    )
+    def test_a_failing_name_change_response_is_counted_not_raised(self, error: Exception) -> None:
+        # #1665 safety review: the name-change request itself (not only its
+        # parse) never fails the daily run that asked for it.
+        def fetch_name_changes(_s: list[str], _a: date, _b: date) -> dict[str, object]:
+            raise error
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS),
+            fetch_actions=_Recorded().actions,
+            fetch_name_changes=fetch_name_changes,
+            settings=_settings(),
+        )
+        assert source.symbol_changes(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.malformed_categories == ("name_changes",)
+
+    def test_spinoff_is_kept_when_only_its_parent_is_requested(self) -> None:
+        # #1673 (1): a partial request (backfill, replay subset) that asks
+        # for the parent alone still returns the parent's spin-off.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    )
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        actions = source.corporate_actions(["SEC_AAPL"], date(2020, 8, 1), date(2020, 8, 31))
+        assert [(a.security_id, a.action_type, a.source_action_id) for a in actions] == [
+            ("SEC_MSFT", ActionType.SPINOFF, "SEC_AAPL")
+        ]
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.spinoffs_unrequested == 0
+        assert "spin-off(s) of unrequested" not in source.resolution_summary()
+
+    def test_spinoff_of_neither_requested_security_is_counted(self) -> None:
+        # #1673 (1): a spin-off whose parent and child were both not asked
+        # for is not returned, and is counted on the run report.
+        def fetch(_symbols: list[str], _start: date, _end: date) -> dict[str, object]:
+            return {
+                "spin_offs": [
+                    _spinoff(
+                        source_symbol="AAPL",
+                        new_symbol="MSFT",
+                        ex_date="2020-08-31",
+                        process_date="2020-09-04",
+                    )
+                ]
+            }
+
+        source = AlpacaPriceSource(
+            ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+        )
+        assert source.corporate_actions(["SEC_KO"], date(2020, 8, 1), date(2020, 8, 31)) == []
+        assert source.last_actions_report is not None
+        assert source.last_actions_report.spinoffs_unrequested == 1
+        assert "1 spin-off(s) of unrequested securities dropped" in source.resolution_summary()
+
+    def test_spinoffs_leave_split_and_dividend_output_identical(self) -> None:
+        # #1664 ruling (a): the split and dividend output is byte-identical
+        # with a spin-off in the payload, whatever ids the spin-off carries.
+        def run(with_spinoff: bool) -> tuple[list[CorporateAction], list[CorporateAction]]:
+            recorded = _Recorded()
+
+            def fetch(symbols: list[str], start: date, end: date) -> dict[str, object]:
+                payload: dict[str, object] = dict(recorded.actions(symbols, start, end))
+                if with_spinoff:
+                    payload["spin_offs"] = [
+                        _spinoff(
+                            source_symbol="AAPL",
+                            new_symbol="MSFT",
+                            ex_date="2020-08-31",
+                            process_date="2020-09-04",
+                        )
+                    ]
+                return payload
+
+            source = AlpacaPriceSource(
+                ListingResolver(LISTINGS), fetch_actions=fetch, settings=_settings()
+            )
+            actions = source.corporate_actions(
+                ["SEC_AAPL", "SEC_MSFT"], date(2020, 8, 1), date(2020, 8, 31)
+            )
+            assert source.last_actions_report is not None
+            others = [a for a in actions if a.action_type is not ActionType.SPINOFF]
+            reported = [
+                a
+                for a in source.last_actions_report.actions
+                if a.action_type is not ActionType.SPINOFF
+            ]
+            return others, reported
+
+        assert run(True) == run(False)
+        assert run(False)[0]  # the pin compares real rows
 
     def test_actions_processed_after_the_window_are_kept(self) -> None:
         # MSFT's dividend goes ex 2020-08-19 but is processed 2020-09-10.
@@ -3872,3 +4094,320 @@ class TestRule8Handover:
     def test_last_bar_needs_the_configured_window(self) -> None:
         with pytest.raises(ValueError, match="handover_sessions"):
             ListingResolver([], last_bar=lambda sid, start, before: None)
+
+
+class TestFilenameListingBackfill:
+    """#1597 (spec "Amendment 2026-10-12 (#1597)", plan T184f), the Resolution
+    line's last two clauses: no other security's resolution changes on any
+    session except the counted `filename_disputes`, and a colliding prefix (a
+    span whose `asof` payload runs past its end) is listed in
+    `filename_collisions` and stores nothing."""
+
+    OLD = "0000000001"  # the delister whose 10-K's instance prefix read its ticker
+    SUCCESSOR = "0000000002"  # the company that holds the ticker today
+
+    def test_a_filing_name_row_changes_no_resolution_on_its_own(self) -> None:
+        # A delister's own span: every session the merge base resolved
+        # elsewhere or to nobody stays, and the span's own sessions were
+        # nobody's before it, so nothing is lost to it.
+        listings = [
+            _listing("SEC_KEEP", "KEEP", START),
+            _filing_name(self.OLD, "KEG", START),
+            _filing_name(self.OLD, "KEG", date(2018, 1, 1)),  # the span runs on
+        ]
+        resolver = ListingResolver(listings)
+        assert resolver.report.filename_disputes == 0
+        assert resolver.resolve("KEG", date(2017, 6, 5)) == self.OLD
+        assert "0 sessions another security lost" in resolver.report.summary()
+
+    def test_a_claim_of_a_filing_name_row_counts_the_holders_lost_sessions(self) -> None:
+        # A wrong prefix that is another company's live symbol: the claimant's
+        # `filing_name` span shadows the holder (a rule-6 disputed claim), so
+        # the holder loses every session from the claimant's start to the
+        # run's day, and `filename_disputes` counts exactly those.
+        listings = [
+            _listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value"),
+            _filing_name(MGE, "MGEE", date(2026, 2, 27), "Common Stock, $1 Par Value"),
+        ]
+        resolver = ListingResolver(listings, _evidence(MGEE_FACTS))
+        assert resolver.resolve("MGEE", date(2026, 2, 26)) == MGEE
+        assert resolver.resolve("MGEE", RUN_DAY) is None
+        assert resolver.report.disputed_spans == 1
+        lost = len(list(_sessions(date(2026, 2, 27), RUN_DAY)))  # to the run's day
+        assert resolver.report.filename_disputes == lost
+        assert (
+            f"{lost} sessions another security lost to a filing_name span"
+            in resolver.report.summary()
+        )
+        # The store passes a generator (`repair.store_resolver`), and the
+        # dispute diff re-reads the rows: the count must survive one.
+        once = ListingResolver(iter(listings), _evidence(MGEE_FACTS))
+        assert once.report.filename_disputes == lost
+        # The count is the clause itself: every session whose owner moved to
+        # another security's loss, no other.
+        base = ListingResolver(
+            [row for row in listings if row.get("provenance") != "filing_name"],
+            _evidence(MGEE_FACTS),
+        )
+        changed = sum(
+            base._owner("MGEE", day) is not None
+            and resolver._owner("MGEE", day) != base._owner("MGEE", day)
+            for day in _sessions(date(2019, 8, 7), RUN_DAY)
+        )
+        assert changed == resolver.report.filename_disputes
+
+    def test_the_same_listings_without_the_filing_name_rows_count_nothing(self) -> None:
+        listings = [_listing(MGEE, "MGEE", date(2019, 8, 7), "Common Stock, $1 Par Value")]
+        assert ListingResolver(listings, _evidence(MGEE_FACTS)).report.filename_disputes == 0
+
+    def _filing_name_source(
+        self,
+        listings: list[dict[str, object]],
+        rows: Mapping[date, Mapping[str, Any]],
+        *,
+        run_day: date,
+    ) -> tuple[AlpacaPriceSource, list[tuple[date, date | None]]]:
+        """A source over a resolver run on `run_day`, a fake Alpaca serving
+        `rows` (session -> extra row fields: a trade, or `{"v": 0, "n": 0}`
+        for #104's zero-volume padding) on every request, and every
+        request's `(start, asof)`, so a test can count the collision probes
+        the run makes."""
+        seen: list[tuple[date, date | None]] = []
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            seen.append((start, asof))
+            served = [
+                dict(_row(d, 11.0), **fields)
+                for d, fields in sorted(rows.items())
+                if start <= d <= end
+            ]
+            return {"feed": "sip", "bars": {"KEG": served}}
+
+        resolver = ListingResolver(listings, _evidence([], as_of=run_day))
+        return AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings()), seen
+
+    def test_a_colliding_span_stores_nothing_in_any_month(self) -> None:
+        # The BLOCKER (#1597): the backfill asks one month at a time, so a
+        # month before the span's end holds no bar past it. The verdict is
+        # read once per span per run, from the sessions after the end, so
+        # every month that touches the span stores nothing for it.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),  # a later row: the span ends there
+            _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
+        ]
+        end = date(2017, 7, 3)
+        served = {date(2016, 6, 7): {}, _nth_session_after(end, 6): {}}  # its own; then the other's
+        source, seen = self._filing_name_source(listings, served, run_day=RUN_DAY)
+        stored: list[tuple[str, date, float]] = []
+        listed: list[tuple[str, ...]] = []
+        for first, last in _months(date(2016, 6, 1), date(2017, 8, 31)):
+            stored += [
+                (b.security_id, b.session, b.close) for b in source.bars([self.OLD], first, last)
+            ]
+            listed.append(source.last_filename_collisions)
+        assert stored == []  # nothing in any month
+        assert listed[0] == (f"{self.OLD}:KEG",)  # counted once, on the first month's row
+        assert all(call == () for call in listed[1:])
+        probes = [call for call in seen if call[0] == _nth_session_after(end, 1)]
+        assert len(probes) == 1  # one probe fetch for the span, not one per month
+        assert probes[0][1] == START + timedelta(days=7)  # asked at the span's own asof day
+
+    def test_a_clean_span_stores_normally_month_by_month_with_one_probe(self) -> None:
+        # No bar past the window after the end: every month stores its rows,
+        # nothing is listed, and the probe is read once for the whole run.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        source, seen = self._filing_name_source(
+            listings,
+            {date(2016, 6, 7): {}, date(2017, 6, 6): {}, _nth_session_after(end, 5): {}},
+            run_day=RUN_DAY,
+        )
+        stored = []
+        for first, last in _months(date(2016, 6, 1), date(2017, 8, 31)):
+            stored += [b.session for b in source.bars([self.OLD], first, last)]
+            assert source.last_filename_collisions == ()
+        assert date(2016, 6, 7) in stored and date(2017, 6, 6) in stored
+        assert len([call for call in seen if call[0] == _nth_session_after(end, 1)]) == 1
+
+    def test_bars_up_to_the_transfer_window_after_the_end_are_no_collision(self) -> None:
+        # A wrong prefix is proven by a bar more than
+        # `master.transfer_window_sessions` sessions after the span's end;
+        # a bar on the window-th one (the 5th session after it here) is a
+        # stopped line, and #104's zero-volume padding is no trade at all.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        inside = _nth_session_after(end, 5)  # exactly `transfer_window_sessions`
+        source, _ = self._filing_name_source(
+            listings,
+            {date(2016, 6, 7): {}, inside: {}, _nth_session_after(end, 9): {"v": 0, "n": 0}},
+            run_day=RUN_DAY,
+        )
+        bars = source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2))
+        assert [(b.session, b.close) for b in bars] == [(date(2016, 6, 7), 11.0)]
+        assert source.last_filename_collisions == ()
+
+    def test_a_bar_on_the_window_plus_first_session_after_the_end_collides(self) -> None:
+        # The rule's threshold: the (window + 1)-th session after the span's
+        # end already holds another company's bar.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        outside = _nth_session_after(end, 6)
+        source, _ = self._filing_name_source(
+            listings, {date(2016, 6, 7): {}, outside: {}}, run_day=RUN_DAY
+        )
+        assert source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2)) == []
+        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
+
+    def test_two_colliding_tickers_on_one_symbol_each_keep_their_label(self) -> None:
+        # #1653: two master tickers of one security can share Alpaca's symbol
+        # `KEG`; the second used to overwrite the first in the plan, so the
+        # run row listed one of two colliding spans. The resolver folds such
+        # spellings itself today, so a resolver that hands both out stands in.
+        class Spelled(ListingResolver):
+            def symbols(self, *args: Any, **kwargs: Any) -> list[str]:
+                return ["KEG", "KEG*"]
+
+            def filing_name_spans(self, security_id: str, ticker: str) -> tuple[TickerSpan, ...]:
+                return tuple(
+                    dataclasses.replace(span, ticker=ticker)
+                    for span in super().filing_name_spans(security_id, "KEG")
+                )
+
+            def asof(self, security_id: str, ticker: str, offset_days: int) -> date | None:
+                return super().asof(security_id, "KEG", offset_days)
+
+            def since(self, security_id: str, ticker: str) -> date | None:
+                return super().since(security_id, "KEG")
+
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        served = {date(2016, 6, 7): {}, _nth_session_after(date(2017, 7, 3), 6): {}}
+
+        def fetch(
+            symbols: list[str], start: date, end: date, *, asof: date | None = None
+        ) -> dict[str, Any]:
+            rows = [
+                dict(_row(d, 11.0), **f) for d, f in sorted(served.items()) if start <= d <= end
+            ]
+            return {"feed": "sip", "bars": {"KEG": rows}}
+
+        resolver = Spelled(listings, _evidence([], as_of=RUN_DAY))
+        source = AlpacaPriceSource(resolver, fetch_bars=fetch, settings=_settings())
+        assert source.bars([self.OLD], date(2016, 6, 6), date(2017, 8, 2)) == []
+        assert sorted(source.last_filename_collisions) == [
+            f"{self.OLD}:KEG",
+            f"{self.OLD}:KEG*",
+        ]
+
+    def test_the_collision_probe_is_bounded_to_the_window_plus_a_margin(self) -> None:
+        # #1653: the probe asks the sessions after the span's end through
+        # `transfer_window_sessions + 1 + collision_probe_margin_sessions`,
+        # not on to the run's day; a bar just inside collides, one just
+        # outside is never fetched.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+        ]
+        end = date(2017, 7, 3)
+        reach = 5 + 1 + 10  # _settings() defaults: window 5, margin 10
+        for n, expected in ((reach, (f"{self.OLD}:KEG",)), (reach + 1, ())):
+            source, seen = self._filing_name_source(
+                listings, {date(2016, 6, 7): {}, _nth_session_after(end, n): {}}, run_day=RUN_DAY
+            )
+            source.bars([self.OLD], date(2016, 6, 6), date(2016, 6, 30))
+            assert source.last_filename_collisions == expected
+            assert len([c for c in seen if c[0] == _nth_session_after(end, 1)]) == 1
+
+    def test_a_collision_drops_only_its_own_span(self) -> None:
+        # The colliding span's own rows (inside its span, dated before the
+        # successor's) are stored for no one, while the successor keeps the
+        # rows its own span covers: nothing is stored for the colliding span,
+        # only the span.
+        listings = [
+            _filing_name(self.OLD, "KEG", START),
+            _listing(self.OLD, "N/A", date(2017, 7, 3)),
+            _listing(self.SUCCESSOR, "KEG", date(2018, 3, 1)),
+        ]
+        served = {
+            date(2016, 6, 7): {},
+            _nth_session_after(date(2017, 7, 3), 6): {},
+            date(2019, 6, 3): {},
+        }
+        source, _ = self._filing_name_source(listings, served, run_day=RUN_DAY)
+        bars = source.bars([self.OLD, self.SUCCESSOR], date(2016, 6, 6), date(2019, 6, 4))
+        assert [(b.security_id, b.session) for b in bars] == [(self.SUCCESSOR, date(2019, 6, 3))]
+        assert source.last_filename_collisions == (f"{self.OLD}:KEG",)
+
+    def test_a_rename_counts_the_sessions_of_both_its_tickers(self) -> None:
+        # A rename whose old ticker a `filing_name` span takes loses the old
+        # ticker's sessions to the span (or its shadow) and the new ticker's
+        # lead sessions to nobody: both tickers' sessions are counted.
+        renamer = self.OLD
+        listings = [
+            _listing(renamer, "OLDT", START, "Common Stock"),
+            _listing(renamer, "NEWT", date(2019, 6, 3), "Common Stock"),
+            _filing_name(self.SUCCESSOR, "OLDT", date(2018, 3, 1), "Common Stock"),
+        ]
+        resolver = ListingResolver(
+            listings,
+            _evidence([_shares(renamer, date(2018, 2, 20), 12345, date(2018, 3, 1))]),
+            rename_lead_days=45,
+        )
+        base = ListingResolver(
+            [row for row in listings if row.get("provenance") != "filing_name"],
+            _evidence([_shares(renamer, date(2018, 2, 20), 12345, date(2018, 3, 1))]),
+            rename_lead_days=45,
+        )
+
+        def lost(ticker: str) -> int:
+            return sum(
+                base._owner(ticker, day) is not None
+                and resolver._owner(ticker, day) != base._owner(ticker, day)
+                for day in _sessions(START, RUN_DAY)
+            )
+
+        assert lost("OLDT") > 0 and lost("NEWT") > 0  # the new ticker's lead is refused too
+        assert resolver.report.filename_disputes == lost("OLDT") + lost("NEWT")
+
+
+def _sessions(first: date, last: date) -> Iterator[date]:
+    """Every XNYS session in `[first, last]`, for a whole-resolution diff."""
+    day = first if is_session(first) else next_session(first)
+    while day <= last:
+        yield day
+        day = next_session(day)
+
+
+def _nth_session_after(end: date, n: int) -> date:
+    """The `n`-th XNYS session strictly after `end` (#1597: `n = 1` is the
+    session after a span's exclusive end, so a bar on the
+    `transfer_window_sessions + 1`-th one collides)."""
+    day = next_session(end)
+    for _ in range(n - 1):
+        day = next_session(day)
+    return day
+
+
+def _months(first: date, last: date) -> Iterator[tuple[date, date]]:
+    """Every month's `[first day, last day]` chunk covering `[first, last]`
+    (#1597: how `backfill._price_chunk` asks a source, one month at a time)."""
+    day = date(first.year, first.month, 1)
+    while day <= last:
+        after = date(day.year + (day.month == 12), day.month % 12 + 1, 1)
+        month_end = after - timedelta(days=1)
+        yield max(first, day), min(last, month_end)
+        day = after

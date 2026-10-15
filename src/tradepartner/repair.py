@@ -68,18 +68,30 @@ revision would leave every earlier as-of read counting the payment twice,
 so it is a delete under the same rules as `delete_bars`; it refuses the
 whole run on any stale entry (the vendor touched it, or the kept row
 differs or is gone), so the list is never half-applied.
+
+`delete_master_rows` (`tradepartner delete-master-rows`, #1682 lever B,
+T191) deletes stored `listings` and `delistings` rows that were never right
+at any instant (a note's listing or its Form 25 on the common's primary id)
+from a reviewed manifest, each with the filing, accepted no later than the
+row's `known_at`, whose text shows the instrument was never the common (spec
+open question 35 (a)). It runs on the caller's connection and transaction,
+refuses a row whose filing is not the security's CIK's or was accepted after
+the row's `known_at`, and refuses every row an open paper window read.
 """
 
 from __future__ import annotations
 
+import csv
 import functools
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
@@ -90,6 +102,7 @@ from tradepartner.adapters.alpaca_prices import (
     ListingResolver,
     registrant_evidence,
 )
+from tradepartner.adapters.filings import FilingHeader
 from tradepartner.calendar import is_session, previous_session
 from tradepartner.config import Settings
 from tradepartner.ingest import SourceRun, _read, _write_run
@@ -99,6 +112,11 @@ from tradepartner.store.delistings import listing_ends_as_of
 from tradepartner.store.dividend_reviews import DUPLICATE, ReviewedGroup, reviewed_groups
 from tradepartner.store.master import first_session, session_of
 from tradepartner.store.registry import open_release
+from tradepartner.store.restamp_precheck import (
+    crossed_instants,
+    read_instants,
+    window_first_session,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 REPAIR = "repair"
@@ -193,11 +211,12 @@ class Misattributed:
 
     bars: Mapping[Key, int]
     actions: Mapping[Key, int]
+    spinoffs: Mapping[Key, int] = field(default_factory=dict)
 
     @property
     def securities(self) -> tuple[str, ...]:
         """Every security with such a key, sorted."""
-        return tuple(sorted({sid for sid, _ in (*self.bars, *self.actions)}))
+        return tuple(sorted({sid for sid, _ in (*self.bars, *self.actions, *self.spinoffs)}))
 
 
 def misattributed(
@@ -225,6 +244,7 @@ class RepairResult:
     bar_keys_checked: int
     action_keys_checked: int
     dry_run: bool
+    unjudged_symbol_changes: int = 0
 
     @property
     def bar_rows(self) -> int:
@@ -234,7 +254,7 @@ class RepairResult:
     @property
     def action_rows(self) -> int:
         """Action rows found (deleted unless `dry_run`)."""
-        return sum(self.found.actions.values())
+        return sum(self.found.actions.values()) + sum(self.found.spinoffs.values())
 
     def summary(self) -> str:
         """One line for the run row and the terminal."""
@@ -245,8 +265,10 @@ class RepairResult:
         return (
             f"{verb} {self.bar_rows} bar rows ({len(self.found.bars)} of "
             f"{self.bar_keys_checked} keys) and {self.action_rows} action rows "
-            f"({len(self.found.actions)} of {self.action_keys_checked} keys) that the "
-            f"resolver no longer assigns to their security, on {len(named)} securities{shown}"
+            f"({len(self.found.actions) + len(self.found.spinoffs)} of "
+            f"{self.action_keys_checked} keys) that the "
+            f"resolver no longer assigns to their security, on {len(named)} securities{shown}; "
+            f"{self.unjudged_symbol_changes} symbol_changes rows unjudged"
         )
 
     def lines(self) -> list[str]:
@@ -258,8 +280,9 @@ class RepairResult:
             bars[sid].append(day)
             rows[sid] += n
         actions: dict[str, int] = defaultdict(int)
-        for (sid, _), n in self.found.actions.items():
-            actions[sid] += n
+        for found in (self.found.actions, self.found.spinoffs):
+            for (sid, _), n in found.items():
+                actions[sid] += n
         out = []
         for sid in self.found.securities:
             days = bars.get(sid, [])
@@ -278,12 +301,18 @@ class _Counted:
     set, streamed; `seen` counts them once iterated."""
 
     def __init__(
-        self, conn: duckdb.DuckDBPyConnection, table: str, day: str, sources: list[str]
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        table: str,
+        day: str,
+        sources: list[str],
+        action_types: Sequence[str] | None = None,
     ) -> None:
+        extra = " AND list_contains(?, action_type)" if action_types is not None else ""
         self._cursor = conn.execute(
             f"SELECT security_id, {day}, count(*) FROM {table} "
-            "WHERE list_contains(?, source) GROUP BY ALL",
-            [sources],
+            f"WHERE list_contains(?, source){extra} GROUP BY ALL",
+            [sources, *([list(action_types)] if action_types is not None else [])],
         )
         self.seen = 0
 
@@ -294,12 +323,28 @@ class _Counted:
                 yield str(sid), day, int(rows)
 
 
+def _delete_spinoffs(conn: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, date, str]]) -> int:
+    """Delete the `spinoff` rows from `ACTIONS_SOURCE` whose `(child, ex_date,
+    parent)` is in `keys`, never another parent's row of the same child and
+    day; the number deleted."""
+    if not keys:
+        return 0
+    before = _rows(conn, "corporate_actions")
+    conn.executemany(
+        "DELETE FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' "
+        "AND security_id = ? AND ex_date = ? AND source_action_id = ?",
+        [[ACTIONS_SOURCE, *key] for key in keys],
+    )
+    return before - _rows(conn, "corporate_actions")
+
+
 def _delete(
     conn: duckdb.DuckDBPyConnection,
     table: str,
     day: str,
     sources: list[str],
     keys: Iterable[Key],
+    action_types: Sequence[str] | None = None,
 ) -> int:
     """Delete every row of `table` from `sources` whose `(security_id,
     <day>)` is in `keys`; the number deleted."""
@@ -309,10 +354,11 @@ def _delete(
     conn.execute("CREATE OR REPLACE TEMP TABLE _repair_keys (security_id VARCHAR, day DATE)")
     conn.executemany("INSERT INTO _repair_keys VALUES (?, ?)", rows)
     before = _rows(conn, table)
+    extra = " AND list_contains(?, action_type)" if action_types is not None else ""
     conn.execute(
-        f"DELETE FROM {table} WHERE list_contains(?, source) AND (security_id, {day}) IN "
-        "(SELECT (security_id, day) FROM _repair_keys)",
-        [sources],
+        f"DELETE FROM {table} WHERE list_contains(?, source){extra} "
+        f"AND (security_id, {day}) IN (SELECT (security_id, day) FROM _repair_keys)",
+        [sources, *([list(action_types)] if action_types is not None else [])],
     )
     conn.execute("DROP TABLE _repair_keys")
     return before - _rows(conn, table)
@@ -371,13 +417,39 @@ def repair_resolution(
         resolver = store_resolver(conn, started, settings)
         bars = _Counted(conn, "prices_daily", "session", bar_sources)
         found_bars = misattributed(resolver, bars, ()).bars
-        actions = _Counted(conn, "corporate_actions", "ex_date", [ACTIONS_SOURCE])
-        found = Misattributed(found_bars, misattributed(resolver, (), actions).actions)
+        actions = _Counted(
+            conn,
+            "corporate_actions",
+            "ex_date",
+            [ACTIONS_SOURCE],
+            action_types=("split", "dividend"),
+        )
+        ordinary = misattributed(resolver, (), actions).actions
+        spin_rows = conn.execute(
+            "SELECT security_id, ex_date, source_action_id, count(*) "
+            "FROM corporate_actions WHERE source = ? AND action_type = 'spinoff' GROUP BY ALL",
+            [ACTIONS_SOURCE],
+        ).fetchall()
+        spinoffs: dict[Key, int] = defaultdict(int)
+        bad_spins: list[tuple[str, date, str]] = []  # (child, ex_date, parent)
+        for child, ex_date, parent, count in spin_rows:
+            if not (
+                resolver.holds(parent, previous_session(ex_date), actions=True)
+                and resolver.holds(child, ex_date, actions=True)
+            ):
+                spinoffs[(child, ex_date)] += int(count)
+                bad_spins.append((child, ex_date, parent))
+        spinoffs = dict(spinoffs)
+        found = Misattributed(found_bars, ordinary, spinoffs)
+        unjudged_row = conn.execute("SELECT count(*) FROM symbol_changes").fetchone()
+        assert unjudged_row is not None
+        unjudged = int(unjudged_row[0])
         result = RepairResult(
             found=found,
             bar_keys_checked=bars.seen,
-            action_keys_checked=actions.seen,
+            action_keys_checked=actions.seen + len(spin_rows),
             dry_run=dry_run,
+            unjudged_symbol_changes=unjudged,
         )
         if not dry_run:
             if (result.bar_rows, result.action_rows) != expect:
@@ -387,7 +459,15 @@ def repair_resolution(
                 )
             deleted = (
                 _delete(conn, "prices_daily", "session", bar_sources, found.bars),
-                _delete(conn, "corporate_actions", "ex_date", [ACTIONS_SOURCE], found.actions),
+                _delete(
+                    conn,
+                    "corporate_actions",
+                    "ex_date",
+                    [ACTIONS_SOURCE],
+                    found.actions,
+                    action_types=("split", "dividend"),
+                )
+                + _delete_spinoffs(conn, bad_spins),
             )
             if deleted != (result.bar_rows, result.action_rows):  # never a partial repair
                 raise RuntimeError(
@@ -756,3 +836,376 @@ def _delete_identities(
     )
     conn.execute("DROP TABLE _retract_ids")
     return before - _rows(conn, "corporate_actions")
+
+
+# --- T191 (#1682 lever B): the reviewed delete of never-true master rows ---
+
+#: The tables `delete_master_rows` may delete from.
+MASTER_DELETE_TABLES: tuple[str, ...] = ("listings", "delistings")
+
+#: The manifest's columns, in order (`read_master_manifest`). A `listings`
+#: row is keyed by `ticker, exchange, valid_from` (and its title, checked),
+#: a `delistings` row by `form, class_title, exchange, filed_at`; both by
+#: `security_id` and `known_at`, the table's UNIQUE key. `accession` names
+#: the filing whose text shows the instrument was never the common.
+MASTER_MANIFEST_COLUMNS: tuple[str, ...] = (
+    "table",
+    "security_id",
+    "ticker",
+    "exchange",
+    "valid_from",
+    "form",
+    "class_title",
+    "filed_at",
+    "known_at",
+    "accession",
+)
+
+#: A delete moves a row's stamp to never: every read at or after its
+#: `known_at` reads it differently afterwards (`ingest._crosses`, #1522).
+_NEVER = datetime.max.replace(tzinfo=UTC)
+
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class MasterRowKey:
+    """One reviewed manifest row: the stored row's key and the evidence."""
+
+    table: str
+    security_id: str
+    exchange: str
+    class_title: str | None
+    known_at: datetime
+    accession: str
+    #: `listings` only.
+    ticker: str | None = None
+    valid_from: date | None = None
+    #: `delistings` only.
+    form: str | None = None
+    filed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Check the table's key columns and make the instants UTC."""
+        if self.table not in MASTER_DELETE_TABLES:
+            raise ValueError(f"table {self.table!r} is not one of {MASTER_DELETE_TABLES}")
+        for name in ("security_id", "exchange", "accession"):
+            if not getattr(self, name):
+                raise ValueError(f"{self.table} row: {name} is empty")
+        object.__setattr__(
+            self, "known_at", ensure_tz_aware_utc(self.known_at, field_name="known_at")
+        )
+        if self.table == "listings":
+            if not self.ticker or self.valid_from is None:
+                raise ValueError("a listings row needs ticker and valid_from")
+            if self.form is not None or self.filed_at is not None:
+                raise ValueError("a listings row has no form or filed_at")
+        else:
+            if not self.form or not self.class_title or self.filed_at is None:
+                raise ValueError("a delistings row needs form, class_title and filed_at")
+            if self.ticker is not None or self.valid_from is not None:
+                raise ValueError("a delistings row has no ticker or valid_from")
+            object.__setattr__(
+                self, "filed_at", ensure_tz_aware_utc(self.filed_at, field_name="filed_at")
+            )
+
+    def label(self) -> str:
+        """The row as one line: table, id, key, stamp, evidence."""
+        if self.table == "listings":
+            key = f"{self.ticker} {self.exchange} {self.valid_from} {self.class_title!r}"
+        else:
+            assert self.filed_at is not None
+            key = f"{self.form} {self.class_title!r} {self.exchange} {self.filed_at.isoformat()}"
+        return (
+            f"{self.table} {self.security_id} {key} known_at {self.known_at.isoformat()} "
+            f"({self.accession})"
+        )
+
+
+def _optional(record: Mapping[str, str | None], name: str) -> str | None:
+    value = (record.get(name) or "").strip()
+    return value or None
+
+
+def read_master_manifest(path: Path) -> list[MasterRowKey]:
+    """The reviewed manifest at `path`: a CSV with `MASTER_MANIFEST_COLUMNS`
+    as its header, one stored row per line (empty cells for the other
+    table's key columns), instants as ISO 8601 with an offset. Raises
+    `ValueError` for another header, a malformed or naive value, or a row
+    listed twice."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != MASTER_MANIFEST_COLUMNS:
+            raise ValueError(
+                f"{path.name}: the header must be {','.join(MASTER_MANIFEST_COLUMNS)}, "
+                f"not {','.join(reader.fieldnames or ())}"
+            )
+        rows: list[MasterRowKey] = []
+        seen: set[tuple[object, ...]] = set()
+        for line, record in enumerate(reader, start=2):
+            try:
+                valid_from = _optional(record, "valid_from")
+                filed_at = _optional(record, "filed_at")
+                row = MasterRowKey(
+                    table=(record["table"] or "").strip(),
+                    security_id=(record["security_id"] or "").strip(),
+                    exchange=(record["exchange"] or "").strip(),
+                    class_title=_optional(record, "class_title"),
+                    known_at=datetime.fromisoformat((record["known_at"] or "").strip()),
+                    accession=(record["accession"] or "").strip(),
+                    ticker=_optional(record, "ticker"),
+                    valid_from=None if valid_from is None else date.fromisoformat(valid_from),
+                    form=_optional(record, "form"),
+                    filed_at=None if filed_at is None else datetime.fromisoformat(filed_at),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{path.name} line {line}: {error}") from None
+            key = (row.table, *_key(row), row.known_at)
+            if key in seen:
+                raise ValueError(f"{path.name} line {line}: listed twice: {row.label()}")
+            seen.add(key)
+            rows.append(row)
+    return rows
+
+
+@dataclass(frozen=True)
+class MasterRowsDeleted:
+    """What `delete_master_rows` found for a manifest and, unless `dry_run`,
+    deleted (`BarsDeleted`'s shape)."""
+
+    release: str
+    #: The manifest's rows.
+    rows: int
+    #: Rows that pass every check, by table.
+    listings: int
+    delistings: int
+    #: One line per row that passes, and per refused row with the reason.
+    found: tuple[str, ...]
+    refused: tuple[str, ...]
+    dry_run: bool
+
+    def summary(self) -> str:
+        """One line for the run row and the terminal."""
+        verb = "would delete" if self.dry_run else "deleted"
+        return (
+            f"{verb} {self.listings} listings and {self.delistings} delistings rows of "
+            f"{self.rows} manifest rows; refused {len(self.refused)}; release {self.release}"
+        )
+
+
+#: `(cik, accession)` -> that filing's SGML header read for that CIK
+#: (`adapters.edgar.parse_sgml_header(text, cik)`); raises `ValueError` when
+#: the filing cannot be read or names no such filer or subject company.
+HeaderLookup = Callable[[str, str], FilingHeader]
+
+
+def _stored_master_row(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> list[tuple[str, str]]:
+    """`(source, provenance)` of each stored row with `row`'s key and stamp."""
+    if row.table == "listings":
+        return conn.execute(
+            "SELECT source, provenance FROM listings WHERE security_id = ? AND ticker = ? "
+            "AND exchange = ? AND valid_from = ? AND known_at = ? "
+            "AND class_title IS NOT DISTINCT FROM ?",
+            [
+                row.security_id,
+                row.ticker,
+                row.exchange,
+                row.valid_from,
+                row.known_at,
+                row.class_title,
+            ],
+        ).fetchall()
+    return conn.execute(
+        "SELECT source, provenance FROM delistings WHERE security_id = ? AND form = ? "
+        "AND class_title = ? AND exchange = ? AND filed_at = ? AND known_at = ?",
+        [row.security_id, row.form, row.class_title, row.exchange, row.filed_at, row.known_at],
+    ).fetchall()
+
+
+def _revisions(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> set[datetime]:
+    """The `known_at` of every stored revision of `row`'s key."""
+    if row.table == "listings":
+        found = conn.execute(
+            "SELECT known_at FROM listings WHERE security_id = ? AND ticker = ? "
+            "AND exchange = ? AND valid_from = ?",
+            [row.security_id, row.ticker, row.exchange, row.valid_from],
+        ).fetchall()
+    else:
+        found = conn.execute(
+            "SELECT known_at FROM delistings WHERE security_id = ? AND form = ? "
+            "AND class_title = ? AND exchange = ? AND filed_at = ?",
+            [row.security_id, row.form, row.class_title, row.exchange, row.filed_at],
+        ).fetchall()
+    return {ensure_tz_aware_utc(k, field_name="known_at") for (k,) in found}
+
+
+def _master_row_refusal(
+    conn: duckdb.DuckDBPyConnection,
+    row: MasterRowKey,
+    manifest: Sequence[MasterRowKey],
+    headers: HeaderLookup,
+    window: tuple[date, Sequence[datetime]] | None,
+) -> str | None:
+    """Why `row` may not be deleted, or None (`delete_master_rows`)."""
+    stored = _stored_master_row(conn, row)
+    if not stored:
+        return "no stored row has this key and known_at"
+    if stored != [("edgar", "filing")]:
+        return f"the stored row is {stored[0][0]} {stored[0][1]}, not an EDGAR filing row"
+    listed = {r.known_at for r in manifest if r.table == row.table and _same_key(r, row)}
+    if missing := sorted(_revisions(conn, row) - listed):
+        return "another revision of this key is not in the manifest: " + ", ".join(
+            k.isoformat() for k in missing
+        )
+    ciks = conn.execute(
+        "SELECT DISTINCT cik FROM securities WHERE security_id = ?", [row.security_id]
+    ).fetchall()
+    if len(ciks) != 1:
+        return f"the security has {len(ciks)} CIKs in securities, not one"
+    cik = str(ciks[0][0])
+    try:
+        header = headers(cik, row.accession)
+    except ValueError as error:
+        return f"{row.accession} does not read as CIK {cik}'s filing: {error}"
+    if header.cik != cik or header.accession != row.accession:
+        return f"{row.accession}'s header names {header.cik} {header.accession}, not CIK {cik}"
+    if header.accepted_at > row.known_at:
+        return (
+            f"{row.accession} was accepted at {header.accepted_at.isoformat()}, after the "
+            f"row's known_at"
+        )
+    if window is not None:
+        first, instants = window
+        if crossed := crossed_instants(_NEVER, row.known_at, instants):
+            return (
+                f"an open paper window (first session {first}) read it: {len(crossed)} read "
+                f"instants from {crossed[0].isoformat()}"
+            )
+        if row.known_at.astimezone(_NEW_YORK).date() >= first:
+            return f"known inside the open paper window (first session {first})"
+    return None
+
+
+def _key(row: MasterRowKey) -> tuple[object, ...]:
+    """`row`'s stored key without `known_at`: the table's UNIQUE columns."""
+    if row.table == "listings":
+        return (row.security_id, row.ticker, row.exchange, row.valid_from)
+    return (row.security_id, row.form, row.class_title, row.exchange, row.filed_at)
+
+
+def _same_key(a: MasterRowKey, b: MasterRowKey) -> bool:
+    """True when `a` and `b` are revisions of one stored key."""
+    return a.table == b.table and _key(a) == _key(b)
+
+
+def _delete_master_row(conn: duckdb.DuckDBPyConnection, row: MasterRowKey) -> int:
+    """Delete the one stored row `row` names; the number deleted."""
+    before = _rows(conn, row.table)
+    if row.table == "listings":
+        conn.execute(
+            "DELETE FROM listings WHERE security_id = ? AND ticker = ? AND exchange = ? "
+            "AND valid_from = ? AND known_at = ? AND class_title IS NOT DISTINCT FROM ?",
+            [
+                row.security_id,
+                row.ticker,
+                row.exchange,
+                row.valid_from,
+                row.known_at,
+                row.class_title,
+            ],
+        )
+    else:
+        conn.execute(
+            "DELETE FROM delistings WHERE security_id = ? AND form = ? AND class_title = ? "
+            "AND exchange = ? AND filed_at = ? AND known_at = ?",
+            [row.security_id, row.form, row.class_title, row.exchange, row.filed_at, row.known_at],
+        )
+    return before - _rows(conn, row.table)
+
+
+def delete_master_rows(
+    conn: duckdb.DuckDBPyConnection,
+    manifest: Sequence[MasterRowKey],
+    release: str,
+    *,
+    dry_run: bool,
+    headers: HeaderLookup,
+    clock: Callable[[], datetime] = utc_now,
+) -> MasterRowsDeleted:
+    """Delete the never-true master rows of a reviewed manifest (spec
+    amendment 2026-10-14, item 7; #1682 lever B; data-foundation plan T191),
+    on `conn`, inside the caller's transaction (`open_for_write`, so a
+    refusal or failure rolls everything back); with `dry_run`, check and
+    count them and change nothing.
+
+    A stored `listings` or `delistings` row that was never right at any
+    instant (a note's listing, or its Form 25, on the common's id) has no
+    `known_at` at which a retraction could be stored (the #1613 rule): it is
+    deleted, the release's backup being the history. Each manifest row is
+    **refused** unless:
+
+    - exactly one stored row has its key and `known_at`, an EDGAR `filing`
+      row (never a snapshot row, which no filing produced);
+    - every stored revision of its key is in the manifest (a key leaves
+      whole, as `delete_bars` deletes every revision);
+    - its `accession` is a filing of the security's CIK (the CIK's own, or
+      one naming it as the subject company, a 25-NSE) and was accepted no
+      later than the row's `known_at`, read from the filing's own SGML
+      header (`headers`), so the delete corrects a misreading of what was
+      public and never applies knowledge learned later;
+    - no open paper window read it: with a window open, the row's
+      `known_at` is before every read instant (`restamp_precheck.
+      read_instants`; a delete moves the stamp to never, the `ingest.
+      _crosses` rule of #1522) and before the window's first session.
+
+    A dry run lists every row found and refused. A real run deletes only a
+    manifest with no refused row, only inside the open data release
+    `release` (`release_refusal`), and raises `RepairRefused` before
+    anything is deleted otherwise; it writes one `ingestion_runs` row
+    (source `edgar`, mode `repair`, status `repaired`) with the counts. A
+    delete that misses its count raises `RuntimeError`, so the caller's
+    transaction rolls back. A delete is not a revision: an as-of read at a
+    `t` before a row's `known_at` is unchanged, and one after it no longer
+    sees the row (the delete-only rerun rule of
+    `docs/runbooks/data-releases.md` applies to the sweeps that read it)."""
+    if not release or not release.strip():
+        raise ValueError("a master-row delete names its data release: pass release")
+    started = ensure_tz_aware_utc(clock(), field_name="clock()")
+    if not dry_run and (why := release_refusal(conn, release)):
+        raise RepairRefused(f"{why}; nothing deleted")
+    first = window_first_session(conn)
+    window = None if first is None else (first, read_instants(conn))
+    found: list[str] = []
+    refused: list[str] = []
+    passing: list[MasterRowKey] = []
+    for row in manifest:
+        why_not = _master_row_refusal(conn, row, manifest, headers, window)
+        if why_not is None:
+            passing.append(row)
+            found.append(f"  {row.label()}")
+        else:
+            refused.append(f"  {row.label()}: {why_not}")
+    result = MasterRowsDeleted(
+        release=release,
+        rows=len(manifest),
+        listings=sum(r.table == "listings" for r in passing),
+        delistings=sum(r.table == "delistings" for r in passing),
+        found=tuple(found),
+        refused=tuple(refused),
+        dry_run=dry_run,
+    )
+    if dry_run:
+        return result
+    if refused:
+        raise RepairRefused(
+            f"{len(refused)} of {len(manifest)} manifest rows refused; nothing deleted:\n"
+            + "\n".join(refused)
+        )
+    deleted = sum(_delete_master_row(conn, row) for row in passing)
+    if deleted != len(passing):  # never a partial delete
+        raise RuntimeError(
+            f"delete removed {deleted} rows where the manifest names {len(passing)}; rolled back"
+        )
+    run = SourceRun("edgar", REPAIRED, 0, "", result.summary())
+    _write_run(conn, uuid.uuid4().hex, started, clock(), run, REPAIR)
+    return result

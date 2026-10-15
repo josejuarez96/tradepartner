@@ -9,7 +9,10 @@ checks as status chips, per-source ingest status, survivorship gap,
 unclassifiable and `snapshot_static` reliance, settings, statement facts
 (issue 660, T77c: the switch's state, coverage and derived share while it
 is on, the last EDGAR run's `statement_*` counts and a warning badge while
-`statement_vintage_late > 0`), the coverage check against the named
+`statement_vintage_late > 0`), the borrow-status block (issue 1506,
+T171e: the switch, rows, the latest observation, the shortable and ETB
+counts at it, the last run and the stale and switch warnings), the coverage
+check against the named
 reference (issue 1541, T180: "not computed" until the viewer presses its
 button, since it costs one universe read per sample session; never computed
 on a refresh, whatever `coverage.check_enabled` says)); and the gap,
@@ -62,8 +65,10 @@ from tradepartner.config import Settings, get_settings
 from tradepartner.dashboard import header, theme
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     health_report,
 )
 from tradepartner.repair import REPAIRED
@@ -316,7 +321,7 @@ def coverage_badge(block: CoverageReference | None) -> tuple[str, theme.Status]:
     return label, "good" if block.checked and not block.failed else "warning"
 
 
-def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
+def _coverage_card(report: HealthReport, check_enabled: bool, index_gated: bool = False) -> None:
     """The coverage-reference card. Its button reruns the page, which then reads
     the button's state before loading the view (`render`)."""
     block = report.coverage_reference
@@ -331,6 +336,12 @@ def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
             if check_enabled:
                 theme.status_badge(
                     "coverage.check_enabled is on: `health --check` enforces this check",
+                    "warning",
+                )
+            if index_gated:
+                theme.status_badge(
+                    "coverage.index_max_missing is set: `health --check` enforces "
+                    f"{INDEX_MEMBERS_MISSING}",
                     "warning",
                 )
             return
@@ -348,6 +359,39 @@ def _coverage_card(report: HealthReport, check_enabled: bool) -> None:
         if not block.late_known.is_empty():
             st.markdown(f"Late-known listings ({block.late_known.height})")
             st.dataframe(block.late_known, hide_index=True)
+        _index_members_table(block.index_members)
+
+
+def _index_members_table(index: IndexMembersCheck | None) -> None:
+    """The card's second table (issue 1682, T189b): the S&P 500 answer key per
+    sample session, from the report (the key's SHA included), then its misses.
+    A check only: the key is never a universe or a signal."""
+    if index is None:
+        st.caption("S&P 500 answer key: off (`coverage.index_members`)")
+        return
+    label, tone = index_badge(index)
+    st.markdown("S&P 500 answer key (a check only, never a source)")
+    theme.status_badge(label, tone)
+    if index.error is not None:
+        return
+    st.caption(f"Key commit `{index.commit}`, last dated row {index.through}")
+    st.dataframe(index.samples, hide_index=True)
+    if not index.misses.is_empty():
+        st.markdown(f"Answer-key misses ({index.misses.height})")
+        st.dataframe(index.misses, hide_index=True)
+
+
+def index_badge(index: IndexMembersCheck) -> tuple[str, theme.Status]:
+    """`index_members_missing`' chip: critical only when the block fails
+    (`coverage.index_max_missing` set and exceeded); good when checked and
+    within the threshold; else a caution (report-only misses, nothing checked,
+    or the key unavailable)."""
+    label = f"{INDEX_MEMBERS_MISSING}: {index.verdict}"
+    if index.failed:
+        return label, "critical"
+    if index.max_missing is not None and index.checked:
+        return label, "good"
+    return label, "good" if index.checked and index.misses.is_empty() else "warning"
 
 
 def _sources_card(report: HealthReport) -> None:
@@ -400,6 +444,14 @@ def _data_card(report: HealthReport) -> None:
         )
         tables = ", ".join(f"{k} {v}" for k, v in sorted(static.by_table.items())) or "none"
         st.markdown(f"snapshot_static reliance: {static.count} ({tables})")
+        filename = report.filename_listings
+        st.markdown(
+            f"Filing-name listings: {filename.rows} rows · "
+            f"{filename.only_listing} securities rely only on them · "
+            f"{filename.no_bars.height} spans without traded bars"
+        )
+        if not filename.no_bars.is_empty():
+            st.dataframe(filename.no_bars, hide_index=True)
         rule = "on" if report.settings["liquidity_rule_enabled"] else "off"
         st.markdown(f"Liquidity rule: {rule} · Fill price: {report.settings['fill_price']}")
 
@@ -455,6 +507,31 @@ def _rates_card(report: HealthReport) -> None:
         )
 
 
+def _borrow_card(report: HealthReport) -> None:
+    """The borrow-status block (issue 1506, T171e): rows, assets, the latest
+    observation (the run cursor) and `known_at`, the shortable and ETB counts
+    at it, the last run's counts, and each warning as a badge."""
+    borrow = report.borrow
+    with st.container(border=True):
+        st.subheader("Borrow status")
+        state = "on" if borrow.enabled else "off"
+        st.markdown(f"Switch (`borrow.enabled`): **{state}**")
+        st.markdown(f"{borrow.rows} rows · {borrow.assets} assets")
+        st.caption(
+            f"Latest observation {header.when(borrow.latest_observation)} · "
+            f"latest known at {header.when(borrow.latest_known_at)}"
+        )
+        if borrow.latest_observation is not None:
+            st.markdown(
+                f"At the latest observation: {borrow.shortable} shortable, "
+                f"{borrow.easy_to_borrow} easy to borrow (active assets)"
+            )
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(borrow.run_counts.items()))
+        st.caption(f"Last snapshot run: {borrow.last_run_status or 'never'}; {counts or 'none'}")
+        for warning in borrow.warnings:
+            theme.status_badge(warning, "warning")
+
+
 def _tables(report: HealthReport) -> None:
     st.subheader("Gap report")
     st.dataframe(report.gaps.rows, hide_index=True)
@@ -500,5 +577,10 @@ def render(conn: duckdb.DuckDBPyConnection) -> None:
         _survivorship_card(view.report)
         _statement_card(view.report)
         _rates_card(view.report)
-        _coverage_card(view.report, settings.coverage.check_enabled)
+        _borrow_card(view.report)
+        _coverage_card(
+            view.report,
+            settings.coverage.check_enabled,
+            index_gated=settings.coverage.index_max_missing is not None,
+        )
     _tables(view.report)
