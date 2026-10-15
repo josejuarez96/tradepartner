@@ -111,7 +111,7 @@ def test_rule_2_is_invariant_under_truncation(store: duckdb.DuckDBPyConnection) 
     settings = Settings(_env_file=None)
     truncated = TruncatedStore(store)
     try:
-        passed: set[tuple[str, str]] = set()
+        seen: set[tuple[str, bool]] = set()
         probes = probe_timestamps(store)
         assert len(probes) >= 8
         for t in probes:
@@ -124,8 +124,14 @@ def test_rule_2_is_invariant_under_truncation(store: duckdb.DuckDBPyConnection) 
                 for r in full.exclusions.iter_rows(named=True)
                 if r["rule_name"] == "exchange"
             }
-            passed |= {(sid, t.date().isoformat()) for sid in ROWS if sid not in failed}
-        # Not vacuous: SECOND passes rule 2 on the secondary row once it is known.
-        assert any(sid == "SECOND" for sid, _ in passed)
+            on_second = t >= _at(2020, 6, 2)
+            on_otc = t >= _at(2020, 9, 3)
+            if on_second and "SECOND" not in failed:
+                seen.add(("SECOND", True))
+            if on_otc and "OFFLIST" in failed:
+                seen.add(("OFFLIST", True))
+        # Not vacuous: SECOND passes only once its Chicago row is known and OFFLIST
+        # fails only once its OTC row is known (rule 2's reason, per probe).
+        assert ("SECOND", True) in seen and ("OFFLIST", True) in seen
     finally:
         truncated.close()

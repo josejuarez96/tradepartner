@@ -41,6 +41,7 @@ CASES: dict[str, list[tuple[str, date, datetime]]] = {
     "TX": [("NASDAQ", *OLD), ("NYSETX", *NEW)],
     "OTC": [("NYSE", *OLD), ("OTC", *NEW)],
     "NONE": [("NYSE", *OLD), ("NONE", *NEW)],
+    "OTCQX": [("NYSE", *OLD), ("OTCQX", *NEW)],
     "ENDED": [("NYSE", *OLD), ("NYSE_CHICAGO", *NEW)],
     "ONLYCHI": [("NYSE_CHICAGO", *OLD)],
     "ARCA": [("NYSE_ARCA", *OLD), ("NYSE_CHICAGO", *NEW)],
@@ -137,6 +138,7 @@ def test_the_newer_row_on_no_venue_is_a_move_off_the_exchange(
     reasons = _rule_2(conn)
     assert reasons["OTC"] == "exchange:OTC"
     assert reasons["NONE"] == "exchange:NONE"
+    assert reasons["OTCQX"] == "exchange:OTCQX"  # an unknown name is not a vouched venue
 
 
 def test_a_listing_ended_by_its_own_form_25_is_not_live(

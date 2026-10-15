@@ -16,9 +16,9 @@ reported once, under the first rule it fails:
    `NYSETX`: a secondary quote of the same class, #1682 lever A) does not
    hide a listing that is still live on a venue in `universe.exchanges`:
    the security passes while any of its rows at or before the session is
-   live on that list. A newer row on `OTC`, `NONE` or no name is a move off
-   the exchange and still fails, and a listing ended by its own Form 25 is
-   not live. It is live while `listed`, or while
+   live on that list. A newer row on `OTC`, `NONE`, no name or any value
+   outside `_SECONDARY_VENUES` is a move off the exchange and still fails,
+   and a listing ended by its own Form 25 is not live. It is live while `listed`, or while
    `transferred` up to its end session; a `delisted` listing (a Form 25
    known at `t`) is out from the filing's `known_at`, even while bars
    continue, so nothing enters a name on its way out.
@@ -217,9 +217,22 @@ def _last_sessions(session: date, count: int) -> frozenset[date]:
     return frozenset(out)
 
 
-#: Exchange values that name no venue: a newer row on one is a move off the
-#: exchange, never a secondary quote (same set as `delistings._OFF_EXCHANGE`).
-_NO_VENUE = frozenset({"", "NONE", "OTC"})
+#: Real venues off `universe.exchanges` whose newer row is a secondary quote
+#: of a class listed on the list (T196). An allow-list: any other value
+#: (`OTC`, `NONE`, blank, an OTC tier's slug, an unknown name) is not a
+#: venue the rule vouches for and still fails.
+_SECONDARY_VENUES = frozenset(
+    {
+        "NYSE_CHICAGO",
+        "NYSETX",
+        "NYSE_NATIONAL",
+        "NASDAQ_BX",
+        "NASDAQ_PHLX",
+        "NYSE_ARCA",
+        "CBOE_BZX",
+        "CBOE",
+    }
+)
 
 
 def _is_live(row: dict[str, Any], session: date) -> bool:
@@ -283,7 +296,7 @@ def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: li
         return f"status:{status}"
     if listing["exchange"] not in exchanges:
         # A secondary quote on a real venue does not hide a live listing on the list.
-        if listing["on_listed_exchange"] and listing["exchange"] not in _NO_VENUE:
+        if listing["on_listed_exchange"] and listing["exchange"] in _SECONDARY_VENUES:
             return ""
         return f"exchange:{listing['exchange']}"
     return ""
