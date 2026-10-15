@@ -31,7 +31,7 @@ import duckdb
 import polars as pl
 import pytest
 
-from tradepartner.adapters.edgar import parse_cover_page
+from tradepartner.adapters.edgar import parse_cover_page, parse_fsn
 from tradepartner.adapters.filings import (
     CompanySnapshotEntry,
     CoverPage,
@@ -360,3 +360,67 @@ def test_the_residual_pg_reads_as_its_note_until_the_retraction(settings: Settin
             "ORDER BY known_at",
             [PG, "PG25"],
         ).fetchall() == [(_at(2022, 10, 19), False), (RETRACT_AT, True)]
+
+
+# --- T193 (#1682, #1675): NiSource's real FSN rows, end to end ------------------------
+
+NI = "0001111711"
+NI_ACCESSION = "0001111711-21-000018"
+NI_ACCEPTED = datetime(2021, 5, 5, 17, 8, 52, tzinfo=UTC)
+FSN_SPLIT = FIXTURES.parent / "fsn_split" / "nisource_2021q2"
+
+
+def _ni_source(on: bool) -> FixtureFilingSource:
+    """NiSource with one cover page, its real 2021-05-05 10-Q as FSN holds it
+    (Common Stock `NI`, Series A Corporate Units `NIMC`, the Series B
+    depositary shares), parsed with the switch `on` or off; the companies
+    snapshot names `NI`."""
+
+    def rows(name: str) -> list[dict[str, str]]:
+        lines = (FSN_SPLIT / name).read_text(encoding="utf-8").splitlines()
+        header = lines[0].split("\t")
+        return [dict(zip(header, line.split("\t"), strict=False)) for line in lines[1:]]
+
+    parsed = parse_fsn(
+        rows("sub.tsv"),
+        rows("num.tsv"),
+        rows("txt.tsv"),
+        rows("dim.tsv"),
+        exchange_axis=True,
+        split_contexts=on,
+    )
+    [record] = parsed.records
+    first = _accession(NI, 2015, 1)
+    return FixtureFilingSource(
+        index=[
+            FilingIndexEntry(NI, "NiSource Inc.", "10-K", first, _at(2015, 2, 18)),
+            FilingIndexEntry(NI, "NiSource Inc.", "10-Q", NI_ACCESSION, NI_ACCEPTED),
+        ],
+        headers=[
+            FilingHeader(NI, first, "10-K", 4931, _at(2015, 2, 18)),
+            FilingHeader(NI, NI_ACCESSION, "10-Q", 4931, NI_ACCEPTED),
+        ],
+        cover_pages=[CoverPage(NI, NI_ACCESSION, NI_ACCEPTED, record.listings)],
+        facts=[],
+        snapshot=[CompanySnapshotEntry(NI, "NiSource Inc.", "NI", "NYSE", SNAPSHOT_AT)],
+    )
+
+
+def test_nisource_common_holds_the_primary_id_and_its_units_their_own(
+    settings: Settings,
+) -> None:
+    """#1675's done-when, end to end: with the switch on, the common `NI` is
+    the primary id's filing listing from its 2021-05-05 acceptance, and
+    `NIMC` sits on its own class id, never on the common's."""
+    _ingest(settings, _ni_source(True), RUN)
+    rows = _filing_listings(settings, RUN)
+    on_primary = [row for row in rows if row[0] == NI]
+    assert [(r[1], r[2], r[5]) for r in on_primary] == [("NI", "NYSE", NI_ACCEPTED)]
+    [units] = [row for row in rows if row[1] == "NIMC"]
+    assert units[0] != NI and units[0].startswith(f"{NI}:")
+    assert units[3] == "Series A Corporate Units"
+
+
+def test_nisource_with_the_switch_off_has_no_filing_listing(settings: Settings) -> None:
+    _ingest(settings, _ni_source(False), RUN)
+    assert _filing_listings(settings, RUN) == []
