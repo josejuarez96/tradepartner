@@ -39,6 +39,7 @@ from tradepartner.adapters.edgar import (
     FsnFailure,
     FsnFiling,
     FsnShare,
+    joinable_title,
     parse_fsn,
     restore_class_letter_space,
 )
@@ -1523,10 +1524,10 @@ class TestParseFsnSplitContexts:
             (
                 "Security12bTitle",
                 "Common Stock, par value $0.01 per share",
-                "StatementEquityComponents=CommonStock;",
+                "EquityComponents=CommonStock;",
             ),
-            ("TradingSymbol", "NI", "StatementEquityComponents=CommonStock;"),
-            ("SecurityExchangeName", "NYSE", "StatementEquityComponents=CommonStock;"),
+            ("TradingSymbol", "NI", "EquityComponents=CommonStock;"),
+            ("SecurityExchangeName", "NYSE", "EquityComponents=CommonStock;"),
             (
                 "Security12bTitle",
                 "Series A Corporate Units",
@@ -1545,7 +1546,7 @@ class TestParseFsnSplitContexts:
 
     def test_same_member_name_on_two_axes_does_not_merge(self) -> None:
         rows = [
-            ("Security12bTitle", "Common Stock", "StatementEquityComponents=CommonStock;"),
+            ("Security12bTitle", "Common Stock", "EquityComponents=CommonStock;"),
             ("TradingSymbol", "NIMC", "CapitalUnitsByClass=CommonStock;"),
             ("SecurityExchangeName", "NYSE", "CapitalUnitsByClass=CommonStock;"),
         ]
@@ -1577,7 +1578,7 @@ class TestParseFsnSplitContexts:
             _num(adsh, SHARES_TAG, "100", "20210331", dimh="0x1", dimn="1"),
             _num(adsh, SHARES_TAG, "392217046", "20210331"),
         ]
-        dim = [_dim("0x1", "StatementEquityComponents=PreferredStock;")]
+        dim = [_dim("0x1", "EquityComponents=PreferredStock;")]
         parsed = parse_fsn([_sub(adsh, "1111711", "10-Q")], num, [], dim, split_contexts=True)
         assert parsed.failures == ()
         [record] = parsed.records
@@ -1698,3 +1699,187 @@ def test_an_undecodable_byte_in_a_capital_units_segment_fails_closed_only_with_t
     assert [f.accession for f in parsed.failures] == [adsh]
     assert "undecodable byte" in parsed.failures[0].error
     assert parse_fsn(*args).failures == ()  # today's parse drops the row
+
+
+# --- T193 (#1682, #1675): the split-context join inside one class, on real FSN rows ---
+#
+# `tests/fixtures/edgar/fsn_split/<label>/{sub,num,txt,dim}.tsv`: the cover rows of
+# one real filing each, cut from SEC's FSN period zip (2020q1, 2020q3, 2021q2,
+# 2023q3) with only the columns `_ensure_fsn` reads. Real rows, not
+# hand-built ones: the synthetic NiSource rows spelled the axis
+# `StatementEquityComponents`, which FSN never writes, so the common was
+# dropped on every real NiSource filing and its units listing took the
+# primary id (#1675, #1680).
+
+SPLIT_FIXTURES = EDGAR_FIXTURES / "fsn_split"
+
+#: label -> (accession, listings with the switch on, listings with it off).
+_REAL_SHAPES: dict[str, tuple[str, list[tuple[str, str, str]], list[tuple[str, str, str]]]] = {
+    "nisource_2021q2": (
+        "0001111711-21-000018",
+        [
+            ("Common Stock, par value $0.01 per share", "NI", "NYSE"),
+            ("Series A Corporate Units", "NIMC", "NYSE"),
+            (
+                "Depositary Shares, each representing a 1/1,000th ownership interest in a share"
+                " of 6.50% Series B",
+                "NI PR B",
+                "NYSE",
+            ),
+        ],
+        [],
+    ),
+    "fifth_third_2020q3": (
+        "0000035527-20-000077",
+        [
+            ("Common Stock, Without Par Value", "FITB", "NASDAQ"),
+            (_FIFTH_THIRD_PREF, "FITBI", "NASDAQ"),
+            ("4.95% Non-Cumulative Perpetual Preferred Stock, Series K", "FITBO", "NASDAQ"),
+            ("6.00% Non-Cumulative Perpetual Class B Preferred Stock, Series A", "FITBP", "NASDAQ"),
+        ],
+        [],
+    ),
+    "abbott_2020q3": (
+        "0001104659-20-087850",
+        [
+            ("Common Shares, Without Par Value", "ABT", "NYSE"),
+            ("Common Shares, Without Par Value", "ABT", "NYSE_CHICAGO"),
+        ],
+        [],
+    ),
+    "mmc_2020q1": (
+        "0000062709-20-000010",
+        [
+            ("Common Stock, par value $1.00 per share", "MMC", "NYSE"),
+            ("Common Stock, par value $1.00 per share", "MMC", "NYSE_CHICAGO"),
+        ],
+        [],
+    ),
+}
+
+
+def _real(label: str, *, on: bool) -> Any:
+    sub, num, txt, dim = _read_period_tsvs(SPLIT_FIXTURES / label)
+    parsed = parse_fsn(sub, num, txt, dim, exchange_axis=True, split_contexts=on)
+    assert parsed.failures == ()
+    [record] = parsed.records
+    return record
+
+
+def _triples(record: Any) -> list[tuple[str, str, str]]:
+    return [(i.title, i.ticker, i.exchange) for i in record.listings]
+
+
+class TestRealSplitContextShapes:
+    @pytest.mark.parametrize("label", sorted(_REAL_SHAPES))
+    def test_each_class_is_found_with_the_switch_on(self, label: str) -> None:
+        accession, on, _ = _REAL_SHAPES[label]
+        record = _real(label, on=True)
+        assert record.accession == accession
+        assert sorted(_triples(record)) == sorted(on)
+        assert record.incomplete_listings == 0
+
+    @pytest.mark.parametrize("label", sorted(_REAL_SHAPES))
+    def test_switch_off_is_todays_output(self, label: str) -> None:
+        _, _, off = _REAL_SHAPES[label]
+        assert _triples(_real(label, on=False)) == off
+        sub, num, txt, dim = _read_period_tsvs(SPLIT_FIXTURES / label)
+        default = parse_fsn(sub, num, txt, dim, exchange_axis=True).records[0]
+        assert default == _real(label, on=False)  # the default is off
+
+    def test_nisource_units_ticker_is_never_on_the_common(self) -> None:
+        """#1675's done-when, on the real rows of 2021-05-05: the common and
+        the equity units are two classes, and `NIMC` only ever carries the
+        units' title."""
+        by_ticker = {i.ticker: i.title for i in _real("nisource_2021q2", on=True).listings}
+        assert by_ticker["NI"] == "Common Stock, par value $0.01 per share"
+        assert by_ticker["NIMC"] == "Series A Corporate Units"
+        assert [i.ticker for i in _real("nisource_2021q2", on=True).listings].count("NIMC") == 1
+
+    def test_nisource_shares_stay_the_undimensioned_total(self) -> None:
+        record = _real("nisource_2021q2", on=True)
+        assert [(s.class_member, s.value) for s in record.shares] == [("", 392_217_046)]
+
+    def test_pg_2023_common_is_joined_and_its_notes_take_no_other_context(self) -> None:
+        """P&G's FY2023 10-K: the common's title and symbol on its member,
+        its exchange on the member plus XNYS (joined); each note's title and
+        symbol on its own member and the exchange only on a bare XNYS
+        context, which is no note's member, so the 17 notes stay incomplete
+        with the switch on as off."""
+        on, off = _real("pg_2023q3", on=True), _real("pg_2023q3", on=False)
+        assert _triples(on) == [("Common Stock, without Par Value", "PG", "NYSE")]
+        assert (off.listings, off.incomplete_listings) == ((), 18)
+        assert on.incomplete_listings == 17
+
+
+@pytest.mark.parametrize(
+    ("title", "joinable"),
+    [
+        ("Common Stock, par value $0.01 per share", True),
+        ("Common Stock, $0.01 par value, and associated Preferred Stock Purchase Rights", True),
+        ("Common shares (including common share purchase rights)", True),
+        ("American Depositary Shares, each representing the right to receive one share", True),
+        ("Common Units representing limited partner interests", True),
+        ("Depositary Shares, each representing a 1/1,000th interest in a share", True),
+        ("6.625% Fixed-to-Floating Rate Non-Cumulative Perpetual Preferred Stock", True),
+        ("Series A Corporate Units", False),
+        ("Equity Units", False),
+        ("Tangible Equity Units", False),
+        ("1.375% Notes due 2025", False),
+        ("7% Debentures due 2029", False),
+        ("Warrants, each exercisable for one share of Class A common stock", False),
+        ("Common Stock Purchase Warrants", False),
+        ("Preferred Share Purchase Rights", False),
+        ("Units, each consisting of one share of Class A common stock and one-half warrant", False),
+        ("Units, each comprising one share and one right", False),
+        ("Units comprised of one share and one warrant", False),
+        ("Units, consisting of one share of Class A common stock and one warrant", False),
+        ("Each Unit consisting of one share and one-third of one warrant", False),
+        ("Units", False),
+        ("One share of Class A common stock and one-half of one redeemable warrant", False),
+        ("Common Stock and Warrants", False),
+        ("Class A Common Stock with one Warrant attached", False),
+        # reviewers' common-with-rights forms (#1701): the clause is not the head
+        ("Common Stock and Preferred Share Purchase Rights", True),
+        ("Common Stock and Rights to Purchase Series A Preferred", True),
+        ("Ordinary Shares and Rights", True),
+        ("Class A Common Stock with voting rights", True),
+        ("Common Shares of Beneficial Interest and Rights", True),
+        ("Common Stock\nand Rights", True),
+        ("Class A common stock included as part of the units, each consisting of one share", True),
+    ],
+)
+def test_joinable_title(title: str, joinable: bool) -> None:
+    assert joinable_title(title) is joinable
+
+
+def test_joinable_title_is_linear_on_a_long_title() -> None:
+    """A filer's title is untrusted input: 100 KB of repeated unit words
+    reads in well under a second (safety review on #1701)."""
+    import time
+
+    for title in ("unit " * 20_000, "Units each consisting " * 5_000, "a" * 100_000):
+        started = time.perf_counter()
+        joinable_title(title)
+        assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "title", ["Series A Corporate Units", "1.375% Notes due 2025", "Warrants to purchase"]
+)
+def test_a_unit_note_or_warrant_class_is_never_joined(title: str) -> None:
+    """T193: the title and the symbol of one class member on two contexts are
+    joined for a common (the PG shape), never for a unit, note or warrant:
+    such a class reads one context at a time, as with the switch off."""
+    member = "ClassOfStock=SomeMember;"
+    rows = [
+        ("Security12bTitle", title, member),
+        ("TradingSymbol", "XYZ", f"{member}EntityListingsExchange=XNYS;"),
+        ("SecurityExchangeName", "NYSE", f"{member}EntityListingsExchange=XNYS;"),
+    ]
+    [record] = _split_fsn("", on=True, rows=rows).records
+    assert record.listings == ()
+    assert record.incomplete_listings == 1
+    common = [("Security12bTitle", "Common Stock", member), *rows[1:]]
+    [joined] = _split_fsn("", on=True, rows=common).records
+    assert [(i.title, i.ticker) for i in joined.listings] == [("Common Stock", "XYZ")]

@@ -1,0 +1,13 @@
+adsh	tag	dimh	dimn	coreg	value
+0000035527-20-000077	Security12bTitle	0x19b516a3d9335169b3f3f0894c15b594	1		6.00% Non-Cumulative Perpetual ClassB Preferred Stock, Series A
+0000035527-20-000077	Security12bTitle	0x4e310144dc36ec6fc51689f413f9593a	1		4.95% Non-Cumulative Perpetual Preferred Stock, Series K
+0000035527-20-000077	Security12bTitle	0xdd3a8c58f602187c5643e093be3f0bc1	1		Common Stock, Without Par Value
+0000035527-20-000077	Security12bTitle	0xfe48d0d0640250ea3f86c9d9555040b9	1		6.625% Fixed-to-Floating Rate Non-Cumulative Perpetual Preferred Stock, Series I
+0000035527-20-000077	SecurityExchangeName	0x19b516a3d9335169b3f3f0894c15b594	1		NASDAQ
+0000035527-20-000077	SecurityExchangeName	0x4e310144dc36ec6fc51689f413f9593a	1		NASDAQ
+0000035527-20-000077	SecurityExchangeName	0xdd3a8c58f602187c5643e093be3f0bc1	1		NASDAQ
+0000035527-20-000077	SecurityExchangeName	0xfe48d0d0640250ea3f86c9d9555040b9	1		NASDAQ
+0000035527-20-000077	TradingSymbol	0x19b516a3d9335169b3f3f0894c15b594	1		FITBP
+0000035527-20-000077	TradingSymbol	0x4e310144dc36ec6fc51689f413f9593a	1		FITBO
+0000035527-20-000077	TradingSymbol	0xdd3a8c58f602187c5643e093be3f0bc1	1		FITB
+0000035527-20-000077	TradingSymbol	0xfe48d0d0640250ea3f86c9d9555040b9	1		FITBI

@@ -1878,3 +1878,27 @@ def test_filename_first_page_classes_match_the_cik_not_only_the_second() -> None
     assert (
         on.filename_counts["filename_class_unread"] == 1
     )  # the first CIK's own class, nothing of the second's
+
+
+def test_registered_shares_class_is_the_primary_under_the_fallback() -> None:
+    # T194: the page lists a preferred first; "Registered Shares" is the common.
+    cik = "0000000983"
+    source = FixtureFilingSource(
+        index=[FilingIndexEntry(cik, "Swiss AG", "10-K", f"{cik}-1", _at(2016, 3, 1))],
+        cover_pages=[
+            _cover(
+                cik,
+                _at(2019, 3, 4),
+                ("6% Series A Preferred Shares", "SWP", "NYSE"),
+                ("Registered Shares, CHF 0.10 par value", "SWS", "NYSE"),
+            )
+        ],
+    )
+    first: dict[bool, str] = {}
+    for on in (True, False):
+        built = build_master(
+            source, _settings(edgar={"title_fallback": on}), ingested_at=INGESTED_AT
+        )
+        primary = primary_security_id(cik)
+        first[on] = next(r["ticker"] for r in built.listings if r["security_id"] == primary)
+    assert first == {True: "SWS", False: "SWP"}

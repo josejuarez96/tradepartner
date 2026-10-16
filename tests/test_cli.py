@@ -926,7 +926,8 @@ def test_health_check_fails_coverage_reference_names_only_with_check_enabled(
     refused = _invoke(enforced, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
     assert refused.exit_code == 1
     assert refused.output.strip() == (
-        "--no-coverage cannot be used with --check while coverage.check_enabled is on"
+        "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+        "or coverage.index_max_missing is set"
     )
     skipped = _invoke(enforced, ["health", "--no-coverage"], clock=lambda: T_END)
     assert skipped.exit_code == 0, skipped.output
@@ -2044,3 +2045,199 @@ def test_health_prints_the_borrow_block_and_its_warnings(
     assert "last alpaca_assets run: never; none" in result.output
     assert "None shortable" not in result.output
     assert "warning: borrow.enabled is off" in result.output
+
+
+def test_health_coverage_prints_the_index_lines_with_the_reports_sha(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1682, T189b: two lines under the coverage block (the key's SHA, the
+    counts, then the misses by bucket) and the rule's verdict, report-only."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    result = _invoke(settings, ["health", "--coverage", "--check"], clock=lambda: T_END)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    [summary] = [line for line in lines if line.startswith("  index members (key ")]
+    assert summary.startswith(
+        "  index members (key a2430f2af0c79ddf0748e91de11bdeb1616ab5a7 through 2026-08-18): "
+        "2 sessions checked, 0 beyond the key; 0 of 1010 hits (0.0%); "
+    )
+    assert summary.endswith("max missing per session (report-only)")
+    [buckets] = [line for line in lines if line.startswith("  index misses by bucket: ")]
+    assert (
+        "unresolved 1010 member-sessions, 517 names (" in buckets
+        and " member-sessions, " in buckets
+        and "AAPL" in buckets
+    )
+    assert "  index_members_missing: " in result.output
+    plain = _invoke(settings, ["health", "--check"], clock=lambda: T_END)
+    assert "  index_members_missing: not computed (run with --coverage)" in plain.output
+
+
+def test_health_check_fails_index_members_missing_once_the_threshold_is_set(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    gated = _settings(tmp_path, store=fixture_store_path, coverage={"index_max_missing": 0})
+    failed = _invoke(gated, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "health check failed: index_members_missing" in failed.output
+    assert ": fail (max 0)" in failed.output
+    refused = _invoke(gated, ["health", "--no-coverage", "--check"], clock=lambda: T_END)
+    assert refused.exit_code == 1
+    assert "coverage.index_max_missing is set" in refused.output
+    off = _settings(tmp_path, store=fixture_store_path, coverage={"index_members": False})
+    result = _invoke(off, ["health", "--coverage"], clock=lambda: T_END)
+    assert "  index members: off (coverage.index_members)" in result.output
+    assert "  index_members_missing: off (coverage.index_members)" in result.output
+
+
+# --- T191 (#1682 lever B): delete-master-rows ---
+
+_VZ = "0000732712"
+_NOTE = "2.375% Notes due 2022"
+_NOTE_KNOWN = datetime(2019, 10, 30, 16, 18, 19, tzinfo=UTC)
+_TENQ = "0000732712-19-000063"
+_MASTER_RELEASE = "restate-test"
+
+
+def _sgml(accession: str, accepted_eastern: str, cik: str) -> str:
+    return (
+        f"<SEC-DOCUMENT>{accession}.txt : 20191030\n<SEC-HEADER>{accession}.hdr.sgml\n"
+        f"<ACCEPTANCE-DATETIME>{accepted_eastern}\nACCESSION NUMBER:\t\t{accession}\n"
+        "CONFORMED SUBMISSION TYPE:\t10-Q\nFILER:\n\tCOMPANY DATA:\n"
+        f"\t\tCENTRAL INDEX KEY:\t\t\t{cik}\n"
+        "\t\tSTANDARD INDUSTRIAL CLASSIFICATION:\tTELEPHONE COMMUNICATIONS [4813]\n"
+        "</SEC-HEADER>\n"
+    )
+
+
+@pytest.fixture
+def master_store(secrets_set: Settings, tmp_path: Path) -> tuple[Settings, Path]:
+    """Verizon's primary with the common and the note's listing; a release
+    open; a manifest naming the note's row with its 10-Q."""
+    with open_for_write(secrets_set) as conn:
+        init_schema(conn)
+        common = datetime(2019, 8, 8, 17, 4, 24, tzinfo=UTC)
+        insert_row(
+            conn,
+            "securities",
+            {
+                "security_id": _VZ,
+                "cik": _VZ,
+                "name": "VZ",
+                "known_at": common,
+                "ingested_at": NOW,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+        for ticker, title, known in (("VZ", "Common Stock", common), ("VZ22A", _NOTE, _NOTE_KNOWN)):
+            insert_row(
+                conn,
+                "listings",
+                {
+                    "security_id": _VZ,
+                    "ticker": ticker,
+                    "exchange": "NYSE",
+                    "class_title": title,
+                    "valid_from": known.date(),
+                    "known_at": known,
+                    "ingested_at": datetime(2026, 10, 4, tzinfo=UTC),
+                    "source": "edgar",
+                    "provenance": "filing",
+                },
+            )
+        registry.open_data_release(
+            conn, conn, name=_MASTER_RELEASE, backup_path="b.duckdb", reason="#1682"
+        )
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text(
+        "table,security_id,ticker,exchange,valid_from,form,class_title,filed_at,known_at,"
+        f"accession\nlistings,{_VZ},VZ22A,NYSE,2019-10-30,,{_NOTE},,{_NOTE_KNOWN.isoformat()},"
+        f"{_TENQ}\n"
+    )
+    return secrets_set, manifest
+
+
+def _edgar_headers(accepted_eastern: str, cik: str = _VZ) -> tuple[httpx.Client, list[str]]:
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        if (
+            request.url.path
+            == f"/Archives/edgar/data/{int(_VZ)}/{_TENQ.replace('-', '')}/{_TENQ}.txt"
+        ):
+            return httpx.Response(206, text=_sgml(_TENQ, accepted_eastern, cik))
+        return httpx.Response(404)
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), asked
+
+
+def _stored_tickers(settings: Settings) -> list[str]:
+    with duckdb.connect(str(settings.store.path), read_only=True) as conn:
+        return [
+            r[0] for r in conn.execute("SELECT ticker FROM listings ORDER BY ticker").fetchall()
+        ]
+
+
+def test_delete_master_rows_dry_run_then_delete(master_store: tuple[Settings, Path]) -> None:
+    settings, manifest = master_store
+    client, asked = _edgar_headers("20191030121819")  # 12:18:19 New York = the row's stamp
+    args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
+    dry = _invoke(settings, [*args, "--dry-run"], edgar_client=client)
+    assert dry.exit_code == 0, dry.output
+    assert dry.output.startswith("would delete 1 listings and 0 delistings rows of 1 manifest")
+    assert f"listings {_VZ} VZ22A NYSE 2019-10-30" in dry.output
+    assert asked and _stored_tickers(settings) == ["VZ", "VZ22A"]
+    done = _invoke(settings, args, edgar_client=client)
+    assert done.exit_code == 0, done.output
+    assert done.output.startswith("deleted 1 listings")
+    assert _stored_tickers(settings) == ["VZ"]
+
+
+def test_delete_master_rows_refuses_later_evidence_and_another_cik(
+    master_store: tuple[Settings, Path],
+) -> None:
+    settings, manifest = master_store
+    args = ["delete-master-rows", "--manifest", str(manifest), "--release", _MASTER_RELEASE]
+    for client, reason in (
+        (_edgar_headers("20191030121820")[0], "after the row's known_at"),
+        (
+            _edgar_headers("20191030121819", cik="0000000001")[0],
+            f"does not read as CIK {_VZ}'s filing",
+        ),
+    ):
+        for extra in (["--dry-run"], []):
+            result = _invoke(settings, [*args, *extra], edgar_client=client)
+            assert result.exit_code == 1, result.output
+            assert reason in result.output
+        assert _stored_tickers(settings) == ["VZ", "VZ22A"]
+    other = manifest.parent / "other.csv"
+    other.write_text(manifest.read_text().replace(_TENQ, "0000732712-19-000064"))
+    gone = _invoke(
+        settings,
+        ["delete-master-rows", "--manifest", str(other), "--release", _MASTER_RELEASE],
+        edgar_client=_edgar_headers("20191030121819")[0],
+    )
+    assert gone.exit_code == 1 and "EDGAR has no 0000732712-19-000064" in gone.output
+
+
+def test_delete_master_rows_usage_errors(
+    master_store: tuple[Settings, Path], tmp_path: Path
+) -> None:
+    settings, manifest = master_store
+    client, _ = _edgar_headers("20191030121819")
+    base = ["delete-master-rows", "--manifest", str(manifest)]
+    assert _invoke(settings, base, edgar_client=client).exit_code == cli.USAGE_ERROR
+    blank = _invoke(settings, [*base, "--release", " "], edgar_client=client)
+    assert blank.exit_code == cli.USAGE_ERROR and "--release <name>" in blank.output
+    other = _invoke(settings, [*base, "--release", "other"], edgar_client=client)
+    assert other.exit_code == 1 and "no open data release named 'other'" in other.output
+    empty = tmp_path / "empty.csv"
+    empty.write_text(manifest.read_text().splitlines()[0] + "\n")
+    no_rows = _invoke(settings, [*base[:2], str(empty), "--release", _MASTER_RELEASE])
+    assert no_rows.exit_code == cli.USAGE_ERROR and "lists no rows" in no_rows.output
+    no_agent = settings.model_copy(update={"sec_edgar_user_agent": None})
+    missing = _invoke(no_agent, [*base, "--release", _MASTER_RELEASE, "--dry-run"])
+    assert missing.exit_code == cli.USAGE_ERROR and "SEC_EDGAR_USER_AGENT" in missing.output
+    assert _stored_tickers(settings) == ["VZ", "VZ22A"]

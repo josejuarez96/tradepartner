@@ -2429,3 +2429,27 @@ def test_borrow_defaults_keep_the_snapshot_off(monkeypatch: pytest.MonkeyPatch) 
 def test_invalid_borrow_config_is_rejected(borrow: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, borrow=borrow)
+
+
+# --- coverage: the index answer key (#1682, T189b) -----------------------------
+
+
+def test_the_index_keys_default_to_on_and_report_only() -> None:
+    cfg = Settings(_env_file=None).coverage
+    assert cfg.index_members is True
+    assert cfg.index_max_missing is None
+    assert cfg.computed_by_default is False
+
+
+def test_a_set_index_threshold_computes_the_block_by_default() -> None:
+    assert Settings(_env_file=None, coverage={"index_max_missing": 0}).coverage.computed_by_default
+    assert Settings(_env_file=None, coverage={"check_enabled": True}).coverage.computed_by_default
+
+
+def test_the_index_threshold_refuses_a_negative_count_and_needs_the_check_on() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, coverage={"index_max_missing": -1})
+    with pytest.raises(ValidationError, match=r"needs coverage\.index_members on"):
+        Settings(_env_file=None, coverage={"index_members": False, "index_max_missing": 5})
+    off = Settings(_env_file=None, coverage={"index_members": False}).coverage
+    assert off.index_members is False

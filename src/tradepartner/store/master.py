@@ -362,9 +362,19 @@ def _norm_title(title: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9%]+", " ", head).split())
 
 
-def _is_common(title: str) -> bool:
+#: Whole-word common titles added under `edgar.title_fallback` (#1682 lever H,
+#: T194): "Registered Shares" is the Swiss and Irish form of common stock
+#: (Garmin, Bunge). "Ordinary shares" is already named by `_COMMON_WORDS`.
+_FALLBACK_COMMON = re.compile(r"\bregistered shares?\b")
+
+
+def _is_common(title: str, *, whole_words: bool = False) -> bool:
+    """True when the title head names common equity. `whole_words` (the
+    `edgar.title_fallback` reading) also accepts "Registered Shares"."""
     norm = _norm_title(title)
-    return any(word in norm for word in _COMMON_WORDS)
+    if any(word in norm for word in _COMMON_WORDS):
+        return True
+    return whole_words and _FALLBACK_COMMON.search(norm) is not None
 
 
 def _session_on_or_after(day: date) -> date:
@@ -616,7 +626,8 @@ class _Builder:
             starts: dict[tuple[str, str], date] = {}  # (security_id, exchange) -> row start
             items = list(page.listings)
             if not classes:  # the primary is the first common class, else the first
-                items.sort(key=lambda item: not _is_common(item.title))
+                title_fallback = self.settings.edgar.title_fallback
+                items.sort(key=lambda item: not _is_common(item.title, whole_words=title_fallback))
             for item in items:
                 live = [c for c in classes if not c.retired]
                 cls = _match(live, item, claimed)

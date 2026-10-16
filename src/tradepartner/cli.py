@@ -78,6 +78,15 @@ Phase 3 plan T42, backtest spec reqs 10-12 and 16).
   (`store/dividend_reviews.csv`) with an ex-date on or before `--to`, counts
   the later ones deferred, and lists every stale entry (a dry run exits 1 on
   any; a real run refuses).
+- `tradepartner delete-master-rows --manifest <csv> --release <name>
+  [--dry-run]` runs `repair.delete_master_rows` (#1682 lever B,
+  data-foundation plan T191): it deletes the reviewed manifest's never-true
+  `listings` and `delistings` rows, each refused unless its accession's SGML
+  header (fetched from EDGAR; needs the user agent) names the security's CIK
+  and was accepted no later than the row's `known_at`, and every row an open
+  paper window read. Refused without a release name; a dry run lists the rows
+  found and refused (exit 1 on any refused), a real run deletes only a
+  manifest with none refused, inside the open release named.
 - `tradepartner dashboard` runs the Streamlit shell (`dashboard/app.py`) bound to
   localhost with usage telemetry off (ADR 0011), and exits with Streamlit's code.
 - `tradepartner export OUT_DIR` writes every table in the store to
@@ -345,6 +354,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime
@@ -358,10 +368,12 @@ import httpx
 import polars as pl
 import typer
 
-from tradepartner.adapters import alpaca_raw
+from tradepartner.adapters import alpaca_raw, edgar_raw
 from tradepartner.adapters.alpaca_prices import AlpacaPriceSource, FetchBars
 from tradepartner.adapters.broker import Broker
+from tradepartner.adapters.edgar import parse_sgml_header
 from tradepartner.adapters.edgar_source import EdgarFilingSource
+from tradepartner.adapters.filings import FilingHeader
 from tradepartner.adapters.fred_rates import FredRateSource
 from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
 from tradepartner.adapters.rates import RateSource
@@ -396,9 +408,11 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    INDEX_MEMBERS_MISSING,
     SESSION_HOLES,
     CoverageReference,
     HealthReport,
+    IndexMembersCheck,
     health_report,
 )
 from tradepartner.ingest import (
@@ -418,8 +432,11 @@ from tradepartner.ingest import (
     read_manifest,
 )
 from tradepartner.repair import (
+    HeaderLookup,
     RepairRefused,
     delete_bars,
+    delete_master_rows,
+    read_master_manifest,
     repair_resolution,
     retract_dividends,
     store_resolver,
@@ -764,6 +781,7 @@ def _print_report(report: HealthReport) -> None:
         verdict = "pass" if check.passed else f"FAIL ({check.violations.height} rows)"
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
+    echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
 
 
 def _print_duplicate_dividends(report: HealthReport) -> None:
@@ -790,6 +808,15 @@ def _coverage_verdict(block: CoverageReference | None) -> str:
     return block.verdict
 
 
+def _index_verdict(block: CoverageReference | None) -> str:
+    """`index_members_missing`' line: never a pass the block did not check."""
+    if block is None:
+        return "not computed (run with --coverage)"
+    if block.index_members is None:
+        return "off (coverage.index_members)"
+    return block.index_members.verdict
+
+
 def _print_coverage_reference(block: CoverageReference | None) -> None:
     echo = typer.echo
     if block is None:
@@ -812,6 +839,37 @@ def _print_coverage_reference(block: CoverageReference | None) -> None:
         )
     ratio = "n/a" if block.member_ratio is None else f"{block.member_ratio:.2f}"
     echo(f"  snapshot CIKs on universe exchanges: {block.snapshot_ciks}; member ratio {ratio}")
+    _print_index_members(block.index_members)
+
+
+def _print_index_members(index: IndexMembersCheck | None) -> None:
+    """The answer-key check's two lines (#1682, T189b): the key's SHA from the
+    report, the per-session counts, then the misses by bucket with their names."""
+    echo = typer.echo
+    if index is None:
+        echo("  index members: off (coverage.index_members)")
+        return
+    if index.error is not None:
+        echo(f"  index members: {index.verdict}")
+        return
+    counted = index.samples.filter(~pl.col("beyond_key"))
+    beyond = index.samples.height - counted.height
+    hits, members = int(counted["hits"].sum()), int(counted["members"].sum())
+    share = f"{hits / members:.1%}" if members else "n/a"
+    echo(
+        f"  index members (key {index.commit} through {index.through}): "
+        f"{counted.height} sessions checked, {beyond} beyond the key; "
+        f"{hits} of {members} hits ({share}); {index.verdict}"
+    )
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for row in index.misses.iter_rows(named=True):
+        buckets[row["bucket"]].append(row["ticker"])
+    parts = [
+        f"{bucket} {len(names)} member-sessions, {len(set(names))} names "
+        f"({', '.join(sorted(set(names)))})"
+        for bucket, names in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+    echo(f"  index misses by bucket: {'; '.join(parts) if parts else 'none'}")
 
 
 def _print_session_holes(report: HealthReport) -> None:
@@ -897,6 +955,41 @@ def _parse_day(flag: str, value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise _fail(f"{flag} must be YYYY-MM-DD, got {value!r}", USAGE_ERROR) from None
+
+
+def _filing_headers(settings: Settings, client: httpx.Client | None) -> HeaderLookup:
+    """`repair.HeaderLookup` over EDGAR: the filing's SGML header under the
+    CIK's archive path (`edgar.header_bytes`, then `edgar.stamp_header_bytes`
+    when cut short), parsed for that CIK, each read once; a 404 or 410, or a
+    header longer than both, is a `ValueError`."""
+
+    read: dict[tuple[str, str], FilingHeader] = {}
+
+    def lookup(cik: str, accession: str) -> FilingHeader:
+        if (cik, accession) in read:
+            return read[(cik, accession)]
+        text = ""
+        for size in (settings.edgar.header_bytes, settings.edgar.stamp_header_bytes):
+            try:
+                text = edgar_raw.filing_sgml_header(
+                    cik, accession, header_bytes=size, settings=settings, client=client
+                )
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in (404, 410):
+                    raise ValueError(f"EDGAR has no {accession} under CIK {cik} ({code})") from None
+                raise
+            if "</SEC-HEADER>" in text:
+                break
+        if "</SEC-HEADER>" not in text:
+            raise ValueError(
+                f"{accession}'s SGML header is longer than edgar.stamp_header_bytes "
+                f"({settings.edgar.stamp_header_bytes}); raise it and run again"
+            )
+        header = read[(cik, accession)] = parse_sgml_header(text, cik)
+        return header
+
+    return lookup
 
 
 def _blank_text(value: str | None) -> bool:
@@ -2111,6 +2204,68 @@ def make_app(
                 f"{len(result.stale)} stale list entries: re-review them before a real run", 1
             )
 
+    @app.command("delete-master-rows")
+    def delete_master_rows_(
+        manifest: Annotated[
+            Path, typer.Option(help="the reviewed manifest CSV (repair.MASTER_MANIFEST_COLUMNS)")
+        ],
+        release: Annotated[
+            str, typer.Option(help="the data release (open, on a real run); always required")
+        ],
+        dry_run: Annotated[
+            bool, typer.Option(help="check and list the rows and change nothing")
+        ] = False,
+    ) -> None:
+        """Delete a reviewed manifest's never-true listings and delistings rows (#1682)."""
+        if _blank_text(release):
+            raise _fail(
+                "a master-row delete names its data release: pass --release <name>", USAGE_ERROR
+            )
+        try:
+            rows = read_master_manifest(manifest)
+        except OSError as exc:
+            raise _fail(f"cannot read the manifest: {exc}", USAGE_ERROR) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {exc}", USAGE_ERROR) from None
+        if not rows:
+            raise _fail(f"refused: {manifest.name} lists no rows", USAGE_ERROR)
+        s = settings()
+        if (missing_store := _store_missing(s)) is not None:
+            raise missing_store
+        missing = _missing_secrets(s, "edgar")
+        if missing:
+            raise _fail(
+                f"missing required secret(s): {', '.join(missing)}. "
+                "Set them in .env (see .env.example).",
+                USAGE_ERROR,
+            )
+        try:
+            with _read(s) if dry_run else open_for_write(s) as conn:
+                result = delete_master_rows(
+                    conn,
+                    rows,
+                    release,
+                    dry_run=dry_run,
+                    headers=_filing_headers(s, edgar_client),
+                    clock=clock,
+                )
+        except StoreLockedError as exc:
+            raise _fail(f"store busy: {exc}", 1) from None
+        except RepairRefused as exc:
+            raise _fail(f"repair refused: {_scrubbed(str(exc), s)}", 1) from None
+        except ValueError as exc:
+            raise _fail(f"refused: {_scrubbed(str(exc), s)}", USAGE_ERROR) from None
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise _fail(f"nothing deleted (rolled back): {_scrubbed(str(exc), s)}", 1) from None
+        typer.echo(result.summary())
+        for line in result.found:
+            typer.echo(line)
+        if result.refused:
+            typer.echo("refused:")
+            for line in result.refused:
+                typer.echo(_scrubbed(line, s))
+            raise _fail(f"{len(result.refused)} manifest rows refused: fix the manifest", 1)
+
     @app.command("master-retract")
     def master_retract_(
         apply: Annotated[
@@ -2198,8 +2353,9 @@ def make_app(
                 "--coverage/--no-coverage",
                 help=(
                     "run (or skip) the coverage check against coverage.reference_names "
-                    "(one universe read per sample session); default: while "
-                    "coverage.check_enabled is on"
+                    "and the index answer key (one universe read per sample session); "
+                    "default: while coverage.check_enabled is on or "
+                    "coverage.index_max_missing is set"
                 ),
             ),
         ] = None,
@@ -2207,9 +2363,10 @@ def make_app(
         """Print the data-health report."""
         cutoff = _parse_day("--jumps-before", jumps_before)
         s = settings()
-        if check and coverage is False and s.coverage.check_enabled:
+        if check and coverage is False and s.coverage.computed_by_default:
             raise _fail(
-                "--no-coverage cannot be used with --check while coverage.check_enabled is on",
+                "--no-coverage cannot be used with --check while coverage.check_enabled is on "
+                "or coverage.index_max_missing is set",
                 1,
             )
         if (missing := _store_missing(s)) is not None:

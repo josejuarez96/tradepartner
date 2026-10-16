@@ -152,6 +152,27 @@ here is this module's and is stated once:
   `check_enabled` is on; otherwise `coverage_reference` is `None`, "not
   computed", never a pass.
 
+  The block's `index_members` (#1682, T189b; `IndexMembersCheck`) is the
+  S&P 500 answer key (`store.index_members`, T189) as a second reference, on
+  the same sample sessions, while `coverage.index_members` is on (the
+  default). **A check only**: S&P membership is a committee's after-the-fact
+  selection, so this module is the key's one reader outside its loader, and
+  no universe, signal, backtest, paper or research read touches it
+  (`tests/lookahead/test_check_only_inputs.py`). On each sample session S up
+  to the key's last dated row, every key interval covering S is resolved to
+  a security through the listing rows known at `t` (`index_members.resolve`)
+  and is a hit when that security is a member of `universe_as_of(close(S))`,
+  by `security_id`, so a second class's own miss counts; a miss carries the
+  universe's exclusion (`rule_name:reason`), `unresolved` (no listing row
+  carries the ticker) or `not_considered`. A session after the key's last
+  dated row is flagged `beyond_key` and counts nothing. The block reports the
+  key's commit SHA, the hit share per session, and the misses with their
+  names. The rule `index_members_missing` is in `HealthReport.failures` only
+  while `coverage.index_max_missing` is set and some session's misses exceed
+  it, or the key cannot be loaded; unset (the default), it reports and fails
+  nothing. Setting the threshold also makes `health` compute the block on
+  every run.
+
 **Integrity rules** (`integrity_checks`), each a named `IntegrityCheck` whose
 `violations` frame lists the offending rows or keys, empty when it passes.
 `HealthReport.ok` is true when every rule passes; `health --check` exits
@@ -305,6 +326,7 @@ EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 
 from __future__ import annotations
 
+import csv
 import math
 import re
 from bisect import bisect_left, bisect_right
@@ -368,6 +390,13 @@ from tradepartner.store.dividend_reviews import (
     equal_amount_groups,
     reviewed_groups,
 )
+from tradepartner.store.index_members import (
+    UNRESOLVED,
+    IndexMembers,
+    load_index_members,
+    normalize_ticker,
+    resolve,
+)
 from tradepartner.store.master import first_session, securities_as_of, session_of
 from tradepartner.store.retraction import RETRACT, underived_as_of
 from tradepartner.store.schema import (
@@ -409,6 +438,9 @@ FILING_EVENTS_UNIQUE = "filing_events_unique"
 #: The coverage check's rule (#1541): reported from the `coverage_reference`
 #: block, never from `INTEGRITY_RULES` (module docstring).
 COVERAGE_REFERENCE_NAMES = "coverage_reference_names"
+#: The index answer key's rule (#1682, T189b): reported from the
+#: `coverage_reference` block's `index_members`, never from `INTEGRITY_RULES`.
+INDEX_MEMBERS_MISSING = "index_members_missing"
 #: The session-hole rule (#1575): an XNYS session in the universe history
 #: window whose `prices_daily` row count is below
 #: `health.min_session_rows_share` of the previous session's.
@@ -851,6 +883,98 @@ class BorrowHealth:
         return tuple(out)
 
 
+_INDEX_SAMPLE_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "beyond_key": pl.Boolean,
+    "members": pl.Int64,
+    "hits": pl.Int64,
+    "misses": pl.Int64,
+    "unresolved": pl.Int64,
+    "hit_share": pl.Float64,
+}
+_INDEX_HIT_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "ticker": pl.Utf8,
+    "security_id": pl.Utf8,
+}
+_INDEX_MISS_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "ticker": pl.Utf8,
+    "security_id": pl.Utf8,
+    "outcome": pl.Utf8,
+    "rule_name": pl.Utf8,
+    "reason": pl.Utf8,
+    "bucket": pl.Utf8,
+}
+#: A resolved security the universe neither admits nor excludes (no
+#: `securities` row at the session's close, say).
+NOT_CONSIDERED = "not_considered"
+
+
+@dataclass(frozen=True, eq=False)
+class IndexMembersCheck:
+    """The S&P 500 answer key against the universe on each sample session
+    (#1682, T189b; module docstring). A check only: the key is never a
+    universe, signal, filter or feature.
+
+    `commit` and `through` are the key's pinned source SHA and last dated
+    row (None when it could not be loaded, `error` saying why). `samples`:
+    one row per sample session, `beyond_key` true after `through` (nothing
+    resolved or counted there), `members` the key's intervals covering it,
+    `hits` the ones whose resolved security is a universe member, `misses`
+    the rest, `unresolved` the misses no listing row carries, `hit_share`
+    hits over members (None beyond the key or with no members). `hits`: one
+    row per hit `(session, ticker, security_id)`. `misses`: one row per miss
+    with the resolution outcome, the universe's exclusion for the resolved
+    security and its `bucket` (`rule_name:reason`, `unresolved` or
+    `not_considered`). `max_missing` is `coverage.index_max_missing` as the
+    block was computed: only while it is set does the block fail."""
+
+    commit: str | None
+    through: date | None
+    error: str | None
+    max_missing: int | None
+    samples: pl.DataFrame
+    hits: pl.DataFrame
+    misses: pl.DataFrame
+
+    @property
+    def worst(self) -> int:
+        """The most misses on one sample session inside the key (0 for none)."""
+        counted = self.samples.filter(~pl.col("beyond_key"))
+        return 0 if counted.is_empty() else int(counted["misses"].max())  # type: ignore[arg-type]
+
+    @property
+    def checked(self) -> bool:
+        """Whether some key interval covered some sample session inside the key."""
+        return self.error is None and int(self.samples["members"].sum()) > 0
+
+    @property
+    def failed(self) -> bool:
+        """While `max_missing` is set: the key could not be loaded, it
+        checked nothing (every sample session beyond it, or none covered), or
+        some sample session's misses exceed it; a gate never passes on a check
+        it did not make. Never while it is unset."""
+        if self.max_missing is None:
+            return False
+        return not self.checked or self.worst > self.max_missing
+
+    @property
+    def verdict(self) -> str:
+        """The one wording the CLI and page share: `key unavailable (...)`,
+        `nothing checked`, then `<n> max missing per session` with
+        `report-only`, `pass (max <m>)` or `fail (max <m>)`."""
+        if self.error is not None:
+            gate = "fail" if self.failed else "report-only"
+            return f"key unavailable ({self.error}): {gate}"
+        if not self.checked:
+            return "nothing checked: fail" if self.failed else "nothing checked"
+        head = f"{self.worst} max missing per session"
+        if self.max_missing is None:
+            return f"{head} (report-only)"
+        return f"{head}: {'fail' if self.failed else 'pass'} (max {self.max_missing})"
+
+
 @dataclass(frozen=True, eq=False)
 class CoverageReference:
     """The coverage check against a named reference at `t` (#1541; module
@@ -870,6 +994,8 @@ class CoverageReference:
     late_known: pl.DataFrame
     snapshot_ciks: int
     member_ratio: float | None
+    #: The answer-key check; None while `coverage.index_members` is off.
+    index_members: IndexMembersCheck | None = None
 
     @property
     def failed(self) -> bool:
@@ -1022,11 +1148,16 @@ class HealthReport:
     def failures(self) -> tuple[str, ...]:
         """The failing integrity rules, in `INTEGRITY_RULES` order, then
         `coverage_reference_names` when the block was computed with
-        `coverage.check_enabled` on and a reference name is missing."""
+        `coverage.check_enabled` on and a reference name is missing, then
+        `index_members_missing` when the block's answer-key check failed
+        (`IndexMembersCheck.failed`: only while `coverage.index_max_missing`
+        is set)."""
         failed = tuple(check.rule for check in self.integrity if not check.passed)
         block = self.coverage_reference
         if block is not None and block.check_enabled and block.failed:
             failed += (COVERAGE_REFERENCE_NAMES,)
+        if block is not None and block.index_members is not None and block.index_members.failed:
+            failed += (INDEX_MEMBERS_MISSING,)
         return failed
 
     @property
@@ -1043,6 +1174,7 @@ def health_report(
     jumps_before: date | None = None,
     with_coverage_reference: bool | None = None,
     reviewed: Sequence[ReviewedGroup] | None = None,
+    index_key: IndexMembers | None = None,
 ) -> HealthReport:
     """Every metric and integrity rule at `t` (module docstring). `settings`
     defaults to `get_settings()` and is passed to every derived read. Listing
@@ -1050,9 +1182,11 @@ def health_report(
     `jumps_before` limits the price-jump list to sessions before it, and the
     shares-outlier list to `as_of_date`s before it. `with_coverage_reference`
     computes the `coverage_reference` block when true, never when false, and
-    when `None` (the default) only while `coverage.check_enabled` is on.
-    `reviewed` is the duplicate-dividend list, by default the packaged one
-    (`store.dividend_reviews.reviewed_groups`)."""
+    when `None` (the default) only while `coverage.check_enabled` is on or
+    `coverage.index_max_missing` is set. `reviewed` is the duplicate-dividend
+    list, by default the packaged one (`store.dividend_reviews.reviewed_groups`).
+    `index_key` is the answer key, by default the packaged one
+    (`store.index_members.load_index_members`)."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
@@ -1089,9 +1223,9 @@ def health_report(
         filename_listings=_filename_listings(conn, t, listings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
         coverage_reference=(
-            _coverage_reference(conn, t, settings, listings)
+            _coverage_reference(conn, t, settings, listings, index_key)
             if (
-                settings.coverage.check_enabled
+                settings.coverage.computed_by_default
                 if with_coverage_reference is None
                 else with_coverage_reference
             )
@@ -1477,14 +1611,18 @@ def sample_sessions(t: datetime, settings: Settings | None = None) -> tuple[date
 
 
 def coverage_reference(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings | None = None,
+    index_key: IndexMembers | None = None,
 ) -> CoverageReference:
     """The coverage check against the named reference at `t` (#1541; module
     docstring), computed whatever `coverage.check_enabled` says: one
-    `universe_as_of` per sample session, so callers ask for it on demand."""
+    `universe_as_of` per sample session, so callers ask for it on demand.
+    `index_key` is the answer key (#1682), by default the packaged one."""
     t = _validate_t(t)
     settings = settings if settings is not None else get_settings()
-    return _coverage_reference(conn, t, settings, listing_ends_as_of(conn, t, settings))
+    return _coverage_reference(conn, t, settings, listing_ends_as_of(conn, t, settings), index_key)
 
 
 def _covers(row: dict[str, Any], session: date) -> bool:
@@ -1596,10 +1734,108 @@ def _reference_exclusion(
     }
 
 
+def _load_key(index_key: IndexMembers | None) -> tuple[IndexMembers | None, str | None]:
+    """The answer key and None, or None and why it could not be loaded (an
+    absent, emptied or malformed packaged file is reported, never raised)."""
+    if index_key is not None:
+        return index_key, None
+    try:
+        return load_index_members(), None
+    except FileNotFoundError:
+        return None, "file absent"
+    except (OSError, ValueError, csv.Error) as exc:
+        # IndexMembersError and UnicodeDecodeError are ValueErrors.
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _key_listings(listings: pl.DataFrame, key: IndexMembers) -> pl.DataFrame:
+    """Every listing row of the securities with some row carrying a key
+    ticker (`normalize_ticker`): all `resolve` needs, every row of each kept
+    so a row's span still ends at its security's next row. Taken once per
+    block, not per sample session."""
+    wanted = {normalize_ticker(i.ticker) for i in key.intervals}
+    carried = {
+        ticker
+        for ticker in listings["ticker"].drop_nulls().unique().to_list()
+        if normalize_ticker(ticker) in wanted
+    }
+    sids = listings.filter(pl.col("ticker").is_in(sorted(carried)))["security_id"].unique()
+    return listings.filter(pl.col("security_id").is_in(sids.to_list()))
+
+
+def _index_session(
+    key: IndexMembers,
+    session: date,
+    listings: pl.DataFrame,
+    member_ids: set[str],
+    exclusions: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """One sample session of the answer-key check: its `samples` row, hits
+    and misses (`IndexMembersCheck`). A hit is the resolved security being a
+    member, by `security_id`, so a second class's own miss counts."""
+    if session > key.through:
+        row = {
+            "session": session,
+            "beyond_key": True,
+            "members": 0,
+            "hits": 0,
+            "misses": 0,
+            "unresolved": 0,
+            "hit_share": None,
+        }
+        return row, [], []
+    hits: list[dict[str, Any]] = []
+    misses: list[dict[str, Any]] = []
+    for res in resolve(key.intervals, session, listings):
+        sid = res.security_id
+        if sid is not None and sid in member_ids:
+            hits.append({"session": session, "ticker": res.ticker, "security_id": sid})
+            continue
+        found = exclusions.get(sid) if sid is not None else None
+        if sid is None:
+            rule_name, reason, bucket = None, None, UNRESOLVED
+        elif found is None:
+            rule_name, reason, bucket = None, None, NOT_CONSIDERED
+        else:
+            rule_name, reason = found["rule_name"], found["reason"]
+            bucket = f"{rule_name}:{reason}"
+        misses.append(
+            {
+                "session": session,
+                "ticker": res.ticker,
+                "security_id": sid,
+                "outcome": res.outcome,
+                "rule_name": rule_name,
+                "reason": reason,
+                "bucket": bucket,
+            }
+        )
+    members = len(hits) + len(misses)
+    row = {
+        "session": session,
+        "beyond_key": False,
+        "members": members,
+        "hits": len(hits),
+        "misses": len(misses),
+        "unresolved": sum(m["bucket"] == UNRESOLVED for m in misses),
+        "hit_share": len(hits) / members if members else None,
+    }
+    return row, hits, misses
+
+
 def _coverage_reference(
-    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings, listings: pl.DataFrame
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    listings: pl.DataFrame,
+    index_key: IndexMembers | None = None,
 ) -> CoverageReference:
     refs = settings.coverage.references()
+    key, key_error = _load_key(index_key) if settings.coverage.index_members else (None, None)
+    key_listings = _key_listings(listings, key) if key is not None else listings
+    index_samples: list[dict[str, Any]] = []
+    index_hits: list[dict[str, Any]] = []
+    index_misses: list[dict[str, Any]] = []
     cik_of = {
         r["security_id"]: r["cik"]
         for r in securities_as_of(conn, t).select("security_id", "cik").iter_rows(named=True)
@@ -1636,6 +1872,13 @@ def _coverage_reference(
             is not None
         ]
         missing.extend(found)
+        if key is not None:
+            sample, hit_rows, miss_rows = _index_session(
+                key, session, key_listings, set(universe.members["security_id"]), exclusions
+            )
+            index_samples.append(sample)
+            index_hits.extend(hit_rows)
+            index_misses.extend(miss_rows)
         current = _current_from(listings, session)
         listed = sorted(sid for sid, row in current.items() if _covers(row, session))
         late_here = 0
@@ -1689,6 +1932,19 @@ def _coverage_reference(
         snapshot_ciks=snapshot_ciks,
         member_ratio=(
             latest_members / snapshot_ciks if latest_members is not None and snapshot_ciks else None
+        ),
+        index_members=(
+            IndexMembersCheck(
+                commit=None if key is None else key.commit,
+                through=None if key is None else key.through,
+                error=key_error,
+                max_missing=settings.coverage.index_max_missing,
+                samples=pl.DataFrame(index_samples, schema=_INDEX_SAMPLE_SCHEMA),
+                hits=pl.DataFrame(index_hits, schema=_INDEX_HIT_SCHEMA),
+                misses=pl.DataFrame(index_misses, schema=_INDEX_MISS_SCHEMA),
+            )
+            if settings.coverage.index_members
+            else None
         ),
     )
 
