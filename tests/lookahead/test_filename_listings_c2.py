@@ -281,8 +281,8 @@ def test_no_writer_path_uses_the_static_row_before_its_known_at() -> None:
 
 def test_the_confirmation_rule_cannot_see_snapshot_rows() -> None:
     """`confirm_filename_listings` judges filing readings only (spec: a
-    `snapshot_static` row "is **not** a reading"). Its module must name no
-    snapshot identifier, so a later edit cannot quietly feed one in."""
+    `snapshot_static` row "is **not** a reading"). Guard: no identifier in
+    its module names a snapshot, so the rule cannot refer to one by name."""
     tree = ast.parse((_SRC / "store" / "filename_listings.py").read_text("utf-8"))
     names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
         node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
