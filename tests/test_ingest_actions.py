@@ -27,6 +27,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
 )
 from tradepartner.backfill import month_windows
+from tradepartner.config import Settings
 from tradepartner.ingest import _add_actions, _replay_actions, _replay_plan
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.schema import init_schema
@@ -407,6 +408,63 @@ def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
         "SELECT security_id, source_action_id, known_at FROM corporate_actions "
         "WHERE action_type = 'spinoff'"
     ).fetchall() == [("CHILD", "PARENT", stamp)]
+
+
+def test_spinoff_known_at_is_raised_to_the_ex_date_floor(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1712: known_at = max(source stamp, session_close(previous_session(ex_date)))."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.calendar import previous_session, session_close
+
+    ex = date(2024, 10, 1)
+    floor = session_close(previous_session(ex))
+    early = announcement_date_known_at(date(2024, 7, 10))  # Curbline's bulk process_date
+    late = announcement_date_known_at(date(2024, 9, 30))
+    assert early < floor < late
+    actions = [
+        _action(ex, kind=ActionType.SPINOFF, source_id="EARLY", known_at=early),
+        _action(ex, kind=ActionType.SPINOFF, source_id="LATE", known_at=late),
+    ]
+    at = datetime(2024, 10, 2, 22, tzinfo=UTC)
+    assert _add_actions(conn, actions, (ex, date(2024, 10, 31)), ingested_at=at) == 2
+    assert conn.execute(
+        "SELECT source_action_id, known_at FROM corporate_actions "
+        "WHERE action_type = 'spinoff' ORDER BY source_action_id"
+    ).fetchall() == [("EARLY", floor), ("LATE", late)]
+
+
+def test_the_backfill_path_store_passes_the_spinoff_known_at_floor_rule(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+) -> None:
+    """#1712: the fixture universe and one Alpaca-shaped spin-off, written by
+    the backfill path, clear health's `spinoff_known_at_floor` rule."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.health import SPINOFF_KNOWN_AT_FLOOR, integrity_checks
+
+    source = FixturePriceSource(UNIVERSE_DIR)
+    ids = [row[0] for row in _fixture_ids()]
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    for first, last in month_windows(date(2017, 1, 1), date(2020, 6, 30)):
+        at += timedelta(seconds=1)
+        actions, covered = _replay(
+            conn, source, source.corporate_actions(ids, first, last), (first, last)
+        )
+        _add_actions(conn, actions, (first, last), ingested_at=at, covered=covered)
+    ex, window = date(2024, 10, 1), (date(2024, 10, 1), date(2024, 10, 31))
+    spin = _action(
+        ex,
+        kind=ActionType.SPINOFF,
+        source_id="PARENT",
+        known_at=announcement_date_known_at(date(2024, 7, 10)),
+    )
+    at = datetime(2026, 1, 1, 1, tzinfo=UTC)
+    assert _add_actions(conn, [spin], window, ingested_at=at) == 1
+    check = next(
+        c for c in integrity_checks(conn, at, settings) if c.rule == SPINOFF_KNOWN_AT_FLOOR
+    )
+    assert check.violations.is_empty()
 
 
 def test_symbol_change_revision_is_stamped_at_ingest(
