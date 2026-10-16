@@ -372,3 +372,14 @@ def test_walk_fails_on_a_paper_account_number_left_in_a_paper_recording(tmp_path
 def test_paper_account_number_pattern_ignores_upper_case_words() -> None:
     assert not PAPER_ACCOUNT_NUMBER_PATTERN.search("PARTNERSHIP PARTICIPATIONS")
     assert PAPER_ACCOUNT_NUMBER_PATTERN.search("PA3FAKE12345")
+
+
+def test_openfigi_recorder_scrubs_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tradepartner.adapters.openfigi_raw import record_mapping_fixture
+
+    secret = "short-synthetic-openfigi-key"
+    monkeypatch.setenv("OPENFIGI_API_KEY", secret)
+    path = tmp_path / "mapping.json"
+    record_mapping_fixture(path, ["VZ"], [{"data": [{"securityType": "Common Stock"}]}])
+    assert secret not in path.read_text()
+    assert json.loads(path.read_text())["headers"]["X-OPENFIGI-APIKEY"] == SCRUBBED
