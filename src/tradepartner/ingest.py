@@ -3204,7 +3204,7 @@ def _add_actions(
     is not a withdrawal. An id-less key re-dated out of `window` is not
     seen, so both keys stay live; sources with ids (Alpaca) avoid that.
     """
-    rows = []
+    groups: dict[_Identity, list[tuple[datetime, Row]]] = defaultdict(list)
     for action in actions:
         row = _action_row(action, ingested_at)
         if action.action_type.value == "spinoff":
@@ -3218,7 +3218,20 @@ def _add_actions(
                 if stats is not None:
                     stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
                 continue
-        rows.append(row)
+        groups[_identity(row)].append((action.known_at, row))
+    rows: list[Row] = []
+    for revisions in groups.values():
+        # Raising a stamp to the floor must not reorder an identity's
+        # revisions: in source-stamp order a newer revision is never stamped
+        # before an older one, so a revision that moves the ex-date earlier
+        # still wins (code-review on #1717).
+        revisions.sort(key=lambda pair: pair[0])
+        stamp: datetime | None = None
+        for _, row in revisions:
+            if stamp is not None and row["known_at"] < stamp:
+                row["known_at"] = stamp
+            stamp = row["known_at"]
+            rows.append(row)
     history = _stored_actions(conn, rows, window)
     first, last = window
     lo, hi = covered or window
