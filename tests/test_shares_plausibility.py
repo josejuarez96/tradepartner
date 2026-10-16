@@ -427,6 +427,106 @@ def test_a_new_common_class_of_the_cik_explains_nothing(
     assert pick.outliers["explained"].to_list() == [False]
 
 
+# --- A pre-trading seed fact is no baseline (#1682, T190b) --------------------
+
+
+SEED = "SEC_SEED_FACT"  # a seed before its first listing, then a true fact
+KEPT = "SEC_SEED_LISTED"  # a seed on/after its first listing: still a baseline
+
+
+def _seed_listing(
+    conn: duckdb.DuckDBPyConnection, security_id: str, valid_from: date, known: datetime
+) -> None:
+    """A first listing for `security_id`, from `valid_from`, known at `known`."""
+    insert_row(
+        conn,
+        "listings",
+        {
+            "security_id": security_id,
+            "ticker": "SEED",
+            "exchange": "NYSE",
+            "class_title": "Common Stock",
+            "valid_from": valid_from,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def test_a_pre_trading_seed_is_no_baseline(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    # AMCR's shape: a 100-share seed dated before the class's first listing
+    # (2019-01-15) must not make the true 750,000,000 fact out of line.
+    _seed_listing(fixture_store, SEED, date(2019, 1, 15), _known(date(2019, 1, 15)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+    assert pick.fallbacks.is_empty()
+
+
+def test_a_seed_on_or_after_the_first_listing_still_anchors(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # One class whose seed is on/after its listing keeps today's behaviour (the
+    # seed anchors, the far fact is a fallback); one whose seed precedes its
+    # listing is skipped. The guard against over-skipping a window.
+    _seed_listing(fixture_store, KEPT, date(2018, 12, 1), _known(date(2018, 12, 1)))
+    _fact(fixture_store, KEPT, date(2019, 1, 15), 100, _known(date(2019, 1, 16)))
+    _fact(fixture_store, KEPT, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    _seed_listing(fixture_store, SEED, date(2019, 1, 15), _known(date(2019, 1, 15)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [KEPT, SEED], _settings())
+    assert pick.shares[KEPT] == (date(2019, 1, 15), 100)  # still the seed
+    assert pick.fallbacks["security_id"].to_list() == [KEPT]
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+
+
+def test_a_seed_before_the_first_securities_row_is_no_baseline(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # With no listing, the security's first session is its earliest
+    # `securities` row (#974): a fact dated before it is no baseline.
+    born = _known(date(2019, 3, 15))
+    insert_row(
+        fixture_store,
+        "securities",
+        {
+            "security_id": SEED,
+            "cik": "0000000001",
+            "name": "Seed Co",
+            "benchmark": False,
+            "known_at": born,
+            "ingested_at": born,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    _fact(fixture_store, SEED, date(2019, 3, 1), 100, _known(date(2019, 3, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+
+
+def test_a_listing_known_after_t_leaves_the_read_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The listing is known only from 2019-07-01: at T1 (before it) the seed is
+    # still the baseline and the true fact a fallback; at T2 (from it) the seed
+    # is skipped and the true fact anchors.
+    _seed_listing(fixture_store, SEED, date(2019, 1, 15), _known(date(2019, 7, 1)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 29)))
+    before = shares_as_of(fixture_store, _known(date(2019, 6, 30)), [SEED], _settings())
+    assert before.shares[SEED] == (date(2018, 12, 31), 100)
+    assert before.fallbacks["as_of_date"].to_list() == [date(2019, 6, 28)]
+    after = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert after.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+    assert after.fallbacks.is_empty()
+
+
 # --- No look-ahead ------------------------------------------------------------
 
 
