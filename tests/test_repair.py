@@ -1211,6 +1211,52 @@ def test_repair_deletes_only_the_bad_parents_spinoff_of_a_shared_child(
     ) == [(LIVE,)]
 
 
+def _symbol_change(sid: str, old: str, new: str, process: date, known: datetime) -> dict[str, Any]:
+    return {
+        "security_id": sid,
+        "old_symbol": old,
+        "new_symbol": new,
+        "old_cusip": "714046109",
+        "new_cusip": "714046109",
+        "process_date": process,
+        "source_action_id": f"{old}-{new}",
+        "known_at": known,
+        "ingested_at": known,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+
+
+def test_the_store_resolver_follows_a_stored_symbol_change(settings: Settings) -> None:
+    """#1696: `store_resolver` reads the `symbol_changes` known at the run,
+    so a rename the listings never show (PKI -> RVTY) bounds both spans."""
+    pki, rename = "0000031791", date(2023, 5, 16)
+    known = session_close(rename)
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "listings", _listing(pki, "PKI", date(2019, 8, 6)))
+        insert_row(conn, "symbol_changes", _symbol_change(pki, "PKI", "RVTY", rename, known))
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, settings)
+    assert resolver.resolve("RVTY", rename) == pki
+    assert resolver.resolve("PKI", rename) is None
+    assert resolver.resolve("PKI", previous_session(rename)) == pki
+    assert resolver.report.symbol_changes_followed == 1
+
+
+def test_the_store_resolver_reads_no_changes_before_schema_28(settings: Settings) -> None:
+    """#1696 (code-review): a store without the `symbol_changes` table (before
+    schema 28, read-only so not migrated) builds its resolver as before."""
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        insert_row(conn, "listings", _listing("0000031791", "PKI", date(2019, 8, 6)))
+        conn.execute("DROP TABLE symbol_changes")
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        resolver = store_resolver(conn, RUN, settings)
+    assert resolver.resolve("PKI", date(2024, 6, 3)) == "0000031791"
+    assert resolver.report.symbol_changes_followed == 0
+
+
 # --- T191 (#1682 lever B): the reviewed delete of never-true master rows ---
 
 VZ = "0000732712"

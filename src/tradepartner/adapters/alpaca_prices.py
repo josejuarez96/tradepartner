@@ -74,7 +74,16 @@ rows (`security_id`, `ticker`, `valid_from`, `class_title`):
   then Facebook's `FB` -> `META`). Alpaca serves a renamed company's
   history under its new symbol as well (#104), so rows under that ticker
   on the old holder's dates may be the renamed company's. They resolve to
-  nothing and are reported, never assigned; `contested_spans` lists them;
+  nothing and are reported, never assigned; `contested_spans` lists them.
+  Only a span still live when the renamer's span starts is contested
+  (#1696): a span that ended before it (Paramount's `PARA`, delisted in
+  2025, then Banzai's `BNZI -> PARA` in 2026) is asked with `asof` inside
+  its own span (**Asof per span**), and a row is kept only from the
+  request made for the security it resolves to, so today's holder's
+  copied history never fills it. Corporate actions, fetched without
+  `asof`, still never resolve to such a span (`resolve_action`), nor does
+  `holds(..., actions=True)`: it takes no action, as while contested. The
+  overlap is judged on the span's end before a rule-8 hand-over cut it;
 - across companies, a span that starts while another company's span of
   the ticker is live (the holder) is a **claim** unless the holder has
   left by the claimant's start (#793). `RegistrantEvidence` (from the
@@ -111,6 +120,37 @@ and no session is stored twice. The mapping is the master's at the run,
 as for every row; a bar's `known_at` stays its session's close.
 Corporate actions take no rename lead, nor does `holds(...,
 actions=True)`, the repair's action check.
+
+**Symbol changes (#1696).** A listing row's `valid_from` can trail a
+ticker change by months (no row in the store names Revvity's `RVTY` by 2026-10,
+Expand Energy's first cover page naming `EXE` came 19 months after
+Chesapeake's `CHK -> EXE`), past what the rename lead reaches, while
+Alpaca serves the old symbol no bar after the change. With
+`symbol_changes` (`repair.store_resolver`: Alpaca's name changes known at
+the run, `store.asof.symbol_changes_as_of`), a change of a security from
+`old` to `new` on `process_date` is followed when the security's listing
+rows lag it: its last equity row before that day is under `old` and no
+equity row of that day names `new`. The resolver then reads a row under
+`new` (Alpaca's symbol) on `process_date`, so the span under `old` ends
+there and the span under `new` starts there, under the same security;
+a later cover page under `new` joins that span, and rows under `old` from
+that day up to the security's next equity row under another ticker are
+dropped as lagging cover pages (`_follow_changes`). Every other rule runs on the
+rows so read, the rename lead included (it now ends at `process_date`).
+A change whose two symbols are one Alpaca symbol (a CUSIP change) bounds
+nothing; one the listings already show needs nothing; any other matches
+no listing and is counted (`ResolverReport.symbol_changes_unmatched`),
+never followed. A followed change whose new ticker the rules then give to
+no one, or to another security, on `process_date` (another company still
+holds it by a lagging row, a same-day tie, a contest) is **refused**: the
+resolver is built again without it (`symbol_changes_refused`). So is one
+that takes a session of its old or new ticker, up to the run's day, from
+another security the listings alone give it to (a sibling class already
+listing the new ticker: `MSW -> PMA` on the bare CIK while its Class A
+lists `PMA`). A change only ever adds sessions to its own security. A
+change known after the run is not read, so it bounds nothing at that run
+(the mapping is the master's at the run, as for every row; a bar's
+`known_at` stays its session's close).
 
 **First-span lead (#974).** A security's earliest ticker-bearing cover
 page comes with iXBRL cover tagging (periods ending after 2019-06-15),
@@ -180,8 +220,12 @@ window's end asks whether Alpaca knows the company at all: if it does, the
 empty window stands (the company had stopped trading, a span that ends
 late); if not (DAVE, AMCI, MBC, STRN, SMLR in #1314 and #1311), the symbol
 falls back to the request without `asof`, as before the fix, and is named
-on `resolution_summary`. The `asof` day only picks the company; a bar's
-`known_at` stays its session's close.
+on `resolution_summary`. Never for a span that a later renamer of another
+company took the ticker after (#1696, `ListingResolver.renamed_after`):
+without `asof` Alpaca serves the renamer's copied history there, the rows
+the contested rule kept out before it was made time-aware; such a symbol
+stores nothing and is named on `resolution_summary` too. The `asof` day
+only picks the company; a bar's `known_at` stays its session's close.
 
 **Filing-name spans (#1597).** A listing row read from a filing's own file
 names (`provenance = 'filing_name'`, `store.master`) is a filing row of its
@@ -469,8 +513,10 @@ class ResolverReport:
     relisting kept through one; (#974) the securities given a first-span
     lead and those refused one for a reused ticker; and (#1314, rule 8)
     the spans ended where another issuer took the ticker and the first-span
-    leads clipped to such a hand-over; and (#1597) the sessions another
-    security lost to a `filing_name` span."""
+    leads clipped to such a hand-over; (#1597) the sessions another
+    security lost to a `filing_name` span; and (#1696) the stored symbol
+    changes followed, those refused and those matching no listing
+    (`_follow_changes`)."""
 
     placeholder: int = 0
     non_equity: Mapping[str, int] = field(default_factory=dict)
@@ -493,6 +539,9 @@ class ResolverReport:
     handover_spans: int = 0
     first_span_clipped: int = 0
     filename_disputes: int = 0
+    symbol_changes_followed: int = 0
+    symbol_changes_unmatched: int = 0
+    symbol_changes_refused: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -517,7 +566,10 @@ class ResolverReport:
             f"{self.first_span_refused} refused one for a reused ticker, "
             f"{self.first_span_clipped} clipped to a hand-over; "
             f"{self.handover_spans} spans ended where another issuer took the ticker; "
-            f"{self.filename_disputes} sessions another security lost to a filing_name span"
+            f"{self.filename_disputes} sessions another security lost to a filing_name span; "
+            f"{self.symbol_changes_followed} symbol changes followed, "
+            f"{self.symbol_changes_refused} refused (the new ticker not theirs on the day), "
+            f"{self.symbol_changes_unmatched} matching no listing"
         )
 
 
@@ -766,7 +818,12 @@ class ListingResolver:
     (`alpaca.accepted_relistings`, #943) are security ids whose spans rule
     7's stopped-line cut (#847) never ends. `first_sessions` (#974) maps a
     security id to its first session and turns on the first-span lead;
-    `None` leaves every mapping as without it."""
+    `None` leaves every mapping as without it. `symbol_changes` (#1696) are
+    `symbol_changes` rows (`security_id`, `old_symbol`, `new_symbol`,
+    `process_date`) known at the run, followed where the listings lag them
+    (the module docstring's **Symbol changes**)."""
+
+    report: ResolverReport
 
     def __init__(
         self,
@@ -779,12 +836,74 @@ class ListingResolver:
         class_symbols: Mapping[str, str] | None = None,
         last_bar: LastBar | None = None,
         handover_sessions: int | None = None,
+        symbol_changes: Iterable[Mapping[str, Any]] = (),
     ) -> None:
         # `listings` is read twice more below (#1597: the `filing_name`
         # count's guard and the merge-base resolver), and the store passes a
         # generator (`repair.store_resolver`), so it is materialised once
-        # here rather than exhausted on the first pass.
+        # here rather than exhausted on the first pass. So are the changes,
+        # read again by the merge base and by a rebuild after a refusal.
         listings = list(listings)
+        changes = [
+            (
+                str(change["security_id"]),
+                change["process_date"],
+                str(change["old_symbol"]),
+                str(change["new_symbol"]),
+            )
+            for change in symbol_changes
+        ]
+        options: dict[str, Any] = {
+            "rename_lead_days": rename_lead_days,
+            "accepted_relistings": accepted_relistings,
+            "first_sessions": first_sessions,
+            "class_symbols": class_symbols,
+            "last_bar": last_bar,
+            "handover_sessions": handover_sessions,
+        }
+        # A followed change is refused, and the resolver built again without
+        # it, when the rules then give its new ticker to no one or to another
+        # security on its day (another company still holds it by a lagging
+        # row, a tie, a contest), or when it takes a session of its old or
+        # new ticker from another security that held it without the changes
+        # (a sibling class already listing the new ticker, #1696 review): a
+        # change only ever adds sessions to its own security.
+        refused = 0
+        base: ListingResolver | None = None
+        while True:
+            late, followed = self._build(listings, evidence, changes, **options)
+            if not late and followed:
+                if base is None:
+                    base = ListingResolver(listings, evidence, **options)
+                late = {change for change in followed if self._takes(base, change)}
+            if not late:
+                break
+            changes = [change for change in changes if change not in late]
+            refused += len(late)
+        if refused:
+            self.report = replace(self.report, symbol_changes_refused=refused)
+
+    def _build(
+        self,
+        listings: list[Mapping[str, Any]],
+        evidence: RegistrantEvidence | None,
+        changes: list[tuple[str, date, str, str]],
+        *,
+        rename_lead_days: int,
+        accepted_relistings: Collection[str],
+        first_sessions: Mapping[str, date] | None,
+        class_symbols: Mapping[str, str] | None,
+        last_bar: LastBar | None,
+        handover_sessions: int | None,
+    ) -> tuple[set[tuple[str, date, str, str]], list[tuple[str, date, str, str]]]:
+        """Build every mapping from `listings` with `changes` followed; the
+        followed changes the built mapping does not honour (to refuse), and
+        every change followed."""
+        changes_of: dict[str, list[tuple[date, str, str]]] = defaultdict(list)
+        for security_id, day, before, after in changes:
+            changes_of[security_id].append((day, before, after))
+        followed: list[tuple[str, date, str, str]] = []
+        unmatched = 0
         self._evidence = evidence
         self._accepted = frozenset(accepted_relistings)
         by_security: dict[str, list[_Row]] = defaultdict(list)
@@ -825,6 +944,9 @@ class ListingResolver:
             rows, pair_day, typos, ignored = _clean_rows(listed)
             same_day_typos += typos
             unreadable += ignored
+            rows, applied, missed = _follow_changes(rows, changes_of.get(security_id, ()))
+            followed += [(security_id, *change) for change in applied]
+            unmatched += missed
             index = 0
             while index < len(rows):
                 first = index
@@ -930,10 +1052,12 @@ class ListingResolver:
             if any(
                 other.security_id != span.security_id
                 and other.start > span.start
+                and self._live_at(span, other.start)  # #1696: overlapping only
                 and self._renamed_into(other)
                 for other in (*spans, *(d for d in duplicated if d.ticker == span.ticker))
             )
         )
+        self._duplicated = frozenset(duplicated)  # the renamers `renamed_after` reads
         ambiguous = {
             span
             for spans in self._by_ticker.values()
@@ -999,6 +1123,14 @@ class ListingResolver:
             first_span_refused=first_span_refused,
             handover_spans=sum(len(h) for h in self._handovers.values()),
             first_span_clipped=first_span_clipped,
+            symbol_changes_followed=len(followed),
+            symbol_changes_unmatched=unmatched
+            + sum(  # a change of a security with no listing row matches nothing
+                not same_alpaca_symbol(old, new)
+                for security_id, own in changes_of.items()
+                if security_id not in by_security
+                for _, old, new in own
+            ),
             filename_disputes=(
                 self._filing_name_disputes(
                     listings,
@@ -1009,11 +1141,36 @@ class ListingResolver:
                     class_symbols=class_symbols,
                     last_bar=last_bar,
                     handover_sessions=handover_sessions,
+                    symbol_changes=changes,
                 )
                 if any(row.get("provenance") == _FILING_NAME for row in listings)
                 else 0
             ),
         )
+        late = {
+            (security_id, day, old, new)
+            for security_id, day, old, new in followed
+            if self.resolve(alpaca_symbol(new) or new, day) != security_id
+        }
+        return late, followed
+
+    def _takes(self, base: ListingResolver, change: tuple[str, date, str, str]) -> bool:
+        """True when following `change` (`security_id`, day, old, new) gives
+        a session of its old or new ticker, from its day to the run's day,
+        to other than the security `base` (the listings alone) gave it to,
+        when `base` gave it to another security (#1696)."""
+        security_id, day, old, new = change
+        tickers = {alpaca_symbol(t) or t for t in (old, new)}
+        session = day if is_session(day) else next_session(day)
+        while session <= self.run_day:
+            for ticker in tickers:
+                before = base.resolve(ticker, session) or base.lead(ticker, session)
+                if before not in (None, security_id) and before != (
+                    self.resolve(ticker, session) or self.lead(ticker, session)
+                ):
+                    return True
+            session = next_session(session)
+        return False
 
     def _hand_over(
         self,
@@ -1159,6 +1316,7 @@ class ListingResolver:
         class_symbols: Mapping[str, str] | None,
         last_bar: LastBar | None,
         handover_sessions: int | None,
+        symbol_changes: Sequence[tuple[str, date, str, str]],
     ) -> int:
         """`filename_disputes` (#1597): the XNYS sessions, known at the run,
         on which another security loses a ticker to this resolver's
@@ -1179,6 +1337,10 @@ class ListingResolver:
             class_symbols=class_symbols,
             last_bar=last_bar,
             handover_sessions=handover_sessions,
+            symbol_changes=(
+                {"security_id": s, "process_date": d, "old_symbol": o, "new_symbol": n}
+                for s, d, o, n in symbol_changes
+            ),
         )
         # A claim or later-class span that never holds the ticker (a
         # co-registrant claim, rule 6) changes no other security's
@@ -1384,6 +1546,44 @@ class ListingResolver:
             return _CO_REGISTRANT, until
         return _DISPUTED, until
 
+    def _live_at(self, span: TickerSpan, day: date) -> bool:
+        """True when `span`, as its listings run (before a rule-8 hand-over
+        cut its end, #1314), is still live on `day`."""
+        end = self._end_before_handover.get(span, span.end)
+        return end is None or day < end
+
+    def renamed_after(self, security_id: str, ticker: str) -> bool:
+        """True when another security arrived at `ticker` through a rename
+        after one of `security_id`'s assigned spans of it started (#1696):
+        a span the contested rule no longer covers once it ended first, so
+        a request without `asof` would serve the renamer's history there."""
+        own = [
+            span
+            for span in self._by_security.get(security_id, [])
+            if span.ticker == ticker and self._assigned(span)
+        ]
+        return any(
+            other.security_id != security_id
+            and other.start > span.start
+            and self._renamed_into(other)
+            for span in own
+            for other in (
+                *self._by_ticker.get(ticker, []),
+                *(d for d in self._duplicated if d.ticker == ticker),
+            )
+        )
+
+    def resolve_action(self, ticker: str, session: date) -> str | None:
+        """`resolve` for a corporate action (#1696): `None` on a span a later
+        renamer of another company took the ticker after (`renamed_after`).
+        Actions are fetched without `asof`, so Alpaca may list the renamer's
+        own pre-rename actions under the ticker on the old holder's dates;
+        such a span takes no action, as while the contested rule covered it."""
+        owner = self.resolve(ticker, session)
+        if owner is not None and self.renamed_after(owner, ticker):
+            return None
+        return owner
+
     def _renamed_into(self, span: TickerSpan) -> bool:
         """True if `span`'s security traded under another ticker before it."""
         return any(
@@ -1460,7 +1660,8 @@ class ListingResolver:
         if any(
             span.covers(session)
             and self._assigned(span)
-            and self.resolve(span.ticker, session) == security_id
+            and (self.resolve_action if actions else self.resolve)(span.ticker, session)
+            == security_id
             for span in self._by_security.get(security_id, [])
         ):
             return True
@@ -1728,6 +1929,60 @@ def _drop_same_day_typos(rows: Sequence[_Row]) -> tuple[list[_Row], date | None]
             return kept, day
         kept = [r for r in kept if not (r.day == day and r.kind == EQUITY and r.ticker != held)]
     return kept, None
+
+
+def _follow_changes(
+    rows: Sequence[_Row], changes: Iterable[tuple[date, str, str]]
+) -> tuple[list[_Row], list[tuple[date, str, str]], int]:
+    """A security's cleaned rows with each stored symbol change
+    `(process_date, old, new)` (#1696) followed where its listing rows lag
+    it, the changes followed, and how many matched no listing.
+
+    A change is followed when the security's last equity row before
+    `process_date` is under `old` and no equity row of that day already
+    names `new`: a row under `new` (Alpaca's symbol) is added on
+    `process_date`, so the span under `old` ends there and the span under
+    `new` starts there (a later cover page under `new` joins that span),
+    and the rows under `old` from that day up to the security's next equity
+    row under another ticker are dropped as lagging cover pages. A change whose
+    symbols are one Alpaca symbol (a CUSIP change) bounds nothing; one the
+    listings already show (the last equity row before the day, or one that
+    day, under `new`) needs nothing; any other matches no listing and is
+    counted, never followed."""
+    out = list(rows)
+    followed: list[tuple[date, str, str]] = []
+    unmatched = 0
+    for day, old, new in sorted(changes):
+        if same_alpaca_symbol(old, new):
+            continue
+        today = [r for r in out if r.day == day and r.kind == EQUITY]
+        if any(same_alpaca_symbol(r.ticker, new) for r in today):
+            continue
+        before = [r for r in out if r.day < day and r.kind == EQUITY]
+        last = before[-1] if before else None
+        if last is not None and last.kind == EQUITY and same_alpaca_symbol(last.ticker, new):
+            continue
+        if last is None or last.kind != EQUITY or not same_alpaca_symbol(last.ticker, old):
+            unmatched += 1
+            continue
+        stop = next(
+            (
+                r.day
+                for r in out
+                if r.day > day and r.kind == EQUITY and not same_alpaca_symbol(r.ticker, old)
+            ),
+            None,
+        )
+        lagging = [
+            r
+            for r in out
+            if r.day >= day and (stop is None or r.day < stop) and same_alpaca_symbol(r.ticker, old)
+        ]
+        out = [r for r in out if r not in lagging]
+        out.append(_Row(day, alpaca_symbol(new) or new, EQUITY))
+        out.sort(key=_row_order)
+        followed.append((day, old, new))
+    return out, followed, unmatched
 
 
 # --- bars ------------------------------------------------------------------
@@ -2345,6 +2600,7 @@ class AlpacaPriceSource(PriceSource):
         self.last_excluded_symbols: tuple[str, ...] = ()
         self.last_filename_collisions: tuple[str, ...] = ()
         self.last_asof_fallbacks: tuple[str, ...] = ()
+        self.last_asof_refused: tuple[str, ...] = ()  # #1696: no fallback after a renamer
 
     def _plan(
         self, security_ids: Sequence[str], start: date, end: date, *, symbols_from: date
@@ -2387,6 +2643,7 @@ class AlpacaPriceSource(PriceSource):
         touches it: `last_filename_collisions` lists it once per run."""
         self.last_bars_report = None
         self.last_asof_fallbacks = ()
+        self.last_asof_refused = ()
         self.last_filename_collisions = ()
         ids, symbols = self._plan(security_ids, start, end, symbols_from=start)
         if not symbols:
@@ -2423,6 +2680,7 @@ class AlpacaPriceSource(PriceSource):
                     filings.setdefault((security_id, symbol), []).extend(collided)
         fetched: list[Fetched] = []
         fallbacks: set[str] = set()
+        refused: set[str] = set()
         collisions: list[str] = []
         for day, owners in sorted(dated.items()):
             payload = self._fetch_bars(sorted(owners), start, end, asof=day)
@@ -2439,6 +2697,9 @@ class AlpacaPriceSource(PriceSource):
                         security_id, symbol, since[(security_id, symbol)], end, day
                     ):
                         continue
+                    if self._resolver.renamed_after(security_id, symbol):
+                        refused.add(symbol)  # #1696: the renamer's copies, never its own
+                        continue
                     plain[symbol].add(security_id)
                     fallbacks.add(symbol)
         if plain:
@@ -2447,6 +2708,7 @@ class AlpacaPriceSource(PriceSource):
                 (self._fetch_bars(sorted(plain), start, end), plain, self._resolver.resolve)
             )
         self.last_asof_fallbacks = tuple(sorted(fallbacks))
+        self.last_asof_refused = tuple(sorted(refused))
         self.last_filename_collisions = tuple(collisions)
         payload, decided = _own_rows(fetched, self._resolver.lead)
 
@@ -2545,6 +2807,12 @@ class AlpacaPriceSource(PriceSource):
         if self.last_asof_fallbacks:
             named = ", ".join(self.last_asof_fallbacks)
             line += f"; {len(self.last_asof_fallbacks)} symbol(s) asked without asof: {named}"
+        if self.last_asof_refused:
+            named = ", ".join(self.last_asof_refused)
+            line += (
+                f"; {len(self.last_asof_refused)} symbol(s) unknown at asof and taken "
+                f"by a later renamer, nothing stored: {named}"
+            )
         if self.last_filename_collisions:
             named = ", ".join(self.last_filename_collisions)
             line += f"; {len(self.last_filename_collisions)} colliding filing_name span(s): {named}"
@@ -2618,7 +2886,7 @@ class AlpacaPriceSource(PriceSource):
         lead = functools.partial(self._resolver.lead, actions=True)  # #974: no rename lead
         parsed = parse_corporate_actions(
             payload,
-            self._resolver.resolve,
+            self._resolver.resolve_action,  # #1696: no action on a renamer's old ticker
             lead,
             process_start=start - self._lag,
             process_end=end + self._lag,
@@ -2635,7 +2903,7 @@ class AlpacaPriceSource(PriceSource):
             try:
                 spins = parse_corporate_actions(
                     {"spin_offs": spin_offs},
-                    self._resolver.resolve,
+                    self._resolver.resolve_action,
                     lead,
                     process_start=start - self._lag,
                     process_end=end + self._lag,
