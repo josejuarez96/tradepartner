@@ -58,7 +58,11 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good. An out-of-line fact is *explained*, and accepted as
+   name out for good. A fact dated before the security's first trade -- the
+   later of its first listing `valid_from` and its first session, both known
+   at `t` -- is no baseline (#1682, T190b): the first fact on or after that
+   date anchors, so a tiny pre-trading seed does not out-rank every later
+   true fact. An out-of-line fact is *explained*, and accepted as
    the new baseline, when an event known at `t` lies between its baseline's
    `as_of_date` and its own (#1682, T190): a `spinoff` action whose child is
    this security.
@@ -95,7 +99,7 @@ import statistics
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from functools import cache
 from typing import Any
 
@@ -114,7 +118,8 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
-from tradepartner.store.master import securities_as_of
+from tradepartner.store.master import first_session, securities_as_of, session_of
+from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: ADR 0006 rules in order; a rule's number is its position plus one.
 RULES: tuple[str, ...] = (
@@ -418,6 +423,34 @@ def _class_titles(
     return out
 
 
+def _first_trade_dates(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str], settings: Settings
+) -> dict[str, date]:
+    """Per security, the session its class first traded (#1682, T190b): the
+    later of the earliest `valid_from` among its `listings` rows known at `t`
+    and its first session, the session of the earliest `known_at` among its
+    non-retracted `securities` rows known at `t` (the #974 rule, the floor
+    `repair.first_sessions` uses). A side with no row known at `t` constrains
+    nothing; a security with neither has no entry, so nothing gates it. A
+    listing or session known only after `t` is not read."""
+    firsts: dict[str, date] = {}
+    for row in listings_as_of(conn, t, ids).iter_rows(named=True):
+        sid, valid_from = row["security_id"], row["valid_from"]
+        firsts[sid] = min(firsts.get(sid, valid_from), valid_from)
+    floor = datetime.combine(first_session(settings), time(12), tzinfo=UTC)
+    wanted = set(ids)
+    for sid, known in conn.execute(
+        "SELECT security_id, min(known_at) FROM securities "
+        "WHERE known_at <= ? AND NOT retracted GROUP BY ALL",
+        [t],
+    ).fetchall():
+        if str(sid) not in wanted:
+            continue
+        session = session_of(max(ensure_tz_aware_utc(known, field_name="known_at"), floor))
+        firsts[sid] = max(firsts.get(sid, session), session)
+    return firsts
+
+
 def shares_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -457,6 +490,13 @@ def shares_as_of(
     read as an explanation: the master dates a class by its first cover page,
     not by a reorganisation, so it would explain mis-scaled facts (#1703).
 
+    Pre-trading seed (T190b): a fact dated before the security's first trade
+    -- the later of its first listing `valid_from` and its first session
+    (`_first_trade_dates`), both read at `t` -- is no baseline and is skipped;
+    the first fact on or after that date anchors. So an issuer's tiny
+    pre-trading registration count never makes every later true fact out of
+    line.
+
     The latest date decides: ambiguous, its own value when accepted, else
     the last accepted fact. Only facts, splits, spin-offs, listings and
     securities known at `t` are read, never a later filing.
@@ -476,6 +516,7 @@ def shares_as_of(
         elif action["action_type"] == "spinoff":
             spinoffs[action["security_id"]].append(action["ex_date"])
     titles = _class_titles(conn, t, sorted(rows))
+    firsts = _first_trade_dates(conn, t, sorted(rows), settings)
 
     def explained(sid: str, after: date, through: date) -> bool:
         """A spin-off known at `t` with `sid` as its child, its `ex_date` in
@@ -498,6 +539,7 @@ def shares_as_of(
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
 
     for sid in sorted(rows):
+        first = firsts.get(sid)
         picks = _date_picks(rows[sid], titles.get(sid, []))
         base: tuple[date, float] | None = None
         run: list[tuple[date, float]] = []  # rejected facts in line with each other
@@ -505,6 +547,11 @@ def shares_as_of(
         for as_of, value in picks.items():
             latest_ok = False
             if value is None:
+                continue
+            if first is not None and as_of < first:
+                # A pre-trading seed: dated before the class's first listing
+                # or first session, it is no baseline (T190b); the next fact
+                # on or after `first` anchors.
                 continue
             if not (value > 0 and math.isfinite(value)):  # zero, negative, NaN, inf
                 # Not a share count: always rejected, never a baseline, and no
