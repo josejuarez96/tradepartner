@@ -2480,8 +2480,10 @@ def fact_rows(
        CIK, each periodic cover page's acceptance, a page listing nothing
        left out as `MasterBuild.shown` leaves it), while another candidate
        is shown on one of them, stops being a candidate (WBD's old Series B
-       and C after the 2022 merger). With fewer pages known, or no
-       `cover_pages_at`, no class dies by this rule.
+       and C after the 2022 merger) for a fact rules 1 and 2 and the rules
+       above leave unmatched: a fact that lands without it lands as before
+       (Lithia's unlisted Class B keeps its `CommonClassB` facts). With fewer
+       pages known, or no `cover_pages_at`, no class dies by this rule.
 
     While two or more candidates remain, a total, or a member linking no
     candidate or two, stays unmatched.
@@ -2520,10 +2522,11 @@ def fact_rows(
                 return True
         return False
 
-    def common_at(cik: str, t: datetime) -> list[str]:
+    def common_at(cik: str, t: datetime, *, missed: bool = False) -> list[str]:
         """The CIK's classes classified `common` by the latest row known at
         `t`, less any whose successor (new equity, #820) is known at `t` and
-        any dead at `t` (#1165)."""
+        any dead at `t` (#1165); with `missed`, also less any dead by rule 3
+        of the class-member link (T190d)."""
         out = []
         for sid in by_cik.get(cik, []):
             if sid in succeeded and succeeded[sid] <= t:
@@ -2532,9 +2535,9 @@ def fact_rows(
             if known and known[-1] == "common":
                 out.append(sid)
         alive = [sid for sid in out if not dead_at(sid, out, t)]
-        if class_member_link and cover_pages_at is not None:
-            missed = _missed_pages(alive, spans, cover_pages_at.get(cik, ()), t, dead_class_filings)
-            alive = [sid for sid in alive if sid not in missed]
+        if missed and cover_pages_at is not None:
+            gone = _missed_pages(alive, spans, cover_pages_at.get(cik, ()), t, dead_class_filings)
+            alive = [sid for sid in alive if sid not in gone]
         return alive
 
     letters: dict[str, set[str]] = defaultdict(set)
@@ -2563,16 +2566,23 @@ def fact_rows(
                 f"{record.accession}: accepted_at {record.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        ids = common_at(record.cik, record.accepted_at)
         member = _MEMBER_CLASS.search(record.class_member)
         override = _MEMBER_CLASS.search((class_member_overrides or {}).get(record.cik, ""))
         if member and override and member.group(1) == override.group(1):
             member = None  # the owner named this member the sole common class's
-        candidates = ids
-        if member:
-            ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
-        if class_member_link and len(ids) != 1 and record.class_member:
-            ids = linker.link(record, candidates, largest)
+        # Rule 3 (`missed`) only places a fact the other rules leave
+        # unmatched: a class missing from the pages (an unlisted Class B)
+        # keeps the facts it already takes.
+        ids: list[str] = []
+        for missed in (False, True) if class_member_link else (False,):
+            candidates = common_at(record.cik, record.accepted_at, missed=missed)
+            ids = candidates
+            if member:
+                ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
+            if class_member_link and len(ids) != 1 and record.class_member:
+                ids = linker.link(record, candidates, largest)
+            if len(ids) == 1:
+                break
         if record.fact_name not in FACT_NAMES or len(ids) != 1:
             unmatched.append(record)
             continue

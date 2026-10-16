@@ -1644,6 +1644,26 @@ def test_rule_3_a_class_missing_from_four_pages_stops_being_a_candidate(
     assert rows == {(LINK, "", 2_400.0), (LINK, "", 2_430.0)}
 
 
+def test_rule_3_never_takes_a_fact_from_the_class_it_already_lands_on(
+    settings: Settings,
+) -> None:
+    # Lithia-shaped: Class B delisted (no longer on the pages) but still
+    # outstanding; its `CommonClassB` facts keep landing on it.
+    lettered = (("Class A Common Stock", "LNKA"), ("Class B Common Stock", "LNKB"))
+    pages = [
+        _page(1, _at(2018, 3, 1), *lettered),
+        *(_page(2 + i, _at(2018, 5 + i, 1), lettered[0]) for i in range(4)),
+    ]
+    class_b = _share("CommonClassB", 400_000.0, pages[-1].accession, pages[-1].accepted_at)
+    total = _share("", 25_400_000.0, pages[-1].accession, pages[-1].accepted_at)
+    rows, unmatched = _linked(settings, _link_source(pages, [class_b, total]))
+    assert rows == {
+        (f"{LINK}:class-b-common-stock", "CommonClassB", 400_000.0),
+        (LINK, "", 25_400_000.0),  # the total: B is dead for it (rule 3)
+    }
+    assert unmatched == ()
+
+
 def test_rule_3_a_page_listing_nothing_is_no_missed_page(settings: Settings) -> None:
     blanks = [_page(10 + i, _at(2018, 3, 2 + i)) for i in range(4)]
     pages = [_WBD_PAGES[0], *blanks, _WBD_PAGES[1]]
