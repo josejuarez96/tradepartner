@@ -1,7 +1,7 @@
 """No live API calls: verify mapping batches, pace, key handling and clocks."""
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -113,3 +113,20 @@ def test_429_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     assert len(result) == 1 and len(calls) == 2
     assert slept == [60]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        datetime(2026, 10, 16),  # noqa: DTZ001 - deliberately naive
+        datetime(2026, 10, 16, tzinfo=timezone(timedelta(hours=-4))),
+    ],
+)
+def test_clock_must_be_utc_aware(bad: datetime) -> None:
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(lambda _: pytest.fail("request sent"))
+        ) as client,
+        pytest.raises(ValueError, match="UTC-aware"),
+    ):
+        map_tickers(["VZ"], OpenfigiConfig(enabled=True), client=client, clock=lambda: bad)
