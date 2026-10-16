@@ -1454,6 +1454,7 @@ def _build_filings(
         class_member_overrides=settings.edgar.class_member_overrides,
         class_member_link=link,
         dead_class_filings=settings.edgar.dead_class_filings,
+        lettered_member_max_minor_share=settings.edgar.lettered_member_max_minor_share,
         cover_pages_at=_listing_pages(filings, master, ciks) if link else None,
     )
     return master, delistings, classes, facts, unmatched
@@ -2433,6 +2434,7 @@ def fact_rows(
     class_member_overrides: Mapping[str, str] | None = None,
     class_member_link: bool = False,
     dead_class_filings: int = 4,
+    lettered_member_max_minor_share: float = 0.001,
     cover_pages_at: Mapping[str, Sequence[datetime]] | None = None,
 ) -> tuple[tuple[Row, ...], tuple[FactRecord, ...]]:
     """`facts` rows for `records`, and the records no security could take.
@@ -2470,26 +2472,38 @@ def fact_rows(
        (BF's `NonvotingCommonStock` on "Class B Common Stock (nonvoting)").
     2. A lettered common member (`CommonClassA`) still unmatched goes to the
        sole candidate with a listing known at `t` when no candidate's title
-       or slug known at `t` names any class letter, provided the member
-       holds the filing's largest value among its lettered common members
-       (IBKR's and SPG's `CommonClassA`; their 100 and 8,000 Class B shares,
-       an unlisted class, stay unmatched; a tie links neither).
-    3. The dead-class rule by missed pages: a candidate shown on a cover
-       page known at `t`, but on none of the CIK's last
-       `dead_class_filings` cover pages known at `t` (`cover_pages_at`: per
-       CIK, each periodic cover page's acceptance, a page listing nothing
-       left out as `MasterBuild.shown` leaves it), while another candidate
-       is shown on one of them, stops being a candidate (WBD's old Series B
-       and C after the 2022 merger) for a fact rules 1 and 2 and the rules
-       above leave unmatched: a fact that lands without it lands as before
-       (Lithia's unlisted Class B keeps its `CommonClassB` facts). With fewer
-       pages known, or no `cover_pages_at`, no class dies by this rule.
+       or slug known at `t` names any class letter, provided every class
+       member of the filing (for that fact) is a lettered common member, the
+       member holds the filing's largest value, and every other member is
+       at most `lettered_member_max_minor_share` of it (a nominal class:
+       IBKR's 100 and SPG's 8,000 Class B shares beside their listed
+       `CommonClassA`; those stay unmatched). A filing tagging its listed
+       class `CommonStock`, or whose other class is not nominal (Ford's,
+       Weber's or DKS's Class B), links nothing by this rule: the largest
+       lettered member is not always the listed class (census on #1723).
+    3. The dead-class rule by missed pages, for an undimensioned total
+       only: a candidate shown on a cover page known at `t`, but on none of
+       the CIK's last `dead_class_filings` cover pages known at `t`
+       (`cover_pages_at`: per CIK, each periodic cover page's acceptance, a
+       page listing nothing left out as `MasterBuild.shown` leaves it),
+       while another candidate is shown on one of them, stops being a
+       candidate (WBD's old Series B and C after the 2022 merger) for a
+       total the rules above leave unmatched. A fact that lands without it
+       lands as before (Lithia's unlisted Class B keeps its `CommonClassB`
+       facts), and a dimensioned member never lands by it (Constellation's
+       Class 1 shares stay off its Class A). With fewer pages known, or no
+       `cover_pages_at`, no class dies by this rule.
 
     While two or more candidates remain, a total, or a member linking no
     candidate or two, stays unmatched.
     """
     if dead_class_filings < 1:
         raise ValueError(f"dead_class_filings must be at least 1, got {dead_class_filings}")
+    if not 0 < lettered_member_max_minor_share < 1:
+        raise ValueError(
+            "lettered_member_max_minor_share must be in (0, 1), "
+            f"got {lettered_member_max_minor_share}"
+        )
     records = list(records)
     kinds: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in sorted(classes.classifications, key=lambda r: r["known_at"]):
@@ -2557,7 +2571,11 @@ def fact_rows(
         return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
 
     linker = _ClassLinker(master)
-    largest = _largest_lettered_members(records) if class_member_link else {}
+    largest = (
+        _largest_lettered_members(records, lettered_member_max_minor_share)
+        if class_member_link
+        else {}
+    )
     rows: list[Row] = []
     unmatched: list[FactRecord] = []
     for record in records:
@@ -2570,11 +2588,12 @@ def fact_rows(
         override = _MEMBER_CLASS.search((class_member_overrides or {}).get(record.cik, ""))
         if member and override and member.group(1) == override.group(1):
             member = None  # the owner named this member the sole common class's
-        # Rule 3 (`missed`) only places a fact the other rules leave
+        # Rule 3 (`missed`) only places a total the other rules leave
         # unmatched: a class missing from the pages (an unlisted Class B)
         # keeps the facts it already takes.
         ids: list[str] = []
-        for missed in (False, True) if class_member_link else (False,):
+        third = class_member_link and not record.class_member
+        for missed in (False, True) if third else (False,):
             candidates = common_at(record.cik, record.accepted_at, missed=missed)
             ids = candidates
             if member:
@@ -2611,20 +2630,28 @@ def _lettered_common(member: str) -> str | None:
     return match.group(1) if match and "common" in member.lower() else None
 
 
-def _largest_lettered_members(records: Sequence[FactRecord]) -> dict[tuple[str, str], str]:
-    """Per (accession, fact name), the lettered common member holding the
-    filing's largest value, when exactly one does (rule 2, T190d)."""
+def _largest_lettered_members(
+    records: Sequence[FactRecord], max_minor_share: float
+) -> dict[tuple[str, str], str]:
+    """Per (accession, fact name), the member rule 2 may place (T190d): the
+    filing's largest, when every class member of that filing and fact is a
+    lettered common member, the largest is positive and unique, and every
+    other member is at most `max_minor_share` of it."""
     top: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
     for record in records:
-        if _lettered_common(record.class_member) is None:
+        if not record.class_member:
             continue
         held = top[(record.accession, record.fact_name)]
         held[record.class_member] = max(held.get(record.class_member, record.value), record.value)
     out: dict[tuple[str, str], str] = {}
     for key, values in top.items():
+        if any(_lettered_common(member) is None for member in values):
+            continue
         best = max(values.values())
         winners = [member for member, value in values.items() if value == best]
-        if len(winners) == 1:
+        if len(winners) != 1 or best <= 0:
+            continue
+        if all(v <= max_minor_share * best for m, v in values.items() if m != winners[0]):
             out[key] = winners[0]
     return out
 

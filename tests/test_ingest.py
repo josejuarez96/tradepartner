@@ -1597,18 +1597,45 @@ def test_rule_2_needs_the_largest_member_and_no_lettered_title(settings: Setting
     assert rows == set() and unmatched == (other,)
 
 
-def test_rule_2_covers_the_owner_override_cases_with_the_overrides_empty(
+def test_rule_2_leaves_a_class_that_is_not_nominal_to_the_owner_override(
     settings: Settings,
 ) -> None:
     # DKS/TR/VMEO (#1169): one listed "Common Stock", shares tagged
-    # `CommonClassA` and the unlisted `CommonClassB`. `_linked` empties
-    # `edgar.class_member_overrides`; rule 2 lands Class A as the override did.
+    # `CommonClassA` and an unlisted `CommonClassB` of 24M: not nominal, so
+    # rule 2 places neither and `edgar.class_member_overrides` stays.
     page = _page(1, _at(2019, 3, 1), ("Common Stock, $0.01 par value", "DKS"))
     class_a = _share("CommonClassA", 64_000_000.0, page.accession, _at(2019, 3, 1))
     class_b = _share("CommonClassB", 24_000_000.0, page.accession, _at(2019, 3, 1))
-    rows, unmatched = _linked(settings, _link_source([page], [class_a, class_b]))
+    source = _link_source([page], [class_a, class_b])
+    rows, unmatched = _linked(settings, source)
+    assert rows == set() and set(unmatched) == {class_a, class_b}
+    rows, unmatched = _linked(settings, source, class_member_overrides={LINK: "CommonClassA"})
     assert rows == {(LINK, "CommonClassA", 64_000_000.0)}
     assert unmatched == (class_b,)
+
+
+def test_rule_2_never_puts_an_unlisted_class_on_the_listed_common(settings: Settings) -> None:
+    # Census on #1723. Ford-shaped: the listed class tagged `CommonStock`
+    # (placed by the plain rule), the unlisted Class B lettered; Weber-shaped:
+    # the unlisted Class B the larger. Neither Class B lands on the listing.
+    page = _page(1, _at(2019, 3, 1), ("Common Stock, par value $.01 per share", "LNK"))
+    acc = page.accession
+    common = _share("CommonStock", 3_916_743_591.0, acc, _at(2019, 3, 1))
+    ford_b = _share("CommonClassB", 70_852_076.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([page], [common, ford_b]))
+    assert (LINK, "CommonClassB", 70_852_076.0) not in rows
+    assert ford_b in unmatched
+    weber_a = _share("CommonClassA", 53_738_392.0, acc, _at(2019, 3, 1))
+    weber_b = _share("CommonClassB", 234_476_377.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([page], [weber_a, weber_b]))
+    assert rows == set() and set(unmatched) == {weber_a, weber_b}
+    # The share is configurable: at 0.5, Weber's A (23% of B) is nominal.
+    rows, _ = _linked(
+        settings,
+        _link_source([page], [weber_a, weber_b]),
+        lettered_member_max_minor_share=0.5,
+    )
+    assert rows == {(LINK, "CommonClassB", 234_476_377.0)}
 
 
 #: WBD-shaped: three series shown together, then the merged company's
@@ -1662,6 +1689,14 @@ def test_rule_3_never_takes_a_fact_from_the_class_it_already_lands_on(
         (LINK, "", 25_400_000.0),  # the total: B is dead for it (rule 3)
     }
     assert unmatched == ()
+
+
+def test_rule_3_places_a_total_only(settings: Settings) -> None:
+    # Constellation-shaped: once the old series is dead, a dimensioned member
+    # naming no letter (`ConvertibleCommonStock`, Class 1) still lands nowhere.
+    member = _share("ConvertibleCommonStock", 23_241.0, _WBD_PAGES[4].accession, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source(_WBD_PAGES, [member]))
+    assert rows == set() and unmatched == (member,)
 
 
 def test_rule_3_a_page_listing_nothing_is_no_missed_page(settings: Settings) -> None:
