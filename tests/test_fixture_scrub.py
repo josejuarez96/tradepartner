@@ -378,8 +378,9 @@ def test_openfigi_recorder_scrubs_api_key(tmp_path: Path, monkeypatch: pytest.Mo
     from tradepartner.adapters.openfigi_raw import record_mapping_fixture
 
     secret = "short-synthetic-openfigi-key"
-    monkeypatch.setenv("OPENFIGI_API_KEY", secret)
+    monkeypatch.setenv("OPENFIGI_API_KEY", f"  {secret}  ")
     path = tmp_path / "mapping.json"
-    record_mapping_fixture(path, ["VZ"], [{"data": [{"securityType": "Common Stock"}]}])
+    record_mapping_fixture(path, ["VZ"], [{"echo": f"{secret} and   {secret}  "}])
     assert secret not in path.read_text()
+    assert f"  {secret}  " not in path.read_text()
     assert json.loads(path.read_text())["headers"]["X-OPENFIGI-APIKEY"] == SCRUBBED

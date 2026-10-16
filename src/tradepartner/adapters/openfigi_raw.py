@@ -13,10 +13,15 @@ from typing import Any
 
 import httpx
 
-from tradepartner.cli_record import scrub_json
+from tradepartner.cli_record import SCRUBBED, scrub_json
 from tradepartner.config import OpenfigiConfig
 
 _ENDPOINT = "https://api.openfigi.com/v3/mapping"
+
+
+def _api_key() -> str:
+    """The key sent on the wire, from the process environment only."""
+    return os.environ.get("OPENFIGI_API_KEY", "").strip()
 
 
 def map_tickers(
@@ -29,7 +34,9 @@ def map_tickers(
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[tuple[list[Any], datetime, datetime]]:
     """Return (response, sent, received) for each batch in request order."""
-    key = os.environ.get("OPENFIGI_API_KEY", "").strip()
+    if not config.enabled:
+        raise ValueError("OpenFIGI client is disabled")
+    key = _api_key()
     requests, window, jobs = config.limits(keyed=bool(key))
     headers = {"Content-Type": "application/json"}
     if key:
@@ -40,27 +47,32 @@ def map_tickers(
     batches: list[tuple[list[Any], datetime, datetime]] = []
     try:
         for offset in range(0, len(tickers), jobs):
-            now = monotonic()
-            while recent and now - recent[0] >= window:
-                recent.popleft()
-            if len(recent) >= requests:
-                sleep(max(0, window - (now - recent[0])))
-                now = monotonic()
-                while recent and now - recent[0] >= window:
-                    recent.popleft()
-            recent.append(now)
             body = [
                 {"idType": "TICKER", "idValue": ticker, "exchCode": "US"}
                 for ticker in tickers[offset : offset + jobs]
             ]
-            sent = clock()
-            try:
-                response = client.post(_ENDPOINT, json=body, headers=headers)
-                response.raise_for_status()
-                payload = response.json()
-            except (httpx.HTTPError, ValueError):
-                raise RuntimeError("OpenFIGI mapping request failed") from None
-            received = clock()
+            for attempt in range(2):
+                now = monotonic()
+                while recent and now - recent[0] >= window:
+                    recent.popleft()
+                if len(recent) >= requests:
+                    sleep(max(0, window - (now - recent[0])))
+                    now = monotonic()
+                    while recent and now - recent[0] >= window:
+                        recent.popleft()
+                recent.append(now)
+                sent = clock()
+                try:
+                    response = client.post(_ENDPOINT, json=body, headers=headers)
+                    if response.status_code == 429 and attempt == 0:
+                        sleep(window)
+                        continue
+                    response.raise_for_status()
+                    payload = response.json()
+                except (httpx.HTTPError, ValueError):
+                    raise RuntimeError("OpenFIGI mapping request failed") from None
+                received = clock()
+                break
             if not isinstance(payload, list) or len(payload) != len(body):
                 raise ValueError("OpenFIGI mapping response has wrong length")
             batches.append((payload, sent, received))
@@ -72,11 +84,12 @@ def map_tickers(
 
 def record_mapping_fixture(path: Path, tickers: Sequence[str], responses: list[Any]) -> None:
     """Write a scrubbed mapping fixture; never serialize the environment key."""
-    key = os.environ.get("OPENFIGI_API_KEY", "")
+    raw_key = os.environ.get("OPENFIGI_API_KEY", "")
+    key = _api_key()
     document = {
         "tickers": list(tickers),
         "responses": responses,
-        "headers": {"X-OPENFIGI-APIKEY": key} if key else {},
+        "headers": {"X-OPENFIGI-APIKEY": SCRUBBED} if key else {},
     }
-    clean, _ = scrub_json(document, secrets=[key] if key else [])
+    clean, _ = scrub_json(document, secrets=[value for value in (raw_key, key) if value])
     path.write_text(json.dumps(clean, indent=2) + "\n")

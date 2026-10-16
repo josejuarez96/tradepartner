@@ -32,7 +32,7 @@ def test_keyless_batches_and_paces(monkeypatch: pytest.MonkeyPatch) -> None:
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         result = map_tickers(
             [f"T{i}" for i in range(126)],
-            OpenfigiConfig(),
+            OpenfigiConfig(enabled=True),
             client=client,
             clock=tick,
             monotonic=lambda: elapsed[0],
@@ -59,7 +59,7 @@ def test_keyed_limits_and_secret_free_error(monkeypatch: pytest.MonkeyPatch) -> 
         httpx.Client(transport=httpx.MockTransport(fail)) as client,
         pytest.raises(RuntimeError) as caught,
     ):
-        map_tickers([f"T{i}" for i in range(100)], OpenfigiConfig(), client=client)
+        map_tickers([f"T{i}" for i in range(100)], OpenfigiConfig(enabled=True), client=client)
     assert secret not in str(caught.value)
 
 
@@ -82,7 +82,7 @@ def test_keyed_request_window(monkeypatch: pytest.MonkeyPatch) -> None:
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         map_tickers(
             [f"T{i}" for i in range(2501)],
-            OpenfigiConfig(),
+            OpenfigiConfig(enabled=True),
             client=client,
             clock=tick,
             monotonic=lambda: now[0],
@@ -90,3 +90,26 @@ def test_keyed_request_window(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     assert len(starts) == 26
     assert starts[25] - starts[0] >= 6
+
+
+def test_disabled_client_refuses_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="disabled"):
+        map_tickers(["VZ"], OpenfigiConfig())
+
+
+def test_429_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
+    calls = []
+    slept = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(429 if len(calls) == 1 else 200, json=[{}])
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = map_tickers(
+            ["VZ"], OpenfigiConfig(enabled=True), client=client, sleep=slept.append
+        )
+    assert len(result) == 1 and len(calls) == 2
+    assert slept == [60]
