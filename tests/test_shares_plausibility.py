@@ -433,6 +433,7 @@ def test_a_new_common_class_of_the_cik_explains_nothing(
 SEED = "SEC_SEED_FACT"  # a seed before its first bar, then a true fact
 KEPT = "SEC_SEED_BAR"  # a first fact on/after its first bar: still a baseline
 NORMAL = "SEC_NORMAL_PREBAR"  # a normal fact before the first bar: untouched
+MULTI = "SEC_MULTI_SEED"  # several pre-bar seeds (LIN, VTRS shape)
 
 
 def _seed_listing(
@@ -510,6 +511,39 @@ def test_a_pre_trading_seed_is_no_baseline(fixture_store: duckdb.DuckDBPyConnect
     _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
     pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
     assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+    assert pick.fallbacks.is_empty()
+
+
+def test_several_pre_bar_seeds_are_all_skipped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # LIN's shape: two pre-bar seeds (25,000, ...) before the true count: every
+    # one the first post-bar fact exceeds by more than 100x is skipped, not
+    # just the first, so the true count anchors.
+    _bar(fixture_store, MULTI, date(2019, 1, 2), _known(date(2019, 1, 2)))
+    _fact(fixture_store, MULTI, date(2018, 3, 23), 25_000, _known(date(2018, 3, 26)))
+    _fact(fixture_store, MULTI, date(2018, 9, 30), 15_000, _known(date(2018, 10, 1)))
+    _fact(fixture_store, MULTI, date(2019, 1, 31), 551_054_569, _known(date(2019, 2, 1)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 2, 5)), [MULTI], _settings())
+    assert pick.shares[MULTI] == (date(2019, 1, 31), 551_054_569)
+    assert pick.fallbacks.is_empty()
+
+
+def test_four_pre_bar_seeds_are_all_skipped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # VTRS's shape: four pre-bar seeds before the true count.
+    _bar(fixture_store, MULTI, date(2021, 2, 2), _known(date(2021, 2, 2)))
+    for as_of, value in [
+        (date(2020, 11, 10), 100),
+        (date(2020, 12, 31), 150),
+        (date(2021, 1, 15), 250),
+        (date(2021, 1, 29), 400),
+    ]:
+        _fact(fixture_store, MULTI, as_of, value, _known(as_of))
+    _fact(fixture_store, MULTI, date(2021, 2, 22), 1_207_082_624, _known(date(2021, 2, 23)))
+    pick = shares_as_of(fixture_store, _known(date(2021, 3, 1)), [MULTI], _settings())
+    assert pick.shares[MULTI] == (date(2021, 2, 22), 1_207_082_624)
     assert pick.fallbacks.is_empty()
 
 

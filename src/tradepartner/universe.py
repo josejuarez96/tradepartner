@@ -58,13 +58,14 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good. A fact is a *pre-trading seed* -- and is no
-   baseline -- only when it is the first fact, dated before the security's
-   first stored bar session known at `t`, and the next fact on or after
-   that session is more than `universe.max_shares_ratio` times it (#1682,
-   T190b): then that next fact anchors, so a tiny pre-trading seed does not
-   out-rank every later true fact. Everything else keeps today's
-   behaviour, a normal pre-listing fact included. An out-of-line fact is
+   name out for good. A fact dated before the security's first stored bar
+   session known at `t` is a *pre-trading seed* -- and is no baseline --
+   when the first fact on or after that session is more than
+   `universe.max_shares_ratio` times it (#1682, T190b): every such seed is
+   skipped and that first post-bar fact anchors, so an issuer's one to
+   several tiny pre-trading seeds do not out-rank every later true fact.
+   Everything else keeps today's behaviour, a normal pre-listing fact
+   included. An out-of-line fact is
    *explained*, and accepted as the new baseline, when an event known at
    `t` lies between its baseline's `as_of_date` and its own (#1682, T190):
    a `spinoff` action whose child is this security.
@@ -486,15 +487,15 @@ def shares_as_of(
     read as an explanation: the master dates a class by its first cover page,
     not by a reorganisation, so it would explain mis-scaled facts (#1703).
 
-    Pre-trading seed (T190b): the first fact is no baseline, and is skipped,
-    only when it is dated before the security's first stored bar session
-    known at `t` (`_first_bar_sessions`) *and* the next fact on or after that
-    session is more than `universe.max_shares_ratio` times it (split-moved);
-    then that next fact anchors. A fact before the first bar that a later
-    fact keeps in line stays the baseline, and a security with no traded bar
-    known at `t` is untouched -- so an issuer's tiny pre-trading registration
-    count no longer out-ranks every later true fact, without moving a normal
-    pre-listing fact at a historical `t`.
+    Pre-trading seed (T190b): a fact dated before the security's first stored
+    bar session known at `t` (`_first_bar_sessions`) is no baseline, and is
+    skipped, when the first fact on or after that session is more than
+    `universe.max_shares_ratio` times it (split-moved); every such seed is
+    skipped and that first post-bar fact anchors. A pre-bar fact the first
+    post-bar fact keeps in line stays the baseline, and a security with no
+    traded bar known at `t` is untouched -- so an issuer's one to several tiny
+    pre-trading registration counts no longer out-rank every later true fact,
+    without moving a normal pre-listing fact at a historical `t`.
 
     The latest date decides: ambiguous, its own value when accepted, else
     the last accepted fact. Only facts, splits, spin-offs, listings and
@@ -537,30 +538,36 @@ def shares_as_of(
         change = value / moved if moved > 0 else float("inf")
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
 
-    def seed_date(sid: str, picks: dict[date, float | None], first_bar: date | None) -> date | None:
-        """The first fact's date when it is a pre-trading seed (T190b): it is
-        the first share count, dated before the security's first stored bar
-        session known at `t`, and the next fact on or after that session is
-        more than `universe.max_shares_ratio` times it (split-moved). `None`
-        otherwise, so every other shape keeps today's behaviour."""
+    def seed_dates(sid: str, picks: dict[date, float | None], first_bar: date | None) -> set[date]:
+        """The dates of the pre-trading seeds to skip (T190b): every share
+        count dated before the security's first stored bar session known at
+        `t` that the first count on or after that session exceeds by more than
+        `universe.max_shares_ratio` (split-moved). Empty otherwise, so every
+        other shape keeps today's behaviour. An issuer has one to several
+        pre-bar seeds (LIN, PSKY, VTRS), so all of them are skipped, not just
+        the first, and the first post-bar fact anchors."""
         if first_bar is None:
-            return None
+            return set()
         counts = [
             (as_of, value)
             for as_of, value in picks.items()
             if value is not None and value > 0 and math.isfinite(value)
         ]
-        if not counts or counts[0][0] >= first_bar:
-            return None
         nxt = next(((as_of, value) for as_of, value in counts if as_of >= first_bar), None)
         if nxt is None:
-            return None
-        change = in_line(sid, counts[0], nxt[0], nxt[1])
-        return counts[0][0] if change is not None and change > cfg.max_shares_ratio else None
+            return set()
+        seeds = set()
+        for as_of, value in counts:
+            if as_of >= first_bar:
+                continue
+            change = in_line(sid, (as_of, value), nxt[0], nxt[1])
+            if change is not None and change > cfg.max_shares_ratio:
+                seeds.add(as_of)
+        return seeds
 
     for sid in sorted(rows):
         picks = _date_picks(rows[sid], titles.get(sid, []))
-        seed = seed_date(sid, picks, first_bars.get(sid))
+        seeds = seed_dates(sid, picks, first_bars.get(sid))
         base: tuple[date, float] | None = None
         run: list[tuple[date, float]] = []  # rejected facts in line with each other
         latest_ok = False
@@ -568,8 +575,8 @@ def shares_as_of(
             latest_ok = False
             if value is None:
                 continue
-            if as_of == seed:
-                # A pre-trading seed: skipped as a baseline (T190b); the next
+            if as_of in seeds:
+                # A pre-trading seed: skipped as a baseline (T190b); the first
                 # fact on or after the first bar session anchors.
                 continue
             if not (value > 0 and math.isfinite(value)):  # zero, negative, NaN, inf
