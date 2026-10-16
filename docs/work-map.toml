@@ -1204,7 +1204,7 @@ unblocks = ["task:T184e", "task:T184f"]
 [task.T184e]
 what = "listings rows with provenance filing_name from the records and verdicts, the Form 25 row of last resort after the CIK's 10-K rows, the Underived rule extended, the fetch-pass wiring, the run-row counts, the fixture cases and the look-ahead tests."
 why = "Gives survivors and delisters alike a point-in-time listing before 2019 so the universe and the backfill see them, with no row stamped earlier than its filing (#1597)."
-unblocks = ["task:T184g"]
+unblocks = ["task:T184g", "task:T199"]
 
 [task.T184f]
 what = "The Alpaca backfill's filename_collisions (a filing_name span whose asof payload runs past its end stores nothing and is listed) and filename_disputes counts."
@@ -1236,8 +1236,8 @@ why = "Puts the repaired dividends in the store under one named release with a b
 
 [issue.1682]
 what = "The owner's decision on the security master after T181: keep patching the EDGAR-inferred master, or key securities on a vendor or FIGI; decided no vendor on 2026-10-14, with the free S&P 500 answer key as a check and the root causes fixed in lever order."
-why = "Identity defects were being patched one name at a time; the answer key showed 2,232 index member-months lost to eleven fixable causes, which a vendor would not have touched."
-unblocks = ["adr:0022", "task:T189", "task:T189b", "task:T189c", "task:T190", "task:T190b", "task:T190c", "task:T191", "task:T192", "task:T193", "task:T194", "task:T195", "task:T196", "task:T197", "task:T198", "task:T184h"]
+why = "Identity defects were being patched one name at a time; the answer key showed 2,232 index member-months lost to twelve buckets of causes, which a vendor would not have touched."
+unblocks = ["adr:0022", "task:T189", "task:T189b", "task:T189c", "task:T190", "task:T190b", "task:T190c", "task:T190d", "task:T191", "task:T192", "task:T192b", "task:T193", "task:T194", "task:T195", "task:T196", "task:T197", "task:T198", "task:T199", "task:T184h"]
 
 [adr.0022]
 what = "No vendor security master: identity stays SEC filings plus Alpaca, the free index history and OpenFIGI's current type are check-only health blocks, and the identity defects are fixed root cause by root cause under censuses and named releases."
@@ -1258,18 +1258,23 @@ what = "The OpenFIGI types cross-check: the paced client under the owner's key, 
 why = "The one free outside view on what kind of instrument a ticker is, stored at its fetch time so it never back-dates and never enters a trial; the orchestrator's addition, kept small and gating nothing (#1682)."
 
 [task.T190]
-what = "Shares facts by rule, as of t: the class-member link from the stored member and class title, the ambiguity rule, and jumps explained by an action known at t; the census is Codex census 2 on #1682."
-why = "The largest lever: 324 of the 525 index member-months lost to missing or ambiguous per-class shares on 8 names, and the per-name override list retired (#1682)."
-unblocks = ["task:T198"]
+what = "Shares facts by rule, as of t: the class-member link from the stored member and class title, the ambiguity rule, and jumps explained by an action known at t; the census is Codex census 2 on #1682 and the census on #1698."
+why = "165 index member-months on 5 names lost to two class rows on one date (ARES, HRL, PWR, SCHW, TAP); the 159 per-class-absent months have no stored row and moved to T190d (#1698)."
+unblocks = ["task:T190b", "task:T190d", "task:T198"]
 
 [task.T190b]
 what = "A tiny pre-trading seed fact (1, 100, 1,000 shares) is no baseline for the plausibility rule, so the true facts already stored are accepted; the failing test first."
 why = "59 index member-months on 7 names (AMCR, CTVA, FOXA, LIN, PSKY, SW, VTRS) are a plain defect in shares_as_of, not missing data (#1682, Codex census 2)."
-unblocks = ["task:T198"]
+unblocks = ["task:T190d"]
 
 [task.T190c]
-what = "The per-period cover shares fact for filers whose context shape the FSN and cover parsers drop (IBKR, SPG, WBD and 11 non-index names), read under the cache bump of rederive-1682; census of the shape first."
-why = "142 index member-months read a shares count from 2009 to 2022 while every later 10-Q states the fresh one; extraction coverage, not a single repair (#1682, Codex census 2)."
+what = "Folded into T190d (census on #1709): the FSN cache holds IBKR's, SPG's and WBD's per-period cover shares facts; ingest.fact_rows drops them, so no parser change."
+why = "142 index member-months read a shares count from 2009 to 2022 while every later 10-Q states the fresh one; the cause is the fact-to-class mapping (#1682, #1709)."
+unblocks = []
+
+[task.T190d]
+what = "The per-class shares link at ingest, behind edgar.class_member_link: fact_rows links a two-common-class CIK's facts to the class its member names, a lettered member to the sole unlettered listed common, and drops a class unseen on four periodic cover pages as a candidate, all as of each fact's filing; the switch flips in rederive-1682; census first."
+why = "301 index member-months: BF.B, FOX and MKC (159, #1698) and IBKR, SPG and WBD (142, #1709, T190c folded in), whose counts are filed and parsed but never stored; the per-name override list is judged against the rule."
 unblocks = ["task:T198"]
 
 [task.T191]
@@ -1280,7 +1285,12 @@ unblocks = ["task:T197"]
 [task.T192]
 what = "The resolver follows a stored symbol_changes row as the span boundary of a rename when the listing rows lag it; census of the 20 names' bar gaps first."
 why = "270 member-months lost to holes in the history window, many at renames the master dates late (#1682)."
-unblocks = ["task:T195", "task:T198"]
+unblocks = ["task:T192b", "task:T195", "task:T198"]
+
+[task.T192b]
+what = "--fill-holes lists mid-month and first-day gaps: a month with stored bars is also a hole when a session the resolver assigns the security has no traded bar known at the clock, not only a rename lead's gap."
+why = "129 member-months plus STX's 12 have no traded bar in a month the dry run calls complete; only rederive-1682's fill fetches them (#1682, #1696, #1707)."
+unblocks = ["task:T198"]
 
 [task.T193]
 what = "Split-context cover pages joined inside one class member only (the #1675 lesson), behind the existing switch; census of the cover-page shapes first."
@@ -1302,9 +1312,15 @@ what = "Universe rule 2 passes on any live listing on a listed exchange, so a ne
 why = "IBM, 3M, D.R. Horton and seven more drop out from 2025-07 on a rule-selection defect, 75 member-months (#1682)."
 
 [task.T197]
-what = "The owner's release restate-1682: the reviewed manifests, the backup, the dry run, the re-stamps and back-dated retractions, health, the index block before and after."
+what = "The owner's release restate-1682: the reviewed manifest, the backup, the dry run, the reviewed delete, health, the index block before and after."
 why = "Lands the point-in-time restatements under one named release with a backup and one before/after number (#1682)."
+unblocks = ["task:T198"]
 
 [task.T198]
 what = "The owner's release rederive-1682: the split-context flip with the cache bumps, the re-derive, the classification rebuild, the fill-holes backfill, the first OpenFIGI run, health, the index block before and after."
 why = "Lands every rule-based fix in one sitting so trials go stale once and the windows restart once (#1682)."
+
+[task.T199]
+what = "The C2 done-test: a test-only fixture in AEP's shape (a snapshot_static NASDAQ row known at the fetch, a 2019 10-K whose instance prefix is aep and whose 12(b) text names NYSE, a 2021 10-K naming NASDAQ) plus the look-ahead test that no writer path uses a snapshot_static row's exchange or valid_from as evidence for a row known before that snapshot's known_at."
+why = "T184h's release is the C2 fix, so the AEP-shaped readiness test and the no-look-ahead test must exist and be green before its sitting (#1682)."
+unblocks = ["task:T184h"]
