@@ -15,7 +15,7 @@ import sys
 import textwrap
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1595,6 +1595,21 @@ def test_rule_2_needs_the_largest_member_and_no_lettered_title(settings: Setting
     other = _share("ClassAExchangeableShares", 9.0, acc, _at(2019, 3, 1))
     rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [other]))
     assert rows == set() and unmatched == (other,)
+
+
+def test_rule_2_needs_the_nominal_class_on_the_same_date(settings: Settings) -> None:
+    # code-review on #1727: a lone lettered member is no evidence the other
+    # class is nominal, and members on another date of the filing do not count.
+    acc = _IBKR_PAGE.accession
+    lone_b = _share("CommonClassB", 24_000_000.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [lone_b]))
+    assert rows == set() and unmatched == (lone_b,)
+    class_a = _share("CommonClassA", 450.0, acc, _at(2019, 3, 1))
+    prior_b = replace(
+        _share("CommonClassB", 0.1, acc, _at(2019, 3, 1)), as_of_date=date(2018, 12, 31)
+    )
+    rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [class_a, prior_b]))
+    assert rows == set() and set(unmatched) == {class_a, prior_b}
 
 
 def test_rule_2_never_fires_beside_an_undimensioned_total(settings: Settings) -> None:

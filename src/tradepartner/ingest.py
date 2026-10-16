@@ -2472,8 +2472,9 @@ def fact_rows(
        (BF's `NonvotingCommonStock` on "Class B Common Stock (nonvoting)").
     2. A lettered common member (`CommonClassA`) still unmatched goes to the
        sole candidate with a listing known at `t` when no candidate's title
-       or slug known at `t` names any class letter, provided every class
-       member of the filing (for that fact) is a lettered common member, it
+       or slug known at `t` names any class letter, provided the filing
+       carries two or more class members for the fact on that date, every
+       one a lettered common member, it
        carries no undimensioned value for the fact, the member holds the
        filing's largest value, and every other member is at most
        `lettered_member_max_minor_share` of it (a nominal class: IBKR's 100
@@ -2571,7 +2572,7 @@ def fact_rows(
         titles known at `t` name (no later page names an earlier fact's class)."""
         return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
 
-    linker = _ClassLinker(master)
+    linker = _ClassLinker(master) if class_member_link else None
     largest = (
         _largest_lettered_members(records, lettered_member_max_minor_share)
         if class_member_link
@@ -2599,7 +2600,7 @@ def fact_rows(
             ids = candidates
             if member:
                 ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
-            if class_member_link and len(ids) != 1 and record.class_member:
+            if linker is not None and len(ids) != 1 and record.class_member:
                 ids = linker.link(record, candidates, largest)
             if len(ids) == 1:
                 break
@@ -2631,31 +2632,38 @@ def _lettered_common(member: str) -> str | None:
     return match.group(1) if match and "common" in member.lower() else None
 
 
+#: (CIK, accession, fact name, as-of date): one filing's values for one fact
+#: on one date, rule 2's unit (T190d).
+_FilingKey = tuple[str, str, str, date]
+
+
 def _largest_lettered_members(
     records: Sequence[FactRecord], max_minor_share: float
-) -> dict[tuple[str, str, str], str]:
-    """Per (CIK, accession, fact name), the member rule 2 may place (T190d):
-    the filing's largest, when every class member of that filing and fact is
-    a lettered common member, the filing carries no undimensioned value for
+) -> dict[_FilingKey, str]:
+    """Per (CIK, accession, fact name, as-of date), the member rule 2 may
+    place (T190d): the filing's largest, when that filing carries two or
+    more class members for the fact on that date (a lone lettered member is
+    no evidence the other class is nominal), every one a lettered common
+    member, the filing carries no undimensioned value for
     the fact (a total beside one class: BioAtla's unlisted Class B beside
     its 32M total, #1727), the largest is positive and unique, and every
     other member is at most `max_minor_share` of it."""
-    top: dict[tuple[str, str, str], dict[str, float]] = defaultdict(dict)
-    totals: set[tuple[str, str, str]] = set()
+    top: dict[_FilingKey, dict[str, float]] = defaultdict(dict)
+    totals: set[_FilingKey] = set()
     for record in records:
-        key = (record.cik, record.accession, record.fact_name)
+        key = (record.cik, record.accession, record.fact_name, record.as_of_date)
         if not record.class_member:
             totals.add(key)
             continue
         held = top[key]
         held[record.class_member] = max(held.get(record.class_member, record.value), record.value)
-    out: dict[tuple[str, str, str], str] = {}
+    out: dict[_FilingKey, str] = {}
     for key, values in top.items():
         if key in totals or any(_lettered_common(member) is None for member in values):
             continue
         best = max(values.values())
         winners = [member for member, value in values.items() if value == best]
-        if len(winners) != 1 or best <= 0:
+        if len(values) < 2 or len(winners) != 1 or best <= 0:
             continue
         if all(v <= max_minor_share * best for m, v in values.items() if m != winners[0]):
             out[key] = winners[0]
@@ -2715,7 +2723,7 @@ class _ClassLinker:
         self,
         record: FactRecord,
         candidates: Sequence[str],
-        largest: Mapping[tuple[str, str, str], str],
+        largest: Mapping[_FilingKey, str],
     ) -> list[str]:
         """The candidates rule 1, else rule 2, gives `record` (`fact_rows`)."""
         t = record.accepted_at
@@ -2729,7 +2737,8 @@ class _ClassLinker:
             return linked
         if _lettered_common(record.class_member) is None:
             return []
-        if largest.get((record.cik, record.accession, record.fact_name)) != record.class_member:
+        key = (record.cik, record.accession, record.fact_name, record.as_of_date)
+        if largest.get(key) != record.class_member:
             return []
         if any(_title_letter(title) for sid in candidates for title in titles[sid]):
             return []
