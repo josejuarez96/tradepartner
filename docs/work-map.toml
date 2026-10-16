@@ -1204,7 +1204,7 @@ unblocks = ["task:T184e", "task:T184f"]
 [task.T184e]
 what = "listings rows with provenance filing_name from the records and verdicts, the Form 25 row of last resort after the CIK's 10-K rows, the Underived rule extended, the fetch-pass wiring, the run-row counts, the fixture cases and the look-ahead tests."
 why = "Gives survivors and delisters alike a point-in-time listing before 2019 so the universe and the backfill see them, with no row stamped earlier than its filing (#1597)."
-unblocks = ["task:T184g"]
+unblocks = ["task:T184g", "task:T199"]
 
 [task.T184f]
 what = "The Alpaca backfill's filename_collisions (a filing_name span whose asof payload runs past its end stores nothing and is listed) and filename_disputes counts."
