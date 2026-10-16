@@ -2453,3 +2453,13 @@ def test_the_index_threshold_refuses_a_negative_count_and_needs_the_check_on() -
         Settings(_env_file=None, coverage={"index_members": False, "index_max_missing": 5})
     off = Settings(_env_file=None, coverage={"index_members": False}).coverage
     assert off.index_members is False
+
+
+def test_openfigi_defaults_are_disabled_and_bounded() -> None:
+    from tradepartner.config import OpenfigiConfig
+
+    config = OpenfigiConfig()
+    assert config.enabled is False and config.max_disagreements is None
+    assert config.limits(keyed=True) == (25, 6, 100)
+    assert config.limits(keyed=False) == (25, 60, 5)
+    assert OpenfigiConfig(jobs_per_request=100).limits(keyed=False)[2] == 5
