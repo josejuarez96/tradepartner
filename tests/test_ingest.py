@@ -1473,6 +1473,240 @@ def test_the_edgar_run_applies_the_configured_overrides(settings: Settings) -> N
     assert class_a not in unmatched
 
 
+# --- the per-class shares link at ingest (#1682 T190d, `edgar.class_member_link`)
+
+LINK = "0000000003"  # one fixture CIK per case, built alone
+
+
+def _share(member: str, value: float, accession: str, at: datetime) -> FactRecord:
+    return FactRecord(
+        LINK, "EntityCommonStockSharesOutstanding", at.date(), member, value, accession, at
+    )
+
+
+def _page(n: int, at: datetime, *listings: tuple[str, str]) -> CoverPage:
+    """Cover page `n` of LINK, accepted at `at`, listing (title, ticker) on NYSE."""
+    items = tuple(CoverListing(title, ticker, "NYSE") for title, ticker in listings)
+    return CoverPage(LINK, f"{LINK}-18-{n:06d}", at, items)
+
+
+def _link_source(pages: Sequence[CoverPage], facts: Sequence[FactRecord]) -> FixtureFilingSource:
+    first = FilingIndexEntry(LINK, "Link Corp", "10-K", f"{LINK}-17-000001", _at(2017, 3, 1))
+    return FixtureFilingSource(
+        index=[first],
+        cover_pages=pages,
+        headers=[FilingHeader(LINK, p.accession, "10-K", 2080, p.accepted_at) for p in pages],
+        facts=facts,
+    )
+
+
+def _linked(
+    settings: Settings, source: FixtureFilingSource, *, on: bool = True, **edgar: Any
+) -> tuple[set[tuple[str, str, float]], tuple[FactRecord, ...]]:
+    """(security id, member, value) of each fact row, and the unmatched,
+    through `_build_filings` with `edgar.class_member_link` set to `on`."""
+    configured = settings.model_copy(
+        update={
+            "edgar": settings.edgar.model_copy(
+                update={"class_member_link": on, "class_member_overrides": {}, **edgar}
+            )
+        }
+    )
+    *_, facts, unmatched = _build_filings(source, configured, NOW)
+    return {(r["security_id"], r["class_member"], r["value"]) for r in facts}, unmatched
+
+
+#: BF-shaped (Brown-Forman): voting Class A, nonvoting Class B, its shares
+#: tagged `NonvotingCommonStock` (no letter).
+_BF_PAGE = _page(
+    1,
+    _at(2019, 3, 1),
+    ("Class A Common Stock (voting), $0.15 par value", "BFA"),
+    ("Class B Common Stock (nonvoting), $0.15 par value", "BFB"),
+)
+
+
+def test_rule_1_a_member_naming_no_letter_lands_on_the_class_it_links(
+    settings: Settings,
+) -> None:
+    acc = _BF_PAGE.accession
+    nonvoting = _share("NonvotingCommonStock", 300.0, acc, _at(2019, 3, 1))
+    class_a = _share("CommonClassA", 169.0, acc, _at(2019, 3, 1))
+    source = _link_source([_BF_PAGE], [nonvoting, class_a])
+    off, off_unmatched = _linked(settings, source, on=False)
+    assert off == {(LINK, "CommonClassA", 169.0)}
+    assert off_unmatched == (nonvoting,)
+    rows, unmatched = _linked(settings, source)
+    sids = {sid for sid, _, _ in rows}
+    assert len(sids - {LINK}) == 1
+    (b_id,) = sids - {LINK}
+    assert b_id.startswith(f"{LINK}:class-b-common-stock")
+    assert rows == {(LINK, "CommonClassA", 169.0), (b_id, "NonvotingCommonStock", 300.0)}
+    assert unmatched == ()
+
+
+def test_rule_1_a_member_linking_two_classes_or_none_stays_unmatched(
+    settings: Settings,
+) -> None:
+    # MKC-shaped: "Common Stock" (voting) and "Common Stock Non-Voting". The
+    # nonvoting member links one class; a plain `CommonStock` links both
+    # titles, and a total links none: both stay unmatched.
+    page = _page(1, _at(2019, 3, 1), ("Common Stock", "MKCV"), ("Common Stock Non-Voting", "MKC"))
+    acc = page.accession
+    nonvoting = _share("NonvotingCommonStock", 240.0, acc, _at(2019, 3, 1))
+    plain = _share("CommonStock", 9.0, acc, _at(2019, 3, 1))
+    total = _share("", 249.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([page], [nonvoting, plain, total]))
+    assert rows == {(f"{LINK}:common-stock-non-voting", "NonvotingCommonStock", 240.0)}
+    assert set(unmatched) == {plain, total}
+
+
+#: IBKR-shaped: one listed common titled with no letter; the cover tags the
+#: listed Class A and the unlisted Class B (100 shares held by the parent).
+_IBKR_PAGE = _page(1, _at(2019, 3, 1), ("Common Stock, par value $.01 per share", "IBKR"))
+
+
+def test_rule_2_the_largest_lettered_member_lands_on_the_sole_listed_common(
+    settings: Settings,
+) -> None:
+    acc = _IBKR_PAGE.accession
+    class_a = _share("CommonClassA", 445_246_976.0, acc, _at(2019, 3, 1))
+    class_b = _share("CommonClassB", 100.0, acc, _at(2019, 3, 1))
+    source = _link_source([_IBKR_PAGE], [class_a, class_b])
+    off, off_unmatched = _linked(settings, source, on=False)
+    assert off == set() and set(off_unmatched) == {class_a, class_b}
+    rows, unmatched = _linked(settings, source)
+    assert rows == {(LINK, "CommonClassA", 445_246_976.0)}
+    assert unmatched == (class_b,)
+
+
+def test_rule_2_needs_the_largest_member_and_no_lettered_title(settings: Settings) -> None:
+    acc = _IBKR_PAGE.accession
+    tie_a = _share("CommonClassA", 5.0, acc, _at(2019, 3, 1))
+    tie_b = _share("CommonClassB", 5.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [tie_a, tie_b]))
+    assert rows == set() and set(unmatched) == {tie_a, tie_b}  # a tie links neither
+    # A lettered title anywhere on the CIK: the letter rule decides, rule 2 never.
+    lettered = _page(1, _at(2019, 3, 1), ("Class B Common Stock", "LNKB"))
+    class_a = _share("CommonClassA", 9.0, lettered.accession, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([lettered], [class_a]))
+    assert rows == set() and unmatched == (class_a,)
+    # Not a common member: an exchangeable class never takes the common's place.
+    other = _share("ClassAExchangeableShares", 9.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [other]))
+    assert rows == set() and unmatched == (other,)
+
+
+def test_rule_2_covers_the_owner_override_cases_with_the_overrides_empty(
+    settings: Settings,
+) -> None:
+    # DKS/TR/VMEO (#1169): one listed "Common Stock", shares tagged
+    # `CommonClassA` and the unlisted `CommonClassB`. `_linked` empties
+    # `edgar.class_member_overrides`; rule 2 lands Class A as the override did.
+    page = _page(1, _at(2019, 3, 1), ("Common Stock, $0.01 par value", "DKS"))
+    class_a = _share("CommonClassA", 64_000_000.0, page.accession, _at(2019, 3, 1))
+    class_b = _share("CommonClassB", 24_000_000.0, page.accession, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([page], [class_a, class_b]))
+    assert rows == {(LINK, "CommonClassA", 64_000_000.0)}
+    assert unmatched == (class_b,)
+
+
+#: WBD-shaped: three series shown together, then the merged company's
+#: pages show Series A only (the old B and C never get a Form 25 here).
+_SERIES = (
+    ("Series A Common Stock", "LNKA"),
+    ("Series B Common Stock", "LNKB"),
+    ("Series C Common Stock", "LNKK"),
+)
+_WBD_PAGES = [
+    _page(1, _at(2018, 3, 1), *_SERIES),
+    _page(2, _at(2018, 5, 1), _SERIES[0]),
+    _page(3, _at(2018, 8, 1), _SERIES[0]),
+    _page(4, _at(2018, 11, 1), _SERIES[0]),
+    _page(5, _at(2019, 3, 1), _SERIES[0]),
+]
+
+
+def test_rule_3_a_class_missing_from_four_pages_stops_being_a_candidate(
+    settings: Settings,
+) -> None:
+    third = _share("", 2_400.0, _WBD_PAGES[3].accession, _WBD_PAGES[3].accepted_at)
+    fourth = _share("", 2_430.0, _WBD_PAGES[4].accession, _WBD_PAGES[4].accepted_at)
+    source = _link_source(_WBD_PAGES, [third, fourth])
+    off, off_unmatched = _linked(settings, source, on=False)
+    assert off == set() and set(off_unmatched) == {third, fourth}
+    rows, unmatched = _linked(settings, source)
+    # Three missed pages: the old series still count, so the total is no one
+    # class's; the fourth missed page ends them and the total is the primary's.
+    assert rows == {(LINK, "", 2_430.0)}
+    assert unmatched == (third,)
+    rows, unmatched = _linked(settings, source, dead_class_filings=3)
+    assert rows == {(LINK, "", 2_400.0), (LINK, "", 2_430.0)}
+
+
+def test_rule_3_a_page_listing_nothing_is_no_missed_page(settings: Settings) -> None:
+    blanks = [_page(10 + i, _at(2018, 3, 2 + i)) for i in range(4)]
+    pages = [_WBD_PAGES[0], *blanks, _WBD_PAGES[1]]
+    total = _share("", 1.0, _WBD_PAGES[1].accession, _WBD_PAGES[1].accepted_at)
+    rows, unmatched = _linked(settings, _link_source(pages, [total]))
+    assert rows == set() and unmatched == (total,)
+
+
+def test_rule_3_never_kills_the_class_the_pages_still_show(settings: Settings) -> None:
+    # A one-class CIK whose later pages list only a note: its common is not
+    # shown, but no other common is either, so it stays the candidate.
+    pages = [
+        _page(1, _at(2018, 3, 1), ("Common Stock", "LNK")),
+        *(_page(2 + i, _at(2018, 5 + i, 1), ("4.5% Notes due 2030", "LNK30")) for i in range(4)),
+    ]
+    total = _share("", 7.0, pages[-1].accession, pages[-1].accepted_at)
+    rows, unmatched = _linked(settings, _link_source(pages, [total]))
+    assert rows == {(LINK, "", 7.0)} and unmatched == ()
+
+
+def test_a_total_on_a_live_two_class_cik_stays_unmatched(settings: Settings) -> None:
+    total = _share("", 10.0, _BF_PAGE.accession, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([_BF_PAGE], [total]))
+    assert rows == set() and unmatched == (total,)
+
+
+def test_the_switch_off_changes_no_row(settings: Settings) -> None:
+    # Off, `_build_filings` passes no page list and `fact_rows` is the
+    # pre-T190d function: every fixture above, the main fixture included.
+    cases = [
+        _filings(),
+        _link_source([_BF_PAGE], [_share("NonvotingCommonStock", 3.0, _BF_PAGE.accession, NOW)]),
+        _link_source([_IBKR_PAGE], [_share("CommonClassA", 3.0, _IBKR_PAGE.accession, NOW)]),
+        _link_source(_WBD_PAGES, [_share("", 3.0, _WBD_PAGES[4].accession, NOW)]),
+    ]
+    for source in cases:
+        master = build_master(source, settings, ingested_at=NOW)
+        classes = build_classifications(source, master, settings, ingested_at=NOW)
+        records = [f for cik in (ACME, DUAL, LINK) for f in source.facts(cik, list(FACT_NAMES))]
+        before = fact_rows(
+            records,
+            master,
+            classes,
+            ingested_at=NOW,
+            class_member_overrides=settings.edgar.class_member_overrides,
+        )
+        *_, facts, unmatched = _build_filings(source, settings, NOW)
+        assert settings.edgar.class_member_link is False
+        assert (facts, unmatched) == before
+        pages = {LINK: [p.accepted_at for p in source.cover_pages(LINK)]}
+        assert fact_rows(records, master, classes, ingested_at=NOW, cover_pages_at=pages) == (
+            fact_rows(records, master, classes, ingested_at=NOW)
+        )
+
+
+def test_dead_class_filings_below_one_is_refused(settings: Settings) -> None:
+    source = _filings()
+    master = build_master(source, settings, ingested_at=NOW)
+    classes = build_classifications(source, master, settings, ingested_at=NOW)
+    with pytest.raises(ValueError, match="dead_class_filings"):
+        fact_rows([], master, classes, ingested_at=NOW, dead_class_filings=0)
+
+
 def test_filename_evidence_is_fetched_before_freeze_only_when_enabled(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

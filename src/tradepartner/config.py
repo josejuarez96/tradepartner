@@ -462,6 +462,18 @@ class EdgarConfig(BaseModel):
             "0001837686": "CommonClassA",  # VMEO
         }
     )
+    # T190d (#1682 lever F): the per-class shares link at ingest. On, a
+    # shares fact `fact_rows` leaves unmatched goes to the one common class
+    # its member names by `universe.member_links_title` (BF.B, FOX, MKC), a
+    # lettered member to the sole listed common when no title names a letter
+    # (IBKR, SPG; the filing's largest lettered member only), and a common
+    # class missing from the CIK's last `dead_class_filings` cover pages stops
+    # being a candidate (WBD's old series), all as of each fact's acceptance.
+    # Off, every `facts` row is as before. The release `rederive-1682` (T198)
+    # flips it with the facts re-derive, never a nightly run before it.
+    class_member_link: bool = False
+    # Rule 3's page count: one fiscal year of periodic cover pages.
+    dead_class_filings: int = Field(default=4, ge=1)
     # T184 (#1597, spec amendment 2026-10-12): pre-2019 listings read from a
     # filing's own file names and its primary document's text. While the switch
     # is off the EDGAR `FilingSource` answers `filename_listings` as it does
