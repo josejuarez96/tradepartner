@@ -30,6 +30,7 @@ from tradepartner.universe import (
     SharesPick,
     Universe,
     latest_shares_as_of,
+    member_links_title,
     shares_as_of,
     universe_as_of,
 )
@@ -232,11 +233,198 @@ def test_a_non_positive_fact_is_never_a_baseline(
 def test_the_ambiguous_latest_date_is_still_ambiguous(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
+    # Different values on unlinked members ("Common Stock" names no letter):
+    # equal values would collapse (T190).
     _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "ClassA")
-    _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "ClassB")
+    _fact(fixture_store, SID, SPIKE, MOVED // 2, _known(date(2019, 3, 1)), "ClassB")
     shares, ambiguous = latest_shares_as_of(fixture_store, T_LATE, [SID], _settings())
     assert ambiguous == {SID}
     assert SID not in shares
+
+
+# --- The class-member link and the explained jump (#1682, T190) ---------------
+
+
+def _listing(
+    conn: duckdb.DuckDBPyConnection, security_id: str, title: str, known: datetime
+) -> None:
+    """A revision of `security_id`'s fixture listing (SPBT, NYSE, 2017-01-03)
+    retitling its class `title` from `known` on."""
+    insert_row(
+        conn,
+        "listings",
+        {
+            "security_id": security_id,
+            "ticker": "SPBT",
+            "exchange": "NYSE",
+            "class_title": title,
+            "valid_from": date(2017, 1, 3),
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def _spinoff(conn: duckdb.DuckDBPyConnection, child: str, ex_date: date, known: datetime) -> None:
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": child,
+            "action_type": "spinoff",
+            "ex_date": ex_date,
+            "ratio_or_amount": 0.5,
+            "announced_at": None,
+            "source_action_id": "SEC_PARENT",
+            "cancelled": False,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("member", "title", "links"),
+    [
+        # Census 2's ambiguous names (#1682): the listed common's member links.
+        ("CommonStock", "Common Stock", True),  # HRL, SCHW
+        ("NonvotingCommonStock", "Common Stock", False),
+        ("CommonStockClassUndefined", "Common Stock, $0.00001 par value", True),  # PWR
+        ("ExchangeableShares", "Common Stock, $0.00001 par value", False),
+        ("CommonClassA", "Class A common stock, par value $0.01 per share", True),  # ARES
+        ("NonvotingCommonStock", "Class A common stock, par value $0.01 per share", False),
+        ("CommonClassB", "Class B Common Stock, $0.01 par value", True),  # TAP
+        ("ClassBExchangeableShares", "Class B Common Stock, $0.01 par value", False),
+        # A nonvoting class titled so links its own member (BF.B, MKC).
+        ("NonvotingCommonStock", "Class B Common Stock (nonvoting)", True),
+        ("CommonStock", "Class B Common Stock (nonvoting)", False),
+        ("CommonStock", "Class A Common Stock", False),
+        ("NonvotingCommonStock", "Common Stock Non-Voting", True),
+        ("CommonClassB", "Class B Common Stock (nonvoting)", True),
+        (
+            "ClassACommonStockParValue100PerShare",
+            "Class A Common Stock, par value $1.00 per share",
+            True,
+        ),
+        # A letter the title does not name never links (DKS's `CommonClassA`
+        # on "Common Stock" is the ingest override's case, T190d).
+        ("CommonClassA", "Common Stock", False),
+        ("CommonClassA", "Class B Common Stock", False),
+        # A Series letter is a class letter, a "non-" prefix one word.
+        ("SeriesBCommonStock", "Series A common stock", False),
+        ("SeriesBCommonStock", "Series B common stock", True),
+        ("NonVotingCommonStock", "Class B Common Stock (non-voting)", True),
+        ("NonVotingCommonStock", "Common Stock", False),
+        ("", "Common Stock", False),
+    ],
+)
+def test_a_member_links_the_class_its_title_names(member: str, title: str, links: bool) -> None:
+    assert member_links_title(member, title) is links
+
+
+def test_the_listed_common_wins_over_a_nonvoting_member(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # HRL's shape: CommonStock and NonvotingCommonStock on one date, the
+    # class titled "Common Stock" (the fixture's listing).
+    _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "CommonStock")
+    _fact(fixture_store, SID, SPIKE, 2_000_000, _known(date(2019, 3, 1)), "NonvotingCommonStock")
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.ambiguous == set()
+    assert pick.shares[SID] == (SPIKE, MOVED)
+    u = universe_as_of(fixture_store, T_LATE, _settings())
+    assert _member(u, SID)["shares"] == pytest.approx(MOVED)
+
+
+def test_a_class_b_title_selects_its_common_over_exchangeable_shares(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # TAP's shape: the class retitled "Class B Common Stock" before the fact.
+    _listing(fixture_store, SID, "Class B Common Stock, $0.01 par value", _known(date(2019, 2, 1)))
+    _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "CommonClassB")
+    _fact(fixture_store, SID, SPIKE, 900_000, _known(date(2019, 3, 1)), "ClassBExchangeableShares")
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.ambiguous == set()
+    assert pick.shares[SID] == (SPIKE, MOVED)
+
+
+def test_equal_member_values_collapse_and_different_ones_stay_ambiguous(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "CommonUnits")
+    _fact(fixture_store, SID, SPIKE, MOVED, _known(date(2019, 3, 1)), "SubordinatedUnits")
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.ambiguous == set()
+    assert pick.shares[SID] == (SPIKE, MOVED)
+    later = date(2019, 5, 31)
+    _fact(fixture_store, SID, later, MOVED, _known(date(2019, 6, 3)), "VotingCommonStock")
+    _fact(fixture_store, SID, later, MOVED // 3, _known(date(2019, 6, 3)), "NonvotingCommonStock")
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.ambiguous == {SID}
+
+
+def test_a_jump_explained_by_a_spinoff_known_at_t_is_accepted(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A spun-off child's count jumps far past the 100x bound across its
+    # distribution: the spinoff row (child = this security) explains it.
+    jump = date(2019, 5, 31)
+    _fact(fixture_store, SID, jump, MOVED * 1000, _known(date(2019, 6, 3)))
+    _spinoff(fixture_store, SID, date(2019, 4, 1), _known(date(2019, 3, 25)))
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.shares[SID] == (jump, MOVED * 1000)
+    assert pick.fallbacks.is_empty()
+    assert pick.outliers.select("as_of_date", "accepted", "reanchored", "explained").rows() == [
+        (jump, False, False, True)
+    ]
+
+
+def test_a_spinoff_outside_the_span_explains_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    jump = date(2019, 5, 31)
+    _fact(fixture_store, SID, jump, MOVED * 1000, _known(date(2019, 6, 3)))
+    _spinoff(fixture_store, SID, date(2019, 6, 3), _known(date(2019, 5, 28)))  # after the fact
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.shares[SID] == (date(2018, 10, 29), 5_000_000)
+    assert pick.outliers["explained"].to_list() == [False]
+
+
+def test_a_new_common_class_of_the_cik_explains_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The master dates a class by its first cover page, not by a
+    # reorganisation: a sibling class first known inside the span never
+    # explains a 1,000x fact (#1703 review).
+    cik = fixture_store.execute(
+        "SELECT cik FROM securities WHERE security_id = ?", [SID]
+    ).fetchone()
+    assert cik is not None
+    born = _known(date(2019, 4, 1))
+    for table, row in (
+        ("securities", {"cik": cik[0], "name": "Split Between Filing Co", "benchmark": False}),
+        ("classifications", {"sic": "7372", "security_type": "common", "rule": "common_default"}),
+    ):
+        insert_row(
+            fixture_store,
+            table,
+            {
+                "security_id": f"{SID}:class-b",
+                **row,
+                "known_at": born,
+                "ingested_at": born,
+                "source": "edgar",
+                "provenance": "filing",
+            },
+        )
+    _fact(fixture_store, SID, date(2019, 5, 31), MOVED * 1000, _known(date(2019, 6, 3)))
+    pick = shares_as_of(fixture_store, T_LATE, [SID], _settings())
+    assert pick.shares[SID] == (date(2018, 10, 29), 5_000_000)
+    assert pick.outliers["explained"].to_list() == [False]
 
 
 # --- No look-ahead ------------------------------------------------------------

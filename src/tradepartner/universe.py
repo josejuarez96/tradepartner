@@ -41,7 +41,15 @@ reported once, under the first rule it fails:
    `universe.max_shares_age_days` old at the session. Rows sharing that
    `as_of_date` are never summed: the one row with a class member wins
    over an undimensioned total (`''`); two class-member rows on one
-   security are `ambiguous_shares`. A fact out of line with the
+   security are `ambiguous_shares`, unless the class-member link settles
+   them (#1682, T190): a member *links* to the security's class when it
+   names the class letter its stored title names (or neither names one)
+   and every other qualifying word of the member ("Nonvoting",
+   "Exchangeable", "Preferred", ...) is in the title; titles are the
+   security's `listings` rows known at `t` and the slug in its id. The
+   linked rows decide the date when there are any; rows whose values are
+   all equal collapse to that value; only different values with no single
+   linked value stay `ambiguous_shares`. A fact out of line with the
    security's last accepted earlier fact (ratio, after the splits known
    at `t` between them, above `universe.max_shares_ratio` or below its
    inverse) is rejected unless `universe.accepted_shares_facts` names it,
@@ -50,7 +58,10 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good.
+   name out for good. An out-of-line fact is *explained*, and accepted as
+   the new baseline, when an event known at `t` lies between its baseline's
+   `as_of_date` and its own (#1682, T190): a `spinoff` action whose child is
+   this security.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -79,6 +90,7 @@ EDGAR's `EntityCommonStockSharesOutstanding` to it.
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from collections import defaultdict
 from collections.abc import Sequence
@@ -95,6 +107,7 @@ from tradepartner.config import Settings, get_settings, parse_accepted_shares_fa
 from tradepartner.store.asof import (
     _validate_t,
     facts_as_of,
+    listings_as_of,
     live_actions_as_of,
     price_jumps_as_of,
     prices_as_of,
@@ -147,7 +160,10 @@ _MEMBER_SCHEMA: dict[str, Any] = {
 #: a zero or negative value has a null `ratio` (and null `baseline_*` when it
 #: comes first). `reanchored` is true on the fact that re-anchored the
 #: baseline (#853); it keeps `accepted` false (the owner did not accept it), so
-#: health's review list still shows it.
+#: health's review list still shows it. `explained` is true on a fact accepted
+#: as the new baseline because a spin-off known at `t` (this security its
+#: child) lies between it and its baseline (T190); it also keeps `accepted`
+#: false, so health's review list still shows it.
 SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "as_of_date": pl.Date,
@@ -157,6 +173,7 @@ SHARES_OUTLIER_SCHEMA: dict[str, Any] = {
     "ratio": pl.Float64,
     "accepted": pl.Boolean,
     "reanchored": pl.Boolean,
+    "explained": pl.Boolean,
 }
 #: `SharesPick.fallbacks` and `Universe.shares_fallbacks`: the rejected latest
 #: fact (`as_of_date`, `value`, `ratio`) and the accepted one used instead.
@@ -291,9 +308,81 @@ class SharesPick:
     fallbacks: pl.DataFrame
 
 
-def _date_picks(rows: list[dict[str, Any]]) -> dict[date, float | None]:
-    """Per `as_of_date`, the one value rule 7 reads (a class row wins over an
-    undimensioned total), or `None` when two class rows make it ambiguous."""
+#: A class member naming its class by letter (`CommonClassB`,
+#: `ClassBExchangeableShares`, `SeriesBCommonStock`); `ClassUndefined` names
+#: none. Ingest's `fact_rows` reads `Class<letter>` only (#1169).
+_MEMBER_LETTER = re.compile(r"(?:Class|Series)([A-Z])(?![a-z])")
+#: A title naming its class by letter ("Class B Common Stock", "Series C
+#: common stock"; ingest's `_TITLE_CLASS`, #1166), on the lower-cased title.
+_TITLE_LETTER = re.compile(r"\bclass ([a-z])\b|^\s*series ([a-z])\b")
+#: Member words that qualify no class: the generic nouns of an equity member.
+_NEUTRAL_MEMBER_WORDS = frozenset(
+    {"common", "stock", "class", "share", "shares", "ordinary", "undefined", "member"}
+)
+
+
+def _member_letter(member: str) -> str | None:
+    match = _MEMBER_LETTER.search(member)
+    return match.group(1) if match else None
+
+
+def _title_letter(title: str) -> str | None:
+    match = _TITLE_LETTER.search(title.lower())
+    return next(g for g in match.groups() if g).upper() if match else None
+
+
+def _title_words(title: str) -> set[str]:
+    """The title's lower-case words, "non-voting" and "non voting" read as
+    one word "nonvoting" (any `non` prefix joins its word)."""
+    folded = re.sub(r"\bnon[\s-]+", "non", title.lower())
+    return set(re.findall(r"[a-z]+", folded))
+
+
+def _member_words(member: str) -> set[str]:
+    """The member's camel-case words, lower case, a `Non` joined to the word
+    after it (`NonVotingCommonStock` -> nonvoting, common, stock)."""
+    words = [w.lower() for w in re.findall(r"[A-Z][a-z]+|[a-z]+", member)]
+    out: list[str] = []
+    for word in words:
+        if out and out[-1] == "non":
+            out[-1] = "non" + word
+        else:
+            out.append(word)
+    return set(out)
+
+
+def member_links_title(member: str, title: str) -> bool:
+    """Whether the XBRL class member `member` names the class titled `title`
+    (#1682, T190). Every qualifying word of the member (camel-case split,
+    less the generic nouns `_NEUTRAL_MEMBER_WORDS` and single letters) is a
+    word of the title, with "non-voting" read as "nonvoting"; and a member
+    naming a class letter matches the letter the title names, while a member
+    naming none links a lettered title only through such a qualifier. So
+    `CommonStock` links "Common Stock" and `NonvotingCommonStock` does not;
+    `CommonClassB` links "Class B Common Stock" and `ClassBExchangeableShares`
+    does not; `NonvotingCommonStock` links "Class B Common Stock (nonvoting)"
+    and `CommonStock` does not. An empty member (an undimensioned total)
+    links nothing. Pure: no per-name list."""
+    if not member:
+        return False
+    qualifiers = {w for w in _member_words(member) if w not in _NEUTRAL_MEMBER_WORDS | {"series"}}
+    qualifiers = {w for w in qualifiers if len(w) > 1}
+    if not qualifiers <= _title_words(title):
+        return False
+    letter, title_letter = _member_letter(member), _title_letter(title)
+    if letter is not None or title_letter is None:
+        return letter == title_letter
+    # A member naming no letter links a lettered title only by a qualifier
+    # the title states ("Class B Common Stock (nonvoting)").
+    return bool(qualifiers)
+
+
+def _date_picks(rows: list[dict[str, Any]], titles: Sequence[str]) -> dict[date, float | None]:
+    """Per `as_of_date`, the one value rule 7 reads, or `None` when it is
+    ambiguous. A class row wins over an undimensioned total; among several
+    class rows the ones whose member links one of `titles`
+    (`member_links_title`) win; the rows left collapse when their values are
+    equal and are ambiguous when they differ."""
     by_date: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         by_date[row["as_of_date"]].append(row)
@@ -301,8 +390,32 @@ def _date_picks(rows: list[dict[str, Any]]) -> dict[date, float | None]:
     for as_of in sorted(by_date):
         classed = [r for r in by_date[as_of] if r["class_member"]]
         chosen = classed or by_date[as_of]
-        picks[as_of] = chosen[0]["value"] if len(chosen) == 1 else None
+        if len(chosen) > 1:
+            linked = [
+                r for r in chosen if any(member_links_title(r["class_member"], t) for t in titles)
+            ]
+            chosen = linked or chosen
+        values = {r["value"] for r in chosen}
+        picks[as_of] = chosen[0]["value"] if len(values) == 1 else None
     return picks
+
+
+def _class_titles(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str]
+) -> dict[str, list[str]]:
+    """Per security, the class titles known at `t`: its live `listings`
+    rows' `class_title`s (`listings_as_of`, retractions applied) and the slug
+    of a class id (`<cik>:<slug>`, hyphens read as spaces) whose `securities`
+    row is live at `t`. No later cover page or listing names a class at `t`."""
+    out: dict[str, list[str]] = defaultdict(list)
+    for row in listings_as_of(conn, t, ids).iter_rows(named=True):
+        if row["class_title"]:
+            out[row["security_id"]].append(row["class_title"])
+    for row in securities_as_of(conn, t, ids).iter_rows(named=True):
+        sid = row["security_id"]
+        if ":" in sid:
+            out[sid].append(sid.split(":", 1)[1].replace("-", " "))
+    return out
 
 
 def shares_as_of(
@@ -330,9 +443,23 @@ def shares_as_of(
     `reanchored`. A date with two class rows, and a value that is not a share
     count, neither extend nor break a run.
 
-    A date with two class rows is skipped by the walk. The latest date
-    decides: ambiguous, its own value when accepted, else the last accepted
-    fact. Only facts and splits known at `t` are read, never a later filing.
+    Class rows (#1682, T190): on one `as_of_date`, the class rows whose
+    member links the security's class titles known at `t` decide
+    (`_date_picks`, `member_links_title`); equal values collapse; a date
+    still holding two different values is ambiguous and skipped by the walk.
+
+    Explained jump (T190): an out-of-line fact that no owner entry accepts is
+    accepted as the new baseline, flagged `explained`, when a `spinoff`
+    action known at `t` whose child is this security has its `ex_date` after
+    the baseline's `as_of_date` and on or before the fact's own (a child's
+    count moves from its pre-distribution seed to the distributed count). A
+    spin-off known after `t` explains nothing at `t`. A security row is not
+    read as an explanation: the master dates a class by its first cover page,
+    not by a reorganisation, so it would explain mis-scaled facts (#1703).
+
+    The latest date decides: ambiguous, its own value when accepted, else
+    the last accepted fact. Only facts, splits, spin-offs, listings and
+    securities known at `t` are read, never a later filing.
     """
     cfg = settings.universe
     accepted_list = {parse_accepted_shares_fact(e) for e in cfg.accepted_shares_facts}
@@ -341,10 +468,19 @@ def shares_as_of(
         if row["fact_name"] == SHARES_FACT:
             rows[row["security_id"]].append(row)
     splits: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    spinoffs: dict[str, list[date]] = defaultdict(list)
     split_ids = None if ids is None else sorted(rows)
     for action in live_actions_as_of(conn, t, split_ids).iter_rows(named=True):
         if action["action_type"] == "split":
             splits[action["security_id"]].append((action["ex_date"], action["ratio_or_amount"]))
+        elif action["action_type"] == "spinoff":
+            spinoffs[action["security_id"]].append(action["ex_date"])
+    titles = _class_titles(conn, t, sorted(rows))
+
+    def explained(sid: str, after: date, through: date) -> bool:
+        """A spin-off known at `t` with `sid` as its child, its `ex_date` in
+        `(after, through]`, explains a jump."""
+        return any(after < ex_date <= through for ex_date in spinoffs.get(sid, []))
 
     shares: dict[str, tuple[date, float]] = {}
     ambiguous: set[str] = set()
@@ -362,7 +498,7 @@ def shares_as_of(
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
 
     for sid in sorted(rows):
-        picks = _date_picks(rows[sid])
+        picks = _date_picks(rows[sid], titles.get(sid, []))
         base: tuple[date, float] | None = None
         run: list[tuple[date, float]] = []  # rejected facts in line with each other
         latest_ok = False
@@ -383,6 +519,7 @@ def shares_as_of(
                         "ratio": None,
                         "accepted": False,
                         "reanchored": False,
+                        "explained": False,
                     }
                 )
                 continue
@@ -392,7 +529,8 @@ def shares_as_of(
             change = in_line(sid, base, as_of, value)
             owner_ok = (sid, as_of) in accepted_list
             reanchored = False
-            if change is not None and not owner_ok:
+            explains = change is not None and not owner_ok and explained(sid, base[0], as_of)
+            if change is not None and not owner_ok and not explains:
                 if not run or in_line(sid, run[-1], as_of, value) is not None:
                     run = []
                 run.append((as_of, value))
@@ -408,9 +546,10 @@ def shares_as_of(
                         "ratio": change,
                         "accepted": owner_ok,
                         "reanchored": reanchored,
+                        "explained": explains,
                     }
                 )
-            if change is None or owner_ok or reanchored:
+            if change is None or owner_ok or reanchored or explains:
                 base, latest_ok, run = (as_of, value), True, []
         latest_as_of = max(picks)
         latest_value = picks[latest_as_of]
