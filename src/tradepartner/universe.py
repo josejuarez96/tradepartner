@@ -12,7 +12,13 @@ reported once, under the first rule it fails:
    transfer supersedes the older row). When the rows of one class share
    that latest `valid_from` (filed on two exchanges, #1574), a row on a
    venue in `universe.exchanges` wins, whatever order the names sort in.
-   It is live while `listed`, or while
+   A newer row on a real venue that is not on the list (`NYSE_CHICAGO`,
+   `NYSETX`: a secondary quote of the same class, #1682 lever A) does not
+   hide a listing that is still live on a venue in `universe.exchanges`:
+   the security passes while any of its rows at or before the session is
+   live on that list. A newer row on `OTC`, `NONE`, no name or any value
+   outside `_SECONDARY_VENUES` is a move off the exchange and still fails,
+   and a listing ended by its own Form 25 is not live. It is live while `listed`, or while
    `transferred` up to its end session; a `delisted` listing (a Form 25
    known at `t`) is out from the filing's `known_at`, even while bars
    continue, so nothing enters a name on its way out.
@@ -58,10 +64,17 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good. An out-of-line fact is *explained*, and accepted as
-   the new baseline, when an event known at `t` lies between its baseline's
-   `as_of_date` and its own (#1682, T190): a `spinoff` action whose child is
-   this security.
+   name out for good. A fact dated before the security's first stored bar
+   session known at `t` is a *pre-trading seed* -- and is no baseline --
+   when the first fact on or after that session is more than
+   `universe.max_shares_ratio` times it (#1682, T190b): every such seed is
+   skipped and that first post-bar fact anchors, so an issuer's one to
+   several tiny pre-trading seeds do not out-rank every later true fact.
+   Everything else keeps today's behaviour, a normal pre-listing fact
+   included. An out-of-line fact is
+   *explained*, and accepted as the new baseline, when an event known at
+   `t` lies between its baseline's `as_of_date` and its own (#1682, T190):
+   a `spinoff` action whose child is this security.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -228,6 +241,35 @@ def _last_sessions(session: date, count: int) -> frozenset[date]:
     return frozenset(out)
 
 
+#: Real venues off `universe.exchanges` whose newer row is a secondary quote
+#: of a class listed on the list (T196). An allow-list: any other value
+#: (`OTC`, `NONE`, blank, an OTC tier's slug, an unknown name) is not a
+#: venue the rule vouches for and still fails.
+_SECONDARY_VENUES = frozenset(
+    {
+        "NYSE_CHICAGO",
+        "NYSETX",
+        "NYSE_NATIONAL",
+        "NASDAQ_BX",
+        "NASDAQ_PHLX",
+        "NYSE_ARCA",
+        "CBOE_BZX",
+        "CBOE",
+    }
+)
+
+
+def _is_live(row: dict[str, Any], session: date) -> bool:
+    """Whether a listing row (with `status` and `end_session`) is live at `session`."""
+    if row["status"] == LISTED:
+        return True
+    return (
+        row["status"] == TRANSFERRED
+        and row["end_session"] is not None
+        and (row["end_session"] >= session)
+    )
+
+
 def _current_listings(
     conn: duckdb.DuckDBPyConnection, t: datetime, session: date, settings: Settings
 ) -> dict[str, dict[str, Any]]:
@@ -237,12 +279,19 @@ def _current_listings(
     When the rows of one security share that latest `valid_from` (one class
     filed on two exchanges, #1574), the tie goes to a row whose `exchange` is
     in `universe.exchanges`, whatever order the names sort in; with no such
-    row, `listing_ends_as_of`'s frame order still decides the tie."""
+    row, `listing_ends_as_of`'s frame order still decides the tie.
+
+    Each listing also carries `on_listed_exchange` (T196, #1682 lever A):
+    whether any row of the security at or before `session`, whatever its
+    `valid_from`, is live at `session` on a venue in `universe.exchanges`."""
     exchanges = frozenset(settings.universe.exchanges)
     current: dict[str, dict[str, Any]] = {}
+    on_list: set[str] = set()
     for row in listing_ends_as_of(conn, t, settings).iter_rows(named=True):
         if row["valid_from"] > session:
             continue
+        if row["exchange"] in exchanges and _is_live(row, session):
+            on_list.add(row["security_id"])
         held = current.get(row["security_id"])
         newer = held is None or row["valid_from"] > held["valid_from"]
         # A same-day tie (#1574): prefer a venue on the universe's list over
@@ -255,7 +304,7 @@ def _current_listings(
         )
         if newer or tie_to_universe:
             current[row["security_id"]] = row
-    return current
+    return {sid: {**row, "on_listed_exchange": sid in on_list} for sid, row in current.items()}
 
 
 def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: list[str]) -> str:
@@ -270,6 +319,9 @@ def _listing_reason(listing: dict[str, Any] | None, session: date, exchanges: li
     if status not in (LISTED, TRANSFERRED):
         return f"status:{status}"
     if listing["exchange"] not in exchanges:
+        # A secondary quote on a real venue does not hide a live listing on the list.
+        if listing["on_listed_exchange"] and listing["exchange"] in _SECONDARY_VENUES:
+            return ""
         return f"exchange:{listing['exchange']}"
     return ""
 
@@ -418,6 +470,29 @@ def _class_titles(
     return out
 
 
+def _first_bar_sessions(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str]
+) -> dict[str, date]:
+    """Per security, its first stored bar session known at `t` (#1682, T190b):
+    the earliest `session` whose latest revision as of `t` has positive
+    volume, the same rows `prices_as_of(..., traded_only=True)` keeps. A
+    security with no traded bar known at `t` has no entry. A bar known only
+    after `t` is not read."""
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT security_id, min(session) FROM ("
+        "  SELECT security_id, session, volume, row_number() OVER ("
+        "    PARTITION BY security_id, session ORDER BY known_at DESC"
+        "  ) AS _rn FROM prices_daily WHERE known_at <= ?"
+        f"    AND security_id IN ({placeholders})"
+        ") WHERE _rn = 1 AND volume > 0 GROUP BY security_id",
+        [t, *ids],
+    ).fetchall()
+    return {str(sid): session for sid, session in rows}
+
+
 def shares_as_of(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -457,6 +532,16 @@ def shares_as_of(
     read as an explanation: the master dates a class by its first cover page,
     not by a reorganisation, so it would explain mis-scaled facts (#1703).
 
+    Pre-trading seed (T190b): a fact dated before the security's first stored
+    bar session known at `t` (`_first_bar_sessions`) is no baseline, and is
+    skipped, when the first fact on or after that session is more than
+    `universe.max_shares_ratio` times it (split-moved); every such seed is
+    skipped and that first post-bar fact anchors. A pre-bar fact the first
+    post-bar fact keeps in line stays the baseline, and a security with no
+    traded bar known at `t` is untouched -- so an issuer's one to several tiny
+    pre-trading registration counts no longer out-rank every later true fact,
+    without moving a normal pre-listing fact at a historical `t`.
+
     The latest date decides: ambiguous, its own value when accepted, else
     the last accepted fact. Only facts, splits, spin-offs, listings and
     securities known at `t` are read, never a later filing.
@@ -476,6 +561,7 @@ def shares_as_of(
         elif action["action_type"] == "spinoff":
             spinoffs[action["security_id"]].append(action["ex_date"])
     titles = _class_titles(conn, t, sorted(rows))
+    first_bars = _first_bar_sessions(conn, t, sorted(rows))
 
     def explained(sid: str, after: date, through: date) -> bool:
         """A spin-off known at `t` with `sid` as its child, its `ex_date` in
@@ -497,14 +583,46 @@ def shares_as_of(
         change = value / moved if moved > 0 else float("inf")
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
 
+    def seed_dates(sid: str, picks: dict[date, float | None], first_bar: date | None) -> set[date]:
+        """The dates of the pre-trading seeds to skip (T190b): every share
+        count dated before the security's first stored bar session known at
+        `t` that the first count on or after that session exceeds by more than
+        `universe.max_shares_ratio` (split-moved). Empty otherwise, so every
+        other shape keeps today's behaviour. An issuer has one to several
+        pre-bar seeds (LIN, PSKY, VTRS), so all of them are skipped, not just
+        the first, and the first post-bar fact anchors."""
+        if first_bar is None:
+            return set()
+        counts = [
+            (as_of, value)
+            for as_of, value in picks.items()
+            if value is not None and value > 0 and math.isfinite(value)
+        ]
+        nxt = next(((as_of, value) for as_of, value in counts if as_of >= first_bar), None)
+        if nxt is None:
+            return set()
+        seeds = set()
+        for as_of, value in counts:
+            if as_of >= first_bar:
+                continue
+            change = in_line(sid, (as_of, value), nxt[0], nxt[1])
+            if change is not None and change > cfg.max_shares_ratio:
+                seeds.add(as_of)
+        return seeds
+
     for sid in sorted(rows):
         picks = _date_picks(rows[sid], titles.get(sid, []))
+        seeds = seed_dates(sid, picks, first_bars.get(sid))
         base: tuple[date, float] | None = None
         run: list[tuple[date, float]] = []  # rejected facts in line with each other
         latest_ok = False
         for as_of, value in picks.items():
             latest_ok = False
             if value is None:
+                continue
+            if as_of in seeds:
+                # A pre-trading seed: skipped as a baseline (T190b); the first
+                # fact on or after the first bar session anchors.
                 continue
             if not (value > 0 and math.isfinite(value)):  # zero, negative, NaN, inf
                 # Not a share count: always rejected, never a baseline, and no
