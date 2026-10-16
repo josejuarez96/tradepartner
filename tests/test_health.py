@@ -1290,6 +1290,21 @@ def test_an_otc_same_day_pair_not_ending_in_d_still_fails(
     assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
 
 
+def test_an_otc_pair_on_a_base_longer_than_four_letters_is_not_temporary(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: the FINRA temporary symbol is the base's *fifth* character, so
+    # a longer base with a trailing `D` (`ABCDE`/`ABCDED`) is two lines.
+    for ticker in ("ABCDE", "ABCDED"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_FINRA_D_LONG", ticker, "OTC", date(2011, 4, 12)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
 def test_listing_live_after_the_next_one_started_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

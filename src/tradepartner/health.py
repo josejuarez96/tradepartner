@@ -421,6 +421,9 @@ OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
 #: reverse split opens appends this letter to the old symbol (`JFIL` ->
 #: `JFILD`). A rule of the source, not a tunable threshold.
 FINRA_TEMPORARY_SUFFIX = "D"
+#: The length of the base a FINRA temporary symbol is built on: the suffix
+#: is the base's *fifth* character, so the base itself is four letters.
+FINRA_TEMPORARY_BASE_LENGTH = 4
 #: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
 #: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
 _PLACEHOLDER_KIND = "placeholder"
@@ -2644,16 +2647,21 @@ def _same_day_typo_pair(
 def _finra_temporary_pair(current: dict[str, Any], following: dict[str, Any]) -> bool:
     """True when a same-start pair is one OTC quote under FINRA's
     fifth-letter `D` temporary symbol and its own base symbol (#1720):
-    `JFIL` and `JFILD` on one day, both off-exchange, one ticker the other
-    plus a trailing `D`. A reverse split gives the new quote the temporary
-    symbol and the OTC feed carries both from the same day, so the pair is
-    one line, not two listings. An exchange line never carries the
-    temporary symbol, so the rule stays inside `OFF_EXCHANGE` (#822)."""
+    `JFIL` and `JFILD` on one day, both off-exchange, the base a four-letter
+    symbol the temporary symbol's own prefix. A reverse split gives the new
+    quote the temporary symbol and the OTC feed carries both from the same
+    day, so the pair is one line, not two listings. An exchange line never
+    carries the temporary symbol, so the rule stays inside `OFF_EXCHANGE`
+    (#822)."""
     if current["exchange"] not in OFF_EXCHANGE or following["exchange"] not in OFF_EXCHANGE:
         return False
-    one = _resolver_ticker(str(current["ticker"]))
-    other = _resolver_ticker(str(following["ticker"]))
-    return one == other + FINRA_TEMPORARY_SUFFIX or other == one + FINRA_TEMPORARY_SUFFIX
+    shorter, longer = sorted(
+        (_resolver_ticker(str(current["ticker"])), _resolver_ticker(str(following["ticker"]))),
+        key=len,
+    )
+    return (
+        len(shorter) == FINRA_TEMPORARY_BASE_LENGTH and longer == shorter + FINRA_TEMPORARY_SUFFIX
+    )
 
 
 def _overlap_row(
