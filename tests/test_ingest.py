@@ -1597,6 +1597,18 @@ def test_rule_2_needs_the_largest_member_and_no_lettered_title(settings: Setting
     assert rows == set() and unmatched == (other,)
 
 
+def test_rule_2_never_fires_beside_an_undimensioned_total(settings: Settings) -> None:
+    # BioAtla-shaped (quant-auditor on #1727): the filing's undimensioned
+    # total and one lettered member, the unlisted Class B. The total lands on
+    # the sole common; Class B must not land beside it.
+    acc = _IBKR_PAGE.accession
+    total = _share("", 32_000_000.0, acc, _at(2019, 3, 1))
+    class_b = _share("CommonClassB", 1_490_000.0, acc, _at(2019, 3, 1))
+    rows, unmatched = _linked(settings, _link_source([_IBKR_PAGE], [total, class_b]))
+    assert rows == {(LINK, "", 32_000_000.0)}
+    assert unmatched == (class_b,)
+
+
 def test_rule_2_leaves_a_class_that_is_not_nominal_to_the_owner_override(
     settings: Settings,
 ) -> None:
@@ -1726,32 +1738,32 @@ def test_a_total_on_a_live_two_class_cik_stays_unmatched(settings: Settings) -> 
 
 
 def test_the_switch_off_changes_no_row(settings: Settings) -> None:
-    # Off, `_build_filings` passes no page list and `fact_rows` is the
-    # pre-T190d function: every fixture above, the main fixture included.
-    cases = [
-        _filings(),
-        _link_source([_BF_PAGE], [_share("NonvotingCommonStock", 3.0, _BF_PAGE.accession, NOW)]),
-        _link_source([_IBKR_PAGE], [_share("CommonClassA", 3.0, _IBKR_PAGE.accession, NOW)]),
-        _link_source(_WBD_PAGES, [_share("", 3.0, _WBD_PAGES[4].accession, NOW)]),
+    # Off, each fixture's rows are pinned: the pre-T190d result (checked on
+    # the merge base), not this code compared with itself.
+    assert settings.edgar.class_member_link is False
+    acc = _BF_PAGE.accession
+    bf = [_share("NonvotingCommonStock", 3.0, acc, NOW), _share("CommonClassA", 2.0, acc, NOW)]
+    ibkr = [
+        _share("CommonClassA", 3.0, _IBKR_PAGE.accession, NOW),
+        _share("CommonClassB", 0.001, _IBKR_PAGE.accession, NOW),
     ]
-    for source in cases:
-        master = build_master(source, settings, ingested_at=NOW)
-        classes = build_classifications(source, master, settings, ingested_at=NOW)
-        records = [f for cik in (ACME, DUAL, LINK) for f in source.facts(cik, list(FACT_NAMES))]
-        before = fact_rows(
-            records,
-            master,
-            classes,
-            ingested_at=NOW,
-            class_member_overrides=settings.edgar.class_member_overrides,
-        )
-        *_, facts, unmatched = _build_filings(source, settings, NOW)
-        assert settings.edgar.class_member_link is False
-        assert (facts, unmatched) == before
-        pages = {LINK: [p.accepted_at for p in source.cover_pages(LINK)]}
-        assert fact_rows(records, master, classes, ingested_at=NOW, cover_pages_at=pages) == (
-            fact_rows(records, master, classes, ingested_at=NOW)
-        )
+    wbd = [_share("", 3.0, _WBD_PAGES[4].accession, NOW)]
+    cases = [
+        (_link_source([_BF_PAGE], bf), {(LINK, "CommonClassA", 2.0)}, [bf[0]]),
+        (_link_source([_IBKR_PAGE], ibkr), set(), ibkr),
+        (_link_source(_WBD_PAGES, wbd), set(), wbd),
+    ]
+    for source, rows, unmatched in cases:
+        *_, facts, left = _build_filings(source, settings, NOW)
+        assert {(r["security_id"], r["class_member"], r["value"]) for r in facts} == rows
+        assert sorted(left, key=repr) == sorted(unmatched, key=repr)
+    *_, facts, left = _build_filings(_filings(), settings, NOW)
+    assert {(r["security_id"], r["class_member"], r["value"]) for r in facts} == {
+        (ACME, "", 5_000_000),
+        (DUAL, "us-gaap:CommonClassAMember", 9_000_000),
+        (DUAL_B, "us-gaap:CommonClassBMember", 1_000_000),
+    }
+    assert left == ()
 
 
 def test_dead_class_filings_below_one_is_refused(settings: Settings) -> None:
