@@ -1,0 +1,12 @@
+{
+  "synthetic": true,
+  "source_shape": "https://www.openfigi.com/api/documentation#post-v3-mapping",
+  "tickers": ["VZ", "VZ22A", "CRH", "ADR", "UNMAPPED"],
+  "responses": [
+    {"data": [{"figi": "BBG000BVG1Z4", "compositeFIGI": "BBG000BVG1Z4", "shareClassFIGI": "BBG001S5ZPM4", "securityType": "Common Stock", "securityType2": "Common Stock", "marketSector": "Equity", "name": "VERIZON COMMUNICATIONS INC", "exchCode": "US"}]},
+    {"data": [{"figi": "BBG00NOTE001", "securityType": "Medium Term Note", "securityType2": "Note", "marketSector": "Corp", "name": "VERIZON NOTE", "exchCode": "US"}]},
+    {"data": [{"figi": "BBG00COMMON1", "securityType": "Common Stock", "marketSector": "Equity", "name": "CRH PLC", "exchCode": "US"}]},
+    {"data": [{"figi": "BBG00ADR0001", "securityType": "Depositary Receipt", "marketSector": "Equity", "name": "ADR EXAMPLE", "exchCode": "US"}]},
+    {"warning": "No identifier found."}
+  ]
+}

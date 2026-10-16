@@ -939,6 +939,24 @@ class BorrowConfig(_ClosedConfig):
     raw_dir: str = Field(default_factory=_default_alpaca_assets_dir)
 
 
+class OpenfigiConfig(_ClosedConfig):
+    """Current types check; unset limits use documented keyed/keyless limits."""
+
+    enabled: bool = False
+    requests_per_window: int | None = Field(default=None, ge=1)
+    window_seconds: float | None = Field(default=None, gt=0)
+    jobs_per_request: int | None = Field(default=None, ge=1)
+    max_disagreements: int | None = Field(default=None, ge=0)
+
+    def limits(self, *, keyed: bool) -> tuple[int, float, int]:
+        """Mapping API's documented defaults, bounded even when configured."""
+        return (
+            min(self.requests_per_window or 25, 25),
+            max(self.window_seconds or (6 if keyed else 60), 6 if keyed else 60),
+            min(self.jobs_per_request or (100 if keyed else 5), 100 if keyed else 5),
+        )
+
+
 class AdjustConfig(_ClosedConfig):
     """Price-adjustment rules for `store.asof.adjusted_prices_as_of`.
 
@@ -2111,6 +2129,7 @@ class Settings(BaseSettings):
     health: HealthConfig = Field(default_factory=HealthConfig)
     # #1506 (T171c): the borrow-status snapshot, after `health` for the same reason.
     borrow: BorrowConfig = Field(default_factory=BorrowConfig)
+    openfigi: OpenfigiConfig = Field(default_factory=OpenfigiConfig)
 
     alpaca_api_key: SecretStr | None = Field(default=None)
     alpaca_api_secret: SecretStr | None = Field(default=None)
