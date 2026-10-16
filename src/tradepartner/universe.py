@@ -58,14 +58,16 @@ reported once, under the first rule it fails:
    A run of rejected facts, each in line with the one before it, that
    spans more than `universe.max_shares_age_days` re-anchors the baseline
    on its latest fact (#853), so a mis-scaled first fact cannot keep a
-   name out for good. A fact dated before the security's first trade -- the
-   later of its first listing `valid_from` and its first session, both known
-   at `t` -- is no baseline (#1682, T190b): the first fact on or after that
-   date anchors, so a tiny pre-trading seed does not out-rank every later
-   true fact. An out-of-line fact is *explained*, and accepted as
-   the new baseline, when an event known at `t` lies between its baseline's
-   `as_of_date` and its own (#1682, T190): a `spinoff` action whose child is
-   this security.
+   name out for good. A fact is a *pre-trading seed* -- and is no
+   baseline -- only when it is the first fact, dated before the security's
+   first stored bar session known at `t`, and the next fact on or after
+   that session is more than `universe.max_shares_ratio` times it (#1682,
+   T190b): then that next fact anchors, so a tiny pre-trading seed does not
+   out-rank every later true fact. Everything else keeps today's
+   behaviour, a normal pre-listing fact included. An out-of-line fact is
+   *explained*, and accepted as the new baseline, when an event known at
+   `t` lies between its baseline's `as_of_date` and its own (#1682, T190):
+   a `spinoff` action whose child is this security.
 8. `size`: companies (one `cik`) with a class that passed rules 1-7,
    ranked by market cap; the top `universe.top_n_by_cap` kept, and each of
    their classes that passed rules 1-7 admitted. A class's cap is its
@@ -99,7 +101,7 @@ import statistics
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time
+from datetime import date, datetime
 from functools import cache
 from typing import Any
 
@@ -118,8 +120,7 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.delistings import DELISTED, LISTED, TRANSFERRED, listing_ends_as_of
-from tradepartner.store.master import first_session, securities_as_of, session_of
-from tradepartner.timeutil import ensure_tz_aware_utc
+from tradepartner.store.master import securities_as_of
 
 #: ADR 0006 rules in order; a rule's number is its position plus one.
 RULES: tuple[str, ...] = (
@@ -423,32 +424,27 @@ def _class_titles(
     return out
 
 
-def _first_trade_dates(
-    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str], settings: Settings
+def _first_bar_sessions(
+    conn: duckdb.DuckDBPyConnection, t: datetime, ids: Sequence[str]
 ) -> dict[str, date]:
-    """Per security, the session its class first traded (#1682, T190b): the
-    later of the earliest `valid_from` among its `listings` rows known at `t`
-    and its first session, the session of the earliest `known_at` among its
-    non-retracted `securities` rows known at `t` (the #974 rule, the floor
-    `repair.first_sessions` uses). A side with no row known at `t` constrains
-    nothing; a security with neither has no entry, so nothing gates it. A
-    listing or session known only after `t` is not read."""
-    firsts: dict[str, date] = {}
-    for row in listings_as_of(conn, t, ids).iter_rows(named=True):
-        sid, valid_from = row["security_id"], row["valid_from"]
-        firsts[sid] = min(firsts.get(sid, valid_from), valid_from)
-    floor = datetime.combine(first_session(settings), time(12), tzinfo=UTC)
-    wanted = set(ids)
-    for sid, known in conn.execute(
-        "SELECT security_id, min(known_at) FROM securities "
-        "WHERE known_at <= ? AND NOT retracted GROUP BY ALL",
-        [t],
-    ).fetchall():
-        if str(sid) not in wanted:
-            continue
-        session = session_of(max(ensure_tz_aware_utc(known, field_name="known_at"), floor))
-        firsts[sid] = max(firsts.get(sid, session), session)
-    return firsts
+    """Per security, its first stored bar session known at `t` (#1682, T190b):
+    the earliest `session` whose latest revision as of `t` has positive
+    volume, the same rows `prices_as_of(..., traded_only=True)` keeps. A
+    security with no traded bar known at `t` has no entry. A bar known only
+    after `t` is not read."""
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT security_id, min(session) FROM ("
+        "  SELECT security_id, session, volume, row_number() OVER ("
+        "    PARTITION BY security_id, session ORDER BY known_at DESC"
+        "  ) AS _rn FROM prices_daily WHERE known_at <= ?"
+        f"    AND security_id IN ({placeholders})"
+        ") WHERE _rn = 1 AND volume > 0 GROUP BY security_id",
+        [t, *ids],
+    ).fetchall()
+    return {str(sid): session for sid, session in rows}
 
 
 def shares_as_of(
@@ -490,12 +486,15 @@ def shares_as_of(
     read as an explanation: the master dates a class by its first cover page,
     not by a reorganisation, so it would explain mis-scaled facts (#1703).
 
-    Pre-trading seed (T190b): a fact dated before the security's first trade
-    -- the later of its first listing `valid_from` and its first session
-    (`_first_trade_dates`), both read at `t` -- is no baseline and is skipped;
-    the first fact on or after that date anchors. So an issuer's tiny
-    pre-trading registration count never makes every later true fact out of
-    line.
+    Pre-trading seed (T190b): the first fact is no baseline, and is skipped,
+    only when it is dated before the security's first stored bar session
+    known at `t` (`_first_bar_sessions`) *and* the next fact on or after that
+    session is more than `universe.max_shares_ratio` times it (split-moved);
+    then that next fact anchors. A fact before the first bar that a later
+    fact keeps in line stays the baseline, and a security with no traded bar
+    known at `t` is untouched -- so an issuer's tiny pre-trading registration
+    count no longer out-ranks every later true fact, without moving a normal
+    pre-listing fact at a historical `t`.
 
     The latest date decides: ambiguous, its own value when accepted, else
     the last accepted fact. Only facts, splits, spin-offs, listings and
@@ -516,7 +515,7 @@ def shares_as_of(
         elif action["action_type"] == "spinoff":
             spinoffs[action["security_id"]].append(action["ex_date"])
     titles = _class_titles(conn, t, sorted(rows))
-    firsts = _first_trade_dates(conn, t, sorted(rows), settings)
+    first_bars = _first_bar_sessions(conn, t, sorted(rows))
 
     def explained(sid: str, after: date, through: date) -> bool:
         """A spin-off known at `t` with `sid` as its child, its `ex_date` in
@@ -538,9 +537,30 @@ def shares_as_of(
         change = value / moved if moved > 0 else float("inf")
         return None if 1 / cfg.max_shares_ratio <= change <= cfg.max_shares_ratio else change
 
+    def seed_date(sid: str, picks: dict[date, float | None], first_bar: date | None) -> date | None:
+        """The first fact's date when it is a pre-trading seed (T190b): it is
+        the first share count, dated before the security's first stored bar
+        session known at `t`, and the next fact on or after that session is
+        more than `universe.max_shares_ratio` times it (split-moved). `None`
+        otherwise, so every other shape keeps today's behaviour."""
+        if first_bar is None:
+            return None
+        counts = [
+            (as_of, value)
+            for as_of, value in picks.items()
+            if value is not None and value > 0 and math.isfinite(value)
+        ]
+        if not counts or counts[0][0] >= first_bar:
+            return None
+        nxt = next(((as_of, value) for as_of, value in counts if as_of >= first_bar), None)
+        if nxt is None:
+            return None
+        change = in_line(sid, counts[0], nxt[0], nxt[1])
+        return counts[0][0] if change is not None and change > cfg.max_shares_ratio else None
+
     for sid in sorted(rows):
-        first = firsts.get(sid)
         picks = _date_picks(rows[sid], titles.get(sid, []))
+        seed = seed_date(sid, picks, first_bars.get(sid))
         base: tuple[date, float] | None = None
         run: list[tuple[date, float]] = []  # rejected facts in line with each other
         latest_ok = False
@@ -548,10 +568,9 @@ def shares_as_of(
             latest_ok = False
             if value is None:
                 continue
-            if first is not None and as_of < first:
-                # A pre-trading seed: dated before the class's first listing
-                # or first session, it is no baseline (T190b); the next fact
-                # on or after `first` anchors.
+            if as_of == seed:
+                # A pre-trading seed: skipped as a baseline (T190b); the next
+                # fact on or after the first bar session anchors.
                 continue
             if not (value > 0 and math.isfinite(value)):  # zero, negative, NaN, inf
                 # Not a share count: always rejected, never a baseline, and no
