@@ -1241,6 +1241,55 @@ def test_same_day_pair_is_one_alpaca_symbol_is_not_an_overlap(
     assert check.passed, check.violations
 
 
+def test_finra_temporary_d_symbol_beside_its_base_is_not_an_overlap(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # #1720: JFIL/JFILD, one OTC security quoted from the same day under its
+    # base symbol and its FINRA fifth-letter "D" temporary symbol (the mark
+    # of a new quote after a reverse split: JFIL + D): one line, not two
+    # listings. Neither `_same_line` (tickers differ) nor the held-ticker
+    # typo rule nor `same_alpaca_symbol` excuses the pair today.
+    for ticker in ("JFIL", "JFILD"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_FINRA_D", ticker, "OTC", date(2011, 4, 12)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    check = next(c for c in checks if c.rule == NON_OVERLAPPING_LISTINGS)
+    assert check.passed, check.violations
+
+
+def test_finra_d_suffix_on_an_exchange_is_still_a_second_listing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: the tolerance is the OTC quote's own temporary symbol, not any
+    # "+D" ticker. Two exchange lines starting the same day still fail.
+    for ticker in ("EXCH", "EXCHD"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_FINRA_D_EXCH", ticker, "NASDAQ", date(2019, 6, 3)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
+def test_an_otc_same_day_pair_not_ending_in_d_still_fails(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # Control: an OTC same-day pair whose tickers are not one-plus-"D" is
+    # still a genuine overlap.
+    for ticker in ("JFIL", "JFILX"):
+        insert_row(
+            fixture_store,
+            "listings",
+            _listing_row("SEC_FINRA_D_NO", ticker, "OTC", date(2011, 4, 12)),
+        )
+    checks = integrity_checks(fixture_store, T_END, _settings())
+    assert _failed(checks) == {NON_OVERLAPPING_LISTINGS}
+
+
 def test_listing_live_after_the_next_one_started_fails_its_rule(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:

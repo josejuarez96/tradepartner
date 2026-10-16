@@ -195,13 +195,16 @@ derived at `t`, as the data is read.
   fact to test: the derived end of a delisted or transferred listing is
   clipped before the next listing's start by construction (spec req 4). A
   listing with no Form 25 is superseded by the next one (a ticker change), as
-  the as-of reads treat it. Two cases are not a second line (#822): rows of
-  the same ticker starting the same day, which differ only in the exchange
-  their filers tagged (or the class title's wording), are one line; and a
-  row on `OFF_EXCHANGE` (NONE or OTC) is no exchange line at all (the normal
-  suspension, OTC quote, late Form 25 sequence), so a late filing is tested
-  against the next row that is neither. Every other same-start pair of
-  different tickers fails unless the owner lists it in
+  the as-of reads treat it. Three cases are not a second line (#822,
+  #1720): rows of the same ticker starting the same day, which differ only in
+  the exchange their filers tagged (or the class title's wording), are one
+  line; a row on `OFF_EXCHANGE` (NONE or OTC) is no exchange line at all (the
+  normal suspension, OTC quote, late Form 25 sequence), so a late filing is
+  tested against the next row that is neither; and a same-start OTC pair
+  where one ticker is the other plus FINRA's fifth-letter `D` temporary
+  symbol (`JFIL`/`JFILD`) is one line, the new quote a reverse split opens.
+  Every other same-start pair of different tickers fails unless the owner
+  lists it in
   `universe.accepted_same_day_pairs` (#855). An accepted pair counts as one
   line: a late Form 25 on its rows is still tested, against the next
   exchange line after that day, and the report lists the pair.
@@ -414,6 +417,10 @@ _COMMON = "common"
 #: registered with no exchange ("None") or quoted over the counter: a row on
 #: one of them is never a second exchange line (#822).
 OFF_EXCHANGE: frozenset[str] = frozenset({"NONE", "OTC"})
+#: FINRA's fifth-letter temporary-symbol suffix (#1720): the new quote a
+#: reverse split opens appends this letter to the old symbol (`JFIL` ->
+#: `JFILD`). A rule of the source, not a tunable threshold.
+FINRA_TEMPORARY_SUFFIX = "D"
 #: `_row_kind`'s result for a placeholder-ticker row (#846): never `EQUITY`,
 #: matching `ListingResolver`'s own `_PLACEHOLDER` kind.
 _PLACEHOLDER_KIND = "placeholder"
@@ -2634,6 +2641,21 @@ def _same_day_typo_pair(
     )
 
 
+def _finra_temporary_pair(current: dict[str, Any], following: dict[str, Any]) -> bool:
+    """True when a same-start pair is one OTC quote under FINRA's
+    fifth-letter `D` temporary symbol and its own base symbol (#1720):
+    `JFIL` and `JFILD` on one day, both off-exchange, one ticker the other
+    plus a trailing `D`. A reverse split gives the new quote the temporary
+    symbol and the OTC feed carries both from the same day, so the pair is
+    one line, not two listings. An exchange line never carries the
+    temporary symbol, so the rule stays inside `OFF_EXCHANGE` (#822)."""
+    if current["exchange"] not in OFF_EXCHANGE or following["exchange"] not in OFF_EXCHANGE:
+        return False
+    one = _resolver_ticker(str(current["ticker"]))
+    other = _resolver_ticker(str(following["ticker"]))
+    return one == other + FINRA_TEMPORARY_SUFFIX or other == one + FINRA_TEMPORARY_SUFFIX
+
+
 def _overlap_row(
     current: dict[str, Any], flagged: dict[str, Any], filing_session: date | None
 ) -> dict[str, Any]:
@@ -2673,6 +2695,7 @@ def _overlapping_listings(
                 if same_start
                 and not _same_line(current, following)
                 and not _same_day_typo_pair(ordered, i, current, following)
+                and not _finra_temporary_pair(current, following)
                 else None
             )
             filed = current["delisting_filed_at"]
