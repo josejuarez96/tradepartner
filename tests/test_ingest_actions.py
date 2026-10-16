@@ -27,6 +27,7 @@ from tradepartner.adapters.prices import (
     action_first_seen_known_at,
 )
 from tradepartner.backfill import month_windows
+from tradepartner.config import Settings
 from tradepartner.ingest import _add_actions, _replay_actions, _replay_plan
 from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.schema import init_schema
@@ -407,6 +408,110 @@ def test_spinoff_waits_for_stamp_and_second_run_is_idempotent(
         "SELECT security_id, source_action_id, known_at FROM corporate_actions "
         "WHERE action_type = 'spinoff'"
     ).fetchall() == [("CHILD", "PARENT", stamp)]
+
+
+def test_spinoff_known_at_is_raised_to_the_ex_date_floor(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1712: known_at = max(source stamp, session_close(previous_session(ex_date)))."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+    from tradepartner.calendar import previous_session, session_close
+
+    ex = date(2024, 10, 1)
+    floor = session_close(previous_session(ex))
+    early = announcement_date_known_at(date(2024, 7, 10))  # Curbline's bulk process_date
+    late = announcement_date_known_at(date(2024, 9, 30))
+    assert early < floor < late
+    actions = [
+        _action(ex, kind=ActionType.SPINOFF, source_id="EARLY", known_at=early),
+        _action(ex, kind=ActionType.SPINOFF, source_id="LATE", known_at=late),
+    ]
+    at = datetime(2024, 10, 2, 22, tzinfo=UTC)
+    assert _add_actions(conn, actions, (ex, date(2024, 10, 31)), ingested_at=at) == 2
+    assert conn.execute(
+        "SELECT source_action_id, known_at FROM corporate_actions "
+        "WHERE action_type = 'spinoff' ORDER BY source_action_id"
+    ).fetchall() == [("EARLY", floor), ("LATE", late)]
+
+
+def test_spinoff_revision_order_survives_the_ex_date_floor(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """#1712 (code-review on #1717): raising a stamp to the floor must not let
+    a superseded revision win. The older revision's ex-date is later, so its
+    floor is later; the newer revision moves the ex-date earlier and must
+    still be the one stored."""
+    from tradepartner.adapters.prices import announcement_date_known_at
+
+    late_ex, early_ex = date(2024, 11, 1), date(2024, 10, 1)
+    older = CorporateAction(
+        "CHILD",
+        ActionType.SPINOFF,
+        late_ex,
+        2.0,
+        announcement_date_known_at(date(2024, 7, 10)),
+        "alpaca",
+        source_action_id="PARENT",
+    )
+    newer = CorporateAction(
+        "CHILD",
+        ActionType.SPINOFF,
+        early_ex,
+        3.0,
+        announcement_date_known_at(date(2024, 8, 15)),
+        "alpaca",
+        source_action_id="PARENT",
+    )
+    at = datetime(2024, 11, 15, 22, tzinfo=UTC)
+    assert (
+        _add_actions(conn, [older, newer], (date(2024, 9, 1), date(2024, 11, 30)), ingested_at=at)
+        == 1
+    )
+    assert conn.execute(
+        "SELECT ex_date, ratio_or_amount FROM corporate_actions WHERE action_type = 'spinoff'"
+    ).fetchall() == [(early_ex, 3.0)]
+
+
+def test_the_backfill_path_store_passes_the_spinoff_known_at_floor_rule(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+) -> None:
+    """#1712: the fixture universe and one Alpaca spin-off payload, written by
+    the backfill path, clear health's `spinoff_known_at_floor` rule."""
+    from tradepartner.adapters.alpaca_prices import ListingResolver, parse_corporate_actions
+    from tradepartner.health import SPINOFF_KNOWN_AT_FLOOR, integrity_checks
+
+    source = FixturePriceSource(UNIVERSE_DIR)
+    ids = [row[0] for row in _fixture_ids()]
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    for first, last in month_windows(date(2017, 1, 1), date(2020, 6, 30)):
+        at += timedelta(seconds=1)
+        actions, covered = _replay(
+            conn, source, source.corporate_actions(ids, first, last), (first, last)
+        )
+        _add_actions(conn, actions, (first, last), ingested_at=at, covered=covered)
+    resolver = ListingResolver(
+        [
+            {"security_id": "PARENT", "ticker": "SRC", "valid_from": date(2020, 1, 2)},
+            {"security_id": "CHILD", "ticker": "NEW", "valid_from": date(2024, 10, 1)},
+        ]
+    )
+    row = {
+        "id": "spin",
+        "source_symbol": "SRC",
+        "new_symbol": "NEW",
+        "ex_date": "2024-10-01",
+        "process_date": "2024-07-10",
+        "source_rate": 2,
+        "new_rate": 1,
+    }
+    [spin] = parse_corporate_actions({"spin_offs": [row]}, resolver.resolve).actions
+    window, at = (date(2024, 10, 1), date(2024, 10, 31)), datetime(2026, 1, 1, 1, tzinfo=UTC)
+    assert _add_actions(conn, [spin], window, ingested_at=at) == 1
+    check = next(
+        c for c in integrity_checks(conn, at, settings) if c.rule == SPINOFF_KNOWN_AT_FLOOR
+    )
+    assert check.violations.is_empty()
 
 
 def test_symbol_change_revision_is_stamped_at_ingest(

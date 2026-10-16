@@ -320,6 +320,22 @@ def action_first_seen_known_at(ex_date: date, *, announced_at: datetime | None =
     return proxy
 
 
+def spinoff_known_at_floor(ex_date: date) -> datetime | None:
+    """The earliest `known_at` a stored spin-off may carry (#1712): the close
+    of the last XNYS session strictly before `ex_date`, since a spin-off's
+    terms (its ratio) are not final before then. `None` when `ex_date` has no
+    such session in the configured calendar range.
+
+    Health's `spinoff_known_at_floor` rule rejects a row stamped before this,
+    and the writer stamps a spin-off at `max(source stamp, floor)`, so the two
+    read one definition and can never disagree.
+    """
+    try:
+        return action_first_seen_known_at(ex_date)
+    except (ValueError, IndexError):
+        return None
+
+
 def announcement_date_known_at(day: date) -> datetime:
     """`announced_at` for a source that gives only an announcement date
     (spec req 5): the XNYS close of the first session strictly after `day`.

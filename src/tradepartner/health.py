@@ -347,7 +347,7 @@ from tradepartner.adapters.alpaca_prices import (
     is_same_day_typo,
     same_alpaca_symbol,
 )
-from tradepartner.adapters.prices import announcement_date_known_at
+from tradepartner.adapters.prices import announcement_date_known_at, spinoff_known_at_floor
 from tradepartner.adapters.rates import rate_known_at
 from tradepartner.calendar import (
     all_sessions,
@@ -2369,10 +2369,7 @@ def _new_action_stamp_rules(conn: duckdb.DuckDBPyConnection) -> dict[str, pl.Dat
             "WHERE action_type = 'spinoff'"
         ).fetchall()
         for security_id, ex_date, stamp in rows:
-            try:
-                floor = session_close(previous_session(ex_date))
-            except (ValueError, IndexError):
-                floor = None
+            floor = spinoff_known_at_floor(ex_date)
             if floor is None or stamp < floor:
                 bad_spin.append({"security_id": security_id, "known_at": stamp})
     bad_change: list[dict[str, Any]] = []
