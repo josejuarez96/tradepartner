@@ -239,7 +239,13 @@ from tradepartner.adapters.filings import (
     FilingSource,
     StatementFactRecord,
 )
-from tradepartner.adapters.prices import Bar, CorporateAction, PriceSource, SymbolChange
+from tradepartner.adapters.prices import (
+    Bar,
+    CorporateAction,
+    PriceSource,
+    SymbolChange,
+    spinoff_known_at_floor,
+)
 from tradepartner.adapters.rates import RateObservation, RateSource, rate_known_at
 from tradepartner.adapters.stamp_repair import (
     MANIFEST_COLUMNS,
@@ -3183,7 +3189,10 @@ def _add_actions(
     identity never stored adds nothing.
 
     Replacements are stamped at `ingested_at`, never at a first-seen proxy
-    (look-ahead). A first-seen id row whose `(security_id, action_type,
+    (look-ahead). A spin-off not yet knowable is skipped as before, but its
+    stamp is first raised to `spinoff_known_at_floor(ex_date)` (#1712), so a
+    stored spin-off is never stamped before the close of the session before
+    its ex-date. A first-seen id row whose `(security_id, action_type,
     ex_date)` is a live stored id-less key cancels that key (once, however
     many ids share it). When exactly one live id-less key of a security and
     type in `window` is gone from the answer and exactly one new key of that
@@ -3197,11 +3206,19 @@ def _add_actions(
     """
     rows = []
     for action in actions:
-        if action.action_type.value == "spinoff" and action.known_at > ingested_at:
-            if stats is not None:
-                stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
-            continue
-        rows.append(_action_row(action, ingested_at))
+        row = _action_row(action, ingested_at)
+        if action.action_type.value == "spinoff":
+            # A spin-off is stamped no earlier than health's floor (#1712):
+            # max(source stamp, session_close(previous_session(ex_date))), the
+            # same helper health's `spinoff_known_at_floor` rule reads.
+            floor = spinoff_known_at_floor(action.ex_date)
+            if floor is not None and row["known_at"] < floor:
+                row["known_at"] = floor
+            if row["known_at"] > ingested_at:
+                if stats is not None:
+                    stats["actions_not_yet_known"] = stats.get("actions_not_yet_known", 0) + 1
+                continue
+        rows.append(row)
     history = _stored_actions(conn, rows, window)
     first, last = window
     lo, hi = covered or window
