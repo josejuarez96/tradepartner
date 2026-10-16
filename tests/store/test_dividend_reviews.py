@@ -84,12 +84,12 @@ def test_the_amount_is_the_stored_double_exactly() -> None:
 
 
 def test_the_committed_list_pins_its_counts() -> None:
-    """193 groups (183 at the amendment, 10 added by #1666): a later edit is deliberate."""
+    """195 groups (183 at the amendment, 10 by #1666, 2 by #1720): a later edit is deliberate."""
     groups = reviewed_groups()
-    assert Counter(g.verdict for g in groups) == {"duplicate": 179, "distinct": 11, "unresolved": 3}
+    assert Counter(g.verdict for g in groups) == {"duplicate": 180, "distinct": 12, "unresolved": 3}
     assert all(g.evidence for g in groups)
     assert min(g.ex_date for g in groups) == date(2019, 6, 27)
-    assert max(g.ex_date for g in groups) == date(2026, 9, 30)
+    assert max(g.ex_date for g in groups) == date(2026, 10, 15)
 
 
 @pytest.mark.parametrize(
@@ -98,6 +98,8 @@ def test_the_committed_list_pins_its_counts() -> None:
         ("AIV", date(2020, 11, 3), 8.2, "duplicate"),
         ("TDG", date(2025, 9, 2), 90.0, "duplicate"),
         ("MKTW", date(2026, 3, 18), 0.2, "duplicate"),
+        ("PNNT", date(2026, 10, 15), 0.04, "distinct"),
+        ("PFLT", date(2026, 10, 15), 0.0033, "duplicate"),
         ("F", date(2025, 2, 18), 0.15, "distinct"),
         ("CHRD", date(2023, 11, 13), 1.25, "distinct"),
         ("MKTW", date(2025, 8, 15), 0.2, "distinct"),
@@ -123,6 +125,11 @@ def test_the_listing_gap_groups_are_unresolved() -> None:
     ]
 
 
+#: The owner-side raw export's own last ex_date (#1613/#1666 snapshot): a
+#: duplicate added after it has no raw pair the local export can check.
+RAW_EXPORT_LAST_EX_DATE = date(2026, 10, 1)
+
+
 @pytest.mark.skipif(not RAW_EXPORT.exists(), reason="the owner-side raw export is local only")
 def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
     export = json.loads(RAW_EXPORT.read_text())
@@ -131,9 +138,15 @@ def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
         for g in export
     }
     duplicates = [g for g in reviewed_groups() if g.verdict == "duplicate"]
-    assert len(duplicates) == 179
+    assert len(duplicates) == 180
     for group in duplicates:
-        pair = ids[group.key]
+        pair = ids.get(group.key)
+        if pair is None:
+            # Only a group added after the export's snapshot (#1720's
+            # 2026-10-15 PFLT pair) may lack a raw pair here; the check
+            # stays strict for every group the export does cover.
+            assert group.ex_date > RAW_EXPORT_LAST_EX_DATE, group.key
+            continue
         assert len(pair) == 2
         assert group.retract_source_action_id == max(pair)
 
