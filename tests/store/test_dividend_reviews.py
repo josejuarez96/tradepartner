@@ -125,6 +125,11 @@ def test_the_listing_gap_groups_are_unresolved() -> None:
     ]
 
 
+#: The owner-side raw export's own last ex_date (#1613/#1666 snapshot): a
+#: duplicate added after it has no raw pair the local export can check.
+RAW_EXPORT_LAST_EX_DATE = date(2026, 10, 1)
+
+
 @pytest.mark.skipif(not RAW_EXPORT.exists(), reason="the owner-side raw export is local only")
 def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
     export = json.loads(RAW_EXPORT.read_text())
@@ -137,9 +142,10 @@ def test_every_retract_id_is_the_greater_of_its_groups_two_ids() -> None:
     for group in duplicates:
         pair = ids.get(group.key)
         if pair is None:
-            # The export is a snapshot through 2026-10-01 (it was built for
-            # #1613/#1666): a group listed after it (#1720's 2026-10-15 PFLT
-            # pair) has no raw pair here to check.
+            # Only a group added after the export's snapshot (#1720's
+            # 2026-10-15 PFLT pair) may lack a raw pair here; the check
+            # stays strict for every group the export does cover.
+            assert group.ex_date > RAW_EXPORT_LAST_EX_DATE, group.key
             continue
         assert len(pair) == 2
         assert group.retract_source_action_id == max(pair)
