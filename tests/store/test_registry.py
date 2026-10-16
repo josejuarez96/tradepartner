@@ -1122,7 +1122,7 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # (#1506, the 2026-10-11 amendment) -- none is read by a reader a
         # registered trial uses. `symbol_changes` is not a store table until
         # T172b lands it, so it is classified here ahead of that task.
-        excluded = {"rates", "borrow_status", "symbol_changes"}
+        excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types"}
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
         # be classified on one side. `symbol_changes` is the amendment's

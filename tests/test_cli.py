@@ -209,6 +209,25 @@ def test_ingest_runs_the_session_and_exits_zero_when_every_source_is_ok(
     assert "edgar" in result.output and "alpaca" in result.output
 
 
+def test_openfigi_is_explicit_only(monkeypatch: pytest.MonkeyPatch, secrets_set: Settings) -> None:
+    secrets_set.openfigi.enabled = True
+    figi = _patched(monkeypatch, "ingest_openfigi", _ok("openfigi"))
+    session = _patched(monkeypatch, "ingest_session", _ok("edgar", "alpaca"))
+    explicit = _invoke(secrets_set, ["ingest", "--source", "openfigi"])
+    assert explicit.exit_code == 0, explicit.output
+    assert len(figi.calls) == 1
+    all_run = _invoke(secrets_set, ["ingest", "--source", "all"])
+    assert all_run.exit_code == 0, all_run.output
+    assert len(figi.calls) == 1
+    assert session.calls[-1]["source"] == "all"
+
+
+def test_openfigi_disabled_by_default(tmp_path: Path) -> None:
+    result = _invoke(_settings(tmp_path), ["ingest", "--source", "openfigi"])
+    assert result.exit_code == 2
+    assert "openfigi.enabled" in result.output
+
+
 def test_ingest_exits_non_zero_when_a_source_is_stale(
     monkeypatch: pytest.MonkeyPatch, secrets_set: Settings
 ) -> None:

@@ -425,6 +425,7 @@ from tradepartner.ingest import (
     import_assets,
     ingest_actions_backfill,
     ingest_assets,
+    ingest_openfigi,
     ingest_rates,
     ingest_session,
     manifest_release,
@@ -1757,7 +1758,10 @@ def make_app(
     def ingest(
         source: Annotated[
             str,
-            typer.Option(help="alpaca, edgar, fred, alpaca_assets or all", show_default=True),
+            typer.Option(
+                help="alpaca, edgar, fred, alpaca_assets, openfigi or all",
+                show_default=True,
+            ),
         ] = "all",
         backfill_: Annotated[
             bool, typer.Option("--backfill", help="backfill from --since, resuming")
@@ -1842,15 +1846,18 @@ def make_app(
         ] = None,
     ) -> None:
         """Bring the store up to the expected session, or backfill it."""
-        if source not in ("all", *SOURCES, ASSETS_SOURCE):
+        if source not in ("all", *SOURCES, ASSETS_SOURCE, "openfigi"):
             raise _fail(
-                f"--source must be all, {' or '.join((*SOURCES, ASSETS_SOURCE))}; got {source!r}",
+                "--source must be all, "
+                f"{' or '.join((*SOURCES, ASSETS_SOURCE, 'openfigi'))}; got {source!r}",
                 USAGE_ERROR,
             )
         if import_dir is not None and source != ASSETS_SOURCE:
             raise _fail(f"--import-dir needs --source {ASSETS_SOURCE}", USAGE_ERROR)
         if source == ASSETS_SOURCE and backfill_:
             raise _fail(f"--source {ASSETS_SOURCE} has no backfill", USAGE_ERROR)
+        if source == "openfigi" and backfill_:
+            raise _fail("--source openfigi has no backfill", USAGE_ERROR)
         if actions_backfill:
             if source != "alpaca" or backfill_ or fill_holes_:
                 raise _fail(
@@ -1875,7 +1882,7 @@ def make_app(
             ("--rebuild-filing-events", rebuild_filing_events),
             ("--rebuild-classifications", rebuild_classifications),
         ):
-            if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE)):
+            if given and (backfill_ or source in ("alpaca", "fred", ASSETS_SOURCE, "openfigi")):
                 raise _fail(f"{flag} is for a session ingest with the edgar source", USAGE_ERROR)
         restamp: list[ManifestRow] | None = None
         restamped: list[RestampResult] = []
@@ -1918,6 +1925,8 @@ def make_app(
             except ValueError:
                 raise _fail(f"--through must be YYYY-MM-DD, got {through!r}", USAGE_ERROR) from None
         s = settings()
+        if source == "openfigi" and not s.openfigi.enabled:
+            raise _fail("--source openfigi needs openfigi.enabled=true", USAGE_ERROR)
         if actions_backfill:
             assert start is not None
             if start < s.alpaca.actions_backfill_floor:
@@ -1985,6 +1994,10 @@ def make_app(
             raise typer.Exit(result.exit_code)
         if source == ASSETS_SOURCE:
             result = ingest_assets(s, lambda: assets_source(s, clock), clock=clock, dry_run=dry_run)
+            _print_result(result)
+            raise typer.Exit(result.exit_code)
+        if source == "openfigi":
+            result = ingest_openfigi(s, clock=clock, dry_run=dry_run)
             _print_result(result)
             raise typer.Exit(result.exit_code)
         filings = EdgarFilingSource(

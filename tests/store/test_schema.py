@@ -52,6 +52,7 @@ FACT_TABLES: tuple[str, ...] = (
     "rates",
     "borrow_status",
     "symbol_changes",
+    "openfigi_types",
 )
 
 
@@ -179,6 +180,19 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "borrow_status": "easy_to_borrow",
             "fractionable": True,
             "present": True,
+        }
+    elif table == "openfigi_types":
+        business = {
+            "security_id": "S1",
+            "ticker": "TST",
+            "figi": "BBG1",
+            "composite_figi": "BBG1",
+            "share_class_figi": "BBG2",
+            "security_type": "Common Stock",
+            "security_type2": "Common Stock",
+            "market_sector": "Equity",
+            "name": "Test",
+            "exch_code": "US",
         }
     else:
         raise ValueError(f"no minimal row defined for {table!r}")
@@ -621,7 +635,7 @@ def test_migrating_a_genuine_pre_version_10_store_creates_statement_facts() -> N
         ).fetchall()
         assert len(constraints) == 1
         assert set(constraints[0][1]) == {"cik", "fact_name", "period_end", "period_days"}
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (28,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (29,)
     finally:
         conn.close()
 
@@ -770,9 +784,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -952,9 +966,9 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29]
         schema.init_schema(conn)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["rates"] == _shape(fresh)["rates"]
@@ -1132,9 +1146,9 @@ def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (0,)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29]
         schema.init_schema(conn)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["borrow_status"] == _shape(fresh)["borrow_status"]
@@ -1270,15 +1284,15 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
         assert sum(len(rows) for rows in rows_before.values()) >= 3
         schema.init_schema(conn)
         shape_after = _shape(conn)
-        assert set(shape_after) - set(shape_before) == {"symbol_changes"}
+        assert set(shape_after) - set(shape_before) == {"symbol_changes", "openfigi_types"}
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
             "classifications",
         }
         assert _all_rows(conn, tables_before) == rows_before
-        assert _versions(conn) == [25, 26, 27, 28]
+        assert _versions(conn) == [25, 26, 27, 28, 29]
         schema.init_schema(conn)
-        assert _versions(conn) == [25, 26, 27, 28]
+        assert _versions(conn) == [25, 26, 27, 28, 29]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         for table in ("listings", "classifications"):
@@ -1443,9 +1457,9 @@ def test_the_version_28_migration_adds_symbol_changes_and_nothing_else() -> None
         assert {i: indexes_after[i] for i in indexes_before} == indexes_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
-        assert _versions(conn) == [27, 28]
+        assert _versions(conn) == [27, 28, 29]
         schema.init_schema(conn)
-        assert _versions(conn) == [27, 28]
+        assert _versions(conn) == [27, 28, 29]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["symbol_changes"] == _shape(fresh)["symbol_changes"]
@@ -1453,6 +1467,24 @@ def test_the_version_28_migration_adds_symbol_changes_and_nothing_else() -> None
             indexes_after["symbol_changes_identity"] == _indexes(fresh)["symbol_changes_identity"]
         )
         fresh.close()
+    finally:
+        conn.close()
+
+
+def test_version_29_adds_openfigi_types_without_touching_prior_rows() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE openfigi_types")
+        conn.execute("DELETE FROM schema_version WHERE version = 29")
+        conn.execute("INSERT INTO schema_version VALUES (28, TIMESTAMPTZ '2026-10-15 00:00:00+00')")
+        before = _all_rows(conn, sorted(set(_shape(conn)) - {"schema_version"}))
+        schema.init_schema(conn)
+        assert _versions(conn)[-2:] == [28, 29]
+        assert conn.execute("SELECT COUNT(*) FROM openfigi_types").fetchone() == (0,)
+        assert _all_rows(conn, sorted(before)) == before
+        schema.init_schema(conn)
+        assert _versions(conn)[-2:] == [28, 29]
     finally:
         conn.close()
 
@@ -1557,7 +1589,7 @@ def test_migrating_a_genuine_version_12_store_adds_the_six_columns_and_keeps_eve
             "n_excluded_malformed, n_derived FROM trial_rebalances"
         ).fetchall()
         assert rows == [(1, 15.0, 10, None, None, None, None, None, None)]
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (28,)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (29,)
     finally:
         conn.close()
 
@@ -1697,6 +1729,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
             26,
             27,
             28,
+            29,
         ]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
@@ -2199,7 +2232,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     `filing_name` in the two master tables' allowed sets (T184d) is version
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28."""
-    assert schema.CURRENT_SCHEMA_VERSION == 28
+    assert schema.CURRENT_SCHEMA_VERSION == 29
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------

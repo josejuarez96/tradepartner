@@ -7,7 +7,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,13 @@ from tradepartner.cli_record import SCRUBBED, scrub_json
 from tradepartner.config import OpenfigiConfig
 
 _ENDPOINT = "https://api.openfigi.com/v3/mapping"
+
+
+def _utc_clock(clock: Callable[[], datetime]) -> datetime:
+    value = clock()
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("OpenFIGI clock must be UTC-aware")
+    return value
 
 
 def _api_key() -> str:
@@ -61,7 +68,7 @@ def map_tickers(
                     while recent and now - recent[0] >= window:
                         recent.popleft()
                 recent.append(now)
-                sent = clock()
+                sent = _utc_clock(clock)
                 try:
                     response = client.post(_ENDPOINT, json=body, headers=headers)
                     if response.status_code == 429 and attempt == 0:
@@ -71,7 +78,9 @@ def map_tickers(
                     payload = response.json()
                 except (httpx.HTTPError, ValueError):
                     raise RuntimeError("OpenFIGI mapping request failed") from None
-                received = clock()
+                received = _utc_clock(clock)
+                if received <= sent:
+                    raise ValueError("OpenFIGI response clock must follow request clock")
                 break
             if not isinstance(payload, list) or len(payload) != len(body):
                 raise ValueError("OpenFIGI mapping response has wrong length")

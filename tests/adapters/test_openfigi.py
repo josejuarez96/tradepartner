@@ -20,3 +20,13 @@ def test_parse_synthetic_mapping_fixture() -> None:
         None,
     ]
     assert rows[0] is not None and rows[0].share_class_figi == "BBG001S5ZPM4"
+
+
+def test_multiple_us_results_have_stable_composite_choice() -> None:
+    ordinary = {"figi": "BBG2", "compositeFIGI": "BBG1", "exchCode": "US"}
+    composite = {"figi": "BBG1", "compositeFIGI": "BBG1", "exchCode": "US"}
+    assert parse_mapping([{"data": [ordinary, composite]}]) == parse_mapping(
+        [{"data": [composite, ordinary]}]
+    )
+    assert parse_mapping([{"data": [ordinary, composite]}])[0].figi == "BBG1"
+    assert parse_mapping([{"data": [{"figi": "OTHER", "exchCode": "LN"}]}]) == [None]
