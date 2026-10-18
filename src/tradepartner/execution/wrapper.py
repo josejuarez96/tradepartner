@@ -727,24 +727,22 @@ class RiskGatedBroker:
 
     def _alert_skips(self, run: PaperRunRow, skips: Sequence[Skip]) -> None:
         """One `skipped` alert for the run naming every per-name skip (the three
-        allowlist reasons) by security id and reason. A write that fails is logged,
-        never raised: the skip is already journaled and the run has traded."""
+        allowlist reasons) by security id and reason. The alerter dedupes on
+        (kind, run), so a second call in one run is a no-op."""
         named = [s for s in skips if s.reason in _ALERTED_SKIPS]
         if not named or run.run_id is None:
             return
         message = self._scrub(
             f"{len(named)} skipped: " + "; ".join(f"{s.security_id} {s.reason}" for s in named)
         )
-        try:
-            self._alerter.write(
-                "skipped",
-                run.run_id,
-                self._session(run, self.read_clock),
-                message,
-                book_id=self._run_book(run),
-            )
-        except Exception as exc:
-            _logger.warning("skipped alert not written (%s)", type(exc).__name__)
+        # No guard, as the run's other alerts (`run._alert`): an error takes the fault path.
+        self._alerter.write(
+            "skipped",
+            run.run_id,
+            self._session(run, self.read_clock),
+            message,
+            book_id=self._run_book(run),
+        )
 
     def _trade(
         self,
@@ -823,7 +821,11 @@ class RiskGatedBroker:
             sold = phases.PhaseOrders(gated.left, gated.skips, session=run.session, held=sold.held)
             skips, counted = gated.skips, gated.counted
             submitted, refused = self._submit_all(
-                run, gated.to_submit, gated.counted, len(decisions)
+                run,
+                gated.to_submit,
+                gated.counted,
+                len(decisions),
+                frozenset(book.ledger.positions),
             )
             skips, counted = (*skips, *refused), counted + len(refused)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
@@ -876,6 +878,8 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        # A buy adding to a held name the broker lacks is a disagreement, not a skip.
+        _refuse_unknown_held(assets, book, buys=True)
         # A name the broker does not know (the `assets` read's 404 answer) is
         # `skip_asset_unknown`, not `skip_untradable` (spec amendment 2026-10-18 item 2).
         unknown = {
@@ -907,7 +911,9 @@ class RiskGatedBroker:
             in_flight=not scope.last,
             plan_decisions=plan_decisions,
         )
-        submitted, refused = self._submit_all(run, gated.to_submit, gated.counted, plan_decisions)
+        submitted, refused = self._submit_all(
+            run, gated.to_submit, gated.counted, plan_decisions, frozenset(book.ledger.positions)
+        )
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
             run,
@@ -934,6 +940,7 @@ class RiskGatedBroker:
             (
                 _buy_cash(o.notional, o.quantity, o.price, o.whole_share, self._frozen, costs)
                 for o in gated.left
+                if o.decision_id not in refused_ids
             ),
             Decimal(0),
         )
@@ -1355,6 +1362,7 @@ class RiskGatedBroker:
         pairs: Sequence[tuple[OrderRow, OrderRequest]],
         counted: int,
         plan_decisions: int,
+        held: Collection[str] = (),
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1364,9 +1372,10 @@ class RiskGatedBroker:
         order `rejected` with the skip reason, with the decision's `skipped` row,
         in one write chunk, and counts toward the skip cap (`counted` skips so
         far, `plan_decisions` the plan's size); a count over the cap raises
-        `SkipCapError` before the next submit. On a sell it is a
-        `ReconciliationError`: a held name the broker refuses means the ledger and
-        the broker disagree. Returns the ids submitted and the refusals' skips."""
+        `SkipCapError` before the next submit (after its `skipped` alert). On a sell,
+        or a buy of a `held` name, it is a `ReconciliationError`: a held name the
+        broker refuses means the ledger and the broker disagree. Returns the ids
+        submitted and the refusals' skips."""
         submitted: list[str] = []
         refused: list[Skip] = []
         for row, request in pairs:
@@ -1375,7 +1384,7 @@ class RiskGatedBroker:
             except DuplicateClientOrderIdError as duplicate:
                 self.replay(request, duplicate)
             except SUBMIT_ALLOWLIST as refusal:
-                if row.side != _BUY:
+                if row.side != _BUY or row.security_id in held:
                     raise ReconciliationError(
                         f"the broker refused the {row.side} of held name {row.security_id}"
                         f" ({type(refusal).__name__})"
@@ -1383,6 +1392,7 @@ class RiskGatedBroker:
                 skip = self._close_refused(run, row, refusal)
                 refused.append(skip)
                 if counted + len(refused) > skip_cap(self._frozen, plan_decisions):
+                    self._alert_skips(run, refused)
                     raise SkipCapError(
                         f"{counted + len(refused)} skips counted against the cap of "
                         f"{skip_cap(self._frozen, plan_decisions)}"
@@ -1737,7 +1747,7 @@ class RiskGatedBroker:
         return text
 
 
-def _refuse_unknown_held(assets: Mapping[str, Asset], book: _Book) -> None:
+def _refuse_unknown_held(assets: Mapping[str, Asset], book: _Book, *, buys: bool = False) -> None:
     """A sells phase's name the broker's `assets` read does not know (its 404 answer,
     `UNRESOLVED_ASSET`) is a held name the broker lacks: the ledger and the broker
     disagree, so `ReconciliationError`, never a skip (spec amendment 2026-10-18
@@ -1746,7 +1756,9 @@ def _refuse_unknown_held(assets: Mapping[str, Asset], book: _Book) -> None:
     unknown = sorted(
         sid
         for sid, asset in assets.items()
-        if asset is UNRESOLVED_ASSET and sid not in book.unmappable
+        if asset is UNRESOLVED_ASSET
+        and sid not in book.unmappable
+        and (not buys or sid in book.ledger.positions)
     )
     if unknown:
         raise ReconciliationError(f"the broker does not know held names {unknown}")

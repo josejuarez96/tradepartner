@@ -348,25 +348,38 @@ def _error_message(error: AlpacaTradingError) -> str:
     return message if isinstance(message, str) else ""
 
 
-def _raise_typed_refusal(error: AlpacaTradingError, coid: str) -> None:
+#: Alpaca's code on the per-order 403 refusals.
+_FORBIDDEN_CODE = 40310000
+
+
+def _raise_typed_refusal(error: AlpacaTradingError, request: OrderRequest) -> None:
     """Map the submit refusals the wrapper's allowlist knows to typed errors
     (spec amendment 2026-10-18 item 2, T202); return for any other refusal, which
-    the caller raises as is. By refusal, not by side: the wrapper decides what a
-    sell's refusal means."""
-    message = _error_message(error)
-    if error.status_code == _NOT_FOUND and _error_code(error) == _ASSET_NOT_FOUND_CODE:
+    the caller raises as is. The map is exact: a 404 only with code 40410000, a 403
+    only with code 40310000 and `asset "<the order's symbol>" is not
+    tradable|fractionable`, and never for a retried submit (an earlier attempt may
+    have reached the broker, so the run halts and resume settles it). By refusal, not
+    by side: the wrapper decides what a sell's refusal means."""
+    if error.retried:
+        return
+    coid = request.client_order_id
+    code = _error_code(error)
+    if error.status_code == _NOT_FOUND and code == _ASSET_NOT_FOUND_CODE:
         raise AssetNotFoundError(f"the broker does not know the asset of order {coid!r}") from None
-    if error.status_code == _FORBIDDEN:
-        if "insufficient qty available" in message:
-            raise ReconciliationError(f"the broker holds less than order {coid!r} sells") from None
-        if "is not fractionable" in message:
-            raise NotFractionableError(
-                f"the broker refused order {coid!r}: asset not fractionable"
-            ) from None
-        if "is not tradable" in message:
-            raise AssetNotTradableError(
-                f"the broker refused order {coid!r}: asset not tradable"
-            ) from None
+    if error.status_code != _FORBIDDEN or code != _FORBIDDEN_CODE:
+        return
+    message = _error_message(error)
+    if "insufficient qty available" in message:
+        raise ReconciliationError(f"the broker holds less than order {coid!r} sells") from None
+    symbol = re.escape(request.symbol)
+    if re.fullmatch(rf'asset "{symbol}" is not fractionable', message):
+        raise NotFractionableError(
+            f"the broker refused order {coid!r}: asset not fractionable"
+        ) from None
+    if re.fullmatch(rf'asset "{symbol}" is not tradable', message):
+        raise AssetNotTradableError(
+            f"the broker refused order {coid!r}: asset not tradable"
+        ) from None
 
 
 def _decimals(value: float) -> int:
@@ -456,7 +469,7 @@ class AlpacaBroker(Broker):
                 raise DuplicateClientOrderIdError(
                     f"the broker refused order {coid!r} as a duplicate"
                 ) from None
-            _raise_typed_refusal(error, coid)
+            _raise_typed_refusal(error, request)
             raise
         order = _mapped("order", _order, payload)
         if order.client_order_id != coid:
