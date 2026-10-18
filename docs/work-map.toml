@@ -958,7 +958,7 @@ why = "Several books trading on paper is the point of ADR 0017; this is the mome
 unblocks = ["task:T162"]
 
 [task.T162]
-what = "Owner: the shakedown_span row (N = 10, M = 5, the live-first strategy named in its reason), the kill-switch drill on main on an H1 fill session, and paper shakedown exit 0 over every book."
+what = "Owner: the shakedown_span row (N = 10, M = 5, its reason names no live strategy: ADR 0023 D6, the live book is chosen in T163), the kill-switch drill on main on an H1 fill session, and paper shakedown exit 0 over every book."
 why = "This is the Phase 4 exit and the Phase 6 entry: the machine shown ready by frozen criteria, not a strategy shown profitable."
 unblocks = ["task:T71b", "task:T163"]
 
@@ -1324,3 +1324,87 @@ why = "Lands every rule-based fix in one sitting so trials go stale once and the
 what = "The C2 done-test: a test-only fixture in AEP's shape (a snapshot_static NASDAQ row known at the fetch, a 2019 10-K whose instance prefix is aep and whose 12(b) text names NYSE, a 2021 10-K naming NASDAQ) plus the look-ahead test that no writer path uses a snapshot_static row's exchange or valid_from as evidence for a row known before that snapshot's known_at."
 why = "T184h's release is the C2 fix, so the AEP-shaped readiness test and the no-look-ahead test must exist and be green before its sitting (#1682)."
 unblocks = ["task:T184h"]
+
+[issue.1731]
+what = "The alignment of 2026-10-18: the owner's decisions D1 to D9 (the #969 accept rule, the halt policy, open fills for fast books, a liquidity-ranked universe for forward books, the pause list, the live book deferred to the Phase 6 ADR under a start feasibility rule, no vendor action, the data-release id, #878 and compliance) and the break-first working rule, recorded in ADR 0023 and the spec and plan amendments of that date."
+why = "Seven open decisions blocked eight tasks on the way to a clean shakedown, a fast forward exam and the first live order; one class-B PR closes them all."
+unblocks = ["adr:0023", "task:T202", "task:T206", "task:T210", "task:T212", "task:T214", "task:T163"]
+
+[adr.0023]
+what = "Break first: fast strategies through a kill ladder, paper books as pre-registered forward exams with minimum fills per cadence, open fills for daily and weekly registrations, per-name faults skipped under a share cap instead of halting the book, a dollar-volume-ranked universe for forward books, the #969 accept rule, a pause list, and the live book left to the Phase 6 ADR after the shakedown and the first kill-ladder verdicts."
+why = "Records the owner's 2026-10-18 decisions (#1731) that reorder the work toward a clean shakedown span, a first fast forward exam and the first live order in weeks, with every build task tied to an observed or provoked break."
+unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
+
+[task.T200]
+what = "A1: the raw trading client retries 5xx and connection errors with bounded backoff and the duplicate read-back by client_order_id before any re-send."
+why = "A 502 or a dropped connection on one submit halts a whole paper book today; the shakedown span cannot survive that (#1731)."
+unblocks = ["task:T162"]
+
+[task.T201]
+what = "A3: a FakeBroker that refuses what Alpaca refuses (symbol form, unknown assets, whole shares on a non-fractionable name) and one end-to-end drill per fault on the fixture store."
+why = "The fake accepted GEF-B, so the suite missed #1729; the drills are the failing tests the halt policy is built against (#1731)."
+unblocks = ["task:T202"]
+
+[task.T202]
+what = "A2 part 1: the fixed allowlist of per-name broker refusals (asset not found, not fractionable on a buy, not tradable) become counted skips with one alert, and the skip cap is a share of the plan frozen at start; sell refusals, reconciliation, limit, clock, kill-switch and universe faults still halt."
+why = "One bad name halted the daily book (#1729); a $100 book trips the absolute skip cap every session; the shakedown span restarts on every halt (#1731, D2)."
+unblocks = ["task:T162", "task:T202b", "task:T206"]
+
+[task.T202b]
+what = "A2 part 2: an acknowledgement timeout polls longer, then leaves that one order pending_unresolved with its notional in the reserve; the next run's start reads it back and settles it, or halts if it cannot."
+why = "A 30 s acknowledgement timeout halts a whole book today; one unresolved order should cost one order, never the session, and never an open-ended tolerance (#1731, D2)."
+unblocks = ["task:T162"]
+
+[task.T203]
+what = "A8b: a per-fill slippage line on paper report and paper status: fill against the session's SIP official open in basis points per side, median and p90 per book."
+why = "The cost model is one uncalibrated 15 bp and no paper fill has been measured since Probe 3; the number is kill-ladder rung 1 for B10 and B9 and the measured cost level in the backtest (#1731)."
+unblocks = ["task:T210", "task:T165e", "task:T164e"]
+
+[task.T204]
+what = "A4, conditional and paused: per-book concurrent paper runs, one subprocess per book with its own lock."
+why = "Built only if a book's sells phase is seen to start outside the submit window in O1's first week; the zero-code plist stagger comes first (#1731)."
+
+[task.T205]
+what = "A9b: the no-trade band and the hold rule in the paper planner, pinned to the backtest by one shared fixture."
+why = "Backtest and paper must agree on which drifts trade before a hold-mode book runs on paper (#1731)."
+
+[task.T206]
+what = "A16: the small-account profile risk.small_account: every buy a fractional notional order, the start bound names x min_order_notional x (1 + buffer) <= equity within the frozen limits refused at paper start, a generic 25-name $100 fixture plan with zero skips."
+why = "At $100 every whole-share name is skipped and the cap trips on every plan; whatever book T163 names must fit the bound before its first order (#1731, D6)."
+unblocks = ["phase:6"]
+
+[task.T207]
+what = "A7a: vectorised valuation over a polars frame and the scale test harness: a synthetic 1,000-name, 10-year daily fixture with a wall-clock budget and a byte-identical check against today's path."
+why = "A 10-year daily trial is estimated at 5 to 15 hours; no fast strategy can be backtested until it runs in minutes (#1731)."
+unblocks = ["task:T208"]
+
+[task.T208]
+what = "A7b: bounded and incremental marking reads in the engine: the per-step marking share passes sessions_from, the adjusted frame is extended rather than rebuilt, the lookahead suite unchanged."
+why = "The per-step marking read re-adjusts full history every session; the scale test cannot pass without it (#1731)."
+unblocks = ["task:T209", "task:T211"]
+
+[task.T209]
+what = "A9a: strategy.weighting = hold with hold_sessions and rebalance_band, cash as a position, and backtest.cash_rate = store accruing the stored T-bill rate."
+why = "The engine cannot express hold each name N sessions, trades every drift to exact targets, and refuses a cash rate while Sharpe subtracts one; B9 needs all three (#1731)."
+unblocks = ["task:T205"]
+
+[task.T210]
+what = "A8a: costs.spread_bps and costs.impact_coeff (square-root impact on ADV from the bars frame), both default zero, and a measured cost level fed by the paper books' slippage."
+why = "One 15 bp figure is the size of a 20-session hold's whole expected edge; the kill ladder's rung 1 and rung 4 need a cost model with a spread and an impact term (#1731)."
+
+[task.T211]
+what = "A10: beta-adjusted alpha against SPY as a reported metric only, and the spin-off ratio in the price adjustment path."
+why = "Backtest and paper disagree on a spin-off session, and excess over SPY is not beta-adjusted; neither number may select anything (#1731)."
+
+[task.T212]
+what = "A11: universe.rank_by in {cap, dollar_volume}: a forward book ranks by median dollar volume from bars alone, intersected with Alpaca's tradable assets at t, no shares fact; cap stays byte-identical."
+why = "IBM, ABBV, ABT, MMM, VZ, ALL, FITB and MMC are never in the universe and BLK and XOM dropped out on identity defects; a forward exam only needs the universe to be right today (#1731, D4)."
+unblocks = ["task:T161"]
+
+[task.T213]
+what = "A12: the resolver assigns bars to a renamed name under stored symbol_changes (#1728: Alight, Barrick, ContextLogic)."
+why = "Live daily ingest can drop a held name's bar, which the daily book would read as a stale exit (#1728, #1731)."
+
+[task.T214]
+what = "A13, optional, hold: one data.release_id in the frozen set in place of the master, gap and adjust sections, re-recorded under rederive-1682 in the same sitting."
+why = "Every data fix stales every trial; the swap pays only when it coincides with the release that stales everything anyway (#1731, D8)."
