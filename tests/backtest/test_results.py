@@ -947,6 +947,9 @@ class TestRefusals:
                     "strategy.hold_target_names",
                     "strategy.rebalance_band",
                     "universe.rank_by",
+                    "strategy.signal_delay_sessions",
+                    "strategy.placebo",
+                    "strategy.placebo_seed",
                 )
             )
         }
