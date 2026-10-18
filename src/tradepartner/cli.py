@@ -4142,7 +4142,9 @@ def make_app(
                 window_id = page.window.window_id if page.window is not None else None
                 if window_id is None or page.journal_outdated is not None:
                     return page, None
-                return page, paper_slippage.window_slippage(conn, window_id)
+                return page, paper_slippage.window_slippage(
+                    conn, window_id, ensure_tz_aware_utc(clock(), field_name="clock()")
+                )
 
         data, fill_slippage = _paper_call(s, read)
         for line in _status_lines(data, chosen, fill_slippage):

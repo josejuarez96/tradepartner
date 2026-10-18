@@ -914,7 +914,7 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         closes = _price_of(conn, "close")
         comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
         targets = compare_targets(window, trial, journal, conn)
-        fill_slippage = window_slippage(conn, window_id)
+        fill_slippage = window_slippage(conn, window_id, utc_now())
 
     now = utc_now()
     paper_report_row = PaperReportRow(

@@ -1510,7 +1510,8 @@ STATUS_MAIN = (
     "positions 0 (value 0.00); open orders 0; targets 0\n"
     "kill switch released (causes: -)\n"
     "reconciliation n/a\n"
-    "slippage vs open (bp, adverse positive): buy n=0; sell n=0; all n=0; no bar 0\n"
+    "slippage vs open (bp, adverse positive, per order): buy n=0; sell n=0; all n=0; "
+    "no bar 0; off session 0; pending 0\n"
     "alerts (0):\n"
 )
 CHECK_MAIN = (
@@ -1670,7 +1671,7 @@ def test_report_prints_the_slippage_line(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
     """#1733: a report that carries a slippage summary prints its one line last."""
-    side = paper_slippage.SideSlippage(2, 12.5, 20.0)
+    side = paper_slippage.SideSlippage(2, 15.0, 12.5, 20.0)
     canned = paper_report.Report(
         comparison=paper_report.PeriodComparison(
             tracking_rule="raw", tracking_k=2.0, periods=(), passed=True, failing_period=None
@@ -1685,15 +1686,21 @@ def test_report_prints_the_slippage_line(
             ingested_at=SESSION_CLOCK,
         ),
         slippage=paper_slippage.Slippage(
-            buy=side, sell=paper_slippage.SideSlippage(0, None, None), overall=side, no_bar=3
+            buy=side,
+            sell=paper_slippage.SideSlippage(0, None, None, None),
+            overall=side,
+            no_bar=3,
+            off_session=1,
+            pending=2,
         ),
     )
     monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
     out = _paper(clock, factory, "report")
     assert out.exit_code == 0
     assert out.output.splitlines()[-1] == (
-        "slippage vs open (bp, adverse positive): buy n=2 median 12.50 p90 20.00; "
-        "sell n=0; all n=2 median 12.50 p90 20.00; no bar 3"
+        "slippage vs open (bp, adverse positive, per order): "
+        "buy n=2 wmean 15.00 median 12.50 p90 20.00; sell n=0; "
+        "all n=2 wmean 15.00 median 12.50 p90 20.00; no bar 3; off session 1; pending 2"
     )
 
 
