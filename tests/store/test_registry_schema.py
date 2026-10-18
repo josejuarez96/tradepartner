@@ -118,6 +118,7 @@ def _make_old_store(path: Path, version: int) -> None:
             + schema._RATES_TABLE_DDL
             + schema._BORROW_STATUS_TABLE_DDL
             + schema._SYMBOL_CHANGES_TABLE_DDL
+            + schema._OPENFIGI_TYPES_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:
