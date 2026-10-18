@@ -456,6 +456,28 @@ def test_edgar_class_member_overrides_may_be_emptied() -> None:
     assert s.edgar.class_member_overrides == {}
 
 
+def test_edgar_class_member_link_is_off_with_four_dead_class_filings() -> None:
+    """T190d: the link stays off until the release `rederive-1682` (T198)."""
+    edgar = Settings(_env_file=None).edgar
+    assert edgar.class_member_link is False
+    assert edgar.dead_class_filings == 4
+    assert edgar.lettered_member_max_minor_share == 0.001
+    on = Settings(_env_file=None, edgar={"class_member_link": True, "dead_class_filings": 2})
+    assert (on.edgar.class_member_link, on.edgar.dead_class_filings) == (True, 2)
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_edgar_dead_class_filings_refuses_less_than_one(count: int) -> None:
+    with pytest.raises(ValidationError, match="dead_class_filings"):
+        Settings(_env_file=None, edgar={"dead_class_filings": count})
+
+
+@pytest.mark.parametrize("share", [0.0, -0.1, 1.0, 2.0])
+def test_edgar_lettered_member_max_minor_share_is_a_fraction(share: float) -> None:
+    with pytest.raises(ValidationError, match="lettered_member_max_minor_share"):
+        Settings(_env_file=None, edgar={"lettered_member_max_minor_share": share})
+
+
 def test_edgar_unknown_key_is_refused() -> None:
     """#1037: a mistyped nested key fails instead of being silently ignored."""
     with pytest.raises(ValidationError, match="statement_unit"):
@@ -892,6 +914,9 @@ def test_strategy_defaults() -> None:
     assert s.top_fraction == pytest.approx(0.10)
     assert s.weighting == "equal"
     assert s.signal_total_return is True
+    assert s.hold_sessions == 1
+    assert s.hold_target_names == 0
+    assert s.rebalance_band == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
@@ -907,6 +932,42 @@ def test_strategy_defaults() -> None:
 def test_strategy_rejects_invalid_values(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, strategy=override)
+
+
+def test_strategy_weighting_literal_lists_hold() -> None:
+    """ADR 0023 D3/`hold` (backtest spec amendment #1731, T209a): the key's value set."""
+    assert set(get_args(StrategyConfig.model_fields["weighting"].annotation)) == {
+        "equal",
+        "hold",
+    }
+
+
+def test_strategy_refuses_hold_and_band_until_they_are_wired() -> None:
+    """T209a adds the keys; the engine learns them in T209b. Until then a run would trade
+    equal-weight targets while the row says otherwise, so a config validator refuses,
+    naming T209b (reviewer on #1788)."""
+    with pytest.raises(ValidationError, match="T209b"):
+        StrategyConfig(weighting="hold")
+    with pytest.raises(ValidationError, match="T209b"):
+        StrategyConfig(rebalance_band=0.05)
+    assert StrategyConfig().weighting == "equal"
+    assert StrategyConfig().rebalance_band == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"hold_sessions": 0},
+        {"hold_sessions": -1},
+        {"hold_target_names": -1},
+        {"rebalance_band": -0.01},
+        {"rebalance_band": 1.0},
+        {"rebalance_band": float("nan")},
+    ],
+)
+def test_strategy_rejects_bad_hold_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(**override)  # type: ignore[arg-type]
 
 
 def test_costs_defaults() -> None:
@@ -955,6 +1016,19 @@ def test_backtest_defaults() -> None:
     assert b.cash_rate == pytest.approx(0.0)
     assert b.delisting_exit == "last_close"
     assert b.stale_exit_sessions == 5
+
+
+def test_cash_rate_accepts_the_store_marker() -> None:
+    """`backtest.cash_rate = store` accrues the store's rf series (amendment #1731, T209a)."""
+    assert Settings(_env_file=None, backtest={"cash_rate": "store"}).backtest.cash_rate == "store"
+    assert Settings(_env_file=None, backtest={"cash_rate": 0.0}).backtest.cash_rate == 0.0
+
+
+@pytest.mark.parametrize("rate", [0.05, -0.01, 1.0])
+def test_cash_rate_refuses_a_numeric_non_zero_rate(rate: float) -> None:
+    """A made-up rate is not a point-in-time fact; only 0.0 or `store` load."""
+    with pytest.raises(ValidationError, match="cash_rate"):
+        Settings(_env_file=None, backtest={"cash_rate": rate})
 
 
 @pytest.mark.parametrize(
