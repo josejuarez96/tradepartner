@@ -4745,3 +4745,106 @@ class TestContestIsTimeAware:
         assert resolver.report.symbol_changes_refused == 0
         assert resolver.resolve("PARA", date(2022, 2, 17)) == self.PARAMOUNT
         assert resolver.resolve("VIAC", date(2022, 2, 17)) is None
+
+
+class TestARenameNeverCostsItsOwnSessions:
+    """#1728 (#1696 follow-up): following a stored name change starts the new
+    ticker's span on the change's day, which can put it *before* another
+    security's span of that ticker (a lagging cover page of a stale holder)
+    and so flip the latest-start rule against the renamed security's own
+    cover-page span: Alight (WPF -> ALIT) and ContextLogic (WISH -> LOGC) lost
+    every bar after their first cover page under the new ticker. A change
+    only ever adds sessions to its own security, never takes its own away."""
+
+    TITLE = "Class A Common Stock"
+    ALIGHT, STALE = "0001809104", "0000000077"
+    WISH, HOLDER = "0001822250", "0000000088"
+
+    def _alight(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE),
+            _listing(self.ALIGHT, "ALIT", date(2021, 11, 15), self.TITLE),
+            _listing(self.STALE, "ALIT", date(2021, 9, 1), self.TITLE),
+        ]
+
+    def _logc(self) -> list[dict[str, object]]:
+        return [
+            _listing(self.WISH, "WISH", date(2020, 12, 10), self.TITLE),
+            _listing(self.WISH, "LOGC", date(2024, 8, 8), self.TITLE),
+            _listing(self.HOLDER, "LOGC", date(2024, 6, 3), self.TITLE),
+        ]
+
+    CASES: ClassVar[list[tuple[str, str, str, date, date]]] = [
+        ("alight", "WPF", "ALIT", date(2021, 7, 6), date(2021, 11, 15)),
+        ("logc", "WISH", "LOGC", date(2024, 5, 13), date(2024, 8, 8)),
+    ]
+
+    def _case(self, name: str) -> tuple[Any, ...]:
+        _, old, new, day, cover = next(c for c in self.CASES if c[0] == name)
+        if name == "alight":
+            return self._alight(), self.ALIGHT, old, new, day, cover
+        return self._logc(), self.WISH, old, new, day, cover
+
+    @pytest.mark.parametrize("name", ["alight", "logc"])
+    def test_the_bars_after_the_change_stay_with_their_security(self, name: str) -> None:
+        listings, sid, old, new, day, cover = self._case(name)
+        change = _change(sid, old, new, day)
+        resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
+        plain = ListingResolver(listings, rename_lead_days=400)
+        for session in _sessions(cover, date(2026, 10, 15)):
+            assert plain.holds(sid, session)  # the listings alone keep them
+            assert resolver.holds(sid, session), session
+            assert resolver.resolve(new, session) == plain.resolve(new, session)
+        assert resolver.report.symbol_changes_refused == 1
+
+    @pytest.mark.parametrize("name", ["alight", "logc"])
+    def test_the_ingest_resolver_keeps_landing_new_bars_on_the_security(self, name: str) -> None:
+        listings, sid, old, new, day, cover = self._case(name)
+        resolver = ListingResolver(
+            listings, rename_lead_days=400, symbol_changes=[_change(sid, old, new, day)]
+        )
+        days = [cover, next_session(cover), date(2026, 10, 15)]
+        rows = [{**_row(d, 10.0), "t": f"{d.isoformat()}T12:00:00Z"} for d in days]  # any zone
+        payload = {"feed": "sip", "bars": {new: rows}}
+        parsed = parse_bars(payload, resolver.resolve, resolver.lead)
+        assert [(b.security_id, b.session) for b in parsed.bars] == [(sid, d) for d in days]
+
+    @pytest.mark.parametrize("name", ["alight", "logc"])
+    def test_the_repair_dry_run_proposes_no_new_deletion(self, name: str) -> None:
+        from tradepartner.repair import misattributed
+
+        listings, sid, old, new, day, _ = self._case(name)
+        keys = [(sid, s, 1) for s in _sessions(day, date(2026, 10, 15))]
+        plain = ListingResolver(listings, rename_lead_days=400)
+        resolver = ListingResolver(
+            listings, rename_lead_days=400, symbol_changes=[_change(sid, old, new, day)]
+        )
+        assert misattributed(resolver, keys, []).bars == misattributed(plain, keys, []).bars
+
+    def test_a_cover_page_trailing_the_change_past_the_lead_is_refused_as_before(self) -> None:
+        # Pinned (#1728 review): own cover page 2023-03-01, rival 2022-06-01,
+        # change 2021-07-06. The change is refused and the listings stand;
+        # the sessions only the change would have given are forgone.
+        listings = [
+            _listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE),
+            _listing(self.ALIGHT, "ALIT", date(2023, 3, 1), self.TITLE),
+            _listing(self.STALE, "ALIT", date(2022, 6, 1), self.TITLE),
+        ]
+        change = _change(self.ALIGHT, "WPF", "ALIT", date(2021, 7, 6))
+        resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
+        plain = ListingResolver(listings, rename_lead_days=400)
+        assert resolver.report.symbol_changes_refused == 1
+        for session in _sessions(date(2021, 7, 6), date(2024, 6, 3)):
+            assert resolver.resolve("ALIT", session) == plain.resolve("ALIT", session)
+            assert resolver.lead("ALIT", session) == plain.lead("ALIT", session)
+            assert resolver.holds(self.ALIGHT, session) == plain.holds(self.ALIGHT, session)
+
+    def test_a_clean_rename_is_still_followed(self) -> None:
+        # No rival holds the ticker: the change is followed as in #1696.
+        listings = [_listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE)]
+        resolver = ListingResolver(
+            listings, symbol_changes=[_change(self.ALIGHT, "WPF", "ALIT", date(2021, 7, 6))]
+        )
+        assert resolver.report.symbol_changes_followed == 1
+        assert resolver.report.symbol_changes_refused == 0
+        assert resolver.resolve("ALIT", date(2021, 12, 1)) == self.ALIGHT
