@@ -1326,12 +1326,12 @@ why = "T184h's release is the C2 fix, so the AEP-shaped readiness test and the n
 unblocks = ["task:T184h"]
 
 [issue.1731]
-what = "The alignment of 2026-10-18: the owner's decisions D1 to D9 (the #969 accept rule, the halt policy, open fills for fast books, a liquidity-ranked universe for forward books, the pause list, the $100 live book as H1 sized by notional, no vendor action, the data-release id, #878 and compliance) and the break-first working rule, recorded in ADR 0023 and the spec and plan amendments of that date."
+what = "The alignment of 2026-10-18: the owner's decisions D1 to D9 (the #969 accept rule, the halt policy, open fills for fast books, a liquidity-ranked universe for forward books, the pause list, the $100 live book as a concentrated momentum operations book sized by notional, no vendor action, the data-release id, #878 and compliance) and the break-first working rule, recorded in ADR 0023 and the spec and plan amendments of that date."
 why = "Seven open decisions blocked eight tasks on the way to a clean shakedown, a fast forward exam and the first live order; one class-B PR closes them all."
 unblocks = ["adr:0023", "task:T202", "task:T206", "task:T210", "task:T212", "task:T214", "task:T163"]
 
 [adr.0023]
-what = "Break first: fast strategies through a kill ladder, paper books as pre-registered forward exams with minimum fills per cadence, open fills for daily and weekly registrations, per-name faults skipped under a share cap instead of halting the book, a dollar-volume-ranked universe for forward books, the #969 accept rule, a pause list, and the $100 live book as H1 unchanged."
+what = "Break first: fast strategies through a kill ladder, paper books as pre-registered forward exams with minimum fills per cadence, open fills for daily and weekly registrations, per-name faults skipped under a share cap instead of halting the book, a dollar-volume-ranked universe for forward books, the #969 accept rule, a pause list, and the $100 live book as a concentrated momentum operations book on H1's signal."
 why = "Records the owner's 2026-10-18 decisions (#1731) that reorder the work toward a clean shakedown span, a first fast forward exam and the first live order in weeks, with every build task tied to an observed or provoked break."
 unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
 
@@ -1346,9 +1346,14 @@ why = "The fake accepted GEF-B, so the suite missed #1729; the drills are the fa
 unblocks = ["task:T202"]
 
 [task.T202]
-what = "A2: the halt policy: per-name faults become counted skips with one alert, the skip cap is a share of the plan, an acknowledgement timeout leaves one order pending_unresolved; reconciliation, limit, clock, kill-switch and universe faults still halt."
+what = "A2 part 1: the fixed allowlist of per-name broker refusals (asset not found, not fractionable on a buy, not tradable) become counted skips with one alert, and the skip cap is a share of the plan frozen at start; sell refusals, reconciliation, limit, clock, kill-switch and universe faults still halt."
 why = "One bad name halted the daily book (#1729); a $100 book trips the absolute skip cap every session; the shakedown span restarts on every halt (#1731, D2)."
-unblocks = ["task:T162", "task:T206"]
+unblocks = ["task:T162", "task:T202b", "task:T206"]
+
+[task.T202b]
+what = "A2 part 2: an acknowledgement timeout polls longer, then leaves that one order pending_unresolved with its notional in the reserve; the next run's start reads it back and settles it, or halts if it cannot."
+why = "A 30 s acknowledgement timeout halts a whole book today; one unresolved order should cost one order, never the session, and never an open-ended tolerance (#1731, D2)."
+unblocks = ["task:T162"]
 
 [task.T203]
 what = "A8b: a per-fill slippage line on paper report and paper status: fill against the session's SIP official open in basis points per side, median and p90 per book."
@@ -1364,9 +1369,14 @@ what = "A9b: the no-trade band and the hold rule in the paper planner, pinned to
 why = "Backtest and paper must agree on which drifts trade before a hold-mode book runs on paper (#1731)."
 
 [task.T206]
-what = "A16: the small-account profile risk.small_account: fractional notional orders for every fractionable name, zero orders below the minimum at the live book's equity, a $100 fixture plan of H1."
-why = "At $100 every whole-share name is skipped and the cap trips on every plan; the live book is H1 unchanged with only its sizing changed (#1731, D6)."
+what = "A16: the small-account profile risk.small_account: every buy a fractional notional order, the start bound names x min_order_notional x (1 + buffer) <= equity refused at paper start, a ten-name $100 fixture plan with zero skips."
+why = "At $100 every whole-share name is skipped and the cap trips on every plan; the concentrated live book must fit the bound before its first order (#1731, D6 as revised)."
 unblocks = ["phase:6"]
+
+[task.T215]
+what = "The concentrated live hypothesis file (H1's signal with a small fixed name count, proposed top 10) and its registration as an operations/live book, never an exam of record, counted as a trial."
+why = "The owner's revised D6 of 2026-10-18: H1 unchanged fails the sizing bound at $100, so the first live book is this one, under the charter's cap, with the strategy evidence left on paper (#1731)."
+unblocks = ["task:T163", "phase:6"]
 
 [task.T207]
 what = "A7a: vectorised valuation over a polars frame and the scale test harness: a synthetic 1,000-name, 10-year daily fixture with a wall-clock budget and a byte-identical check against today's path."
