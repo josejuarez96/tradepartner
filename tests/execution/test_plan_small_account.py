@@ -498,3 +498,96 @@ def test_a_rounded_up_buy_over_the_cash_left_by_the_buy_reserve_halts_before_any
         _execute(_gate(env, alerter_conn, _profile(min_order_notional=3500.0)), env, [buy])
     assert _submits(env.fake) == []
     assert _missed(env.settings) == [("missed", "limit_breach")]
+
+
+# --- review findings on #1807 (T206) --------------------------------------------------
+
+
+def test_a_rounded_up_buy_plans_what_it_submits_so_shakedown_e3_passes() -> None:
+    """Section on: the decision row journaled for a rounded-up buy carries
+    `planned_notional` = the $1.00 it submits, not the $0.50 target. Shakedown E.3
+    (`shakedown._orders_line`) fails a decision whose notional fills exceed
+    `decisions.planned_notional` + the frozen `risk.reconcile_cash_tolerance`; a full
+    fill of each submitted notional must pass that same inequality for all 25 buys."""
+    frozen = _profile()
+    chain = _chain(frozen)
+    rows = {row.security_id: row for row in chain.rows}
+    assert {sid: rows[sid].planned_notional for sid in SMALL} == dict.fromkeys(SMALL, MIN_BUY)
+    assert {sid: rows[sid].planned_notional for sid in FULL} == dict.fromkeys(FULL, FULL_BUY)
+    submitted = {r.symbol: r.notional for r in chain.requests if r.side is Side.BUY}
+    assert sorted(submitted) == sorted(TARGETS)
+    for sid, notional in submitted.items():
+        planned = rows[sid].planned_notional
+        assert planned is not None and notional is not None
+        # E.3's per-decision check, at a full fill of the order.
+        assert notional <= planned + frozen.reconcile_cash_tolerance, sid
+
+
+#: Cash short of the plan: $50 for 21 x $4.00 + 4 x $1.00. The current priority (the
+#: orchestrator's decision on #1807, open to the owner): the rounded-up buys take
+#: their cash first, 4 x $1.00 x 1.001 = $4.004; the 21 larger buys share the rest,
+#: $45.996 / 1.001 = $45.95005 over $84.00 of targets, a scale of 0.547024, so each
+#: is floor-to-cent($4.00 x 0.547024) = $2.18. Spent: 21 x 2.18 x 1.001 + 4.004 =
+#: 49.82978; cash left 0.17022.
+SHORT_CASH = 50.0
+SCALED_FULL_BUY = 2.18
+SHORT_CASH_LEFT = 0.17022
+
+
+def test_short_cash_pays_the_rounded_up_buys_first_and_scales_the_larger_ones() -> None:
+    """Section on, buys cash $50: the four rounded-up buys keep their $1.00 minimum
+    and the 21 $4.00 buys scale down to $2.18 each; nothing is deferred or skipped
+    and the batch passes `check_phase`. Pins today's priority (rounded first)."""
+    frozen = _profile()
+    chain = _chain(frozen)
+    buys = buy_orders(
+        chain.rows,
+        chain.states,
+        SHORT_CASH,
+        chain.sells,
+        price_of,
+        COSTS,
+        _assets(),
+        frozen,
+        session=S,
+    )
+    assert buys.skips == ()
+    assert buys.deferred == ()
+    assert {o.security_id: o.notional for o in buys.orders} == {
+        **dict.fromkeys(FULL, SCALED_FULL_BUY),
+        **dict.fromkeys(SMALL, MIN_BUY),
+    }
+    assert buys.cash_left == pytest.approx(SHORT_CASH_LEFT, abs=1e-9)
+    checked = check_phase(
+        [o.to_risk(o.security_id, listing_ended=False) for o in buys.orders],
+        Ledger(positions={}, cash=SHORT_CASH, through=S),
+        _account(SHORT_CASH),
+        _assets(),
+        frozen,
+        DECIMALS,
+        price_of=price_of,
+        costs=COSTS,
+        prior_orders=len(chain.sells.orders),
+    )
+    assert isinstance(checked, Skips), checked
+    assert len(checked.orders) == len(TARGETS)
+
+
+def test_a_window_frozen_with_the_section_on_reads_back_on() -> None:
+    """A window whose `frozen_json` holds `risk.small_account` = {"enabled": true}
+    beside the sixteen keys reads back on through `frozen_risk`, compares equal to the
+    profile it froze, and dumps the section back unchanged; it never reads as off."""
+    frozen_json = json.dumps(
+        {**json.loads(PRE_T206_FROZEN_JSON), "risk.small_account": {"enabled": True}},
+        sort_keys=True,
+    )
+    window = replace(_pre_t206_window(), frozen_json=frozen_json)
+    read = frozen_risk(window)
+    assert read.small_account.enabled is True
+    assert read == _profile()
+    assert read != RiskConfig()
+    assert read.model_dump()["small_account"] == {"enabled": True}
+    assert (
+        frozen_risk(replace(window, frozen_json=PRE_T206_FROZEN_JSON)).small_account.enabled
+        is False
+    )

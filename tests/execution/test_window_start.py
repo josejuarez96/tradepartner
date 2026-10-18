@@ -2098,3 +2098,133 @@ def test_the_section_frozen_off_by_default(
         journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
     )
     assert frozen_risk(result.window).small_account.enabled is False
+
+
+# --- review findings on #1807 (T206): the frozen limits and the family name counts ---
+# The rule reads "within the frozen limits": a window whose names cannot each hold
+# the minimum order inside ADR 0010's limits is refused at start, as one whose buys
+# cannot fit the cash is. With the 5 % weight limit an equal-weight book needs at
+# least 1 / 0.05 = 20 names; and one minimum order with its buffer, $1.00 x 1.02 =
+# $1.02, must fit the per-order limit at the start cash. (The position-weight form of
+# the second clause is implied by the first and the cash clause together:
+# n >= 1/w and n x m x (1 + b) <= cash give m x (1 + b) <= cash x w; so the order
+# limit is the one a test can isolate.)
+
+#: 0.1 of a 150-name universe: 15 names. 15 x $1.02 = $15.30 fits $100, but 15 < 20.
+FIFTEEN_NAMES = {"strategy.top_fraction": 0.1, "universe.top_n_by_cap": 150}
+#: 0.1 of a 200-name universe: 20 names, exactly 1 / 0.05.
+TWENTY_NAMES = {"strategy.top_fraction": 0.1, "universe.top_n_by_cap": 200}
+
+
+def test_start_refuses_fewer_names_than_the_frozen_weight_limit_allows(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Section on: 15 names at $100 fit the cash ($15.30) but each would hold 1/15 =
+    6.7 % of equity, over the frozen 5 % `risk.max_position_weight`: fewer than
+    1 / 0.05 = 20 names is `refused_small_account`, before any write."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    assert settings.risk.max_position_weight == 0.05
+    _register_names(settings, tmp_path, FIFTEEN_NAMES)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            settings,
+            _connect(settings),
+            _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH),
+            fixed_clock,
+            "h1",
+        )
+    assert exc.value.reason == "refused_small_account"
+    assert _windows(settings) == []
+
+
+def test_start_accepts_exactly_the_names_the_weight_limit_needs(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Section on: 20 names = 1 / 0.05, $20.40 of buys at $100: accepted (the
+    boundary of the weight clause is inclusive)."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    _register_names(settings, tmp_path, TWENTY_NAMES)
+    result = window.start(
+        settings,
+        _connect(settings),
+        _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH),
+        fixed_clock,
+        "h1",
+    )
+    assert [w[0] for w in _windows(settings)] == [result.window.window_id]
+
+
+def test_start_refuses_a_minimum_order_over_the_frozen_order_limit(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Section on, `risk.max_order_notional_fraction` frozen at 1 %: at $100 one
+    order may be $1.00, but the minimum order with its buffer is $1.00 x 1.02 =
+    $1.02. The 25-name registration fits the cash ($25.50) and the weight clause
+    (25 >= 20), and is still `refused_small_account`, before any write."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": journal_settings.store.path},
+        risk={"small_account": {"enabled": True}, "max_order_notional_fraction": 0.01},
+    )
+    _register_names(settings, tmp_path, TWENTY_FIVE_NAMES)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            settings,
+            _connect(settings),
+            _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH),
+            fixed_clock,
+            "h1",
+        )
+    assert exc.value.reason == "refused_small_account"
+    assert _windows(settings) == []
+
+
+# The name count n per family, from the key that family registers: momentum
+# `strategy.top_fraction`, profitability `profitability.top_fraction`, combined
+# `combined.top_fraction` (config.py `ProfitabilityConfig`, `CombinedConfig`), each a
+# share of `universe.top_n_by_cap` (250 here). A momentum key in another family's set
+# is not its count: each case carries `strategy.top_fraction` at the other count, so
+# reading the momentum key gives the opposite answer.
+
+FAMILY_COUNT_CASES = [
+    # (family, its fraction, the stray momentum fraction, refused)
+    pytest.param("profitability", 0.1, 0.4, False, id="profitability-25-accepted"),
+    pytest.param("profitability", 0.4, 0.1, True, id="profitability-100-refused"),
+    pytest.param("combined", 0.1, 0.4, False, id="combined-25-accepted"),
+    pytest.param("combined", 0.4, 0.1, True, id="combined-100-refused"),
+]
+
+
+@pytest.mark.parametrize(("family", "fraction", "momentum_fraction", "refused"), FAMILY_COUNT_CASES)
+def test_the_name_count_is_the_family_own_top_fraction(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    family: str,
+    fraction: float,
+    momentum_fraction: float,
+    refused: bool,
+) -> None:
+    """Section on, $100: the family's own `top_fraction` x 250 is n. 0.1 gives 25
+    names ($25.50, accepted); 0.4 gives 100 names ($102.00, refused
+    `refused_small_account` before any write)."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    params = _params(
+        **{
+            f"{family}.top_fraction": fraction,
+            "strategy.top_fraction": momentum_fraction,
+            "universe.top_n_by_cap": 250,
+        }
+    )
+    with open_for_write(settings) as conn:
+        hyp = _register(conn, settings, "b3", HOLDOUT_END_PAST, params=params, family=family)
+        _sign_off(conn, settings, hyp, tmp_path)
+    fake = _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH)
+    if refused:
+        with pytest.raises(window.StartRefusedError) as exc:
+            window.start(settings, _connect(settings), fake, fixed_clock, "b3")
+        assert exc.value.reason == "refused_small_account"
+        assert _windows(settings) == []
+    else:
+        result = window.start(settings, _connect(settings), fake, fixed_clock, "b3")
+        assert result.window.hypothesis_id == hyp.hypothesis_id
