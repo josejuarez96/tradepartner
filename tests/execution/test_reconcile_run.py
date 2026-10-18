@@ -112,7 +112,11 @@ class BookedFake(FakeBroker):
 @pytest.fixture
 def fake(fixed_clock: FixedClock) -> BookedFake:
     return BookedFake(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PA1"
+        assets=FakeBroker.active_assets("SPY", "MTUM"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
     )
 
 
@@ -1216,7 +1220,13 @@ def b_frozen_window(journal_settings: Settings, frozen_window: PaperWindowRow) -
 
 
 def _b_fake(clock: FixedClock) -> BookedFake:
-    return BookedFake(clock=clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1")
+    return BookedFake(
+        assets=FakeBroker.active_assets("SPY", "MTUM"),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PB1",
+    )
 
 
 def test_a_reconciliation_fault_halts_only_its_book(

@@ -60,7 +60,7 @@ def fixed_clock() -> FixedClock:
 def scripted_fake(fixed_clock: FixedClock) -> FakeBroker:
     return FakeBroker(
         assets=FakeBroker.active_assets(
-            "SPY", "AAA", "BBB", "DUALA", "DUALB", "PRE9", "WNDX", "AAPL", "MSFT"
+            "SPY", "AAA", "BBB", "DUALA", "DUALB", "PRE9", "WNDX", "AAPL", "MSFT", "ZZZ"
         ),
         clock=fixed_clock,
         price_of=lambda _symbol: REFERENCE_PRICE,

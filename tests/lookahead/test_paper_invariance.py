@@ -1129,7 +1129,13 @@ def test_a_cut_at_the_settle_gates_reading_does_not_see_its_rows(
 
     settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
     base = _SettleClock(DAY1)
-    fake = FakeBroker(clock=base, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
+    fake = FakeBroker(
+        assets=FakeBroker.active_assets("SPY"),
+        clock=base,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA1",
+    )
     s = Settle(settings, base, fake, new_window(settings))
     s.place("tp-settle")
     fake.apply("tp-settle", Vanish())

@@ -536,7 +536,11 @@ class _Factory:
 
     def __init__(self, clock: _Clock) -> None:
         self.fake = FakeBroker(
-            clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1"
+            assets=FakeBroker.active_assets("SPY"),
+            clock=clock,
+            price_of=lambda _s: 100.0,
+            auto_fill=False,
+            account_id="PA1",
         )
         self.clocks: list[Any] = []
         self.books: list[str] = []
@@ -928,7 +932,11 @@ class _BookFactory(_Factory):
         self.books.append(book_id)
         if book_id not in self.fakes:
             self.fakes[book_id] = FakeBroker(
-                clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id=f"P{book_id}"
+                assets=FakeBroker.active_assets("SPY"),
+                clock=clock,
+                price_of=lambda _s: 100.0,
+                auto_fill=False,
+                account_id=f"P{book_id}",
             )
         return self.fakes[book_id]
 
@@ -1405,7 +1413,11 @@ def test_settle_on_another_account_exits_refused(clock: _Clock, factory: _Factor
     factory.fake.apply("tp-a", Vanish())
     _engage(clock, factory)
     factory.fake = FakeBroker(
-        clock=clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA2"
+        assets=FakeBroker.active_assets("SPY"),
+        clock=clock,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA2",
     )
     out = _settle(clock, factory, "--order", "tp-a", "--reason", LONG_REASON)
     assert out.exit_code == REFUSED, out.output
