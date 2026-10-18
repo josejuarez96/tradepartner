@@ -139,7 +139,7 @@ def test_openfigi_revisions_errors_and_unmapped(settings: Settings) -> None:
     def fake_mapping(
         tickers: list[str], _config: object, **_kwargs: object
     ) -> list[tuple[list[object], datetime, datetime]]:
-        assert tickers == ["VZ", "BFB", "CRH"]
+        assert tickers == ["VZ", "BF/B", "CRH"]
         calls[0] += 1
         stamp = stamp_override[0] or datetime(2026, 10, 16, 20, tzinfo=UTC) + timedelta(
             minutes=calls[0]

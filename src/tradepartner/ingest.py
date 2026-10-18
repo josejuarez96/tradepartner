@@ -329,7 +329,7 @@ def ingest_openfigi(
     first_bar = now.date() - relativedelta(months=settings.universe.min_history_months)
     prepared: list[tuple[str, str, str]] = []
     responses: list[tuple[list[Any], datetime, datetime]] = []
-    undotted = {value: key for key, value in settings.alpaca.class_symbols.items()}
+    class_symbols = settings.alpaca.class_symbols
 
     def prepare() -> None:
         with open_read_only(settings) as conn:
@@ -356,7 +356,13 @@ def ingest_openfigi(
                 )
                 if live and row["exchange"] in settings.universe.exchanges and sid in bars:
                     ticker = row["ticker"]
-                    prepared.append((sid, ticker, undotted.get(ticker, ticker.replace(".", ""))))
+                    # OpenFIGI's `TICKER` id spells a US class share with a slash
+                    # (`BF/B`), the undotted form the spec names; `class_symbols`
+                    # gives the dotted Alpaca symbol for an undotted NYSE master
+                    # ticker (#1219), so a `BFB` or `BF.B` store ticker both land on
+                    # `BF/B`.
+                    undotted = class_symbols.get(ticker, ticker).replace(".", "/")
+                    prepared.append((sid, ticker, undotted))
         responses.extend(mapping([job[2] for job in prepared], settings.openfigi, clock=clock))
 
     def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
