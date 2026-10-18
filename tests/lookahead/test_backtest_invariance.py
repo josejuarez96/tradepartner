@@ -62,6 +62,15 @@ The frozen settings are the defaults except `strategy.top_fraction = 0.5`, so th
 fixture's small universe (at most six names) yields several targets per rebalance
 instead of one, the case's `schedule.rebalance_cadence`, and no benchmarks (`_frozen`);
 nothing else about the run changes.
+
+**One store, built once** (T215). One session-scoped template DuckDB file
+(`harness.FixtureTemplate`) holds the schema and the fixture universe; every case's
+store (and every teeth variant's) is its own `shutil.copy` of that template with the
+case's revisions applied as a small delta. The schema-and-load build is
+thus paid once per worker, not once per case. A case's revisions land only on its copy:
+the template's fact-table fingerprint is pinned (`TEMPLATE_FINGERPRINT`), so one case
+can never read another's revisions, and `test_the_truncation_guard_bites_on_a_stamped_revision`
+keeps the truncation comparison honest on the shared store.
 """
 
 from __future__ import annotations
@@ -76,20 +85,25 @@ from typing import get_args
 import duckdb
 import polars as pl
 import pytest
-from conftest import load_universe_fixtures
 
-from lookahead.harness import TruncatedStore, screened_strategy
+# `harness` holds the fixture-store template (T215): the class that builds the shared
+# DuckDB file once and copies it per case, and the fingerprint that pins it.
+from lookahead.harness import (
+    FIXTURE_UNIVERSE,
+    FixtureTemplate,
+    TruncatedStore,
+    screened_strategy,
+    template_fingerprint,
+)
 from tradepartner.backtest.engine import BacktestResult, Plan, plan, run
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, Settings
-from tradepartner.store import registry, schema
+from tradepartner.store import registry
 from tradepartner.store.asof import prices_as_of
-from tradepartner.store.db import configure_connection, insert_row
-
-UNIVERSE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+from tradepartner.store.db import insert_row
 
 #: The fixture's bars run 2017-01-03 through 2020-06-30 (fixture README).
 FIXTURE_START = date(2017, 1, 3)
@@ -263,12 +277,10 @@ def _frozen(cadence: Cadence, family: HypothesisFamily, *, screened: bool = Fals
     )
 
 
-def _store(case: Case) -> duckdb.DuckDBPyConnection:
-    """The fixture universe plus `case`'s seeded revisions (module docstring)."""
-    conn = duckdb.connect(":memory:")
-    configure_connection(conn)
-    schema.init_schema(conn)
-    load_universe_fixtures(conn, UNIVERSE_DIR)
+def _store(case: Case, template: FixtureTemplate) -> duckdb.DuckDBPyConnection:
+    """A copy of the shared `template` plus `case`'s seeded revisions (module docstring).
+    The copy is the case's own: its revisions never reach the template or another case."""
+    conn = template.copy()
     # A seeded dividend has no source id, so the as-of read keys it by (type, ex-date):
     # two seeded on one ex-date would be revisions of one action, and a late dividend
     # would read as a restated one. Every seeded ex-date is distinct.
@@ -374,10 +386,20 @@ class Fixture:
             )
 
 
+@pytest.fixture(scope="session")
+def backtest_fixture_template(tmp_path_factory: pytest.TempPathFactory) -> FixtureTemplate:
+    """The fixture-store template, built once per session (T215): the schema and the
+    fixture universe on disk, copied per case so the build is paid once per worker
+    instead of once per case."""
+    return FixtureTemplate(tmp_path_factory.mktemp("backtest-template"), FIXTURE_UNIVERSE)
+
+
 @pytest.fixture(scope="module", params=list(CASES.values()), ids=list(CASES))
-def fixture(request: pytest.FixtureRequest) -> Iterator[Fixture]:
+def fixture(
+    request: pytest.FixtureRequest, backtest_fixture_template: FixtureTemplate
+) -> Iterator[Fixture]:
     case: Case = request.param
-    conn = _store(case)
+    conn = _store(case, backtest_fixture_template)
     settings = _frozen(case.cadence, case.family, screened=case.screened)
     try:
         yield Fixture(
@@ -542,7 +564,9 @@ def _step_frame(result: BacktestResult, start: date) -> pl.DataFrame:
     return frame
 
 
-def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) -> None:
+def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(
+    fixture: Fixture, backtest_fixture_template: FixtureTemplate
+) -> None:
     case = fixture.case
     t_i, t_next = case.teeth, case.teeth_next
     revised_at = fixture.read_time(t_i) + REVISION_DELAY
@@ -571,7 +595,7 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) 
     first_seen = session_close(previous_session(t_i)) - REVISION_DELAY
 
     def store(revision: str | None) -> duckdb.DuckDBPyConnection:
-        conn = _store(case)
+        conn = _store(case, backtest_fixture_template)
         # First seen before T_i in every variant, so only the revision differs.
         _dividend(conn, entitled[0], t_i, 0.5, first_seen)
         _dividend(conn, targets[0], in_step_ex, 0.5, first_seen)
@@ -607,7 +631,7 @@ def test_revisions_known_after_t_i_leave_run_to_t_i_unchanged(fixture: Fixture) 
 
 
 def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
-    fixture: Fixture,
+    fixture: Fixture, backtest_fixture_template: FixtureTemplate
 ) -> None:
     if fixture.case.family not in ("profitability", "combined"):
         pytest.skip("only the profitability and combined families read statement facts")
@@ -617,7 +641,7 @@ def test_a_10k_accepted_after_close_t_i_reaches_only_runs_planning_after_t_i(
     # After the plan's read at T_i, before the fill session's close and the next plan's read.
     fill_close = session_close(fill_session(t_i, fixture.case.cadence))
     assert fixture.read_time(t_i) < accepted < fill_close < fixture.read_time(t_next)
-    without = _store(fixture.case)
+    without = _store(fixture.case, backtest_fixture_template)
     try:
         query = "DELETE FROM statement_facts WHERE cik = ? AND known_at = ?"
         assert without.execute(query, [cik, accepted]).fetchone() == (2,)
@@ -678,7 +702,7 @@ SHARES_REVISION = ("SEC_TRANSFER", date(2018, 12, 31), 12_000_000.0)
 
 
 def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
-    fixture: Fixture,
+    fixture: Fixture, backtest_fixture_template: FixtureTemplate
 ) -> None:
     if not fixture.case.screened:
         pytest.skip("only the turnover-screened case reads shares facts in its signal")
@@ -687,7 +711,7 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
     t_next, t_after = fixture.sessions[i + 1], fixture.sessions[i + 2]
 
     def store(known_at: datetime) -> duckdb.DuckDBPyConnection:
-        conn = _store(fixture.case)
+        conn = _store(fixture.case, backtest_fixture_template)
         fact = {"security_id": sid, "fact_name": "shares_outstanding", "as_of_date": t_i}
         fact |= {"class_member": "", "value": value, "filing_accession": ""}
         fact |= {"known_at": known_at, "ingested_at": known_at, "source": "edgar"}
@@ -720,3 +744,84 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
         late.close()
     for level in COST_LEVELS:
         assert got[level].targets != want[level].targets, f"run to {t_after}, level {level}"
+
+
+# --- the shared store's isolation and its guard (T215) ---------------------------
+
+
+#: The session template's fact-table fingerprint, pinned so a case's revisions (which
+#: land only on its own copy) can never reach the template another case starts from.
+#: Recompute with `harness.template_fingerprint` after any fixture-universe change.
+TEMPLATE_FINGERPRINT = "7272ae23e759eec4d1fad465221dc7d36e35a6d7a40b48cd0498edfd956fa558"
+
+
+def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:
+    """Rows in `prices_daily` for (sid, session): 1 for a fixture bar, 2 for a
+    revision of one."""
+    [count] = conn.execute(
+        "SELECT count(*) FROM prices_daily WHERE security_id = ? AND session = ?",
+        [sid, session],
+    ).fetchone()
+    return count
+
+
+def test_the_shared_template_is_pinned(backtest_fixture_template: FixtureTemplate) -> None:
+    assert template_fingerprint(backtest_fixture_template.path) == TEMPLATE_FINGERPRINT
+
+
+def test_a_cases_revisions_stay_on_its_own_copy(
+    backtest_fixture_template: FixtureTemplate,
+) -> None:
+    """A case's revisions land on its own copy: the shared template -- and so every
+    other case's starting point -- is fingerprint-identical after they are applied."""
+    before = template_fingerprint(backtest_fixture_template.path)
+    assert before == TEMPLATE_FINGERPRINT
+    case = CASES["month_end"]
+    conn = _store(case, backtest_fixture_template)
+    try:
+        # The copy carries the case's seeded revisions (a seeded bar at T_k is a
+        # second row for its (sid, T_k)); the template below is untouched.
+        assert _bar_revisions(conn, SEEDED_IDS[0], case.seeded[0]) == 2
+    finally:
+        conn.close()
+    assert template_fingerprint(backtest_fixture_template.path) == before
+
+
+def test_the_truncation_guard_bites_on_a_stamped_revision(
+    backtest_fixture_template: FixtureTemplate,
+) -> None:
+    """The truncation comparison must see the case's revisions on **both** sides: plant
+    a revision stamped **before** `t` (visible at `t`, so it changes `run(end=t)`) on the
+    truncated side only and show the comparison goes red. A shared store that let a
+    revision reach one side and not the other would be caught by exactly this. One case
+    (the default `month_end` walk) is enough for the guard."""
+    case = CASES["month_end"]
+    conn = _store(case, backtest_fixture_template)
+    settings = _frozen(case.cadence, case.family, screened=case.screened)
+    try:
+        fixture = Fixture(
+            case=case,
+            conn=conn,
+            settings=settings,
+            handle=_open_trial(conn, settings, case),
+            sessions=case.sessions,
+        )
+        end, t = case.teeth, fixture.read_time(case.teeth)
+        before = previous_session(end)
+        base = fixture.run(end)
+        held = _held_at_close(base[COST_LEVELS[-1]], before)
+        assert held, f"nothing held at close({before})"
+        injected = _store(case, backtest_fixture_template)
+        try:
+            _revise_bar(injected, held[0], before, t - REVISION_DELAY, factor=2.0)
+            truncated = TruncatedStore(injected)
+            try:
+                cut = fixture.run(end, connect=_factory(truncated.at(t)))
+            finally:
+                truncated.close()
+        finally:
+            injected.close()
+    finally:
+        conn.close()
+    with pytest.raises(AssertionError):
+        _assert_same(cut, base, f"revision stamped {t - REVISION_DELAY} must bite")
