@@ -1,1 +1,0 @@
-- #1734 IRRX kill-ladder rung 2: not decided from open data (no public industry-relative reversal series; needs firm-level returns), so IRRX's long leg moves to a store-side computation.
