@@ -119,6 +119,7 @@ def _rules(
     family: str = "momentum",
     seed: float | None = None,
     parent_family: str | None = None,
+    fixed: dict[str, Any] | None = None,
 ) -> lab_registry.FamilyRules:
     return lab_registry.write_family_rules(
         conn,
@@ -128,7 +129,7 @@ def _rules(
         holdout_start=HOLDOUT_START,
         holdout_end=HOLDOUT_END,
         in_sample_start=IN_SAMPLE_START,
-        fixed_params=_FIXED,
+        fixed_params={**_FIXED, **(fixed or {})},
         sr_star_seed_annual=seed,
         settings=settings,
     )
@@ -688,6 +689,54 @@ def test_grandfathered_members_lists_pre_lab_members_off_the_rules(
         ("extra", ("backtest.initial_capital",)),
     ]
     assert after_lab.hypothesis_id not in {m.hypothesis_id for m in members}
+
+
+@pytest.mark.parametrize(
+    ("fixed", "cases"),
+    [
+        (
+            {},
+            {
+                "spread": ({"costs.spread_bps": 5.0}, None),
+                "impact": ({"costs.impact_coeff": 0.1}, None),
+                "adv": ({"costs.adv_sessions": 10}, ("costs.adv_sessions",)),
+                "defaults": (
+                    {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20},
+                    None,
+                ),
+            },
+        ),
+        (
+            {"costs.spread_bps": 5.0},
+            {
+                "lower": ({"costs.spread_bps": 2.0}, ("costs.spread_bps",)),
+                "higher": ({"costs.spread_bps": 8.0}, None),
+                "same": ({"costs.spread_bps": 5.0}, None),
+            },
+        ),
+    ],
+    ids=["rules-before-the-terms", "rules-fixing-spread"],
+)
+def test_grandfathered_members_read_the_cost_terms_as_the_lab_does(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    fixed: dict[str, Any],
+    cases: dict[str, tuple[dict[str, Any], tuple[str, ...] | None]],
+) -> None:
+    """Spec amendment #1792, item 1: the rules' value of a term they lack is its table
+    default (rules stored before T210 lack all three), and `spread_bps` and
+    `impact_coeff` may be higher than the rules', as `per_side_bps` may."""
+    h1 = _register(lab_store, settings, "h1")
+    _rules(lab_store, settings, h1.hypothesis_id, fixed=fixed)
+    mark_pre_lab(lab_store, h1.hypothesis_id)
+    for slug, (extra, _differences) in cases.items():
+        record = _register(lab_store, settings, slug, params=_params(**{**fixed, **extra}))
+        mark_pre_lab(lab_store, record.hypothesis_id)
+    members = {m.slug: m.differences for m in lab_registry.grandfathered_members(lab_store)}
+    expected = {slug: d for slug, (_extra, d) in cases.items() if d is not None}
+    if fixed:  # h1 itself lacks the rules' spread: read at 0.0, lower than 5.0
+        expected["h1"] = ("costs.spread_bps",)
+    assert members == expected
 
 
 def test_registry_size_bytes_is_the_store_file_and_its_wal(tmp_path: Path) -> None:

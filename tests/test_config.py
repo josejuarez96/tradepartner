@@ -2576,3 +2576,37 @@ def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper={"min_free_disk_gb": -1})
     assert "min_free_disk_gb" not in FROZEN_PAPER_KEYS
+
+
+# --- T210: the cost terms (backtest spec, amendment 2026-10-18 #1731, "Config keys") ---
+
+
+def test_t210_cost_term_defaults_are_the_identity() -> None:
+    """`costs.spread_bps=0.0`, `costs.impact_coeff=0.0`, `costs.adv_sessions=20`."""
+    c = _settings().costs
+    assert c.spread_bps == 0.0
+    assert c.impact_coeff == 0.0
+    assert c.adv_sessions == 20
+    assert isinstance(c.adv_sessions, int)
+
+
+def test_t210_cost_terms_accept_positive_values() -> None:
+    c = Settings(
+        _env_file=None, costs={"spread_bps": 2.5, "impact_coeff": 0.1, "adv_sessions": 60}
+    ).costs
+    assert (c.spread_bps, c.impact_coeff, c.adv_sessions) == (2.5, 0.1, 60)
+
+
+@pytest.mark.parametrize("field", ["spread_bps", "impact_coeff"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_t210_cost_terms_negative_or_non_finite_rejected(field: str, value: float) -> None:
+    """A negative cost would pay the strategy to trade (`CostsConfig`'s rule)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={field: value})
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_t210_adv_window_must_hold_a_session(value: int) -> None:
+    """A median over no sessions is undefined."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={"adv_sessions": value})
