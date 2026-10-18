@@ -17,8 +17,9 @@ path and a book can only reach its own account. A failed request is re-raised as
 the SDK's exception so no `__context__` keeps its request (whose headers carry the keys).
 
 The EDGAR client pattern: requests are paced at `alpaca.trading_requests_per_minute`,
-time out after `alpaca.trading_request_timeout_seconds`, and a timeout (or a 429/504,
-the SDK's own retry codes, whose internal retry is switched off) is retried
+time out after `alpaca.trading_request_timeout_seconds`, and a timeout, a connection error or a
+429/500/502/503/504 (the SDK's own retry codes plus the 5xx an outage returns, whose
+internal retry is switched off) is retried
 `alpaca.trading_max_retries` times, then raised. `submit_order` requires a
 `client_order_id`, so the broker refuses a second order with it; when a retry of a
 submit is refused as a duplicate (422 with Alpaca code 40010001, recorded in
@@ -52,7 +53,7 @@ from tradepartner.timeutil import ensure_tz_aware_utc
 # `GET /v2/account/activities` at most 100 per page (Alpaca API reference).
 OPEN_ORDERS_LIMIT = 500
 ACTIVITIES_PAGE_SIZE = 100
-_RETRY_STATUS_CODES = frozenset({429, 504})
+_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _DUPLICATE_STATUS_CODE = 422
 _DUPLICATE_ERROR_CODE = 40010001  # "client_order_id must be unique" (recorded, T48b)
 
@@ -214,7 +215,7 @@ def _build_client(key: str, secret: str, timeout_seconds: float) -> TradingClien
 
 
 def _retryable(error: BaseException) -> bool:
-    if isinstance(error, requests.Timeout):
+    if isinstance(error, requests.Timeout | requests.ConnectionError):
         return True
     return isinstance(error, APIError) and error.status_code in _RETRY_STATUS_CODES
 
