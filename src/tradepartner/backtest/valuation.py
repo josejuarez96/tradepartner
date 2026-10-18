@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal, get_args
 
+import numpy as np
 import polars as pl
 
 from tradepartner.calendar import all_sessions, is_session, next_session
@@ -133,6 +134,15 @@ def _check_prices(frame: pl.DataFrame, field: str, price: str = "price") -> None
         _check_price(sid, session, field, value)
 
 
+def _scaled(frame: pl.DataFrame, value: str, num: str, den: str) -> pl.Series:
+    """`value * num / den` row by row, as Python evaluates it (multiply, then divide, both
+    IEEE doubles; a null `num` gives NaN). Polars' own expression divides a constant-like
+    column by multiplying with its reciprocal, which is not byte-identical, so the
+    arithmetic is numpy's, one rounding per operation, on any platform."""
+    product = np.multiply(frame[value].to_numpy(), frame[num].to_numpy())
+    return pl.Series(np.divide(product, frame[den].to_numpy()), dtype=pl.Float64)
+
+
 def _price_at_or_before(
     bars: pl.DataFrame,
     held: pl.DataFrame,
@@ -215,7 +225,9 @@ def value_positions(
     has_bar = pl.col("close").is_not_null()
     return (
         marked.with_columns(
-            value=pl.when(has_bar).then(pl.col("position") * pl.col("close") / pl.col("base")),
+            value=_scaled(marked, "position", "close", "base").zip_with(
+                marked["close"].is_not_null(), pl.Series([None] * marked.height, dtype=pl.Float64)
+            ),
             marked_at=pl.when(has_bar).then(pl.col("session")),
         )
         .with_columns(
@@ -226,6 +238,7 @@ def value_positions(
             .fill_null(pl.col("base_session")),
         )
         .select(list(_VALUE_SCHEMA))
+        .rechunk()
     )
 
 
@@ -291,9 +304,8 @@ def carry_to_fill(
     both = marks.join(
         target.select("security_id", pl.col("base").alias("target")), on="security_id"
     )
-    carried = both.sort("security_id").with_columns(
-        carried=pl.col("position") * pl.col("target") / pl.col("base")
-    )
+    both = both.sort("security_id")
+    carried = both.with_columns(carried=_scaled(both, "position", "target", "base"))
     return dict(carried.select("security_id", "carried").iter_rows())
 
 

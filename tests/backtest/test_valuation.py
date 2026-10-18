@@ -507,7 +507,11 @@ def _digest(result: Any) -> dict[str, Any]:
         risk_free_period_returns=constant_period_returns(0.0, 252, len(daily)),
     )
     return {
-        "metrics_sha": hashlib.sha256(repr(sorted(metrics.items())).encode()).hexdigest()[:16],
+        "metrics_sha": hashlib.sha256(
+            repr(
+                sorted((k, None if v is None else round(v, 9)) for k, v in metrics.items())
+            ).encode()
+        ).hexdigest()[:16],
         "equity_sha": hashlib.sha256(repr(equity).encode()).hexdigest()[:16],
         "rebalances_sha": hashlib.sha256(repr(rebalances).encode()).hexdigest()[:16],
         "positions_sha": hashlib.sha256(repr(values).encode()).hexdigest()[:16],
@@ -541,7 +545,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         0.0: {
             "equity_sha": "41b42afe01bbaf08",
             "final_equity": "118909.48789598294",
-            "metrics_sha": "7335a8ceb885d29f",
+            "metrics_sha": "ccc320d72324675c",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "30f815c8ffc807ed",
@@ -550,7 +554,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         15.0: {
             "equity_sha": "2213b471eda2b663",
             "final_equity": "118553.47731502213",
-            "metrics_sha": "71621ba6fa87bd79",
+            "metrics_sha": "bf1a5e2788148f76",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "2e9fb107aba9f127",
@@ -561,7 +565,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         0.0: {
             "equity_sha": "99638c6f46d57b30",
             "final_equity": "117814.81281860062",
-            "metrics_sha": "846c5952400fd284",
+            "metrics_sha": "c14bb8b8890c5dd4",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "584da82b920751ff",
@@ -570,7 +574,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         15.0: {
             "equity_sha": "f2a1319309739751",
             "final_equity": "117464.94162804325",
-            "metrics_sha": "3bc7e92eda8ab160",
+            "metrics_sha": "02d24ffcf069f038",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "8ca51261b130ef3f",
@@ -581,7 +585,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         0.0: {
             "equity_sha": "0e0935d9c8f7f80e",
             "final_equity": "119060.66687801277",
-            "metrics_sha": "f3a2e82f526508f0",
+            "metrics_sha": "22cf634476d0d13d",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "87c382d6717a27ab",
@@ -590,7 +594,7 @@ STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
         15.0: {
             "equity_sha": "62dd0e81ce9b3baa",
             "final_equity": "118704.20784205146",
-            "metrics_sha": "a822c81699377333",
+            "metrics_sha": "a78cb88097585d4b",
             "n_equity": 63,
             "n_rebalances": 3,
             "positions_sha": "d91647f5c08858f3",
@@ -830,3 +834,25 @@ def test_empty_positions_give_an_empty_typed_frame() -> None:
     assert got.height == 0
     assert got.schema == loop_value_positions({}, frame, F0, fill_price="close", through=D2).schema
     assert carry_to_fill({}, frame, T0, F0, fill_price="close", marked_at={}) == {}
+
+
+@pytest.mark.parametrize("fill_price", ["close", "open"])
+def test_a_single_name_single_price_ratio_is_byte_identical_to_the_loop(
+    fill_price: FillPrice,
+) -> None:
+    """Polars divides a constant-like column by multiplying with its reciprocal, one ulp
+    off the loop's `pos * close / base`; this single-name frame found it (the H1 twin)."""
+    frame = _frame(
+        [
+            ("A", F0, 321.4488391715713, 322.09045362101557),
+            ("A", D2, 322.73463452825763, 323.37881543549963),
+        ]
+    )
+    kwargs: dict[str, Any] = {"fill_price": fill_price, "through": D2}
+    got = value_positions({"A": 100000.0}, frame, F0, **kwargs)
+    assert got.equals(loop_value_positions({"A": 100000.0}, frame, F0, **kwargs))
+    marks: dict[str, date] = {"A": F0}
+    carry = {"fill_price": fill_price, "marked_at": marks}
+    assert carry_to_fill({"A": 7.3}, frame, F0, D2, **carry) == loop_carry_to_fill(
+        {"A": 7.3}, frame, F0, D2, **carry
+    )
