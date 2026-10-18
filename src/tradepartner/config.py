@@ -1956,6 +1956,9 @@ class PaperConfig(BaseModel):
     fewer members than the first, or fewer than `p x (1 - fraction)` against the
     window's last plan of `p` members, halts the run. Both are read at run time and are
     not in `FROZEN_PAPER_KEYS`, so windows opened before them are covered.
+    `min_free_disk_gb` (#1758) is the free space, in GB, the store's disk must have
+    for a run to start; below it the run refuses before any broker call, with a
+    `run_failed` alert and no kill switch. 0 turns the check off. Run-time, not frozen.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1979,6 +1982,7 @@ class PaperConfig(BaseModel):
     min_override_reason_chars: int = Field(default=20, ge=1)
     min_universe_names: int = Field(default=1, ge=1)
     max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
+    min_free_disk_gb: float = Field(default=5.0, ge=0)
     #: `paper status` reads the slippage line over only the newest
     #: `status_slippage_sessions` order sessions of the window (#1741): the line is
     #: a diagnostic, and one `prices_as_of` read per session would otherwise grow
