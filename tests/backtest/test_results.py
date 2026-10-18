@@ -42,7 +42,7 @@ from tradepartner.backtest.results import (
     metric_rows,
     write_results,
 )
-from tradepartner.backtest.riskfree import constant_period_returns
+from tradepartner.backtest.riskfree import RiskFreeMissing, constant_period_returns
 from tradepartner.backtest.schedule import read_time, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import FAMILIES, Cadence, Settings
@@ -1273,3 +1273,288 @@ def test_every_pre_existing_metric_row_is_byte_identical(
     ]
     digest = sha256("\n".join(kept).encode()).hexdigest()
     assert digest == PINNED_METRIC_DIGESTS[rate], digest
+
+
+# --- the risk-free series from the store (backtest spec amendment 2026-10-11, T170c) ----
+
+
+def _rate_value(index: int) -> float:
+    """The published DTB3 quote (percent) of the `index`-th session: a slow ramp."""
+    return 4.0 + 0.01 * (index % 40)
+
+
+def _rate_rows(
+    sessions: list[date] = SESSIONS, *, series: str = "DTB3", lag: int = 0
+) -> pl.DataFrame:
+    """One observation per session, known at the close of the session `lag` later."""
+    rows = [
+        (series, s, _rate_value(i), s, session_close(sessions[min(i + lag, len(sessions) - 1)]))
+        for i, s in enumerate(sessions)
+    ]
+    return pl.DataFrame(
+        rows,
+        schema={
+            "series": pl.Utf8,
+            "observation_date": pl.Date,
+            "value": pl.Float64,
+            "vintage_date": pl.Date,
+            "known_at": pl.Datetime("us", "UTC"),
+        },
+        orient="row",
+    )
+
+
+def _store_settings(tmp_path: Path, **metrics: Any) -> Settings:
+    return _settings(tmp_path, metrics={"risk_free_source": "store", **metrics})
+
+
+def _hand_product(sessions: list[date], quote: dict[date, float], ends: list[date]) -> float:
+    """`risk_free_annual` by hand: each session after T_0 accrues `y * n / 365`, with `y`
+    the bond-equivalent yield of the discount quote and `n` the calendar days since the
+    previous session; the annualised product over the periods."""
+    inside = [s for s in sessions if ends[0] <= s <= ends[-1]]
+    growth = 1.0
+    for previous, session in pairwise(inside):
+        d = quote[session] / 100
+        y = 365 * d / (360 - 91 * d)
+        growth *= 1 + y * (session - previous).days / 365
+    return growth ** (12 / (len(ends) - 1)) - 1
+
+
+class TestRiskFreeStore:
+    def test_constant_never_reads_rates_and_adds_the_constant_annual_row(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path, metrics={"risk_free_rate": 0.03})
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows())
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
+        assert not [c for c in provider.calls if c.method == "rates"]
+        assert all(r.rates is None for r in results.values())
+        rows = metric_rows(results, settings, cadence="month_end", family="momentum")
+        annual = [r for r in rows if r.metric == "risk_free_annual"]
+        assert len(annual) == 3 * len(LEVELS)
+        assert {(r.series, r.cost_per_side_bps) for r in annual} == {
+            (s, level) for s in ("strategy", "SPY", "MTUM") for level in LEVELS
+        }
+        assert all(r.value == pytest.approx(0.03, abs=1e-12) for r in annual)
+
+    def test_the_frame_is_read_once_at_the_data_cutoff(self, tmp_path: Path) -> None:
+        settings = _store_settings(tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows())
+        results = run(settings, provider, START, END, _fake_handle(), LEVELS, family="momentum")
+        reads = [c for c in provider.calls if c.method == "rates"]
+        assert [(c.t, c.series) for c in reads] == [(read_time(END), "DTB3")]
+        frames = [r.rates for r in results.values()]
+        assert all(f is not None and f.equals(frames[0]) for f in frames)
+        assert frames[0] is not None and frames[0]["known_at"].max() <= read_time(END)
+        assert frames[0].height == len([s for s in SESSIONS if session_close(s) <= read_time(END)])
+
+    def test_the_stored_annual_equals_the_hand_product(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _store_settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows())
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
+        assert write_results(conn, handle, results, settings) == "ok"
+        quote = {s: _rate_value(i) for i, s in enumerate(SESSIONS)}
+        want = _hand_product(SESSIONS, quote, rebalance_sessions(START, END))
+        for series in ("strategy", "SPY", "MTUM"):
+            for level in LEVELS:
+                got = _metrics(conn, handle.trial_id, series, level)["risk_free_annual"]
+                assert got == pytest.approx(want, rel=1e-12)
+        assert 0.04 < want < 0.05
+
+    def test_the_series_moves_the_raw_sharpe_and_leaves_excess_spy_alone(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        constant = _settings(tmp_path)
+        store = _store_settings(tmp_path)
+        _register(conn, store)
+        handle = _open(conn, store, tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows())
+        results = run(store, provider, START, END, handle, LEVELS, family="momentum")
+        rows = {
+            source: {
+                (r.series, r.cost_per_side_bps, r.metric): r.value
+                for r in metric_rows(results, params, cadence="month_end", family="momentum")
+            }
+            for source, params in (("constant", constant), ("store", store))
+        }
+        base = ("strategy", BASE)
+        assert rows["store"][(*base, "sharpe_period")] < rows["constant"][(*base, "sharpe_period")]
+        for key in EXCESS_SPY_KEYS:
+            assert rows["store"][(*base, key)] == rows["constant"][(*base, key)]
+        assert rows["store"][(*base, "cagr")] == rows["constant"][(*base, "cagr")]
+
+    def test_a_store_without_the_series_fails_before_any_row(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _store_settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows(series="OTHER"))
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
+        with pytest.raises(RiskFreeMissing, match="risk_free_missing: no DTB3 rate"):
+            write_results(conn, handle, results, settings)
+        for table in ("trial_metrics", "trial_equity", "trial_rebalances", "trial_results"):
+            assert _count(conn, table, handle.trial_id) == 0
+
+    def test_a_mistyped_series_names_itself(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _store_settings(tmp_path, risk_free_series="DTB33")
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        provider = replace(_provider(), rate_rows=_rate_rows())
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
+        with pytest.raises(RiskFreeMissing, match="DTB33"):
+            write_results(conn, handle, results, settings)
+        assert _count(conn, "trial_metrics", handle.trial_id) == 0
+
+    def test_a_first_period_before_the_first_stamp_fails_naming_the_session(
+        self, conn: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        settings = _store_settings(tmp_path)
+        _register(conn, settings)
+        handle = _open(conn, settings, tmp_path)
+        late = [s for s in SESSIONS if s >= date(2024, 2, 5)]
+        provider = replace(_provider(), rate_rows=_rate_rows(late))
+        results = run(settings, provider, START, END, handle, LEVELS, family="momentum")
+        with pytest.raises(RiskFreeMissing) as raised:
+            write_results(conn, handle, results, settings)
+        assert raised.value.session == date(2024, 2, 1)
+        assert _count(conn, "trial_equity", handle.trial_id) == 0
+
+    def test_a_rate_known_after_a_close_is_not_used_at_that_close(self, tmp_path: Path) -> None:
+        """A one-session lag in `known_at` changes the carried quote, so the lag shows."""
+        settings = _store_settings(tmp_path)
+        results = {}
+        for lag in (0, 1):
+            provider = replace(_provider(), rate_rows=_rate_rows(lag=lag))
+            results[lag] = run(
+                settings, provider, START, END, _fake_handle(), LEVELS, family="momentum"
+            )
+        annual = {
+            lag: next(
+                r.value
+                for r in metric_rows(res, settings, cadence="month_end", family="momentum")
+                if r.metric == "risk_free_annual" and r.series == "strategy"
+            )
+            for lag, res in results.items()
+        }
+        sessions = SESSIONS
+        quote = {s: _rate_value(i - 1) for i, s in enumerate(sessions)}
+        assert annual[0] != annual[1]
+        assert annual[1] == pytest.approx(
+            _hand_product(sessions, quote, rebalance_sessions(START, END)), rel=1e-12
+        )
+
+    def test_a_result_without_its_frame_is_refused(self, tmp_path: Path) -> None:
+        settings = _store_settings(tmp_path)
+        results = {
+            level: replace(result, rates=None)
+            for level, result in _run(settings, _fake_handle()).items()
+        }
+        with pytest.raises(ValueError, match="no rates frame"):
+            metric_rows(results, settings, cadence="month_end", family="momentum")
+
+
+def _fake_handle() -> registry.TrialHandle:
+    return registry._issue_handle(
+        trial_id=1,
+        hypothesis_id=1,
+        family="momentum",
+        params_sha256="0" * 64,
+        kind="in_sample",
+        synthetic=True,
+        started_at=datetime(2024, 10, 1, tzinfo=UTC),
+        store_max_ingested_at=None,
+        database=None,
+    )
+
+
+def _lend(conn: duckdb.DuckDBPyConnection) -> Any:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        yield conn
+
+    return _connect
+
+
+FIXTURE_RATES = Path(__file__).parents[1] / "fixtures" / "universe" / "rates.csv"
+
+
+def _fixture_quote_at_close(session: date) -> float:
+    """The latest observation (by observation date) of the fixture's `rates.csv` known at
+    the close of `session`, read straight off the file."""
+    frame = pl.read_csv(FIXTURE_RATES, try_parse_dates=True)
+    known = frame.filter(pl.col("known_at") <= session_close(session))
+    return float(known.sort("observation_date")["value"][-1])
+
+
+def test_a_fixture_backtest_under_store_stores_the_hand_product(
+    fixture_store_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One backtest end to end on the fixture store (its `rates.csv` starts five sessions
+    before the first bar): the stored `risk_free_annual` is the hand product of the file."""
+    from tradepartner.backtest.store_provider import StoreProvider
+
+    # `StoreProvider` refuses frozen calendar settings that differ from the live ones.
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    start, end = date(2019, 1, 2), date(2019, 12, 31)
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(tmp_path / "real_store.duckdb")},
+        strategy={"top_fraction": 0.5},
+        holdout={"start": HOLDOUT[0], "end": HOLDOUT[1]},
+        metrics={"risk_free_source": "store"},
+    )
+    connection = duckdb.connect(str(fixture_store_path))
+    try:
+        registry.register_hypothesis(
+            connection,
+            slug="h-rf",
+            family="momentum",
+            title="risk-free on the fixture store",
+            doc_path="docs/hypotheses/h-rf.md",
+            doc_sha256="d" * 64,
+            params=frozen_params_of(settings, family="momentum"),
+            in_sample_start=start,
+            holdout_start=HOLDOUT[0],
+            holdout_end=HOLDOUT[1],
+            registered_by="owner",
+            settings=settings,
+        )
+        sessions = rebalance_sessions(start, end)
+        handle = registry.open_trial(
+            connection,
+            hypothesis_id=registry.get_hypothesis(connection, "h-rf").hypothesis_id,
+            kind="in_sample",
+            start_session=start,
+            end_session=end,
+            data_cutoff=read_time(sessions[-1]),
+            synthetic=True,
+            run_by="test",
+            settings=settings,
+            repo_dir=tmp_path,
+        )
+        connect = _lend(connection)
+        with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+            results = run(settings, provider, start, end, handle, LEVELS, family="momentum")
+        assert write_results(connection, handle, results, settings) == "ok"
+        every = [s for s in all_sessions() if sessions[0] <= s <= sessions[-1]]
+        quote = {s: _fixture_quote_at_close(s) for s in every[1:]}
+        want = _hand_product(every, quote, sessions)
+        assert 0.0 < want < 0.05
+        for series in ("strategy", "SPY", "MTUM"):
+            for level in LEVELS:
+                got = _metrics(connection, handle.trial_id, series, level)["risk_free_annual"]
+                assert got == pytest.approx(want, rel=1e-12)
+    finally:
+        connection.close()
