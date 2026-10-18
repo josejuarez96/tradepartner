@@ -636,8 +636,8 @@ def _interior_gaps(
         for day in sessions:
             if not lo < day < hi or day in traded[sid]:
                 continue
-            held = (t for t in resolver.symbols(sid, day, day) if _lands(resolver, t, sid, day))
-            if any(alpaca_symbol(t) is not None for t in held):
+            held = (tk for tk in resolver.symbols(sid, day, day) if _lands(resolver, tk, sid, day))
+            if any(alpaca_symbol(tk) is not None for tk in held):
                 gaps.add(sid)
                 break
     return gaps
