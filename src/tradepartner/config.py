@@ -47,9 +47,12 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
+    SerializerFunctionWrapHandler,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -1860,6 +1863,20 @@ def paper_key_variable_names(book_id: str) -> tuple[str, str]:
     return f"{head}API_KEY", f"{head}API_SECRET"
 
 
+class SmallAccountConfig(BaseModel):
+    """`risk.small_account` (spec amendment 2026-10-18 item 8; ADR 0023 D6; plan T206).
+
+    `enabled` turns the small-account profile on: every buy is a fractional notional
+    order rounded up to `risk.min_order_notional`, and the limits judge the rounded
+    figure. ADR 0010's limits are unchanged. Off by default, so every window frozen
+    before the section existed is unchanged. Unknown keys and non-booleans are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+    enabled: bool = False
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -1885,9 +1902,42 @@ class RiskConfig(BaseModel):
     The value is a fixed default, not derived at run time; a window keeps the value it
     froze at `paper start`. After the first `paper start` any change to a default is a
     new ADR (ADR 0010 point 5).
+
+    `small_account` (T206, `SmallAccountConfig`) is frozen with the section as the key
+    `risk.small_account`, but it is deliberately not a pydantic field: a window frozen
+    before T206 has no such key, and `reconcile_run.frozen_risk` refuses a `frozen_json`
+    that lacks any of `RiskConfig.model_fields`. It is read from the input by a wrap
+    validator, defaults to off when absent, and is written back by the serializer, so
+    `model_dump()` (what `paper start` freezes) carries it.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
+
+    _small_account: SmallAccountConfig = PrivateAttr(default_factory=SmallAccountConfig)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _read_small_account(cls, data: Any, handler: Any) -> Any:
+        """Split `small_account` off the input before the field validation sees it."""
+        if isinstance(data, dict) and "small_account" in data:
+            rest = {k: v for k, v in data.items() if k != "small_account"}
+            section = SmallAccountConfig.model_validate(data["small_account"])
+            built = handler(rest)
+            built._small_account = section
+            return built
+        return handler(data)
+
+    @model_serializer(mode="wrap")
+    def _write_small_account(self, handler: SerializerFunctionWrapHandler) -> Any:
+        """The dump carries `small_account`, so `paper start` freezes it."""
+        dumped = handler(self)
+        dumped["small_account"] = self._small_account.model_dump()
+        return dumped
+
+    @property
+    def small_account(self) -> SmallAccountConfig:
+        """The small-account profile (off unless the window froze it on)."""
+        return self._small_account
 
     max_position_weight: float = Field(default=0.05, ge=0, le=1)
     max_order_notional_fraction: float = Field(default=0.05, ge=0, le=1)

@@ -229,6 +229,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
@@ -340,6 +341,47 @@ class StartRefusedError(RuntimeError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+def _target_names(registered: Mapping[str, Any]) -> int | None:
+    """The most names the hypothesis's rule can hold: `strategy.top_fraction` of
+    `universe.top_n_by_cap`, rounded up; `None` when the registration has neither key
+    (a family with no such count), where the feasibility rule has nothing to count."""
+    fraction = registered.get("strategy.top_fraction")
+    universe = registered.get("universe.top_n_by_cap")
+    if (
+        isinstance(fraction, bool)
+        or isinstance(universe, bool)
+        or not isinstance(fraction, int | float)
+        or not isinstance(universe, int | float)
+    ):
+        return None
+    names: int = math.ceil(Decimal(repr(float(fraction))) * Decimal(repr(float(universe))))
+    return names
+
+
+def _refuse_small_account(
+    registered: Mapping[str, Any], settings: Settings, cash: float, slug: str
+) -> None:
+    """The start feasibility rule, every window (spec amendment 2026-10-18 item 8;
+    ADR 0023 D6; T206): n x `risk.min_order_notional` x (1 + `risk.whole_share_price_buffer`)
+    must fit the account's cash, or `StartRefusedError("refused_small_account")` before
+    any write."""
+    names = _target_names(registered)
+    if names is None:
+        return
+    need = (
+        Decimal(names)
+        * Decimal(repr(settings.risk.min_order_notional))
+        * (1 + Decimal(repr(settings.risk.whole_share_price_buffer)))
+    )
+    if need > Decimal(repr(float(cash))):
+        raise StartRefusedError(
+            "refused_small_account",
+            f"{slug!r} holds up to {names} names; {names} x the {settings.risk.min_order_notional} "
+            f"minimum order x (1 + {settings.risk.whole_share_price_buffer}) = {need:.2f} "
+            f"does not fit the account's cash {cash:.2f}",
+        )
 
 
 @dataclass(frozen=True)
@@ -776,6 +818,7 @@ def start(
                 f"account() failed on the paper endpoint ({type(exc).__name__})",
             ) from exc
         _refuse_account_in_use(account.account_id, other_accounts)
+        _refuse_small_account(registered, settings, account.cash, slug)
         open_orders = broker.open_orders()
         positions = broker.positions()
         # The booked-`FEE` seen-set `paper start` records (#1583, T183, spec item

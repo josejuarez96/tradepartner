@@ -741,6 +741,17 @@ def size_buys(
     }
     buffer = 1 + _dec(frozen.whole_share_price_buffer)
     cash_d = _dec(cash)
+    minimum = frozen.min_order_notional
+    # The small-account profile (T206): a notional buy under the minimum is ordered at
+    # exactly the minimum, never scaled or deferred; the limits then judge the rounded
+    # figure, and a cash shortfall is `check_phase`'s `buys_within_cash`, not a quiet skip.
+    rounded = {
+        id(b)
+        for b in decisions
+        if frozen.small_account.enabled
+        and not b.by_whole_shares
+        and 0 < b.remainder.notional < minimum
+    }
 
     def whole_shares(buy: BuyToSize, scale: Decimal) -> float:
         buffered = _dec(prices[buy.decision.security_id]) * buffer
@@ -749,6 +760,8 @@ def size_buys(
         )
 
     def attempt(buy: BuyToSize, scale: Decimal) -> float:
+        if id(buy) in rounded:
+            return minimum
         return float((_dec(buy.remainder.notional) * scale).quantize(_CENT, rounding=ROUND_DOWN))
 
     def need(buy: BuyToSize, scale: Decimal) -> Decimal:
@@ -756,6 +769,16 @@ def size_buys(
         if buy.by_whole_shares:
             return _buy_cash(None, whole_shares(buy, scale), price, True, frozen, costs)
         return _buy_cash(attempt(buy, scale), None, price, False, frozen, costs)
+
+    fixed_need = sum(
+        (
+            _buy_cash(minimum, None, prices[b.decision.security_id], False, frozen, costs)
+            for b in decisions
+            if id(b) in rounded
+        ),
+        Decimal(0),
+    )
+    cash_rest = max(cash_d - fixed_need, Decimal(0))
 
     def scale_for(active: list[BuyToSize]) -> Decimal:
         total = sum((_dec(b.remainder.notional) for b in active), Decimal(0))
@@ -765,7 +788,7 @@ def size_buys(
         # the most shares (the worst case for a per-share one); Alpaca charges
         # neither.
         low_price = min(prices[b.decision.security_id] for b in active)
-        return min(Decimal(1), _spendable(cash_d, len(active), low_price, costs) / total)
+        return min(Decimal(1), _spendable(cash_rest, len(active), low_price, costs) / total)
 
     def below_minimum(buy: BuyToSize, scale: Decimal) -> bool:
         if not buy.by_whole_shares:
@@ -775,7 +798,7 @@ def size_buys(
         value = quantity * prices[buy.decision.security_id]
         return quantity < 1 or value < frozen.min_order_notional
 
-    active = [b for b in decisions if b.remainder.notional > 0]
+    active = [b for b in decisions if b.remainder.notional > 0 and id(b) not in rounded]
     deferred: set[int] = {id(b) for b in decisions if b.remainder.notional <= 0}
     never_fit = {id(b) for b in active if below_minimum(b, Decimal(1))}
     deferred.update(never_fit)
@@ -808,8 +831,12 @@ def size_buys(
     # overshoot (a dollar less needs at least a dollar less), so no loop; an
     # overshoot above a cent is not rounding, and raises.
     over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
-    if over > 0:
-        largest = max(notionals, key=lambda k: notionals[k])
+    # Rounded buys the cash cannot pay are left whole: `check_phase` refuses the batch.
+    if over > 0 and fixed_need <= cash_d:
+        cuttable = [k for k in notionals if k not in rounded]
+        if not cuttable:
+            raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")
+        largest = max(cuttable, key=lambda k: notionals[k])
         cut = over.quantize(_CENT, rounding=ROUND_UP)
         if cut > _CENT or notionals[largest] - cut < _dec(frozen.min_order_notional):
             raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")

@@ -1202,7 +1202,13 @@ def decisions_from(
                 override_id=override_id,
             )
             continue
-        if intent.notional == 0 or intent.notional < minimum:
+        rounded_up = (
+            frozen.small_account.enabled
+            and intent.side == _BUY
+            and not whole
+            and 0 < intent.notional < minimum
+        )
+        if intent.notional == 0 or (intent.notional < minimum and not rounded_up):
             decided[sid] = Decision(
                 **base(sid),
                 decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
