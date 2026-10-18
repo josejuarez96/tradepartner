@@ -1053,7 +1053,7 @@ why = "The event signal is only as point-in-time as this read; the filed-date tr
 
 [task.T164e]
 what = "The ingest write, the config switch and keys, the health count, and the first real-store run under a named data release."
-why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
+why = "B9 is killed (2026-10-18, #1768); the 8-K items store now serves IRRX's earnings-announcement window, parked behind T198, so the real-store run waits for that."
 
 [task.T166]
 what = "The pure rules of the EDGAR stamps repair: New York's offset, the filing-date rule, the per-CIK class from SGML probes, the audit sample and stop rule, the manifest row."
