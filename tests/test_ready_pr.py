@@ -205,6 +205,12 @@ def test_merge_train_paths_require_the_safety_review() -> None:
         assert "safety-reviewer" in ready_pr.required_reviews([path]), path
 
 
+def test_procedures_folder_requires_the_safety_review() -> None:
+    # owner-run procedures under ways-of-working (#1782)
+    path = "docs/ways-of-working/procedures/example.md"
+    assert "safety-reviewer" in ready_pr.required_reviews([path])
+
+
 def test_kill_switch_page_requires_the_safety_review() -> None:
     # the dashboard's kill-switch override page and its test (#773, PR #771's safety review)
     for path in (

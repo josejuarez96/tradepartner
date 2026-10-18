@@ -157,6 +157,7 @@ SAFETY_PREFIXES = (
     "tests/fixtures/alpaca/",
     "tests/fixtures/edgar/",
     "docs/runbooks/",
+    "docs/ways-of-working/procedures/",
     ".env.example",
     ".claude/settings.json",
     ".pre-commit-config.yaml",
