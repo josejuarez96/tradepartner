@@ -574,6 +574,12 @@ class Asset:
         _validate_bool(self.marginable, field_name="marginable")
 
 
+#: The `Asset` of a symbol the broker does not know, or of a listing whose
+#: ticker has no broker form (#1729): never tradable, so a buy of it is a
+#: `skip_untradable` before any order and the run goes on, never a halt.
+UNRESOLVED_ASSET = Asset(tradable=False, fractionable=False, status="unresolved", cusip=None)
+
+
 class Broker(abc.ABC):
     """Abstract order-placement interface (paper-trading spec req 1).
 

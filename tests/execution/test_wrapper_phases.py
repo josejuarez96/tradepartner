@@ -66,7 +66,9 @@ CUT = session_close(PREV)  # close(S-1)
 T_I = date(2026, 9, 30)  # the batch's rebalance session
 A, B, C = "SEC_DUAL_A", "SEC_DUAL_B", "SEC_STATIC_PRE2019"
 GONE = "SEC_WINDOW_DELIST"  # its listing ended in 2019
-SYMBOLS = {A: "DUALA", B: "DUALB", C: "PRE9", GONE: "WNDX"}
+#: C's fixture ticker `PRE9` has a digit, so it has no broker form (#792, #1729);
+#: the `env` fixture re-tickers it to an equity-shaped `PREN` in its temp store.
+SYMBOLS = {A: "DUALA", B: "DUALB", C: "PREN", GONE: "WNDX"}
 PRICE = 100.0
 
 
@@ -181,9 +183,16 @@ def alerter_conn(journal_settings: Settings) -> Iterator[duckdb.DuckDBPyConnecti
         conn.close()
 
 
+def _retick(settings: Settings) -> None:
+    """C's listing reads `SYMBOLS[C]` in the temp store (see `SYMBOLS`)."""
+    with open_for_write(settings) as conn:
+        conn.execute("UPDATE listings SET ticker = ? WHERE security_id = ?", [SYMBOLS[C], C])
+
+
 @pytest.fixture
 def env(journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock) -> Env:
     settings = _settings(journal_settings.store.path)
+    _retick(settings)
     for security_id in SYMBOLS:
         _bar(settings, security_id, PRICE)
     earlier = _run(settings, open_window, PREV, CUT - timedelta(hours=3))
