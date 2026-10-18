@@ -4,18 +4,13 @@
 Closes #
 
 ## Spec / plan
-<!-- Link the spec + plan task this implements, or "n/a (size S)" -->
+<!-- The plan line this implements, or "n/a (size S)" -->
 
-## How it was verified
-- [ ] `uv run pytest` passes; new behavior has tests
-- [ ] Ran it for real (command/output or screenshot below), not just tests
-
-## Review checklist
-- [ ] Scope matches the plan task — nothing extra
-- [ ] No secrets, data files, or notebooks with outputs committed
-- [ ] Docs updated (STATUS/CHANGELOG fragment via `scripts/fragments.py add`, spec/plan checkboxes, `.env.example`, ADR if a decision was made)
-- [ ] Touches data/backtest/signals → `quant-auditor` run, findings addressed, latest verdict comment is `quant-auditor: PASS` (re-run after PASS WITH FIXES)
-- [ ] Touches broker/orders/LLM inputs/secrets → `safety-reviewer` run, findings addressed, latest verdict comment is `safety-reviewer: PASS` (re-run after PASS WITH FIXES)
+## Checklist
+- [ ] Scope matches the plan task or issue, nothing extra; no secrets, data files or notebooks with outputs committed
+- [ ] The targeted tests named here pass locally and new behavior has tests (CI runs the suite): <!-- files -->
+- [ ] Ran it for real (command/output below), or `n/a, <why>` (pure module, docs only)
+- [ ] The reviewers `scripts/ready_pr.py` requires for these paths (`quant-auditor`, `safety-reviewer`) ran before pass 1, and each latest verdict comment is `<agent>: PASS`, or `n/a, none required`
 
 ## Notes for reviewer
 <!-- Risks, open questions, things you're unsure about -->

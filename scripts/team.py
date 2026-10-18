@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -821,6 +822,30 @@ def cmd_register(gh: GitHub, root: Path, name: str, *, force: bool = False) -> i
     return 0
 
 
+# No `pre-commit install` here: git hooks live in the shared common git dir, so a per-team
+# install would point the one hook at that team's venv. Teams commit with `uv run git commit`.
+SETUP_COMMANDS: tuple[tuple[str, ...], ...] = (("uv", "sync"),)
+
+
+def setup_env(path: Path) -> list[str]:
+    """Run ``uv sync`` in a new team directory; return the commands that failed.
+
+    ``VIRTUAL_ENV`` is dropped from the child env so ``uv`` builds this directory's own
+    ``.venv``, not the caller's. A failure never aborts: the caller prints the command to
+    run by hand. Idempotent: ``uv sync`` is safe to repeat.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    failed: list[str] = []
+    for cmd in SETUP_COMMANDS:
+        try:
+            ok = subprocess.run(list(cmd), cwd=path, env=env, check=False).returncode == 0
+        except OSError:
+            ok = False
+        if not ok:
+            failed.append(" ".join(cmd))
+    return failed
+
+
 def cmd_start(
     gh: GitHub, main: Path, name: str, *, ref: str = DEFAULT_PLAN_REF, reuse: bool = False
 ) -> int:
@@ -848,7 +873,12 @@ def cmd_start(
     (path / TEAM_FILE).write_text(name + "\n")
     gh.ensure_label(f"{TEAM_LABEL_PREFIX}{name}", TEAM_LABEL_COLOR, f"Claimed by team {name}")
     print(f"team '{name}' is set up at {path} (detached at {ref})")
+    for cmd in setup_env(path):
+        print(
+            f"setup step failed; run by hand: cd {shlex.quote(str(path))}; unset VIRTUAL_ENV; {cmd}"
+        )
     print(f"cd {path}")
+    print("unset VIRTUAL_ENV")
     print("then: uv run python scripts/team.py status   (and work only inside this directory)")
     return 0
 

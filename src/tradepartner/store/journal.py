@@ -671,6 +671,8 @@ class OrderedFill:
     symbol: str
     run_id: int
     window_id: int
+    #: The order's journaled `orders.session` (None only for a hand-built row).
+    order_session: date | None = None
 
 
 #: The tables `require_journal` asks for: every journal table but those a
@@ -871,19 +873,21 @@ def fills_for(
     order = "ORDER BY f.fill_id" if limit is None else "ORDER BY f.fill_id DESC LIMIT ?"
     rows = conn.execute(
         f"SELECT {selected}, o.side, o.security_id, o.symbol, o.run_id, r.run_id, "
-        f"r.window_id {in_scope}{order}",
+        f"r.window_id, o.session {in_scope}{order}",
         scope if limit is None else [*scope, limit],
     ).fetchall()
     width = len(_FILL_COLUMNS)
     result: list[OrderedFill] = []
     for row in rows:
         fill = FillRow(**dict(zip(_FILL_COLUMNS, row[:width], strict=True)))
-        side, security_id, symbol, run_id, known_run, fill_window = row[width:]
+        side, security_id, symbol, run_id, known_run, fill_window, order_session = row[width:]
         if side is None or known_run is None:
             raise _orphan_fill_error(
                 fill.fill_id, fill.broker_fill_id, fill.client_order_id, side, run_id
             )
-        result.append(OrderedFill(fill, side, security_id, symbol, run_id, fill_window))
+        result.append(
+            OrderedFill(fill, side, security_id, symbol, run_id, fill_window, order_session)
+        )
     return result
 
 

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal, get_args
 
+import numpy as np
 import polars as pl
 
 from tradepartner.calendar import all_sessions, is_session, next_session
@@ -106,9 +107,69 @@ def _last_at_or_before(series: Sequence[_Bar], session: date) -> _Bar | None:
     return series[index - 1] if index else None
 
 
-def _fill_value(sid: str, bar: _Bar, fill_price: FillPrice) -> float:
-    value = bar.open if fill_price == "open" else bar.close
-    return _check_price(sid, bar.session, fill_price, value)
+def _held_bars(frame: pl.DataFrame, positions: Mapping[str, float]) -> pl.DataFrame:
+    """The held names' bars, sorted by `security_id`, `session`: `security_id`, `session`,
+    `close` and, when the frame has it, `open`. Raises `ValueError` on a duplicate
+    `(security_id, session)` bar or a null `security_id`, `session` or `close`."""
+    bars = frame.select(
+        "security_id",
+        "session",
+        "close",
+        pl.col("open") if "open" in frame.columns else pl.lit(None, pl.Float64).alias("open"),
+    ).filter(pl.col("security_id").is_in(sorted(positions)))
+    if bars.select(pl.struct("security_id", "session").is_duplicated().any()).item():
+        raise ValueError("marking frame has a duplicate (security_id, session) bar")
+    if bars.select(["security_id", "session", "close"]).null_count().sum_horizontal().item():
+        raise ValueError("marking frame has a null security_id, session or close")
+    return bars.sort("security_id", "session")
+
+
+def _check_prices(frame: pl.DataFrame, field: str, price: str = "price") -> None:
+    """Raise `ValueError` (as `_check_price`) for the first row, in frame order, whose
+    `price` column is null, not finite or not positive."""
+    bad = frame.filter(
+        pl.col(price).is_null() | ~(pl.col(price).is_finite() & (pl.col(price) > 0))
+    ).head(1)
+    for sid, session, value in bad.select("security_id", "session", price).iter_rows():
+        _check_price(sid, session, field, value)
+
+
+def _scaled(frame: pl.DataFrame, value: str, num: str, den: str) -> pl.Series:
+    """`value * num / den` row by row, as Python evaluates it (multiply, then divide, both
+    IEEE doubles; a null `num` gives NaN). Polars' own expression divides a constant-like
+    column by multiplying with its reciprocal, which is not byte-identical, so the
+    arithmetic is numpy's, one rounding per operation, on any platform."""
+    product = np.multiply(frame[value].to_numpy(), frame[num].to_numpy())
+    return pl.Series(np.divide(product, frame[den].to_numpy()), dtype=pl.Float64)
+
+
+def _price_at_or_before(
+    bars: pl.DataFrame,
+    held: pl.DataFrame,
+    session: date,
+    fill_price: FillPrice,
+) -> pl.DataFrame:
+    """Each held name's price at its last bar at or before `session`: `security_id`,
+    `base` (the fill price when that bar is on `session`, else its close, both checked
+    positive and finite) and `base_session`, the bar's session.
+
+    Raises `ValueError` for a held name with no bar at or before `session`."""
+    last = (
+        bars.filter(pl.col("session") <= session)
+        .group_by("security_id")
+        .agg(pl.all().sort_by("session").last())
+    )
+    joined = held.select("security_id").join(last, on="security_id", how="left").sort("security_id")
+    missing = joined.filter(pl.col("session").is_null()).head(1)
+    for (sid,) in missing.select("security_id").iter_rows():
+        raise ValueError(f"no bar for {sid} at or before {session.isoformat()}")
+    on_day = pl.col("session") == session
+    joined = joined.with_columns(
+        price=pl.when(on_day).then(pl.col(fill_price)).otherwise(pl.col("close"))
+    )
+    _check_prices(joined.filter(on_day), fill_price)
+    _check_prices(joined.filter(~on_day), "close")
+    return joined.select("security_id", pl.col("price").alias("base"), base_session="session")
 
 
 def _sessions(first: date, last: date) -> list[date]:
@@ -146,25 +207,39 @@ def value_positions(
     _check_fill_price(fill_price)
     _check_positions(positions)
     sessions = _sessions(fill_session, through)
-    bars = _bars(marking_frame, set(positions))
-    rows: list[tuple[str, date, float, date]] = []
-    for sid in sorted(positions):
-        series = bars.get(sid, [])
-        base_bar = _last_at_or_before(series, fill_session)
-        if base_bar is None:
-            raise ValueError(f"no bar for {sid} at or before {fill_session.isoformat()}")
-        if base_bar.session == fill_session:
-            base = _fill_value(sid, base_bar, fill_price)
-        else:
-            base = _check_price(sid, base_bar.session, "close", base_bar.close)
-        closes = {bar.session: bar.close for bar in series}
-        value, marked_at = positions[sid], base_bar.session
-        for session in sessions:
-            if session in closes:
-                close = _check_price(sid, session, "close", closes[session])
-                value, marked_at = positions[sid] * close / base, session
-            rows.append((sid, session, value, marked_at))
-    return pl.DataFrame(rows, schema=_VALUE_SCHEMA, orient="row")
+    if not positions:
+        return pl.DataFrame(schema=_VALUE_SCHEMA)
+    bars = _held_bars(marking_frame, positions)
+    ids = sorted(positions)
+    held = pl.DataFrame({"security_id": ids, "position": [positions[sid] for sid in ids]})
+    base = _price_at_or_before(bars, held, fill_session, fill_price)
+    grid = held.join(base, on="security_id").join(
+        pl.DataFrame({"session": sessions}, schema={"session": pl.Date}), how="cross"
+    )
+    marked = grid.join(
+        bars.select("security_id", "session", "close"),
+        on=["security_id", "session"],
+        how="left",
+    ).sort("security_id", "session")
+    _check_prices(marked.drop_nulls("close"), "close", "close")
+    has_bar = pl.col("close").is_not_null()
+    return (
+        marked.with_columns(
+            value=_scaled(marked, "position", "close", "base").zip_with(
+                marked["close"].is_not_null(), pl.Series([None] * marked.height, dtype=pl.Float64)
+            ),
+            marked_at=pl.when(has_bar).then(pl.col("session")),
+        )
+        .with_columns(
+            pl.col("value").forward_fill().over("security_id").fill_null(pl.col("position")),
+            pl.col("marked_at")
+            .forward_fill()
+            .over("security_id")
+            .fill_null(pl.col("base_session")),
+        )
+        .select(list(_VALUE_SCHEMA))
+        .rechunk()
+    )
 
 
 def carry_to_fill(
@@ -196,29 +271,42 @@ def carry_to_fill(
             f"fill_session {fill_session.isoformat()} is not the next session after "
             f"rebalance_session {rebalance_session.isoformat()}"
         )
-    bars = _bars(marking_frame, set(positions))
-    carried: dict[str, float] = {}
-    for sid in sorted(positions):
+    ids = sorted(positions)
+    for sid in ids:
         mark = marked_at.get(sid)
         if mark is None or mark > rebalance_session:
             raise ValueError(
                 f"{sid} needs a marked_at session at or before {rebalance_session.isoformat()}, "
                 f"got {mark}"
             )
-        series = bars.get(sid, [])
-        closes = {bar.session: bar.close for bar in series}
-        if mark not in closes:
-            raise ValueError(f"no bar for {sid} on its last mark {mark.isoformat()}")
-        base = _check_price(sid, mark, "close", closes[mark])
-        target_bar = _last_at_or_before(series, fill_session)
-        if target_bar is None:  # unreachable: the bar on `mark` is at or before it
-            raise ValueError(f"no bar for {sid} at or before {fill_session.isoformat()}")
-        if target_bar.session == fill_session:
-            target = _fill_value(sid, target_bar, fill_price)
-        else:
-            target = _check_price(sid, target_bar.session, "close", target_bar.close)
-        carried[sid] = positions[sid] * target / base
-    return carried
+    if not ids:
+        return {}
+    bars = _held_bars(marking_frame, positions)
+    held = pl.DataFrame(
+        {
+            "security_id": ids,
+            "position": [positions[sid] for sid in ids],
+            "mark": [marked_at[sid] for sid in ids],
+        },
+        schema={"security_id": pl.Utf8, "position": pl.Float64, "mark": pl.Date},
+    )
+    marks = held.join(
+        bars.select("security_id", pl.col("session").alias("mark"), pl.col("close").alias("base")),
+        on=["security_id", "mark"],
+        how="left",
+    )
+    for sid, mark in (
+        marks.filter(pl.col("base").is_null()).select("security_id", "mark").head(1).iter_rows()
+    ):
+        raise ValueError(f"no bar for {sid} on its last mark {mark.isoformat()}")
+    _check_prices(marks.rename({"mark": "session"}), "close", "base")
+    target = _price_at_or_before(bars, held, fill_session, fill_price)
+    both = marks.join(
+        target.select("security_id", pl.col("base").alias("target")), on="security_id"
+    )
+    both = both.sort("security_id")
+    carried = both.with_columns(carried=_scaled(both, "position", "target", "base"))
+    return dict(carried.select("security_id", "carried").iter_rows())
 
 
 def stitched_returns(steps: Sequence[StepFrame]) -> pl.DataFrame:
