@@ -757,6 +757,11 @@ class _SharedReads:
     def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
         return cast(Mapping[str, int | None], self._read(("sics", t), ids))
 
+    def rates(self, t: datetime, series: str) -> pl.DataFrame:
+        # Not an id read: made as asked, once per step for one `(t, series)` (T170b; the
+        # engine's own use of it is T170c's).
+        return self._once(("rates", t, series), lambda: self._provider.rates(t, series))
+
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
     ) -> TurnoverInputs:
@@ -820,6 +825,10 @@ class _Requests:
     def sics(self, t: datetime, ids: Sequence[str]) -> Mapping[str, int | None]:
         self._ask(("sics", t), ids)
         return {}
+
+    def rates(self, t: datetime, series: str) -> pl.DataFrame:
+        # Not a keyed read: nothing is declared or read here (T170b).
+        return pl.DataFrame()
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
