@@ -94,6 +94,11 @@ import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
 from tradepartner.backtest.engine import Plan
+from tradepartner.backtest.portfolio import (
+    _selected_count,
+    apply_rebalance_band,
+    hold_membership,
+)
 from tradepartner.backtest.schedule import fill_session
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import Cadence, RiskConfig, Settings
@@ -231,6 +236,26 @@ class BuyCosts:
 
     per_side_bps: float
     commissions: Commissions
+
+
+@dataclass(frozen=True)
+class HoldBook:
+    """The state a `weighting = "hold"` plan needs from the window (backtest spec
+    amendment 2026-10-18 #1731, "Hold mode and the no-trade band"; plan T205).
+
+    It is the paper side of `backtest.portfolio.hold_membership`: `entries` is
+    each held name's entry session (the ordinal it entered at), `ordinal` the
+    session being planned, and `hold_sessions`, `hold_target_names` and
+    `top_fraction` the frozen `strategy.*` construction keys. Where a paper
+    window takes `entries` from is not decided yet (#1832), so `planning.py`
+    refuses a hold window until it is; this type is the seam.
+    """
+
+    entries: Mapping[str, int]
+    ordinal: int
+    hold_sessions: int
+    hold_target_names: int
+    top_fraction: float
 
 
 PriceOf = Callable[[str], float]
@@ -1056,6 +1081,8 @@ def decisions_from(
     price_of: PriceOf,
     actions_as_of: pl.DataFrame,
     costs: BuyCosts,
+    band: float = 0.0,
+    hold: HoldBook | None = None,
 ) -> Decisions:
     """The decisions of rebalance T_i = `plan.session` on the run's session
     S = `ledger.through` (spec Definitions > Decision, reqs 7 step 6 and 9).
@@ -1080,6 +1107,30 @@ def decisions_from(
       below one share, is plan-time `dust` (never by the buffered-share minimum,
       ADR 0010 amendment 2026-09-30); a trade below the minimum is
       `skip_below_minimum`, and exactly zero `skip_zero`.
+
+    `band` (the frozen `strategy.rebalance_band`, default 0.0) suppresses a
+    trade whose absolute drift from target is within the band: the planned
+    weight is `backtest.portfolio.apply_rebalance_band(plan.targets, drifted,
+    band)` over the ledger weights `drifted`, so a name inside the band keeps its
+    drifted weight and its zero delta is a `skip_zero`. The `target_weight`
+    column stays the engine's `plan.targets` weight, and exits and entries are
+    unchanged (the band never holds back an exit or a new entry). A band of 0.0
+    is today's plan byte for byte.
+
+    `hold` is the hold book of a `weighting = "hold"` window (`HoldBook`), or
+    None for the default `equal` weighting; the two are exclusive and `hold`
+    wins when both are given. Under hold, `plan.targets` is not read for
+    construction: membership comes from `backtest.portfolio.hold_membership` on
+    `plan.scores` ranked by (-score, security_id), and only held names and the
+    session's `entering` names get a decision. Each entering name is sized at
+    equity / the target count (`hold.hold_target_names`, or the `top_fraction`
+    count when that is 0); a fresh entry is a notional buy and a re-entry (a name
+    both exiting and entering) trades the delta to that amount. A name exiting
+    without re-entering is a full exit (`trade`, reason `left_targets`), and a
+    live held name is never re-weighted (`skip_zero`), even when it has left the
+    universe (a hold plan never writes `left_universe`). The `skip_delisted`,
+    override, forced-exit, minimum and `target_notional` rules apply as for
+    `equal`. `target_weight` under hold is the hold weight, not `plan.targets`.
 
     Weights and notionals are at S: the ledger's quantities and `price_of`, the
     reference price on S (the close(S-1) close in post-split shares, as
@@ -1115,13 +1166,41 @@ def decisions_from(
     if not (math.isfinite(equity) and equity > 0):
         raise ValueError(f"equity is {equity}, the plan needs a positive equity")
     drifted = ledger.weights(marks)
-    for sid, weight in plan.targets.items():
-        _finite(weight, f"target weight of {sid}", non_negative=True)
+    if hold is None:
+        for sid, weight in plan.targets.items():
+            _finite(weight, f"target weight of {sid}", non_negative=True)
     signals = _signals(plan)
     named = _plan_overrides(overrides, plan.session)
     universe = set(plan.members)
     held = {sid for sid, quantity in ledger.positions.items() if quantity > 0}
-    targets = {sid for sid, weight in plan.targets.items() if weight > 0}
+    targets = {sid for sid, weight in plan.targets.items() if weight > 0} if hold is None else set()
+    if hold is None:
+        effective = apply_rebalance_band(plan.targets, drifted, band)
+        entering: frozenset[str] = frozenset()
+        exiting: frozenset[str] = frozenset()
+        hold_weight = 0.0
+        names = held | targets
+    else:
+        # The backtest's pure membership rule, never a copy (#1731, T209a).
+        ranked = sorted(plan.scores, key=lambda sid: (-plan.scores[sid], sid))
+        membership = hold_membership(
+            ranked,
+            hold.entries,
+            hold.ordinal,
+            hold.hold_sessions,
+            hold.hold_target_names,
+            hold.top_fraction,
+        )
+        entering = frozenset(membership.entering)
+        exiting = frozenset(membership.exiting)
+        count = (
+            hold.hold_target_names
+            if hold.hold_target_names > 0
+            else _selected_count(len(ranked), hold.top_fraction)
+        )
+        hold_weight = 1.0 / count if count > 0 else 0.0
+        effective = {}
+        names = held | set(entering)
 
     def ended(sid: str) -> bool:
         if sid not in listings_at:
@@ -1136,17 +1215,22 @@ def decisions_from(
             return False
         return not assets[sid].fractionable
 
+    def base_weight(sid: str) -> float:
+        if hold is None:
+            return plan.targets.get(sid, 0.0)
+        return 0.0 if sid in exiting and sid not in entering else hold_weight
+
     def base(sid: str) -> dict[str, Any]:
         return {
             "security_id": sid,
             "rebalance_session": plan.session,
-            "target_weight": plan.targets.get(sid, 0.0),
+            "target_weight": base_weight(sid),
             "drifted_weight": drifted.get(sid, 0.0),
         }
 
     decided: dict[str, Decision] = {}
     intents: dict[str, _Intent] = {}  # names with an order to place, before the minimum
-    for sid in sorted(held | targets):
+    for sid in sorted(names):
         if sid in open_forced_exits:
             continue
         if ended(sid):
@@ -1167,12 +1251,20 @@ def decisions_from(
         value = ledger.positions.get(sid, 0.0) * marks.get(sid, 0.0)
         if override is not None:
             intent = _Intent(_SELL, value, _EXCLUDE_NAME, ledger.positions[sid])
+        elif hold is not None:
+            if sid in exiting and sid not in entering:
+                intent = _Intent(_SELL, value, _LEFT_TARGETS, ledger.positions[sid])
+            elif sid in entering:
+                delta = hold_weight * equity - value
+                intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
+            else:
+                intent = _Intent(_BUY, 0.0)  # a live held name is never re-weighted
         elif sid in held and sid not in universe:
             intent = _Intent(_SELL, value, _LEFT_UNIVERSE, ledger.positions[sid])
         elif sid in held and sid not in targets:
             intent = _Intent(_SELL, value, _LEFT_TARGETS, ledger.positions[sid])
         else:
-            delta = (plan.targets.get(sid, 0.0) - drifted.get(sid, 0.0)) * equity
+            delta = (effective.get(sid, 0.0) - drifted.get(sid, 0.0)) * equity
             intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
         intents[sid] = intent
 
