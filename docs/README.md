@@ -39,12 +39,12 @@ docs/
 | **Sweep** | Which grid of variants are we registering as counted trials of one family, ranked by which pre-declared statistic, with which promotion floor and retirement condition? | Before any sweep run ([strategy-lab spec](specs/strategy-lab.md)) | **Frozen** once registered: a changed file is a new registration with new variants | [sweep](templates/sweep.md) |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
 | **CHANGELOG** | What changed, per version? | Every PR | One fragment per PR in `changelog.d/` (its STATUS line and CHANGELOG bullets), folded by doc-keeper | n/a |
-| **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
+| **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | With the PR that creates the task, ADR, spec, plan or report; a plain issue when someone writes one | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
 
 ## Rules
 
 - **Link, don't copy.** Specs link to research and ADRs, and plans link to specs. Never paste the same content into two places.
 - **Frozen docs stay frozen.** Fixing a typo is fine. Changing the substance means writing a new doc that supersedes the old one.
 - **Dates are absolute** (`2026-09-24`), never "last week".
-- **Every piece of work gets a work-map entry.** When you open an issue or a research brief, add `[issue.<n>]` (or `[research.<stem>]`, `[adr.<nnnn>]`, `[task.<id>]`) to [work-map.toml](work-map.toml): one sentence on what it is, one on why it matters on the way to the MVP, and `unblocks` for the decision or task it feeds. The cockpit (`uv run python scripts/cockpit.py`) reads it and lists what is missing.
+- **Work-map entries come with the PR that creates the work.** A spec, plan or ADR PR adds `[task.<id>]`, `[adr.<nnnn>]`, `[plan.<stem>]` or `[spec.<stem>]` to [work-map.toml](work-map.toml) for what it creates; a research report PR adds `[research.<stem>]`; a plain issue gets `[issue.<n>]` only when someone writes one. Each entry: one sentence on what it is, one on why it matters on the way to the MVP, and `unblocks` for the decision or task it feeds. Nothing in CI checks this; the cockpit (`uv run python scripts/cockpit.py`) lists the ids it is missing, and a docs or fold PR may fill them in.
 - **Keep CLAUDE.md short.** It's loaded into every agent session, so it holds rules and pointers, not specs.
