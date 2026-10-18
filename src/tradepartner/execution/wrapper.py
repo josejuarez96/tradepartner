@@ -208,6 +208,7 @@ from pydantic import ValidationError
 
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
+    UNRESOLVED_ASSET,
     Account,
     Asset,
     Broker,
@@ -255,6 +256,7 @@ from tradepartner.execution.risk import (
     order_shape_violation,
     unfilled_sells,
 )
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.ingest import MODE as INGEST_MODE
 from tradepartner.ingest import OK as INGEST_OK
 from tradepartner.ingest import PRICE_SOURCE
@@ -500,7 +502,8 @@ class _Book:
     close(S-1): the window and its frozen costs, the splits, the ledger stated
     for S, the reference prices (and, for a name only an open order brings in
     that has none, the reason, raised when read: #569), each decision's state and each sold name's
-    residue, the tickers and ended listings of the batch's names, every own
+    residue, the broker symbols, unmappable names (#1729) and ended listings
+    of the batch's names, every own
     order, event and live fill of any window, and the last `ok` daily price
     ingest's `finished_at` (`last_ok_price_ingest`)."""
 
@@ -512,7 +515,8 @@ class _Book:
     unpriced: Mapping[str, str]
     states: Mapping[int, DecisionState]
     residues: Mapping[str, float]
-    tickers: Mapping[str, str | None]
+    symbols: Mapping[str, str | None]
+    unmappable: frozenset[str]
     ended: frozenset[str]
     orders: Sequence[OrderRow]
     events: Sequence[OrderEventRow]
@@ -906,7 +910,7 @@ class RiskGatedBroker:
         session = run.session
         self._requests(built, book, session)
         candidates = [
-            o.to_risk(str(book.tickers[o.security_id]), listing_ended=o.security_id in book.ended)
+            o.to_risk(str(book.symbols[o.security_id]), listing_ended=o.security_id in book.ended)
             for o in built.orders
         ]
         counted = prior_skips + sum(s.counts_toward_cap for s in built.skips)
@@ -1112,7 +1116,7 @@ class RiskGatedBroker:
             open_names = {o.security_id for o in orders if o.client_order_id not in terminal}
             optional, unpriced = _optional_prices(conn, session, open_names - names, actions)
             prices = {**prices, **optional}
-            tickers, ended = _listings(
+            symbols, unmappable, ended = _listings(
                 conn, session, sorted({d.security_id for d in rows}), self._settings
             )
             residue_rows = (
@@ -1165,7 +1169,8 @@ class RiskGatedBroker:
             unpriced,
             states,
             residues,
-            tickers,
+            symbols,
+            unmappable,
             ended,
             orders,
             events,
@@ -1220,7 +1225,7 @@ class RiskGatedBroker:
         names = sorted(
             {a.decision.security_id for a in attempt_scope(rows, book.states, phase=side).attempts}
         )
-        unknown = [sid for sid in names if not book.tickers.get(sid)]
+        unknown = [sid for sid in names if not book.symbols.get(sid) and sid not in book.unmappable]
         if unknown:
             raise ValueError(f"no listing known at close(S-1) for {unknown}")
         delisted = frozenset(sid for sid in names if sid in book.ended)
@@ -1228,13 +1233,21 @@ class RiskGatedBroker:
             cut = session_close(previous_session(run.session))
             with self._journal() as conn:
                 current = current_listings(listings_as_of(conn, cut, sorted(delisted)), run.session)
-                _refuse_reused_tickers(conn, cut, run.session, current, delisted)
-        symbols = {sid: canonical_symbol(str(book.tickers[sid])) for sid in names}
-        answer = self._broker.assets(sorted(symbols.values()))
+                _refuse_reused_tickers(
+                    conn, cut, run.session, current, delisted, self._settings.alpaca.class_symbols
+                )
+        # A name with no broker form is never sent: untradable, so skipped (#1729).
+        unresolved = {sid: UNRESOLVED_ASSET for sid in names if sid in book.unmappable}
+        symbols = {
+            sid: canonical_symbol(str(book.symbols[sid])) for sid in names if sid not in unresolved
+        }
+        if len(set(symbols.values())) != len(symbols):
+            raise ValueError(f"two names share a broker symbol: {symbols}")
+        answer = self._broker.assets(sorted(symbols.values())) if symbols else {}
         missing = sorted(sym for sym in symbols.values() if sym not in answer)
         if missing:
             raise ValueError(f"the assets read did not answer for {missing}")
-        return {sid: answer[symbol] for sid, symbol in symbols.items()}
+        return {**unresolved, **{sid: answer[symbol] for sid, symbol in symbols.items()}}
 
     def _decimals(self) -> int:
         decimals = self._settings.alpaca.quantity_decimals
@@ -1247,7 +1260,7 @@ class RiskGatedBroker:
     ) -> list[OrderRequest]:
         return phases.requests_for(
             built,
-            book.tickers,
+            book.symbols,
             self._settings.paper.order_id_prefix,
             book.window.book_id,
             [o for o in book.orders if o.session == session],
@@ -1678,10 +1691,12 @@ def _optional_prices(
 
 def _listings(
     conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str], settings: Settings
-) -> tuple[dict[str, str | None], frozenset[str]]:
-    """Each name's ticker (its current listing at S among rows known at
-    close(S-1); None without one) and the names whose listing ended
-    (`delisted`) at close(S-1).
+) -> tuple[dict[str, str | None], frozenset[str], frozenset[str]]:
+    """Each name's broker symbol (`execution.symbols.broker_symbol` of its
+    current listing at S among rows known at close(S-1); None without one or
+    without a broker form), the names whose listing has no broker form
+    (`unmappable`, #1729), and the names whose listing ended (`delisted`) at
+    close(S-1).
 
     A delisted name's own ticker must not also be a *later* issuer's current
     ticker as of close(S-1): that reuse would otherwise let the `assets`
@@ -1695,15 +1710,20 @@ def _listings(
     names its own phase's attempt scope actually resolves, right before the
     broker `assets` call."""
     if not names:
-        return {}, frozenset()
+        return {}, frozenset(), frozenset()
     cut = session_close(previous_session(session))
     current = current_listings(listings_as_of(conn, cut, list(names)), session)
-    tickers = {sid: (str(current[sid]["ticker"]) if sid in current else None) for sid in names}
+    class_symbols = settings.alpaca.class_symbols
+    symbols = {
+        sid: (broker_symbol(current[sid], class_symbols) if sid in current else None)
+        for sid in names
+    }
+    unmappable = frozenset(sid for sid in current if sid in symbols and symbols[sid] is None)
     ends = current_listings(
         listing_ends_as_of(conn, cut, settings, list(names)), previous_session(session)
     )
     delisted = frozenset(sid for sid, row in ends.items() if row["status"] == DELISTED)
-    return tickers, delisted
+    return symbols, unmappable, delisted
 
 
 def _refuse_reused_tickers(
@@ -1712,10 +1732,13 @@ def _refuse_reused_tickers(
     session: date,
     current: Mapping[str, Mapping[str, Any]],
     delisted: frozenset[str],
+    class_symbols: Mapping[str, str] | None,
 ) -> None:
     """For each `delisted` name, refuse when some other security's current
     listing (as of close(S-1), across the whole universe) names the same
     ticker with a strictly later `valid_from`: a later issuer who reused it.
+    Tickers compare in their broker form (`broker_symbol`, #1729), the form the
+    `assets` read is made in, so a delisted `BF-B` collides with a later `BFB`.
     An earlier owner of the same ticker (this name itself took it over from
     someone even older) is not a collision, and neither is a coincidental
     match with a security that has never been this name's own listing's
@@ -1728,13 +1751,13 @@ def _refuse_reused_tickers(
         row = current.get(sid)
         if row is None:
             continue
-        ticker = str(row["ticker"])
+        ticker = broker_symbol(row, class_symbols) or str(row["ticker"])
         own_valid_from = row["valid_from"]
         reused_by = sorted(
             other
             for other, other_row in universe.items()
             if other != sid
-            and str(other_row["ticker"]) == ticker
+            and (broker_symbol(other_row, class_symbols) or str(other_row["ticker"])) == ticker
             and other_row["valid_from"] is not None
             and (own_valid_from is None or other_row["valid_from"] > own_valid_from)
         )

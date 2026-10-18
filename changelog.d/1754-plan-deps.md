@@ -1,0 +1,3 @@
+- Plan edits of 2026-10-18 (#1754): T202, T206, T210, T211 and T208 depend on need, not file order; T209 split into T209a/T209b; one data sitting on T198 (T195 out); T114, T160, T172d ticked; T215-T217 added; #1602/#1605/#1547 wording.
+### Changed
+- Plans: dependency edits from the 2026-10-18 roadmap analysis (T202, T206, T210, T211 to n/a; T208 to T207; T209 split into T209a and T209b; T205 on T206 and T209a; T161 drops T159; T165e drops T114), the one data sitting on T198 with T195 struck and T166c cut to the a3 store step, T114, T160 and T172d ticked, new lines T215 to T217 (test infra, the ladder's shocks), and the wording fixes of #1602, #1605 and #1547 (#1754).
