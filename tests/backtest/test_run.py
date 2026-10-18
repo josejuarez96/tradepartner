@@ -741,6 +741,9 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "metrics.risk_free_source",
                 "metrics.risk_free_series",
                 "metrics.risk_free_basis",
+                "strategy.hold_sessions",
+                "strategy.hold_target_names",
+                "strategy.rebalance_band",
             )
         )
     }
@@ -839,6 +842,9 @@ def _register_more(
             "metrics.risk_free_source",
             "metrics.risk_free_series",
             "metrics.risk_free_basis",
+            "strategy.hold_sessions",
+            "strategy.hold_target_names",
+            "strategy.rebalance_band",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
