@@ -1870,7 +1870,27 @@ class _Run:
             name: assets[symbol].tradable for name, symbol in symbols.items() if symbol in assets
         }
         with open_read_only(self.settings) as conn:
-            rows = marks.marks_for(conn, self.window, ledger, sessions, flags, actions=actions)
+            rows = marks.marks_for(
+                conn,
+                self.window,
+                ledger,
+                sessions,
+                flags,
+                actions=actions,
+                max_stale_sessions=marks.frozen_max_stale_mark_sessions(self.window),
+            )
+        carried = [m for m in rows if m.stale_close is not None]
+        if carried:
+            self._alert(
+                "stale_mark",
+                "tradable held name(s) with no bar, marked at their last close: "
+                + "; ".join(
+                    f"{m.security_id} {m.session.isoformat()} at {m.stale_close.isoformat()}'s "
+                    f"close (gap {m.stale_gap})"
+                    for m in carried
+                    if m.stale_close is not None
+                ),
+            )
         if rows:
             stamp = self.gate.read_clock()
             with self.connect() as conn:

@@ -37,6 +37,8 @@ Nothing here writes a row, delivers an alert or reads a clock.
 
 from __future__ import annotations
 
+import bisect
+import json
 import logging
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -47,7 +49,7 @@ import duckdb
 import polars as pl
 
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
-from tradepartner.calendar import next_session, previous_session, session_close
+from tradepartner.calendar import all_sessions, next_session, previous_session, session_close
 from tradepartner.config import Cadence
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.switch import ENGAGED, FAULTED_RUN_STATUSES, RELEASED
@@ -64,6 +66,7 @@ from tradepartner.store.journal import (
 _logger = logging.getLogger(__name__)
 
 _PAPER_MAX_CATCH_UP = "paper.max_catch_up_sessions"
+_PAPER_MAX_STALE_MARK = "paper.max_stale_mark_sessions"
 _EXECUTED = "executed"
 _MISSED = "missed"
 _CATCH_UP_LAPSED = "catch_up_lapsed"
@@ -89,6 +92,12 @@ class Mark:
     value: float | None
     cash: float
     tradable: bool | None
+    #: Set only when a *tradable* name's missing bar was carried at its last
+    #: close (#1763): that close's session, and how many sessions it trails
+    #: `session` by (1 = the first missing bar). The run alerts on these; the
+    #: `positions_daily` row does not store them.
+    stale_close: date | None = None
+    stale_gap: int = 0
 
 
 class UnreadableMarkError(ValueError):
@@ -169,6 +178,21 @@ def _frozen_int(frozen: Mapping[str, object], key: str) -> int:
     return value
 
 
+def frozen_max_stale_mark_sessions(window: PaperWindowRow) -> int:
+    """The window's frozen `paper.max_stale_mark_sessions` (#1763): how many
+    consecutive sessions a tradable held name may be marked at its last close.
+    A window frozen before the key existed has none and reads 0, today's
+    behaviour (a missing bar raises); a present value must be a non-negative
+    int."""
+    try:
+        parsed = json.loads(window.frozen_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"window {window.window_id} frozen_json is not JSON") from exc
+    if not isinstance(parsed, dict) or _PAPER_MAX_STALE_MARK not in parsed:
+        return 0
+    return _frozen_int(parsed, _PAPER_MAX_STALE_MARK)
+
+
 def _last_bars(
     conn: duckdb.DuckDBPyConnection, books: Mapping[date, Ledger], sessions: Sequence[date]
 ) -> dict[str, date]:
@@ -210,6 +234,12 @@ def _split_factor(actions: pl.DataFrame, security_id: str, after: date, through:
     return factor
 
 
+def _sessions_between(after: date, through: date) -> int:
+    """How many sessions `through` is after `after` (both sessions)."""
+    sessions = all_sessions()
+    return bisect.bisect_left(sessions, through) - bisect.bisect_left(sessions, after)
+
+
 def marks_for(
     conn: duckdb.DuckDBPyConnection,
     window: PaperWindowRow,
@@ -218,6 +248,7 @@ def marks_for(
     tradable_flags: Mapping[str, bool],
     *,
     actions: pl.DataFrame,
+    max_stale_sessions: int = 0,
 ) -> list[Mark]:
     """`Mark` rows for every session in `sessions` (ascending; the caller
     derives the range from the window's last mark, exclusive, through S-1,
@@ -246,10 +277,17 @@ def marks_for(
     its ex-date after the stale close's session and on or before the marked
     one (from `actions`, the same frame the caller's `ledger` applies, so the
     ledger's quantity already counts it) divides the carried close by its
-    ratio, so the carried value stays on the quantity's own basis (#1116). Every other missing bar
-    (a tradable name, a gap before the name's last bar, or a name with no
-    bar at all) raises `ValueError`, so a stale mark is never carried
-    silently.
+    ratio, so the carried value stays on the quantity's own basis (#1116).
+
+    A *tradable* held name (flag true) with no bar is marked the same way for
+    at most `max_stale_sessions` consecutive sessions (#1763, owner decision;
+    the frozen `paper.max_stale_mark_sessions`, 0 reproducing #892's raise):
+    the carried close is its latest bar known at close(session), so none from
+    later, and the `Mark` carries `stale_close` and `stale_gap` for the run's
+    alert. A gap longer than the limit, or a name with no earlier bar at all,
+    raises. Every other missing bar (an untradable name's gap before its last
+    bar, or a name with no bar at all) raises `ValueError`, so a stale mark is
+    never carried silently.
     """
     books = {session: ledger(session) for session in sessions}
     own: dict[date, dict[str, float]] = {}
@@ -291,18 +329,27 @@ def marks_for(
             continue
         for security_id in sorted(book.positions):
             flag = tradable_flags.get(security_id)
+            stale_close_session: date | None = None
+            gap = 0
             if security_id in own[session]:
                 price = own[session][security_id]
             else:
                 stale = last_known[session].get(security_id)
                 later = last_bar.get(security_id)
-                if flag is True or stale is None or (later is not None and later > session):
+                if stale is None:
                     raise ValueError(f"no price for {security_id} at close({session})")
                 stale_session, stale_close = stale
+                if flag is True:
+                    gap = _sessions_between(stale_session, session)
+                    if gap > max_stale_sessions:
+                        raise ValueError(f"no price for {security_id} at close({session})")
+                    stale_close_session = stale_session
+                elif later is not None and later > session:
+                    raise ValueError(f"no price for {security_id} at close({session})")
                 price = stale_close / _split_factor(actions, security_id, stale_session, session)
                 _logger.warning(
                     "marks: %s has no bar at close(%s); marked at its last close, %s's, "
-                    "as untradable (tradable flag %s)",
+                    "(tradable flag %s)",
                     security_id,
                     session.isoformat(),
                     stale_session.isoformat(),
@@ -318,6 +365,8 @@ def marks_for(
                     value=quantity * price,
                     cash=book.cash,
                     tradable=flag,
+                    stale_close=stale_close_session,
+                    stale_gap=gap,
                 )
             )
     return marks
