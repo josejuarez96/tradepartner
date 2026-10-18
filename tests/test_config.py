@@ -456,6 +456,28 @@ def test_edgar_class_member_overrides_may_be_emptied() -> None:
     assert s.edgar.class_member_overrides == {}
 
 
+def test_edgar_class_member_link_is_off_with_four_dead_class_filings() -> None:
+    """T190d: the link stays off until the release `rederive-1682` (T198)."""
+    edgar = Settings(_env_file=None).edgar
+    assert edgar.class_member_link is False
+    assert edgar.dead_class_filings == 4
+    assert edgar.lettered_member_max_minor_share == 0.001
+    on = Settings(_env_file=None, edgar={"class_member_link": True, "dead_class_filings": 2})
+    assert (on.edgar.class_member_link, on.edgar.dead_class_filings) == (True, 2)
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_edgar_dead_class_filings_refuses_less_than_one(count: int) -> None:
+    with pytest.raises(ValidationError, match="dead_class_filings"):
+        Settings(_env_file=None, edgar={"dead_class_filings": count})
+
+
+@pytest.mark.parametrize("share", [0.0, -0.1, 1.0, 2.0])
+def test_edgar_lettered_member_max_minor_share_is_a_fraction(share: float) -> None:
+    with pytest.raises(ValidationError, match="lettered_member_max_minor_share"):
+        Settings(_env_file=None, edgar={"lettered_member_max_minor_share": share})
+
+
 def test_edgar_unknown_key_is_refused() -> None:
     """#1037: a mistyped nested key fails instead of being silently ignored."""
     with pytest.raises(ValidationError, match="statement_unit"):
