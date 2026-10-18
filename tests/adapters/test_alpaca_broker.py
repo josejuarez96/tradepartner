@@ -632,18 +632,18 @@ def test_the_brokers_recorded_duplicate_refusal_raises_duplicate() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "expected"),
+    ("name", "symbol", "expected"),
     [
         # "insufficient qty available": the ledger and the broker disagree (spec
         # amendment 2026-10-18 item 2), mapped here, whatever the order.
-        ("sell_above_held", ReconciliationError),
+        ("sell_above_held", "KO", ReconciliationError),
         # Mapped by the refusal, not the side: the wrapper makes it a
         # `ReconciliationError` on a sell (the #395 deliberate fractional exit).
-        ("non_fractionable_sell_fractional", NotFractionableError),
+        ("non_fractionable_sell_fractional", "OCGN", NotFractionableError),
     ],
 )
 def test_a_recorded_submit_refusal_is_raised_typed_with_no_key_in_it(
-    name: str, expected: type[Exception]
+    name: str, symbol: str, expected: type[Exception]
 ) -> None:
     error = _load(name)["error"]
     broker, http = _broker()
@@ -651,7 +651,9 @@ def test_a_recorded_submit_refusal_is_raised_typed_with_no_key_in_it(
     http.route("POST", "/v2/orders", (error["status_code"], json.loads(error["body"])))
 
     with pytest.raises(expected) as err:
-        broker.submit(_request(side=Side.SELL, notional=None, quantity=0.5))
+        # The recorded refusals name their own symbol (KO, OCGN): a 403 maps only
+        # for the order's own symbol (T202 safety review).
+        broker.submit(_request(symbol=symbol, side=Side.SELL, notional=None, quantity=0.5))
     assert not isinstance(err.value, DuplicateClientOrderIdError)
     text = str(err.value) + repr(vars(err.value))
     for secret in (PAPER_KEY, PAPER_SECRET, DATA_KEY, DATA_SECRET):
@@ -665,8 +667,8 @@ def test_a_recorded_submit_refusal_is_raised_typed_with_no_key_in_it(
 #: Alpaca's exact submit-time body is unrecorded, so the message is what is matched).
 PER_NAME_REFUSALS = [
     (404, {"code": 40410000, "message": "asset not found for ZZZZ"}, AssetNotFoundError),
-    (403, {"code": 40310000, "message": 'asset "OCGN" is not fractionable'}, NotFractionableError),
-    (403, {"code": 40310000, "message": 'asset "ZZZ" is not tradable'}, AssetNotTradableError),
+    (403, {"code": 40310000, "message": 'asset "KO" is not fractionable'}, NotFractionableError),
+    (403, {"code": 40310000, "message": 'asset "KO" is not tradable'}, AssetNotTradableError),
 ]
 
 
@@ -685,6 +687,57 @@ def test_a_per_name_refusal_on_a_buy_is_raised_as_its_typed_error(
     text = str(err.value) + repr(vars(err.value))
     for secret in (PAPER_KEY, PAPER_SECRET, DATA_KEY, DATA_SECRET):
         assert secret not in text
+
+
+#: T202's review (safety, SHOULD FIX 1): the map is exact. A 403 is a skip only with
+#: code 40310000 and the message `asset "<the order's symbol>" is not
+#: tradable|fractionable`; anything near it is raised as is, so the run halts.
+NEAR_MISSES = [
+    # another symbol's refusal
+    (403, {"code": 40310000, "message": 'asset "ZZZ" is not tradable'}),
+    (403, {"code": 40310000, "message": 'asset "OCGN" is not fractionable'}),
+    # the right text under another code
+    (403, {"code": 40310001, "message": 'asset "KO" is not tradable'}),
+    (403, {"code": 40310001, "message": 'asset "KO" is not fractionable'}),
+    (403, {"message": 'asset "KO" is not tradable'}),
+    # an account-wide refusal that merely contains the words
+    (403, {"code": 40310000, "message": "account is not tradable"}),
+    (403, {"code": 40310000, "message": 'account blocked: asset "KO" is not tradable'}),
+]
+
+
+@pytest.mark.parametrize(("status", "body"), NEAR_MISSES)
+def test_a_refusal_near_the_allowlist_is_raised_as_is(status: int, body: dict[str, Any]) -> None:
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (status, body))
+
+    with pytest.raises(AlpacaTradingError) as err:
+        broker.submit(_request(symbol="KO"))
+    assert err.value.status_code == status
+    assert not isinstance(
+        err.value, (AssetNotFoundError, NotFractionableError, AssetNotTradableError)
+    )
+
+
+@pytest.mark.parametrize(("status", "body", "typed"), PER_NAME_REFUSALS)
+def test_a_per_name_refusal_after_a_retry_is_raised_as_is(
+    status: int, body: dict[str, Any], typed: type[Exception]
+) -> None:
+    """A refusal answered to a retried submit (`error.retried`: an earlier attempt
+    timed out or met a 5xx, and the broker may hold that attempt's order) is
+    never a skip: it is raised unchanged, so the run halts and resume settles it."""
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    answers = iter([(503, {"code": 50300000, "message": "service unavailable"}), (status, body)])
+    http.route("POST", "/v2/orders", lambda _request: next(answers))
+
+    with pytest.raises(AlpacaTradingError) as err:
+        broker.submit(_request(symbol="KO"))
+    assert err.value.retried is True
+    assert err.value.status_code == status
+    assert not isinstance(err.value, typed)
+    assert len(http.calls("POST", "/v2/orders")) == 2
 
 
 @pytest.mark.parametrize(

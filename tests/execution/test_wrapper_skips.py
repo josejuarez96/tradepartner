@@ -26,11 +26,13 @@ from tradepartner.config import RiskConfig
 from tradepartner.errors import (
     AssetNotFoundError,
     AssetNotTradableError,
+    ClockError,
     NotFractionableError,
     ReconciliationError,
     SkipCapError,
 )
 from tradepartner.execution import wrapper
+from tradepartner.execution.alerts import Alerter
 from tradepartner.execution.collect import WriteOffContext, collect
 from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.store.db import insert_row, open_for_write
@@ -536,6 +538,93 @@ def test_a_submit_time_skip_over_the_cap_halts_before_the_next_submit(
         if coid not in submitted
     ]
     assert never and all(_events_of(env, coid) == [("pending", None)] for coid in never)
+
+
+# --- review findings (T202 quant-auditor and safety-reviewer passes, #1829) --------
+
+
+@pytest.mark.parametrize("via", ["assets_read", "submit"])
+def test_a_buy_adding_to_a_held_name_the_broker_does_not_know_halts_reconciliation(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, via: str
+) -> None:
+    """Spec item 2: a held name is never in the allowlist, whatever the side. A buy
+    that adds to a ledger-held name the broker cannot find (a 404 on the `assets`
+    read, or `AssetNotFoundError` on submit) is the same ledger/broker disagreement
+    as a sell's: `ReconciliationError`, never `skip_asset_unknown`."""
+    _hold(env, A, 10.0)
+    if via == "assets_read":
+        env.fake.remove_asset(SYMBOLS[A])
+    else:
+        env.fake.script(TransportFault(error=AssetNotFoundError("refused")))
+    buy = _decision(env, A, "buy", notional=3000.0)
+
+    with pytest.raises(ReconciliationError):
+        _execute(_gate(env, alerter_conn), env, [buy])
+
+    assert _decision_events(env.settings) == []
+    assert _skipped_alerts(env) == []
+    if via == "assets_read":
+        assert _submits(env.fake) == []
+
+
+def test_a_refused_buys_cash_stays_in_cash_left(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The quant-auditor's probe: three $3,000 buys at the frozen 15 bps, the first
+    refused at submit. Only the two submitted buys are spent, $3,004.50 each, so
+    `cash_left` = 100,000 - 6,009.00 = 93,991.00 (not 90,986.50), and the run's
+    `unspent_cash` test sees the refused $3,000 back."""
+    buys = [_decision(env, sid, "buy", notional=3000.0) for sid in (A, B, C)]
+    env.fake.script(TransportFault(error=AssetNotFoundError("refused")))
+
+    outcome = _execute(_gate(env, alerter_conn), env, buys)
+
+    assert outcome.status == "ok"
+    assert outcome.cash == pytest.approx(100_000.0)
+    assert outcome.cash_left == pytest.approx(93_991.0)
+
+
+def test_a_halt_at_the_skip_cap_during_submit_still_alerts_the_refused_names(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """The safety review's NIT 3: the two refusals that took the run over the cap are
+    journaled skips, so the run's `skipped` alert names them and their reasons
+    even though the batch halts `SkipCapError`."""
+    frozen = FROZEN.model_copy(update={"max_skips_per_run": 1})
+    buys = [_decision(env, sid, "buy", notional=3000.0) for sid in (A, B, C)]
+    env.fake.script(TransportFault(error=AssetNotFoundError("refused")))
+    env.fake.script(TransportFault(error=NotFractionableError("refused")))
+
+    with pytest.raises(SkipCapError):
+        _execute(_gate(env, alerter_conn, frozen), env, buys)
+
+    ((run_id, message),) = _skipped_alerts(env)
+    assert run_id == env.run.run_id
+    assert "skip_asset_unknown" in message and "skip_not_fractionable" in message
+    assert A in message or SYMBOLS[A] in message
+    assert B in message or SYMBOLS[B] in message
+
+
+def test_a_clock_error_writing_the_skipped_alert_is_not_swallowed(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety review's NIT 2. The run writes its other alerts with no guard
+    (`run._alert`: an error raises and takes the run's fault path), so a
+    `ClockError` met writing the `skipped` alert raises out of `execute` too, to
+    halt, rather than being logged and dropped."""
+    real_write = Alerter.write
+
+    def clock_fault(self: Alerter, kind: str, *args: Any, **kwargs: Any) -> Any:
+        if kind == "skipped":
+            raise ClockError("clock went back")
+        return real_write(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(Alerter, "write", clock_fault)
+    env.fake.remove_asset(SYMBOLS[C])
+    buys = [_decision(env, sid, "buy", notional=3000.0) for sid in (A, C)]
+
+    with pytest.raises(ClockError):
+        _execute(_gate(env, alerter_conn), env, buys)
 
 
 # --- anything else still halts ---------------------------------------------------------
