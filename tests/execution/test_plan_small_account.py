@@ -352,7 +352,7 @@ def test_the_live_capital_count_is_printed_as_today_and_binds_nothing() -> None:
 # --- the one allowed skip -------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="T202")
+@pytest.mark.xfail(strict=True, reason="#1828")
 def test_a_scripted_non_fractionable_name_is_the_one_allowed_skip() -> None:
     """Section on, the `assets` read scripts N25 not fractionable: its buy is never
     a whole-share order but the one skip, `skip_not_fractionable`, taken before
