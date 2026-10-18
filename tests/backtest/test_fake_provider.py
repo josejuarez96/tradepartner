@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -244,3 +245,24 @@ def test_turnover_inputs_bound_the_bars_and_are_recorded() -> None:
     ]
     with pytest.raises(TypeError, match="sessions_from"):
         provider.turnover_inputs(T_JAN, ["A"], T_JAN)  # type: ignore[arg-type]
+
+
+def test_rates_are_the_series_known_at_t_latest_revision_and_recorded() -> None:
+    known = datetime(2019, 3, 14, 20, tzinfo=UTC)
+    revised = datetime(2019, 3, 21, 20, tzinfo=UTC)
+    obs = date(2019, 3, 12)
+    rows = pl.DataFrame(
+        {
+            "series": ["DTB3", "DTB3", "OTHER"],
+            "observation_date": [obs, obs, obs],
+            "value": [2.25, 2.27, 9.0],
+            "vintage_date": [date(2019, 3, 13), date(2019, 3, 20), date(2019, 3, 13)],
+            "known_at": [known, revised, known],
+        },
+        schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+    )
+    provider = replace(_provider(), rate_rows=rows)
+    assert provider.rates(known, "DTB3")["value"].to_list() == [2.25]
+    assert provider.rates(revised, "DTB3")["value"].to_list() == [2.27]
+    assert provider.rates(known - timedelta(microseconds=1), "DTB3").is_empty()
+    assert [call.series for call in provider.calls] == ["DTB3"] * 3
