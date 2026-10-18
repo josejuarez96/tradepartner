@@ -163,6 +163,9 @@ def test_the_rename_table_covers_every_phase3_period_key() -> None:
         "turnover_annual",
         "sharpe_annual_excess_spy",
         "risk_free_annual",
+        # T211's reported keys; no migration writes them.
+        "beta_spy",
+        "alpha_spy_annual",
     }
     kept = {k for k in _PHASE3 if k not in schema.PERIOD_KEY_RENAMES}
     assert kept | set(schema.PERIOD_KEY_RENAMES.values()) | added == set(METRIC_KEYS)
@@ -199,8 +202,9 @@ def test_the_migration_inserts_the_period_rows_and_keeps_the_monthly_ones(
     for series in ("strategy", "SPY", "MTUM"):
         for level in _LEVELS:
             keys = {row[3] for row in after if row[1] == series and row[2] == level}
-            # Past trials lack `risk_free_annual` (T170): no migration writes it.
-            assert set(METRIC_KEYS) - {"risk_free_annual"} <= keys
+            # Past trials lack `risk_free_annual` (T170) and T211's `beta_spy` and
+            # `alpha_spy_annual`: no migration writes them.
+            assert set(METRIC_KEYS) - {"risk_free_annual", "beta_spy", "alpha_spy_annual"} <= keys
 
 
 def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(

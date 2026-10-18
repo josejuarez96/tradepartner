@@ -1976,6 +1976,15 @@ def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None
             Settings(_env_file=None, dashboard={"page_row_limit": bad})
 
 
+def test_status_slippage_sessions_defaults_and_must_be_positive() -> None:
+    """#1741: `paper status` reads only the newest N order sessions for the slippage
+    line; N is config, never hardcoded."""
+    assert _settings().paper.status_slippage_sessions == 20
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, paper={"status_slippage_sessions": bad})
+
+
 def test_research_experiments_dir_defaults_to_docs_experiments() -> None:
     """docs/specs/research-registry.md req 2, req 14: the one key `experiment
     register`/`dataset register` read from; no env var (spec, Config keys)."""

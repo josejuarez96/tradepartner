@@ -86,6 +86,23 @@ reported once, under the first rule it fails:
    not shrink its company (ADR 0006: "summed over all classes"). Ties rank
    by `cik`.
 
+   `universe.rank_by` (ADR 0023 D4, T212; default `cap`, which is everything
+   above, byte for byte) switches rules 7 and 8 for a forward book. Under
+   `dollar_volume` rule 7 is skipped (no shares fact is read: `rules_enabled`
+   says so and `shares_fallbacks` is empty) and rule 8 ranks companies by the
+   sum of their classes' median raw close x raw volume over the
+   `universe.min_history_months` window (every class that passed rules 1-6
+   has a bar on each of its sessions), from bars known at `t` alone; ties
+   rank by `cik`. The top `universe.top_n_by_cap` are kept, then each kept
+   class is intersected with Alpaca's tradable assets as of `t`
+   (`borrow_status_as_of`: the latest row per asset with `known_at <= t`,
+   `status = 'active'` and `tradable`, matched on the class's Alpaca symbol:
+   `master_symbol` with `alpaca.class_symbols`, as the broker names it); a kept class with no such
+   asset is excluded under rule 8 with reason `untradable_asset`. **Before the
+   first assets snapshot with `known_at <= t` the intersection is skipped**, never today's list read
+   into the past: `Universe.assets_intersection_skipped` is true and
+   `n_assets_intersected` 0.
+
 Every rule reads bars with `traded_only=True` (#787): a zero-volume bar is
 missing, not a price, so it fails rule 6 and is no close for rules 4 and 8
 and no dollar volume for rule 5.
@@ -116,9 +133,10 @@ import duckdb
 import polars as pl
 
 from tradepartner.calendar import last_completed_session, previous_session, sessions_in_month_window
-from tradepartner.config import Settings, get_settings, parse_accepted_shares_fact
+from tradepartner.config import Settings, UniverseConfig, get_settings, parse_accepted_shares_fact
 from tradepartner.store.asof import (
     _validate_t,
+    borrow_status_as_of,
     facts_as_of,
     listings_as_of,
     live_actions_as_of,
@@ -140,6 +158,9 @@ RULES: tuple[str, ...] = (
     "shares",
     "size",
 )
+
+#: `borrow_status.status` of an asset Alpaca lists as trading.
+_ASSET_ACTIVE = "active"
 
 #: The store's `fact_name` for shares outstanding (see the module docstring).
 SHARES_FACT = "shares_outstanding"
@@ -198,6 +219,13 @@ SHARES_FALLBACK_SCHEMA: dict[str, Any] = {
     "used_value": pl.Float64,
     "ratio": pl.Float64,
 }
+#: The one extra member column under `rank_by = dollar_volume`: the company's
+#: ranking value (its classes' summed median dollar volume). `shares`,
+#: `market_cap` and `company_cap` are null there: no shares fact is read.
+_DOLLAR_VOLUME_MEMBER_SCHEMA: dict[str, Any] = {
+    **_MEMBER_SCHEMA,
+    "company_dollar_volume": pl.Float64,
+}
 _EXCLUSION_SCHEMA: dict[str, Any] = {
     "security_id": pl.Utf8,
     "rule": pl.Int64,
@@ -219,6 +247,12 @@ class Universe:
     as out of line (#845), with the fact used instead
     (`SHARES_FALLBACK_SCHEMA`); such a class may still fail rule 7 as
     `stale_shares` when that fact is too old.
+
+    `n_assets_intersected` and `assets_intersection_skipped` record the
+    `rank_by = dollar_volume` intersection (module docstring): the kept
+    classes checked against the assets snapshot, and whether the
+    intersection was skipped because no snapshot was known at `t`. Both are
+    0 and false under `cap`.
     """
 
     t: datetime
@@ -230,6 +264,8 @@ class Universe:
     shares_fallbacks: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(schema=SHARES_FALLBACK_SCHEMA)
     )
+    n_assets_intersected: int = 0
+    assets_intersection_skipped: bool = False
 
 
 @cache
@@ -708,6 +744,122 @@ def latest_shares_as_of(
     return pick.shares, pick.ambiguous
 
 
+def _assets_snapshot_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> bool:
+    """True when an assets snapshot row with `known_at <= t` exists. A store
+    without the `borrow_status` table (below schema version 24) has none."""
+    tables = {
+        name
+        for (name,) in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+            " AND table_catalog = current_database()"
+        ).fetchall()
+    }
+    if "borrow_status" not in tables:
+        return False
+    row = conn.execute("SELECT count(*) FROM borrow_status WHERE known_at <= ?", [t]).fetchone()
+    return row is not None and row[0] > 0
+
+
+def _tradable_symbols(conn: duckdb.DuckDBPyConnection, t: datetime) -> set[str]:
+    """The Alpaca symbols of the assets active and tradable at `t`."""
+    from tradepartner.adapters.alpaca_prices import alpaca_symbol  # cycle: it imports this module
+
+    frame = borrow_status_as_of(conn, t)
+    keys = {
+        alpaca_symbol(symbol)
+        for symbol, status, tradable in frame.select("symbol", "status", "tradable").iter_rows()
+        if tradable and status == _ASSET_ACTIVE
+    }
+    return {key for key in keys if key is not None}
+
+
+def _dollar_volume_universe(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    session: date,
+    cfg: UniverseConfig,
+    securities: dict[str, dict[str, Any]],
+    listings: dict[str, dict[str, Any]],
+    alive: list[str],
+    close: dict[str, float],
+    bars: dict[str, dict[date, tuple[float, int]]],
+    history: Sequence[date],
+    exclusions: list[dict[str, Any]],
+    settings: Settings,
+) -> Universe:
+    """Rules 7 and 8 under `rank_by = dollar_volume` (module docstring): `alive`
+    passed rules 1-6, so every class has a bar on each `history` session."""
+    from tradepartner.adapters.alpaca_prices import master_symbol  # cycle: it imports this module
+
+    size_rule = RULES.index("size") + 1
+    window = frozenset(history)
+    median = {
+        sid: statistics.median(c * v for s, (c, v) in bars[sid].items() if s in window)
+        for sid in alive
+    }
+    company_dv: dict[str, float] = defaultdict(float)
+    for sid in alive:
+        company_dv[securities[sid]["cik"]] += median[sid]
+    ranked = sorted(company_dv, key=lambda cik: (-company_dv[cik], cik))
+    rank = {cik: position + 1 for position, cik in enumerate(ranked)}
+    kept = set(ranked[: cfg.top_n_by_cap])
+
+    def exclude(sid: str, reason: str) -> None:
+        exclusions.append(
+            {"security_id": sid, "rule": size_rule, "rule_name": "size", "reason": reason}
+        )
+
+    for sid in alive:
+        if securities[sid]["cik"] not in kept:
+            exclude(sid, "top_n_by_cap")
+    admitted = [sid for sid in alive if securities[sid]["cik"] in kept]
+    skipped = not _assets_snapshot_known(conn, t)
+    checked = len(admitted)
+    if not skipped:
+        tradable = _tradable_symbols(conn, t)
+        for sid in admitted:
+            if master_symbol(listings[sid], settings.alpaca.class_symbols) not in tradable:
+                exclude(sid, "untradable_asset")
+        admitted = [
+            sid
+            for sid in admitted
+            if master_symbol(listings[sid], settings.alpaca.class_symbols) in tradable
+        ]
+    members = [
+        {
+            "security_id": sid,
+            "cik": securities[sid]["cik"],
+            "ticker": listings[sid]["ticker"],
+            "exchange": listings[sid]["exchange"],
+            "close": close[sid],
+            "shares": None,
+            "market_cap": None,
+            "company_cap": None,
+            "company_rank": rank[securities[sid]["cik"]],
+            "company_dollar_volume": company_dv[securities[sid]["cik"]],
+        }
+        for sid in admitted
+    ]
+    return Universe(
+        t=t,
+        session=session,
+        members=pl.DataFrame(members, schema=_DOLLAR_VOLUME_MEMBER_SCHEMA).sort(
+            "company_rank", "security_id"
+        ),
+        exclusions=pl.DataFrame(exclusions, schema=_EXCLUSION_SCHEMA).sort("security_id"),
+        rules_enabled={
+            rule: (rule != "liquidity" or cfg.liquidity_rule_enabled) and rule != "shares"
+            for rule in RULES
+        },
+        settings={
+            "universe": cfg.model_dump(mode="json"),
+            "fill_price": settings.execution.fill_price,
+        },
+        n_assets_intersected=0 if skipped else checked,
+        assets_intersection_skipped=skipped,
+    )
+
+
 def universe_as_of(
     conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
 ) -> Universe:
@@ -806,6 +958,22 @@ def universe_as_of(
         ~pl.col("accepted") & pl.col("session").is_in(list(history))
     )
     apply("history", dict.fromkeys(jumps["security_id"].to_list(), "price_jump"))
+
+    if cfg.rank_by == "dollar_volume":
+        return _dollar_volume_universe(
+            conn,
+            t,
+            session,
+            cfg,
+            securities,
+            listings,
+            alive,
+            close,
+            bars,
+            history,
+            exclusions,
+            settings,
+        )
 
     pick = shares_as_of(conn, t, sized, settings)
     latest_shares, ambiguous = pick.shares, pick.ambiguous

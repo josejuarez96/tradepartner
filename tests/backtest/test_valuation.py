@@ -509,7 +509,12 @@ def _digest(result: Any) -> dict[str, Any]:
     return {
         "metrics_sha": hashlib.sha256(
             repr(
-                sorted((k, None if v is None else round(v, 9)) for k, v in metrics.items())
+                sorted(
+                    (k, None if v is None else round(v, 9))
+                    for k, v in metrics.items()
+                    # T211's reported-only keys postdate these pins (taken on 6a9e2dec)
+                    if k not in ("beta_spy", "alpha_spy_annual")
+                )
             ).encode()
         ).hexdigest()[:16],
         "equity_sha": hashlib.sha256(repr(equity).encode()).hexdigest()[:16],

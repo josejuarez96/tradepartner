@@ -159,6 +159,7 @@ def _core_env(fixture_store_path: Path) -> CoreEnv:
     settings = _alerting_settings(fixture_store_path)
     clock = CoreClock(core_at(TUE))
     fake = FakeBroker(
+        assets=FakeBroker.active_assets("SPY", "DUALB", "SPFT", "TRNS", "WNDX"),
         clock=clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1171,6 +1172,7 @@ def test_drawdown_alert_row_exists_when_the_command_returns(
     window = core_env.window(started=core_at(MON, 22), starting_equity=peak)
     core_env.ingest(core_at(TUE, 21))
     core_env.fake = FakeBroker(
+        assets=FakeBroker.active_assets("SPY", "DUALB", "SPFT", "TRNS", "WNDX"),
         clock=core_env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
