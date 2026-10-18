@@ -55,7 +55,9 @@ as_of`:
   is not delisted, and stays unmapped (compare's `unknown_symbol`) when
   there is none or more than one. When two journal names share a ticker,
   only the one not delisted keeps it; when that does not settle it, neither
-  does, and a held one becomes compare's `unknown_security`.
+  does, and a held one becomes compare's `unknown_security`. A held name whose
+  ticker changed in the store at close(S-1) maps to the broker's one new
+  symbol (#1761), recorded on the row's `symbol_changes`.
 - `ended`: journal names whose current listing is `delisted` at close(S-1)
   (`store.delistings.listing_ends_as_of`; a transfer is not an end).
 - `dividends`: per held name, the cash due from `dividend` actions with an
@@ -122,7 +124,7 @@ from tradepartner.execution.reconcile import (
     compare,
 )
 from tradepartner.execution.symbols import broker_symbol
-from tradepartner.store.asof import live_actions_as_of, prices_as_of
+from tradepartner.store.asof import live_actions_as_of, prices_as_of, symbol_changes_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
     ReviewedGroup,
@@ -276,17 +278,54 @@ def _ledger(
     )
 
 
+def _applied_change(
+    name: str,
+    symbol: str,
+    changes: Mapping[str, Sequence[tuple[str, str]]],
+    broker_symbols: Collection[str],
+) -> tuple[str, str] | None:
+    """The one ticker change this reconciliation applies for `name` (#1761), or
+    None: the name's current symbol is a change's old symbol and exactly one
+    distinct new symbol is on the broker (`broker_symbols`). A name with no
+    change, one the broker has not renamed yet, and one with two candidate new
+    symbols apply nothing, so the position stays a mismatch, never a guess."""
+    candidates = {new for old, new in changes.get(name, ()) if old == symbol}
+    if len(candidates) != 1:
+        return None
+    (new,) = candidates
+    return (symbol, new) if new in broker_symbols else None
+
+
+def _symbol_change_candidates(
+    conn: duckdb.DuckDBPyConnection, cut: datetime, names: Iterable[str]
+) -> dict[str, list[tuple[str, str]]]:
+    """Per name, the `(old symbol, new symbol)` ticker changes the store held at
+    close(S-1) (`store.asof.symbol_changes_as_of`, #1761); the read is at `cut`
+    like every store fact, so a change known only after it is invisible."""
+    rows = symbol_changes_as_of(conn, cut, sorted(set(names)))
+    changes: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for row in rows.iter_rows(named=True):
+        changes[row["security_id"]].append((row["old_symbol"], row["new_symbol"]))
+    return changes
+
+
 def _symbols(
     names: Iterable[str],
     order_symbols: Mapping[str, str],
     current: Mapping[str, Mapping[str, Any]],
     broker_symbols: Collection[str],
     class_symbols: Mapping[str, str] | None,
-) -> dict[str, str]:
-    """`security_id` to broker symbol, one name per symbol (module docstring). A
-    listing's ticker is read in its broker form (`broker_symbol`, #1729), so a
-    `GEF.B` position matches the `GEF-B` listing."""
+    changes: Mapping[str, Sequence[tuple[str, str]]],
+) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+    """`security_id` to broker symbol, one name per symbol, and the ticker
+    changes applied to it (module docstring). A listing's ticker is read in its
+    broker form (`broker_symbol`, #1729), so a `GEF.B` position matches the
+    `GEF-B` listing. A held name whose stored change (at close(S-1)) puts it
+    under a new symbol the broker holds maps to that symbol (#1761), so the
+    ledger's old-symbol position matches, and the applied changes come back for
+    the row's record."""
     claims: dict[str, list[str]] = defaultdict(list)
+    applied: dict[str, tuple[str, str]] = {}
     for name in sorted(set(names)):
         listing = current.get(name)
         symbol = (
@@ -294,6 +333,12 @@ def _symbols(
             if listing is not None
             else order_symbols.get(name)
         )
+        change = (
+            _applied_change(name, symbol, changes, broker_symbols) if symbol is not None else None
+        )
+        if change is not None:
+            applied[name] = change
+            symbol = change[1]
         if symbol is not None:
             claims[symbol].append(name)
     symbols: dict[str, str] = {}
@@ -311,7 +356,12 @@ def _symbols(
         ]
         if len(matches) == 1:
             symbols[matches[0]] = symbol
-    return symbols
+    # Only a change the final map kept is recorded: a later pass (the
+    # unclaimed-symbol rule) can put the name back on its listing's symbol
+    # when the broker holds both, and the row must not claim it was applied.
+    return symbols, {
+        name: change for name, change in applied.items() if symbols.get(name) == change[1]
+    }
 
 
 def _reference_prices(
@@ -450,7 +500,14 @@ def _explanations(
     )
     order_symbols = {o.security_id: o.symbol for o in state.orders}
     current = current_listings(listing_ends_as_of(conn, cut, settings), session)
-    symbols = _symbols(names, order_symbols, current, broker_symbols, settings.alpaca.class_symbols)
+    symbols, symbol_changes = _symbols(
+        names,
+        order_symbols,
+        current,
+        broker_symbols,
+        settings.alpaca.class_symbols,
+        _symbol_change_candidates(conn, cut, names),
+    )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
@@ -474,6 +531,7 @@ def _explanations(
         stock_dividend_references=_stock_dividend_references(conn, cut, priced, stock_dividends),
         seen_activity_ids=seen_ids,
         activity_seen_before=seen_before,
+        symbol_changes=symbol_changes,
     )
 
 
@@ -558,8 +616,9 @@ def explanations_as_of(
     """What the store knew at close(S-1), and the journal at `as_of`, to explain
     the broker on S (module docstring). Read-only. `as_of` is the journal cut
     (tz-aware). `broker_symbols` are `positions()`' keys, so a symbol
-    the journal never held can still be matched. `settings` gives
-    `master.transfer_window_sessions` for the listing ends, and
+    the journal never held can still be matched, and a held name whose ticker
+    changed at close(S-1) maps to the broker's new symbol (#1761). `settings`
+    gives `master.transfer_window_sessions` for the listing ends, and
     `quantity_tolerance` is the frozen `risk.reconcile_quantity_tolerance`.
     Raises `ValueError` for a non-session `session` or a naive `as_of`."""
     cut = _cut(session)

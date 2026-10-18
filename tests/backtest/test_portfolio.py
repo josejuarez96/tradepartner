@@ -8,7 +8,9 @@ import pytest
 
 from tradepartner.backtest.portfolio import (
     _selected_count,
+    apply_rebalance_band,
     drifted_weights,
+    hold_membership,
     target_weights,
     trades_from,
 )
@@ -131,3 +133,117 @@ def test_trades_drop_exact_zeros() -> None:
 
 def test_trades_ordered_by_security_id() -> None:
     assert list(trades_from({"C": 0.5, "A": 0.5}, {"B": 1.0})) == ["A", "B", "C"]
+
+
+# --- the no-trade band (backtest spec amendment #1731; T209a) -----------------------
+
+
+def test_band_of_zero_returns_the_targets_unchanged() -> None:
+    target = {"A": 0.5, "B": 0.3, "C": 0.2}
+    current = {"A": 0.52, "B": 0.28, "D": 0.05}
+    assert apply_rebalance_band(target, current, 0.0) == target
+
+
+def test_a_band_wider_than_every_drift_returns_the_current_weights() -> None:
+    target = {"A": 0.5, "B": 0.3}
+    current = {"A": 0.5, "B": 0.28}
+    assert apply_rebalance_band(target, current, 0.99) == current
+
+
+def test_band_suppresses_only_the_drifts_inside_it() -> None:
+    # A 0.05 band on a 0.5 target is 0.025: A's 0.01 drift is inside, B's 0.1 is outside.
+    # A keeps 0.51; the traded B fills the remaining 0.49 of the budget.
+    target = {"A": 0.5, "B": 0.5}
+    current = {"A": 0.51, "B": 0.4}
+    assert apply_rebalance_band(target, current, 0.05) == {"A": 0.51, "B": 0.49}
+
+
+def test_band_never_leaves_weights_summing_above_one() -> None:
+    """A suppressed held name can over-fill the target; the traded names are scaled into
+    what is left of the budget (reviewer's repro on #1788)."""
+    effective = apply_rebalance_band({"A": 0.5, "B": 0.5}, {"A": 0.52, "B": 0.47}, 0.05)
+    assert effective == {"A": 0.52, "B": 0.48}
+    assert math.fsum(effective.values()) <= 1.0
+
+
+def test_band_never_scales_a_traded_name_above_its_target() -> None:
+    """Scaling only shrinks: a partly invested book keeps the rest in cash (reviewer's
+    pass-2 repro on #1788)."""
+    assert apply_rebalance_band({"A": 0.4, "B": 0.4}, {}, 0.05) == {"A": 0.4, "B": 0.4}
+    assert apply_rebalance_band({"A": 0.5, "B": 0.3}, {"A": 0.49, "B": 0.1}, 0.05) == {
+        "A": 0.49,
+        "B": 0.3,
+    }
+
+
+def test_band_always_exits_a_name_absent_from_target() -> None:
+    """A held name with no target has a zero band, so it is always sold."""
+    assert apply_rebalance_band({"A": 1.0}, {"A": 0.9, "B": 0.1}, 0.99) == {"A": 0.9}
+
+
+def test_a_band_of_zero_reproduces_todays_trades() -> None:
+    target = {"A": 0.5, "C": 0.5}
+    current = {"A": 0.6, "B": 0.3}
+    assert trades_from(apply_rebalance_band(target, current, 0.0), current) == trades_from(
+        target, current
+    )
+
+
+@pytest.mark.parametrize("band", [-0.1, 1.0, 1.5, float("nan"), float("inf")])
+def test_band_out_of_range_refused(band: float) -> None:
+    with pytest.raises(ValueError, match="band"):
+        apply_rebalance_band({"A": 1.0}, {"A": 1.0}, band)
+
+
+# --- hold-mode membership (backtest spec amendment #1731; T209a) --------------------
+
+
+def test_hold_fills_the_target_from_the_rank_order() -> None:
+    step = hold_membership(
+        ("X", "Y", "Z"), {}, session=0, hold_sessions=3, hold_target_names=2, top_fraction=0.5
+    )
+    assert step.entering == ("X", "Y")
+    assert step.exiting == ()
+    assert step.held == ("X", "Y")
+    assert step.entries == {"X": 0, "Y": 0}
+
+
+def test_hold_exits_a_name_on_session_n_and_no_earlier() -> None:
+    ranked, entries = ("Z",), {"X": 0}
+    second = hold_membership(ranked, entries, 2, 3, 1, 1.0)
+    assert second.exiting == ()
+    assert second.held == ("X",)
+    third = hold_membership(ranked, entries, 3, 3, 1, 1.0)
+    assert third.exiting == ("X",)
+    assert third.held == ("Z",)
+    assert third.entries == {"Z": 3}
+
+
+def test_hold_keeps_live_names_beyond_the_target_in_cash() -> None:
+    """A book with more live names than its target keeps them all; it never force-exits."""
+    step = hold_membership(("Z",), {"A": 0, "B": 0, "C": 0}, 1, 3, 1, 1.0)
+    assert step.entering == ()
+    assert step.exiting == ()
+    assert step.held == ("A", "B", "C")
+
+
+def test_a_name_re_entering_on_its_exit_restarts_its_hold() -> None:
+    step = hold_membership(("X",), {"X": 0}, 3, 3, 1, 1.0)
+    assert step.exiting == ("X",)
+    assert step.entering == ("X",)
+    assert step.held == ("X",)
+    assert step.entries == {"X": 3}
+
+
+def test_hold_target_names_zero_means_the_top_fraction_count() -> None:
+    step = hold_membership(
+        ("A", "B", "C", "D"), {}, session=0, hold_sessions=5, hold_target_names=0, top_fraction=0.5
+    )
+    assert step.entering == ("A", "B")
+    assert step.held == ("A", "B")
+
+
+@pytest.mark.parametrize(("hold_sessions", "session"), [(0, 0), (-1, 0), (3, -1)])
+def test_hold_membership_refuses_bad_inputs(hold_sessions: int, session: int) -> None:
+    with pytest.raises(ValueError):
+        hold_membership(("X",), {}, session, hold_sessions, 1, 1.0)
