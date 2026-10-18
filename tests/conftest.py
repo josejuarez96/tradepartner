@@ -39,10 +39,12 @@ from __future__ import annotations
 
 import csv
 import errno
+import hashlib
 import os
 import re
 import socket
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,10 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 # varies by up to a third between runs; the 2026-10-07 table had gone stale: test_lab and
 # test_health were missing or light, so shard job times ranged 6.5 to 16.2 min); units at 3 s
 # or more are listed, everything else defaults to `_DEFAULT_TEST_FILE_WEIGHT`.
+# T216 (#1803) split the four truncation-heavy tests of test_health, test_gap_invariance,
+# test_universe_invariance and test_asof_invariance into `PROBE_CHUNKS` chunks each: the file's
+# work is the same, so its weight is the run's table plus the ~1.5 s fixture setup of each extra
+# chunk (8 per test). Re-measure from the next full CI run's table.
 # A stale weight still balances fine — it only shifts which shard a unit lands on, never which tests
 # run — so this table does not need to be kept in lockstep with the suite; re-measure
 # and update it only if a shard's wall clock drifts noticeably from the others.
@@ -79,9 +85,9 @@ _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
 # bucket would have saved and lets those cases land on different shards.
 _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/backtest/test_lab.py": 877.0,
-    "tests/test_health.py": 576.0,
-    "tests/lookahead/test_asof_invariance.py": 447.0,
-    "tests/lookahead/test_gap_invariance.py": 435.0,
+    "tests/test_health.py": 588.0,
+    "tests/lookahead/test_asof_invariance.py": 471.0,
+    "tests/lookahead/test_gap_invariance.py": 447.0,
     "tests/lookahead/test_backtest_invariance.py::"
     "test_truncation_invariance_at_every_rebalance[week_end]": 421.0,
     "tests/lookahead/test_backtest_invariance.py::"
@@ -92,7 +98,7 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/lookahead/test_backtest_invariance.py::"
     "test_truncation_invariance_at_every_rebalance[profitability]": 281.0,
     "tests/execution/test_run_exits.py": 280.0,
-    "tests/lookahead/test_universe_invariance.py": 278.0,
+    "tests/lookahead/test_universe_invariance.py": 290.0,
     "tests/lookahead/test_backtest_invariance.py::"
     "test_truncation_invariance_at_every_rebalance[combined]": 277.0,
     "tests/execution/test_run_trade.py": 269.0,
@@ -543,6 +549,53 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
             "read_csv(?, header=true, all_varchar=true, force_not_null=?)",
             [str(csv_path), force_not_null],
         )
+
+
+# Truncation-invariance tests walk ~1,900 probes in one test, 250 to 450 worker-seconds each,
+# which set the shard wall clock (#1754, T216): xdist can only spread whole tests. So each such
+# test is parametrised over `PROBE_CHUNKS` strided slices of its probe list (`probe_chunk`), run
+# with the same assertions; a count-and-hash pin per test proves the slices are the old probe set.
+# Odd, so a chunk's stride alternates parity: the gap test's stale key alternates by position
+# (`i % 2`), and an even stride would give a chunk only one of its two keys.
+PROBE_CHUNKS = 9
+
+
+def probe_chunk_indices(count: int, chunk: int) -> range:
+    """The positions of chunk `chunk` (of `PROBE_CHUNKS`) in a probe list of `count`, strided
+    so every chunk spans the whole timeline and the chunks cost about the same."""
+    return range(chunk, count, PROBE_CHUNKS)
+
+
+def probe_chunk(probes: Sequence[datetime], chunk: int) -> list[datetime]:
+    """Chunk `chunk` of `probes`: positions `chunk`, `chunk + PROBE_CHUNKS`, ..."""
+    return [probes[i] for i in probe_chunk_indices(len(probes), chunk)]
+
+
+def probe_digest(probes: Iterable[datetime]) -> str:
+    """A SHA-256 over the sorted probes' ISO strings, so a test can pin a probe set."""
+    return hashlib.sha256("\n".join(sorted(p.isoformat() for p in probes)).encode()).hexdigest()
+
+
+def assert_chunks_are_the_probe_set(probes: Sequence[datetime], count: int, digest: str) -> None:
+    """The chunks of `probes` are disjoint and their union is exactly the pinned probe set:
+    `count` probes with SHA-256 `digest` (`probe_digest`). No probe dropped or doubled."""
+    chunks = [probe_chunk(probes, c) for c in range(PROBE_CHUNKS)]
+    union = [t for chunk in chunks for t in chunk]
+    assert len(union) == len(set(union)) == count
+    assert probe_digest(union) == digest
+    assert sorted(union) == sorted(probes)
+
+
+def failing_chunks(probes: Sequence[datetime], check: Callable[[datetime], None]) -> list[int]:
+    """Which chunks of `probes` hold a probe `check` fails on (it raises AssertionError)."""
+    failed: list[int] = []
+    for chunk in range(PROBE_CHUNKS):
+        try:
+            for t in probe_chunk(probes, chunk):
+                check(t)
+        except AssertionError:
+            failed.append(chunk)
+    return failed
 
 
 @pytest.fixture

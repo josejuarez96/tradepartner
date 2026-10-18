@@ -21,10 +21,12 @@ result built on it).
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import duckdb
 import pytest
+from conftest import PROBE_CHUNKS, assert_chunks_are_the_probe_set, failing_chunks, probe_chunk
 
 from lookahead.harness import TruncatedStore, probe_timestamps
 from tradepartner.calendar import session_close
@@ -43,18 +45,63 @@ def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedSto
         store.close()
 
 
-def test_universe_as_of_invariant_under_truncation(
-    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
-) -> None:
+def _assert_universe_invariant_at(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, t: datetime
+) -> int:
+    """One probe `t`; returns the member count it saw."""
     settings = Settings(_env_file=None, universe={"top_n_by_cap": 1})
-    members_seen = 0
-    for t in probe_timestamps(fixture_store):
-        full = universe_as_of(fixture_store, t, settings)
-        cut = universe_as_of(truncated.at(t), t, settings)
-        assert full.members.equals(cut.members), f"members disagree at T={t!r}"
-        assert full.exclusions.equals(cut.exclusions), f"exclusions disagree at T={t!r}"
-        members_seen += full.members.height
-    # Not vacuous: the universe is non-empty at many probes.
+    full = universe_as_of(fixture_store, t, settings)
+    cut = universe_as_of(truncated.at(t), t, settings)
+    assert full.members.equals(cut.members), f"members disagree at T={t!r}"
+    assert full.exclusions.equals(cut.exclusions), f"exclusions disagree at T={t!r}"
+    return full.members.height
+
+
+#: `probe_timestamps` on the fixture store, pinned (T216): the chunks walk exactly these.
+PROBE_COUNT = 1942
+PROBE_DIGEST = "f8ccd42c8faaea4b04835e4161798c90701298e1a924f450b147b3058563ccef"
+
+
+def test_universe_chunks_are_the_pinned_probe_set(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """No probe dropped: the chunks' union is today's probe set, by count and hash."""
+    assert_chunks_are_the_probe_set(probe_timestamps(fixture_store), PROBE_COUNT, PROBE_DIGEST)
+
+
+def test_a_planted_lookahead_fails_exactly_one_universe_chunk(
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `universe_as_of` that reads 400 days past T on the full store at one probe
+    fails the chunk holding that probe and no other."""
+    probes = probe_timestamps(fixture_store)
+    planted = probes[900]
+    real = universe_as_of
+
+    def leaky(conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings) -> Any:
+        read_at = t + timedelta(days=400) if conn is fixture_store and t == planted else t
+        return real(conn, read_at, settings)
+
+    monkeypatch.setitem(globals(), "universe_as_of", leaky)
+    window = probes[880:920]
+    failed = failing_chunks(
+        window, lambda t: _assert_universe_invariant_at(fixture_store, truncated, t)
+    )
+    assert failed == [window.index(planted) % PROBE_CHUNKS]
+
+
+@pytest.mark.parametrize("chunk", range(PROBE_CHUNKS))
+def test_universe_as_of_invariant_under_truncation(
+    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, chunk: int
+) -> None:
+    """One strided chunk of the probes (see `conftest.PROBE_CHUNKS`)."""
+    members_seen = sum(
+        _assert_universe_invariant_at(fixture_store, truncated, t)
+        for t in probe_chunk(probe_timestamps(fixture_store), chunk)
+    )
+    # Not vacuous: the universe is non-empty at many probes of the chunk.
     assert members_seen > 0
 
 
