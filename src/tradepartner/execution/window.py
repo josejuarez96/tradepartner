@@ -358,11 +358,11 @@ def _number(value: object) -> float | None:
 
 def _target_names(registered: Mapping[str, Any], family: str) -> int | None:
     """The most names the hypothesis's rule can hold: `strategy.hold_target_names` when
-    it is above 0, else the family's own `<section>.top_fraction` of
-    `universe.top_n_by_cap`, rounded up; `None` when the registration has no such count,
-    where the feasibility rule has nothing to count."""
+    `strategy.weighting` is `hold` and it is above 0, else the family's own
+    `<section>.top_fraction` of `universe.top_n_by_cap`, rounded up; `None` when the
+    registration has no such count, where the feasibility rule has nothing to count."""
     hold = _number(registered.get("strategy.hold_target_names"))
-    if hold is not None and hold > 0:
+    if registered.get("strategy.weighting") == "hold" and hold is not None and hold > 0:
         return int(hold)
     section = FAMILY_SIGNAL_SECTIONS.get(cast(Any, family), "strategy")
     fraction = _number(registered.get(f"{section}.top_fraction"))

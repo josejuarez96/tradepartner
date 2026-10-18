@@ -1877,6 +1877,15 @@ class SmallAccountConfig(BaseModel):
 
     enabled: StrictBool = False
 
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _bool_or_its_word(cls, value: object) -> object:
+        """A real bool, or the strings "true"/"false" in any case (the env-var form);
+        everything else ("yes", "1", "on", ints) is left for the strict check to refuse."""
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        return value
+
 
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
