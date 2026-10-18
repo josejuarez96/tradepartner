@@ -977,6 +977,23 @@ def test_a_name_unknown_to_the_master_is_refused_before_any_broker_call(
     assert env.fake.calls == ()
 
 
+def test_two_names_in_one_phase_sharing_a_broker_symbol_raise_before_any_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Safety review of #1729: two master spellings can meet in one broker
+    symbol (here B is re-tickered to `duala`, A's `DUALA` in broker form). The
+    phase refuses before its assets read, so neither name trades as the other."""
+    with open_for_write(env.settings) as conn:
+        conn.execute("UPDATE listings SET ticker = 'duala' WHERE security_id = ?", [B])
+    buys = [
+        _decision(env, A, "buy", notional=3000.0),
+        _decision(env, B, "buy", notional=3000.0),
+    ]
+    with pytest.raises(ValueError, match="share a broker symbol"):
+        _execute(_gate(env, alerter_conn), env, buys)
+    assert not [c for c in env.fake.calls if c.method in {"assets", "submit"}]
+
+
 # --- acknowledgement, rejections and the kill switch ---------------------------------------
 
 
