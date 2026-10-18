@@ -84,6 +84,11 @@ class StoreLockedError(RuntimeError):
     same process with a different mode (spec req 9)."""
 
 
+class StoreSameProcessLockedError(StoreLockedError):
+    """The store is open in this process in another mode: a bug, not another
+    process's lock, so a paper run fails closed on it (#1757)."""
+
+
 def utc_now() -> datetime:
     """The current instant, tz-aware UTC — the only clock the store uses
     for `ingested_at` (CLAUDE.md: datetimes are always timezone-aware UTC)."""
@@ -244,7 +249,7 @@ def _is_lock_error(exc: duckdb.IOException) -> bool:
 
 
 def _same_process_locked_error(settings: Settings, *, mode: str) -> StoreLockedError:
-    return StoreLockedError(
+    return StoreSameProcessLockedError(
         f"{settings.store.path!r} is already open in this process in a different "
         f"mode than the {mode} connection just requested — DuckDB shares one "
         "database instance per file path per process, so this is not a "
@@ -254,25 +259,41 @@ def _same_process_locked_error(settings: Settings, *, mode: str) -> StoreLockedE
 
 
 @contextmanager
-def open_read_only(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+def open_read_only(
+    settings: Settings, *, retry: bool = False
+) -> Iterator[duckdb.DuckDBPyConnection]:
     """A single short-lived, read-only connection to the store.
 
     Callers hold this only as long as needed for one read; DuckDB itself
-    rejects any write attempted on it (spec req 1). Makes exactly one
-    connection attempt (no retry): a caller that wants "busy" behavior
+    rejects any write attempted on it (spec req 1). By default makes exactly
+    one connection attempt (no retry): a caller that wants "busy" behavior
     (spec req 1's "store busy" state) catches `StoreLockedError` itself.
+
+    `retry=True` (the paper run, #1757) retries a genuine cross-process lock
+    conflict for up to `store.lock_retry_seconds` with the write path's
+    backoff, then raises `StoreLockedError`; a same-process mode conflict is
+    never retried.
     """
-    try:
-        conn = duckdb.connect(database=settings.store.path, read_only=True)
-    except duckdb.ConnectionException as exc:
-        raise _same_process_locked_error(settings, mode="read-only") from exc
-    except duckdb.IOException as exc:
-        if _is_lock_error(exc):
-            raise StoreLockedError(
-                f"could not open a read-only connection to {settings.store.path!r}: "
-                "the file is locked for writing by another process"
-            ) from exc
-        raise
+    deadline = time.monotonic() + settings.store.lock_retry_seconds
+    delay = settings.store.lock_retry_initial_delay_seconds
+    conn: duckdb.DuckDBPyConnection | None = None
+    while conn is None:
+        try:
+            conn = duckdb.connect(database=settings.store.path, read_only=True)
+        except duckdb.ConnectionException as exc:
+            raise _same_process_locked_error(settings, mode="read-only") from exc
+        except duckdb.IOException as exc:
+            if not _is_lock_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if not retry or remaining <= 0:
+                raise StoreLockedError(
+                    f"could not open a read-only connection to {settings.store.path!r}: "
+                    "the file is locked for writing by another process"
+                    + (f" within {settings.store.lock_retry_seconds}s" if retry else "")
+                ) from exc
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, settings.store.lock_retry_max_delay_seconds)
     try:
         configure_connection(conn, settings.store)
         yield conn
