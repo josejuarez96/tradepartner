@@ -996,3 +996,29 @@ def test_full_suite_runs_in_parallel_only_with_xdist() -> None:
     assert ready_pr.parallel_if_full_suite(targeted, xdist=True) == targeted
     other = ("uv", "run", "mypy")
     assert ready_pr.parallel_if_full_suite(other, xdist=True) == other
+
+
+def test_ci_timeout_default_is_45_minutes() -> None:
+    assert ready_pr.CI_TIMEOUT_S == 45 * 60
+    assert ready_pr.build_parser().parse_args(["1"]).timeout_min == 45
+
+
+def test_pytest_env_sets_a_per_checkout_basetemp_when_none_given(tmp_path: Path) -> None:
+    out = ready_pr.pytest_env({"PATH": "/bin"}, tmp_path)
+    assert out["PYTEST_ADDOPTS"] == f"--basetemp={tmp_path / '.pytest-tmp'}"
+    assert out["PATH"] == "/bin"
+    out = ready_pr.pytest_env({"PYTEST_ADDOPTS": "-x"}, tmp_path)
+    assert out["PYTEST_ADDOPTS"] == f"-x --basetemp={tmp_path / '.pytest-tmp'}"
+
+
+def test_pytest_env_keeps_the_callers_basetemp(tmp_path: Path) -> None:
+    env = {"PYTEST_ADDOPTS": "--basetemp=/scratch/pytest -q"}
+    assert ready_pr.pytest_env(env, tmp_path) == env
+
+
+def test_the_new_template_has_no_box_ready_pr_cannot_tick() -> None:
+    body = (Path(__file__).parent.parent / ".github" / "pull_request_template.md").read_text()
+    boxes = ready_pr.unchecked_boxes(body)
+    assert len(boxes) == 4
+    assert not any("uv run pytest" in b for b in boxes)
+    assert ready_pr.unchecked_boxes(body.replace("- [ ]", "- [x]")) == []

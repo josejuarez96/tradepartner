@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -190,7 +191,12 @@ TREE_SCAN_TESTS: dict[str, tuple[str, ...]] = {
 # (pushes to main always run the full suite).
 TEST_TRIGGER_PREFIXES = ("src/", "tests/", "scripts/", ".github/")
 TEST_TRIGGER_FILES = ("pyproject.toml", "uv.lock", ".python-version")
-CI_TIMEOUT_S = 25 * 60
+# A CI run with the full suite takes 24-34 min; a shorter default loops (each timeout
+# re-merges main and starts a new run).
+CI_TIMEOUT_S = 45 * 60
+# Per-checkout fixed pytest basetemp (gitignored): default pytest dirs collide across
+# checkouts and fill the disk, so ready_pr sets one itself when the caller did not.
+BASETEMP_DIR = ".pytest-tmp"
 FULL_CI_LABEL = "ci:full"
 # After re-triggering a cancelled full run, the rollup still shows the old cancelled run
 # until the new one reports; tolerate that this long before calling it cancelled again.
@@ -254,6 +260,15 @@ def parallel_if_full_suite(cmd: Sequence[str], *, xdist: bool) -> tuple[str, ...
     if xdist and tuple(cmd) == PYTEST_CHECK:
         return (*cmd, *XDIST_ARGS)
     return tuple(cmd)
+
+
+def pytest_env(env: Mapping[str, str], root: Path) -> dict[str, str]:
+    """``env`` with ``--basetemp=<root>/.pytest-tmp`` added to PYTEST_ADDOPTS when it has none."""
+    out = dict(env)
+    opts = out.get("PYTEST_ADDOPTS", "")
+    if "--basetemp" not in opts:
+        out["PYTEST_ADDOPTS"] = f"{opts} --basetemp={root / BASETEMP_DIR}".strip()
+    return out
 
 
 def resolve_append_conflicts(text: str) -> str | None:
@@ -823,7 +838,8 @@ class ShellRunner:
 
     def run_check(self, cmd: Sequence[str]) -> bool:
         cmd = parallel_if_full_suite(cmd, xdist=importlib.util.find_spec("xdist") is not None)
-        return subprocess.run(list(cmd), cwd=self.root, check=False).returncode == 0
+        env = pytest_env(os.environ, self.root)
+        return subprocess.run(list(cmd), cwd=self.root, check=False, env=env).returncode == 0
 
     def read(self, path: str) -> str:
         return (self.root / path).read_text()
