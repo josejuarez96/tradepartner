@@ -735,7 +735,7 @@ RANK_BY_KEY = "universe.rank_by"
 
 
 def test_rank_by_entry_is_last_and_pinned_by_value() -> None:
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[16:], ((RANK_BY_KEY, "cap", 28),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((RANK_BY_KEY, "cap", 28),))
     assert RANK_BY_KEY not in frozen.POST_REGISTRATION_OWN_KEYS  # universe is no family's own
 
 
