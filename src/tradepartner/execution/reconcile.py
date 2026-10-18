@@ -66,6 +66,14 @@ difference an allowance absorbs is listed under `allowed`.
   a broker position the ledger lacks when it is at most parent held x ratio and
   less than one share below it (cash in lieu of a fraction): a `spinoff_receipt`
   adjustment adds it.
+- A ticker change known at close(S-1) (`explanations.symbol_changes`,
+  `security_id` to `(old symbol, new symbol)`) is the one identity explanation
+  (#1761): the caller has mapped the name to the broker's new symbol from the
+  store alone, so the ledger's position under the old symbol matches the
+  broker's under the new one, and `compare` records the mapping on the row's
+  `symbol_changes` key. No identity rule is invented, so a change not known at
+  close(S-1), a quantity difference under the new symbol, or two candidate new
+  symbols stay a mismatch.
 - A credited dividend (`explanations.dividends`: cash due per name) explains a
   cash difference equal to the total due: one `dividend_cash` adjustment per
   name. It is not journaled when the cash does not show it. Beside an ended
@@ -88,8 +96,9 @@ adjustment never enters the append-only journal.
 **Status**: `mismatch` over `pending_unresolved` over `fills_lagging` over `ok`.
 Only an `ok` result carries `broker_cash`, the value that re-bases the ledger's
 cash, and `adjustments`. `mismatches_json` always lists the mismatches, the
-lagging and pending ids, the allowed and deferred differences and the
-explanations. Non-finite inputs, a repeated order id, an unknown side or a
+lagging and pending ids, the allowed and deferred differences, the explanations
+and the ticker changes the symbol map applied (`symbol_changes`, #1761).
+Non-finite inputs, a repeated order id, an unknown side or a
 symbol mapped from two names raise `ValueError`.
 """
 
@@ -190,6 +199,11 @@ class Explanations:
     ended: frozenset[str] = frozenset()
     spinoffs: Mapping[str, tuple[str, float]] = field(default_factory=dict)
     dividends: Mapping[str, float] = field(default_factory=dict)
+    #: The ticker changes the symbol map applied this reconciliation (#1761):
+    #: `security_id` to `(old symbol, new symbol)`, from stored `symbol_changes`
+    #: rows known at close(S-1). `compare` records them on the row's
+    #: `symbol_changes` key; they move no position, quantity or cash.
+    symbol_changes: Mapping[str, tuple[str, str]] = field(default_factory=dict)
     #: Held names with an equal-amount dividend group the reviewed list does
     #: not explain, each with its detail (#1625): never summed into
     #: `dividends`, each an `unexplained_dividend_group` mismatch.
@@ -271,6 +285,17 @@ class ActivityRecord:
 
 
 @dataclass(frozen=True)
+class SymbolChangeRecord:
+    """One held name's ticker change a reconciliation applied (#1761): the
+    store's `symbol_changes` mapping, recorded on the `reconciliations` row. It
+    moves no position, quantity or cash."""
+
+    security_id: str
+    old_symbol: str
+    new_symbol: str
+
+
+@dataclass(frozen=True)
 class Reconciliation:
     """The result of one compare (module docstring)."""
 
@@ -283,6 +308,7 @@ class Reconciliation:
     explained: tuple[ProposedAdjustment, ...] = ()
     allowed: tuple[Allowed, ...] = ()
     activities: tuple[ActivityRecord, ...] = ()
+    symbol_changes: tuple[SymbolChangeRecord, ...] = ()
 
     @property
     def mismatches_json(self) -> str:
@@ -295,6 +321,7 @@ class Reconciliation:
                 "explained": [vars(a) for a in self.explained],
                 "allowed": [vars(a) for a in self.allowed],
                 "activities": [vars(a) for a in self.activities],
+                "symbol_changes": [vars(s) for s in self.symbol_changes],
             },
             sort_keys=True,
             allow_nan=False,
@@ -731,6 +758,12 @@ def compare(
         status = FILLS_LAGGING
     else:
         status = OK
+    # The ticker changes the symbol map applied (#1761): recorded on the row,
+    # never a difference, so they are listed whatever the status.
+    symbol_changes = tuple(
+        SymbolChangeRecord(name, old, new)
+        for name, (old, new) in sorted(explanations.symbol_changes.items())
+    )
     return Reconciliation(
         status=status,
         broker_cash=account.cash if status == OK else None,
@@ -741,6 +774,7 @@ def compare(
         explained=tuple(explained),
         allowed=tuple(allowed),
         activities=activity_records,
+        symbol_changes=symbol_changes,
     )
 
 

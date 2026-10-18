@@ -632,6 +632,9 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "metrics.risk_free_source",
             "metrics.risk_free_series",
             "metrics.risk_free_basis",
+            "strategy.hold_sessions",
+            "strategy.hold_target_names",
+            "strategy.rebalance_band",
             "universe.rank_by",
         ),
     ],
@@ -1304,6 +1307,9 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "metrics.risk_free_source",
         "metrics.risk_free_series",
         "metrics.risk_free_basis",
+        "strategy.hold_sessions",
+        "strategy.hold_target_names",
+        "strategy.rebalance_band",
         "universe.rank_by",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}

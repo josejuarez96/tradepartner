@@ -595,6 +595,54 @@ def _rename_gaps(
     return gaps
 
 
+def _interior_gaps(
+    conn: duckdb.DuckDBPyConnection,
+    resolver: ListingResolver,
+    t: datetime,
+    window: tuple[date, date],
+    sids: Collection[str],
+) -> set[str]:
+    """Those of `sids` (each with a bar known at `t` in `window`) with a
+    session in `window` that the resolver assigns it (by span, or by a lead
+    under an Alpaca symbol: `_assignable`'s test), with no traded bar
+    (volume above zero) known at `t`, and that lies strictly between two of
+    its traded bars (any month): a mid-month gap, or a first-day gap inside
+    a lead (#1721). A session before its first traded bar or after its
+    last (a delisting tail) is none: a refetch could not fill it. Where the
+    source has no bar either (a halt) the month is listed again every run
+    and counted as a hole the source cannot fill."""
+    if not sids:
+        return set()
+    sessions = _sessions_in(window)
+    ordered = sorted(sids)
+    spans = {
+        sid: (lo, hi)
+        for sid, lo, hi in conn.execute(
+            "SELECT security_id, min(session), max(session) FROM prices_daily "
+            "WHERE known_at <= ? AND volume > 0 AND list_contains(?, security_id) GROUP BY ALL",
+            [t, ordered],
+        ).fetchall()
+    }
+    traded: dict[str, set[date]] = defaultdict(set)
+    for sid, session in conn.execute(
+        "SELECT DISTINCT security_id, session FROM prices_daily "
+        "WHERE session BETWEEN ? AND ? AND known_at <= ? AND volume > 0 "
+        "AND list_contains(?, security_id)",
+        [window[0], window[1], t, ordered],
+    ).fetchall():
+        traded[sid].add(session)
+    gaps: set[str] = set()
+    for sid, (lo, hi) in spans.items():
+        for day in sessions:
+            if not lo < day < hi or day in traded[sid]:
+                continue
+            held = (tk for tk in resolver.symbols(sid, day, day) if _lands(resolver, tk, sid, day))
+            if any(alpaca_symbol(tk) is not None for tk in held):
+                gaps.add(sid)
+                break
+    return gaps
+
+
 def _month_holes(
     conn: duckdb.DuckDBPyConnection,
     resolver: ListingResolver,
@@ -606,10 +654,10 @@ def _month_holes(
 ) -> tuple[list[str], set[str], set[str], dict[str, str], set[str]]:
     """The holes of `window` as of `t` among the fetched `ids` (of `only`,
     when given): the ids to fetch, sorted; those of them that are rename
-    gaps (`_rename_gaps`); the ids with a bar known at `t` in `window`; the
-    ids with no bar that no fetched bar could land on, with why
-    (`_assignable`); and those with a rule-8 window in it (#1314,
-    `_handed_over`), holes whatever they store."""
+    gaps (`_rename_gaps`) or interior gaps (`_interior_gaps`, #1721); the
+    ids with a bar known at `t` in `window`; the ids with no bar that no
+    fetched bar could land on, with why (`_assignable`); and those with a
+    rule-8 window in it (#1314, `_handed_over`), holes whatever they store."""
     stored = _with_bars(conn, t, window)
     named = [sid for sid in ids if only is None or sid in only]
     handed = _handed_over(resolver, named, window)
@@ -617,6 +665,7 @@ def _month_holes(
     dropped = {sid: why for sid, why in dropped.items() if sid not in handed}
     with_bars = [sid for sid in named if sid in stored]
     gaps = _rename_gaps(conn, resolver, t, window, with_bars, horizon)
+    gaps |= _interior_gaps(conn, resolver, t, window, with_bars)
     return sorted({*empty, *gaps, *handed}), gaps, stored, dropped, handed
 
 

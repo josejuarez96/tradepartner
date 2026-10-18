@@ -943,6 +943,9 @@ class TestRefusals:
                     "metrics.risk_free_source",
                     "metrics.risk_free_series",
                     "metrics.risk_free_basis",
+                    "strategy.hold_sessions",
+                    "strategy.hold_target_names",
+                    "strategy.rebalance_band",
                     "universe.rank_by",
                 )
             )
