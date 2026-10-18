@@ -572,8 +572,9 @@ def requests_for(
     """One `OrderRequest` per order of `phase_orders`, in order, every one
     built and validated before any is returned (spec req 3 (b), (e)).
 
-    `listings_at` maps a `security_id` to its ticker in the master's listing
-    at close(S-1) (`None` or absent: none, a `ValueError` before any request is
+    `listings_at` maps a `security_id` to its broker symbol, the broker form
+    of its master listing at close(S-1) (`execution.symbols.broker_symbol`,
+    #1729; `None` or absent: none, a `ValueError` before any request is
     built); `prefix` is `paper.order_id_prefix`; `book` is the window's
     `book_id` (`ids.client_order_id`'s token, ADR 0015 seam 1);
     `orders_on_session` every `orders` row journaled on S = `session`, every
