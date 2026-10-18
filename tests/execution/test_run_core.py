@@ -2082,3 +2082,19 @@ def test_a_store_lock_after_the_trade_step_began_still_fails_closed(
     assert env.results()[env.latest_run()][:2] == ("failed", "StoreLockedError")
     env.ingest(_at(TUE, 21))
     assert env.run(_at(WED)).status == "skipped_kill_switch"
+
+
+def test_a_same_process_store_conflict_before_any_submit_still_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store.db import StoreSameProcessLockedError
+
+    _marked(env)
+
+    def conflict(_self: object) -> None:
+        raise StoreSameProcessLockedError("open in this process in another mode")
+
+    monkeypatch.setattr(run_module._Run, "_actions", conflict)
+    with pytest.raises(StoreSameProcessLockedError):
+        env.run(_at(TUE))
+    assert env.results()[env.latest_run()][:2] == ("failed", "StoreSameProcessLockedError")

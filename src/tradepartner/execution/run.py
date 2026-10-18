@@ -262,7 +262,12 @@ from tradepartner.execution.wrapper import (
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
-from tradepartner.store.db import StoreLockedError, open_read_only, utc_now
+from tradepartner.store.db import (
+    StoreLockedError,
+    StoreSameProcessLockedError,
+    open_read_only,
+    utc_now,
+)
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -1253,7 +1258,7 @@ class _Run:
         except (SystemFaultError, StaleDataError) as fault:
             self.gate.halt(fault, self.run, write_offs=self.write_offs)
         except StoreLockedError as locked:
-            if self.submit_begun:
+            if self.submit_begun or isinstance(locked, StoreSameProcessLockedError):
                 self._fail(locked)
                 raise
             # Another process (ingest, backfill, repair, a second book) held the

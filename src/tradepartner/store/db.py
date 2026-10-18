@@ -84,6 +84,11 @@ class StoreLockedError(RuntimeError):
     same process with a different mode (spec req 9)."""
 
 
+class StoreSameProcessLockedError(StoreLockedError):
+    """The store is open in this process in another mode: a bug, not another
+    process's lock, so a paper run fails closed on it (#1757)."""
+
+
 def utc_now() -> datetime:
     """The current instant, tz-aware UTC — the only clock the store uses
     for `ingested_at` (CLAUDE.md: datetimes are always timezone-aware UTC)."""
@@ -244,7 +249,7 @@ def _is_lock_error(exc: duckdb.IOException) -> bool:
 
 
 def _same_process_locked_error(settings: Settings, *, mode: str) -> StoreLockedError:
-    return StoreLockedError(
+    return StoreSameProcessLockedError(
         f"{settings.store.path!r} is already open in this process in a different "
         f"mode than the {mode} connection just requested — DuckDB shares one "
         "database instance per file path per process, so this is not a "
