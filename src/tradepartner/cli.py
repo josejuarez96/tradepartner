@@ -1591,7 +1591,7 @@ def _status_lines(
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
-        *([paper_slippage.slippage_line(fill_slippage)] if fill_slippage is not None else []),
+        *paper_slippage.slippage_report_lines(fill_slippage),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
     lines += [f"  {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
@@ -4057,11 +4057,7 @@ def make_app(
                 f"{_fmt(t.paper_weight)} trial {_fmt(t.trial_weight)} ({t.difference})"
                 for t in result.targets.rows
             ),
-            *(
-                [paper_slippage.slippage_line(result.slippage)]
-                if result.slippage is not None
-                else []
-            ),
+            *paper_slippage.slippage_report_lines(result.slippage, result.slippage_note),
         ]
         for line in lines:
             _echo_scrubbed(line, s)
@@ -4143,7 +4139,10 @@ def make_app(
                 if window_id is None or page.journal_outdated is not None:
                     return page, None
                 return page, paper_slippage.window_slippage(
-                    conn, window_id, ensure_tz_aware_utc(clock(), field_name="clock()")
+                    conn,
+                    window_id,
+                    ensure_tz_aware_utc(clock(), field_name="clock()"),
+                    sessions=s.paper.status_slippage_sessions,
                 )
 
         data, fill_slippage = _paper_call(s, read)
