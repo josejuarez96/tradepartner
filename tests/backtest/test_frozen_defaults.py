@@ -773,15 +773,16 @@ def test_rank_by_at_cap_moves_no_fingerprint_and_no_canonical_set() -> None:
 # --- the cost terms (backtest spec amendment #1792, T210) ----------------------------
 
 COST_ENTRIES = (
-    ("costs.spread_bps", 0.0, 28),
-    ("costs.impact_coeff", 0.0, 28),
-    ("costs.adv_sessions", 20, 28),
+    ("costs.spread_bps", 0.0, 29),
+    ("costs.impact_coeff", 0.0, 29),
+    ("costs.adv_sessions", 20, 29),
 )
 
 
 def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     """Appended after `universe.rank_by` (the table is append-only and
-    `frozen_hash_matches` drops only a suffix), at schema version 28."""
+    `frozen_hash_matches` drops only a suffix), at schema version 29: T202a
+    (#1818) takes 29 and lands first."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[20:23], COST_ENTRIES)
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[20:], COST_ENTRIES)
 
