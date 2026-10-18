@@ -57,6 +57,7 @@ class Clock:
 
 def make_broker(*, auto_fill: bool = False, **kwargs: object) -> tuple[FakeBroker, Clock]:
     clock = Clock()
+    kwargs.setdefault("assets", FakeBroker.active_assets(*PRICES))
     broker = FakeBroker(
         clock=clock,
         price_of=PRICES.__getitem__,
@@ -293,7 +294,12 @@ def test_a_clock_fault_consumes_no_instruction() -> None:
 
 
 def test_a_bad_fill_price_consumes_no_instruction_and_changes_nothing() -> None:
-    broker = FakeBroker(clock=Clock(), price_of=lambda symbol: float("nan"), auto_fill=False)
+    broker = FakeBroker(
+        clock=Clock(),
+        price_of=lambda symbol: float("nan"),
+        auto_fill=False,
+        assets=FakeBroker.active_assets(*PRICES),
+    )
     broker.script(FillAt())
 
     with pytest.raises(ValueError):

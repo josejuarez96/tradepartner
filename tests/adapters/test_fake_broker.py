@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
     Account,
@@ -79,6 +80,7 @@ def make_clock(start: datetime = T0) -> tuple[list[datetime], Callable[[], datet
 
 def make_broker(*, auto_fill: bool = True, **kwargs: Any) -> tuple[FakeBroker, list[datetime]]:
     ticks, clock = make_clock()
+    kwargs.setdefault("assets", {symbol: Asset(True, True, "active", None) for symbol in PRICES})
     return FakeBroker(clock=clock, price_of=price_of, auto_fill=auto_fill, **kwargs), ticks
 
 
@@ -144,7 +146,14 @@ def test_fake_broker_implements_every_method() -> None:
 
 def test_fake_broker_exposes_its_clock_for_the_identity_test() -> None:
     _, clock = make_clock()
-    assert FakeBroker(clock=clock, price_of=price_of).clock is clock
+    assert (
+        FakeBroker(
+            assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+            clock=clock,
+            price_of=price_of,
+        ).clock
+        is clock
+    )
 
 
 # --- Idempotency --------------------------------------------------------
@@ -231,7 +240,12 @@ def test_broker_order_and_fill_ids_are_unique() -> None:
 
 def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
     prices = {"AAPL": float("nan")}
-    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__, cash=500.0)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=make_clock()[1],
+        price_of=prices.__getitem__,
+        cash=500.0,
+    )
     with pytest.raises(ValueError, match="price"):
         broker.submit(make_request())
     with pytest.raises(UnknownOrderError):
@@ -244,7 +258,11 @@ def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
 
 def test_account_refuses_a_bad_mark_price() -> None:
     prices = {"AAPL": 10.0}
-    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=make_clock()[1],
+        price_of=prices.__getitem__,
+    )
     broker.submit(make_request(quantity=1))
     prices["AAPL"] = True  # type: ignore[assignment]
     with pytest.raises(ValueError, match="price"):
@@ -347,7 +365,12 @@ def test_simulate_fill_on_accepted_order_with_auto_fill_disabled() -> None:
 
 def test_simulate_fill_uses_the_price_at_fill_time() -> None:
     prices = {"AAPL": 100.0}
-    broker = FakeBroker(clock=make_clock()[1], price_of=prices.__getitem__, auto_fill=False)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=make_clock()[1],
+        price_of=prices.__getitem__,
+        auto_fill=False,
+    )
     broker.submit(make_request())
     prices["AAPL"] = 105.0
     assert broker.simulate_fill("co-1").filled_avg_price == 105.0
@@ -460,11 +483,13 @@ def test_position_netting_uses_exact_decimal_arithmetic() -> None:
     assert "AAPL" not in broker.positions()
 
 
-def test_sell_with_no_prior_long_books_a_short_position() -> None:
+def test_sell_with_no_prior_long_is_refused() -> None:
     broker, _ = make_broker()
-    broker.submit(make_request(client_order_id="co-1", symbol="AAPL", side=Side.SELL, quantity=5))
-
-    assert broker.positions()["AAPL"].quantity == -5
+    with pytest.raises(AlpacaTradingError, match="insufficient qty available"):
+        broker.submit(
+            make_request(client_order_id="co-1", symbol="AAPL", side=Side.SELL, quantity=5)
+        )
+    assert broker.positions() == {}
 
 
 def test_positions_sign_is_correct_for_each_side() -> None:
@@ -491,17 +516,20 @@ def test_account_shape_and_cash_follows_fills() -> None:
     assert before.as_of == ticks[-1]
 
     broker.submit(make_request(symbol="AAPL", quantity=10))  # 1,000 at 100
-    broker.submit(make_request(client_order_id="co-2", symbol="MSFT", side=Side.SELL, quantity=1))
+    broker.submit(make_request(client_order_id="co-2", symbol="AAPL", side=Side.SELL, quantity=1))
     after = broker.account()
-    assert after.cash == 10_000.0 - 1_000.0 + 200.0
+    assert after.cash == 10_000.0 - 1_000.0 + 100.0
     assert after.buying_power == after.cash
-    # Equity marks positions at the injected price: 10 AAPL at 100, -1 MSFT at 200.
-    assert after.equity == after.cash + 1_000.0 - 200.0
+    assert after.equity == after.cash + 900.0
 
 
 def test_account_cash_is_exact_in_cents() -> None:
     broker = FakeBroker(
-        clock=make_clock()[1], price_of=lambda symbol: 0.1, cash=0.3, auto_fill=True
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=make_clock()[1],
+        price_of=lambda symbol: 0.1,
+        cash=0.3,
+        auto_fill=True,
     )
     broker.submit(make_request(quantity=1))
     broker.submit(make_request(client_order_id="co-2", quantity=2))
@@ -509,7 +537,11 @@ def test_account_cash_is_exact_in_cents() -> None:
 
 
 def test_account_reads_the_clock_through_the_wrap() -> None:
-    broker = FakeBroker(clock=lambda: datetime(2026, 1, 5), price_of=price_of)  # noqa: DTZ001
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=lambda: datetime(2026, 1, 5),  # noqa: DTZ001
+        price_of=price_of,
+    )
     with pytest.raises(ClockError):
         broker.account()
 
@@ -523,7 +555,7 @@ def test_assets_default_to_tradable_fractionable_active() -> None:
 
 def test_assets_serve_the_configured_flags() -> None:
     halted = Asset(tradable=False, fractionable=False, status="inactive", cusip="000000000")
-    broker, _ = make_broker(assets={"brk.b": halted})
+    broker, _ = make_broker(assets={"brk.b": halted, "AAPL": Asset(True, True, "active", None)})
     assets = broker.assets(["BRK.B", "AAPL"])
     assert assets["BRK.B"] == halted
     assert assets["AAPL"].tradable is True
@@ -534,8 +566,44 @@ def test_assets_of_no_symbols_is_empty() -> None:
     assert broker.assets([]) == {}
 
 
+def test_unknown_asset_and_non_alpaca_spelling_refuse_with_40410000() -> None:
+    broker, _ = make_broker(assets={"GEF.B": Asset(True, True, "active", None)})
+    for symbol in ("GEF-B", "ABSENT"):
+        with pytest.raises(AlpacaTradingError) as caught:
+            broker.assets([symbol])
+        assert (caught.value.status_code, '"code": 40410000' in caught.value.body) == (404, True)
+        with pytest.raises(AlpacaTradingError) as caught:
+            broker.submit(make_request(symbol=symbol))
+        assert caught.value.status_code == 404
+    assert broker.assets(["GEF.B"])["GEF.B"].tradable
+    assert broker.positions() == {} and broker.fills() == []
+
+
+def test_nonfractionable_asset_refuses_notional_and_fractional_quantity() -> None:
+    broker, _ = make_broker(assets={"AAPL": Asset(True, False, "active", None)})
+    for request in (make_request(notional=100), make_request(quantity=1.5)):
+        with pytest.raises(AlpacaTradingError, match="not fractionable"):
+            broker.submit(request)
+    assert broker.submit(make_request(quantity=2)).filled_quantity == 2
+
+
+def test_call_fault_is_one_shot_and_subsequent_read_succeeds() -> None:
+    broker, _ = make_broker()
+    broker.script_call_fault("assets", AlpacaTradingError(500, "server error", retried=False))
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.assets(["AAPL"])
+    assert caught.value.status_code == 500
+    assert broker.assets(["AAPL"])["AAPL"].tradable
+
+
 def test_every_returned_object_carries_the_read_side_defaults() -> None:
-    broker, _ = make_broker(auto_fill=False, assets={"AAPL": Asset(True, True, "active", None)})
+    broker, _ = make_broker(
+        auto_fill=False,
+        assets={
+            "AAPL": Asset(True, True, "active", None),
+            "MSFT": Asset(True, True, "active", None),
+        },
+    )
     submitted = broker.submit(make_request())
     # submit, get_order and the open-orders read all return an Order at the defaults.
     for order in (submitted, broker.get_order("co-1"), broker.open_orders()[0]):
@@ -953,7 +1021,11 @@ def test_a_bad_clock_makes_submit_raise_clock_error_and_records_nothing(
 ) -> None:
     clock = _SwitchableClock(bad)
     clock.good = False
-    broker = FakeBroker(clock=clock, price_of=price_of)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+    )
 
     with pytest.raises(ClockError) as caught:
         broker.submit(make_request())
@@ -983,7 +1055,12 @@ def test_a_bad_clock_makes_submit_raise_clock_error_without_auto_fill(
 ) -> None:
     clock = _SwitchableClock(bad)
     clock.good = False
-    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+        auto_fill=False,
+    )
     with pytest.raises(ClockError) as caught:
         broker.submit(make_request())
     assert isinstance(caught.value.__cause__, cause)
@@ -1001,7 +1078,12 @@ def test_a_bad_clock_makes_simulate_fill_raise_clock_error_and_changes_nothing(
     bad: object, cause: type[BaseException]
 ) -> None:
     clock = _SwitchableClock(bad)
-    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+        auto_fill=False,
+    )
     held = broker.submit(make_request(client_order_id="held", symbol="MSFT"))
     broker.simulate_fill(held.client_order_id)  # a position exists before the fault
     order = broker.submit(make_request())
@@ -1037,7 +1119,11 @@ def test_a_clock_error_names_the_clock_and_only_the_cause_type() -> None:
     def leaky() -> datetime:
         raise RuntimeError("GET https://broker.example/clock?key=do-not-print")
 
-    broker = FakeBroker(clock=leaky, price_of=price_of)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=leaky,
+        price_of=price_of,
+    )
     with pytest.raises(ClockError, match=r"^clock failed: RuntimeError$") as caught:
         broker.submit(make_request())
     assert "do-not-print" not in str(caught.value)
@@ -1050,19 +1136,32 @@ def test_a_base_exception_from_the_clock_is_not_turned_into_a_clock_error() -> N
     def interrupted() -> datetime:
         raise KeyboardInterrupt
 
-    broker = FakeBroker(clock=interrupted, price_of=price_of)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=interrupted,
+        price_of=price_of,
+    )
     with pytest.raises(KeyboardInterrupt):
         broker.submit(make_request())
 
 
 def test_the_clock_is_read_once_per_submit_and_once_per_simulate_fill() -> None:
     clock = _SwitchableClock(None)
-    broker = FakeBroker(clock=clock, price_of=price_of, auto_fill=False)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+        auto_fill=False,
+    )
     order = broker.submit(make_request())
     assert clock.calls == 1
     broker.simulate_fill(order.client_order_id)
     assert clock.calls == 2
-    auto = FakeBroker(clock=clock, price_of=price_of)
+    auto = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+    )
     auto.submit(make_request())
     assert clock.calls == 3
 
@@ -1073,7 +1172,11 @@ def test_non_utc_clock_is_normalized_to_utc() -> None:
     def clock() -> datetime:
         return eastern
 
-    broker = FakeBroker(clock=clock, price_of=price_of)
+    broker = FakeBroker(
+        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        clock=clock,
+        price_of=price_of,
+    )
     order = broker.submit(make_request())
 
     assert order.submitted_at == T0

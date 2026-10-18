@@ -338,7 +338,14 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def env(journal_settings: Settings) -> Env:
     clock = Clock(_at(TUE))
     fake = FakeBroker(
-        clock=clock, price_of=lambda _s: PRICE, auto_fill=False, cash=FAKE_CASH, account_id="PA1"
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=FAKE_CASH,
+        account_id="PA1",
     )
     return Env(journal_settings, clock, fake)
 
@@ -668,6 +675,9 @@ def test_the_run_row_records_invoked_by(
 def test_a_different_account_id_halts_through_the_halt_path(env: Env) -> None:
     _marked(env)
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -968,6 +978,9 @@ def _hold_spy(env: Env, window: PaperWindowRow) -> None:
     from tradepartner.store.journal import AdjustmentRow
 
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1284,6 +1297,9 @@ def test_a_drawdown_breach_on_a_back_filled_session_engages(
     window = env.window(started=_at(MON, 22), starting_equity=peak)
     env.ingest(_at(TUE, 21))
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1559,6 +1575,9 @@ def test_a_crossing_on_a_mark_written_after_the_release_still_engages(
         )
     )
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1626,6 +1645,9 @@ def test_an_ordinary_s_minus_1_crossing_after_a_morning_of_s_release_is_not_labe
         )
     )
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1727,6 +1749,9 @@ def _book_fakes(env: Env, *accounts: str) -> dict[str, FakeBroker]:
     """One scripted fake per account, on the env's clock (each book its own account)."""
     return {
         account: FakeBroker(
+            assets=FakeBroker.active_assets(
+                "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+            ),
             clock=env.clock,
             price_of=lambda _s: PRICE,
             auto_fill=False,
@@ -1953,6 +1978,9 @@ def test_one_book_main_runs_exactly_as_before_books(
     for settings in (journal_settings, twin_settings):
         clock = Clock(_at(TUE))
         fake = FakeBroker(
+            assets=FakeBroker.active_assets(
+                "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+            ),
             clock=clock,
             price_of=lambda _s: PRICE,
             auto_fill=False,

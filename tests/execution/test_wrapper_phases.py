@@ -88,6 +88,7 @@ class Env:
 
     def new_fake(self, **kwargs: Any) -> FakeBroker:
         """A non-filling fake on the clock, pricing by `prices`."""
+        kwargs.setdefault("assets", FakeBroker.active_assets(*SYMBOLS.values()))
         self.fake = FakeBroker(
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],
@@ -351,6 +352,8 @@ def test_a_split_on_s_known_at_close_s_minus_1_halves_the_reference_price(
         2.0,
         CUT - timedelta(minutes=1) if known_by_cut else CUT + timedelta(minutes=1),
     )
+    if known_by_cut:
+        env.fake.apply_split("DUALA", 2.0)
     trim = _decision(env, A, "sell", notional=750.0)
 
     outcome = _execute(_gate(env, alerter_conn), env, [trim])

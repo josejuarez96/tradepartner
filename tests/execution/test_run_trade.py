@@ -108,6 +108,12 @@ class Env:
         self.new_fake()
 
     def new_fake(self, **kwargs: Any) -> FakeBroker:
+        kwargs.setdefault(
+            "assets",
+            FakeBroker.active_assets(
+                *(ticker for (ticker,) in self.query("SELECT DISTINCT ticker FROM listings"))
+            ),
+        )
         self.fake = FakeBroker(
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],

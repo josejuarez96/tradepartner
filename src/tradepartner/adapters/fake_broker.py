@@ -5,9 +5,8 @@ paper-trading spec req 1, plan T46b; scripting for the wrapper tests, T46c).
 sizing, no reconciliation: those live in the risk-gated wrapper (ADR 0003
 rule 7). `FakeBroker` exists so the rest of the system has something to
 submit orders to without a real broker; it does no I/O, no network calls,
-and spawns no threads. It models **net** positions only: a sell with no
-prior long is accepted and books a negative (short) quantity; nothing here
-prevents or limits that.
+and spawns no threads. It models **net** positions only and refuses a sell
+above the held quantity, like the paper account.
 
 **Fill mechanism (documented choice).** An order fills at `price_of(symbol)`,
 the price function injected at construction, read when the order fills;
@@ -68,9 +67,11 @@ position on every fill.
 `round_cash_to_cent=True`; `buying_power` equals `cash` unless set apart
 (`buying_power=` or `set_buying_power`), when it is that fixed value;
 `equity` is cash plus every position marked at `price_of`. `assets` answers
-every symbol with its `Asset` for the session (the clock's New York date,
-read only for a symbol with a dated schedule, `set_asset(...,
-from_session=)`), or a tradable, fractionable, `active` asset with no CUSIP.
+only symbols explicitly supplied through `assets=` or `set_asset`; an unknown
+symbol raises Alpaca's 404 / 40410000. A dated asset schedule uses the clock's
+New York date. `submit` also checks tradability, fractionability and held sell
+quantity. `script_call_fault` injects one error on a named Broker method;
+retryable SDK faults follow the raw trading client's retry predicate.
 
 **Lagging fills, hook and log.** After `lag_fills(n)`, each fill recorded is
 missing from the next `n` calls of `fills()` and delivered from the one
@@ -125,6 +126,7 @@ account it hands the run (T183's fixture sets `account()`'s cash directly).
 from __future__ import annotations
 
 import copy
+import json
 import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -133,6 +135,7 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
+from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError, _retryable
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
     Account,
@@ -333,8 +336,20 @@ class FakeBroker(Broker):
         self._cancel_holds: dict[str, HoldCancel] = {}
         self._cancel_pending: set[str] = set()
         self._calls: list[BrokerCall] = []
+        self._call_faults: dict[str, deque[Exception]] = {}
 
     # --- scripting (not `Broker` methods) --------------------------------
+
+    @staticmethod
+    def active_assets(*symbols: str) -> dict[str, Asset]:
+        """Build an explicit active asset catalog for a test fixture."""
+        return {canonical_symbol(symbol): _DEFAULT_ASSET for symbol in symbols}
+
+    def script_call_fault(self, method: str, error: Exception) -> None:
+        """Raise ``error`` on the next call to a Broker method named ``method``."""
+        if method not in Broker.__abstractmethods__:
+            raise ValueError(f"unknown Broker method {method!r}")
+        self._call_faults.setdefault(method, deque()).append(error)
 
     def script(self, *instructions: Instruction, client_order_id: str | None = None) -> None:
         """Script one order: at most one submit outcome and at most one
@@ -448,6 +463,10 @@ class FakeBroker(Broker):
         schedule = [e for e in current if e[0] != from_session] + [(from_session, asset)]
         self._assets[key] = sorted(schedule, key=lambda entry: entry[0])
 
+    def remove_asset(self, symbol: str) -> None:
+        """Make a formerly known symbol return Alpaca's unknown-asset refusal."""
+        self._assets.pop(canonical_symbol(symbol), None)
+
     def apply_split(self, symbol: str, ratio: float) -> None:
         """Book a broker-side forward/reverse split (the fake has no
         corporate actions): multiplies `symbol`'s net quantity by `ratio`,
@@ -478,6 +497,31 @@ class FakeBroker(Broker):
             raise DuplicateClientOrderIdError(f"client_order_id already submitted: {cid!r}")
 
         submitted_at = self._now()
+        asset = self._asset_for(request.symbol, submitted_at)
+        if not asset.tradable or asset.status != "active":
+            raise AlpacaTradingError(
+                422,
+                json.dumps({"code": 42210000, "message": "asset is not tradable"}),
+                retried=False,
+            )
+        if request.side is Side.SELL and request.quantity is not None:
+            held = self._net_quantity.get(request.symbol, Decimal(0))
+            if Decimal(repr(request.quantity)) > held:
+                raise AlpacaTradingError(
+                    422,
+                    json.dumps({"code": 40310000, "message": "insufficient qty available"}),
+                    retried=False,
+                )
+        if not asset.fractionable and (
+            request.notional is not None
+            or (request.quantity is not None and not float(request.quantity).is_integer())
+        ):
+            raise AlpacaTradingError(
+                422,
+                json.dumps({"code": 42210001, "message": "asset is not fractionable"}),
+                retried=False,
+            )
+
         script = self._scripted_by_id.get(cid) or (
             self._scripted_next[0] if self._scripted_next else None
         )
@@ -614,16 +658,42 @@ class FakeBroker(Broker):
         result: dict[str, Asset] = {}
         session: date | None = None
         for symbol in (canonical_symbol(s) for s in symbols):
-            schedule = self._assets.get(symbol, [(date.min, _DEFAULT_ASSET)])
+            schedule = self._assets.get(symbol)
+            if schedule is None:
+                raise self._unknown_asset(symbol)
             if len(schedule) > 1 and session is None:
                 session = self._now().astimezone(_NEW_YORK).date()
             result[symbol] = [a for start, a in schedule if session is None or start <= session][-1]
         return result
 
+    def _asset_for(self, symbol: str, at: datetime) -> Asset:
+        schedule = self._assets.get(symbol)
+        if schedule is None:
+            raise self._unknown_asset(symbol)
+        session = at.astimezone(_NEW_YORK).date()
+        return [asset for start, asset in schedule if start <= session][-1]
+
+    @staticmethod
+    def _unknown_asset(symbol: str) -> AlpacaTradingError:
+        return AlpacaTradingError(
+            404,
+            json.dumps({"code": 40410000, "message": f"asset not found for {symbol}"}),
+            retried=False,
+        )
+
     # --- internals --------------------------------------------------------
 
     def _log(self, method: str, *args: object) -> None:
         self._calls.append(BrokerCall(method, args))
+        faults = self._call_faults.get(method)
+        if faults:
+            error = faults.popleft()
+            if _retryable(error):
+                # Model one successful retry through the raw client's rule.
+                # The second call keeps the same arguments and order id.
+                self._calls.append(BrokerCall(method, args))
+            else:
+                raise error
 
     def _now(self) -> datetime:
         """One clock reading, tz-aware UTC, or `ClockError` (module docstring)."""
