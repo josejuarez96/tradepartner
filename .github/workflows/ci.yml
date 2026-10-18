@@ -171,7 +171,7 @@ jobs:
   # blocked, ready_pr waiting) until a full run reports it. The job always runs rather than
   # being skipped there, since a skipped job reports success.
   checks:
-    name: ${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:full') && 'checks (label event, no run)' || ((github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full') && needs.scope.outputs.tests-needed != 'no') && 'checks (draft, no shards)' || 'checks')) }}
+    name: ${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:full') && 'checks (label event, no run)' || ((github.event.pull_request.draft == true && !contains(github.event.pull_request.labels.*.name, 'ci:full') && needs.scope.outputs.tests-needed != 'no') && 'checks (draft, no shards)' || 'checks') }}
     needs: [scope, checks-fast, pytest-shard]
     if: always()
     runs-on: ubuntu-latest
