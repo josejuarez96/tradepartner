@@ -244,6 +244,7 @@ class Runner(Protocol):
     def read(self, path: str) -> str: ...
     def write(self, path: str, text: str) -> None: ...
     def pr(self, number: int) -> Pr: ...
+    def edit_body(self, number: int, body: str) -> None: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
     def add_label(self, number: int, label: str) -> None: ...
@@ -349,6 +350,38 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
         if m:
             latest[m.group("agent").lower()] = " ".join(m.group("verdict").split()).lower()
     return sorted(r for r in required if latest.get(r) != "pass")
+
+
+def tick_reviewer_boxes(
+    body: str, required: set[str], comments: Sequence[str], head_sha: str
+) -> tuple[str, list[str], list[str]]:
+    """Return a body with only reviewer boxes ticked, other boxes, and changed lines."""
+    reviewed_at: dict[str, str] = {}
+    for comment in comments:
+        verdict = VERDICT_RE.match(comment)
+        if verdict:
+            sha = re.search(r"^reviewed at ([0-9a-f]{8,40})$", comment, re.MULTILINE)
+            reviewed_at[verdict.group("agent").lower()] = sha.group(1) if sha else head_sha
+    suffix = (
+        "; ".join(
+            f"{agent}: PASS at {reviewed_at.get(agent, head_sha)[:8]}" for agent in sorted(required)
+        )
+        if required
+        else "n/a, none required"
+    )
+    other: list[str] = []
+    ticked: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        label = match.group(1)
+        if not re.search(r"quant-auditor|safety-reviewer|reviewer", label, re.IGNORECASE):
+            other.append(label.strip())
+            return match.group(0)
+        line = match.group(0).replace("- [ ]", "- [x]", 1) + "; " + suffix
+        ticked.append(line)
+        return line
+
+    return UNCHECKED_RE.sub(replace, body), other, ticked
 
 
 def matrix_base(name: str) -> str:
@@ -677,15 +710,18 @@ def ready(
             raise ReadyError(f"local check failed: {' '.join(cmd)}")
 
     # 5. template, linked issue, specialist reviews
-    boxes = unchecked_boxes(pr.body)
-    if boxes:
+    required = required_reviews(touched)
+    new_body, other_boxes, ticked = tick_reviewer_boxes(
+        pr.body, required, pr.comments, r.git("rev-parse", "HEAD")
+    )
+    if other_boxes:
         raise ReadyError(
-            "PR body still has unticked boxes (tick them or write n/a and why): " + "; ".join(boxes)
+            "PR body still has unticked boxes (tick them or write n/a and why): "
+            + "; ".join(other_boxes)
         )
     issue = issue_of_branch(pr.branch)
     if issue is not None and issue not in closed_issues(pr.body):
         raise ReadyError(f"PR body must say `Closes #{issue}` (the branch's issue)")
-    required = required_reviews(touched)
     missing = missing_reviews(required, pr.comments)
     if missing:
         raise ReadyError(
@@ -693,6 +729,10 @@ def ready(
             "verdict line is `<agent>: PASS` (PASS WITH FIXES needs a re-review) for each: "
             + ", ".join(missing)
         )
+    for line in ticked:
+        say(f"reviewer box: {line}")
+    if ticked and not dry_run:
+        r.edit_body(number, new_body)
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 
     if dry_run:
@@ -879,6 +919,9 @@ class ShellRunner:
             tuple(str(c.get("body", "")) for c in raw.get("comments", [])),
             tuple(str(lb.get("name", "")) for lb in raw.get("labels") or []),
         )
+
+    def edit_body(self, number: int, body: str) -> None:
+        self._gh("pr", "edit", str(number), "--body", body)
 
     def head_checks(self, number: int) -> HeadChecks:
         raw = json.loads(
