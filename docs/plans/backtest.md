@@ -93,7 +93,7 @@ Dependent tasks one team should keep, in order. A chain is a preference, not a l
 | close-out | T45 → T45b (owner) | every other chain merged, T29 and T35b included |
 | profitability (#720, #1033) | {T85, T85b, T85c, T85d} → T85e → T85f (owner) | any time for T85, T85b, T85c and T85d (T35, T96, T34, T95, T76b, T99 and T31b are merged; the four may run in parallel, disjoint files); T85e after T98 and T98b (strategy-lab plan), and it is the seam the [strategy-interface plan](strategy-interface.md)'s T127 and T128 build on (#1074); T85f after T78 (data-foundation plan) and before the lab's T113 |
 | turnover screen (B10, #1358) | {T165, T165b} → T165c → T165d → T165e (owner) | any time for T165 and T165b (disjoint files, in parallel); T165c after both; T165d after T165c; T165e after T165d and the owner's T114 |
-| fast engine (ADR 0023, #1731) | T207 → T208 → {T209, T211}; T210 beside them; then the paper plan's T205 | T207 the moment this amendment merges (no decision needed); T208 after T207; T209 and T211 after T208, in parallel (disjoint files but `engine.py`, which T211 does not touch); T210 after the paper plan's T203; T165e (rung 4) does not wait for any of them |
+| fast engine (ADR 0023, #1731) | T207 → T208 → {T209, T211}; T210 beside them; then the paper plan's T205 | T207 the moment this amendment merges (no decision needed); T208 after T207 and T170c; T209 and T211 after T208, in parallel (disjoint files but `engine.py`, which T211 does not touch); T210 after the paper plan's T203; T165e (rung 4) does not wait for any of them |
 | fixes | open `size:S` issues with no `team:` label | any time |
 
 ## Verification
