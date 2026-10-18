@@ -474,7 +474,7 @@ registry; #83 took version 2 first, so the registry is version 3):
   outside the new set. The version-6 stray-value guard reads
   `ORDER_EVENT_REASONS`. A read-only connection accepts a version-28 store:
   every read works, and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 29**, with its own migration and a
+- **A later DDL change goes to version 30**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -3516,7 +3516,7 @@ def _migrate_skip_reasons(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 26 store to version 27.
+    version-2 to 28 store to version 29.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
