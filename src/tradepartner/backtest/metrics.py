@@ -73,6 +73,8 @@ METRIC_KEYS: tuple[str, ...] = (
     "n_periods",
     "periods_per_year",
     "risk_free_annual",
+    "beta_spy",
+    "alpha_spy_annual",
 )
 
 
@@ -158,6 +160,19 @@ def _require_variance(name: str, x: FloatArray) -> None:
     scale = max(1.0, abs(float(np.mean(x))))
     if float(np.std(x)) <= float(np.finfo(np.float64).eps) * scale:
         raise ValueError(f"{name} has zero variance: Sharpe, skew and kurtosis are undefined")
+
+
+def _beta_alpha(y: FloatArray, x: FloatArray, periods_per_year: int) -> tuple[float, float]:
+    """OLS slope and annualised intercept of `y` on `x` (both already excess of rf).
+
+    The per-period intercept `a` is compounded, (1 + a)^periods_per_year - 1."""
+    dx = x - x.mean()
+    sxx = float(np.sum(dx * dx))
+    if not sxx > 0:
+        raise ValueError("spy excess returns have zero variance: beta is undefined")
+    beta = float(np.sum(dx * (y - y.mean()))) / sxx
+    intercept = float(y.mean()) - beta * float(x.mean())
+    return beta, (1 + intercept) ** periods_per_year - 1
 
 
 def series_metrics(
@@ -275,6 +290,7 @@ def series_metrics(
         "periods_per_year": float(ppy),
         "risk_free_annual": annualised(risk_free_period_returns, ppy),
     }
+    out["beta_spy"], out["alpha_spy_annual"] = _beta_alpha(excess_rf, spy - rf, ppy)
     if series != "SPY":
         sharpe_excess = _period_sharpe(ex_spy)
         out["sharpe_period_excess_spy"] = sharpe_excess
