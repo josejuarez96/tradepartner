@@ -2858,6 +2858,30 @@ section = "Evidence"
 bears_on = ["spec:data-foundation"]
 note = "Our EDGAR adapter reads the submissions payload (form, accession, acceptanceDateTime) but does not keep `items`; the store has no filings table. Data-foundation amendment #1358 (T164 to T164e) adds `filing_events`. TP-2: the example times are 4 h late (the 8-K was accepted 20:30:28Z, the 10-Q 10:01:02Z); the fact stands."
 
+# ===== 2026-10-18-irrx-long-leg.md =====
+# Rung 2 of the IRRX kill ladder (#1734). Status INCOMPLETE: no computation ran (no shell in the
+# session; most hosts failed DNS). Rung 2 is not decided.
+
+[[claim]]
+id = "IL-1"
+statement = "The Chen & Zimmermann open-source release has no industry-relative or announcement-adjusted reversal signal: its reversal signals (STreversal, LRreversal, MRreversal, MomRev, MomOffSeason*) use raw own-stock returns, and its industry signals (IndMom, IndRetBig, retConglomerate, iomom_*) are industry-level, not stock-minus-industry."
+kind = "fact"
+grade = "UNGRADED"
+scope = "SignalDoc.csv and pyCode predictors on OpenSourceAP/CrossSection master, fetched 2026-10-18"
+source = "docs/research/2026-10-18-irrx-long-leg.md"
+section = "Evidence"
+note = "So no CZ series can stand in for IRRX (SH-4); a faithful long leg needs firm-level returns with industry and announcement-window adjustment."
+
+[[claim]]
+id = "IL-2"
+statement = "The long leg of announcement-adjusted industry-relative reversal (IRRX) over 2010-2024 is not measured in any source reached: no published long-leg decomposition was found, and the only computed related series, plain one-month reversal (CZ STreversal, size-screened), has a 2010-2024 long leg of -0.16%/month (t -0.59), which is not a valid IRRX proxy because post-2001 REV earns 0.18 (t 0.62) against IRRX 0.58 (t 3.29)."
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "US, monthly, gross; long leg = top portfolio minus the mean of the signal's portfolios; rung 2 kill test (long leg >= 0.10%/month and t >= 1.0, 2010-2024) not decided"
+source = "docs/research/2026-10-18-irrx-long-leg.md"
+section = "Answer"
+note = "Proxy figure from SH-1's 2026-10-09 CZ computation, not re-run. IRRX vs REV figures from Dai et al. (2023 WP) via SH-1/SH-4. Owner-side computation listed in the report."
+
 # ===== TradePartner's own results (TP-) =====
 
 [[claim]]
