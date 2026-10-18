@@ -83,7 +83,7 @@ def test_rejects_non_positive_shard_count() -> None:
 
 
 def test_default_weight_applies_to_unlisted_files() -> None:
-    assert "tests/test_pytest_sharding.py" not in _HEAVY_TEST_FILE_WEIGHTS
+    assert "tests/unlisted_a.py" not in _HEAVY_TEST_FILE_WEIGHTS
     # a file not in the heavy table gets the default weight implicitly: two
     # unlisted files of equal (default) weight go to two different shards.
     assignment = shard_assignment(["tests/unlisted_a.py", "tests/unlisted_b.py"], shard_count=2)
