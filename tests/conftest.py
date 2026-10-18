@@ -228,6 +228,7 @@ _HEAVY_TEST_FILE_WEIGHTS: dict[str, float] = {
     "tests/lookahead/test_suite.py": 4.0,
     "tests/backtest/test_store_provider.py": 4.0,
     "tests/test_cli_research_labeling.py": 4.0,
+    "tests/test_pytest_sharding.py": 20.0,
     "tests/test_calendar.py": 4.0,
     "tests/test_gap.py": 4.0,
     "tests/test_cli_research.py": 3.0,
