@@ -930,7 +930,8 @@ class TestRefusals:
         settings = _settings(tmp_path)
         all_params = frozen_params_of(settings, family="momentum")
         # Also before `gap.stale_listing_sessions` (#1199) and
-        # `strategy.turnover_top_fraction` (#1358) and `universe.rank_by` (T212) landed.
+        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+        # `universe.rank_by` (T212) landed.
         params = {
             k: v
             for k, v in all_params.items()
@@ -939,6 +940,9 @@ class TestRefusals:
                     "schedule.",
                     "gap.stale_listing_sessions",
                     "strategy.turnover_top_fraction",
+                    "metrics.risk_free_source",
+                    "metrics.risk_free_series",
+                    "metrics.risk_free_basis",
                     "universe.rank_by",
                 )
             )

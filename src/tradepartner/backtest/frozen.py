@@ -57,6 +57,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # B10's share-turnover screen (backtest spec amendment #1358, T165): 1.0 is no screen.
     # A post-registration own-section key, so it is in `POST_REGISTRATION_OWN_KEYS` below.
     ("strategy.turnover_top_fraction", 1.0, 19),
+    # The risk-free series from the store (backtest spec amendment #1498, T170b). None
+    # enters the fingerprint (`_FINGERPRINT_KEYS`); the table entry for the source stays
+    # `constant` even after T170d flips the live default to `store`.
+    ("metrics.risk_free_source", "constant", 28),
+    ("metrics.risk_free_series", "DTB3", 28),
+    ("metrics.risk_free_basis", "discount", 28),
     # The universe's rule 8 ranking (ADR 0023 D4, T212): `cap` is today's rule, so no stored
     # fingerprint moves. A forward book registers `dollar_volume`.
     ("universe.rank_by", "cap", 28),

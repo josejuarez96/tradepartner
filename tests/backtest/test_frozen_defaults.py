@@ -324,7 +324,13 @@ COMBINED_DEFAULTS = (
     ("combined.top_fraction", 0.10, 16),
     ("combined.weighting", "equal", 16),
 )
-COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction", "universe.rank_by")
+#: T170b's three keys: stored by a registration made after it, absent from the pinned sets.
+RISK_FREE_KEYS = (
+    "metrics.risk_free_source",
+    "metrics.risk_free_series",
+    "metrics.risk_free_basis",
+)
+COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction", *RISK_FREE_KEYS, "universe.rank_by")
 
 
 def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -361,6 +367,7 @@ def test_stale_listing_entry_is_pinned_by_value() -> None:
 LATER_KEYS = (
     "gap.stale_listing_sessions",
     "strategy.turnover_top_fraction",
+    *RISK_FREE_KEYS,
     "universe.rank_by",
 )
 
@@ -559,8 +566,10 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
 
     parsed = hypothesis.parse_file(path)
     params = hypothesis.frozen_params(parsed, _defaults_settings())
-    # The pinned hash is of the set stored before `universe.rank_by` landed (T212).
-    assert registry.params_sha256(_before(params, ("universe.rank_by",))) == params_sha256
+    assert (
+        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by")))
+        == params_sha256
+    )
     assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
     canonical = frozen.canonical_frozen_set(params, parsed.family)
     assert registry.params_sha256(canonical) == canonical_sha256
@@ -648,13 +657,50 @@ def test_a_momentum_file_naming_the_default_is_the_twin_and_another_value_is_not
     assert {k: v for k, v in canonical.items() if k != TURNOVER_KEY} == twin_canonical
 
 
+# --- the risk-free keys (backtest spec amendment #1498, T170b) ------------------------
+
+
+def test_risk_free_entries_are_last_and_pinned_by_value() -> None:
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[13:16],
+        (
+            ("metrics.risk_free_source", "constant", 28),
+            ("metrics.risk_free_series", "DTB3", 28),
+            ("metrics.risk_free_basis", "discount", 28),
+        ),
+    )
+
+
+def test_risk_free_keys_are_frozen_and_none_enters_the_fingerprint() -> None:
+    keys = set(hypothesis.frozen_keys())
+    assert set(RISK_FREE_KEYS) <= keys
+    assert not set(RISK_FREE_KEYS) & set(frozen._FINGERPRINT_KEYS)
+    assert "metrics" not in frozen._FINGERPRINT_SECTIONS
+
+
+def test_risk_free_keys_leave_every_canonical_set_and_fingerprint_where_they_were() -> None:
+    """H1's and the TWIN's canonical set, fingerprint and hash do not move: the three keys
+    at their defaults are left out of the canonical set; a `store` trial shares the pair."""
+    settings = _defaults_settings()
+    current = _new_params(settings)
+    assert all(k in current for k in RISK_FREE_KEYS)
+    without = {k: v for k, v in current.items() if k not in RISK_FREE_KEYS}
+    for family_params in (current, without):
+        assert frozen.fingerprint("momentum", family_params, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(current, "momentum")
+    assert canonical == frozen.canonical_frozen_set(without, "momentum")
+    assert not set(RISK_FREE_KEYS) & set(canonical)
+    store = {**current, "metrics.risk_free_source": "store"}
+    assert frozen.fingerprint("momentum", store, date(2017, 1, 31)) == TWIN_FINGERPRINT
+
+
 # --- `universe.rank_by` (ADR 0023 D4, T212) ------------------------------------------
 
 RANK_BY_KEY = "universe.rank_by"
 
 
 def test_rank_by_entry_is_last_and_pinned_by_value() -> None:
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[13:], ((RANK_BY_KEY, "cap", 28),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[16:], ((RANK_BY_KEY, "cap", 28),))
     assert RANK_BY_KEY not in frozen.POST_REGISTRATION_OWN_KEYS  # universe is no family's own
 
 
