@@ -12,7 +12,8 @@ import ast
 import hashlib
 import itertools
 import math
-from collections.abc import Iterator
+import random
+from collections.abc import Iterator, Mapping
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -22,15 +23,17 @@ import polars as pl
 import pytest
 
 from backtest.test_engine import F1, T3, _params, _provider, _run
+from tradepartner.backtest import valuation
 from tradepartner.backtest.metrics import series_metrics
 from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.backtest.valuation import (
+    FillPrice,
     StepFrame,
     carry_to_fill,
     stitched_returns,
     value_positions,
 )
-from tradepartner.calendar import session_close
+from tradepartner.calendar import all_sessions, next_session, session_close
 from tradepartner.store import schema
 from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
@@ -602,3 +605,222 @@ def test_the_standard_fixture_matches_the_pinned_loop_results(case: str) -> None
     """Equity, rebalance rows, position values and metrics are byte-identical to the
     per-name loop's: the pins were taken before the vectorised path existed."""
     assert _standard_cases()[case] == STANDARD_PINS[case]
+
+
+# --- T207: the vectorised paths against main's per-name loops, kept here verbatim ----
+
+
+def _loop_fill_value(sid: str, bar: Any, fill_price: str) -> float:
+    value = bar.open if fill_price == "open" else bar.close
+    return valuation._check_price(sid, bar.session, fill_price, value)
+
+
+def loop_value_positions(
+    positions: Mapping[str, float],
+    marking_frame: pl.DataFrame,
+    fill_session: date,
+    *,
+    fill_price: FillPrice,
+    through: date,
+) -> pl.DataFrame:
+    valuation._check_fill_price(fill_price)
+    valuation._check_positions(positions)
+    sessions = valuation._sessions(fill_session, through)
+    bars = valuation._bars(marking_frame, set(positions))
+    rows: list[tuple[str, date, float, date]] = []
+    for sid in sorted(positions):
+        series = bars.get(sid, [])
+        base_bar = valuation._last_at_or_before(series, fill_session)
+        if base_bar is None:
+            raise ValueError(f"no bar for {sid} at or before {fill_session.isoformat()}")
+        if base_bar.session == fill_session:
+            base = _loop_fill_value(sid, base_bar, fill_price)
+        else:
+            base = valuation._check_price(sid, base_bar.session, "close", base_bar.close)
+        closes = {bar.session: bar.close for bar in series}
+        value, marked_at = positions[sid], base_bar.session
+        for session in sessions:
+            if session in closes:
+                close = valuation._check_price(sid, session, "close", closes[session])
+                value, marked_at = positions[sid] * close / base, session
+            rows.append((sid, session, value, marked_at))
+    return pl.DataFrame(rows, schema=valuation._VALUE_SCHEMA, orient="row")
+
+
+def loop_carry_to_fill(
+    positions: Mapping[str, float],
+    marking_frame: pl.DataFrame,
+    rebalance_session: date,
+    fill_session: date,
+    *,
+    fill_price: FillPrice,
+    marked_at: Mapping[str, date],
+) -> dict[str, float]:
+    valuation._check_fill_price(fill_price)
+    valuation._check_positions(positions)
+    if fill_session != next_session(rebalance_session):
+        raise ValueError(
+            f"fill_session {fill_session.isoformat()} is not the next session after "
+            f"rebalance_session {rebalance_session.isoformat()}"
+        )
+    bars = valuation._bars(marking_frame, set(positions))
+    carried: dict[str, float] = {}
+    for sid in sorted(positions):
+        mark = marked_at.get(sid)
+        if mark is None or mark > rebalance_session:
+            raise ValueError(
+                f"{sid} needs a marked_at session at or before {rebalance_session.isoformat()}, "
+                f"got {mark}"
+            )
+        series = bars.get(sid, [])
+        closes = {bar.session: bar.close for bar in series}
+        if mark not in closes:
+            raise ValueError(f"no bar for {sid} on its last mark {mark.isoformat()}")
+        base = valuation._check_price(sid, mark, "close", closes[mark])
+        target_bar = valuation._last_at_or_before(series, fill_session)
+        if target_bar is None:  # unreachable: the bar on `mark` is at or before it
+            raise ValueError(f"no bar for {sid} at or before {fill_session.isoformat()}")
+        if target_bar.session == fill_session:
+            target = _loop_fill_value(sid, target_bar, fill_price)
+        else:
+            target = valuation._check_price(sid, target_bar.session, "close", target_bar.close)
+        carried[sid] = positions[sid] * target / base
+    return carried
+
+
+def _gappy_frame(seed: int, names: int = 12) -> pl.DataFrame:
+    """Random-walk bars for `names` securities from 2024-01-02 through 2024-03-28 with
+    ~15% of bars missing (seeded), a split-like level shift and a closed-form open."""
+    rng = random.Random(seed)
+    sessions = [s for s in all_sessions() if date(2024, 1, 2) <= s <= date(2024, 3, 28)]
+    rows = []
+    for n in range(names):
+        close = rng.uniform(20, 400)
+        for session in sessions:
+            previous, close = close, close * (1 + rng.uniform(-0.03, 0.03))
+            if rng.random() < 0.15:
+                continue
+            rows.append((f"S{n:02d}", session, (previous + close) / 2, close))
+    return _frame(rows)
+
+
+def _random_positions(seed: int, frame: pl.DataFrame) -> dict[str, float]:
+    rng = random.Random(seed)
+    ids = sorted(frame["security_id"].unique())
+    return {sid: rng.uniform(0, 50_000) for sid in rng.sample(ids, 9)}
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("fill_price", ["close", "open"])
+def test_value_positions_is_byte_identical_to_the_loop(seed: int, fill_price: FillPrice) -> None:
+    frame = _gappy_frame(seed)
+    positions = _random_positions(seed, frame)
+    # Fill sessions with and without a bar for some held names; names whose first bar
+    # is later than the fill session raise in both paths.
+    fill, through = date(2024, 2, 1), date(2024, 3, 15)
+    try:
+        expected = loop_value_positions(
+            positions, frame, fill, fill_price=fill_price, through=through
+        )
+    except ValueError as loop_error:
+        with pytest.raises(ValueError) as error:
+            value_positions(positions, frame, fill, fill_price=fill_price, through=through)
+        assert str(error.value) == str(loop_error)
+        return
+    got = value_positions(positions, frame, fill, fill_price=fill_price, through=through)
+    assert got.schema == expected.schema
+    assert got.equals(expected)
+    assert got.height == len(positions) * len(valuation._sessions(fill, through))
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("fill_price", ["close", "open"])
+def test_carry_to_fill_is_byte_identical_to_the_loop(seed: int, fill_price: FillPrice) -> None:
+    frame = _gappy_frame(seed)
+    positions = _random_positions(seed, frame)
+    rebalance = date(2024, 2, 29)
+    fill = next_session(rebalance)
+    bars = valuation._bars(frame, set(positions))
+    marked = {sid: bars[sid][-1].session for sid in positions if bars.get(sid)}
+    marked = {sid: min(m, rebalance) for sid, m in marked.items()}
+    marked = {
+        sid: next(b.session for b in reversed(bars[sid]) if b.session <= m)
+        for sid, m in marked.items()
+    }
+    kwargs: dict[str, Any] = {"fill_price": fill_price, "marked_at": marked}
+    expected = loop_carry_to_fill(positions, frame, rebalance, fill, **kwargs)
+    got = carry_to_fill(positions, frame, rebalance, fill, **kwargs)
+    assert list(got) == list(expected)
+    assert [repr(v) for v in got.values()] == [repr(v) for v in expected.values()]
+
+
+def _error_cases() -> list[tuple[str, dict[str, float], pl.DataFrame, FillPrice]]:
+    good = _frame([("A", F0, 10.0, 11.0), ("A", D2, 11.0, 12.0)])
+    return [
+        ("negative position", {"A": -1.0}, good, "close"),
+        ("no bar at or before", {"B": 5.0}, good, "close"),
+        ("bad close", {"A": 5.0}, _frame([("A", F0, 10.0, 0.0)]), "close"),
+        (
+            "bad later close",
+            {"A": 5.0},
+            _frame([("A", F0, 10.0, 11.0), ("A", D2, 1.0, -2.0)]),
+            "close",
+        ),
+        ("bad open", {"A": 5.0}, _frame([("A", F0, math.nan, 11.0)]), "open"),
+        (
+            "bad base close",
+            {"A": 5.0},
+            _frame([("A", T0, 10.0, math.inf), ("A", D2, 1.0, 2.0)]),
+            "close",
+        ),
+        ("duplicate bar", {"A": 5.0}, _frame([("A", F0, 1.0, 1.0), ("A", F0, 1.0, 1.0)]), "close"),
+        (
+            "null close",
+            {"A": 5.0},
+            _frame([("A", F0, 1.0, 1.0)]).with_columns(close=pl.lit(None, pl.Float64)),
+            "close",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("case", _error_cases(), ids=lambda c: c[0])
+def test_value_positions_refuses_what_the_loop_refuses(
+    case: tuple[str, dict[str, float], pl.DataFrame, FillPrice],
+) -> None:
+    _, positions, frame, fill_price = case
+    with pytest.raises(ValueError) as expected:
+        loop_value_positions(positions, frame, F0, fill_price=fill_price, through=D5)
+    with pytest.raises(ValueError) as got:
+        value_positions(positions, frame, F0, fill_price=fill_price, through=D5)
+    assert str(got.value) == str(expected.value)
+
+
+@pytest.mark.parametrize(
+    ("marks", "frame"),
+    [
+        ({"A": T0}, _frame([("A", T0, 1.0, 2.0), ("A", F0, 1.0, 2.0)])),
+        ({"A": D2}, _frame([("A", T0, 1.0, 2.0)])),
+        ({}, _frame([("A", T0, 1.0, 2.0)])),
+        ({"A": T0}, _frame([("A", T0, 1.0, 0.0), ("A", F0, 1.0, 2.0)])),
+        ({"A": T0}, _frame([("A", T0, 1.0, 2.0), ("A", F0, math.nan, 2.0)])),
+    ],
+    ids=["ok", "mark after rebalance", "no mark", "bad base", "bad open target"],
+)
+def test_carry_to_fill_agrees_with_the_loop_on_edge_cases(
+    marks: dict[str, date], frame: pl.DataFrame
+) -> None:
+    def run(fn: Any) -> Any:
+        try:
+            return fn({"A": 100.0}, frame, T0, F0, fill_price="open", marked_at=marks)
+        except ValueError as error:
+            return str(error)
+
+    assert run(carry_to_fill) == run(loop_carry_to_fill)
+
+
+def test_empty_positions_give_an_empty_typed_frame() -> None:
+    frame = _frame([("A", F0, 1.0, 1.0)])
+    got = value_positions({}, frame, F0, fill_price="close", through=D2)
+    assert got.height == 0
+    assert got.schema == loop_value_positions({}, frame, F0, fill_price="close", through=D2).schema
+    assert carry_to_fill({}, frame, T0, F0, fill_price="close", marked_at={}) == {}
