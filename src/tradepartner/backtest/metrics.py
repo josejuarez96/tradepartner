@@ -157,16 +157,27 @@ def _require_variance(name: str, x: FloatArray) -> None:
     one float epsilon of its scale), whose Sharpe would be arbitrary. Refuse it rather
     than let a NaN, a division by zero or a meaningless Sharpe reach the stored
     metrics and the DSR."""
-    scale = max(1.0, abs(float(np.mean(x))))
-    if float(np.std(x)) <= float(np.finfo(np.float64).eps) * scale:
+    if _is_constant(x):
         raise ValueError(f"{name} has zero variance: Sharpe, skew and kurtosis are undefined")
 
 
-def _beta_alpha(y: FloatArray, x: FloatArray, periods_per_year: int) -> tuple[float, float]:
+def _is_constant(x: FloatArray) -> bool:
+    """True when `x` is constant up to rounding noise: its standard deviation is within one
+    float epsilon of its scale."""
+    scale = max(1.0, abs(float(np.mean(x))))
+    return float(np.std(x)) <= float(np.finfo(np.float64).eps) * scale
+
+
+def _beta_alpha(
+    y: FloatArray, x: FloatArray, periods_per_year: int
+) -> tuple[float | None, float | None]:
     """OLS slope and annualised intercept of `y` on `x` (both already excess of rf).
 
-    The per-period intercept `a` is compounded, (1 + a)^periods_per_year - 1. The caller
-    has refused a constant `x` (`series_metrics`), so the slope's denominator is positive."""
+    The per-period intercept `a` is compounded, (1 + a)^periods_per_year - 1. A constant
+    `x` has no slope: both are None, never a refusal, since the two keys are reported
+    only and must not fail a run."""
+    if _is_constant(x):
+        return None, None
     dx = x - x.mean()
     beta = float(np.sum(dx * (y - y.mean()))) / float(np.sum(dx * dx))
     intercept = float(y.mean()) - beta * float(x.mean())
@@ -205,10 +216,10 @@ def series_metrics(
     are, so that case reads them off `r_i` and they stay bit-identical); `risk_free_annual`
     is the annualised risk-free return of the run. `beta_spy` and `alpha_spy_annual` are the
     OLS slope and the compounded intercept of `r_i - rf_i` on `spy_i - rf_i`, on every series
-    (SPY gives 1 and 0); they are reported only. The `*_excess_spy` keys are None when
-    `series` is `SPY`. Raises `ValueError` when the series (or, except for SPY, its excess
-    over SPY), its excess over `rf`, or SPY's excess over `rf` is constant, or
-    `periods_per_year` is not positive.
+    (SPY gives 1 and 0); they are reported only, and both are None when SPY's excess over
+    `rf` is constant. The `*_excess_spy` keys are None when `series` is `SPY`. Raises
+    `ValueError` when the series (or, except for SPY, its excess over SPY) or its excess
+    over `rf` is constant, or `periods_per_year` is not positive.
     """
     if periods_per_year < 1:
         raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
@@ -259,7 +270,6 @@ def series_metrics(
         _require_variance("period_returns minus spy_period_returns", ex_spy)
     excess_rf = net - rf
     _require_variance("period_returns minus risk_free_period_returns", excess_rf)
-    _require_variance("spy_period_returns minus risk_free_period_returns", spy - rf)
     # A constant rf leaves the central moments of `net` as they are; reading them off
     # `net` keeps them bit-identical to the scalar-rate code.
     moments_of = net if bool(np.all(rf == rf[0])) else excess_rf

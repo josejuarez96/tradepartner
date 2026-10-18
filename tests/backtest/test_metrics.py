@@ -889,6 +889,25 @@ def _identifiers_and_strings(path: Path) -> set[str]:
     return out
 
 
+def test_beta_and_alpha_are_none_on_a_constant_spy_excess_and_nothing_fails() -> None:
+    """Reported only: a constant SPY minus rf (here SPY flat at 0 with rf = 0) has no slope,
+    so both keys are None and every other key is still computed; the run does not fail."""
+    m = series_metrics(
+        "strategy",
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=[0.0] * len(NET),
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_period_returns=constant_period_returns(0.0, 12, len(NET)),
+    )
+    assert m["beta_spy"] is None
+    assert m["alpha_spy_annual"] is None
+    assert m["cagr"] == _metrics()["cagr"]
+
+
 def test_beta_and_alpha_reach_no_selection_path() -> None:
     """Reported only: never in V, DSR, the red flag, a promotion rule or a selection
     statistic. The holdout, promotion and sweep-report modules name neither key (nor a
