@@ -729,7 +729,8 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     frozen = _frozen()
     all_params = frozen_params_of(frozen, family="momentum")
     # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
-    # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498) landed.
+    # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+    # `universe.rank_by` (T212) landed.
     params = {
         k: v
         for k, v in all_params.items()
@@ -744,6 +745,7 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "strategy.hold_sessions",
                 "strategy.hold_target_names",
                 "strategy.rebalance_band",
+                "universe.rank_by",
             )
         )
     }
@@ -834,7 +836,8 @@ def _register_more(
     params = frozen_params_of(frozen, family="momentum")
     if drop_schedule:
         # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
-        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498) landed.
+        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+        # `universe.rank_by` (T212) landed.
         later = (
             "schedule.",
             "gap.stale_listing_sessions",
@@ -845,6 +848,7 @@ def _register_more(
             "strategy.hold_sessions",
             "strategy.hold_target_names",
             "strategy.rebalance_band",
+            "universe.rank_by",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:

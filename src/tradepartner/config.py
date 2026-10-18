@@ -871,6 +871,11 @@ class UniverseConfig(_ClosedConfig):
     max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
     accepted_shares_facts: list[str] = Field(default_factory=list)
     top_n_by_cap: int = 1000
+    # Rule 8's ranking (ADR 0023 D4, T212): `cap` is ADR 0006's market-cap rank (needs
+    # rule 7's shares fact); `dollar_volume` ranks by median dollar volume from bars alone
+    # and intersects with Alpaca's tradable assets as of T, for forward books. Frozen with
+    # `universe.*`; a registered family keeps `cap` (`FROZEN_KEY_DEFAULTS`).
+    rank_by: Literal["cap", "dollar_volume"] = "cap"
     # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
     # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
     # split or dividend known at T explains, fails rule 6 while its session is in the
@@ -1769,7 +1774,8 @@ class LabConfig(BaseModel):
 
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
 
-# The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
+# The `paper.*` keys req 14 freezes (the sixth, `max_stale_mark_sessions`, #1763, reads 0
+# for a window frozen before it existed) into the window at `paper start`, beside the
 # whole `risk.*` section; every other `paper.*` key is read at run time. `min_rebalances`
 # is frozen as its window's cadence's entry of the per-cadence table (ADR 0017 part C).
 FROZEN_PAPER_KEYS: tuple[str, ...] = (
@@ -1778,6 +1784,7 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "tracking_rule",
     "max_catch_up_sessions",
     "min_override_reason_chars",
+    "max_stale_mark_sessions",
 )
 
 # The `execution.*` keys req 14 also freezes into the window at `paper start` (#366
@@ -1920,7 +1927,11 @@ _DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
-    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys. The six
+    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys.
+    `max_stale_mark_sessions` (#1763, owner decision) is how many consecutive sessions a
+    tradable held name missing its S-1 bar is marked at its last close, with an alert,
+    before the run fails; 0 is the old fail-at-once rule, which an already-open window
+    keeps (its `frozen_json` lacks the key). The six
     timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
     `accept_wait_seconds`, `fill_read_overlap_seconds`) were checked against Probe 3's
     measured paper fill latency and all kept (#182, T70, the ADR 0006 amendment of
@@ -1956,6 +1967,7 @@ class PaperConfig(BaseModel):
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
+    max_stale_mark_sessions: int = Field(default=3, ge=0)
     submit_window_before_open_minutes: int = Field(default=90, ge=0)
     submit_window_after_open_minutes: int = Field(default=30, ge=0)
     sell_wait_seconds: float = Field(default=900.0, ge=0)
@@ -1967,6 +1979,12 @@ class PaperConfig(BaseModel):
     min_override_reason_chars: int = Field(default=20, ge=1)
     min_universe_names: int = Field(default=1, ge=1)
     max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
+    #: `paper status` reads the slippage line over only the newest
+    #: `status_slippage_sessions` order sessions of the window (#1741): the line is
+    #: a diagnostic, and one `prices_as_of` read per session would otherwise grow
+    #: with the window's length. Read at run time, never frozen; `paper report`
+    #: keeps the full window (its `paper_reports` row is the record).
+    status_slippage_sessions: int = Field(default=20, gt=0)
 
     @field_validator("min_rebalances")
     @classmethod

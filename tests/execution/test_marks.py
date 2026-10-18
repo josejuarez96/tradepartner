@@ -1063,3 +1063,102 @@ def test_module_has_no_write_statements() -> None:
     text = inspect.getsource(marks)
     for keyword in ("INSERT", "UPDATE", "DELETE"):
         assert not re.search(rf"\b{keyword}\b", text, re.IGNORECASE), keyword
+
+
+# --- a tradable name missing its bar (#1763; reverses #892's "raises" within N) -----------
+
+
+def _tradable_gap(tmp_path, held_sessions: list[date], max_stale: int, **kwargs):
+    """A tradable A with a bar on D0 only (10.0), held on `held_sessions`."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    ledger = _ledger_for({d: {A: 4.0} for d in held_sessions})
+    try:
+        return marks_for(
+            conn,
+            _window(),
+            ledger,
+            held_sessions,
+            {A: True},
+            actions=NO_ACTIONS,
+            max_stale_sessions=max_stale,
+            **kwargs,
+        )
+    finally:
+        conn.close()
+
+
+def test_a_one_session_gap_on_a_tradable_name_marks_at_its_last_close(tmp_path) -> None:
+    """The name's D1 bar is missing: marked at D0's close, 4 x 10.0 = 40.0, and the
+    mark says which close stood in and how long the gap is."""
+    (mark,) = _tradable_gap(tmp_path, [D1], 3)
+    assert (mark.session, mark.mark_price, mark.value, mark.tradable) == (D1, 10.0, 40.0, True)
+    assert (mark.stale_close, mark.stale_gap) == (D0, 1)
+
+
+def test_a_tradable_gap_of_exactly_n_sessions_still_marks(tmp_path) -> None:
+    marks = _tradable_gap(tmp_path, [D1, D2, D3], 3)
+    assert [(m.session, m.mark_price, m.stale_gap) for m in marks] == [
+        (D1, 10.0, 1),
+        (D2, 10.0, 2),
+        (D3, 10.0, 3),
+    ]
+
+
+def test_n_plus_one_consecutive_gaps_fail_as_today(tmp_path) -> None:
+    with pytest.raises(ValueError, match="no price"):
+        _tradable_gap(tmp_path, [D1, D2, D3, next_session(D3)], 3)
+
+
+def test_a_zero_limit_keeps_today_s_failure(tmp_path) -> None:
+    """A window frozen before the key existed reads 0: a tradable gap raises."""
+    with pytest.raises(ValueError, match="no price"):
+        _tradable_gap(tmp_path, [D1], 0)
+
+
+def test_a_tradable_name_with_no_prior_close_fails(tmp_path) -> None:
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    ledger = _ledger_for({D1: {A: 1.0}})
+    with pytest.raises(ValueError, match="no price"):
+        marks_for(
+            conn, _window(), ledger, [D1], {A: True}, actions=NO_ACTIONS, max_stale_sessions=3
+        )
+    conn.close()
+
+
+def test_a_tradable_gap_never_uses_a_bar_known_after_the_marked_close(tmp_path) -> None:
+    """No look-ahead: D2's bar exists but is known only after close(D1), so D1 is
+    marked at D0's close, never at D2's."""
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    _bar(conn, A, D2, 99.0)
+    ledger = _ledger_for({D1: {A: 1.0}})
+    (mark,) = marks_for(
+        conn, _window(), ledger, [D1], {A: True}, actions=NO_ACTIONS, max_stale_sessions=3
+    )
+    conn.close()
+    assert mark.mark_price == 10.0
+
+
+def test_a_tradable_gap_across_a_split_divides_the_carried_close(tmp_path) -> None:
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, D0, 10.0)
+    actions = pl.DataFrame(
+        {
+            "security_id": [A],
+            "action_type": ["split"],
+            "ex_date": [D1],
+            "ratio_or_amount": [2.0],
+        },
+        schema=NO_ACTIONS.schema,
+    )
+    ledger = _ledger_for({D1: {A: 8.0}})
+    (mark,) = marks_for(
+        conn, _window(), ledger, [D1], {A: True}, actions=actions, max_stale_sessions=3
+    )
+    conn.close()
+    assert (mark.mark_price, mark.value) == (5.0, 40.0)

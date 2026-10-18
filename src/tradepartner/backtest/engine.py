@@ -109,7 +109,11 @@ class BacktestResult:
     per-step frames, shared by every level (req 14 stitches them), empty when the run
     was asked not to keep them (`run_many(..., keep_marking_frames=False)`); `weights`
     and `position_values` are empty when it was asked to keep no detail
-    (`run_many(..., keep_detail=False)`, #1448)."""
+    (`run_many(..., keep_detail=False)`, #1448). `rates` is the risk-free series the
+    trial's `metrics.risk_free_series` names, as `DataProvider.rates` returned it at the
+    run's data cutoff (one read per run, the same frame at every level; backtest spec,
+    amendment 2026-10-11, T170c); `None` unless `metrics.risk_free_source` is `store`,
+    when the provider's `rates` is never called."""
 
     cost_per_side_bps: float
     equity: tuple[EquityRow, ...]
@@ -118,6 +122,7 @@ class BacktestResult:
     position_values: pl.DataFrame
     marking_frames: tuple[StepFrame, ...]
     targets: Mapping[date, Mapping[str, float]]
+    rates: pl.DataFrame | None = None
 
     def stitched_returns(self) -> pl.DataFrame:
         """`valuation.stitched_returns` over this run's marking frames."""
@@ -758,8 +763,8 @@ class _SharedReads:
         return cast(Mapping[str, int | None], self._read(("sics", t), ids))
 
     def rates(self, t: datetime, series: str) -> pl.DataFrame:
-        # Not an id read: made as asked, once per step for one `(t, series)` (T170b; the
-        # engine's own use of it is T170c's).
+        # Not an id read: made as asked, once per step for one `(t, series)` (T170b);
+        # the engine reads it once, at the cutoff, under `store` only (`_run_group`).
         return self._once(("rates", t, series), lambda: self._provider.rates(t, series))
 
     def turnover_inputs(
@@ -770,6 +775,17 @@ class _SharedReads:
             ("turnover_inputs", t, tuple(ids), sessions_from),
             lambda: self._provider.turnover_inputs(t, ids, sessions_from),
         )
+
+
+#: The columns of `DataProvider.rates` (`store.asof.rates_as_of`), for the declaring pass's
+#: empty frame.
+_RATES_SCHEMA: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "series": pl.String,
+    "observation_date": pl.Date,
+    "value": pl.Float64,
+    "vintage_date": pl.Date,
+    "known_at": pl.Datetime("us", "UTC"),
+}
 
 
 class _Requests:
@@ -827,8 +843,9 @@ class _Requests:
         return {}
 
     def rates(self, t: datetime, series: str) -> pl.DataFrame:
-        # Not a keyed read: nothing is declared or read here (T170b).
-        return pl.DataFrame()
+        # Not a keyed read: nothing is declared or read here; the empty frame has the
+        # provider's columns (T170b, T170c).
+        return pl.DataFrame(schema=_RATES_SCHEMA)
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
@@ -852,6 +869,7 @@ class _Variant:
     keep_detail: bool = True
     frames: list[StepFrame] = field(default_factory=list)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
+    rates: pl.DataFrame | None = None
 
     @property
     def trial_id(self) -> int:
@@ -985,6 +1003,7 @@ def run_many(
                 position_values=pl.concat([pl.DataFrame(schema=_POSITION_SCHEMA), *book.values]),
                 marking_frames=tuple(variant.frames),
                 targets=dict(variant.targets),
+                rates=variant.rates,
             )
             for book in variant.books
         }
@@ -1052,6 +1071,17 @@ def _run_group(
                 raise
             except Exception as exc:
                 failed(variant, exc)
+    # The one risk-free read, at the run's data cutoff and only under `store` (backtest
+    # spec, amendment 2026-10-11): `constant` never touches the provider's `rates`.
+    cutoff = read_time(sessions[-1], cadence)
+    read: dict[str, pl.DataFrame] = {}
+    for variant in group:
+        metrics = variant.settings.metrics
+        if metrics.risk_free_source == "store":
+            series = metrics.risk_free_series
+            if series not in read:
+                read[series] = view.rates(cutoff, series)
+            variant.rates = read[series]
 
 
 def _marking_ids(

@@ -132,6 +132,7 @@ class Env:
         first: date = T_0,
         started: datetime | None = None,
         starting_equity: float = FAKE_CASH,
+        max_stale_marks: int | None = None,
     ) -> PaperWindowRow:
         """The window on a registered hypothesis (as `test_planning.py`)."""
         params = Settings(
@@ -158,6 +159,8 @@ class Env:
         started = started or at(T_0, 12, 0)
         values: dict[str, Any] = {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items()}
         values["paper.max_catch_up_sessions"] = MAX_CATCH_UP
+        if max_stale_marks is not None:
+            values["paper.max_stale_mark_sessions"] = max_stale_marks
         values.update({f"costs.{k}": getattr(CostsConfig(), k) for k in FROZEN_COSTS_KEYS})
         row = PaperWindowRow(
             hypothesis_id=hypothesis.hypothesis_id,
@@ -492,6 +495,40 @@ def test_a_name_held_only_on_a_back_filled_session_gets_its_own_assets_read(
     only for names held at S, so DUALA got no flag and was carried at its
     04-30 close without a word."""
     bought(env, tmp_path)
+    hold_phantom_on_f_0(env, monkeypatch)
+    with pytest.raises(ValueError, match=f"no price for {PHANTOM}"):
+        env.run(at(date(2019, 5, 6)))
+    status, fault_type, _ = env.result(env.latest_run())
+    assert (status, fault_type) == ("failed", "ValueError")
+    assert any(c.method == "assets" and "DUALA" in c.args[0] for c in env.fake.calls), (
+        "DUALA was never read from the broker"
+    )
+    assert env.query("SELECT count(*) FROM positions_daily WHERE security_id = ?", [PHANTOM]) == [
+        (0,)
+    ]
+
+
+def test_a_tradable_gap_within_the_frozen_limit_is_marked_and_alerted(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1763: the same one-session gap on a tradable name, in a window frozen with
+    `paper.max_stale_mark_sessions = 3`: the run goes on, marks DUALA at its
+    04-30 close and writes one `stale_mark` alert naming it and the gap. The
+    test above, with no frozen key, keeps today's failure."""
+    env.open_window(tmp_path, max_stale_marks=3)
+    assert env.run(at(F_0)).status == "ok"
+    hold_phantom_on_f_0(env, monkeypatch)
+    outcome = env.run(at(date(2019, 5, 6)))
+    assert outcome.status == "ok", env.result(outcome.run_id)
+    (row,) = env.query("SELECT mark_price FROM positions_daily WHERE security_id = ?", [PHANTOM])
+    assert row[0] == pytest.approx(env.close(PHANTOM, T_0))
+    ((run_id, session, message),) = env.alerts("stale_mark")
+    assert (run_id, session) == (outcome.run_id, date(2019, 5, 6))
+    assert PHANTOM in message and F_0.isoformat() in message and T_0.isoformat() in message
+
+
+def hold_phantom_on_f_0(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DUALA is held on F_0 only and has no bar from F_0 through 05-03."""
     with open_for_write(env.settings) as conn:
         conn.execute(
             "DELETE FROM prices_daily WHERE security_id = ? AND session BETWEEN ? AND ?",
@@ -511,16 +548,6 @@ def test_a_name_held_only_on_a_back_filled_session_gets_its_own_assets_read(
         return with_phantom
 
     monkeypatch.setattr(run_module._Run, "_ledger_for", ledger_for)
-    with pytest.raises(ValueError, match=f"no price for {PHANTOM}"):
-        env.run(at(date(2019, 5, 6)))
-    status, fault_type, _ = env.result(env.latest_run())
-    assert (status, fault_type) == ("failed", "ValueError")
-    assert any(c.method == "assets" and "DUALA" in c.args[0] for c in env.fake.calls), (
-        "DUALA was never read from the broker"
-    )
-    assert env.query("SELECT count(*) FROM positions_daily WHERE security_id = ?", [PHANTOM]) == [
-        (0,)
-    ]
 
 
 # --- an unreadable mark faults the drawdown check (#713 (ii)(a), #1116) ---------------------

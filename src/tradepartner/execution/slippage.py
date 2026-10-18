@@ -196,9 +196,31 @@ def read_opens(
     return opens
 
 
-def window_slippage(conn: duckdb.DuckDBPyConnection, window_id: int, now: datetime) -> Slippage:
-    """The slippage summary of every live fill of `window_id` (read-only)."""
+def _newest_sessions(fills: Sequence[OrderedFill], count: int) -> list[OrderedFill]:
+    """`fills` restricted to those whose order session is among the newest `count`
+    sessions present, in `fills`' order. The session set comes from the fills
+    themselves, so no separate session read is made."""
+    newest = set(sorted({_session_of(item) for item in fills}, reverse=True)[:count])
+    return [item for item in fills if _session_of(item) in newest]
+
+
+def window_slippage(
+    conn: duckdb.DuckDBPyConnection,
+    window_id: int,
+    now: datetime,
+    *,
+    sessions: int | None = None,
+) -> Slippage:
+    """The slippage summary of `window_id`'s live fills (read-only).
+
+    `sessions` bounds the read to the newest `sessions` order sessions (#1741):
+    the line is a diagnostic, and one `prices_as_of` read per session would grow
+    with the window's length. `paper status` passes `paper.status_slippage_sessions`;
+    `paper report` passes None and keeps the whole window.
+    """
     fills = store_journal.fills_for(conn, window_id=window_id)
+    if sessions is not None:
+        fills = _newest_sessions(fills, sessions)
     return summarise(fills, read_opens(conn, fills), now)
 
 
@@ -217,3 +239,13 @@ def slippage_line(s: Slippage) -> str:
         f"{part('buy', s.buy)}; {part('sell', s.sell)}; {part('all', s.overall)}; "
         f"no bar {s.no_bar}; off session {s.off_session}; pending {s.pending}"
     )
+
+
+def slippage_report_lines(s: Slippage | None, unavailable: str | None = None) -> list[str]:
+    """The slippage diagnostic for `paper report`/`paper status` (#1741): the one
+    summary line when it was computed, `slippage n/a (<reason>)` when the
+    computation raised and the caller kept its row, or nothing when there is no
+    summary and no reason to give."""
+    if s is not None:
+        return [slippage_line(s)]
+    return [] if unavailable is None else [f"slippage n/a ({unavailable})"]

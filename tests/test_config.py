@@ -1945,13 +1945,14 @@ def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
         Settings(_env_file=None, paper={"min_rebalances": {"month_end": 6, "week_end": 13}})
 
 
-def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
+def test_frozen_paper_keys_are_the_req_14_names() -> None:
     assert FROZEN_PAPER_KEYS == (
         "tracking_k",
         "min_rebalances",
         "tracking_rule",
         "max_catch_up_sessions",
         "min_override_reason_chars",
+        "max_stale_mark_sessions",  # #1763; a window frozen before it reads 0
     )
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
     # The universe-collapse keys are read at run time, never frozen (#1550, T188), so
@@ -1973,6 +1974,15 @@ def test_dashboard_page_row_limit_defaults_to_500_and_must_be_positive() -> None
     for bad in (0, -1):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, dashboard={"page_row_limit": bad})
+
+
+def test_status_slippage_sessions_defaults_and_must_be_positive() -> None:
+    """#1741: `paper status` reads only the newest N order sessions for the slippage
+    line; N is config, never hardcoded."""
+    assert _settings().paper.status_slippage_sessions == 20
+    for bad in (0, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, paper={"status_slippage_sessions": bad})
 
 
 def test_research_experiments_dir_defaults_to_docs_experiments() -> None:

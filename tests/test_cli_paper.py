@@ -1679,6 +1679,59 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert books == [None, "b"]
 
 
+def test_report_prints_slippage_na_when_the_line_could_not_be_computed(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#1741: a report whose slippage computation failed still prints the `n/a`
+    line naming the reason; `report()` has already written the row."""
+    canned = paper_report.Report(
+        comparison=paper_report.PeriodComparison(
+            tracking_rule="raw", tracking_k=2.0, periods=(), passed=True, failing_period=None
+        ),
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=date(2026, 11, 30),
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+        slippage=None,
+        slippage_note="ValueError: not an XNYS session: 2019-08-31",
+    )
+    monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
+    out = _paper(clock, factory, "report")
+    assert out.exit_code == 0
+    assert out.output.splitlines()[-1] == (
+        "slippage n/a (ValueError: not an XNYS session: 2019-08-31)"
+    )
+
+
+@pytest.mark.usefixtures("started")
+def test_status_bounds_the_slippage_read_to_the_configured_sessions(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#1741: `paper status` hands `paper.status_slippage_sessions` to the slippage
+    read, so the line never pays for the window's whole history."""
+    seen: list[int | None] = []
+    empty = paper_slippage.Slippage(
+        buy=paper_slippage.SideSlippage(0, None, None, None),
+        sell=paper_slippage.SideSlippage(0, None, None, None),
+        overall=paper_slippage.SideSlippage(0, None, None, None),
+        no_bar=0,
+    )
+
+    def recording(_conn: Any, _window_id: int, _now: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("sessions"))
+        return empty
+
+    monkeypatch.setattr(paper_slippage, "window_slippage", recording)
+    out = _paper(clock, factory, "status")
+    assert out.exit_code == 0, out.output
+    assert seen == [_settings().paper.status_slippage_sessions]
+
+
 def test_report_prints_the_slippage_line(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
 ) -> None:
