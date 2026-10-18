@@ -400,7 +400,7 @@ def test_report_still_writes_its_row_when_the_slippage_line_cannot_be_computed(
     outcome = report(report_settings, partial(open_read_only, report_settings))
 
     assert outcome.slippage is None
-    assert outcome.slippage_note == "not an XNYS session: 2019-08-31"
+    assert outcome.slippage_note == "ValueError: not an XNYS session: 2019-08-31"
     with open_read_only(report_settings) as conn:
         rows = conn.execute("SELECT window_id FROM paper_reports").fetchall()
     assert [row[0] for row in rows] == [window_id]

@@ -1686,12 +1686,14 @@ def test_report_prints_slippage_na_when_the_line_could_not_be_computed(
             ingested_at=SESSION_CLOCK,
         ),
         slippage=None,
-        slippage_note="not an XNYS session: 2019-08-31",
+        slippage_note="ValueError: not an XNYS session: 2019-08-31",
     )
     monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
     out = _paper(clock, factory, "report")
     assert out.exit_code == 0
-    assert out.output.splitlines()[-1] == "slippage n/a (not an XNYS session: 2019-08-31)"
+    assert out.output.splitlines()[-1] == (
+        "slippage n/a (ValueError: not an XNYS session: 2019-08-31)"
+    )
 
 
 @pytest.mark.usefixtures("started")

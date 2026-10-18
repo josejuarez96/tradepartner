@@ -852,12 +852,13 @@ def _slippage_for_report(
     raises (#1741). A missing bar, a session that is not a trading session, or any
     other slip failure is a diagnostic, never the `paper_reports` row's price:
     only the `window_slippage` call is wrapped, so a bug in the comparisons above
-    still raises."""
+    still raises. `reason` names the exception's type, not just its message."""
     now = utc_now()
     try:
         return window_slippage(conn, window_id, now), None
     except Exception as exc:  # a slippage diagnostic never blocks the report row
-        return None, (str(exc) or type(exc).__name__)
+        message = str(exc)
+        return None, f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def report(settings: Settings, connect: Connect, book_id: str | None = None) -> Report:
