@@ -57,6 +57,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -267,7 +268,7 @@ def pytest_env(env: Mapping[str, str], root: Path) -> dict[str, str]:
     out = dict(env)
     opts = out.get("PYTEST_ADDOPTS", "")
     if "--basetemp" not in opts:
-        out["PYTEST_ADDOPTS"] = f"{opts} --basetemp={root / BASETEMP_DIR}".strip()
+        out["PYTEST_ADDOPTS"] = f"{opts} --basetemp={shlex.quote(str(root / BASETEMP_DIR))}".strip()
     return out
 
 
@@ -838,7 +839,8 @@ class ShellRunner:
 
     def run_check(self, cmd: Sequence[str]) -> bool:
         cmd = parallel_if_full_suite(cmd, xdist=importlib.util.find_spec("xdist") is not None)
-        env = pytest_env(os.environ, self.root)
+        is_pytest = tuple(cmd[:3]) == ("uv", "run", "pytest")
+        env = pytest_env(os.environ, self.root) if is_pytest else None
         return subprocess.run(list(cmd), cwd=self.root, check=False, env=env).returncode == 0
 
     def read(self, path: str) -> str:

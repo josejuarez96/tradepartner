@@ -1011,6 +1011,14 @@ def test_pytest_env_sets_a_per_checkout_basetemp_when_none_given(tmp_path: Path)
     assert out["PYTEST_ADDOPTS"] == f"-x --basetemp={tmp_path / '.pytest-tmp'}"
 
 
+def test_pytest_env_quotes_a_path_with_spaces(tmp_path: Path) -> None:
+    import shlex
+
+    root = tmp_path / "My Projects"
+    opts = ready_pr.pytest_env({}, root)["PYTEST_ADDOPTS"]
+    assert shlex.split(opts) == [f"--basetemp={root / '.pytest-tmp'}"]
+
+
 def test_pytest_env_keeps_the_callers_basetemp(tmp_path: Path) -> None:
     env = {"PYTEST_ADDOPTS": "--basetemp=/scratch/pytest -q"}
     assert ready_pr.pytest_env(env, tmp_path) == env
