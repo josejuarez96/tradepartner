@@ -222,3 +222,16 @@ def test_the_session_filter_is_the_as_of_read_at_each_close(walk: Walk) -> None:
         latest = known.sort("observation_date").row(-1, named=True)
         assert used[session] == pytest.approx(latest["value"] / 100, abs=0.0)
         assert latest["known_at"] <= session_close(session)
+
+
+def test_a_revised_observation_is_carried_from_the_cutoff_frame(walk: Walk) -> None:
+    """The fixture revises DTB3 2019-03-12 (2.25, then 2.27 known 2019-03-21). The engine
+    reads the latest revision once, at the cutoff, so at 2019-03-14 the 03-12 row is not
+    known yet and the carry is 03-11's 2.25, which is also what the as-of read at that close
+    gives (the original 03-12 quote is 2.25 too): a pinned case of the documented carry."""
+    result = walk.run(walk.sessions[-1])[LEVELS[-1]]
+    sessions = [s for s in all_sessions() if walk.sessions[0] <= s <= walk.sessions[-1]]
+    used = results_module._rates_by_session(result.rates, SERIES, sessions)
+    assert used[date(2019, 3, 14)] == 2.25 / 100
+    as_of = rates_as_of(walk.conn, session_close(date(2019, 3, 14)), SERIES)
+    assert as_of.sort("observation_date")["value"][-1] == 2.25

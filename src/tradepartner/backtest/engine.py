@@ -1074,10 +1074,14 @@ def _run_group(
     # The one risk-free read, at the run's data cutoff and only under `store` (backtest
     # spec, amendment 2026-10-11): `constant` never touches the provider's `rates`.
     cutoff = read_time(sessions[-1], cadence)
+    read: dict[str, pl.DataFrame] = {}
     for variant in group:
-        risk_free = variant.settings.metrics
-        if risk_free.risk_free_source == "store":
-            variant.rates = view.rates(cutoff, risk_free.risk_free_series)
+        metrics = variant.settings.metrics
+        if metrics.risk_free_source == "store":
+            series = metrics.risk_free_series
+            if series not in read:
+                read[series] = view.rates(cutoff, series)
+            variant.rates = read[series]
 
 
 def _marking_ids(
