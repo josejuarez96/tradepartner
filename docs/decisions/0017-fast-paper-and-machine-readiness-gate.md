@@ -107,7 +107,7 @@ The command is pure over a read-only connection (the `check.py` pattern), prints
 5. **A kill in one book.** Recommend per-book switches (today's derivation, per window) plus `paper kill --all` for the owner; the accounts are separate, so nothing in one book can move another's cash. Run the E.4 drill on the fastest book that is not a forward exam.
 6. **ADR 0005's `tracking_k` at faster cadences.** The modelled cost per rebalance is small at `daily`, so `k × cost` is a tight band. Recommend keeping `k = 2` and reading the first fast book's report before changing anything; a changed k is a new ADR 0005 amendment with that evidence, as its reversibility clause asks.
 7. **The live book's home.** Recommend the same journal and store, book token `live`, so one page and one check cover paper and live; the Phase 6 ADR decides.
-8. **Which strategy goes live first.** Recommend naming it in the `shakedown_span` row's reason, before the span opens, from its exam of record (H1 is the registered MVP with a spent holdout), so the paper books cannot be read as a contest.
+8. **Which strategy goes live first.** Recommend naming it in the `shakedown_span` row's reason, before the span opens, from its exam of record (H1 is the registered MVP with a spent holdout), so the paper books cannot be read as a contest. *Superseded 2026-10-18 by [ADR 0023](0023-break-first-fast-books-paper-exam.md) D6: the reason names no live strategy; the live book is chosen in T163.*
 
 ## Consequences
 
