@@ -9,15 +9,21 @@ with a hand count of shares.
 from __future__ import annotations
 
 import ast
+import hashlib
+import itertools
 import math
 from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
 import pytest
 
+from backtest.test_engine import F1, T3, _params, _provider, _run
+from tradepartner.backtest.metrics import series_metrics
+from tradepartner.backtest.riskfree import constant_period_returns
 from tradepartner.backtest.valuation import (
     StepFrame,
     carry_to_fill,
@@ -474,3 +480,125 @@ def test_valuation_module_has_no_stray_numeric_literals() -> None:
         and node.value not in ALLOWED_LITERALS
     ]
     assert stray == []
+
+
+# --- T207: the engine's standard fixture pinned on the per-name loop (#1742) ---------
+
+
+def _digest(result: Any) -> dict[str, Any]:
+    """A cost level's run reduced to hashes of its exact rows plus readable counts."""
+    equity = [(r.series, r.session, r.equity, r.cash) for r in result.equity]
+    rebalances = [repr(r) for r in result.rebalances]
+    strategy = [e.equity for e in result.equity if e.series == "strategy"]
+    values = result.position_values.sort("security_id", "session").rows()
+    daily = [b / a - 1 for a, b in itertools.pairwise(strategy)]
+    metrics = series_metrics(
+        "strategy",
+        period_returns=daily,
+        gross_period_returns=daily,
+        daily_equity=strategy,
+        turnover=[row.turnover for row in result.rebalances],
+        spy_period_returns=[r * 0.5 + 0.0001 * (i % 3) for i, r in enumerate(daily)],
+        mtum_period_returns=[r * 0.25 - 0.0001 * (i % 2) for i, r in enumerate(daily)],
+        periods_per_year=252,
+        risk_free_period_returns=constant_period_returns(0.0, 252, len(daily)),
+    )
+    return {
+        "metrics_sha": hashlib.sha256(repr(sorted(metrics.items())).encode()).hexdigest()[:16],
+        "equity_sha": hashlib.sha256(repr(equity).encode()).hexdigest()[:16],
+        "rebalances_sha": hashlib.sha256(repr(rebalances).encode()).hexdigest()[:16],
+        "positions_sha": hashlib.sha256(repr(values).encode()).hexdigest()[:16],
+        "final_equity": repr(strategy[-1]),
+        "n_equity": len(equity),
+        "n_rebalances": len(rebalances),
+    }
+
+
+def _standard_cases() -> dict[str, dict[float, dict[str, Any]]]:
+    """The test_engine fixture (A..D, T0..T3) under close and open fills and with the
+    fill bars of A and C missing on F1, each run through the engine and digested."""
+    cases: dict[str, tuple[Any, Any]] = {
+        "close": (_provider(), _params(execution={"fill_price": "close"})),
+        "open": (_provider(), _params(execution={"fill_price": "open"})),
+        "missed": (_provider(skip=[("A", F1), ("C", F1)]), _params()),
+    }
+    return {
+        name: {
+            level: _digest(res)
+            for level, res in _run(provider, params, end=T3, levels=(0.0, 15.0)).items()
+        }
+        for name, (provider, params) in cases.items()
+    }
+
+
+#: Digests of the engine's standard fixture, taken on main's per-name loop (6a9e2dec)
+#: before `valuation.py` was vectorised (T207, #1742); the vectorised path must match.
+STANDARD_PINS: dict[str, dict[float, dict[str, Any]]] = {
+    "close": {
+        0.0: {
+            "equity_sha": "41b42afe01bbaf08",
+            "final_equity": "118909.48789598294",
+            "metrics_sha": "7335a8ceb885d29f",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "30f815c8ffc807ed",
+            "rebalances_sha": "ceea09fda7475722",
+        },
+        15.0: {
+            "equity_sha": "2213b471eda2b663",
+            "final_equity": "118553.47731502213",
+            "metrics_sha": "71621ba6fa87bd79",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "2e9fb107aba9f127",
+            "rebalances_sha": "574d658d89ad7fe2",
+        },
+    },
+    "missed": {
+        0.0: {
+            "equity_sha": "99638c6f46d57b30",
+            "final_equity": "117814.81281860062",
+            "metrics_sha": "846c5952400fd284",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "584da82b920751ff",
+            "rebalances_sha": "91d7130735c51c57",
+        },
+        15.0: {
+            "equity_sha": "f2a1319309739751",
+            "final_equity": "117464.94162804325",
+            "metrics_sha": "3bc7e92eda8ab160",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "8ca51261b130ef3f",
+            "rebalances_sha": "1c00cdcaac4ab8fd",
+        },
+    },
+    "open": {
+        0.0: {
+            "equity_sha": "0e0935d9c8f7f80e",
+            "final_equity": "119060.66687801277",
+            "metrics_sha": "f3a2e82f526508f0",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "87c382d6717a27ab",
+            "rebalances_sha": "ceea09fda7475722",
+        },
+        15.0: {
+            "equity_sha": "62dd0e81ce9b3baa",
+            "final_equity": "118704.20784205146",
+            "metrics_sha": "a822c81699377333",
+            "n_equity": 63,
+            "n_rebalances": 3,
+            "positions_sha": "d91647f5c08858f3",
+            "rebalances_sha": "05339d60644fba88",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("case", sorted(STANDARD_PINS))
+def test_the_standard_fixture_matches_the_pinned_loop_results(case: str) -> None:
+    """Equity, rebalance rows, position values and metrics are byte-identical to the
+    per-name loop's: the pins were taken before the vectorised path existed."""
+    assert _standard_cases()[case] == STANDARD_PINS[case]
