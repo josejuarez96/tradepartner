@@ -970,6 +970,56 @@ def test_strategy_rejects_bad_hold_values(override: dict[str, object]) -> None:
         StrategyConfig(**override)  # type: ignore[arg-type]
 
 
+def test_strategy_shock_keys_load_at_their_defaults() -> None:
+    """T217 (backtest spec amendment #1820, items 1 and 2): rung 4's delay and rung 5's
+    placebo keys load at the values that reproduce today's run."""
+    for s in (_settings().strategy, StrategyConfig()):
+        assert s.signal_delay_sessions == 0
+        assert type(s.signal_delay_sessions) is int
+        assert s.placebo == "none"
+        assert s.placebo_seed == 0
+        assert type(s.placebo_seed) is int
+    assert set(get_args(StrategyConfig.model_fields["placebo"].annotation)) == {
+        "none",
+        "shuffle",
+        "random_entry",
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"signal_delay_sessions": 1},
+        {"signal_delay_sessions": 5},
+        {"placebo": "shuffle"},
+        {"placebo": "random_entry"},
+        {"placebo_seed": 7},
+        {"placebo": "shuffle", "placebo_seed": 7, "signal_delay_sessions": 1},
+    ],
+)
+def test_strategy_refuses_a_shock_until_t217c_wires_it(override: dict[str, object]) -> None:
+    """Until T217c wires the engine, a non-default delay, placebo or seed would label a
+    trial row with a shock the engine never ran, so `StrategyConfig` refuses each, naming
+    T217c, and so does `Settings.model_validate`, which registration goes through."""
+    with pytest.raises(ValidationError, match="T217c"):
+        StrategyConfig(**override)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="T217c"):
+        Settings.model_validate({"strategy": override})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"signal_delay_sessions": -1},
+        {"placebo_seed": -1},
+        {"placebo": "bogus"},
+    ],
+)
+def test_strategy_rejects_bad_shock_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(**override)  # type: ignore[arg-type]
+
+
 def test_costs_defaults() -> None:
     c = _settings().costs
     assert c.per_side_bps == pytest.approx(15.0)

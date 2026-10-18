@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import time
+from bisect import bisect_left, bisect_right
 from datetime import UTC, date, datetime
 
 import numpy as np
@@ -21,7 +22,7 @@ import pytest
 from backtest.fake_provider import FakeProvider
 from tradepartner.backtest.engine import run
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import all_sessions, session_close
+from tradepartner.calendar import all_sessions, last_completed_session, session_close
 from tradepartner.config import Settings
 from tradepartner.store import registry
 
@@ -65,11 +66,76 @@ def scale_prices(
     )
 
 
+class _ScaleProvider(FakeProvider):
+    """The fixture has one immutable bar per name and session.
+
+    Serve its contiguous session blocks directly. The general FakeProvider
+    sorts all 2.7 million bars on every read to resolve revisions that this
+    fixture does not contain; that setup cost would hide the engine budget.
+    """
+
+    def __init__(self, prices: pl.DataFrame, members: dict[date, list[str]]) -> None:
+        super().__init__(prices=prices, members=members, benchmarks={})
+        self._sessions = prices["session"].unique(maintain_order=True).to_list()
+        self._names = len(members[next(iter(members))])
+        self._name_index = {
+            sid: index for index, sid in enumerate(sorted(members[next(iter(members))]))
+        }
+        self._raw_by_id = prices.sort("security_id", "session")
+
+    def _bars(
+        self, t: datetime, ids: list[str] | tuple[str, ...], sessions_from: date
+    ) -> pl.DataFrame:
+        first = bisect_left(self._sessions, sessions_from)
+        last = bisect_right(self._sessions, last_completed_session(t))
+        bars = self.prices.slice(first * self._names, (last - first) * self._names)
+        if len(ids) != self._names:
+            bars = bars.filter(pl.col("security_id").is_in(ids))
+        return bars.sort("security_id", "session")
+
+    def adjusted_prices(
+        self,
+        t: datetime,
+        ids: list[str] | tuple[str, ...],
+        include_dividends: bool,
+        *,
+        sessions_from: date | None = None,
+    ) -> pl.DataFrame:
+        self._record(
+            "adjusted_prices",
+            t,
+            ids=ids,
+            include_dividends=include_dividends,
+            sessions_from=sessions_from,
+        )
+        return self._bars(t, ids, sessions_from or self._sessions[0])
+
+    def raw_prices(self, t: datetime, ids: list[str] | tuple[str, ...]) -> pl.DataFrame:
+        self._record("raw_prices", t, ids=ids)
+        through = bisect_right(self._sessions, last_completed_session(t))
+        n_sessions = len(self._sessions)
+        return (
+            pl.concat(
+                [
+                    self._raw_by_id.slice(self._name_index[sid] * n_sessions, through)
+                    for sid in sorted(ids)
+                ]
+            )
+            if ids
+            else self._raw_by_id.slice(0, 0)
+        )
+
+    def marking_changed_ids(
+        self, previous_t: datetime, t: datetime, ids: list[str] | tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return ()
+
+
 def _scale_provider(names: int, start: date, end: date, history_start: date) -> FakeProvider:
     ids = [f"N{i:04d}" for i in range(names)]
     members = {s: ids for s in rebalance_sessions(start, end, "daily")}
     prices = scale_prices(names, history_start, end)
-    return FakeProvider(prices=prices, members=members, benchmarks={})
+    return _ScaleProvider(prices, members)
 
 
 def _handle() -> registry.TrialHandle:
@@ -112,8 +178,17 @@ def test_a_small_daily_trial_runs_on_the_scale_fixture() -> None:
     start, end = date(2024, 2, 1), date(2024, 2, 15)
     provider = _scale_provider(30, start, end, date(2022, 12, 1))
     result = run(_daily_params(), provider, start, end, _handle(), (15.0,), family="momentum")[15.0]
+    ordinary = FakeProvider(prices=provider.prices, members=provider.members, benchmarks={})
+    baseline = run(_daily_params(), ordinary, start, end, _handle(), (15.0,), family="momentum")[
+        15.0
+    ]
     assert len(result.rebalances) == len(rebalance_sessions(start, end, "daily")) - 1
     assert result.equity[-1].equity > 0
+    assert result.equity == baseline.equity
+    assert result.rebalances == baseline.rebalances
+    assert result.weights == baseline.weights
+    assert result.targets == baseline.targets
+    assert result.position_values.equals(baseline.position_values)
 
 
 @pytest.mark.slow
