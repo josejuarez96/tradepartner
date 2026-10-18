@@ -505,7 +505,8 @@ def test_migrating_a_version_28_store_widens_both_reason_checks_once_and_keeps_r
     try:
         _version_28_store(conn)
         rebuilt = tuple(sorted(_V28_REASONS))
-        others = tuple(sorted(_table_names(conn) - set(rebuilt)))
+        # `schema_version` gains the version-29 row, asserted below.
+        others = tuple(sorted(_table_names(conn) - {*rebuilt, "schema_version"}))
         rows_before = {table: _rows_in_insertion_order(conn, table) for table in rebuilt}
         others_before = _snapshot(conn, others)
 

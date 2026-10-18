@@ -71,6 +71,18 @@ def _v11_journal_ddl() -> str:
         "'spinoff_receipt', 'carried_residue'))",
         1,
     )
+    # version 29 widened both event reason sets (#1813, T202a); restore the v11 sets
+    blob = blob.replace(
+        schema._check("decision_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('skip_below_one_share', 'skip_untradable', "
+        "'skip_below_minimum', 'skip_delisted', 'dust', 'untradable', 'unfunded'))",
+        1,
+    )
+    blob = blob.replace(
+        schema._check("order_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('halt', 'not_received', 'owner_settled_unknown'))",
+        1,
+    )
     for table in ("orders", "lots", "disposals"):
         blob = blob.replace(f",\n    {schema._check(table, 'position_side')}", "")
     for table in ("decisions", "positions_daily"):
