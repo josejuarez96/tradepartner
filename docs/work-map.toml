@@ -1342,6 +1342,7 @@ unblocks = ["task:T162"]
 [task.T201]
 what = "A3: a FakeBroker that refuses what Alpaca refuses (symbol form, unknown assets, whole shares on a non-fractionable name) and one end-to-end drill per fault on the fixture store."
 why = "The fake accepted GEF-B, so the suite missed #1729; the drills are the failing tests the halt policy is built against (#1731); T202 runs beside it and the drills assert its behaviour once both are in (#1754)."
+unblocks = ["task:T162"]
 
 [task.T202]
 what = "A2 part 1: the fixed allowlist of per-name broker refusals (asset not found, not fractionable on a buy, not tradable) become counted skips with one alert, and the skip cap is a share of the plan frozen at start; sell refusals, reconciliation, limit, clock, kill-switch and universe faults still halt."
@@ -1422,7 +1423,6 @@ why = "Four single tests of 250 to 450 worker-seconds set the shard wall clock (
 [task.T217]
 what = "The kill ladder's rung-4 delay shock (strategy.signal_delay_sessions) and rung-5 placebos (a seeded strategy.placebo: shuffle or random entry) in the engine, every placebo run a trials row."
 why = "ADR 0023's ladder needs a one-session delay at rung 4 and placebos at rung 5, and no key or mode existed for either (#1754)."
-unblocks = ["task:T165e"]
 
 [issue.1754]
 what = "The plan edits of 2026-10-18: dependencies rewritten by need (T202, T206, T208, T210, T211), T209 split, one data sitting, T195 out of T198's gate, T114, T160 and T172d ticked, three wording fixes, and the new lines T215 to T217."
