@@ -71,6 +71,18 @@ def _v11_journal_ddl() -> str:
         "'spinoff_receipt', 'carried_residue'))",
         1,
     )
+    # version 29 widened both event reason sets (#1813, T202a); restore the v11 sets
+    blob = blob.replace(
+        schema._check("decision_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('skip_below_one_share', 'skip_untradable', "
+        "'skip_below_minimum', 'skip_delisted', 'dust', 'untradable', 'unfunded'))",
+        1,
+    )
+    blob = blob.replace(
+        schema._check("order_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('halt', 'not_received', 'owner_settled_unknown'))",
+        1,
+    )
     for table in ("orders", "lots", "disposals"):
         blob = blob.replace(f",\n    {schema._check(table, 'position_side')}", "")
     for table in ("decisions", "positions_daily"):
@@ -276,7 +288,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 29
+    assert schema.CURRENT_SCHEMA_VERSION == 30
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -361,7 +373,7 @@ def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [29]
+    assert _versions(conn) == [30]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
@@ -370,7 +382,7 @@ def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [29]
+    assert _versions(conn) == [30]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -672,6 +684,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
             27,
             28,
             29,
+            30,
         ]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
@@ -712,7 +725,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     )
     assert all(c in ddl_after["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS)
     # Version 21 (#1358) adds `filing_events`, version 23 (#1498) `rates`,
-    # version 24 (#1506) `borrow_status` and version 29 (#1713, T189c)
+    # version 24 (#1506) `borrow_status` and version 30 (#1713, T189c)
     # `openfigi_types`, all empty; nothing else gains a table.
     assert rows_after == {
         **rows_before,
