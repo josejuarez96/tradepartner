@@ -22,7 +22,7 @@ You implement one task from an approved TradePartner plan.
 - Before every push: `uv run ruff check . && uv run ruff format . && uv run mypy && uv run pytest <the test files you touched>` (CI runs the full suite).
 
 ## Finish
-1. Push and open a **draft** PR (`gh pr create --draft`), with the PR template complete and real command output under "How it was verified".
+1. Push and open a **draft** PR (`gh pr create --draft`), with every PR template box complete: the targeted tests you ran, and real command output (or `n/a, <why>`).
 2. Tick your plan checkbox in the same PR; leave the rest of the line until step 6.
 3. **Reviews, pass 1.** Spawn every reviewer your line's `Review:` names (as `team.py show <Tn>` prints it from `origin/main`) and every one the touched paths require (`quant-auditor` for data, backtests, signals; `safety-reviewer` for broker, orders, secrets, LLM inputs; at least what `ready_pr.py`'s `QUANT_PREFIXES` / `SAFETY_PREFIXES` list), with the PR number. Each posts its report as the PR verdict comment (`<agent>: PASS` first line) and returns a summary. If one could not post, post its file with `gh pr comment <n> --body-file <path>`. If you cannot spawn a reviewer, stop and report; never write a verdict line yourself.
 4. **Fix.** Address every BLOCKER and SHOULD FIX in one commit. A pass-1 follow-up that takes under ~15 minutes goes in that commit too.
