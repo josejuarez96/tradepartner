@@ -892,6 +892,9 @@ def test_strategy_defaults() -> None:
     assert s.top_fraction == pytest.approx(0.10)
     assert s.weighting == "equal"
     assert s.signal_total_return is True
+    assert s.hold_sessions == 1
+    assert s.hold_target_names == 0
+    assert s.rebalance_band == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
@@ -907,6 +910,24 @@ def test_strategy_defaults() -> None:
 def test_strategy_rejects_invalid_values(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, strategy=override)
+
+
+def test_strategy_weighting_accepts_hold() -> None:
+    """ADR 0023 D3/`hold` (backtest spec amendment #1731, T209a)."""
+    assert StrategyConfig(weighting="hold").weighting == "hold"
+    assert StrategyConfig(weighting="equal").weighting == "equal"
+
+
+def test_strategy_rejects_bad_hold_values() -> None:
+    for override in (
+        {"hold_sessions": 0},
+        {"hold_sessions": -1},
+        {"hold_target_names": -1},
+        {"rebalance_band": -0.01},
+        {"rebalance_band": float("nan")},
+    ):
+        with pytest.raises(ValidationError):
+            StrategyConfig(**override)  # type: ignore[arg-type]
 
 
 def test_costs_defaults() -> None:
@@ -955,6 +976,19 @@ def test_backtest_defaults() -> None:
     assert b.cash_rate == pytest.approx(0.0)
     assert b.delisting_exit == "last_close"
     assert b.stale_exit_sessions == 5
+
+
+def test_cash_rate_accepts_the_store_marker() -> None:
+    """`backtest.cash_rate = store` accrues the store's rf series (amendment #1731, T209a)."""
+    assert Settings(_env_file=None, backtest={"cash_rate": "store"}).backtest.cash_rate == "store"
+    assert Settings(_env_file=None, backtest={"cash_rate": 0.0}).backtest.cash_rate == 0.0
+
+
+@pytest.mark.parametrize("rate", [0.05, -0.01, 1.0])
+def test_cash_rate_refuses_a_numeric_non_zero_rate(rate: float) -> None:
+    """A made-up rate is not a point-in-time fact; only 0.0 or `store` load."""
+    with pytest.raises(ValidationError, match="cash_rate"):
+        Settings(_env_file=None, backtest={"cash_rate": rate})
 
 
 @pytest.mark.parametrize(

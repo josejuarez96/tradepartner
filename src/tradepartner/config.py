@@ -1201,6 +1201,13 @@ class StrategyConfig(BaseModel):
     rule and a post-registration own-section key (`backtest/frozen.py`
     `POST_REGISTRATION_OWN_KEYS`): a file that leaves it out freezes 1.0, never the live
     value.
+
+    `weighting` is `equal` or `hold`; under `hold` an entry is sized at 1 /
+    `hold_target_names` of equity and kept for `hold_sessions` sessions (backtest spec
+    amendment #1731). `hold_sessions`, `hold_target_names` and `rebalance_band` are
+    post-registration own-section keys too, inert under the default `equal` weighting.
+    `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
+    trades every non-zero drift, so every default reproduces today's behaviour.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1208,9 +1215,12 @@ class StrategyConfig(BaseModel):
     formation_months: int = Field(default=12, gt=0)
     skip_months: int = Field(default=1, ge=0)
     top_fraction: float = Field(default=0.10, gt=0, le=1)
-    weighting: Literal["equal"] = "equal"
+    weighting: Literal["equal", "hold"] = "equal"
     signal_total_return: bool = True
     turnover_top_fraction: float = Field(default=1.0, gt=0, le=1)
+    hold_sessions: int = Field(default=1, gt=0)
+    hold_target_names: int = Field(default=0, ge=0)
+    rebalance_band: float = Field(default=0.0, ge=0)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1478,14 +1488,31 @@ class BacktestConfig(BaseModel):
     `initial_capital` is scale-free with fractional shares but sizes per-order
     commissions. `delisting_exit=last_close` is the ADR 0004 oracle convention.
     `stale_exit_sessions` mirrors `gap.missing_tail_sessions` (spec open question 4).
+
+    `cash_rate` is `0.0` or `store`: under `store` cash accrues the store's risk-free
+    series per session (backtest spec amendment #1731), and a run pairs it with
+    `metrics.risk_free_source = "store"`. A numeric value other than 0 is refused: a
+    made-up rate is not a point-in-time fact.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     initial_capital: float = Field(default=100_000.0, gt=0)
-    cash_rate: float = 0.0
+    cash_rate: float | Literal["store"] = 0.0
     delisting_exit: Literal["last_close"] = "last_close"
     stale_exit_sessions: int = Field(default=5, gt=0)
+
+    @field_validator("cash_rate")
+    @classmethod
+    def _validate_cash_rate(cls, value: float | Literal["store"]) -> float | Literal["store"]:
+        if isinstance(value, str):
+            return value
+        if value != 0:
+            raise ValueError(
+                f"backtest.cash_rate must be 0.0 or 'store', got {value}; "
+                "a made-up rate is not a point-in-time fact"
+            )
+        return value
 
 
 class MetricsConfig(BaseModel):

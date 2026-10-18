@@ -7,11 +7,12 @@ non-negative, weights sum to at most 1, and the remainder is cash.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Literal
 
-Weighting = Literal["equal"]
+Weighting = Literal["equal", "hold"]
 
 
 def _selected_count(n_ranked: int, top_fraction: float) -> int:
@@ -51,7 +52,10 @@ def target_weights(
     if not (0 < top_fraction <= 1):
         raise ValueError(f"top_fraction must be in (0, 1], got {top_fraction}")
     if weighting != "equal":
-        raise ValueError(f"unknown weighting {weighting!r}; only 'equal' is defined")
+        raise ValueError(
+            f"target_weights builds only 'equal' weighting, got {weighting!r}; "
+            "'hold' is built by hold_membership"
+        )
     for sid, score in scores.items():
         if not math.isfinite(score):
             raise ValueError(f"score for {sid} must be finite, got {score}")
@@ -89,3 +93,95 @@ def trades_from(target: Mapping[str, float], drifted: Mapping[str, float]) -> di
         sid: target.get(sid, 0.0) - drifted.get(sid, 0.0) for sid in sorted({*target, *drifted})
     }
     return {sid: delta for sid, delta in trades.items() if delta != 0}
+
+
+def apply_rebalance_band(
+    target: Mapping[str, float],
+    current: Mapping[str, float],
+    band: float,
+) -> dict[str, float]:
+    """Effective target weights with every drift inside the no-trade band left alone.
+
+    `strategy.rebalance_band` is a fraction of a name's target weight (backtest spec
+    amendment #1731): a name whose absolute drift from its target is at most
+    `band * target` is not traded, so its effective target is its current weight. A band
+    of 0 trades every non-zero drift and returns `target` unchanged; a band wide enough
+    to cover every drift returns `current` over the shared names. A name absent from
+    `target` has a target of 0 and therefore a band of 0, so an exit is always traded.
+    Names whose effective weight is 0 are dropped, as `trades_from` drops zero deltas.
+    Raises `ValueError` for a negative or non-finite band. Ordered by `security_id`.
+    """
+    if not (math.isfinite(band) and band >= 0):
+        raise ValueError(f"rebalance_band must be non-negative and finite, got {band}")
+    if band == 0:
+        return dict(target)
+    effective: dict[str, float] = {}
+    for sid in sorted({*target, *current}):
+        desired = target.get(sid, 0.0)
+        held = current.get(sid, 0.0)
+        weight = held if abs(desired - held) <= band * desired else desired
+        if weight != 0:
+            effective[sid] = weight
+    return effective
+
+
+@dataclass(frozen=True)
+class HoldMembership:
+    """The held set at one session under `strategy.weighting = "hold"` (backtest spec
+    amendment #1731, "Hold mode and the no-trade band").
+
+    `entering` and `exiting` are the names added to and removed from the held set at the
+    session; `held` is the new held set, a live name keeping its place and a new entry
+    following in rank order. `entries` is the state to carry to the next session: every
+    held name with the session it entered. A name whose hold elapsed at the session is
+    eligible to enter again in it (a re-entry restarts its hold), so it can appear in
+    both `exiting` and `entering`.
+    """
+
+    entering: tuple[str, ...]
+    exiting: tuple[str, ...]
+    held: tuple[str, ...]
+    entries: Mapping[str, int]
+
+
+def hold_membership(
+    ranked: Sequence[str],
+    entries: Mapping[str, int],
+    session: int,
+    hold_sessions: int,
+    hold_target_names: int,
+    top_fraction: float,
+) -> HoldMembership:
+    """Hold-mode membership at `session`, given each held name's entry session.
+
+    An entry made at session E is live at sessions E, E+1, …, E + `hold_sessions` - 1 and
+    exits at session E + `hold_sessions`; so a name exits on session N and no earlier.
+    Live names are all kept. New entries fill the target up to `hold_target_names` (the
+    best `ranked` names not already live, in rank order); a non-positive
+    `hold_target_names` means the count `top_fraction` selects. A book with fewer live
+    names than its target holds the rest in cash, so live names are never force-exited.
+    Raises `ValueError` for `hold_sessions` below 1 or a negative `session`.
+    """
+    if hold_sessions < 1:
+        raise ValueError(f"hold_sessions must be at least 1, got {hold_sessions}")
+    if session < 0:
+        raise ValueError(f"session must be non-negative, got {session}")
+    target = (
+        hold_target_names if hold_target_names > 0 else _selected_count(len(ranked), top_fraction)
+    )
+    live: list[str] = []
+    exiting: list[str] = []
+    for name, entered in entries.items():
+        (exiting if session - entered >= hold_sessions else live).append(name)
+    live_names = set(live)
+    entering = [name for name in dict.fromkeys(ranked) if name not in live_names][
+        : max(0, target - len(live))
+    ]
+    new_entries = {name: entries[name] for name in live}
+    new_entries.update({name: session for name in entering})
+    return HoldMembership(
+        entering=tuple(entering),
+        exiting=tuple(exiting),
+        held=tuple((*live, *entering)),
+        entries=new_entries,
+    )
