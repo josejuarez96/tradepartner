@@ -72,6 +72,11 @@ def test_plan_tasks_reads_open_finished_and_owner_lines() -> None:
     assert doc_check.plan_tasks(PLAN) == {"T1", "T2", "T3"}
 
 
+def test_a_split_tasks_former_id_resolves() -> None:
+    split = "- [ ] **T7a: Pure half.** Split from T7.\n- [ ] **T7b: Engine half.** After T7a.\n"
+    assert doc_check.plan_tasks(split) == {"T7", "T7a", "T7b"}
+
+
 def test_open_plan_lines_flag_each_unresolved_kind(repo: Path) -> None:
     findings = doc_check.check_citations(repo)
     assert _refs(findings) == {

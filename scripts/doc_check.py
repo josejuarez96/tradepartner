@@ -6,7 +6,8 @@ open (``- [ ]``) task lines of ``docs/plans/*.md`` and every ``.py`` file under 
 and ``tests/``, and checks four kinds of citation:
 
 - a task number (``T45``, ``T190b``; ``T0`` and ``T04`` are not task numbers) names a task
-  line in some plan (open or finished);
+  line in some plan (open or finished), or is the former id of a split task (``T209`` for
+  ``T209a``);
 - an ADR number (``ADR 0023``, ``ADR-17``) names a file ``docs/decisions/<NNNN>-*.md``;
 - a claim ID (``HO-10``, ``ER-4``, ``EP-P11``, ``G2-A``) whose prefix is a claim-register
   prefix names an ``id`` in ``docs/research/claims.toml``;
@@ -118,8 +119,13 @@ def _claim_pattern(prefixes: frozenset[str]) -> re.Pattern[str]:
 
 
 def plan_tasks(text: str) -> set[str]:
-    """Task ids defined by a plan's task lines, open or finished."""
-    return {m.group(1) for line in text.splitlines() if (m := TASK_DEF_RE.match(line))}
+    """Task ids defined by a plan's task lines, open or finished.
+
+    A split task's former id resolves too (``T209`` once only ``T209a`` and ``T209b`` have
+    lines), since plans cite it as history ("split from T209").
+    """
+    ids = {m.group(1) for line in text.splitlines() if (m := TASK_DEF_RE.match(line))}
+    return ids | {i.rstrip("abcdefghijklmnopqrstuvwxyz") for i in ids}
 
 
 def spec_requirements(text: str) -> frozenset[int]:
