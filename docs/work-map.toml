@@ -958,7 +958,7 @@ why = "Several books trading on paper is the point of ADR 0017; this is the mome
 unblocks = ["task:T162"]
 
 [task.T162]
-what = "Owner: the shakedown_span row (N = 10, M = 5, the live-first strategy named in its reason), the kill-switch drill on main on an H1 fill session, and paper shakedown exit 0 over every book."
+what = "Owner: the shakedown_span row (N = 10, M = 5, its reason names no live strategy: ADR 0023 D6, the live book is chosen in T163), the kill-switch drill on main on an H1 fill session, and paper shakedown exit 0 over every book."
 why = "This is the Phase 4 exit and the Phase 6 entry: the machine shown ready by frozen criteria, not a strategy shown profitable."
 unblocks = ["task:T71b", "task:T163"]
 
