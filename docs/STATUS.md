@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-10-18 · **Phase:** 1 closed; 2 Data foundation (70/98), 3 Strategy lab (28/29) and 4 Paper trading (81/90) in build (counts as of 10-12) · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
+**Updated:** 2026-10-18 · **Phase:** 1 closed; 2 Data foundation (105/133), 3 Strategy lab (29/29) and 4 Paper trading (85/101) in build (counts as of 10-18) · **Last tag:** v0.1.0 · **Next tag:** v0.2.0
 
 ## Recently done
 Phase 1 backtest closed: T45b real-store H1 run (in-sample 2020-08-31..2023-12-29, 40 monthly returns); trial 2 PASS (DSR 0.7262 psr basis, costs 1.25% at 15 bps); trial 1 FAIL on #853 disclosed; quant-auditor verdicts linked in PR. What's next: open holdout gates #1017/#1018 (gap coverage, RVTY/FI), Phase 2 data tasks, T116c evidence, strategy lab, research labeling. Pending follow-up issues: S1 (listing ends 78 Form 25 re-opens), S3 (PerkinElmer/Revvity, WTW bars).
@@ -19,13 +19,13 @@ Phase 1 backtest closed: T45b real-store H1 run (in-sample 2020-08-31..2023-12-2
 Direction: [ADR 0023](decisions/0023-break-first-fast-books-paper-exam.md) (#1740): break first, fast books, paper as the exam. The D5 pause list (T189c, #1598, T187-T187c, T184h, T174c and labeling, T171d, T23, T116c, T141, T204) is stopped; lines stay, no claims. Orchestrator: window tradepartner-82 (main checkout, team atlas). Live teams and claims: `team.py status`. Handovers: issue #836.
 
 ## In progress
-- Paper: the Daily book is halted on its first rebalance (`GEF-B` asset lookup, #1729); fix #1730 is in ready_pr (with #1735 retry, ready). Book `main`: first rebalance 2026-10-30.
+- Paper: the Daily book resumed 2026-10-18 after the `GEF-B` fix (#1730, 5xx retries #1735, both merged); it runs Mon 08:05. Book `main`: first rebalance 2026-10-30.
 - Data: #969 closed by D1. One data sitting, T197 then T186c then #1382 a3 then T198, targeted 2026-10-24..27. #1728 resolver fix: #1736 (draft).
 - Kill ladder: B9 killed and B3 retired (recorded in #1768, merged); IRRX parked behind T198; B10 is next, rung 1 waits on about 10 sessions of Daily fills.
-- Open PRs (draft unless noted): #1730 and #1735 (ready); #1727 T190d class link (ready); #1736 rename fix; #1738 slippage line; #1750 T192b fill-holes; #1748 T212 dollar-volume rank; #1746 T207 vectorised valuation; #1773 T170c risk-free engine (team rfwire); #1771 mark held name missing S-1 bar; #1769 retry read-only store opens; #1772 plan dependency edits; #1767 and #1777 docs passes (docsw1, docsw2); #1766 tooling; #1755 CI shards.
+- Open PRs (draft unless noted): #1727 T190d class link, #1769 store-open retry and #1766 tooling (ready); #1736 rename fix; #1738 slippage line; #1750 T192b fill-holes; #1748 T212 dollar-volume rank; #1746 T207 vectorised valuation; #1773 T170c risk-free engine (team rfwire); #1771 and #1783 held-name marks; #1784 FakeBroker (T201); #1767 docs pass (docsw1); #1755 CI shards.
 
 ## Ready frontier snapshot
-Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready). Agent: T195, T213 (#1728), T200 and T203 (PRs open: #1735, #1738), T187 and T189c and T174c are on the pause list. Owner: T197, T186c, T71, T159, T75b, T114, T166c; T116c, T141, T184h are paused. Unclaimed issues: see `team.py status`.
+Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready). Agent: T195, T213 (#1728), T200 (merged, #1735), T203 (PR #1738), T187 and T189c and T174c are on the pause list. Owner: T197, T186c, T71, T159, T75b, T114, T166c; T116c, T141, T184h are paused. Unclaimed issues: see `team.py status`.
 
 ## Blocked
 T23 (paused), T204 (paused until its trigger), T146-T149b (after T144's verdict and T145), T160-T163c (the Daily book and the shakedown span), T71b, T126 (#1351 seeded-recall gate, the owner's call). #1728's repair-resolution waits on #1736.
