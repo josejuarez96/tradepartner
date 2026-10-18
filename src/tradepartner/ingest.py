@@ -281,7 +281,13 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
-from tradepartner.store.master import MasterBuild, build_master, securities_as_of, session_of
+from tradepartner.store.master import (
+    MasterBuild,
+    build_master,
+    primary_security_id,
+    securities_as_of,
+    session_of,
+)
 from tradepartner.store.restamp_precheck import (
     PrecheckFile,
     crossed_instants,
@@ -293,7 +299,7 @@ from tradepartner.store.restamp_precheck import (
 from tradepartner.store.retraction import record_underived, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
-from tradepartner.universe import SHARES_FACT
+from tradepartner.universe import SHARES_FACT, member_links_title
 
 OK, STALE, FAILED, LOCKED = "ok", "stale", "failed", "locked"
 ACTIONS_FILLED = "filled"
@@ -1439,14 +1445,42 @@ def _build_filings(
     if fetch and settings.edgar.filing_events_enabled:  # #1358: full history, every run
         for cik in ciks:
             filings.filing_events(cik)
+    link = settings.edgar.class_member_link
     facts, unmatched = fact_rows(
         records,
         master,
         classes,
         ingested_at=ingested_at,
         class_member_overrides=settings.edgar.class_member_overrides,
+        class_member_link=link,
+        dead_class_filings=settings.edgar.dead_class_filings,
+        lettered_member_max_minor_share=settings.edgar.lettered_member_max_minor_share,
+        cover_pages_at=_listing_pages(filings, master, ciks) if link else None,
     )
     return master, delistings, classes, facts, unmatched
+
+
+def _listing_pages(
+    filings: FilingSource, master: MasterBuild, ciks: Iterable[str]
+) -> dict[str, list[datetime]]:
+    """Per CIK, the acceptance of each cover page listing a class, at least
+    the CIK's first issuer filing, as `build_master` dates a page
+    (`MasterBuild.shown`): the pages rule 3 of the class-member link counts
+    (T190d). The answers are those `build_master` already asked for."""
+    first = {
+        row["cik"]: row["known_at"]
+        for row in master.securities
+        if row["security_id"] == primary_security_id(row["cik"])
+    }
+    out: dict[str, list[datetime]] = {}
+    for cik in ciks:
+        floor = first.get(cik)
+        out[cik] = sorted(
+            max(page.accepted_at, floor) if floor is not None else page.accepted_at
+            for page in filings.cover_pages(cik)
+            if page.listings
+        )
+    return out
 
 
 def _issuer_ciks(master: MasterBuild) -> list[str]:
@@ -2398,6 +2432,10 @@ def fact_rows(
     *,
     ingested_at: datetime,
     class_member_overrides: Mapping[str, str] | None = None,
+    class_member_link: bool = False,
+    dead_class_filings: int = 4,
+    lettered_member_max_minor_share: float = 0.001,
+    cover_pages_at: Mapping[str, Sequence[datetime]] | None = None,
 ) -> tuple[tuple[Row, ...], tuple[FactRecord, ...]]:
     """`facts` rows for `records`, and the records no security could take.
 
@@ -2422,7 +2460,53 @@ def fact_rows(
     like an undimensioned fact, although no title names its letter (an
     owner-reviewed exception, never a general rule). Raises `ValueError` for a
     record accepted after `ingested_at`.
+
+    `class_member_link` (`edgar.class_member_link`, #1682 T190d; off, every
+    row is as above) adds three rules, each read as of the fact's acceptance
+    `t` (nothing known after `t` links, kills or revives a class):
+
+    1. A fact the rules above leave unmatched goes to the one candidate its
+       member links (`universe.member_links_title`) over the candidate's
+       titles known at `t`: its listing titles, its cover-page titles and the
+       slug of a class id (`<cik>:<slug>`) whose `securities` row is known
+       (BF's `NonvotingCommonStock` on "Class B Common Stock (nonvoting)").
+    2. A lettered common member (`CommonClassA`) still unmatched goes to the
+       sole candidate with a listing known at `t` when no candidate's title
+       or slug known at `t` names any class letter, provided the filing
+       carries two or more class members for the fact on that date, every
+       one a lettered common member, it
+       carries no undimensioned value for the fact, the member holds the
+       filing's largest value, and every other member is at most
+       `lettered_member_max_minor_share` of it (a nominal class: IBKR's 100
+       and SPG's 8,000 Class B shares beside their listed `CommonClassA`;
+       those stay unmatched). A filing tagging its listed
+       class `CommonStock`, or whose other class is not nominal (Ford's,
+       Weber's or DKS's Class B), links nothing by this rule: the largest
+       lettered member is not always the listed class (census on #1723).
+    3. The dead-class rule by missed pages, for an undimensioned total
+       only: a candidate shown on a cover page known at `t`, but on none of
+       the CIK's last `dead_class_filings` cover pages known at `t`
+       (`cover_pages_at`: per CIK, each periodic cover page's acceptance, a
+       page listing nothing left out as `MasterBuild.shown` leaves it),
+       while another candidate is shown on one of them, stops being a
+       candidate (WBD's old Series B and C after the 2022 merger) for a
+       total the rules above leave unmatched. A fact that lands without it
+       lands as before (Lithia's unlisted Class B keeps its `CommonClassB`
+       facts), and a dimensioned member never lands by it (Constellation's
+       Class 1 shares stay off its Class A). With fewer pages known, or no
+       `cover_pages_at`, no class dies by this rule.
+
+    While two or more candidates remain, a total, or a member linking no
+    candidate or two, stays unmatched.
     """
+    if dead_class_filings < 1:
+        raise ValueError(f"dead_class_filings must be at least 1, got {dead_class_filings}")
+    if not 0 < lettered_member_max_minor_share < 1:
+        raise ValueError(
+            "lettered_member_max_minor_share must be in (0, 1), "
+            f"got {lettered_member_max_minor_share}"
+        )
+    records = list(records)
     kinds: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     for row in sorted(classes.classifications, key=lambda r: r["known_at"]):
         kinds[row["security_id"]].append((row["known_at"], row["security_type"]))
@@ -2454,10 +2538,11 @@ def fact_rows(
                 return True
         return False
 
-    def common_at(cik: str, t: datetime) -> list[str]:
+    def common_at(cik: str, t: datetime, *, missed: bool = False) -> list[str]:
         """The CIK's classes classified `common` by the latest row known at
         `t`, less any whose successor (new equity, #820) is known at `t` and
-        any dead at `t` (#1165)."""
+        any dead at `t` (#1165); with `missed`, also less any dead by rule 3
+        of the class-member link (T190d)."""
         out = []
         for sid in by_cik.get(cik, []):
             if sid in succeeded and succeeded[sid] <= t:
@@ -2465,7 +2550,11 @@ def fact_rows(
             known = [kind for at, kind in kinds[sid] if at <= t]
             if known and known[-1] == "common":
                 out.append(sid)
-        return [sid for sid in out if not dead_at(sid, out, t)]
+        alive = [sid for sid in out if not dead_at(sid, out, t)]
+        if missed and cover_pages_at is not None:
+            gone = _missed_pages(alive, spans, cover_pages_at.get(cik, ()), t, dead_class_filings)
+            alive = [sid for sid in alive if sid not in gone]
+        return alive
 
     letters: dict[str, set[str]] = defaultdict(set)
     for row in master.listings:
@@ -2483,6 +2572,12 @@ def fact_rows(
         titles known at `t` name (no later page names an earlier fact's class)."""
         return letters[sid] | {letter for at, letter in titled[sid] if at <= t}
 
+    linker = _ClassLinker(master) if class_member_link else None
+    largest = (
+        _largest_lettered_members(records, lettered_member_max_minor_share)
+        if class_member_link
+        else {}
+    )
     rows: list[Row] = []
     unmatched: list[FactRecord] = []
     for record in records:
@@ -2491,13 +2586,24 @@ def fact_rows(
                 f"{record.accession}: accepted_at {record.accepted_at.isoformat()} is after "
                 f"ingested_at {ingested_at.isoformat()}"
             )
-        ids = common_at(record.cik, record.accepted_at)
         member = _MEMBER_CLASS.search(record.class_member)
         override = _MEMBER_CLASS.search((class_member_overrides or {}).get(record.cik, ""))
         if member and override and member.group(1) == override.group(1):
             member = None  # the owner named this member the sole common class's
-        if member:
-            ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
+        # Rule 3 (`missed`) only places a total the other rules leave
+        # unmatched: a class missing from the pages (an unlisted Class B)
+        # keeps the facts it already takes.
+        ids: list[str] = []
+        third = class_member_link and not record.class_member
+        for missed in (False, True) if third else (False,):
+            candidates = common_at(record.cik, record.accepted_at, missed=missed)
+            ids = candidates
+            if member:
+                ids = [sid for sid in ids if member.group(1) in letters_at(sid, record.accepted_at)]
+            if linker is not None and len(ids) != 1 and record.class_member:
+                ids = linker.link(record, candidates, largest)
+            if len(ids) == 1:
+                break
         if record.fact_name not in FACT_NAMES or len(ids) != 1:
             unmatched.append(record)
             continue
@@ -2516,6 +2622,130 @@ def fact_rows(
             }
         )
     return tuple(rows), tuple(unmatched)
+
+
+def _lettered_common(member: str) -> str | None:
+    """The class letter of a common member naming one (`CommonClassA`,
+    `ClassBCommonStock`), else `None`: rule 2 of the class-member link
+    (T190d) reads only these, never `ClassBExchangeableShares`."""
+    match = _MEMBER_CLASS.search(member)
+    return match.group(1) if match and "common" in member.lower() else None
+
+
+#: (CIK, accession, fact name, as-of date): one filing's values for one fact
+#: on one date, rule 2's unit (T190d).
+_FilingKey = tuple[str, str, str, date]
+
+
+def _largest_lettered_members(
+    records: Sequence[FactRecord], max_minor_share: float
+) -> dict[_FilingKey, str]:
+    """Per (CIK, accession, fact name, as-of date), the member rule 2 may
+    place (T190d): the filing's largest, when that filing carries two or
+    more class members for the fact on that date (a lone lettered member is
+    no evidence the other class is nominal), every one a lettered common
+    member, the filing carries no undimensioned value for
+    the fact (a total beside one class: BioAtla's unlisted Class B beside
+    its 32M total, #1727), the largest is positive and unique, and every
+    other member is at most `max_minor_share` of it."""
+    top: dict[_FilingKey, dict[str, float]] = defaultdict(dict)
+    totals: set[_FilingKey] = set()
+    for record in records:
+        key = (record.cik, record.accession, record.fact_name, record.as_of_date)
+        if not record.class_member:
+            totals.add(key)
+            continue
+        held = top[key]
+        held[record.class_member] = max(held.get(record.class_member, record.value), record.value)
+    out: dict[_FilingKey, str] = {}
+    for key, values in top.items():
+        if key in totals or any(_lettered_common(member) is None for member in values):
+            continue
+        best = max(values.values())
+        winners = [member for member, value in values.items() if value == best]
+        if len(values) < 2 or len(winners) != 1 or best <= 0:
+            continue
+        if all(v <= max_minor_share * best for m, v in values.items() if m != winners[0]):
+            out[key] = winners[0]
+    return out
+
+
+def _missed_pages(
+    alive: Sequence[str],
+    spans: Mapping[str, Sequence[tuple[datetime, datetime]]],
+    pages: Sequence[datetime],
+    t: datetime,
+    n: int,
+) -> set[str]:
+    """The candidates in `alive` dead at `t` by rule 3 of the class-member
+    link (T190d): each shown on a cover page known at `t` but on none of the
+    CIK's last `n` listing pages known at `t` (`pages`), while another of
+    `alive` is shown on one of them. A page is a listing page of the CIK, so
+    a class is shown on it exactly when one of its spans covers it."""
+    known = sorted(p for p in pages if p <= t)
+    if len(known) < n:
+        return set()
+    window = known[-n:]
+
+    def on(sid: str, page: datetime) -> bool:
+        return any(start <= page <= end for start, end in spans.get(sid, ()))
+
+    shown_by_t = {sid for sid in alive if any(start <= t for start, _ in spans.get(sid, ()))}
+    missing = {sid for sid in shown_by_t if not any(on(sid, p) for p in window)}
+    present = {sid for sid in alive if any(on(sid, p) for p in window)}
+    return missing if present else set()
+
+
+class _ClassLinker:
+    """Rules 1 and 2 of `fact_rows`' class-member link (T190d), over the
+    titles, slugs and listings each candidate has at the fact's acceptance."""
+
+    def __init__(self, master: MasterBuild) -> None:
+        self._titles: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+        self._listed: dict[str, datetime] = {}
+        for row in master.listings:
+            sid, at = row["security_id"], row["known_at"]
+            if row["class_title"]:
+                self._titles[sid].append((at, row["class_title"]))
+            self._listed[sid] = min(self._listed.get(sid, at), at)
+        for title in master.class_titles:
+            self._titles[title.security_id].append((title.known_at, title.title))
+        for row in master.securities:
+            sid = row["security_id"]
+            if ":" in sid:
+                self._titles[sid].append((row["known_at"], sid.split(":", 1)[1].replace("-", " ")))
+
+    def titles_at(self, sid: str, t: datetime) -> list[str]:
+        """`sid`'s listing and cover-page titles and its slug, known at `t`."""
+        return [title for at, title in self._titles.get(sid, ()) if at <= t]
+
+    def link(
+        self,
+        record: FactRecord,
+        candidates: Sequence[str],
+        largest: Mapping[_FilingKey, str],
+    ) -> list[str]:
+        """The candidates rule 1, else rule 2, gives `record` (`fact_rows`)."""
+        t = record.accepted_at
+        titles = {sid: self.titles_at(sid, t) for sid in candidates}
+        linked = [
+            sid
+            for sid in candidates
+            if any(member_links_title(record.class_member, title) for title in titles[sid])
+        ]
+        if linked:
+            return linked
+        if _lettered_common(record.class_member) is None:
+            return []
+        key = (record.cik, record.accession, record.fact_name, record.as_of_date)
+        if largest.get(key) != record.class_member:
+            return []
+        if any(_title_letter(title) for sid in candidates for title in titles[sid]):
+            return []
+        return [sid for sid in candidates if self._listed.get(sid, _NEVER) <= t]
+
+
+_NEVER = datetime.max.replace(tzinfo=UTC)
 
 
 # --- the price chunk --------------------------------------------------------
