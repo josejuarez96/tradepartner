@@ -83,7 +83,7 @@ def test_rejects_non_positive_shard_count() -> None:
 
 
 def test_default_weight_applies_to_unlisted_files() -> None:
-    assert "tests/test_pytest_sharding.py" not in _HEAVY_TEST_FILE_WEIGHTS
+    assert "tests/unlisted_a.py" not in _HEAVY_TEST_FILE_WEIGHTS
     # a file not in the heavy table gets the default weight implicitly: two
     # unlisted files of equal (default) weight go to two different shards.
     assignment = shard_assignment(["tests/unlisted_a.py", "tests/unlisted_b.py"], shard_count=2)
@@ -127,3 +127,55 @@ def test_split_by_test_files_have_only_nodeid_keys_in_the_weight_table() -> None
     for split_file in _SPLIT_BY_TEST:
         assert split_file not in _HEAVY_TEST_FILE_WEIGHTS
         assert any(key.startswith(f"{split_file}::") for key in _HEAVY_TEST_FILE_WEIGHTS)
+
+
+def test_real_collection_shards_partition_the_full_suite() -> None:
+    """Collect the real suite once unsharded and once per shard (as CI does, #1749): every
+    nodeid lands in exactly one shard, so no test is lost or run twice."""
+    import os
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    count = 8
+
+    def collect(index: int | None) -> list[str]:
+        skipped = ("PYTEST_SHARD", "PYTEST_XDIST", "PYTEST_CURRENT_TEST")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(skipped)}
+        if index is not None:
+            env["PYTEST_SHARD_COUNT"] = str(count)
+            env["PYTEST_SHARD_INDEX"] = str(index)
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+            ],
+            cwd=_ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+        return [line for line in done.stdout.splitlines() if "::" in line]
+
+    with ThreadPoolExecutor(max_workers=count + 1) as pool:
+        full, *shards = list(pool.map(collect, [None, *range(count)]))
+    flat = [nodeid for shard in shards for nodeid in shard]
+    assert len(flat) == len(set(flat)), "a test is collected by more than one shard"
+    assert set(flat) == set(full)
+    assert len(full) == len(set(full))
+    assert len(full) > 1000, "collection looks empty or truncated"
+    # no stale weight keys: every listed unit is a real file or nodeid (a renamed test or
+    # parameter would otherwise fall back to the default weight and unbalance a shard).
+    units = {
+        nodeid if nodeid.split("::")[0] in _SPLIT_BY_TEST else nodeid.split("::")[0]
+        for nodeid in full
+    }
+    stale = sorted(set(_HEAVY_TEST_FILE_WEIGHTS) - units)
+    assert not stale, f"weight table keys that match no collected unit: {stale}"

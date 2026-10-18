@@ -108,6 +108,7 @@ from tradepartner.execution.plan import (
 )
 from tradepartner.execution.plan import current_listings as current_listings
 from tradepartner.execution.reconcile_run import frozen_risk
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
 from tradepartner.store.asof import listings_as_of, live_actions_as_of, prices_as_of
@@ -420,33 +421,63 @@ def _ended(
 
 
 def _symbols(
-    conn: duckdb.DuckDBPyConnection, session: date, names: Sequence[str]
-) -> dict[str, str]:
-    """Each name's ticker: its current listing at S among rows known at close(S-1).
-    A name with none raises, since its `assets` read cannot be made."""
+    conn: duckdb.DuckDBPyConnection,
+    session: date,
+    names: Sequence[str],
+    class_symbols: Mapping[str, str] | None,
+) -> dict[str, str | None]:
+    """Each name's broker symbol (`execution.symbols.broker_symbol` of its
+    current listing at S among rows known at close(S-1)); `None` for a listing
+    with no broker form (#1729). A name with no listing raises, since its
+    `assets` read cannot be made."""
     if not names:
         return {}
     current = current_listings(listings_as_of(conn, _cut(session), list(names)), session)
     missing = sorted(set(names) - set(current))
     if missing:
         raise ValueError(f"no listing known at close(S-1) for {missing}")
-    symbols = {sid: str(current[sid]["ticker"]) for sid in names}
-    if len(set(symbols.values())) != len(symbols):
-        raise ValueError(f"two names share a ticker: {symbols}")
+    symbols = {sid: broker_symbol(current[sid], class_symbols) for sid in names}
+    _check_unique(symbols)
     return symbols
 
 
-def _assets(assets_read: AssetsRead, symbols: Mapping[str, str]) -> dict[str, AssetFlags]:
-    """The `assets` read for `symbols`' names, keyed by `security_id`. Whatever
-    `assets_read` raises propagates unchanged; a symbol it does not answer for
-    raises `ValueError` after the call."""
-    if not symbols:
-        return {}
-    answer = assets_read(sorted(symbols.values()))
-    missing = sorted(sym for sym in symbols.values() if sym not in answer)
+def _check_unique(symbols: Mapping[str, str | None]) -> None:
+    """Raise when two names map to one broker symbol (`GEF-B` and `GEF/B` are
+    both `GEF.B`): the `assets` read and any order would be ambiguous."""
+    mapped = [symbol for symbol in symbols.values() if symbol is not None]
+    if len(set(mapped)) != len(mapped):
+        raise ValueError(f"two names share a broker symbol: {dict(symbols)}")
+
+
+@dataclass(frozen=True)
+class _Unresolved:
+    """The flags of a name with no broker symbol (#1729), as
+    `adapters.broker.UNRESOLVED_ASSET` answers them (this module imports no
+    adapter): what `decisions_from` reads; the phase skips the name as
+    untradable."""
+
+    fractionable: bool = False
+
+
+_UNRESOLVED = _Unresolved()
+
+
+def _assets(assets_read: AssetsRead, symbols: Mapping[str, str | None]) -> dict[str, AssetFlags]:
+    """The `assets` read for `symbols`' names, keyed by `security_id`; a name
+    with no broker symbol is `_UNRESOLVED` and never read (#1729).
+    Whatever `assets_read` raises propagates unchanged; a symbol it does not
+    answer for raises `ValueError` after the call."""
+    unresolved: dict[str, AssetFlags] = {
+        sid: _UNRESOLVED for sid, symbol in symbols.items() if symbol is None
+    }
+    mapped = {sid: symbol for sid, symbol in symbols.items() if symbol is not None}
+    if not mapped:
+        return unresolved
+    answer = assets_read(sorted(mapped.values()))
+    missing = sorted(sym for sym in mapped.values() if sym not in answer)
     if missing:
         raise ValueError(f"the assets read did not answer for {missing}")
-    return {sid: answer[symbol] for sid, symbol in symbols.items()}
+    return {**unresolved, **{sid: answer[symbol] for sid, symbol in mapped.items()}}
 
 
 def _ledger(
@@ -550,6 +581,7 @@ class _Reads:
     forced: frozenset[str]
     overrides: tuple[store_journal.OverrideRow, ...]
     held_assets: dict[str, AssetFlags]
+    held_symbols: dict[str, str | None]
 
 
 def _frozen_params(
@@ -599,7 +631,8 @@ def _read(
 
     forced = _open_forced_exits(conn, window_id, session, actions, frozen, exit_price)
     overrides = tuple(o.override for o in store_journal.overrides_for(conn, window_id))
-    held_assets = _assets(assets_read, _symbols(conn, session, held))
+    held_symbols = _symbols(conn, session, held, settings.alpaca.class_symbols)
+    held_assets = _assets(assets_read, held_symbols)
     return _Reads(
         hypothesis=hypothesis,
         params=params,
@@ -610,6 +643,7 @@ def _read(
         forced=forced,
         overrides=overrides,
         held_assets=held_assets,
+        held_symbols=held_symbols,
     )
 
 
@@ -771,7 +805,9 @@ def plan_rebalance(
         _check_universe(conn, window, window.window_id, t_i, plan.n_universe, settings)
         held = set(reads.held_assets)
         new = sorted(set(plan.targets) - held)
-        assets = {**reads.held_assets, **_assets(assets_read, _symbols(conn, session, new))}
+        new_symbols = _symbols(conn, session, new, settings.alpaca.class_symbols)
+        _check_unique({**reads.held_symbols, **new_symbols})
+        assets = {**reads.held_assets, **_assets(assets_read, new_symbols)}
         prices = {**reads.prices, **reference_prices(conn, session, new, reads.actions)}
         listings_at = {**reads.ended, **_ended(conn, session, new, reads.params)}
         costs = reads.params.costs
