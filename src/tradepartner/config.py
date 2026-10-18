@@ -852,6 +852,11 @@ class UniverseConfig(_ClosedConfig):
     max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
     accepted_shares_facts: list[str] = Field(default_factory=list)
     top_n_by_cap: int = 1000
+    # Rule 8's ranking (ADR 0023 D4, T212): `cap` is ADR 0006's market-cap rank (needs
+    # rule 7's shares fact); `dollar_volume` ranks by median dollar volume from bars alone
+    # and intersects with Alpaca's tradable assets as of T, for forward books. Frozen with
+    # `universe.*`; a registered family keeps `cap` (`FROZEN_KEY_DEFAULTS`).
+    rank_by: Literal["cap", "dollar_volume"] = "cap"
     # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
     # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
     # split or dividend known at T explains, fails rule 6 while its session is in the

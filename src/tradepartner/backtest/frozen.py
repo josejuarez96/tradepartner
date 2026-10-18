@@ -57,6 +57,9 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # B10's share-turnover screen (backtest spec amendment #1358, T165): 1.0 is no screen.
     # A post-registration own-section key, so it is in `POST_REGISTRATION_OWN_KEYS` below.
     ("strategy.turnover_top_fraction", 1.0, 19),
+    # The universe's rule 8 ranking (ADR 0023 D4, T212): `cap` is today's rule, so no stored
+    # fingerprint moves. A forward book registers `dollar_volume`.
+    ("universe.rank_by", "cap", 28),
 )
 
 #: Keys added to a family's own listed section **after** that family's first

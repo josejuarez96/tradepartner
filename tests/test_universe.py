@@ -6,7 +6,10 @@ Probe times are the fixture README's documented `probe T` values.
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
+import statistics
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -536,3 +539,222 @@ def test_the_bounded_bar_read_gives_the_full_history_universe(
     assert bounded.members.equals(full.members)
     assert bounded.exclusions.equals(full.exclusions)
     assert bounded.shares_fallbacks.equals(full.shares_fallbacks)
+
+
+# --- `universe.rank_by` (ADR 0023 D4, T212) ---------------------------------------------
+
+#: The probe instants above, one per fixture case.
+_RANK_BY_PROBES = (
+    T_DUAL,
+    T_SPLIT_FUTURE,
+    T_SPLIT_BETWEEN,
+    T_STALE,
+    T_TRANSFER,
+    T_WINDOW_DELIST,
+    T_LATE,
+    datetime(2020, 6, 30, 21, 0, tzinfo=UTC),
+)
+
+#: SHA-256 of `universe_as_of` under the default settings at `_RANK_BY_PROBES`: the member
+#: and exclusion rows, the rules, the shares fallbacks and the fill price. Computed on
+#: `origin/main`'s `universe.py` before the key existed (6a9e2dec); it moves on any drift of
+#: `cap`, the default, for any universe, backtest or paper read.
+_CAP_DIGEST = "877e7484094758330f09c5537c080c8db3be30dca6834ac1cd61d7cf2713c3fe"
+
+#: The fixture's first assets snapshot is fetched 2020-06-26 21:00 UTC.
+_BEFORE_SNAPSHOT = datetime(2020, 6, 25, 21, 0, tzinfo=UTC)
+_AFTER_SNAPSHOT = datetime(2020, 6, 30, 21, 0, tzinfo=UTC)
+
+
+def _digest(conn: duckdb.DuckDBPyConnection, settings: Settings) -> str:
+    h = hashlib.sha256()
+    for t in _RANK_BY_PROBES:
+        u = universe_as_of(conn, t, settings)
+        payload = [
+            u.members.columns,
+            u.members.rows(),
+            u.exclusions.rows(),
+            u.rules_enabled,
+            u.shares_fallbacks.rows(),
+            u.settings["fill_price"],
+        ]
+        h.update(json.dumps(payload, default=str, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _rank_settings(**universe: Any) -> Settings:
+    return _settings(rank_by="dollar_volume", **universe)
+
+
+def _history_median(security_id: str, session: date, months: int = 12) -> float:
+    """The median raw close x volume over the history window, from the fixture's first-seen
+    bars (a hand value, never `universe_as_of`'s own read)."""
+    window = {d.isoformat() for d in sessions_in_month_window(session, months)}
+    with (UNIVERSE_DIR / "prices_daily.csv").open(newline="") as fh:
+        first_seen: dict[str, dict[str, str]] = {}
+        for r in sorted(csv.DictReader(fh), key=lambda r: r["known_at"]):
+            if r["security_id"] == security_id and r["session"] in window:
+                first_seen.setdefault(r["session"], r)
+    assert len(first_seen) == len(window)
+    return statistics.median(float(r["close"]) * float(r["volume"]) for r in first_seen.values())
+
+
+def test_rank_by_defaults_to_cap_and_refuses_anything_else() -> None:
+    assert Settings(_env_file=None).universe.rank_by == "cap"  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        _settings(rank_by="market_cap")
+
+
+def test_cap_is_byte_identical_to_main_on_every_probe(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert _digest(fixture_store, Settings(_env_file=None)) == _CAP_DIGEST  # type: ignore[call-arg]
+    assert _digest(fixture_store, _settings(rank_by="cap")) == _CAP_DIGEST
+    u = universe_as_of(fixture_store, T_DUAL, _settings(rank_by="cap"))
+    assert u.members.columns == [
+        "security_id",
+        "cik",
+        "ticker",
+        "exchange",
+        "close",
+        "shares",
+        "market_cap",
+        "company_cap",
+        "company_rank",
+    ]
+    assert (u.n_assets_intersected, u.assets_intersection_skipped) == (0, False)
+
+
+def test_dollar_volume_ranks_by_the_median_over_the_history_window(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, T_DUAL, _rank_settings())
+    session = last_completed_session(T_DUAL)
+    # DUALA and DUALB are one company: its value is its classes' medians summed.
+    expected = {
+        "SEC_SPLIT_FUTURE": _history_median("SEC_SPLIT_FUTURE", session),
+        "SEC_DUAL_A": _history_median("SEC_DUAL_A", session)
+        + _history_median("SEC_DUAL_B", session),
+        "SEC_SPLIT_BETWEEN": _history_median("SEC_SPLIT_BETWEEN", session),
+    }
+    for security_id, value in expected.items():
+        assert _member(u, security_id)["company_dollar_volume"] == pytest.approx(value)
+    values = u.members.unique("cik").sort("company_rank")["company_dollar_volume"].to_list()
+    assert values == sorted(values, reverse=True)
+    # The same instant under `cap` ranks by shares x close instead: the two orders differ.
+    cap = universe_as_of(fixture_store, T_DUAL, _settings())
+    assert u.members.sort("company_rank", "security_id")["security_id"].to_list() != (
+        cap.members["security_id"].to_list()
+    )
+    assert _member(u, "SEC_DUAL_A")["company_rank"] == _member(u, "SEC_DUAL_B")["company_rank"]
+
+
+def test_dollar_volume_needs_no_shares_fact(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    assert universe_as_of(fixture_store, T_LATE, _settings()).members.height > 0
+    with_facts = universe_as_of(fixture_store, T_LATE, _rank_settings())
+    fixture_store.execute("DELETE FROM facts")
+    assert universe_as_of(fixture_store, T_LATE, _settings()).members.is_empty()
+    u = universe_as_of(fixture_store, T_LATE, _rank_settings())
+    assert u.members["security_id"].to_list() == with_facts.members["security_id"].to_list()
+    assert u.members["shares"].null_count() == u.members.height
+    assert u.members["market_cap"].null_count() == u.members.height
+    assert not u.rules_enabled["shares"]
+    assert u.shares_fallbacks.is_empty()
+    assert not (set(_excluded(u).values()) & {(7, "shares", r) for r in MISSING_DATA_REASONS})
+
+
+def test_dollar_volume_keeps_the_high_volume_low_shares_name(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """SPFT has the fewest shares of the three names `cap` ranks at T_DUAL and the most
+    dollar volume: it is last under `cap` and first under `dollar_volume`."""
+    cap = universe_as_of(fixture_store, T_DUAL, _settings(top_n_by_cap=2))
+    assert "SEC_SPLIT_BETWEEN" not in _members(cap)
+    top = universe_as_of(fixture_store, T_DUAL, _rank_settings(top_n_by_cap=1))
+    assert _members(top) == {"SEC_SPLIT_FUTURE"}
+    assert _excluded(top)["SEC_SPLIT_BETWEEN"] == (8, "size", "top_n_by_cap")
+
+
+def test_the_floors_still_apply_under_dollar_volume(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, T_DUAL, _rank_settings(min_median_dollar_volume=1e18))
+    assert u.members.is_empty()
+    assert {reason for _, _, reason in _excluded(u).values()} >= {"min_median_dollar_volume"}
+
+
+def test_intersection_removes_an_untradable_asset_after_the_first_snapshot(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    before = universe_as_of(fixture_store, _BEFORE_SNAPSHOT, _rank_settings())
+    assert not u.assets_intersection_skipped
+    # The latest snapshot lists SPLT, TRNS, RDAT, TCKB (and BNDX, delisted): those stay.
+    assert {m["ticker"] for m in u.members.iter_rows(named=True)} == {
+        "SPLT",
+        "RDAT",
+        "TRNS",
+        "TCKB",
+    }
+    untradable = {
+        s for s, (_, name, reason) in _excluded(u).items() if reason == "untradable_asset"
+    }
+    assert untradable and untradable <= _members(before)
+    assert all(_excluded(u)[s][:2] == (8, "size") for s in untradable)
+    assert u.n_assets_intersected == u.members.height + len(untradable)
+
+
+def test_a_flagged_untradable_asset_is_excluded_and_an_inactive_one_too(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    fixture_store.execute(
+        "UPDATE borrow_status SET tradable = FALSE WHERE symbol = 'SPLT'"
+        " AND known_at > '2020-06-29'"
+    )
+    fixture_store.execute(
+        "UPDATE borrow_status SET status = 'inactive' WHERE symbol = 'RDAT'"
+        " AND known_at > '2020-06-29'"
+    )
+    u = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    assert {m["ticker"] for m in u.members.iter_rows(named=True)} == {"TRNS", "TCKB"}
+
+
+def test_top_n_is_taken_before_the_intersection(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    """The cut is the ranked set's, then the intersection removes from it: a name beyond
+    the top N never takes the place of a removed one."""
+    full = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    cut = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings(top_n_by_cap=1))
+    assert cut.members.height <= 1
+    assert _members(cut) <= _members(full)
+
+
+def test_before_the_first_snapshot_the_intersection_is_skipped_and_recorded(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, _BEFORE_SNAPSHOT, _rank_settings())
+    assert u.assets_intersection_skipped
+    assert u.n_assets_intersected == 0
+    assert all(r != "untradable_asset" for _, _, r in _excluded(u).values())
+    # Never today's list read backwards: the store's later snapshots leave it unchanged.
+    fixture_store.execute("DELETE FROM borrow_status")
+    assert universe_as_of(fixture_store, _BEFORE_SNAPSHOT, _rank_settings()).members.equals(
+        u.members
+    )
+    # And with no snapshot at all (even after the instant), the same rule.
+    after = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    assert after.assets_intersection_skipped and after.members.height > 0
+
+
+def test_a_store_without_the_assets_table_skips_the_intersection(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    fixture_store.execute("DROP TABLE borrow_status")
+    u = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    assert u.assets_intersection_skipped and u.members.height > 0
+
+
+def test_rank_by_is_a_frozen_universe_key_in_the_config_dump(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    u = universe_as_of(fixture_store, T_DUAL, _rank_settings())
+    assert u.settings["universe"]["rank_by"] == "dollar_volume"
