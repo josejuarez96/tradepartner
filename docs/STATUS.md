@@ -4,16 +4,16 @@
 
 ## Recently done
 Phase 1 backtest closed: T45b real-store H1 run (in-sample 2020-08-31..2023-12-29, 40 monthly returns); trial 2 PASS (DSR 0.7262 psr basis, costs 1.25% at 15 bps); trial 1 FAIL on #853 disclosed; quant-auditor verdicts linked in PR. What's next: open holdout gates #1017/#1018 (gap coverage, RVTY/FI), Phase 2 data tasks, T116c evidence, strategy lab, research labeling. Pending follow-up issues: S1 (listing ends 78 Form 25 re-opens), S3 (PerkinElmer/Revvity, WTW bars).
-- Cover-page listings (#1541): spec and plan amendment for the exchange-axis parse fix, the title fallback, a standing coverage check and the owner's release (T178-T182); failed-banks hole disclosed in a research note (TP-4)
-- #1553: `repair_stamps.py restamp-unrepaired --from <unrepaired.csv.gz>` re-stamps an earlier release's unrepaired list filing by filing from each SGML ACCEPTANCE-DATETIME (release restamp-1382a3 next, owner merges).
-- #1555 follow-up: same-run statement cache refresh and separate payload-lag/no-row counters; the production cause remains open. PR #1558.
-- Financial issuers: revenue_financial from RevenuesNetOfInterestExpense, else net interest income + noninterest income, per filing and period (#1556)
-- T179 (#1541): classify.py title fallback behind edgar.title_fallback (default off): placeholders, whole-word types, issuer-name-first titles, class-letter shares. Not enabled until the T181 release.
-- T182 built: ingest --source edgar --rebuild-classifications deletes the covered securities' classifications and rewrites the build's rows at their own known_at (PR open) (#1560)
-- T180 (#1561): health's coverage check against a named reference list (coverage.* config, health --coverage, on-demand page card); report-only until T181 flips coverage.check_enabled.
-- T176 merged: universe.exclude_sic_ranges defaults to none, value guard replaced by a shape check, health guarded_sic_default rule removed; stored registrations keep [[4900, 4999]]. (#1562)
-- T178 (#1563): both cover-page parsers read listings tagged by dei:EntityListingsExchangeAxis behind edgar.exchange_axis_listings (default off; T181 flips it with the version bumps); mismatched MIC members are counted.
-- health --check fails on a session hole: an XNYS session in the universe.min_history_months window whose prices_daily rows are below health.min_session_rows_share of the previous session's (#1575, #1550 part c)
+- #1707: plan line T192b (fill-holes lists mid-month and first-day gaps, 141 E2 member-months) and the spec's time-aware contested rule (T192, #1696).
+- T196: universe rule 2 passes on any live listing on a listed exchange when the newer row is a secondary quote venue (NYSE_CHICAGO, NYSETX); OTC/NONE and Form-25-ended still fail; read-time, no release (#1710)
+- #1712 Spin-off writer stamps known_at at health's ex-date floor
+- T189c slice 1: OpenFIGI mapping client and synthetic fixture built; schema, ingest and health follow in slices 2 and 3. (#1713)
+- #1714 T190b: a pre-trading seed shares fact is no baseline (PR #1716)
+- #1720 `health --check` after the 2026-10-15 ingest: a FINRA "D" OTC pair and two dividend groups
+- T199 (#1722): the C2 done-test -- an AEP-shaped static NASDAQ row with a 2019 NYSE 10-K and a 2021 NASDAQ 10-K, plus the snapshot_static-evidence, writer-path look-ahead test.
+- ADR 0023 break first (#1731): D1-D9 recorded; paper, backtest and data-foundation specs and plans amended (T200-T214, pause list, kill ladder B10 -> B9 -> IRRX); #878 and compliance settled in ADR 0005, roadmap, charter.
+- #1734 IRRX kill-ladder rung 2: not decided from open data (no public industry-relative reversal series; needs firm-level returns), so IRRX's long leg moves to a store-side computation.
+- T170b: metrics.risk_free_source/series/basis frozen keys (defaults constant/DTB3/discount, table entries at schema 28, no fingerprint move) and DataProvider.rates(t, series) over rates_as_of; T170c wires the engine. (#1744)
 
 ## Teams
 Orchestrator session 2351048c (main checkout, team atlas); window tradepartner-c4. No live build teams. Atlas holds T22 #1264. Handovers: issue #836.
