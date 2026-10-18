@@ -1243,7 +1243,9 @@ class TestFamilyBenchmarks:
 
 #: sha256 of every metric row (series, level, key, value as repr) except `risk_free_annual`,
 #: for the fixture run below, taken on the code before `series_metrics` took a per-period
-#: risk-free sequence (T170). The H1 twin's metrics must not move.
+#: risk-free sequence (T170). The H1 twin's metrics must not move. T211's two reported keys
+#: (`beta_spy`, `alpha_spy_annual`) are new rows, left out of the digest and checked below.
+T211_KEYS = ("beta_spy", "alpha_spy_annual")
 PINNED_METRIC_DIGESTS = {
     0.0: "7b0461c930f107298f2f2f05faceb098ed145f90e22f952c11db08d88b6e26d3",
     0.02: "69a52a3f6343ed984d0a6853ceeb8c5ea1f11acefa99da5197117bcfb98c8b5a",
@@ -1269,7 +1271,13 @@ def test_every_pre_existing_metric_row_is_byte_identical(
     kept = [
         "|".join([r.series, str(r.cost_per_side_bps), r.metric, _digits(r.value)])
         for r in rows
-        if r.metric != "risk_free_annual"
+        if r.metric != "risk_free_annual" and r.metric not in T211_KEYS
     ]
     digest = sha256("\n".join(kept).encode()).hexdigest()
     assert digest == PINNED_METRIC_DIGESTS[rate], digest
+    # T211: the two keys are present on every (series, level) the run wrote, as numbers.
+    pairs = {(r.series, r.cost_per_side_bps) for r in rows}
+    for key in T211_KEYS:
+        got = {(r.series, r.cost_per_side_bps): r.value for r in rows if r.metric == key}
+        assert set(got) == pairs, key
+        assert all(v is not None and math.isfinite(v) for v in got.values()), key
