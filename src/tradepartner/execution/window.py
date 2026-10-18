@@ -229,18 +229,26 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, cast, get_args
 from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
 
-from tradepartner.adapters.broker import TERMINAL_STATUSES, Broker, Order, UnknownOrderError
+from tradepartner.adapters.broker import (
+    TERMINAL_STATUSES,
+    Account,
+    Broker,
+    Order,
+    UnknownOrderError,
+)
 from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Frozen, is_forward
 from tradepartner.backtest.schedule import rebalance_sessions
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import (
+    FAMILY_SIGNAL_SECTIONS,
     FROZEN_COSTS_KEYS,
     FROZEN_EXECUTION_KEYS,
     FROZEN_PAPER_KEYS,
@@ -340,6 +348,65 @@ class StartRefusedError(RuntimeError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _target_names(registered: Mapping[str, Any], family: str) -> int | None:
+    """The most names the hypothesis's rule can hold: `strategy.hold_target_names` when
+    `strategy.weighting` is `hold` and it is above 0, else the family's own
+    `<section>.top_fraction` of `universe.top_n_by_cap`, rounded up; `None` when the
+    registration has no such count, where the feasibility rule has nothing to count."""
+    hold = _number(registered.get("strategy.hold_target_names"))
+    if registered.get("strategy.weighting") == "hold" and hold is not None and hold > 0:
+        return int(hold)
+    section = FAMILY_SIGNAL_SECTIONS.get(cast(Any, family), "strategy")
+    fraction = _number(registered.get(f"{section}.top_fraction"))
+    universe = _number(registered.get("universe.top_n_by_cap"))
+    if fraction is None or universe is None:
+        return None
+    names: int = math.ceil(Decimal(repr(fraction)) * Decimal(repr(universe)))
+    return names
+
+
+def _refuse_small_account(
+    registered: Mapping[str, Any], family: str, settings: Settings, account: Account, slug: str
+) -> None:
+    """The start feasibility rule, every window (spec amendment 2026-10-18 item 8;
+    ADR 0023 D6; T206): within the limits the window will freeze, n names must each be
+    able to hold the minimum order. Refused as `refused_small_account`, before any
+    write, when n x `risk.min_order_notional` x (1 + `risk.whole_share_price_buffer`)
+    exceeds the account's cash, when n is under 1 / `risk.max_position_weight`, or when
+    one buffered minimum order exceeds `risk.max_order_notional_fraction` of equity."""
+    names = _target_names(registered, family)
+    if names is None:
+        return
+    risk = settings.risk
+    unit = Decimal(repr(risk.min_order_notional)) * (
+        1 + Decimal(repr(risk.whole_share_price_buffer))
+    )
+    cash = Decimal(repr(float(account.cash)))
+    equity = Decimal(repr(float(account.equity)))
+    problem: str | None = None
+    if Decimal(names) * unit > cash:
+        problem = (
+            f"{names} x {unit:.2f} = {Decimal(names) * unit:.2f} does not fit the cash {cash:.2f}"
+        )
+    elif risk.max_position_weight > 0 and names * Decimal(repr(risk.max_position_weight)) < 1:
+        problem = f"{names} names are too few for the {risk.max_position_weight} position limit"
+    elif unit > Decimal(repr(risk.max_order_notional_fraction)) * equity:
+        problem = (
+            f"one minimum order {unit:.2f} is over {risk.max_order_notional_fraction} "
+            f"of the equity {equity:.2f}"
+        )
+    if problem is not None:
+        raise StartRefusedError(
+            "refused_small_account", f"{slug!r} cannot start on this account: {problem}"
+        )
 
 
 @dataclass(frozen=True)
@@ -776,6 +843,7 @@ def start(
                 f"account() failed on the paper endpoint ({type(exc).__name__})",
             ) from exc
         _refuse_account_in_use(account.account_id, other_accounts)
+        _refuse_small_account(registered, hyp.family, settings, account, slug)
         open_orders = broker.open_orders()
         positions = broker.positions()
         # The booked-`FEE` seen-set `paper start` records (#1583, T183, spec item
