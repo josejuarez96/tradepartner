@@ -375,6 +375,62 @@ def test_report_appends_a_paper_reports_row_naming_the_trial_and_through_session
     assert stored_trial_id == outcome.paper_report.trial_id
 
 
+def test_report_still_writes_its_row_when_the_slippage_line_cannot_be_computed(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1741: a fill whose session has no calendar entry (or any other slip failure)
+    makes the slippage computation raise; `paper report` must print
+    `slippage n/a (<reason>)` and still write its `paper_reports` row. The real
+    raise for a non-session date is covered by
+    `tests/execution/test_slippage.py::test_an_order_session_that_is_not_a_trading_session_raises`;
+    here the computation fails with that same error."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        window_id = _seed_tracking_window(conn)
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: REPORT_NOW)
+
+    def bad_slippage(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("not an XNYS session: 2019-08-31")
+
+    monkeypatch.setattr(report_module, "window_slippage", bad_slippage)
+
+    outcome = report(report_settings, partial(open_read_only, report_settings))
+
+    assert outcome.slippage is None
+    assert outcome.slippage_note == "not an XNYS session: 2019-08-31"
+    with open_read_only(report_settings) as conn:
+        rows = conn.execute("SELECT window_id FROM paper_reports").fetchall()
+    assert [row[0] for row in rows] == [window_id]
+
+
+def test_report_does_not_swallow_a_failure_outside_the_slippage_computation(
+    fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1741: only the slippage call is wrapped, so a bug in the comparisons still
+    raises and never hides behind the diagnostic's `n/a`."""
+    report_settings = Settings(_env_file=None, store={"path": str(fixture_store_path)})
+    with open_for_write(report_settings) as conn:
+        _seed_tracking_window(conn)
+
+    import tradepartner.execution.report as report_module
+
+    monkeypatch.setattr(report_module, "utc_now", lambda: REPORT_NOW)
+
+    def bad_targets(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("a bug outside the slippage code")
+
+    monkeypatch.setattr(report_module, "compare_targets", bad_targets)
+
+    with pytest.raises(RuntimeError, match="a bug outside the slippage code"):
+        report(report_settings, partial(open_read_only, report_settings))
+    with open_read_only(report_settings) as conn:
+        count = conn.execute("SELECT count(*) FROM paper_reports").fetchone()
+    assert count is not None and count[0] == 0
+
+
 def test_report_for_a_book_runs_that_books_hypothesis_never_mains(
     fixture_store_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1967,6 +1967,12 @@ class PaperConfig(BaseModel):
     min_override_reason_chars: int = Field(default=20, ge=1)
     min_universe_names: int = Field(default=1, ge=1)
     max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
+    #: `paper status` reads the slippage line over only the newest
+    #: `status_slippage_sessions` order sessions of the window (#1741): the line is
+    #: a diagnostic, and one `prices_as_of` read per session would otherwise grow
+    #: with the window's length. Read at run time, never frozen; `paper report`
+    #: keeps the full window (its `paper_reports` row is the record).
+    status_slippage_sessions: int = Field(default=20, gt=0)
 
     @field_validator("min_rebalances")
     @classmethod

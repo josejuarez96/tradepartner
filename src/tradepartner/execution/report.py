@@ -711,6 +711,9 @@ class Report:
     paper_report: PaperReportRow
     #: Per-fill slippage against the session open (#1733); None only in canned test reports.
     slippage: Slippage | None = None
+    #: Why `slippage` is None when the computation raised (#1741): `paper report`
+    #: prints `slippage n/a (<reason>)` and the `paper_reports` row is still written.
+    slippage_note: str | None = None
 
 
 def _local_date(at: datetime) -> date:
@@ -842,6 +845,21 @@ def _before(session: date, cadence: Cadence) -> date:
     return rebalance_sessions(last - _REBALANCE_SEARCH, last, cadence)[-1]
 
 
+def _slippage_for_report(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> tuple[Slippage | None, str | None]:
+    """The report's slippage summary, or `(None, reason)` when the computation
+    raises (#1741). A missing bar, a session that is not a trading session, or any
+    other slip failure is a diagnostic, never the `paper_reports` row's price:
+    only the `window_slippage` call is wrapped, so a bug in the comparisons above
+    still raises."""
+    now = utc_now()
+    try:
+        return window_slippage(conn, window_id, now), None
+    except Exception as exc:  # a slippage diagnostic never blocks the report row
+        return None, (str(exc) or type(exc).__name__)
+
+
 def report(settings: Settings, connect: Connect, book_id: str | None = None) -> Report:
     """`paper report --book <book>` (spec req 10; ADR 0017 B.7): opens a
     `kind=tracking` trial over `[T_0, last completed T]` on the real store with
@@ -914,7 +932,7 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         closes = _price_of(conn, "close")
         comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
         targets = compare_targets(window, trial, journal, conn)
-        fill_slippage = window_slippage(conn, window_id, utc_now())
+        fill_slippage, slippage_note = _slippage_for_report(conn, window_id)
 
     now = utc_now()
     paper_report_row = PaperReportRow(
@@ -933,4 +951,5 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         targets=targets,
         paper_report=paper_report_row,
         slippage=fill_slippage,
+        slippage_note=slippage_note,
     )

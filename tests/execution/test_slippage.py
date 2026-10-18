@@ -204,3 +204,79 @@ def test_a_fill_without_its_order_session_is_refused_naming_the_fill(
     monkeypatch.setattr(slippage.store_journal, "fills_for", lambda *_a, **_k: fills)
     with pytest.raises(ValueError, match=r"fill 7 \(b7\)"):
         slippage.window_slippage(store, 1, AFTER)
+
+
+# --- bounded status read (#1741) ----------------------------------------------------
+
+_OLDER = date(2026, 10, 13)
+_MIDDLE = date(2026, 10, 14)
+_NEWEST = date(2026, 10, 15)
+_SATURDAY = date(2026, 10, 17)
+_AFTER_ALL = datetime(2026, 10, 18, 14, tzinfo=UTC)
+
+
+def _at(session: date) -> datetime:
+    return datetime(session.year, session.month, session.day, 15, tzinfo=UTC)
+
+
+def _bar_on(
+    conn: duckdb.DuckDBPyConnection, security: str, session: date, open_: float, close: float
+) -> None:
+    known = session_close(session)
+    conn.execute(
+        "INSERT INTO prices_daily (security_id, session, open, high, low, close, volume, "
+        "known_at, ingested_at, source, provenance) VALUES (?, ?, ?, 999, 1, ?, 10, ?, ?, "
+        "'test', 'bar')",
+        [security, session, open_, close, known, known],
+    )
+
+
+def test_a_bounded_read_measures_only_the_newest_sessions(
+    store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1741: `paper status` passes `sessions=N`, so the read is bounded to the
+    newest N order sessions, one `prices_as_of` per session at most; the whole
+    window is never measured."""
+    for session in (_OLDER, _MIDDLE, _NEWEST):
+        _bar_on(store, "A", session, open_=100.0, close=101.0)
+    fills = [
+        _fill("buy", "A", 110.0, 1, order="oldest", session=_OLDER, at=_at(_OLDER)),
+        _fill("buy", "A", 101.0, 2, order="middle", session=_MIDDLE, at=_at(_MIDDLE)),
+        _fill("buy", "A", 102.0, 3, order="newest", session=_NEWEST, at=_at(_NEWEST)),
+    ]
+    monkeypatch.setattr(slippage.store_journal, "fills_for", lambda *_a, **_k: fills)
+    reads: list[datetime] = []
+    real = slippage.prices_as_of
+
+    def counting(
+        conn: duckdb.DuckDBPyConnection, as_of: datetime, securities: list[str], **kwargs: object
+    ) -> object:
+        reads.append(as_of)
+        return real(conn, as_of, securities, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(slippage, "prices_as_of", counting)
+    out = slippage.window_slippage(store, 1, _AFTER_ALL, sessions=2)
+    assert len(reads) == 2  # at most the newest two sessions' prices
+    assert out.buy.count == 2  # and only those two orders are measured
+    assert out.buy.p90_bp == pytest.approx(190.0)  # the oldest order's 1000 bp is absent
+    assert session_close(_OLDER) not in reads
+
+
+def test_an_order_session_that_is_not_a_trading_session_raises(
+    store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property's error source (#1741): a fill whose session has no calendar
+    entry makes the slippage computation raise, which `paper report` must then
+    catch so its row is still written."""
+    at = datetime(2026, 10, 17, 15, tzinfo=UTC)
+    fills = [_fill("buy", "A", 100.0, 1, session=_SATURDAY, at=at)]
+    monkeypatch.setattr(slippage.store_journal, "fills_for", lambda *_a, **_k: fills)
+    with pytest.raises(ValueError, match="not an XNYS session: 2026-10-17"):
+        slippage.window_slippage(store, 1, _AFTER_ALL)
+
+
+def test_the_report_line_names_the_reason_when_the_summary_is_unavailable() -> None:
+    assert slippage.slippage_report_lines(None, "not an XNYS session: 2026-10-17") == [
+        "slippage n/a (not an XNYS session: 2026-10-17)"
+    ]
+    assert slippage.slippage_report_lines(None) == []
