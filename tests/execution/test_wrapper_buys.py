@@ -33,6 +33,7 @@ from .test_wrapper_phases import (
     _gate,
     _hold,
     _query,
+    _retick,
     _run,
     _settings,
     _submits,
@@ -47,6 +48,7 @@ def timed_env(
 ) -> Env:
     """Build the fixture's run after moving the clock before the open."""
     settings = _settings(journal_settings.store.path)
+    _retick(settings)
     for security_id in SYMBOLS:
         _bar(settings, security_id, PRICE)
     earlier = _run(settings, open_window, PREV, CUT - timedelta(hours=3))

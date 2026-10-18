@@ -249,6 +249,7 @@ from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, 
 from tradepartner.execution.reconcile import OK as RECONCILED
 from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
 from tradepartner.execution.risk import OpenSell, unfilled_sells
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
 from tradepartner.execution.wrapper import (
     CRASH_EXIT_CODE,
@@ -632,7 +633,13 @@ def _exit_book(context: StepContext) -> _ExitBook:
             if held
             else {}
         )
-        tickers = _current_tickers(listings_as_of(conn, cut, held), session) if held else {}
+        tickers = (
+            _current_symbols(
+                listings_as_of(conn, cut, held), session, context.settings.alpaca.class_symbols
+            )
+            if held
+            else {}
+        )
         marks_rows = positions_daily_for(conn, window_id)
         run_rows = [r.run for r in runs_for(conn, window_id)]
     price_of = _lookup(prices, unpriced)
@@ -1829,12 +1836,12 @@ class _Run:
         return self._ledger_for(actions)(through)
 
     def _symbols(self, names: Sequence[str]) -> dict[str, str]:
-        """Each name's ticker on its listing current at S, known at close(S-1)."""
+        """Each name's broker symbol on its listing current at S, known at close(S-1)."""
         if not names:
             return {}
         with open_read_only(self.settings) as conn:
             listings = listings_as_of(conn, self._cut(), list(names))
-        return _current_tickers(listings, self.session)
+        return _current_symbols(listings, self.session, self.settings.alpaca.class_symbols)
 
     def _start_day(self) -> date:
         return self.window.started_at.astimezone(_NEW_YORK).date()
@@ -1856,7 +1863,11 @@ class _Run:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
             symbols = (
-                _current_tickers(listings_as_of(conn, self._cut(), sorted(held)), self.session)
+                _current_symbols(
+                    listings_as_of(conn, self._cut(), sorted(held)),
+                    self.session,
+                    self.settings.alpaca.class_symbols,
+                )
                 if held
                 else {}
             )
@@ -2148,8 +2159,14 @@ def _rebalance_kind(
     )
 
 
-def _current_tickers(listings: pl.DataFrame, day: date) -> dict[str, str]:
-    return {sid: row["ticker"] for sid, row in planning.current_listings(listings, day).items()}
+def _current_symbols(
+    listings: pl.DataFrame, day: date, class_symbols: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Each name's broker symbol on its listing current on `day` (#1729); a
+    name whose ticker has no broker form is left out (never sent)."""
+    current = planning.current_listings(listings, day)
+    symbols = {sid: broker_symbol(row, class_symbols) for sid, row in current.items()}
+    return {sid: symbol for sid, symbol in symbols.items() if symbol is not None}
 
 
 def _current_ids(listings: pl.DataFrame, day: date, ticker: str) -> list[str]:
