@@ -83,6 +83,7 @@ from tradepartner.execution.lock import resolve_book
 from tradepartner.execution.marks import equity_at
 from tradepartner.execution.plan import residue as residue_of
 from tradepartner.execution.plan import stop_session as stop_session_of_request
+from tradepartner.execution.slippage import Slippage, window_slippage
 from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal as store_journal
 from tradepartner.store import registry
@@ -708,6 +709,8 @@ class Report:
     comparison: PeriodComparison
     targets: TargetComparison
     paper_report: PaperReportRow
+    #: Per-fill slippage against the session open (#1733); None only in canned test reports.
+    slippage: Slippage | None = None
 
 
 def _local_date(at: datetime) -> date:
@@ -911,6 +914,7 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
         closes = _price_of(conn, "close")
         comparison = compare_periods(window, trial, journal, actions, prices, closes, stop_session)
         targets = compare_targets(window, trial, journal, conn)
+        fill_slippage = window_slippage(conn, window_id)
 
     now = utc_now()
     paper_report_row = PaperReportRow(
@@ -924,4 +928,9 @@ def report(settings: Settings, connect: Connect, book_id: str | None = None) -> 
     with open_for_write(settings) as write_conn:
         store_journal.append(write_conn, paper_report_row)
 
-    return Report(comparison=comparison, targets=targets, paper_report=paper_report_row)
+    return Report(
+        comparison=comparison,
+        targets=targets,
+        paper_report=paper_report_row,
+        slippage=fill_slippage,
+    )

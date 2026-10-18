@@ -35,6 +35,7 @@ from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
+from tradepartner.execution import slippage as paper_slippage
 from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import run_lock
 from tradepartner.execution.lots_reconcile import BrokerLotRow
@@ -1509,6 +1510,7 @@ STATUS_MAIN = (
     "positions 0 (value 0.00); open orders 0; targets 0\n"
     "kill switch released (causes: -)\n"
     "reconciliation n/a\n"
+    "slippage vs open (bp, adverse positive): buy n=0; sell n=0; all n=0; no bar 0\n"
     "alerts (0):\n"
 )
 CHECK_MAIN = (
@@ -1662,6 +1664,37 @@ def test_report_passes_the_book_and_prints_the_same_lines(
     assert (plain.exit_code, plain.output) == (0, expected)
     assert (for_b.exit_code, for_b.output) == (0, expected)
     assert books == [None, "b"]
+
+
+def test_report_prints_the_slippage_line(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, factory: _Factory
+) -> None:
+    """#1733: a report that carries a slippage summary prints its one line last."""
+    side = paper_slippage.SideSlippage(2, 12.5, 20.0)
+    canned = paper_report.Report(
+        comparison=paper_report.PeriodComparison(
+            tracking_rule="raw", tracking_k=2.0, periods=(), passed=True, failing_period=None
+        ),
+        targets=paper_report.TargetComparison(rows=()),
+        paper_report=journal.PaperReportRow(
+            window_id=1,
+            trial_id=7,
+            through_session=date(2026, 11, 30),
+            run_at=SESSION_CLOCK,
+            known_at=SESSION_CLOCK,
+            ingested_at=SESSION_CLOCK,
+        ),
+        slippage=paper_slippage.Slippage(
+            buy=side, sell=paper_slippage.SideSlippage(0, None, None), overall=side, no_bar=3
+        ),
+    )
+    monkeypatch.setattr(paper_report, "report", lambda *_a, **_k: canned)
+    out = _paper(clock, factory, "report")
+    assert out.exit_code == 0
+    assert out.output.splitlines()[-1] == (
+        "slippage vs open (bp, adverse positive): buy n=2 median 12.50 p90 20.00; "
+        "sell n=0; all n=2 median 12.50 p90 20.00; no bar 3"
+    )
 
 
 # --- `paper shakedown` (ADR 0017 part E; plan T157b) --------------------------------
