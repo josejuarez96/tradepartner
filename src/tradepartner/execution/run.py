@@ -199,6 +199,7 @@ from __future__ import annotations
 import bisect
 import json
 import os
+import shutil
 import sys
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -206,6 +207,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, TypeVar, cast
 from zoneinfo import ZoneInfo
 
@@ -333,12 +335,20 @@ OK = "ok"
 LOCKED = "locked"
 NO_WINDOW = "no_window"
 RUN_FAILED = "run_failed"
+
+
+class DiskFloorError(RuntimeError):
+    """The store's disk has less free space than `paper.min_free_disk_gb`
+    (#1758): the run refuses to start, before any broker call or run row."""
+
+
 #: A clock or store fault before the run row exists: `tracking_run` sends a
 #: `run_failed` alert with no run id, then re-raises (owner decision on #1440 Q2).
 _PRE_RUN_FAULTS: tuple[type[Exception], ...] = (
     ClockError,
     duckdb.Error,
     StoreLockedError,
+    DiskFloorError,
     JournalNotInitialised,
     JournalIntegrityError,
     SchemaVersionError,
@@ -984,7 +994,30 @@ def _start(
             book_id=book,
         )
         return RunOutcome(LOCKED, session=session)
+    _require_free_disk(settings)
     return _locked_run(settings, connect, broker, clock, sleep, book)
+
+
+def _free_bytes(path: Path) -> int:
+    """Free bytes on the disk holding `path`, or its nearest existing parent."""
+    probe = path.resolve()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free
+
+
+def _require_free_disk(settings: Settings) -> None:
+    """`DiskFloorError` when the store's disk is below `paper.min_free_disk_gb`
+    (#1758); a floor of 0 skips the check. It is a pre-run fault: a
+    `run_failed` alert with no run id, no result row, so no kill switch."""
+    floor_gb = settings.paper.min_free_disk_gb
+    if floor_gb <= 0:
+        return
+    free_gb = _free_bytes(Path(settings.store.path)) / 1e9
+    if free_gb < floor_gb:
+        raise DiskFloorError(
+            f"{free_gb:.1f} GB free is below paper.min_free_disk_gb ({floor_gb:g} GB)"
+        )
 
 
 def _pre_run_failed(

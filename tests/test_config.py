@@ -2482,3 +2482,13 @@ def test_openfigi_defaults_are_disabled_and_bounded() -> None:
     assert config.limits(keyed=True) == (25, 6, 100)
     assert config.limits(keyed=False) == (25, 60, 5)
     assert OpenfigiConfig(jobs_per_request=100).limits(keyed=False)[2] == 5
+
+
+def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None:
+    """#1758: `paper.min_free_disk_gb` defaults above zero, 0 turns it off, a
+    negative value is refused, and it is not frozen at `paper start`."""
+    assert Settings(_env_file=None).paper.min_free_disk_gb > 0
+    assert Settings(_env_file=None, paper={"min_free_disk_gb": 0}).paper.min_free_disk_gb == 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, paper={"min_free_disk_gb": -1})
+    assert "min_free_disk_gb" not in FROZEN_PAPER_KEYS
