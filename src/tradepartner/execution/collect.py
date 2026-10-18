@@ -150,6 +150,11 @@ WRITER_KINDS = ("run", "resume")
 _RUN = WRITER_KINDS[0]
 _PENDING = "pending"
 _REJECTED = "rejected"
+#: The reasons of a `rejected` event that is an allowlisted per-name refusal on
+#: `submit`, a skip and never a rejection (paper spec amendment 2026-10-18 item 2, T202).
+_SKIP_REFUSAL_REASONS = frozenset(
+    {"skip_asset_unknown", "skip_not_fractionable", "skip_untradable"}
+)
 _BUY = "buy"
 _WRITTEN_OFF = "written_off"
 _UNFUNDED = "unfunded"
@@ -385,6 +390,7 @@ def _runs_to_judge(
         run_of[e.client_order_id]
         for e in events
         if e.status == _REJECTED
+        and e.reason not in _SKIP_REFUSAL_REASONS
         and e.client_order_id in run_of
         and (last_run is None or e.known_at > last_run)
     }
@@ -558,11 +564,22 @@ def rejection_breaches(
 ) -> tuple[RejectionBreach, ...]:
     """The rejection verdicts for the submitting runs `run_ids`, in run order:
     `rejected` orders above `max_rejections` (the frozen
-    `risk.max_rejections_per_run`), or every order of the run rejected."""
-    rejected_ids = {e.client_order_id for e in order_events if e.status == _REJECTED}
+    `risk.max_rejections_per_run`), or every order of the run rejected. An order
+    closed `rejected` with a skip reason (an allowlisted refusal on `submit`) is a
+    skip: it leaves the count and the run's order total alike."""
+    refused = {
+        e.client_order_id
+        for e in order_events
+        if e.status == _REJECTED and e.reason in _SKIP_REFUSAL_REASONS
+    }
+    rejected_ids = {
+        e.client_order_id
+        for e in order_events
+        if e.status == _REJECTED and e.reason not in _SKIP_REFUSAL_REASONS
+    }
     breaches = []
     for run_id in sorted(set(run_ids)):
-        mine = [o for o in orders if o.run_id == run_id]
+        mine = [o for o in orders if o.run_id == run_id and o.client_order_id not in refused]
         rejected = sum(o.client_order_id in rejected_ids for o in mine)
         all_rejected = bool(mine) and rejected == len(mine)
         if rejected > max_rejections or all_rejected:

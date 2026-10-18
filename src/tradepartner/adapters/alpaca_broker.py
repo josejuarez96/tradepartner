@@ -122,7 +122,14 @@ from tradepartner.adapters.broker import (
     canonical_symbol,
 )
 from tradepartner.config import Settings
-from tradepartner.errors import ClockError, SystemFaultError
+from tradepartner.errors import (
+    AssetNotFoundError,
+    AssetNotTradableError,
+    ClockError,
+    NotFractionableError,
+    ReconciliationError,
+    SystemFaultError,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Every Alpaca order status this adapter accepts (spec req 2); any other raises.
@@ -327,6 +334,41 @@ def _error_code(error: AlpacaTradingError) -> object:
     return body.get("code") if isinstance(body, dict) else None
 
 
+#: HTTP status of the broker's per-order 403 refusals (code 40310000).
+_FORBIDDEN = 403
+
+
+def _error_message(error: AlpacaTradingError) -> str:
+    """The `message` in a refusal's JSON body, or an empty string."""
+    try:
+        body = json.loads(error.body)
+    except ValueError:
+        return ""
+    message = body.get("message") if isinstance(body, dict) else None
+    return message if isinstance(message, str) else ""
+
+
+def _raise_typed_refusal(error: AlpacaTradingError, coid: str) -> None:
+    """Map the submit refusals the wrapper's allowlist knows to typed errors
+    (spec amendment 2026-10-18 item 2, T202); return for any other refusal, which
+    the caller raises as is. By refusal, not by side: the wrapper decides what a
+    sell's refusal means."""
+    message = _error_message(error)
+    if error.status_code == _NOT_FOUND and _error_code(error) == _ASSET_NOT_FOUND_CODE:
+        raise AssetNotFoundError(f"the broker does not know the asset of order {coid!r}") from None
+    if error.status_code == _FORBIDDEN:
+        if "insufficient qty available" in message:
+            raise ReconciliationError(f"the broker holds less than order {coid!r} sells") from None
+        if "is not fractionable" in message:
+            raise NotFractionableError(
+                f"the broker refused order {coid!r}: asset not fractionable"
+            ) from None
+        if "is not tradable" in message:
+            raise AssetNotTradableError(
+                f"the broker refused order {coid!r}: asset not tradable"
+            ) from None
+
+
 def _decimals(value: float) -> int:
     exponent = Decimal(repr(value)).normalize().as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
@@ -414,6 +456,7 @@ class AlpacaBroker(Broker):
                 raise DuplicateClientOrderIdError(
                     f"the broker refused order {coid!r} as a duplicate"
                 ) from None
+            _raise_typed_refusal(error, coid)
             raise
         order = _mapped("order", _order, payload)
         if order.client_order_id != coid:
