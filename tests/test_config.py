@@ -1945,13 +1945,14 @@ def test_paper_min_rebalances_table_overrides_one_cadence() -> None:
         Settings(_env_file=None, paper={"min_rebalances": {"month_end": 6, "week_end": 13}})
 
 
-def test_frozen_paper_keys_are_the_five_req_14_names() -> None:
+def test_frozen_paper_keys_are_the_req_14_names() -> None:
     assert FROZEN_PAPER_KEYS == (
         "tracking_k",
         "min_rebalances",
         "tracking_rule",
         "max_catch_up_sessions",
         "min_override_reason_chars",
+        "max_stale_mark_sessions",  # #1763; a window frozen before it reads 0
     )
     assert set(FROZEN_PAPER_KEYS) <= set(PaperConfig.model_fields)
     # The universe-collapse keys are read at run time, never frozen (#1550, T188), so

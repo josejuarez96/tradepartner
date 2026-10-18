@@ -70,6 +70,7 @@ from itertools import pairwise
 from typing import cast
 
 import duckdb
+import polars as pl
 
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult
 from tradepartner.backtest.frozen import frozen_values
@@ -81,8 +82,9 @@ from tradepartner.backtest.metrics import (
     red_flag,
     series_metrics,
 )
-from tradepartner.backtest.riskfree import constant_period_returns
+from tradepartner.backtest.riskfree import constant_period_returns, period_risk_free
 from tradepartner.backtest.schedule import periods_per_year, rebalance_sessions
+from tradepartner.calendar import session_close
 from tradepartner.config import FAMILIES, Cadence, HypothesisFamily, Settings
 from tradepartner.store import registry, research, schema
 from tradepartner.store.registry import (
@@ -234,6 +236,68 @@ def _period_returns(rows: Sequence[EquityRow], ends: Sequence[date]) -> list[flo
     return [equity[b] / equity[a] - 1 for a, b in pairwise(ends)]
 
 
+#: `rates.value` is the published quote in percent (`5.25` is 5.25%); the conversion takes
+#: a fraction.
+_PERCENT = 100.0
+
+
+def _rates_by_session(
+    frame: pl.DataFrame | None, series: str, sessions: Sequence[date]
+) -> dict[date, float]:
+    """`rf(s)` for every session after the first, as the published fraction: the value of
+    the latest observation (by `observation_date`) among the frame's rows with
+    `known_at <= close(s)`, carried across the sessions with none newer. A session with
+    nothing known at its close is left out, which `period_risk_free` turns into
+    `RiskFreeMissing` (a series the store lacks, or sessions before its first stamp).
+
+    The frame is the engine's one read at the data cutoff: the latest revision of each
+    observation known then, so a revision first known after `close(s)` and before the
+    cutoff hides that observation from `s` (the earlier carry applies) rather than
+    serving the earlier revision."""
+    if frame is None:
+        raise ValueError(
+            "metrics.risk_free_source is 'store' but the result carries no rates frame"
+        )
+    rows = sorted(
+        (
+            (known_at, observed, value)
+            for known_at, observed, value in frame.filter(pl.col("series") == series)
+            .select("known_at", "observation_date", "value")
+            .iter_rows()
+        ),
+        key=lambda row: row[0],
+    )
+    out: dict[date, float] = {}
+    latest: tuple[date, float] | None = None
+    taken = 0
+    for session in sessions[1:]:
+        close = session_close(session)
+        while taken < len(rows) and rows[taken][0] <= close:
+            _, observed, value = rows[taken]
+            if latest is None or observed >= latest[0]:
+                latest = (observed, value)
+            taken += 1
+        if latest is not None:
+            out[session] = latest[1] / _PERCENT
+    return out
+
+
+def _risk_free_returns(
+    result: BacktestResult, params: Settings, ends: Sequence[date], ppy: int, n_periods: int
+) -> list[float]:
+    """The risk-free return of each period: `constant`, the compounded
+    `metrics.risk_free_rate`, or `store`, the compounded T-bill accrual over the sessions
+    of the period (`riskfree.period_risk_free`). Raises `RiskFreeMissing` (before any
+    row is written) when a session has no rate known at its close."""
+    metrics = params.metrics
+    if metrics.risk_free_source == "constant":
+        return constant_period_returns(metrics.risk_free_rate, ppy, n_periods)
+    series = metrics.risk_free_series
+    sessions = sorted({row.session for row in result.equity})
+    published = _rates_by_session(result.rates, series, sessions)
+    return period_risk_free(sessions, ends, published, basis=metrics.risk_free_basis, series=series)
+
+
 def metric_rows(
     results: Mapping[float, BacktestResult],
     params: Settings,
@@ -253,6 +317,7 @@ def metric_rows(
         result = results[level]
         ends = _period_ends(result, cadence)
         returns = {s: _period_returns(_series_equity(result, s), ends) for s in all_series}
+        risk_free = _risk_free_returns(result, params, ends, ppy, len(ends) - 1)
         for series in all_series:
             values = series_metrics(
                 series,
@@ -265,9 +330,7 @@ def metric_rows(
                 spy_period_returns=returns[SPY_SERIES],
                 mtum_period_returns=returns[MTUM_SERIES],
                 periods_per_year=ppy,
-                risk_free_period_returns=constant_period_returns(
-                    params.metrics.risk_free_rate, ppy, len(returns[series])
-                ),
+                risk_free_period_returns=risk_free,
                 family_benchmark=None if third is None else (third, returns[third]),
             )
             rows.extend(MetricRow(series, level, key, value) for key, value in values.items())

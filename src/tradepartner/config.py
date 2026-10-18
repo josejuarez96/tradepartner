@@ -1769,7 +1769,8 @@ class LabConfig(BaseModel):
 
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
 
-# The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
+# The `paper.*` keys req 14 freezes (the sixth, `max_stale_mark_sessions`, #1763, reads 0
+# for a window frozen before it existed) into the window at `paper start`, beside the
 # whole `risk.*` section; every other `paper.*` key is read at run time. `min_rebalances`
 # is frozen as its window's cadence's entry of the per-cadence table (ADR 0017 part C).
 FROZEN_PAPER_KEYS: tuple[str, ...] = (
@@ -1778,6 +1779,7 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "tracking_rule",
     "max_catch_up_sessions",
     "min_override_reason_chars",
+    "max_stale_mark_sessions",
 )
 
 # The `execution.*` keys req 14 also freezes into the window at `paper start` (#366
@@ -1920,7 +1922,11 @@ _DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
-    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys. The six
+    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys.
+    `max_stale_mark_sessions` (#1763, owner decision) is how many consecutive sessions a
+    tradable held name missing its S-1 bar is marked at its last close, with an alert,
+    before the run fails; 0 is the old fail-at-once rule, which an already-open window
+    keeps (its `frozen_json` lacks the key). The six
     timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
     `accept_wait_seconds`, `fill_read_overlap_seconds`) were checked against Probe 3's
     measured paper fill latency and all kept (#182, T70, the ADR 0006 amendment of
@@ -1959,6 +1965,7 @@ class PaperConfig(BaseModel):
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
+    max_stale_mark_sessions: int = Field(default=3, ge=0)
     submit_window_before_open_minutes: int = Field(default=90, ge=0)
     submit_window_after_open_minutes: int = Field(default=30, ge=0)
     sell_wait_seconds: float = Field(default=900.0, ge=0)
