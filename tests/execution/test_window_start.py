@@ -2228,3 +2228,48 @@ def test_the_name_count_is_the_family_own_top_fraction(
     else:
         result = window.start(settings, _connect(settings), fake, fixed_clock, "b3")
         assert result.window.hypothesis_id == hyp.hypothesis_id
+
+
+# `strategy.hold_target_names` is the name count only under `strategy.weighting =
+# hold`; under the default `equal` it is inert (config.py `StrategyConfig`), so a stray
+# value never counts. 0.1 x 250 = 25 names ($25.50 at $100, accepted); 150 hold names
+# need $153.00 (refused).
+
+
+@pytest.mark.parametrize(
+    ("weighting", "refused"),
+    [
+        pytest.param("equal", False, id="equal-ignores-hold-names-accepted"),
+        pytest.param("hold", True, id="hold-counts-hold-names-refused"),
+    ],
+)
+def test_hold_target_names_count_only_under_hold_weighting(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    tmp_path: Path,
+    weighting: str,
+    refused: bool,
+) -> None:
+    """Section on, $100, the same 25-name `top_fraction` registration with
+    `strategy.hold_target_names` = 150: under `equal` the start rule counts 25 names
+    and opens; under `hold` it counts 150 and refuses `refused_small_account` before
+    any write."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    _register_names(
+        settings,
+        tmp_path,
+        {
+            **TWENTY_FIVE_NAMES,
+            "strategy.weighting": weighting,
+            "strategy.hold_target_names": 150,
+        },
+    )
+    fake = _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH)
+    if refused:
+        with pytest.raises(window.StartRefusedError) as exc:
+            window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+        assert exc.value.reason == "refused_small_account"
+        assert _windows(settings) == []
+    else:
+        result = window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+        assert [w[0] for w in _windows(settings)] == [result.window.window_id]

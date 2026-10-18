@@ -2611,3 +2611,36 @@ def test_risk_small_account_refuses_unknown_keys_and_non_booleans(
     assert Settings(_env_file=None, risk={"small_account": {"enabled": False}}).risk
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={"small_account": section})
+
+
+# The env-var form (#1807 re-review): `RISK__SMALL_ACCOUNT__ENABLED` is how the
+# section is set beside the other `risk.*` keys. "true"/"false" load (any case); every
+# other spelling of a boolean, and an int, is refused at load, never read as on.
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [("true", True), ("false", False), ("TRUE", True), ("False", False)],
+)
+def test_risk_small_account_loads_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str, enabled: bool
+) -> None:
+    monkeypatch.setenv("RISK__SMALL_ACCOUNT__ENABLED", value)
+    assert Settings(_env_file=None).risk.small_account.enabled is enabled
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "on", "0"])
+def test_risk_small_account_refuses_other_boolean_spellings_in_the_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RISK__SMALL_ACCOUNT__ENABLED", value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", [1, 0, "yes", "1"])
+def test_risk_small_account_refuses_an_int_or_other_spelling_in_the_section(
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"small_account": {"enabled": value}})
