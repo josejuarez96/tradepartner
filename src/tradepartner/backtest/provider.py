@@ -19,6 +19,10 @@ The turnover read (`turnover_inputs`; backtest spec amendment #1358, plan T165b)
 the `momentum` family's turnover screen: the formation sessions' raw `traded_only` bars,
 rule 7's raw shares pick and the splits known at `t`, each read with `known_at <= t`. It
 is raw on purpose: the screen moves volume and shares into `t`'s share units itself.
+
+The rates read (`rates`; backtest spec amendment 2026-10-11, #1498, plan T170b) serves the
+risk-free series: the engine reads it once, at the run's data cutoff, and only when the
+frozen `metrics.risk_free_source` is `store`.
 """
 
 from __future__ import annotations
@@ -175,4 +179,12 @@ class DataProvider(Protocol):
         session, `universe.shares_as_of(t, ids)`'s raw picks with their `as_of_date`, and
         the splits of `live_actions_as_of(t, ids)` with `ex_date` at or before `t`'s
         session. Only rows with `known_at <= t` are read."""
+        ...
+
+    def rates(self, t: datetime, series: str) -> pl.DataFrame:
+        """`rates_as_of(t, series)`: the published rates of `series` known at `t`
+        (`known_at <= t`), latest revision per observation date; `series`,
+        `observation_date`, `value`, `vintage_date`, `known_at`, sorted by observation
+        date. Nothing known after `t` is in the frame, so a per-session filter on its
+        `known_at` is the as-of read at that session's close."""
         ...

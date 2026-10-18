@@ -57,6 +57,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # B10's share-turnover screen (backtest spec amendment #1358, T165): 1.0 is no screen.
     # A post-registration own-section key, so it is in `POST_REGISTRATION_OWN_KEYS` below.
     ("strategy.turnover_top_fraction", 1.0, 19),
+    # The risk-free series from the store (backtest spec amendment #1498, T170b). None
+    # enters the fingerprint (`_FINGERPRINT_KEYS`); the table entry for the source stays
+    # `constant` even after T170d flips the live default to `store`.
+    ("metrics.risk_free_source", "constant", 28),
+    ("metrics.risk_free_series", "DTB3", 28),
+    ("metrics.risk_free_basis", "discount", 28),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
