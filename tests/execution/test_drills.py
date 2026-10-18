@@ -153,6 +153,7 @@ def test_mid_run_fractionability_refusal_skips_only_the_buy(
 
 
 def test_untradable_buy_is_skipped_before_submit(env: Env, window: PaperWindowRow) -> None:
+    # The not-tradable 403 is unrecorded; the skip keys on the asset read, never on a code.
     env.fake.set_asset("SPFT", Asset(False, True, "active", None))
     outcome = env.run(at(F_0))
     orders, events, fills = journal(env)

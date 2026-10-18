@@ -1,3 +1,3 @@
-- T201 full-run fault drills built on the strict fake; T202 and T202b scenarios remain strict xfails for the halt-policy tasks.
+- T201 done: full paper-run fault drills on the strict fake (PR #PR2NUM); T202/T202b outcomes are strict xfails.
 ### Added
-- End-to-end paper-run drills cover bad symbols, 5xx and connection faults, acknowledgement timeout, skip cap, partial/rejected fills, delisted and split holdings, and sleeping-Mac catch-up.
+- End-to-end paper-run drills for bad symbol, 5xx, connection error, partial fill, accept-then-reject, delisted and split holdings and sleeping-Mac catch-up; skip-cap, mid-run not-fractionable and ack-timeout drills are strict xfails for T202/T202b.
