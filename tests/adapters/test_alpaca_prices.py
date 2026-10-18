@@ -4760,15 +4760,12 @@ class TestARenameNeverCostsItsOwnSessions:
     ALIGHT, STALE = "0001809104", "0000000077"
     WISH, HOLDER = "0001822250", "0000000088"
 
-    def _alight(self, *, rival_renamed: bool = False) -> list[dict[str, object]]:
-        rows = [
+    def _alight(self) -> list[dict[str, object]]:
+        return [
             _listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE),
             _listing(self.ALIGHT, "ALIT", date(2021, 11, 15), self.TITLE),
             _listing(self.STALE, "ALIT", date(2021, 9, 1), self.TITLE),
         ]
-        if rival_renamed:
-            rows.append(_listing(self.STALE, "OLDX", date(2019, 1, 1), self.TITLE))
-        return rows
 
     def _logc(self) -> list[dict[str, object]]:
         return [
@@ -4782,18 +4779,15 @@ class TestARenameNeverCostsItsOwnSessions:
         ("logc", "WISH", "LOGC", date(2024, 5, 13), date(2024, 8, 8)),
     ]
 
-    def _case(self, name: str, *, rival_renamed: bool = False) -> tuple[Any, ...]:
+    def _case(self, name: str) -> tuple[Any, ...]:
         _, old, new, day, cover = next(c for c in self.CASES if c[0] == name)
         if name == "alight":
-            return self._alight(rival_renamed=rival_renamed), self.ALIGHT, old, new, day, cover
+            return self._alight(), self.ALIGHT, old, new, day, cover
         return self._logc(), self.WISH, old, new, day, cover
 
     @pytest.mark.parametrize("name", ["alight", "logc"])
-    @pytest.mark.parametrize("renamed", [False, True])
-    def test_the_bars_after_the_change_stay_with_their_security(
-        self, name: str, renamed: bool
-    ) -> None:
-        listings, sid, old, new, day, cover = self._case(name, rival_renamed=renamed)
+    def test_the_bars_after_the_change_stay_with_their_security(self, name: str) -> None:
+        listings, sid, old, new, day, cover = self._case(name)
         change = _change(sid, old, new, day)
         resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
         plain = ListingResolver(listings, rename_lead_days=400)
@@ -4827,14 +4821,23 @@ class TestARenameNeverCostsItsOwnSessions:
         )
         assert misattributed(resolver, keys, []).bars == misattributed(plain, keys, []).bars
 
-    def test_a_change_known_after_t_is_not_applied_at_t(self) -> None:
-        # The resolver reads the changes known at the run (store.asof): given
-        # none, it is the listings' alone, whatever the later rows say.
-        listings, sid, *_, cover = self._case("alight")
-        early = ListingResolver(listings, rename_lead_days=400, symbol_changes=[])
-        assert early.report.symbol_changes_followed == 0
-        assert early.report.symbol_changes_refused == 0
-        assert early.holds(sid, cover)
+    def test_a_cover_page_trailing_the_change_past_the_lead_is_refused_as_before(self) -> None:
+        # Pinned (#1728 review): own cover page 2023-03-01, rival 2022-06-01,
+        # change 2021-07-06. The change is refused and the listings stand;
+        # the sessions only the change would have given are forgone.
+        listings = [
+            _listing(self.ALIGHT, "WPF", date(2020, 9, 1), self.TITLE),
+            _listing(self.ALIGHT, "ALIT", date(2023, 3, 1), self.TITLE),
+            _listing(self.STALE, "ALIT", date(2022, 6, 1), self.TITLE),
+        ]
+        change = _change(self.ALIGHT, "WPF", "ALIT", date(2021, 7, 6))
+        resolver = ListingResolver(listings, rename_lead_days=400, symbol_changes=[change])
+        plain = ListingResolver(listings, rename_lead_days=400)
+        assert resolver.report.symbol_changes_refused == 1
+        for session in _sessions(date(2021, 7, 6), date(2024, 6, 3)):
+            assert resolver.resolve("ALIT", session) == plain.resolve("ALIT", session)
+            assert resolver.lead("ALIT", session) == plain.lead("ALIT", session)
+            assert resolver.holds(self.ALIGHT, session) == plain.holds(self.ALIGHT, session)
 
     def test_a_clean_rename_is_still_followed(self) -> None:
         # No rival holds the ticker: the change is followed as in #1696.

@@ -151,8 +151,12 @@ lists `PMA`), or one that costs its own security a session of the new
 ticker the listings alone give it (#1728: the span the change starts on
 its day precedes another security's lagging span of the ticker and wins
 the latest-start rule against the security's own later cover page, as
-Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A change
-only ever adds sessions to its own security. A
+Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A refused
+change leaves the listings' mapping, so it can forgo sessions only the change
+would have given (its own cover page trailing it by more than
+`alpaca.rename_lead_days`, a rival's span in between); it never takes one.
+Both refusal tests judge the resolver with every change applied, so another
+security's change can refuse this one (#1728 follow-up). A
 change known after the run is not read, so it bounds nothing at that run
 (the mapping is the master's at the run, as for every row; a bar's
 `known_at` stays its session's close).
