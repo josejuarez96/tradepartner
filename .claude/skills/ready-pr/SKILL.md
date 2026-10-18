@@ -5,80 +5,46 @@ description: Bring your draft PR up to date with main, run every check and requi
 
 # Ready a PR
 
-Run this when the work on your claimed issue is complete and the draft PR describes it.
+Run this when the work on your claimed issue is done and the draft PR describes it.
 
 ## Before you run it
-
-1. Bookkeeping goes in **one fragment file, not the shared files**. If you have not done so:
-   ```bash
-   uv run python scripts/fragments.py add <issue> --slug <short-slug> \
-     --status "<one Recently done line, at most 240 characters, with the PR number>" \
-     --added "<one CHANGELOG bullet>"      # or --changed / --fixed
-   ```
-   Do not edit `docs/STATUS.md` or `CHANGELOG.md` yourself. Tick only your plan checkbox.
-2. Run the specialist reviews the touched paths require (the plan task's `Review:` field):
-   `quant-auditor` for data, store, signals, backtests; `safety-reviewer` for broker, orders,
-   secrets, config, LLM inputs. Give the agent the PR number: it posts its full report as **a
-   PR comment** whose first line is the verdict (`quant-auditor: PASS` or `quant-auditor: PASS
-   WITH FIXES`) and returns a ten-line summary; if it says it could not post, post the file it
-   wrote with `gh pr comment <n> --body-file <path>`. Address the findings and re-run it for a
-   fresh verdict. Only the **first line** of a comment counts, the latest verdict per agent
-   wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` both block until a re-review
-   after the fixes posts `PASS` (#356). The PR body does not count because the template already names
-   both agents. (#352)
-3. Fill in the PR template. Tick every box, or replace an inapplicable one with `n/a` and why.
-   The body must say `Closes #<issue>`.
+1. **One fragment, not the shared files:** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Recently done line, ≤240 chars, with the PR number>" --added "<CHANGELOG bullet>"` (or `--changed` / `--fixed`). Never edit `docs/STATUS.md` or `CHANGELOG.md`. Tick only your own plan box.
+2. **Reviews:** the plan line's `Review:`, plus `quant-auditor` for data, store, signals, backtests and `safety-reviewer` for broker, orders, secrets, config, LLM inputs. `QUANT_PREFIXES` / `SAFETY_PREFIXES` in `ready_pr.py` are the minimum it enforces by path. Give each the PR number; it posts its full report as a PR comment whose first line is the verdict (`quant-auditor: PASS`) and returns a ten-line summary. If it could not post, post its file with `gh pr comment <n> --body-file <path>`. Only a comment's first line counts, the latest verdict per agent wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` block until a re-review after the fixes posts `PASS` (#356). The PR body never counts (#352).
+3. **Template:** tick every box, or mark it `n/a` with why. The body says `Closes #<issue>`.
 
 ## Run it
-
 ```bash
-uv run python scripts/ready_pr.py <pr-number>
+uv run python scripts/ready_pr.py <pr-number> --timeout-min 45
 ```
+From your team directory, on the PR's branch, clean tree. `--timeout-min 45`: CI with tests outlasts the 25-minute default. It:
+1. merges `origin/main` in (no rebase, no force-push); a STATUS/CHANGELOG conflict is auto-resolved only when both sides purely inserted bullets at one spot (both kept); a deleted or edited line stops it;
+2. runs the local checks, then verifies the template and the reviews;
+3. pushes, waits for CI on that exact commit, and marks the PR ready.
 
-From your team directory, with the PR's branch checked out and a clean tree. It:
-merges `origin/main` in (no rebase, no force-push), auto-resolves a STATUS/CHANGELOG
-conflict only when both sides purely inserted bullets at the same spot (keeps both; a deleted
-or edited line stops it), runs the local checks,
-verifies the template and reviews, pushes, waits for CI on that exact commit, then marks the
-PR ready. Expect the wait: CI takes a few minutes. `--dry-run` runs everything up to the
-push; it still commits the merge of `main` locally, which is what you want anyway.
-
-What runs locally:
-
-| Check | When |
+| Flag | Effect |
 |---|---|
-| ruff check, ruff format --check, mypy, fragment check, `tests/test_docs_budget.py` | always |
-| pytest, targeted | only when the diff against `origin/main` touches `src/`, `tests/`, `scripts/`, `.github/`, `pyproject.toml`, `uv.lock` or `.python-version`; then only the test files the diff maps to |
+| `--dry-run` | everything up to the push (the merge of `main` is still committed locally) |
+| `--tests` / `--full-tests` / `--no-tests` | force local targeted pytest / run the full suite locally / skip it |
+| `--allow-shared-files` | see Never |
 
-The mapping (#456): a changed test file runs itself; a `src/` module runs the test files that
-import it by name plus the static checks over its subtree (all of `src/`, and the backtest
-import scan for `backtest/`); a file under `scripts/` or `.github/` runs the tests that name
-it. The full suite runs instead when the mapping is unclear: a `conftest.py`, `pyproject.toml`,
-`uv.lock` or `.python-version`, a fixture or helper under `tests/`, a package `__init__`, a
-deleted or moved module, or a module or script no test names. The command prints which it chose. A test that
-reaches a module only through another one is not run locally, so CI, which runs the full
-suite on every such PR (`ready_pr.py --tests-needed`) and every push to main, catches it
-later. A docs, fragment or process PR skips local pytest, and CI skips it on that PR too.
-`--full-tests` runs the full suite locally; `--tests` forces the local run; `--no-tests` skips it.
+Always run locally: ruff check, ruff format --check, mypy, the fragment check, `tests/test_docs_budget.py`. No local pytest by default: CI runs the full suite on every diff touching `TEST_TRIGGER_PREFIXES` / `TEST_TRIGGER_FILES` and on every push to main. `--tests` runs the test files the diff maps to, or the full suite when the mapping is unclear, and prints which (rules: `targeted_tests` in `ready_pr.py`, #456).
 
 ## When it says NOT READY
-
-Each message names one fix. Do that fix, commit, and run the command again:
+Each message names one fix. Fix, commit, run again.
 
 | Message | Do |
 |---|---|
-| `conflicts in <file> ... resolve by hand` | Open the file, keep both sides where both are right, `git add`, `git commit`, run again. Never resolve by dropping the other team's lines. |
-| `adds lines to the shared lists` | Move those lines into fragments (step 1 above) and remove **only those lines** from `STATUS.md` / `CHANGELOG.md`. Keep any other edit you made there (Blocked, Decisions needed, snapshot sections in a process PR). |
-| `no fragment for this PR's issue` | Step 1 above. |
-| `local check failed` | Fix lint, types or tests. Do not skip tests. |
-| `unticked boxes` / `Closes #` | Edit the PR body: `gh pr edit <n> --body-file <file>`. |
-| `run these reviews` | Spawn the named agent on your diff, address findings, post the verdict comment (step 2 above). |
-| `CI failure` | Read `gh pr checks <n>`; fix; run again. |
+| `conflicts in <file> ... resolve by hand` | Keep both sides where both are right, `git add`, `git commit`. Never drop the other team's lines. |
+| `adds lines to the shared lists` | Move those lines into your fragment and remove **only those lines** from STATUS/CHANGELOG; keep other edits there (Blocked, Decisions needed, snapshot sections in a process PR). |
+| `no fragment for this PR's issue` | Step 1. |
+| `local check failed` | Fix lint, types or tests. Never skip tests. |
+| `unticked boxes` / `Closes #` | `gh pr edit <n> --body-file <file>`. |
+| `run these reviews` | Run the named agent, fix, post the verdict (step 2). |
+| `CI failure` | Read `gh pr checks <n>`, fix, run again. |
 | `CI timeout` | Run again; CI queues can be slow. |
 
 ## Never
-
-- Pass `--allow-shared-files` unless your PR is a fold host the owner asked for (doc-keeper folding fragments and refreshing the STATUS snapshot sections) or a process change that must edit those files.
-- Merge the PR. PRs land through the merge train, and only on the owner's "merge train `<batch id>`"; a single PR is merged by hand only when the owner says to merge that specific PR, never with `--admin`; subagents never merge ([git-workflow rule 7](../../../docs/ways-of-working/git-workflow.md)).
-- Force-push. The command does not need it and neither do you.
+- Pass `--allow-shared-files`, unless the PR is a fold host the owner asked for (doc-keeper folding fragments and refreshing the STATUS snapshot sections) or a process change that must edit those files.
+- Merge. Landing follows [git-workflow rule 7](../../../docs/ways-of-working/git-workflow.md#the-rules-in-one-screen); subagents and team windows never merge, and nobody uses `--admin`.
+- Force-push.
 - Run it in another team's directory or the main checkout.
