@@ -5448,3 +5448,172 @@ def test_import_dry_run_keeps_the_counts_before_a_failing_file(
     assert [(run.status, run.rows_added) for run in dry.runs] == [(OK, 5), (FAILED, 0)]
     assert dry.runs[0].message.startswith("dry run: assets-c.json.gz")
     assert read("SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+# --- successor chains (#821, plan T187) -------------------------------------
+
+_CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
+_CHAIN_CASE = next(
+    case
+    for case in json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
+    if case["case"] == "chain_1to1"
+)
+
+
+def _chain_parse(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _chain_filings(case: dict[str, Any], *, cover_shift: timedelta = timedelta(0)):
+    """`_filings()` plus the fixture's `chain_1to1` pair: each CIK's issuer
+    filings, its cover page listing the pair's ticker and exchange, and the
+    successor's 8-K12B. `cover_shift` moves the successor's listing row (to
+    drive `chains_moved`)."""
+    predecessor = case["predecessor"]
+    successor = case["successor"]
+    ticker = case["ticker"]
+    evidence = case["evidence"]
+    successor_cover = _chain_parse(successor["cover"]) + cover_shift
+    return _filings(
+        extra_index=[
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000001",
+                _chain_parse(predecessor["first_index"]),
+            ),
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                "10-K",
+                f"{successor['cik']}-20-000001",
+                _chain_parse(successor["first_index"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                evidence["form"],
+                evidence["accession"],
+                _chain_parse(evidence["accepted_at"]),
+            ),
+        ],
+        extra_covers=[
+            CoverPage(
+                predecessor["cik"],
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+            CoverPage(
+                successor["cik"],
+                f"{successor['cik']}-20-000002",
+                successor_cover,
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+        ],
+    )
+
+
+def _chained_settings(settings: Settings, case: dict[str, Any]) -> Settings:
+    entry = (
+        f"{case['predecessor']['cik']}->{case['successor']['cik']}@{case['evidence']['accession']}"
+    )
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"chains": [entry]})}
+    )
+
+
+def _chain_now() -> datetime:
+    return datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
+
+
+def test_a_chain_entry_writes_a_row_and_the_run_row_counts_it(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: the run row counts `chains_written` and `chains_refused`, the row
+    is stored at the evidence's `known_at`, and a second run adds nothing."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    rows = read(
+        "SELECT predecessor_id, successor_id, evidence_form, known_at, ingested_at "
+        "FROM successor_chains"
+    )
+    assert rows == [
+        (
+            _CHAIN_CASE["predecessor"]["cik"],
+            _CHAIN_CASE["successor"]["cik"],
+            "8-K12B",
+            _chain_parse(_CHAIN_CASE["expected_known_at"]),
+            _chain_now(),
+        )
+    ]
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chains_written: 1" in message
+    assert "chains_refused: none" in message
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 1
+    second = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any("chains_written: 0" in m for m in second)
+
+
+def test_a_moved_chain_is_retracted_and_rewritten_in_one_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: a listing row restamped later moves the row's `known_at`; the run
+    retracts the live row at its clock and writes the new one, counting
+    `chains_moved`."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    moved_known = _chain_parse(_CHAIN_CASE["expected_known_at"]) + timedelta(days=30)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
+        now=_chain_now() + timedelta(days=60),
+    )
+    assert read("SELECT known_at FROM successor_chains WHERE retracted") == [
+        (_chain_now() + timedelta(days=60),)
+    ]
+    derived = {row[0] for row in read("SELECT known_at FROM successor_chains WHERE NOT retracted")}
+    assert derived == {_chain_parse(_CHAIN_CASE["expected_known_at"]), moved_known}
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any("chains_moved: 1" in m for m in messages)
+
+
+def test_held_ids_reads_open_windows_only() -> None:
+    """#821: `_held_ids` is `retract.py`'s `[traded]` test limited to open
+    windows: an adjustment of a window with no closing stop row holds its
+    security; a `closed` stop releases it."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, "
+            "'v', TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, 'HELD', 1.0, NULL, NULL, "
+            "TIMESTAMPTZ '2025-12-02 14:00:00+00', TIMESTAMPTZ '2025-12-02 14:00:00+00')"
+        )
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == frozenset({"HELD"})
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', 'closed', NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
+        )
+        assert ingest_module._held_ids(conn, ["HELD"]) == frozenset()
+    finally:
+        conn.close()

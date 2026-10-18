@@ -34,6 +34,10 @@ Shared conventions: securities needing a universe-rule-passing history run bars 
 | Ticker reused by a different company: two security_ids, non-overlapping listings, same ticker (req 13) | SEC_REUSE_1, SEC_REUSE_2 | REUSE (both) | SEC_REUSE_1 delisted 2018-12-26; SEC_REUSE_2 listed from 2019-08-01 | n/a |
 | Truncated-history delisting (req 13) | SEC_TRUNC_DELIST | TRHX | last bar 2018-05-25, Form 25 filed 2018-06-14 (last session before filing 2018-06-13, gap 12 sessions > gap.missing_tail_sessions=5) | n/a |
 | Unclassifiable name (req 13) | SEC_UNCLASSIFIABLE | UNCX | classifications.security_type = 'unclassifiable', rule = 'no_rule_matched' | n/a |
+| chain_1to1 | 0001000010 -> 0001000011 | CHNA | hand-over 2020-01-06, chain known 2020-02-07 | successor_chains known_at 2020-02-07T20:30:00+00:00 |
+| chain_evidence_latest | 0001000012 -> 0001000013 | CHNE | hand-over 2020-02-19, chain known 2020-03-30 | successor_chains known_at 2020-03-30T20:30:00+00:00 |
+| chain_predecessor_latest | 0001000014 -> 0001000015 | CHNP | hand-over 2020-04-01, chain known 2020-05-11 | successor_chains known_at 2020-05-11T20:30:00+00:00 |
+| chain_spinoff | 0001000016 -> 0001000017 | CHNX | hand-over 2020-05-14, no 8-K12B | refused no_evidence; no successor_chains row |
 | snapshot_static-only pre-2019 listing (req 13) | SEC_STATIC_PRE2019 | PRE9 | listing valid_from 2017-01-03 (pre-2019), provenance snapshot_static, known_at 2020-01-15T14:00:00+00:00 (the fetch time, later than valid_from); securities.known_at 2016-12-02T20:30:00+00:00 precedes the first bar (review round 3 MUST FIX 6); bars through 2020-06-30 | n/a |
 
 ## Notes for readers

@@ -681,7 +681,8 @@ def version_4_store(path: Path) -> Path:
     `schema._BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`)
     and `schema._migrate_filing_name` (version 26, #1597; the
     `filing_name` provenance `CHECK` the fixture listings and
-    classifications rows may carry)."""
+    classifications rows may carry), and `schema._SUCCESSOR_CHAINS_TABLE_DDL`
+    (version 29, #821, plan T187; `successor_chains.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -693,6 +694,7 @@ def version_4_store(path: Path) -> Path:
             + schema._RATES_TABLE_DDL
             + schema._BORROW_STATUS_TABLE_DDL
             + schema._SYMBOL_CHANGES_TABLE_DDL
+            + schema._SUCCESSOR_CHAINS_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)

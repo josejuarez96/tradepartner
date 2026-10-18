@@ -1,4 +1,8 @@
 security_id,action_type,ex_date,ratio_or_amount,announced_at,source_action_id,cancelled,known_at,ingested_at,source,provenance
+0001000010,dividend,2019-12-05,0.25,,,FALSE,2019-12-04T21:00:00+00:00,2019-12-04T21:10:00+00:00,alpaca,action
+0001000012,dividend,2020-01-21,0.25,,,FALSE,2020-01-17T21:00:00+00:00,2020-01-17T21:10:00+00:00,alpaca,action
+0001000014,dividend,2020-03-04,0.25,,,FALSE,2020-03-03T21:00:00+00:00,2020-03-03T21:10:00+00:00,alpaca,action
+0001000016,dividend,2020-04-16,0.25,,,FALSE,2020-04-15T20:00:00+00:00,2020-04-15T20:10:00+00:00,alpaca,action
 SEC_DIV_CANCELLED,dividend,2019-09-16,0.4,,,FALSE,2019-09-13T20:00:00+00:00,2019-09-13T20:10:00+00:00,alpaca,action
 SEC_DIV_CANCELLED,dividend,2019-09-16,0.4,,,TRUE,2019-09-20T21:00:00+00:00,2019-09-20T21:00:00+00:00,alpaca,action
 SEC_DIV_REVISED,dividend,2019-02-25,0.1,,,FALSE,2019-02-22T21:00:00+00:00,2019-02-22T21:10:00+00:00,alpaca,action

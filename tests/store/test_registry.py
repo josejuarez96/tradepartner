@@ -1120,8 +1120,8 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # Outside the trial vintage: `rates` (#1538, T169b: stored for later
         # consumers), `borrow_status` (#1506, T171) and `symbol_changes`
         # (#1506, the 2026-10-11 amendment) -- none is read by a reader a
-        # registered trial uses. `symbol_changes` is not a store table until
-        # T172b lands it, so it is classified here ahead of that task.
+        # registered trial uses. `successor_chains` (#821, T187) is inside
+        # the vintage: its rows move the chained reads a trial sees.
         excluded = {"rates", "borrow_status", "symbol_changes"}
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must

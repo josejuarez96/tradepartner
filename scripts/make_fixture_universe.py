@@ -218,6 +218,17 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "source",
         "provenance",
     ),
+    "successor_chains": (
+        "predecessor_id",
+        "successor_id",
+        "evidence_accession",
+        "evidence_form",
+        "retracted",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
     "facts": (
         "security_id",
         "fact_name",
@@ -400,6 +411,8 @@ class Rows:
     filing_events: list[dict[str, object]] = field(default_factory=list)
     rates: list[dict[str, object]] = field(default_factory=list)
     borrow_status: list[dict[str, object]] = field(default_factory=list)
+    successor_chains: list[dict[str, object]] = field(default_factory=list)
+    chain_cases: list[dict[str, object]] = field(default_factory=list)
     readme_cases: list[dict[str, str]] = field(default_factory=list)
     statement_readme_cases: list[dict[str, str]] = field(default_factory=list)
     filing_event_readme_cases: list[dict[str, str]] = field(default_factory=list)
@@ -506,6 +519,33 @@ class Rows:
                 "known_at": filed_at,
                 "ingested_at": filed_at + ingested_delay,
                 "source": source,
+                "provenance": "filing",
+            }
+        )
+
+    def successor_chain(
+        self,
+        predecessor_id: str,
+        successor_id: str,
+        evidence_accession: str,
+        evidence_form: str,
+        known_at: datetime,
+        *,
+        ingested_delay: timedelta = timedelta(minutes=10),
+    ) -> None:
+        """One `successor_chains` row (#821, plan T187): the live chain the
+        fixture stores, its `known_at` the latest of the four evidence stamps,
+        its `ingested_at` the run that wrote it."""
+        self.successor_chains.append(
+            {
+                "predecessor_id": predecessor_id,
+                "successor_id": successor_id,
+                "evidence_accession": evidence_accession,
+                "evidence_form": evidence_form,
+                "retracted": False,
+                "known_at": known_at,
+                "ingested_at": known_at + ingested_delay,
+                "source": _SOURCE_EDGAR,
                 "provenance": "filing",
             }
         )
@@ -2831,6 +2871,189 @@ def _write_readme(
     path.write_text("\n".join(lines) + "\n")
 
 
+def _successor_chain_cases(rows: Rows) -> None:
+    """T187 (#821): the four req 13 successor-CIK chain cases.
+
+    The store rows (the pair's securities, listings, classifications, bars,
+    facts and the old security's dividend) and the `chain_cases.json` source
+    evidence come from one table, so the store and the derivation tests
+    cannot drift. The 8-K12B itself is source evidence (no fixture CSV holds
+    the filing index), carried in `chain_cases.json` for the tests that build
+    a `FixtureFilingSource`.
+
+    The latest-stamp cases are `chain_1to1` (the successor's first listing
+    row, the usual case), `chain_evidence_latest` (an `8-K12B/A` accepted
+    after the listing row) and `chain_predecessor_latest` (the predecessor's
+    last listing row known after the successor's) -- the stamp the spec's
+    truncated third parenthetical leaves reachable once the successor's
+    `securities` row is understood to share its listing row's stamp (both
+    come from the same cover page). `chain_spinoff` has no 8-K12B and no
+    entry.
+    """
+    base = _session_on_or_after(date(2020, 1, 6))
+    definitions = (
+        # key, predecessor CIK, successor CIK, ticker, successor name,
+        # evidence late, predecessor listing late, spin-off.
+        ("chain_1to1", "0001000010", "0001000011", "CHNA", "Chain One Inc", False, False, False),
+        (
+            "chain_evidence_latest",
+            "0001000012",
+            "0001000013",
+            "CHNE",
+            "Chain Evidence Inc",
+            True,
+            False,
+            False,
+        ),
+        (
+            "chain_predecessor_latest",
+            "0001000014",
+            "0001000015",
+            "CHNP",
+            "Chain Predecessor Inc",
+            False,
+            True,
+            False,
+        ),
+        (
+            "chain_spinoff",
+            "0001000016",
+            "0001000017",
+            "CHNX",
+            "Chain Spinoff Inc",
+            False,
+            False,
+            True,
+        ),
+    )
+    for number, definition in enumerate(definitions):
+        key, pred_cik, succ_cik, ticker, succ_name, evidence_late, pred_late, spin = definition
+        exchange = "NYSE"
+        hand = nth_session_after(base, 30 * number)
+        pred_first = nth_session_before(hand, 250)
+        pred_last_bar = previous_session(hand)
+        succ_first = nth_session_after(hand, 20)  # a 20-session hole
+        succ_list_session = nth_session_after(succ_first, 3)
+        succ_list_known = _filing_acceptance(succ_list_session)
+        pred_list_session = nth_session_before(hand, 40)
+        if pred_late:
+            pred_list_session = nth_session_after(succ_list_session, 4)
+        pred_list_known = _filing_acceptance(pred_list_session)
+        succ_first_known = _filing_acceptance(nth_session_before(hand, 50))
+        pred_first_known = _filing_acceptance(nth_session_before(hand, 260))
+        evidence_session = nth_session_before(hand, 2)
+        if evidence_late:
+            evidence_session = nth_session_after(succ_list_session, 5)
+        evidence_known = _filing_acceptance(evidence_session)
+        form = "8-K12B/A" if evidence_late else "8-K12B"
+        accession = f"{succ_cik}-24-{number + 1:06d}"
+        known_at = max(evidence_known, succ_list_known, pred_list_known)
+
+        rows.security(pred_cik, pred_cik, f"{ticker} Holdings Inc", pred_list_known)
+        rows.security(succ_cik, succ_cik, succ_name, succ_list_known)
+        rows.listing(pred_cik, ticker, exchange, pred_first, pred_list_known)
+        rows.listing(succ_cik, ticker, exchange, succ_first, succ_list_known)
+        rows.classification(pred_cik, "common", "common_default", pred_list_known)
+        rows.classification(succ_cik, "common", "common_default", succ_list_known)
+        rows.delisting(
+            pred_cik,
+            "25-NSE",
+            "Common Stock",
+            exchange,
+            _filing_acceptance(nth_session_before(hand, 1)),
+        )
+        rows.bars(
+            pred_cik,
+            sessions_between(pred_first, pred_last_bar),
+            start_price=20.0,
+            seed=900 + number,
+        )
+        rows.bars(
+            succ_cik,
+            sessions_between(succ_first, nth_session_after(succ_first, 40)),
+            start_price=19.5,
+            seed=950 + number,
+        )
+        # A dividend on the old security, a predecessor share fact dated after
+        # the hand-over and a successor share fact known later (#821).
+        ex_date = nth_session_before(hand, 20)
+        rows.action(
+            pred_cik,
+            "dividend",
+            ex_date,
+            0.25,
+            known_at=session_close(previous_session(ex_date)),
+        )
+        rows.fact(
+            pred_cik,
+            "shares_outstanding",
+            nth_session_after(hand, 5),
+            1.0e8,
+            _filing_acceptance(nth_session_after(hand, 25)),
+        )
+        rows.fact(
+            succ_cik,
+            "shares_outstanding",
+            succ_first,
+            1.0e8,
+            _filing_acceptance(nth_session_after(succ_list_session, 2)),
+        )
+        rows.fact(
+            pred_cik,
+            "shares_outstanding",
+            nth_session_before(hand, 30),
+            1.0e8,
+            _filing_acceptance(nth_session_before(hand, 35)),
+        )
+
+        rows.chain_cases.append(
+            {
+                "case": key,
+                "ticker": ticker,
+                "predecessor": {
+                    "cik": pred_cik,
+                    "name": f"{ticker} Holdings Inc",
+                    "first_index": pred_first_known.isoformat(),
+                    "cover": pred_list_known.isoformat(),
+                    "listing_from": pred_list_session.isoformat(),
+                },
+                "successor": {
+                    "cik": succ_cik,
+                    "name": succ_name,
+                    "first_index": succ_first_known.isoformat(),
+                    "cover": succ_list_known.isoformat(),
+                    "listing_from": succ_first.isoformat(),
+                },
+                "evidence": None
+                if spin
+                else {
+                    "accession": accession,
+                    "form": form,
+                    "accepted_at": evidence_known.isoformat(),
+                },
+                "expected_known_at": None if spin else known_at.isoformat(),
+                "expected_reason": "no_evidence" if spin else None,
+            }
+        )
+        if not spin:
+            rows.successor_chain(pred_cik, succ_cik, accession, form, known_at)
+            rows.case(
+                key,
+                f"{pred_cik} -> {succ_cik}",
+                ticker,
+                f"hand-over {hand.isoformat()}, chain known {known_at.date().isoformat()}",
+                f"successor_chains known_at {known_at.isoformat()}",
+            )
+        else:
+            rows.case(
+                key,
+                f"{pred_cik} -> {succ_cik}",
+                ticker,
+                f"hand-over {hand.isoformat()}, no 8-K12B",
+                "refused no_evidence; no successor_chains row",
+            )
+
+
 def build_rows() -> Rows:
     rows = Rows()
     _truncated_delisting(rows)
@@ -2866,6 +3089,7 @@ def build_rows() -> Rows:
     _filing_events(rows)
     _rates(rows)
     _borrow_status(rows)
+    _successor_chain_cases(rows)
     return rows
 
 
@@ -2943,6 +3167,12 @@ def write_fixtures(output_dir: Path) -> None:
         rows.borrow_status,
         ("asset_id", "known_at"),
     )
+    _write_csv(
+        output_dir / "successor_chains.csv",
+        "successor_chains",
+        rows.successor_chains,
+        ("successor_id", "known_at"),
+    )
     _write_readme(
         output_dir / "README.md",
         rows.readme_cases,
@@ -2953,6 +3183,9 @@ def write_fixtures(output_dir: Path) -> None:
     )
     (output_dir / "filename_cases.json").write_text(
         json.dumps(_filename_cases(), indent=2, sort_keys=True) + "\n"
+    )
+    (output_dir / "chain_cases.json").write_text(
+        json.dumps(rows.chain_cases, indent=2, sort_keys=True) + "\n"
     )
 
 

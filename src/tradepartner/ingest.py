@@ -209,7 +209,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -281,8 +281,13 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
+from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import (
+    HELD_PREDECESSOR,
+    Chain,
+    ChainRefusal,
     MasterBuild,
+    build_chains,
     build_master,
     primary_security_id,
     securities_as_of,
@@ -296,7 +301,7 @@ from tradepartner.store.restamp_precheck import (
     read_instants,
     window_first_session,
 )
-from tradepartner.store.retraction import record_underived, split_kept, stored_underived
+from tradepartner.store.retraction import record_underived, retraction, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
@@ -1242,6 +1247,11 @@ def _ingest_filings(
         # rows at the new stamps beside them (#1382, an owner decision).
         kept = [row for row in rows if row["security_id"] not in skipped] if skipped else rows
         added += _add_rows(conn, table, kept, ingested_at=now, current=False)
+    chains = ""
+    if settings.master.chains:
+        chain_tally = _write_chains(conn, master, now)
+        added += chain_tally.written
+        chains = chain_tally.message()
     statements = ""
     if settings.edgar.statement_facts_enabled:
         tally = _write_statement_facts(
@@ -1274,7 +1284,7 @@ def _ingest_filings(
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
@@ -1335,6 +1345,125 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
     return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+
+
+# --- the successor chains (#821, plan T187) --------------------------------
+
+#: The journal tables naming a security a window holds, each reaching its
+#: open window: `orders` and `positions_daily` by their `run_id`, `adjustments`
+#: by its `window_id`, and `lots` (which has none) by the books that have an
+#: open window. `?` is the ids list, then the closing stop states. This is
+#: `retract.py`'s `[traded]` test limited to open windows (the amendment's
+#: "A held position" paragraph): an order in flight counts as held.
+_HELD_SQL = """
+    SELECT security_id FROM orders
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM positions_daily
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM adjustments
+        WHERE list_contains(?, security_id) AND window_id IN (
+            SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+    UNION SELECT security_id FROM lots
+        WHERE list_contains(?, security_id) AND book_id IN (
+            SELECT book_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+"""
+
+
+def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
+    """The ids among `ids` an open paper window holds (#821): named by a
+    journal order, adjustment, daily position or lot of a window with no
+    `closed`/`abandoned` stop row. A store without the journal tables (a fact
+    fixture) holds nothing."""
+    wanted = sorted(set(ids))
+    if not wanted:
+        return frozenset()
+    states = list(CLOSING_STOP_STATES)
+    try:
+        rows = conn.execute(
+            _HELD_SQL,
+            [wanted, states, wanted, states, wanted, states, wanted, states],
+        ).fetchall()
+    except duckdb.CatalogException:  # a fixture store with no journal tables
+        return frozenset()
+    return frozenset(sid for (sid,) in rows if sid is not None)
+
+
+@dataclass(frozen=True)
+class _ChainTally:
+    """What `_write_chains` did: live rows written, live rows moved (retracted
+    and rewritten at a new stamp), and every refusal with its reason."""
+
+    written: int
+    moved: int
+    refusals: tuple[ChainRefusal, ...]
+
+    def message(self) -> str:
+        """The run row's chain clause; the refusals name each successor and
+        its reason."""
+        refused = "; ".join(item.describe() for item in self.refusals) or "none"
+        return (
+            f"; chains_written: {self.written}; chains_refused: {refused}; "
+            f"chains_moved: {self.moved}"
+        )
+
+
+def _chain_same(stored: Mapping[str, Any], chain: Chain) -> bool:
+    """Whether `stored` is the row `chain` derives, stamp and all."""
+    return bool(
+        stored["predecessor_id"] == chain.predecessor_id
+        and stored["evidence_accession"] == chain.evidence_accession
+        and stored["evidence_form"] == chain.evidence_form
+        and stored["known_at"] == chain.known_at
+    )
+
+
+def _write_chains(
+    conn: duckdb.DuckDBPyConnection, master: MasterBuild, now: datetime
+) -> _ChainTally:
+    """Write the `successor_chains` rows `master` derives (#821).
+
+    An entry whose predecessor an open paper window holds is refused `held`
+    and writes nothing. A successor with no live row gets one. A successor
+    whose stored live row's stamp no longer matches its evidence has that row
+    retracted at `now` (the run's clock, #859) and the newly derived one
+    written in the same run, counted under `chains_moved`; an unchanged re-run
+    writes nothing."""
+    held = _held_ids(conn, [chain.predecessor_id for chain in master.chains])
+    refusals: list[ChainRefusal] = list(master.chain_refusals)
+    written = 0
+    moved = 0
+    for chain in master.chains:
+        if chain.predecessor_id in held:
+            refusals.append(
+                ChainRefusal(chain.predecessor_id, chain.successor_id, HELD_PREDECESSOR)
+            )
+            continue
+        cursor = conn.execute(
+            "SELECT * FROM successor_chains WHERE successor_id = ? AND NOT retracted "
+            "AND known_at < ? ORDER BY known_at",
+            [chain.successor_id, now],
+        )
+        names = [column[0] for column in cursor.description]
+        stored = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
+        row = chain.row()
+        if stored and _chain_same(stored[-1], chain):
+            continue
+        for previous in stored:
+            insert_row(conn, "successor_chains", retraction(previous, now))
+        if stored:
+            moved += 1
+        else:
+            written += 1
+        insert_row(conn, "successor_chains", row)
+    return _ChainTally(written, moved, tuple(refusals))
 
 
 def _delete_classifications(
@@ -1437,6 +1566,10 @@ def _build_filings(
     master = build_master(filings, settings, ingested_at=ingested_at)
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
+    if settings.master.chains:  # #821: the chained rows, on the classification
+        types = {row["security_id"]: row["security_type"] for row in classes.classifications}
+        chain_build = build_chains(filings, settings, master, types, ingested_at=ingested_at)
+        master = replace(master, chains=chain_build.chains, chain_refusals=chain_build.refusals)
     ciks = _issuer_ciks(master)
     records = [record for cik in ciks for record in filings.facts(cik, list(FACT_NAMES))]
     if fetch and settings.edgar.statement_facts_enabled:

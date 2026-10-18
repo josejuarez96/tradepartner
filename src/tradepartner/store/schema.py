@@ -579,6 +579,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "rates": ("release",),
     "borrow_status": ("snapshot",),
     "symbol_changes": ("action",),
+    "successor_chains": ("filing",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -727,9 +728,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 28 (#1506, data-foundation plan T172b): the `symbol_changes` table and
 #:   its identity index, created by the DDL pass (`_SYMBOL_CHANGES_TABLE_DDL`);
 #:   no existing table changes (module docstring, "Schema versions").
-#: - A later DDL change goes to version 29, with its own migration and a
+#: - 29 (#821, data-foundation plan T187): the `successor_chains` table,
+#:   created by the DDL pass (`_SUCCESSOR_CHAINS_TABLE_DDL`); no existing
+#:   table changes (module docstring, "Schema versions").
+#: - A later DDL change goes to version 30, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 28
+CURRENT_SCHEMA_VERSION = 29
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -857,6 +861,11 @@ _PRE_CASH_IN_LIEU_VERSION = 26
 #: read-only connections serve every other read; a `symbol_changes` read
 #: there fails on the missing table, as a `borrow_status` read did at 23.
 _PRE_SYMBOL_CHANGES_VERSION = 27
+
+#: The last version without `successor_chains` (#821, T187, version 29):
+#: read-only connections serve every other read; a `successor_chains` read
+#: there fails on the missing table, as a `symbol_changes` read did at 27.
+_PRE_SUCCESSOR_CHAINS_VERSION = 28
 
 
 class SchemaVersionError(RuntimeError):
@@ -1200,6 +1209,27 @@ CREATE TABLE IF NOT EXISTS schema_version (
 )
 """
 
+# T187 (#821): one live row per chained successor, the append-only master
+# shape (`known_at`, `ingested_at`, `source`, `provenance`) plus the #859
+# retraction flag. `known_at` is the latest of the four evidence stamps (the
+# 8-K12B's acceptance, the successor's `securities` row, its first listing row
+# under the predecessor's ticker and the predecessor's last listing row), so a
+# read before it sees two securities; a moved stamp is a retraction at the
+# run's clock plus the newly derived row. `evidence_form` is one of the four
+# successor-issuer forms. UNIQUE (successor_id, known_at): an id appears once
+# per instant, so "the latest revision" is never a tie.
+_CREATE_SUCCESSOR_CHAINS = f"""
+CREATE TABLE IF NOT EXISTS successor_chains (
+    predecessor_id VARCHAR NOT NULL,
+    successor_id VARCHAR NOT NULL,
+    evidence_accession VARCHAR NOT NULL,
+    evidence_form VARCHAR NOT NULL,
+    retracted BOOLEAN NOT NULL DEFAULT FALSE,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["successor_chains"])},
+    UNIQUE (successor_id, known_at)
+)
+"""
+
 #: Every table this module owns, in dependency-free creation order (no
 #: foreign keys are declared, so order only needs schema_version last for
 #: readability). Used by `init_schema` and exposed for the test loader.
@@ -1216,6 +1246,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "rates",
     "borrow_status",
     "symbol_changes",
+    "successor_chains",
     "ingestion_runs",
     "schema_version",
 )
@@ -1270,6 +1301,12 @@ _SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
     _CREATE_SYMBOL_CHANGES,
     _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
 )
+
+#: `successor_chains` (#821, T187), added at version 29: its own tuple, as
+#: `_SYMBOL_CHANGES_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
+#: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
+#: schema version with its own migration.
+_SUCCESSOR_CHAINS_TABLE_DDL: tuple[str, ...] = (_CREATE_SUCCESSOR_CHAINS,)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -2705,6 +2742,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FEE_ACTIVITIES_VERSION,
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
+        _PRE_SUCCESSOR_CHAINS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2733,7 +2771,8 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # (the booked-fee activity's `explanations_as_of` names one), which a
         # version-24 store lacks; version 25 every read (no `filing_name` row
         # can exist there, and no read depends on the provenance `CHECK`);
-        # version 26 every read; version 27 every read but `symbol_changes`.
+        # version 26 every read; version 27 every read but `symbol_changes`;
+        # version 28 every read but `successor_chains`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3447,7 +3486,7 @@ def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 26 store to version 27.
+    version-2 to 28 store to version 29.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3460,6 +3499,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     On a writable connection, in one transaction (the caller's if open): a
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
+    `successor_chains` created where it lacks it (purely additive; a
+    version-28 store gets a version-29 row; #821, T187); every store gets
     `adjustments` rebuilt with its version-27 DDL (the `kind` `CHECK` widened
     with `cash_in_lieu`, every row kept, byte-identical; a version-2 to 26 store
     gets a version-27 row; #1627); every store gets
@@ -3528,7 +3569,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-26, 25 (every read; the
+    On a read-only connection no DDL runs: a version-28, 27 (every read but
+    `successor_chains`, missing there), 26, 25 (every read; the
     provenance `CHECK` only widens), 24 (every read
     but the two version-25 columns `adjustments.broker_activity_id` and
     `paper_windows.activities_seen_json`), 23 (every read but
@@ -3592,6 +3634,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FEE_ACTIVITIES_VERSION,
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
+        _PRE_SUCCESSOR_CHAINS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3632,6 +3675,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
             + _SYMBOL_CHANGES_TABLE_DDL
+            + _SUCCESSOR_CHAINS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

@@ -503,6 +503,10 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "facts",
     "statement_facts",
     "filing_events",
+    # #821 (T187): a `successor_chains` row stales every registered trial whose
+    # cutoff is at or after its `known_at` (the amendment's "A held position"
+    # paragraph), so the chained reads a trial sees are reproducible.
+    "successor_chains",
 )
 
 #: The rows of `corporate_actions` a trial can read: the action types that
