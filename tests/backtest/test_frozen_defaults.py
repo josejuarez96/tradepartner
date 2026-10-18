@@ -838,3 +838,37 @@ def test_a_momentum_file_naming_the_shock_defaults_is_the_twin(tmp_path: Path) -
     assert frozen.fingerprint("momentum", explicit, date(2017, 1, 31)) == TWIN_FINGERPRINT
     canonical = frozen.canonical_frozen_set(explicit, "momentum")
     assert registry.params_sha256(canonical) == TWIN_PRE_LAB_PARAMS_SHA256
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("strategy.placebo", "shuffle"),
+        ("strategy.placebo", "random_entry"),
+        ("strategy.placebo_seed", 7),
+        ("strategy.signal_delay_sessions", 1),
+    ],
+)
+def test_a_non_default_shock_enters_the_canonical_set_and_the_fingerprint(
+    key: str, value: Any
+) -> None:
+    """The other direction (quant-auditor on #1827): a shocked file is its own
+    hypothesis, never H1's or the TWIN's. Built on a params dict past the T217c guard,
+    which refuses the value through `Settings`."""
+    settings = _defaults_settings()
+    start = date(2017, 1, 31)
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        shocked = {**params, key: value}
+        canonical = frozen.canonical_frozen_set(shocked, family)
+        assert canonical[key] == value
+        assert {k: v for k, v in canonical.items() if k != key} == (
+            frozen.canonical_frozen_set(params, family)
+        )
+        assert frozen.fingerprint(family, shocked, start) != frozen.fingerprint(
+            family, params, start
+        )
+    twin = {**_new_params(settings), key: value}
+    assert frozen.fingerprint("momentum", twin, start) != TWIN_FINGERPRINT

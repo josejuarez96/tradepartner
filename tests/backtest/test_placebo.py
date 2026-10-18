@@ -12,12 +12,14 @@ from __future__ import annotations
 import ast
 import random
 import sys
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from tradepartner.backtest import placebo
+from tradepartner.backtest import frozen, placebo
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "tradepartner"
 PLACEBO_PY = SRC / "backtest" / "placebo.py"
@@ -190,6 +192,51 @@ DEFAULTS = {
 )
 def test_shock_note(overrides: dict[str, object], expected: str | None) -> None:
     assert placebo.shock_note({**DEFAULTS, **overrides}) == expected
+
+
+@dataclass(frozen=True)
+class _Record:
+    params: dict[str, Any] = field(default_factory=dict)
+    family: str = "momentum"
+
+
+@pytest.mark.parametrize(
+    ("family", "params", "expected"),
+    [
+        # `strategy` is inert for `profitability`, so its frozen values carry no
+        # `strategy.*` key: no shock, no tag (quant-auditor on #1827).
+        ("profitability", {}, None),
+        ("profitability", {"profitability.top_fraction": 0.2}, None),
+        ("combined", {}, None),
+        (
+            "combined",
+            {"strategy.placebo": "shuffle", "strategy.placebo_seed": 7},
+            "placebo=shuffle seed=7",
+        ),
+        ("combined", {"strategy.signal_delay_sessions": 1}, "signal_delay=1"),
+        (
+            "momentum",
+            {
+                "strategy.placebo": "random_entry",
+                "strategy.placebo_seed": 3,
+                "strategy.signal_delay_sessions": 2,
+            },
+            "placebo=random_entry seed=3 signal_delay=2",
+        ),
+    ],
+)
+def test_shock_note_on_each_familys_frozen_values(
+    family: str, params: dict[str, Any], expected: str | None
+) -> None:
+    """`shock_note` reads the frozen values every trial row opens with, for every
+    family, and never raises for one that does not list `strategy`."""
+    values = frozen.frozen_values(_Record(params, family=family))
+    assert placebo.shock_note(values) == expected
+
+
+def test_shock_note_on_no_strategy_keys_is_none() -> None:
+    assert placebo.shock_note({}) is None
+    assert placebo.shock_note({"profitability.top_fraction": 0.1}) is None
 
 
 # --- purity -----------------------------------------------------------------------
