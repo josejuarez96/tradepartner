@@ -41,10 +41,10 @@ def shock_note(frozen_values: Mapping[str, Any]) -> str | None:
     """The trial-row tag: `placebo=<mode> seed=<n>` when the placebo is not `none` and
     `signal_delay=<d>` when d > 0, space-separated in that order; None at the defaults."""
     parts: list[str] = []
-    mode = frozen_values["strategy.placebo"]
+    mode = frozen_values.get("strategy.placebo", "none")
     if mode != "none":
-        parts.append(f"placebo={mode} seed={frozen_values['strategy.placebo_seed']}")
-    delay = frozen_values["strategy.signal_delay_sessions"]
+        parts.append(f"placebo={mode} seed={frozen_values.get('strategy.placebo_seed', 0)}")
+    delay = frozen_values.get("strategy.signal_delay_sessions", 0)
     if delay > 0:
         parts.append(f"signal_delay={delay}")
     return " ".join(parts) or None
