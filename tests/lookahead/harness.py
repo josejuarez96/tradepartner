@@ -53,12 +53,15 @@ implementation would not.
 
 from __future__ import annotations
 
+import hashlib
+import shutil
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
 import duckdb
+from conftest import load_universe_fixtures
 
 from tradepartner.backtest import hypothesis
 from tradepartner.store import schema
@@ -92,6 +95,66 @@ _FACT_TABLES: Final[tuple[str, ...]] = tuple(
 )
 
 _SOURCE_SCHEMA = "truncation_source"
+
+#: The fixture universe every look-ahead suite's store is built from
+#: (`tests/fixtures/universe`, the CSVs `conftest.load_universe_fixtures` loads).
+FIXTURE_UNIVERSE: Final[Path] = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+
+
+class FixtureTemplate:
+    """A fixture-store **template on disk**, built once per session and copied per case
+    (T215).
+
+    Building a store is `schema.init_schema` plus `conftest.load_universe_fixtures`, the
+    same for every case; only a case's planted revisions differ. So the template holds
+    the schema and the fixture universe on disk, and every case gets its own copy to
+    revise. A case's revisions land only on its copy, never on the template or another
+    case's copy (pinned by `template_fingerprint`), so the schema-and-load build is paid
+    once per worker instead of once per case.
+    """
+
+    def __init__(self, directory: Path, fixtures_dir: Path) -> None:
+        self.directory: Final[Path] = directory
+        self.path: Final[Path] = directory / "template.duckdb"
+        conn = duckdb.connect(str(self.path))
+        try:
+            configure_connection(conn)
+            schema.init_schema(conn)
+            load_universe_fixtures(conn, fixtures_dir)
+        finally:
+            conn.close()
+        self._copies = 0
+
+    def copy(self) -> duckdb.DuckDBPyConnection:
+        """A fresh, writable copy of the template, opened for the caller to revise."""
+        self._copies += 1
+        path = self.directory / f"copy-{self._copies}.duckdb"
+        shutil.copy(self.path, path)
+        conn = duckdb.connect(str(path))
+        configure_connection(conn)
+        return conn
+
+
+def template_fingerprint(path: Path) -> str:
+    """A SHA-256 over every row of every fact table in the store at `path`, in a
+    fixed order, so a test can pin the template's content.
+
+    Bookkeeping tables are excluded: `schema_version`'s `applied_at` and the fixture
+    marker's stamp carry a build clock, not fixture data, and would make the hash
+    differ run to run. `_FACT_TABLES` is exactly the point-in-time tables a case's
+    revisions land in, which is what a pinned hash must watch.
+    """
+    digest = hashlib.sha256()
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        configure_connection(conn)  # TimeZone='UTC', so timestamps hash the same anywhere
+        for table in sorted(_FACT_TABLES):
+            digest.update(f"{table}\n".encode())
+            for row in conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall():
+                digest.update(f"{row!r}\n".encode())
+    finally:
+        conn.close()
+    return digest.hexdigest()
 
 
 class TruncatedStore:
