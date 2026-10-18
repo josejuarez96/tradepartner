@@ -48,9 +48,10 @@ def journal(
 
 
 def test_the_fakes_retry_model_is_the_raw_clients_predicate() -> None:
-    """The scripted-fault drills below retry through the raw client's own
-    `_retryable` rule (the fake delegates to it), so removing T200's 5xx and
-    connection-error retries turns them red."""
+    """The fake's modelled retry delegates to the raw client's `_retryable`
+    rule, so changing T200's 5xx or connection-error predicate turns the retry
+    drills below red. Neither this pin nor those drills exercises the raw
+    client's retry loop itself (tests/adapters/test_alpaca_trading_raw.py does)."""
     from tradepartner.adapters.alpaca_trading_raw import _retryable
 
     assert _retryable(http_fault(502)) and _retryable(http_fault(500))
@@ -100,7 +101,9 @@ def test_class_share_is_sent_to_broker_in_alpaca_form(env: Env, window: PaperWin
     assert env.alerts("halted") == []
 
 
-def test_502_on_submit_retries_same_order_once(env: Env, window: PaperWindowRow) -> None:
+def test_502_on_submit_run_completes_after_the_modelled_retry(
+    env: Env, window: PaperWindowRow
+) -> None:
     env.fake.script_call_fault("submit", http_fault(502))
     outcome = env.run(at(F_0))
     orders, events, fills = journal(env)
@@ -111,7 +114,21 @@ def test_502_on_submit_retries_same_order_once(env: Env, window: PaperWindowRow)
     assert env.alerts("halted") == []
 
 
-def test_connection_error_on_order_read_retries(env: Env, window: PaperWindowRow) -> None:
+def test_unretryable_4xx_on_submit_reaches_the_wrapper_and_halts(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """A fault the retry rule does not cover is not absorbed: the run halts."""
+    env.fake.script_call_fault("submit", http_fault(400))
+    with pytest.raises(Exception):  # noqa: B017
+        env.run(at(F_0))
+    assert env.result(env.latest_run())[0] == "halted"
+    assert len(env.alerts("halted")) == 1
+    assert not journal(env)[2]
+
+
+def test_connection_error_on_order_read_run_completes_after_the_modelled_retry(
+    env: Env, window: PaperWindowRow
+) -> None:
     env.fake.script_call_fault("get_order", requests.ConnectionError("connection reset"))
     outcome = env.run(at(F_0))
     orders, events, fills = journal(env)
@@ -122,7 +139,9 @@ def test_connection_error_on_order_read_retries(env: Env, window: PaperWindowRow
     assert env.alerts("halted") == []
 
 
-def test_500_on_order_read_retries(env: Env, window: PaperWindowRow) -> None:
+def test_500_on_order_read_run_completes_after_the_modelled_retry(
+    env: Env, window: PaperWindowRow
+) -> None:
     env.fake.script_call_fault("get_order", http_fault(500))
     outcome = env.run(at(F_0))
     orders, events, fills = journal(env)
@@ -237,7 +256,7 @@ def test_sell_refused_after_position_changes_is_reconciliation_fault(
 
 @pytest.mark.xfail(strict=True, reason="T202b")
 def test_ack_timeout_stays_pending_until_next_run(env: Env, window: PaperWindowRow) -> None:
-    env.fake.script(TransportFault(error=TimeoutError("ack delayed")))
+    env.fake.script(TransportFault(after_record=True, error=TimeoutError("ack delayed")))
     first = env.run(at(F_0))
     orders, events, fills = journal(env)
     assert first.status == "ok"
