@@ -1249,15 +1249,10 @@ def test_a_buy_of_a_name_that_lost_fractionable_flooring_to_zero_is_deferred() -
 def _unknown_buys(count: int) -> list[PhaseOrder]:
     """`count` $50 buys of names the `assets` read lacks: each a `skip_asset_unknown`."""
     return [
-        _order(
-            "C",
-            "buy",
-            100 + i,
+        replace(
+            _order("C", "buy", 100 + i, price=10.0, notional=50.0, target_weight=0.04),
             security_id=f"U{i:03d}",
             symbol=f"U{i:03d}",
-            price=10.0,
-            notional=50.0,
-            target_weight=0.04,
         )
         for i in range(count)
     ]

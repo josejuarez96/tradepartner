@@ -584,7 +584,8 @@ def test_a_window_frozen_with_the_section_on_reads_back_on() -> None:
     window = replace(_pre_t206_window(), frozen_json=frozen_json)
     read = frozen_risk(window)
     assert read.small_account.enabled is True
-    assert read == _profile()
+    # The json predates `risk.max_skip_share` too: T202's back-fill reads it as 0.
+    assert read == _profile(max_skip_share=0.0)
     assert read != RiskConfig()
     assert read.model_dump()["small_account"] == {"enabled": True}
     assert (
