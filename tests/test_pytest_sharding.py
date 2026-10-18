@@ -127,3 +127,50 @@ def test_split_by_test_files_have_only_nodeid_keys_in_the_weight_table() -> None
     for split_file in _SPLIT_BY_TEST:
         assert split_file not in _HEAVY_TEST_FILE_WEIGHTS
         assert any(key.startswith(f"{split_file}::") for key in _HEAVY_TEST_FILE_WEIGHTS)
+
+
+def test_real_collection_shards_partition_the_full_suite() -> None:
+    """Collect the real suite once unsharded and once per shard (as CI does, #1749): every
+    nodeid lands in exactly one shard, so no test is lost or run twice."""
+    import os
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    count = 8
+
+    def collect(index: int | None) -> list[str]:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_SHARD")}
+        env["PYTEST_ADDOPTS"] = ""
+        if index is not None:
+            env["PYTEST_SHARD_COUNT"] = str(count)
+            env["PYTEST_SHARD_INDEX"] = str(index)
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-o",
+                "addopts=",
+                "-m",
+                "not network",
+            ],
+            cwd=_ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+        return [line for line in done.stdout.splitlines() if "::" in line]
+
+    with ThreadPoolExecutor(max_workers=count + 1) as pool:
+        full, *shards = list(pool.map(collect, [None, *range(count)]))
+    flat = [nodeid for shard in shards for nodeid in shard]
+    assert len(flat) == len(set(flat)), "a test is collected by more than one shard"
+    assert set(flat) == set(full)
+    assert len(full) == len(set(full))
