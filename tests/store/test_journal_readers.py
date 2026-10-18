@@ -1008,3 +1008,28 @@ def test_events_and_outcomes_filter_by_client_order_ids_within_the_window(
     assert outcomes() == ["a", "b", "c"]  # unchanged
     assert outcomes(client_order_ids=["b"]) == ["b"]
     assert outcomes(client_order_ids=[]) == []
+
+
+def test_fills_for_carries_the_orders_journaled_session(conn: duckdb.DuckDBPyConnection) -> None:
+    """#1733: `OrderedFill.order_session` is `orders.session` through the real SELECT,
+    not the date of `filled_at` (here the fill lands a day after its order's session)."""
+    window_id = _window(conn)
+    run_id = _run(conn, window_id)
+    decision_id = _decision(conn, run_id)
+    session = date(2026, 10, 13)
+    _order(conn, run_id, decision_id, "os-1", session=session)
+    append(
+        conn,
+        FillRow(
+            client_order_id="os-1",
+            filled_at=_at(1) + timedelta(days=1),
+            quantity=1.0,
+            price=10.0,
+            price_implied=False,
+            broker_fill_id="bf-os",
+            source="broker_feed",
+            **_stamp(2),
+        ),
+    )
+    got = journal.fills_for(conn, window_id=window_id)
+    assert [f.order_session for f in got] == [session]
