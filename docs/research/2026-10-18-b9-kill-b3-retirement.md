@@ -1,8 +1,8 @@
-# B9 killed at kill-ladder rungs 1-2, and B3 retired (owner, 2026-10-18)
+# B9 killed, B3 retired, IRRX parked (owner, 2026-10-18)
 
 **Date:** 2026-10-18  ·  **Issue:** #1765  ·  **Decided by:** the owner, in chat with the orchestrator, from the strategy pass of the same day  ·  **Kind:** desk note, arithmetic on graded evidence; no run, no trial, no store read.
 
-Two verdicts. Each states its criterion, the numbers, the sources and what it closes.
+Three verdicts. Each states its criterion, the numbers, the sources and what it closes.
 
 ## 1. B9 (earnings-reaction drift) is killed at rungs 1 and 2
 
@@ -27,7 +27,7 @@ Two verdicts. Each states its criterion, the numbers, the sources and what it cl
 **What it closes.**
 - B9's hypothesis file (`docs/hypotheses/b9-earnings-reaction-drift.md`) is left as filed: it was never registered and a pre-registration is not edited.
 - No `earnings_drift` root family, spec amendment, event-path engine task or paper book is built for B9.
-- T164e's B9 reason (the ADR 0023 gate, "B9's kill-ladder rung 1") is gone. T164e remains on the plan only if another consumer wants the 8-K `items` store (IRRX needs it, and is itself parked behind the T198 sitting, see [the IRRX note](2026-10-18-irrx-long-leg.md)). The orchestrator decides whether the plan line gets a note (plan edits are class B and are not made here).
+- T164e's B9 reason (the ADR 0023 gate, "B9's kill-ladder rung 1") is gone. T164e remains on the plan only if another consumer wants the 8-K `items` store (IRRX needs it, and is itself parked behind the T198 sitting, see section 3). The orchestrator decides whether the plan line gets a note (plan edits are class B and are not made here).
 - The fast book that could have carried a forward exam (B9's unspent `earnings_drift` holdout) no longer exists; a forward exam needs a new root family from a new idea that survives the ladder.
 
 ## 2. B3 (gross profitability) is retired by its own retirement rule
@@ -55,10 +55,20 @@ Beta-adjusted (B11, 2026-10-10): alpha -3.2 pp/yr, beta 1.08, R² 0.84, so the t
 
 **Sources.** PR #1158 (T85f evidence and auditor verdict); `docs/hypotheses/b3-gross-profitability.md`; `docs/sweeps/b4-momentum-profitability-combined.md`; [B11 note](2026-10-10-b11-beta-alpha-split.md); QI-6 SUPPORTED (narrow), QI-16 MIXED in `claims.toml`; the strategy pass of 2026-10-18.
 
-## 3. Formal retirement mechanism
+## 3. IRRX is parked behind T198
+
+**Criterion (ADR 0023 rung 2, pre-stated in the #1734 brief).** Kill if the 2010-2024 long-only leg is under 0.10 %/month or t is under 1.0; if no usable published long leg exists, IRRX is **parked** behind T198, neither killed nor passed.
+
+**Finding.** The Dai, Medhat, Novy-Marx and Rizova (FAJ 2024) paper reports only winner-minus-loser spreads for REV, IRR and IRRX (long-short 0.58 %/month, t 3.29, May 2001 to December 2021), with no loser-side leg and no post-2010 split. Chen-Zimmermann, JKP and Ken French carry no industry-relative or announcement-adjusted reversal series. The plain-reversal proxy's 2010-2024 long leg is -0.16 %/month (t -0.59), but IRRX and plain reversal diverge after 2001, so the proxy cannot decide the rung. Long-leg number: none published; evidence grade **INSUFFICIENT**. Full report: [IRRX rung-2 retry](2026-10-18-irrx-rung2-retry.md) (earlier attempt: [#1734](2026-10-18-irrx-long-leg.md)).
+
+**Verdict.** Parked. Next step when T198 lands: build the long leg on our own store (rung 4; it needs the 8-K dates of T164e and only reaches back to 2016). Nothing is built for IRRX before then.
+
+**Capacity note (rung 3 preview).** About 98 names fit $100 under D6's feasibility rule; a top 20-50 subset on fractional orders fits.
+
+## 4. Formal retirement mechanism
 
 `tradepartner sweep retire <slug> --reason TEXT` (`backtest.promotion.retire`) retires **sweeps** only: it looks the slug up in the sweep registry and appends a `sweep_retired` decision. B3 is a hypothesis registered before the strategy lab (hypothesis 2, grandfathered), B9 and B4 were never registered, and no command retires a hypothesis. So no store write exists for these verdicts: this note and the backlog statuses are the record. Nothing was run against the store.
 
 ## Effect on the queue
 
-The backlog's priority note order B10 -> B9 -> IRRX becomes **B10 -> IRRX**. Ladder items still open: B10 (rungs 1, 3, 4), IRRX (parked behind the T198 sitting per the 2026-10-18 note), then any new idea.
+The backlog's priority note order B10 -> B9 -> IRRX becomes **B10 first; IRRX parked behind T198; B9 killed; B3 retired**. Ladder items still open: B10 (rungs 1, 3, 4), then any new idea.
