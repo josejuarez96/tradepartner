@@ -1,6 +1,6 @@
-# Runbook: the `protect-main` ruleset
+# Procedure: the `protect-main` ruleset
 
-The server-side layer of [git-workflow.md, How the rules are enforced](../ways-of-working/git-workflow.md#how-the-rules-are-enforced). File: `.github/rulesets/protect-main.json`; active since 2026-10-04 (plan T75b, ruleset id 24443727). It refuses a direct push, a force-push and a deletion of `main` for every token, the owner's included, requires a PR, squash only, with the `checks` run on the head commit. It does **not** refuse a PR merge with a red `checks` run by the owner's admin token (#762 merged red on purpose; #772 reverts it), so the merge classes and the green-head condition of rule 7 are a process rule, not a server one.
+The server-side layer of [git-workflow.md, How the rules are enforced](../git-workflow.md#how-the-rules-are-enforced). File: `.github/rulesets/protect-main.json`; active since 2026-10-04 (plan T75b, ruleset id 24443727). It refuses a direct push, a force-push and a deletion of `main` for every token, the owner's included, requires a PR, squash only, with the `checks` run on the head commit. It does **not** refuse a PR merge with a red `checks` run by the owner's admin token (#762 merged red on purpose; #772 reverts it), so the merge classes and the green-head condition of rule 7 are a process rule, not a server one.
 
 ## What the file says and why
 

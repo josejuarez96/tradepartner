@@ -1,6 +1,6 @@
-# Runbook: orchestrator handover and takeover
+# Procedure: orchestrator handover and takeover
 
-The procedure behind [teams.md, Orchestrator](../ways-of-working/teams.md#orchestrator). There is exactly one orchestrator session at a time; it retires only after this handover is complete, and its successor starts from the handover comment.
+The procedure behind [teams.md, Orchestrator](../teams.md#orchestrator). There is exactly one orchestrator session at a time; it retires only after this handover is complete, and its successor starts from the handover comment.
 
 ## Retiring, in this order
 

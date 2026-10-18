@@ -81,6 +81,6 @@ The owner's line: research freedom in development, evidence discipline in valida
 
 | Date | Change | Where |
 |---|---|---|
-| 2026-10-02 | Draft v0.1: the loop, the claims register, the backlog, promotion gates | #620 |
+| 2026-10-03 | Draft v0.1: the loop, the claims register, the backlog, promotion gates | #620, PR #621 |
 | 2026-10-09 | Zones, the development boundary and forward exams, from the owner's decisions of 2026-10-08 | #1331, #1301 |
 | 2026-10-18 | Rewritten for length, meaning unchanged; the loop as a numbered list; the 10-08 track snapshot points at STATUS | #1752 |

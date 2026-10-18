@@ -88,7 +88,7 @@ From the research handoff; process rules, not just code rules.
 The steps are [teams.md, Session protocol](teams.md#session-protocol); every command is on its [command card](teams.md#command-card). No claim, no branch (spikes excepted). In addition:
 
 - **What a writer reads:** the task's plan line and its dependencies' lines (`claim` prints them, `team.py show <Tn>` reprints them) plus the spec sections the line cites, never the whole plan or spec.
-- **A blocker or a decision needed** goes on the issue or the PR (a `blocked:` line to the orchestrator, who carries it to the owner), not into `STATUS.md`. Never edit STATUS "Next up" or the frontier snapshot to reserve work.
+- **A blocker or a decision needed** goes on the issue or the PR (a `blocked:` line to the orchestrator, who carries it to the owner). A team does not write it into `STATUS.md`: the "Blocked" and "Decisions needed from owner" lists there are `doc-keeper`'s, filled from the issues when it refreshes STATUS, and the cockpit and the planning team read them from there. Never edit STATUS "Next up" or the frontier snapshot to reserve work.
 - **End of session:** commit and push; update the draft PR description; record what changed in one fragment; stopping for good, `team.py release` with a handoff comment on the issue. `STATUS.md` replaces ad-hoc handoff documents: it tells you where things stand in two minutes of reading.
 
 ## Retros

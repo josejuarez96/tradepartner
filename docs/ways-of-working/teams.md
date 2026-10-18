@@ -76,7 +76,7 @@ For a window Jose drives. A background team follows the brief it was spawned wit
 ### Orchestrator
 
 - **The session Jose names as the orchestrator.** It spawns the teams, sends each its assignment, triages their `ready` and `blocked` lines and reports to him; it claims and builds like any team when it does so; it is the only session that spawns teams. **Exactly one at a time:** any other session Jose opens takes work as a team and spawns none. ("Orchestrator" in [agents.md](agents.md#orchestrator-windows-and-model-tiers) still means a team's own lead session, the one that spawns that team's agents.)
-- **It retires only after the handover is complete:** every live team listed (issue, PR or issue alone, state, model); its live teams stopped, their claims kept for the successor; dead teams' claims released or parked as that team from its own directory, or listed for Jose's `release --force`; and the handover written as a comment on the one standing issue titled exactly **`Orchestrator log`**, never as a memory note (a note may point at the comment, never replace it). Steps and contents: the [handover runbook](../runbooks/orchestrator-handover.md).
+- **It retires only after the handover is complete:** every live team listed (issue, PR or issue alone, state, model); its live teams stopped, their claims kept for the successor; dead teams' claims released or parked as that team from its own directory, or listed for Jose's `release --force`; and the handover written as a comment on the one standing issue titled exactly **`Orchestrator log`**, never as a memory note (a note may point at the comment, never replace it). Steps and contents: the [handover procedure](procedures/orchestrator-handover.md).
 - **The successor starts from that comment:** first a one-line "taking over" comment there, then it re-spawns each live team from that team's own directory with "continue PR #N" (or "continue issue #N") and its assignment, never entering it. A team's final report reaches only the session that spawned it, so a team left under a retired orchestrator is a team nobody hears from. Same claim, same branch, same PR.
 
 ### The claim protocol, exactly
@@ -94,7 +94,7 @@ For a window Jose drives. A background team follows the brief it was spawned wit
 
 In this order: (1) the next task in the chain you are on; (2) any task on the ready frontier; (3) any unclaimed issue with a size label, smallest first: `size:S` follow-ups; `type:research` issues whose body is a brief on the [template](../templates/research-brief.md), filed or approved on the issue by Jose (no approved brief, not claimable), run with the `researcher` agent, one issue per run, report PR to `docs/research/`; `type:decision` and `type:docs` issues (ADR, spec or plan drafts), Fable-tier, `spec-critic` before ready, the owner accepts by merging. An issue with no size label is not ready to claim; ask the owner to size it. (4) Nothing left: **do not invent work.** Report to the owner. Parallelism is bounded by the plan's dependency graph, not by the number of windows. Chains are a preference, not a lock: every task is claimed individually.
 
-**The planning team** fills the frontier once a plan is consumed: a team like any other, spawned by the orchestrator when the agent-claimable frontier is below two tasks or three or more unclaimed issues name one shared module, on Fable, one PR in flight, never messaging a team, filing no code issues. Its trigger, inputs, outputs, claim and caps: the [planning-team runbook](../runbooks/planning-team.md).
+**The planning team** fills the frontier once a plan is consumed: a team like any other, spawned by the orchestrator when the agent-claimable frontier is below two tasks or three or more unclaimed issues name one shared module, on Fable, one PR in flight, never messaging a team, filing no code issues. Its trigger, inputs, outputs, claim and caps: the [planning-team procedure](procedures/planning-team.md).
 
 ### Shared files: how N PRs avoid conflicts
 
@@ -114,7 +114,7 @@ The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull requ
 - `team.py status` from any clone shows every team's claims. Merging the head of a chain widens the frontier for everyone, so prefer chain heads first. Labels of retired teams are harmless.
 - **Directories of retired teams are pruned ad hoc, never automatically.** `team.py prune` lists directories with no open claim idle for six hours or more (`--hours`); `--yes` removes them with `git worktree remove`; directories with uncommitted changes are listed and skipped. Agents never run it.
 - Two windows on one task is a process failure, never a judgment call; when it happens, the lower issue number wins and the other PR is closed with a pointer.
-- You are not a role in the tool. You approve every class-B merge (your word on that PR, or your "merge train `<batch id>`", which lets the window you say it to run `merge_train.py merge`); the orchestrator lands class A under the same [rule 7](git-workflow.md#merge-classes-rule-7). You decide which window claims an owner task, and you `release --force` when a window dies. Whatever window you type in is a normal team.
+- You are not a role in the tool. You approve every class-B merge (your word on that PR, or your "merge train `<batch id>`", which lets the window you say it to run `merge_train.py merge`); the orchestrator, the single session above the teams and never a team's own lead session, lands class A under the same [rule 7](git-workflow.md#merge-classes-rule-7). You decide which window claims an owner task, and you `release --force` when a window dies. Whatever window you type in is a normal team.
 
 ### Never
 
@@ -123,7 +123,7 @@ The `claims` job runs `scripts/team.py check-claims --pr <n>` on every pull requ
 - Enter another team's directory or the main checkout for any reason.
 - Touch a branch, PR or issue another team currently **holds** (released or parked is fair game after you claim it). Closing another team's issue is the tool's job under the duplicate rule, never yours.
 - Claim an owner task, or claim past unmerged dependencies without a written stub agreement.
-- Merge. The one exception is the orchestrator landing a class-A PR under every condition of [rule 7](git-workflow.md#merge-classes-rule-7); a class-B PR lands only on the owner's word for that PR, a train only on his "merge train `<batch id>`" (building one is not merging and happens only when he asks); the ruleset bypass (`--admin`) is never a window's.
+- Merge. The one exception is the orchestrator (the single session above the teams, never a team's own lead session) landing a class-A PR under every condition of [rule 7](git-workflow.md#merge-classes-rule-7); a class-B PR lands only on the owner's word for that PR, a train only on his "merge train `<batch id>`" (building one is not merging and happens only when he asks); the ruleset bypass (`--admin`) is never a window's.
 
 ### Model tiers
 
@@ -136,4 +136,4 @@ Set by the table in [agents.md](agents.md#orchestrator-windows-and-model-tiers),
 | 2026-09-24 | v1.0: claims, team identity, the CI guard, after two sessions opened PRs for the same two tasks within a minute | #36, PR #37 |
 | 2026-09-25 to 10-01 | Fragments instead of shared-file lines (#70); one fragment per PR and the finished-line shape (#351, #353); report-only messages and two review passes (#489); `claim` prints the task lines (#352); `prune` skips dirty directories (#167) | those issues |
 | 2026-10-04 | Orchestrator section and the planning team (audit items 1 and 6); background subagents count as windows; train commands on the card | #780, #782, #773, #529, [audit](../retros/2026-10-04-orchestration-layer-audit.md) |
-| 2026-10-18 | Rewritten for length; merge rules live only in git-workflow.md; the team writes its own code, `implementer` optional; protocol scoped to driven windows; handover and planning-team procedures moved to runbooks | #1752 |
+| 2026-10-18 | Rewritten for length; merge rules live only in git-workflow.md; the team writes its own code, `implementer` optional; protocol scoped to driven windows; handover and planning-team procedures moved to procedure pages | #1752 |

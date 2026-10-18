@@ -1,6 +1,6 @@
-# Runbook: the verification-pass diff
+# Procedure: the verification-pass diff
 
-What a reviewer reads on its verification pass ([agents.md, Review passes](../ways-of-working/agents.md#review-passes) rule 2): everything pushed to the PR's own files since pass 1, with `main`'s hunks told apart from the PR's. Commits a merge of `main` brought in were reviewed on their own PRs and are skipped.
+What a reviewer reads on its verification pass ([agents.md, Review passes](../agents.md#review-passes) rule 2): everything pushed to the PR's own files since pass 1, with `main`'s hunks told apart from the PR's. Commits a merge of `main` brought in were reviewed on their own PRs and are skipped.
 
 1. **Fetch first.** `git fetch origin`. Stale, `origin/main` puts files only the merge touched in the second list below.
 2. **Scope the diff to the PR's own files**, as they stood at pass 1 and as they stand now:

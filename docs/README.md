@@ -39,7 +39,7 @@ docs/
 | **Sweep** | Which grid of variants are we registering as counted trials of one family, ranked by which pre-declared statistic, with which promotion floor and retirement condition? | Before any sweep run ([strategy-lab spec](specs/strategy-lab.md)) | **Frozen** once registered: a changed file is a new registration with new variants | [sweep](templates/sweep.md) |
 | **Retro** | What should we change about how we work? | End of each phase | Frozen | [retro](templates/retro.md) |
 | **CHANGELOG** | What changed, per version? | Every PR | One fragment per PR in `changelog.d/` (its STATUS line and CHANGELOG bullets), folded by doc-keeper | n/a |
-| **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | When an issue, research brief, ADR, spec or plan is opened | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
+| **Work map** | What is this piece of work, in plain English, and why does it matter for the MVP? | With the PR that creates the task, ADR, spec, plan or report; a plain issue when someone writes one | Living; the cockpit lists the ids it is missing | the header comment in [work-map.toml](work-map.toml) |
 
 ## Rules
 

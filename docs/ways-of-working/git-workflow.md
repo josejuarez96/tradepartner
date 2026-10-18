@@ -101,7 +101,7 @@ Each orchestrator session is a **team** in its own working directory (a worktree
 | CI | Lint, format, types, hygiene on every PR; the full suite, sharded, when the PR touches code, tests, scripts, deps or CI, and on every push to `main` and `train/**`. PR CI keeps the full suite (#773): targeted-only PR CI waits until `ready_pr.py` or the ruleset checks that a hand-merged head ran the full suite | `.github/workflows/ci.yml` |
 | CI `claims` job | A PR whose issue is unclaimed; two open PRs for one plan task | `scripts/team.py check-claims` |
 | Merge train | Ready PRs landing on a combined tree CI never ran | [above](#the-merge-train) |
-| Server-side ruleset `protect-main`, active since 2026-10-04 (plan T75b, id 24443727) | Direct pushes, force-push and deletion, for every token, the owner's included; a PR required, squash only, the `checks` run required on the head commit. It does **not** refuse a red-`checks` merge by the owner's admin token ([Both classes](#both-classes)). What the file says and why, and how the owner changes it: [runbook](../runbooks/protect-main-ruleset.md) | `.github/rulesets/protect-main.json` |
+| Server-side ruleset `protect-main`, active since 2026-10-04 (plan T75b, id 24443727) | Direct pushes, force-push and deletion, for every token, the owner's included; a PR required, squash only, the `checks` run required on the head commit. It does **not** refuse a red-`checks` merge by the owner's admin token ([Both classes](#both-classes)). What the file says and why, and how the owner changes it: [procedure](procedures/protect-main-ruleset.md) | `.github/rulesets/protect-main.json` |
 
 **Local hooks**, once per clone (worktrees share them): `uv run pre-commit install`. **Emergency override:** `git commit --no-verify` exists; using it on `main` requires a note in the PR or `STATUS.md` explaining why, and agents may never use it.
 
@@ -110,8 +110,8 @@ Each orchestrator session is a **team** in its own working directory (a worktree
 | Date | Change | Where |
 |---|---|---|
 | 2026-09-24 | v1.0 | PR #2 |
-| 2026-09-30 | No stacked PRs; CI on the exact commit | [phase-1 retro](../retros/phase-1.md) |
+| 2026-09-24 | No stacked PRs; CI on the exact commit | [phase-1 retro](../retros/phase-1.md), #14 |
 | 2026-10-03 | Merge train, after two `main`-red incidents on 10-01 | [spec](../specs/merge-train.md), #529 |
 | 2026-10-04 | Rule 7 as two classes, replacing the chat-granted approval (#781, [audit](../retros/2026-10-04-orchestration-layer-audit.md) item 2); PR CI keeps the full suite (#773); ruleset active; #762 red-merge test (#772); threads resolved whoever opened them (#803) | [ADR 0002](../decisions/0002-git-workflow.md#amendment-2026-10-04-two-merge-classes-781-audit-item-2) |
 | 2026-10-06, 10-13 | The PR's own plan-box tick keeps class A (#1110); a plan-named release PR lands like class A (#1647) | those PRs |
-| 2026-10-18 | Rewritten for length, meaning unchanged; the one home for the classes and the train; ruleset explanation moved to a runbook | #1752 |
+| 2026-10-18 | Rewritten for length, meaning unchanged; the one home for the classes and the train; ruleset explanation moved to a procedure page | #1752 |
