@@ -588,7 +588,7 @@ def _exit_book(context: StepContext) -> _ExitBook:
     session = context.session
     window_id = _window_id(context.window)
     cut = calendar.session_close(previous_session(session))
-    with open_read_only(context.settings) as conn:
+    with open_read_only(context.settings, retry=True) as conn:
         actions = live_actions_as_of(conn, cut)
         journaled = decisions_for(conn, window_id)
         orders = orders_for(conn, window_id=None)
@@ -1030,7 +1030,7 @@ def open_books(settings: Settings) -> tuple[str, ...]:
     token order, over a short read-only connection; empty on a store with no
     journal. A book with two open windows is listed once: its own run then fails
     closed on them (`journal.open_window`)."""
-    with open_read_only(settings) as conn:
+    with open_read_only(settings, retry=True) as conn:
         try:
             require_journal(conn)
         except JournalNotInitialised:
@@ -1089,7 +1089,7 @@ def _locked_run(
     book: str,
 ) -> RunOutcome | _Run:
     now = _read_clock(clock)
-    with open_read_only(settings) as conn:
+    with open_read_only(settings, retry=True) as conn:
         window = open_window(conn, book)
     if window is None:
         session = _alert_session(now)
@@ -1149,7 +1149,7 @@ def _locked_run(
     # `window_journal_inputs`: an orders/fills integrity error must surface inside
     # `_Run.execute`, whose `_fail` path alerts and writes the failed result, not
     # here before the run row exists (#507 safety review).
-    with open_read_only(settings) as conn:
+    with open_read_only(settings, retry=True) as conn:
         runs = runs_for(conn, window_id)
         rows = kill_switch_events_for(conn, window_id)
         events = rebalance_events_for(conn, window_id)
@@ -1239,6 +1239,9 @@ class _Run:
         self.assets: dict[str, Asset] = {}
         self.sleep = sleep
         self.cadence = cadence
+        #: True once a step that can submit an order has begun: a store lock after
+        #: that fails closed (#1757); before it, the run ends stale-style.
+        self.submit_begun = False
 
     # --- exits ---------------------------------------------------------------------
 
@@ -1249,6 +1252,22 @@ class _Run:
             self.gate.halt(carried.fault, self.run, write_offs=self.write_offs)
         except (SystemFaultError, StaleDataError) as fault:
             self.gate.halt(fault, self.run, write_offs=self.write_offs)
+        except StoreLockedError as locked:
+            if self.submit_begun:
+                self._fail(locked)
+                raise
+            # Another process (ingest, backfill, repair, a second book) held the
+            # store past `store.lock_retry_seconds` before any order was sent: the
+            # same as stale data, no kill switch, and the next run starts afresh.
+            self.gate.halt(
+                StaleDataError(
+                    f"the store stayed locked by another process for "
+                    f"{self.settings.store.lock_retry_seconds}s before any order was "
+                    f"submitted ({locked}); the next scheduled run picks up"
+                ),
+                self.run,
+                write_offs=self.write_offs,
+            )
         except Exception as exc:
             self._fail(exc)
             raise
@@ -1306,7 +1325,7 @@ class _Run:
         source and reason, and every cause the derived state gives. That row is
         `switch.derive`'s own `engaged_row`, so the alert and the derivation
         share one definition of "latest" (#699)."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             inputs = window_journal_inputs(conn, self.window_id)
         state = switch.derive(
             self.window,
@@ -1433,6 +1452,7 @@ class _Run:
         )
         rebalance: date | None = None
         if self.kind == _STOP:
+            self.submit_begun = True
             batch = stop_step(context)
         elif self._due() is not None:
             plan = self._plan(lagging)
@@ -1441,8 +1461,10 @@ class _Run:
             self.write_offs = WriteOffContext(
                 self.window_id, actions, self._pending_prices(actions).__getitem__, self.session
             )
+            self.submit_begun = True
             batch = trade_step(replace(context, plan=plan))
         else:
+            self.submit_begun = True
             batch = exits_step(context)
         if batch is not None:
             self._collect_own()
@@ -1466,7 +1488,7 @@ class _Run:
         first = self.window.first_rebalance_session
         if fill_session(first, self.cadence) > self.session:
             return
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             settled = {e.rebalance_session for e in rebalance_events_for(conn, self.window_id)}
         pending = [
             t_i
@@ -1500,7 +1522,7 @@ class _Run:
         now = self.gate.read_clock()
         before = previous_session(self.session)
         symbol = self.settings.ingest.reference_symbol
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             finished = last_ok_price_ingest(conn, by=now)
             if finished is None:
                 raise StaleDataError(
@@ -1524,13 +1546,13 @@ class _Run:
         return calendar.session_close(previous_session(self.session))
 
     def _actions(self) -> pl.DataFrame:
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             return live_actions_as_of(conn, self._cut())
 
     def _pending_prices(self, actions: pl.DataFrame) -> dict[str, float]:
         """Reference prices on S for every name decided in a pending rebalance:
         the write-off back-fill's and the `executed` test's `price_of`."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             settled = {e.rebalance_session for e in rebalance_events_for(conn, self.window_id)}
             names = {
                 d.decision.security_id
@@ -1542,7 +1564,7 @@ class _Run:
 
     def _collect(self) -> Collected:
         """Step 3's collection, the rejection cap and the lag bound."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             pending = {o.client_order_id for o in pending_orders(conn, window_id=self.window_id)}
             orders = [
                 o
@@ -1570,7 +1592,7 @@ class _Run:
     def _lag_bound(self, collected: Collected) -> None:
         if not collected.lagging:
             return
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             history = reconciliations_for(conn, self.window_id)
         past = [
             reading
@@ -1628,7 +1650,7 @@ class _Run:
         first = self.window.first_rebalance_session
         if fill_session(first, self.cadence) > self.session:
             return []
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             inputs = window_journal_inputs(conn, self.window_id)
         settled = {e.rebalance_session for e in inputs.rebalance_events}
         executed: list[date] = []
@@ -1693,7 +1715,7 @@ class _Run:
         paper = self.settings.paper
         deadline = self.gate.read_clock() + timedelta(seconds=paper.accept_wait_seconds)
         while True:
-            with open_read_only(self.settings) as conn:
+            with open_read_only(self.settings, retry=True) as conn:
                 pending = {
                     o.client_order_id for o in pending_orders(conn, window_id=self.window_id)
                 }
@@ -1709,7 +1731,7 @@ class _Run:
                 raise RejectionCapError("; ".join(b.message for b in collected.rejections))
             now = self.gate.read_clock()
             if now >= deadline:
-                with open_read_only(self.settings) as conn:
+                with open_read_only(self.settings, retry=True) as conn:
                     still = sorted(
                         o.client_order_id
                         for o in non_terminal_orders(conn, window_id=self.window_id)
@@ -1801,7 +1823,7 @@ class _Run:
 
     def _ledger_for(self, actions: pl.DataFrame) -> Callable[[date], Ledger]:
         """The window's ledger stated through a session, from one journal read."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             fills = fills_for(conn, window_id=self.window_id)
             orders = orders_for(conn, window_id=self.window_id)
             adjustments = adjustments_for(conn, self.window_id)
@@ -1832,7 +1854,7 @@ class _Run:
         """Each name's ticker on its listing current at S, known at close(S-1)."""
         if not names:
             return {}
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             listings = listings_as_of(conn, self._cut(), list(names))
         return _current_tickers(listings, self.session)
 
@@ -1852,7 +1874,7 @@ class _Run:
     def _mark(self, actions: pl.DataFrame) -> None:
         """Step 5's marks, then the drawdown check and the `missed_run` alert."""
         ledger = self._ledger_for(actions)
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             sessions = self._mark_sessions(last_marked_session(conn, self.window_id))
             held = {name for day in sessions for name in ledger(day).positions}
             symbols = (
@@ -1869,7 +1891,7 @@ class _Run:
         flags = {
             name: assets[symbol].tradable for name, symbol in symbols.items() if symbol in assets
         }
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             rows = marks.marks_for(conn, self.window, ledger, sessions, flags, actions=actions)
         if rows:
             stamp = self.gate.read_clock()
@@ -1892,7 +1914,7 @@ class _Run:
                         ),
                     )
         self._drawdown({mark.session for mark in rows})
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
         boundary = previous_session(self.session)
         if boundary > self._start_day() and marks.missed_run(run_rows, self.session):
@@ -1920,7 +1942,7 @@ class _Run:
         releases, so a crashed run's marks are not dropped from the check
         (#648).
         """
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             marks_rows = positions_daily_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
         try:
@@ -1948,7 +1970,7 @@ class _Run:
 
     def _lapses(self) -> None:
         """The lapse rows from `marks.lapses`, with one `missed_rebalance` alert."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             runs = runs_for(conn, self.window_id)
             events = rebalance_events_for(conn, self.window_id)
             rows = kill_switch_events_for(conn, self.window_id)
@@ -1997,7 +2019,7 @@ class _Run:
         to write it, through that later run's own horizon (recomputed the
         same way from the stored facts), not through this run's `flat`. The
         value written is unaffected: only which run ends up writing it."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             names = sorted({o.security_id for o in orders_for(conn, window_id=self.window_id)})
             bars = prices_as_of(conn, self._cut(), names) if names else pl.DataFrame()
         closes = {
@@ -2043,7 +2065,7 @@ class _Run:
         session: the outcome of an order terminal and flat at an earlier `stop`
         run was written by that run (outcomes are written once, at the first
         run they are due)."""
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             stops = window_stops_for(conn, self.window_id)
             requested_rows = [s for s in stops if s.state == _REQUESTED]
             if not requested_rows or self.kind != _STOP:
@@ -2086,7 +2108,7 @@ class _Run:
         return stop_session(min(s.at for s in requested_rows)), flat
 
     def _due(self) -> planning.RebalanceKind | None:
-        with open_read_only(self.settings) as conn:
+        with open_read_only(self.settings, retry=True) as conn:
             run_rows = [r.run for r in runs_for(conn, self.window_id)]
             events = rebalance_events_for(conn, self.window_id)
         return _rebalance_kind(self.window, run_rows, events, self.session, self.cadence)
