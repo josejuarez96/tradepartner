@@ -78,6 +78,10 @@ class _ScaleProvider(FakeProvider):
         super().__init__(prices=prices, members=members, benchmarks={})
         self._sessions = prices["session"].unique(maintain_order=True).to_list()
         self._names = len(members[next(iter(members))])
+        self._name_index = {
+            sid: index for index, sid in enumerate(sorted(members[next(iter(members))]))
+        }
+        self._raw_by_id = prices.sort("security_id", "session")
 
     def _bars(
         self, t: datetime, ids: list[str] | tuple[str, ...], sessions_from: date
@@ -108,9 +112,18 @@ class _ScaleProvider(FakeProvider):
 
     def raw_prices(self, t: datetime, ids: list[str] | tuple[str, ...]) -> pl.DataFrame:
         self._record("raw_prices", t, ids=ids)
-        # Every fixture name has a bar on every session, so only the current
-        # bar can be used by the engine's fill and exit price lookups.
-        return self._bars(t, ids, last_completed_session(t))
+        through = bisect_right(self._sessions, last_completed_session(t))
+        n_sessions = len(self._sessions)
+        return (
+            pl.concat(
+                [
+                    self._raw_by_id.slice(self._name_index[sid] * n_sessions, through)
+                    for sid in sorted(ids)
+                ]
+            )
+            if ids
+            else self._raw_by_id.slice(0, 0)
+        )
 
     def marking_changed_ids(
         self, previous_t: datetime, t: datetime, ids: list[str] | tuple[str, ...]

@@ -672,8 +672,10 @@ class _SharedReads:
     the group shares is made once, for the union of the variants' ids (`share`), and
     each variant's own request is served from it restricted to its ids. A request no
     shared read covers is made as asked. With `covering` false (a group of one, `run`)
-    a read serves only the one request it was made for, so every request is one
-    provider call exactly as asked. Every real call's error is a `_ReadError`."""
+    ordinary reads serve only the request they were made for. Marking reads
+    use a cross-step cache when the provider can report newly known inputs;
+    otherwise they are made as asked. Every real call's error is a
+    `_ReadError`."""
 
     def __init__(self, provider: DataProvider, *, covering: bool) -> None:
         self._provider = provider
@@ -1186,6 +1188,7 @@ def _marking_bound(variant: _Variant, step_end: date, family: HypothesisFamily) 
         bounds.append(formation(plan.session))
     for book in variant.books:
         bounds.extend(book.marked_at.values())
+        bounds.extend(book.held_since.values())
         bounds.extend(
             holding.marked_at
             for holding in book.benchmarks.values()
