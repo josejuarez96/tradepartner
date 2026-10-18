@@ -159,8 +159,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_28() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 28
+def test_current_schema_version_is_29() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 29
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -280,7 +280,7 @@ def test_migrating_a_version_24_store_books_the_fee_columns_once_and_keeps_rows(
         ).fetchone()[0]
         assert "'fee_cash'" in ddl
         assert "'cash_in_lieu'" in ddl  # the same init pass runs the version-27 widen
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 28
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 29
     finally:
         conn.close()
 
@@ -328,7 +328,7 @@ def test_migrating_a_version_26_store_widens_the_kind_check_once_and_keeps_rows(
         schema.init_schema(conn)
 
         assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 28
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 29
         ddl = conn.execute(
             "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
         ).fetchone()[0]
@@ -349,6 +349,245 @@ def test_migrating_a_version_26_store_widens_the_kind_check_once_and_keeps_rows(
             )
     finally:
         conn.close()
+
+
+#: The reason `CHECK` of each table as version 28 left it, in DuckDB's stored
+#: form (#1808, T202a): `decision_events` without `skip_asset_unknown` and
+#: `skip_not_fractionable`, `order_events` without the three skip reasons.
+_V28_REASONS = {
+    "decision_events": (
+        "skip_below_one_share",
+        "skip_untradable",
+        "skip_below_minimum",
+        "skip_delisted",
+        "dust",
+        "untradable",
+        "unfunded",
+    ),
+    "order_events": ("halt", "not_received", "owner_settled_unknown"),
+}
+#: The values version 29 adds to each table's reason `CHECK` (spec amendment
+#: item 2, #1808).
+_V29_NEW_REASONS = {
+    "decision_events": ("skip_asset_unknown", "skip_not_fractionable"),
+    "order_events": ("skip_asset_unknown", "skip_not_fractionable", "skip_untradable"),
+}
+_REASON_CHECK = re.compile(r"CHECK\(\(\(reason IS NULL\) OR \(reason IN \([^)]*\)\)\)\)")
+_LATER = _NOW + timedelta(minutes=1)
+
+
+def _rebuild_with_reasons(
+    conn: duckdb.DuckDBPyConnection, table: str, reasons: tuple[str, ...]
+) -> None:
+    """Rebuild `table` from its live `CREATE TABLE` with the reason `CHECK` set to
+    exactly `reasons`, every row kept in insertion order (DuckDB cannot alter a
+    `CHECK` in place, as `_version_26_store` notes)."""
+    ddl = conn.execute(
+        "SELECT sql FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND table_name = ?",
+        [table],
+    ).fetchone()[0]
+    allowed = ", ".join(f"'{reason}'" for reason in reasons)
+    narrowed, count = _REASON_CHECK.subn(
+        f"CHECK(((reason IS NULL) OR (reason IN ({allowed}))))", ddl
+    )
+    assert count == 1, ddl
+    staging = f"{table}_v28"
+    conn.execute(narrowed.replace(f"CREATE TABLE {table}(", f"CREATE TABLE {staging}(", 1))
+    conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
+def _version_28_store(conn: duckdb.DuckDBPyConnection, stray: dict[str, str] | None = None) -> None:
+    """A store as version 28 left it (main before T202a): every table at the
+    current shape but `decision_events` and `order_events` with their version-28
+    reason `CHECK`s, every `schema_version` row set to 28, and four rows in each
+    table inserted out of key order with tied `known_at` stamps (so a copy that
+    sorted by anything but rowid would reorder them). `stray` maps a table to one
+    reason outside its version-29 set, which its `CHECK` is widened to admit and
+    which is then stored, as a hand-edited store could hold."""
+    schema.init_schema(conn)
+    for table, reasons in _V28_REASONS.items():
+        extra = (stray[table],) if stray and table in stray else ()
+        _rebuild_with_reasons(conn, table, reasons + extra)
+    conn.execute("UPDATE schema_version SET version = 28")
+    decision_rows: list[tuple[object, ...]] = [
+        (7, 2, "skipped", "skip_untradable", None, _NOW, _NOW),
+        (3, 2, "written_off", "unfunded", 1234.5678, _NOW, _NOW),
+        (9, 1, "skipped", None, None, _NOW, _LATER),
+        (1, 2, "skipped", "skip_below_one_share", None, _LATER, _LATER),
+    ]
+    for row in decision_rows:
+        conn.execute(
+            "INSERT INTO decision_events (decision_id, run_id, status, reason, "
+            "unfunded_notional, known_at, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            list(row),
+        )
+    order_rows: list[tuple[object, ...]] = [
+        ("tp-9", _NOW, "pending", None, None, None, None, None, _NOW, _NOW),
+        ("tp-9", _NOW, "cancel_requested", "halt", "b-9", None, None, '{"a": 1}', _NOW, _NOW),
+        ("tp-9", _NOW, "cancel_noop", None, "b-9", 0.25, 101.125, '{"b": 2}', _NOW, _NOW),
+        ("tp-2", None, "cancelled", "not_received", None, None, None, None, _NOW, _LATER),
+    ]
+    for row in order_rows:
+        conn.execute(
+            "INSERT INTO order_events (client_order_id, event_at, status, reason, "
+            "broker_order_id, filled_quantity, filled_avg_price, raw_json, known_at, "
+            "ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            list(row),
+        )
+    if stray:
+        for table, reason in stray.items():
+            if table == "decision_events":
+                conn.execute(
+                    "INSERT INTO decision_events (decision_id, run_id, status, reason, "
+                    "known_at, ingested_at) VALUES (5, 2, 'skipped', ?, ?, ?)",
+                    [reason, _LATER, _LATER],
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO order_events (client_order_id, status, reason, known_at, "
+                    "ingested_at) VALUES ('tp-5', 'rejected', ?, ?, ?)",
+                    [reason, _LATER, _LATER],
+                )
+
+
+def _insert_reason(conn: duckdb.DuckDBPyConnection, table: str, reason: str | None) -> None:
+    if table == "decision_events":
+        conn.execute(
+            "INSERT INTO decision_events (decision_id, run_id, status, reason, known_at, "
+            "ingested_at) VALUES (99, 3, 'skipped', ?, ?, ?)",
+            [reason, _LATER, _LATER],
+        )
+    else:
+        conn.execute(
+            "INSERT INTO order_events (client_order_id, status, reason, known_at, "
+            "ingested_at) VALUES ('tp-99', 'rejected', ?, ?, ?)",
+            [reason, _LATER, _LATER],
+        )
+
+
+def _rows_in_insertion_order(conn: duckdb.DuckDBPyConnection, table: str) -> list[Any]:
+    return conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+
+
+def _ddl(conn: duckdb.DuckDBPyConnection, table: str) -> str:
+    return conn.execute(
+        "SELECT sql FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND table_name = ?",
+        [table],
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("table", sorted(_V28_REASONS))
+def test_the_version_28_helper_refuses_every_version_29_reason(table: str) -> None:
+    """The helper's tables really are version 28's: each new reason is refused."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_28_store(conn)
+        for reason in _V29_NEW_REASONS[table]:
+            with pytest.raises(duckdb.ConstraintException):
+                _insert_reason(conn, table, reason)
+    finally:
+        conn.close()
+
+
+def test_migrating_a_version_28_store_widens_both_reason_checks_once_and_keeps_rows(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    """Version 29 (#1808, T202a; spec amendment item 2): a write open of a
+    version-28 store rebuilds `decision_events` and `order_events` with the
+    widened reason `CHECK`s, every row kept in insertion order and byte-identical,
+    every other table untouched, and one version-29 row appended. It must fail if
+    the migration is a no-op or reorders rows."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_28_store(conn)
+        rebuilt = tuple(sorted(_V28_REASONS))
+        others = tuple(sorted(_table_names(conn) - set(rebuilt)))
+        rows_before = {table: _rows_in_insertion_order(conn, table) for table in rebuilt}
+        others_before = _snapshot(conn, others)
+
+        schema.init_schema(conn)
+
+        assert {table: _rows_in_insertion_order(conn, table) for table in rebuilt} == rows_before
+        assert [row[0] for row in rows_before["decision_events"]] == [7, 3, 9, 1]
+        assert [row[2] for row in rows_before["order_events"]] == [
+            "pending",
+            "cancel_requested",
+            "cancel_noop",
+            "cancelled",
+        ]
+        assert _snapshot(conn, others) == others_before
+        assert _versions(conn) == [28, 29]
+        for table in rebuilt:
+            assert _ddl(conn, table) == _ddl(journal, table)
+            for reason in (*_V28_REASONS[table], *_V29_NEW_REASONS[table], None):
+                _insert_reason(conn, table, reason)
+            with pytest.raises(duckdb.ConstraintException):
+                _insert_reason(conn, table, "skip_asset_unkown")
+    finally:
+        conn.close()
+
+
+def test_a_version_28_store_migrates_once_and_reopens_without_another_version_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v28.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _version_28_store(conn)
+    for _ in range(2):
+        with duckdb.connect(str(path)) as conn:
+            schema.init_schema(conn)
+            assert _versions(conn) == [28, 29]
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [28, 29]
+
+
+@pytest.mark.parametrize(
+    ("table", "stray"),
+    [
+        ("decision_events", "skip_asset_unkown"),
+        ("decision_events", "not_fractionable"),
+        ("order_events", "skip_not_fractional"),
+        ("order_events", "halted"),
+    ],
+)
+def test_a_stored_reason_outside_the_version_29_set_refuses_the_migration_and_changes_nothing(
+    table: str, stray: str
+) -> None:
+    """Spec amendment item 2, as versions 6 and 7 did: a stored reason outside the
+    widened set needs the owner's look, so the write open raises
+    `SchemaVersionError` naming it, and neither table, nor the version, changes."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_28_store(conn, stray={table: stray})
+        both = tuple(sorted(_V28_REASONS))
+        before = _snapshot(conn, both)
+        with pytest.raises(schema.SchemaVersionError, match=f"'{stray}'"):
+            schema.init_schema(conn)
+        assert _versions(conn) == [28]
+        assert _snapshot(conn, both) == before
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_28_store_passes(tmp_path: Path) -> None:
+    """No read depends on the reason `CHECK`s, and no new reason can exist at 28, so
+    a read-only open (the dashboard's) of a store no write has migrated yet passes
+    and reads both tables."""
+    path = tmp_path / "v28.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _version_28_store(conn)
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [28]
+        assert [
+            row[0] for row in conn.execute("SELECT decision_id FROM decision_events").fetchall()
+        ] == [7, 3, 9, 1]
+        assert conn.execute("SELECT count(*) FROM order_events").fetchone()[0] == 4
 
 
 def test_the_expansion_seam_table_lists_agree() -> None:
@@ -373,7 +612,7 @@ def test_fact_and_registry_ddl_are_pinned_at_version_4() -> None:
 
 def test_fresh_init_creates_the_journal_at_version_17(journal: duckdb.DuckDBPyConnection) -> None:
     assert set(schema.JOURNAL_TABLE_NAMES) <= _table_names(journal)
-    assert _versions(journal) == [28]
+    assert _versions(journal) == [29]
 
 
 def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
@@ -440,6 +679,7 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
         26,
         27,
         28,
+        29,
     ]
     # `store_markers`: the fixture loader's marker table (strategy-lab plan T101).
     assert tables == set(kept) | set(schema.JOURNAL_TABLE_NAMES) | set(
@@ -492,6 +732,7 @@ def test_a_migrated_store_reopens_without_another_version_row(v4_path: Path) -> 
             26,
             27,
             28,
+            29,
         ]
 
 
@@ -639,7 +880,7 @@ def test_migrating_a_version_16_store_keeps_every_row_and_fills_the_new_columns(
             for table, columns in old_columns.items()
         }
         schema.init_schema(conn)
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         assert conn.execute("SELECT window_id, book_id FROM paper_windows").fetchall() == [
             (1, "main")
         ]
@@ -708,7 +949,7 @@ def test_a_version_16_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
     finally:
         conn.close()
 
@@ -865,7 +1106,7 @@ def test_migrating_a_version_18_store_keeps_every_alert_and_books_it_main() -> N
         before = conn.execute(select).fetchall()
         assert [row[0] for row in before] == [3, 1, 4]
         schema.init_schema(conn)
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         assert conn.execute(select).fetchall() == before
         assert conn.execute("SELECT alert_id, book_id FROM alerts ORDER BY rowid").fetchall() == [
             (3, "main"),
@@ -921,7 +1162,7 @@ def test_a_version_18_store_gets_no_new_version_row_on_a_second_open() -> None:
         first = _snapshot(conn, tuple(sorted(_table_names(conn))))
         schema.init_schema(conn)
         assert _snapshot(conn, tuple(sorted(_table_names(conn)))) == first
-        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        assert _versions(conn) == [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
     finally:
         conn.close()
 
@@ -964,7 +1205,7 @@ def test_a_version_4_store_gets_alerts_book_id_directly(v4_path: Path) -> None:
     with duckdb.connect(str(v4_path)) as conn:
         schema.init_schema(conn)
         assert _columns(conn, "alerts")["book_id"] is False  # NOT NULL
-        assert _versions(conn)[-1] == 28
+        assert _versions(conn)[-1] == 29
 
 
 def test_default_book_id_is_a_nonempty_word() -> None:

@@ -197,15 +197,86 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
         _decision(journal, reason)
 
 
+# --- `decision_events.reason`, widened at version 29 (#1808, T202a) -------------------
+
+#: Spec "Data / interfaces" > Tables, `decision_events`: the version-28 set, then
+#: amendment item 2's `skip_asset_unknown` and `skip_not_fractionable` (its third
+#: allowlist reason, `skip_untradable`, was already in the set).
+_DECISION_EVENT_REASONS = (
+    "skip_below_one_share",
+    "skip_untradable",
+    "skip_below_minimum",
+    "skip_delisted",
+    "dust",
+    "untradable",
+    "unfunded",
+    "skip_asset_unknown",
+    "skip_not_fractionable",
+)
+
+
+def _decision_event(conn: duckdb.DuckDBPyConnection, reason: str | None) -> None:
+    conn.execute(
+        "INSERT INTO decision_events (decision_id, run_id, status, reason, known_at, "
+        "ingested_at) VALUES (1, 1, 'skipped', ?, ?, ?)",
+        [reason, _NOW, _NOW],
+    )
+
+
+def test_the_decision_event_reasons_are_the_spec_set_in_order() -> None:
+    assert schema.JOURNAL_ENUMS["decision_events", "reason"] == _DECISION_EVENT_REASONS
+    assert ("decision_events", "reason") in schema.NULLABLE_JOURNAL_ENUMS
+
+
+def test_the_spec_lists_exactly_the_checked_decision_event_reasons() -> None:
+    """Spec "Data / interfaces" > Tables: the `decision_events.reason` list is closed
+    and names exactly the `CHECK`'s values."""
+    text = _SPEC.read_text(encoding="utf-8")
+    match = re.search(r"`decision_events\(decision_id[^`]*?reason ∈ \{([^}]*)\}", text)
+    assert match is not None
+    listed = [value.strip() for value in match.group(1).split(",")]
+    assert "…" not in listed
+    assert sorted(listed) == sorted(schema.JOURNAL_ENUMS["decision_events", "reason"])
+
+
+@pytest.mark.parametrize("reason", [None, *_DECISION_EVENT_REASONS])
+def test_every_decision_event_reason_and_null_is_accepted(
+    journal: duckdb.DuckDBPyConnection, reason: str | None
+) -> None:
+    """The two new skip reasons and every version-28 reason."""
+    _decision_event(journal, reason)
+    assert journal.execute("SELECT reason FROM decision_events").fetchall() == [(reason,)]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "skip_asset_unkown",
+        "asset_unknown",
+        "skip_not_fractional",
+        "not_fractionable",
+        "Skip_Not_Fractionable",
+        "skip-asset-unknown",
+        "",
+        "halt",
+    ],
+)
+def test_a_misspelt_decision_event_reason_is_refused(
+    journal: duckdb.DuckDBPyConnection, reason: str
+) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        _decision_event(journal, reason)
+
+
 # --- version 7 and the migrations from versions 6 and 5 ----------------------------------
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 28
+    assert schema.CURRENT_SCHEMA_VERSION == 29
 
 
 def test_fresh_init_records_version_17(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [28]
+    assert _versions(journal) == [29]
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -229,7 +300,7 @@ def test_write_open_adds_the_check_and_keeps_every_row(
             _decision(conn, "left_target", decision_id=99)
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == list(range(version, 29))
+    assert versions == list(range(version, 30))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -281,6 +352,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             26,
             27,
             28,
+            29,
         ]
 
 
