@@ -32,6 +32,7 @@ from tradepartner.config import FROZEN_COSTS_KEYS, FROZEN_EXECUTION_KEYS, Settin
 from tradepartner.execution import report, window
 from tradepartner.execution.ledger import from_journal
 from tradepartner.execution.lock import LockHeld, run_lock
+from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.ingest import _action_row
 from tradepartner.store import registry, schema
 from tradepartner.store.asof import live_actions_as_of
@@ -2006,3 +2007,94 @@ def test_a_book_outside_the_token_grammar_is_refused_before_anything(
         )
     assert fake.calls == ()
     assert _windows(journal_settings) == []
+
+
+# --- the start feasibility rule (spec amendment 2026-10-18 item 8; ADR 0023 D6; T206) ---
+# `paper start` refuses (`refused_small_account`) a window whose plan cannot fit:
+# n x `risk.min_order_notional` x (1 + `risk.whole_share_price_buffer`) <= `account().cash`.
+# n is the hypothesis's target name count from its frozen set; for momentum the most
+# names `strategy.top_fraction` selects from `universe.top_n_by_cap`. At the defaults
+# ($1.00 x 1.02 per name) and $100 of cash: 100 names need $102.00 (refused), 25 need
+# $25.50 (accepted).
+
+SMALL_ACCOUNT_CASH = 100.0
+#: H1's default count: 0.1 of a 1,000-name universe.
+HUNDRED_NAMES = {"strategy.top_fraction": 0.1, "universe.top_n_by_cap": 1000}
+#: 0.1 of a 250-name universe.
+TWENTY_FIVE_NAMES = {"strategy.top_fraction": 0.1, "universe.top_n_by_cap": 250}
+
+
+def _small_account_settings(settings: Settings, *, enabled: bool) -> Settings:
+    return Settings(
+        _env_file=None,
+        store={"path": settings.store.path},
+        risk={"small_account": {"enabled": enabled}},
+    )
+
+
+def _register_names(
+    settings: Settings, tmp_path: Path, names: dict[str, Any]
+) -> registry.HypothesisRecord:
+    with open_for_write(settings) as conn:
+        hyp = _register(conn, settings, "h1", HOLDOUT_END_PAST, params=_params(**names))
+        _sign_off(conn, settings, hyp, tmp_path)
+    return hyp
+
+
+def test_start_refuses_a_100_name_registration_at_100_before_any_write(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Section on: 100 x $1.00 x 1.02 = $102.00 of buys cannot fit $100 of cash."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    _register_names(settings, tmp_path, HUNDRED_NAMES)
+    fake = _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+    assert exc.value.reason == "refused_small_account"
+    assert _windows(settings) == []
+
+
+def test_start_accepts_the_25_name_registration_at_100_and_freezes_the_section(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """Section on: 25 x $1.00 x 1.02 = $25.50 fits $100; the window opens on the
+    account's $100 and freezes `risk.small_account` on, read back by `frozen_risk`."""
+    settings = _small_account_settings(journal_settings, enabled=True)
+    _register_names(settings, tmp_path, TWENTY_FIVE_NAMES)
+    fake = _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH)
+    result = window.start(settings, _connect(settings), fake, fixed_clock, "h1")
+    assert result.window.window_id is not None
+    assert result.window.starting_cash == SMALL_ACCOUNT_CASH
+    assert frozen_risk(result.window).small_account.enabled is True
+    assert [w[0] for w in _windows(settings)] == [result.window.window_id]
+
+
+def test_the_feasibility_rule_holds_for_every_window_with_the_section_off(
+    journal_settings: Settings, fixed_clock: FixedClock, tmp_path: Path
+) -> None:
+    """The spec's "the feasibility rule, every window": with the section off the
+    100-name registration at $100 is refused the same way, before any write."""
+    settings = _small_account_settings(journal_settings, enabled=False)
+    _register_names(settings, tmp_path, HUNDRED_NAMES)
+    with pytest.raises(window.StartRefusedError) as exc:
+        window.start(
+            settings,
+            _connect(settings),
+            _fake(fixed_clock, cash=SMALL_ACCOUNT_CASH),
+            fixed_clock,
+            "h1",
+        )
+    assert exc.value.reason == "refused_small_account"
+    assert _windows(settings) == []
+
+
+def test_the_section_frozen_off_by_default(
+    journal_settings: Settings,
+    fixed_clock: FixedClock,
+    ready_hypothesis: registry.HypothesisRecord,
+) -> None:
+    """A start with live defaults freezes `risk.small_account` off."""
+    result = window.start(
+        journal_settings, _connect(journal_settings), _fake(fixed_clock), fixed_clock, "h1"
+    )
+    assert frozen_risk(result.window).small_account.enabled is False

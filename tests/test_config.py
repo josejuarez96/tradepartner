@@ -2576,3 +2576,38 @@ def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper={"min_free_disk_gb": -1})
     assert "min_free_disk_gb" not in FROZEN_PAPER_KEYS
+
+
+# --- risk.small_account (spec amendment 2026-10-18 item 8; ADR 0023 D6; T206) ---
+
+
+def test_risk_small_account_is_off_by_default() -> None:
+    """The open windows are unchanged: the section defaults off."""
+    assert _settings().risk.small_account.enabled is False
+    assert RiskConfig().small_account.enabled is False
+
+
+def test_risk_small_account_turns_on_through_the_risk_section() -> None:
+    on = Settings(_env_file=None, risk={"small_account": {"enabled": True}}).risk
+    assert on.small_account.enabled is True
+    # ADR 0010's limits are unchanged by the section.
+    assert (on.max_position_weight, on.max_order_notional_fraction) == (0.05, 0.05)
+    assert on.min_order_notional == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"enabled": True, "min_names": 20},  # an unknown key in the section
+        {"enable": True},  # a typo of the one key
+        {"enabled": "sometimes"},  # not a boolean
+    ],
+)
+def test_risk_small_account_refuses_unknown_keys_and_non_booleans(
+    section: dict[str, object],
+) -> None:
+    """The section is frozen by name like the rest of `risk.*`: a typo or a
+    nonsense value fails at load, never falls back to off."""
+    assert Settings(_env_file=None, risk={"small_account": {"enabled": False}}).risk
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"small_account": section})
