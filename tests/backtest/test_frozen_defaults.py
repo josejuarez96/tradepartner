@@ -330,7 +330,9 @@ RISK_FREE_KEYS = (
     "metrics.risk_free_series",
     "metrics.risk_free_basis",
 )
-COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction", *RISK_FREE_KEYS)
+#: T209a's three post-registration own-section keys (backtest spec amendment #1731).
+HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
+COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction", *RISK_FREE_KEYS, *HOLD_KEYS)
 
 
 def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -364,7 +366,12 @@ def test_stale_listing_entry_is_pinned_by_value() -> None:
 
 #: Frozen keys that landed after the twin hashes were pinned: a registration made
 #: before them stores none, so the pinned hashes are over the set without them.
-LATER_KEYS = ("gap.stale_listing_sessions", "strategy.turnover_top_fraction", *RISK_FREE_KEYS)
+LATER_KEYS = (
+    "gap.stale_listing_sessions",
+    "strategy.turnover_top_fraction",
+    *RISK_FREE_KEYS,
+    *HOLD_KEYS,
+)
 
 
 def test_h1_twin_canonical_set_fingerprint_and_hash_unchanged() -> None:
@@ -590,7 +597,7 @@ def test_turnover_entry_is_last_and_pinned_by_value() -> None:
 
 def test_post_registration_own_keys_pinned_and_each_a_listed_table_key() -> None:
     """Append-only (removing a member moves every stored own-section fingerprint)."""
-    assert frozenset({TURNOVER_KEY}) == frozen.POST_REGISTRATION_OWN_KEYS
+    assert frozenset({TURNOVER_KEY, *HOLD_KEYS}) == frozen.POST_REGISTRATION_OWN_KEYS
     table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
     listed = {section for spec in config.FAMILIES.values() for section in spec.sections}
     for key in frozen.POST_REGISTRATION_OWN_KEYS:
@@ -652,15 +659,42 @@ def test_a_momentum_file_naming_the_default_is_the_twin_and_another_value_is_not
 # --- the risk-free keys (backtest spec amendment #1498, T170b) ------------------------
 
 
-def test_risk_free_entries_are_last_and_pinned_by_value() -> None:
+def test_risk_free_entries_are_pinned_by_value() -> None:
     assert frozen.is_default(
-        frozen.FROZEN_KEY_DEFAULTS[13:],
+        frozen.FROZEN_KEY_DEFAULTS[13:16],
         (
             ("metrics.risk_free_source", "constant", 28),
             ("metrics.risk_free_series", "DTB3", 28),
             ("metrics.risk_free_basis", "discount", 28),
         ),
     )
+
+
+def test_hold_entries_are_pinned_by_value() -> None:
+    """T209a: hold mode's keys land after T170b's, in id order, at their defaults."""
+    assert frozen.is_default(
+        frozen.FROZEN_KEY_DEFAULTS[16:19],
+        (
+            ("strategy.hold_sessions", 1, 28),
+            ("strategy.hold_target_names", 0, 28),
+            ("strategy.rebalance_band", 0.0, 28),
+        ),
+    )
+
+
+def test_hold_keys_are_post_registration_and_leave_every_fingerprint() -> None:
+    """H1's and the TWIN's canonical set, fingerprint and hash do not move: the three
+    keys at their defaults are left out even of `strategy`'s own canonical set."""
+    settings = _defaults_settings()
+    current = _new_params(settings)
+    assert all(k in current for k in HOLD_KEYS)
+    without = {k: v for k, v in current.items() if k not in HOLD_KEYS}
+    for family_params in (current, without):
+        assert frozen.fingerprint("momentum", family_params, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(current, "momentum")
+    assert canonical == frozen.canonical_frozen_set(without, "momentum")
+    assert not set(HOLD_KEYS) & set(canonical)
+    assert set(HOLD_KEYS) <= frozen.POST_REGISTRATION_OWN_KEYS
 
 
 def test_risk_free_keys_are_frozen_and_none_enters_the_fingerprint() -> None:
