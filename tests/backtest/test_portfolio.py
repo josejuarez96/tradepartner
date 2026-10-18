@@ -166,6 +166,16 @@ def test_band_never_leaves_weights_summing_above_one() -> None:
     assert math.fsum(effective.values()) <= 1.0
 
 
+def test_band_never_scales_a_traded_name_above_its_target() -> None:
+    """Scaling only shrinks: a partly invested book keeps the rest in cash (reviewer's
+    pass-2 repro on #1788)."""
+    assert apply_rebalance_band({"A": 0.4, "B": 0.4}, {}, 0.05) == {"A": 0.4, "B": 0.4}
+    assert apply_rebalance_band({"A": 0.5, "B": 0.3}, {"A": 0.49, "B": 0.1}, 0.05) == {
+        "A": 0.49,
+        "B": 0.3,
+    }
+
+
 def test_band_always_exits_a_name_absent_from_target() -> None:
     """A held name with no target has a zero band, so it is always sold."""
     assert apply_rebalance_band({"A": 1.0}, {"A": 0.9, "B": 0.1}, 0.99) == {"A": 0.9}

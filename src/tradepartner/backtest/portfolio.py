@@ -107,14 +107,16 @@ def apply_rebalance_band(
     `band * target` is not traded and keeps its current weight. A name absent from
     `target` has a target of 0 and therefore a band of 0, so an exit is always traded.
     The names still traded are then reconciled into what is left of the budget, so the
-    result never sums above 1: each traded name's target is scaled by
-    `(1 - Σ held-within-band weights) / Σ traded target weights` (a no-op when every
-    target is traded, and 0 when the held names already fill the budget). A band of 0 is
-    the identity and returns `target` unchanged; a band wide enough to cover every drift
-    returns `current` over the shared names. Names whose effective weight is 0, and
-    unscaled exact zeros, are dropped, as `trades_from` drops zero deltas. `band` must be
-    in [0, 1): a band of 1 or more would suppress every new entry. Raises `ValueError` for
-    a band outside that range. Ordered by `security_id`.
+    result never sums above 1 and scaling only ever shrinks: each traded name's target is
+    scaled by `min(1, (1 - Σ held-within-band weights) / Σ traded target weights)`, so a
+    traded name is never lifted past its target and leftover equity stays cash. Scaling is
+    a no-op when every target is traded and the targets already sum to at most 1, and 0
+    when the held names fill the budget. A band of 0 is the identity and returns `target`
+    unchanged; a band wide enough to cover every drift returns `current` over the shared
+    names. Names whose effective weight is 0, and unscaled exact zeros, are dropped, as
+    `trades_from` drops zero deltas. `band` must be in [0, 1): a band of 1 or more would
+    suppress every new entry. Raises `ValueError` for a band outside that range. Ordered by
+    `security_id`.
     """
     if not (math.isfinite(band) and 0 <= band < 1):
         raise ValueError(f"rebalance_band must be in [0, 1), got {band}")
@@ -131,7 +133,7 @@ def apply_rebalance_band(
             traded[sid] = desired
     budget = max(0.0, 1.0 - math.fsum(held_within.values()))
     traded_total = math.fsum(traded.values())
-    scale = budget / traded_total if traded_total > 0 else 0.0
+    scale = min(1.0, budget / traded_total) if traded_total > 0 else 0.0
     effective = {sid: weight for sid, weight in held_within.items() if weight != 0}
     for sid, weight in traded.items():
         scaled = weight * scale
