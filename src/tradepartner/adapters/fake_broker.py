@@ -68,8 +68,9 @@ position on every fill.
 (`buying_power=` or `set_buying_power`), when it is that fixed value;
 `equity` is cash plus every position marked at `price_of`. `assets` answers
 only symbols explicitly supplied through `assets=` or `set_asset`; an unknown
-symbol raises Alpaca's 404 / 40410000. A dated asset schedule uses the clock's
-New York date. `submit` also checks tradability, fractionability and held sell
+symbol returns `UNRESOLVED_ASSET`, while `submit` of one raises Alpaca's
+404 / 40410000. A dated asset schedule uses the clock's New York date.
+`submit` also checks tradability, fractionability and unreserved held sell
 quantity. `script_call_fault` injects one error on a named Broker method;
 retryable SDK faults follow the raw trading client's retry predicate.
 
@@ -138,6 +139,7 @@ from zoneinfo import ZoneInfo
 from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError, _retryable
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
+    UNRESOLVED_ASSET,
     Account,
     Asset,
     Broker,
@@ -499,17 +501,72 @@ class FakeBroker(Broker):
         submitted_at = self._now()
         asset = self._asset_for(request.symbol, submitted_at)
         if not asset.tradable or asset.status != "active":
+            # Open question: Alpaca's exact submit-time untradable body has
+            # not been recorded. This follows its observed 403 refusal family;
+            # T202 must classify the message, not this assumed code alone.
             raise AlpacaTradingError(
-                422,
-                json.dumps({"code": 42210000, "message": "asset is not tradable"}),
+                403,
+                json.dumps(
+                    {"code": 40310000, "message": f'asset "{request.symbol}" is not tradable'},
+                    separators=(",", ":"),
+                ),
                 retried=False,
             )
-        if request.side is Side.SELL and request.quantity is not None:
+        if request.side is Side.SELL:
             held = self._net_quantity.get(request.symbol, Decimal(0))
-            if Decimal(repr(request.quantity)) > held:
+            price: Decimal | None = None
+
+            def price_now() -> Decimal:
+                nonlocal price
+                if price is None:
+                    price = Decimal(
+                        repr(
+                            validate_positive_finite(
+                                self._price_of(request.symbol), field_name="price"
+                            )
+                        )
+                    )
+                return price
+
+            reserved = Decimal(0)
+            for open_order in self._orders.values():
+                if (
+                    open_order.symbol != request.symbol
+                    or open_order.side is not Side.SELL
+                    or open_order.status in TERMINAL_STATUSES
+                ):
+                    continue
+                filled_qty, filled_notional = self._filled.get(
+                    open_order.client_order_id, (Decimal(0), Decimal(0))
+                )
+                if open_order.quantity is not None:
+                    reserved += max(Decimal(0), Decimal(repr(open_order.quantity)) - filled_qty)
+                elif open_order.notional is not None:
+                    reserved += (
+                        max(Decimal(0), Decimal(repr(open_order.notional)) - filled_notional)
+                        / price_now()
+                    )
+            requested = (
+                Decimal(repr(request.quantity))
+                if request.quantity is not None
+                else Decimal(repr(request.notional)) / price_now()
+            )
+            available = max(Decimal(0), held - reserved)
+            if requested > available:
                 raise AlpacaTradingError(
-                    422,
-                    json.dumps({"code": 40310000, "message": "insufficient qty available"}),
+                    403,
+                    json.dumps(
+                        {
+                            "available": str(available),
+                            "code": 40310000,
+                            "existing_qty": str(held),
+                            "held_for_orders": str(reserved),
+                            "message": "insufficient qty available for order "
+                            f"(requested: {requested}, available: {available})",
+                            "symbol": request.symbol,
+                        },
+                        separators=(",", ":"),
+                    ),
                     retried=False,
                 )
         if not asset.fractionable and (
@@ -517,8 +574,11 @@ class FakeBroker(Broker):
             or (request.quantity is not None and not float(request.quantity).is_integer())
         ):
             raise AlpacaTradingError(
-                422,
-                json.dumps({"code": 42210001, "message": "asset is not fractionable"}),
+                403,
+                json.dumps(
+                    {"code": 40310000, "message": f'asset "{request.symbol}" is not fractionable'},
+                    separators=(",", ":"),
+                ),
                 retried=False,
             )
 
@@ -660,7 +720,8 @@ class FakeBroker(Broker):
         for symbol in (canonical_symbol(s) for s in symbols):
             schedule = self._assets.get(symbol)
             if schedule is None:
-                raise self._unknown_asset(symbol)
+                result[symbol] = UNRESOLVED_ASSET
+                continue
             if len(schedule) > 1 and session is None:
                 session = self._now().astimezone(_NEW_YORK).date()
             result[symbol] = [a for start, a in schedule if session is None or start <= session][-1]
