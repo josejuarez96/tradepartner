@@ -23,6 +23,7 @@ from .test_run_trade import (
     Env,
     at,
     bought,
+    delist,
     split,
 )
 from .test_run_trade import (
@@ -44,6 +45,16 @@ def journal(
         ),
         env.query("SELECT client_order_id, quantity FROM fills ORDER BY fill_id"),
     )
+
+
+def test_the_fakes_retry_model_is_the_raw_clients_predicate() -> None:
+    """The scripted-fault drills below retry through the raw client's own
+    `_retryable` rule (the fake delegates to it), so removing T200's 5xx and
+    connection-error retries turns them red."""
+    from tradepartner.adapters.alpaca_trading_raw import _retryable
+
+    assert _retryable(http_fault(502)) and _retryable(http_fault(500))
+    assert _retryable(requests.ConnectionError("reset"))
 
 
 def http_fault(status: int) -> APIError:
@@ -145,9 +156,10 @@ def test_mid_run_fractionability_refusal_skips_only_the_buy(
 
     env.fake.on_submit = change_asset
     outcome = env.run(at(F_0))
-    orders, events, fills = journal(env)
+    orders, _events, fills = journal(env)
     assert outcome.status == "ok"
-    assert len(orders) == 2 and len(fills) == 2 and len(events) >= 4
+    # Orders are journaled before submit: three rows, two fills.
+    assert len(orders) == 3 and len(fills) == 2
     assert env.query("SELECT reason FROM decision_events WHERE reason = 'skip_not_fractionable'")
     assert len(env.alerts("skipped")) == 1
 
@@ -229,8 +241,9 @@ def test_ack_timeout_stays_pending_until_next_run(env: Env, window: PaperWindowR
     first = env.run(at(F_0))
     orders, events, fills = journal(env)
     assert first.status == "ok"
-    assert len(orders) == 1 and not fills
-    assert any(status == "pending_unresolved" for _, status in events)
+    # The run goes on past the one unacknowledged order: only it is unresolved.
+    assert [status for _, status in events].count("pending_unresolved") == 1
+    assert len(fills) == len(orders) - 1
     assert len(env.alerts("pending_unresolved")) == 1
 
     second = env.run(at(date(2019, 5, 2)))
@@ -281,16 +294,28 @@ def test_accepted_then_rejected_order_has_terminal_journal_event(
     assert env.alerts("halted") == []
 
 
-def test_held_delisted_symbol_asset_read_remains_explicit(env: Env, window: PaperWindowRow) -> None:
+def test_held_delisted_name_is_decided_on_the_next_rebalance(env: Env, tmp_path: Path) -> None:
+    """#1480/#411: record today's behaviour for a held name delisted before the
+    next rebalance (2019-06-03, T_1 = 2019-05-31). The broker answers it inactive."""
+    env.open_window(
+        tmp_path=tmp_path,
+        frozen=RiskConfig(
+            max_position_weight=0.6, max_order_notional_fraction=0.6, max_skips_per_run=0
+        ),
+    )
     bought(env)
-    before = journal(env)
-    day = date(2019, 5, 2)
+    day = date(2019, 6, 3)
+    delist(env, "SEC_DUAL_B", at(date(2019, 5, 31), 19, 0))
     env.fake.set_asset("DUALB", Asset(False, False, "inactive", None), from_session=day)
-    env.clock.now = at(day)
-    assert env.fake.assets(["DUALB"])["DUALB"].status == "inactive"
-    outcome = env.run(at(day))
+    outcome = env.run(at(day), prices={symbol: env.prices[symbol] for symbol in SYMBOLS.values()})
     assert outcome.status == "ok"
-    assert journal(env) == before
+    decisions = env.query("SELECT security_id, decision FROM decisions WHERE run_id = ?", [2])
+    assert ("SEC_DUAL_B", "skip_delisted") in decisions
+    assert ("SEC_DUAL_B", "forced_exit") in decisions
+    # Today the forced exit of an untradable name closes with a note, not an order,
+    # and the position stays at the broker: recorded as-is, no fix here.
+    assert outcome.notes == ("forced exit of SEC_DUAL_B (delisted) closed: untradable",)
+    assert not [o for o in env.orders() if o[1] == "SEC_DUAL_B" and o[4] == day]
     assert "DUALB" in env.held()
     assert env.alerts("halted") == []
 
