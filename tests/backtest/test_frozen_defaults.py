@@ -332,11 +332,14 @@ RISK_FREE_KEYS = (
 )
 #: T209a's three post-registration own-section keys (backtest spec amendment #1731).
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
+#: T217's three post-registration own-section keys (backtest spec amendment #1820).
+SHOCK_KEYS = ("strategy.signal_delay_sessions", "strategy.placebo", "strategy.placebo_seed")
 COMBINED_LATER_KEYS = (
     "strategy.turnover_top_fraction",
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
     "universe.rank_by",
+    *SHOCK_KEYS,
 )
 
 
@@ -377,6 +380,7 @@ LATER_KEYS = (
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
     "universe.rank_by",
+    *SHOCK_KEYS,
 )
 
 
@@ -606,7 +610,7 @@ def test_turnover_entry_is_last_and_pinned_by_value() -> None:
 
 def test_post_registration_own_keys_pinned_and_each_a_listed_table_key() -> None:
     """Append-only (removing a member moves every stored own-section fingerprint)."""
-    assert frozenset({TURNOVER_KEY, *HOLD_KEYS}) == frozen.POST_REGISTRATION_OWN_KEYS
+    assert frozenset({TURNOVER_KEY, *HOLD_KEYS, *SHOCK_KEYS}) == frozen.POST_REGISTRATION_OWN_KEYS
     table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
     listed = {section for spec in config.FAMILIES.values() for section in spec.sections}
     for key in frozen.POST_REGISTRATION_OWN_KEYS:
@@ -734,8 +738,8 @@ def test_risk_free_keys_leave_every_canonical_set_and_fingerprint_where_they_wer
 RANK_BY_KEY = "universe.rank_by"
 
 
-def test_rank_by_entry_is_last_and_pinned_by_value() -> None:
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((RANK_BY_KEY, "cap", 28),))
+def test_rank_by_entry_is_pinned_by_value() -> None:
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[19:20], ((RANK_BY_KEY, "cap", 28),))
     assert RANK_BY_KEY not in frozen.POST_REGISTRATION_OWN_KEYS  # universe is no family's own
 
 
@@ -763,3 +767,74 @@ def test_rank_by_at_cap_moves_no_fingerprint_and_no_canonical_set() -> None:
             family, params, start
         )
         assert frozen.canonical_frozen_set(forward, family)[RANK_BY_KEY] == "dollar_volume"
+
+
+# --- the kill ladder's delay and placebo keys (backtest spec amendment #1820, T217) ----
+
+SHOCK_ENTRIES = (
+    ("strategy.signal_delay_sessions", 0, 29),
+    ("strategy.placebo", "none", 29),
+    ("strategy.placebo_seed", 0, 29),
+)
+
+
+def test_shock_entries_are_last_and_pinned_by_value() -> None:
+    """Appended in landing order (#1792) at their defaults, at schema version 29; the
+    last-entry pin is these three's until a later entry lands and re-pins it."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:], SHOCK_ENTRIES)
+    keys = [key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS]
+    assert keys.index(SHOCK_KEYS[0]) > keys.index(RANK_BY_KEY)
+    assert set(SHOCK_KEYS) <= set(hypothesis.frozen_keys())
+
+
+def test_shock_keys_are_post_registration_and_leave_every_fingerprint() -> None:
+    """H1's and the TWIN's canonical set and fingerprint do not move: the three keys at
+    their defaults are stored by a new registration and left out of `strategy`'s own
+    canonical set, for every family that lists `strategy`."""
+    settings = _defaults_settings()
+    assert set(SHOCK_KEYS) <= frozen.POST_REGISTRATION_OWN_KEYS
+    current = _new_params(settings)
+    assert (
+        current["strategy.signal_delay_sessions"],
+        current["strategy.placebo"],
+        current["strategy.placebo_seed"],
+    ) == (0, "none", 0)
+    without = _before(current, SHOCK_KEYS)
+    for family_params in (current, without):
+        assert frozen.fingerprint("momentum", family_params, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    for family, params in (
+        ("momentum", current),
+        ("oracle", current),
+        ("combined", _combined_params(settings)),
+    ):
+        canonical = frozen.canonical_frozen_set(params, family)
+        assert not set(SHOCK_KEYS) & set(canonical)
+        assert canonical == frozen.canonical_frozen_set(_before(params, SHOCK_KEYS), family)
+    # A registration stored before the keys reads them at their table defaults.
+    values = frozen.frozen_values(_Record(without))
+    assert {k: values[k] for k in SHOCK_KEYS} == {
+        "strategy.signal_delay_sessions": 0,
+        "strategy.placebo": "none",
+        "strategy.placebo_seed": 0,
+    }
+    # The real H1 file still fingerprints as registered.
+    parsed = hypothesis.parse_file(H1_FILE)
+    h1 = hypothesis.frozen_params(parsed, settings)
+    assert frozen.fingerprint("momentum", h1, parsed.in_sample_start) == H1_FINGERPRINT
+
+
+def test_a_momentum_file_naming_the_shock_defaults_is_the_twin(tmp_path: Path) -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    explicit = hypothesis.frozen_params(
+        hypothesis.parse_file(
+            _twin_with(tmp_path, 'signal_delay_sessions = 0\nplacebo = "none"\nplacebo_seed = 0')
+        ),
+        settings,
+    )
+    assert explicit == twin
+    assert frozen.fingerprint("momentum", explicit, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(explicit, "momentum")
+    assert registry.params_sha256(canonical) == TWIN_PRE_LAB_PARAMS_SHA256
