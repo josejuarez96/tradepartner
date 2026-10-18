@@ -1296,22 +1296,24 @@ def test_a_rename_gap_fill_stores_each_session_once_at_its_close(settings: Setti
     assert again.holes == ()
 
 
-def test_a_partial_month_gap_without_a_rename_lead_is_no_hole(settings: Settings) -> None:
-    # The lead off: the gap is no session a fetched bar could newly land on
-    # (`parse_bars` assigns the new symbol's rows only from its span).
+def test_a_gap_between_stored_bars_is_a_hole_with_or_without_a_rename_lead(
+    settings: Settings,
+) -> None:
+    # The lead off, the gap is still a session the resolver assigns ACME
+    # (by span), strictly between two of its traded bars: a hole (#1721).
     _rename_gap(settings)
     found = fill_holes(
         _no_lead(settings), prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True
     )
-    assert found.holes == ()
-    # And a gap after the rename, under ACMX's own span, is no rename gap.
+    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    # And a gap after the rename, under ACMX's own span, is one too.
     plain = _no_lead(settings).model_copy(
         update={"store": settings.store.model_copy(update={"path": settings.store.path + "2"})}
     )
     assert _backfill(plain, _History(), filings=_with_rename()).ok
     _drop_bars(plain, ACME, (date(2019, 6, 24), date(2019, 6, 26)))
     later = fill_holes(plain, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
-    assert later.holes == ()
+    assert _holes(later) == [(ACME, JUNE_WINDOW)]
 
 
 def test_a_named_rename_gap_is_fetched_and_others_are_not(settings: Settings) -> None:
@@ -1350,21 +1352,40 @@ def test_a_month_only_the_rename_lead_can_fill_is_assignable(settings: Settings)
     assert dict(found.dropped) == {UNASSIGNED: 1}
 
 
-def test_a_missing_session_the_old_symbol_traded_after_is_no_rename_gap(
+def test_a_halt_between_traded_bars_is_listed_every_run_and_fills_nothing(
     settings: Settings,
 ) -> None:
-    # A halt (or a no-trade day) inside the lead window, with old-symbol bars
-    # after it, is no rename gap: the new symbol has no bar there to fill
-    # it, so it would be refetched on every run. Only the run of sessions
-    # from the old symbol's last bar to the new span is.
+    # A halt (or a no-trade day) with bars either side is a hole the source
+    # cannot fill (#1721; BIIB 2020-11-06, 2023-06-09): the refetch lands
+    # nothing, so the month is listed again on the next run, as is.
     assert _backfill(settings, _History(), filings=_with_rename()).ok
-    _drop_bars(settings, ACME, (date(2019, 5, 15), date(2019, 5, 15)))
-    _drop_bars(settings, ACME, (date(2019, 6, 28), date(2019, 6, 28)))  # after the rename
+    halt, after = date(2019, 5, 15), date(2019, 6, 27)
+    _drop_bars(settings, ACME, (halt, halt))
+    _drop_bars(settings, ACME, (after, after))
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
-    assert found.holes == ()
-    _drop_bars(settings, ACME, GAP)
+    assert _holes(found) == [(ACME, MAY_WINDOW), (ACME, JUNE_WINDOW)]
+    source = _History(gaps={(ACME, halt), (ACME, after)})
+    result = fill_holes(
+        settings, prices=source, since=SINCE, clock=_ticking(LATER, timedelta(minutes=1))
+    )
+    assert [r.status for r in result.runs] == [FILLED, FILLED], result.runs
+    sql = f"SELECT count(*) FROM prices_daily WHERE security_id = '{ACME}' AND session = ?"
+    with duckdb.connect(settings.store.path, read_only=True) as conn:
+        assert [conn.execute(sql, [d]).fetchone() for d in (halt, after)] == [(0,), (0,)]
+    again = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(again) == [(ACME, MAY_WINDOW), (ACME, JUNE_WINDOW)]
+
+
+def test_a_month_before_the_first_bar_or_a_delisting_tail_is_no_hole(settings: Settings) -> None:
+    # Missing sessions before a security's first traded bar or after its
+    # last cannot be bracketed by two bars: not listed (#1721, option a).
+    assert _backfill(settings, _History(), filings=_with_rename()).ok
+    _drop_bars(settings, ACME, (SINCE, date(2019, 5, 9)))  # head: no traded bar before it
     found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
-    assert _holes(found) == [(ACME, JUNE_WINDOW)]
+    assert _holes(found) == [(ACME, (SINCE, date(2019, 4, 30)))]  # only the empty month
+    _drop_bars(settings, ACME, (date(2019, 6, 24), date(2019, 6, 28)))  # tail, no bar after
+    tail = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(tail) == [(ACME, (SINCE, date(2019, 4, 30)))]
 
 
 # --- first-span lead months (#974) ---------------------------------------------
@@ -1429,6 +1450,15 @@ def test_a_dry_run_lists_a_led_ids_empty_months_and_its_partial_month(
     assert found.lines() == [
         f"  {FIRST_LED} LEDY: 2019-04..2019-06 (3 months, 0 between its stored bars, 1 lead gaps)"
     ]
+
+
+def test_a_first_day_gap_inside_a_first_span_lead_is_a_hole(settings: Settings) -> None:
+    # The first sessions of May are missing, with led bars before and after
+    # (UTX/RTX 2019-10 shape, #1721): LEDY leads to FIRST_LED on them.
+    assert _backfill(_loose(settings), _History(), filings=_with_first_span()).ok
+    _drop_bars(settings, FIRST_LED, (date(2019, 5, 1), date(2019, 5, 2)))
+    found = fill_holes(settings, prices=_History(), since=SINCE, clock=lambda: LATER, dry_run=True)
+    assert _holes(found) == [(FIRST_LED, MAY_WINDOW)]
 
 
 def test_a_led_fill_stores_each_session_once_at_its_close(settings: Settings) -> None:

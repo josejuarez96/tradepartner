@@ -27,6 +27,7 @@ from tradepartner.execution.reconcile import (
     Explanations,
     JournalOpenOrder,
     Reconciliation,
+    SymbolChangeRecord,
     compare,
 )
 from tradepartner.store.journal import FillRow, OrderedFill, OrderRow, PaperWindowRow
@@ -681,7 +682,31 @@ def test_the_mismatches_json_is_stable() -> None:
         "explained",
         "allowed",
         "activities",
+        "symbol_changes",
     }
+
+
+def test_a_ticker_change_maps_the_broker_symbol_and_records_it_without_a_difference() -> None:
+    """#1761: a held name the caller mapped to the broker's new symbol (from the
+    store's `symbol_changes` at close(S-1)) reconciles -- same quantity under the
+    new symbol -- and the row records the mapping, adding no adjustment."""
+    result = _run(
+        _ledger(SEC_A=10.0),
+        _positions(AAAX=10.0),
+        1_000.0,
+        explanations=_explanations(
+            symbols={**SYMBOLS, "SEC_A": "AAAX"},
+            symbol_changes={"SEC_A": ("AAA", "AAAX")},
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.mismatches == ()
+    assert result.adjustments == ()
+    assert result.symbol_changes == (SymbolChangeRecord("SEC_A", "AAA", "AAAX"),)
+    assert json.loads(result.mismatches_json)["symbol_changes"] == [
+        {"security_id": "SEC_A", "old_symbol": "AAA", "new_symbol": "AAAX"}
+    ]
 
 
 # --- review fixes: bounds, deferral, validation ---------------------------------

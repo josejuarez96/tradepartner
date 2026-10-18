@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -2009,3 +2011,117 @@ def test_a_zero_free_disk_floor_turns_the_check_off(
     env.settings.paper.min_free_disk_gb = 0
     assert env.run(_at(TUE)).status != "skipped_kill_switch"
     assert ("run_failed", None, TUE) not in env.alerts()
+
+
+# --- a store lock held by another process (#1757) -----------------------------------------
+
+
+_HOLDER = (
+    "import duckdb, sys, time\n"
+    "conn = duckdb.connect(sys.argv[1])\n"
+    "print('held', flush=True)\n"
+    "time.sleep(float(sys.argv[2]))\n"
+)
+
+
+@contextmanager
+def writer_held(path: str, seconds: float) -> Iterator[None]:
+    """Another process holds the store's writer lock for `seconds`."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, path, str(seconds)], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "held"
+        yield
+    finally:
+        proc.wait(timeout=30)
+
+
+def test_a_store_lock_before_any_submit_ends_the_run_stale_style(
+    rebalance_env: tuple[Env, PaperWindowRow],
+) -> None:
+    env, _window = rebalance_env
+    env.settings.store.lock_retry_seconds = 1
+    env.ingest(_at(date(2019, 4, 30), 21))
+    real_account = env.fake.account
+    holder = writer_held(env.settings.store.path, 2.0)
+    held: list[None] = []
+
+    def account() -> Any:
+        if not held:
+            held.append(holder.__enter__())  # held from step 1 on, for longer than the read retry
+        return real_account()
+
+    env.fake.account = account  # type: ignore[method-assign]
+    try:
+        with pytest.raises(StaleDataError, match="locked"):
+            env.run(_at(F_0))
+    finally:
+        if held:
+            holder.__exit__(None, None, None)
+    run_id = env.latest_run()
+    status, fault_type, message = env.results()[run_id]
+    assert (status, fault_type) == ("stale", "StaleDataError")
+    assert message is not None and "locked by another process" in message
+    assert ("stale_data", run_id, F_0) in env.alerts()
+    assert env.engaged() == []  # no kill switch
+    assert "submit" not in env.broker_methods()
+    assert env.count("rebalance_events") == 0  # the next scheduled run picks it up
+
+
+def test_a_store_lock_that_clears_within_the_retry_is_not_a_fault(
+    env: Env, exits_done: list[object]
+) -> None:
+    _marked(env)
+    env.settings.store.lock_retry_seconds = 20
+    real_account = env.fake.account
+    holder = writer_held(env.settings.store.path, 1.0)
+    held: list[None] = []
+
+    def account() -> Any:
+        if not held:
+            held.append(holder.__enter__())
+        return real_account()
+
+    env.fake.account = account  # type: ignore[method-assign]
+    try:
+        outcome = env.run(_at(TUE))
+    finally:
+        if held:
+            holder.__exit__(None, None, None)
+    assert outcome.status == "ok"
+
+
+def test_a_store_lock_after_the_trade_step_began_still_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store.db import StoreLockedError
+
+    _marked(env)
+
+    def locked(_context: object) -> None:
+        raise StoreLockedError("the store is locked")
+
+    monkeypatch.setattr(run_module, "exits_step", locked)
+    with pytest.raises(StoreLockedError):
+        env.run(_at(TUE))
+    assert env.results()[env.latest_run()][:2] == ("failed", "StoreLockedError")
+    env.ingest(_at(TUE, 21))
+    assert env.run(_at(WED)).status == "skipped_kill_switch"
+
+
+def test_a_same_process_store_conflict_before_any_submit_still_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store.db import StoreSameProcessLockedError
+
+    _marked(env)
+
+    def conflict(_self: object) -> None:
+        raise StoreSameProcessLockedError("open in this process in another mode")
+
+    monkeypatch.setattr(run_module._Run, "_actions", conflict)
+    with pytest.raises(StoreSameProcessLockedError):
+        env.run(_at(TUE))
+    assert env.results()[env.latest_run()][:2] == ("failed", "StoreSameProcessLockedError")
