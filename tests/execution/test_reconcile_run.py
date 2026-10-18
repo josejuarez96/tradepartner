@@ -538,6 +538,29 @@ def test_a_quantity_mismatch_under_the_new_symbol_is_a_mismatch(
     assert _adjustments(journal_settings, open_window) == []
 
 
+def test_a_ticker_change_is_not_recorded_when_the_broker_holds_both_symbols(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761 (review fix 1): the broker holding both the old and the new symbol
+    leaves the name on its listing's symbol -- the unclaimed-symbol rule puts it
+    back on the old one -- so the leftover new-symbol position is an unknown
+    symbol and the row records no applied change (the map did not keep it)."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPYX": 10.0}  # the broker holds the old 10 and a new 10
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    (row,) = _rows(journal_settings, open_window)
+    listed = json.loads(row.mismatches_json or "")
+    assert [m["kind"] for m in listed["mismatches"]] == ["unknown_symbol"]
+    assert listed["symbol_changes"] == []
+
+
 def test_two_candidate_ticker_changes_for_a_name_are_a_mismatch(
     journal_settings: Settings,
     fake: BookedFake,

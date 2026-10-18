@@ -348,7 +348,12 @@ def _symbols(
         ]
         if len(matches) == 1:
             symbols[matches[0]] = symbol
-    return symbols, {name: applied[name] for name in applied if name in symbols}
+    # Only a change the final map kept is recorded: a later pass (the
+    # unclaimed-symbol rule) can put the name back on its listing's symbol
+    # when the broker holds both, and the row must not claim it was applied.
+    return symbols, {
+        name: change for name, change in applied.items() if symbols.get(name) == change[1]
+    }
 
 
 def _reference_prices(
