@@ -20,7 +20,8 @@ Point-in-time: a bar revised after the session close is never used.
 
 Aggregation, per side and overall: the notional-weighted mean
 `sum(notional * bp) / sum(notional)` (notional = executed `sum(q * p)`, the order's
-dollar weight) is THE input to the measured cost level and kill-ladder rung 1;
+dollar weight) is meant as the input to the measured cost level (T210) and kill-ladder
+rung 1 (nothing consumes it yet);
 the median and p90 (linear interpolation) are diagnostics. Excluded from the
 statistics and counted apart, never a crash: `no_bar` (the session is complete but
 has no bar, or the order has no positive volume), `pending` (the order's session
@@ -105,7 +106,13 @@ def slippage_bp(side: str, price: float, open_price: float) -> float:
 
 
 def _session_of(item: OrderedFill) -> date:
-    return item.order_session or item.fill.filled_at.astimezone(_NEW_YORK).date()
+    """The order's journaled session; a fill that lacks it is refused, never guessed
+    from the fill's own date."""
+    if item.order_session is None:
+        raise ValueError(
+            f"fill {item.fill.fill_id} ({item.fill.broker_fill_id}) has no order session"
+        )
+    return item.order_session
 
 
 def _orders(fills: Sequence[OrderedFill]) -> list[_Order]:

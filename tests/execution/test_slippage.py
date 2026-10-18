@@ -195,3 +195,12 @@ def test_the_line_leads_with_the_weighted_mean_and_names_every_exclusion() -> No
         "buy n=1 wmean 50.00 median 50.00 p90 50.00; sell n=0; "
         "all n=1 wmean 50.00 median 50.00 p90 50.00; no bar 0; off session 0; pending 0"
     )
+
+
+def test_a_fill_without_its_order_session_is_refused_naming_the_fill(
+    store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fills = [_fill("buy", "A", 100.5, 7, session=None)]
+    monkeypatch.setattr(slippage.store_journal, "fills_for", lambda *_a, **_k: fills)
+    with pytest.raises(ValueError, match=r"fill 7 \(b7\)"):
+        slippage.window_slippage(store, 1, AFTER)
