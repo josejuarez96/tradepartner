@@ -597,23 +597,23 @@ def test_start_prints_shell_lines_and_hand_commands_for_failed_setup(
     out = capsys.readouterr().out
     path = root.parent / f"{root.name}-teams" / "guilo"
     assert (path / team.TEAM_FILE).read_text().strip() == "guilo"
-    assert "unset VIRTUAL_ENV; uv sync" in out
+    assert f"cd {path}; unset VIRTUAL_ENV; uv sync" in out
     assert f"cd {path}\nunset VIRTUAL_ENV\n" in out
 
 
-def test_setup_env_runs_sync_and_hook_without_virtual_env(
+def test_setup_env_runs_sync_without_virtual_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[list[str], dict[str, str], Path]] = []
 
     def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str], check: bool) -> object:
         calls.append((cmd, env, cwd))
-        return subprocess.CompletedProcess(cmd, 1 if cmd[:2] == ["uv", "run"] else 0)
+        return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setenv("VIRTUAL_ENV", "/elsewhere/.venv")
     monkeypatch.setattr(team.subprocess, "run", fake_run)
-    assert _REAL_SETUP_ENV(tmp_path) == ["uv run pre-commit install"]
-    assert [c[0] for c in calls] == [["uv", "sync"], ["uv", "run", "pre-commit", "install"]]
+    assert _REAL_SETUP_ENV(tmp_path) == []
+    assert [c[0] for c in calls] == [["uv", "sync"]]  # never `pre-commit install` (shared hook)
     assert all("VIRTUAL_ENV" not in env and cwd == tmp_path for _, env, cwd in calls)
 
 
