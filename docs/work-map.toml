@@ -1053,7 +1053,7 @@ why = "The event signal is only as point-in-time as this read; the filed-date tr
 
 [task.T164e]
 what = "The ingest write, the config switch and keys, the health count, and the first real-store run under a named data release."
-why = "The B9 engine tasks can be claimed only once the owner's store holds the rows."
+why = "B9 is killed (2026-10-18, #1768); the 8-K items store now serves IRRX's earnings-announcement window, parked behind T198, so the real-store run waits for that."
 
 [task.T166]
 what = "The pure rules of the EDGAR stamps repair: New York's offset, the filing-date rule, the per-CIK class from SGML probes, the audit sample and stop rule, the manifest row."
@@ -1071,7 +1071,7 @@ why = "A repaired cache changes nothing in the store until the rows that carry i
 unblocks = ["task:T166c"]
 
 [task.T166c]
-what = "The owner's repair releases restamp-1382a2 and restamp-1382b: repair, rebuild, health check, the trial records (B3 trial 3 re-run, trial 4 checked and not re-run) and the evidence on #1382."
+what = "The owner's repair release, cut on 2026-10-18 (#1754) to the restamp-1382a3 store step inside T198's data sitting: the restamp run, the health check, the after record and the evidence on #1382; restamp-1382b is struck under ADR 0023 D1."
 why = "Closes #1382 so the B9 work and T164e's real-store run can read filing times that are point in time."
 
 [task.T166f]
@@ -1303,9 +1303,8 @@ why = "Invesco, CRH, Garmin and Bunge read depositary or unclassifiable for 183 
 unblocks = ["task:T198"]
 
 [task.T195]
-what = "A share class's first span leads back to the CIK's first session instead of the class's first cover page; census of the 16 class ids first."
-why = "BRK.B, GOOG, NWS and other second classes have no bars before 2019 and fail the history rule for 144 member-months (#1682)."
-unblocks = ["task:T198"]
+what = "Parked 2026-10-16 (#1726): a share class's first span leads back to the CIK's first session instead of the class's first cover page; the census said NO-GO (476 class ids, not 16)."
+why = "BRK.B, GOOG, NWS and other second classes have no bars before 2019 and fail the history rule for 144 member-months (#1682); T198 runs without it and the #969 gate decides whether a guarded rebuild is needed."
 
 [task.T196]
 what = "Universe rule 2 passes on any live listing on a listed exchange, so a newer NYSE Texas or Chicago row does not read as a transfer; census first."
@@ -1317,7 +1316,7 @@ why = "Lands the point-in-time restatements under one named release with a backu
 unblocks = ["task:T198"]
 
 [task.T198]
-what = "The owner's release rederive-1682: the split-context flip with the cache bumps, the re-derive, the classification rebuild, the fill-holes backfill, the first OpenFIGI run, health, the index block before and after."
+what = "The owner's release rederive-1682, now the one data sitting (#1754): T197, T186c, the #1382 restamp-1382a3 store step, this release, T170d's backfill and T214's merge in one sitting with one backup and one abandon/restart, each step run by the orchestrator on the owner's go."
 why = "Lands every rule-based fix in one sitting so trials go stale once and the windows restart once (#1682)."
 
 [task.T199]
@@ -1333,7 +1332,7 @@ unblocks = ["adr:0023", "task:T202", "task:T206", "task:T210", "task:T212", "tas
 [adr.0023]
 what = "Break first: fast strategies through a kill ladder, paper books as pre-registered forward exams with minimum fills per cadence, open fills for daily and weekly registrations, per-name faults skipped under a share cap instead of halting the book, a dollar-volume-ranked universe for forward books, the #969 accept rule, a pause list, and the live book left to the Phase 6 ADR after the shakedown and the first kill-ladder verdicts."
 why = "Records the owner's 2026-10-18 decisions (#1731) that reorder the work toward a clean shakedown span, a first fast forward exam and the first live order in weeks, with every build task tied to an observed or provoked break."
-unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
+unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209a", "task:T209b", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
 
 [task.T200]
 what = "A1: the raw trading client retries 5xx and connection errors with bounded backoff and the duplicate read-back by client_order_id before any re-send."
@@ -1342,13 +1341,13 @@ unblocks = ["task:T162"]
 
 [task.T201]
 what = "A3: a FakeBroker that refuses what Alpaca refuses (symbol form, unknown assets, whole shares on a non-fractionable name) and one end-to-end drill per fault on the fixture store."
-why = "The fake accepted GEF-B, so the suite missed #1729; the drills are the failing tests the halt policy is built against (#1731)."
-unblocks = ["task:T202"]
+why = "The fake accepted GEF-B, so the suite missed #1729; the drills are the failing tests the halt policy is built against (#1731); T202 runs beside it and the drills assert its behaviour once both are in (#1754)."
+unblocks = ["task:T162"]
 
 [task.T202]
 what = "A2 part 1: the fixed allowlist of per-name broker refusals (asset not found, not fractionable on a buy, not tradable) become counted skips with one alert, and the skip cap is a share of the plan frozen at start; sell refusals, reconciliation, limit, clock, kill-switch and universe faults still halt."
 why = "One bad name halted the daily book (#1729); a $100 book trips the absolute skip cap every session; the shakedown span restarts on every halt (#1731, D2)."
-unblocks = ["task:T162", "task:T202b", "task:T206"]
+unblocks = ["task:T162", "task:T202b"]
 
 [task.T202b]
 what = "A2 part 2: an acknowledgement timeout polls longer, then leaves that one order pending_unresolved with its notional in the reserve; the next run's start reads it back and settles it, or halts if it cannot."
@@ -1358,7 +1357,7 @@ unblocks = ["task:T162"]
 [task.T203]
 what = "A8b: a per-fill slippage line on paper report and paper status: fill against the session's SIP official open in basis points per side, median and p90 per book."
 why = "The cost model is one uncalibrated 15 bp and no paper fill has been measured since Probe 3; the number is kill-ladder rung 1 for B10 and B9 and the measured cost level in the backtest (#1731)."
-unblocks = ["task:T210", "task:T165e", "task:T164e"]
+unblocks = ["task:T165e", "task:T164e"]
 
 [task.T204]
 what = "A4, conditional and paused: per-book concurrent paper runs, one subprocess per book with its own lock."
@@ -1381,12 +1380,16 @@ unblocks = ["task:T208"]
 [task.T208]
 what = "A7b: bounded and incremental marking reads in the engine: the per-step marking share passes sessions_from, the adjusted frame is extended rather than rebuilt, the lookahead suite unchanged."
 why = "The per-step marking read re-adjusts full history every session; the scale test cannot pass without it (#1731)."
-unblocks = ["task:T209", "task:T211"]
+unblocks = ["task:T209b"]
 
-[task.T209]
-what = "A9a: strategy.weighting = hold with hold_sessions and rebalance_band, cash as a position, and backtest.cash_rate = store accruing the stored T-bill rate."
+[task.T209a]
+what = "A9a, the pure half: hold-mode membership and the no-trade band as pure functions in portfolio.py, and the keys (strategy.weighting = hold, hold_sessions, hold_target_names, rebalance_band, backtest.cash_rate = store) with their frozen defaults."
+why = "The paper planner's band and hold rule (T205) share these functions, so splitting them off lets T205 start without the engine chain (#1754)."
+unblocks = ["task:T205", "task:T209b"]
+
+[task.T209b]
+what = "A9a, the engine half: hold exits on session N, the band applied to targets, and cash accrual from the stored T-bill series."
 why = "The engine cannot express hold each name N sessions, trades every drift to exact targets, and refuses a cash rate while Sharpe subtracts one; B9 needs all three (#1731)."
-unblocks = ["task:T205"]
 
 [task.T210]
 what = "A8a: costs.spread_bps and costs.impact_coeff (square-root impact on ADV from the bars frame), both default zero, and a measured cost level fed by the paper books' slippage."
@@ -1408,3 +1411,20 @@ why = "Live daily ingest can drop a held name's bar, which the daily book would 
 [task.T214]
 what = "A13, optional, hold: one data.release_id in the frozen set in place of the master, gap and adjust sections, re-recorded under rederive-1682 in the same sitting."
 why = "Every data fix stales every trial; the swap pays only when it coincides with the release that stales everything anyway (#1731, D8)."
+
+[task.T215]
+what = "Test infra: the backtest-invariance fixture store built once from a template DuckDB and revised per case as a delta, every assertion byte-identical."
+why = "That file is 30 % of CI worker time, 1,884 s of it fixture setup rebuilt per case; a PR's CI is 24 to 28 minutes (#1754)."
+
+[task.T216]
+what = "Test infra: the four truncation-heavy as-of tests parametrised over their probe sets so xdist spreads them, no guard weakened."
+why = "Four single tests of 250 to 450 worker-seconds set the shard wall clock (6.5 to 16.2 minutes per shard) (#1754)."
+
+[task.T217]
+what = "The kill ladder's rung-4 delay shock (strategy.signal_delay_sessions) and rung-5 placebos (a seeded strategy.placebo: shuffle or random entry) in the engine, every placebo run a trials row."
+why = "ADR 0023's ladder needs a one-session delay at rung 4 and placebos at rung 5, and no key or mode existed for either (#1754)."
+
+[issue.1754]
+what = "The plan edits of 2026-10-18: dependencies rewritten by need (T202, T206, T208, T210, T211), T209 split, one data sitting, T195 out of T198's gate, T114, T160 and T172d ticked, three wording fixes, and the new lines T215 to T217."
+why = "Six dependency chains were written for file order, not need; the alignment puts T202, T206, T209a, T210 and T211 on the ready frontier and makes the critical path honest (T161 onward)."
+unblocks = ["task:T202", "task:T206", "task:T209a", "task:T210", "task:T211", "task:T215", "task:T216", "task:T217"]
