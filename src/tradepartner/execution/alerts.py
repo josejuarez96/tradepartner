@@ -23,6 +23,10 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
 - `lot_ledger`: the tracking run (T63), when the lot ledger cannot be rebuilt
   (`execution.outcomes`); added 2026-10-01 by the owner's answer to #366 Q5.
   Run-scoped.
+- `stale_mark`: the tracking run's mark step, when a tradable held name with no S-1
+  bar was marked at its last close (#1763, owner decision; bounded by the frozen
+  `paper.max_stale_mark_sessions`). Run-scoped; one alert per run naming every such
+  name, a distinct kind so it never shadows the run's own `stale_data`.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
   No run id; one alert per (book, kind, session), `session` being the calendar
   session containing the instant, or the next one on a non-session day (the
@@ -112,6 +116,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "locked",
     "no_window",
     "lot_ledger",
+    "stale_mark",
 )
 #: Kinds with no run, deduped on (kind, session).
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")
