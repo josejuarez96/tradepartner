@@ -8,7 +8,7 @@ name: CI
 # the PR), and marks the PR ready only once it is green. `labeled` runs CI only for
 # the `ci:full` label (#1753); `unlabeled` is not a trigger (removing a label starts no
 # run, and could not cancel the head's full run): adding any other label starts a run whose jobs are all
-# skipped (GitHub cannot filter a trigger by label), in its own concurrency group so it
+# skipped but `claims` (a skipped required check reads as a pass) (GitHub cannot filter a trigger by label), in its own concurrency group so it
 # can never cancel a real run; `ready_for_review` is deliberately not a trigger: marking ready after that green
 # run would only repeat it. A PR marked ready by hand without a full run has no `checks` on
 # its head until its next push or label, so the required check blocks its merge (fail
@@ -213,7 +213,9 @@ jobs:
           fi
 
   claims:
-    if: ${{ github.event_name == 'pull_request' && !(github.event.action == 'labeled' && github.event.label.name != 'ci:full') }}
+    # Runs on every PR event, label noise included: a skipped `claims` would report success and could
+    # stand in for a real failure on the same head (safety-reviewer, #1753).
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
