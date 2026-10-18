@@ -12,7 +12,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,7 @@ from tradepartner.store.asof import (
     dropped_dividends_as_of,
     live_actions_as_of,
     prices_as_of,
+    rates_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.classify import classifications_as_of
@@ -1010,3 +1011,45 @@ def test_the_fake_and_store_providers_answer_alike_on_the_fixture(
     assert dict(got.shares) == dict(want.shares)
     assert dict(got.splits) == dict(want.splits)
     assert fake.calls == [Call("turnover_inputs", t, ids=tuple(TURNOVER_IDS), sessions_from=start)]
+
+
+# --- the rates read (backtest spec amendment #1498, T170b) ------------------------------
+
+RATES_FIRST = datetime(2019, 3, 14, 20, tzinfo=UTC)
+RATES_REVISED = datetime(2019, 3, 21, 20, tzinfo=UTC)
+RATES_OBSERVATION = date(2019, 3, 12)
+
+
+def _rate_on(frame: pl.DataFrame, observation: date) -> list[float]:
+    return frame.filter(pl.col("observation_date") == observation)["value"].to_list()
+
+
+def test_rates_are_the_as_of_read_of_the_series(store: Store) -> None:
+    with store.provider() as provider:
+        got = provider.rates(RATES_REVISED, "DTB3")
+    with store.direct() as conn:
+        want = rates_as_of(conn, RATES_REVISED, "DTB3")
+    assert not got.is_empty()
+    assert got.equals(want)
+    assert set(got["series"].to_list()) == {"DTB3"}
+
+
+def test_rates_show_the_first_value_then_the_revision_and_nothing_known_after_t(
+    store: Store,
+) -> None:
+    before = RATES_FIRST - timedelta(microseconds=1)
+    with store.provider() as provider:
+        assert _rate_on(provider.rates(before, "DTB3"), RATES_OBSERVATION) == []
+        assert _rate_on(provider.rates(RATES_FIRST, "DTB3"), RATES_OBSERVATION) == [2.25]
+        assert _rate_on(provider.rates(RATES_REVISED, "DTB3"), RATES_OBSERVATION) == [2.27]
+        early = provider.rates(RATES_FIRST, "DTB3")
+    assert early["known_at"].max() <= RATES_FIRST
+
+
+def test_rates_of_an_unknown_series_are_empty_and_t_is_checked(store: Store) -> None:
+    with store.provider() as provider:
+        assert provider.rates(RATES_REVISED, "NOPE").is_empty()
+        with pytest.raises(TypeError, match="tz-aware datetime"):
+            provider.rates(date(2019, 3, 21), "DTB3")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="tz-aware"):
+            provider.rates(datetime(2019, 3, 21, 20), "DTB3")  # noqa: DTZ001
