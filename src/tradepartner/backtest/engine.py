@@ -933,6 +933,7 @@ class _Variant:
     keep_frames: bool = True
     keep_detail: bool = True
     frames: list[StepFrame] = field(default_factory=list)
+    last_stitched: dict[str, date] = field(default_factory=dict)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
     rates: pl.DataFrame | None = None
 
@@ -1125,7 +1126,7 @@ def _run_group(
         view.share(
             ("marking_prices", t),
             [
-                (marked, _marking_bound(variant, step_end, family))
+                (marked, _marking_bound(variant, step_end, family, marked))
                 for variant, (_, marked, _) in zip(group, own, strict=True)
             ],
         )
@@ -1137,7 +1138,9 @@ def _run_group(
         next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
         for variant in list(group):
             try:
-                _variant_step(view, variant, step_end, benchmarks, next_plans.get(variant.trial_id))
+                _variant_step(
+                    view, variant, step_end, benchmarks, next_plans.get(variant.trial_id), family
+                )
             except _ReadError:
                 raise
             except Exception as exc:
@@ -1167,7 +1170,9 @@ def _marking_ids(
     return tuple(ids), tuple(marked), tuple(ever_held)
 
 
-def _marking_bound(variant: _Variant, step_end: date, family: HypothesisFamily) -> date:
+def _marking_bound(
+    variant: _Variant, step_end: date, family: HypothesisFamily, marked: Sequence[str]
+) -> date:
     """Earliest held formation anchor or stale-exit window, including last marks."""
     plan = cast(Plan, variant.plan)
     settings = variant.settings
@@ -1175,6 +1180,7 @@ def _marking_bound(variant: _Variant, step_end: date, family: HypothesisFamily) 
     at = bisect.bisect_right(sessions, step_end) - 1
     stale = sessions[max(0, at - settings.backtest.stale_exit_sessions)]
     bounds = [stale, plan.session]
+    bounds.extend(variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched)
     if family in ("momentum", "combined"):
 
         def formation(session: date) -> date:
@@ -1205,6 +1211,7 @@ def _variant_step(
     step_end: date,
     benchmarks: Mapping[str, str],
     next_plan: Plan | None,
+    family: HypothesisFamily,
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`."""
@@ -1213,9 +1220,7 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    frame = view.marking_prices(
-        t, marked, _marking_bound(variant, step_end, cast(HypothesisFamily, variant.handle.family))
-    )
+    frame = view.marking_prices(t, marked, _marking_bound(variant, step_end, family, marked))
     raw = view.raw_prices(t, marked)
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
@@ -1224,6 +1229,13 @@ def _variant_step(
         next_plan = _no_benchmark_members(next_plan, benchmarks)
     if variant.keep_frames:
         variant.frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
+    for sid, session in (
+        frame.filter((pl.col("session") > plan.session) & (pl.col("session") <= step_end))
+        .group_by("security_id")
+        .agg(pl.col("session").max())
+        .iter_rows()
+    ):
+        variant.last_stitched[sid] = session
     variant.targets[plan.fill_session] = dict(plan.targets)
     for book in variant.books:
         _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)
