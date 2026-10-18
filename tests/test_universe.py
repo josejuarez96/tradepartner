@@ -758,3 +758,19 @@ def test_rank_by_is_a_frozen_universe_key_in_the_config_dump(
 ) -> None:
     u = universe_as_of(fixture_store, T_DUAL, _rank_settings())
     assert u.settings["universe"]["rank_by"] == "dollar_volume"
+
+
+def test_a_nyse_class_ticker_matches_its_alpaca_symbol_through_class_symbols(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The broker names a NYSE class share by `alpaca.class_symbols` (`BFB` -> `BF.B`,
+    #1219): the intersection matches on the same symbol, never the filer's spelling."""
+    fixture_store.execute("UPDATE borrow_status SET symbol = 'SPL.T' WHERE symbol = 'SPLT'")
+    plain = universe_as_of(fixture_store, _AFTER_SNAPSHOT, _rank_settings())
+    assert "SEC_SPLIT_PLAIN" not in _members(plain)
+    mapped = Settings(
+        _env_file=None,
+        universe={"rank_by": "dollar_volume"},
+        alpaca={"class_symbols": {"SPLT": "SPL.T"}},
+    )
+    assert "SEC_SPLIT_PLAIN" in _members(universe_as_of(fixture_store, _AFTER_SNAPSHOT, mapped))

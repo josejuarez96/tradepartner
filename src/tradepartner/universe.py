@@ -96,10 +96,10 @@ reported once, under the first rule it fails:
    rank by `cik`. The top `universe.top_n_by_cap` are kept, then each kept
    class is intersected with Alpaca's tradable assets as of `t`
    (`borrow_status_as_of`: the latest row per asset with `known_at <= t`,
-   `status = 'active'` and `tradable`, matched on `alpaca_symbol` of the
-   class's ticker); a kept class with no such asset is excluded under rule 8
-   with reason `untradable_asset`. **Before the first assets snapshot with
-   `known_at <= t` the intersection is skipped**, never today's list read
+   `status = 'active'` and `tradable`, matched on the class's Alpaca symbol:
+   `master_symbol` with `alpaca.class_symbols`, as the broker names it); a kept class with no such
+   asset is excluded under rule 8 with reason `untradable_asset`. **Before the
+   first assets snapshot with `known_at <= t` the intersection is skipped**, never today's list read
    into the past: `Universe.assets_intersection_skipped` is true and
    `n_assets_intersected` 0.
 
@@ -747,7 +747,13 @@ def latest_shares_as_of(
 def _assets_snapshot_known(conn: duckdb.DuckDBPyConnection, t: datetime) -> bool:
     """True when an assets snapshot row with `known_at <= t` exists. A store
     without the `borrow_status` table (below schema version 24) has none."""
-    tables = {name for (name,) in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
+    tables = {
+        name
+        for (name,) in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+            " AND table_catalog = current_database()"
+        ).fetchall()
+    }
     if "borrow_status" not in tables:
         return False
     row = conn.execute("SELECT count(*) FROM borrow_status WHERE known_at <= ?", [t]).fetchone()
@@ -783,7 +789,7 @@ def _dollar_volume_universe(
 ) -> Universe:
     """Rules 7 and 8 under `rank_by = dollar_volume` (module docstring): `alive`
     passed rules 1-6, so every class has a bar on each `history` session."""
-    from tradepartner.adapters.alpaca_prices import alpaca_symbol  # cycle: it imports this module
+    from tradepartner.adapters.alpaca_prices import master_symbol  # cycle: it imports this module
 
     size_rule = RULES.index("size") + 1
     window = frozenset(history)
@@ -812,9 +818,13 @@ def _dollar_volume_universe(
     if not skipped:
         tradable = _tradable_symbols(conn, t)
         for sid in admitted:
-            if alpaca_symbol(listings[sid]["ticker"]) not in tradable:
+            if master_symbol(listings[sid], settings.alpaca.class_symbols) not in tradable:
                 exclude(sid, "untradable_asset")
-        admitted = [sid for sid in admitted if alpaca_symbol(listings[sid]["ticker"]) in tradable]
+        admitted = [
+            sid
+            for sid in admitted
+            if master_symbol(listings[sid], settings.alpaca.class_symbols) in tradable
+        ]
     members = [
         {
             "security_id": sid,
