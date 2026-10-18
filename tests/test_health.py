@@ -18,6 +18,12 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+from conftest import (
+    PROBE_CHUNKS,
+    assert_chunks_are_the_probe_set,
+    failing_chunks,
+    probe_chunk,
+)
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from pydantic import ValidationError
 
@@ -1787,34 +1793,84 @@ def _probes(conn: duckdb.DuckDBPyConnection) -> list[datetime]:
     return sorted(probes)
 
 
+def _assert_as_of_metrics_invariant_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    settings: Settings,
+    t: datetime,
+) -> None:
+    cut = truncated.at(t)
+    assert coverage(fixture_store, t, settings) == coverage(cut, t, settings), t
+    assert bar_gaps(fixture_store, t).rows.equals(bar_gaps(cut, t).rows), t
+    assert static_reliance(fixture_store, t, settings) == static_reliance(cut, t, settings), t
+    full_delisted = delisted_names(fixture_store, t, settings).frame
+    assert full_delisted.equals(delisted_names(cut, t, settings).frame), t
+    assert unclassifiable(fixture_store, t) == unclassifiable(cut, t), t
+    # The two integrity rules derived at `t` as the listings are read
+    # (module docstring), not merely read off stored rows (#827).
+    # Only these two are computed (via the same helpers `integrity_checks`
+    # uses): the rest of `integrity_checks` is not asserted here, and
+    # its rate rules cost seconds per call at ~1,900 probes (#1669).
+    window = settings.master.transfer_window_sessions
+    full_listings = listing_ends_as_of(fixture_store, t, settings)
+    cut_listings = listing_ends_as_of(cut, t, settings)
+    full_overlaps, _ = _overlapping_listings(full_listings, settings)
+    cut_overlaps, _ = _overlapping_listings(cut_listings, settings)
+    assert full_overlaps.equals(cut_overlaps), (NON_OVERLAPPING_LISTINGS, t)
+    full_after = _bars_after_delisting(fixture_store, t, full_listings, window)
+    cut_after = _bars_after_delisting(cut, t, cut_listings, window)
+    assert full_after.equals(cut_after), (NO_BARS_AFTER_DELISTING, t)
+
+
+#: `_probes` on the fixture store, pinned (T216): the chunked test below walks exactly these.
+PROBE_COUNT = 1936
+PROBE_DIGEST = "01a1b6bb43d91d9f55b490c27c2176da46a823a86918b00c8bfa26f9f1a10ded"
+
+
+def test_as_of_metrics_chunks_are_the_pinned_probe_set(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """No probe dropped: the chunks' union is today's probe set, by count and hash."""
+    assert_chunks_are_the_probe_set(_probes(fixture_store), PROBE_COUNT, PROBE_DIGEST)
+
+
+def test_a_planted_lookahead_fails_exactly_one_metrics_chunk(
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `coverage` that reads 400 days past T on the full store at one probe fails the
+    chunk holding that probe and no other."""
+    probes = _probes(fixture_store)
+    planted = probes[900]
+    real = coverage
+
+    def leaky(conn: duckdb.DuckDBPyConnection, t: datetime, s: Settings) -> Any:
+        read_at = t + timedelta(days=400) if conn is fixture_store and t == planted else t
+        return real(conn, read_at, s)
+
+    monkeypatch.setitem(globals(), "coverage", leaky)
+    failed = failing_chunks(
+        probes[880:920],
+        lambda t: _assert_as_of_metrics_invariant_at(fixture_store, truncated, settings, t),
+    )
+    assert failed == [(900 - 880) % PROBE_CHUNKS]
+
+
+@pytest.mark.parametrize("chunk", range(PROBE_CHUNKS))
 def test_as_of_metrics_invariant_under_truncation(
-    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, settings: Settings
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    settings: Settings,
+    chunk: int,
 ) -> None:
     """Every metric read as of T equals the same metric on the store cut
     to `known_at <= T`, at the probes of `_probes` (the survivorship gap
-    has its own suite over every probe in `tests/lookahead/`)."""
-    for t in _probes(fixture_store):
-        cut = truncated.at(t)
-        assert coverage(fixture_store, t, settings) == coverage(cut, t, settings), t
-        assert bar_gaps(fixture_store, t).rows.equals(bar_gaps(cut, t).rows), t
-        assert static_reliance(fixture_store, t, settings) == static_reliance(cut, t, settings), t
-        full_delisted = delisted_names(fixture_store, t, settings).frame
-        assert full_delisted.equals(delisted_names(cut, t, settings).frame), t
-        assert unclassifiable(fixture_store, t) == unclassifiable(cut, t), t
-        # The two integrity rules derived at `t` as the listings are read
-        # (module docstring), not merely read off stored rows (#827).
-        # Only these two are computed (via the same helpers `integrity_checks`
-        # uses): the rest of `integrity_checks` is not asserted here, and
-        # its rate rules cost seconds per call at ~1,900 probes (#1669).
-        window = settings.master.transfer_window_sessions
-        full_listings = listing_ends_as_of(fixture_store, t, settings)
-        cut_listings = listing_ends_as_of(cut, t, settings)
-        full_overlaps, _ = _overlapping_listings(full_listings, settings)
-        cut_overlaps, _ = _overlapping_listings(cut_listings, settings)
-        assert full_overlaps.equals(cut_overlaps), (NON_OVERLAPPING_LISTINGS, t)
-        full_after = _bars_after_delisting(fixture_store, t, full_listings, window)
-        cut_after = _bars_after_delisting(cut, t, cut_listings, window)
-        assert full_after.equals(cut_after), (NO_BARS_AFTER_DELISTING, t)
+    has its own suite over every probe in `tests/lookahead/`). The probes are
+    split into `PROBE_CHUNKS` strided chunks, one test each, so xdist spreads them."""
+    for t in probe_chunk(_probes(fixture_store), chunk):
+        _assert_as_of_metrics_invariant_at(fixture_store, truncated, settings, t)
 
 
 # --- Owner-accepted same-day pairs (#855) -----------------------------------
