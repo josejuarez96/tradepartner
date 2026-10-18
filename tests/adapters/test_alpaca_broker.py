@@ -37,6 +37,7 @@ from tradepartner.adapters.alpaca_trading_raw import (
     AlpacaTradingRaw,
 )
 from tradepartner.adapters.broker import (
+    UNRESOLVED_ASSET,
     Account,
     Asset,
     CashActivity,
@@ -864,15 +865,28 @@ def test_an_asset_answered_for_another_symbol_raises() -> None:
         broker.assets(["KO"])
 
 
-def test_an_asset_read_the_broker_answers_404_raises_not_omits() -> None:
-    """#410: a symbol Alpaca does not know (a 404 on `GET /v2/assets/{symbol}`)
-    is raised, never dropped from the answer, so `Broker.assets` keeps its
-    one-`Asset`-per-symbol contract and the run halts fail-closed."""
+def test_an_asset_the_broker_answers_404_is_unresolved_not_omitted() -> None:
+    """#1729 (was #410's halt): a symbol Alpaca does not know (404, code
+    40410000, on `GET /v2/assets/{symbol}`) answers `UNRESOLVED_ASSET`, never
+    tradable, so the run skips that one name instead of halting the book;
+    `Broker.assets` keeps its one-`Asset`-per-symbol contract."""
     broker, http = _broker()
-    http.route("GET", "/v2/assets/KO", (200, _load("assets")[0]))
+    ko = _load("assets")[0]
+    http.route("GET", "/v2/assets/KO", (200, ko))
     http.route("GET", "/v2/assets/GONE", (404, {"code": 40410000, "message": "asset not found"}))
+    answer = broker.assets(["KO", "GONE"])
+    assert answer["GONE"] == UNRESOLVED_ASSET
+    assert not answer["GONE"].tradable
+    assert answer["KO"].tradable
+
+
+def test_an_asset_read_404_with_another_code_raises() -> None:
+    """Only Alpaca's asset-not-found code is an unresolved name; any other 404
+    is a fault and halts fail-closed."""
+    broker, http = _broker()
+    http.route("GET", "/v2/assets/GONE", (404, {"code": 40400000, "message": "not found"}))
     with pytest.raises(AlpacaTradingError) as raised:
-        broker.assets(["KO", "GONE"])
+        broker.assets(["GONE"])
     assert raised.value.status_code == 404
 
 

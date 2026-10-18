@@ -121,6 +121,7 @@ from tradepartner.execution.reconcile import (
     Reconciliation,
     compare,
 )
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store.asof import live_actions_as_of, prices_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
@@ -280,12 +281,19 @@ def _symbols(
     order_symbols: Mapping[str, str],
     current: Mapping[str, Mapping[str, Any]],
     broker_symbols: Collection[str],
+    class_symbols: Mapping[str, str] | None,
 ) -> dict[str, str]:
-    """`security_id` to broker symbol, one name per symbol (module docstring)."""
+    """`security_id` to broker symbol, one name per symbol (module docstring). A
+    listing's ticker is read in its broker form (`broker_symbol`, #1729), so a
+    `GEF.B` position matches the `GEF-B` listing."""
     claims: dict[str, list[str]] = defaultdict(list)
     for name in sorted(set(names)):
         listing = current.get(name)
-        symbol = listing["ticker"] if listing is not None else order_symbols.get(name)
+        symbol = (
+            broker_symbol(listing, class_symbols)
+            if listing is not None
+            else order_symbols.get(name)
+        )
         if symbol is not None:
             claims[symbol].append(name)
     symbols: dict[str, str] = {}
@@ -299,7 +307,7 @@ def _symbols(
         matches = [
             name
             for name, row in current.items()
-            if row["ticker"] == symbol and row["status"] != DELISTED
+            if broker_symbol(row, class_symbols) == symbol and row["status"] != DELISTED
         ]
         if len(matches) == 1:
             symbols[matches[0]] = symbol
@@ -442,7 +450,7 @@ def _explanations(
     )
     order_symbols = {o.security_id: o.symbol for o in state.orders}
     current = current_listings(listing_ends_as_of(conn, cut, settings), session)
-    symbols = _symbols(names, order_symbols, current, broker_symbols)
+    symbols = _symbols(names, order_symbols, current, broker_symbols, settings.alpaca.class_symbols)
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))
     seen_ids, seen_before = _seen_activities(state.adjustments, state.base(through), window)
