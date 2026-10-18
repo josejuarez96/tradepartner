@@ -22,7 +22,7 @@ uv run ruff check . && uv run ruff format .   # lint + format
 uv run pre-commit run --all-files             # all hooks
 uv add [--dev] <pkg>                          # only if the plan lists it
 ```
-Before every push: lint, format, mypy and the test files you touched. CI runs the full suite on code, test, script, CI and dependency changes, and on every push to main.
+Before every push: lint, format, mypy and the test files you touched. CI runs the full suite on every PR touching the paths in `ready_pr.py`'s `TEST_TRIGGER_PREFIXES` / `TEST_TRIGGER_FILES`, and on every push to main.
 
 ## Code standards
 - Python 3.12, `src/tradepartner/` layout, type hints everywhere (mypy strict), docstrings on public functions.
@@ -33,7 +33,7 @@ Before every push: lint, format, mypy and the test files you touched. CI runs th
 
 ## Before readying a PR
 1. Fill in the PR template completely.
-2. Run, in pass 1, every reviewer the plan line's `Review:` names and `scripts/ready_pr.py` requires for your paths (`QUANT_PREFIXES`, `SAFETY_PREFIXES` are the source; roughly: `quant-auditor` for data, backtests, signals; `safety-reviewer` for broker, orders, secrets, LLM inputs). [Review passes](docs/ways-of-working/agents.md#review-passes).
+2. Run, in pass 1, `quant-auditor` if the PR touches data, backtests or signals and `safety-reviewer` if it touches the broker, orders, secrets or LLM inputs, plus the plan line's `Review:`. `QUANT_PREFIXES` / `SAFETY_PREFIXES` in `scripts/ready_pr.py` are the minimum it enforces by path. [Review passes](docs/ways-of-working/agents.md#review-passes).
 3. Put your STATUS line and CHANGELOG bullet in one fragment (`fragments.py add`, [command card](docs/ways-of-working/teams.md#command-card)); never edit `STATUS.md` or `CHANGELOG.md`.
 4. Run `/ready-pr` (`uv run python scripts/ready_pr.py <pr> --timeout-min 45`). It merges main in, runs the checks, waits for CI, marks ready. Never mark ready by hand.
 

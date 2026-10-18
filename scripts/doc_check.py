@@ -8,12 +8,13 @@ and ``tests/``, and checks four kinds of citation:
 - a task number (``T45``, ``T190b``; ``T0`` and ``T04`` are not task numbers) names a task
   line in some plan (open or finished);
 - an ADR number (``ADR 0023``, ``ADR-17``) names a file ``docs/decisions/<NNNN>-*.md``;
-- a claim ID (``HO-10``, ``ER-4``) whose prefix is a claim-register prefix names an
-  ``id`` in ``docs/research/claims.toml``;
+- a claim ID (``HO-10``, ``ER-4``, ``EP-P11``, ``G2-A``) whose prefix is a claim-register
+  prefix names an ``id`` in ``docs/research/claims.toml``;
 - a requirement (``req 5``) names a numbered item under a spec's ``## Requirements``.
   The spec is the one named just before it on the same line (``strategy-lab spec req 4``,
-  ``specs/backtest.md`` ... ``req 3``); else, on a plan line, the spec with the plan's own
-  name; else any spec with that requirement number. A retired requirement keeps its
+  ``specs/backtest.md req 3``, within ``SPEC_SCOPE_CHARS``); else, on a plan line, the spec
+  with the plan's own name; else any spec with that requirement number (a weak check: most
+  ``req N`` in ``src/`` and ``tests/`` name no spec). A retired requirement keeps its
   number, so it still resolves.
 
 A line that holds ``doc-check: ignore`` (test data such as made-up task ids) is skipped,
@@ -72,7 +73,9 @@ ADR_REF_RE = re.compile(r"\bADR[ -]?(\d{1,4})\b")
 ADR_FILE_RE = re.compile(r"^(\d{4})-")
 REQ_REF_RE = re.compile(r"\breq (\d+)\b")
 REQ_ITEM_RE = re.compile(r"^(\d+)\. ")
-SPEC_NAME_RE = re.compile(r"(?:specs/([a-z0-9-]+)\.md|\b([a-z0-9-]+) spec\b)")
+SPEC_NAME_RE = re.compile(r"(?:specs/([a-z0-9-]+)\.md|\b([a-z0-9-]+) spec\b)", re.IGNORECASE)
+#: How close (characters) a spec name must end before ``req N`` to scope it.
+SPEC_SCOPE_CHARS = 30
 IGNORE_MARK = "doc-check: ignore"
 IGNORE_FILE_MARK = "doc-check: ignore-file"
 
@@ -111,7 +114,7 @@ class Registry:
 @functools.cache
 def _claim_pattern(prefixes: frozenset[str]) -> re.Pattern[str]:
     alternatives = "|".join(sorted(map(re.escape, prefixes)))
-    return re.compile(rf"\b(?:{alternatives})-\d+\b")
+    return re.compile(rf"\b(?:{alternatives})-(?:[A-Z]{{0,2}}\d+|[A-Z])\b")
 
 
 def plan_tasks(text: str) -> set[str]:
@@ -164,12 +167,13 @@ def load_registry(root: Path) -> Registry:
 
 
 def _spec_before(line: str, pos: int, specs: Iterable[str]) -> str | None:
-    """The last known spec named on ``line`` before ``pos``, if any."""
+    """The known spec named on ``line`` just before ``pos`` (ending within
+    ``SPEC_SCOPE_CHARS``), if any; a spec named earlier in another clause does not count."""
     known = set(specs)
     named = None
     for m in SPEC_NAME_RE.finditer(line, 0, pos):
-        name = m.group(1) or m.group(2)
-        if name in known:
+        name = (m.group(1) or m.group(2)).lower()
+        if name in known and pos - m.end() <= SPEC_SCOPE_CHARS:
             named = name
     return named
 

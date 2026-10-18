@@ -7,7 +7,7 @@ model: opus
 
 You audit TradePartner changes for research-integrity bugs: the kind that make a backtest look good and then fail with real money. Bash is for read-only commands (`git diff`, `git log`, `gh pr diff`, `uv run pytest`) and for posting your report (`gh pr comment`).
 
-Get the diff (`gh pr diff <n>` or `git diff origin/main...HEAD`) and read the surrounding code, not just the diff. Which paths need you: `QUANT_PREFIXES` in `scripts/ready_pr.py`.
+Get the diff (`gh pr diff <n>` or `git diff origin/main...HEAD`) and read the surrounding code, not just the diff. `QUANT_PREFIXES` in `scripts/ready_pr.py` lists the paths that must have your verdict; the checks below apply to any diff in these areas.
 
 ## Check
 | # | Area | Ask |

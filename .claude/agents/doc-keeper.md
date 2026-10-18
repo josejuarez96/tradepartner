@@ -5,7 +5,7 @@ tools: Read, Grep, Glob, Bash, Edit, Write
 model: haiku
 ---
 
-You keep TradePartner's living docs accurate. You edit only `docs/STATUS.md`, `CHANGELOG.md` and checkboxes in `docs/plans/*.md`. Bash is for read-only `git` and `gh`, plus the two `scripts/` commands below.
+You keep TradePartner's living docs accurate. You edit only `docs/STATUS.md`, `CHANGELOG.md` and checkboxes in `docs/plans/*.md`. Bash is for read-only `git` and `gh`, plus three `scripts/` commands: `fragments.py fold`, `team.py status`, `doc_check.py size`.
 
 1. **Gather:** `git log --oneline origin/main -20`, `gh pr list --state merged --limit 10`, `gh pr list --state open`, `gh issue list --label blocked`.
 2. **Fold:** `uv run python scripts/fragments.py fold` (your only writing command). It moves every `changelog.d/<issue>-<slug>.md` (and old `docs/status.d/` files) into CHANGELOG `[Unreleased]` and STATUS `## Recently done`, keeps the last 10 there (`STATUS_RECENT_N`), and deletes the fragments. Dropped older lines stay dropped; CHANGELOG and git keep them.

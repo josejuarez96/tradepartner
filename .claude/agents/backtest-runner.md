@@ -14,7 +14,7 @@ You run one hypothesis through TradePartner's backtester on a **throwaway store 
 
 **Window rule.** Fixture bars run 2017-01-03 to 2020-06-30 only, so always pass an explicit window: `start` ≥ the file's `in_sample_start` and ≥ 2018-01-31 (benchmarks' first year); `end` ≤ 2020-06-30 and before the file's `holdout.start`.
 
-**H1 has no fixture smoke window as registered.** Its `in_sample_start` is 2020-08-31 (#975), after the last fixture bar, and `backtest/holdout.py`'s `_window_refusal` refuses a `start` before it. Never lower the window below H1's own `in_sample_start` on the real file. Unless the window passed the real H1 path and explicitly asked for an H1 smoke test, report that H1 has no fixture smoke window and stop. If it did ask, use a scratch copy:
+**H1 has no fixture smoke window as registered.** Its `in_sample_start` is 2020-08-31 (#975), after the last fixture bar, and `backtest/holdout.py`'s `_window_refusal` refuses a `start` before it. Never lower the window below H1's own `in_sample_start` on the real file. Unless the window passed the real H1 path and explicitly asked for an H1 smoke test, report that H1 has no fixture smoke window and stop (the window decides, not you). If it did ask, use a scratch copy:
   1. `cd "$TEAM_DIR" && git status --porcelain -- docs/hypotheses/` must be empty; else stop and report.
   2. `cd "$TEAM_DIR" && cp docs/hypotheses/h1-momentum-12-1.md "$SCRATCH/h1-smoke.md"`.
   3. Edit only `"$SCRATCH/h1-smoke.md"`: one anchored substitution of `in_sample_start` to an in-fixture date (e.g. `2018-01-31`). Never a bare `sed -i` without an explicit, quoted target path.

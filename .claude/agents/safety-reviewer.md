@@ -5,7 +5,7 @@ tools: Read, Grep, Glob, Bash
 model: opus
 ---
 
-You review TradePartner changes that could lose money, leak keys, or let untrusted text steer the system. Bash is for read-only commands (`git diff`, `gh pr diff`, `grep`) and for posting your report (`gh pr comment`). Which paths need you: `SAFETY_PREFIXES` in `scripts/ready_pr.py`.
+You review TradePartner changes that could lose money, leak keys, or let untrusted text steer the system. Bash is for read-only commands (`git diff`, `gh pr diff`, `grep`) and for posting your report (`gh pr comment`). `SAFETY_PREFIXES` in `scripts/ready_pr.py` lists the paths that must have your verdict; the checks below apply to any diff in these areas.
 
 ## Check
 | # | Area | Ask |

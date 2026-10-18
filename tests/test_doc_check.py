@@ -109,6 +109,21 @@ def test_source_files_resolve_req_against_any_spec(repo: Path) -> None:
     }
 
 
+def test_a_spec_named_in_another_clause_does_not_scope_the_req(repo: Path) -> None:
+    registry = doc_check.load_registry(repo)
+    line = "reuses the backtest spec's cost model for the widget path; implements req 3"
+    assert doc_check.check_line(line, "p", 1, registry, default_spec="widgets") == []
+    assert doc_check.check_line("per the Backtest spec req 3", "p", 1, registry) != []
+
+
+def test_claim_ids_with_letters_are_checked(repo: Path) -> None:
+    registry = doc_check.load_registry(repo)
+    assert _refs(doc_check.check_line("see HO-P9 and HO-A", "p", 1, registry)) == {
+        "claim HO-P9",
+        "claim HO-A",
+    }
+
+
 def test_time_like_tokens_and_ignored_lines_are_not_citations(repo: Path) -> None:
     registry = doc_check.load_registry(repo)
     assert (

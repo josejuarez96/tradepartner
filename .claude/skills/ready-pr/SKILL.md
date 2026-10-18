@@ -9,7 +9,7 @@ Run this when the work on your claimed issue is done and the draft PR describes 
 
 ## Before you run it
 1. **One fragment, not the shared files:** `uv run python scripts/fragments.py add <issue> --slug <slug> --status "<Recently done line, ≤240 chars, with the PR number>" --added "<CHANGELOG bullet>"` (or `--changed` / `--fixed`). Never edit `docs/STATUS.md` or `CHANGELOG.md`. Tick only your own plan box.
-2. **Reviews:** every reviewer the plan line's `Review:` names and `ready_pr.py` requires for your paths (`QUANT_PREFIXES`, `SAFETY_PREFIXES`). Give each the PR number; it posts its full report as a PR comment whose first line is the verdict (`quant-auditor: PASS`) and returns a ten-line summary. If it could not post, post its file with `gh pr comment <n> --body-file <path>`. Only a comment's first line counts, the latest verdict per agent wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` block until a re-review after the fixes posts `PASS` (#356). The PR body never counts (#352).
+2. **Reviews:** the plan line's `Review:`, plus `quant-auditor` for data, store, signals, backtests and `safety-reviewer` for broker, orders, secrets, config, LLM inputs. `QUANT_PREFIXES` / `SAFETY_PREFIXES` in `ready_pr.py` are the minimum it enforces by path. Give each the PR number; it posts its full report as a PR comment whose first line is the verdict (`quant-auditor: PASS`) and returns a ten-line summary. If it could not post, post its file with `gh pr comment <n> --body-file <path>`. Only a comment's first line counts, the latest verdict per agent wins, and only `PASS` passes: `PASS WITH FIXES` and `FAIL` block until a re-review after the fixes posts `PASS` (#356). The PR body never counts (#352).
 3. **Template:** tick every box, or mark it `n/a` with why. The body says `Closes #<issue>`.
 
 ## Run it
@@ -27,7 +27,7 @@ From your team directory, on the PR's branch, clean tree. `--timeout-min 45`: CI
 | `--tests` / `--full-tests` / `--no-tests` | force local targeted pytest / run the full suite locally / skip it |
 | `--allow-shared-files` | see Never |
 
-Always run locally: ruff check, ruff format --check, mypy, the fragment check, `tests/test_docs_budget.py`. No local pytest by default: CI runs the full suite on every code, test, script, CI or dependency diff and on every push to main. `--tests` runs the test files the diff maps to, or the full suite when the mapping is unclear, and prints which (rules: `targeted_tests` in `ready_pr.py`, #456).
+Always run locally: ruff check, ruff format --check, mypy, the fragment check, `tests/test_docs_budget.py`. No local pytest by default: CI runs the full suite on every diff touching `TEST_TRIGGER_PREFIXES` / `TEST_TRIGGER_FILES` and on every push to main. `--tests` runs the test files the diff maps to, or the full suite when the mapping is unclear, and prints which (rules: `targeted_tests` in `ready_pr.py`, #456).
 
 ## When it says NOT READY
 Each message names one fix. Fix, commit, run again.
