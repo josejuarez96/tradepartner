@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from tradepartner.adapters.alpaca_prices import alpaca_symbol
 from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -63,6 +64,7 @@ SYMBOLS = {
     "SEC_STATIC_PRE2019": "PRE9",
     "SEC_DUAL_A": "DUALA",
 }
+BROKER_ASSETS = ("DUALB", "SPFT", "TRNS", "SPY", "WNDX", "DUALA", "SPBT")
 TARGETS = ("SEC_DUAL_B", "SEC_SPLIT_FUTURE", "SEC_TRANSFER")
 #: Loose enough that a third of equity is one order and one position.
 FROZEN = RiskConfig(max_position_weight=0.4, max_order_notional_fraction=0.4)
@@ -108,12 +110,7 @@ class Env:
         self.new_fake()
 
     def new_fake(self, **kwargs: Any) -> FakeBroker:
-        kwargs.setdefault(
-            "assets",
-            FakeBroker.active_assets(
-                *(ticker for (ticker,) in self.query("SELECT DISTINCT ticker FROM listings"))
-            ),
-        )
+        kwargs.setdefault("assets", FakeBroker.active_assets(*BROKER_ASSETS))
         self.fake = FakeBroker(
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],
@@ -318,6 +315,10 @@ def retick(env: Env, security_id: str, ticker: str) -> None:
     """The temp store's listing of `security_id` reads `ticker` (the master's form)."""
     with open_for_write(env.settings) as conn:
         conn.execute("UPDATE listings SET ticker = ? WHERE security_id = ?", [ticker, security_id])
+    env.fake.remove_asset(SYMBOLS[security_id])
+    broker_form = alpaca_symbol(ticker)
+    if broker_form is not None:
+        env.fake.set_asset(broker_form, Asset(True, True, "active", None))
 
 
 def test_a_class_share_trades_and_reconciles_in_the_brokers_form(

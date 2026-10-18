@@ -21,9 +21,11 @@ bad clock (naive, overflowing, not a `datetime`, or raising) making
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -32,6 +34,7 @@ import pytest
 from tradepartner.adapters.alpaca_trading_raw import AlpacaTradingError
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
+    UNRESOLVED_ASSET,
     Account,
     Asset,
     Broker,
@@ -148,7 +151,7 @@ def test_fake_broker_exposes_its_clock_for_the_identity_test() -> None:
     _, clock = make_clock()
     assert (
         FakeBroker(
-            assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+            assets=FakeBroker.active_assets(*PRICES),
             clock=clock,
             price_of=price_of,
         ).clock
@@ -241,7 +244,7 @@ def test_broker_order_and_fill_ids_are_unique() -> None:
 def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
     prices = {"AAPL": float("nan")}
     broker = FakeBroker(
-        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        assets=FakeBroker.active_assets(*PRICES),
         clock=make_clock()[1],
         price_of=prices.__getitem__,
         cash=500.0,
@@ -259,7 +262,7 @@ def test_a_bad_price_fails_submit_before_anything_is_recorded() -> None:
 def test_account_refuses_a_bad_mark_price() -> None:
     prices = {"AAPL": 10.0}
     broker = FakeBroker(
-        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        assets=FakeBroker.active_assets(*PRICES),
         clock=make_clock()[1],
         price_of=prices.__getitem__,
     )
@@ -366,7 +369,7 @@ def test_simulate_fill_on_accepted_order_with_auto_fill_disabled() -> None:
 def test_simulate_fill_uses_the_price_at_fill_time() -> None:
     prices = {"AAPL": 100.0}
     broker = FakeBroker(
-        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        assets=FakeBroker.active_assets(*PRICES),
         clock=make_clock()[1],
         price_of=prices.__getitem__,
         auto_fill=False,
@@ -525,7 +528,7 @@ def test_account_shape_and_cash_follows_fills() -> None:
 
 def test_account_cash_is_exact_in_cents() -> None:
     broker = FakeBroker(
-        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        assets=FakeBroker.active_assets(*PRICES),
         clock=make_clock()[1],
         price_of=lambda symbol: 0.1,
         cash=0.3,
@@ -538,7 +541,7 @@ def test_account_cash_is_exact_in_cents() -> None:
 
 def test_account_reads_the_clock_through_the_wrap() -> None:
     broker = FakeBroker(
-        assets={symbol: Asset(True, True, "active", None) for symbol in PRICES},
+        assets=FakeBroker.active_assets(*PRICES),
         clock=lambda: datetime(2026, 1, 5),  # noqa: DTZ001
         price_of=price_of,
     )
@@ -546,7 +549,7 @@ def test_account_reads_the_clock_through_the_wrap() -> None:
         broker.account()
 
 
-def test_assets_default_to_tradable_fractionable_active() -> None:
+def test_explicit_catalog_assets_are_tradable_fractionable_active() -> None:
     broker, _ = make_broker()
     assets = broker.assets(["aapl", "MSFT"])
     assert set(assets) == {"AAPL", "MSFT"}
@@ -569,14 +572,64 @@ def test_assets_of_no_symbols_is_empty() -> None:
 def test_unknown_asset_and_non_alpaca_spelling_refuse_with_40410000() -> None:
     broker, _ = make_broker(assets={"GEF.B": Asset(True, True, "active", None)})
     for symbol in ("GEF-B", "ABSENT"):
-        with pytest.raises(AlpacaTradingError) as caught:
-            broker.assets([symbol])
-        assert (caught.value.status_code, '"code": 40410000' in caught.value.body) == (404, True)
+        assert broker.assets([symbol])[symbol] == UNRESOLVED_ASSET
         with pytest.raises(AlpacaTradingError) as caught:
             broker.submit(make_request(symbol=symbol))
-        assert caught.value.status_code == 404
+        assert (caught.value.status_code, json.loads(caught.value.body)["code"]) == (404, 40410000)
     assert broker.assets(["GEF.B"])["GEF.B"].tradable
+    broker.remove_asset("GEF.B")
+    assert broker.assets(["GEF.B"])["GEF.B"] == UNRESOLVED_ASSET
     assert broker.positions() == {} and broker.fills() == []
+
+
+def _recorded_refusal(name: str) -> dict[str, object]:
+    path = Path(__file__).parents[1] / "fixtures" / "alpaca" / "paper" / f"{name}.json"
+    return json.loads(path.read_text())["error"]  # type: ignore[no-any-return]
+
+
+def test_sell_above_held_matches_the_recorded_alpaca_response() -> None:
+    broker, _ = make_broker(assets={"KO": Asset(True, True, "active", None)})
+    broker.apply_account(SetPosition("KO", 0.557436865))
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(make_request(symbol="KO", side=Side.SELL, quantity=1.057436865))
+    recorded = _recorded_refusal("sell_above_held")
+    assert (caught.value.status_code, caught.value.body) == (
+        recorded["status_code"],
+        recorded["body"],
+    )
+
+
+def test_nonfractionable_sell_matches_the_recorded_alpaca_response() -> None:
+    broker, _ = make_broker(assets={"OCGN": Asset(True, False, "active", None)})
+    broker.apply_account(SetPosition("OCGN", 1))
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(make_request(symbol="OCGN", side=Side.SELL, quantity=0.5))
+    recorded = _recorded_refusal("non_fractionable_sell_fractional")
+    assert (caught.value.status_code, caught.value.body) == (
+        recorded["status_code"],
+        recorded["body"],
+    )
+
+
+def test_open_sell_reserves_quantity_and_refuses_a_second_quantity_or_notional_sell() -> None:
+    broker, _ = make_broker(auto_fill=False)
+    broker.apply_account(SetPosition("AAPL", 5))
+    broker.submit(make_request(side=Side.SELL, quantity=5))
+    for request in (
+        make_request(client_order_id="co-2", side=Side.SELL, quantity=1),
+        make_request(client_order_id="co-3", side=Side.SELL, notional=100),
+    ):
+        with pytest.raises(AlpacaTradingError, match="insufficient qty"):
+            broker.submit(request)
+    assert len(broker.open_orders()) == 1
+
+
+def test_untradable_submit_is_refused_before_order_or_fill() -> None:
+    broker, _ = make_broker(assets={"AAPL": Asset(False, True, "inactive", None)})
+    with pytest.raises(AlpacaTradingError, match="not tradable") as caught:
+        broker.submit(make_request())
+    assert caught.value.status_code == 403
+    assert broker.open_orders() == [] and broker.fills() == []
 
 
 def test_nonfractionable_asset_refuses_notional_and_fractional_quantity() -> None:
