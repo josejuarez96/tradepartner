@@ -332,7 +332,12 @@ RISK_FREE_KEYS = (
 )
 #: T209a's three post-registration own-section keys (backtest spec amendment #1731).
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
-COMBINED_LATER_KEYS = ("strategy.turnover_top_fraction", *RISK_FREE_KEYS, *HOLD_KEYS)
+COMBINED_LATER_KEYS = (
+    "strategy.turnover_top_fraction",
+    *RISK_FREE_KEYS,
+    *HOLD_KEYS,
+    "universe.rank_by",
+)
 
 
 def _before(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -371,6 +376,7 @@ LATER_KEYS = (
     "strategy.turnover_top_fraction",
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
+    "universe.rank_by",
 )
 
 
@@ -568,7 +574,10 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
 
     parsed = hypothesis.parse_file(path)
     params = hypothesis.frozen_params(parsed, _defaults_settings())
-    assert registry.params_sha256(_before(params, RISK_FREE_KEYS)) == params_sha256
+    assert (
+        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by")))
+        == params_sha256
+    )
     assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
     canonical = frozen.canonical_frozen_set(params, parsed.family)
     assert registry.params_sha256(canonical) == canonical_sha256
@@ -718,3 +727,39 @@ def test_risk_free_keys_leave_every_canonical_set_and_fingerprint_where_they_wer
     assert not set(RISK_FREE_KEYS) & set(canonical)
     store = {**current, "metrics.risk_free_source": "store"}
     assert frozen.fingerprint("momentum", store, date(2017, 1, 31)) == TWIN_FINGERPRINT
+
+
+# --- `universe.rank_by` (ADR 0023 D4, T212) ------------------------------------------
+
+RANK_BY_KEY = "universe.rank_by"
+
+
+def test_rank_by_entry_is_last_and_pinned_by_value() -> None:
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((RANK_BY_KEY, "cap", 28),))
+    assert RANK_BY_KEY not in frozen.POST_REGISTRATION_OWN_KEYS  # universe is no family's own
+
+
+def test_rank_by_at_cap_moves_no_fingerprint_and_no_canonical_set() -> None:
+    """The default entry is left out of the canonical set and the fingerprint, so a
+    registration stored without the key (every registered family) reads the same as one
+    that freezes `cap`; `dollar_volume` is a different universe and fingerprints so."""
+    settings = _defaults_settings()
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        start = date(2017, 1, 31)
+        without = _before(params, (RANK_BY_KEY,))
+        assert params[RANK_BY_KEY] == "cap"
+        assert frozen.fingerprint(family, params, start) == frozen.fingerprint(
+            family, without, start
+        )
+        assert frozen.canonical_frozen_set(params, family) == frozen.canonical_frozen_set(
+            without, family
+        )
+        assert RANK_BY_KEY not in frozen.canonical_frozen_set(params, family)
+        forward = {**params, RANK_BY_KEY: "dollar_volume"}
+        assert frozen.fingerprint(family, forward, start) != frozen.fingerprint(
+            family, params, start
+        )
+        assert frozen.canonical_frozen_set(forward, family)[RANK_BY_KEY] == "dollar_volume"

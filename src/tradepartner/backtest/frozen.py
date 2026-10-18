@@ -67,6 +67,9 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("strategy.hold_sessions", 1, 28),
     ("strategy.hold_target_names", 0, 28),
     ("strategy.rebalance_band", 0.0, 28),
+    # The universe's rule 8 ranking (ADR 0023 D4, T212): `cap` is today's rule, so no stored
+    # fingerprint moves. A forward book registers `dollar_volume`.
+    ("universe.rank_by", "cap", 28),
 )
 
 #: Keys added to a family's own listed section **after** that family's first

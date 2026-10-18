@@ -930,7 +930,8 @@ class TestRefusals:
         settings = _settings(tmp_path)
         all_params = frozen_params_of(settings, family="momentum")
         # Also before `gap.stale_listing_sessions` (#1199) and
-        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498) landed.
+        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+        # `universe.rank_by` (T212) landed.
         params = {
             k: v
             for k, v in all_params.items()
@@ -945,6 +946,7 @@ class TestRefusals:
                     "strategy.hold_sessions",
                     "strategy.hold_target_names",
                     "strategy.rebalance_band",
+                    "universe.rank_by",
                 )
             )
         }
