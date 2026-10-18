@@ -353,35 +353,48 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
 
 
 def tick_reviewer_boxes(
-    body: str, required: set[str], comments: Sequence[str], head_sha: str
-) -> tuple[str, list[str], list[str]]:
-    """Return a body with only reviewer boxes ticked, other boxes, and changed lines."""
+    body: str, required: set[str], comments: Sequence[str]
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Return the edited body, other boxes, changed lines, and PASS comments lacking a SHA."""
     reviewed_at: dict[str, str] = {}
     for comment in comments:
         verdict = VERDICT_RE.match(comment)
         if verdict:
             sha = re.search(r"^reviewed at ([0-9a-f]{8,40})$", comment, re.MULTILINE)
-            reviewed_at[verdict.group("agent").lower()] = sha.group(1) if sha else head_sha
-    suffix = (
-        "; ".join(
-            f"{agent}: PASS at {reviewed_at.get(agent, head_sha)[:8]}" for agent in sorted(required)
+            agent = verdict.group("agent").lower()
+            if sha:
+                reviewed_at[agent] = sha.group(1)
+            else:
+                reviewed_at.pop(agent, None)
+    boxes = list(UNCHECKED_RE.finditer(body))
+
+    def is_review_box(label: str) -> bool:
+        return bool(
+            re.search(r"\b(?:quant-auditor|safety-reviewer|reviewers?)\b", label, re.IGNORECASE)
+            and re.search(r"\b(?:ran|run|pass|verdict|required)\b", label, re.IGNORECASE)
         )
+
+    other = [m.group(1).strip() for m in boxes if not is_review_box(m.group(1))]
+    if not any(is_review_box(m.group(1)) for m in boxes):
+        return body, other, [], []
+    missing_sha = sorted(required - reviewed_at.keys())
+    if missing_sha:
+        return body, other, [], missing_sha
+    suffix = (
+        "; ".join(f"{agent}: PASS at {reviewed_at[agent][:8]}" for agent in sorted(required))
         if required
         else "n/a, none required"
     )
-    other: list[str] = []
     ticked: list[str] = []
 
     def replace(match: re.Match[str]) -> str:
-        label = match.group(1)
-        if not re.search(r"quant-auditor|safety-reviewer|reviewer", label, re.IGNORECASE):
-            other.append(label.strip())
+        if not is_review_box(match.group(1)):
             return match.group(0)
         line = match.group(0).replace("- [ ]", "- [x]", 1) + "; " + suffix
         ticked.append(line)
         return line
 
-    return UNCHECKED_RE.sub(replace, body), other, ticked
+    return UNCHECKED_RE.sub(replace, body), other, ticked, []
 
 
 def matrix_base(name: str) -> str:
@@ -711,9 +724,7 @@ def ready(
 
     # 5. template, linked issue, specialist reviews
     required = required_reviews(touched)
-    new_body, other_boxes, ticked = tick_reviewer_boxes(
-        pr.body, required, pr.comments, r.git("rev-parse", "HEAD")
-    )
+    new_body, other_boxes, ticked, missing_sha = tick_reviewer_boxes(pr.body, required, pr.comments)
     if other_boxes:
         raise ReadyError(
             "PR body still has unticked boxes (tick them or write n/a and why): "
@@ -729,9 +740,16 @@ def ready(
             "verdict line is `<agent>: PASS` (PASS WITH FIXES needs a re-review) for each: "
             + ", ".join(missing)
         )
+    if missing_sha:
+        raise ReadyError(
+            "latest PASS review comment needs `reviewed at <sha>` before ticking the "
+            "reviewer box: " + ", ".join(missing_sha)
+        )
     for line in ticked:
         say(f"reviewer box: {line}")
     if ticked and not dry_run:
+        if r.pr(number).body != pr.body:
+            raise ReadyError("PR body changed during checks; rerun to avoid overwriting that edit")
         r.edit_body(number, new_body)
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 

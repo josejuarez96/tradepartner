@@ -724,7 +724,7 @@ def test_reviewer_box_is_ticked_from_latest_pass_comments_and_only_that_line_cha
 
 
 def test_another_unticked_box_still_refuses_without_editing() -> None:
-    r = FakeRunner(body=BODY_OK + "- [ ] reviewer ran\n- [ ] Ran it for real\n")
+    r = FakeRunner(body=BODY_OK + "- [ ] reviewer ran\n- [ ] Update reviewer docs\n")
     with pytest.raises(ready_pr.ReadyError, match="PR body still has unticked boxes"):
         ready_pr.ready(r, 69, dry_run=True)
     assert r.edited_bodies == []
@@ -760,6 +760,31 @@ def test_dry_run_prints_reviewer_box_change_without_writing(
     )
     assert ready_pr.ready(r, 69, dry_run=True) == 0
     assert "- [x] reviewer ran; quant-auditor: PASS at abc1234d" in capsys.readouterr().out
+    assert r.edited_bodies == []
+
+
+def test_reviewer_box_needs_the_reviewed_sha_to_annotate_pass() -> None:
+    r = FakeRunner(body=BODY_OK + "- [ ] reviewer ran\n")
+    with pytest.raises(ready_pr.ReadyError, match="reviewed at"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+def test_body_changed_during_checks_is_not_overwritten() -> None:
+    body = BODY_OK + "- [ ] reviewer ran\n"
+    r = FakeRunner(body=body, comments=("quant-auditor: PASS\nreviewed at abc1234def",))
+    original_check = r.run_check
+
+    def check_and_edit(cmd: Sequence[str]) -> bool:
+        if r._pr.body == body:
+            r._pr = ready_pr.Pr(
+                69, "feat/69-x", "main", True, body + "external edit\n", r._pr.comments
+            )
+        return original_check(cmd)
+
+    r.run_check = check_and_edit
+    with pytest.raises(ready_pr.ReadyError, match="PR body changed during checks"):
+        ready_pr.ready(r, 69, wait=False)
     assert r.edited_bodies == []
 
 
