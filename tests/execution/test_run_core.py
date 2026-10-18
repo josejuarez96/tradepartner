@@ -2014,6 +2014,33 @@ def test_one_book_main_runs_exactly_as_before_books(
     assert lock_path(driven.settings, "main").exists()
 
 
+def test_a_run_below_the_free_disk_floor_refuses_with_an_alert_and_no_switch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1758: below `paper.min_free_disk_gb` the run refuses before any run row or
+    broker call, sends a `run_failed` alert with no run id and engages no kill switch."""
+    _marked(env)
+    free = {"bytes": int(1e9)}
+    monkeypatch.setattr(run_module, "_free_bytes", lambda _path: free["bytes"])
+    with pytest.raises(run_module.DiskFloorError):
+        env.run(_at(TUE))
+    assert env.count("paper_runs") == 0
+    assert env.engaged() == []
+    assert env.alerts() == [("run_failed", None, TUE)]
+    ((message,),) = env.query("SELECT message FROM alerts")
+    assert "min_free_disk_gb" in message
+
+
+def test_a_zero_free_disk_floor_turns_the_check_off(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _marked(env)
+    monkeypatch.setattr(run_module, "_free_bytes", lambda _path: 0)
+    env.settings.paper.min_free_disk_gb = 0
+    assert env.run(_at(TUE)).status != "skipped_kill_switch"
+    assert ("run_failed", None, TUE) not in env.alerts()
+
+
 # --- a store lock held by another process (#1757) -----------------------------------------
 
 
