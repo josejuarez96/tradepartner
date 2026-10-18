@@ -140,8 +140,8 @@ def test_real_collection_shards_partition_the_full_suite() -> None:
     count = 8
 
     def collect(index: int | None) -> list[str]:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_SHARD")}
-        env["PYTEST_ADDOPTS"] = ""
+        skipped = ("PYTEST_SHARD", "PYTEST_XDIST", "PYTEST_CURRENT_TEST")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(skipped)}
         if index is not None:
             env["PYTEST_SHARD_COUNT"] = str(count)
             env["PYTEST_SHARD_INDEX"] = str(index)
@@ -154,10 +154,6 @@ def test_real_collection_shards_partition_the_full_suite() -> None:
                 "-q",
                 "-p",
                 "no:cacheprovider",
-                "-o",
-                "addopts=",
-                "-m",
-                "not network",
             ],
             cwd=_ROOT_DIR,
             env=env,
@@ -174,3 +170,12 @@ def test_real_collection_shards_partition_the_full_suite() -> None:
     assert len(flat) == len(set(flat)), "a test is collected by more than one shard"
     assert set(flat) == set(full)
     assert len(full) == len(set(full))
+    assert len(full) > 1000, "collection looks empty or truncated"
+    # no stale weight keys: every listed unit is a real file or nodeid (a renamed test or
+    # parameter would otherwise fall back to the default weight and unbalance a shard).
+    units = {
+        nodeid if nodeid.split("::")[0] in _SPLIT_BY_TEST else nodeid.split("::")[0]
+        for nodeid in full
+    }
+    stale = sorted(set(_HEAVY_TEST_FILE_WEIGHTS) - units)
+    assert not stale, f"weight table keys that match no collected unit: {stale}"
