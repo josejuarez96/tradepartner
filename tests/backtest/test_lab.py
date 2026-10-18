@@ -1,20 +1,31 @@
 """The sweep runner (strategy-lab spec req 2; plan task T107; #1218).
 
-Every case runs `run_sweep` on a temp-file copy of one lab store built once per
+Every case runs `run_sweep` on a temp-file copy of a lab store built once per
 module: the fixture universe with the lab tables, H1's fixture twin registered
 pre-lab with its family rules and run once (an `ok` trial, so the family is ready
 for a sweep), and `tests/fixtures/sweeps/fixture-sweep.md` registered (four
 variants: `strategy.top_fraction` x `schedule.rebalance_cadence`, so two read
 groups of two, one per cadence). The twin and the sweep share a window that
-fits the fixture bars (2017-01-03 to 2020-06-30): in-sample from 2018-01-31,
-holdout 2019-05-01 to 2020-06-30, so the default window ends at close(2019-04-30)
-at `month_end` and close(2019-04-26) at `week_end` (cutoffs differ by cadence).
+fits the fixture bars (2017-01-03 to 2020-06-30): holdout 2019-05-01 to
+2020-06-30, so the default window ends at close(2019-04-30) at `month_end` and
+close(2019-04-26) at `week_end` (cutoffs differ by cadence).
 
 The live `settings.store.path` is the copy (a non-synthetic run, as the CLI's)
 unless a case passes `store_path`. The clock is a fake one starting on a
 Saturday, when no configured quiet interval applies, unless a case is about
 quiet intervals; the checkout reads clean (`code_version` patched), so failures
 count toward terminal failure as on a clean checkout.
+
+`template` shrinks every case's inputs (#1776) so each runs in seconds: it prunes
+the store to `LAB_UNIVERSE` (the two benchmark series and every security carrying
+a `shares_outstanding` fact, the only ones that can pass universe rule 7, so the
+sweep plans and trades exactly the members the full fixture would) and copies the
+files with `EDITS_SMALL` (in-sample from 2019-02-28, a one-level cost grid).
+`long_template` is the same store with the `EDITS_LONG` window (from 2018-10-31),
+for the one case whose clamped window must reach back before its 2018-12-31
+development boundary. The one end-to-end smoke test (`test_a_full_size_sweep_smoke`)
+runs `full_template` -- the whole fixture universe with the `EDITS` window
+(in-sample from 2018-01-31) and five cost levels -- at today's size.
 """
 
 from __future__ import annotations
@@ -44,13 +55,43 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 SWEEP_SOURCE = FIXTURES / "sweeps" / "fixture-sweep.md"
 TWIN_SOURCE = FIXTURES / "hypotheses" / "fixture-momentum.md"
 SLUG = "fixture-sweep"
+#: The window the full-size smoke test's fixture files are copied with, today's inputs:
+#: a ~15-month in-sample window (2018-01-31..2019-04-30) and the four extra per-side
+#: cost levels.
 EDITS = (
     ("in_sample_start = 2017-01-31", "in_sample_start = 2018-01-31"),
     ("start = 2023-01-03", "start = 2019-05-01"),
     ("end = 2025-12-31", "end = 2020-06-30"),
 )
+#: The shrunk window every case but the full-size smoke test copies its files with
+#: (#1776): the same holdout, a ~2-month in-sample window (2019-02-28..2019-04-30, so
+#: the default window still ends on `LAST_SESSION` and still overlaps another family's
+#: holdout months, and each group still holds the two rebalance sessions a Sharpe
+#: needs), and a one-level cost grid (the base rate at 0 bp, so the base and gross
+#: books coincide and the runner marks one book per step instead of five).
+EDITS_SMALL = (
+    ("in_sample_start = 2017-01-31", "in_sample_start = 2019-02-28"),
+    ("start = 2023-01-03", "start = 2019-05-01"),
+    ("end = 2025-12-31", "end = 2020-06-30"),
+    ("per_side_bps = 15.0", "per_side_bps = 0.0"),
+    ("sensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]", "sensitivity_per_side_bps = [0.0]"),
+)
+#: `EDITS_SMALL` with the in-sample window reaching back to 2018-10-31: the one case
+#: that writes a development boundary in 2018-12-31 needs a clamped window holding the
+#: three `month_end` sessions a Sharpe's two returns need (#1776).
+EDITS_LONG = (
+    ("in_sample_start = 2017-01-31", "in_sample_start = 2018-10-31"),
+    ("start = 2023-01-03", "start = 2019-05-01"),
+    ("end = 2025-12-31", "end = 2020-06-30"),
+    ("per_side_bps = 15.0", "per_side_bps = 0.0"),
+    ("sensitivity_per_side_bps = [0.0, 30.0, 60.0, 100.0]", "sensitivity_per_side_bps = [0.0]"),
+)
 #: The default window's last rebalance session per cadence (the cutoff's session).
 LAST_SESSION = {"month_end": date(2019, 4, 30), "week_end": date(2019, 4, 26)}
+#: A session inside the shrunk default window (2019-02-28..2019-04-30): the bar
+#: `_insert_bar` ingests mid-run carries it and its close as `known_at`, so it moves the
+#: data vintage at every cutoff (#1776).
+IN_WINDOW = date(2019, 3, 15)
 #: A Saturday: no configured quiet interval (weekdays only) and none within a day.
 SATURDAY = datetime(2026, 10, 10, 16, 0, tzinfo=UTC)
 #: The registry tables a refused run must leave unchanged.
@@ -64,6 +105,45 @@ REGISTRY_TABLES = (
     "sweep_trials",
 )
 _CLEAN: tuple[str, bool] = ("test-clean", False)
+#: The shrunk fixture universe every case but the one full-size smoke test runs on
+#: (#1776): the two benchmark series the config names and every fixture security that
+#: carries a `shares_outstanding` fact. Universe rule 7 admits a class only from such
+#: a fact, so every security this set drops could never be a member, and none is read
+#: as a benchmark -- the sweep plans and trades the same members as the full fixture,
+#: while the loop scans about three times fewer names and bars from.
+LAB_UNIVERSE = frozenset(
+    {
+        "SEC_DUAL_A",
+        "SEC_DUAL_B",
+        "SEC_FACTS_RESTATED",
+        "SEC_FACTS_STALE",
+        "SEC_MTUM",
+        "SEC_SPY",
+        "SEC_SPLIT_BETWEEN",
+        "SEC_SPLIT_FUTURE",
+        "SEC_TRANSFER",
+        "SEC_WINDOW_DELIST",
+    }
+)
+#: The store tables keyed by `security_id` the shrunk template prunes to `LAB_UNIVERSE`.
+_SECURITY_KEYED_TABLES = (
+    "securities",
+    "listings",
+    "classifications",
+    "prices_daily",
+    "corporate_actions",
+    "delistings",
+    "facts",
+    "symbol_changes",
+)
+
+
+def _prune_universe(conn: duckdb.DuckDBPyConnection) -> None:
+    """Delete every row of a `security_id`-keyed table for a security outside
+    `LAB_UNIVERSE`, shrinking the store the backtest loop scans (#1776)."""
+    ids = sorted(LAB_UNIVERSE)
+    for table in _SECURITY_KEYED_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE security_id NOT IN (SELECT UNNEST(?))", [ids])
 
 
 class FakeClock:
@@ -88,9 +168,9 @@ class FakeClock:
         self.t += timedelta(**delta)
 
 
-def _copy_file(directory: Path, source: Path) -> Path:
+def _copy_file(directory: Path, source: Path, edits: tuple[tuple[str, str], ...]) -> Path:
     text = source.read_text()
-    for old, new in EDITS:
+    for old, new in edits:
         assert old in text, old
         text = text.replace(old, new, 1)
     directory.mkdir(parents=True, exist_ok=True)
@@ -107,9 +187,12 @@ def _env(path: Path, tmp: Path) -> Iterator[pytest.MonkeyPatch]:
         yield mp
 
 
-@pytest.fixture(scope="module")
-def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The lab store every case copies (module docstring)."""
+def _lab_template(
+    tmp_path_factory: pytest.TempPathFactory, *, prune: bool, edits: tuple[tuple[str, str], ...]
+) -> Path:
+    """The lab store a case copies (module docstring). `prune` prunes the fixture
+    universe to `LAB_UNIVERSE` and `edits` sets the window and cost grid the copies are
+    written with (#1776)."""
     directory = tmp_path_factory.mktemp("lab-template")
     path = directory / "lab.duckdb"
     conn = duckdb.connect(str(path))
@@ -117,6 +200,8 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         configure_connection(conn)
         schema.init_schema(conn)
         load_universe_fixtures(conn, FIXTURES / "universe")
+        if prune:
+            _prune_universe(conn)
     finally:
         conn.close()
     settings = Settings(_env_file=None)
@@ -126,7 +211,7 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
             # a plain standalone file (T104c).
             twin = hypothesis.register(
                 conn,
-                _copy_file(directory / "files", TWIN_SOURCE),
+                _copy_file(directory / "files", TWIN_SOURCE, edits),
                 registered_by="test",
                 settings=settings,
             )
@@ -154,16 +239,15 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         with open_for_write(Settings()) as conn:
             sweep.register(
                 conn,
-                _copy_file(directory / "files", SWEEP_SOURCE),
+                _copy_file(directory / "files", SWEEP_SOURCE, edits),
                 settings,
                 registered_by="test",
             )
     return path
 
 
-@pytest.fixture
-def store(template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A fresh copy of the template, the live store, read as a clean checkout."""
+def _fresh_store(template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fresh copy of `template`, the live store, read as a clean checkout."""
     path = tmp_path / "lab.duckdb"
     shutil.copy(template, path)
     monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
@@ -171,6 +255,44 @@ def store(template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     monkeypatch.setattr(registry, "code_version", lambda repo_dir=None: _CLEAN)
     monkeypatch.setattr(lab_registry, "code_version", lambda repo_dir=None: _CLEAN)
     return path
+
+
+@pytest.fixture(scope="module")
+def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The shrunk lab store most cases copy (module docstring, #1776)."""
+    return _lab_template(tmp_path_factory, prune=True, edits=EDITS_SMALL)
+
+
+@pytest.fixture(scope="module")
+def long_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The shrunk lab store for the one case whose window must reach back before
+    2018-12-31 (the development-boundary case, #1776)."""
+    return _lab_template(tmp_path_factory, prune=True, edits=EDITS_LONG)
+
+
+@pytest.fixture(scope="module")
+def full_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The full fixture-universe lab store (#1776): the input of the one end-to-end
+    smoke test kept at today's full size."""
+    return _lab_template(tmp_path_factory, prune=False, edits=EDITS)
+
+
+@pytest.fixture
+def store(template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fresh copy of the shrunk template, the live store, read as a clean checkout."""
+    return _fresh_store(template, tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def long_store(long_template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fresh copy of the longer-window shrunk template, read as a clean checkout."""
+    return _fresh_store(long_template, tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def full_store(full_template: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fresh copy of the full-universe template, read as a clean checkout (#1776)."""
+    return _fresh_store(full_template, tmp_path, monkeypatch)
 
 
 @pytest.fixture
@@ -348,6 +470,25 @@ def test_a_plain_run_runs_every_variant_then_nothing_then_rerun_runs_all(
         assert len(registry.family_sharpes(conn, "momentum").excess_spy) == 5
 
 
+def test_a_full_size_sweep_smoke(full_store: Path, clock: FakeClock) -> None:
+    """The one end-to-end sweep smoke test kept at today's full size (#1776): the whole
+    fixture universe over the full `EDITS` window (in-sample from 2018-01-31) and five
+    cost levels, so the numbers the shrink moves -- fewer names, a shorter window, one
+    extra cost level -- are still exercised end to end. Every other case runs on the
+    shrunk `store`."""
+    outcome = lab.run_sweep(SLUG, clock=clock)
+    assert (outcome.n_declared, outcome.n_planned, outcome.n_ok, outcome.n_failed) == (4, 4, 4, 0)
+    assert outcome.completed and not outcome.stopped_by_budget and not outcome.synthetic
+    with _read(full_store) as conn:
+        trials = conn.execute(
+            "SELECT r.status FROM trials t JOIN trial_results r USING (trial_id) "
+            "WHERE t.trial_id IN (SELECT trial_id FROM sweep_trials)"
+        ).fetchall()
+        assert len(trials) == 4 and all(status == ("ok",) for status in trials)
+        assert len(registry.family_sharpes(conn, "momentum").excess_spy) == 5
+    assert lab.run_sweep(SLUG, clock=clock).n_planned == 0
+
+
 def test_a_variants_trials_row_records_the_sweep_detail_level(
     store: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -451,7 +592,7 @@ def test_the_size_guard_refuses_with_every_table_unchanged(
 
 
 def test_a_window_reading_another_familys_exam_is_refused_before_any_row(
-    store: Path, clock: FakeClock
+    long_store: Path, clock: FakeClock
 ) -> None:
     """#1441: a registration that reads another family's holdout months (one made
     before the guard, or before that family's rules) refuses to run without the
@@ -471,12 +612,12 @@ def test_a_window_reading_another_familys_exam_is_refused_before_any_row(
             sr_star_seed_annual=None,
             settings=Settings(_env_file=None),
         )
-    before = _counts(store)
+    before = _counts(long_store)
     with pytest.raises(
         sweep.DefaultWindowOverlapError, match=r"'profitability''s \[2019-01-02, 2019-03-29\]"
     ):
         lab.run_sweep(SLUG, clock=clock)
-    assert _counts(store) == before
+    assert _counts(long_store) == before
 
     with open_for_write(Settings()) as conn:
         registry.write_development_boundary(conn, boundary=date(2018, 12, 31), reason="test")
@@ -547,7 +688,7 @@ def test_an_in_window_fact_mid_group_fails_that_group_and_the_next_run_resumes(
         if not inserted:
             inserted.append(True)
             self.end_step()
-            _insert_bar(store, date(2018, 6, 1), _close(date(2018, 6, 1)))
+            _insert_bar(store, IN_WINDOW, _close(IN_WINDOW))
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(lab._PausingProvider, "listing_ends", inserting)
@@ -581,7 +722,7 @@ def test_a_variants_own_failure_on_changed_data_is_store_changed_not_its_error(
         if not inserted:
             inserted.append(True)
             self.end_step()
-            _insert_bar(store, date(2018, 6, 1), _close(date(2018, 6, 1)))
+            _insert_bar(store, IN_WINDOW, _close(IN_WINDOW))
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(engine, "_plan", failing_plan)
@@ -727,7 +868,7 @@ def test_the_stale_and_rerun_cycle(
     def insert_between_groups(*args: Any, **kwargs: Any) -> bool:
         calls.append(1)
         if len(calls) == 2:
-            _insert_bar(store, date(2018, 6, 1), _close(date(2018, 6, 1)))
+            _insert_bar(store, IN_WINDOW, _close(IN_WINDOW))
         return real_ready(*args, **kwargs)
 
     monkeypatch.setattr(lab, "_ready_to_start", insert_between_groups)
@@ -889,7 +1030,7 @@ def test_a_group_running_into_an_interval_pauses_with_no_connection_or_row(
         if self._conn is None or self._step_t != t:
             if len(resumed) < len(paused):
                 resumed.append(_counts(store))  # the first step after a pause
-            clock.advance(minutes=2)  # each step takes two minutes
+            clock.advance(minutes=7)  # each step takes seven minutes
         return real_at(self, t)
 
     monkeypatch.setattr(lab.StoreProvider, "_at", stepping)
