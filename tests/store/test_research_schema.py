@@ -71,6 +71,18 @@ def _v11_journal_ddl() -> str:
         "'spinoff_receipt', 'carried_residue'))",
         1,
     )
+    # version 29 widened both event reason sets (#1813, T202a); restore the v11 sets
+    blob = blob.replace(
+        schema._check("decision_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('skip_below_one_share', 'skip_untradable', "
+        "'skip_below_minimum', 'skip_delisted', 'dust', 'untradable', 'unfunded'))",
+        1,
+    )
+    blob = blob.replace(
+        schema._check("order_events", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('halt', 'not_received', 'owner_settled_unknown'))",
+        1,
+    )
     for table in ("orders", "lots", "disposals"):
         blob = blob.replace(f",\n    {schema._check(table, 'position_side')}", "")
     for table in ("decisions", "positions_daily"):
@@ -276,7 +288,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 28
+    assert schema.CURRENT_SCHEMA_VERSION == 29
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -361,7 +373,7 @@ def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [28]
+    assert _versions(conn) == [29]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
@@ -370,7 +382,7 @@ def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [28]
+    assert _versions(conn) == [29]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -671,6 +683,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
             26,
             27,
             28,
+            29,
         ]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")
