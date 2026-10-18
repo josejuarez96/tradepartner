@@ -1,83 +1,74 @@
 # Git Workflow
 
-**Status:** Accepted v1.0 (PR #2, 2026-09-24)
-**Model:** trunk-based development with short-lived branches, and every change goes through a PR. `main` is always green and runnable.
+**Status:** Accepted v1.0 (PR #2, 2026-09-24; [changes](#changes) at the end). Trunk-based development, short-lived branches, every change through a PR; `main` is always green and runnable. This page is the one home for the merge classes and the merge train; CLAUDE.md, the agent files, [teams.md](teams.md) and [development-process.md](development-process.md) link here and do not restate them.
 
 ## The rules in one screen
 
-1. **Never commit directly to `main`.** This applies to everyone: owner, agents, docs, typos.
-2. **One issue → one branch → one PR.** If there is no issue, create one first. Size-S issues can be a single line.
-3. **Branch from the latest `main`, merge back within about 3 days.** Long-lived branches drift and turn into merge conflicts.
-4. **Push whenever you stop working.** The remote branch is the backup and the handoff point for the next session or agent.
-5. **Open a draft PR early** (after the first meaningful commit), so CI runs and progress is visible.
-6. **Squash-merge only.** The PR title becomes the single commit on `main`, so it must be a Conventional Commit.
-7. **Every merge is approved: a class-A PR by this rule, a class-B PR by the owner's word on that PR.** Agents open PRs and address review comments. They never force-push shared branches or push to `main`. Which class a PR is in depends only on the files it changes; one class-B file makes the whole PR class B. (Amended 2026-10-04 by [ADR 0002](../decisions/0002-git-workflow.md#amendment-2026-10-04-two-merge-classes-781-audit-item-2), from item 2 of the [orchestration-layer audit](../retros/2026-10-04-orchestration-layer-audit.md). This written rule **replaces the standing approval that was granted in chat and re-granted to each new orchestrator session**; it holds until the owner edits it, and no session asks for it again.)
-   - **Class A: the orchestrator lands it.** A PR whose files are all under `src/`, `tests/`, `docs/research/`, `docs/retros/`, `docs/runbooks/` or `changelog.d/` (code, tests, research, retros, runbooks, fragments). A change to `docs/plans/` that only ticks the PR's own task box and collapses that one line to its finished shape (`- [x] **Tn: …** (#issue, PR #pr) · Files: … · Depends on: …`) does not make the PR class B (amended 2026-10-06, #1110: the tick alone had made most code PRs class B); any other plan edit does. It lands when it is ready (through `ready_pr.py`), `checks` and `claims` are green on its head SHA, the latest verdict of every required reviewer is `PASS`, every review thread on it is resolved, whoever opened it (#803), and the orchestrator has trial-merged it against the current `main` (the branch merged onto `origin/main` in a scratch worktree, the targeted tests run) and posted one line on the PR naming the `main` SHA it was tried at. The orchestrator session (the one session the owner is typing to, [teams.md](teams.md)) lands it, and nobody else: team windows and subagents never merge. Until the merge train is the class-A path, class A lands by hand: `gh pr merge --squash --match-head-commit <head SHA>`, with `checks` green on that head (that is what "no bypass" means here: GitHub applies the admin bypass by itself to a red one, see below). The train becomes the class-A path only once audit item 3's conditions hold (#764 fixed, its PR #765 merged, and one dry build green on a real batch) and the [merge-train spec](../specs/merge-train.md#owner-decisions-2026-10-01) is amended to say so, which is the owner's decision; until then [The merge train](#the-merge-train) stands as written: a train is built only when the owner asks for one, and `merge_train.py merge <batch id>` runs only on his "merge train `<batch id>`", for that id, by him or the window he said it to.
-   - **A plan-named release PR lands like class A (amended 2026-10-13, #1647, the owner's word on the workflow review).** The release PR of an owner release task (a `(owner)` plan line whose steps say "merge this task's release PR") is landed by the orchestrator inside the sitting, without a separate owner word, when it changes only what that plan line's Files name for the release step (the switch defaults and version constants it names, the tests those values break, and the PR's own fragment), it is ready, `checks` is green on its head and every required reviewer's latest verdict is `PASS`. Its `hold` label is removed by the orchestrator at that step of the sitting, and the PR comment says so. Any other file in it, or a value the line does not name, makes it class B as below.
-   - **Class B: it waits for the owner's word on that PR.** Every other PR: one that changes any file outside the class-A directories, which includes everything under `docs/specs/`, `docs/plans/`, `docs/decisions/`, `docs/ways-of-working/`, `.claude/` and `.github/`, and `CLAUDE.md`, `docs/charter.md`, `docs/roadmap.md`, `.pre-commit-config.yaml`, `scripts/ready_pr.py`, `scripts/merge_train.py`, `scripts/team.py`, `pyproject.toml` and `uv.lock`; and any PR labelled `hold` (the label is checked at the trial merge and again just before the merge command). It is merged only when the owner says to merge that specific PR (by hand, `gh pr merge --squash`, no bypass, CI green on its head, its review threads resolved) or names it in a "merge train `<batch id>`". Nothing in the checks, the labels or the ready flag stands in for his word.
-   - **Both classes.** The ruleset's pull-request bypass (`gh pr merge --admin`) is the owner's alone, in his own shell, for a red-check emergency; no window ever runs it. **The server does not enforce the classes, or the green-head condition, against our tokens.** On 2026-10-04, with the `protect-main` ruleset active (required check `checks`; bypass actor the repository admin role, pull requests only), a plain `gh pr merge` by the owner's admin token merged #762, a throwaway PR whose `checks` run was red on purpose, through that bypass (#772 reverts it). Every token in this repository is the owner's and admin, so the required check binds none of them. The class rule is therefore a process rule, kept by this page, the `ask` prompt on `gh pr merge` in `.claude/settings.json`, and the trial-merge line on each class-A PR, not by the server.
+1. **Never commit directly to `main`.** Owner, agents, docs, typos: everyone.
+2. **One issue, one branch, one PR.** No issue: create one first (a size-S issue can be one line).
+3. **Branch from the latest `main`; merge back within about 3 days.** Long-lived branches drift into conflicts.
+4. **Push whenever you stop working.** The remote branch is the backup and the handoff point.
+5. **Open a draft PR early**, after the first meaningful commit, so CI runs and progress is visible.
+6. **Squash-merge only.** The PR title becomes the one commit on `main`, so it must be a Conventional Commit.
+7. **Every merge is approved: a class-A PR by this rule, a class-B PR by the owner's word on that PR** ([Merge classes](#merge-classes-rule-7)). Agents open PRs and address review comments; they never force-push shared branches or push to `main`. This written rule replaces the standing approval that was granted in chat and re-granted to each new orchestrator session. It holds until the owner edits it, and no session asks for it again ([ADR 0002, amendment 2026-10-04](../decisions/0002-git-workflow.md#amendment-2026-10-04-two-merge-classes-781-audit-item-2)).
 
-## When to create a branch
+## Merge classes (rule 7)
 
-| Situation | Branch? | Prefix |
-|---|---|---|
-| New capability from a spec/plan task | Yes | `feat/` |
-| Bug fix, including urgent ones | Yes | `fix/` |
-| Docs, specs, plans, ADRs, research reports | Yes | `docs/` or `research/` |
-| Tooling, deps, CI | Yes | `chore/` |
-| Restructure with no behavior change | Yes | `refactor/` |
-| Throwaway experiment ("does this library even work?") | Yes, **never merged** | `spike/` |
+Which class a PR is in depends only on the files it changes. One class-B file makes the whole PR class B.
 
-**Name format:** `<prefix>/<issue#>-<short-slug>`, for example `feat/14-price-ingestion` or `research/9-insider-disconfirmation`.
+### Class A: the orchestrator lands it
 
-**Split the branch** when:
-- the diff exceeds about 400 changed lines (excluding lockfiles and generated files)
-- you find yourself writing "and also…" in the PR description
-- the work touches two unrelated areas
+- **Files:** all under `src/`, `tests/`, `docs/research/`, `docs/retros/`, `docs/runbooks/` or `changelog.d/`. A `docs/plans/` edit that only ticks the PR's own task box and collapses that one line to its finished shape (`- [x] **Tn: …** (#issue, PR #pr) · Files: … · Depends on: …`) keeps the PR in class A; any other plan edit makes it class B.
+- **Conditions, every one of them:** it is ready, through `ready_pr.py`; `checks` and `claims` are green on its head SHA; the latest verdict of every required reviewer is `PASS`; every review thread on it is resolved, whoever opened it; and the orchestrator has trial-merged it against the current `main` (the branch merged onto `origin/main` in a scratch worktree, the targeted tests run) and posted one line on the PR naming the `main` SHA it was tried at.
+- **Who and how:** the orchestrator session (the one session the owner is typing to, [teams.md](teams.md#orchestrator)) lands it, and nobody else; team windows and subagents never merge. Until the merge train is the class-A path, class A lands by hand: `gh pr merge --squash --match-head-commit <head SHA>`, with `checks` green on that head. That is what "no bypass" means here: GitHub applies the admin bypass by itself to a red one ([Both classes](#both-classes)).
+- **The train becomes the class-A path** only once audit item 3's conditions hold (#764 fixed, its PR #765 merged, one dry build green on a real batch) and the [merge-train spec](../specs/merge-train.md#owner-decisions-2026-10-01) is amended to say so; that is the owner's decision. Until then [The merge train](#the-merge-train) stands as written: a train is built only when the owner asks for one, and `merge_train.py merge <batch id>` runs only on his "merge train `<batch id>`", for that id, by him or the window he said it to.
 
-**Spikes:** the code on a `spike/` branch is disposable. Findings are written up in `docs/research/` in a separate `docs/` PR. Then the spike branch is deleted.
+### A plan-named release PR lands like class A
 
-## When to commit
+The release PR of an owner release task (an `(owner)` plan line whose steps say "merge this task's release PR") is landed by the orchestrator inside the sitting, without a separate owner word, when it changes only what that plan line's Files name for the release step (the switch defaults and version constants it names, the tests those values break, and the PR's own fragment), it is ready, `checks` is green on its head and every required reviewer's latest verdict is `PASS`. The orchestrator removes its `hold` label at that step of the sitting, and the PR comment says so. Any other file in it, or a value the line does not name, makes it class B.
 
-- **Commit** after each logical step that leaves the tests passing, such as "add parser" or "add test for holiday edge case". Small commits make bisecting and reviewing easier. They get squashed on merge anyway.
-- **Don't commit** secrets, data files (`data/` is gitignored), notebooks with outputs, or commented-out code.
+### Class B: it waits for the owner's word on that PR
 
-**Messages** follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): imperative summary`.
-- **Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `ci`, `perf`, `research`.
-- **Scopes** (grow as modules appear): `data`, `backtest`, `signals`, `risk`, `exec`, `llm`, `journal`, `infra`.
-- **Agent commits** end with a `Co-Authored-By:` trailer.
+- **Files:** every other PR, one that changes any file outside the class-A directories. That includes everything under `docs/specs/`, `docs/plans/`, `docs/decisions/`, `docs/ways-of-working/`, `.claude/` and `.github/`, and `CLAUDE.md`, `docs/charter.md`, `docs/roadmap.md`, `.pre-commit-config.yaml`, `scripts/ready_pr.py`, `scripts/merge_train.py`, `scripts/team.py`, `pyproject.toml` and `uv.lock`. Also any PR labelled `hold`; the label is checked at the trial merge and again just before the merge command.
+- **How:** it is merged only when the owner says to merge that specific PR (by hand, `gh pr merge --squash`, no bypass, CI green on its head, its review threads resolved) or names it in a "merge train `<batch id>`". Nothing in the checks, the labels or the ready flag stands in for his word.
 
-## When to push
+### Both classes
 
-- At the end of every work session, even if the work is incomplete. Keep the PR as a draft.
-- Before asking for review.
-- Before switching to other work.
-- Never with `--force` on a branch someone else (or another agent) is working on. `--force-with-lease` on your own branch after a rebase is fine.
+- The ruleset's pull-request bypass (`gh pr merge --admin`) is the owner's alone, in his own shell, for a red-check emergency. No window ever runs it.
+- **The server does not enforce the classes, or the green-head condition, against our tokens.** Every token in this repository is the owner's and admin, so the required check binds none of them (#762, a throwaway PR red on purpose, merged through the bypass on a plain `gh pr merge`; #772 reverts it). The class rule is a process rule, kept by this page, the `ask` prompt on `gh pr merge` in `.claude/settings.json`, and the trial-merge line on each class-A PR, not by the server.
+
+## Branches, commits, pushes
+
+| Situation | Prefix |
+|---|---|
+| New capability from a spec/plan task | `feat/` |
+| Bug fix, including urgent ones | `fix/` |
+| Docs, specs, plans, ADRs, research reports | `docs/` or `research/` |
+| Tooling, deps, CI | `chore/` |
+| Restructure with no behaviour change | `refactor/` |
+| Throwaway experiment, **never merged** | `spike/` |
+
+- Every situation above gets a branch, named `<prefix>/<issue#>-<short-slug>` (`feat/14-price-ingestion`). **Split it** past about 400 changed lines (lockfiles and generated files excluded), when the description needs "and also…", or when it touches two unrelated areas. **Spikes** are disposable: findings go to `docs/research/` in a separate `docs/` PR, then the branch is deleted.
+- **Commit** after each logical step that leaves the tests passing; small commits bisect and review better and are squashed anyway. Never commit secrets, data files (`data/` is gitignored), notebooks with outputs, or commented-out code.
+- **Messages** are [Conventional Commits](https://www.conventionalcommits.org), `type(scope): imperative summary`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `ci`, `perf`, `research`. Scopes grow as modules appear: `data`, `backtest`, `signals`, `risk`, `exec`, `llm`, `journal`, `infra`. Agent commits end with a `Co-Authored-By:` trailer.
+- **Push** at the end of every work session (keep the PR a draft), before asking for review, before switching work. Never `--force` on a branch another person or agent works on; `--force-with-lease` on your own branch after a rebase is fine.
 
 ## PR lifecycle
 
-```
-issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → merge (rule 7: class A landed by the orchestrator after a trial merge; class B on the owner's word for that PR; the train once it is the class-A path) → branch auto-deleted
-```
+`issue → branch → draft PR → CI green → self-review → specialist review agents → ready for review → merge (rule 7) → branch auto-deleted`
 
-**Before marking a PR ready for review:** run `/ready-pr` (`uv run python scripts/ready_pr.py <pr>`). It checks every item below the same way for every team, waits for CI on the exact commit, and marks the PR ready. Marking ready by hand is not the process.
-- [ ] CI is green (`checks` job) and the `claims` job passes: the branch's issue carries your `team:` label and no other open PR builds the same plan task ([teams.md](teams.md)).
-- [ ] The PR template is filled in: what/why, linked issue (`Closes #n`), how it was verified.
-- [ ] The author has reviewed their own diff on GitHub.
-- [ ] The required specialist reviews have run (see [agents.md](agents.md)):
-  - `quant-auditor` for data, backtest or signal changes
-  - `safety-reviewer` for broker, orders, LLM inputs or secrets
-- [ ] Docs are updated: a STATUS/CHANGELOG fragment (`scripts/fragments.py add`, never the shared files themselves), plan checkboxes, `.env.example`, and an ADR if a decision was made.
+**Before marking a PR ready**, run `/ready-pr` (`uv run python scripts/ready_pr.py <pr>`): it checks the list below the same way for every team, waits for CI on the exact commit, and marks the PR ready. Marking ready by hand is not the process.
 
-**Keeping current:** `ready_pr.py` merges `origin/main` into the branch (`git merge origin/main`). Merging, not rebasing, means no force-push, which matters once a branch has been pushed by more than one team. `main` keeps its linear history regardless, because the PR is squash-merged. A rebase is still fine on a branch only you have pushed.
+- CI is green (`checks`) and the `claims` job passes: the branch's issue carries your `team:` label and no other open PR builds the same plan task ([CI guard](teams.md#ci-guard)).
+- The PR template is filled in (what/why, `Closes #n`, how it was verified) and the author has reviewed their own diff on GitHub.
+- The required specialist reviews have run ([agents.md](agents.md#review-passes)): `quant-auditor` for data, backtest or signal changes; `safety-reviewer` for broker, orders, LLM inputs or secrets.
+- Docs are updated: one STATUS/CHANGELOG fragment (the [command card](teams.md#command-card)'s `fragments.py add`, never the shared files themselves), the plan checkbox, `.env.example`, an ADR if a decision was made.
 
-**No stacked PRs.** Don't open a PR whose base is another open PR's branch: when the base squash-merges, GitHub closes or breaks the stacked PR. Wait for the base to merge, then branch from `main`. (Phase 1 retro.)
-
-**CI must have run on the exact commit being merged.** "No checks reported" is not green; wait for the run (`gh pr checks <n> --watch`) after any merge of `main`, rebase or force-push; `ready_pr.py` does this wait for you. (Phase 1 retro.)
+**Keeping current.** `ready_pr.py` merges `origin/main` into the branch; merging, not rebasing, needs no force-push, which matters once more than one team has pushed the branch, and `main` stays linear because the PR is squash-merged. A rebase is fine on a branch only you have pushed. **No stacked PRs:** a PR based on another open PR's branch is closed or broken when the base squash-merges; wait for the base, then branch from `main`. **CI must have run on the exact commit being merged:** "no checks reported" is not green; after any merge of `main`, rebase or force-push, wait for the run (`gh pr checks <n> --watch`; `ready_pr.py` does this for you).
 
 ### The merge train
 
-A ready PR is not merged on its own run: its CI tested it against the `main` of that run, not against the other ready PRs. The train ([spec](../specs/merge-train.md), added 2026-10-03 after two `main`-red incidents on 2026-10-01) tests a batch of ready PRs **together** and lands only what ran green. `scripts/merge_train.py` has four commands (`build` from any team directory; `merge` and `prune` where the next paragraphs say); this block is the one place the flags are written out, [teams.md](teams.md#command-card) points here, and the `merge` spelling is the one `.claude/settings.json` prompts on (#529):
+A ready PR's CI tested it against that run's `main`, not against the other ready PRs. The train ([spec](../specs/merge-train.md)) tests a batch of ready PRs **together** and lands only what ran green. The flags are written out here only ([command card](teams.md#command-card) points here); the `merge` spelling is the one `.claude/settings.json` prompts on (#529).
 
 ```bash
 uv run python scripts/merge_train.py build [PR ...] [--order N [N ...]] [--timeout-min 60] [--poll-s 30]
@@ -87,57 +78,40 @@ uv run python scripts/merge_train.py status [<batch id>]         # print one rec
 uv run python scripts/merge_train.py prune                       # delete train/* branches and worktrees of finished batches
 ```
 
-- **`build`** runs only when the owner asks for a train (never on a schedule or because N PRs are ready), by any window or the orchestrator. With no PR numbers it takes every eligible PR (open and not a draft, the owner's own from this repository, against `main`, not `parked`, not the culprit of an earlier train at this head, `checks` and `claims` green on its head SHA, no unticked template box, a `Closes #` for its branch's issue, its fragment in the diff with a CHANGELOG bullet on a `feat/` or `fix/` branch, every required review verdict `PASS`, and no unresolved review thread, whoever opened it: the `ready_pr.py` checks plus the train's own, re-derived from GitHub at build time rather than read from the ready flag); `--order` sets the sequence (ascending PR number by default). It squash-merges the batch in order onto `origin/main` in its own worktree, pushes `train/<batch id>`, waits for the one full CI run (`ci.yml` runs the whole suite on `train/**`), reruns a red run once so a flake names no culprit, bisects a confirmed red over prefixes, and posts one comment per PR whose first line is `merge-train: <OUTCOME> batch <batch id>` (`TESTED`, `DROPPED`, `CULPRIT`, `HELD`, `INCONCLUSIVE`, `INELIGIBLE`). It merges nothing. A PR that conflicts inside the train is `DROPPED` for its team to bring `main` in with `ready_pr.py`; the next train takes it. A PR that is merely behind `main` needs no new `ready_pr.py` run: testing it against the current `main` is the train's job.
-- **`merge`** takes a batch id and nothing else: no PR list, no order, no flag that widens the batch. It re-verifies that `origin/main` is still the batch's base and every PR still matches the record, lands the longest **green** prefix PR by PR (`gh pr merge --squash --match-head-commit`, the landed tree checked against the recorded one), posts `MERGED` or `HELD` (`UNCONFIRMED` on a PR that landed but failed the tree or parent check), and stops at the first PR it cannot land. `--resume` continues a stopped merge from the recorded position. It runs on the machine that holds the batch's record: the window that ran `build`, or the owner's shell on the same machine.
-- **`status`** and **`prune`** are housekeeping; `prune` runs from the clone whose `build` created the worktree (a worktree is registered in the clone that made it).
-
-The record lives in `~/.tradepartner/merge_train/` (`TRADEPARTNER_MERGE_TRAIN_DIR`), outside every team directory; the PR comments and that record are the whole log. The owner's "merge train `<batch id>`" is the only instruction that runs `merge_train.py merge`, so a window never asks "shall I merge?": it reports `build`'s result and waits.
+- **`build`** runs only when the owner asks for a train (never on a schedule or because N PRs are ready), by any window or the orchestrator, from any team directory; it merges nothing. With no PR numbers it takes every **eligible** PR: open and not a draft; the owner's own, from this repository, against `main`; not `parked`; not the culprit of an earlier train at this head; `checks` and `claims` green on its head SHA; no unticked template box; a `Closes #` for its branch's issue; its fragment in the diff, with a CHANGELOG bullet on a `feat/` or `fix/` branch; every required review verdict `PASS`; no unresolved review thread, whoever opened it. These are the `ready_pr.py` checks plus the train's own, re-derived from GitHub at build time rather than read from the ready flag. `--order` sets the sequence (ascending PR number by default).
+- It squash-merges the batch in order onto `origin/main` in its own worktree, pushes `train/<batch id>`, waits for the one full CI run (`ci.yml` runs the whole suite on `train/**`), reruns a red run once so a flake names no culprit, bisects a confirmed red over prefixes, and posts one comment per PR whose first line is `merge-train: <OUTCOME> batch <batch id>` (`TESTED`, `DROPPED`, `CULPRIT`, `HELD`, `INCONCLUSIVE`, `INELIGIBLE`). A PR that conflicts inside the train is `DROPPED`, for its team to bring `main` in with `ready_pr.py`; the next train takes it. A PR merely behind `main` needs no new `ready_pr.py` run: testing it against the current `main` is the train's job.
+- **`merge`** takes a batch id and nothing else: no PR list, no order, no flag that widens the batch. It re-verifies that `origin/main` is still the batch's base and every PR still matches the record, lands the longest **green** prefix PR by PR (`gh pr merge --squash --match-head-commit`, the landed tree checked against the recorded one), posts `MERGED` or `HELD` (`UNCONFIRMED` on a PR that landed but failed the tree or parent check), and stops at the first PR it cannot land; `--resume` continues from the recorded position. It runs on the machine that holds the batch's record: the window that ran `build`, or the owner's shell on the same machine.
+- **`status`** and **`prune`** are housekeeping; `prune` runs from the clone whose `build` created the worktree. The record lives in `~/.tradepartner/merge_train/` (`TRADEPARTNER_MERGE_TRAIN_DIR`), outside every team directory; the PR comments and that record are the whole log. The owner's "merge train `<batch id>`" is the only instruction that runs `merge`, so a window never asks "shall I merge?": it reports `build`'s result and waits.
 
 ## Releases
 
-- Tag `v0.<phase>.0` on `main` when a phase completes, for example `v0.2.0` = data foundation done.
-- Fold the pending fragments (`uv run python scripts/fragments.py fold`) and move the `[Unreleased]` entries in `CHANGELOG.md` under the new version in the same PR that closes the phase.
+Tag `v0.<phase>.0` on `main` when a phase completes (`v0.2.0` = data foundation done). The PR that closes the phase folds the pending fragments (`uv run python scripts/fragments.py fold`) and moves the `[Unreleased]` entries in `CHANGELOG.md` under the new version.
 
 ## Parallel agents and teams
 
-- Each orchestrator session is a **team** in its **own working directory** (a worktree of this repo, or a clone). Claims, the ready frontier, shared-file rules and the CI guard are in [teams.md](teams.md). No branch without `uv run python scripts/team.py claim` (`spike/` branches excepted).
-- Within a team, each subagent working in parallel gets its own **git worktree** and branch (`claude --worktree` or the worktree isolation option). Two agents never share a working directory.
-- Parallel agents must work on **non-overlapping files**. If two plan tasks touch the same module, run them one after the other. What may run alongside a single implementer (read-only helpers, reviewers) is in [agents.md](agents.md#parallelism-inside-a-team).
+Each orchestrator session is a **team** in its own working directory (a worktree or a clone); claims, the ready frontier, shared files and the CI guard are in [teams.md](teams.md), and no branch is cut without `uv run python scripts/team.py claim` (`spike/` excepted). Within a team, parallel subagents get their own worktree and branch each, never a shared working directory, and work on non-overlapping files ([agents.md](agents.md#parallelism-inside-a-team)).
 
 ## How the rules are enforced
 
-The repository is **public since 2026-10-01**, so GitHub's repository rulesets are available without a paid plan; once the owner activates it (plan T75b), the server-side layer below is the one layer that does not depend on a hook being installed or a permission rule being read. Enforcement is layered:
-
 | Layer | What it blocks | Where |
 |---|---|---|
-| pre-commit hook | Commits on `main`, private keys and secrets (gitleaks), files over 500 KB | `.pre-commit-config.yaml` |
-| pre-push hook | Pushes to `main` | `.pre-commit-config.yaml` (`no-push-to-main`) |
-| Claude Code permission rules | Agents pushing to main, force-pushing, reading `.env` (deny); `gh pr merge` and `uv run python scripts/merge_train.py merge` always prompt for confirmation (ask) | `.claude/settings.json` |
-| GitHub repo settings | Merge commits and rebase-merge (squash only), stale branches (auto-delete) | Repo settings (applied) |
-| CI | Lint, format, types, hygiene on every PR; tests when the PR touches code, tests, scripts, deps or CI; the full suite on every push to `main` and to `train/**` | `.github/workflows/ci.yml` |
-| CI `claims` job | A PR whose issue is unclaimed; two open PRs for one plan task | `scripts/team.py check-claims`, `.github/workflows/ci.yml` |
-| **Merge train** | Ready PRs landing on a combined tree CI never ran: `build` tests the batch as one tree, bisects a red one, and `merge` lands only trees that ran green, only on the owner's "merge train `<batch id>`" | `scripts/merge_train.py` ([The merge train](#the-merge-train)) |
-| **Server-side ruleset** (direct pushes, force-push and deletion refused for every token, the owner's included; a PR required, squash only, the `checks` run required on the head commit) | **Activated by the owner on 2026-10-04 (plan T75b, id 24443727)**. It refuses the direct push, the force-push and the deletion; it does **not** refuse a PR merge with a red `checks` run by the owner's admin token (#762 merged red through the pull-request bypass; #772 reverts it), and every token here is his, so the merge classes and the green-head condition in rule 7 are a process rule, not a server one | `.github/rulesets/protect-main.json` |
+| pre-commit and pre-push hooks | Commits and pushes on `main`; private keys and secrets (gitleaks); files over 500 KB | `.pre-commit-config.yaml` |
+| Claude Code permissions | Pushing to `main`, force-pushing, reading `.env` (deny); `gh pr merge` and `uv run python scripts/merge_train.py merge` always prompt (ask) | `.claude/settings.json` |
+| GitHub repo settings | Merge commits and rebase-merge (squash only); stale branches (auto-delete) | Repo settings |
+| CI | Lint, format, types, hygiene on every PR; the full suite, sharded, when the PR touches code, tests, scripts, deps or CI, and on every push to `main` and `train/**`. PR CI keeps the full suite (#773): targeted-only PR CI waits until `ready_pr.py` or the ruleset checks that a hand-merged head ran the full suite | `.github/workflows/ci.yml` |
+| CI `claims` job | A PR whose issue is unclaimed; two open PRs for one plan task | `scripts/team.py check-claims` |
+| Merge train | Ready PRs landing on a combined tree CI never ran | [above](#the-merge-train) |
+| Server-side ruleset `protect-main`, active since 2026-10-04 (plan T75b, id 24443727) | Direct pushes, force-push and deletion, for every token, the owner's included; a PR required, squash only, the `checks` run required on the head commit. It does **not** refuse a red-`checks` merge by the owner's admin token ([Both classes](#both-classes)). What the file says and why, and how the owner changes it: [runbook](../runbooks/protect-main-ruleset.md) | `.github/rulesets/protect-main.json` |
 
-**PR CI keeps the full suite** (#773). A PR that touches code, tests, scripts, deps or CI runs the whole suite, sharded, on its head. Moving PR CI to targeted tests only, with the full suite left to the train and `main` (the first flow audit's top-10 item 6, PR #771), waits until something checks that a hand-merged PR's head ran the full suite, `ready_pr.py` or the ruleset; until then a hand merge would land code no full run has seen.
+**Local hooks**, once per clone (worktrees share them): `uv run pre-commit install`. **Emergency override:** `git commit --no-verify` exists; using it on `main` requires a note in the PR or `STATUS.md` explaining why, and agents may never use it.
 
-**What the ruleset file says and why** (JSON allows no comment, so the explanation lives here; spec req 10, owner decision 1 of 2026-10-01):
-- `strict_required_status_checks_policy: false`. Strict would require every branch to be up to date with `main` before it merges, which is exactly what the train does not require: the train tests a PR against the current `main` as part of the batch, so a PR behind `main` is eligible as it stands.
-- `bypass_actors`: the repository admin role (`actor_type: RepositoryRole`, `actor_id: 5`) with `bypass_mode: pull_request`, **never `always`**. GitHub's rulesets API reference requires an `actor_id` for `RepositoryRole` but no longer prints the numbers; the base repository role ids are maintain 2, write 4, admin 5 (the Terraform GitHub provider's `repository_ruleset` docs list them for this field), and the read-back after activation below is the check. A green PR needs no bypass. The bypass exists so the owner, in his own shell, can merge a PR whose `checks` run is red in an emergency, as an explicit act (the bypass dialog in the UI, or `gh pr merge --admin`), while a direct push to `main`, a force-push and a deletion stay refused for his token too. `OrganizationAdmin` does not apply to a personal repository.
-- No `merge-train` status context. A context only the train would set would refuse every hand merge and turn a `main`-red hotfix into a one-PR train. The ruleset is a guard against habit, not an authentication boundary: every token in this repository is the owner's, and what keeps an agent from using the bypass is rule 7 and the `ask` entry, not the server.
+## Changes
 
-**Activating the server-side ruleset** (owner, once; plan T75b; `gh api -X POST` is not in an agent's allow list):
-
-```bash
-gh api -X POST repos/josejuarez96/tradepartner/rulesets --input .github/rulesets/protect-main.json
-```
-
-Then read it back, `gh api repos/josejuarez96/tradepartner/rulesets/<id> --jq '.bypass_actors, (.rules[] | select(.type == "required_status_checks"))'` with the id from `gh api repos/josejuarez96/tradepartner/rulesets`: `bypass_actors` must show `RepositoryRole` 5 with `pull_request`, and the status-check rule `strict_required_status_checks_policy: false`. A later change to the file is applied with `gh api -X PUT repos/josejuarez96/tradepartner/rulesets/<id> --input .github/rulesets/protect-main.json`; the file in the repository is the record of what is active.
-
-**Local hooks after cloning** (run once per clone; worktrees share the hooks):
-
-```bash
-uv run pre-commit install
-```
-
-**Emergency override:** `git commit --no-verify` exists. Using it on `main` requires a note in the PR or `STATUS.md` explaining why. Agents may never use `--no-verify`.
+| Date | Change | Where |
+|---|---|---|
+| 2026-09-24 | v1.0 | PR #2 |
+| 2026-09-30 | No stacked PRs; CI on the exact commit | [phase-1 retro](../retros/phase-1.md) |
+| 2026-10-03 | Merge train, after two `main`-red incidents on 10-01 | [spec](../specs/merge-train.md), #529 |
+| 2026-10-04 | Rule 7 as two classes, replacing the chat-granted approval (#781, [audit](../retros/2026-10-04-orchestration-layer-audit.md) item 2); PR CI keeps the full suite (#773); ruleset active; #762 red-merge test (#772); threads resolved whoever opened them (#803) | [ADR 0002](../decisions/0002-git-workflow.md#amendment-2026-10-04-two-merge-classes-781-audit-item-2) |
+| 2026-10-06, 10-13 | The PR's own plan-box tick keeps class A (#1110); a plan-named release PR lands like class A (#1647) | those PRs |
+| 2026-10-18 | Rewritten for length, meaning unchanged; the one home for the classes and the train; ruleset explanation moved to a runbook | #1752 |
