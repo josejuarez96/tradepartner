@@ -104,24 +104,39 @@ def apply_rebalance_band(
 
     `strategy.rebalance_band` is a fraction of a name's target weight (backtest spec
     amendment #1731): a name whose absolute drift from its target is at most
-    `band * target` is not traded, so its effective target is its current weight. A band
-    of 0 trades every non-zero drift and returns `target` unchanged; a band wide enough
-    to cover every drift returns `current` over the shared names. A name absent from
+    `band * target` is not traded and keeps its current weight. A name absent from
     `target` has a target of 0 and therefore a band of 0, so an exit is always traded.
-    Names whose effective weight is 0 are dropped, as `trades_from` drops zero deltas.
-    Raises `ValueError` for a negative or non-finite band. Ordered by `security_id`.
+    The names still traded are then reconciled into what is left of the budget, so the
+    result never sums above 1: each traded name's target is scaled by
+    `(1 - Σ held-within-band weights) / Σ traded target weights` (a no-op when every
+    target is traded, and 0 when the held names already fill the budget). A band of 0 is
+    the identity and returns `target` unchanged; a band wide enough to cover every drift
+    returns `current` over the shared names. Names whose effective weight is 0, and
+    unscaled exact zeros, are dropped, as `trades_from` drops zero deltas. `band` must be
+    in [0, 1): a band of 1 or more would suppress every new entry. Raises `ValueError` for
+    a band outside that range. Ordered by `security_id`.
     """
-    if not (math.isfinite(band) and band >= 0):
-        raise ValueError(f"rebalance_band must be non-negative and finite, got {band}")
+    if not (math.isfinite(band) and 0 <= band < 1):
+        raise ValueError(f"rebalance_band must be in [0, 1), got {band}")
     if band == 0:
         return dict(target)
-    effective: dict[str, float] = {}
+    held_within: dict[str, float] = {}
+    traded: dict[str, float] = {}
     for sid in sorted({*target, *current}):
         desired = target.get(sid, 0.0)
         held = current.get(sid, 0.0)
-        weight = held if abs(desired - held) <= band * desired else desired
-        if weight != 0:
-            effective[sid] = weight
+        if abs(desired - held) <= band * desired:
+            held_within[sid] = held
+        else:
+            traded[sid] = desired
+    budget = max(0.0, 1.0 - math.fsum(held_within.values()))
+    traded_total = math.fsum(traded.values())
+    scale = budget / traded_total if traded_total > 0 else 0.0
+    effective = {sid: weight for sid, weight in held_within.items() if weight != 0}
+    for sid, weight in traded.items():
+        scaled = weight * scale
+        if scaled != 0:
+            effective[sid] = scaled
     return effective
 
 

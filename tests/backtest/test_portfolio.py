@@ -147,19 +147,28 @@ def test_band_of_zero_returns_the_targets_unchanged() -> None:
 def test_a_band_wider_than_every_drift_returns_the_current_weights() -> None:
     target = {"A": 0.5, "B": 0.3}
     current = {"A": 0.5, "B": 0.28}
-    assert apply_rebalance_band(target, current, 1.0) == current
+    assert apply_rebalance_band(target, current, 0.99) == current
 
 
 def test_band_suppresses_only_the_drifts_inside_it() -> None:
     # A 0.05 band on a 0.5 target is 0.025: A's 0.01 drift is inside, B's 0.1 is outside.
+    # A keeps 0.51; the traded B fills the remaining 0.49 of the budget.
     target = {"A": 0.5, "B": 0.5}
     current = {"A": 0.51, "B": 0.4}
-    assert apply_rebalance_band(target, current, 0.05) == {"A": 0.51, "B": 0.5}
+    assert apply_rebalance_band(target, current, 0.05) == {"A": 0.51, "B": 0.49}
+
+
+def test_band_never_leaves_weights_summing_above_one() -> None:
+    """A suppressed held name can over-fill the target; the traded names are scaled into
+    what is left of the budget (reviewer's repro on #1788)."""
+    effective = apply_rebalance_band({"A": 0.5, "B": 0.5}, {"A": 0.52, "B": 0.47}, 0.05)
+    assert effective == {"A": 0.52, "B": 0.48}
+    assert math.fsum(effective.values()) <= 1.0
 
 
 def test_band_always_exits_a_name_absent_from_target() -> None:
     """A held name with no target has a zero band, so it is always sold."""
-    assert apply_rebalance_band({"A": 1.0}, {"A": 0.9, "B": 0.1}, 1.0) == {"A": 0.9}
+    assert apply_rebalance_band({"A": 1.0}, {"A": 0.9, "B": 0.1}, 0.99) == {"A": 0.9}
 
 
 def test_a_band_of_zero_reproduces_todays_trades() -> None:
@@ -170,9 +179,9 @@ def test_a_band_of_zero_reproduces_todays_trades() -> None:
     )
 
 
-@pytest.mark.parametrize("band", [-0.1, float("nan"), float("inf")])
+@pytest.mark.parametrize("band", [-0.1, 1.0, 1.5, float("nan"), float("inf")])
 def test_band_out_of_range_refused(band: float) -> None:
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValueError, match="band"):
         apply_rebalance_band({"A": 1.0}, {"A": 1.0}, band)
 
 
