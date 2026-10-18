@@ -59,6 +59,10 @@ read like any others, through `adjusted_prices` and `raw_prices` at `t`.
 the step's connection like every other method (backtest spec amendment
 #720, plan T85c).
 
+`rates(t, series)` is `store.asof.rates_as_of(conn, t, series)` on the step's connection
+(backtest spec amendment #1498, plan T170b): rows with `known_at <= t`, latest revision
+per observation date, unchanged.
+
 `turnover_inputs(t, ids, sessions_from)` (backtest spec amendment #1358,
 plan T165b) is three reads on the step's connection with the frozen
 `Settings`: `prices_as_of(traded_only=True)` kept to `[sessions_from,
@@ -103,6 +107,7 @@ from tradepartner.store.asof import (
     dropped_dividends_as_of,
     listings_as_of,
     prices_as_of,
+    rates_as_of,
     statement_facts_as_of,
 )
 from tradepartner.store.benchmarks import benchmark_security_ids
@@ -287,6 +292,10 @@ class StoreProvider:
         rows = classifications_as_of(self._at(t), t, wanted)
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in wanted}
+
+    def rates(self, t: datetime, series: str) -> pl.DataFrame:
+        t = check_t(t)
+        return rates_as_of(self._at(t), t, series)
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
