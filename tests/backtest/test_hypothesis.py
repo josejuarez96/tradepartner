@@ -629,6 +629,9 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "profitability.",
             "gap.stale_listing_sessions",
             "strategy.turnover_top_fraction",
+            "metrics.risk_free_source",
+            "metrics.risk_free_series",
+            "metrics.risk_free_basis",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1295,9 +1298,13 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
     """H1's case: stored without the key. `frozen_hash_matches` holds on its loaded
     settings, and `hypothesis register` on the unchanged file writes nothing."""
     parsed = hypothesis.parse_file(FIXTURE)
-    params = {
-        k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k != TURNOVER_KEY
-    }
+    later = (
+        TURNOVER_KEY,
+        "metrics.risk_free_source",
+        "metrics.risk_free_series",
+        "metrics.risk_free_basis",
+    )
+    params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
