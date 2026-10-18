@@ -818,7 +818,24 @@ def _assert_same_results(
         assert len(other.marking_frames) == len(result.marking_frames)
         for a, b in zip(other.marking_frames, result.marking_frames, strict=True):
             assert (a.start, a.end) == (b.start, b.end)
-            assert a.frame.equals(b.frame)
+            if a.frame.is_empty():
+                assert b.frame.is_empty()
+            else:
+                assert a.frame.equals(b.frame.filter(pl.col("session") >= a.frame["session"].min()))
+            # Stitching and valuation need each name's latest bar at or
+            # before this step's start, even if its first new bar is later.
+            anchors = (
+                b.frame.filter(pl.col("session") <= a.start)
+                .group_by("security_id")
+                .agg(pl.col("session").max())
+            )
+            for sid, anchor_session in anchors.iter_rows():
+                assert (
+                    a.frame.filter(
+                        (pl.col("security_id") == sid) & (pl.col("session") == anchor_session)
+                    ).height
+                    == 1
+                )
 
 
 class TestSignalFrameBound:
@@ -854,7 +871,7 @@ class TestSignalFrameBound:
         signal_reads = [
             call
             for call in bounded.calls
-            if call.method == "adjusted_prices" and call.sessions_from is not None
+            if call.method == "adjusted_prices" and len(call.ids or ()) == len(GROWTH) + 1
         ]
         sessions = rebalance_sessions(start, end, cadence)
         assert len(signal_reads) == len(sessions) - 1  # one per plan, none at T_n
@@ -866,15 +883,22 @@ class TestSignalFrameBound:
             assert date(2023, 2, 5).weekday() == 6  # the weekend T - k
             assert any(call.sessions_from == date(2023, 2, 3) for call in signal_reads)
 
-    def test_the_marking_read_is_unbounded(self) -> None:
+    def test_the_marking_read_is_bounded(self) -> None:
         provider = _provider()
         _run(provider)
         marking = [
             call
             for call in provider.calls
-            if call.method == "adjusted_prices" and call.sessions_from is None
+            if call.method == "adjusted_prices" and len(call.ids or ()) < len(GROWTH)
         ]
         assert len(marking) == len(rebalance_sessions(T0, T3)) - 1
+        # T0's 12-month formation anchor is 2023-01-31; A remains held,
+        # so it is earlier than each step's five-session stale window.
+        assert [(call.t, call.sessions_from) for call in marking] == [
+            (read_time(T1), date(2023, 1, 31)),
+            (read_time(T2), date(2023, 1, 31)),
+            (read_time(T3), date(2023, 1, 31)),
+        ]
 
 
 class TestCombinationsAndLag:
@@ -1126,7 +1150,7 @@ TWIN_CALL_METHODS = {
     "late_dividends",
 }
 TWIN_N_CALLS = 37
-TWIN_CALL_LOG_SHA256 = "a67e79433a68e158dacc4838930cc8dc787b6ca0db80d0938c0d8e135a49d341"
+TWIN_CALL_LOG_SHA256 = "0ddf16574afb66249b0115c32bdd659dddb9259ed87abf2bf2c2500d6d003665"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {
