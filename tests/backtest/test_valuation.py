@@ -773,6 +773,12 @@ def _error_cases() -> list[tuple[str, dict[str, float], pl.DataFrame, FillPrice]
             _frame([("A", T0, 10.0, math.inf), ("A", D2, 1.0, 2.0)]),
             "close",
         ),
+        (
+            "open fill, no open column",
+            {"A": 5.0},
+            _frame([("A", F0, 1.0, 1.0)]).drop("open"),
+            "open",
+        ),
         ("duplicate bar", {"A": 5.0}, _frame([("A", F0, 1.0, 1.0), ("A", F0, 1.0, 1.0)]), "close"),
         (
             "null close",

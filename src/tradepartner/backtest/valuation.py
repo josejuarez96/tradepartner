@@ -110,8 +110,12 @@ def _held_bars(frame: pl.DataFrame, positions: Mapping[str, float]) -> pl.DataFr
     """The held names' bars, sorted by `security_id`, `session`: `security_id`, `session`,
     `close` and, when the frame has it, `open`. Raises `ValueError` on a duplicate
     `(security_id, session)` bar or a null `security_id`, `session` or `close`."""
-    columns = ["security_id", "session", "close", *(["open"] if "open" in frame.columns else [])]
-    bars = frame.select(columns).filter(pl.col("security_id").is_in(sorted(positions)))
+    bars = frame.select(
+        "security_id",
+        "session",
+        "close",
+        pl.col("open") if "open" in frame.columns else pl.lit(None, pl.Float64).alias("open"),
+    ).filter(pl.col("security_id").is_in(sorted(positions)))
     if bars.select(pl.struct("security_id", "session").is_duplicated().any()).item():
         raise ValueError("marking frame has a duplicate (security_id, session) bar")
     if bars.select(["security_id", "session", "close"]).null_count().sum_horizontal().item():
