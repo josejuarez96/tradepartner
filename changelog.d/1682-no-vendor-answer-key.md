@@ -1,3 +1,0 @@
-- Owner decision #1682 (no vendor, ADR 0022): spec+plan amendment; the S&P 500 answer key and OpenFIGI types become check-only health blocks (T189-T189c); identity defects fixed by rule under censuses and two releases (T190-T198).
-### Added
-- Spec, plan and ADR 0022 for #1682 (class B): no vendor (T144 not run, T145 recorded, T146-T150 not built); the index answer key and OpenFIGI types as check-only health blocks (T189, T189b, T189c); the identity levers fixed by rule under read-only censuses (T190 to T196) and two named releases (T197 restate-1682, T198 rederive-1682); open questions 30 to 35.

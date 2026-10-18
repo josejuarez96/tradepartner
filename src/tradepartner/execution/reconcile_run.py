@@ -123,6 +123,7 @@ from tradepartner.execution.reconcile import (
     Reconciliation,
     compare,
 )
+from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store.asof import live_actions_as_of, prices_as_of, symbol_changes_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
@@ -313,18 +314,25 @@ def _symbols(
     order_symbols: Mapping[str, str],
     current: Mapping[str, Mapping[str, Any]],
     broker_symbols: Collection[str],
+    class_symbols: Mapping[str, str] | None,
     changes: Mapping[str, Sequence[tuple[str, str]]],
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """`security_id` to broker symbol, one name per symbol, and the ticker
-    changes applied to it (module docstring, #1761): a held name whose stored
-    change (at close(S-1)) puts it under a new symbol the broker holds maps to
-    that symbol, so the ledger's old-symbol position matches, and the applied
-    changes come back for the row's record."""
+    changes applied to it (module docstring). A listing's ticker is read in its
+    broker form (`broker_symbol`, #1729), so a `GEF.B` position matches the
+    `GEF-B` listing. A held name whose stored change (at close(S-1)) puts it
+    under a new symbol the broker holds maps to that symbol (#1761), so the
+    ledger's old-symbol position matches, and the applied changes come back for
+    the row's record."""
     claims: dict[str, list[str]] = defaultdict(list)
     applied: dict[str, tuple[str, str]] = {}
     for name in sorted(set(names)):
         listing = current.get(name)
-        symbol = listing["ticker"] if listing is not None else order_symbols.get(name)
+        symbol = (
+            broker_symbol(listing, class_symbols)
+            if listing is not None
+            else order_symbols.get(name)
+        )
         change = (
             _applied_change(name, symbol, changes, broker_symbols) if symbol is not None else None
         )
@@ -344,7 +352,7 @@ def _symbols(
         matches = [
             name
             for name, row in current.items()
-            if row["ticker"] == symbol and row["status"] != DELISTED
+            if broker_symbol(row, class_symbols) == symbol and row["status"] != DELISTED
         ]
         if len(matches) == 1:
             symbols[matches[0]] = symbol
@@ -493,7 +501,12 @@ def _explanations(
     order_symbols = {o.security_id: o.symbol for o in state.orders}
     current = current_listings(listing_ends_as_of(conn, cut, settings), session)
     symbols, symbol_changes = _symbols(
-        names, order_symbols, current, broker_symbols, _symbol_change_candidates(conn, cut, names)
+        names,
+        order_symbols,
+        current,
+        broker_symbols,
+        settings.alpaca.class_symbols,
+        _symbol_change_candidates(conn, cut, names),
     )
     ended = frozenset(n for n in names if current.get(n, {}).get("status") == DELISTED)
     priced = sorted(names | set(symbols))

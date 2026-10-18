@@ -628,3 +628,55 @@ def test_an_unread_main_books_entry_never_refuses_another_book(
     )
     AlpacaTradingRaw(settings, book_id="b", clock=FakeClock())
     assert built[0]["api_key"] == B_KEY
+
+
+# --- 5xx and connection errors are retried (#1732) --------------------------
+
+
+def test_a_502_then_success_submits_exactly_once() -> None:
+    client = FakeClient(fail_with=[_api_error(502)])
+    assert _raw(client=client).submit_order(_request()) == {"id": "o1", "status": "accepted"}
+    # One refused attempt, one landed attempt: the order reached the broker once.
+    assert [name for name, _ in client.calls] == ["submit_order", "submit_order"]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_a_5xx_on_an_order_read_is_re_read(status: int) -> None:
+    client = FakeClient(fail_with=[_api_error(status)])
+    assert _raw(client=client).get_order_by_id("b1") == {"id": "b1"}
+    assert [name for name, _ in client.calls] == ["get_order_by_id", "get_order_by_id"]
+
+
+def test_a_connection_error_then_a_duplicate_refusal_reads_the_order_back() -> None:
+    client = FakeClient(fail_with=[requests.ConnectionError("reset"), _recorded_duplicate()])
+    assert _raw(client=client).submit_order(_request()) == {"client_order_id": "rec-1"}
+    assert [name for name, _ in client.calls] == [
+        "submit_order",
+        "submit_order",
+        "get_order_by_client_id",
+    ]
+
+
+def test_a_5xx_on_a_cancel_is_retried() -> None:
+    client = FakeClient(fail_with=[_api_error(500)])
+    _raw(client=client).cancel_order("b1")
+    assert [name for name, _ in client.calls] == ["cancel_order_by_id"] * 2
+
+
+def test_retries_exhausted_on_503_raise_with_retried_and_no_secret() -> None:
+    client = FakeClient(fail_with=[_api_error(503)] * 10)
+    raw = AlpacaTradingRaw(_settings(trading_max_retries=2), client=client, clock=FakeClock())
+    with pytest.raises(AlpacaTradingError) as err:
+        raw.get_account()
+    assert err.value.status_code == 503 and err.value.retried
+    assert len(client.calls) == 3
+    assert err.value.__context__ is None and PAPER_KEY not in str(err.value)
+
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+def test_client_errors_are_still_not_retried(status: int) -> None:
+    client = FakeClient(fail_with=[_api_error(status), _api_error(status)])
+    with pytest.raises(AlpacaTradingError) as err:
+        _raw(client=client).get_order_by_id("b1")
+    assert err.value.status_code == status and not err.value.retried
+    assert len(client.calls) == 1
