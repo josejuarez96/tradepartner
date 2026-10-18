@@ -976,6 +976,25 @@ def test_metrics_defaults() -> None:
     assert m.red_flag_excess_cagr_pp == pytest.approx(3.0)
 
 
+def test_metrics_risk_free_keys_default_to_constant_dtb3_discount() -> None:
+    """Backtest spec amendment #1498 (T170b); the live source flips to `store` in T170d."""
+    m = _settings().metrics
+    assert (m.risk_free_source, m.risk_free_series, m.risk_free_basis) == (
+        "constant",
+        "DTB3",
+        "discount",
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"risk_free_source": "fred"}, {"risk_free_basis": "bond"}],
+)
+def test_metrics_risk_free_keys_reject_other_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, metrics=override)
+
+
 def test_metrics_has_no_periods_per_year() -> None:
     """`MONTHS_PER_YEAR = 12` is a derived constant (ADR 0006), not a key."""
     assert "periods_per_year" not in type(_settings().metrics).model_fields

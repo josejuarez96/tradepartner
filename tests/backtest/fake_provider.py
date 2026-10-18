@@ -87,6 +87,13 @@ _SPLIT_SCHEMA: dict[str, Any] = {
     "cancelled": pl.Boolean,
     "known_at": pl.Datetime("us", "UTC"),
 }
+_RATE_SCHEMA: dict[str, Any] = {
+    "series": pl.Utf8,
+    "observation_date": pl.Date,
+    "value": pl.Float64,
+    "vintage_date": pl.Date,
+    "known_at": pl.Datetime("us", "UTC"),
+}
 
 
 @dataclass(frozen=True)
@@ -99,6 +106,7 @@ class Call:
     include_dividends: bool | None = None
     t_prev: datetime | None = None
     sessions_from: date | None = None
+    series: str | None = None
 
 
 def _known(frame: pl.DataFrame, t: datetime) -> pl.DataFrame:
@@ -147,6 +155,7 @@ class FakeProvider:
     )
     shares_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SHARES_SCHEMA))
     split_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_SPLIT_SCHEMA))
+    rate_rows: pl.DataFrame = field(default_factory=lambda: pl.DataFrame(schema=_RATE_SCHEMA))
     calls: list[Call] = field(default_factory=list)
 
     def _record(self, method: str, t: datetime, **kwargs: Any) -> datetime:
@@ -265,6 +274,11 @@ class FakeProvider:
         rows = _latest(_for_ids(_known(self.classification_rows, t), ids), ["security_id"])
         known: dict[str, int | None] = dict(rows.select("security_id", "sic").iter_rows())
         return {sid: known.get(sid) for sid in ids}
+
+    def rates(self, t: datetime, series: str) -> pl.DataFrame:
+        t = self._record("rates", t, series=series)
+        rows = _known(self.rate_rows, t).filter(pl.col("series") == series)
+        return _latest(rows, ["series", "observation_date"])
 
     def turnover_inputs(
         self, t: datetime, ids: Sequence[str], sessions_from: date
