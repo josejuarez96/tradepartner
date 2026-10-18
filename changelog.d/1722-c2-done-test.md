@@ -1,3 +1,0 @@
-- T199 (#1722): the C2 done-test -- an AEP-shaped static NASDAQ row with a 2019 NYSE 10-K and a 2021 NASDAQ 10-K, plus the snapshot_static-evidence, writer-path look-ahead test.
-### Added
-- Tests: tests/lookahead/test_filename_listings_c2.py pins the C2 acceptance line (#1682) -- reads before the static row's fetch see no listing, NYSE from the 2019 10-K's acceptance, NASDAQ only from the 2021 10-K's, the static rows byte-identical with the switch off; a truncated-source invariance check and a pre-rename-prefix case fail if any writer path (confirmation included) uses a static row's exchange or valid_from before its known_at. Test-only; no source change.
