@@ -53,6 +53,7 @@ SPEC_KINDS = (
     "locked",
     "no_window",
     "lot_ledger",  # #366 Q5 (a), 2026-10-01
+    "stale_mark",  # #1763, 2026-10-18
 )
 
 
