@@ -112,6 +112,14 @@ CASES = [
     ),
     # The dual-class company ranks first; both its classes stay.
     Case("top_n_by_cap", 1, removed={"SEC_SPLIT_BETWEEN": (8, "top_n_by_cap")}),
+    # `dollar_volume` ranks from bars and needs no shares fact: the three names rule 7
+    # drops at T_LATE (`no_shares`, `stale_shares`) enter (T212; the fixture has no assets
+    # snapshot before 2020, so the intersection is skipped).
+    Case(
+        "rank_by",
+        "dollar_volume",
+        admitted={"SEC_SPLIT_FUTURE", "SEC_SPLIT_BACKFILLED", "SEC_TRANSFER"},
+    ),
     # Price-quality gate (#787). SEC_SPLIT_BETWEEN's largest one-day rise in the
     # window is x1.01506 (2019-04-05); the dual classes' stay under x1.015.
     Case("max_jump_ratio", 1.015, removed={"SEC_SPLIT_BETWEEN": (6, "price_jump")}),
@@ -222,7 +230,10 @@ def test_override_via_environment_is_the_loaded_default(
     monkeypatch: pytest.MonkeyPatch, case: Case
 ) -> None:
     for key, value in {**case.base, case.key: case.value}.items():
-        monkeypatch.setenv(f"UNIVERSE__{key.upper()}", json.dumps(value))
+        # A scalar string is its own environment form; lists and numbers are JSON.
+        monkeypatch.setenv(
+            f"UNIVERSE__{key.upper()}", value if isinstance(value, str) else json.dumps(value)
+        )
     explicit = _settings(**case.base, **{case.key: case.value})
     assert get_settings().universe == explicit.universe
 

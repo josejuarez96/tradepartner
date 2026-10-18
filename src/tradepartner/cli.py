@@ -399,6 +399,7 @@ from tradepartner.execution import report as paper_report
 from tradepartner.execution import resume as paper_resume
 from tradepartner.execution import run as paper_run
 from tradepartner.execution import shakedown as paper_shakedown
+from tradepartner.execution import slippage as paper_slippage
 from tradepartner.execution.brokers import build_broker
 from tradepartner.execution.lock import LockHeld, resolve_book
 from tradepartner.execution.lots_reconcile import BrokerLotRow
@@ -1570,7 +1571,9 @@ def _for_book(book: str | None) -> str:
     return "" if book is None else f" for book {book!r}"
 
 
-def _status_lines(data: ops.OpsData, book: str | None = None) -> list[str]:
+def _status_lines(
+    data: ops.OpsData, book: str | None = None, fill_slippage: paper_slippage.Slippage | None = None
+) -> list[str]:
     """`paper status`: the operations page's numbers (spec req 12), one per line."""
     if data.journal_outdated is not None:
         return [f"paper status: {data.journal_outdated}"]
@@ -1589,6 +1592,7 @@ def _status_lines(data: ops.OpsData, book: str | None = None) -> list[str]:
         f"kill switch {switch_text} (causes: {causes})",
         "reconciliation "
         + ("n/a" if recon is None else f"{recon.reconciliation_id} {recon.status} at {recon.at}"),
+        *paper_slippage.slippage_report_lines(fill_slippage),
         f"alerts ({len(data.alerts)}{', capped' if data.alerts_capped else ''}):",
     ]
     lines += [f"  {a.at} {a.kind} {a.session}: {a.message}" for a in data.alerts]
@@ -4066,6 +4070,7 @@ def make_app(
                 f"{_fmt(t.paper_weight)} trial {_fmt(t.trial_weight)} ({t.difference})"
                 for t in result.targets.rows
             ),
+            *paper_slippage.slippage_report_lines(result.slippage, result.slippage_note),
         ]
         for line in lines:
             _echo_scrubbed(line, s)
@@ -4140,12 +4145,21 @@ def make_app(
                 _echo_scrubbed(line, s)
             return
 
-        def read() -> ops.OpsData:
+        def read() -> tuple[ops.OpsData, paper_slippage.Slippage | None]:
             with open_read_only(s) as conn:
-                return ops.page_data(conn, s, chosen)
+                page = ops.page_data(conn, s, chosen)
+                window_id = page.window.window_id if page.window is not None else None
+                if window_id is None or page.journal_outdated is not None:
+                    return page, None
+                return page, paper_slippage.window_slippage(
+                    conn,
+                    window_id,
+                    ensure_tz_aware_utc(clock(), field_name="clock()"),
+                    sessions=s.paper.status_slippage_sessions,
+                )
 
-        data = _paper_call(s, read)
-        for line in _status_lines(data, chosen):
+        data, fill_slippage = _paper_call(s, read)
+        for line in _status_lines(data, chosen, fill_slippage):
             _echo_scrubbed(line, s)
         if data.journal_outdated is not None:
             raise typer.Exit(PAPER_REFUSAL_EXIT["refused"])

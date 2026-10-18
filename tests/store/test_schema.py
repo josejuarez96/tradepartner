@@ -1439,7 +1439,7 @@ def _indexes(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
 def test_the_version_28_migration_adds_symbol_changes_and_nothing_else() -> None:
     """From 27: `symbol_changes` and its identity index appear, empty and
     shaped as a fresh store's; every other table's DDL, index and row is
-    unchanged; the versions go to [27, 28] and a second open adds nothing."""
+    unchanged; the versions go to [27, 28, 29] and a second open adds nothing."""
     conn = duckdb.connect(":memory:")
     try:
         _version_27_store(conn)
@@ -2231,7 +2231,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     fee cash activity columns (#1583, T183) are version 25; #1597's
     `filing_name` in the two master tables' allowed sets (T184d) is version
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
-    (T172b) is version 28."""
+    (T172b) is version 28; #1713's `openfigi_types` (T189c) is version 29."""
     assert schema.CURRENT_SCHEMA_VERSION == 29
 
 

@@ -462,6 +462,25 @@ class EdgarConfig(BaseModel):
             "0001837686": "CommonClassA",  # VMEO
         }
     )
+    # T190d (#1682 lever F): the per-class shares link at ingest. On, a
+    # shares fact `fact_rows` leaves unmatched goes to the one common class
+    # its member names by `universe.member_links_title` (BF.B, FOX, MKC), a
+    # lettered member to the sole listed common when no title names a letter
+    # and the filing's other classes are nominal (IBKR, SPG), and a common
+    # class missing from the CIK's last `dead_class_filings` cover pages stops
+    # being a candidate for a total (WBD's old series), all as of each fact's
+    # acceptance.
+    # Off, every `facts` row is as before. The release `rederive-1682` (T198)
+    # flips it with the facts re-derive, never a nightly run before it.
+    class_member_link: bool = False
+    # Rule 3's page count: one fiscal year of periodic cover pages.
+    dead_class_filings: int = Field(default=4, ge=1)
+    # Rule 2's nominal class: every other member of the filing at most this
+    # share of the largest (IBKR's 400 Class B shares beside 453M Class A).
+    # The census on #1723: a looser rule put an unlisted Class B's count on
+    # the listed common (Ford, Weber); DKS's 24M Class B is not nominal, so
+    # `class_member_overrides` keeps its three entries.
+    lettered_member_max_minor_share: float = Field(default=0.001, gt=0, lt=1)
     # T184 (#1597, spec amendment 2026-10-12): pre-2019 listings read from a
     # filing's own file names and its primary document's text. While the switch
     # is off the EDGAR `FilingSource` answers `filename_listings` as it does
@@ -852,6 +871,11 @@ class UniverseConfig(_ClosedConfig):
     max_shares_ratio: float = Field(default=100, gt=1, allow_inf_nan=False)
     accepted_shares_facts: list[str] = Field(default_factory=list)
     top_n_by_cap: int = 1000
+    # Rule 8's ranking (ADR 0023 D4, T212): `cap` is ADR 0006's market-cap rank (needs
+    # rule 7's shares fact); `dollar_volume` ranks by median dollar volume from bars alone
+    # and intersects with Alpaca's tradable assets as of T, for forward books. Frozen with
+    # `universe.*`; a registered family keeps `cap` (`FROZEN_KEY_DEFAULTS`).
+    rank_by: Literal["cap", "dollar_volume"] = "cap"
     # Price-quality gate (#787), part of rule 6: a close-to-close ratio between two
     # consecutive traded bars above `max_jump_ratio` or below `min_jump_ratio`, that no
     # split or dividend known at T explains, fails rule 6 while its session is in the
@@ -1201,6 +1225,14 @@ class StrategyConfig(BaseModel):
     rule and a post-registration own-section key (`backtest/frozen.py`
     `POST_REGISTRATION_OWN_KEYS`): a file that leaves it out freezes 1.0, never the live
     value.
+
+    `weighting` is `equal` or `hold`; under `hold` an entry is sized at 1 /
+    `hold_target_names` of equity and kept for `hold_sessions` sessions (backtest spec
+    amendment #1731). `hold_sessions`, `hold_target_names` and `rebalance_band` are
+    post-registration own-section keys too, inert under the default `equal` weighting.
+    `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
+    trades every non-zero drift, so every default reproduces today's behaviour. Until
+    T209b wires the engine, `hold` and a non-zero `rebalance_band` are refused.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1208,9 +1240,12 @@ class StrategyConfig(BaseModel):
     formation_months: int = Field(default=12, gt=0)
     skip_months: int = Field(default=1, ge=0)
     top_fraction: float = Field(default=0.10, gt=0, le=1)
-    weighting: Literal["equal"] = "equal"
+    weighting: Literal["equal", "hold"] = "equal"
     signal_total_return: bool = True
     turnover_top_fraction: float = Field(default=1.0, gt=0, le=1)
+    hold_sessions: int = Field(default=1, gt=0)
+    hold_target_names: int = Field(default=0, ge=0)
+    rebalance_band: float = Field(default=0.0, ge=0, lt=1)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1218,6 +1253,23 @@ class StrategyConfig(BaseModel):
             raise ValueError(
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_hold_mode_until_wired(self) -> StrategyConfig:
+        """`hold` and a non-zero band load as keys but no build reads them yet, so until
+        T209b wires the engine a run would trade equal-weight targets while the row says
+        otherwise. T209b removes this guard."""
+        if self.weighting == "hold":
+            raise ValueError(
+                "strategy.weighting = 'hold' is not wired until T209b: the engine still "
+                "builds equal-weight targets and keeps no entry sessions"
+            )
+        if self.rebalance_band != 0:
+            raise ValueError(
+                f"strategy.rebalance_band = {self.rebalance_band} is not wired until "
+                "T209b: the engine still trades every drift to its exact target"
             )
         return self
 
@@ -1478,14 +1530,31 @@ class BacktestConfig(BaseModel):
     `initial_capital` is scale-free with fractional shares but sizes per-order
     commissions. `delisting_exit=last_close` is the ADR 0004 oracle convention.
     `stale_exit_sessions` mirrors `gap.missing_tail_sessions` (spec open question 4).
+
+    `cash_rate` is `0.0` or `store`: under `store` cash accrues the store's risk-free
+    series per session (backtest spec amendment #1731), and a run pairs it with
+    `metrics.risk_free_source = "store"`. A numeric value other than 0 is refused: a
+    made-up rate is not a point-in-time fact.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     initial_capital: float = Field(default=100_000.0, gt=0)
-    cash_rate: float = 0.0
+    cash_rate: float | Literal["store"] = 0.0
     delisting_exit: Literal["last_close"] = "last_close"
     stale_exit_sessions: int = Field(default=5, gt=0)
+
+    @field_validator("cash_rate")
+    @classmethod
+    def _validate_cash_rate(cls, value: float | Literal["store"]) -> float | Literal["store"]:
+        if isinstance(value, str):
+            return value
+        if value != 0:
+            raise ValueError(
+                f"backtest.cash_rate must be 0.0 or 'store', got {value}; "
+                "a made-up rate is not a point-in-time fact"
+            )
+        return value
 
 
 class MetricsConfig(BaseModel):
@@ -1501,6 +1570,15 @@ class MetricsConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     risk_free_rate: float = 0.0
+    #: Where the per-period risk-free rate comes from (backtest spec amendment
+    #: 2026-10-11, #1498): `constant` reads `risk_free_rate`; `store` reads the `rates`
+    #: table. The live default flips to `store` with T170d; the frozen-key table entry
+    #: stays `constant`.
+    risk_free_source: Literal["constant", "store"] = "constant"
+    #: The `rates.series` id a `store` trial reads.
+    risk_free_series: str = "DTB3"
+    #: Quote basis of the stored rate: `discount` (DTB3's) or `yield`.
+    risk_free_basis: Literal["discount", "yield"] = "discount"
     red_flag_excess_cagr_pp: float = Field(default=3.0, ge=0)
 
 
@@ -1696,7 +1774,8 @@ class LabConfig(BaseModel):
 
 # --- Phase 4: paper trading and journal (docs/specs/paper-trading.md, ADR 0010, T47) ---
 
-# The five `paper.*` keys req 14 freezes into the window at `paper start`, beside the
+# The `paper.*` keys req 14 freezes (the sixth, `max_stale_mark_sessions`, #1763, reads 0
+# for a window frozen before it existed) into the window at `paper start`, beside the
 # whole `risk.*` section; every other `paper.*` key is read at run time. `min_rebalances`
 # is frozen as its window's cadence's entry of the per-cadence table (ADR 0017 part C).
 FROZEN_PAPER_KEYS: tuple[str, ...] = (
@@ -1705,6 +1784,7 @@ FROZEN_PAPER_KEYS: tuple[str, ...] = (
     "tracking_rule",
     "max_catch_up_sessions",
     "min_override_reason_chars",
+    "max_stale_mark_sessions",
 )
 
 # The `execution.*` keys req 14 also freezes into the window at `paper start` (#366
@@ -1847,7 +1927,11 @@ _DEFAULT_MIN_REBALANCES: dict[Cadence, int] = {
 class PaperConfig(BaseModel):
     """Paper-window and tracking-run settings (spec reqs 3, 7, 8, 10, 14).
 
-    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys. The six
+    `FROZEN_PAPER_KEYS` are frozen at `paper start`; the rest are run-time keys.
+    `max_stale_mark_sessions` (#1763, owner decision) is how many consecutive sessions a
+    tradable held name missing its S-1 bar is marked at its last close, with an alert,
+    before the run fails; 0 is the old fail-at-once rule, which an already-open window
+    keeps (its `frozen_json` lacks the key). The six
     timing keys (`submit_window_*`, `sell_wait_seconds`, `poll_interval_seconds`,
     `accept_wait_seconds`, `fill_read_overlap_seconds`) were checked against Probe 3's
     measured paper fill latency and all kept (#182, T70, the ADR 0006 amendment of
@@ -1872,6 +1956,9 @@ class PaperConfig(BaseModel):
     fewer members than the first, or fewer than `p x (1 - fraction)` against the
     window's last plan of `p` members, halts the run. Both are read at run time and are
     not in `FROZEN_PAPER_KEYS`, so windows opened before them are covered.
+    `min_free_disk_gb` (#1758) is the free space, in GB, the store's disk must have
+    for a run to start; below it the run refuses before any broker call, with a
+    `run_failed` alert and no kill switch. 0 turns the check off. Run-time, not frozen.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1883,6 +1970,7 @@ class PaperConfig(BaseModel):
     tracking_k: float = Field(default=2.0, ge=0)
     tracking_rule: Literal["raw", "residual"] = "residual"
     max_catch_up_sessions: int = Field(default=5, ge=0)
+    max_stale_mark_sessions: int = Field(default=3, ge=0)
     submit_window_before_open_minutes: int = Field(default=90, ge=0)
     submit_window_after_open_minutes: int = Field(default=30, ge=0)
     sell_wait_seconds: float = Field(default=900.0, ge=0)
@@ -1894,6 +1982,13 @@ class PaperConfig(BaseModel):
     min_override_reason_chars: int = Field(default=20, ge=1)
     min_universe_names: int = Field(default=1, ge=1)
     max_universe_drop_fraction: float = Field(default=0.5, ge=0, le=1)
+    min_free_disk_gb: float = Field(default=5.0, ge=0)
+    #: `paper status` reads the slippage line over only the newest
+    #: `status_slippage_sessions` order sessions of the window (#1741): the line is
+    #: a diagnostic, and one `prices_as_of` read per session would otherwise grow
+    #: with the window's length. Read at run time, never frozen; `paper report`
+    #: keeps the full window (its `paper_reports` row is the record).
+    status_slippage_sessions: int = Field(default=20, gt=0)
 
     @field_validator("min_rebalances")
     @classmethod

@@ -75,9 +75,12 @@ Alpaca's nanosecond timestamps are truncated to microseconds.
 separators: `symbol_for` is the prices adapter's `master_symbol` rule (with
 `alpaca.class_symbols`), `ticker_for` its inverse over the master rows it is
 given; an unmapped or ambiguous symbol raises `SystemFaultError`. The adapter
-sends `OrderRequest.symbol` as given: the wrapper maps it (T60c's
-`phases.requests_for`), because the adapter has neither the master nor the
-session.
+sends `OrderRequest.symbol` as given: the order path maps every listing to its
+broker form first (`execution.symbols.broker_symbol`, the same rule, #1729),
+because the adapter has neither the master nor the session. A symbol Alpaca
+does not know (404, code 40410000) is answered by `assets` as
+`UNRESOLVED_ASSET`, never tradable, so that one name is skipped, not the run
+halted (#1729; #410 had made it a halt).
 
 **No secret in any exception**: errors from the raw client hold only a status
 code and a response body, and this module's own messages name no setting value.
@@ -102,6 +105,7 @@ from tradepartner.adapters.alpaca_trading_raw import (
 )
 from tradepartner.adapters.broker import (
     TERMINAL_STATUSES,
+    UNRESOLVED_ASSET,
     Account,
     Asset,
     Broker,
@@ -138,6 +142,8 @@ STATUS_TABLE: Mapping[str, OrderStatus] = {
 _SIMPLE_ORDER_CLASS = "simple"
 #: HTTP status and Alpaca code of the broker's duplicate-id refusal (T48b).
 _NOT_FOUND = 404
+#: Alpaca's code on a `GET /v2/assets/{symbol}` 404 for a symbol it does not know (#1729).
+_ASSET_NOT_FOUND_CODE = 40410000
 _DUPLICATE_STATUS = 422
 _DUPLICATE_CODE = 40010001
 #: A cancel refused because the order is no longer cancelable, or gone.
@@ -502,14 +508,26 @@ class AlpacaBroker(Broker):
         return _mapped("account", lambda p: _account(p, now), payload)
 
     def assets(self, symbols: Sequence[str]) -> dict[str, Asset]:
-        """Alpaca's `Asset` per requested symbol, keyed by canonical symbol."""
+        """Alpaca's `Asset` per requested symbol, keyed by canonical symbol. A
+        symbol Alpaca does not know (404, code 40410000) answers
+        `UNRESOLVED_ASSET` (#1729), so the run skips that one name; any other
+        refusal raises."""
         self._now()
         wanted = [canonical_symbol(symbol) for symbol in symbols]
-        payloads = self._raw.get_assets(wanted)
-        if len(payloads) != len(wanted):
-            raise SystemFaultError(f"asset read answered {len(payloads)} of {len(wanted)} symbols")
         assets: dict[str, Asset] = {}
-        for symbol, payload in zip(wanted, payloads, strict=True):
+        for symbol in wanted:
+            try:
+                payloads = self._raw.get_assets([symbol])
+            except AlpacaTradingError as error:
+                if error.status_code != _NOT_FOUND or _error_code(error) != _ASSET_NOT_FOUND_CODE:
+                    raise
+                assets[symbol] = UNRESOLVED_ASSET
+                continue
+            if len(payloads) != 1:
+                raise SystemFaultError(
+                    f"asset read answered {len(payloads)} of 1 symbols for {symbol!r}"
+                )
+            (payload,) = payloads
             if _mapped("asset", lambda p: canonical_symbol(p["symbol"]), payload) != symbol:
                 raise SystemFaultError(f"asset read for {symbol!r} answered another symbol")
             assets[symbol] = _mapped("asset", _asset, payload)

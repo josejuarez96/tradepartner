@@ -729,12 +729,24 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
     frozen = _frozen()
     all_params = frozen_params_of(frozen, family="momentum")
     # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
-    # `strategy.turnover_top_fraction` (#1358) landed.
+    # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+    # `universe.rank_by` (T212) landed.
     params = {
         k: v
         for k, v in all_params.items()
         if not k.startswith(
-            ("schedule.", "gap.stale_listing_sessions", "strategy.turnover_top_fraction")
+            (
+                "schedule.",
+                "gap.stale_listing_sessions",
+                "strategy.turnover_top_fraction",
+                "metrics.risk_free_source",
+                "metrics.risk_free_series",
+                "metrics.risk_free_basis",
+                "strategy.hold_sessions",
+                "strategy.hold_target_names",
+                "strategy.rebalance_band",
+                "universe.rank_by",
+            )
         )
     }
     hashed = sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -824,8 +836,20 @@ def _register_more(
     params = frozen_params_of(frozen, family="momentum")
     if drop_schedule:
         # Pre-T96, so also before `gap.stale_listing_sessions` (#1199) and
-        # `strategy.turnover_top_fraction` (#1358) landed.
-        later = ("schedule.", "gap.stale_listing_sessions", "strategy.turnover_top_fraction")
+        # `strategy.turnover_top_fraction` (#1358) and `metrics.risk_free_*` (#1498),
+        # `universe.rank_by` (T212) landed.
+        later = (
+            "schedule.",
+            "gap.stale_listing_sessions",
+            "strategy.turnover_top_fraction",
+            "metrics.risk_free_source",
+            "metrics.risk_free_series",
+            "metrics.risk_free_basis",
+            "strategy.hold_sessions",
+            "strategy.hold_target_names",
+            "strategy.rebalance_band",
+            "universe.rank_by",
+        )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
         record = registry.register_hypothesis(

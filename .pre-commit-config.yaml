@@ -40,3 +40,16 @@ repos:
         entry: uv run ruff format
         language: system
         types: [python]
+      - id: doc-size-budget
+        name: doc size budgets (warn only)
+        entry: uv run python scripts/doc_check.py size
+        language: system
+        pass_filenames: false
+        files: ^(CLAUDE\.md|docs/STATUS\.md|\.claude/(agents|skills)/|docs/ways-of-working/)
+        verbose: true   # always exits 0; verbose shows the WARN lines (#1751)
+      - id: doc-citations
+        name: doc citations resolve
+        entry: uv run python scripts/doc_check.py cite
+        language: system
+        pass_filenames: false
+        files: ^(docs/(plans|specs|decisions)/|docs/research/claims\.toml|src/|tests/)   # CI's pre-commit step runs this on docs-only PRs too (#1751)

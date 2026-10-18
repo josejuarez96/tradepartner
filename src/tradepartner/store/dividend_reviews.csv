@@ -192,3 +192,5 @@ security_id,ex_date,amount,verdict,retract_source_action_id,ticker,evidence
 0001496048,2019-11-27,0.33,duplicate,70fb9c80-db66-4c7f-bbea-6fe458d9ba73,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
 0001496048,2020-02-27,0.3325,duplicate,fd1db0ac-43a5-4c23-ba50-5aca3529891f,BPR,same rate and ex-date under old symbol BPR and new BPYU; one quarterly payment
 0001514281,2019-06-27,0.5,duplicate,88cc3d07-5c7d-4cc7-9938-01e731b705b2,MITT,raw records differ by cusip only
+0001383414,2026-10-15,0.04,distinct,,PNNT,base plus supplemental: https://pnnt.pennantpark.com/dividends-splits
+0001504619,2026-10-15,0.0033,duplicate,764fdbfa-b7dd-47af-b79d-dd57095cc021,PFLT,one $0.0033 supplemental beside the $0.08 base: https://pflt.pennantpark.com/stock-information/dividends-splits

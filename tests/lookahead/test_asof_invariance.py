@@ -34,6 +34,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
+from conftest import PROBE_CHUNKS, assert_chunks_are_the_probe_set, failing_chunks, probe_chunk
 
 from lookahead.harness import PROBE_EPSILON, TruncatedStore, probe_timestamps
 from tradepartner.store import schema
@@ -71,9 +72,19 @@ def _assert_invariant_over_every_probe(
     **kwargs: Any,
 ) -> None:
     for t in probe_timestamps(fixture_store):
-        full = func(fixture_store, t, **kwargs)
-        result = func(truncated.at(t), t, **kwargs)
-        assert full.equals(result), f"{func.__name__} disagreed at T={t!r}"
+        _assert_invariant_at(fixture_store, truncated, func, t, **kwargs)
+
+
+def _assert_invariant_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    func: AsOfFunc,
+    t: datetime,
+    **kwargs: Any,
+) -> None:
+    full = func(fixture_store, t, **kwargs)
+    result = func(truncated.at(t), t, **kwargs)
+    assert full.equals(result), f"{func.__name__} disagreed at T={t!r}"
 
 
 def test_snapshot_static_listing_invariant_under_truncation_without_exemption(
@@ -114,13 +125,54 @@ def test_as_of_function_invariant_under_truncation(
     _assert_invariant_over_every_probe(fixture_store, truncated, func)
 
 
+#: `probe_timestamps` on the fixture store, pinned (T216): the chunks walk exactly these.
+PROBE_COUNT = 1942
+PROBE_DIGEST = "f8ccd42c8faaea4b04835e4161798c90701298e1a924f450b147b3058563ccef"
+
+
+def test_adjusted_prices_chunks_are_the_pinned_probe_set(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """No probe dropped: the chunks' union is today's probe set, by count and hash."""
+    assert_chunks_are_the_probe_set(probe_timestamps(fixture_store), PROBE_COUNT, PROBE_DIGEST)
+
+
 @pytest.mark.parametrize("include_dividends", [False, True])
-def test_adjusted_prices_as_of_invariant_under_truncation(
+def test_a_planted_lookahead_fails_exactly_one_adjusted_prices_chunk(
     fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore, include_dividends: bool
 ) -> None:
-    _assert_invariant_over_every_probe(
-        fixture_store, truncated, adjusted_prices_as_of, include_dividends=include_dividends
+    """An `adjusted_prices_as_of` that reads 400 days past T on the full store at one
+    probe fails the chunk holding that probe and no other."""
+    probes = probe_timestamps(fixture_store)
+    planted = probes[900]
+
+    def leaky(conn: duckdb.DuckDBPyConnection, t: datetime, **kwargs: Any) -> pl.DataFrame:
+        read_at = t + timedelta(days=400) if conn is fixture_store and t == planted else t
+        return adjusted_prices_as_of(conn, read_at, **kwargs)
+
+    window = probes[880:920]
+    failed = failing_chunks(
+        window,
+        lambda t: _assert_invariant_at(
+            fixture_store, truncated, leaky, t, include_dividends=include_dividends
+        ),
     )
+    assert failed == [window.index(planted) % PROBE_CHUNKS]
+
+
+@pytest.mark.parametrize("chunk", range(PROBE_CHUNKS))
+@pytest.mark.parametrize("include_dividends", [False, True])
+def test_adjusted_prices_as_of_invariant_under_truncation(
+    fixture_store: duckdb.DuckDBPyConnection,
+    truncated: TruncatedStore,
+    include_dividends: bool,
+    chunk: int,
+) -> None:
+    """One strided chunk of the probes (see `conftest.PROBE_CHUNKS`)."""
+    for t in probe_chunk(probe_timestamps(fixture_store), chunk):
+        _assert_invariant_at(
+            fixture_store, truncated, adjusted_prices_as_of, t, include_dividends=include_dividends
+        )
 
 
 def _bar(

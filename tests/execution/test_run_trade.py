@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from tradepartner.adapters.alpaca_prices import alpaca_symbol
 from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill
 from tradepartner.backtest.hypothesis import frozen_params_of
@@ -63,6 +64,7 @@ SYMBOLS = {
     "SEC_STATIC_PRE2019": "PRE9",
     "SEC_DUAL_A": "DUALA",
 }
+BROKER_ASSETS = ("DUALB", "SPFT", "TRNS", "SPY", "WNDX", "DUALA", "SPBT")
 TARGETS = ("SEC_DUAL_B", "SEC_SPLIT_FUTURE", "SEC_TRANSFER")
 #: Loose enough that a third of equity is one order and one position.
 FROZEN = RiskConfig(max_position_weight=0.4, max_order_notional_fraction=0.4)
@@ -108,6 +110,7 @@ class Env:
         self.new_fake()
 
     def new_fake(self, **kwargs: Any) -> FakeBroker:
+        kwargs.setdefault("assets", FakeBroker.active_assets(*BROKER_ASSETS))
         self.fake = FakeBroker(
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],
@@ -303,6 +306,66 @@ def bought(env: Env) -> RunOutcome:
     assert outcome.status == "ok", env.result(env.latest_run())
     assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
     return outcome
+
+
+# --- broker symbols (#1729) ----------------------------------------------------------
+
+
+def retick(env: Env, security_id: str, ticker: str) -> None:
+    """The temp store's listing of `security_id` reads `ticker` (the master's form)."""
+    with open_for_write(env.settings) as conn:
+        conn.execute("UPDATE listings SET ticker = ? WHERE security_id = ?", [ticker, security_id])
+    env.fake.remove_asset(SYMBOLS[security_id])
+    broker_form = alpaca_symbol(ticker)
+    if broker_form is not None:
+        env.fake.set_asset(broker_form, Asset(True, True, "active", None))
+
+
+def test_a_class_share_trades_and_reconciles_in_the_brokers_form(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1729: the master's class ticker `DUAL-B` is Alpaca's `DUAL.B`. The
+    assets read and the order carry `DUAL.B`, never `DUAL-B`, and the next
+    run's reconciliation maps the broker's `DUAL.B` position back to it."""
+    retick(env, "SEC_DUAL_B", "DUAL-B")
+    monkeypatch.setitem(SYMBOLS, "SEC_DUAL_B", "DUAL.B")
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert sorted(env.held()) == ["DUAL.B", "SPFT", "TRNS"]
+    asked = {s for c in env.fake.calls if c.method == "assets" for s in c.args[0]}  # type: ignore[union-attr]
+    assert "DUAL.B" in asked and "DUAL-B" not in asked
+    assert "DUAL.B" in {r.symbol for r in env.submits()}
+    later = env.run(at(F_0_PLUS_1))
+    assert later.status == "ok", env.result(env.latest_run())
+
+
+def test_a_target_with_no_broker_form_is_skipped_not_halted(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """#1729: a target whose ticker has no Alpaca form is left out before any
+    order (`skip_untradable`) and never sent to the broker; the run ends `ok`
+    and buys the other targets."""
+    retick(env, "SEC_SPLIT_FUTURE", "SPFT WS")
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert sorted(env.held()) == ["DUALB", "TRNS"]
+    asked = {s for c in env.fake.calls if c.method == "assets" for s in c.args[0]}  # type: ignore[union-attr]
+    assert not any("SPFT" in s for s in asked)
+    assert env.rebalance_events() == [(T_0, "executed", None, outcome.run_id)]
+
+
+def test_two_names_mapping_to_one_broker_symbol_halt_before_any_order(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Safety review of #1729: `DUAL-B` and `DUAL/B` are both `DUAL.B`, so the
+    assets read and the order would be ambiguous; the plan raises before any
+    submit (fail-closed, as the ticker check did) instead of trading one name
+    for the other."""
+    retick(env, "SEC_DUAL_B", "DUAL-B")
+    retick(env, "SEC_SPLIT_FUTURE", "DUAL/B")
+    with pytest.raises(ValueError, match="share a broker symbol"):
+        env.run(at(F_0))
+    assert env.submits() == []
 
 
 # --- the submit window ---------------------------------------------------------------

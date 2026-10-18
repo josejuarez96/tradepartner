@@ -363,7 +363,12 @@ def _precheck_at(
     settings: Settings, conn: duckdb.DuckDBPyConnection, now: object, last_ok: datetime | None
 ) -> datetime:
     clock = lambda: now  # noqa: E731
-    fake = FakeBroker(clock=clock, price_of=lambda _s: 100.0, auto_fill=False)  # type: ignore[arg-type]
+    fake = FakeBroker(
+        assets=FakeBroker.active_assets("AAA", "BBB", "DUALA"),
+        clock=clock,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+    )  # type: ignore[arg-type]
     gate = _wrapper(settings, fake, clock, conn)  # type: ignore[arg-type]
     return gate.clock_precheck(SESSION, last_ok)
 
@@ -404,7 +409,12 @@ def test_a_raising_clock_is_a_clock_error(
     def broken() -> datetime:
         raise OSError("no time")
 
-    fake = FakeBroker(clock=broken, price_of=lambda _s: 100.0, auto_fill=False)
+    fake = FakeBroker(
+        assets=FakeBroker.active_assets("AAA", "BBB", "DUALA"),
+        clock=broken,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+    )
     gate = _wrapper(journal_settings, fake, broken, alerter_conn)
     with pytest.raises(ClockError, match="OSError"):
         gate.clock_precheck(SESSION, None)
@@ -438,7 +448,13 @@ def ticking() -> TickingClock:
 
 @pytest.fixture
 def ticking_fake(ticking: TickingClock) -> FakeBroker:
-    return FakeBroker(clock=ticking, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1")
+    return FakeBroker(
+        assets=FakeBroker.active_assets("AAA", "BBB", "DUALA"),
+        clock=ticking,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA1",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1262,6 +1278,7 @@ def _shaped_env(env: Env, shaped: str | None) -> ShapedBroker:
         price_of=lambda symbol: env.prices[symbol],
         auto_fill=False,
         account_id="PA1",
+        assets=FakeBroker.active_assets("DUALA", "DUALB", "PRE9", "WNDX"),
     )
     return env.fake
 
@@ -1367,6 +1384,7 @@ def test_a_replayed_limit_order_halts_after_its_replay_event(
         price_of=lambda _s: 100.0,
         auto_fill=False,
         account_id="PA1",
+        assets=FakeBroker.active_assets("AAA"),
     )
     run = _run(journal_settings, open_window, fixed_clock())
     _order(journal_settings, fake, fixed_clock, run, "tp-r", acknowledge=False)

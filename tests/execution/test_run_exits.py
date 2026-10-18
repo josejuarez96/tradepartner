@@ -33,7 +33,7 @@ from execution.test_run_trade import (
     window,
 )
 from tradepartner.adapters.broker import Asset, OrderRequest, Side
-from tradepartner.adapters.fake_broker import Expire
+from tradepartner.adapters.fake_broker import Expire, SetPosition
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import run as run_module
@@ -784,6 +784,11 @@ def stale_order(
     )
     coid = f"tp-stale-no-bar-{side}"
     env.prices[NO_BAR_SYMBOL] = 10.0
+    env.fake.set_asset(NO_BAR_SYMBOL, TRADABLE)
+    if side == "sell":
+        # The fake refuses a sell above the held quantity: hold the name only while the
+        # stale order is accepted, so the book is back to unheld when the run starts.
+        env.fake.apply_account(SetPosition(NO_BAR_SYMBOL, 100))
     placed = env.fake.submit(
         OrderRequest(
             coid,
@@ -793,6 +798,8 @@ def stale_order(
             notional=notional,
         )
     )
+    if side == "sell":
+        env.fake.apply_account(SetPosition(NO_BAR_SYMBOL, None))
     env.append(
         OrderRow(
             client_order_id=coid,

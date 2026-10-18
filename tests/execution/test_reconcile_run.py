@@ -30,6 +30,7 @@ from tradepartner.execution.reconcile import (
     OK,
     PENDING_UNRESOLVED,
     Explanations,
+    SymbolChangeRecord,
 )
 from tradepartner.execution.reconcile_run import (
     _NEW_YORK,
@@ -112,7 +113,11 @@ class BookedFake(FakeBroker):
 @pytest.fixture
 def fake(fixed_clock: FixedClock) -> BookedFake:
     return BookedFake(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PA1"
+        assets=FakeBroker.active_assets("SPY", "MTUM"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
     )
 
 
@@ -181,6 +186,33 @@ def _delisting(settings: Settings, security_id: str, filed_at: datetime) -> None
         ingested_at=filed_at,
         source="edgar",
         provenance="filing",
+    )
+
+
+def _symbol_change(
+    settings: Settings,
+    security_id: str,
+    old: str,
+    new: str,
+    known_at: datetime,
+    source_action_id: str = "rename-1",
+) -> None:
+    """A stored `symbol_changes` row: the name's ticker went `old` -> `new`, one
+    `known_at` for both its process-date close and the read cut."""
+    _fact(
+        settings,
+        "symbol_changes",
+        security_id=security_id,
+        old_symbol=old,
+        new_symbol=new,
+        old_cusip=f"OLD-{security_id}",
+        new_cusip=f"NEW-{security_id}",
+        process_date=known_at.date() - timedelta(days=1),
+        source_action_id=source_action_id,
+        known_at=known_at,
+        ingested_at=known_at,
+        source="alpaca",
+        provenance="action",
     )
 
 
@@ -406,6 +438,156 @@ def test_explanations_read_a_listing_with_no_valid_from_as_the_shared_rule_does(
             quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
         )
     assert found.symbols == {SPY: "SPY"}
+
+
+def test_a_ticker_change_known_at_close_s_minus_1_maps_the_broker_symbol(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761: a held name whose ticker changed (a stored `symbol_changes` row
+    known at close(S-1)) reconciles -- the broker's new-symbol position matches
+    the ledger's old-symbol one, and the `reconciliations` row records it."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}  # the broker renamed the position
+
+    result = _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    assert result.status == OK
+    assert result.symbol_changes == (SymbolChangeRecord(SPY, "SPY", "SPYX"),)
+    assert _adjustments(journal_settings, open_window) == []  # nothing moved
+    row = _rows(journal_settings, open_window)[-1]
+    assert json.loads(row.mismatches_json or "")["symbol_changes"] == [
+        {"security_id": SPY, "old_symbol": "SPY", "new_symbol": "SPYX"}
+    ]
+
+
+def test_a_broker_symbol_with_no_stored_change_is_a_mismatch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761: the broker's new symbol with no stored change is the same unknown
+    symbol and lone ledger position as before, and records no mapping."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    (row,) = _rows(journal_settings, open_window)
+    listed = json.loads(row.mismatches_json or "")
+    assert sorted(m["kind"] for m in listed["mismatches"]) == [
+        "ledger_only_position",
+        "unknown_symbol",
+    ]
+    assert listed["symbol_changes"] == []
+
+
+def test_a_symbol_change_known_only_after_close_s_minus_1_is_not_applied(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761 (no look-ahead): the read is at close(S-1), so a change stamped a
+    minute after it is invisible and the new broker symbol is a mismatch."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT + timedelta(minutes=1))
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
+
+    with open_read_only(journal_settings) as conn:
+        found = explanations_as_of(
+            conn,
+            open_window,
+            S,
+            as_of=CUT,
+            settings=journal_settings,
+            broker_symbols=["SPY", "SPYX"],
+            quantity_tolerance=FROZEN.reconcile_quantity_tolerance,
+        )
+    assert found.symbols == {SPY: "SPY"}
+    assert found.symbol_changes == {}
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+    (row,) = _rows(journal_settings, open_window)
+    assert json.loads(row.mismatches_json or "")["symbol_changes"] == []
+
+
+def test_a_quantity_mismatch_under_the_new_symbol_is_a_mismatch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761: the change maps the symbol but not a size -- a broker quantity that
+    differs under the new symbol is compare's `quantity` mismatch as ever."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 9.0}
+
+    with pytest.raises(ReconciliationError, match="quantity"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    (row,) = _rows(journal_settings, open_window)
+    listed = json.loads(row.mismatches_json or "")
+    assert [m["kind"] for m in listed["mismatches"]] == ["quantity"]
+    assert listed["symbol_changes"] == [
+        {"security_id": SPY, "old_symbol": "SPY", "new_symbol": "SPYX"}
+    ]
+    assert _adjustments(journal_settings, open_window) == []
+
+
+def test_a_ticker_change_is_not_recorded_when_the_broker_holds_both_symbols(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761 (review fix 1): the broker holding both the old and the new symbol
+    leaves the name on its listing's symbol -- the unclaimed-symbol rule puts it
+    back on the old one -- so the leftover new-symbol position is an unknown
+    symbol and the row records no applied change (the map did not keep it)."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1))
+    fake.extra_quantity = {"SPYX": 10.0}  # the broker holds the old 10 and a new 10
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    (row,) = _rows(journal_settings, open_window)
+    listed = json.loads(row.mismatches_json or "")
+    assert [m["kind"] for m in listed["mismatches"]] == ["unknown_symbol"]
+    assert listed["symbol_changes"] == []
+
+
+def test_two_candidate_ticker_changes_for_a_name_are_a_mismatch(
+    journal_settings: Settings,
+    fake: BookedFake,
+    open_window: PaperWindowRow,
+    fixed_clock: FixedClock,
+) -> None:
+    """#1761: two stored new symbols for one held name are two candidates, so the
+    position stays a mismatch (fail closed, never a guess)."""
+    _hold(journal_settings, fake, open_window, {(SPY, "SPY"): 10.0})
+    _symbol_change(journal_settings, SPY, "SPY", "SPYX", CUT - timedelta(minutes=1), "r1")
+    _symbol_change(journal_settings, SPY, "SPY", "SPYZ", CUT - timedelta(minutes=1), "r2")
+    fake.extra_quantity = {"SPY": -10.0, "SPYX": 10.0}
+
+    with pytest.raises(ReconciliationError, match="unknown_symbol"):
+        _reconcile(journal_settings, fake, open_window, fixed_clock)
+
+    (row,) = _rows(journal_settings, open_window)
+    listed = json.loads(row.mismatches_json or "")
+    assert sorted(m["kind"] for m in listed["mismatches"]) == [
+        "ledger_only_position",
+        "unknown_symbol",
+    ]
+    assert listed["symbol_changes"] == []
 
 
 def test_a_split_known_at_close_of_the_previous_session_explains_the_new_quantity(
@@ -1216,7 +1398,13 @@ def b_frozen_window(journal_settings: Settings, frozen_window: PaperWindowRow) -
 
 
 def _b_fake(clock: FixedClock) -> BookedFake:
-    return BookedFake(clock=clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1")
+    return BookedFake(
+        assets=FakeBroker.active_assets("SPY", "MTUM"),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PB1",
+    )
 
 
 def test_a_reconciliation_fault_halts_only_its_book(

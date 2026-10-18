@@ -427,6 +427,203 @@ def test_a_new_common_class_of_the_cik_explains_nothing(
     assert pick.outliers["explained"].to_list() == [False]
 
 
+# --- A pre-trading seed fact is no baseline (#1682, T190b) --------------------
+
+
+SEED = "SEC_SEED_FACT"  # a seed before its first bar, then a true fact
+KEPT = "SEC_SEED_BAR"  # a first fact on/after its first bar: still a baseline
+NORMAL = "SEC_NORMAL_PREBAR"  # a normal fact before the first bar: untouched
+MULTI = "SEC_MULTI_SEED"  # several pre-bar seeds (LIN, VTRS shape)
+
+
+def _seed_listing(
+    conn: duckdb.DuckDBPyConnection, security_id: str, valid_from: date, known: datetime
+) -> None:
+    """A first listing for `security_id`, from `valid_from`, known at `known`."""
+    insert_row(
+        conn,
+        "listings",
+        {
+            "security_id": security_id,
+            "ticker": "SEED",
+            "exchange": "NYSE",
+            "class_title": "Common Stock",
+            "valid_from": valid_from,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+
+
+def _security_row(
+    conn: duckdb.DuckDBPyConnection,
+    security_id: str,
+    known: datetime,
+    *,
+    retracted: bool = False,
+) -> None:
+    """A `securities` row for `security_id`, known at `known`."""
+    insert_row(
+        conn,
+        "securities",
+        {
+            "security_id": security_id,
+            "cik": "0000000001",
+            "name": "Seed Co",
+            "benchmark": False,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "edgar",
+            "provenance": "filing",
+            "retracted": retracted,
+        },
+    )
+
+
+def _bar(conn: duckdb.DuckDBPyConnection, security_id: str, session: date, known: datetime) -> None:
+    """A traded bar for `security_id` on `session`, known at `known`."""
+    insert_row(
+        conn,
+        "prices_daily",
+        {
+            "security_id": security_id,
+            "session": session,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "volume": 1000,
+            "known_at": known,
+            "ingested_at": known,
+            "source": "alpaca",
+            "provenance": "bar",
+        },
+    )
+
+
+def test_a_pre_trading_seed_is_no_baseline(fixture_store: duckdb.DuckDBPyConnection) -> None:
+    # AMCR's shape: a 100-share seed dated before the class's first bar
+    # (2019-06-11) must not make the true 750,000,000 fact out of line.
+    _bar(fixture_store, SEED, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+    assert pick.fallbacks.is_empty()
+
+
+def test_several_pre_bar_seeds_are_all_skipped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # LIN's shape: two pre-bar seeds (25,000, ...) before the true count: every
+    # one the first post-bar fact exceeds by more than 100x is skipped, not
+    # just the first, so the true count anchors.
+    _bar(fixture_store, MULTI, date(2019, 1, 2), _known(date(2019, 1, 2)))
+    _fact(fixture_store, MULTI, date(2018, 3, 23), 25_000, _known(date(2018, 3, 26)))
+    _fact(fixture_store, MULTI, date(2018, 9, 30), 15_000, _known(date(2018, 10, 1)))
+    _fact(fixture_store, MULTI, date(2019, 1, 31), 551_054_569, _known(date(2019, 2, 1)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 2, 5)), [MULTI], _settings())
+    assert pick.shares[MULTI] == (date(2019, 1, 31), 551_054_569)
+    assert pick.fallbacks.is_empty()
+
+
+def test_four_pre_bar_seeds_are_all_skipped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # VTRS's shape: four pre-bar seeds before the true count.
+    _bar(fixture_store, MULTI, date(2021, 2, 2), _known(date(2021, 2, 2)))
+    for as_of, value in [
+        (date(2020, 11, 10), 100),
+        (date(2020, 12, 31), 150),
+        (date(2021, 1, 15), 250),
+        (date(2021, 1, 29), 400),
+    ]:
+        _fact(fixture_store, MULTI, as_of, value, _known(as_of))
+    _fact(fixture_store, MULTI, date(2021, 2, 22), 1_207_082_624, _known(date(2021, 2, 23)))
+    pick = shares_as_of(fixture_store, _known(date(2021, 3, 1)), [MULTI], _settings())
+    assert pick.shares[MULTI] == (date(2021, 2, 22), 1_207_082_624)
+    assert pick.fallbacks.is_empty()
+
+
+def test_a_seed_on_or_after_the_first_bar_still_anchors(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # One class whose first fact is on/after its first bar keeps today's
+    # behaviour (it anchors, the far fact is a fallback); one whose seed
+    # precedes its first bar is skipped. The guard against over-skipping.
+    _bar(fixture_store, KEPT, date(2019, 1, 2), _known(date(2019, 1, 2)))
+    _fact(fixture_store, KEPT, date(2019, 1, 15), 100, _known(date(2019, 1, 16)))
+    _fact(fixture_store, KEPT, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    _bar(fixture_store, SEED, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [KEPT, SEED], _settings())
+    assert pick.shares[KEPT] == (date(2019, 1, 15), 100)  # still the first fact
+    assert pick.fallbacks["security_id"].to_list() == [KEPT]
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+
+
+def test_a_normal_pre_bar_fact_stays_the_baseline(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # AAPL's shape on the store: the only listing known at t is the first
+    # cover-page row, dated late, and a normal fact predates the first bar.
+    # The over-broad rule (master dates) dropped such names at scale; only a
+    # fact more than `universe.max_shares_ratio` under the next one is a seed.
+    _seed_listing(fixture_store, NORMAL, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _bar(fixture_store, NORMAL, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _fact(fixture_store, NORMAL, date(2018, 12, 31), 5_000_000_000, _known(date(2019, 1, 2)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [NORMAL], _settings())
+    assert pick.shares[NORMAL] == (date(2018, 12, 31), 5_000_000_000)
+    assert pick.outliers.is_empty() and pick.fallbacks.is_empty()
+
+
+def test_a_bar_known_after_t_leaves_the_read_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The bar is known only from 2019-07-01: at T1 (before it) the seed is
+    # still the baseline and the true fact a fallback; at T2 (from it) the
+    # seed is skipped and the true fact anchors.
+    _bar(fixture_store, SEED, date(2019, 6, 11), _known(date(2019, 7, 1)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 29)))
+    before = shares_as_of(fixture_store, _known(date(2019, 6, 30)), [SEED], _settings())
+    assert before.shares[SEED] == (date(2018, 12, 31), 100)
+    assert before.fallbacks["as_of_date"].to_list() == [date(2019, 6, 28)]
+    after = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert after.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+    assert after.fallbacks.is_empty()
+
+
+def test_a_securities_row_known_after_t_does_not_move_the_read(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # The narrowed rule reads bars, not master dates: a `securities` row known
+    # only after t leaves the read at t unchanged.
+    _bar(fixture_store, SEED, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    _security_row(fixture_store, SEED, _known(date(2019, 8, 1)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+
+
+def test_a_retracted_securities_row_does_not_move_the_read(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    # A retracted `securities` row (#859) is a withdrawn key: the rule reads
+    # bars, so it changes nothing.
+    _seed_listing(fixture_store, SEED, date(2019, 1, 15), _known(date(2019, 1, 15)))
+    _security_row(fixture_store, SEED, _known(date(2019, 1, 10)), retracted=True)
+    _bar(fixture_store, SEED, date(2019, 6, 11), _known(date(2019, 6, 11)))
+    _fact(fixture_store, SEED, date(2018, 12, 31), 100, _known(date(2019, 1, 2)))
+    _fact(fixture_store, SEED, date(2019, 6, 28), 750_000_000, _known(date(2019, 6, 28)))
+    pick = shares_as_of(fixture_store, _known(date(2019, 7, 1)), [SEED], _settings())
+    assert pick.shares[SEED] == (date(2019, 6, 28), 750_000_000)
+
+
 # --- No look-ahead ------------------------------------------------------------
 
 
@@ -803,7 +1000,8 @@ def test_the_re_anchor_adds_no_frozen_universe_key(monkeypatch: pytest.MonkeyPat
     for name in list(os.environ):
         if name.upper().startswith("UNIVERSE__"):
             monkeypatch.delenv(name)
-    keys = [k for k in frozen_keys() if k.startswith("universe.")]
+    # `universe.rank_by` (T212) landed after this pin: the re-anchor adds none of its own.
+    keys = [k for k in frozen_keys() if k.startswith("universe.") and k != "universe.rank_by"]
     assert keys == list(UNIVERSE_FROZEN)
     params = frozen_params_of(
         Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]}),

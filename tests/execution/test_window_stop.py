@@ -16,7 +16,7 @@ import pytest
 
 from execution.test_run_core import registered_hypothesis
 from tradepartner.adapters.broker import OrderRequest, Side
-from tradepartner.adapters.fake_broker import Expire, FakeBroker
+from tradepartner.adapters.fake_broker import Expire, FakeBroker, SetPosition
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.execution import switch
 from tradepartner.execution import window as window_module
@@ -96,7 +96,11 @@ OVERRIDE_REASON = "the owner excludes this name for a known reason"
 @pytest.fixture
 def fake(fixed_clock: FixedClock) -> FakeBroker:
     return FakeBroker(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PA1"
+        assets=FakeBroker.active_assets("SPY"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
     )
 
 
@@ -806,6 +810,8 @@ def test_abandon_is_refused_while_an_own_order_is_open_at_the_broker(
     """The owner's decision on #542: `abandon` never leaves an own order
     working at the broker and never cancels one; it refuses, writing nothing."""
     run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    if side == "sell":
+        fake.apply_account(SetPosition("SPY", 1.0))
     _buy(journal_settings, fake, fixed_clock, run_id, f"tp-{side}", 1.0, fill=False, side=side)
     assert [o.client_order_id for o in fake.open_orders()] == [f"tp-{side}"]
 
@@ -1178,7 +1184,9 @@ def test_a_short_holding_the_broker_agrees_with_is_never_flat(
     journal_settings: Settings, fake: FakeBroker, window: PaperWindowRow, fixed_clock: FixedClock
 ) -> None:
     run_id = _run(journal_settings, window, DAY1 - timedelta(hours=1))
+    fake.apply_account(SetPosition("SPY", 1.0))
     _buy(journal_settings, fake, fixed_clock, run_id, "tp-s1", 1.0, side="sell")
+    fake.apply_account(SetPosition("SPY", -1.0))
     _outcome(journal_settings, "tp-s1", "realised_pnl")
     _requested(journal_settings, window, DAY1 - timedelta(minutes=50))
 
@@ -1634,7 +1642,11 @@ def b_window(journal_settings: Settings, window: PaperWindowRow) -> PaperWindowR
 @pytest.fixture
 def b_fake(fixed_clock: FixedClock) -> FakeBroker:
     return FakeBroker(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PB1"
+        assets=FakeBroker.active_assets("SPY"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PB1",
     )
 
 

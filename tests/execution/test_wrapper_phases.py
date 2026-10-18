@@ -66,7 +66,9 @@ CUT = session_close(PREV)  # close(S-1)
 T_I = date(2026, 9, 30)  # the batch's rebalance session
 A, B, C = "SEC_DUAL_A", "SEC_DUAL_B", "SEC_STATIC_PRE2019"
 GONE = "SEC_WINDOW_DELIST"  # its listing ended in 2019
-SYMBOLS = {A: "DUALA", B: "DUALB", C: "PRE9", GONE: "WNDX"}
+#: C's fixture ticker `PRE9` has a digit, so it has no broker form (#792, #1729);
+#: the `env` fixture re-tickers it to an equity-shaped `PREN` in its temp store.
+SYMBOLS = {A: "DUALA", B: "DUALB", C: "PREN", GONE: "WNDX"}
 PRICE = 100.0
 
 
@@ -88,6 +90,7 @@ class Env:
 
     def new_fake(self, **kwargs: Any) -> FakeBroker:
         """A non-filling fake on the clock, pricing by `prices`."""
+        kwargs.setdefault("assets", FakeBroker.active_assets(*SYMBOLS.values()))
         self.fake = FakeBroker(
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],
@@ -181,9 +184,16 @@ def alerter_conn(journal_settings: Settings) -> Iterator[duckdb.DuckDBPyConnecti
         conn.close()
 
 
+def _retick(settings: Settings) -> None:
+    """C's listing reads `SYMBOLS[C]` in the temp store (see `SYMBOLS`)."""
+    with open_for_write(settings) as conn:
+        conn.execute("UPDATE listings SET ticker = ? WHERE security_id = ?", [SYMBOLS[C], C])
+
+
 @pytest.fixture
 def env(journal_settings: Settings, open_window: PaperWindowRow, fixed_clock: FixedClock) -> Env:
     settings = _settings(journal_settings.store.path)
+    _retick(settings)
     for security_id in SYMBOLS:
         _bar(settings, security_id, PRICE)
     earlier = _run(settings, open_window, PREV, CUT - timedelta(hours=3))
@@ -351,6 +361,8 @@ def test_a_split_on_s_known_at_close_s_minus_1_halves_the_reference_price(
         2.0,
         CUT - timedelta(minutes=1) if known_by_cut else CUT + timedelta(minutes=1),
     )
+    if known_by_cut:
+        env.fake.apply_split("DUALA", 2.0)
     trim = _decision(env, A, "sell", notional=750.0)
 
     outcome = _execute(_gate(env, alerter_conn), env, [trim])
@@ -966,6 +978,23 @@ def test_a_name_unknown_to_the_master_is_refused_before_any_broker_call(
     with pytest.raises(ValueError, match="no listing known at close"):
         _execute(_gate(env, alerter_conn), env, [buy])
     assert env.fake.calls == ()
+
+
+def test_two_names_in_one_phase_sharing_a_broker_symbol_raise_before_any_call(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Safety review of #1729: two master spellings can meet in one broker
+    symbol (here B is re-tickered to `duala`, A's `DUALA` in broker form). The
+    phase refuses before its assets read, so neither name trades as the other."""
+    with open_for_write(env.settings) as conn:
+        conn.execute("UPDATE listings SET ticker = 'duala' WHERE security_id = ?", [B])
+    buys = [
+        _decision(env, A, "buy", notional=3000.0),
+        _decision(env, B, "buy", notional=3000.0),
+    ]
+    with pytest.raises(ValueError, match="share a broker symbol"):
+        _execute(_gate(env, alerter_conn), env, buys)
+    assert not [c for c in env.fake.calls if c.method in {"assets", "submit"}]
 
 
 # --- acknowledgement, rejections and the kill switch ---------------------------------------

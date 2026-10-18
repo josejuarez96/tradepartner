@@ -160,6 +160,7 @@ def ready_hypothesis(journal_settings: Settings, tmp_path: Path) -> registry.Hyp
 
 
 def _fake(clock: FixedClock, **kwargs: Any) -> FakeBroker:
+    kwargs.setdefault("assets", FakeBroker.active_assets("SPY", "MTUM", "SPLT", "SSP"))
     return FakeBroker(
         clock=clock,
         price_of=lambda _s: REFERENCE_PRICE,
