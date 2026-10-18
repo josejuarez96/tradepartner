@@ -1177,6 +1177,7 @@ def decisions_from(
         intents[sid] = intent
 
     minimum = frozen.min_order_notional
+    original = {sid: i.notional for sid, i in intents.items()}
     for sid, intent in list(intents.items()):
         whole = whole_share(sid, required=True)
         kind = _OVERRIDE if intent.full_exit_reason == _EXCLUDE_NAME else _TRADE
@@ -1208,7 +1209,12 @@ def decisions_from(
             and not whole
             and 0 < intent.notional < minimum
         )
-        if intent.notional == 0 or (intent.notional < minimum and not rounded_up):
+        if rounded_up:
+            # The order goes out at the minimum, so the decision plans the minimum
+            # (shakedown E.3 measures fills against `planned_notional`).
+            intents[sid] = replace(intent, notional=minimum)
+            intent = intents[sid]
+        if intent.notional == 0 or intent.notional < minimum:
             decided[sid] = Decision(
                 **base(sid),
                 decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
@@ -1230,7 +1236,7 @@ def decisions_from(
         decided[sid] = replace(decided[sid], target_notional=target)
 
     live_scale = settings.paper.live_capital_reference / equity
-    below = sum(1 for i in intents.values() if i.notional * live_scale < minimum)
+    below = sum(1 for sid, _ in intents.items() if original[sid] * live_scale < minimum)
     return Decisions(
         decisions=tuple(decided[sid] for sid in sorted(decided)),
         signals=signals,

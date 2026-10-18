@@ -750,7 +750,7 @@ def size_buys(
         for b in decisions
         if frozen.small_account.enabled
         and not b.by_whole_shares
-        and 0 < b.remainder.notional < minimum
+        and 0 < b.remainder.notional <= minimum
     }
 
     def whole_shares(buy: BuyToSize, scale: Decimal) -> float:
@@ -832,7 +832,7 @@ def size_buys(
     # overshoot above a cent is not rounding, and raises.
     over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
     # Rounded buys the cash cannot pay are left whole: `check_phase` refuses the batch.
-    if over > 0 and fixed_need <= cash_d:
+    if over > 0 and not (rounded and fixed_need > cash_d):
         cuttable = [k for k in notionals if k not in rounded]
         if not cuttable:
             raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")

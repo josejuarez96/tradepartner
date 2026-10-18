@@ -50,6 +50,7 @@ from pydantic import (
     PrivateAttr,
     SecretStr,
     SerializerFunctionWrapHandler,
+    StrictBool,
     ValidationError,
     field_validator,
     model_serializer,
@@ -1874,7 +1875,7 @@ class SmallAccountConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
 
-    enabled: bool = False
+    enabled: StrictBool = False
 
 
 class RiskConfig(BaseModel):

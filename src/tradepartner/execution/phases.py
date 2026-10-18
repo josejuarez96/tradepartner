@@ -552,7 +552,11 @@ def buy_orders(
             )
         )
     left = Decimal(repr(float(cash))) - spent
-    if left < 0 and frozen.small_account.enabled:
+    if (
+        left < 0
+        and frozen.small_account.enabled
+        and any(o.notional is not None and o.notional <= frozen.min_order_notional for o in orders)
+    ):
         # A rounded-up buy the cash cannot pay: `risk.check_phase` refuses the batch
         # (`buys_within_cash`) before any submit, so nothing is clamped silently.
         left = Decimal(0)
