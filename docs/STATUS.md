@@ -16,7 +16,8 @@ Phase 1 backtest closed: T45b real-store H1 run (in-sample 2020-08-31..2023-12-2
 - health --check fails on a session hole: an XNYS session in the universe.min_history_months window whose prices_daily rows are below health.min_session_rows_share of the previous session's (#1575, #1550 part c)
 
 ## Teams
-Orchestrator session 2351048c (main checkout, team atlas); window tradepartner-c4. No live build teams. Atlas holds T22 #1264. Handovers: issue #836.
+- Orchestrator session 2351048c (main checkout, team atlas); window tradepartner-c4. Handovers: issue #836.
+- No live build teams. Atlas holds T22 #1264.
 
 ## In progress
 - Merged 2026-10-12: #1548 #1531 #1569 #1567 #1578 #1557 #1579, and earlier the same day #1564 #1565 #1558 #1570 #1571 #1573. The store is still at schema 23; the main checkout's next store write migrates it to 24 (T171's `borrow_status` table).
@@ -27,10 +28,18 @@ Orchestrator session 2351048c (main checkout, team atlas); window tradepartner-c
 - T22 (#1264): scheduled-ingest evidence (five consecutive scheduled `ok` runs).
 
 ## Ready frontier snapshot
-Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready). Agent: T169d (rates ingest), T170b (risk-free keys), T171b, T171c, T171e (borrow status), T174c (Jev-only `arms` key), T145 (vendor and budget ADR), T150 (after T144's verdict and T145), T164e (its real-store run waits for the restamp release). Owner: T116c, T141, T144, T75b, T71, T159, T125, T114 (box unticked; the sweep ran), T166c, T181. Unclaimed issues: see `team.py status`.
+Claim through `team.py claim`; read each task line for gates (board-ready is not plan-ready).
+- Agent: T169d (rates ingest), T170b (risk-free keys), T171b, T171c, T171e (borrow status), T174c (Jev-only `arms` key), T145 (vendor and budget ADR), T150 (after T144's verdict and T145), T164e (its real-store run waits for the restamp release).
+- Owner: T116c, T141, T144, T75b, T71, T159, T125, T114 (box unticked; the sweep ran), T166c, T181.
+- Unclaimed issues: see `team.py status`.
 
 ## Blocked
-T165e, T23 (T22's evidence), T146-T149b (after T144's verdict and T145), T169e and T170c-T170d (the rates/risk-free chain), T171d (owner, after T171b/c/e), T172b-T172e (after T172b), T160-T163c (the Daily book and the shakedown span), T71b, T126 (#1351's seeded-recall gate, the owner's call), T181 (after T166c's release).
+- T23 (T22's evidence); T165e; T71b.
+- T146-T149b (after T144's verdict and T145).
+- T169e, T170c-T170d (the rates/risk-free chain).
+- T171d (owner, after T171b/c/e); T172b-T172e (after T172b).
+- T160-T163c (the Daily book and the shakedown span).
+- T126 (#1351's seeded-recall gate, the owner's call); T181 (after T166c's release).
 
 ## Decisions needed from owner
 - Merge when ready (class B): this fold.

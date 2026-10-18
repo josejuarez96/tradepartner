@@ -7,24 +7,27 @@ model: sonnet
 You implement one task from an approved TradePartner plan.
 
 ## Before coding
-1. Read `CLAUDE.md` and `docs/STATUS.md`. Then read **only** the lines the orchestrator's `claim` printed for your task (its plan line and its dependencies' lines; `uv run python scripts/team.py show <Tn>` reprints them). Read the plan file's introduction above its task list (the invariants every task in that plan obeys, such as the order-path rules in the paper-trading plan) and nothing below it: the task line is the spec-lite, and the dependency lines are the written contract for what you build on (#352); a finished dependency's line is collapsed to its paths (#353), so its contract is the code in those Files paths.
-1b. From the spec, read the Definitions section, the numbered requirements your task line cites (`req 5`, `#247 Q4`), and the acceptance-criteria block whose heading matches. Read the whole spec only when the task line cites no requirement.
-2. Confirm the task is Ready: its dependencies are merged (ticked on `origin/main`), and its files and tests are named. If it isn't Ready, stop and report why.
-2b. The orchestrator tells you your team name. Confirm the task's issue carries that `team:<name>` label (`gh issue view <n>`). You never claim or release; the orchestrator does. Unclaimed or held by another team: stop and report.
-3. `git fetch origin && git switch -c <prefix>/<issue#>-<slug> origin/main` (works in a worktree, where `main` may be checked out elsewhere).
+1. Read `CLAUDE.md` and `docs/STATUS.md`. Then read **only** your task's lines as `claim` printed them (its plan line and its dependencies' lines; `uv run python scripts/team.py show <Tn>` reprints them), plus the plan's introduction above its task list (the invariants every task obeys). The task line is the spec-lite; dependency lines are the contract you build on (#352). A finished dependency's line is collapsed to its paths (#353), so its contract is the code in those Files.
+2. From the spec read the Definitions, the requirements your line cites (`req 5`, `#247 Q4`) and the matching acceptance-criteria block. Read the whole spec only when the line cites no requirement.
+3. Confirm the task is Ready: dependencies merged (ticked on `origin/main`), files and tests named. If not, stop and report why.
+4. Confirm the issue carries your `team:<name>` label (`gh issue view <n>`); the orchestrator tells you the name. You never claim or release. Unclaimed or held by another team: stop and report.
+5. `git fetch origin && git switch -c <prefix>/<issue#>-<slug> origin/main`.
 
 ## While coding
-- Tests first: write a failing test for each acceptance criterion, then make it pass.
-- Touch only the files the task names. If you need to go beyond them, stop and report.
-- Anything else you notice that is a real defect or an owner decision: open a GitHub issue with `gh issue create` and keep going. Don't fix it now. Refactors, ideas and nits are dropped (agents.md, "Review passes", rule 6).
-- Commit small, green steps as Conventional Commits, with the Co-Authored-By trailer.
-- Run `uv run ruff check . && uv run ruff format . && uv run mypy && uv run pytest` before every push.
+- Tests first: a failing test per acceptance criterion, then make it pass.
+- Touch only the files the task names. Needing more: stop and report.
+- A real defect or owner decision you notice: `gh issue create` and keep going; don't fix it now. Refactors, ideas and nits are dropped ([rule 6](../../docs/ways-of-working/agents.md#review-passes)).
+- Small green commits, Conventional Commits, with the Co-Authored-By trailer.
+- Before every push: `uv run ruff check . && uv run ruff format . && uv run mypy && uv run pytest` (targeted test files; CI runs the suite).
 
 ## Finish
-1. Push the branch and open a **draft** PR with `gh pr create --draft`, filling in the PR template completely, including real command output under "How it was verified".
-2. Tick the task's checkbox in the plan file, in the same PR. Leave the rest of the line as it is until step 3 is done.
-3. Specialist reviews: spawn each reviewer the task line's `Review:` field (as `uv run python scripts/team.py show <Tn>` prints it from `origin/main`) or the touched paths require with the PR number. Each returns a short summary and posts its full report as the verdict comment on the PR itself (`<agent>: PASS` first line); when it reports that it could not post, post the file it wrote with `gh pr comment <n> --body-file <path>`. Address every BLOCKER and SHOULD FIX finding in one commit, then run the reviewer **once more as a verification pass**: give it its pass-1 comment, which names the head commit it reviewed, and ask it to verify the fixes over `git diff <that head>..HEAD` scoped to the PR's own files; commits a merge of `main` brought in are skipped (agents.md, "Review passes", rule 2 gives the command, #489). Two passes per reviewer is the limit unless the verification pass ends `FAIL`. Sort follow-ups by the follow-up rule (agents.md, "Review passes", rule 6, #1123): a pass-1 finding that takes under about 15 minutes goes in the pass-1 fix commit; anything the verification pass lists under "Follow-ups" is dropped if a nit, or filed only if a real defect or an owner decision, as one `size:S` issue at most, linked on the PR. Never ask for a third pass over follow-ups. If you cannot spawn a reviewer, stop and report that; never write a verdict line yourself. Once every verdict is in, collapse your plan line to the finished shape (#353): `- [x] **Tn: Title** (#issue, PR #n) · Files: <the Files paths, nothing else> · Depends on: <unchanged>`. Tests, review and prose live in the PR and git history.
-4. Final message, at most fifteen lines: the PR URL, what was done, what was deferred (with issue links), each reviewer's verdict line, and any open question for the owner. Never paste a reviewer's report; it is on the PR.
+1. Push and open a **draft** PR (`gh pr create --draft`), with the PR template complete and real command output under "How it was verified".
+2. Tick your plan checkbox in the same PR; leave the rest of the line until step 6.
+3. **Reviews, pass 1.** Spawn every reviewer your line's `Review:` names (as `team.py show <Tn>` prints it from `origin/main`) and every one `ready_pr.py` requires for your paths (`QUANT_PREFIXES`, `SAFETY_PREFIXES`), with the PR number. Each posts its report as the PR verdict comment (`<agent>: PASS` first line) and returns a summary. If one could not post, post its file with `gh pr comment <n> --body-file <path>`. If you cannot spawn a reviewer, stop and report; never write a verdict line yourself.
+4. **Fix.** Address every BLOCKER and SHOULD FIX in one commit. A pass-1 follow-up that takes under ~15 minutes goes in that commit too.
+5. **Verify.** Run each reviewer once more as a verification pass: give it its pass-1 comment (which names the head it reviewed) and ask it to check the fixes over `git diff <that head>..HEAD` on the PR's own files, skipping commits a merge of `main` brought in ([Review passes](../../docs/ways-of-working/agents.md#review-passes) rule 2, #489). Two passes per reviewer unless the second ends `FAIL`. Follow-ups the verification pass lists: drop nits; file a real defect or owner decision as at most one `size:S` issue, linked on the PR (rule 6, #1123). Never ask for a third pass over follow-ups.
+6. Once every verdict is in, collapse your plan line (#353): `- [x] **Tn: Title** (#issue, PR #n) · Files: <the Files paths> · Depends on: <unchanged>`.
+7. Final message, at most fifteen lines: the PR URL, what was done, what was deferred (issue links), each reviewer's verdict line, any open question for the owner. Never paste a reviewer's report.
 
 ## Never
 Push to `main`, merge, force-push, use `--no-verify`, read `.env`, add dependencies the plan doesn't list, or change tests just to make them pass without saying so in the PR.

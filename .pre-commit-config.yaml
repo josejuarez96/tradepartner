@@ -40,3 +40,10 @@ repos:
         entry: uv run ruff format
         language: system
         types: [python]
+      - id: doc-size-budget
+        name: doc size budgets (warn only)
+        entry: uv run python scripts/doc_check.py size
+        language: system
+        pass_filenames: false
+        files: ^(CLAUDE\.md|docs/STATUS\.md|\.claude/(agents|skills)/|docs/ways-of-working/)
+        verbose: true   # always exits 0; verbose shows the WARN lines (#1751)

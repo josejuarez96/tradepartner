@@ -428,8 +428,9 @@ def test_owner_gates_reports_an_owner_task_off_the_critical_path(
 
 
 def test_task_sort_key_orders_task_ids_numerically_not_lexically() -> None:
-    ids = ["T10", "T2", "T1", "T9b", "T9a"]
-    assert sorted(ids, key=team.task_sort_key) == ["T1", "T2", "T9a", "T9b", "T10"]
+    ids = ["T10", "T2", "T1", "T9b", "T9a"]  # doc-check: ignore
+    expected = ["T1", "T2", "T9a", "T9b", "T10"]  # doc-check: ignore
+    assert sorted(ids, key=team.task_sort_key) == expected
 
 
 def test_depth_levels_sorts_same_depth_ids_numerically() -> None:
