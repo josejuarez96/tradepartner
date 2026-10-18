@@ -1311,6 +1311,40 @@ def test_a_split_and_a_bar_still_move_the_trial_vintage(
             assert vintage == _LATE_INGEST, cutoff
 
 
+def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821: a `successor_chains` row is inside the trial vintage, so a trial
+    with a cutoff at or after its `known_at` reads stale and an earlier one
+    stays current (plan T187; the amendment's "A held position" paragraph)."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    assert "successor_chains" in _tables(fixture_store)
+    insert_row(
+        fixture_store,
+        "successor_chains",
+        {
+            "predecessor_id": "0001000010",
+            "successor_id": "0001000011",
+            "evidence_accession": "0001000011-24-000001",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
 def test_open_trial_records_the_data_vintage_at_its_cutoff(
     conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
 ) -> None:

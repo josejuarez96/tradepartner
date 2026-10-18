@@ -284,6 +284,7 @@ from tradepartner.store.delistings import (
 from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import (
     HELD_PREDECESSOR,
+    UNJUDGED,
     Chain,
     ChainRefusal,
     MasterBuild,
@@ -1232,8 +1233,9 @@ def _ingest_filings(
     else:
         skipped = frozenset()
     rebuilt = ""
+    unjudged_ciks = _unjudged_ciks(recorded).ciks
     if rebuild_classifications:
-        deleted = _delete_classifications(conn, master, skipped, _unjudged_ciks(recorded).ciks)
+        deleted = _delete_classifications(conn, master, skipped, unjudged_ciks)
         rebuilt = f"; classifications_deleted: {deleted}"
     added = 0
     for table, rows in (
@@ -1249,8 +1251,8 @@ def _ingest_filings(
         added += _add_rows(conn, table, kept, ingested_at=now, current=False)
     chains = ""
     if settings.master.chains:
-        chain_tally = _write_chains(conn, master, now)
-        added += chain_tally.written
+        chain_tally = _write_chains(conn, master, now, unjudged=unjudged_ciks, skipped=skipped)
+        added += chain_tally.inserted
         chains = chain_tally.message()
     statements = ""
     if settings.edgar.statement_facts_enabled:
@@ -1399,10 +1401,12 @@ def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[
 @dataclass(frozen=True)
 class _ChainTally:
     """What `_write_chains` did: live rows written, live rows moved (retracted
-    and rewritten at a new stamp), and every refusal with its reason."""
+    and rewritten at a new stamp), rows inserted, and every refusal with its
+    reason."""
 
     written: int
     moved: int
+    inserted: int
     refusals: tuple[ChainRefusal, ...]
 
     def message(self) -> str:
@@ -1425,45 +1429,74 @@ def _chain_same(stored: Mapping[str, Any], chain: Chain) -> bool:
     )
 
 
+#: The live rows for a successor: not retracted, and not a stamp a retraction
+#: names. A retraction is a `retracted` row at the run's clock whose
+#: `withdrawn_known_at` names the revision it withdraws, so a reader can tell
+#: which stamp moved (`schema.successor_chains`).
+_LIVE_CHAINS_SQL = """
+    SELECT * FROM successor_chains
+    WHERE successor_id = ? AND NOT retracted AND known_at < ?
+      AND known_at NOT IN (
+          SELECT withdrawn_known_at FROM successor_chains
+          WHERE successor_id = ? AND retracted
+      )
+    ORDER BY known_at
+"""
+
+
 def _write_chains(
-    conn: duckdb.DuckDBPyConnection, master: MasterBuild, now: datetime
+    conn: duckdb.DuckDBPyConnection,
+    master: MasterBuild,
+    now: datetime,
+    *,
+    unjudged: frozenset[str] = frozenset(),
+    skipped: frozenset[str] = frozenset(),
 ) -> _ChainTally:
     """Write the `successor_chains` rows `master` derives (#821).
 
-    An entry whose predecessor an open paper window holds is refused `held`
-    and writes nothing. A successor with no live row gets one. A successor
-    whose stored live row's stamp no longer matches its evidence has that row
-    retracted at `now` (the run's clock, #859) and the newly derived one
-    written in the same run, counted under `chains_moved`; an unchanged re-run
-    writes nothing."""
+    An entry whose predecessor an open paper window holds is refused `held`,
+    and one whose predecessor or successor CIK this run did not judge
+    (`unjudged`), or whose security it skipped as restamp-refused (`skipped`),
+    is refused `unjudged` -- a transient fetch failure must not move a chain.
+    Both write nothing. A successor with no live row gets one. A successor
+    whose live row's stamp no longer matches its evidence has that row
+    retracted at `now` (the run's clock, #859) with `withdrawn_known_at` naming
+    it, and the newly derived row written in the same run, counted under
+    `chains_moved`; an unchanged re-run writes nothing."""
     held = _held_ids(conn, [chain.predecessor_id for chain in master.chains])
     refusals: list[ChainRefusal] = list(master.chain_refusals)
     written = 0
     moved = 0
+    inserted = 0
     for chain in master.chains:
-        if chain.predecessor_id in held:
-            refusals.append(
-                ChainRefusal(chain.predecessor_id, chain.successor_id, HELD_PREDECESSOR)
-            )
+        if (
+            chain.predecessor_id in held
+            or chain.predecessor_id in skipped
+            or chain.successor_id in skipped
+            or chain.predecessor_id[:10] in unjudged
+            or chain.successor_id[:10] in unjudged
+        ):
+            reason = HELD_PREDECESSOR if chain.predecessor_id in held else UNJUDGED
+            refusals.append(ChainRefusal(chain.predecessor_id, chain.successor_id, reason))
             continue
-        cursor = conn.execute(
-            "SELECT * FROM successor_chains WHERE successor_id = ? AND NOT retracted "
-            "AND known_at < ? ORDER BY known_at",
-            [chain.successor_id, now],
-        )
+        cursor = conn.execute(_LIVE_CHAINS_SQL, [chain.successor_id, now, chain.successor_id])
         names = [column[0] for column in cursor.description]
         stored = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
         row = chain.row()
         if stored and _chain_same(stored[-1], chain):
             continue
         for previous in stored:
-            insert_row(conn, "successor_chains", retraction(previous, now))
+            withdrawn = retraction(previous, now)
+            withdrawn["withdrawn_known_at"] = previous["known_at"]
+            insert_row(conn, "successor_chains", withdrawn)
+            inserted += 1
         if stored:
             moved += 1
         else:
             written += 1
         insert_row(conn, "successor_chains", row)
-    return _ChainTally(written, moved, tuple(refusals))
+        inserted += 1
+    return _ChainTally(written, moved, inserted, tuple(refusals))
 
 
 def _delete_classifications(

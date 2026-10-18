@@ -94,7 +94,7 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import build_classifications, classifications_as_of
 from tradepartner.store.db import insert_row, open_for_write
-from tradepartner.store.master import build_master
+from tradepartner.store.master import build_chains, build_master
 from tradepartner.store.schema import init_schema
 
 
@@ -5464,7 +5464,12 @@ def _chain_parse(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def _chain_filings(case: dict[str, Any], *, cover_shift: timedelta = timedelta(0)):
+def _chain_filings(
+    case: dict[str, Any],
+    *,
+    cover_shift: timedelta = timedelta(0),
+    successor_ticker: str | None = None,
+):
     """`_filings()` plus the fixture's `chain_1to1` pair: each CIK's issuer
     filings, its cover page listing the pair's ticker and exchange, and the
     successor's 8-K12B. `cover_shift` moves the successor's listing row (to
@@ -5516,7 +5521,7 @@ def _chain_filings(case: dict[str, Any], *, cover_shift: timedelta = timedelta(0
                 successor["cik"],
                 f"{successor['cik']}-20-000002",
                 successor_cover,
-                (CoverListing("Common Stock", ticker, "NYSE"),),
+                (CoverListing("Common Stock", successor_ticker or ticker, "NYSE"),),
             ),
         ],
     )
@@ -5568,23 +5573,133 @@ def test_a_moved_chain_is_retracted_and_rewritten_in_one_run(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
     """#821: a listing row restamped later moves the row's `known_at`; the run
-    retracts the live row at its clock and writes the new one, counting
-    `chains_moved`."""
+    retracts the live row at its clock (`withdrawn_known_at` names it) and
+    writes the new one, counting `chains_moved`. The withdrawn stamp is no
+    longer live, and the chain is live only from the new stamp."""
     chained = _chained_settings(settings, _CHAIN_CASE)
     _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
-    moved_known = _chain_parse(_CHAIN_CASE["expected_known_at"]) + timedelta(days=30)
+    old_known = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    moved_known = old_known + timedelta(days=30)
+    clock = _chain_now() + timedelta(days=60)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
+        now=clock,
+    )
+    assert read("SELECT known_at, withdrawn_known_at FROM successor_chains WHERE retracted") == [
+        (clock, old_known)
+    ]
+    live = [
+        row[0]
+        for row in read(
+            "SELECT known_at FROM successor_chains WHERE NOT retracted AND known_at NOT IN "
+            "(SELECT withdrawn_known_at FROM successor_chains WHERE retracted)"
+        )
+    ]
+    assert live == [moved_known]
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any("chains_moved: 1" in m for m in messages)
+
+
+def test_two_moves_and_an_unchanged_third_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: a second move retracts the current live stamp (never two rows at
+    the same clock, which `UNIQUE (successor_id, known_at)` refuses); an
+    unchanged third run writes nothing and does not raise."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    first = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    second = first + timedelta(days=30)
+    third = first + timedelta(days=60)
     _run(
         chained,
         filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
         now=_chain_now() + timedelta(days=60),
     )
-    assert read("SELECT known_at FROM successor_chains WHERE retracted") == [
-        (_chain_now() + timedelta(days=60),)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=60)),
+        now=_chain_now() + timedelta(days=120),
+    )
+    assert read("SELECT withdrawn_known_at FROM successor_chains WHERE retracted ORDER BY 1") == [
+        (first,),
+        (second,),
     ]
-    derived = {row[0] for row in read("SELECT known_at FROM successor_chains WHERE NOT retracted")}
-    assert derived == {_chain_parse(_CHAIN_CASE["expected_known_at"]), moved_known}
+    live = [
+        row[0]
+        for row in read(
+            "SELECT known_at FROM successor_chains WHERE NOT retracted AND known_at NOT IN "
+            "(SELECT withdrawn_known_at FROM successor_chains WHERE retracted)"
+        )
+    ]
+    assert live == [third]
+    before = read("SELECT count(*) FROM successor_chains")[0][0]
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=60)),
+        now=_chain_now() + timedelta(days=180),
+    )
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == before
+
+
+def test_a_held_predecessor_is_refused_then_written_after_the_window_closes(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: an open paper window holding the predecessor names `held` on the
+    run row and writes nothing; the first run after the window closes writes
+    the row."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    with duckdb.connect(chained.store.path) as conn:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, 'v', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, ?, 1.0, NULL, NULL, "
+            "TIMESTAMPTZ '2025-12-02 14:00:00+00', TIMESTAMPTZ '2025-12-02 14:00:00+00')",
+            [predecessor],
+        )
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 0
     messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
-    assert any("chains_moved: 1" in m for m in messages)
+    assert any(f"{_CHAIN_CASE['successor']['cik']}=held" in m for m in messages)
+    with duckdb.connect(chained.store.path) as conn:
+        init_schema(conn)
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', 'closed', NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
+        )
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now() + timedelta(days=1))
+    assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
+
+
+def test_a_missing_listing_row_is_refused_and_written_on_the_next_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: an entry whose successor has no listing row under the
+    predecessor's ticker names `no_listing` on the run row and writes nothing;
+    the next run, with the row known, writes it."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, successor_ticker="CHNZ"),
+        now=_chain_now(),
+    )
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 0
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any(f"{_CHAIN_CASE['successor']['cik']}=no_listing" in m for m in messages)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now() + timedelta(days=1))
+    assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
 
 
 def test_held_ids_reads_open_windows_only() -> None:
@@ -5615,5 +5730,39 @@ def test_held_ids_reads_open_windows_only() -> None:
             "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
         )
         assert ingest_module._held_ids(conn, ["HELD"]) == frozenset()
+    finally:
+        conn.close()
+
+
+def test_an_unjudged_entry_is_refused_and_writes_nothing() -> None:
+    """#821: an entry whose CIK this run did not judge is refused `unjudged`,
+    so a transient fetch failure never moves a chain."""
+    import duckdb as _duckdb
+
+    from tradepartner.config import Settings as _Settings
+
+    source = _chain_filings(_CHAIN_CASE)
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    settings = _Settings(
+        _env_file=None,
+        master={
+            "chains": [
+                f"{predecessor}->{_CHAIN_CASE['successor']['cik']}"
+                f"@{_CHAIN_CASE['evidence']['accession']}"
+            ]
+        },
+    )
+    built = build_master(source, settings, ingested_at=_chain_now())
+    chains = build_chains(source, settings, built, {}, ingested_at=_chain_now())
+    master = replace(built, chains=chains.chains, chain_refusals=chains.refusals)
+    conn = _duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        tally = ingest_module._write_chains(
+            conn, master, _chain_now(), unjudged=frozenset({predecessor})
+        )
+        assert tally.written == 0
+        assert tally.refusals[-1].reason == "unjudged"
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
     finally:
         conn.close()

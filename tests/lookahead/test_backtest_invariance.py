@@ -752,7 +752,7 @@ def test_a_shares_fact_accepted_after_close_t_i_reaches_only_plans_after_t_i(
 #: The session template's fact-table fingerprint, pinned so a case's revisions (which
 #: land only on its own copy) can never reach the template another case starts from.
 #: Recompute with `harness.template_fingerprint` after any fixture-universe change.
-TEMPLATE_FINGERPRINT = "5c98ec91bdba426eb6a349116f25ac85a3308d800ffb51d35cb9dc6f728c56ef"
+TEMPLATE_FINGERPRINT = "8b35c5ea2d1b892ea90599f314415b85d5286e9b64e859660ea103b95290f77d"
 
 
 def _bar_revisions(conn: duckdb.DuckDBPyConnection, sid: str, session: date) -> int:

@@ -259,6 +259,7 @@ NO_SECURITY = "no_security"
 NO_LISTING = "no_listing"
 SPAC_PREDECESSOR = "spac"
 HELD_PREDECESSOR = "held"
+UNJUDGED = "unjudged"
 
 
 @dataclass(frozen=True)
@@ -283,14 +284,15 @@ class Chain:
             "evidence_accession": self.evidence_accession,
             "evidence_form": self.evidence_form,
             "retracted": False,
+            "withdrawn_known_at": None,
         } | _row(self.known_at, self.ingested_at, _EDGAR, "filing")
 
 
 @dataclass(frozen=True)
 class ChainRefusal:
     """A `master.chains` entry that derives no row (#821): `reason` is one of
-    `NO_EVIDENCE`, `NO_SECURITY`, `NO_LISTING`, `SPAC_PREDECESSOR` or
-    `HELD_PREDECESSOR`, named with the ids on the run row."""
+    `NO_EVIDENCE`, `NO_SECURITY`, `NO_LISTING`, `SPAC_PREDECESSOR`,
+    `HELD_PREDECESSOR` or `UNJUDGED`, named with the ids on the run row."""
 
     predecessor_id: str
     successor_id: str
@@ -1099,8 +1101,10 @@ def build_chains(
     run: the accession is in the filing index under the successor's CIK with
     form `8-K12B`, `8-K12B/A`, `8-K12G3` or `8-K12G3/A`; the successor has a
     `securities` row; and the successor's earliest-known listing row names the
-    predecessor's last listing row's ticker and exchange. `known_at` is the
-    latest of those four stamps, never the config's edit or the run's clock,
+    predecessor's last listing row's ticker and exchange (the earliest *known*
+    such row, not necessarily the successor's first listing row: the code
+    matches the earliest row carrying that ticker and exchange). `known_at` is
+    the latest of those four stamps, never the config's edit or the run's clock,
     so a read before it sees two securities. An entry whose predecessor is
     classified `spac` (`security_types`, the latest classification per id)
     derives no row either, and each refusal is returned with its reason.
