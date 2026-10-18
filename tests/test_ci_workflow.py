@@ -22,10 +22,13 @@ def _concurrency_block() -> dict[str, str]:
 
 
 TRAIN = "startsWith(github.ref, 'refs/heads/train/')"
+NOISE = "(github.event.action == 'labeled' && github.event.label.name != 'ci:full')"
 MAIN_SHARED = (
-    "ci-${{ github.ref == 'refs/heads/main' && 'main' || ("
+    "ci-${{ "
+    + NOISE
+    + " && format('noise-{0}', github.run_id) || (github.ref == 'refs/heads/main' && 'main' || ("
     + TRAIN
-    + " && github.sha || github.ref) }}"
+    + " && github.sha || github.ref)) }}"
 )
 
 
@@ -38,14 +41,22 @@ def test_main_runs_in_progress_are_never_cancelled() -> None:
     block = _concurrency_block()
     assert block["group"] == MAIN_SHARED, block
     assert block["cancel-in-progress"] == (
-        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " }}"
+        "${{ github.ref != 'refs/heads/main' && !" + TRAIN + " && !" + NOISE + " }}"
     ), block
+
+
+def test_a_label_event_other_than_ci_full_has_its_own_group_and_never_cancels() -> None:
+    """#1753: a non-`ci:full` label starts a run of skipped jobs; it must sit in a group
+    of its own (its run id) and not cancel, so it can never cancel the head's real run."""
+    block = _concurrency_block()
+    assert "format('noise-{0}', github.run_id)" in block["group"], block
+    assert "!" + NOISE in block["cancel-in-progress"], block
 
 
 def test_pr_branches_still_cancel_superseded_runs() -> None:
     """Off main the group falls back to the ref, and a new push cancels the old run."""
     block = _concurrency_block()
-    assert "|| github.ref) }}" in block["group"], block
+    assert "|| github.ref)) }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
 
 
@@ -94,7 +105,7 @@ def test_checks_is_a_thin_aggregator_over_fast_and_shards() -> None:
     assert "\n  checks:\n" in text
     checks = text[text.index("\n  checks:\n") :].split("\n  claims:\n", 1)[0]
     lines = [ln.strip() for ln in checks.splitlines()]
-    assert "needs: [checks-fast, pytest-shard]" in lines, lines
+    assert "needs: [scope, checks-fast, pytest-shard]" in lines, lines
     assert "if: always()" in checks
 
 
@@ -107,7 +118,7 @@ DRAFT = (
     "github.event.pull_request.draft == true && "
     "!contains(github.event.pull_request.labels.*.name, 'ci:full')"
 )
-DRAFT_NEEDING_TESTS = DRAFT + " && needs.checks-fast.outputs.tests-needed != 'no'"
+DRAFT_NEEDING_TESTS = DRAFT + " && needs.scope.outputs.tests-needed != 'no'"
 
 
 def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> None:
@@ -115,10 +126,15 @@ def test_a_draft_pr_runs_no_shard_and_never_reports_the_required_checks() -> Non
     report under a name other than the required `checks`, so such a run can never satisfy
     it; every other run (non-draft or labelled PR, push) reports `checks` as before."""
     shard = _job("pytest-shard", "checks")
-    assert f"if: needs.checks-fast.outputs.tests-needed != 'no' && !({DRAFT})" in shard
+    assert f"if: needs.scope.outputs.tests-needed != 'no' && !({DRAFT})" in shard
+    assert "needs: scope" in shard  # #1753: shards do not wait for checks-fast
     checks = _job("checks", "claims")
     assert (
-        "name: ${{ (" + DRAFT_NEEDING_TESTS + ") && 'checks (draft, no shards)' || 'checks' }}"
+        "name: ${{ "
+        + NOISE
+        + " && 'checks (label event, no run)' || (("
+        + DRAFT_NEEDING_TESTS
+        + ") && 'checks (draft, no shards)' || 'checks') }}"
     ) in checks
     # the step's draft branch tests the same condition, so the name and the exit agree
     assert 'if [ "${{ ' + DRAFT_NEEDING_TESTS + ' }}" = "true" ]; then' in checks
@@ -130,14 +146,14 @@ def test_a_label_starts_the_full_run_and_ready_for_review_starts_none() -> None:
     run of the same head."""
     text = CI.read_text()
     on = text[text.index("\non:\n") : text.index("\nconcurrency:\n")]
-    assert "    types: [opened, synchronize, reopened, labeled]\n" in on
+    assert "    types: [opened, synchronize, reopened, labeled]\n" in on  # no `unlabeled` (#1753)
     assert "ready_for_review]" not in on and "workflow_dispatch:" not in on
 
 
 def test_only_a_push_to_main_may_skip_the_shards_on_a_tested_tree() -> None:
     """#1192: main skips the shards only on the exact word `skip`; a failed lookup reads as
     `run`. The lookup sits in the push-to-main branch alone, not on PRs or `train/**`."""
-    fast = _job("checks-fast", "pytest-shard")
+    fast = _job("scope", "checks-fast")
     assert (
         'elif [ "${{ github.event_name }}" = "push" ] && '
         '[ "${{ github.ref }}" = "refs/heads/main" ]; then\n'
@@ -174,7 +190,7 @@ def test_pytest_shard_skips_with_checks_fast_when_no_tests_needed() -> None:
     """A docs-only PR must skip every shard too, not just the fast job's own Tests step."""
     text = CI.read_text()
     shard = text[text.index("\n  pytest-shard:\n") : text.index("\n  checks:\n")]
-    assert "if: needs.checks-fast.outputs.tests-needed != 'no'" in shard
+    assert "if: needs.scope.outputs.tests-needed != 'no'" in shard
 
 
 def test_uv_cache_is_keyed_on_the_lock_and_only_main_saves_it() -> None:

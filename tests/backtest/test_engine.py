@@ -42,9 +42,9 @@ GROWTH = {"A": 0.004, "B": 0.003, "C": 0.001, "D": -0.001}
 C_JUMP = date(2024, 1, 10)
 
 
-def _handle() -> registry.TrialHandle:
+def _handle(trial_id: int = 1) -> registry.TrialHandle:
     return registry._issue_handle(
-        trial_id=1,
+        trial_id=trial_id,
         hypothesis_id=1,
         family="momentum",
         params_sha256="0" * 64,
@@ -142,6 +142,87 @@ class TestReads:
         # The signal frame also includes dividends by default; one marking read per step.
         steps = len(rebalance_sessions(T0, T3)) - 1
         assert len(marking) >= steps
+
+
+def _rate_frame(series: str, value: float = 5.0) -> pl.DataFrame:
+    rows = [(series, s, value, s, session_close(s)) for s in SESSIONS]
+    return pl.DataFrame(
+        rows,
+        schema={
+            "series": pl.Utf8,
+            "observation_date": pl.Date,
+            "value": pl.Float64,
+            "vintage_date": pl.Date,
+            "known_at": pl.Datetime("us", "UTC"),
+        },
+        orient="row",
+    )
+
+
+class TestRiskFreeRead:
+    """The engine's one risk-free read (backtest spec amendment 2026-10-11, T170c)."""
+
+    def test_constant_never_calls_rates(self) -> None:
+        provider = _provider()
+        results = _run(provider, _params(metrics={"risk_free_rate": 0.02}), levels=(0.0, 15.0))
+        assert [c for c in provider.calls if c.method == "rates"] == []
+        assert all(result.rates is None for result in results.values())
+
+    def test_store_reads_once_at_the_cutoff_and_every_level_shares_the_frame(self) -> None:
+        provider = dataclasses.replace(_provider(), rate_rows=_rate_frame("DTB3"))
+        params = _params(metrics={"risk_free_source": "store"})
+        results = _run(provider, params, levels=(0.0, 15.0, 30.0))
+        reads = [c for c in provider.calls if c.method == "rates"]
+        assert [(c.t, c.series) for c in reads] == [(read_time(T3), "DTB3")]
+        frames = [result.rates for result in results.values()]
+        assert all(frame is not None and frame.equals(frames[0]) for frame in frames)
+        assert frames[0] is not None and frames[0]["known_at"].max() <= read_time(T3)
+
+    def test_the_series_key_is_the_one_read(self) -> None:
+        frame = pl.concat([_rate_frame("DTB3", 5.0), _rate_frame("OTHER", 1.0)])
+        provider = dataclasses.replace(_provider(), rate_rows=frame)
+        params = _params(metrics={"risk_free_source": "store", "risk_free_series": "OTHER"})
+        (result,) = _run(provider, params).values()
+        assert result.rates is not None
+        assert set(result.rates["series"]) == {"OTHER"}
+        assert set(result.rates["value"]) == {1.0}
+
+    def test_a_missing_series_is_an_empty_frame_with_the_columns(self) -> None:
+        provider = _provider()
+        params = _params(metrics={"risk_free_source": "store"})
+        (result,) = _run(provider, params).values()
+        assert result.rates is not None and result.rates.is_empty()
+        assert result.rates.columns == [
+            "series",
+            "observation_date",
+            "value",
+            "vintage_date",
+            "known_at",
+        ]
+
+    def test_the_declaring_pass_reads_nothing_and_returns_the_columns(self) -> None:
+        requests = engine._Requests(engine._SharedReads(_provider(), covering=True))
+        frame = requests.rates(read_time(T0), "DTB3")
+        assert frame.is_empty() and frame.columns == list(engine._RATES_SCHEMA)
+        assert requests.asked == {}
+
+    def test_group_variants_each_read_their_own_series_once(self) -> None:
+        frame = pl.concat([_rate_frame("DTB3", 5.0), _rate_frame("OTHER", 1.0)])
+        provider = dataclasses.replace(_provider(), rate_rows=frame)
+        variants = [
+            (_params(metrics={"risk_free_source": "store"}), _handle()),
+            (_params(), _handle(2)),
+            (
+                _params(metrics={"risk_free_source": "store", "risk_free_series": "OTHER"}),
+                _handle(3),
+            ),
+        ]
+        out = engine.run_many(variants, provider, T0, T3, (15.0,), family="momentum")
+        reads = sorted(c.series for c in provider.calls if c.method == "rates")
+        assert reads == ["DTB3", "OTHER"]
+        assert out[1][15.0].rates is not None and set(out[1][15.0].rates["series"]) == {"DTB3"}
+        assert out[2][15.0].rates is None
+        assert out[3][15.0].rates is not None and set(out[3][15.0].rates["series"]) == {"OTHER"}
 
 
 class TestHandle:
