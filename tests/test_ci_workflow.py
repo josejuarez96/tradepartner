@@ -56,7 +56,7 @@ def test_a_label_event_other_than_ci_full_has_its_own_group_and_never_cancels() 
 def test_pr_branches_still_cancel_superseded_runs() -> None:
     """Off main the group falls back to the ref, and a new push cancels the old run."""
     block = _concurrency_block()
-    assert "|| github.ref) }}" in block["group"], block
+    assert "|| github.ref)) }}" in block["group"], block
     assert "github.ref != 'refs/heads/main'" in block["cancel-in-progress"], block
 
 
