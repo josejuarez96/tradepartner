@@ -315,7 +315,11 @@ def new_window(settings: Settings, frozen: str | None = None) -> PaperWindowRow:
 @pytest.fixture
 def s(journal_settings: Settings, fixed_clock: Any) -> Settle:
     fake = FakeBroker(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PA1"
+        assets=FakeBroker.active_assets("SPY", "QQQ"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
     )
     return Settle(journal_settings, fixed_clock, fake, new_window(journal_settings))
 

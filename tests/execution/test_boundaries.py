@@ -18,8 +18,9 @@ Static checks over `src/tradepartner/`, tests excepted:
    (it may be called with any name later); an order name subscripted out of
    `__dict__` or `vars()` is refused too (#471).
 3. `adapters.alpaca_trading_raw` and `AlpacaTradingRaw` are imported or read
-   only by `adapters/alpaca_broker.py` and `cli_record.py` (the owner-run paper
-   recorder, T48), re-exports and attribute chains included.
+   only by `adapters/alpaca_broker.py`, `cli_record.py` (the owner-run paper
+   recorder, T48) and `adapters/fake_broker.py` (its error type and retry rule,
+   T201), re-exports and attribute chains included.
 4. No module other than `store/journal.py` and `store/schema.py` names the
    `fills` table in SQL (after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE` or
    `USING`, parenthesised or not, or in a comma-separated `FROM` list after
@@ -59,7 +60,13 @@ BROKER_MODULES = (ALPACA_BROKER_MODULE, "tradepartner.adapters.fake_broker")
 TRADING_RAW_MODULE = "tradepartner.adapters.alpaca_trading_raw"
 ORDER_CALLS = frozenset({"submit", "cancel"})
 WRAPPER = "tradepartner.execution.wrapper"
-TRADING_RAW_IMPORTERS = frozenset({ALPACA_BROKER_MODULE, "tradepartner.cli_record"})
+FAKE_BROKER_MODULE = "tradepartner.adapters.fake_broker"
+# The fake imports only `AlpacaTradingError` and `_retryable`, to answer refusals in
+# Alpaca's own shape and to model the raw client's retry rule; it never builds a raw
+# client (T201, #1774).
+TRADING_RAW_IMPORTERS = frozenset(
+    {ALPACA_BROKER_MODULE, "tradepartner.cli_record", FAKE_BROKER_MODULE}
+)
 TRADING_RAW_NAMES = frozenset({"AlpacaTradingRaw", "alpaca_trading_raw"})
 FILLS_SQL_OWNERS = frozenset({"tradepartner.store.journal", "tradepartner.store.schema"})
 _DYNAMIC_IMPORTERS = frozenset({"import_module", "__import__"})
