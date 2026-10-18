@@ -80,7 +80,11 @@ class SkewedFake(FakeBroker):
 @pytest.fixture
 def fake(fixed_clock: FixedClock) -> SkewedFake:
     return SkewedFake(
-        clock=fixed_clock, price_of=lambda _s: PRICE, auto_fill=False, account_id="PA1"
+        assets=FakeBroker.active_assets("SPY"),
+        clock=fixed_clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        account_id="PA1",
     )
 
 

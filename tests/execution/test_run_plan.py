@@ -94,6 +94,7 @@ class Env:
 
     def __post_init__(self) -> None:
         self.fake = FakeBroker(
+            assets=FakeBroker.active_assets(*SYMBOLS.values(), "DUALA", "WNDX", "SPBT"),
             clock=self.clock,
             price_of=lambda symbol: self.prices[symbol],
             auto_fill=False,

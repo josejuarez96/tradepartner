@@ -84,6 +84,12 @@ def test_every_key_matches_hand_computed_weekly_values() -> None:
     sharpe_period = _mean(net_rf) / _sample_std(net_rf)
     sharpe_excess = _mean(ex_spy) / _sample_std(ex_spy)
     turnover_period = sum(TURNOVER) / len(TURNOVER)
+    spy_rf = [v - rf_week for v in SPY]
+    mx, my = _mean(spy_rf), _mean(net_rf)
+    beta = sum((u - mx) * (v - my) for u, v in zip(spy_rf, net_rf, strict=True)) / sum(
+        (u - mx) ** 2 for u in spy_rf
+    )
+    intercept = my - beta * mx
     expected: dict[str, float] = {
         "cagr": _cagr(NET),
         "vol_annual": _sample_std(NET) * math.sqrt(52),
@@ -106,6 +112,9 @@ def test_every_key_matches_hand_computed_weekly_values() -> None:
         "n_periods": 6.0,
         "periods_per_year": 52.0,
         "risk_free_annual": pytest.approx(RF, rel=1e-12),
+        # T211: OLS of (NET - rf) on (SPY - rf), intercept compounded to 52 periods.
+        "beta_spy": beta,
+        "alpha_spy_annual": (1 + intercept) ** 52 - 1,
     }
     assert set(expected) == set(METRIC_KEYS) == set(m)
     for key, value in expected.items():

@@ -63,6 +63,13 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("metrics.risk_free_source", "constant", 28),
     ("metrics.risk_free_series", "DTB3", 28),
     ("metrics.risk_free_basis", "discount", 28),
+    # T209a: hold mode and the no-trade band (backtest spec amendment #1731).
+    ("strategy.hold_sessions", 1, 28),
+    ("strategy.hold_target_names", 0, 28),
+    ("strategy.rebalance_band", 0.0, 28),
+    # The universe's rule 8 ranking (ADR 0023 D4, T212): `cap` is today's rule, so no stored
+    # fingerprint moves. A forward book registers `dollar_volume`.
+    ("universe.rank_by", "cap", 28),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -73,7 +80,14 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
 #: it lands. A key enters in the same PR as its table entry. Append-only: removing a
 #: member would put the key back into every stored set at its default; pinned by value
 #: in `tests/backtest/test_frozen_defaults.py`.
-POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset({"strategy.turnover_top_fraction"})
+POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "strategy.turnover_top_fraction",
+        "strategy.hold_sessions",
+        "strategy.hold_target_names",
+        "strategy.rebalance_band",
+    }
+)
 
 #: The frozen key set before the lab (`frozen_keys()` on 2026-10-05, schema version 12).
 #: Every frozen key outside it needs a `FROZEN_KEY_DEFAULTS` entry.

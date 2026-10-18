@@ -130,6 +130,15 @@ def root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+_REAL_SETUP_ENV = team.setup_env
+
+
+@pytest.fixture(autouse=True)
+def _no_env_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``cmd_start`` would run ``uv sync`` in the new directory; tests never do."""
+    monkeypatch.setattr(team, "setup_env", lambda path: [])
+
+
 @pytest.fixture
 def graph_root(tmp_path: Path) -> Path:
     (tmp_path / "docs" / "plans").mkdir(parents=True)
@@ -428,8 +437,9 @@ def test_owner_gates_reports_an_owner_task_off_the_critical_path(
 
 
 def test_task_sort_key_orders_task_ids_numerically_not_lexically() -> None:
-    ids = ["T10", "T2", "T1", "T9b", "T9a"]
-    assert sorted(ids, key=team.task_sort_key) == ["T1", "T2", "T9a", "T9b", "T10"]
+    ids = ["T10", "T2", "T1", "T9b", "T9a"]  # doc-check: ignore
+    expected = ["T1", "T2", "T9a", "T9b", "T10"]  # doc-check: ignore
+    assert sorted(ids, key=team.task_sort_key) == expected
 
 
 def test_depth_levels_sorts_same_depth_ids_numerically() -> None:
@@ -577,6 +587,35 @@ def test_start_creates_a_worktree_outside_the_repo_and_registers_it(
     assert (root / team.TEAM_FILE).read_text().strip() == "atlas"  # main checkout untouched
     with pytest.raises(SystemExit, match="already exists"):
         team.cmd_start(gh, root, "guilo", ref="HEAD")
+
+
+def test_start_prints_shell_lines_and_hand_commands_for_failed_setup(
+    root: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(root)
+    monkeypatch.setattr(team, "setup_env", lambda path: ["uv sync"])
+    assert team.cmd_start(FakeGitHub(), root, "guilo", ref="HEAD") == 0  # failure never aborts
+    out = capsys.readouterr().out
+    path = root.parent / f"{root.name}-teams" / "guilo"
+    assert (path / team.TEAM_FILE).read_text().strip() == "guilo"
+    assert f"cd {path}; unset VIRTUAL_ENV; uv sync" in out
+    assert f"cd {path}\nunset VIRTUAL_ENV\n" in out
+
+
+def test_setup_env_runs_sync_without_virtual_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, str], Path]] = []
+
+    def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str], check: bool) -> object:
+        calls.append((cmd, env, cwd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setenv("VIRTUAL_ENV", "/elsewhere/.venv")
+    monkeypatch.setattr(team.subprocess, "run", fake_run)
+    assert _REAL_SETUP_ENV(tmp_path) == []
+    assert [c[0] for c in calls] == [["uv", "sync"]]  # never `pre-commit install` (shared hook)
+    assert all("VIRTUAL_ENV" not in env and cwd == tmp_path for _, env, cwd in calls)
 
 
 def test_start_refuses_a_name_that_holds_open_issues(root: Path) -> None:

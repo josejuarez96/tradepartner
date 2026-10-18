@@ -80,7 +80,11 @@ def test_an_order_open_orders_lists_is_refused_though_get_order_says_terminal(
     s: Settle,
 ) -> None:
     s.fake = ListsTerminalAsOpen(
-        clock=s.clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA1"
+        clock=s.clock,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA1",
+        assets=FakeBroker.active_assets("SPY"),
     )
     s.place("tp-a")
     s.fake.apply("tp-a", Expire())
@@ -204,7 +208,13 @@ def test_another_account_is_refused_account_mismatch(s: Settle) -> None:
     s.place("tp-a")
     s.fake.apply("tp-a", Vanish())
     s.engage()
-    other = FakeBroker(clock=s.clock, price_of=lambda _s: 100.0, auto_fill=False, account_id="PA2")
+    other = FakeBroker(
+        assets=FakeBroker.active_assets("SPY"),
+        clock=s.clock,
+        price_of=lambda _s: 100.0,
+        auto_fill=False,
+        account_id="PA2",
+    )
     s.refused(ACCOUNT_MISMATCH, "tp-a", broker=other)
     assert [c.method for c in other.calls] == ["account"]
 

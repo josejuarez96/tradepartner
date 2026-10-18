@@ -1000,7 +1000,8 @@ def test_the_re_anchor_adds_no_frozen_universe_key(monkeypatch: pytest.MonkeyPat
     for name in list(os.environ):
         if name.upper().startswith("UNIVERSE__"):
             monkeypatch.delenv(name)
-    keys = [k for k in frozen_keys() if k.startswith("universe.")]
+    # `universe.rank_by` (T212) landed after this pin: the re-anchor adds none of its own.
+    keys = [k for k in frozen_keys() if k.startswith("universe.") and k != "universe.rank_by"]
     assert keys == list(UNIVERSE_FROZEN)
     params = frozen_params_of(
         Settings(_env_file=None, universe={"exclude_sic_ranges": [[4900, 4999]]}),

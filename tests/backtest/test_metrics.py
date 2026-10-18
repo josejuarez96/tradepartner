@@ -114,6 +114,10 @@ def test_metric_keys_are_exactly_the_spec_list() -> None:
         "n_periods",
         "periods_per_year",
         "risk_free_annual",
+        # T211 (backtest spec, amendment 2026-10-18, "Beta-adjusted alpha"): the two
+        # reported keys are appended, every earlier key keeps its name and position.
+        "beta_spy",
+        "alpha_spy_annual",
     )
     assert not any("monthly" in key or "months" in key for key in METRIC_KEYS)
     assert set(_metrics()) == set(METRIC_KEYS)
@@ -144,6 +148,10 @@ def test_every_key_matches_hand_computed_values() -> None:
         "n_periods": 4.0,
         "periods_per_year": 12.0,
         "risk_free_annual": 0.0,
+        # T211, rf = 0: the OLS slope of NET on SPY is 71/70 and the intercept
+        # 0.61/70, compounded to (1 + 0.61/70)^12 - 1 (see the T211 section below).
+        "beta_spy": 71 / 70,
+        "alpha_spy_annual": (1 + 0.61 / 70) ** 12 - 1,
     }
     assert set(expected) == set(METRIC_KEYS)
     for key, value in expected.items():
@@ -715,6 +723,9 @@ def test_the_varying_series_leaves_every_other_key_and_the_excess_spy_keys_bitwi
         "skew_period",
         "kurtosis_period",
         "risk_free_annual",
+        # T211: both sides of the regression are excess of rf, so a varying rf moves them.
+        "beta_spy",
+        "alpha_spy_annual",
     }
     assert {k: m[k] for k in unchanged} == {k: base[k] for k in unchanged}
     for k in EXCESS_SPY_KEYS:
@@ -753,3 +764,167 @@ def test_risk_free_sequence_must_match_the_periods_and_be_finite() -> None:
         _with_rf(RF_SERIES[:3])
     with pytest.raises(ValueError, match="finite"):
         _with_rf([0.001, float("nan"), 0.001, 0.001])
+
+
+# --- T211: beta-adjusted alpha against SPY, reported only ------------------------------
+#
+# Backtest spec, amendment 2026-10-18, "Beta-adjusted alpha (req 7; T211)": `beta_spy` is
+# the OLS slope and `alpha_spy_annual` the annualised OLS intercept of the period excess
+# returns (series minus rf) regressed on SPY's excess returns (SPY minus rf) over the same
+# periods, at every cost level and series. Annualisation compounds the per-period
+# intercept, (1 + a)^periods_per_year - 1, the convention of every other annual return
+# key here (`cagr`, `risk_free_annual`) and of `empyrical.alpha`.
+
+NEW_KEYS = ("beta_spy", "alpha_spy_annual")
+
+
+def _ols(y: list[float], x: list[float]) -> tuple[float, float]:
+    """(slope, intercept) of y on x by the textbook sums, no library."""
+    mx, my = _mean(x), _mean(y)
+    sxy = sum((u - mx) * (v - my) for u, v in zip(x, y, strict=True))
+    sxx = sum((u - mx) ** 2 for u in x)
+    slope = sxy / sxx
+    return slope, my - slope * mx
+
+
+def test_beta_and_alpha_at_zero_rate_equal_the_hand_regression() -> None:
+    """rf = 0. x = SPY = [0.01, -0.02, 0.02, 0.0], mean 0.0025; y = NET, mean 0.01125.
+    Sxy = 8.875e-4, Sxx = 8.75e-4, slope = 71/70 = 1.0142857142857142; intercept =
+    0.01125 - (71/70)(0.0025) = 0.61/70 = 0.008714285714285714; annual =
+    (1 + 0.61/70)^12 - 1 = 0.10973186795924..."""
+    m = _metrics()
+    slope, intercept = _ols(NET, SPY)
+    assert slope == pytest.approx(71 / 70, rel=1e-12)
+    assert intercept == pytest.approx(0.61 / 70, rel=1e-12)
+    assert m["beta_spy"] == pytest.approx(71 / 70, rel=1e-12)
+    assert m["alpha_spy_annual"] == pytest.approx((1 + 0.61 / 70) ** 12 - 1, rel=1e-12)
+    assert m["alpha_spy_annual"] == pytest.approx(0.1097318679592485, rel=1e-12)
+
+
+def test_beta_and_alpha_regress_excess_of_rf_on_both_sides() -> None:
+    """A varying rf series (RF_SERIES) is subtracted from the strategy and from SPY before
+    the regression. Hand values: slope = 1.0144405344399736, intercept =
+    0.008728700211701038, annual = 0.10992217934454218. Subtracting rf from the strategy
+    alone (or ignoring it in the slope, as `empyrical.alpha_beta` does with an array rf:
+    slope 71/70, annual 0.10992519...) misses these at rel 1e-12."""
+    m = _with_rf(RF_SERIES)
+    y, x = _diff(NET, RF_SERIES), _diff(SPY, RF_SERIES)
+    slope, intercept = _ols(y, x)
+    assert slope == pytest.approx(1.0144405344399736, rel=1e-12)
+    assert intercept == pytest.approx(0.008728700211701038, rel=1e-12)
+    assert m["beta_spy"] == pytest.approx(slope, rel=1e-12)
+    assert m["alpha_spy_annual"] == pytest.approx((1 + intercept) ** 12 - 1, rel=1e-12)
+    assert m["beta_spy"] != pytest.approx(71 / 70, rel=1e-9)
+
+
+def test_beta_and_alpha_are_on_every_series_spy_regressed_on_itself() -> None:
+    """ "At every ... series": MTUM gets its own regression; SPY on itself is slope 1,
+    intercept 0 (not null: unlike `EXCESS_SPY_KEYS`, the two keys are numbers on SPY)."""
+    mtum = _metrics("MTUM")
+    slope, intercept = _ols(NET, SPY)  # series_metrics regresses `period_returns`
+    assert mtum["beta_spy"] == pytest.approx(slope, rel=1e-12)
+    assert mtum["alpha_spy_annual"] == pytest.approx((1 + intercept) ** 12 - 1, rel=1e-12)
+    spy = series_metrics(
+        "SPY",
+        period_returns=SPY,
+        gross_period_returns=SPY,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=SPY,
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_period_returns=RF_SERIES,
+    )
+    assert spy["beta_spy"] == pytest.approx(1.0, rel=1e-12)
+    assert spy["alpha_spy_annual"] == pytest.approx(0.0, abs=1e-12)
+    assert not set(NEW_KEYS) & set(EXCESS_SPY_KEYS)
+
+
+def test_beta_and_alpha_use_the_cadence_and_the_family_benchmark_moves_neither() -> None:
+    """Weekly periods compound the intercept to 52; a family benchmark adds only its own
+    two keys and leaves the SPY regression as it is."""
+    weekly = series_metrics(
+        "strategy",
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=SPY,
+        mtum_period_returns=MTUM,
+        periods_per_year=52,
+        risk_free_period_returns=[0.0] * len(NET),
+    )
+    assert weekly["beta_spy"] == pytest.approx(71 / 70, rel=1e-12)
+    assert weekly["alpha_spy_annual"] == pytest.approx((1 + 0.61 / 70) ** 52 - 1, rel=1e-12)
+    out = _with_family_benchmark(("QUAL", QUAL))
+    assert {k: out[k] for k in NEW_KEYS} == {k: _metrics()[k] for k in NEW_KEYS}
+    assert set(metric_keys("QUAL")) == set(METRIC_KEYS) | {
+        "excess_cagr_qual",
+        "tracking_error_qual",
+    }
+
+
+def test_the_new_keys_are_appended_and_nothing_else_moves() -> None:
+    """The key tuple is the pre-T211 tuple plus exactly the two names, appended; every
+    pre-T211 key's value is the hand value pinned above (no reordering, no rename)."""
+    assert METRIC_KEYS[-2:] == NEW_KEYS
+    assert len(METRIC_KEYS) == 23 and len(set(METRIC_KEYS)) == 23
+    assert list(_metrics()) == list(METRIC_KEYS)
+
+
+_SELECTION_MODULES = ("holdout.py", "promotion.py", "sweep_report.py")
+
+
+def _identifiers_and_strings(path: Path) -> set[str]:
+    out: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.add(node.value)
+        elif isinstance(node, ast.Name):
+            out.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            out.add(node.attr)
+        elif isinstance(node, ast.alias):
+            out.add(node.asname or node.name)
+    return out
+
+
+def test_beta_and_alpha_are_none_on_a_constant_spy_excess_and_nothing_fails() -> None:
+    """Reported only: a constant SPY minus rf (here SPY flat at 0 with rf = 0) has no slope,
+    so both keys are None and every other key is still computed; the run does not fail."""
+    m = series_metrics(
+        "strategy",
+        period_returns=NET,
+        gross_period_returns=GROSS,
+        daily_equity=DAILY_EQUITY,
+        turnover=TURNOVER,
+        spy_period_returns=[0.0] * len(NET),
+        mtum_period_returns=MTUM,
+        periods_per_year=12,
+        risk_free_period_returns=constant_period_returns(0.0, 12, len(NET)),
+    )
+    assert m["beta_spy"] is None
+    assert m["alpha_spy_annual"] is None
+    assert m["cagr"] == _metrics()["cagr"]
+
+
+def test_beta_and_alpha_reach_no_selection_path() -> None:
+    """Reported only: never in V, DSR, the red flag, a promotion rule or a selection
+    statistic. The holdout, promotion and sweep-report modules name neither key (nor a
+    string containing it) and never iterate `METRIC_KEYS`/`metric_keys`, so the keys
+    cannot reach them; `red_flag` and both DSR bases ignore the two values."""
+    assert set(NEW_KEYS) <= set(METRIC_KEYS)
+    for name in _SELECTION_MODULES:
+        found = _identifiers_and_strings(BACKTEST_SRC / name)
+        leaks = {s for s in found for key in NEW_KEYS if key in s}
+        assert not leaks, (name, leaks)
+        assert not {"METRIC_KEYS", "metric_keys"} & found, name
+    base = _metrics()
+    moved = {**base, "beta_spy": -50.0, "alpha_spy_annual": 99.0}
+    s = Settings(_env_file=None)
+    assert red_flag(moved, s) is red_flag(base, s)
+    pairs = [0.4, 0.9, 0.6]
+    for basis in ("raw", "excess_spy"):
+        assert deflated_sharpe(
+            moved, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12
+        ) == deflated_sharpe(base, basis, n_trials=5, pair_sharpes=pairs, periods_per_year=12)

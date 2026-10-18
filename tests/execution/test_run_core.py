@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -338,7 +340,14 @@ def _no_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def env(journal_settings: Settings) -> Env:
     clock = Clock(_at(TUE))
     fake = FakeBroker(
-        clock=clock, price_of=lambda _s: PRICE, auto_fill=False, cash=FAKE_CASH, account_id="PA1"
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
+        clock=clock,
+        price_of=lambda _s: PRICE,
+        auto_fill=False,
+        cash=FAKE_CASH,
+        account_id="PA1",
     )
     return Env(journal_settings, clock, fake)
 
@@ -668,6 +677,9 @@ def test_the_run_row_records_invoked_by(
 def test_a_different_account_id_halts_through_the_halt_path(env: Env) -> None:
     _marked(env)
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -968,6 +980,9 @@ def _hold_spy(env: Env, window: PaperWindowRow) -> None:
     from tradepartner.store.journal import AdjustmentRow
 
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1284,6 +1299,9 @@ def test_a_drawdown_breach_on_a_back_filled_session_engages(
     window = env.window(started=_at(MON, 22), starting_equity=peak)
     env.ingest(_at(TUE, 21))
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1559,6 +1577,9 @@ def test_a_crossing_on_a_mark_written_after_the_release_still_engages(
         )
     )
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1626,6 +1647,9 @@ def test_an_ordinary_s_minus_1_crossing_after_a_morning_of_s_release_is_not_labe
         )
     )
     env.fake = FakeBroker(
+        assets=FakeBroker.active_assets(
+            "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+        ),
         clock=env.clock,
         price_of=lambda _s: PRICE,
         auto_fill=False,
@@ -1727,6 +1751,9 @@ def _book_fakes(env: Env, *accounts: str) -> dict[str, FakeBroker]:
     """One scripted fake per account, on the env's clock (each book its own account)."""
     return {
         account: FakeBroker(
+            assets=FakeBroker.active_assets(
+                "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+            ),
             clock=env.clock,
             price_of=lambda _s: PRICE,
             auto_fill=False,
@@ -1953,6 +1980,9 @@ def test_one_book_main_runs_exactly_as_before_books(
     for settings in (journal_settings, twin_settings):
         clock = Clock(_at(TUE))
         fake = FakeBroker(
+            assets=FakeBroker.active_assets(
+                "SPY", "DUALB", "SPFT", "TRNS", "WNDX", "SPBT", "DUALA", "PRE9"
+            ),
             clock=clock,
             price_of=lambda _s: PRICE,
             auto_fill=False,
@@ -1982,3 +2012,117 @@ def test_one_book_main_runs_exactly_as_before_books(
     assert _snapshot(driven.settings) == _snapshot(before.settings)
     assert legacy_lock_path(driven.settings).exists()
     assert lock_path(driven.settings, "main").exists()
+
+
+# --- a store lock held by another process (#1757) -----------------------------------------
+
+
+_HOLDER = (
+    "import duckdb, sys, time\n"
+    "conn = duckdb.connect(sys.argv[1])\n"
+    "print('held', flush=True)\n"
+    "time.sleep(float(sys.argv[2]))\n"
+)
+
+
+@contextmanager
+def writer_held(path: str, seconds: float) -> Iterator[None]:
+    """Another process holds the store's writer lock for `seconds`."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, path, str(seconds)], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "held"
+        yield
+    finally:
+        proc.wait(timeout=30)
+
+
+def test_a_store_lock_before_any_submit_ends_the_run_stale_style(
+    rebalance_env: tuple[Env, PaperWindowRow],
+) -> None:
+    env, _window = rebalance_env
+    env.settings.store.lock_retry_seconds = 1
+    env.ingest(_at(date(2019, 4, 30), 21))
+    real_account = env.fake.account
+    holder = writer_held(env.settings.store.path, 2.0)
+    held: list[None] = []
+
+    def account() -> Any:
+        if not held:
+            held.append(holder.__enter__())  # held from step 1 on, for longer than the read retry
+        return real_account()
+
+    env.fake.account = account  # type: ignore[method-assign]
+    try:
+        with pytest.raises(StaleDataError, match="locked"):
+            env.run(_at(F_0))
+    finally:
+        if held:
+            holder.__exit__(None, None, None)
+    run_id = env.latest_run()
+    status, fault_type, message = env.results()[run_id]
+    assert (status, fault_type) == ("stale", "StaleDataError")
+    assert message is not None and "locked by another process" in message
+    assert ("stale_data", run_id, F_0) in env.alerts()
+    assert env.engaged() == []  # no kill switch
+    assert "submit" not in env.broker_methods()
+    assert env.count("rebalance_events") == 0  # the next scheduled run picks it up
+
+
+def test_a_store_lock_that_clears_within_the_retry_is_not_a_fault(
+    env: Env, exits_done: list[object]
+) -> None:
+    _marked(env)
+    env.settings.store.lock_retry_seconds = 20
+    real_account = env.fake.account
+    holder = writer_held(env.settings.store.path, 1.0)
+    held: list[None] = []
+
+    def account() -> Any:
+        if not held:
+            held.append(holder.__enter__())
+        return real_account()
+
+    env.fake.account = account  # type: ignore[method-assign]
+    try:
+        outcome = env.run(_at(TUE))
+    finally:
+        if held:
+            holder.__exit__(None, None, None)
+    assert outcome.status == "ok"
+
+
+def test_a_store_lock_after_the_trade_step_began_still_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store.db import StoreLockedError
+
+    _marked(env)
+
+    def locked(_context: object) -> None:
+        raise StoreLockedError("the store is locked")
+
+    monkeypatch.setattr(run_module, "exits_step", locked)
+    with pytest.raises(StoreLockedError):
+        env.run(_at(TUE))
+    assert env.results()[env.latest_run()][:2] == ("failed", "StoreLockedError")
+    env.ingest(_at(TUE, 21))
+    assert env.run(_at(WED)).status == "skipped_kill_switch"
+
+
+def test_a_same_process_store_conflict_before_any_submit_still_fails_closed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tradepartner.store.db import StoreSameProcessLockedError
+
+    _marked(env)
+
+    def conflict(_self: object) -> None:
+        raise StoreSameProcessLockedError("open in this process in another mode")
+
+    monkeypatch.setattr(run_module._Run, "_actions", conflict)
+    with pytest.raises(StoreSameProcessLockedError):
+        env.run(_at(TUE))
+    assert env.results()[env.latest_run()][:2] == ("failed", "StoreSameProcessLockedError")
