@@ -95,9 +95,9 @@ import polars as pl
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs
 from tradepartner.backtest.engine import Plan
 from tradepartner.backtest.portfolio import (
-    _selected_count,
     apply_rebalance_band,
     hold_membership,
+    target_weights,
 )
 from tradepartner.backtest.schedule import fill_session
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
@@ -1124,13 +1124,16 @@ def decisions_from(
     `plan.scores` ranked by (-score, security_id), and only held names and the
     session's `entering` names get a decision. Each entering name is sized at
     equity / the target count (`hold.hold_target_names`, or the `top_fraction`
-    count when that is 0); a fresh entry is a notional buy and a re-entry (a name
-    both exiting and entering) trades the delta to that amount. A name exiting
-    without re-entering is a full exit (`trade`, reason `left_targets`), and a
-    live held name is never re-weighted (`skip_zero`), even when it has left the
-    universe (a hold plan never writes `left_universe`). The `skip_delisted`,
-    override, forced-exit, minimum and `target_notional` rules apply as for
-    `equal`. `target_weight` under hold is the hold weight, not `plan.targets`.
+    count when that is 0: the spec's "1 / `hold_target_names` of equity"); a fresh
+    entry is a notional buy and a re-entry (a name both exiting and entering)
+    trades the delta to that amount. A name exiting without re-entering is a full
+    exit (`trade`, reason `left_targets`), and a live held name is never
+    re-weighted (`skip_zero`), even when it has left the universe (a hold plan
+    never writes `left_universe`). A held name the book cannot place (absent from
+    `hold.entries`) is treated as exiting, so no position is stranded. The
+    `skip_delisted`, override, forced-exit, minimum and `target_notional` rules
+    apply as for `equal`. `target_weight` under hold is the hold weight, not
+    `plan.targets`.
 
     Weights and notionals are at S: the ledger's quantities and `price_of`, the
     reference price on S (the close(S-1) close in post-split shares, as
@@ -1192,11 +1195,13 @@ def decisions_from(
             hold.top_fraction,
         )
         entering = frozenset(membership.entering)
-        exiting = frozenset(membership.exiting)
+        # A held name the book cannot place cannot be held either: it exits, so a
+        # position is never stranded.
+        exiting = frozenset(membership.exiting) | (held - set(hold.entries))
         count = (
             hold.hold_target_names
             if hold.hold_target_names > 0
-            else _selected_count(len(ranked), hold.top_fraction)
+            else len(target_weights(plan.scores, hold.top_fraction, "equal"))
         )
         hold_weight = 1.0 / count if count > 0 else 0.0
         effective = {}
