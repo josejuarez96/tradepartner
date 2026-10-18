@@ -147,7 +147,12 @@ resolver is built again without it (`symbol_changes_refused`). So is one
 that takes a session of its old or new ticker, up to the run's day, from
 another security the listings alone give it to (a sibling class already
 listing the new ticker: `MSW -> PMA` on the bare CIK while its Class A
-lists `PMA`). A change only ever adds sessions to its own security. A
+lists `PMA`), or one that costs its own security a session of the new
+ticker the listings alone give it (#1728: the span the change starts on
+its day precedes another security's lagging span of the ticker and wins
+the latest-start rule against the security's own later cover page, as
+Alight's `WPF -> ALIT` and ContextLogic's `WISH -> LOGC` did). A change
+only ever adds sessions to its own security. A
 change known after the run is not read, so it bounds nothing at that run
 (the mapping is the master's at the run, as for every row; a bar's
 `known_at` stays its session's close).
@@ -1158,16 +1163,25 @@ class ListingResolver:
         """True when following `change` (`security_id`, day, old, new) gives
         a session of its old or new ticker, from its day to the run's day,
         to other than the security `base` (the listings alone) gave it to,
-        when `base` gave it to another security (#1696)."""
+        when `base` gave it to another security (#1696), or takes from its
+        own security a session of its new ticker `base` gave it (#1728)."""
         security_id, day, old, new = change
         tickers = {alpaca_symbol(t) or t for t in (old, new)}
+        added = alpaca_symbol(new) or new
         session = day if is_session(day) else next_session(day)
         while session <= self.run_day:
             for ticker in tickers:
                 before = base.resolve(ticker, session) or base.lead(ticker, session)
-                if before not in (None, security_id) and before != (
-                    self.resolve(ticker, session) or self.lead(ticker, session)
-                ):
+                after = self.resolve(ticker, session) or self.lead(ticker, session)
+                if before not in (None, security_id) and before != after:
+                    return True
+                # #1728: nor may it cost its own security a session of the new
+                # ticker the listings gave it (the span the change starts on
+                # its day can precede a rival's lagging span of the ticker and
+                # win the latest-start rule against the security's own cover
+                # page). The old ticker's sessions from the day are dropped by
+                # design, so only the new ticker is judged.
+                if ticker == added and before == security_id and after != security_id:
                     return True
             session = next_session(session)
         return False
