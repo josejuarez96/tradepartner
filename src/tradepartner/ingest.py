@@ -1382,19 +1382,16 @@ _HELD_SQL = """
 def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
     """The ids among `ids` an open paper window holds (#821): named by a
     journal order, adjustment, daily position or lot of a window with no
-    `closed`/`abandoned` stop row. A store without the journal tables (a fact
-    fixture) holds nothing."""
+    `closed`/`abandoned` stop row. A store missing a journal table raises
+    (`duckdb.CatalogException`): the gate never fails open."""
     wanted = sorted(set(ids))
     if not wanted:
         return frozenset()
     states = list(CLOSING_STOP_STATES)
-    try:
-        rows = conn.execute(
-            _HELD_SQL,
-            [wanted, states, wanted, states, wanted, states, wanted, states],
-        ).fetchall()
-    except duckdb.CatalogException:  # a fixture store with no journal tables
-        return frozenset()
+    rows = conn.execute(
+        _HELD_SQL,
+        [wanted, states, wanted, states, wanted, states, wanted, states],
+    ).fetchall()
     return frozenset(sid for (sid,) in rows if sid is not None)
 
 

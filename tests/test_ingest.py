@@ -5846,6 +5846,88 @@ def test_held_ids_reads_open_windows_only() -> None:
         conn.close()
 
 
+_HELD_TS = "TIMESTAMPTZ '2025-12-02 14:00:00+00'"
+
+#: One journal row naming security `HELD` in window 1 (run 1), per source the
+#: held gate reads (`ingest._HELD_SQL`).
+_HELD_ROWS = {
+    "order": (
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) VALUES "
+        f"('c1', 1, 1, DATE '2025-12-02', 1, 'buy', 'HELD', 'HLD', 'buy', FALSE, {_HELD_TS}, "
+        f"{_HELD_TS})"
+    ),
+    "daily position": (
+        "INSERT INTO positions_daily (run_id, session, security_id, quantity, known_at, "
+        f"ingested_at) VALUES (1, DATE '2025-12-02', 'HELD', 1.0, {_HELD_TS}, {_HELD_TS})"
+    ),
+    "lot": (
+        "INSERT INTO lots (lot_id, account_id, account_type, account_owner, security_id, symbol, "
+        "trade_at, trade_date_local, quantity, cost_basis, known_at, ingested_at) VALUES "
+        f"(1, 'acc', 'paper', 'owner', 'HELD', 'HLD', {_HELD_TS}, DATE '2025-12-02', 1.0, 1.0, "
+        f"{_HELD_TS}, {_HELD_TS})"
+    ),
+    "adjustment": (
+        "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+        "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+        "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, 'HELD', 1.0, NULL, NULL, "
+        f"{_HELD_TS}, {_HELD_TS})"
+    ),
+}
+
+
+@pytest.mark.parametrize("source", _HELD_ROWS)
+@pytest.mark.parametrize(
+    ("state", "held"), [("requested", True), ("closed", False), ("abandoned", False)]
+)
+def test_every_journal_source_holds_until_a_closing_stop(
+    source: str, state: str, held: bool
+) -> None:
+    """#821 (safety review): an order (in flight or not), a daily position, a
+    lot or an adjustment of an open window holds its security; a `requested`
+    stop keeps the window open, a `closed` or `abandoned` one releases it."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, 'v', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO paper_runs (run_id, window_id, started_at, invoked_by, code_version, "
+            f"known_at, ingested_at) VALUES (1, 1, {_HELD_TS}, 'tty', 'v', {_HELD_TS}, {_HELD_TS})"
+        )
+        conn.execute(_HELD_ROWS[source])
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == frozenset({"HELD"})
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', ?, NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')",
+            [state],
+        )
+        expected = frozenset({"HELD"}) if held else frozenset()
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == expected
+    finally:
+        conn.close()
+
+
+def test_the_held_gate_fails_loud_without_the_journal() -> None:
+    """#821 (safety review): a store missing a journal table raises rather
+    than reading as holding nothing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute("DROP TABLE lots")
+        with pytest.raises(duckdb.CatalogException):
+            ingest_module._held_ids(conn, ["HELD"])
+    finally:
+        conn.close()
+
+
 def test_an_unjudged_entry_is_refused_and_writes_nothing() -> None:
     """#821: an entry whose CIK this run did not judge is refused `unjudged`,
     so a transient fetch failure never moves a chain."""
