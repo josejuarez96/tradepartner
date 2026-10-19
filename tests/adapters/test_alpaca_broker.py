@@ -631,14 +631,34 @@ def test_a_duplicate_id_found_through_get_order_raises_before_any_submit() -> No
     assert http.calls("POST", "/v2/orders") == []
 
 
-def test_the_brokers_recorded_duplicate_refusal_raises_duplicate() -> None:
-    error = _load("duplicate_client_order_id")["error"]
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("client_order_id must be unique", DuplicateClientOrderIdError),
+        ("invalid position_intent specified", AlpacaTradingError),
+        ("qty must be > 0", AlpacaTradingError),
+        (
+            "trailing stop orders cannot specify both trail_price and trail_percent",
+            AlpacaTradingError,
+        ),
+    ],
+)
+def test_the_brokers_recorded_40010001_refusals_are_classified_by_message(
+    message: str, expected: type[Exception]
+) -> None:
+    recorded = _load("duplicate_client_order_id")["error"]
+    body = json.loads(recorded["body"])
+    body["message"] = message
     broker, http = _broker()
     http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
-    http.route("POST", "/v2/orders", (error["status_code"], json.loads(error["body"])))
+    http.route("POST", "/v2/orders", (recorded["status_code"], body))
 
-    with pytest.raises(DuplicateClientOrderIdError):
+    with pytest.raises(expected) as err:
         broker.submit(_request())
+    assert type(err.value) is expected
+    if isinstance(err.value, AlpacaTradingError):
+        assert err.value.status_code == 422
+        assert json.loads(err.value.body) == body
 
 
 @pytest.mark.parametrize(
