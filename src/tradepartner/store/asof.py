@@ -628,23 +628,24 @@ def _spin_off_actions_filter(
 ) -> str:
     """`_security_filter` for `latest_actions` when it also reads `spinoff`
     rows: a split or dividend is selected by its `security_id`, a spin-off
-    by its parent in `source_action_id` (its `security_id` is the child).
-    Same `None` / empty-sequence rules. With `mapped` (a live chain at `t`,
-    #821) both keys go through `_CHAINS_VIEW`, so a chained predecessor's
-    parent id matches its successor."""
+    by its parent. Same `None` / empty-sequence rules. With `mapped` (a live
+    chain at `t`, #821) both keys go through `_CHAINS_VIEW`: the row's
+    `security_id` (a split's or dividend's security, a spin-off's child)
+    through the join on `security_id`, and a spin-off's parent through the
+    `pchain` join on `source_action_id` the chained `latest_actions` adds."""
     if security_ids is None:
         return ""
     if not security_ids:
         return "AND FALSE"
     params.extend(security_ids)
     placeholders = ", ".join("?" for _ in security_ids)
-
-    def key(column: str) -> str:
-        return f"COALESCE({_CHAINS_VIEW}.successor_id, {column})" if mapped else column
-
+    if mapped:
+        row = f"COALESCE({_CHAINS_VIEW}.successor_id, security_id)"
+        parent = "COALESCE(pchain.successor_id, source_action_id)"
+    else:
+        row, parent = "security_id", "source_action_id"
     return (
-        f"AND (CASE WHEN action_type = 'spinoff' THEN {key('source_action_id')} "
-        f"ELSE {key('security_id')} END) IN ({placeholders})"
+        f"AND (CASE WHEN action_type = 'spinoff' THEN {parent} ELSE {row} END) IN ({placeholders})"
     )
 
 
@@ -1496,50 +1497,17 @@ def _adjusted_ctes(
     `no_child_close`. `spin_ratio` and `child_close` carry r and C for
     `_raise_on_invalid_factor`.
     """
-    if spin_offs:
-        spin_ctes = """
-        child_close AS (
-            SELECT security_id, session, close FROM (
-                SELECT security_id, session, close, ROW_NUMBER() OVER (
-                    PARTITION BY security_id, session ORDER BY known_at DESC
-                ) AS _rn
-                FROM prices_daily
-                WHERE known_at <= ?
-                  AND (security_id, session) IN (
-                      SELECT security_id, ex_date FROM latest_actions
-                      WHERE action_type = 'spinoff'
-                  )
-            )
-            WHERE _rn = 1
-        ),
-        -- A spin-off is keyed by its parent; D = r x C is its amount.
-        keyed_actions AS (
-            SELECT
-                CASE WHEN la.action_type = 'spinoff'
-                    THEN la.source_action_id ELSE la.security_id END AS security_id,
-                la.security_id AS child_id,
-                la.ex_date,
-                la.action_type,
-                CASE WHEN la.action_type = 'spinoff'
-                    THEN la.ratio_or_amount * cc.close
-                    ELSE la.ratio_or_amount END AS ratio_or_amount,
-                la.ratio_or_amount AS spin_ratio,
-                cc.close AS child_close
-            FROM latest_actions la
-            LEFT JOIN child_close cc
-                ON la.action_type = 'spinoff'
-                AND cc.security_id = la.security_id AND cc.session = la.ex_date
-        ),"""
-        action_source = "keyed_actions"
-        extra_cols = (
-            "\n                la.child_id,\n                la.spin_ratio,\n"
-            "                la.child_close,"
-        )
-        no_child = "WHEN action_type = 'spinoff' AND child_close IS NULL THEN 'no_child_close'"
-    else:
-        spin_ctes, action_source, extra_cols, no_child = "", "latest_actions", "", ""
-
     if chained:
+        extra_join = (
+            f"LEFT JOIN {_CHAINS_VIEW} pchain ON pchain.predecessor_id = a.source_action_id"
+            if spin_offs
+            else ""
+        )
+        parent_key = (
+            "COALESCE(pchain.successor_id, a.source_action_id)"
+            if spin_offs
+            else "a.source_action_id"
+        )
         latest_bars = f"""
         latest_bars AS (
             SELECT * EXCLUDE (_rn, _own) FROM (
@@ -1563,8 +1531,11 @@ def _adjusted_ctes(
                     PARTITION BY {_ACTION_IDENTITY_PARTITION} ORDER BY _own, known_at DESC
                 ) AS _rn
                 FROM (
-                    SELECT * REPLACE ({_chain_id("a")} AS security_id), {_chain_own("a")} AS _own
+                    SELECT * REPLACE ({_chain_id("a")} AS security_id),
+                        {parent_key} AS parent_key,
+                        {_chain_own("a")} AS _own
                     FROM corporate_actions a {_chain_join("a")}
+                    {extra_join}
                     WHERE a.known_at <= ?
                     {actions_filter}
                 )
@@ -1589,7 +1560,7 @@ def _adjusted_ctes(
         latest_actions = f"""
         latest_actions AS (
             SELECT * EXCLUDE (_rn) FROM (
-                SELECT *, ROW_NUMBER() OVER (
+                SELECT *, source_action_id AS parent_key, ROW_NUMBER() OVER (
                     PARTITION BY {_ACTION_IDENTITY_PARTITION}
                     ORDER BY known_at DESC
                 ) AS _rn
@@ -1600,6 +1571,71 @@ def _adjusted_ctes(
             WHERE _rn = 1 AND NOT cancelled AND ex_date <= ?
               AND action_type IN ({action_types})
         ),"""
+
+    if spin_offs:
+        if chained:
+            child_close = f"""
+        child_close AS (
+            SELECT security_id, session, close FROM (
+                SELECT COALESCE(cc.successor_id, p.security_id) AS security_id,
+                    p.session, p.close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(cc.successor_id, p.security_id), p.session
+                        ORDER BY p.known_at DESC
+                    ) AS _rn
+                FROM prices_daily p
+                LEFT JOIN {_CHAINS_VIEW} cc ON cc.predecessor_id = p.security_id
+                WHERE p.known_at <= ?
+                  AND (COALESCE(cc.successor_id, p.security_id), p.session) IN (
+                      SELECT security_id, ex_date FROM latest_actions
+                      WHERE action_type = 'spinoff'
+                  )
+            )
+            WHERE _rn = 1
+        ),"""
+        else:
+            child_close = """
+        child_close AS (
+            SELECT security_id, session, close FROM (
+                SELECT security_id, session, close, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily
+                WHERE known_at <= ?
+                  AND (security_id, session) IN (
+                      SELECT security_id, ex_date FROM latest_actions
+                      WHERE action_type = 'spinoff'
+                  )
+            )
+            WHERE _rn = 1
+        ),"""
+        spin_ctes = f"""{child_close}
+        -- A spin-off is keyed by its parent; D = r x C is its amount.
+        keyed_actions AS (
+            SELECT
+                CASE WHEN la.action_type = 'spinoff'
+                    THEN la.parent_key ELSE la.security_id END AS security_id,
+                la.security_id AS child_id,
+                la.ex_date,
+                la.action_type,
+                CASE WHEN la.action_type = 'spinoff'
+                    THEN la.ratio_or_amount * cc.close
+                    ELSE la.ratio_or_amount END AS ratio_or_amount,
+                la.ratio_or_amount AS spin_ratio,
+                cc.close AS child_close
+            FROM latest_actions la
+            LEFT JOIN child_close cc
+                ON la.action_type = 'spinoff'
+                AND cc.security_id = la.security_id AND cc.session = la.ex_date
+        ),"""
+        action_source = "keyed_actions"
+        extra_cols = (
+            "\n                la.child_id,\n                la.spin_ratio,\n"
+            "                la.child_close,"
+        )
+        no_child = "WHEN action_type = 'spinoff' AND child_close IS NULL THEN 'no_child_close'"
+    else:
+        spin_ctes, action_source, extra_cols, no_child = "", "latest_actions", "", ""
     return f"""
         {latest_bars}
         -- Latest revision per action identity (#108): the source's id when
@@ -2031,20 +2067,26 @@ def unvalued_spin_offs_as_of(
     does (a non-positive or non-finite ratio or child close).
     """
     t = _validate_t(t)
-    common_ctes, params = _adjusted_params(
-        t, security_ids, settings, include_dividends=True, include_spin_offs=True
-    )
-    sql = f"""
-        WITH {common_ctes}
-        SELECT
-            security_id AS parent,
-            child_id AS child,
-            ex_date,
-            drop_reason AS reason
-        FROM event_factor
-        WHERE action_type = 'spinoff' AND drop_reason IS NOT NULL
-        ORDER BY parent, ex_date, child
-    """
-    with _sessions_registered(conn, include_dividends=True):
-        _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=True)
-        return conn.execute(sql, params).pl()
+    with _chains_registered(conn, t) as chains:
+        common_ctes, params = _adjusted_params(
+            t,
+            security_ids,
+            settings,
+            include_dividends=True,
+            include_spin_offs=True,
+            chains=chains,
+        )
+        sql = f"""
+            WITH {common_ctes}
+            SELECT
+                security_id AS parent,
+                child_id AS child,
+                ex_date,
+                drop_reason AS reason
+            FROM event_factor
+            WHERE action_type = 'spinoff' AND drop_reason IS NOT NULL
+            ORDER BY parent, ex_date, child
+        """
+        with _sessions_registered(conn, include_dividends=True):
+            _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=True)
+            return conn.execute(sql, params).pl()

@@ -555,3 +555,95 @@ def test_the_chain_reads_are_truncation_invariant_from_the_known_at(
         full = universe_as_of(chain_fixture_store, t, settings)
         seen = universe_as_of(truncated.at(t), t, settings)
         assert full.members.equals(seen.members) and full.exclusions.equals(seen.exclusions), t
+
+
+def test_a_spin_off_of_a_chained_parent_adjusts_the_successors_early_bars() -> None:
+    """A spin-off whose parent is a chained predecessor (P -> S, #821) adjusts
+    S's bars before the ex-date by the factor, for `ids=None` and `ids=['S']`:
+    the chained read re-keys the parent's bars to S and keys the spin-off by
+    the parent's successor, not by its child."""
+    from tradepartner.store.db import configure_connection
+    from tradepartner.store.schema import init_schema
+
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    init_schema(conn)
+    p, s, child = "P", "S", "C"
+    sessions = [date(2024, 1, day) for day in (2, 3, 4, 5, 8, 9)]
+    ex_date = sessions[3]
+
+    def bar(security_id: str, session: date, close: float) -> dict[str, object]:
+        stamp = session_close(session)
+        return {
+            "security_id": security_id,
+            "session": session,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000,
+            "known_at": stamp,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "bar",
+        }
+
+    for session in sessions[:4]:
+        insert_row(conn, "prices_daily", bar(p, session, 100.0))
+    for session in sessions[3:]:
+        insert_row(conn, "prices_daily", bar(child, session, 20.0))
+    for session in sessions[4:]:
+        insert_row(conn, "prices_daily", bar(s, session, 100.0))
+    stamp = session_close(ex_date)
+    insert_row(
+        conn,
+        "corporate_actions",
+        {
+            "security_id": child,  # a spin-off stores the child here
+            "action_type": "spinoff",
+            "ex_date": ex_date,
+            "ratio_or_amount": 0.5,
+            "announced_at": None,
+            "source_action_id": p,  # and the parent here
+            "cancelled": False,
+            "known_at": stamp,
+            "ingested_at": stamp,
+            "source": "alpaca",
+            "provenance": "action",
+        },
+    )
+    insert_row(
+        conn,
+        "successor_chains",
+        {
+            "predecessor_id": p,
+            "successor_id": s,
+            "evidence_accession": "S-24-000001",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "source": "edgar",
+            "provenance": "filing",
+            "known_at": session_close(sessions[1]),
+            "ingested_at": session_close(sessions[1]),
+        },
+    )
+    settings = Settings(_env_file=None)
+    try:
+        for ids in (None, [s]):
+            frame = adjusted_prices_as_of(
+                conn,
+                session_close(sessions[5]),
+                ids,
+                include_dividends=True,
+                include_spin_offs=True,
+                settings=settings,
+            )
+            assert frame.filter(pl.col("security_id") == p).is_empty()
+            for session in sessions[:3]:  # P's bars, re-keyed to S, factor 0.9
+                close = frame.filter((pl.col("security_id") == s) & (pl.col("session") == session))[
+                    "close"
+                ].item()
+                assert close == pytest.approx(100.0 * 0.9, abs=1e-12)
+    finally:
+        conn.close()
