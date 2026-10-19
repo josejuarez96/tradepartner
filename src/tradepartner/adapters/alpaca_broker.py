@@ -130,6 +130,9 @@ from tradepartner.adapters.broker_refusals import (
     error_code as _error_code,
 )
 from tradepartner.adapters.broker_refusals import (
+    error_message as _error_message,
+)
+from tradepartner.adapters.broker_refusals import (
     typed_refusal,
 )
 from tradepartner.config import Settings
@@ -157,6 +160,8 @@ _SIMPLE_ORDER_CLASS = "simple"
 #: HTTP status and Alpaca code of the broker's duplicate-id refusal (T48b).
 _DUPLICATE_STATUS = 422
 _DUPLICATE_CODE = 40010001
+#: Exact message in tests/fixtures/alpaca/paper/duplicate_client_order_id.json.
+_DUPLICATE_MESSAGE = "client_order_id must be unique"
 #: A cancel refused because the order is no longer cancelable, or gone.
 _CANCEL_REFUSALS = frozenset({_NOT_FOUND, _DUPLICATE_STATUS})
 #: `fills(None)` reads from here.
@@ -426,7 +431,11 @@ class AlpacaBroker(Broker):
         try:
             payload = self._raw.submit_order(order_data)
         except AlpacaTradingError as error:
-            if error.status_code == _DUPLICATE_STATUS and _error_code(error) == _DUPLICATE_CODE:
+            if (
+                error.status_code == _DUPLICATE_STATUS
+                and _error_code(error) == _DUPLICATE_CODE
+                and _error_message(error) == _DUPLICATE_MESSAGE
+            ):
                 raise DuplicateClientOrderIdError(
                     f"the broker refused order {coid!r} as a duplicate"
                 ) from None
