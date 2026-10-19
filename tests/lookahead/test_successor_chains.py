@@ -233,6 +233,7 @@ from datetime import UTC, date, timedelta  # noqa: E402
 
 import polars as pl  # noqa: E402
 
+from tradepartner.calendar import session_close  # noqa: E402
 from tradepartner.config import Settings, parse_accepted_jump  # noqa: E402
 from tradepartner.store.asof import (  # noqa: E402
     LiveChains,
@@ -370,24 +371,45 @@ def test_an_accepted_price_jumps_entry_naming_the_predecessor_excuses_the_succes
 def test_universe_admits_the_chained_history(
     chain_fixture_store: duckdb.DuckDBPyConnection, tmp_path: Path
 ) -> None:
-    """The predecessor's re-keyed bars are the successor's rule-6 history: by
-    2020-05-01 the successor is excluded for liquidity, not for missing bars,
-    while without the chain rows the same read fails rule 6."""
+    """Once the sessions from the predecessor's delisting tail to the successor's
+    first bar are filled, the predecessor's re-keyed bars are the successor's
+    rule-6 history: with the chain it is a member at 2020-04-01 (its own bars end
+    2020-04-01), without the chain rows it fails rule 6. Liquidity is off so only
+    rule 6 can move it."""
     from conftest import load_chain_overlay, load_universe_fixtures
 
     from tradepartner.store.db import configure_connection, open_for_write
     from tradepartner.store.schema import init_schema
 
-    late = datetime.fromisoformat("2020-05-01T20:30:00+00:00")
-    settings = Settings(_env_file=None)
-    with_chain = universe_as_of(chain_fixture_store, late, settings)
-    assert "0001000011" not in set(with_chain.members["security_id"].to_list())
-    reasons = {row[3] for row in with_chain.exclusions.rows() if row[0] == _SUCCESSOR}
-    assert "missing_bars" not in reasons  # rule 6 satisfied by the chain
-    assert reasons  # and it is excluded for liquidity instead
+    def fill_hole(conn: duckdb.DuckDBPyConnection) -> None:
+        for day in _session_range(date(2020, 1, 6), date(2020, 2, 3)):
+            insert_row(
+                conn,
+                "prices_daily",
+                {
+                    "security_id": _SUCCESSOR,
+                    "session": day,
+                    "open": 20.0,
+                    "high": 21.0,
+                    "low": 19.0,
+                    "close": 20.0,
+                    "volume": 1_000_000,
+                    "known_at": session_close(day),
+                    "ingested_at": session_close(day),
+                    "source": "alpaca",
+                    "provenance": "bar",
+                },
+            )
 
-    # The same fixture with the chain rows deleted: the successor reads only its own
-    # ~40 bars (not the predecessor's 250), which is the history the chain supplies.
+    fill_hole(chain_fixture_store)
+    late = datetime.fromisoformat("2020-04-01T20:30:00+00:00")
+    settings = Settings(_env_file=None, universe={"liquidity_rule_enabled": False})
+    with_chain = universe_as_of(chain_fixture_store, late, settings)
+    assert "0001000011" in set(with_chain.members["security_id"].to_list())
+
+    # The same fixture with the chain rows deleted: the successor has only its own
+    # ~3 months of bars, so rule 6 excludes it (the predecessor's re-keyed history
+    # is what fills the 12-month window at `late`).
     path = tmp_path / "nochain.duckdb"
     bare = Settings(_env_file=None, store={"path": str(path)})
     with open_for_write(bare) as conn:
@@ -396,16 +418,27 @@ def test_universe_admits_the_chained_history(
         load_universe_fixtures(conn, fixtures)
         load_chain_overlay(conn)
         conn.execute("DELETE FROM successor_chains")
+        fill_hole(conn)
     conn = duckdb.connect(str(path), read_only=True)
     try:
         configure_connection(conn)
         without = universe_as_of(conn, late, settings)
-        own = prices_as_of(conn, late, [_SUCCESSOR]).height
+        assert prices_as_of(conn, late, [_SUCCESSOR]).height < 100  # its own bars only
     finally:
         conn.close()
-    with_chain_bars = prices_as_of(chain_fixture_store, late, [_SUCCESSOR]).height
-    assert with_chain_bars > 200 > own  # the predecessor's re-keyed bars
     assert "0001000011" not in set(without.members["security_id"].to_list())
+    assert [r[3] for r in without.exclusions.rows() if r[0] == _SUCCESSOR] == ["missing_bars"]
+
+
+def _session_range(start: date, end: date) -> list[date]:
+    from tradepartner.calendar import is_session
+
+    day, days = start, []
+    while day <= end:
+        if is_session(day):
+            days.append(day)
+        day = date.fromordinal(day.toordinal() + 1)
+    return days
 
 
 def test_a_chained_successor_bar_before_its_first_listing_is_hidden(
@@ -511,6 +544,8 @@ def test_the_chain_reads_are_truncation_invariant_from_the_known_at(
     ]
     settings = Settings(_env_file=None)
     for t in (
+        _CHAIN_KNOWN_AT - timedelta(days=1),
+        _CHAIN_KNOWN_AT - PROBE_EPSILON,
         _CHAIN_KNOWN_AT,
         _CHAIN_KNOWN_AT + PROBE_EPSILON,
         _CHAIN_KNOWN_AT + timedelta(days=30),
