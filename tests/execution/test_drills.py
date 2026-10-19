@@ -215,7 +215,7 @@ def test_skip_share_cap_halts_before_any_buy(env: Env, tmp_path: Path) -> None:
     assert journal(env) == ([], [], [])
 
 
-@pytest.mark.xfail(strict=True, reason="#1828")
+@pytest.mark.xfail(strict=True, reason="#1848")
 def test_sell_refused_after_position_changes_is_reconciliation_fault(
     env: Env, window: PaperWindowRow
 ) -> None:
