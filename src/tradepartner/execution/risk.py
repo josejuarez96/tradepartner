@@ -138,6 +138,7 @@ __all__ = [
     "order_shape_violation",
     "round_down",
     "size_buys",
+    "skip_cap",
     "unfilled_sells",
 ]
 
@@ -157,6 +158,14 @@ _CENT = Decimal(1).scaleb(-2)
 _CAP_EXEMPT = frozenset({"dust", "untradable"})
 
 PriceOf = Callable[[str], float]
+
+
+def skip_cap(frozen: RiskConfig, plan_decisions: int = 0) -> int:
+    """The run's skip cap: max(`max_skips_per_run`, floor(`max_skip_share` x the
+    plan's decisions)) (paper spec amendment 2026-10-18 item 3). Exact in
+    `Decimal`: 0.57 x 100 is 56.99999999999999 as a float."""
+    share = math.floor(Decimal(str(frozen.max_skip_share)) * plan_decisions)
+    return max(frozen.max_skips_per_run, share)
 
 
 @dataclass(frozen=True)
@@ -524,12 +533,15 @@ def check_phase(
     open_sells: Sequence[OpenSell] = (),
     prior_orders: int = 0,
     prior_skips: int = 0,
+    plan_decisions: int = 0,
     rows_on_session: Sequence[DecisionRow | OrderRow] = (),
 ) -> Violations | Skips:
     """Check one phase's batch (module docstring). `assets` is keyed by
     `security_id`; `open_sells` are the non-terminal own sells from any session
     (`unfilled_sells`); `prior_orders` and `prior_skips` are this run's earlier
-    phases' counts; `rows_on_session` are the session's `decisions` and
+    phases' counts; `plan_decisions` is the plan's decision count, for the skip
+    cap max(`max_skips_per_run`, floor(`max_skip_share` x it)), 0 (the floor alone
+    binds) when not given; `rows_on_session` are the session's `decisions` and
     `orders` rows, read only for `refused_position_side` and (its `orders`
     rows) `refused_order_shape`."""
     for order in orders:
@@ -589,7 +601,12 @@ def check_phase(
             continue
         asset = assets.get(order.security_id)
         if asset is None:
-            breach("asset_missing", f"no asset read for {order.security_id}")
+            if order.side == _BUY:
+                # A buy of a name the broker does not know is a per-name skip
+                # (spec amendment 2026-10-18 item 2); a held name's sell still fails closed.
+                skips.append(Skip(order.decision_id, order.security_id, "skip_asset_unknown"))
+            else:
+                breach("asset_missing", f"no asset read for {order.security_id}")
             continue
         # A full exit keeps its decision's basis and sells the whole holding (#395).
         whole = order.whole_share or (not asset.fractionable and not order.full_exit)
@@ -605,10 +622,11 @@ def check_phase(
         left.append(order)
 
     counted = prior_skips + sum(s.counts_toward_cap for s in skips)
-    if counted > frozen.max_skips_per_run:
+    cap = skip_cap(frozen, plan_decisions)
+    if counted > cap:
         breach(
             "max_skips_per_run",
-            f"{counted} skips counted against the cap of {frozen.max_skips_per_run}",
+            f"{counted} skips counted against the cap of {cap}",
             _SKIP_CAP,
         )
 

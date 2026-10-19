@@ -17,6 +17,7 @@ from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import Expire, FakeBroker, FillAt, PartialFill, Reject
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import ClockError, RejectionCapError, SystemFaultError
+from tradepartner.execution import collect as collect_module
 from tradepartner.execution.collect import (
     Collected,
     RejectionBreach,
@@ -860,6 +861,87 @@ def test_a_cancelled_or_filled_order_is_not_a_rejection() -> None:
     orders = [_plain_order("a", 1), _plain_order("b", 1)]
     events = [_event("a", "cancelled"), _event("b", "rejected")]
     assert rejection_breaches([1], orders, events, max_rejections=5) == ()
+
+
+# --- an allowlisted refusal is a skip, never a rejection (T202) ----------------------
+#
+# Paper spec amendment 2026-10-18 item 2 (#1808): a refusal on `submit` in the
+# allowlist closes its order `rejected` with the skip reason; req 4's rejection count
+# and its "every order of a run rejected" rule leave it out, from the count and from
+# the run's order total alike.
+
+SKIP_REASONS = ("skip_asset_unknown", "skip_not_fractionable", "skip_untradable")
+
+
+def _closed(client_order_id: str, status: str, reason: str | None = None) -> OrderEventRow:
+    at = datetime(2026, 10, 1, 14, 1, tzinfo=UTC)
+    return OrderEventRow(
+        client_order_id=client_order_id, status=status, reason=reason, known_at=at, ingested_at=at
+    )
+
+
+@pytest.mark.parametrize("reason", SKIP_REASONS)
+def test_exactly_the_cap_of_rejections_plus_a_skip_refusal_passes(reason: str) -> None:
+    """Two broker rejections at `max_rejections_per_run` = 2, plus one refusal
+    closed `rejected` with a skip reason, and one fill: no verdict."""
+    orders = [_plain_order(c, 1) for c in "abcd"]
+    events = [
+        _closed("a", "rejected"),
+        _closed("b", "rejected"),
+        _closed("c", "rejected", reason),
+        _closed("d", "filled"),
+    ]
+    assert rejection_breaches([1], orders, events, max_rejections=2) == ()
+
+
+def test_one_rejection_over_the_cap_still_breaches_beside_a_skip_refusal() -> None:
+    """The other side: three broker rejections at a cap of 2 breach; the refusal is
+    in neither the count (3) nor the order total (4 of the 5 orders)."""
+    orders = [_plain_order(c, 1) for c in "abcde"]
+    events = [
+        _closed("a", "rejected"),
+        _closed("b", "rejected"),
+        _closed("c", "rejected"),
+        _closed("d", "rejected", "skip_asset_unknown"),
+        _closed("e", "cancelled"),
+    ]
+    assert rejection_breaches([1], orders, events, max_rejections=2) == (
+        RejectionBreach(run_id=1, rejected=3, orders=4, all_rejected=False),
+    )
+
+
+def test_a_run_whose_every_order_is_a_skip_refusal_is_not_every_order_rejected() -> None:
+    orders = [_plain_order(c, 1) for c in "abc"]
+    events = [_closed(c, "rejected", reason) for c, reason in zip("abc", SKIP_REASONS, strict=True)]
+    assert rejection_breaches([1], orders, events, max_rejections=5) == ()
+
+
+def test_two_skip_refusals_beside_one_broker_rejection_are_every_order_rejected() -> None:
+    """The mixed case: the refusals leave the order total too, so the one broker
+    rejection is every order of the run (1 of 1), under the cap of 5."""
+    orders = [_plain_order(c, 1) for c in "abc"]
+    events = [
+        _closed("a", "rejected", "skip_asset_unknown"),
+        _closed("b", "rejected", "skip_not_fractionable"),
+        _closed("c", "rejected"),
+    ]
+    assert rejection_breaches([1], orders, events, max_rejections=5) == (
+        RejectionBreach(run_id=1, rejected=1, orders=1, all_rejected=True),
+    )
+
+
+def test_a_skip_refusal_and_an_ordinary_order_are_not_every_order_rejected() -> None:
+    orders = [_plain_order(c, 1) for c in "ab"]
+    events = [_closed("a", "rejected", "skip_untradable"), _closed("b", "filled")]
+    assert rejection_breaches([1], orders, events, max_rejections=0) == ()
+
+
+def test_a_run_with_only_skip_refusals_since_the_cursor_is_not_judged() -> None:
+    """The runs a collection judges leave out a `rejected` event with a skip
+    reason: run 1's only new rejection is a refusal, run 2's a broker rejection."""
+    orders = [_plain_order("a", 1), _plain_order("b", 2)]
+    events = [_closed("a", "rejected", "skip_asset_unknown"), _closed("b", "rejected")]
+    assert collect_module._runs_to_judge([], orders, events, None) == [2]
 
 
 # --- the lag bound ------------------------------------------------------------
