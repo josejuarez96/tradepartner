@@ -44,6 +44,18 @@ Conventions this module fixes for the writers (T61 reconcile, T64 window start):
   journaled before it and is in its `broker_cash`, and the strict comparison
   in `from_journal` never drops a later fill.
 
+- **Short holdings (T232, paper spec amendment #1872 item 10).** A fill of an
+  order whose `position_side` is `short` (a `sell_to_open` sell, a
+  `buy_to_close` buy) moves `Ledger.short_holdings`, an unsigned quantity per
+  `security_id` apart from `positions`, so a long-side oversell stays the
+  negative position `short_names` reports. Cash is signed as for any fill:
+  a short sale's proceeds are credited and a cover debited. `equity` is cash +
+  long value - short value at the marks, and `free_cash` (ADR 0010's restated
+  cash rule) is cash less the short value at the same marks; the rule's other
+  term, the unfilled notional of our own non-terminal buys, is the phase
+  sizing's (T230). A cover beyond the held short is a journal error
+  (`ValueError`), and a fully covered short is dropped like a zero position.
+
 A row's own date for the split test is its `session` (an adjustment) or the
 New York date of `filled_at` (a fill): a fill on the ex-date is already in
 post-split shares. Quantities within `quantity_tolerance` of zero
@@ -60,7 +72,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from fractions import Fraction
 from zoneinfo import ZoneInfo
@@ -68,7 +80,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from tradepartner.store.journal import AdjustmentRow, OrderedFill, OrderRow, ReconciliationRow
-from tradepartner.store.schema import JOURNAL_ENUMS
+from tradepartner.store.schema import JOURNAL_ENUMS, LONG
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _SPLIT = "split"
@@ -76,6 +88,7 @@ _OK = "ok"
 _BUY = "buy"
 _SELL = "sell"
 _CASH_IN_LIEU = "cash_in_lieu"
+_SHORT_FILL = "short_fill"
 _ADJUSTMENT_KINDS = frozenset(JOURNAL_ENUMS[("adjustments", "kind")])
 
 #: The replay's ranks within one session (#1627): the session's split, then its
@@ -108,6 +121,9 @@ class Ledger:
     #: The cash-bound multiplier (`risk.reconcile_cash_tolerance` x (1 + this/2),
     #: #1583, T183) scales the whole-dollar rounding each fill can leave.
     fills_since_base: int = 0
+    #: Shares held short per `security_id` (unsigned, dust dropped), from fills
+    #: of `short` orders; empty for a long book and for a ledger built by hand.
+    short_holdings: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def short_names(self) -> tuple[str, ...]:
@@ -126,15 +142,38 @@ class Ledger:
                 raise ValueError(f"mark for {name} is {marks[name]}, not a positive number")
         return {name: self.positions[name] * marks[name] for name in held}
 
+    def _short_value(self, marks: Mapping[str, float]) -> float:
+        """The short holdings at their marks, under `_values`' mark refusals."""
+        missing = sorted(name for name in self.short_holdings if name not in marks)
+        if missing:
+            raise KeyError(f"no mark for short names {missing}")
+        total = 0.0
+        for name in sorted(self.short_holdings):
+            if not math.isfinite(marks[name]) or marks[name] <= 0:
+                raise ValueError(f"mark for {name} is {marks[name]}, not a positive number")
+            total += self.short_holdings[name] * marks[name]
+        return total
+
     def equity(self, marks: Mapping[str, float]) -> float:
-        """Cash plus every held position at its mark. A held name with no mark
-        raises `KeyError`; a non-positive or non-finite mark, or a negative
-        position, raises `ValueError`; marks for names not held are ignored."""
-        return self.cash + sum(self._values(marks).values())
+        """Cash plus every long position at its mark, less every short holding
+        at its mark. A held name with no mark raises `KeyError`; a non-positive
+        or non-finite mark, or a negative position, raises `ValueError`; marks
+        for names not held are ignored."""
+        return self.cash + sum(self._values(marks).values()) - self._short_value(marks)
+
+    def free_cash(self, marks: Mapping[str, float]) -> float:
+        """The cash the buys may use: cash less the short holdings at their
+        marks (ADR 0010's restated cash rule, the ledger's part). The long
+        value is never added. Mark refusals as for `equity`."""
+        return self.cash - self._short_value(marks)
 
     def weights(self, marks: Mapping[str, float]) -> dict[str, float]:
         """Each held name's value over equity, under `equity`'s refusals.
         Equity that is not a positive number raises `ValueError`."""
+        if self.short_holdings:
+            raise ValueError(
+                f"weights are not defined with short holdings {sorted(self.short_holdings)}"
+            )
         values = self._values(marks)
         equity = self.cash + sum(values.values())
         if not math.isfinite(equity) or equity <= 0:
@@ -271,6 +310,7 @@ def from_journal(
     # Summed exactly, never in `float`, so a full exit on a fine quantity grid
     # leaves no float residue, with or without a split (#1296).
     positions: dict[str, Fraction] = defaultdict(Fraction)
+    shorts: dict[str, Fraction] = defaultdict(Fraction)  # unsigned short holdings (T232)
 
     # The rows are replayed in session order, not fills-then-adjustment deltas,
     # so a row's exact position is the shares held *then*: a split takes effect at
@@ -307,7 +347,8 @@ def from_journal(
         if stated_on > through:
             continue
         sign = 1 if fill.side == _BUY else -1
-        _record(stated_on, _REPLAY_FILL_RANK, "fill", fill.security_id, sign * _exact(row.quantity))
+        kind = _SHORT_FILL if by_id[row.client_order_id].position_side != LONG else "fill"
+        _record(stated_on, _REPLAY_FILL_RANK, kind, fill.security_id, sign * _exact(row.quantity))
         if after_base(row.known_at):
             cash -= sign * row.quantity * row.price
             fills_since_base += 1
@@ -339,6 +380,16 @@ def from_journal(
     for _day, _order, _seq, kind, security_id, amount in sorted(replay):
         if kind == "split":
             positions[security_id] *= amount
+            if security_id in shorts:
+                shorts[security_id] *= amount
+        elif kind == _SHORT_FILL:
+            # A short sale (a sell) adds to the short, a cover (a buy) removes.
+            shorts[security_id] -= amount
+            if shorts[security_id] < -_exact(quantity_tolerance):
+                raise ValueError(
+                    f"cover of {security_id} is {float(-shorts[security_id])} shares "
+                    f"beyond the short"
+                )
         elif kind == _CASH_IN_LIEU:
             # #1627: the row removes a stock dividend's fractional remainder at
             # its own point in the replay, so the issuer's exact `Fraction`
@@ -360,4 +411,14 @@ def from_journal(
             positions[security_id] += amount
 
     held = {name: float(q) for name, q in positions.items() if abs(q) > _exact(quantity_tolerance)}
-    return Ledger(positions=held, cash=cash, through=through, fills_since_base=fills_since_base)
+    short_held: dict[str, float] = {}
+    for name, short_quantity in shorts.items():
+        if short_quantity > _exact(quantity_tolerance):
+            short_held[name] = float(short_quantity)
+    return Ledger(
+        positions=held,
+        cash=cash,
+        through=through,
+        fills_since_base=fills_since_base,
+        short_holdings=short_held,
+    )

@@ -1986,6 +1986,20 @@ class SmallAccountConfig(BaseModel):
         return value
 
 
+class ShortRiskConfig(BaseModel):
+    """The three short-side `risk.*` keys (ADR 0010's amendment of 2026-10-19; paper
+    spec amendment #1872 items 7 and 12; plan T231). `RiskConfig` carries them like
+    `small_account`, outside its `model_fields`, so a window frozen before T231 still
+    loads at these defaults. The fractions are shares of equity in [0, 1]; non-finite
+    values and unknown keys are refused."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+    max_short_weight: float = Field(default=0.05, ge=0, le=1)
+    net_exposure_band: float = Field(default=0.10, ge=0, le=1)
+    min_short_equity: float = Field(default=2000.0, ge=0)
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -2023,25 +2037,53 @@ class RiskConfig(BaseModel):
     model_config = _PHASE3_MODEL_CONFIG
 
     _small_account: SmallAccountConfig = PrivateAttr(default_factory=SmallAccountConfig)
+    _short: ShortRiskConfig = PrivateAttr(default_factory=ShortRiskConfig)
 
     @model_validator(mode="wrap")
     @classmethod
     def _read_small_account(cls, data: Any, handler: Any) -> Any:
-        """Split `small_account` off the input before the field validation sees it."""
-        if isinstance(data, dict) and "small_account" in data:
-            rest = {k: v for k, v in data.items() if k != "small_account"}
-            section = SmallAccountConfig.model_validate(data["small_account"])
-            built = handler(rest)
-            built._small_account = section
-            return built
-        return handler(data)
+        """Split `small_account` and the three short keys (T231) off the input
+        before the field validation sees them."""
+        if not isinstance(data, dict):
+            return handler(data)
+        short_keys = {k: data[k] for k in ShortRiskConfig.model_fields if k in data}
+        if "small_account" not in data and not short_keys:
+            return handler(data)
+        rest = {k: v for k, v in data.items() if k != "small_account" and k not in short_keys}
+        section = (
+            SmallAccountConfig.model_validate(data["small_account"])
+            if "small_account" in data
+            else SmallAccountConfig()
+        )
+        short = ShortRiskConfig.model_validate(short_keys)
+        built = handler(rest)
+        built._small_account = section
+        built._short = short
+        return built
 
     @model_serializer(mode="wrap")
     def _write_small_account(self, handler: SerializerFunctionWrapHandler) -> Any:
-        """The dump carries `small_account`, so `paper start` freezes it."""
+        """The dump carries `small_account` and the short keys, so `paper start`
+        freezes them."""
         dumped = handler(self)
         dumped["small_account"] = self._small_account.model_dump()
+        dumped.update(self._short.model_dump())
         return dumped
+
+    @property
+    def max_short_weight(self) -> float:
+        """A short name's most held value over equity (ADR 0010 amendment 2026-10-19)."""
+        return self._short.max_short_weight
+
+    @property
+    def net_exposure_band(self) -> float:
+        """How far the net after a rebalance may sit from the window's `net_exposure`."""
+        return self._short.net_exposure_band
+
+    @property
+    def min_short_equity(self) -> float:
+        """The account equity below which a short open halts."""
+        return self._short.min_short_equity
 
     @property
     def small_account(self) -> SmallAccountConfig:
