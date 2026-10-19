@@ -230,30 +230,7 @@ def test_the_migration_keeps_every_master_row_live(tmp_path: Path) -> None:
             assert after.fetchall() == before[table]
             assert c.execute(f"SELECT DISTINCT retracted FROM {table}").fetchall() == [(False,)]
         assert c.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [
-            (10,),
-            (11,),
-            (12,),
-            (13,),
-            (14,),
-            (15,),
-            (16,),
-            (17,),
-            (18,),
-            (19,),
-            (20,),
-            (21,),
-            (22,),
-            (23,),
-            (24,),
-            (25,),
-            (26,),
-            (27,),
-            (28,),
-            (29,),
-            (30,),
-            (31,),
-            (32,),
-            (33,),
+            (v,) for v in range(10, schema.CURRENT_SCHEMA_VERSION + 1)
         ]
         assert c.execute("SELECT count(*) FROM master_underived").fetchone() == (0,)
         migrated = _ddl(c)
