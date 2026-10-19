@@ -19,7 +19,7 @@
 ## Answer
 **Verdict:** MIXED  ·  **Confidence:** medium (current state); low (dates)
 
-**What works now.** The owner can run the data, backtest and sweep loop today from the CLI and the Streamlit dashboard without an agent, and much of it has run on his store. The paper machine runs unattended every session, and it has already halted correctly three times.
+**What works now.** The owner can run the data, backtest and sweep loop today from the CLI and the Streamlit dashboard without an agent, and much of it has run on his store. The paper machine runs unattended every session, and it has already caught four faults correctly (three kill-switch halts and one stale-data refusal).
 
 **What does not work yet.**
 - Paper has placed **zero orders and recorded zero fills on any book, ever** (orch. query, 2026-10-19). The order path has never run against the broker.
@@ -33,9 +33,9 @@
 
 | Milestone | Earliest date | Planning range |
 |---|---|---|
-| A: backend operational MVP | after the close of **Mon 2026-11-02** | 2026-11-03 to 2026-12-01 |
-| B: owner-facing app MVP | about **2026-11-23** | December 2026 |
-| C: research-to-paper lifecycle | **2026-11-02** for the daily book; **2026-12-01** for a new candidate (B10) | not given |
+| A: backend operational MVP | after the close of **Tue 2026-11-03** (span row on 10-20 after the first rebalance, T161 ticked); Mon 11-02 only if the row is written tonight, 10-19 | 2026-11-03 to 2026-12-01 |
+| B: owner-facing app MVP | no point date: not before the third owner review sitting (about **2026-11-06** if weekly from this week), plus an agent build span this report cannot bind to sessions | December 2026 |
+| C: research-to-paper lifecycle | **2026-10-20** for the daily book (first fills); **2026-12-01** for a new candidate (B10) | daily book 10-20 to 11-03; B10 2026-12-01 to 2027-01-04 |
 
 Every date is bound to trading sessions and owner decisions, not to agent build speed.
 
@@ -113,8 +113,8 @@ The record below is from the orch. query, 2026-10-19.
 - 3 and 4 were abandoned by the owner on 10-18 to freeze `paper.max_stale_mark_sessions`.
 
 **Runs.**
-- No run is recorded for 10-14 or 10-15 (the `missed_run` alerts 6 and 8).
-- Every run since is a `mark`, a `no_session`, or one of the three fault halts below.
+- No run is recorded for 10-15 (the `missed_run` alerts 6 and 8 both name 10-15). No window was open for 10-14's run: windows 1 and 2 were abandoned on 10-13, and windows 3 and 4 opened at 20:50 UTC on 10-14. Why 10-15 was missed is not recorded; the Mac sleeping is an inference (#1759).
+- Every run since is a `mark`, a `no_session`, or one of the fault runs below (three halts, two stale refusals).
 - The daily book (window 5) shows its next rebalance as **Tue 2026-10-20**, run at 08:05 ET (`paper status --all`).
 - `main` (window 6, H1) first rebalances on 2026-10-30, which puts its first fill session on Mon 2026-11-02.
 
@@ -212,7 +212,7 @@ The record below is from the orch. query, 2026-10-19.
 - **Tests:** T201 fault drills on the fake broker (#1794); halts in operation (A3)
 - **Owner intervention:**
   - The owner resumes.
-  - Diagnosing the three real faults so far took agent PRs (A3).
+  - Diagnosing the four real faults so far (three halts, one stale-data refusal) took agent PRs (A3).
 - **Doc gaps:**
   - No entry for a broker 404 on a delisted name (#1480).
   - No "waiting on me" list.
@@ -247,7 +247,7 @@ The record below is from the orch. query, 2026-10-19.
 **Gates it sets before the build:**
 - **Before any webapp task is claimed:** a throwaway `spike/webapp-probe` must report on #1410 (§7, :110-116).
 - **Before any webapp task is claimed:** the charter, roadmap and design-standard amendments must merge (:123).
-- **Next:** `docs/specs/webapp.md` and `docs/plans/webapp.md` (:138).
+- **Next:** `docs/specs/webapp.md` and `docs/plans/webapp.md` (:140).
 
 **None of these exist.**
 - There is no probe branch, no spec and no plan.
@@ -340,7 +340,7 @@ Every row maps to an existing task or issue unless it is marked *proposed*.
 | Runbook entry and code path for a broker 404 on a delisted name | OPS | #1480 | agent |
 | Drill alert kind; small-account non-fractionable skip | OPS | #1848 | agent |
 | Alert table missing four kinds; E.6 lists unconfigured email | OPS | *proposed docs issue* (no task covers scheduling.md :416-435 vs alerts.py :109-127) | agent |
-| Off-Mac alerts (configure email: `.env.example`:32-38) | OPS (comfort) | none needed; owner config | owner |
+| Off-Mac alerts (configure email: `.env.example`:32-38), **before the span opens or after it passes**: E.6 needs an `ok` delivery in the span on every non-store channel (ADR 0017 :88) | OPS (comfort) | none needed; owner config | owner |
 | Pull origin/main and migrate the store to schema 34 (#1881) | OPS | T228 follow-through | owner |
 
 ### Research Lab (Milestone C)
@@ -362,7 +362,7 @@ Every row maps to an existing task or issue unless it is marked *proposed*.
 | ADR 0018 status decision | UI | ADR 0018 :3; class B | owner |
 | Charter, roadmap and design-standard amendments | UI | ADR 0018 :123 | agent drafts, owner merges |
 | `spike/webapp-probe`, its report on #1410 | UI | ADR 0018 §7 | agent |
-| `docs/specs/webapp.md` + `docs/plans/webapp.md` | UI | ADR 0018 :138 | agent drafts, owner merges |
+| `docs/specs/webapp.md` + `docs/plans/webapp.md` | UI | ADR 0018 :140 | agent drafts, owner merges |
 | Missing readers (`paper_report_periods`, waiting-on-me, …) | UI | HANDOFF :57-72; to be plan tasks | agent |
 
 ### Approved parallel, post-MVP and deferred
@@ -425,11 +425,11 @@ Definition: Phase 4's exit, `paper shakedown` exit 0 over every book ([roadmap](
   - the wake.
 - **Elapsed-session dependency:** 10 sessions, with fills on 5.
 - **In parallel:** the OPS docs rows; the T218 report.
-- **Earliest date:** after the close of **Mon 2026-11-02**.
+- **Earliest date:** after the close of **Tue 2026-11-03**, following the report's own order: watch the 10-20 rebalance, tick T161 (T162 depends on it, paper plan :141), write the span row on 10-20, and the span runs 10-21 to 11-03. The aggressive case is Mon 11-02, which needs the row written tonight (10-19 New York date), before any order has ever been placed, and T161 ticked first.
 - **Planning range:** **2026-11-03 to 2026-12-01**.
 - **Risks:**
   - The first-ever orders on 10-20 may surface a new fault. A mismatch or halt restarts the span, and each restart costs 10 or more sessions (two weeks).
-  - Missed runs if the Mac sleeps (10-14 and 10-15 had none).
+  - Missed runs: 10-15 had none, cause unrecorded (#1759 suspects sleep).
   - The drill-host conflict.
   - Schema 34 is not yet on the store.
 - **Confidence:** low for the earliest date; medium for the range.
@@ -452,7 +452,12 @@ Definition: ADR 0018's version 1. That is the read API plus Today, Books and Ope
   3. One or two screen reviews against his HANDOFF rules.
 - **Elapsed-session dependency:** none. The data is better once real fills exist, which follows Milestone A.
 - **In parallel:** everything in Milestone A.
-- **Earliest date:** **about 2026-11-23**, if the document gate is resumed this week and the owner reviews within days.
+- **Earliest date:** no evidence-backed point date. The basis is three owner sittings in sequence (each needs the previous one's documents merged), assumed weekly from the week of 10-19:
+  1. sitting 1 about 10-23: ADR status and the amendments;
+  2. sitting 2 about 10-30: the probe report, the spec and the plan;
+  3. sitting 3 about 11-06: the first screen review.
+
+  The build sits between sittings 2 and 3 and beyond: six pure readers and one journal table (ADR 0018 :121), the API, porting three screens, and kill and resume. Its length depends on agent throughput, which the brief excludes as a basis. So version 1 is **not before about 2026-11-06**, and later by the build span.
 - **Planning range:** **December 2026**. Thanksgiving week and the short build compete for attention.
 - **Risks:**
   - The owner's own design bar: he rejected one canvas.
@@ -470,10 +475,12 @@ Definition: a hypothesis that came through the Lab has a paper window with real 
   2. T165e at the first sitting after ten daily-book fill sessions, about 11-02 or later.
   3. Promotion, then `paper start` (month-end cadence).
   4. The first fills on Tue 12-01.
+- **Already merged:** the hypothesis, sweep and promotion path (sweep 1; decision 6); `paper start`, `paper report` and `paper check` (paper spec reqs 10, 14 and 15); T217/b/c's ladder (backtest plan :98-100); T165 to T165d (B10's screen, backtest plan :128).
 - **Owner-run dependencies:** T198; the T165e sweep; `paper start`.
+- **In parallel:** Milestone A (the same fill sessions count for both); the T218 report; the Q1 repurchasers' rung 1-2 read (strategy discovery).
 - **Elapsed-session dependencies:** 10 daily-book fill sessions; the 11-30 month-end.
-- **Earliest dates:** tier 1 **2026-11-02** (alongside A; the `paper.min_rebalances` count for a `daily` book is NOT VERIFIED). Tier 2 **2026-12-01**.
-- **Planning range:** tier 2 December 2026, if B10 survives.
+- **Earliest dates:** tier 1 **Tue 2026-10-20** (first fills; `paper report --book daily` can compare from then; when `paper check` first passes depends on `paper.min_rebalances` for a `daily` book, NOT VERIFIED). Tier 2 **Tue 2026-12-01**.
+- **Planning range:** tier 1 10-20 to 11-03; a fault on the first orders is fixed while the book keeps marking. Tier 2 12-01 to **2027-01-04**: if the sweep or promotion misses the November month-end, the next signal is 12-31 and the next fills are on 2027-01-04. If B10 dies, tier 2 ends at a recorded rejection.
 - **Risks:**
   - B10's prior is near zero after costs ([daily data readiness](2026-10-18-daily-data-readiness.md):9-11). If its sweep kills it, the lifecycle ends correctly at a recorded rejection. That is a working Lab, but there is no new paper book.
   - The ladder ledger names only B10 and the Q1 repurchasers as live candidates ([strategy discovery](2026-10-19-strategy-discovery.md):11-15).
@@ -494,7 +501,7 @@ Definition: a hypothesis that came through the Lab has a paper window with real 
    Each of these has run on his store (A2).
 2. **What blocks independent use.**
    - The order path has never run: zero orders and zero fills on any book.
-   - Fault diagnosis still needs an agent. All three real faults needed PRs, and #1480's 404 case has no runbook entry.
+   - Fault diagnosis still needs an agent. All four real faults (three halts, one stale-data refusal) needed PRs, and #1480's 404 case has no runbook entry.
    - Experiments other than backtests need an agent-written script, and their kill rule is read by hand.
    - There is no owner runbook for running and reading research.
    - Alerts reach only the Mac. Email is built but not configured.
@@ -531,10 +538,10 @@ Definition: a hypothesis that came through the Lab has a paper window with real 
 
    | Milestone | Earliest | Planning range | Depends on |
    |---|---|---|---|
-   | A: shakedown pass | after the close of Mon 2026-11-02 | 11-03 to 12-01 | the span row being written on 10-19 (New York date) and a daily-book drill |
-   | B: app version 1 | about 2026-11-23 | December 2026 | the owner's review sittings |
-   | C, tier 1: daily book | 2026-11-02 | n/a | |
-   | C, tier 2: B10 | Tue 2026-12-01 | n/a | B10 surviving its sweep |
+   | A: shakedown pass | after the close of Tue 2026-11-03 (Mon 11-02 only if the row is written tonight) | 11-03 to 12-01 | the 10-20 rebalance, T161 ticked, the span row on 10-20, a daily-book drill, no restart |
+   | B: app version 1 | not before about 2026-11-06 (third weekly sitting) plus the build | December 2026 | three owner sittings in sequence, then the agent build |
+   | C, tier 1: daily book | Tue 2026-10-20 | 10-20 to 11-03 | the first orders filling |
+   | C, tier 2: B10 | Tue 2026-12-01 | 12-01 to 2027-01-04 | T198, T165e, B10 surviving its sweep |
 
 ---
 
@@ -557,7 +564,7 @@ Definition: a hypothesis that came through the Lab has a paper window with real 
 
 **What I found against my reading:**
 - The parking is in a #836 comment, not in a plan. So the owner may consider the drill week already dropped, and then the earliest date stands.
-- T162's 10-18 amendment suggests the owner already accepted a drill on `main` on 11-02. If so, the conflict is resolved in favour of 11-02 and Milestone A's earliest date stands.
+- T162's 10-18 amendment suggests the owner already accepted a drill on `main` on 11-02. If so, the conflict is resolved in favour of 11-02 and Milestone A's dates stand.
 
 ## Caveats & gaps
 - The dates assume the daily book trades every session. `rebalance_band` defaults to 0 (config.py:1356) and the file says "every session" ([momentum-daily-shakedown](../hypotheses/momentum-daily-shakedown.md):42, :98). They also assume no restart.
