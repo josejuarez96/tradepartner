@@ -1000,22 +1000,120 @@ def test_two_names_in_one_phase_sharing_a_broker_symbol_raise_before_any_call(
 # --- acknowledgement, rejections and the kill switch ---------------------------------------
 
 
-def test_the_ack_timeout_leaves_the_order_pending(
+def test_the_first_ack_timeout_leaves_the_order_pending_unresolved_and_goes_on(
     env: Env, alerter_conn: duckdb.DuckDBPyConnection
 ) -> None:
+    """Paper spec amendment 2026-10-18 item 4 (T202b; this test said "halts"
+    before it): the poll runs on to `paper.accept_wait_max_seconds`, then journals
+    one `pending_unresolved` event (no reason) and the batch returns."""
     env.fake.script(Vanish())
     gate = _gate(env, alerter_conn)
     start = env.clock.now
-    with pytest.raises(AcknowledgementTimeoutError):
-        _execute(gate, env, [_decision(env, A, "buy", notional=3000.0)])
-    assert env.clock.now - start >= timedelta(seconds=env.settings.paper.accept_wait_seconds)
+    outcome = _execute(gate, env, [_decision(env, A, "buy", notional=3000.0)])
+    assert outcome.status == "ok"
+    paper = env.settings.paper
+    assert env.clock.now - start >= timedelta(seconds=paper.accept_wait_max_seconds)
     (request,) = _submits(env.fake)
-    statuses = _query(
+    events = _query(
         env.settings,
-        "SELECT status FROM order_events WHERE client_order_id = ?",
+        "SELECT status, reason, known_at FROM order_events WHERE client_order_id = ? "
+        "ORDER BY known_at, rowid",
         [request.client_order_id],
     )
-    assert statuses == [("pending",)]
+    assert [(status, reason) for status, reason, _ in events] == [
+        ("pending", None),
+        ("pending_unresolved", None),
+    ]
+    assert events[1][2] - start >= timedelta(seconds=paper.accept_wait_max_seconds)
+
+
+def test_an_unresolved_sell_then_a_closed_window_sends_no_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Review fix (#1843): the sell's longer poll ends after the submit window
+    closes (open + 30 min); the buys phase re-checks the window before its first
+    submit, so no buy goes out and its order is closed `not_received`."""
+    _hold(env, A, 10.0)
+    env.clock.now = session_open(S) + timedelta(minutes=27)
+    env.fake.script(Vanish())
+    trim = _decision(env, A, "sell", notional=500.0)
+    buy = _decision(env, B, "buy", notional=3000.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [trim, buy])
+    assert outcome.status == "ok"
+    assert [r.side for r in _submits(env.fake)] == [Side.SELL]
+    (sell,) = _query(
+        env.settings,
+        "SELECT client_order_id FROM orders WHERE side = 'sell' AND run_id = ?",
+        [env.run.run_id],
+    )
+    assert _query(
+        env.settings,
+        "SELECT status FROM order_events WHERE client_order_id = ? ORDER BY known_at, rowid",
+        [sell[0]],
+    ) == [("pending",), ("pending_unresolved",)]
+    assert _query(
+        env.settings,
+        "SELECT e.status, e.reason FROM order_events e JOIN orders o USING (client_order_id) "
+        "WHERE o.side = 'buy' AND o.run_id = ? ORDER BY e.known_at, e.rowid",
+        [env.run.run_id],
+    ) == [("pending", None), ("cancelled", "not_received")]
+
+
+def test_sells_closed_by_the_window_send_no_buy(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Review fix (#1843): the first sell vanishes and the window closes during
+    its poll, so the second sell is closed unsent; the buys phase must not send
+    a buy either."""
+    _hold(env, A, 10.0)
+    _hold(env, C, 10.0)
+    env.clock.now = session_open(S) + timedelta(minutes=27)
+    env.fake.script(Vanish())
+    sells = [_decision(env, A, "sell", notional=500.0), _decision(env, C, "sell", notional=500.0)]
+    buy = _decision(env, B, "buy", notional=3000.0)
+    outcome = _execute(_gate(env, alerter_conn), env, [*sells, buy])
+    assert outcome.status == "ok"
+    assert [r.side for r in _submits(env.fake)] == [Side.SELL]
+    assert _query(
+        env.settings,
+        "SELECT e.status, e.reason FROM order_events e JOIN orders o USING (client_order_id) "
+        "WHERE o.run_id = ? AND o.security_id = ? ORDER BY e.known_at, e.rowid",
+        [env.run.run_id, C],
+    ) == [("pending", None), ("cancelled", "not_received")]
+
+
+def test_a_second_ack_timeout_in_the_batch_halts_and_leaves_it_pending(
+    env: Env, alerter_conn: duckdb.DuckDBPyConnection
+) -> None:
+    """Item 4: at most one `pending_unresolved` order per run; the second timeout
+    raises `AcknowledgementTimeoutError` as before T202b, its order left `pending`.
+    The submit window is widened so the second submit is still inside it after
+    the first order's longer poll (14:00 + 300 s, against a 14:30 close)."""
+    env.settings = _settings(
+        env.settings.store.path, paper={"submit_window_after_open_minutes": 60}
+    )
+    env.fake.script(Vanish())
+    env.fake.script(Vanish())
+    buys = [_decision(env, A, "buy", notional=3000.0), _decision(env, C, "buy", notional=3000.0)]
+    with pytest.raises(AcknowledgementTimeoutError):
+        _execute(_gate(env, alerter_conn), env, buys)
+    first, second = _submits(env.fake)
+    statuses = {
+        request.client_order_id: [
+            status
+            for (status,) in _query(
+                env.settings,
+                "SELECT status FROM order_events WHERE client_order_id = ? "
+                "ORDER BY known_at, rowid",
+                [request.client_order_id],
+            )
+        ]
+        for request in (first, second)
+    }
+    assert statuses == {
+        first.client_order_id: ["pending", "pending_unresolved"],
+        second.client_order_id: ["pending"],
+    }
 
 
 def test_the_rejection_cap_names_the_submitting_run(

@@ -2142,6 +2142,11 @@ class PaperConfig(BaseModel):
     sell_wait_seconds: float = Field(default=900.0, ge=0)
     poll_interval_seconds: float = Field(default=15.0, gt=0)
     accept_wait_seconds: float = Field(default=30.0, gt=0)
+    #: The longer acknowledgement poll's bound (T202b, spec amendment 2026-10-18
+    #: item 4): an order unacknowledged by then is the run's one
+    #: `pending_unresolved` order. Never below `accept_wait_seconds`; read at run
+    #: time, not frozen.
+    accept_wait_max_seconds: float = Field(default=300.0, gt=0)
     fill_read_overlap_seconds: float = Field(default=60.0, ge=0)
     order_id_prefix: str = Field(default="tp", min_length=1, pattern=r"^\S+$")
     live_capital_reference: float = Field(default=100.0, gt=0)
@@ -2172,6 +2177,11 @@ class PaperConfig(BaseModel):
         if self.poll_interval_seconds > self.accept_wait_seconds:
             raise ValueError(
                 f"poll_interval_seconds ({self.poll_interval_seconds}) must not exceed "
+                f"accept_wait_seconds ({self.accept_wait_seconds})"
+            )
+        if self.accept_wait_max_seconds < self.accept_wait_seconds:
+            raise ValueError(
+                f"accept_wait_max_seconds ({self.accept_wait_max_seconds}) must not be below "
                 f"accept_wait_seconds ({self.accept_wait_seconds})"
             )
         return self

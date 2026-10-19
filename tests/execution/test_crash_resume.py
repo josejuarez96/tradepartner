@@ -49,6 +49,7 @@ from execution.test_run_trade import (
     F_0,
     F_0_PLUS_1,
     FROZEN,
+    T_0,
     TARGETS,
     Clock,
     Env,
@@ -57,17 +58,30 @@ from execution.test_run_trade import (
     env,
     window,
 )
-from tradepartner.adapters.broker import Asset, OrderRequest, Side
+from tradepartner.adapters.broker import Asset, OrderRequest, Side, UnknownOrderError
 from tradepartner.adapters.fake_broker import (
     Expire,
     FakeBroker,
     PartialFill,
     Reject,
     TransportFault,
+    Vanish,
 )
-from tradepartner.calendar import last_session_of_month, next_session, previous_session
+from tradepartner.calendar import (
+    last_session_of_month,
+    next_session,
+    previous_session,
+    session_close,
+)
 from tradepartner.config import PaperConfig, RiskConfig, Settings
-from tradepartner.errors import ReconciliationError, RejectionCapError, SkipCapError, StaleDataError
+from tradepartner.errors import (
+    AcknowledgementTimeoutError,
+    ClockError,
+    ReconciliationError,
+    RejectionCapError,
+    SkipCapError,
+    StaleDataError,
+)
 from tradepartner.execution import alerts as alerts_module
 from tradepartner.execution import check as check_module
 from tradepartner.execution import resume as resume_module
@@ -75,15 +89,21 @@ from tradepartner.execution import run as run_module
 from tradepartner.execution import switch
 from tradepartner.execution.lock import LockHeld, run_lock
 from tradepartner.execution.outcomes import NOT_EXECUTED, POSITION_RETURN, REALISED_PNL
+from tradepartner.execution.reconcile_run import reconcile_command
+from tradepartner.execution.reserve import open_buy_reserve
 from tradepartner.execution.resume import RELEASED
 from tradepartner.execution.window import stop as window_stop
 from tradepartner.execution.wrapper import WRITE_FAILED_EXIT_CODE
+from tradepartner.store.asof import live_actions_as_of
 from tradepartner.store.db import open_read_only
 from tradepartner.store.journal import (
     AdjustmentRow,
+    OverrideRow,
     PaperWindowRow,
     fills_for,
     kill_switch_events_for,
+    order_events_for,
+    orders_for,
     runs_for,
 )
 
@@ -1372,3 +1392,362 @@ def test_resume_releases_while_the_window_holds_a_marked_position(
 
     outcome = _resume(env)
     assert outcome.status == RELEASED, outcome.reasons
+
+
+# --- an acknowledgement timeout leaves one order `pending_unresolved` (#1841, T202b) ---------
+#
+# Paper spec amendment 2026-10-18 item 4, end to end. F_0's three buys are submitted
+# DUALB, SPFT, TRNS (in that order), each a 33,283.40 notional; the fake fills an
+# open order whenever the run sleeps, so only a vanished order stays unfilled.
+
+
+def _events(env: Env, coid: str) -> list[tuple[str, str | None]]:
+    return [
+        (status, reason)
+        for status, reason in env.query(
+            "SELECT status, reason FROM order_events WHERE client_order_id = ? "
+            "ORDER BY known_at, rowid",
+            [coid],
+        )
+    ]
+
+
+def _reconciliations(env: Env, run_id: int | None) -> list[str]:
+    return [
+        status
+        for (status,) in env.query(
+            "SELECT status FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id",
+            [run_id],
+        )
+    ]
+
+
+def _first_reconciled_at(env: Env, run_id: int | None) -> datetime:
+    return env.query("SELECT min(known_at) FROM reconciliations WHERE run_id = ?", [run_id])[0][0]
+
+
+def _unresolved_buy(env: Env) -> tuple[str, int]:
+    """F_0's run with TRNS's buy (the last submit) vanishing at the broker, so it is
+    never acknowledged: (its client_order_id, the run's id)."""
+    coid = buy_id(env, F_0, "SEC_TRANSFER")
+    env.fake.script(Vanish(), client_order_id=coid)
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert outcome.run_id is not None
+    return coid, outcome.run_id
+
+
+def _no_price(security_id: str) -> float:
+    raise AssertionError(f"a notional buy's reserve reads no price ({security_id})")
+
+
+def test_an_unacknowledged_buy_past_the_longer_poll_ends_the_run_ok_pending_unresolved(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """The poll runs to `paper.accept_wait_max_seconds` (300 s), then one
+    `pending_unresolved` event, no reason; the run ends `ok`, its step 8
+    reconciliation `pending_unresolved` (no cash re-base), one
+    `pending_unresolved` alert naming the order, no switch; the decision stays
+    open with its one order, and the order's unfilled 33,283.40 is the next
+    session's whole buy reserve (the other two buys filled)."""
+    coid = buy_id(env, F_0, "SEC_TRANSFER")
+    env.fake.script(Vanish(), client_order_id=coid)
+    outcome = env.run(at(F_0))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    run_id = outcome.run_id
+    assert env.result(run_id)[:2] == ("ok", None)
+    stamped = env.query(
+        "SELECT status, reason, known_at FROM order_events WHERE client_order_id = ? "
+        "ORDER BY known_at, rowid",
+        [coid],
+    )
+    assert [(status, reason) for status, reason, _ in stamped] == [
+        ("pending", None),
+        ("pending_unresolved", None),
+    ]
+    waited = stamped[1][2] - stamped[0][2]
+    assert waited >= timedelta(seconds=env.settings.paper.accept_wait_max_seconds)
+    for security_id in ("SEC_DUAL_B", "SEC_SPLIT_FUTURE"):
+        assert _events(env, buy_id(env, F_0, security_id))[-1] == ("filled", None)
+    assert env.query("SELECT count(*) FROM fills WHERE client_order_id = ?", [coid]) == [(0,)]
+    assert [(a[0], a[2]) for a in _attempts(env, "SEC_TRANSFER")] == [(coid, "pending_unresolved")]
+    assert env.query(
+        "SELECT count(*) FROM decision_events e JOIN orders o USING (decision_id) "
+        "WHERE o.client_order_id = ?",
+        [coid],
+    ) == [(0,)]
+    assert _reconciliations(env, run_id)[-1] == "pending_unresolved"
+    [(alert_run, alert_session, message)] = env.alerts("pending_unresolved")
+    assert (alert_run, alert_session) == (run_id, F_0)
+    assert coid in message
+    assert env.alerts("halted") == []
+    assert env.count("kill_switch") == 0
+    assert not _engaged(env, window)
+
+    (notional,) = env.query("SELECT notional FROM orders WHERE client_order_id = ?", [coid])[0]
+    assert notional == pytest.approx(33_283.40)
+    with open_read_only(env.settings) as conn:
+        orders = orders_for(conn, window_id=None)
+        events = order_events_for(conn, window_id=None)
+        fills = fills_for(conn)
+        actions = live_actions_as_of(conn, session_close(F_0))
+    reserve = open_buy_reserve(
+        orders, events, fills, actions, _no_price, FROZEN, session=F_0_PLUS_1
+    )
+    assert reserve == Decimal("33283.40")
+
+
+def test_the_next_runs_start_cancels_an_order_the_broker_never_got_and_reattempts_it(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 4 (c), unknown: step 3 of the next run (2019-05-02, a catch-up in the
+    window) cancels it `not_received` before step 4 reconciles; the decision,
+    open again, gets one new attempt on that run, which fills; both of that
+    run's reconciliations are `ok`."""
+    coid, _ = _unresolved_buy(env)
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert _events(env, coid) == [
+        ("pending", None),
+        ("pending_unresolved", None),
+        ("cancelled", "not_received"),
+    ]
+    settled_at = env.query(
+        "SELECT known_at FROM order_events WHERE client_order_id = ? AND status = 'cancelled'",
+        [coid],
+    )[0][0]
+    assert settled_at <= _first_reconciled_at(env, nxt.run_id)
+    assert _reconciliations(env, nxt.run_id) == ["ok", "ok"]
+    attempts = _attempts(env, "SEC_TRANSFER")
+    assert [(a[0] == coid, a[2]) for a in attempts] == [(True, "cancelled"), (False, "filled")]
+    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
+
+
+def test_the_next_runs_start_acknowledges_and_collects_an_order_the_broker_did_get(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 4 (c), known: the broker got TRNS's buy late and filled it after the
+    first run gave up. The next run's step 3 journals `accepted` (before step 4),
+    its one fill and `filled`; no new attempt is made, and both reconciliations
+    are `ok`."""
+    coid, _ = _unresolved_buy(env)
+    (notional,) = env.query("SELECT notional FROM orders WHERE client_order_id = ?", [coid])[0]
+    placed = env.fake.submit(OrderRequest(coid, "TRNS", Side.BUY, notional=notional))
+    env.fake.simulate_fill(coid)
+    submits = len(env.submits())
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert [status for status, _ in _events(env, coid)] == [
+        "pending",
+        "pending_unresolved",
+        "accepted",
+        "filled",
+    ]
+    accepted_at, broker_order_id = env.query(
+        "SELECT known_at, broker_order_id FROM order_events "
+        "WHERE client_order_id = ? AND status = 'accepted'",
+        [coid],
+    )[0]
+    assert broker_order_id == placed.broker_order_id
+    assert accepted_at <= _first_reconciled_at(env, nxt.run_id)
+    assert env.query("SELECT count(*) FROM fills WHERE client_order_id = ?", [coid]) == [(1,)]
+    assert len(env.submits()) == submits
+    assert _reconciliations(env, nxt.run_id) == ["ok", "ok"]
+    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
+
+
+def test_a_second_acknowledgement_timeout_in_one_run_halts(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 4 (a): at most one per run. SPFT's buy times out first and is left
+    `pending_unresolved`; TRNS's, the second, halts with
+    `AcknowledgementTimeoutError` as before T202b, its order left `pending`."""
+    first, second = buy_id(env, F_0, "SEC_SPLIT_FUTURE"), buy_id(env, F_0, "SEC_TRANSFER")
+    env.fake.script(Vanish(), client_order_id=first)
+    env.fake.script(Vanish(), client_order_id=second)
+    with pytest.raises(AcknowledgementTimeoutError):
+        env.run(at(F_0))
+    halted = env.latest_run()
+    assert env.result(halted)[:2] == ("halted", "AcknowledgementTimeoutError")
+    assert _events(env, first) == [("pending", None), ("pending_unresolved", None)]
+    assert _events(env, second) == [("pending", None)]
+    assert env.query("SELECT source, fault_type, run_id FROM kill_switch") == [
+        ("fault", "AcknowledgementTimeoutError", halted)
+    ]
+    assert len(env.alerts("halted")) == 1
+
+
+def test_the_clock_check_runs_again_after_the_longer_poll(env: Env, window: PaperWindowRow) -> None:
+    """Item 4 (a): after the longer poll the clock pre-check runs again before the
+    next submit. DUALB's buy (the first submit) vanishes; during its poll the
+    adapter stops sharing the wrapper's clock object (the identity the pre-check
+    tests first), so the check halts with `ClockError` before SPFT is submitted.
+    Nothing else in the run reads that identity: without the second check the
+    run would end `ok`."""
+    coid = buy_id(env, F_0, "SEC_DUAL_B")
+    env.fake.script(Vanish(), client_order_id=coid)
+    shared = env.fake.clock
+
+    def unshare(_now: datetime) -> None:
+        env.fake.clock = lambda: shared()
+
+    env.on_sleep.append(unshare)
+    with pytest.raises(ClockError, match="one clock object"):
+        env.run(at(F_0))
+    halted = env.latest_run()
+    assert env.result(halted)[:2] == ("halted", "ClockError")
+    assert [request.client_order_id for request in env.submits()] == [coid]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+
+
+def test_after_the_longer_poll_outside_the_submit_window_the_rest_is_never_sent(
+    fixture_store_path: Path, tmp_path: Path
+) -> None:
+    """Item 4 (a): the submit-window check runs again after the longer poll. The
+    window closes at the open (13:30 UTC, `submit_window_after_open_minutes` 0);
+    the run starts at 13:27 and DUALB's buy vanishes, so its 300 s poll ends at
+    13:32. SPFT and TRNS, journaled before the first submit, are never sent: each
+    is closed `cancelled` with reason `not_received` (the broker never got it),
+    the run ends `ok`, the rebalance stays pending, and the next in-window run
+    settles DUALB `not_received` and trades all three."""
+    settings = Settings(
+        _env_file=None,
+        store={"path": str(fixture_store_path)},
+        alpaca={"quantity_decimals": 6, "client_order_id_max_length": 48},
+        paper={"submit_window_after_open_minutes": 0},
+    )
+    env = Env(settings, Clock(at(F_0, 13, 27)))
+    env.open_window(tmp_path=tmp_path)
+    coid = buy_id(env, F_0, "SEC_DUAL_B")
+    env.fake.script(Vanish(), client_order_id=coid)
+    outcome = env.run(at(F_0, 13, 27))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert [request.client_order_id for request in env.submits()] == [coid]
+    assert _events(env, coid) == [("pending", None), ("pending_unresolved", None)]
+    for security_id in ("SEC_SPLIT_FUTURE", "SEC_TRANSFER"):
+        assert _events(env, buy_id(env, F_0, security_id)) == [
+            ("pending", None),
+            ("cancelled", "not_received"),
+        ]
+    assert env.rebalance_events() == []
+    assert _reconciliations(env, outcome.run_id)[-1] == "pending_unresolved"
+    assert env.count("kill_switch") == 0
+
+    nxt = env.run(at(F_0_PLUS_1))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert _events(env, coid)[-1] == ("cancelled", "not_received")
+    assert sorted(env.held()) == ["DUALB", "SPFT", "TRNS"]
+    assert _reconciliations(env, nxt.run_id) == ["ok", "ok"]
+
+
+def test_an_unresolved_sells_proceeds_are_not_spent_and_its_name_stays_held(
+    env: Env, window: PaperWindowRow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4 (a), the sell side. On F_1 an `exclude_name` override sells TRNS
+    whole (1,314.510268 shares) and the plan buys 35,155.05 with the proceeds
+    (DUALB 1,192.51, SPFT 246.30, WNDX 33,716.24; cash before the run 149.80).
+    The broker fills the sell but never acknowledges it in the run (`get_order`
+    and the fills feed do not show it): its proceeds are excluded from the
+    buys phase's cash, so the buys submitted cost at most the 149.80, and its
+    position counts as held (no fill journaled; the ledger keeps TRNS until the
+    read-back). The next run's step 3 acknowledges it and journals the fill."""
+    bought(env)
+    assert window.window_id is not None
+    t_1, f_1 = date(2019, 5, 31), date(2019, 6, 3)
+    stamp = at(T_0, 22)
+    env.append(
+        OverrideRow(
+            window_id=window.window_id,
+            made_at=stamp,
+            rebalance_session=t_1,
+            security_id="SEC_TRANSFER",
+            kind="exclude_name",
+            reason="the owner's reason, long enough",
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+    sell = sell_id(env, f_1, "SEC_TRANSFER")
+    hidden = {sell}
+    get_order, fills = env.fake.get_order, env.fake.fills
+
+    def unacknowledged(client_order_id: str) -> object:
+        if client_order_id in hidden:
+            raise UnknownOrderError(client_order_id)
+        return get_order(client_order_id)
+
+    def feed(since: datetime | None = None) -> list[object]:
+        return [f for f in fills(since) if f.client_order_id not in hidden]
+
+    monkeypatch.setattr(env.fake, "get_order", unacknowledged)
+    monkeypatch.setattr(env.fake, "fills", feed)
+    cash_before = env.fake.account().cash
+    assert cash_before == pytest.approx(149.80)
+
+    outcome = env.run(at(f_1))
+    assert outcome.status == "ok", env.result(env.latest_run())
+    assert _events(env, sell) == [("pending", None), ("pending_unresolved", None)]
+    assert env.held().get("TRNS", 0.0) < 1e-6  # the broker did sell it
+    assert env.fake.account().cash > cash_before + 30_000  # and credited the proceeds
+    buys = env.query(
+        "SELECT notional FROM orders WHERE run_id = ? AND side = 'buy'", [outcome.run_id]
+    )
+    assert sum(notional for (notional,) in buys) <= cash_before
+    assert env.query("SELECT count(*) FROM fills WHERE client_order_id = ?", [sell]) == [(0,)]
+    assert _reconciliations(env, outcome.run_id)[-1] == "pending_unresolved"
+    assert len(env.alerts("pending_unresolved")) == 1
+
+    hidden.clear()
+    nxt = env.run(at(date(2019, 6, 4)))
+    assert nxt.status == "ok", env.result(env.latest_run())
+    assert [status for status, _ in _events(env, sell)][-2:] == ["accepted", "filled"]
+    assert env.query("SELECT count(*) FROM fills WHERE client_order_id = ?", [sell]) == [(1,)]
+    assert _reconciliations(env, nxt.run_id)[-1] == "ok"
+
+
+def test_paper_resume_under_the_switch_settles_it_by_the_read_back(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 4 (c): with the switch engaged (the owner's), `paper resume` settles the
+    `pending_unresolved` order by the same read-back (the broker got it and filled
+    it: `accepted`, its fill, `filled`), submits nothing, reconciles and releases."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    engaged = switch.engage(
+        env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
+    )
+    assert isinstance(engaged, int)
+    (notional,) = env.query("SELECT notional FROM orders WHERE client_order_id = ?", [coid])[0]
+    env.fake.submit(OrderRequest(coid, "TRNS", Side.BUY, notional=notional))
+    env.fake.simulate_fill(coid)
+    submits = len(env.submits())
+    outcome = _resume(env)
+    assert outcome.status == RELEASED, outcome.reasons
+    assert [status for status, _ in _events(env, coid)] == [
+        "pending",
+        "pending_unresolved",
+        "accepted",
+        "filled",
+    ]
+    assert len(env.submits()) == submits
+
+
+def test_paper_reconcile_under_the_switch_settles_it_by_the_read_back(
+    env: Env, window: PaperWindowRow
+) -> None:
+    """Item 4 (c): with the switch engaged, `paper reconcile` settles the order by
+    the read-back before it reconciles (the broker never got it: `cancelled`,
+    `not_received`), so its reconciliation is `ok`, not `pending_unresolved`; it
+    submits nothing and releases nothing."""
+    coid, _ = _unresolved_buy(env)
+    assert window.window_id is not None
+    engaged = switch.engage(
+        env.settings, env.clock, window_id=window.window_id, source="owner", reason="test"
+    )
+    assert isinstance(engaged, int)
+    submits = len(env.submits())
+    result = reconcile_command(env.settings, env.connect, env.fake, _ticking(env))
+    assert result.status == "ok"
+    assert _events(env, coid)[-1] == ("cancelled", "not_received")
+    assert _engaged(env, window)
+    assert len(env.submits()) == submits

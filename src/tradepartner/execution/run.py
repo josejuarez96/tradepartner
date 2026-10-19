@@ -41,7 +41,13 @@ security (its listing current at S-1) has a bar for S-1 known by that run's
 `finished_at`. Otherwise `StaleDataError`, before any plan read, any
 collection and any reconciliation.
 
-**Step 3. Collection** (T58) of every acknowledged non-terminal order of the
+**Step 3. Read-back and collection.** First, every `pending_unresolved` order of the
+window (an acknowledgement timeout of an earlier run, T202b, spec amendment 2026-10-18
+item 4 (c)) is read back by `client_order_id` (`reconcile_run.settle_pending_unresolved`):
+known, it gets an `accepted` event; unknown, `cancelled` with reason `not_received`, its
+decision open again; unreadable or unmappable, `ReconciliationError` before step 4.
+
+**Collection** (T58) of every acknowledged non-terminal order of the
 window (a `pending` one is `paper resume`'s), with the `written_off`
 back-fill for the pending rebalances' buys. A rejection verdict raises
 `RejectionCapError` naming the submitting run. An order still
@@ -203,7 +209,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from functools import partial
@@ -249,7 +255,12 @@ from tradepartner.execution.plan import (
 )
 from tradepartner.execution.reconcile import FILLS_LAGGING, MISMATCH, Mismatch, Reconciliation
 from tradepartner.execution.reconcile import OK as RECONCILED
-from tradepartner.execution.reconcile_run import frozen_risk, reconcile_now
+from tradepartner.execution.reconcile_run import (
+    frozen_risk,
+    reconcile_now,
+    settle_pending_unresolved,
+    unresolved_orders,
+)
 from tradepartner.execution.risk import OpenSell, unfilled_sells
 from tradepartner.execution.symbols import broker_symbol
 from tradepartner.execution.window import window_cadence
@@ -1467,6 +1478,13 @@ class _Run:
         actions = self._actions()
         prices = self._pending_prices(actions)
         self.write_offs = WriteOffContext(self.window_id, actions, prices.__getitem__, self.session)
+        with open_read_only(self.settings, retry=True) as conn:
+            unresolved = unresolved_orders(lambda: nullcontext(conn), self.window_id)
+        self._halting(
+            lambda: settle_pending_unresolved(
+                self.broker, self.connect, self.gate.read_clock, unresolved
+            )
+        )
         collected = self._collect()
         self._unspent_cash(self._executed(actions, prices), {})
         if self.kind == _STOP:
