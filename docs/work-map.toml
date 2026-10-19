@@ -1334,6 +1334,11 @@ what = "Break first: fast strategies through a kill ladder, paper books as pre-r
 why = "Records the owner's 2026-10-18 decisions (#1731) that reorder the work toward a clean shakedown span, a first fast forward exam and the first live order in weeks, with every build task tied to an observed or provoked break."
 unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209a", "task:T209b", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
 
+[adr.0024]
+what = "Long-only is no longer a scope constraint: research, backtests and Alpaca paper books may hold short and long/short positions; live stays long-only on the cash account until the live account type is decided."
+why = "Records the owner's 2026-10-19 decision (#1863) so short legs, where the evidence says anomaly profits sit, can enter the candidate pool and the kill ladder, and lists what must exist before the first paper short order."
+unblocks = ["research:2026-10-10-beyond-long-only", "phase:6"]
+
 [task.T200]
 what = "A1: the raw trading client retries 5xx and connection errors with bounded backoff and the duplicate read-back by client_order_id before any re-send."
 why = "A 502 or a dropped connection on one submit halts a whole paper book today; the shakedown span cannot survive that (#1731)."

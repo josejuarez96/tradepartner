@@ -1,5 +1,7 @@
 # 0010. Phase 4 risk rules: the limits, when they are checked, and how an order id is derived
 
+> **Superseded in part by [ADR 0024](0024-long-short-in-scope.md) (2026-10-19):** "no shorts, ever" is no longer a scope rule; shorts are allowed in research, backtests and paper, live stays long-only, and the structural sell-quantity rule stands until the shorting build lifts it for paper.
+
 **Status:** Accepted (by merging PR #256; owner decision on #247 question 12, 2026-09-26 ET)  ·  **Date:** 2026-09-26  ·  **Issue:** #254  ·  **Amends:** ADR 0007 point 6
 
 ## Context
