@@ -93,7 +93,7 @@ Each is walked in full, with what he sees today. Part B places them, and fifteen
 - **Operations page, Fills card:** `No fills yet in this window.` When it has rows, the columns are `security_id, symbol, side, quantity, price, broker_fill_id, known_at`. It covers the whole window, newest first, and is capped with `Showing the newest fills only`. It has no date picker, no slippage, and no reason column.
 - **Order chain card:** pick one order id from a dropdown to see its steps (`at, kind, detail`). This is good for chasing one stuck order. It is not a day's blotter.
 - **Signal ranking card:** the "why". Its tooltip carries `signal_reason`, `decision` and `decision_reason` for each name. It shows **the latest plan only**, so last Tuesday's reasons are not on screen.
-- **CLI:** no command lists orders or fills. None of the 14 `paper` subcommands lists orders or fills. The slippage lines (each order's fill price against the session's opening price) appear only in `paper status` and `paper report`.
+- **CLI:** none of the 14 `paper` subcommands lists orders or fills. The slippage lines (each order's fill price against the session's opening price) appear only in `paper status` and `paper report`.
 
 **What is missing.** A blotter for one session: name, side, shares, fill price, slippage against the open, and the decision reason, with a date picker. Each order's result (`position_return`, `realised_pnl`) exists, but only as steps in the Order chain card, one order at a time. His prototype does not have one either; its Book screen focuses on tracking and the kill switch.
 
