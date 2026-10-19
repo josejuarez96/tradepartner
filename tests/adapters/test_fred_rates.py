@@ -389,3 +389,25 @@ def test_failed_request_surfaces_fred_error_message_but_not_the_key_or_url() -> 
         _fetch(respond)
     assert "HTTP 400: There are 2667 vintage dates" in str(exc.value)
     assert "api.stlouisfed.org" not in str(exc.value)
+
+
+def test_error_message_is_scrubbed_of_the_key_and_capped() -> None:
+    key = "known-dummy-fred-key"
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error_message": f"bad {key} " + "x" * 500})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(FredRequestError) as exc,
+    ):
+        observations(
+            "DTB3",
+            date(2020, 1, 1),
+            date(2020, 1, 1),
+            settings=_settings(key=key),
+            client=client,
+        )
+    assert key not in str(exc.value)
+    assert "bad ***" in str(exc.value)
+    assert len(str(exc.value)) < 300

@@ -289,7 +289,7 @@ class RatesConfig(_ClosedConfig):
     fred_timeout_seconds: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
     fred_max_attempts: int = Field(default=4, ge=1)
     fred_backoff_seconds: float = Field(default=2.0, ge=0.0, allow_inf_nan=False)
-    fred_vintage_window_days: int = Field(default=365, ge=1)
+    fred_vintage_window_days: int = Field(default=365, ge=1, le=1000)
 
     @field_validator("series")
     @classmethod

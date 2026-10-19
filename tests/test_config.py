@@ -141,6 +141,7 @@ def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> 
         {"fred_max_attempts": 0},
         {"fred_backoff_seconds": -1},
         {"fred_vintage_window_days": 0},
+        {"fred_vintage_window_days": 1001},
         {"plausible_range_percent": [25.0, -1.0]},
         {"plausible_range_percent": [float("nan"), 25.0]},
     ],
