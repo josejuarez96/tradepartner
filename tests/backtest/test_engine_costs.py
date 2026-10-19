@@ -7,9 +7,6 @@ Tests clause. The cost of a trade of notional `n` on a name with ADV `adv` is
 commissions here); ADV is the median of raw `close * volume` over the traded bars of the
 `costs.adv_sessions` sessions ending at the plan session T_i, from the step's raw read.
 
-The tests that set a new `costs.*` key need T210 (the keys, the cost terms and
-`adv_by_security`); until it lands they are strict xfails, and the mark lifts by itself
-once `CostsConfig` has the keys, so they then fail only for the missing engine wiring.
 """
 
 from __future__ import annotations
@@ -27,16 +24,11 @@ import pytest
 
 from backtest import test_engine, test_frozen_defaults
 from backtest.fake_provider import FakeProvider
-from tradepartner.backtest import costs as costs_module
 from tradepartner.backtest.engine import STRATEGY_SERIES, BacktestResult, run
 from tradepartner.backtest.results import metric_rows
 from tradepartner.backtest.schedule import fill_session, rebalance_sessions
 from tradepartner.calendar import all_sessions, session_close
 from tradepartner.config import CostsConfig, Settings
-
-_T210_KEYS = {"spread_bps", "impact_coeff", "adv_sessions"}
-HAS_T210 = set(CostsConfig.model_fields) >= _T210_KEYS and hasattr(costs_module, "adv_by_security")
-awaits_t210 = pytest.mark.xfail(not HAS_T210, strict=True, reason="awaits T210")
 
 # --- fixture ---------------------------------------------------------------------------
 
@@ -191,7 +183,6 @@ def test_twin_run_digests_and_final_equity_unchanged() -> None:
     assert _twin_digests(test_engine._twin_settings()) == test_engine.TWIN_RUN_DIGESTS
 
 
-@awaits_t210
 def test_the_twin_with_the_three_keys_named_at_their_defaults_is_byte_identical() -> None:
     twin = test_engine._twin_settings()
     named = twin.model_copy(
@@ -235,7 +226,6 @@ def test_reference_metrics_at_the_defaults_unchanged() -> None:
 # --- the first step's costs by hand (fail until T210c wires the terms) -----------------
 
 
-@awaits_t210
 def test_target_buys_pay_the_hand_cost_over_their_adv_at_t0() -> None:
     """A then B (security_id order), each to half of 100,000: A's buy is the largest
     notional whose cost fits 50,000; B's the same from the 50,000 left."""
@@ -250,7 +240,6 @@ def test_target_buys_pay_the_hand_cost_over_their_adv_at_t0() -> None:
     assert row.cost_paid == pytest.approx(hand_cost(n_a, adv_a) + hand_cost(n_b, adv_b), rel=1e-9)
 
 
-@awaits_t210
 def test_a_forced_exit_pays_the_hand_cost_over_the_names_adv_at_t0() -> None:
     """B, delisted on Feb 15, is sold at its Feb 15 value in step 0 and pays the full
     cost model over its ADV at T_0."""
@@ -265,7 +254,6 @@ def test_a_forced_exit_pays_the_hand_cost_over_the_names_adv_at_t0() -> None:
     assert row.cost_paid == pytest.approx(expected, rel=1e-9)
 
 
-@awaits_t210
 def test_the_benchmark_buy_pays_the_full_cost_model_over_its_own_adv() -> None:
     """The benchmark's one buy at F_0: lower than the untermed run's notional by the hand
     value, and its equity over the untermed run's is one constant from F_0 on."""
@@ -285,7 +273,6 @@ def test_the_benchmark_buy_pays_the_full_cost_model_over_its_own_adv() -> None:
 # --- no look-ahead through ADV ---------------------------------------------------------
 
 
-@awaits_t210
 def test_a_volume_revision_known_by_the_steps_read_enters_adv_as_it_enters_the_fill() -> None:
     """A's volume on Jan 3, the first session of the window ending at T_0, revised to
     10x and known on Feb 15 (after the plan's read, before the step's read at
@@ -299,7 +286,6 @@ def test_a_volume_revision_known_by_the_steps_read_enters_adv_as_it_enters_the_f
     assert _values(result)[("A", F0)] == pytest.approx(n_a, rel=1e-9)
 
 
-@awaits_t210
 def test_a_planted_volume_revision_at_or_after_the_fill_never_enters_adv() -> None:
     """Volume revisions on F_0 and on the session after it (known by the step's read)
     leave step 0's costs and fills exactly as they were."""
@@ -318,7 +304,6 @@ def test_a_planted_volume_revision_at_or_after_the_fill_never_enters_adv() -> No
 # --- monotone in the impact coefficient ------------------------------------------------
 
 
-@awaits_t210
 def test_a_higher_impact_coefficient_never_raises_net_cagr() -> None:
     cagrs = []
     for impact in (0.0, 0.05, 0.1, 0.5):
