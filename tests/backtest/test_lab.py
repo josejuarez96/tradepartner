@@ -1022,6 +1022,28 @@ def test_a_group_running_into_an_interval_pauses_with_no_connection_or_row(
     clock = FakeClock(WEDNESDAY_1500_NY)
     connections = _recording_connections(monkeypatch)
     real_at = lab.StoreProvider._at
+    # The run order of the read groups follows the variants' `params_sha256` order, which
+    # moves whenever a frozen key lands (T210's `costs.*` keys reorder them). So the pause
+    # point comes from the groups `expand_grid` returns, not from a step count: the clock
+    # jumps to the interval's start on the second group's first step, and every group
+    # has more than one step, so the pause always falls inside that group.
+    settings = Settings()
+    sweep_file = sweep.parse_sweep_file(
+        _copy_file(store.parent / "grid", SWEEP_SOURCE, EDITS_SMALL), settings
+    )
+    groups = sweep.read_groups(sweep.expand_grid(sweep_file, settings))
+    assert len(groups) >= 2
+    first_group = len(groups[0])
+    interval_start = WEDNESDAY_1500_NY + timedelta(hours=1)  # 16:00 EDT
+
+    opened: list[int] = []
+    real_open = registry.open_trial
+
+    def counting_open(*args: Any, **kwargs: Any) -> registry.TrialHandle:
+        opened.append(1)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "open_trial", counting_open)
 
     paused: list[tuple[int, dict[str, int]]] = []
     resumed: list[dict[str, int]] = []
@@ -1030,7 +1052,9 @@ def test_a_group_running_into_an_interval_pauses_with_no_connection_or_row(
         if self._conn is None or self._step_t != t:
             if len(resumed) < len(paused):
                 resumed.append(_counts(store))  # the first step after a pause
-            clock.advance(minutes=7)  # each step takes seven minutes
+            clock.advance(minutes=1)  # each step takes a minute
+            if len(opened) > first_group and clock.now() < interval_start:
+                clock.t = interval_start  # the second group's first step runs into it
         return real_at(self, t)
 
     monkeypatch.setattr(lab.StoreProvider, "_at", stepping)

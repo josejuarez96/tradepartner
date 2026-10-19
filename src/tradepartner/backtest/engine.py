@@ -23,8 +23,8 @@ before the plan at close(T_{i+1}) reads the drifted weights, on the same session
 **The plan** (`_plan`) reads the universe, then the registered family's signal inputs.
 For momentum, the frozen `schedule.signal_anchor` and cadence decide the anchors;
 its price frame starts at formation anchor A_form (`sessions_from`). Profitability
-instead reads annual facts and SICs at the same rebalance close. The marking read is
-unbounded for either family.
+instead reads annual facts and SICs at the same rebalance close. The marking read
+starts at the earliest held formation anchor or stale-exit window.
 
 **Exits** (req 5), decided from step i's read after the fill, on the names still held:
 
@@ -84,6 +84,7 @@ from tradepartner.backtest.provider import (
     TurnoverInputs,
 )
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
+from tradepartner.backtest.signals import anchor_sessions
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
     StepFrame,
@@ -91,7 +92,12 @@ from tradepartner.backtest.valuation import (
     stitched_returns,
     value_positions,
 )
-from tradepartner.calendar import all_sessions, previous_session
+from tradepartner.calendar import (
+    all_sessions,
+    last_completed_session,
+    next_session,
+    previous_session,
+)
 from tradepartner.config import HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
@@ -190,6 +196,7 @@ class _Book:
     marked_at: dict[str, date] = field(default_factory=dict)
     benchmarks: dict[str, _Holding] = field(default_factory=dict)
     held_on: dict[str, set[date]] = field(default_factory=dict)
+    held_since: dict[str, date] = field(default_factory=dict)
     equity: list[EquityRow] = field(default_factory=list)
     rebalances: list[RebalanceRow] = field(default_factory=list)
     weights: list[WeightRow] = field(default_factory=list)
@@ -482,9 +489,14 @@ def _step(
     )
 
     book.cash = cash
+    previous_positions = set(book.positions)
     last = values.filter(pl.col("session") == end)
     book.positions = {
         sid: value for sid, value in last.select("security_id", "value").iter_rows() if value > 0
+    }
+    book.held_since = {
+        sid: book.held_since[sid] if sid in previous_positions else plan.session
+        for sid in book.positions
     }
     book.marked_at = {
         sid: marked
@@ -660,14 +672,17 @@ class _SharedReads:
     the group shares is made once, for the union of the variants' ids (`share`), and
     each variant's own request is served from it restricted to its ids. A request no
     shared read covers is made as asked. With `covering` false (a group of one, `run`)
-    a read serves only the one request it was made for, so every request is one
-    provider call exactly as asked. Every real call's error is a `_ReadError`."""
+    ordinary reads serve only the request they were made for. Marking reads
+    use a cross-step cache when the provider can report newly known inputs;
+    otherwise they are made as asked. Every real call's error is a
+    `_ReadError`."""
 
     def __init__(self, provider: DataProvider, *, covering: bool) -> None:
         self._provider = provider
         self._covering = covering
         self._entries: dict[_Key, list[_Entry]] = {}
         self._memo: dict[_Key, object] = {}
+        self._marks: tuple[datetime, tuple[str, ...], date, pl.DataFrame] | None = None
 
     def new_step(self) -> None:
         """Drop the previous step's reads (every key holds its read time)."""
@@ -689,8 +704,55 @@ class _SharedReads:
             ids = tuple(sorted({sid for request_ids, _ in requests for sid in request_ids}))
             bounds = [request_bound for _, request_bound in requests]
             bound = None if None in bounds else min(b for b in bounds if b is not None)
-        value = self._real(lambda: _keyed_call(self._provider, key, list(ids), bound))
+        value: object
+        if key[0] == "marking_prices":
+            assert bound is not None
+            value = self._real(lambda: self._marking_prices(cast(datetime, key[1]), ids, bound))
+        else:
+            value = self._real(lambda: _keyed_call(self._provider, key, list(ids), bound))
         self._entries.setdefault(key, []).append(_Entry(tuple(ids), bound, value))
+
+    def _marking_prices(self, t: datetime, ids: Sequence[str], sessions_from: date) -> pl.DataFrame:
+        """Extend prior marks only when no newly known input can change them."""
+        cache = self._marks
+        changed_ids = getattr(self._provider, "marking_changed_ids", None)
+        if cache is None or changed_ids is None or t <= cache[0]:
+            frame = self._provider.adjusted_prices(t, ids, True, sessions_from=sessions_from)
+        else:
+            previous_t, previous_ids, previous_from, previous = cache
+            changed = set(changed_ids(previous_t, t, ids))
+            rebuild = [
+                sid
+                for sid in ids
+                if sid not in previous_ids or sid in changed or sessions_from < previous_from
+            ]
+            reuse = [sid for sid in ids if sid not in rebuild]
+            parts: list[pl.DataFrame] = []
+            if reuse:
+                new_from = next_session(last_completed_session(previous_t))
+                advancing = new_from <= last_completed_session(t)
+                kept = previous.filter(
+                    pl.col("security_id").is_in(reuse)
+                    & (pl.col("session") >= sessions_from)
+                    & (pl.col("session") < new_from if advancing else pl.lit(True))
+                )
+                if advancing:
+                    added = self._provider.adjusted_prices(
+                        t, reuse, True, sessions_from=max(new_from, sessions_from)
+                    )
+                    kept = pl.concat([kept, added])
+                parts.append(kept)
+            if rebuild:
+                parts.append(
+                    self._provider.adjusted_prices(t, rebuild, True, sessions_from=sessions_from)
+                )
+            frame = (
+                pl.concat(parts).sort("security_id", "session")
+                if parts
+                else self._provider.adjusted_prices(t, ids, True, sessions_from=sessions_from)
+            )
+        self._marks = (t, tuple(ids), sessions_from, frame)
+        return frame
 
     def _read(self, key: _Key, ids: Sequence[str], bound: date | None = None) -> object:
         entries = self._entries.setdefault(key, [])
@@ -729,6 +791,9 @@ class _SharedReads:
     ) -> pl.DataFrame:
         key = ("adjusted_prices", t, include_dividends)
         return cast(pl.DataFrame, self._read(key, ids, sessions_from))
+
+    def marking_prices(self, t: datetime, ids: Sequence[str], sessions_from: date) -> pl.DataFrame:
+        return cast(pl.DataFrame, self._read(("marking_prices", t), ids, sessions_from))
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         return cast(pl.DataFrame, self._read(("raw_prices", t), ids))
@@ -868,6 +933,7 @@ class _Variant:
     keep_frames: bool = True
     keep_detail: bool = True
     frames: list[StepFrame] = field(default_factory=list)
+    last_stitched: dict[str, date] = field(default_factory=dict)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
     rates: pl.DataFrame | None = None
 
@@ -1057,7 +1123,13 @@ def _run_group(
         t = read_time(step_end, cadence)
         own = [_marking_ids(variant, benchmarks) for variant in group]
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
-        view.share(("adjusted_prices", t, True), [(marked, None) for _, marked, _ in own])
+        view.share(
+            ("marking_prices", t),
+            [
+                (marked, _marking_bound(variant, step_end, family, marked))
+                for variant, (_, marked, _) in zip(group, own, strict=True)
+            ],
+        )
         view.share(("raw_prices", t), [(marked, None) for _, marked, _ in own])
         view.share(("listing_ends", t), [(ids, None) for ids, _, _ in own])
         view.share(("dropped_dividends", t), [(ids, None) for ids, _, _ in own])
@@ -1066,7 +1138,9 @@ def _run_group(
         next_plans = {} if last else _plan_all(view, group, step_end, family, failed)
         for variant in list(group):
             try:
-                _variant_step(view, variant, step_end, benchmarks, next_plans.get(variant.trial_id))
+                _variant_step(
+                    view, variant, step_end, benchmarks, next_plans.get(variant.trial_id), family
+                )
             except _ReadError:
                 raise
             except Exception as exc:
@@ -1096,12 +1170,48 @@ def _marking_ids(
     return tuple(ids), tuple(marked), tuple(ever_held)
 
 
+def _marking_bound(
+    variant: _Variant, step_end: date, family: HypothesisFamily, marked: Sequence[str]
+) -> date:
+    """Earliest held formation anchor or stale-exit window, including last marks."""
+    plan = cast(Plan, variant.plan)
+    settings = variant.settings
+    sessions = all_sessions()
+    at = bisect.bisect_right(sessions, step_end) - 1
+    stale = sessions[max(0, at - settings.backtest.stale_exit_sessions)]
+    bounds = [stale, plan.session]
+    bounds.extend(variant.last_stitched[sid] for sid in marked if sid in variant.last_stitched)
+    if family in ("momentum", "combined"):
+
+        def formation(session: date) -> date:
+            return anchor_sessions(
+                session,
+                settings.strategy.formation_months,
+                settings.strategy.skip_months,
+                settings.schedule.signal_anchor,
+            )[0]
+
+        bounds.append(formation(plan.session))
+    for book in variant.books:
+        bounds.extend(book.marked_at.values())
+        bounds.extend(book.held_since.values())
+        bounds.extend(
+            holding.marked_at
+            for holding in book.benchmarks.values()
+            if holding.marked_at is not None
+        )
+        if family in ("momentum", "combined"):
+            bounds.extend(formation(since) for since in book.held_since.values())
+    return min(bounds)
+
+
 def _variant_step(
     view: _SharedReads,
     variant: _Variant,
     step_end: date,
     benchmarks: Mapping[str, str],
     next_plan: Plan | None,
+    family: HypothesisFamily,
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
     own ids: carry, fill, value and exit every level, then take `next_plan`."""
@@ -1110,7 +1220,7 @@ def _variant_step(
     cadence = params.schedule.rebalance_cadence
     t, t_prev = read_time(step_end, cadence), read_time(plan.session, cadence)
     ids, marked, ever_held = (list(part) for part in _marking_ids(variant, benchmarks))
-    frame = view.adjusted_prices(t, marked, True)
+    frame = view.marking_prices(t, marked, _marking_bound(variant, step_end, family, marked))
     raw = view.raw_prices(t, marked)
     ended = _ended(view.listing_ends(t, ids), step_end)
     dropped = view.dropped_dividends(t, ids)
@@ -1119,6 +1229,13 @@ def _variant_step(
         next_plan = _no_benchmark_members(next_plan, benchmarks)
     if variant.keep_frames:
         variant.frames.append(StepFrame(start=plan.session, end=step_end, frame=frame))
+    for sid, session in (
+        frame.filter((pl.col("session") > plan.session) & (pl.col("session") <= step_end))
+        .group_by("security_id")
+        .agg(pl.col("session").max())
+        .iter_rows()
+    ):
+        variant.last_stitched[sid] = session
     variant.targets[plan.fill_session] = dict(plan.targets)
     for book in variant.books:
         _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)

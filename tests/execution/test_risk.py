@@ -18,6 +18,7 @@ order by quantity.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import replace
@@ -34,10 +35,12 @@ from tradepartner.config import RiskConfig
 from tradepartner.execution.ledger import Ledger
 from tradepartner.execution.plan import BuyCosts, Remainder
 from tradepartner.execution.plan import remainder as plan_remainder
+from tradepartner.execution.reconcile_run import frozen_risk
 from tradepartner.execution.risk import (
     BuyToSize,
     OpenSell,
     PhaseOrder,
+    Skip,
     Skips,
     Violations,
     _spendable,
@@ -49,7 +52,13 @@ from tradepartner.execution.risk import (
     unfilled_sells,
 )
 from tradepartner.store import schema
-from tradepartner.store.journal import DecisionRow, OrderedFill, OrderEventRow, OrderRow
+from tradepartner.store.journal import (
+    DecisionRow,
+    OrderedFill,
+    OrderEventRow,
+    OrderRow,
+    PaperWindowRow,
+)
 
 _NOW = datetime(2026, 10, 1, 13, 0, tzinfo=UTC)
 _S = date(2026, 10, 1)
@@ -363,8 +372,22 @@ def test_a_buy_without_a_target_weight_fails_closed() -> None:
     assert _rules(_check(orders)) == {"max_position_weight"}
 
 
-def test_a_missing_asset_fails_closed() -> None:
+def test_a_buy_whose_name_the_assets_read_lacks_is_a_skip_asset_unknown_skip() -> None:
+    """Paper spec amendment 2026-10-18 item 2 (T202): a buy of a name the `assets`
+    read lacks is skipped as `skip_asset_unknown`, counted toward the cap, never an
+    `asset_missing` breach; the rest of the batch goes on."""
     assets = {k: v for k, v in _ASSETS.items() if k != "C"}
+    result = _check(_passing_phase(), assets=assets)
+    assert isinstance(result, Skips), result
+    assert result.skips == (Skip(2, "C", "skip_asset_unknown"),)
+    assert result.skips[0].counts_toward_cap
+    assert [o.decision_id for o in result.orders] == [1]
+
+
+def test_a_sell_whose_name_the_assets_read_lacks_still_fails_closed() -> None:
+    """A held name is never in the allowlist: its sell with no asset read is still
+    `asset_missing` here (the wrapper raises `ReconciliationError` before it)."""
+    assets = {k: v for k, v in _ASSETS.items() if k != "A"}
     assert _rules(_check(_passing_phase(), assets=assets)) == {"asset_missing"}
 
 
@@ -1212,3 +1235,98 @@ def test_a_buy_of_a_name_that_lost_fractionable_flooring_to_zero_is_deferred() -
     assert lost.decision.whole_share is False and lost.by_whole_shares
     (sizing,) = size_buys([lost], 1000.0, _price_of, RiskConfig(), _NO_COSTS)
     assert sizing.deferred
+
+
+# --- the skip cap as a share of the plan (T202) --------------------------------------
+#
+# Paper spec amendment 2026-10-18 item 3: the run halts with `SkipCapError` when its
+# skip count exceeds max(`risk.max_skips_per_run`, floor(`risk.max_skip_share` x the
+# plan's decisions)). `plan_decisions` is the number of decisions in the plan (the
+# wrapper passes the batch's rebalance decisions); left out, it is 0 and the floor
+# alone binds, as before T202.
+
+
+def _unknown_buys(count: int) -> list[PhaseOrder]:
+    """`count` $50 buys of names the `assets` read lacks: each a `skip_asset_unknown`."""
+    return [
+        replace(
+            _order("C", "buy", 100 + i, price=10.0, notional=50.0, target_weight=0.04),
+            security_id=f"U{i:03d}",
+            symbol=f"U{i:03d}",
+        )
+        for i in range(count)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("plan_decisions", "skips", "halts"),
+    [
+        (200, 20, False),  # max(10, floor(0.10 x 200) = 20) = 20
+        (200, 21, True),
+        (209, 20, False),  # floor(20.9) = 20, never rounded to 21
+        (209, 21, True),
+        (20, 5, False),  # max(10, floor(2.0) = 2) = 10: the floor binds a small plan
+        (20, 10, False),
+        (20, 11, True),
+        (0, 10, False),  # no plan size given: the floor alone, as before T202
+        (0, 11, True),
+    ],
+)
+def test_the_skip_cap_is_the_larger_of_the_floor_and_the_share(
+    plan_decisions: int, skips: int, halts: bool
+) -> None:
+    frozen = RiskConfig(max_skips_per_run=10, max_skip_share=0.10)
+    kw: dict[str, Any] = {"plan_decisions": plan_decisions} if plan_decisions else {}
+    result = _check(_unknown_buys(skips), frozen, **kw)
+    if halts:
+        assert isinstance(result, Violations), result
+        assert {v.kind for v in result.violations} == {"skip_cap"}
+    else:
+        assert isinstance(result, Skips), result
+        assert [s.reason for s in result.skips] == ["skip_asset_unknown"] * skips
+
+
+def test_the_share_cap_counts_the_runs_earlier_skips() -> None:
+    """`prior_skips` (the sells phase's, and the submit-time ones) count against the
+    same cap: 15 earlier plus 6 now is 21 over the 20 of a 200-decision plan."""
+    frozen = RiskConfig(max_skips_per_run=10, max_skip_share=0.10)
+    assert isinstance(_check(_unknown_buys(5), frozen, plan_decisions=200, prior_skips=15), Skips)
+    result = _check(_unknown_buys(6), frozen, plan_decisions=200, prior_skips=15)
+    assert isinstance(result, Violations)
+    assert {v.kind for v in result.violations} == {"skip_cap"}
+
+
+def _window_frozen_before_the_share(max_skips_per_run: int) -> PaperWindowRow:
+    values: dict[str, Any] = {
+        f"risk.{k}": v
+        for k, v in RiskConfig().model_dump(mode="json").items()
+        if k != "max_skip_share"
+    }
+    values["risk.max_skips_per_run"] = max_skips_per_run
+    return PaperWindowRow(
+        window_id=1,
+        hypothesis_id=1,
+        first_rebalance_session=_S,
+        account_id="PA1",
+        starting_cash=1000.0,
+        starting_equity=1000.0,
+        code_version="pre-T202",
+        started_at=_NOW,
+        frozen_json=json.dumps(values),
+        frozen_sha256="0" * 64,
+        known_at=_NOW,
+        ingested_at=_NOW,
+    )
+
+
+@pytest.mark.parametrize(("skips", "halts"), [(10, False), (11, True)])
+def test_a_window_frozen_before_the_share_halts_at_exactly_its_frozen_floor(
+    skips: int, halts: bool
+) -> None:
+    """The two open windows' `frozen_json` lacks `risk.max_skip_share`: read as 0
+    through `frozen_risk`, max(10, floor(0 x 200)) = 10 exactly, so 10 skips of a
+    200-decision plan pass and 11 halt (the default 0.10 would allow 20)."""
+    frozen = frozen_risk(_window_frozen_before_the_share(10))
+    assert frozen.max_skip_share == 0
+    result = _check(_unknown_buys(skips), frozen, plan_decisions=200)
+    assert isinstance(result, Violations) is halts, result
