@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime
 
 import duckdb
@@ -880,3 +881,24 @@ def test_a_floored_trim_of_a_name_that_lost_fractionable_stays_open_on_its_remai
         frozen=RiskConfig(min_order_notional=30.0),
     )
     assert cheap.state == State.SETTLED
+
+
+@pytest.mark.parametrize("reason", ["left_targets", None])
+def test_a_partly_filled_short_cover_is_not_written_off_but_a_long_buy_is(
+    reason: str | None,
+) -> None:
+    """A cover (`buy` + `short`) is not a funding shortfall: 3 shares planned at 50
+    (target 150), 1 filled (50), the order expired with no sell in flight. Left:
+    2 shares, 100 -- still `OPEN`, not `CLOSED written_off`. The same rows as a
+    long buy are written off (T229, quant-auditor on #1927)."""
+    long_buy = _decision(
+        side="buy", planned_quantity=3.0, target=150.0, whole_share=True, reason=reason
+    )
+    cover = replace(long_buy, position_side="short")
+    for d, written_off in ((cover, False), (long_buy, True)):
+        o = _order(d, S1, quantity=3.0)
+        events = [_event(o, "accepted"), _event(o, "expired", minute=1)]
+        state = _state(d, [o], events, [_fill(o, 1, PRICE)])
+        assert state.written_off is written_off
+        assert state.state is (State.CLOSED if written_off else State.OPEN)
+        assert state.remainder == Remainder(quantity=2.0, notional=100.0)
