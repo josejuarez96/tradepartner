@@ -218,6 +218,73 @@ def test_openfigi_revisions_errors_and_unmapped(settings: Settings) -> None:
         ).fetchall() == [(False, ""), (True, "BBG3"), (False, "")]
 
 
+def test_openfigi_selection_leaves_out_delisted_and_barless_names(settings: Settings) -> None:
+    """The universe-size set: a live listing on a `universe.exchanges` exchange
+    with a bar in the `min_history_months` window. A line a Form 25 ended before
+    the run, and a live line with no bar in the window, are not mapped."""
+    enabled = settings.model_copy(
+        update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+    )
+    t0 = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    with open_for_write(enabled) as conn:
+        init_schema(conn)
+        conn.execute(
+            "CREATE TEMP TABLE figi_jobs AS SELECT * FROM (VALUES "
+            "('S_LIVE', 'LIVE'), ('S_NOBAR', 'NBAR'), ('S_DELIST', 'DELS')) AS v(sid, ticker)"
+        )
+        conn.execute(
+            "INSERT INTO securities (security_id, cik, name, benchmark, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, sid, sid, FALSE, ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, ticker, 'NYSE', DATE '2025-01-01', ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) VALUES "
+            "('S_LIVE', DATE '2026-10-15', 10, 11, 9, 10, 1000, ?, ?, 'test', 'bar'), "
+            "('S_DELIST', DATE '2026-06-09', 10, 11, 9, 10, 1000, ?, ?, 'test', 'bar')",
+            [t0, t0, t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO delistings (security_id, form, class_title, exchange, filed_at, "
+            "effective_on, known_at, ingested_at, source, provenance) VALUES "
+            "('S_DELIST', '25', 'Common Stock', 'NYSE', TIMESTAMPTZ '2026-06-01 20:30:00+00', "
+            "DATE '2026-06-10', ?, ?, 'test', 'filing')",
+            [t0, t0],
+        )
+
+    seen: list[list[str]] = []
+
+    def fake_mapping(
+        tickers: list[str], _config: object, **_kwargs: object
+    ) -> list[tuple[list[object], datetime, datetime]]:
+        seen.append(tickers)
+        sent = datetime(2026, 10, 16, 20, tzinfo=UTC)
+        return [
+            (
+                [{"figi": f"BBG{i}", "exchCode": "US", "securityType": "Common Stock"}],
+                sent,
+                sent + timedelta(seconds=1),
+            )
+            for i in range(len(tickers))
+        ]
+
+    now = datetime(2026, 10, 16, 21, tzinfo=UTC)
+    result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert seen == [["LIVE"]]
+    assert result.runs[0].rows_added == 1
+    with open_for_write(enabled) as conn:
+        assert conn.execute(
+            "SELECT security_id FROM openfigi_types ORDER BY security_id"
+        ).fetchall() == [("S_LIVE",)]
+
+
 def test_rates_backfill_is_point_in_time_and_idempotent(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:

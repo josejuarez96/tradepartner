@@ -54,6 +54,13 @@ _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
 _KEY_FILE = "index_members.csv"
 #: The two modules allowed to read the key: its loader and `health`.
 _ALLOWED = frozenset({"health.py", "store/index_members.py"})
+#: The `openfigi_types` check-only table (#1713, T189c): the string may appear
+#: only where the table is defined (`store/schema.py`), written (`ingest.py`'s
+#: `openfigi` branch) and read (`health.py`), never on a universe, signal,
+#: backtest, paper or research path. `store/registry.py` names it only in its
+#: trial data-vintage classification comment (the table is excluded there by
+#: construction), so it is allowed by name, not as a reader.
+_FIGI_ALLOWED = frozenset({"health.py", "ingest.py", "store/schema.py", "store/registry.py"})
 #: A text naming the key's module or file: an import path, a file name or a
 #: `from tradepartner.store import ..., index_members` list.
 _NAMING = (
@@ -131,6 +138,34 @@ def test_the_source_scan_has_teeth(text: str) -> None:
 def test_a_config_key_or_report_field_of_that_name_is_not_an_offence() -> None:
     text = "index_members: bool = True\nblock.index_members.verdict\n"
     assert _offences("config.py", text) == []
+
+
+def _figi_offences(relative: str, text: str) -> list[str]:
+    """Why the module at `relative` (under `src/tradepartner/`) names the
+    `openfigi_types` table outside the three modules allowed to."""
+    if relative in _FIGI_ALLOWED or "openfigi_types" not in text:
+        return []
+    return [f"{relative}: names the openfigi_types table"]
+
+
+def test_the_figi_source_scan_finds_no_reader_outside_the_check_and_its_writer() -> None:
+    offences = [
+        offence
+        for path in sorted(_SRC.rglob("*.py"))
+        for offence in _figi_offences(path.relative_to(_SRC).as_posix(), path.read_text("utf-8"))
+    ]
+    assert offences == []
+    # The allowed reader really reads it: the scan is not vacuous.
+    assert "openfigi_types" in (_SRC / "health.py").read_text("utf-8")
+
+
+def test_the_figi_source_scan_has_teeth() -> None:
+    assert _figi_offences("universe.py", "SELECT * FROM openfigi_types")
+    assert _figi_offences("store/asof.py", 'TABLE = "openfigi_types"')
+    assert _figi_offences("health.py", "FROM openfigi_types") == []
+    assert _figi_offences("ingest.py", "openfigi_types") == []
+    assert _figi_offences("store/schema.py", "CREATE TABLE openfigi_types") == []
+    assert _figi_offences("store/registry.py", "# excluded: openfigi_types") == []
 
 
 @contextmanager
@@ -257,3 +292,41 @@ def test_the_run_is_byte_identical_with_the_key_present_absent_and_emptied(
             assert _OPENS == [], f"{name} opened the key: {_OPENS}"
     assert outputs["present"] == outputs["absent"] == outputs["emptied"]
     assert len(outputs["present"]) > 100  # the run produced something to compare
+
+
+def _populate_figi(store: Path) -> None:
+    """One `openfigi_types` row for a fixture security, as the ingest writes
+    one: a `common` name OpenFIGI also calls "Common Stock" (an agreement, so
+    the check has nothing to report but the row must still reach no reader)."""
+    conn = duckdb.connect(str(store))
+    try:
+        configure_connection(conn)
+        conn.execute(
+            "INSERT INTO openfigi_types (security_id, ticker, figi, composite_figi, "
+            "share_class_figi, security_type, security_type2, market_sector, name, "
+            "exch_code, mapped, known_at, ingested_at, provenance, source) "
+            "SELECT 'SEC_FACTS_RESTATED', ticker, 'BBG1', 'BBG1', 'BBG2', 'Common Stock', "
+            "'Common Stock', 'Equity', ticker, 'US', TRUE, known_at, ingested_at, "
+            "'openfigi', 'openfigi' FROM listings WHERE security_id = 'SEC_FACTS_RESTATED' "
+            "ORDER BY valid_from LIMIT 1"
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("name", list(RUNS))
+def test_the_run_is_byte_identical_with_the_figi_table_populated_and_empty(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.setenv("STORE__PATH", str(tmp_path / "real_store.duckdb"))
+    monkeypatch.delenv("TRADEPARTNER_INVOKED_BY", raising=False)
+    outputs: dict[str, str] = {}
+    for variant in ("empty", "populated"):
+        work = tmp_path / f"figi-{name}" / variant
+        store = _new_store(work / "store.duckdb")
+        if variant == "populated":
+            _populate_figi(store)
+        outputs[variant] = RUNS[name](store, work)
+    assert outputs["empty"] == outputs["populated"]
+    assert len(outputs["empty"]) > 100  # the run produced something to compare
