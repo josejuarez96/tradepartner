@@ -323,6 +323,22 @@ than `borrow.max_stale_sessions` sessions before `session` (the sessions
 after the one completed at the observation, through `session`), or none was
 recorded while `borrow.enabled` is on; and `borrow.enabled` is off.
 
+**OpenFIGI types** (`figi_types`, #1713, T189c): a check only, like the
+index answer key, and never a source. The latest `openfigi_types` row per
+security known at `t` against the security's latest classification and its
+current listing's title at `t` (`listing_ends_as_of`): a security the store
+classifies `common` that OpenFIGI calls a note, bond, preferred, warrant,
+unit or depositary receipt, and the converse (ours `depositary`,
+`unclassifiable` or `debt` on a class OpenFIGI calls "Common Stock" or
+"REIT"), each named with both types in `rows`. A security whose latest
+observation is `mapped = FALSE` is not named, only counted in `unmapped`;
+a mapped row that agrees is not reported. The rule
+`figi_types_disagreements` joins `HealthReport.failures` only while
+`openfigi.max_disagreements` is set: the disagreements plus the unmapped
+count over it, or the table holding no observation at `t` (a gate never
+passes on a check it did not make), fails; unset (the default), the block
+reports and fails nothing.
+
 This module holds no threshold; the only numbers in it are 0 and 1, and
 EDGAR's own filing-date cutoff (`EDGAR_FILING_DATE_CUTOFF`).
 """
@@ -464,6 +480,10 @@ SYMBOL_CHANGE_KNOWN_AT = "symbol_changes_known_at_from_process_date"
 DUPLICATE_DIVIDENDS = "duplicate_dividends"
 #: The borrow-status key rule (#1506, T171e): `borrow_status_unique`.
 BORROW_STATUS_UNIQUE = "borrow_status_unique"
+#: The OpenFIGI types rule (#1713, T189c): reported from the `figi_types`
+#: block, never from `INTEGRITY_RULES`, and only while
+#: `openfigi.max_disagreements` is set.
+FIGI_TYPES_DISAGREEMENTS = "figi_types_disagreements"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -893,6 +913,170 @@ class BorrowHealth:
         return tuple(out)
 
 
+_FIGI_DISAGREEMENT_SCHEMA: dict[str, Any] = {
+    "security_id": pl.Utf8,
+    "ticker": pl.Utf8,
+    "class_title": pl.Utf8,
+    "ours": pl.Utf8,
+    "figi_type": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+}
+#: The OpenFIGI `securityType`/`securityType2` words that name a common
+#: equity (`Common Stock`, `REIT`), matched as whole words, case-insensitively.
+_FIGI_COMMON_WORDS: tuple[str, ...] = ("common stock", "reit")
+#: ... and the other instruments the spec names, a disagreement with `common`.
+_FIGI_OTHER_WORDS: tuple[str, ...] = (
+    "note",
+    "bond",
+    "preferred",
+    "warrant",
+    "unit",
+    "depositary receipt",
+)
+#: Our classifications the converse applies to (the spec's list).
+_FIGI_MAY_BE_COMMON: frozenset[str] = frozenset({UNCLASSIFIABLE, "depositary", "debt"})
+
+
+@dataclass(frozen=True, eq=False)
+class FigiTypes:
+    """The `figi_types` block at `t` (module docstring, "OpenFIGI types").
+
+    `rows` names every type disagreement, one row per security whose latest
+    observation disagrees with its latest classification: both types, the
+    current listing's title and the observation's `known_at`. `observations`
+    is how many securities have a stored row known at `t` (mapped or not);
+    `unmapped` how many of their latest rows are `mapped = FALSE`. `worst` is
+    the gated number, disagreements plus unmapped; `max_disagreements` is
+    `openfigi.max_disagreements` as the block was computed -- only while it
+    is set does the block fail."""
+
+    max_disagreements: int | None
+    observations: int
+    unmapped: int
+    rows: pl.DataFrame
+
+    @property
+    def disagreements(self) -> int:
+        """How many securities' latest type disagrees with their classification."""
+        return self.rows.height
+
+    @property
+    def worst(self) -> int:
+        """The gated count: named disagreements plus unmapped securities."""
+        return self.disagreements + self.unmapped
+
+    @property
+    def checked(self) -> bool:
+        """Whether any observation is known at `t`: with none, the block
+        checked nothing and never passes a set gate."""
+        return self.observations > 0
+
+    @property
+    def failed(self) -> bool:
+        """While `max_disagreements` is set: nothing observed at `t`, or
+        `worst` over it. Never while it is unset."""
+        if self.max_disagreements is None:
+            return False
+        return not self.checked or self.worst > self.max_disagreements
+
+    @property
+    def verdict(self) -> str:
+        """`nothing checked`, `<n> disagreements, <n> unmapped (report-only)`,
+        then `pass (max <m>)` or `fail (max <m>)` while a threshold is set."""
+        if not self.checked:
+            return "nothing checked: fail" if self.failed else "nothing checked"
+        head = f"{self.disagreements} disagreements, {self.unmapped} unmapped"
+        if self.max_disagreements is None:
+            return f"{head} (report-only)"
+        return f"{head}: {'fail' if self.failed else 'pass'} (max {self.max_disagreements})"
+
+
+def _figi_word(text: str, words: tuple[str, ...]) -> bool:
+    """Whether `text` (lower-cased) holds one of `words` as a whole word."""
+    return any(re.search(rf"(?<![a-z]){re.escape(word)}(?![a-z])", text) for word in words)
+
+
+def _figi_is_common(security_type: str, security_type2: str) -> bool | None:
+    """Whether an OpenFIGI type names a common equity (`Common Stock`,
+    `REIT`), False for the other instruments the spec names (a note, bond,
+    preferred, warrant, unit or depositary receipt), None when it names
+    neither (module docstring). `securityType2` is read beside
+    `securityType`, since the response spells a short form there."""
+    text = f"{security_type} {security_type2}".lower()
+    if _figi_word(text, _FIGI_COMMON_WORDS):
+        return True
+    if _figi_word(text, _FIGI_OTHER_WORDS):
+        return False
+    return None
+
+
+def figi_types(
+    conn: duckdb.DuckDBPyConnection, t: datetime, settings: Settings | None = None
+) -> FigiTypes:
+    """The `figi_types` block at `t` (module docstring)."""
+    t = _validate_t(t)
+    settings = settings if settings is not None else get_settings()
+    session = last_completed_session(t)
+    current = _current_from(listing_ends_as_of(conn, t, settings), session)
+    return _figi_types_report(conn, t, settings, current, classifications_as_of(conn, t))
+
+
+def _figi_types_report(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    current: dict[str, dict[str, Any]],
+    classes: pl.DataFrame,
+) -> FigiTypes:
+    """`health_report`'s own entry to the block: `current` is its current
+    listing per security and `classes` its latest classification per
+    security, already read."""
+    max_disagreements = settings.openfigi.max_disagreements
+    if "openfigi_types" not in _present_tables(conn):
+        return FigiTypes(
+            max_disagreements, 0, 0, pl.DataFrame([], schema=_FIGI_DISAGREEMENT_SCHEMA)
+        )
+    latest: dict[str, tuple[str, str, str, bool, datetime]] = {}
+    for sid, ticker, stype, stype2, mapped, known_at in conn.execute(
+        "SELECT security_id, ticker, security_type, security_type2, mapped, known_at "
+        "FROM openfigi_types WHERE known_at <= ? ORDER BY known_at, security_id",
+        [t],
+    ).fetchall():
+        latest[sid] = (ticker, stype, stype2, bool(mapped), known_at)
+    ours_by_sid = {r["security_id"]: r["security_type"] for r in classes.iter_rows(named=True)}
+    rows: list[dict[str, Any]] = []
+    unmapped = 0
+    for sid in sorted(latest):
+        ticker, figi_type, figi_type2, mapped, known_at = latest[sid]
+        if not mapped:
+            unmapped += 1
+            continue
+        ours = ours_by_sid.get(sid)
+        theirs = _figi_is_common(figi_type, figi_type2)
+        disagrees = (ours == _COMMON and theirs is False) or (
+            ours in _FIGI_MAY_BE_COMMON and theirs is True
+        )
+        if not disagrees:
+            continue
+        listing = current.get(sid)
+        rows.append(
+            {
+                "security_id": sid,
+                "ticker": ticker,
+                "class_title": None if listing is None else listing["class_title"],
+                "ours": ours,
+                "figi_type": figi_type,
+                "known_at": ensure_tz_aware_utc(known_at, field_name="known_at"),
+            }
+        )
+    return FigiTypes(
+        max_disagreements,
+        len(latest),
+        unmapped,
+        pl.DataFrame(rows, schema=_FIGI_DISAGREEMENT_SCHEMA),
+    )
+
+
 _INDEX_SAMPLE_SCHEMA: dict[str, Any] = {
     "session": pl.Date,
     "beyond_key": pl.Boolean,
@@ -1148,6 +1332,7 @@ class HealthReport:
     filing_events: FilingEvents
     rates: RatesHealth
     borrow: BorrowHealth
+    figi_types: FigiTypes
     duplicate_dividends: DuplicateDividends
     filename_listings: FilenameListings
     integrity: tuple[IntegrityCheck, ...]
@@ -1161,6 +1346,8 @@ class HealthReport:
         `coverage.check_enabled` on and a reference name is missing, then
         `index_members_missing` when the block's answer-key check failed
         (`IndexMembersCheck.failed`: only while `coverage.index_max_missing`
+        is set), then `figi_types_disagreements` when the `figi_types` block
+        failed (`FigiTypes.failed`: only while `openfigi.max_disagreements`
         is set)."""
         failed = tuple(check.rule for check in self.integrity if not check.passed)
         block = self.coverage_reference
@@ -1168,6 +1355,8 @@ class HealthReport:
             failed += (COVERAGE_REFERENCE_NAMES,)
         if block is not None and block.index_members is not None and block.index_members.failed:
             failed += (INDEX_MEMBERS_MISSING,)
+        if self.figi_types.failed:
+            failed += (FIGI_TYPES_DISAGREEMENTS,)
         return failed
 
     @property
@@ -1229,6 +1418,7 @@ def health_report(
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
+        figi_types=_figi_types_report(conn, t, settings, current, classes),
         duplicate_dividends=dividends,
         filename_listings=_filename_listings(conn, t, listings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
