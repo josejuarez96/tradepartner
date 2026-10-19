@@ -25,7 +25,7 @@ from tradepartner.backtest.schedule import fill_session, read_time, rebalance_se
 from tradepartner.backtest.signals import momentum_12_1
 from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, last_completed_session, session_close
-from tradepartner.config import Cadence, Settings, SignalAnchor
+from tradepartner.config import Cadence, HypothesisFamily, Settings, SignalAnchor
 from tradepartner.store import registry
 
 SRC = Path(__file__).parents[2] / "src" / "tradepartner" / "backtest"
@@ -42,11 +42,11 @@ GROWTH = {"A": 0.004, "B": 0.003, "C": 0.001, "D": -0.001}
 C_JUMP = date(2024, 1, 10)
 
 
-def _handle(trial_id: int = 1) -> registry.TrialHandle:
+def _handle(trial_id: int = 1, *, family: HypothesisFamily = "momentum") -> registry.TrialHandle:
     return registry._issue_handle(
         trial_id=trial_id,
         hypothesis_id=1,
-        family="momentum",
+        family=family,
         params_sha256="0" * 64,
         kind="in_sample",
         synthetic=True,
@@ -981,6 +981,7 @@ class TestSignalFrameBound:
         start, end = date(2024, 1, 5), date(2024, 3, 1)
         sessions = rebalance_sessions(start, end, "week_end")
         order = ["A", "C", "D", "B", "A"] + ["A"] * 10
+        assert sum(sessions[0] < s < sessions[4] for s in all_sessions()) > 5
         members = {session: [order[i]] for i, session in enumerate(sessions)}
         provider = FakeProvider(prices=_price_rows(), members=members, benchmarks={})
         result = run(
@@ -992,7 +993,7 @@ class TestSignalFrameBound:
             provider,
             start,
             end,
-            _handle(),
+            _handle(family="oracle"),
             (0.0,),
             family="oracle",
         )[0.0]
