@@ -44,7 +44,7 @@ def error_code(error: Refusal) -> object:
     return body.get("code") if isinstance(body, dict) else None
 
 
-def _error_message(error: Refusal) -> str:
+def error_message(error: Refusal) -> str:
     """The `message` in a refusal's JSON body, or an empty string."""
     try:
         body = json.loads(error.body)
@@ -70,7 +70,7 @@ def typed_refusal(error: Refusal, request: OrderRequest) -> Exception | None:
         return AssetNotFoundError(f"the broker does not know the asset of order {coid!r}")
     if error.status_code != FORBIDDEN or code != FORBIDDEN_CODE:
         return None
-    message = _error_message(error)
+    message = error_message(error)
     if "insufficient qty available" in message:
         return ReconciliationError(f"the broker holds less than order {coid!r} sells")
     symbol = re.escape(request.symbol)
