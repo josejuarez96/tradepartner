@@ -8,10 +8,12 @@ no longer make). This command builds the master exactly as an EDGAR ingest
 would (the same fetch pass, `ingest._prefetch`, then `build_master`) and
 lists every stored live EDGAR `filing` row of `securities` or `listings`
 whose key that build does not derive (`store.retraction.underived`), and
-every live `successor_chains` row no `master.chains` entry names
-(`store.retraction.underived_chains`, #821): the ingest's chain writer owns
-a moved row, so this is the entry-removed case alone. A chain row is
-`[traded]` when the journal names its predecessor or successor.
+every live `successor_chains` row no entry derives at this run
+(`store.retraction.underived_chains`, #821): `build_chains` runs on the same
+build, so an entry that is refused (`spac` predecessor, lost evidence, a
+successor listing that no longer matches) leaves its row underived, as the
+ingest's chain writer skips it. A chain row is `[traded]` when the journal
+names its predecessor or successor.
 
 - **Dry run by default.** It reads on a read-only connection and changes
   nothing. The terminal lists every row found, marks a row of a security
@@ -76,7 +78,6 @@ import duckdb
 
 from tradepartner.adapters.filings import FilingSource
 from tradepartner.config import Settings, clean_message
-from tradepartner.config import parse_chains as _parse_chains
 from tradepartner.ingest import (
     SourceRun,
     _prefetch,
@@ -86,8 +87,9 @@ from tradepartner.ingest import (
     _write_run,
 )
 from tradepartner.repair import release_refusal
+from tradepartner.store.classify import build_classifications
 from tradepartner.store.db import open_for_write, utc_now
-from tradepartner.store.master import build_master
+from tradepartner.store.master import build_chains, build_master
 from tradepartner.store.retraction import (
     EDGAR,
     RETRACT,
@@ -284,9 +286,21 @@ def master_retract(
         keep = frozenset(settings.master.keep_successors)
         derived = frozenset(row["security_id"] for row in build.securities)
         found, kept = split_kept(stored_underived(conn, build, at, unjudged.ciks), keep, derived)
-        derived_successors = frozenset(
-            successor for _, successor, _ in _parse_chains(settings.master.chains)
-        )
+        # #821, T187c: a chain is derived only when `build_chains` honours its
+        # entry at this run, not merely when the entry names the successor. A
+        # refused entry (`spac` predecessor, lost evidence, a successor
+        # listing that no longer matches) leaves its live row underived, as
+        # `store/master.py`'s chain writer skips it.
+        derived_successors: frozenset[str] = frozenset()
+        if settings.master.chains:
+            types = {
+                row["security_id"]: row["security_type"]
+                for row in build_classifications(
+                    recorded, build, settings, ingested_at=at
+                ).classifications
+            }
+            chain_build = build_chains(recorded, settings, build, types, ingested_at=at)
+            derived_successors = frozenset(chain.successor_id for chain in chain_build.chains)
         chains = underived_chains(live_chains_as_of(conn, at), derived_successors, unjudged.ciks)
         found = found + chains
         rest = keep - derived - {u.row["security_id"] for u in kept}

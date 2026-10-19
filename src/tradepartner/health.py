@@ -406,10 +406,13 @@ from tradepartner.config import (
 from tradepartner.gap import SurvivorshipGap, survivorship_gap
 from tradepartner.ingest import DERIVED_FACTS, MODE, OK, SOURCES
 from tradepartner.store.asof import (
+    _FACT_KEY,
+    _PRICE_KEY,
     ASSETS_SOURCE,
+    _latest_as_of,
+    _traded,
     _validate_t,
     borrow_status_as_of,
-    facts_as_of,
     listings_as_of,
     live_actions_as_of,
     price_jumps_as_of,
@@ -1443,6 +1446,27 @@ def _listing_rows(listings: pl.DataFrame, security_ids: Sequence[str]) -> list[d
     return [row for row in listings.iter_rows(named=True) if row["security_id"] in wanted]
 
 
+def _raw_prices(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str]
+) -> pl.DataFrame:
+    """Raw `prices_daily` rows known at `t`, the latest revision per bar and
+    traded only: the successor-chain block's own read (#821, T187c). It never
+    uses `prices_as_of`, which T187b re-keys by chain, or the predecessor's
+    last close vanishes and `chain_price_break` and
+    `chain_predecessor_no_bar_after_handover` go blind."""
+    return _traded(_latest_as_of(conn, "prices_daily", _PRICE_KEY, t, security_ids))
+
+
+def _raw_facts(
+    conn: duckdb.DuckDBPyConnection, t: datetime, security_ids: Sequence[str]
+) -> pl.DataFrame:
+    """Raw `facts` rows known at `t`, the latest revision per key: the
+    successor-chain block's own read (#821, T187c), never `facts_as_of`, which
+    T187b re-keys to the successor, so the predecessor's post-hand-over facts
+    stay visible next to the chain."""
+    return _latest_as_of(conn, "facts", _FACT_KEY, t, security_ids)
+
+
 def successor_chains(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
@@ -1462,10 +1486,10 @@ def successor_chains(
             pl.DataFrame([], schema=_PREDECESSOR_FACT_SCHEMA),
             tuple(candidates),
         )
-    listings = listings_as_of(conn, t)
-    facts = facts_as_of(conn, t)
     ids = sorted({row["predecessor_id"] for row in live} | {row["successor_id"] for row in live})
-    bars = prices_as_of(conn, t, ids, traded_only=True)
+    listings = listings_as_of(conn, t)
+    bars = _raw_prices(conn, t, ids)
+    facts = _raw_facts(conn, t, sorted({row["predecessor_id"] for row in live}))
     first: dict[str, tuple[date, float]] = {}
     last: dict[str, tuple[date, float]] = {}
     for bar in bars.iter_rows(named=True):
@@ -1552,11 +1576,7 @@ def _chain_rule_rows(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, 
     wanted_bars = sorted(
         {row["predecessor_id"] for row in live} | {row["successor_id"] for row in live}
     )
-    for bar in (
-        prices_as_of(conn, t, wanted_bars, traded_only=True).iter_rows(named=True)
-        if wanted_bars
-        else ()
-    ):
+    for bar in _raw_prices(conn, t, wanted_bars).iter_rows(named=True) if wanted_bars else ():
         sid = bar["security_id"]
         predecessor_bars[sid].append(bar["session"])
         if sid not in successor_first_bar or bar["session"] < successor_first_bar[sid]:

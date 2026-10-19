@@ -640,13 +640,71 @@ def test_a_chain_no_entry_names_is_proposed_and_retracted(store: Settings) -> No
     assert master_retract(store, filings=_filings(), clock=lambda: AFTER).found == ()
 
 
-def test_a_chain_on_an_entry_is_never_proposed(store: Settings) -> None:
-    """#821, T187c: while a `master.chains` entry names the successor the row
-    is derived, so `master-retract` leaves it alone (the ingest's chain
-    writer owns the moved-row case)."""
-    _with_chain(store)
-    result = master_retract(_chained(store, CHAIN_SUCC), filings=_filings(), clock=lambda: CHECK)
-    assert all(u.table != "successor_chains" for u in result.found)
+def _chain_source(sic: int) -> FixtureFilingSource:
+    """A predecessor and a successor that both list CHNA on NYSE, the
+    successor with the 8-K12B evidence: a chain `build_chains` derives, unless
+    the predecessor's SIC 6770 (`sic`) makes it `spac` and refuses it."""
+    return FixtureFilingSource(
+        index=[
+            FilingIndexEntry(
+                CHAIN_PRED, "Chain Pred", "10-K", f"{CHAIN_PRED}-19-000001", _at(2019, 1, 2)
+            ),
+            FilingIndexEntry(
+                CHAIN_SUCC, "Chain Succ", "10-K", f"{CHAIN_SUCC}-19-000002", _at(2019, 5, 1)
+            ),
+            FilingIndexEntry(CHAIN_SUCC, "Chain Succ", "8-K12B", CHAIN_EVIDENCE, _at(2019, 5, 2)),
+        ],
+        cover_pages=[
+            CoverPage(
+                CHAIN_PRED,
+                f"{CHAIN_PRED}-19-000001",
+                _at(2019, 1, 2),
+                (CoverListing("Common Stock", "CHNA", "NYSE"),),
+            ),
+            CoverPage(
+                CHAIN_SUCC,
+                f"{CHAIN_SUCC}-19-000002",
+                _at(2019, 5, 2),
+                (CoverListing("Common Stock", "CHNA", "NYSE"),),
+            ),
+        ],
+        headers=[
+            FilingHeader(CHAIN_PRED, f"{CHAIN_PRED}-19-000001", "10-K", sic, _at(2019, 1, 2)),
+            FilingHeader(CHAIN_SUCC, f"{CHAIN_SUCC}-19-000002", "10-K", 3571, _at(2019, 5, 1)),
+        ],
+    )
+
+
+def _ingest_source(settings: Settings, source: FixtureFilingSource, at: datetime) -> None:
+    result = ingest_session(
+        settings, prices=_NoPrices(), filings=source, source="edgar", clock=lambda: at
+    )
+    assert result.ok, result.runs
+
+
+def test_a_derived_chain_is_never_proposed(settings: Settings) -> None:
+    """#821, T187c: an entry naming a successor whose 8-K12B, securities and
+    matching listing all exist is derived by `build_chains`, so its live row
+    is not underived. The store holds only this pair."""
+    source = _chain_source(sic=3571)
+    _ingest_source(settings, source, INGEST)
+    with open_for_write(settings) as conn:
+        insert_row(conn, "successor_chains", _chain_row())
+    result = master_retract(_chained(settings, CHAIN_SUCC), filings=source, clock=lambda: CHECK)
+    assert result.found == ()
+
+
+def test_a_refused_spac_chain_is_proposed(settings: Settings) -> None:
+    """#821, T187c, quant audit of PR #1913: an entry is not 'derived' merely
+    because it names the successor. A predecessor later classified `spac`
+    (SIC 6770) makes `build_chains` refuse, so its live row is underived and
+    the dry run proposes it."""
+    source = _chain_source(sic=6770)
+    _ingest_source(settings, source, INGEST)
+    with open_for_write(settings) as conn:
+        insert_row(conn, "successor_chains", _chain_row())
+    result = master_retract(_chained(settings, CHAIN_SUCC), filings=source, clock=lambda: CHECK)
+    assert [(u.table, u.key) for u in result.found] == [("successor_chains", (CHAIN_SUCC,))]
 
 
 def test_a_chain_row_is_traded_when_the_journal_names_a_side(store: Settings) -> None:

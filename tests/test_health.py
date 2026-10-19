@@ -3974,3 +3974,41 @@ def test_chain_candidates_from_message_parses_the_run_row() -> None:
     )
     assert chain_candidates_from_message(None) == ()
     assert chain_candidates_from_message("chains_written: 0") == ()
+
+
+def test_the_chain_block_and_rules_read_raw_rows(
+    chain_fixture_store: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#821, T187c, quant audit of PR #1913: T187b re-keys `prices_as_of` and
+    `facts_as_of` by chain, so the block and the rules must read the raw rows
+    directly (never through those reads), or a predecessor's last close and
+    its post-hand-over facts vanish. A predecessor bar and a fact dated after
+    the hand-over stay visible even with the chained reads removed."""
+
+    def chained(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the chain block must not read through the chained reads")
+
+    monkeypatch.setattr(health, "prices_as_of", chained)
+    monkeypatch.setattr(health, "facts_as_of", chained, raising=False)
+    insert_row(
+        chain_fixture_store,
+        "facts",
+        {
+            "security_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+            "known_at": session_close(date(2020, 3, 2)),
+            "ingested_at": session_close(date(2020, 3, 2)),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    block = health.successor_chains(chain_fixture_store, T_END, _settings())
+    rows = {row["successor_id"]: row for row in block.frame.iter_rows(named=True)}
+    assert rows["0001000011"]["ratio"] == pytest.approx(19.33 / 15.41)
+    assert block.predecessor_facts["value"].to_list() == [4.2e8]
+    insert_row(chain_fixture_store, "prices_daily", _bar("0001000010", date(2020, 2, 5)))
+    rules = health._chain_rule_rows(chain_fixture_store, T_END)
+    [violation] = rules[CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER].to_dicts()
+    assert (violation["predecessor_id"], violation["successor_id"]) == ("0001000010", "0001000011")
