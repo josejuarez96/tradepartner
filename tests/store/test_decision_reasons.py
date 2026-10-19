@@ -110,6 +110,18 @@ def _shape(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[Any, ...]:
 
 # --- the shared constants -----------------------------------------------------------
 
+#: T228 (paper spec amendment 2026-10-19 item 12, #1872; the plan line): the two short
+#: skips and the three forced-cover reasons, appended last in this order.
+_SHORT_DECISION_REASONS = (
+    "skip_not_borrowable",
+    "skip_short_price",
+    "cover_delisted",
+    "cover_drift",
+    "cover_not_borrowable",
+)
+#: T228: the two short skips `decision_events.reason` and `order_events.reason` gain.
+_SHORT_SKIP_REASONS = ("skip_not_borrowable", "skip_short_price")
+
 
 def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
     """#368's full exit is defined on these exact spellings."""
@@ -120,7 +132,7 @@ def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
     assert schema.DELISTED_REASON == "delisted"
     assert schema.UNTARGETED_RECEIPT_REASON == "untargeted_receipt"
     assert schema.WINDOW_STOP_REASON == "window_stop"
-    assert schema.DECISION_REASONS == (
+    assert (
         schema.LEFT_TARGETS_REASON,
         schema.LEFT_UNIVERSE_REASON,
         schema.EXCLUDE_NAME_REASON,
@@ -128,7 +140,8 @@ def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
         schema.DELISTED_REASON,
         schema.UNTARGETED_RECEIPT_REASON,
         schema.WINDOW_STOP_REASON,
-    )
+        *_SHORT_DECISION_REASONS,
+    ) == schema.DECISION_REASONS
 
 
 def test_the_spec_lists_exactly_the_checked_reasons() -> None:
@@ -190,7 +203,22 @@ def test_every_listed_reason_and_null_is_accepted(
 
 @pytest.mark.parametrize(
     "reason",
-    ["left_target", "Left_Targets", "left universe", "leftuniverse", "window-stop", "", "dust"],
+    [
+        "left_target",
+        "Left_Targets",
+        "left universe",
+        "leftuniverse",
+        "window-stop",
+        "",
+        "dust",
+        "skip_not_borowable",
+        "skip-short-price",
+        "cover",
+        "Cover_Delisted",
+        "cover_drifted",
+        "cover_not_borrowable ",
+        "short_price",
+    ],
 )
 def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason: str) -> None:
     with pytest.raises(duckdb.ConstraintException):
@@ -212,6 +240,7 @@ _DECISION_EVENT_REASONS = (
     "unfunded",
     "skip_asset_unknown",
     "skip_not_fractionable",
+    *_SHORT_SKIP_REASONS,
 )
 
 
@@ -259,6 +288,10 @@ def test_every_decision_event_reason_and_null_is_accepted(
         "skip-asset-unknown",
         "",
         "halt",
+        "skip_not_borowable",
+        "not_borrowable",
+        "Skip_Short_Price",
+        "cover_drift",
     ],
 )
 def test_a_misspelt_decision_event_reason_is_refused(
@@ -272,11 +305,11 @@ def test_a_misspelt_decision_event_reason_is_refused(
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 32
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
 
 
 def test_fresh_init_records_version_17(journal: duckdb.DuckDBPyConnection) -> None:
-    assert _versions(journal) == [32]
+    assert _versions(journal) == [schema.CURRENT_SCHEMA_VERSION]
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -300,7 +333,7 @@ def test_write_open_adds_the_check_and_keeps_every_row(
             _decision(conn, "left_target", decision_id=99)
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == list(range(version, 33))
+    assert versions == list(range(version, schema.CURRENT_SCHEMA_VERSION + 1))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -328,35 +361,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            28,
-            29,
-            30,
-            31,
-            32,
-        ]
+        assert _versions(conn) == list(range(6, schema.CURRENT_SCHEMA_VERSION + 1))
 
 
 @pytest.mark.parametrize("version", [5, 6])
