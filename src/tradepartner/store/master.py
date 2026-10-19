@@ -285,7 +285,6 @@ class Chain:
             "evidence_form": self.evidence_form,
             "retracted": False,
             "withdrawn_known_at": None,
-            "evidence_known_at": self.known_at,
         } | _row(self.known_at, self.ingested_at, _EDGAR, "filing")
 
 

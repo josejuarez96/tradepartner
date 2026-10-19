@@ -17,6 +17,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,7 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import build_classifications, classifications_as_of
 from tradepartner.store.db import insert_row, open_for_write
-from tradepartner.store.master import build_chains, build_master
+from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
 from tradepartner.store.schema import init_schema
 
 
@@ -5581,13 +5582,116 @@ def test_a_chain_entry_writes_a_row_and_the_run_row_counts_it(
     assert any("chains_written: 0" in m for m in second)
 
 
+#: The live chain `schema.successor_chains` documents: the successor's
+#: unretracted row with the greatest `ingested_at`, unless a retraction was
+#: written after it. A read at `t` shows it only when its `known_at <= t` (the
+#: corrected history the UPDATE-moved listing rows give, T166b).
+_CHAIN_LIVE_SQL = """
+    SELECT predecessor_id, evidence_accession, known_at FROM successor_chains c
+    WHERE successor_id = ? AND NOT retracted
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+      )
+"""
+
+
+def _chain_live(
+    read: Callable[[str], list[tuple[Any, ...]]], at: datetime | None = None
+) -> tuple[Any, ...] | None:
+    """The chain of the fixture's successor read at `at` (every revision
+    applied), or the live row with no `at`; None when there is none."""
+    successor = _CHAIN_CASE["successor"]["cik"]
+    rows = read(_CHAIN_LIVE_SQL.replace("?", f"'{successor}'"))
+    assert len(rows) <= 1, rows
+    if not rows or (at is not None and rows[0][2] > at):
+        return None
+    return rows[0]
+
+
+def _chain_unretracted(read: Callable[[str], list[tuple[Any, ...]]]) -> int:
+    """Unretracted rows no later write supersedes: one at most, always."""
+    successor = _CHAIN_CASE["successor"]["cik"]
+    return len(read(_CHAIN_LIVE_SQL.replace("?", f"'{successor}'")))
+
+
+_ACC2 = "0001000011-24-000009"
+
+#: The reviewer's sequences (quant-auditor pass 4 on #1836): each step is the
+#: successor listing row's shift from the fixture stamp (days) and the
+#: evidence accession (None: the fixture's).
+_CHAIN_SEQUENCES = {
+    "move later": [(0, None), (30, None)],
+    "move earlier then later": [(0, None), (-20, None), (30, None)],
+    "same-stamp correction then later": [(0, None), (0, _ACC2), (30, _ACC2)],
+    "later, earlier, later": [(0, None), (30, None), (10, None), (60, None)],
+    "A->B->A, B later": [(0, None), (30, None), (0, None)],
+    "A->B->A, B earlier": [(0, None), (-20, None), (0, None)],
+}
+
+
+@pytest.mark.parametrize("steps", _CHAIN_SEQUENCES.values(), ids=_CHAIN_SEQUENCES.keys())
+def test_every_revision_supersedes_every_earlier_one(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    steps: list[tuple[int, str | None]],
+) -> None:
+    """#821: a write that differs from the live chain retracts it at the
+    run's clock and writes the derived row at its evidence stamp, so after
+    every run exactly one row is live and every earlier revision is gone. A
+    read at `t` gives the newest revision only from its own `known_at`:
+    absent at every earlier stamp the sequence used (the successor's listing
+    row, moved by UPDATE, reads absent there too), present from it, before the
+    last run's clock and after it. An unchanged last run writes nothing and
+    raises nothing."""
+    base = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    default = _CHAIN_CASE["evidence"]["accession"]
+    clocks = [_chain_now() + timedelta(days=60 * i) for i in range(len(steps) + 1)]
+    stamps = []
+    for (shift, accession), clock in zip(steps, clocks, strict=False):
+        _run(
+            _chain_settings_for(settings, accession=accession),
+            filings=_chain_filings(
+                _CHAIN_CASE, cover_shift=timedelta(days=shift), accession=accession
+            ),
+            now=clock,
+        )
+        stamp = base + timedelta(days=shift)
+        stamps.append(stamp)
+        assert _chain_unretracted(read) == 1
+        assert _chain_live(read) == (predecessor, accession or default, stamp)
+    changes = sum(1 for a, b in pairwise(steps) if a != b)
+    assert read("SELECT count(*) FROM successor_chains WHERE retracted") == [(changes,)]
+    final = (predecessor, steps[-1][1] or default, stamps[-1])
+    for stamp in stamps:
+        expected = final if stamp >= stamps[-1] else None
+        assert _chain_live(read, stamp) == expected, stamp
+        assert _chain_live(read, stamp - timedelta(microseconds=1)) == (
+            final if stamp - timedelta(microseconds=1) >= stamps[-1] else None
+        ), stamp
+    assert _chain_live(read, clocks[len(steps) - 1] - timedelta(seconds=1)) == final
+    assert _chain_live(read, clocks[len(steps) - 1] + timedelta(days=1)) == final
+    rows = read("SELECT count(*) FROM successor_chains")
+    shift, accession = steps[-1]
+    _run(
+        _chain_settings_for(settings, accession=accession),
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=shift), accession=accession),
+        now=clocks[-1],
+    )
+    assert read("SELECT count(*) FROM successor_chains") == rows
+    last = read("SELECT message FROM ingestion_runs WHERE source = 'edgar' ORDER BY started_at")
+    assert "chains_written: 0" in last[-1][0]
+    assert "chains_moved: 0" in last[-1][0]
+    assert _chain_live(read) == final
+
+
 def test_a_moved_chain_is_retracted_and_rewritten_in_one_run(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
     """#821: a listing row restamped later moves the row's `known_at`; the run
-    retracts the live row at its clock (`withdrawn_known_at` names it) and
-    writes the new one, counting `chains_moved`. The withdrawn stamp is no
-    longer live, and the chain is live only from the new stamp."""
+    retracts the live row at its clock (`withdrawn_known_at` names its stamp)
+    and writes the new one at the new stamp, counting `chains_moved`."""
     chained = _chained_settings(settings, _CHAIN_CASE)
     _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
     old_known = _chain_parse(_CHAIN_CASE["expected_known_at"])
@@ -5598,61 +5702,37 @@ def test_a_moved_chain_is_retracted_and_rewritten_in_one_run(
         filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
         now=clock,
     )
-    assert read("SELECT known_at, withdrawn_known_at FROM successor_chains WHERE retracted") == [
-        (clock, old_known)
-    ]
-    live = [
-        row[0]
-        for row in read(
-            "SELECT known_at FROM successor_chains WHERE NOT retracted AND known_at NOT IN "
-            "(SELECT withdrawn_known_at FROM successor_chains WHERE retracted)"
-        )
-    ]
-    assert live == [moved_known]
+    assert read(
+        "SELECT known_at, ingested_at, withdrawn_known_at FROM successor_chains WHERE retracted"
+    ) == [(clock, clock, old_known)]
+    assert read(
+        "SELECT known_at, ingested_at FROM successor_chains WHERE NOT retracted ORDER BY 2"
+    ) == [(old_known, _chain_now()), (moved_known, clock)]
+    assert _chain_live(read) == (
+        _CHAIN_CASE["predecessor"]["cik"],
+        _CHAIN_CASE["evidence"]["accession"],
+        moved_known,
+    )
     messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
     assert any("chains_moved: 1" in m for m in messages)
 
 
-def test_two_moves_and_an_unchanged_third_run(
+def test_a_chain_stamped_at_the_run_clock_does_not_collide(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
-    """#821: a second move retracts the current live stamp (never two rows at
-    the same clock, which `UNIQUE (successor_id, known_at)` refuses); an
-    unchanged third run writes nothing and does not raise."""
+    """#821 (pass-4 nit): evidence whose stamp equals the run's clock is
+    written beside the retraction at that clock without a key collision."""
     chained = _chained_settings(settings, _CHAIN_CASE)
-    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
-    first = _chain_parse(_CHAIN_CASE["expected_known_at"])
-    second = first + timedelta(days=30)
-    third = first + timedelta(days=60)
-    _run(
-        chained,
-        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
-        now=_chain_now() + timedelta(days=60),
+    base = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=base + timedelta(days=1))
+    clock = base + timedelta(days=30)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)), now=clock)
+    assert _chain_live(read) == (
+        _CHAIN_CASE["predecessor"]["cik"],
+        _CHAIN_CASE["evidence"]["accession"],
+        clock,
     )
-    _run(
-        chained,
-        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=60)),
-        now=_chain_now() + timedelta(days=120),
-    )
-    assert read("SELECT withdrawn_known_at FROM successor_chains WHERE retracted ORDER BY 1") == [
-        (first,),
-        (second,),
-    ]
-    live = [
-        row[0]
-        for row in read(
-            "SELECT known_at FROM successor_chains WHERE NOT retracted AND known_at NOT IN "
-            "(SELECT withdrawn_known_at FROM successor_chains WHERE retracted)"
-        )
-    ]
-    assert live == [third]
-    before = read("SELECT count(*) FROM successor_chains")[0][0]
-    _run(
-        chained,
-        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=60)),
-        now=_chain_now() + timedelta(days=180),
-    )
-    assert read("SELECT count(*) FROM successor_chains")[0][0] == before
+    assert read("SELECT count(*) FROM successor_chains WHERE retracted") == [(1,)]
 
 
 def test_a_held_predecessor_is_refused_then_written_after_the_window_closes(
@@ -5714,54 +5794,24 @@ def test_a_missing_listing_row_is_refused_and_written_on_the_next_run(
     assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
 
 
-def test_a_same_stamp_correction_does_not_collide(
-    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
-) -> None:
-    """#821: an evidence change at an unchanged stamp is a revision stamped at
-    the run's clock, not a second row at the same `known_at` (which `UNIQUE
-    (successor_id, known_at)` refuses)."""
-    base = _chain_settings_for(settings, accession=None)
-    other = "0001000011-24-000009"
-    _run(base, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
-    changed = _chain_settings_for(settings, accession=other)
-    _run(
-        changed,
-        filings=_chain_filings(_CHAIN_CASE, accession=other),
-        now=_chain_now() + timedelta(days=10),
-    )
-    latest = read(
-        "SELECT evidence_accession FROM successor_chains "
-        "ORDER BY known_at DESC, evidence_known_at DESC LIMIT 1"
-    )
-    assert latest == [(other,)]
-    assert read("SELECT count(*) FROM successor_chains WHERE retracted")[0][0] == 0
-
-
-def test_a_chain_that_moves_back_to_an_earlier_stamp(
-    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
-) -> None:
-    """#821: A -> B -> A does not collide: the move back is a revision at the
-    run's clock, and B is retracted."""
-    chained = _chained_settings(settings, _CHAIN_CASE)
-    first = _chain_parse(_CHAIN_CASE["expected_known_at"])
-    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
-    _run(
-        chained,
-        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
-        now=_chain_now() + timedelta(days=60),
-    )
-    _run(
-        chained,
-        filings=_chain_filings(_CHAIN_CASE),
-        now=_chain_now() + timedelta(days=120),
-    )
-    assert read("SELECT withdrawn_known_at FROM successor_chains WHERE retracted ORDER BY 1") == [
-        (first,)
-    ]
-    assert read("SELECT count(*) FROM successor_chains")[0][0] == 4
-    assert read(
-        "SELECT evidence_known_at FROM successor_chains ORDER BY known_at DESC LIMIT 1"
-    ) == [(first,)]
+def test_a_chain_write_refuses_a_clock_before_the_live_row() -> None:
+    """#821: the live chain is the latest written row, so a run whose clock
+    is not after the live row's `ingested_at` would leave an earlier revision
+    live; the writer raises instead of writing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        stamp = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)
+        first = Chain("0001000010", "0001000011", "0001000011-24-000001", "8-K12B", stamp, stamp)
+        clock = datetime(2026, 1, 2, tzinfo=UTC)
+        master = MasterBuild((), (), (), (), chains=(first,))
+        ingest_module._write_chains(conn, master, clock)
+        moved = replace(first, known_at=stamp + timedelta(days=30))
+        with pytest.raises(ValueError, match="not after"):
+            ingest_module._write_chains(conn, replace(master, chains=(moved,)), clock)
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 def test_held_ids_reads_open_windows_only() -> None:

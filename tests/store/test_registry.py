@@ -1330,7 +1330,6 @@ def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
             "evidence_form": "8-K12B",
             "retracted": False,
             "withdrawn_known_at": None,
-            "evidence_known_at": _PIN_KNOWN,
             "known_at": _PIN_KNOWN,
             "ingested_at": _LATE_INGEST,
             "source": "edgar",
@@ -1341,6 +1340,55 @@ def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
     for cutoff in cutoffs:
         vintage = registry.data_vintage(fixture_store, cutoff)
         if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
+def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821: a chain moved later reads absent at every `t` in [old, new) once
+    moved (`schema.successor_chains`), so its retraction moves the vintage of
+    every cutoff at or after the withdrawn stamp, not only from the new one;
+    an earlier cutoff stays current."""
+    old = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)  # the fixture's chain_1to1 row
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    row = {
+        "predecessor_id": "0001000010",
+        "successor_id": "0001000011",
+        "evidence_accession": "0001000011-24-000001",
+        "evidence_form": "8-K12B",
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    insert_row(
+        fixture_store,
+        "successor_chains",
+        row
+        | {
+            "retracted": True,
+            "withdrawn_known_at": old,
+            "known_at": _LATE_INGEST,
+            "ingested_at": _LATE_INGEST,
+        },
+    )
+    insert_row(
+        fixture_store,
+        "successor_chains",
+        row
+        | {
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+        },
+    )
+    assert any(old <= cutoff < _PIN_KNOWN for cutoff in cutoffs)
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < old:
             assert vintage == before[cutoff], cutoff
         else:
             assert vintage == _LATE_INGEST, cutoff

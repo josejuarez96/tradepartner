@@ -1238,22 +1238,28 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 # T187 (#821): one live row per chained successor, the append-only master
 # shape (`known_at`, `ingested_at`, `source`, `provenance`) plus the #859
-# retraction flag. `evidence_known_at` is the latest of the four evidence
-# stamps (the 8-K12B's acceptance, the successor's `securities` row, its first
-# listing row under the predecessor's ticker and the predecessor's last
-# listing row) and is the row's identity. `known_at` is that stamp for a first
-# write or a move to a newer stamp; when the evidence moves to an earlier or
-# unchanged stamp (or one already held), `known_at` is the run's clock (a
-# revision, as `_filed` does for the master tables), because `UNIQUE
-# (successor_id, known_at)` forbids a second row at a stamp already held.
-# `retracted = FALSE` is a live row; a retraction is `retracted = TRUE` at the
-# run's clock whose `withdrawn_known_at` names the withdrawn row's own
-# `known_at`. A read at `t` takes the live row with the greatest `known_at <=
-# t` among rows no retraction known at `t` names, and reads its
-# `evidence_known_at`: so a chain moves to the new stamp and is absent from
-# the withdrawn one at every read once the retraction is known, never shown
-# from a stamp its evidence no longer carries. `evidence_form` is one of the
-# four successor-issuer forms.
+# retraction flag. A row's `known_at` is always its evidence stamp: the latest
+# of the four (the 8-K12B's acceptance, the successor's `securities` row, its
+# first listing row under the predecessor's ticker and the predecessor's last
+# listing row). A write that differs from the live chain (another
+# predecessor, accession, form or stamp, earlier, later or the same) writes,
+# at the run's clock, a retraction of the live row (`retracted = TRUE`,
+# `known_at` and `ingested_at` the clock, `withdrawn_known_at` the withdrawn
+# row's stamp) and the derived row (`known_at` its evidence stamp,
+# `ingested_at` the clock). The **live chain** is the successor's unretracted
+# row with the greatest `ingested_at`, unless a retraction was written after
+# it, so every newer revision supersedes every earlier one by construction and
+# at most one row is ever live. **A read at `t`** gives the live chain when
+# its `known_at <= t`, and nothing otherwise: the corrected history the
+# successor's listing rows give (a restamp moves them by UPDATE, T166b), so
+# after a move to a later stamp the chain reads absent at every `t` before it,
+# exactly where its listing row does, and `chain_known_at_ge_successor_rows`
+# holds at every read. A truncation of the store to `known_at <= T` is
+# invariant for a chain never moved; a moved one reads as corrected, never as
+# first stored. `registry.data_vintage` counts a retraction at every cutoff
+# from its `withdrawn_known_at`, the reads it changes. `evidence_form` is one
+# of the four successor-issuer forms. A run writes one row of each kind per
+# successor, so `UNIQUE (successor_id, ingested_at, retracted)` holds.
 _CREATE_SUCCESSOR_CHAINS = f"""
 CREATE TABLE IF NOT EXISTS successor_chains (
     predecessor_id VARCHAR NOT NULL,
@@ -1262,9 +1268,8 @@ CREATE TABLE IF NOT EXISTS successor_chains (
     evidence_form VARCHAR NOT NULL,
     retracted BOOLEAN NOT NULL DEFAULT FALSE,
     withdrawn_known_at TIMESTAMPTZ,
-    evidence_known_at TIMESTAMPTZ NOT NULL,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["successor_chains"])},
-    UNIQUE (successor_id, known_at)
+    UNIQUE (successor_id, ingested_at, retracted)
 )
 """
 

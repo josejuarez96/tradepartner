@@ -86,72 +86,62 @@ def test_truncation_sees_exactly_the_rows_known_by_each_probe(
             assert seen == expected, t
 
 
-#: The read rule `schema.successor_chains` documents: the live row with the
-#: greatest `known_at <= t` that no retraction *known at t* names; its
-#: `evidence_known_at` is the chain's stamp.
+#: The read rule `schema.successor_chains` documents: the successor's
+#: unretracted row with the greatest `ingested_at`, unless a retraction was
+#: written after it (every revision applied, the corrected history the
+#: UPDATE-moved listing rows give, T166b), shown at `t` only when its
+#: `known_at <= t`.
 _LIVE_AT_SQL = """
-    SELECT evidence_known_at FROM successor_chains
+    SELECT evidence_accession, known_at FROM successor_chains c
     WHERE successor_id = '0001000011' AND NOT retracted AND known_at <= ?
-      AND known_at NOT IN (
-          SELECT withdrawn_known_at FROM successor_chains
-          WHERE retracted AND known_at <= ?
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
       )
-    ORDER BY known_at DESC LIMIT 1
 """
 
 
-def test_a_moved_chain_is_absent_from_the_old_stamp_once_the_run_is_known(
+def _chain_row(known_at: datetime, ingested_at: datetime, **extra: object) -> dict[str, object]:
+    return {
+        "predecessor_id": "0001000010",
+        "successor_id": "0001000011",
+        "evidence_accession": "0001000011-24-000001",
+        "evidence_form": "8-K12B",
+        "retracted": False,
+        "withdrawn_known_at": None,
+        "known_at": known_at,
+        "ingested_at": ingested_at,
+        "source": "edgar",
+        "provenance": "filing",
+    } | extra
+
+
+def test_a_moved_chain_is_absent_before_its_new_stamp_at_every_read(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
-    """#821: after a move the chain never reads from the withdrawn stamp: the
-    old stamp is live only before the run that moved it is known, and the new
-    stamp is live from its own `known_at` (the truncation harness holds)."""
+    """#821: after a move to a later stamp the chain reads absent at every
+    `t` in [old, new), as the successor's listing row the move follows (moved
+    by UPDATE, T166b) does, so `chain_known_at_ge_successor_rows` holds at
+    every read; it reads the new stamp in [new, the run's clock) and after."""
     from tradepartner.store.db import insert_row
 
-    successor = "0001000011"
     old = datetime.fromisoformat("2020-02-07T20:30:00+00:00")
     new = datetime.fromisoformat("2020-03-08T20:30:00+00:00")
     clock = datetime.fromisoformat("2020-04-01T04:00:00+00:00")
+    accession = "0001000011-24-000001"
 
-    def at(t: datetime) -> list[datetime]:
-        return [row[0] for row in fixture_store.execute(_LIVE_AT_SQL, [t, t]).fetchall()]
+    def at(t: datetime) -> list[tuple[str, datetime]]:
+        return [tuple(row) for row in fixture_store.execute(_LIVE_AT_SQL, [t]).fetchall()]
 
-    assert at(old) == [old]
-    assert at(new) == [old]  # the fixture is unmoved: the old stamp, no new row yet
-    insert_row(
-        fixture_store,
-        "successor_chains",
-        {
-            "predecessor_id": "0001000010",
-            "successor_id": successor,
-            "evidence_accession": "0001000011-24-000001",
-            "evidence_form": "8-K12B",
-            "retracted": True,
-            "withdrawn_known_at": old,
-            "evidence_known_at": old,
-            "known_at": clock,
-            "ingested_at": clock,
-            "source": "edgar",
-            "provenance": "filing",
-        },
-    )
-    insert_row(
-        fixture_store,
-        "successor_chains",
-        {
-            "predecessor_id": "0001000010",
-            "successor_id": successor,
-            "evidence_accession": "0001000011-24-000001",
-            "evidence_form": "8-K12B",
-            "retracted": False,
-            "withdrawn_known_at": None,
-            "evidence_known_at": new,
-            "known_at": new,
-            "ingested_at": clock,
-            "source": "edgar",
-            "provenance": "filing",
-        },
-    )
-    assert at(new) == [new]  # the old stamp is still live before the run is known
-    assert at(clock) == [new]  # and gone from it once the retraction is known
-    assert at(clock.replace(year=2020, month=5)) == [new]
+    assert at(old - PROBE_EPSILON) == []
+    assert at(old) == [(accession, old)]
+    assert at(new) == [(accession, old)]  # unmoved: the old stamp, no new row yet
+    withdrawn = _chain_row(clock, clock, retracted=True, withdrawn_known_at=old)
+    insert_row(fixture_store, "successor_chains", withdrawn)
+    insert_row(fixture_store, "successor_chains", _chain_row(new, clock))
+    for t in (old, old + PROBE_EPSILON, new - PROBE_EPSILON):  # [old, new)
+        assert at(t) == [], t
+    for t in (new, new + PROBE_EPSILON, clock - PROBE_EPSILON):  # [new, clock)
+        assert at(t) == [(accession, new)], t
+    for t in (clock, clock.replace(month=5)):  # from the run on
+        assert at(t) == [(accession, new)], t
