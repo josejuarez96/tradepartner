@@ -8,6 +8,7 @@ environment variable can move a registered hypothesis's holdout or threshold.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -1810,3 +1811,48 @@ def test_on_the_lab_a_promoted_file_may_set_a_term_higher_than_the_rules(
         with pytest.raises(LabRegistrationError, match=refusal):
             promote()
         assert _counts(lab_store) == before
+
+
+# --- T217b: the placebo refusal of an operations file ---------------------------------
+
+_PLACEBO_LINES = '\nplacebo = "shuffle"\nplacebo_seed = 7'
+
+
+def test_an_operations_file_of_a_placebo_variant_is_refused_with_nothing_written(
+    ops: Any,
+) -> None:
+    """`refused_placebo`: the file's frozen `strategy.placebo` is not `none`, so a fake
+    signal is never given a paper book; its variant (a placebo sweep's) is otherwise
+    eligible, with a counted ok trial."""
+    _sweep, (variant,) = ops.sweep([0.35], slug="mom-placebo", shock=_PLACEBO_LINES)
+    ops.trial(variant, 1.0)
+    path = ops.file(OPS_SLUG, 0.35, shock=_PLACEBO_LINES)
+    _ops_refused(ops, path, variant.slug, rf"{re.escape(str(path))}: refused_placebo")
+
+
+def test_an_operations_file_of_a_delayed_variant_registers(ops: Any) -> None:
+    """A stale-signal strategy is implementable; the paper planner honours the delay."""
+    delay = "\nsignal_delay_sessions = 1"
+    _sweep, (variant,) = ops.sweep([0.35], slug="mom-delay", shock=delay)
+    ops.trial(variant, 1.0)
+
+    outcome = _ops_register(ops, ops.file(OPS_SLUG, 0.35, shock=delay), variant.slug)
+
+    assert frozen.frozen_values(outcome.registered)["strategy.signal_delay_sessions"] == 1
+
+
+def test_a_standalone_placebo_file_registers(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """How a rung-5 run gets its `trials` row: only the operations road refuses it."""
+    text = FIXTURE.read_text()
+    assert "\n[strategy]\n" in text
+    path = tmp_path / "hypotheses" / "placebo.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        text.replace("\n[strategy]\n", f"\n[strategy]{_PLACEBO_LINES}\n", 1).replace(
+            f'slug = "{SLUG}"', 'slug = "placebo"', 1
+        )
+    )
+    record = _register(conn, path, settings)
+    assert frozen.frozen_values(record)["strategy.placebo"] == "shuffle"
