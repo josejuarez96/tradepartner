@@ -870,6 +870,45 @@ def _insert_t228_reason(conn: duckdb.DuckDBPyConnection, table: str, reason: str
         _insert_reason(conn, table, reason)
 
 
+#: `decisions.decision` before T228 (#1877): T229's two short skip kinds come last.
+_PRE_T228_DECISION_KINDS = (
+    "trade",
+    "skip_below_minimum",
+    "skip_untradable",
+    "skip_below_one_share",
+    "skip_delisted",
+    "skip_zero",
+    "dust",
+    "override",
+    "forced_exit",
+)
+_T228_NEW_DECISION_KINDS = ("skip_not_borrowable", "skip_short_price")
+_DECISION_CHECK = re.compile(r"CHECK\(\(decision IN \([^)]*\)\)\)")
+
+
+def _narrow_decision_kinds(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild `decisions` from its live `CREATE TABLE` with the `decision` `CHECK`
+    set to the kinds before T228, every row kept in insertion order."""
+    ddl = _ddl(conn, "decisions")
+    allowed = ", ".join(f"'{kind}'" for kind in _PRE_T228_DECISION_KINDS)
+    narrowed, count = _DECISION_CHECK.subn(f"CHECK((decision IN ({allowed})))", ddl)
+    assert count == 1, ddl
+    conn.execute(narrowed.replace("CREATE TABLE decisions(", "CREATE TABLE decisions_pre(", 1))
+    conn.execute("INSERT INTO decisions_pre BY NAME SELECT * FROM decisions ORDER BY rowid")
+    conn.execute("DROP TABLE decisions")
+    conn.execute("ALTER TABLE decisions_pre RENAME TO decisions")
+
+
+def _insert_decision_kind(conn: duckdb.DuckDBPyConnection, kind: str) -> None:
+    conn.execute(
+        "INSERT INTO decisions (decision_id, run_id, security_id, whole_share, decision, "
+        "known_at, ingested_at) "
+        "VALUES ((SELECT coalesce(max(decision_id), 0) + 1 FROM decisions), 3, 'S9', "
+        "FALSE, ?, ?, ?)",
+        [kind, _LATER, _LATER],
+    )
+
+
 def _pre_short_reasons_store(
     conn: duckdb.DuckDBPyConnection, version: int, stray: dict[str, str] | None = None
 ) -> None:
@@ -881,6 +920,7 @@ def _pre_short_reasons_store(
     one reason outside its widened set, which its `CHECK` is widened to admit and
     which is then stored, as a hand-edited store could hold."""
     schema.init_schema(conn)
+    _narrow_decision_kinds(conn)
     for table, reasons in _PRE_T228_REASONS.items():
         extra = (stray[table],) if stray and table in stray else ()
         _rebuild_with_reasons(conn, table, reasons + extra)
@@ -984,6 +1024,35 @@ def test_a_fresh_store_accepts_each_short_reason_and_refuses_misspellings(
             _insert_t228_reason(journal, table, misspelt)
 
 
+def test_the_short_skip_kinds_are_decision_kinds_last() -> None:
+    """#1877: `decisions.decision` gains T229's two short skip kinds, appended last."""
+    assert schema.JOURNAL_ENUMS["decisions", "decision"] == (
+        *_PRE_T228_DECISION_KINDS,
+        *_T228_NEW_DECISION_KINDS,
+    )
+
+
+def test_a_fresh_store_accepts_the_short_skip_kinds_and_refuses_misspellings(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    for kind in (*_PRE_T228_DECISION_KINDS, *_T228_NEW_DECISION_KINDS):
+        _insert_decision_kind(journal, kind)
+    for misspelt in _T228_MISSPELT:
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_decision_kind(journal, misspelt)
+
+
+def test_the_pre_short_reasons_helper_refuses_the_new_decision_kinds() -> None:
+    conn = duckdb.connect(":memory:")
+    try:
+        _pre_short_reasons_store(conn, schema.CURRENT_SCHEMA_VERSION - 1)
+        for kind in _T228_NEW_DECISION_KINDS:
+            with pytest.raises(duckdb.ConstraintException):
+                _insert_decision_kind(conn, kind)
+    finally:
+        conn.close()
+
+
 def test_the_cover_reasons_are_decisions_only(journal: duckdb.DuckDBPyConnection) -> None:
     """Item 12: the forced-cover reasons are `decisions` reasons, not event reasons."""
     for table in ("decision_events", "order_events"):
@@ -1048,6 +1117,10 @@ def test_migrating_an_older_store_widens_the_three_reason_checks_and_keeps_every
             for misspelt in _T228_MISSPELT:
                 with pytest.raises(duckdb.ConstraintException):
                     _insert_t228_reason(conn, table, misspelt)
+        for kind in _T228_NEW_DECISION_KINDS:
+            _insert_decision_kind(conn, kind)
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_decision_kind(conn, "skip_not_borowable")
     finally:
         conn.close()
 

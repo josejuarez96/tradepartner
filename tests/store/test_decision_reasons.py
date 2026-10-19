@@ -225,6 +225,64 @@ def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason
         _decision(journal, reason)
 
 
+# --- `decisions.decision`, widened by T228 (#1877, paper spec amendment 2026-10-19) --
+
+#: The decision kinds before T228, then the two short skips T229 writes as kinds
+#: (`decisions_from`: a name not borrowable, a short under the price floor), last.
+_PRE_T228_DECISION_KINDS = (
+    "trade",
+    "skip_below_minimum",
+    "skip_untradable",
+    "skip_below_one_share",
+    "skip_delisted",
+    "skip_zero",
+    "dust",
+    "override",
+    "forced_exit",
+)
+_DECISION_KINDS = (*_PRE_T228_DECISION_KINDS, *_SHORT_SKIP_REASONS)
+
+
+def test_the_decision_kinds_are_the_spec_set_in_order() -> None:
+    assert schema.JOURNAL_ENUMS["decisions", "decision"] == _DECISION_KINDS
+    assert ("decisions", "decision") not in schema.NULLABLE_JOURNAL_ENUMS
+
+
+def test_the_spec_lists_exactly_the_checked_decision_kinds() -> None:
+    """Spec "Data / interfaces" > Tables: the `decisions.decision` list is closed and
+    names exactly the `CHECK`'s values."""
+    text = _SPEC.read_text(encoding="utf-8")
+    match = re.search(r"`decisions\(decision_id[^`]*?decision ∈ \{([^}]*)\}", text)
+    assert match is not None
+    listed = [value.strip() for value in match.group(1).split(",")]
+    assert "…" not in listed
+    assert sorted(listed) == sorted(schema.JOURNAL_ENUMS["decisions", "decision"])
+
+
+@pytest.mark.parametrize("kind", _DECISION_KINDS)
+def test_every_decision_kind_is_accepted(journal: duckdb.DuckDBPyConnection, kind: str) -> None:
+    _decision(journal, None, decision=kind)
+    assert journal.execute("SELECT decision FROM decisions").fetchall() == [(kind,)]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "skip_not_borowable",
+        "skip-short-price",
+        "Skip_Not_Borrowable",
+        "not_borrowable",
+        "skip_short",
+        "cover_drift",
+        "short",
+        "",
+    ],
+)
+def test_a_misspelt_decision_kind_is_refused(journal: duckdb.DuckDBPyConnection, kind: str) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        _decision(journal, None, decision=kind)
+
+
 # --- `decision_events.reason`, widened at version 29 (#1808, T202a) -------------------
 
 #: Spec "Data / interfaces" > Tables, `decision_events`: the version-28 set, then
