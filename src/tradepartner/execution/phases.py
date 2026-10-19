@@ -144,7 +144,6 @@ _WHOLE_HOLDING_REASONS = frozenset({DELISTED_REASON, UNTARGETED_RECEIPT_REASON})
 _DUST = "dust"
 _UNTRADABLE = "untradable"
 _SKIP_UNTRADABLE = "skip_untradable"
-_SKIP_NOT_FRACTIONABLE = "skip_not_fractionable"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_DELISTED = "skip_delisted"
@@ -522,11 +521,6 @@ def buy_orders(
         asset = _asset(sid, assets)
         if not asset.tradable:
             skips.append(Skip(_id(decision), sid, _SKIP_UNTRADABLE))
-            continue
-        if not asset.fractionable and frozen.small_account.enabled:
-            # Section on: a buy is never a whole-share order, so a name that is not
-            # fractionable is the one allowed skip, taken before sizing (T206).
-            skips.append(Skip(_id(decision), sid, _SKIP_NOT_FRACTIONABLE))
             continue
         lost = True if not asset.fractionable else None
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
