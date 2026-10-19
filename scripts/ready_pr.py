@@ -791,16 +791,8 @@ def ready(
     if ticked:
         for agent in sorted(required):
             sha = reviewed_at[agent]
-            if not r.git_ok(
-                "merge-base", "--is-ancestor", sha, "HEAD"
-            ) or agent in required_reviews(
-                [
-                    path
-                    for path in r.git(
-                        "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
-                    ).splitlines()
-                    if path in touched  # the PR's own changes; a main merge is not one
-                ]
+            if not r.git_ok("merge-base", "--is-ancestor", sha, "HEAD") or agent in (
+                required_reviews(_own_changes_since(r, main_ref, sha, touched))
             ):
                 raise ReadyError(
                     f"{agent} review no longer covers the current head; rerun it before "
@@ -844,6 +836,38 @@ def ready(
     else:
         say(f"PR #{number} was already ready; CI green on {sha[:7]}")
     return 0
+
+
+# A change here never makes a review stale: plans and fragments are not reviewed code (#1851).
+REVIEW_NEUTRAL_PREFIXES = ("docs/", "changelog.d/")
+
+
+def _own_patch(r: Runner, main_ref: str, ref: str, path: str) -> list[str]:
+    """The +/- lines of the PR's own change to ``path`` at ``ref``: the diff from the merge
+    base with main, with hunk headers and context dropped so a main merge that only shifts
+    line numbers or context compares equal."""
+    out = r.git("diff", "--no-renames", "-U0", f"{main_ref}...{ref}", "--", path)
+    return [ln for ln in out.splitlines() if ln[:1] in "+-" and not ln.startswith(("+++", "---"))]
+
+
+def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str]) -> list[str]:
+    """PR-owned paths whose own change differs between the reviewed ``sha`` and ``HEAD``.
+
+    A path counts only if it changed in ``sha..HEAD``, is in the PR's diff against main,
+    is not under ``REVIEW_NEUTRAL_PREFIXES``, and its own patch against main differs at the
+    two commits. So a main merge (even one touching a file the PR also edits) and a plan
+    tick or conflict resolution in docs/ do not stale a review (#1851).
+    """
+    candidates = [
+        path
+        for path in r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines()
+        if path in touched and not path.startswith(REVIEW_NEUTRAL_PREFIXES)
+    ]
+    return [
+        path
+        for path in candidates
+        if _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path)
+    ]
 
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
