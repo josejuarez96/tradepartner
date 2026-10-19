@@ -18,6 +18,7 @@ import duckdb
 import pytest
 from conftest import mark_pre_lab
 
+from tradepartner import config
 from tradepartner.backtest import frozen, hypothesis
 from tradepartner.backtest.hypothesis import HypothesisFileError, LabRegistrationError
 from tradepartner.config import FORBIDDEN_AXIS_PREFIXES, Settings
@@ -48,6 +49,8 @@ FROZEN_SECTIONS = (
     "metrics",
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
+#: T210's post-registration `costs.*` keys (#1792): frozen, never required of a file.
+LATE_COST_KEYS = frozenset({"costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions"})
 
 
 def _spec_frozen_keys() -> set[str]:
@@ -109,7 +112,7 @@ def test_fixture_file_names_every_required_key() -> None:
     assert {"holdout.start", "holdout.end"} <= required
     assert {
         k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))
-    } - frozen.POST_REGISTRATION_OWN_KEYS <= required
+    } - frozen.POST_REGISTRATION_OWN_KEYS - LATE_COST_KEYS <= required
     assert required <= set(parsed.file_params)
 
 
@@ -519,9 +522,9 @@ def test_profitability_file_registers_without_strategy_keys(
 ) -> None:
     parsed = hypothesis.parse_file(PROF_FIXTURE)
     assert hypothesis.required_keys("profitability") <= set(parsed.file_params)
-    assert {k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))} <= (
-        hypothesis.required_keys("profitability")
-    )
+    assert {
+        k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))
+    } - LATE_COST_KEYS <= (hypothesis.required_keys("profitability"))
     record = _register(conn, PROF_FIXTURE, settings)
     assert record.family == "profitability"
     assert not any(k.startswith("strategy.") for k in record.params)
@@ -597,7 +600,7 @@ def test_combined_file_names_and_freezes_both_sub_signal_keys(
         k
         for k in _spec_frozen_keys()
         if k.startswith(("combined.", "strategy.", "profitability.", "costs."))
-    } - frozen.POST_REGISTRATION_OWN_KEYS <= required
+    } - frozen.POST_REGISTRATION_OWN_KEYS - LATE_COST_KEYS <= required
     assert required <= set(parsed.file_params)
     assert frozen.inert_sections("combined") == frozenset()
     record = _register(conn, COMBINED_FIXTURE, settings)
@@ -636,6 +639,9 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "strategy.hold_target_names",
             "strategy.rebalance_band",
             "universe.rank_by",
+            "costs.spread_bps",
+            "costs.impact_coeff",
+            "costs.adv_sessions",
             "strategy.signal_delay_sessions",
             "strategy.placebo",
             "strategy.placebo_seed",
@@ -756,13 +762,13 @@ def test_required_keys_unchanged_for_momentum_and_profitability(settings: Settin
     assert {"holdout.start", "holdout.end"} <= momentum_required
     assert {
         k for k in _spec_frozen_keys() if k.startswith(("strategy.", "costs."))
-    } - frozen.POST_REGISTRATION_OWN_KEYS <= momentum_required
+    } - frozen.POST_REGISTRATION_OWN_KEYS - LATE_COST_KEYS <= momentum_required
     assert not any(k.startswith("profitability.") for k in momentum_required)
     profitability_required = hypothesis.required_keys("profitability")
     assert {"holdout.start", "holdout.end"} <= profitability_required
-    assert {k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))} <= (
-        profitability_required
-    )
+    assert {
+        k for k in _spec_frozen_keys() if k.startswith(("profitability.", "costs."))
+    } - LATE_COST_KEYS <= (profitability_required)
     assert not any(k.startswith("strategy.") for k in profitability_required)
 
 
@@ -1314,6 +1320,9 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "strategy.hold_target_names",
         "strategy.rebalance_band",
         "universe.rank_by",
+        "costs.spread_bps",
+        "costs.impact_coeff",
+        "costs.adv_sessions",
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
@@ -1583,3 +1592,213 @@ def test_on_the_lab_the_h1_twins_unchanged_file_is_refused_under_the_new_default
         _register(lab_store, _lab_file(tmp_path), settings)
     assert _counts(lab_store) == before
     assert _register(lab_store, _lab_file(tmp_path), _named_settings(settings)) == twin
+
+
+# --- the cost terms: the post-registration `costs.*` carve-out (#1792, T210) ---------
+
+COST_TERMS = {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20}
+HYPOTHESES = H1_FILE.parent
+B9_FILE = HYPOTHESES / "b9-earnings-reaction-drift.md"
+#: The registered files whose family is wired on main, and the fixture twins. B9's
+#: `earnings_drift` family is not in `config.FAMILIES` yet, so its file is pinned by
+#: text below: it names none of the three keys, so the carve-out covers it when it lands.
+REGISTERED_FILES = [
+    H1_FILE,
+    HYPOTHESES / "b3-gross-profitability.md",
+    HYPOTHESES / "b10-short-term-momentum.md",
+    FIXTURE,
+    PROF_FIXTURE,
+    COMBINED_FIXTURE,
+]
+
+
+@pytest.mark.parametrize("family", sorted(config.FAMILIES))
+def test_required_keys_leave_out_the_post_registration_cost_keys(family: str) -> None:
+    required = hypothesis.required_keys(family)
+    assert not set(COST_TERMS) & required
+    assert set(COST_TERMS) <= set(hypothesis.family_frozen_keys(family))  # frozen, not required
+    assert {
+        "costs.per_side_bps",
+        "costs.commission_per_share",
+        "costs.commission_per_order",
+        "costs.sensitivity_per_side_bps",
+    } <= required
+
+
+@pytest.mark.parametrize("path", REGISTERED_FILES, ids=lambda p: p.stem)
+def test_registered_files_parse_unchanged_and_freeze_the_term_defaults(path: Path) -> None:
+    parsed = hypothesis.parse_file(path)
+    assert not set(COST_TERMS) & set(parsed.file_params)
+    assert hypothesis.required_keys(parsed.family) <= set(parsed.file_params)
+    params = hypothesis.frozen_params(parsed, Settings(_env_file=None))  # type: ignore[call-arg]
+    assert {key: params[key] for key in COST_TERMS} == COST_TERMS
+    assert frozen.is_default(params["costs.adv_sessions"], 20)  # an int, not 20.0
+
+
+@pytest.mark.parametrize("path", [*REGISTERED_FILES, B9_FILE], ids=lambda p: p.stem)
+def test_no_registered_file_names_a_cost_term(path: Path) -> None:
+    """The files stay unchanged: none names the three keys, which is why they must not
+    be required (spec amendment #1792, item 1)."""
+    text = path.read_text()
+    for key in COST_TERMS:
+        assert f"\n{key.partition('.')[2]} =" not in text, (path.name, key)
+
+
+@pytest.mark.parametrize(
+    ("env", "value"),
+    [("COSTS__SPREAD_BPS", "5"), ("COSTS__IMPACT_COEFF", "0.1"), ("COSTS__ADV_SESSIONS", "60")],
+)
+def test_a_file_without_the_terms_freezes_the_defaults_not_the_live_env(
+    conn: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: str,
+    value: str,
+) -> None:
+    """A cost assumption never reaches a registration from `.env` (spec amendment #1792,
+    item 1): the live value moves, the stored one is the table default."""
+    monkeypatch.setenv(env, value)
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "no.env"))
+    live = Settings()
+    key = "costs." + env.removeprefix("COSTS__").lower()
+    assert live.model_dump(mode="json")["costs"][key.partition(".")[2]] == pytest.approx(
+        float(value)
+    )
+    record = _register(conn, FIXTURE, live)
+    assert record.params[key] == COST_TERMS[key]
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=live)
+    assert getattr(loaded.costs, key.partition(".")[2]) == COST_TERMS[key]
+
+
+def test_a_file_naming_a_term_freezes_its_value(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    text = FIXTURE.read_text().replace(
+        "per_side_bps = 15.0\n", "per_side_bps = 15.0\nspread_bps = 5.0\nimpact_coeff = 0.1\n", 1
+    )
+    record = _register(conn, _copy(tmp_path, text), settings)
+    assert (record.params["costs.spread_bps"], record.params["costs.impact_coeff"]) == (5.0, 0.1)
+    assert record.params["costs.adv_sessions"] == 20
+
+
+def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, recorded: list[dict[str, Any]]
+) -> None:
+    """H1 stored without the three keys: `hypothesis register` on its unchanged file
+    returns that record (the three are a suffix of the table at their defaults)."""
+    parsed = hypothesis.parse_file(H1_FILE)
+    params = {
+        k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in COST_TERMS
+    }
+    stored = registry.register_hypothesis(
+        conn,
+        slug=parsed.slug,
+        family=parsed.family,
+        title=parsed.title,
+        doc_path=H1_FILE.as_posix(),
+        doc_sha256=parsed.doc_sha256,
+        params=params,
+        in_sample_start=parsed.in_sample_start,
+        holdout_start=parsed.holdout_start,
+        holdout_end=parsed.holdout_end,
+        registered_by="test",
+        settings=settings,
+    )
+    recorded.clear()
+
+    assert _register(conn, H1_FILE, settings) == stored
+    assert recorded == []
+    assert conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone() == (1,)
+    loaded = hypothesis.load_frozen(conn, parsed.slug, settings=settings)
+    assert hypothesis.frozen_hash_matches(loaded, stored.params_sha256, family="momentum")
+
+
+def _ruled_twin(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    fixed: dict[str, Any],
+) -> registry.HypothesisRecord:
+    """`_pre_lab_twin`, its rules stored without the three cost terms (rules written
+    before T210) and with `fixed` laid over them."""
+    record = _direct(conn, _lab_file(tmp_path), settings)
+    mark_pre_lab(conn, record.hypothesis_id)
+    lab_registry.write_fingerprint(conn, record.hypothesis_id, _fingerprint(record))
+    rules = {
+        k: v
+        for k, v in frozen.frozen_values(record).items()
+        if k.startswith(FORBIDDEN_AXIS_PREFIXES) and k not in COST_TERMS
+    }
+    lab_registry.write_family_rules(
+        conn,
+        family=record.family,
+        first_hypothesis_id=record.hypothesis_id,
+        parent_family=None,
+        holdout_start=record.holdout_start,
+        holdout_end=record.holdout_end,
+        in_sample_start=record.in_sample_start,
+        fixed_params={**rules, **fixed},
+        sr_star_seed_annual=None,
+        settings=settings,
+    )
+    return record
+
+
+@pytest.mark.parametrize(
+    ("fixed", "line", "refusal"),
+    [
+        ({}, "spread_bps = 5.0", None),
+        ({}, "impact_coeff = 0.1", None),
+        ({}, "adv_sessions = 10", r"costs\.adv_sessions \(not fixed by the family rules\)"),
+        (
+            {"costs.spread_bps": 5.0},
+            "spread_bps = 2.0",
+            r"costs\.spread_bps \(lower than the family's 5\.0\)",
+        ),
+        ({"costs.spread_bps": 5.0}, "spread_bps = 8.0", None),
+    ],
+    ids=[
+        "spread-over-old-rules",
+        "impact-over-old-rules",
+        "adv-over-old-rules",
+        "spread-lower",
+        "spread-higher",
+    ],
+)
+def test_on_the_lab_a_promoted_file_may_set_a_term_higher_than_the_rules(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    fixed: dict[str, Any],
+    line: str,
+    refusal: str | None,
+) -> None:
+    """`hypothesis._rule_differences` (spec amendment #1792, item 1): the rules' value of
+    a term they lack is its table default, and `spread_bps` and `impact_coeff` may be
+    higher than the rules', as `per_side_bps` may; `adv_sessions` may not differ."""
+    _ruled_twin(lab_store, settings, tmp_path, fixed)
+    promoted = _lab_file(
+        tmp_path,
+        ("top_fraction = 0.10", "top_fraction = 0.15"),
+        ("per_side_bps = 15.0\n", f"per_side_bps = 15.0\n{line}\n"),
+        slug="fixture-promoted",
+    )
+    variant = _variant(lab_store, settings, promoted)
+    before = _counts(lab_store)
+
+    def promote() -> registry.HypothesisRecord:
+        return hypothesis.register(
+            lab_store,
+            promoted,
+            registered_by="test",
+            settings=settings,
+            promotion_of=variant.hypothesis_id,
+        )
+
+    if refusal is None:
+        record = promote()
+        assert _fingerprint(record) == _fingerprint(variant)
+    else:
+        with pytest.raises(LabRegistrationError, match=refusal):
+            promote()
+        assert _counts(lab_store) == before
