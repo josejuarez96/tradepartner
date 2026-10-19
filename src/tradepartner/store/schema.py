@@ -474,7 +474,9 @@ registry; #83 took version 2 first, so the registry is version 3):
   `ORDER_EVENT_REASONS`. A read-only connection accepts a version-28 store:
   every read works, and the next writable `init_schema` call migrates it.
 - **Version 30** (#1713, T189c): additive `openfigi_types` current observations,
-  one row per security per change, stamped after the mapping response. Trial
+  one row per security per change, stamped after the mapping response. A
+  `mapped = FALSE` row (FIGI fields `''`) records that a name no longer (or
+  never) maps, so an absence is a stored fact, not a stale type. Trial
   vintage excludes the table. A read-only version-29 store serves older reads.
 - **A later DDL change goes to version 31**, with its own migration and a
   note here, never a silent edit of the DDL below.
@@ -1235,6 +1237,7 @@ CREATE TABLE IF NOT EXISTS openfigi_types (
     market_sector VARCHAR NOT NULL,
     name VARCHAR NOT NULL,
     exch_code VARCHAR NOT NULL,
+    mapped BOOLEAN NOT NULL,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["openfigi_types"])},
     UNIQUE (security_id, known_at)
 )
@@ -2793,7 +2796,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version-24 store lacks; version 25 every read (no `filing_name` row
         # can exist there, and no read depends on the provenance `CHECK`);
         # version 26 every read; version 27 every read but `symbol_changes`;
-        # version 28 every read.
+        # version 28 every read; version 29 every read but `openfigi_types`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:

@@ -209,7 +209,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -240,7 +240,7 @@ from tradepartner.adapters.filings import (
     FilingSource,
     StatementFactRecord,
 )
-from tradepartner.adapters.openfigi import parse_mapping
+from tradepartner.adapters.openfigi import FigiType, parse_mapping
 from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
     Bar,
@@ -321,7 +321,14 @@ def ingest_openfigi(
     dry_run: bool = False,
     mapping: Callable[..., list[tuple[list[Any], datetime, datetime]]] = map_tickers,
 ) -> IngestResult:
-    """Map current live, recently traded listings; append only changed types."""
+    """Map current live, recently traded listings; append only changed observations.
+
+    The set is every live listing on `universe.exchanges` with any bar in the last
+    `universe.min_history_months` calendar months: wider than the universe's
+    minimum-history rule (recent IPOs and thin names are in), which is fine for a
+    check-only table. A name that stops mapping (or never maps) gets a
+    `mapped = FALSE` row when that is a change; a per-job `error` writes nothing.
+    """
     if not settings.openfigi.enabled:
         raise ValueError("OpenFIGI ingest is disabled")
     now = ensure_tz_aware_utc(clock(), field_name="clock()")
@@ -386,11 +393,14 @@ def ingest_openfigi(
                     continue
                 if item is None:
                     unmapped += 1
-                    continue
-                values = {"ticker": ticker, **asdict(item)}
+                    blank = {f.name: "" for f in fields(FigiType)}
+                    values = {"ticker": ticker, **blank, "mapped": False}
+                else:
+                    values = {"ticker": ticker, **asdict(item), "mapped": True}
                 prior = conn.execute(
                     "SELECT ticker, figi, composite_figi, share_class_figi, security_type, "
-                    "security_type2, market_sector, name, exch_code, known_at FROM openfigi_types "
+                    "security_type2, market_sector, name, exch_code, mapped, known_at "
+                    "FROM openfigi_types "
                     "WHERE security_id = ? ORDER BY known_at DESC LIMIT 1",
                     [sid],
                 ).fetchone()

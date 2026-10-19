@@ -193,6 +193,7 @@ def _minimal_row(table: str, *, known_at: datetime, ingested_at: datetime) -> di
             "market_sector": "Equity",
             "name": "Test",
             "exch_code": "US",
+            "mapped": True,
         }
     else:
         raise ValueError(f"no minimal row defined for {table!r}")
