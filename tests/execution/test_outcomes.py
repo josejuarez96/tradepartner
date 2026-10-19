@@ -1033,3 +1033,31 @@ def test_realised_pnl_waits_when_the_changed_ledger_is_not_saved(
     [pnl] = [r for r in outcomes_for(conn, 1) if r.kind == "realised_pnl"]
     assert (pnl.client_order_id, pnl.value) == (sell, pytest.approx(-100.0))
     assert _count(conn, "disposals") == 1
+
+
+def test_the_written_lots_and_disposals_carry_the_short_position_side(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """T232 (#1919): a short lot and its cover disposal are stored with
+    `position_side` 'short', and a long lot beside them keeps the default."""
+    book = Book()
+    book.order("SEC_S", "sell", "filled", [(10.0, 50.0)], session=date(2026, 9, 1), phase="buy")
+    book.order("SEC_S", "buy", "filled", [(10.0, 45.0)], phase="sell")
+    book.order("SEC_L", "buy", "filled", [(5.0, 20.0)])
+    for index in (0, 1):
+        book.orders[index] = replace(book.orders[index], position_side="short")
+    _journal(conn, book)
+
+    write_outcomes_and_lots(
+        conn, 1, ACCOUNT, {}, book.price_of, F_I, _clock, on_lot_error=print, cadence=CADENCE
+    )
+
+    assert conn.execute(
+        "SELECT security_id, position_side, cost_basis FROM lots ORDER BY 1"
+    ).fetchall() == [
+        ("SEC_L", "long", pytest.approx(100.0)),
+        ("SEC_S", "short", pytest.approx(-500.0)),
+    ]
+    assert conn.execute(
+        "SELECT position_side, proceeds, realised_pnl FROM disposals"
+    ).fetchall() == [("short", pytest.approx(-450.0), pytest.approx(50.0))]
