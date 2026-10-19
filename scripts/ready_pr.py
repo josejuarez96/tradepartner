@@ -376,14 +376,17 @@ def tick_reviewer_boxes(
     boxes: dict[int, str] = {}
     fence: str | None = None
     for i, line in enumerate(lines):
-        marker = re.match(r"(`{3,}|~{3,})", line.lstrip())
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
         if marker and fence is None:
-            fence = marker.group(1)
+            candidate, info = marker.groups()
+            if candidate[0] == "~" or "`" not in info:
+                fence = candidate
         elif (
             marker
             and fence
             and marker.group(1)[0] == fence[0]
             and len(marker.group(1)) >= len(fence)
+            and not marker.group(2).strip()
         ):
             fence = None
         elif fence is None and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
@@ -717,9 +720,13 @@ def ready(
 
     # 3. fragments and shared lists
     # --no-renames: a file moved out of src/ must list its old path too.
-    touched = r.git(
-        "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", f"{main_ref}...HEAD"
-    ).splitlines()
+    touched = [
+        path
+        for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{main_ref}...HEAD").split(
+            "\0"
+        )
+        if path
+    ]
     deleted = r.git("diff", "--name-only", "--diff-filter=D", f"{main_ref}...HEAD").splitlines()
     if not allow_shared_files:
         added: list[str] = []
@@ -892,10 +899,8 @@ def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str
     Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
     """
     out: list[str] = []
-    for path in r.git(
-        "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
-    ).splitlines():
-        if path not in touched:
+    for path in r.git("diff", "--no-renames", "--name-only", "-z", f"{sha}..HEAD").split("\0"):
+        if not path or path not in touched:
             continue
         if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):
             continue

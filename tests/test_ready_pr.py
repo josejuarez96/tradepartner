@@ -544,10 +544,8 @@ class FakeRunner:
                 _,
             ):
                 return "\n".join(self.deleted)
-            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", spec) if (
-                "..." in spec
-            ):
-                return "\n".join(self.touched)
+            case ("diff", "--no-renames", "--name-only", "-z", spec) if "..." in spec:
+                return "\0".join(self.touched) + "\0"
             case ("show", spec):
                 return self.main_files[spec.split(":", 1)[1]]
             case ("rev-parse", "HEAD"):
@@ -560,8 +558,8 @@ class FakeRunner:
                 if spec.endswith("...HEAD"):
                     return self.own_patch_at_head
                 return self.own_patch_at_review
-            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", _):
-                return "\n".join(self.since_review_touched)
+            case ("diff", "--no-renames", "--name-only", "-z", _):
+                return "\0".join(self.since_review_touched) + "\0"
             case ("ls-files", "tests"):
                 return "\n".join([*self.test_sources, "tests/fixtures/a.json"])
             case ("push", *_):
@@ -889,7 +887,20 @@ def test_unclosed_fence_fails_closed_even_with_unticked_box(tail: str) -> None:
         ready_pr.ready(r, 69, dry_run=True)
 
 
-def test_real_git_non_ascii_path_makes_review_stale(tmp_path: Path) -> None:
+@pytest.mark.parametrize("line", ["    ```", "```inline```"])
+def test_non_fence_backticks_do_not_hide_unticked_boxes(line: str) -> None:
+    r = FakeRunner(body=BODY_OK + line + "\n- [ ] Complete the checklist\n")
+    with pytest.raises(ready_pr.ReadyError, match="unticked boxes"):
+        ready_pr.ready(r, 69, dry_run=True)
+
+
+@pytest.mark.parametrize("path", ["docs/runbooks/café.md", 'docs/runbooks/café"one.md'])
+def test_real_git_non_ascii_path_makes_review_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
     def git(*args: str) -> str:
         return subprocess.run(
             ["git", "-C", str(tmp_path), *args],
@@ -904,7 +915,6 @@ def test_real_git_non_ascii_path_makes_review_stale(tmp_path: Path) -> None:
     git("config", "core.quotePath", "true")
     git("commit", "--allow-empty", "-m", "base")
     git("switch", "-c", "feature")
-    path = "docs/runbooks/café.md"
     file = tmp_path / path
     file.parent.mkdir(parents=True)
     file.write_text("first\n")
@@ -1258,7 +1268,7 @@ def test_touched_paths_list_both_sides_of_a_rename() -> None:
     assert touched, r.calls
     for call in touched:
         assert "--no-renames" in call, call
-        assert call[1:3] == ("-c", "core.quotePath=false"), call
+        assert "-z" in call, call
 
 
 def test_lacks_changelog_bullets_only_matters_on_feat_and_fix() -> None:
