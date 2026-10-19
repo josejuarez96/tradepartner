@@ -73,7 +73,7 @@ method = "none"
 runs = 1
 configurations = 2
 stop_rule = "one run, one pre-declared design: no other ranking, weighting, floor, fee, hedge ratio or window; no DSR and no selection. A failed or refused run is reported, not re-run in place; a second look is a new registration that discloses this one. Kill-only: the long/short momentum idea is killed if the net spread at 30 bp is below 0 or its one-sided 95% upper bound is below +2.0 pp/yr; otherwise the result is recorded and gates nothing (T219 onward wait only for the run to exist; owner, 2026-10-19, #1876)"
-expected_effect = "a gross spread near zero to a few pp a year with a wide interval (40 months; a monthly spread volatility of 3 to 5% puts the one-sided 95% half-width (1.645 x 12 x sigma / sqrt(40)) near 9 to 16 pp/yr, so a kill by the upper bound needs a mean below about -7 to -14 pp/yr, and the point-estimate rule decides most outcomes); the book below T-bills net of costs at 30 bp (the beyond-long-only prior: about -2 pp/yr, range -7 to +3); the SPY-hedged control below T-bills (B11: the hedged long leg 8 to 17 pp/yr below); the $5 floor replacing few names in a top-1000 universe"
+expected_effect = "a gross spread near zero to a few pp a year with a wide interval (40 months; a monthly spread volatility of 3 to 5% puts the one-sided 95% half-width (1.645 x 12 x sigma / sqrt(40)) near 9 to 16 pp/yr, so a kill by the upper bound needs a mean below about -7 to -14 pp/yr, and the point-estimate rule decides every outcome unless the half-width is below 2 pp/yr); the book below T-bills net of costs at 30 bp (the beyond-long-only prior: about -2 pp/yr, range -7 to +3); the SPY-hedged control below T-bills (B11: the hedged long leg 8 to 17 pp/yr below); the $5 floor replacing few names in a top-1000 universe"
 ```
 
 ## Expected magnitudes and red flags
@@ -85,7 +85,7 @@ expected_effect = "a gross spread near zero to a few pp a year with a wide inter
 - **The control's CAGR far from B11's hedged line:** B11 hedged by trailing beta, this run hedges at 0.5. A gap of a few pp/yr is expected; a different sign of the excess over T-bills is a flag.
 - **`spy_cagr` far from 11.1%:** that is SPY's stored total-return CAGR over 2020-08-31..2023-12-29 in B11. This run's SPY periods start at F_0 and end at T_n, so it should be close, not equal.
 - **`rf_cagr` outside about 1.5% to 2.5%:** DTB3 averaged about 2% over the window (near zero to early 2022, about 5% in 2023).
-- **The engine check:** it ran on the fixture store before registration (above). The spec's wording needs one fix (#1876), and the term is second order. This run's dividends sit inside the adjusted marks, as the engine's will. So the check changes nothing in this run.
+- **The engine check:** it ran on the fixture store before registration (above). The spec's wording was fixed on #1876, and the term is second order. This run's dividends sit inside the adjusted marks, as the engine's will. So the check changes nothing in this run.
 
 ## Retirement condition
 
