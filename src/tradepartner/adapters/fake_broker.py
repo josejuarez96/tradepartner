@@ -151,6 +151,7 @@ from tradepartner.adapters.broker import (
     OrderRequest,
     OrderStatus,
     Position,
+    PositionIntent,
     Side,
     UnknownOrderError,
     canonical_symbol,
@@ -306,8 +307,10 @@ class FakeBroker(Broker):
         buying_power: float | None = None,
         round_cash_to_cent: bool = False,
         on_submit: Callable[[OrderRequest], None] | None = None,
+        paper: bool = False,
     ) -> None:
         self.clock = clock
+        self._paper = paper
         self.on_submit = on_submit
         self._price_of = price_of
         self._auto_fill = auto_fill
@@ -491,6 +494,11 @@ class FakeBroker(Broker):
 
     # --- `Broker` ---------------------------------------------------------
 
+    @property
+    def paper(self) -> bool:
+        """`True` only when built `FakeBroker(paper=True)`; shorts fill only then."""
+        return self._paper
+
     def submit(self, request: OrderRequest) -> Order:
         self._log("submit", request)
         if self.on_submit is not None:
@@ -516,22 +524,41 @@ class FakeBroker(Broker):
                     retried=False,
                 ),
             )
-        if request.side is Side.SELL:
-            held = self._net_quantity.get(request.symbol, Decimal(0))
-            price: Decimal | None = None
+        held = self._net_quantity.get(request.symbol, Decimal(0))
+        price: Decimal | None = None
 
-            def price_now() -> Decimal:
-                nonlocal price
-                if price is None:
-                    price = Decimal(
-                        repr(
-                            validate_positive_finite(
-                                self._price_of(request.symbol), field_name="price"
-                            )
-                        )
+        def price_now() -> Decimal:
+            nonlocal price
+            if price is None:
+                price = Decimal(
+                    repr(
+                        validate_positive_finite(self._price_of(request.symbol), field_name="price")
                     )
-                return price
+                )
+            return price
 
+        intent = request.position_intent
+        # One position per symbol: the intent Alpaca would infer from the book.
+        inferred = _inferred_intent(request.side, held)
+        if intent is not inferred:
+            raise _refused(request, _short_refusal(_mismatch_message(inferred, intent)))
+        if intent is PositionIntent.SELL_TO_OPEN:
+            self._check_short_open(request, asset)
+        if intent is PositionIntent.BUY_TO_CLOSE:
+            requested_cover = (
+                Decimal(repr(request.quantity))
+                if request.quantity is not None
+                else Decimal(repr(request.notional)) / price_now()
+            )
+            if requested_cover > -held:
+                raise _refused(
+                    request,
+                    _short_refusal(
+                        f"cannot cover {requested_cover} shares, short {-held}: "
+                        "a cover cannot flip the position"
+                    ),
+                )
+        if intent is PositionIntent.SELL_TO_CLOSE:
             reserved = Decimal(0)
             for open_order in self._orders.values():
                 if (
@@ -740,6 +767,50 @@ class FakeBroker(Broker):
             result[symbol] = [a for start, a in schedule if session is None or start <= session][-1]
         return result
 
+    def _check_short_open(self, request: OrderRequest, asset: Asset) -> None:
+        """Refuse a `sell_to_open` Alpaca refuses (paper spec amendment item 2;
+        the 2026-10-19 sandbox bodies): not on a paper broker, fractional or
+        notional, a name not shortable or not easy to borrow, or equity under
+        $2,000 (that body is unrecorded until T227)."""
+        if not self._paper:
+            raise _refused(
+                request,
+                AlpacaTradingError(
+                    403,
+                    json.dumps(
+                        {"code": 40310000, "message": "short selling is not enabled"},
+                        separators=(",", ":"),
+                    ),
+                    retried=False,
+                ),
+            )
+        if request.notional is not None or not float(request.quantity or 0).is_integer():
+            raise _refused(request, _short_refusal("fractional orders cannot be sold short"))
+        if not (asset.shortable and asset.easy_to_borrow):
+            raise _refused(
+                request, _short_refusal(f'asset "{request.symbol}" cannot be sold short')
+            )
+        if self._equity() < _SHORT_MIN_EQUITY:
+            raise _refused(
+                request,
+                _short_refusal("you must have $2,000 or more account equity to sell short"),
+            )
+
+    def _equity(self) -> Decimal:
+        """Cash plus every position marked at `price_of` (what `account` reports)."""
+        marked = sum(
+            (
+                net
+                * Decimal(
+                    repr(validate_positive_finite(self._price_of(symbol), field_name="price"))
+                )
+                for symbol, net in self._net_quantity.items()
+                if net != 0
+            ),
+            Decimal(0),
+        )
+        return self._cash + marked
+
     def _asset_for(self, symbol: str, at: datetime) -> Asset:
         schedule = self._assets.get(symbol)
         if schedule is None:
@@ -884,6 +955,30 @@ class FakeBroker(Broker):
             raise OrderNotOpenError(
                 f"order {order.client_order_id!r} is {order.status.value}, cannot {action}"
             )
+
+
+#: Alpaca's minimum account equity to open a short (paper spec amendment item 2).
+_SHORT_MIN_EQUITY = Decimal(2000)
+
+
+def _inferred_intent(side: Side, held: Decimal) -> PositionIntent:
+    """The intent Alpaca infers for `side` against the net `held` quantity."""
+    if side is Side.BUY:
+        return PositionIntent.BUY_TO_CLOSE if held < 0 else PositionIntent.BUY_TO_OPEN
+    return PositionIntent.SELL_TO_CLOSE if held > 0 else PositionIntent.SELL_TO_OPEN
+
+
+def _mismatch_message(inferred: PositionIntent, specified: PositionIntent) -> str:
+    return f"position intent mismatch, inferred: {inferred.value}, specified: {specified.value}"
+
+
+def _short_refusal(message: str) -> AlpacaTradingError:
+    """Alpaca's per-order 422 / 42210000 refusal (2026-10-19 sandbox)."""
+    return AlpacaTradingError(
+        422,
+        json.dumps({"code": 42210000, "message": message}, separators=(",", ":")),
+        retried=False,
+    )
 
 
 def _refused(request: OrderRequest, error: AlpacaTradingError) -> Exception:
