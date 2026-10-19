@@ -385,6 +385,11 @@ def from_journal(
         elif kind == _SHORT_FILL:
             # A short sale (a sell) adds to the short, a cover (a buy) removes.
             shorts[security_id] -= amount
+            if shorts[security_id] < -_exact(quantity_tolerance):
+                raise ValueError(
+                    f"cover of {security_id} is {float(-shorts[security_id])} shares "
+                    f"beyond the short"
+                )
         elif kind == _CASH_IN_LIEU:
             # #1627: the row removes a stock dividend's fractional remainder at
             # its own point in the replay, so the issuer's exact `Fraction`
@@ -408,8 +413,6 @@ def from_journal(
     held = {name: float(q) for name, q in positions.items() if abs(q) > _exact(quantity_tolerance)}
     short_held: dict[str, float] = {}
     for name, short_quantity in shorts.items():
-        if short_quantity < -_exact(quantity_tolerance):
-            raise ValueError(f"cover of {name} is {float(-short_quantity)} shares beyond the short")
         if short_quantity > _exact(quantity_tolerance):
             short_held[name] = float(short_quantity)
     return Ledger(
