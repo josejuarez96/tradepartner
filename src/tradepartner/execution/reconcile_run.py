@@ -128,6 +128,7 @@ from tradepartner.execution.reconcile import (
     Reconciliation,
     compare,
 )
+from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.symbols import broker_symbol
 from tradepartner.store.asof import live_actions_as_of, prices_as_of, symbol_changes_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
@@ -863,6 +864,12 @@ def settle_pending_unresolved(
             raise ReconciliationError(
                 f"pending_unresolved order {coid} could not be read back ({type(exc).__name__})"
             ) from exc
+        violation = order_shape_violation(got)
+        if violation is not None:
+            raise ReconciliationError(
+                f"pending_unresolved order {coid}: {violation.rule}: the read-back "
+                f"returned {violation.detail}"
+            )
         differing = [n for n in _READ_BACK_FIELDS if getattr(got, n) != getattr(order, n)]
         if differing:
             raise ReconciliationError(

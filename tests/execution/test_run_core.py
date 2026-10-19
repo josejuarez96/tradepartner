@@ -1045,6 +1045,26 @@ def test_an_unresolved_order_the_read_back_cannot_settle_halts_before_step_4(
     assert len(exits_done) == 0
 
 
+def test_an_unresolved_order_read_back_in_another_shape_halts_before_step_4(
+    env: Env, exits_done: list[object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix (#1843): the read-back applies the shape refusal the
+    acknowledgement and the replay do; a limit order under the id is a
+    `ReconciliationError`, the order left unsettled."""
+    _unresolved(env)
+    env.clock.now = _at(MON, 14)
+    env.fake.submit(OrderRequest(UNRESOLVED, "SPY", Side.BUY, quantity=1.0))
+    read = env.fake.get_order
+    monkeypatch.setattr(
+        env.fake,
+        "get_order",
+        lambda coid: replace(read(coid), order_type="limit", limit_price=99.5),
+    )
+    with pytest.raises(ReconciliationError, match="refused_order_shape"):
+        env.run(_at(TUE))
+    assert _unresolved_events(env) == [("pending", None), ("pending_unresolved", None)]
+
+
 def test_a_settled_unresolved_order_does_not_hide_an_unrelated_mismatch(env: Env) -> None:
     """Item 4's "the integrity faults still halt": the read-back settles the order,
     then step 4 meets a foreign order and halts with `ReconciliationError`."""
