@@ -783,3 +783,46 @@ def test_the_promoted_slug_runs_and_spends_under_the_phase_3_rules(
 def test_promotion_module_has_no_destructive_statement() -> None:
     text = Path(promotion.__file__).read_text()
     assert re.search(r"\b(DROP|DELETE|TRUNCATE|VACUUM)\b", text, re.IGNORECASE) is None
+
+
+# --- the cost terms are outside the promotion identity (#1792, T210) -----------------
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        "spread_bps = 5.0",
+        "impact_coeff = 0.1",
+        "adv_sessions = 10",
+        "spread_bps = 5.0\nimpact_coeff = 0.1",
+    ],
+)
+def test_a_cost_term_moves_the_fingerprint_but_not_the_promotion_identity(
+    tmp_path: Path, lines: str
+) -> None:
+    """The three are fingerprint keys outside the promotion identity, as
+    `costs.per_side_bps` is (spec amendment #1792, item 1): a survivor re-tested under
+    a term is a new fingerprint and the same strategy, promoted at most once."""
+    settings = Settings(_env_file=None)
+    base_path = tmp_path / "twin.md"
+    base_path.write_text(_text("twin", 0.10, 15.0))
+    term_path = tmp_path / "term.md"
+    term_path.write_text(
+        _text("term", 0.10, 15.0).replace(
+            "per_side_bps = 15.0\n", f"per_side_bps = 15.0\n{lines}\n", 1
+        )
+    )
+    base = hypothesis.frozen_params(hypothesis.parse_file(base_path), settings)
+    term = hypothesis.frozen_params(hypothesis.parse_file(term_path), settings)
+    assert term != base
+    assert frozen.fingerprint("momentum", term, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", base, IN_SAMPLE_START
+    )
+    assert promotion.promotion_identity(
+        "momentum", term, IN_SAMPLE_START
+    ) == promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
+    # A signal key still moves the identity.
+    other = {**term, "strategy.top_fraction": 0.2}
+    assert promotion.promotion_identity(
+        "momentum", other, IN_SAMPLE_START
+    ) != promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
