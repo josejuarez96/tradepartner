@@ -122,7 +122,14 @@ from tradepartner.adapters.broker import (
     canonical_symbol,
 )
 from tradepartner.config import Settings
-from tradepartner.errors import ClockError, SystemFaultError
+from tradepartner.errors import (
+    AssetNotFoundError,
+    AssetNotTradableError,
+    ClockError,
+    NotFractionableError,
+    ReconciliationError,
+    SystemFaultError,
+)
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: Every Alpaca order status this adapter accepts (spec req 2); any other raises.
@@ -327,6 +334,54 @@ def _error_code(error: AlpacaTradingError) -> object:
     return body.get("code") if isinstance(body, dict) else None
 
 
+#: HTTP status of the broker's per-order 403 refusals (code 40310000).
+_FORBIDDEN = 403
+
+
+def _error_message(error: AlpacaTradingError) -> str:
+    """The `message` in a refusal's JSON body, or an empty string."""
+    try:
+        body = json.loads(error.body)
+    except ValueError:
+        return ""
+    message = body.get("message") if isinstance(body, dict) else None
+    return message if isinstance(message, str) else ""
+
+
+#: Alpaca's code on the per-order 403 refusals.
+_FORBIDDEN_CODE = 40310000
+
+
+def _raise_typed_refusal(error: AlpacaTradingError, request: OrderRequest) -> None:
+    """Map the submit refusals the wrapper's allowlist knows to typed errors
+    (spec amendment 2026-10-18 item 2, T202); return for any other refusal, which
+    the caller raises as is. The map is exact: a 404 only with code 40410000, a 403
+    only with code 40310000 and `asset "<the order's symbol>" is not
+    tradable|fractionable`, and never for a retried submit (an earlier attempt may
+    have reached the broker, so the run halts and resume settles it). By refusal, not
+    by side: the wrapper decides what a sell's refusal means."""
+    if error.retried:
+        return
+    coid = request.client_order_id
+    code = _error_code(error)
+    if error.status_code == _NOT_FOUND and code == _ASSET_NOT_FOUND_CODE:
+        raise AssetNotFoundError(f"the broker does not know the asset of order {coid!r}") from None
+    if error.status_code != _FORBIDDEN or code != _FORBIDDEN_CODE:
+        return
+    message = _error_message(error)
+    if "insufficient qty available" in message:
+        raise ReconciliationError(f"the broker holds less than order {coid!r} sells") from None
+    symbol = re.escape(request.symbol)
+    if re.fullmatch(rf'asset "{symbol}" is not fractionable', message):
+        raise NotFractionableError(
+            f"the broker refused order {coid!r}: asset not fractionable"
+        ) from None
+    if re.fullmatch(rf'asset "{symbol}" is not tradable', message):
+        raise AssetNotTradableError(
+            f"the broker refused order {coid!r}: asset not tradable"
+        ) from None
+
+
 def _decimals(value: float) -> int:
     exponent = Decimal(repr(value)).normalize().as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
@@ -414,6 +469,7 @@ class AlpacaBroker(Broker):
                 raise DuplicateClientOrderIdError(
                     f"the broker refused order {coid!r} as a duplicate"
                 ) from None
+            _raise_typed_refusal(error, request)
             raise
         order = _mapped("order", _order, payload)
         if order.client_order_id != coid:

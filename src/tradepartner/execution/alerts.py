@@ -27,6 +27,9 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
   bar was marked at its last close (#1763, owner decision; bounded by the frozen
   `paper.max_stale_mark_sessions`). Run-scoped; one alert per run naming every such
   name, a distinct kind so it never shadows the run's own `stale_data`.
+- `skipped`: the risk-gated wrapper's `execute` (T202), one per run naming each
+  name skipped (an allowlisted per-name refusal or a phase-time skip) and its
+  reason. Run-scoped.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
   No run id; one alert per (book, kind, session), `session` being the calendar
   session containing the instant, or the next one on a non-session day (the
@@ -117,6 +120,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "no_window",
     "lot_ledger",
     "stale_mark",
+    "skipped",
 )
 #: Kinds with no run, deduped on (kind, session).
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")

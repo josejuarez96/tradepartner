@@ -1837,6 +1837,28 @@ def test_risk_defaults_match_adr_0010() -> None:
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
 
 
+def test_risk_max_skip_share_defaults_to_a_tenth() -> None:
+    """Paper spec amendment 2026-10-18 item 3 (T202, ADR 0010's amended table row):
+    the skip cap's share of the plan, default 0.10, beside the floor
+    `max_skips_per_run` = 10."""
+    r = _settings().risk
+    assert r.max_skip_share == pytest.approx(0.10)
+    assert "max_skip_share" in r.model_dump()
+
+
+@pytest.mark.parametrize("value", [0.0, 0.10, 0.25])
+def test_risk_max_skip_share_accepts_zero_to_a_quarter(value: float) -> None:
+    """Validated in [0, 0.25], both ends included: 0 is how a window frozen before
+    the key reads it (`frozen_risk`)."""
+    assert Settings(_env_file=None, risk={"max_skip_share": value}).risk.max_skip_share == value
+
+
+@pytest.mark.parametrize("value", [-0.01, 0.2501, 0.26, 1.0, float("nan"), float("inf")])
+def test_risk_max_skip_share_outside_zero_to_a_quarter_rejected(value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"max_skip_share": value})
+
+
 def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
     assert _settings().alpaca.cash_in_lieu_max_lag_sessions == 10
     with pytest.raises(ValidationError):
