@@ -526,3 +526,133 @@ def test_a_superseded_fill_builds_no_lot_through_the_accessor(
 
     assert len(live) == 2
     assert lot.quantity == 1.0  # the superseded 0.4 is not counted again
+
+
+# --- Short lots (T232; paper spec amendment #1872, item 10) -------------------
+#
+# A short is journaled as `lots` with `position_side = short` and an unsigned
+# quantity; `_close_fifo` closes short lots first in, first out against
+# `buy_to_close` fills, and `disposals` carry the side. An order's intent is the
+# pair (`side`, `position_side`) (item 3): `sell_to_open` is a short-side sell,
+# `buy_to_close` a short-side buy. A short lot's `cost_basis` is the opening
+# sale's value with the sign of the cash it brought in reversed, and a cover's
+# `proceeds` the cover's value as the cash it paid out (both negative, as the
+# broker reports a short's `cost_basis`), so `realised_pnl = proceeds - basis`
+# holds for both sides, as `lots_reconcile` reads it (owner decision
+# 2026-10-19, option (a) on #1903).
+
+SHORT = "short"
+
+
+def _short(
+    book: Book,
+    side: str,
+    quantity: float,
+    price: float,
+    day: date,
+    *,
+    security_id: str = "SEC_X",
+    hour_utc: int = 20,
+) -> str:
+    """A short-side trade: `sell` is `sell_to_open` (buy phase), `buy` is
+    `buy_to_close` (sell phase), item 4."""
+    coid = book.trade(side, quantity, price, day, security_id=security_id, hour_utc=hour_utc)
+    book.orders[-1] = replace(
+        book.orders[-1],
+        position_side=SHORT,
+        phase="buy" if side == "sell" else "sell",
+    )
+    return coid
+
+
+def test_short_open_partial_cover_and_full_cover_close_fifo() -> None:
+    """Two short opens, a cover across both lots (the first closed whole, the
+    second in part), then a cover of the rest. Hand values:
+
+      03-03 sell_to_open 10 @ 50.00  lot 1  basis -500.00
+      03-04 sell_to_open  5 @ 52.00  lot 2  basis -260.00
+      03-05 buy_to_close 12 @ 48.00  = 576.00 paid
+            lot 1: 10 shares, proceeds -480.00, pnl -480 - (-500)     = +20.00
+            lot 2:  2 shares, proceeds  -96.00, pnl  -96 - (-260*2/5) = +8.00
+      03-07 buy_to_close  3 @ 46.00  = 138.00 paid
+            lot 2:  3 shares, proceeds -138.00, pnl -138 - (-260*3/5) = +18.00
+      total +46.00 = (500 + 260) received - (576 + 138) paid.
+    """
+    book = Book()
+    _short(book, "sell", 10, 50.0, date(2025, 3, 3))
+    _short(book, "sell", 5, 52.0, date(2025, 3, 4))
+    first_cover = _short(book, "buy", 12, 48.0, date(2025, 3, 5))
+    last_cover = _short(book, "buy", 3, 46.0, date(2025, 3, 7))
+
+    lot_list, disposals, flags = book.run()
+
+    assert [(lot.lot_id, lot.position_side) for lot in lot_list] == [(1, SHORT), (2, SHORT)]
+    assert [lot.quantity for lot in lot_list] == [10.0, 5.0]
+    assert [lot.cost_basis for lot in lot_list] == [-500.0, -260.0]
+    assert [lot.trade_date_local for lot in lot_list] == [date(2025, 3, 3), date(2025, 3, 4)]
+    assert [
+        (d.disposal_id, d.lot_id, d.quantity, d.proceeds, d.realised_pnl) for d in disposals
+    ] == [
+        (1, 1, 10.0, -480.0, 20.0),
+        (2, 2, 2.0, -96.0, 8.0),
+        (3, 2, 3.0, -138.0, 18.0),
+    ]
+    assert [d.position_side for d in disposals] == [SHORT, SHORT, SHORT]
+    assert [d.client_order_id for d in disposals] == [first_cover, first_cover, last_cover]
+    assert [d.trade_date_local for d in disposals] == [
+        date(2025, 3, 5),
+        date(2025, 3, 5),
+        date(2025, 3, 7),
+    ]
+    assert [d.tax_year for d in disposals] == [2025, 2025, 2025]
+    assert sum(d.realised_pnl for d in disposals) == 46.0
+    # Each short lot's disposals add up to its basis exactly, as a long's do.
+    for lot in lot_list:
+        closed = [d for d in disposals if d.lot_id == lot.lot_id]
+        assert sum(d.proceeds - d.realised_pnl for d in closed) == lot.cost_basis
+    assert flags == []
+
+
+def test_a_cover_beyond_the_short_holding_raises() -> None:
+    """A cover is at most the held short (item 3): 5 opened, 6 covered."""
+    book = Book()
+    _short(book, "sell", 5, 50.0, date(2025, 3, 3))
+    _short(book, "buy", 6, 48.0, date(2025, 3, 5))
+    with pytest.raises(LotLedgerError, match="more than"):
+        book.run()
+
+
+def test_a_short_and_a_long_of_different_names_in_one_ledger() -> None:
+    """A long and a short of two names, each opened then closed in part or in
+    whole, in one rebuild; neither leg touches the other's lots. Hand values:
+
+      03-03 15:00Z buy          SEC_L 10 @ 20.00  lot 1 long   basis  200.00
+      03-03 16:00Z sell_to_open SEC_S  5 @ 30.00  lot 2 short  basis -150.00
+      03-05 15:00Z sell         SEC_L  4 @ 25.00  lot 1  proceeds  100.00
+                                                  pnl 100 - 200*4/10   = +20.00
+      03-05 16:00Z buy_to_close SEC_S  5 @ 28.00  lot 2  proceeds -140.00
+                                                  pnl -140 - (-150)    = +10.00
+    """
+    book = Book()
+    book.trade("buy", 10, 20.0, date(2025, 3, 3), security_id="SEC_L", hour_utc=15)
+    _short(book, "sell", 5, 30.0, date(2025, 3, 3), security_id="SEC_S", hour_utc=16)
+    book.trade("sell", 4, 25.0, date(2025, 3, 5), security_id="SEC_L", hour_utc=15)
+    _short(book, "buy", 5, 28.0, date(2025, 3, 5), security_id="SEC_S", hour_utc=16)
+
+    lot_list, disposals, flags = book.run()
+
+    assert [
+        (lot.lot_id, lot.security_id, lot.position_side, lot.quantity, lot.cost_basis)
+        for lot in lot_list
+    ] == [
+        (1, "SEC_L", "long", 10.0, 200.0),
+        (2, "SEC_S", SHORT, 5.0, -150.0),
+    ]
+    assert [
+        (d.disposal_id, d.lot_id, d.position_side, d.quantity, d.proceeds, d.realised_pnl)
+        for d in disposals
+    ] == [
+        (1, 1, "long", 4.0, 100.0, 20.0),
+        (2, 2, SHORT, 5.0, -140.0, 10.0),
+    ]
+    assert flags == []
