@@ -123,7 +123,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | 1. Have a registered standalone file | `sweep promote …` (a winner), or `hypothesis register docs/hypotheses/<slug>.md --operations-book-of <variant-slug> --reason "<what the book is for>"` (a machine test) | An operations book can never spend the holdout and is not a promotion. |
 | 2. Give it an ok in-sample trial | `backtest <slug>` | The gap sign-off must name an `ok`, in-sample trial. |
 | 3. Sign off the survivorship gap | `decision gap-signoff --trial <id> --reason "<why the gap is acceptable>"` | Read the gap on the Backtest page first. |
-| 4. Prepare the book's account | One new Alpaca paper account per book; its keys go in `.env` as `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` and `..._API_SECRET` (book `main` uses `ALPACA_PAPER_API_KEY`/`_SECRET`) | The account must be flat: no positions and no open orders. |
+| 4. Prepare the book's account | One new Alpaca paper account per book; its keys go in `.env` as `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` and `..._API_SECRET`, `<TOKEN>` being the book token in capitals (for book `daily`: `ALPACA_PAPER_BOOKS__DAILY__API_KEY`). Book `main` uses `ALPACA_PAPER_API_KEY`/`_SECRET` | The account must be flat: no positions and no open orders. **`.env` is secret:** keep it `chmod 600` and edit it yourself. Never paste a key into a chat, a command, a plist, an issue or a commit. Claude never reads it. |
 | 5. Start the window | `paper start --hypothesis <slug> --book <token>` | Refused, among other reasons: for a sweep variant (promote it or use an operations file); for a family that cannot paper trade yet; without the gap sign-off; before the holdout's end (or, for a forward exam, its start); on an open window; on another book's account; on a non-flat account; on an account too small for the minimum order; or if live costs or fill price differ from the file. |
 | 6. The scheduler | `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside `com.tradepartner.ingest.plist` ([scheduling](scheduling.md)) | One job runs every open book, in token order. A new book needs no plist change. Keep the Mac on power and awake overnight. |
 
@@ -137,6 +137,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 **Ending a window.**
 - `paper stop --book <token> --reason "<why>"` is the normal way, in two steps. The first call only records the request. The next scheduled run inside the submit window sells. A second `paper stop` then closes the window. It is refused while the kill switch is engaged.
 - `paper kill` halts trading and keeps the positions. It does not end the window.
+- **Never place, cancel or change an order in Alpaca's dashboard.** The journal would no longer match the broker, and the book halts on reconciliation. The one hand action allowed at Alpaca is the account reset after `abandon`. If `abandon` refuses because of open orders, ask Claude.
 - `paper abandon --book <token> --reason "<why stop could not finish>"` is the last resort, only when `stop` cannot complete. It ends the window without selling. Afterwards, reset that Alpaca paper account until it is strictly flat, and check whether the reset changed the account id or the keys in `.env` ([scheduling](scheduling.md), "`abandon`").
 
 **Toward live.** `decision shakedown-span --sessions 10 --order-sessions 5 --reason "<why the span opens now>"` opens the span (N = 10 and M = 5 are decided). The reason names no live strategy: the live book is chosen later, in T163. (The command's own help text still says to name one; it is out of date.) `decision shakedown-note --alert <id> --reason "<what happened>"` covers only a `stale_data` or `missed_run` alert inside the span. A note never excuses a mismatch or a halt; those restart the span. The kill-switch drill runs once. `paper shakedown` must then exit 0. As of 10-19 no span is open. Live trading (Phase 6) also needs its own ADR, the taxable cash account (#813) and a safety review. The live book is chosen from what survives, never by comparing paper books.
@@ -154,7 +155,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `halted`, `run_failed` | The book stopped. Read the alert and `~/Library/Logs/tradepartner/paper.err.log`, then ask Claude to diagnose. Resume only once the cause is known. |
 | `reconciliation` | The journal and Alpaca disagree. Do not resume blind. Ask Claude. |
 | `rejection_cap`, `skip_cap` | Too many orders refused or names skipped. Find out why before resuming. |
-| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to today's equity), then decide whether to `paper stop`. |
+| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to today's equity), then decide whether to `paper stop`. If you mean to stop, run `paper stop` straight after the resume: the next run in the submit window can trade again. |
 | `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. Inside a shakedown span, add a `decision shakedown-note` for it. |
 | `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake (#1759). |
 | `kill_switch` | The switch changed state. `paper status` shows why. |
@@ -173,7 +174,7 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 ### Where trades and performance live today
 | Question | Where | Limits today |
 |---|---|---|
-| What traded, when, at what price | **Alpaca's dashboard** for that book's account (Orders and Activities, NOT VERIFIED from the repo); the **Operations** page's Fills card | Fills card has no date filter. No CLI lists orders or fills. |
+| What traded, when, at what price | **Alpaca's dashboard** for that book's account (Orders and Activities, NOT VERIFIED from the repo); the **Operations** page's Fills card | Fills card has no date filter. No CLI lists orders or fills. Alpaca is for reading only: never trade there by hand. |
 | Why a name was traded | **Operations** page, Signal ranking card | Latest plan only. |
 | Equity curve, daily P&L | **Alpaca's dashboard**, per book account | Spans every window of that account; read from the current window's start. |
 | Paper vs its backtest | `paper report --book <token>` | **Avoid for now.** Before a book's first rebalance it fails and writes a refused trial into the registry (#1923). It shows a tracking-gap breakdown, not a performance view. |
