@@ -132,6 +132,9 @@ def test_a_request_has_no_price_field() -> None:
         "side",
         "notional",
         "quantity",
+        # T226 (#1872, paper spec amendment item 3): the one field a long
+        # request gains; it is the intent, never a price or an order shape.
+        "position_intent",
     ]
     # The read-side order-shape fields are read only: no request can carry a
     # price, a type or a leg (ADR 0015 seam 3).
@@ -144,6 +147,77 @@ def test_a_request_has_no_price_field() -> None:
         "order_class",
         "legs",
     } & set(names)
+
+
+# --- OrderRequest.position_intent (T226; paper spec amendment #1872, item 3) ------------
+
+#: The four intents as (side, intent): buy-long opens, sell-long closes,
+#: sell-short opens, buy-short closes (ADR 0015 seam 2; Alpaca's spelling).
+INTENTS = [
+    (Side.BUY, "buy_to_open"),
+    (Side.SELL, "sell_to_close"),
+    (Side.SELL, "sell_to_open"),
+    (Side.BUY, "buy_to_close"),
+]
+
+
+@pytest.mark.parametrize(("side", "intent"), INTENTS)
+def test_a_request_carries_each_intent_matching_its_side(side: Side, intent: str) -> None:
+    request = OrderRequest("co-1", "AAPL", side, quantity=1, position_intent=intent)
+    assert request.position_intent == intent
+    assert str(request.position_intent) == intent
+
+
+@pytest.mark.parametrize(
+    ("side", "intent"),
+    [
+        (Side.BUY, "sell_to_open"),
+        (Side.BUY, "sell_to_close"),
+        (Side.SELL, "buy_to_open"),
+        (Side.SELL, "buy_to_close"),
+    ],
+)
+def test_an_intent_that_disagrees_with_its_side_raises(side: Side, intent: str) -> None:
+    with pytest.raises(ValueError, match="position_intent"):
+        OrderRequest("co-1", "AAPL", side, quantity=1, position_intent=intent)
+
+
+@pytest.mark.parametrize("bad", ["sell_short", "SELL_TO_OPEN", "", "open", 1, True])
+def test_an_intent_outside_the_four_raises(bad: object) -> None:
+    """Alpaca answers a bogus intent 422 / 40010001 "invalid position_intent
+    specified" (sandbox 2026-10-19); the request refuses it before any call."""
+    with pytest.raises(ValueError, match="position_intent"):
+        OrderRequest("co-1", "AAPL", Side.SELL, quantity=1, position_intent=bad)  # type: ignore[arg-type]
+
+
+def test_a_long_request_differs_from_todays_only_by_its_intent() -> None:
+    """Field for field today's request, plus the one field (spec item 3)."""
+    buy = OrderRequest("co-1", "aapl", Side.BUY, notional=5.0, position_intent="buy_to_open")
+    sell = OrderRequest("co-2", "AAPL", Side.SELL, quantity=0.5, position_intent="sell_to_close")
+    assert (buy.client_order_id, buy.symbol, buy.side, buy.notional, buy.quantity) == (
+        "co-1",
+        "AAPL",
+        Side.BUY,
+        5.0,
+        None,
+    )
+    assert (sell.client_order_id, sell.symbol, sell.side, sell.notional, sell.quantity) == (
+        "co-2",
+        "AAPL",
+        Side.SELL,
+        None,
+        0.5,
+    )
+    assert (buy.position_intent, sell.position_intent) == ("buy_to_open", "sell_to_close")
+
+
+def test_paper_is_a_property_of_the_broker_interface() -> None:
+    """`Broker.paper` (spec amendment item 1): read by the risk wrapper to lift
+    `refused_position_side` for a paper broker only (T231). A property, not an
+    abstract method: the wrapper's per-method allowlists are keyed by the
+    abstract methods (`test_wrapper_core.py`), outside T226's files."""
+    assert isinstance(inspect.getattr_static(Broker, "paper"), property)
+    assert "paper" not in Broker.__abstractmethods__
 
 
 # --- Order ------------------------------------------------------------------------
