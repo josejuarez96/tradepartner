@@ -178,6 +178,10 @@ _BASIS_METRICS: Final[dict[Basis, str]] = {
 #: The frozen key the window key's rebalance schedule comes from (through `frozen_values`).
 CADENCE_KEY: Final = "schedule.rebalance_cadence"
 
+#: The opt-in frozen key whose `true` value makes a trial's data vintage count
+#: the stored `spinoff` rows it reads (backtest spec amendment #1894, item 6; T211d).
+SPIN_OFFS_KEY: Final = "adjust.apply_spin_offs"
+
 #: The metric row each trial's annualisation reads (strategy-lab spec req 8).
 PERIODS_PER_YEAR_METRIC: Final = "periods_per_year"
 
@@ -519,8 +523,9 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
 
 #: The rows of `corporate_actions` a trial can read: the action types that
 #: move a price series. A `spinoff` row (#1506, T172) is written by the
-#: corporate-actions ingests for `window.start` alone -- the paper path --
-#: and nothing a registered trial reads, so it must not stale a trial.
+#: corporate-actions ingests and read by `window.start` alone until a trial opts
+#: into spin-offs (`data_vintage(..., spin_offs=True)`; backtest spec amendment
+#: #1894, item 6; T211d), so at the default `False` it must not stale a trial.
 #: Every other trial table contributes all of its rows.
 _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
     "corporate_actions": " AND action_type IN ('split', 'dividend')",
@@ -531,7 +536,9 @@ _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
 }
 
 
-def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime | None:
+def data_vintage(
+    conn: duckdb.DuckDBPyConnection, cutoff: datetime, *, spin_offs: bool = False
+) -> datetime | None:
     """The data vintage at `cutoff` (strategy-lab spec, Definitions "Vintage"): the
     latest of the `ingested_at` over trial-readable fact rows with `known_at <=
     cutoff` and the `made_at` of every closed data release whose touched sessions
@@ -549,16 +556,26 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status` or `symbol_changes` row
     therefore moves no trial's vintage, while `store_max_ingested_at` below
     stays whole over every fact table: it is the store's state, not a trial's.
+
+    `spin_offs` (backtest spec amendment #1894, item 6; T211d) adds the
+    `corporate_actions` `spinoff` rows a spin-off-reading trial reads; a caller
+    that has a trial passes that trial's frozen `adjust.apply_spin_offs`, while
+    the release-level vintages stay `False`. At `False` a `spinoff` row moves no
+    vintage, so H1's and the TWIN's stored vintages and every pinned digest are
+    unchanged.
     """
     if cutoff.tzinfo is None:
         raise ValueError(f"cutoff must be timezone-aware, got {cutoff!r}")
+    rows = _TRIAL_TABLE_ROWS
+    if spin_offs:
+        rows = {**rows, "corporate_actions": " AND action_type IN ('split', 'dividend', 'spinoff')"}
     present = set(_present_fact_tables(conn))
     tables = [table for table in _TRIAL_FACT_TABLES if table in present]
     facts: datetime | None = None
     if tables:
         union = " UNION ALL ".join(
             f"SELECT MAX(ingested_at) AS m FROM {table} WHERE known_at <= $cutoff"
-            f"{_TRIAL_TABLE_ROWS.get(table, '')}"
+            f"{rows.get(table, '')}"
             for table in tables
         )
         row = conn.execute(f"SELECT MAX(m) FROM ({union})", {"cutoff": cutoff}).fetchone()
@@ -895,7 +912,9 @@ def open_trial(
     the window rules are checked afterwards (spec req 11), so a refusal is
     still a trial. Captures the code version and the code vintage
     (`repo_dir`, default this checkout), the store's latest `ingested_at`
-    and the data vintage at `data_cutoff`, and records `detail_level`
+    and the data vintage at `data_cutoff`, read under the registration's frozen
+    `adjust.apply_spin_offs` (backtest spec amendment #1894, item 6; T211d), and
+    records `detail_level`
     (`full` by default; a sweep variant's is the sweep's level, which
     `backtest.results.write_results` then must write; module docstring,
     "Vintages"), and the development boundary in force (`development_boundary`,
@@ -911,7 +930,10 @@ def open_trial(
         raise RealStoreRefused("a synthetic trial is refused on the real store")
     version, dirty = code_version(repo_dir)
     max_ingested = store_max_ingested_at(conn)
-    vintage = data_vintage(conn, data_cutoff) if data_cutoff is not None else None
+    spin_offs = bool(frozen_values(hypothesis)[SPIN_OFFS_KEY])
+    vintage = (
+        data_vintage(conn, data_cutoff, spin_offs=spin_offs) if data_cutoff is not None else None
+    )
     boundary = development_boundary(conn)
     trial_id = max(
         _next_id(conn, "trials", "trial_id"), _next_id(conn, "trial_results", "trial_id")
@@ -1003,16 +1025,28 @@ def write_result(
     return "ok"
 
 
+def _registered_spin_offs(conn: duckdb.DuckDBPyConnection, hypothesis_id: int) -> bool:
+    """The hypothesis's frozen `adjust.apply_spin_offs` (backtest spec amendment
+    #1894, item 6; T211d), through `frozen_values`: the flag a trial of it reads
+    its data vintage under, so a `spinoff` row stales it only when `True`."""
+    return bool(frozen_values(get_hypothesis_by_id(conn, hypothesis_id))[SPIN_OFFS_KEY])
+
+
 def _store_changed(conn: duckdb.DuckDBPyConnection, handle: TrialHandle, cutoff: datetime) -> bool:
     """Backtest spec req 9 as amended (strategy-lab spec amendment 7, #1232): the
     data vintage at the trial's own `cutoff` differs from the one `open_trial`
     captured on `handle`, so a late fact known at or before the cutoff fails the
-    run and a row for a session after it fails nothing. A trial with no vintage at
+    run and a row for a session after it fails nothing. Read under the trial's
+    frozen `adjust.apply_spin_offs` (spec amendment #1894, item 6; T211d), the
+    same flag its open read it under. A trial with no vintage at
     its open (no fact known at its cutoff then) keeps the Phase 3 rule, the
     stricter one: the store's latest `ingested_at` at open and write."""
     if handle.data_vintage is None:
         return store_max_ingested_at(conn) != handle.store_max_ingested_at
-    return data_vintage(conn, cutoff) != handle.data_vintage
+    return (
+        data_vintage(conn, cutoff, spin_offs=_registered_spin_offs(conn, handle.hypothesis_id))
+        != handle.data_vintage
+    )
 
 
 def _insert_result(
@@ -1802,21 +1836,24 @@ def record_trial_state(
     stored one (`vintage_equals_trial`) and lists the backup's repair runs started
     since the trial (`repair_runs`, #1321 pass-2 follow-up: a deletion between the
     trial and the backup moves no vintage). A `record` row is never open. Refuses a
-    bad or used name, a blank reason, and a trial without a `data_cutoff`."""
+    bad or used name, a blank reason, and a trial without a `data_cutoff`. The
+    vintage is read under the trial's frozen `adjust.apply_spin_offs` (backtest
+    spec amendment #1894, item 6; T211d), so the comparison is the one the trial
+    itself made."""
     if not reason.strip():
         raise ReleaseRefused("a release needs a reason")
     _check_new_name(conn, name)
     row = conn.execute(
         "SELECT data_cutoff, data_vintage, store_max_ingested_at, start_session, "
-        "end_session, started_at FROM trials WHERE trial_id = ?",
+        "end_session, started_at, hypothesis_id FROM trials WHERE trial_id = ?",
         [trial_id],
     ).fetchone()
     if row is None:
         raise ReleaseRefused(f"trial {trial_id} does not exist")
-    cutoff, trial_vintage, trial_max, start, end, started_at = row
+    cutoff, trial_vintage, trial_max, start, end, started_at, hypothesis_id = row
     if cutoff is None:
         raise ReleaseRefused(f"trial {trial_id} has no data_cutoff (a refused window)")
-    vintage = data_vintage(backup, cutoff)
+    vintage = data_vintage(backup, cutoff, spin_offs=_registered_spin_offs(conn, hypothesis_id))
     now = utc_now()
     values = {
         "name": name,

@@ -90,6 +90,7 @@ from tradepartner.store.lab_registry import (
 )
 from tradepartner.store.lab_schema import require_lab
 from tradepartner.store.registry import (
+    SPIN_OFFS_KEY,
     STORE_CHANGED_MESSAGE,
     UNREAD,
     Unread,
@@ -106,6 +107,12 @@ SHARED_READ_FAILED: Final = "shared read failed"
 
 #: `sweep_state`'s overall value (spec, Definitions "Complete sweep").
 SweepStateName = Literal["complete", "incomplete (stale)", "incomplete (unrun)"]
+
+#: The data-vintage memo the planning reads share, keyed by `(cutoff, spin_offs)`: a
+#: trial's frozen `adjust.apply_spin_offs` decides whether its vintage counts the
+#: stored `spinoff` rows (`registry.data_vintage`; backtest spec amendment #1894,
+#: item 6; T211d), so a `False` variant's cut does not stand in for a `True` one's.
+Vintages = dict[tuple[datetime, bool], datetime | None]
 
 
 class SweepNotCompleteError(LabRegistryError):
@@ -242,7 +249,7 @@ def _counted_trial(
     hypothesis_id: int,
     window: Window,
     code_vintage: str | None,
-    vintages: dict[datetime, datetime | None],
+    vintages: Vintages,
     synthetic: bool = False,
 ) -> TrialRow | None:
     """The counted trial over `window`: the latest **current** `ok`,
@@ -294,18 +301,23 @@ def _is_current(
     conn: duckdb.DuckDBPyConnection,
     trial: TrialRow,
     code_vintage: str | None,
-    vintages: dict[datetime, datetime | None],
+    vintages: Vintages,
 ) -> bool:
     """`is_current` with a pre-computed checkout code vintage and a memo of the
-    data vintage per cutoff (`vintages`), so a caller walking many trials at one
-    cutoff computes the store's vintage once."""
+    data vintage per `(cutoff, spin_offs)` (`vintages`), so a caller walking many
+    trials at one cutoff computes the store's vintage once. The trial's frozen
+    `adjust.apply_spin_offs` decides whether its vintage counts the `spinoff` rows
+    it reads (backtest spec amendment #1894, item 6; T211d), so a `False` variant's
+    cut does not stand in for a `True` one's."""
     if trial.data_cutoff is None or trial.data_vintage is None:
         return False
     if trial.code_tree_sha256 is None or trial.code_tree_sha256 != code_vintage:
         return False
-    if trial.data_cutoff not in vintages:
-        vintages[trial.data_cutoff] = data_vintage(conn, trial.data_cutoff)
-    return vintages[trial.data_cutoff] == trial.data_vintage
+    spin_offs = bool(frozen_values(get_hypothesis_by_id(conn, trial.hypothesis_id))[SPIN_OFFS_KEY])
+    key = (trial.data_cutoff, spin_offs)
+    if key not in vintages:
+        vintages[key] = data_vintage(conn, trial.data_cutoff, spin_offs=spin_offs)
+    return vintages[key] == trial.data_vintage
 
 
 def is_stale(conn: duckdb.DuckDBPyConnection, trial: TrialRow) -> bool:
@@ -516,7 +528,7 @@ def plan_run(
         )
     epoch = rerun_epoch(conn, sweep_id)
     boundary = boundary_date(conn)
-    vintages: dict[datetime, datetime | None] = {}
+    vintages: Vintages = {}
     planned: list[PlannedVariant] = []
     for group_index, group in enumerate(_read_groups(conn, variants), start=1):
         for variant in group:
@@ -561,7 +573,7 @@ def _variant_state(
     sweep_id: int,
     max_failures: int,
     code_vintage: str | None,
-    vintages: dict[datetime, datetime | None],
+    vintages: Vintages,
     epoch: int | None,
     synthetic: bool,
     variant: SweepVariant | None = None,
@@ -629,7 +641,7 @@ def _variant_done(
     sweep_id: int,
     max_failures: int,
     code_vintage: str | None,
-    vintages: dict[datetime, datetime | None],
+    vintages: Vintages,
     epoch: int | None,
     synthetic: bool,
     *,
@@ -667,7 +679,7 @@ def variant_states(
     vintage = code_vintage if code_vintage is not None else code_tree_sha256()
     epoch = rerun_epoch(conn, sweep_id)
     boundary = boundary_date(conn)
-    vintages: dict[datetime, datetime | None] = {}
+    vintages: Vintages = {}
     return tuple(
         _variant_state(
             conn,
