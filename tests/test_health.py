@@ -43,6 +43,7 @@ from tradepartner.health import (
     BORROW_STATUS_UNIQUE,
     COVERAGE_REFERENCE_NAMES,
     DUPLICATE_DIVIDENDS,
+    FIGI_TYPES_DISAGREEMENTS,
     FILENAME_LISTING_VALID_FROM,
     FILING_EVENTS_FORM_ALLOWED,
     FILING_EVENTS_ITEMS_NOT_NULL,
@@ -75,6 +76,7 @@ from tradepartner.health import (
     coverage,
     coverage_reference,
     delisted_names,
+    figi_types,
     filing_event_counts,
     health_report,
     integrity_checks,
@@ -3567,3 +3569,189 @@ def test_the_index_block_reads_only_rows_known_at_t(
         assert full.samples.equals(cut.samples), t
         assert full.hits.equals(cut.hits), t
         assert full.misses.equals(cut.misses), t
+
+
+# --- OpenFIGI types in the health report (#1713, T189c) -----------------------------
+
+
+def _figi(
+    sid: str,
+    ticker: str,
+    security_type: str,
+    *,
+    security_type2: str | None = None,
+    mapped: bool = True,
+    known: datetime = datetime(2020, 6, 29, 21, 0, tzinfo=UTC),
+) -> dict[str, Any]:
+    """One `openfigi_types` row, the columns the block reads (a mapped row's
+    FIGI fields set, an unmapped row's blank, as the ingest writes them)."""
+    return {
+        "security_id": sid,
+        "ticker": ticker,
+        "figi": "" if not mapped else "BBG1",
+        "composite_figi": "" if not mapped else "BBG1",
+        "share_class_figi": "" if not mapped else "BBG2",
+        "security_type": security_type,
+        "security_type2": security_type if security_type2 is None else security_type2,
+        "market_sector": "" if not mapped else "Equity",
+        "name": "" if not mapped else ticker,
+        "exch_code": "" if not mapped else "US",
+        "mapped": mapped,
+        "known_at": known,
+        "ingested_at": known,
+        "provenance": "openfigi",
+        "source": "openfigi",
+    }
+
+
+def _add_figi(conn: duckdb.DuckDBPyConnection, *rows: dict[str, Any]) -> None:
+    for row in rows:
+        insert_row(conn, "openfigi_types", row)
+
+
+def test_figi_types_block_names_disagreements_both_ways_and_the_unmapped(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _add_figi(
+        fixture_store,
+        _figi("SEC_FACTS_RESTATED", "FRST", "Medium Term Note"),
+        _figi("SEC_UNCLASSIFIABLE", "UNCX", "Common Stock"),
+        _figi("SEC_DUAL_A", "DUALA", "Common Stock"),
+        _figi("SEC_MTUM", "MTUM", "Common Stock"),
+        _figi("SEC_STATIC_PRE2019", "PRE9", "", mapped=False),
+    )
+    block = health_report(fixture_store, T_END, _settings()).figi_types
+    assert (block.observations, block.disagreements, block.unmapped) == (5, 2, 1)
+    rows = {row["security_id"]: row for row in block.rows.to_dicts()}
+    ours_common = rows["SEC_FACTS_RESTATED"]
+    assert (ours_common["ours"], ours_common["figi_type"]) == ("common", "Medium Term Note")
+    assert (ours_common["ticker"], ours_common["class_title"]) == ("FRST", "Common Stock")
+    figi_common = rows["SEC_UNCLASSIFIABLE"]
+    assert (figi_common["ours"], figi_common["figi_type"]) == ("unclassifiable", "Common Stock")
+    # A `common` name OpenFIGI also calls common, and an etf (outside the
+    # spec's converse), agree.
+    assert set(rows) == {"SEC_FACTS_RESTATED", "SEC_UNCLASSIFIABLE"}
+    assert block.worst == 3
+    assert block.verdict == "2 disagreements, 1 unmapped (report-only)"
+
+
+def test_the_figi_block_names_a_depositary_class_openfigi_calls_common(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The converse's other arm: ours `depositary` on a class OpenFIGI calls
+    `Common Stock` (`SEC_DUAL_A` reclassified in a later row)."""
+    insert_row(
+        fixture_store,
+        "classifications",
+        {
+            "security_id": "SEC_DUAL_A",
+            "sic": 7372,
+            "security_type": "depositary",
+            "rule": "test",
+            "known_at": datetime(2020, 1, 2, 21, 0, tzinfo=UTC),
+            "ingested_at": datetime(2020, 1, 2, 21, 0, tzinfo=UTC),
+            "source": "test",
+            "provenance": "filing",
+        },
+    )
+    _add_figi(fixture_store, _figi("SEC_DUAL_A", "DUALA", "Common Stock"))
+    block = figi_types(fixture_store, T_END, _settings())
+    assert block.rows.to_dicts() == [
+        {
+            "security_id": "SEC_DUAL_A",
+            "ticker": "DUALA",
+            "class_title": "Class A Common Stock",
+            "ours": "depositary",
+            "figi_type": "Common Stock",
+            "known_at": datetime(2020, 6, 29, 21, 0, tzinfo=UTC),
+        }
+    ]
+
+
+def test_the_figi_block_ignores_a_name_not_live_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The ingest maps live names alone, so a delisted line's last row (here
+    unmapped) never weighs on the block or the gate (`SEC_25NSE`, a Form 25
+    close in 2018)."""
+    _add_figi(
+        fixture_store,
+        _figi("SEC_25NSE", "NSEX", "Medium Term Note"),
+        _figi(
+            "SEC_25NSE",
+            "NSEX",
+            "",
+            mapped=False,
+            known=datetime(2020, 6, 1, 20, 0, tzinfo=UTC),
+        ),
+    )
+    block = figi_types(fixture_store, T_END, _settings())
+    assert (block.observations, block.disagreements, block.unmapped) == (0, 0, 0)
+    assert block.rows.is_empty()
+
+
+def test_figi_types_disagreements_fails_only_while_the_threshold_is_set(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _add_figi(
+        fixture_store,
+        _figi("SEC_FACTS_RESTATED", "FRST", "Medium Term Note"),
+        _figi("SEC_STATIC_PRE2019", "PRE9", "", mapped=False),
+    )
+    unset = health_report(fixture_store, T_END, _settings())
+    assert FIGI_TYPES_DISAGREEMENTS not in unset.failures
+    assert unset.ok
+    tight = health_report(fixture_store, T_END, _settings(openfigi={"max_disagreements": 1}))
+    assert tight.failures == (FIGI_TYPES_DISAGREEMENTS,)
+    assert tight.figi_types.verdict == "1 disagreements, 1 unmapped: fail (max 1)"
+    loose = health_report(fixture_store, T_END, _settings(openfigi={"max_disagreements": 2}))
+    assert loose.ok, loose.failures
+    assert loose.figi_types.verdict == "1 disagreements, 1 unmapped: pass (max 2)"
+    assert FIGI_TYPES_DISAGREEMENTS not in INTEGRITY_RULES
+
+
+def test_a_set_threshold_never_passes_a_figi_block_that_checked_nothing(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    report = health_report(fixture_store, T_END, _settings(openfigi={"max_disagreements": 0}))
+    assert not report.figi_types.checked
+    assert report.figi_types.verdict == "nothing checked: fail"
+    assert report.failures == (FIGI_TYPES_DISAGREEMENTS,)
+    unset = health_report(fixture_store, T_END, _settings())
+    assert (unset.figi_types.failed, unset.figi_types.verdict) == (False, "nothing checked")
+
+
+def test_the_figi_block_reads_the_latest_observation_known_at_t(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    _add_figi(
+        fixture_store,
+        _figi(
+            "SEC_FACTS_RESTATED",
+            "FRST",
+            "Common Stock",
+            known=datetime(2020, 1, 15, 14, 0, tzinfo=UTC),
+        ),
+        _figi(
+            "SEC_FACTS_RESTATED",
+            "FRST",
+            "Medium Term Note",
+            known=datetime(2020, 5, 1, 21, 0, tzinfo=UTC),
+        ),
+    )
+    settings = _settings()
+    store = TruncatedStore(fixture_store)
+    try:
+        for t in (T_END, datetime(2020, 3, 1, 15, 0, tzinfo=UTC)):
+            full = figi_types(fixture_store, t, settings)
+            cut = figi_types(store.at(t), t, settings)
+            assert full.rows.equals(cut.rows), t
+            assert (full.observations, full.unmapped) == (cut.observations, cut.unmapped), t
+    finally:
+        store.close()
+    # Before the second row is known the two agree; after, the later type alone.
+    early = datetime(2020, 3, 1, 15, 0, tzinfo=UTC)
+    assert figi_types(fixture_store, early, settings).rows.is_empty()
+    assert figi_types(fixture_store, T_END, settings).rows["figi_type"].to_list() == [
+        "Medium Term Note"
+    ]

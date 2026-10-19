@@ -1051,14 +1051,15 @@ def test_strategy_shock_keys_load_at_their_defaults() -> None:
         {"placebo": "shuffle", "placebo_seed": 7, "signal_delay_sessions": 1},
     ],
 )
-def test_strategy_refuses_a_shock_until_t217c_wires_it(override: dict[str, object]) -> None:
-    """Until T217c wires the engine, a non-default delay, placebo or seed would label a
-    trial row with a shock the engine never ran, so `StrategyConfig` refuses each, naming
-    T217c, and so does `Settings.model_validate`, which registration goes through."""
-    with pytest.raises(ValidationError, match="T217c"):
-        StrategyConfig(**override)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError, match="T217c"):
-        Settings.model_validate({"strategy": override})
+def test_strategy_loads_a_shock_once_t217c_wires_it(override: dict[str, object]) -> None:
+    """T217c wires the engine, so its guard goes: a non-default delay, placebo or seed
+    loads as given, through `StrategyConfig` and through `Settings.model_validate`, which
+    registration goes through (T217 refused each until then)."""
+    strategy = StrategyConfig(**override)  # type: ignore[arg-type]
+    validated = Settings.model_validate({"strategy": override}).strategy
+    for name, value in override.items():
+        assert getattr(strategy, name) == value
+        assert getattr(validated, name) == value
 
 
 @pytest.mark.parametrize(

@@ -669,7 +669,8 @@ def parse_chains(entries: list[str]) -> list[tuple[str, str, str]]:
                     "'<cik>' or '<cik>:<class>' security id (never a "
                     "'<cik>@<date>' or a keep_successors id)"
                 )
-        if predecessor[:10] == successor[:10]:
+        # #1838: the parsed CIK, not the id's first ten characters.
+        if predecessor.partition(":")[0] == successor.partition(":")[0]:
             raise ValueError(
                 f"master.chains entry {entry!r}: predecessor and successor are "
                 "the same CIK, so there is nothing to chain"
@@ -1331,8 +1332,7 @@ class StrategyConfig(BaseModel):
 
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
-    own-section keys, inert at their defaults, refused otherwise until T217c wires the
-    engine.
+    own-section keys, inert at their defaults and read by the engine's plan step.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1357,20 +1357,6 @@ class StrategyConfig(BaseModel):
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
             )
-        return self
-
-    @model_validator(mode="after")
-    def _refuse_shocks_until_wired(self) -> StrategyConfig:
-        """A delay or placebo loads as a key but no build reads it yet, so until T217c
-        wires the engine a run would trade the real signal while the row says otherwise.
-        T217c removes this guard."""
-        for name in ("signal_delay_sessions", "placebo", "placebo_seed"):
-            value = getattr(self, name)
-            if value != StrategyConfig.model_fields[name].default:
-                raise ValueError(
-                    f"strategy.{name} = {value!r} is not wired until T217c: the engine "
-                    "still reads the signal at the rebalance session, unshocked"
-                )
         return self
 
 

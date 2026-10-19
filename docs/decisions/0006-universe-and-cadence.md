@@ -1,5 +1,7 @@
 # 0006. Universe and cadence
 
+> **Superseded in part by [ADR 0024](0024-lift-long-only-and-top-1000.md) (2026-10-19):** universe size only: rule 8's top 1,000 is a default, not a scope limit; any registered hypothesis may choose a wider universe. Guard (a) and the floors stand.
+
 **Status:** Accepted; Cadence section superseded by [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md) (2026-10-05); the universe section, guards (a) and (b) and Verify stay in force; the amendment of 2026-10-09 (T70, #294) records paper's T+1 execution under ADR 0012 sentence 2; the amendment of 2026-10-11 (#1540) drops rule 3 (the utility-sector exclusion, mis-recorded as a compliance decision) and guard (b), leaving guard (a) and rules 1, 2 and 4 to 8 in force  ·  **Date:** 2026-09-24  ·  **Issue:** #7
 
 ## Context

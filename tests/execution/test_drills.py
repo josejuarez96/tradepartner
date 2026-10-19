@@ -11,11 +11,12 @@ import requests
 from alpaca.common.exceptions import APIError
 
 from tradepartner.adapters.broker import Asset, OrderRequest
-from tradepartner.adapters.fake_broker import PartialFill, Reject, SetPosition, TransportFault
+from tradepartner.adapters.fake_broker import PartialFill, Reject, SetPosition, Vanish
 from tradepartner.config import RiskConfig
 from tradepartner.errors import ReconciliationError
 from tradepartner.store.journal import OverrideRow, PaperWindowRow
 
+from .test_run_stop import buy_id
 from .test_run_trade import (
     F_0,
     SYMBOLS,
@@ -251,9 +252,9 @@ def test_sell_refused_after_position_changes_is_reconciliation_fault(
     assert any(status == "pending" for _, status in events)
 
 
-@pytest.mark.xfail(strict=True, reason="T202b")
 def test_ack_timeout_stays_pending_until_next_run(env: Env, window: PaperWindowRow) -> None:
-    env.fake.script(TransportFault(after_record=True, error=TimeoutError("ack delayed")))
+    coid = buy_id(env, F_0, "SEC_TRANSFER")
+    env.fake.script(Vanish(), client_order_id=coid)
     first = env.run(at(F_0))
     orders, events, fills = journal(env)
     assert first.status == "ok"
