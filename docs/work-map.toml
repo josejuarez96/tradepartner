@@ -1335,8 +1335,8 @@ why = "Records the owner's 2026-10-18 decisions (#1731) that reorder the work to
 unblocks = ["task:T200", "task:T201", "task:T202", "task:T203", "task:T205", "task:T206", "task:T207", "task:T208", "task:T209a", "task:T209b", "task:T210", "task:T211", "task:T212", "task:T213", "task:T214", "phase:6"]
 
 [adr.0024]
-what = "Long-only is no longer a scope constraint: research, backtests and Alpaca paper books may hold short and long/short positions; live stays long-only on the cash account until the live account type is decided."
-why = "Records the owner's 2026-10-19 decision (#1863) so short legs, where the evidence says anomaly profits sit, can enter the candidate pool and the kill ladder, and lists what must exist before the first paper short order."
+what = "Lifts the long-only and top-1,000 limits: research, backtests and Alpaca paper books may short, live stays long-only on the cash account until the live account type is decided, and universe size is a per-hypothesis parameter."
+why = "Records the owner's 2026-10-19 decisions (#1863) so short legs and smaller names can enter the candidate pool and the kill ladder, and lists what must exist before the first paper short and before a wider-universe run."
 unblocks = ["research:2026-10-10-beyond-long-only", "phase:6"]
 
 [task.T200]
