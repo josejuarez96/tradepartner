@@ -838,36 +838,38 @@ def ready(
     return 0
 
 
-# A change here never makes a review stale: plans and fragments are not reviewed code (#1851).
-REVIEW_NEUTRAL_PREFIXES = ("docs/", "changelog.d/")
+HUNK_RE = re.compile(r"^@@ -\S+ \+\S+ @@")
 
 
 def _own_patch(r: Runner, main_ref: str, ref: str, path: str) -> list[str]:
-    """The +/- lines of the PR's own change to ``path`` at ``ref``: the diff from the merge
-    base with main, with hunk headers and context dropped so a main merge that only shifts
-    line numbers or context compares equal."""
-    out = r.git("diff", "--no-renames", "-U0", f"{main_ref}...{ref}", "--", path)
-    return [ln for ln in out.splitlines() if ln[:1] in "+-" and not ln.startswith(("+++", "---"))]
+    """The PR's own change to ``path`` at ``ref``: the diff from the merge base with main,
+    with ``index`` lines dropped and hunk line numbers blanked (the function-name part of
+    a hunk header stays), so a main merge that only shifts line numbers compares equal
+    while a hunk moved to other context does not."""
+    out = r.git("diff", "--no-renames", f"{main_ref}...{ref}", "--", path)
+    return [HUNK_RE.sub("@@ @@", ln) for ln in out.splitlines() if not ln.startswith("index ")]
 
 
 def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str]) -> list[str]:
     """PR-owned paths whose own change differs between the reviewed ``sha`` and ``HEAD``.
 
-    A path counts only if it changed in ``sha..HEAD``, is in the PR's diff against main,
-    is not under ``REVIEW_NEUTRAL_PREFIXES``, and its own patch against main differs at the
-    two commits. So a main merge (even one touching a file the PR also edits) and a plan
-    tick or conflict resolution in docs/ do not stale a review (#1851).
+    A path counts only if it changed in ``sha..HEAD`` and is in the PR's diff against
+    main; then equal blobs mean unchanged, a binary file that differs counts, and a text
+    file counts when its own patch against main differs at the two commits. So a main
+    merge, even one touching a file the PR also edits, does not stale a review (#1851).
+    Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
     """
-    candidates = [
-        path
-        for path in r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines()
-        if path in touched and not path.startswith(REVIEW_NEUTRAL_PREFIXES)
-    ]
-    return [
-        path
-        for path in candidates
-        if _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path)
-    ]
+    out: list[str] = []
+    for path in r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines():
+        if path not in touched:
+            continue
+        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):
+            continue
+        if r.git("diff", "--numstat", sha, "HEAD", "--", path).startswith("-\t-"):
+            out.append(path)  # binary: no line patch to compare
+        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path):
+            out.append(path)
+    return out
 
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:

@@ -458,6 +458,8 @@ class FakeRunner:
         since_review_touched: Sequence[str] = (),
         own_patch_at_review: str = "+a",
         own_patch_at_head: str = "+a",
+        numstat: str = "1\t1\tx",
+        same_blob: bool = False,
     ) -> None:
         self.branch = branch
         self.contains_main = contains_main
@@ -474,6 +476,8 @@ class FakeRunner:
         self.since_review_touched = list(since_review_touched)
         self.own_patch_at_review = own_patch_at_review
         self.own_patch_at_head = own_patch_at_head
+        self.numstat = numstat
+        self.same_blob = same_blob
         self.calls: list[tuple[str, ...]] = []
         self.checks_run: list[tuple[str, ...]] = []
         self.readied: list[int] = []
@@ -506,7 +510,11 @@ class FakeRunner:
                 return self.main_files[spec.split(":", 1)[1]]
             case ("rev-parse", "HEAD"):
                 return "abc1234def"
-            case ("diff", "--no-renames", "-U0", spec, "--", _):
+            case ("ls-tree", ref, "--", _):
+                return "same" if self.same_blob else f"blob-{ref}"
+            case ("diff", "--numstat", _, _, "--", _):
+                return self.numstat
+            case ("diff", "--no-renames", spec, "--", _):
                 if spec.endswith("...HEAD"):
                     return self.own_patch_at_head
                 return self.own_patch_at_review
@@ -877,6 +885,51 @@ def test_a_new_own_src_change_after_the_review_is_stale() -> None:
     )
     with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
         ready_pr.ready(r, 69, dry_run=True)
+
+
+def test_a_gated_docs_path_change_after_the_review_is_stale() -> None:
+    """docs/runbooks/ is a SAFETY prefix; it must not be treated as neutral docs."""
+    r = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        touched=["docs/runbooks/kill-switch.md", "changelog.d/69-x.md"],
+        comments=("safety-reviewer: PASS\nreviewed at abc1234def",),
+        since_review_touched=["docs/runbooks/kill-switch.md"],
+        own_patch_at_head="+rewritten",
+    )
+    with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
+        ready_pr.ready(r, 69, dry_run=True)
+
+
+def test_a_changed_binary_fixture_after_the_review_is_stale() -> None:
+    r = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        touched=["tests/fixtures/edgar/a.gz", "changelog.d/69-x.md"],
+        comments=("safety-reviewer: PASS\nreviewed at abc1234def",),
+        since_review_touched=["tests/fixtures/edgar/a.gz"],
+        numstat="-\t-\ttests/fixtures/edgar/a.gz",
+    )
+    with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
+        ready_pr.ready(r, 69, dry_run=True)
+
+
+def test_an_identical_blob_is_not_stale_and_a_moved_hunk_is() -> None:
+    same = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+        since_review_touched=["src/tradepartner/store/asof.py"],
+        own_patch_at_head="+changed",
+        same_blob=True,
+    )
+    assert ready_pr.ready(same, 69, wait=False) == 0
+    moved = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+        since_review_touched=["src/tradepartner/store/asof.py"],
+        own_patch_at_review="@@ -1,3 +1,4 @@ def f():\n+x",
+        own_patch_at_head="@@ -9,3 +9,4 @@ def g():\n+x",
+    )
+    with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
+        ready_pr.ready(moved, 69, dry_run=True)
 
 
 def test_another_unticked_box_still_refuses_without_editing() -> None:
