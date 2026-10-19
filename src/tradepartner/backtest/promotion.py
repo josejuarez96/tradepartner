@@ -31,7 +31,11 @@ this order, raising `PromotionRefused` before anything is written:
    earlier `promotion` decision's hypothesis already holds, from this or any sweep, at
    any cost base;
 9. an argmax whose `dsr_excess` at the family's SR\\* high-water mark is below the
-   sweep row's `promote_at_least`.
+   sweep row's `promote_at_least`;
+10. `refused_placebo` (T217b, ADR 0023): a file whose frozen `strategy.placebo` is not
+   `none`, a fake signal (refusal 6 makes the file's set the argmax's, so a placebo
+   variant is refused through a matching file too). A delayed file is not refused: a
+   stale-signal strategy is implementable and the paper planner honours the delay.
 
 Then it registers the file with `hypothesis.register(..., promotion_of=<variant id>)`
 (which adds the structural checks: the variant's fingerprint, the family rules, the
@@ -303,6 +307,11 @@ def promote(
             f"{verdicts.dsr_excess_at_high_water:.4f} at the family's SR* high-water mark "
             f"{verdicts.sr_star_high_water_annual:.4f}, below promote_at_least "
             f"{report.promote_at_least}"
+        )
+    if params.get("strategy.placebo", "none") != "none":
+        raise PromotionRefused(
+            f"{file}: refused_placebo: strategy.placebo is {params['strategy.placebo']!r}; a "
+            "placebo is a fake signal and is never promoted (ADR 0023)"
         )
     fingerprint = _variant_fingerprint(conn, variant.hypothesis_id)
     promoted = hypothesis.register(

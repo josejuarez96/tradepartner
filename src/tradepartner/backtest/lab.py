@@ -101,9 +101,10 @@ from typing import Final, Literal, Protocol, cast
 import duckdb
 
 from tradepartner import calendar
-from tradepartner.backtest import engine, quiet
+from tradepartner.backtest import engine, placebo, quiet
 from tradepartner.backtest import sweep as lab_sweep
 from tradepartner.backtest.engine import BacktestResult, SharedReadFailed
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide, gap_sessions
 from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.metrics import expected_max_sharpe
@@ -513,6 +514,7 @@ def _open_group(
             run_by=run_by,
             settings=live,
             detail_level=live.lab.sweep_detail_level,
+            note=placebo.shock_note(frozen_values(record)),
         )
         (vintage,) = conn.execute(  # type: ignore[misc]
             "SELECT data_vintage FROM trials WHERE trial_id = ?", [handle.trial_id]

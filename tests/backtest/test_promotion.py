@@ -53,14 +53,15 @@ REASON = "the argmax, as pre-registered"
 # --- the family --------------------------------------------------------------------
 
 
-def _text(slug: str, top_fraction: float, cost: float) -> str:
-    """The momentum fixture at the module's window, `top_fraction` and `cost`."""
+def _text(slug: str, top_fraction: float, cost: float, shock: str = "") -> str:
+    """The momentum fixture at the module's window, `top_fraction` and `cost`; `shock`
+    is extra `[strategy]` lines (a `strategy.placebo` or `signal_delay_sessions`)."""
     text = FIXTURE.read_text()
     for old, new in (
         ("in_sample_start = 2017-01-31", f"in_sample_start = {IN_SAMPLE_START}"),
         ("start = 2023-01-03", f"start = {HOLDOUT[0]}"),
         ("end = 2025-12-31", f"end = {HOLDOUT[1]}"),
-        ("top_fraction = 0.10", f"top_fraction = {top_fraction}"),
+        ("top_fraction = 0.10", f"top_fraction = {top_fraction}{shock}"),
         ("per_side_bps = 15.0", f"per_side_bps = {cost}"),
         ('slug = "fixture-momentum"', f'slug = "{slug}"'),
     ):
@@ -94,9 +95,11 @@ class Lab:
         self.root = root
         self.vintage = registry.data_vintage(conn, CUTOFF)
 
-    def file(self, slug: str, top_fraction: float = 0.5, cost: float = 15.0) -> Path:
+    def file(
+        self, slug: str, top_fraction: float = 0.5, cost: float = 15.0, shock: str = ""
+    ) -> Path:
         path = self.root / f"{slug}.md"
-        path.write_text(_text(slug, top_fraction, cost))
+        path.write_text(_text(slug, top_fraction, cost, shock))
         return path
 
     def direct(
@@ -153,6 +156,7 @@ class Lab:
         cost: float = 15.0,
         settings: Settings | None = None,
         drop: tuple[str, ...] = (),
+        shock: str = "",
     ) -> tuple[lab_registry.SweepRecord, list[registry.HypothesisRecord]]:
         sweep = lab_registry.register_sweep(
             self.conn,
@@ -177,7 +181,7 @@ class Lab:
         records = []
         for index, top_fraction in enumerate(top_fractions, start=1):
             variant_slug = f"{slug}--r{sweep.sweep_id}-v{index}"
-            path = self.file(f"{variant_slug}-src", top_fraction, cost)
+            path = self.file(f"{variant_slug}-src", top_fraction, cost, shock)
             record = self.direct(path, slug=variant_slug, drop=drop)
             fingerprint = _fingerprint(record)
             lab_registry.write_sweep_variant(
@@ -287,10 +291,11 @@ class Lab:
         provenance: str | None = None,
         cost: float = 15.0,
         edits: tuple[tuple[str, str], ...] = (),
+        shock: str = "",
     ) -> Path:
         """The argmax's file as a standalone `slug` with its provenance section."""
         top = frozen.frozen_values(variant)["strategy.top_fraction"]
-        text = _text(slug, top, cost)
+        text = _text(slug, top, cost, shock)
         for old, new in edits:
             assert old in text, old
             text = text.replace(old, new, 1)
@@ -407,6 +412,32 @@ def test_the_argmax_file_registers_with_its_decision_and_n_is_unchanged(lab: Lab
         "FROM owner_decisions WHERE kind = 'promotion'"
     ).fetchone()
     assert found == sweep.sweep_id
+
+
+PLACEBO = '\nplacebo = "shuffle"\nplacebo_seed = 7'
+DELAY = "\nsignal_delay_sessions = 1"
+
+
+def test_a_placebo_argmax_is_refused_through_a_matching_file_and_writes_nothing(
+    lab: Lab,
+) -> None:
+    """T217b refusal 10: refusal 6 makes the file's frozen set the argmax's, so a placebo
+    variant is refused through a matching file too."""
+    sweep, variants = lab.sweep([0.15, 0.25], shock=PLACEBO)
+    lab.trial(variants[0], 1.5)
+    lab.trial(variants[1], 0.4)
+    assert frozen.frozen_values(variants[0])["strategy.placebo"] == "shuffle"
+    path = lab.promoted_file(sweep, variants[0], shock=PLACEBO)
+    _refused(lab, path, f"{path}: refused_placebo")
+
+
+def test_a_delayed_argmax_is_promoted_not_refused(lab: Lab) -> None:
+    """A stale-signal strategy is implementable (the paper planner honours the delay)."""
+    sweep, variants = lab.sweep([0.15, 0.25], shock=DELAY)
+    lab.trial(variants[0], 1.5)
+    lab.trial(variants[1], 0.4)
+    outcome = lab.promote(lab.promoted_file(sweep, variants[0], shock=DELAY))
+    assert frozen.frozen_values(outcome.promoted)["strategy.signal_delay_sessions"] == 1
 
 
 def test_a_promoted_file_registered_outside_promote_is_still_refused(lab: Lab) -> None:

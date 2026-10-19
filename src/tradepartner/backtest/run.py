@@ -80,16 +80,18 @@ from __future__ import annotations
 
 import math
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import partial
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import duckdb
 
-from tradepartner.backtest import engine
+from tradepartner.backtest import engine, placebo
 from tradepartner.backtest.engine import BacktestResult
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import (
     Decision,
     Flags,
@@ -221,6 +223,13 @@ def _gap_values(decision: Decision, frozen: Frozen, series: dict[date, float]) -
     }
 
 
+def _trial_note(frozen: Mapping[str, Any], note: str | None) -> str | None:
+    """The shock tag (`placebo.shock_note`), then `; ` and the given `note`; at the
+    defaults exactly the given `note`, so no stored row changes."""
+    tag = placebo.shock_note(frozen)
+    return "; ".join(part for part in (tag, note) if part) or None
+
+
 def run_hypothesis(
     slug: str,
     start: date | None,
@@ -252,8 +261,12 @@ def run_hypothesis(
     `registry.UnmarkedStoreRefused` for a `store_path` that is neither
     `settings.store.path` nor a marked fixture store, `ValueError` for a family
     outside `config.ENGINE_FAMILIES` (#1053), and
-    `ValueError` for `kind="tracking"` with a missing `start` or `end`, all before
-    any trial exists.
+    `ValueError` for `kind="tracking"` with a missing `start` or `end`, and
+    `ValueError("<slug>: refused_placebo: ...")` for a holdout or tracking run of a file
+    whose frozen `strategy.placebo` is not `none` (a fake signal never spends a holdout;
+    ADR 0023), all before any trial exists. The trial's `note` is the shock tag
+    (`placebo.shock_note`: `placebo=<mode> seed=<n>`, `signal_delay=<d>`), then `; ` and
+    the `note` given; at the defaults exactly the `note` given.
 
     The results keep no step's marking frame unless `keep_marking_frames` (#1417:
     nothing written reads them, and over a long daily run they grow without bound);
@@ -299,6 +312,15 @@ def run_hypothesis(
             lab=lab,
             boundary=boundary,
         )
+        shock = frozen_values(hypothesis)
+        if shock.get("strategy.placebo", "none") != "none" and (
+            tracking or decision.kind == "holdout"
+        ):
+            # A fake signal never spends a holdout or feeds a tracking book (ADR 0023).
+            raise ValueError(
+                f"{slug}: refused_placebo: strategy.placebo is {shock['strategy.placebo']!r}; "
+                "a placebo file runs in sample only, never on the holdout or as a tracking run"
+            )
         sessions = gap_sessions(window, cadence)
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
@@ -319,7 +341,7 @@ def run_hypothesis(
             holdout_repeat=holdout and decision.holdout_repeat,
             holdout_reason=decision.holdout_reason if holdout else None,
             gap_override_reason=reasons.gap_reason if holdout and flags.override_gap else None,
-            note=note,
+            note=_trial_note(shock, note),
             settings=live,
         )
         if holdout and decision.holdout_reason is not None:

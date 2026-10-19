@@ -607,11 +607,24 @@ def _variant_named(conn: duckdb.DuckDBPyConnection, variant_id: int) -> int | No
 
 
 def _operations_refusal(
-    conn: duckdb.DuckDBPyConnection, path: Path, variant_id: int, code_vintage: str | None
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    variant_id: int,
+    code_vintage: str | None,
+    params: Mapping[str, Any],
 ) -> None:
     """An operations file's own refusals (module docstring), after the promoted
-    file's checks: the variant's counted `ok` trial, its family in `PAPER_FAMILIES`,
-    a family holdout that is not forward, and no decision naming the variant."""
+    file's checks: `refused_placebo` (a file whose frozen `strategy.placebo` is not
+    `none` is a fake signal and gets no paper book; a delayed file is not refused, the
+    paper planner honours the delay, and a standalone `register` of a placebo file is
+    allowed, that is how a rung-5 run gets its `trials` row), the variant's counted
+    `ok` trial, its family in `PAPER_FAMILIES`, a family holdout that is not forward,
+    and no decision naming the variant."""
+    if params.get("strategy.placebo", "none") != "none":
+        raise LabRegistrationError(
+            f"{path}: refused_placebo: strategy.placebo is {params['strategy.placebo']!r}; "
+            "a placebo is a fake signal and gets no operations book (ADR 0023)"
+        )
     # `sweep_report` reads `results`, which imports this module: imported at call time.
     from tradepartner.backtest import sweep_report
 
@@ -733,7 +746,7 @@ def register(
     if is_lab_initialised(conn):
         _lab_refusal(conn, path, parsed, params, fingerprint, promotion_of, operations_of)
         if operations_of is not None:
-            _operations_refusal(conn, path, operations_of, code_vintage)
+            _operations_refusal(conn, path, operations_of, code_vintage, params)
     record = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
