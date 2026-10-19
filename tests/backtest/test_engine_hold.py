@@ -452,3 +452,10 @@ def test_cash_rate_zero_earns_nothing() -> None:
     """The default `0.0` is today's behaviour: an all-cash book stays at its capital."""
     result = _run(_settings(), _cash_provider())[0.0]
     assert {value for value, _ in _equity(result).values()} == {100_000.0}
+
+
+def test_hold_mode_is_refused_off_the_daily_cadence() -> None:
+    """The hold clock counts plans, so `hold_sessions` is sessions only at `daily`."""
+    settings = _with(_hold_settings(), "schedule", rebalance_cadence="week_end")
+    with pytest.raises(ValueError, match="daily"):
+        _run(settings, _hold_provider())

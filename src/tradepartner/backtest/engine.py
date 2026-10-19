@@ -284,8 +284,8 @@ def _ranked(scores: Mapping[str, float]) -> list[str]:
 
 def _hold_candidates(scores: Mapping[str, float], construction: _Construction) -> dict[str, float]:
     """A hold-mode plan's targets: the names it may enter, the top `target_names` ranked,
-    each at `1 / target_names`. Entries never go past that rank, because a live name
-    holds a slot and only the remaining slots fill from the best names not live."""
+    each at `1 / target_names`. A live name holds a slot and the free slots fill from the
+    best names not live, so no entry is ranked below `target_names`."""
     ranked = _ranked(scores)
     count = construction.target_names(len(ranked))
     if not ranked or count == 0:
@@ -1154,6 +1154,12 @@ def _check_variants(
         elif cash_rate != 0:
             raise ValueError(
                 f"refused_cash_rate: backtest.cash_rate must be 0.0 or 'store', got {cash_rate}"
+            )
+    for params, _ in variants:
+        if params.strategy.weighting == "hold" and params.schedule.rebalance_cadence != "daily":
+            raise ValueError(
+                "strategy.weighting = 'hold' needs schedule.rebalance_cadence = 'daily': the "
+                "hold clock counts plans, and the spec counts sessions"
             )
     cadences = {params.schedule.rebalance_cadence for params, _ in variants}
     if len(cadences) != 1:
