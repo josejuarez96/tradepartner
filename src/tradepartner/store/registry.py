@@ -503,6 +503,10 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "facts",
     "statement_facts",
     "filing_events",
+    # #821 (T187): a `successor_chains` row stales every registered trial whose
+    # cutoff is at or after its `known_at` (the amendment's "A held position"
+    # paragraph), so the chained reads a trial sees are reproducible.
+    "successor_chains",
 )
 
 #: The rows of `corporate_actions` a trial can read: the action types that
@@ -512,6 +516,10 @@ _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
 #: Every other trial table contributes all of its rows.
 _TRIAL_TABLE_ROWS: Final[dict[str, str]] = {
     "corporate_actions": " AND action_type IN ('split', 'dividend')",
+    # #821 (T187): a chain's retraction changes the reads from the stamp it
+    # withdraws, since a moved chain reads absent before its new stamp
+    # (`schema.successor_chains`), so it counts from `withdrawn_known_at`.
+    "successor_chains": " OR (retracted AND withdrawn_known_at <= $cutoff)",
 }
 
 
@@ -529,7 +537,8 @@ def data_vintage(conn: duckdb.DuckDBPyConnection, cutoff: datetime) -> datetime 
     over `_TRIAL_FACT_TABLES` -- an explicit list, not every fact table the
     store happens to have -- with a table absent from the store skipped, and
     with `corporate_actions` counted only for its `split` and `dividend` rows
-    (`_TRIAL_TABLE_ROWS`). Writing a `borrow_status` or `symbol_changes` row
+    and a `successor_chains` retraction counted from its `withdrawn_known_at`
+    (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status` or `symbol_changes` row
     therefore moves no trial's vintage, while `store_max_ingested_at` below
     stays whole over every fact table: it is the store's state, not a trial's.
     """

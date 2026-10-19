@@ -1,0 +1,98 @@
+[
+  {
+    "case": "chain_1to1",
+    "evidence": {
+      "accepted_at": "2020-01-02T20:30:00+00:00",
+      "accession": "0001000011-24-000001",
+      "form": "8-K12B"
+    },
+    "expected_known_at": "2020-02-07T20:30:00+00:00",
+    "expected_reason": null,
+    "predecessor": {
+      "cik": "0001000010",
+      "cover": "2019-11-06T20:30:00+00:00",
+      "first_index": "2018-12-21T20:30:00+00:00",
+      "listing_from": "2019-11-06",
+      "name": "CHNA Holdings Inc"
+    },
+    "successor": {
+      "cik": "0001000011",
+      "cover": "2020-02-07T20:30:00+00:00",
+      "first_index": "2019-10-23T20:30:00+00:00",
+      "listing_from": "2020-02-04",
+      "name": "Chain One Inc"
+    },
+    "ticker": "CHNA"
+  },
+  {
+    "case": "chain_evidence_latest",
+    "evidence": {
+      "accepted_at": "2020-03-30T20:30:00+00:00",
+      "accession": "0001000013-24-000002",
+      "form": "8-K12B/A"
+    },
+    "expected_known_at": "2020-03-30T20:30:00+00:00",
+    "expected_reason": null,
+    "predecessor": {
+      "cik": "0001000012",
+      "cover": "2019-12-19T20:30:00+00:00",
+      "first_index": "2019-02-06T20:30:00+00:00",
+      "listing_from": "2019-12-19",
+      "name": "CHNE Holdings Inc"
+    },
+    "successor": {
+      "cik": "0001000013",
+      "cover": "2020-03-23T20:30:00+00:00",
+      "first_index": "2019-12-05T20:30:00+00:00",
+      "listing_from": "2020-03-18",
+      "name": "Chain Evidence Inc"
+    },
+    "ticker": "CHNE"
+  },
+  {
+    "case": "chain_predecessor_latest",
+    "evidence": {
+      "accepted_at": "2020-03-30T20:30:00+00:00",
+      "accession": "0001000015-24-000003",
+      "form": "8-K12B"
+    },
+    "expected_known_at": "2020-05-11T20:30:00+00:00",
+    "expected_reason": null,
+    "predecessor": {
+      "cik": "0001000014",
+      "cover": "2020-05-11T20:30:00+00:00",
+      "first_index": "2019-03-21T20:30:00+00:00",
+      "listing_from": "2020-05-11",
+      "name": "CHNP Holdings Inc"
+    },
+    "successor": {
+      "cik": "0001000015",
+      "cover": "2020-05-05T20:30:00+00:00",
+      "first_index": "2020-01-21T20:30:00+00:00",
+      "listing_from": "2020-04-30",
+      "name": "Chain Predecessor Inc"
+    },
+    "ticker": "CHNP"
+  },
+  {
+    "case": "chain_spinoff",
+    "evidence": null,
+    "expected_known_at": null,
+    "expected_reason": "no_evidence",
+    "predecessor": {
+      "cik": "0001000016",
+      "cover": "2020-03-18T20:30:00+00:00",
+      "first_index": "2019-05-03T20:30:00+00:00",
+      "listing_from": "2020-03-18",
+      "name": "CHNX Holdings Inc"
+    },
+    "successor": {
+      "cik": "0001000017",
+      "cover": "2020-06-17T20:30:00+00:00",
+      "first_index": "2020-03-04T20:30:00+00:00",
+      "listing_from": "2020-06-12",
+      "name": "Chain Spinoff Inc"
+    },
+    "ticker": "CHNX"
+  }
+]

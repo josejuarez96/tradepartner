@@ -84,6 +84,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("costs.spread_bps", 0.0, 29),
     ("costs.impact_coeff", 0.0, 29),
     ("costs.adv_sessions", 20, 29),
+    # T187: the successor-chain keys (#821), ingest and health only; at their defaults no
+    # stored canonical set or fingerprint moves.
+    ("master.chains", [], 31),
+    ("master.chains_dismissed", [], 31),
+    ("master.chain_window_sessions", 65, 31),
+    ("master.chain_max_price_ratio", 1.15, 31),
 )
 
 #: Keys added to a family's own listed section **after** that family's first

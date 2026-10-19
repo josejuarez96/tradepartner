@@ -1120,8 +1120,8 @@ def test_every_fact_table_is_classified_for_trial_vintage(
         # Outside the trial vintage: `rates` (#1538, T169b: stored for later
         # consumers), `borrow_status` (#1506, T171) and `symbol_changes`
         # (#1506, the 2026-10-11 amendment) -- none is read by a reader a
-        # registered trial uses. `symbol_changes` is not a store table until
-        # T172b lands it, so it is classified here ahead of that task.
+        # registered trial uses. `successor_chains` (#821, T187) is inside
+        # the vintage: its rows move the chained reads a trial sees.
         excluded = {"rates", "borrow_status", "symbol_changes", "openfigi_types"}
         assert included.isdisjoint(excluded)
         # An included name must be a store table, and every store table must
@@ -1306,6 +1306,89 @@ def test_a_split_and_a_bar_still_move_the_trial_vintage(
     for cutoff in cutoffs:
         vintage = registry.data_vintage(fixture_store, cutoff)
         if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
+def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821: a `successor_chains` row is inside the trial vintage, so a trial
+    with a cutoff at or after its `known_at` reads stale and an earlier one
+    stays current (plan T187; the amendment's "A held position" paragraph)."""
+    cutoffs = _fixture_cutoffs(fixture_store)
+    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    assert "successor_chains" in _tables(fixture_store)
+    insert_row(
+        fixture_store,
+        "successor_chains",
+        {
+            "predecessor_id": "0001000010",
+            "successor_id": "0001000011",
+            "evidence_accession": "0001000011-24-000001",
+            "evidence_form": "8-K12B",
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    assert registry.store_max_ingested_at(fixture_store) == _LATE_INGEST
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(fixture_store, cutoff)
+        if cutoff < _PIN_KNOWN:
+            assert vintage == before[cutoff], cutoff
+        else:
+            assert vintage == _LATE_INGEST, cutoff
+
+
+def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821: a chain moved later reads absent at every `t` in [old, new) once
+    moved (`schema.successor_chains`), so its retraction moves the vintage of
+    every cutoff at or after the withdrawn stamp, not only from the new one;
+    an earlier cutoff stays current."""
+    old = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)  # the fixture's chain_1to1 row
+    cutoffs = _fixture_cutoffs(chain_fixture_store)
+    before = {cutoff: registry.data_vintage(chain_fixture_store, cutoff) for cutoff in cutoffs}
+    row = {
+        "predecessor_id": "0001000010",
+        "successor_id": "0001000011",
+        "evidence_accession": "0001000011-24-000001",
+        "evidence_form": "8-K12B",
+        "source": "edgar",
+        "provenance": "filing",
+    }
+    insert_row(
+        chain_fixture_store,
+        "successor_chains",
+        row
+        | {
+            "retracted": True,
+            "withdrawn_known_at": old,
+            "known_at": _LATE_INGEST,
+            "ingested_at": _LATE_INGEST,
+        },
+    )
+    insert_row(
+        chain_fixture_store,
+        "successor_chains",
+        row
+        | {
+            "retracted": False,
+            "withdrawn_known_at": None,
+            "known_at": _PIN_KNOWN,
+            "ingested_at": _LATE_INGEST,
+        },
+    )
+    assert any(old <= cutoff < _PIN_KNOWN for cutoff in cutoffs)
+    for cutoff in cutoffs:
+        vintage = registry.data_vintage(chain_fixture_store, cutoff)
+        if cutoff < old:
             assert vintage == before[cutoff], cutoff
         else:
             assert vintage == _LATE_INGEST, cutoff

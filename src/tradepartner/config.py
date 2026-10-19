@@ -590,6 +590,28 @@ class MasterConfig(_ClosedConfig):
     #: `underived_master_rows` does not fail on them. A malformed id refuses
     #: the config.
     keep_successors: list[str] = Field(default_factory=list)
+    #: Owner-reviewed 1:1 successor-CIK chains (#821: the amendment of
+    #: 2026-10-12): `<predecessor>-><successor>@<accession>`, each side a
+    #: `<cik>` or `<cik>:<class>` security id (never a `<cik>@<date>` or a
+    #: `keep_successors` id), the two sides of different CIKs, and the
+    #: accession the successor CIK's 8-K12B or 8-K12G3. One id may appear in
+    #: only one entry (a chained successor's own later reorganisation waits
+    #: for an amendment). A malformed entry refuses the config, never chains
+    #: silently.
+    chains: list[str] = Field(default_factory=list)
+    #: Successor ids the owner reviewed and struck (#821): never counted as
+    #: candidates on the EDGAR run row (T187c). A malformed id refuses the
+    #: config.
+    chains_dismissed: list[str] = Field(default_factory=list)
+    #: Sessions before a candidate's listing row that another company's
+    #: security last listed its ticker and exchange (#821): `chain_candidates`
+    #: names a filer whose ticker and exchange another company held this many
+    #: sessions or fewer before it. 65, the #821 evidence bound.
+    chain_window_sessions: int = Field(default=65, ge=0)
+    #: The close ratio across a chain's hand-over above which `health` warns
+    #: `chain_price_break` (#821): the ratio or its inverse. 1.15, so a break
+    #: over 15% either way.
+    chain_max_price_ratio: float = Field(default=1.15, gt=0)
 
     @field_validator("keep_successors")
     @classmethod
@@ -597,6 +619,76 @@ class MasterConfig(_ClosedConfig):
         for entry in value:
             parse_successor_id(entry)
         return value
+
+    @field_validator("chains")
+    @classmethod
+    def _check_chains(cls, value: list[str]) -> list[str]:
+        parse_chains(value)
+        return value
+
+    @field_validator("chains_dismissed")
+    @classmethod
+    def _check_chains_dismissed(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            check_security_id(entry, "master.chains_dismissed")
+        return value
+
+
+#: A chain entry's accession: an SEC accession, `NNNNNNNNNN-YY-NNNNNN`.
+_CHAIN_ACCESSION = re.compile(r"\d{10}-\d{2}-\d{6}")
+
+#: A chain entry's security id: a ten-digit CIK, optionally a `:<class slug>`.
+#: A `<cik>@<date>` successor (and so a `keep_successors` id) never matches.
+_CHAIN_ID = re.compile(r"\d{10}(?::[a-z0-9]+(?:-[a-z0-9]+)*)?")
+
+
+def parse_chains(entries: list[str]) -> list[tuple[str, str, str]]:
+    """Parse `master.chains` entries (#821) into `(predecessor_id,
+    successor_id, accession)` tuples, in order. Raises `ValueError` naming the
+    key and entry on any other shape: not exactly one `->`, an id that is not
+    a `<cik>` or `<cik>:<class>` id (a `<cik>@<date>` or `keep_successors` id
+    is never chained), two ids of the same CIK, a malformed accession, or an
+    id used in another entry."""
+    parsed: list[tuple[str, str, str]] = []
+    seen: dict[str, str] = {}
+    for entry in entries:
+        predecessor, arrow, rest = entry.partition("->")
+        if not arrow or "->" in rest:
+            raise ValueError(
+                f"master.chains entry {entry!r} is not '<predecessor>-><successor>@<accession>'"
+            )
+        successor, at, accession = rest.rpartition("@")
+        if not at:
+            raise ValueError(
+                f"master.chains entry {entry!r} is not '<predecessor>-><successor>@<accession>'"
+            )
+        for side, value in (("predecessor", predecessor), ("successor", successor)):
+            if _CHAIN_ID.fullmatch(value) is None:
+                raise ValueError(
+                    f"master.chains entry {entry!r}: {side} {value!r} is not a "
+                    "'<cik>' or '<cik>:<class>' security id (never a "
+                    "'<cik>@<date>' or a keep_successors id)"
+                )
+        if predecessor[:10] == successor[:10]:
+            raise ValueError(
+                f"master.chains entry {entry!r}: predecessor and successor are "
+                "the same CIK, so there is nothing to chain"
+            )
+        if _CHAIN_ACCESSION.fullmatch(accession) is None:
+            raise ValueError(
+                f"master.chains entry {entry!r}: accession {accession!r} is not "
+                "'NNNNNNNNNN-YY-NNNNNN'"
+            )
+        for value in (predecessor, successor):
+            other = seen.get(value)
+            if other is not None:
+                raise ValueError(
+                    f"master.chains entry {entry!r}: {value!r} already appears in "
+                    f"entry {other!r}; an id may be in only one entry"
+                )
+            seen[value] = entry
+        parsed.append((predecessor, successor, accession))
+    return parsed
 
 
 #: A successor `security_id` as `store.master._successor` writes it.

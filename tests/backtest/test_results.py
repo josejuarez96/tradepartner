@@ -953,6 +953,10 @@ class TestRefusals:
                     "strategy.signal_delay_sessions",
                     "strategy.placebo",
                     "strategy.placebo_seed",
+                    "master.chains",
+                    "master.chains_dismissed",
+                    "master.chain_window_sessions",
+                    "master.chain_max_price_ratio",
                 )
             )
         }

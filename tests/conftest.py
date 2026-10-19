@@ -57,6 +57,7 @@ from tradepartner.store import lab_schema, schema
 from tradepartner.store.db import configure_connection, utc_now
 
 _FIXTURES_UNIVERSE_DIR = Path(__file__).parent / "fixtures" / "universe"
+_FIXTURES_CHAINS_DIR = _FIXTURES_UNIVERSE_DIR / "chains"
 
 # CI shards pytest across N parallel jobs (#1112); this keeps the same test run as
 # one process, just split into N invocations with no new dependency. Weight is each
@@ -533,6 +534,20 @@ def load_universe_fixtures(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) 
         return
     lab_schema.create_store_markers(conn)
     lab_schema.write_fixture_marker(conn, "tests/conftest.py:load_universe_fixtures")
+    _load_table_csvs(conn, fixtures_dir)
+
+
+def load_chain_overlay(conn: duckdb.DuckDBPyConnection) -> None:
+    """Load the successor-chain overlay (`tests/fixtures/universe/chains/`, #821,
+    T187) on top of a store `load_universe_fixtures` filled: the four req 13 chain
+    pairs' rows and their `successor_chains` rows, kept out of the universe every
+    other test reads."""
+    _load_table_csvs(conn, _FIXTURES_CHAINS_DIR)
+
+
+def _load_table_csvs(conn: duckdb.DuckDBPyConnection, fixtures_dir: Path) -> None:
+    """Insert every `<table>.csv` in `fixtures_dir`, checked as
+    `load_universe_fixtures` documents."""
     for csv_path in sorted(fixtures_dir.glob("*.csv")):
         table = csv_path.stem
         if table not in schema.TABLE_NAMES:
@@ -618,6 +633,21 @@ def fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 @pytest.fixture
+def chain_fixture_store() -> Iterator[duckdb.DuckDBPyConnection]:
+    """`fixture_store` plus the successor-chain overlay (`load_chain_overlay`;
+    #821, T187): only the chain tests read the four pairs."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    load_universe_fixtures(conn, _FIXTURES_UNIVERSE_DIR)
+    load_chain_overlay(conn)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@pytest.fixture
 def lab_store(
     fixture_store: duckdb.DuckDBPyConnection,
 ) -> duckdb.DuckDBPyConnection:
@@ -681,7 +711,8 @@ def version_4_store(path: Path) -> Path:
     `schema._BORROW_STATUS_TABLE_DDL` (version 24, #1506; `borrow_status.csv`)
     and `schema._migrate_filing_name` (version 26, #1597; the
     `filing_name` provenance `CHECK` the fixture listings and
-    classifications rows may carry)."""
+    classifications rows may carry), and `schema._SUCCESSOR_CHAINS_TABLE_DDL`
+    (version 30, #821, plan T187; `successor_chains.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -694,6 +725,7 @@ def version_4_store(path: Path) -> Path:
             + schema._BORROW_STATUS_TABLE_DDL
             + schema._SYMBOL_CHANGES_TABLE_DDL
             + schema._OPENFIGI_TYPES_TABLE_DDL
+            + schema._SUCCESSOR_CHAINS_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)

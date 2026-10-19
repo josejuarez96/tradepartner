@@ -509,7 +509,7 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
         for k in (*lab_schema.SHAKEDOWN_DECISION_KINDS, *lab_schema.OPERATIONS_DECISION_KINDS)
     )
     assert _kind_check(conn) == check_before.replace("'))));", f"', {added}))));")
-    assert _versions(conn) == [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+    assert _versions(conn) == [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     assert lab_schema.is_lab_initialised(conn) == lab
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=20):
         conn.execute(
@@ -531,7 +531,7 @@ def test_migrating_a_version_19_store_keeps_every_row(lab: bool) -> None:
     assert (_rows_but_versions(conn), _kind_check(conn), _versions(conn)) == (
         rows,
         check,
-        [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+        [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
     )
 
 
@@ -581,7 +581,7 @@ def test_read_only_open_of_a_version_19_store_passes_and_has_no_span(tmp_path: P
 
 def test_a_fresh_store_allows_the_shakedown_kinds_and_the_lab_keeps_them() -> None:
     conn = _fresh_store()
-    assert schema.CURRENT_SCHEMA_VERSION == 30 and _versions(conn) == [30]
+    assert schema.CURRENT_SCHEMA_VERSION == 31 and _versions(conn) == [31]
     for decision_id, kind in enumerate(lab_schema.SHAKEDOWN_DECISION_KINDS, start=1):
         conn.execute(
             "INSERT INTO owner_decisions VALUES (?, ?, ?, NULL, NULL, '{}', 'r')",
@@ -635,7 +635,7 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     assert _rows_but_versions(conn) == before
     assert {t: _columns(conn, t) for t in before} == columns_before
     assert _kind_check(conn) == check_before.replace("'))));", "', 'operations_book'))));")
-    assert _versions(conn) == [21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+    assert _versions(conn) == [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     assert lab_schema.is_lab_initialised(conn) == lab
     conn.execute(
         "INSERT INTO owner_decisions VALUES (40, ?, 'operations_book', NULL, NULL, '{}', 'r')",
@@ -650,7 +650,7 @@ def test_migrating_a_version_21_store_keeps_every_row(lab: bool) -> None:
     assert (_rows_but_versions(conn), _kind_check(conn), _versions(conn)) == (
         rows,
         check,
-        [21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+        [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
     )
 
 
@@ -695,7 +695,7 @@ def test_read_only_open_of_a_version_21_store_passes(tmp_path: Path) -> None:
 
 def test_a_fresh_store_allows_the_operations_kind_and_the_lab_keeps_it() -> None:
     conn = _fresh_store()
-    assert _versions(conn) == [schema.CURRENT_SCHEMA_VERSION] == [30]
+    assert _versions(conn) == [schema.CURRENT_SCHEMA_VERSION] == [31]
     conn.execute(
         "INSERT INTO owner_decisions VALUES (1, ?, 'operations_book', NULL, NULL, '{}', 'r')",
         [AT],

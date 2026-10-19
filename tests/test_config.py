@@ -705,6 +705,63 @@ def test_master_keep_successors_accepts_a_numbered_successor() -> None:
     assert s.master.keep_successors == ["0000891103@2020-08-10-2"]
 
 
+def test_master_chain_keys_default() -> None:
+    """#821: no chain is derived, no successor is dismissed and the window and
+    ratio bounds carry their decided defaults until the owner sets them."""
+    master = _settings().master
+    assert master.chains == []
+    assert master.chains_dismissed == []
+    assert master.chain_window_sessions == 65
+    assert master.chain_max_price_ratio == 1.15
+
+
+def test_master_chains_read_the_owner_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `.env` line the PR body gives the owner (BlackRock, #1615)."""
+    monkeypatch.setenv(
+        "MASTER__CHAINS",
+        '["0002012383->0001769628:class-a@0001769628-24-000001"]',
+    )
+    assert _settings().master.chains == ["0002012383->0001769628:class-a@0001769628-24-000001"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "0002012383-0001769628@0001769628-24-000001",  # no `->`
+        "0002012383->0001769628",  # no accession
+        "0002012383->0001769628@24-000001",  # accession not ten digits
+        "0002012383->0001769628@0001769628-2024-000001",
+        "0002012383->0002012383@0002012383-24-000001",  # same CIK
+        "0002012383@2024-01-01->0001769628@0001769628-24-000001",  # a successor id
+        "0002012383->0001769628@2020-08-10@0001769628-24-000001",  # keep_successors shape
+        " 0002012383->0001769628@0001769628-24-000001",
+        "",
+    ],
+)
+def test_master_chains_fail_closed_on_a_malformed_entry(entry: str) -> None:
+    """#821: a malformed entry refuses the config, never chains silently."""
+    with pytest.raises(ValidationError, match=r"master\.chains"):
+        Settings(_env_file=None, master={"chains": [entry]})
+
+
+def test_master_chains_refuse_an_id_in_two_entries() -> None:
+    """A chained successor's own later reorganisation waits for an amendment,
+    so one id may appear in only one entry (#821)."""
+    entries = [
+        "0002012383->0001769628@0001769628-24-000001",
+        "0001769628->0001111111@0001111111-25-000001",
+    ]
+    with pytest.raises(ValidationError, match=r"only one entry"):
+        Settings(_env_file=None, master={"chains": entries})
+
+
+def test_master_chains_dismissed_validates_ids() -> None:
+    s = Settings(_env_file=None, master={"chains_dismissed": ["0001769628"]})
+    assert s.master.chains_dismissed == ["0001769628"]
+    with pytest.raises(ValidationError, match=r"chains_dismissed"):
+        Settings(_env_file=None, master={"chains_dismissed": ["not an id"]})
+
+
 def test_alpaca_accepted_relistings_defaults_empty() -> None:
     """#943: every span stays under the #847 stopped-line cut unless the owner lists it."""
     assert _settings().alpaca.accepted_relistings == []

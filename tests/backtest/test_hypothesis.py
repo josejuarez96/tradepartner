@@ -645,6 +645,10 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "strategy.signal_delay_sessions",
             "strategy.placebo",
             "strategy.placebo_seed",
+            "master.chains",
+            "master.chains_dismissed",
+            "master.chain_window_sessions",
+            "master.chain_max_price_ratio",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1326,6 +1330,10 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
+        "master.chains",
+        "master.chains_dismissed",
+        "master.chain_window_sessions",
+        "master.chain_max_price_ratio",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1685,11 +1693,11 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
     conn: duckdb.DuckDBPyConnection, settings: Settings, recorded: list[dict[str, Any]]
 ) -> None:
     """H1 stored without the three keys: `hypothesis register` on its unchanged file
-    returns that record (the three are a suffix of the table at their defaults)."""
+    returns that record (the three are a suffix of the table at their defaults; a
+    registration from before them also predates T187's later chain keys)."""
     parsed = hypothesis.parse_file(H1_FILE)
-    params = {
-        k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in COST_TERMS
-    }
+    later = {*COST_TERMS, *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain"))}
+    params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
         conn,
         slug=parsed.slug,
