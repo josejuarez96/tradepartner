@@ -70,6 +70,8 @@ MAIN_REF = "origin/main"
 SHARED_FILES = ("docs/STATUS.md", "CHANGELOG.md")
 BULLET_RE = re.compile(r"^- \S")
 UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.*)$", re.MULTILINE)
+# The PR template's reviewer line, the only box ready_pr ticks itself (#1823).
+REVIEWER_BOX_PREFIX = "The reviewers `scripts/ready_pr.py` requires"
 CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
 BRANCH_ISSUE_RE = re.compile(r"^[a-z]+/(\d+)-")
 CONFLICT_RE = re.compile(
@@ -366,17 +368,20 @@ def tick_reviewer_boxes(
                 reviewed_at[agent] = sha.group(1)
             else:
                 reviewed_at.pop(agent, None)
-    boxes = list(UNCHECKED_RE.finditer(body))
-
-    def is_review_box(label: str) -> bool:
-        return bool(
-            re.search(r"\b(?:quant-auditor|safety-reviewer|reviewers?)\b", label, re.IGNORECASE)
-            and re.search(r"\b(?:ran|run|pass|verdict|required)\b", label, re.IGNORECASE)
-        )
-
-    other = [m.group(1).strip() for m in boxes if not is_review_box(m.group(1))]
-    if not any(is_review_box(m.group(1)) for m in boxes):
-        return body, other, [], [], reviewed_at
+    # Only boxes outside fenced code blocks count, and only the template's own reviewer
+    # line is ticked, and only when exactly one such line is unticked (#1823).
+    lines = body.splitlines(keepends=True)
+    boxes: dict[int, str] = {}
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
+            boxes[i] = m.group(1).strip()
+    review = [i for i, label in boxes.items() if label.startswith(REVIEWER_BOX_PREFIX)]
+    if len(review) != 1:
+        return body, list(boxes.values()), [], [], reviewed_at
+    other = [label for i, label in boxes.items() if i != review[0]]
     missing_sha = sorted(required - reviewed_at.keys())
     if missing_sha:
         return body, other, [], missing_sha, reviewed_at
@@ -385,18 +390,11 @@ def tick_reviewer_boxes(
         if required
         else "n/a, none required"
     )
-    ticked: list[str] = []
-
-    def replace(match: re.Match[str]) -> str:
-        if not is_review_box(match.group(1)):
-            return match.group(0)
-        original = match.group(0)
-        ending = "\r" if original.endswith("\r") else ""
-        line = original.removesuffix("\r").replace("- [ ]", "- [x]", 1) + "; " + suffix + ending
-        ticked.append(line)
-        return line
-
-    return UNCHECKED_RE.sub(replace, body), other, ticked, [], reviewed_at
+    original = lines[review[0]]
+    text = original.rstrip("\r\n")
+    ending = original[len(text) :]
+    lines[review[0]] = text.replace("- [ ]", "- [x]", 1) + "; " + suffix + ending
+    return "".join(lines), other, [lines[review[0]].rstrip("\r\n")], [], reviewed_at
 
 
 def matrix_base(name: str) -> str:
@@ -755,7 +753,13 @@ def ready(
             if not r.git_ok(
                 "merge-base", "--is-ancestor", sha, "HEAD"
             ) or agent in required_reviews(
-                r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines()
+                [
+                    path
+                    for path in r.git(
+                        "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
+                    ).splitlines()
+                    if path in touched  # the PR's own changes; a main merge is not one
+                ]
             ):
                 raise ReadyError(
                     f"{agent} review no longer covers the current head; rerun it before "
