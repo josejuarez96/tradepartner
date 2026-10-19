@@ -249,6 +249,43 @@ class Side(StrEnum):
     SELL = "sell"
 
 
+class PositionIntent(StrEnum):
+    """What an order does to a position (ADR 0015 seam 2; Alpaca's spelling):
+    a buy opens a long or covers a short, a sell closes a long or opens a
+    short. Sent on every order, so the broker never infers a short from an
+    oversell."""
+
+    BUY_TO_OPEN = "buy_to_open"
+    SELL_TO_CLOSE = "sell_to_close"
+    SELL_TO_OPEN = "sell_to_open"
+    BUY_TO_CLOSE = "buy_to_close"
+
+
+_INTENT_SIDE: dict[PositionIntent, Side] = {
+    PositionIntent.BUY_TO_OPEN: Side.BUY,
+    PositionIntent.BUY_TO_CLOSE: Side.BUY,
+    PositionIntent.SELL_TO_OPEN: Side.SELL,
+    PositionIntent.SELL_TO_CLOSE: Side.SELL,
+}
+
+
+def _resolve_intent(value: PositionIntent | None, side: Side) -> PositionIntent:
+    """The request's intent: the long intent of `side` when `value` is `None`
+    (buy opens, sell closes), else `value` coerced to a `PositionIntent`.
+    Raises `ValueError` naming `position_intent` for a value outside the four
+    or one that disagrees with `side`."""
+    if value is None:
+        return PositionIntent.BUY_TO_OPEN if side is Side.BUY else PositionIntent.SELL_TO_CLOSE
+    try:
+        intent = PositionIntent(value)
+    except ValueError as exc:
+        allowed = [member.value for member in PositionIntent]
+        raise ValueError(f"position_intent must be one of {allowed}, got {value!r}") from exc
+    if _INTENT_SIDE[intent] is not side:
+        raise ValueError(f"position_intent {intent.value!r} does not match side {side.value!r}")
+    return intent
+
+
 class OrderStatus(StrEnum):
     """The broker's view of an order (spec req 1). A partial fill is
     `ACCEPTED` with `filled_quantity > 0`."""
@@ -293,6 +330,9 @@ class OrderRequest:
     side: Side
     notional: float | None = None
     quantity: float | None = None
+    #: Defaults from the side (buy -> `buy_to_open`, sell -> `sell_to_close`);
+    #: always a `PositionIntent` once built, checked against `side`.
+    position_intent: PositionIntent = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         notional, quantity = _validate_size(self.notional, self.quantity)
@@ -302,7 +342,9 @@ class OrderRequest:
             _validate_identifier(self.client_order_id, field_name="client_order_id"),
         )
         object.__setattr__(self, "symbol", canonical_symbol(self.symbol))
-        object.__setattr__(self, "side", _coerce_side(self.side))
+        side = _coerce_side(self.side)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "position_intent", _resolve_intent(self.position_intent, side))
         object.__setattr__(self, "notional", notional)
         object.__setattr__(self, "quantity", quantity)
 
@@ -586,6 +628,15 @@ class Broker(abc.ABC):
     Instantiating this class directly raises `TypeError` (it declares
     abstract methods). It has no clock member (ADR 0007 point 5).
     """
+
+    @property
+    def paper(self) -> bool:
+        """`True` only for a paper broker (paper spec amendment 2026-10-19,
+        item 1): the risk wrapper reads it to allow a short on paper alone.
+        `False` by default, so a new implementation is live until it says
+        otherwise. A property, not an abstract method: the wrapper's
+        per-method allowlists are keyed by the abstract methods."""
+        return False
 
     @abc.abstractmethod
     def submit(self, request: OrderRequest) -> Order:

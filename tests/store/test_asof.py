@@ -2147,3 +2147,43 @@ def test_spinoff_row_does_not_change_existing_action_consumers(
     assert all(a.equals(b) for a, b in zip(present, absent, strict=True))
     assert universe_present.members.equals(universe_absent.members)
     assert universe_present.exclusions.equals(universe_absent.exclusions)
+
+
+def test_spinoff_row_moves_only_the_flagged_read_and_only_the_parents_pre_ex_sessions(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """With `include_spin_offs=True` (#1894) the frame differs from the row-deleted frame
+    only on the parent's sessions before the ex-date, by 1 - r * C / P (the pin above holds
+    at the defaults)."""
+    t = datetime(2020, 1, 2, 21, tzinfo=UTC)
+    settings = Settings(_env_file=None)
+    parent, child, ex_date = "SEC_TICKCHANGE", "SEC_SPLIT_PLAIN", date(2018, 12, 13)
+    # r = 0.25; the child's raw close on E is 51.23 and the parent's prior close 17.48.
+    factor = 1.0 - 0.25 * 51.23 / 17.48
+
+    def read() -> pl.DataFrame:
+        return adjusted_prices_as_of(
+            fixture_store, t, settings=settings, include_dividends=True, include_spin_offs=True
+        )
+
+    flagged = read()
+    default = adjusted_prices_as_of(fixture_store, t, settings=settings, include_dividends=True)
+    fixture_store.execute("DELETE FROM corporate_actions WHERE action_type = 'spinoff'")
+    deleted = read()
+    assert default.equals(deleted)
+    prices = ["open", "high", "low", "close"]
+    joined = flagged.join(deleted, on=["security_id", "session"], suffix="_d")
+    moved = joined.filter(pl.any_horizontal(pl.col(c).ne(pl.col(f"{c}_d")) for c in prices)).select(
+        "security_id", "session"
+    )
+    want = deleted.filter((pl.col("security_id") == parent) & (pl.col("session") < ex_date))
+    assert (
+        moved.sort("session").rows() == want.select("security_id", "session").sort("session").rows()
+    )
+    assert moved.height > 0
+    for col in prices:
+        ratios = joined.filter(
+            (pl.col("security_id") == parent) & (pl.col("session") < ex_date)
+        ).select((pl.col(col) / pl.col(f"{col}_d")).alias("r"))["r"]
+        assert all(abs(r - factor) < 1e-9 for r in ratios)
+    assert child != parent

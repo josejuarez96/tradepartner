@@ -131,3 +131,29 @@ def test_a_datetime_bound_is_refused(fixture_store: duckdb.DuckDBPyConnection) -
             IDS,
             sessions_from=datetime(2019, 1, 7, tzinfo=UTC),
         )
+
+
+@pytest.mark.parametrize("t", CUTOFFS)
+def test_the_spin_off_flag_keeps_the_bound_a_pure_row_filter(
+    fixture_store: duckdb.DuckDBPyConnection, t: datetime
+) -> None:
+    """`include_spin_offs=True` composes with `sessions_from` and `traded_only` (#1894):
+    the factors are computed over the unbounded history, then rows are cut."""
+    ids = [*IDS, "SEC_TICKCHANGE", "SEC_SPLIT_PLAIN"]
+    kwargs = {"include_dividends": True, "include_spin_offs": True, "traded_only": True}
+    unbounded = adjusted_prices_as_of(fixture_store, t, ids, **kwargs)  # type: ignore[arg-type]
+    bound = date(2019, 1, 7)
+    bounded = adjusted_prices_as_of(
+        fixture_store,
+        t,
+        ids,
+        sessions_from=bound,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert bounded.equals(unbounded.filter(pl.col("session") >= bound))
+    # The flag at its default is the plain total-return read.
+    assert adjusted_prices_as_of(fixture_store, t, ids, include_dividends=True).equals(
+        adjusted_prices_as_of(
+            fixture_store, t, ids, include_dividends=True, include_spin_offs=False
+        )
+    )

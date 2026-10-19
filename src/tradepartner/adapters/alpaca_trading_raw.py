@@ -41,7 +41,7 @@ import requests
 from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderSide, PositionIntent, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, OrderRequest
 from pydantic import SecretStr
 from requests.adapters import HTTPAdapter
@@ -249,10 +249,13 @@ def market_day_order(
     *,
     notional: float | None,
     qty: float | None,
+    position_intent: str | None = None,
 ) -> OrderRequest:
     """The one order shape the adapter sends (spec req 2, ADR 0015 seam 3): a
-    market DAY order by `notional` or `qty`. Built here because only this module
-    may import `alpaca.trading.requests` (#296); `side` is `"buy"` or `"sell"`."""
+    market DAY order by `notional` or `qty`, with its `position_intent` (T226;
+    omitted when `None`: `AlpacaBroker` always names one).
+    Built here because only this module may import `alpaca.trading.requests`
+    (#296); `side` is `"buy"` or `"sell"`."""
     return MarketOrderRequest(
         symbol=symbol,
         side=OrderSide(side),
@@ -260,6 +263,7 @@ def market_day_order(
         client_order_id=client_order_id,
         notional=notional,
         qty=qty,
+        position_intent=None if position_intent is None else PositionIntent(position_intent),
     )
 
 
