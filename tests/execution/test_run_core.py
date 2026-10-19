@@ -27,20 +27,26 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
 import pytest
+from alpaca.common.exceptions import APIError
 
 from tradepartner.adapters.broker import OrderRequest, Side
 from tradepartner.adapters.fake_broker import FakeBroker, PartialFill, Reject
 from tradepartner.backtest.hypothesis import frozen_params_of
 from tradepartner.config import FROZEN_COSTS_KEYS, CostsConfig, RiskConfig, Settings
 from tradepartner.errors import (
+    AcknowledgementTimeoutError,
     ClockError,
+    KillSwitchEngagedError,
+    LimitBreachError,
     ReconciliationError,
     RejectionCapError,
     StaleDataError,
+    UniverseCollapseError,
 )
 from tradepartner.execution import alerts as alerts_module
 from tradepartner.execution import run as run_module
@@ -54,6 +60,7 @@ from tradepartner.execution.run import (
     open_books,
     tracking_run,
 )
+from tradepartner.execution.wrapper import Verdict, classify
 from tradepartner.store import registry
 from tradepartner.store.db import open_for_write, open_read_only
 from tradepartner.store.journal import (
@@ -905,6 +912,173 @@ def test_a_pending_order_does_not_hide_an_unrelated_mismatch(env: Env) -> None:
     assert env.query("SELECT status FROM reconciliations WHERE run_id = ?", [run_id]) == [
         ("mismatch",)
     ]
+
+
+# --- step 3: the read-back of a `pending_unresolved` order (#1841, T202b) --------------------
+#
+# Paper spec amendment 2026-10-18 item 4 (c): before collecting, step 3 reads back every
+# `pending_unresolved` order by `client_order_id`. Known: its acknowledgement, events and
+# fills journaled as any order's; unknown: `cancelled` with reason `not_received`; a read
+# failure or a broker order the journal cannot map: `ReconciliationError`, before step 4.
+
+UNRESOLVED = "tp-unres"
+
+
+def _unresolved(env: Env) -> PaperWindowRow:
+    """The mark window and Monday's `ok` run, whose acknowledgement timeout left
+    `tp-unres` (a 1-share SPY buy, never acknowledged) `pending_unresolved`."""
+    window = _marked(env)
+    earlier = env.past_run(window, _at(MON))
+    env.order(earlier, UNRESOLVED, _at(MON), submit=False)
+    stamp = _at(MON) + timedelta(seconds=30)
+    env.append(
+        OrderEventRow(
+            client_order_id=UNRESOLVED,
+            status="pending_unresolved",
+            known_at=stamp,
+            ingested_at=stamp,
+        )
+    )
+    return window
+
+
+def _unresolved_events(env: Env) -> list[tuple[str, str | None]]:
+    return [
+        (status, reason)
+        for status, reason in env.query(
+            "SELECT status, reason FROM order_events WHERE client_order_id = ? "
+            "ORDER BY known_at, rowid",
+            [UNRESOLVED],
+        )
+    ]
+
+
+def test_step_3_acknowledges_and_collects_an_unresolved_order_the_broker_knows(
+    env: Env, exits_done: list[object]
+) -> None:
+    """The broker got the order after Monday's run gave up on it and filled it:
+    Tuesday's step 3 journals its `accepted` event (the broker's order id), its
+    one fill and its terminal event, so both reconciliations are `ok` (cash
+    100,000 - 1 x 100 on both sides) and the run is `ok`, never engaged."""
+    _unresolved(env)
+    env.clock.now = _at(MON, 14)
+    placed = env.fake.submit(OrderRequest(UNRESOLVED, "SPY", Side.BUY, quantity=1.0))
+    env.fake.simulate_fill(UNRESOLVED)
+    outcome = env.run(_at(TUE))
+    assert outcome.status == "ok", env.results()
+    assert [status for status, _ in _unresolved_events(env)] == [
+        "pending",
+        "pending_unresolved",
+        "accepted",
+        "filled",
+    ]
+    assert env.query(
+        "SELECT broker_order_id FROM order_events WHERE client_order_id = ? "
+        "AND status = 'accepted'",
+        [UNRESOLVED],
+    ) == [(placed.broker_order_id,)]
+    assert env.query(
+        "SELECT quantity, price FROM fills WHERE client_order_id = ?", [UNRESOLVED]
+    ) == [(1.0, PRICE)]
+    assert env.query(
+        "SELECT status FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id",
+        [outcome.run_id],
+    ) == [("ok",), ("ok",)]
+    assert env.engaged() == []
+
+
+def test_step_3_cancels_an_unresolved_order_the_broker_never_got_not_received(
+    env: Env, exits_done: list[object]
+) -> None:
+    _unresolved(env)
+    outcome = env.run(_at(TUE))
+    assert outcome.status == "ok", env.results()
+    assert _unresolved_events(env) == [
+        ("pending", None),
+        ("pending_unresolved", None),
+        ("cancelled", "not_received"),
+    ]
+    assert env.query(
+        "SELECT status FROM reconciliations WHERE run_id = ? ORDER BY reconciliation_id",
+        [outcome.run_id],
+    ) == [("ok",), ("ok",)]
+    assert env.count("fills") == 0
+    assert env.engaged() == []
+
+
+def _read_fault(status: int) -> APIError:
+    return APIError(
+        '{"code":40310000,"message":"forbidden"}',
+        SimpleNamespace(response=SimpleNamespace(status_code=status)),
+    )
+
+
+@pytest.mark.parametrize("broker_state", ["read_fails", "unmappable"])
+def test_an_unresolved_order_the_read_back_cannot_settle_halts_before_step_4(
+    env: Env, exits_done: list[object], broker_state: str
+) -> None:
+    """A read that fails (an unretryable 403 on `get_order`), or a broker order under
+    the id that is not the journal's (DUALB, not SPY: the fields the replay
+    compares), is a `ReconciliationError`: the run halts before its step 4 writes
+    a reconciliation, the order stays unsettled, the switch engages."""
+    _unresolved(env)
+    if broker_state == "read_fails":
+        env.fake.script_call_fault("get_order", _read_fault(403))
+    else:
+        env.clock.now = _at(MON, 14)
+        env.fake.submit(OrderRequest(UNRESOLVED, "DUALB", Side.BUY, quantity=1.0))
+    with pytest.raises(ReconciliationError):
+        env.run(_at(TUE))
+    run_id = env.latest_run()
+    assert env.results()[run_id][:2] == ("halted", "ReconciliationError")
+    assert _unresolved_events(env) == [("pending", None), ("pending_unresolved", None)]
+    assert (
+        env.query(
+            "SELECT status FROM reconciliations WHERE run_id = ? "
+            "AND status IN ('ok', 'pending_unresolved')",
+            [run_id],
+        )
+        == []
+    )
+    assert env.engaged() == [("fault", "ReconciliationError", run_id, None)]
+    assert ("reconciliation", run_id, TUE) in env.alerts()
+    assert len(exits_done) == 0
+
+
+def test_a_settled_unresolved_order_does_not_hide_an_unrelated_mismatch(env: Env) -> None:
+    """Item 4's "the integrity faults still halt": the read-back settles the order,
+    then step 4 meets a foreign order and halts with `ReconciliationError`."""
+    _unresolved(env)
+    env.fake.submit(OrderRequest("owner-1", "SPY", Side.BUY, quantity=1.0))  # foreign
+    with pytest.raises(ReconciliationError):
+        env.run(_at(TUE))
+    run_id = env.latest_run()
+    assert env.results()[run_id][:2] == ("halted", "ReconciliationError")
+    assert _unresolved_events(env)[-1] == ("cancelled", "not_received")
+    assert env.query("SELECT status FROM reconciliations WHERE run_id = ?", [run_id]) == [
+        ("mismatch",)
+    ]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ReconciliationError,
+        LimitBreachError,
+        ClockError,
+        KillSwitchEngagedError,
+        UniverseCollapseError,
+        AcknowledgementTimeoutError,
+    ],
+)
+@pytest.mark.parametrize("method", ["submit", "get_order"])
+def test_the_five_integrity_faults_and_a_second_timeout_still_halt(
+    fault: type[Exception], method: str
+) -> None:
+    """Item 4 tolerates one acknowledgement timeout per run and nothing else: the
+    five integrity faults, and `AcknowledgementTimeoutError` itself (the second
+    timeout's), are still halts on the order path (a regression pin)."""
+    assert classify(method, fault("x")) is Verdict.HALT
 
 
 # --- steps 5 to 9 ----------------------------------------------------------------------------

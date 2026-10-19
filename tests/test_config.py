@@ -1957,6 +1957,29 @@ def test_paper_poll_interval_never_above_accept_wait() -> None:
     assert Settings(_env_file=None, paper=equal).paper.poll_interval_seconds == pytest.approx(30.0)
 
 
+def test_paper_accept_wait_max_defaults_to_300_and_is_live() -> None:
+    """Paper spec amendment 2026-10-18 items 4 and 11 (T202b): the longer
+    acknowledgement poll's bound, default 300 s, read at run time (never frozen)."""
+    p = _settings().paper
+    assert p.accept_wait_max_seconds == pytest.approx(300.0)
+    assert "accept_wait_max_seconds" not in FROZEN_PAPER_KEYS
+
+
+def test_paper_accept_wait_max_never_below_accept_wait() -> None:
+    """Item 4: `paper.accept_wait_max_seconds` is validated >= `accept_wait_seconds`;
+    equal is the old single deadline, and below it names the key (an accept wait
+    of 301 s is above the default bound of 300 s)."""
+    with pytest.raises(ValidationError, match="accept_wait_max_seconds"):
+        Settings(
+            _env_file=None, paper={"accept_wait_seconds": 30.0, "accept_wait_max_seconds": 29.5}
+        )
+    with pytest.raises(ValidationError, match="accept_wait_max_seconds"):
+        Settings(_env_file=None, paper={"accept_wait_seconds": 301.0})
+    equal = {"accept_wait_seconds": 30.0, "accept_wait_max_seconds": 30.0}
+    paper = Settings(_env_file=None, paper=equal).paper
+    assert paper.accept_wait_max_seconds == pytest.approx(30.0)
+
+
 @pytest.mark.parametrize(
     "override",
     [

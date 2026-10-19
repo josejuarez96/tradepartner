@@ -32,6 +32,7 @@ from tradepartner.store.journal import (
     FillRow,
     JournalIntegrityError,
     JournalNotInitialised,
+    OrderEventRow,
     OrderRow,
     PaperRunRow,
     ReconciliationRow,
@@ -554,3 +555,48 @@ def test_a_fills_limit_still_fails_closed_on_an_orphan_past_the_limit(
         _fill(seeded, "a", f"bf-a-{i}")
     with pytest.raises(JournalIntegrityError, match=r"nobody.*orders row"):
         fills_for(seeded, window_id=window_id, limit=1)
+
+
+# --- `pending_unresolved` (#1841, T202b; paper spec amendment 2026-10-18 item 4) -------
+
+
+def _event(
+    conn: duckdb.DuckDBPyConnection, coid: str, status: str, minute: int, **values: Any
+) -> None:
+    stamp = _NOW + timedelta(minutes=minute)
+    append(
+        conn,
+        OrderEventRow(
+            client_order_id=coid, status=status, known_at=stamp, ingested_at=stamp, **values
+        ),
+    )
+
+
+def test_pending_unresolved_is_neither_terminal_nor_acknowledged() -> None:
+    """Item 4: the order the acknowledgement timeout leaves is still unknown to the
+    journal, so it is open and unacknowledged until the read-back settles it."""
+    assert "pending_unresolved" in schema.JOURNAL_ENUMS["order_events", "status"]
+    assert "pending_unresolved" not in journal.TERMINAL_ORDER_STATUSES
+    assert "pending_unresolved" not in journal.ACKNOWLEDGED_ORDER_STATUSES
+
+
+def test_a_pending_unresolved_order_is_pending_and_open_until_the_read_back(
+    seeded: duckdb.DuckDBPyConnection,
+) -> None:
+    """`a` (pending, then pending_unresolved) is in both readers, so `paper resume`
+    (which settles every pending order) settles it; `b`'s read-back found it
+    (`accepted`, then `filled`) and `c`'s did not (`cancelled`, `not_received`)."""
+    for coid in ("a", "b", "c"):
+        _event(seeded, coid, "pending", 0)
+        _event(seeded, coid, "pending_unresolved", 5)
+    _event(seeded, "b", "accepted", 10, broker_order_id="broker-b")
+    _event(seeded, "c", "cancelled", 10, reason="not_received")
+    pending = [o.client_order_id for o in journal.pending_orders(seeded, window_id=None)]
+    open_ = [o.client_order_id for o in journal.non_terminal_orders(seeded, window_id=None)]
+    assert pending == ["a"]
+    assert open_ == ["a", "b"]
+    assert [o.client_order_id for o in journal.pending_orders(seeded, window_id=1)] == ["a"]
+    statuses = [
+        e.status for e in journal.order_events_for(seeded, window_id=1, client_order_ids=["a"])
+    ]
+    assert statuses == ["pending", "pending_unresolved"]

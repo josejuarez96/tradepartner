@@ -591,6 +591,182 @@ def test_read_only_open_of_a_version_28_store_passes(tmp_path: Path) -> None:
         assert conn.execute("SELECT count(*) FROM order_events").fetchone()[0] == 4
 
 
+# --- `order_events.status` gains `pending_unresolved` (#1841, T202b) -----------------
+#
+# Paper spec amendment 2026-10-18 items 4 and 11: one additive schema version, the
+# next free number at merge (the plan line's "version 30, or the next free number"),
+# so every pin below is relative to `schema._PRE_PENDING_UNRESOLVED_VERSION`, the
+# last version without the status, and to `schema.CURRENT_SCHEMA_VERSION`.
+
+#: The status set before T202b, in its stored order.
+_PRE_T202B_STATUSES = (
+    "pending",
+    "accepted",
+    "replay",
+    "cancel_requested",
+    "cancel_noop",
+    "cancel_failed",
+    "filled",
+    "expired",
+    "rejected",
+    "cancelled",
+)
+_STATUS_CHECK = re.compile(r"CHECK\(\(status IN \([^)]*\)\)\)")
+
+
+def _rebuild_with_statuses(conn: duckdb.DuckDBPyConnection, statuses: tuple[str, ...]) -> None:
+    """Rebuild `order_events` from its live `CREATE TABLE` with the status `CHECK`
+    set to exactly `statuses`, every row kept in insertion order."""
+    ddl = _ddl(conn, "order_events")
+    allowed = ", ".join(f"'{status}'" for status in statuses)
+    narrowed, count = _STATUS_CHECK.subn(f"CHECK((status IN ({allowed})))", ddl)
+    assert count == 1, ddl
+    conn.execute(
+        narrowed.replace("CREATE TABLE order_events(", "CREATE TABLE order_events_pre(", 1)
+    )
+    conn.execute("INSERT INTO order_events_pre BY NAME SELECT * FROM order_events ORDER BY rowid")
+    conn.execute("DROP TABLE order_events")
+    conn.execute("ALTER TABLE order_events_pre RENAME TO order_events")
+
+
+def _pre_pending_unresolved_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as the version before T202b left it: every table at the current
+    shape but `order_events` with the version's status `CHECK` (no
+    `pending_unresolved`), its one `schema_version` row at that version, and four
+    events inserted out of key order with tied `known_at` stamps."""
+    schema.init_schema(conn)
+    _rebuild_with_statuses(conn, _PRE_T202B_STATUSES)
+    conn.execute("UPDATE schema_version SET version = ?", [schema._PRE_PENDING_UNRESOLVED_VERSION])
+    rows: list[tuple[object, ...]] = [
+        ("tp-9", "pending", None, _NOW),
+        ("tp-9", "accepted", None, _NOW),
+        ("tp-2", "pending", None, _NOW),
+        ("tp-2", "cancelled", "not_received", _LATER),
+    ]
+    for coid, status, reason, known_at in rows:
+        conn.execute(
+            "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [coid, status, reason, known_at, known_at],
+        )
+
+
+def _insert_status(conn: duckdb.DuckDBPyConnection, status: str) -> None:
+    conn.execute(
+        "INSERT INTO order_events (client_order_id, status, known_at, ingested_at) "
+        "VALUES ('tp-99', ?, ?, ?)",
+        [status, _LATER, _LATER],
+    )
+
+
+def test_order_event_statuses_gain_pending_unresolved_last() -> None:
+    """Item 11: `order_events.status` gains `pending_unresolved`, appended last, a
+    non-terminal, unacknowledged status; the version T202b takes is the next one."""
+    assert schema.JOURNAL_ENUMS["order_events", "status"] == (
+        *_PRE_T202B_STATUSES,
+        "pending_unresolved",
+    )
+    assert ("order_events", "status") not in schema.NULLABLE_JOURNAL_ENUMS
+    assert schema._PRE_PENDING_UNRESOLVED_VERSION >= 29
+    assert schema.CURRENT_SCHEMA_VERSION > schema._PRE_PENDING_UNRESOLVED_VERSION
+
+
+def test_the_schema_docstring_names_the_pending_unresolved_version() -> None:
+    """The plan line: the version is said in `schema.py`'s docstring ("Schema
+    versions"), naming the task and the status."""
+    version = schema._PRE_PENDING_UNRESOLVED_VERSION + 1
+    doc = schema.__doc__ or ""
+    match = re.search(rf"\*\*Version {version}\*\*(.*?)(?:\n\n|\Z)", doc, re.S)
+    assert match is not None, f"no **Version {version}** paragraph"
+    assert "T202b" in match.group(1)
+    assert "pending_unresolved" in match.group(1)
+
+
+def test_a_fresh_store_accepts_pending_unresolved_and_refuses_a_misspelling(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_status(journal, "pending_unresolved")
+    for misspelt in ("pending-unresolved", "unresolved", "Pending_Unresolved", ""):
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_status(journal, misspelt)
+
+
+def test_the_pre_pending_unresolved_helper_refuses_the_new_status() -> None:
+    """The helper's table really is the earlier version's."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _pre_pending_unresolved_store(conn)
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_status(conn, "pending_unresolved")
+    finally:
+        conn.close()
+
+
+def test_migrating_the_previous_version_widens_the_status_check_once_and_keeps_rows(
+    journal: duckdb.DuckDBPyConnection,
+) -> None:
+    """A write open of the version before T202b rebuilds `order_events` with the
+    widened status `CHECK`, every row kept in insertion order and byte-identical,
+    every other table untouched, and the version rows through the current one
+    appended. It must fail if the migration is a no-op or reorders rows."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _pre_pending_unresolved_store(conn)
+        others = tuple(sorted(_table_names(conn) - {"order_events", "schema_version"}))
+        before = _rows_in_insertion_order(conn, "order_events")
+        others_before = _snapshot(conn, others)
+
+        schema.init_schema(conn)
+
+        assert _rows_in_insertion_order(conn, "order_events") == before
+        assert [(row[0], row[2]) for row in before] == [
+            ("tp-9", "pending"),
+            ("tp-9", "accepted"),
+            ("tp-2", "pending"),
+            ("tp-2", "cancelled"),
+        ]
+        assert _snapshot(conn, others) == others_before
+        assert _versions(conn) == list(
+            range(schema._PRE_PENDING_UNRESOLVED_VERSION, schema.CURRENT_SCHEMA_VERSION + 1)
+        )
+        assert _ddl(conn, "order_events") == _ddl(journal, "order_events")
+        _insert_status(conn, "pending_unresolved")
+        with pytest.raises(duckdb.ConstraintException):
+            _insert_status(conn, "pending-unresolved")
+    finally:
+        conn.close()
+
+
+def test_the_previous_version_migrates_once_and_reopens_without_another_version_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pre_t202b.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _pre_pending_unresolved_store(conn)
+    expected = list(
+        range(schema._PRE_PENDING_UNRESOLVED_VERSION, schema.CURRENT_SCHEMA_VERSION + 1)
+    )
+    for _ in range(2):
+        with duckdb.connect(str(path)) as conn:
+            schema.init_schema(conn)
+            assert _versions(conn) == expected
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == expected
+
+
+def test_read_only_open_of_the_previous_version_passes(tmp_path: Path) -> None:
+    """No read depends on the status `CHECK`, so a read-only open (the
+    dashboard's) of a store no write has migrated yet passes and reads the table."""
+    path = tmp_path / "pre_t202b.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        _pre_pending_unresolved_store(conn)
+    with duckdb.connect(str(path), read_only=True) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn) == [schema._PRE_PENDING_UNRESOLVED_VERSION]
+        assert conn.execute("SELECT count(*) FROM order_events").fetchone()[0] == 4
+
+
 def test_the_expansion_seam_table_lists_agree() -> None:
     """`journal.require_journal`'s guard and `schema._migrate_expansion_seams`
     must name the same eight tables (plan T132)."""
