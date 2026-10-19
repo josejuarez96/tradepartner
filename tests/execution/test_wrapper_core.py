@@ -38,8 +38,11 @@ from tradepartner.adapters.fake_broker import (
 from tradepartner.cli import USAGE_ERROR
 from tradepartner.config import RiskConfig, Settings
 from tradepartner.errors import (
+    AssetNotFoundError,
+    AssetNotTradableError,
     ClockError,
     LimitBreachError,
+    NotFractionableError,
     ReconciliationError,
     RejectionCapError,
     SkipCapError,
@@ -285,10 +288,18 @@ def _halt(gate: RiskGatedBroker, fault: Exception, run: PaperRunRow, **kwargs: A
 # --- the allowlist ------------------------------------------------------------------
 
 
+#: The per-name refusals `submit` allows (paper spec amendment 2026-10-18 item 2,
+#: ADR 0023 D2, plan T202): asset not found, not fractionable, not tradable. Each
+#: is a skip on a buy only; the wrapper makes it a `ReconciliationError` on a sell.
+PER_NAME_REFUSALS = {AssetNotFoundError, NotFractionableError, AssetNotTradableError}
+
+
 def test_the_allowlist_constants_are_pinned() -> None:
-    """ADR 0007 point 1, ADR 0010 point 4: submit empty, cancel exactly
-    OrderNotOpenError, every other method empty; one constant per method."""
-    assert SUBMIT_ALLOWLIST == ()
+    """ADR 0007 point 1, ADR 0010 point 4, amended by ADR 0023 D2 (T202): submit
+    exactly the three per-name refusals, cancel exactly OrderNotOpenError, every
+    other method empty; one constant per method."""
+    assert len(SUBMIT_ALLOWLIST) == len(PER_NAME_REFUSALS)
+    assert set(SUBMIT_ALLOWLIST) == PER_NAME_REFUSALS
     assert (OrderNotOpenError,) == CANCEL_ALLOWLIST
     abstract = {
         name
@@ -297,7 +308,8 @@ def test_the_allowlist_constants_are_pinned() -> None:
     }
     assert set(ALLOWLISTS) == abstract
     for method, allowed in ALLOWLISTS.items():
-        assert allowed == (CANCEL_ALLOWLIST if method == "cancel" else ())
+        expected = {"cancel": CANCEL_ALLOWLIST, "submit": SUBMIT_ALLOWLIST}.get(method, ())
+        assert allowed == expected
     for name in (
         "GET_ORDER_ALLOWLIST",
         "OPEN_ORDERS_ALLOWLIST",
@@ -327,6 +339,12 @@ class _AllowedButSystemFault(SystemFaultError, OrderNotOpenError):
         ("submit", ClockError("x"), Verdict.HALT),
         ("submit", FakeTransportError("x"), Verdict.HALT),
         ("submit", DuplicateClientOrderIdError("x"), Verdict.HALT),
+        ("submit", AssetNotFoundError("x"), Verdict.ALLOWED),
+        ("submit", NotFractionableError("x"), Verdict.ALLOWED),
+        ("submit", AssetNotTradableError("x"), Verdict.ALLOWED),
+        ("cancel", AssetNotFoundError("x"), Verdict.HALT),
+        ("get_order", NotFractionableError("x"), Verdict.HALT),
+        ("assets", AssetNotTradableError("x"), Verdict.HALT),
         ("get_order", LocalFault("x"), Verdict.HALT),
         ("fills", StaleDataError("x"), Verdict.HALT),
         ("account", KeyboardInterrupt(), Verdict.PROPAGATE),
@@ -335,6 +353,14 @@ class _AllowedButSystemFault(SystemFaultError, OrderNotOpenError):
 )
 def test_classify(method: str, exc: BaseException, verdict: Verdict) -> None:
     assert classify(method, exc) is verdict
+
+
+@pytest.mark.parametrize("refusal", sorted(PER_NAME_REFUSALS, key=lambda c: c.__name__))
+def test_a_per_name_refusal_is_not_a_system_fault(refusal: type[Exception]) -> None:
+    """`classify` checks `SystemFaultError` first: a refusal under it could never
+    be allowed. None is a `ValueError` either (errors.py)."""
+    assert not issubclass(refusal, SystemFaultError)
+    assert not issubclass(refusal, ValueError)
 
 
 def test_classify_refuses_a_method_the_broker_lacks() -> None:

@@ -2068,6 +2068,8 @@ class RiskConfig(BaseModel):
     max_gross_exposure: float = Field(default=1.0, ge=0, le=1)
     max_orders_per_run: int = Field(default=250, gt=0)
     max_skips_per_run: int = Field(default=10, ge=0)
+    # T202 (ADR 0023 D2): the skip cap is max(max_skips_per_run, floor(share x decisions)).
+    max_skip_share: float = Field(default=0.10, ge=0, le=0.25)
     max_rejections_per_run: int = Field(default=5, ge=0)
     max_drawdown: float = Field(default=0.30, ge=0, le=1)
     min_order_notional: float = Field(default=1.0, ge=0)

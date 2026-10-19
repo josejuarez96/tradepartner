@@ -20,9 +20,12 @@ from __future__ import annotations
 
 __all__ = [
     "AcknowledgementTimeoutError",
+    "AssetNotFoundError",
+    "AssetNotTradableError",
     "ClockError",
     "KillSwitchEngagedError",
     "LimitBreachError",
+    "NotFractionableError",
     "ReconciliationError",
     "RejectionCapError",
     "SkipCapError",
@@ -53,6 +56,22 @@ class RejectionCapError(SystemFaultError):
 
 class SkipCapError(SystemFaultError):
     """A run skipped more orders than its configured cap allows."""
+
+
+class AssetNotFoundError(Exception):
+    """The broker does not know the asset an order names (the submit allowlist,
+    spec amendment 2026-10-18 item 2, T202). A per-name refusal, never a system
+    fault and never a `ValueError`: the wrapper skips a buy and halts a sell."""
+
+
+class NotFractionableError(Exception):
+    """The broker refused a fractional order for an asset that is not
+    fractionable (the submit allowlist, T202). Per name; see `AssetNotFoundError`."""
+
+
+class AssetNotTradableError(Exception):
+    """The broker refused an order for an asset that is not tradable (the submit
+    allowlist, T202). Per name; see `AssetNotFoundError`."""
 
 
 class KillSwitchEngagedError(SystemFaultError):

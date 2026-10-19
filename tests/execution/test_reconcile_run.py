@@ -966,6 +966,43 @@ def test_frozen_risk_refuses_anything_but_the_whole_dotted_section(frozen_json: 
         frozen_risk(_window_with(frozen_json))
 
 
+def _todays_risk_keys_without(*dropped: str) -> dict[str, object]:
+    """Every `risk.*` key of `FROZEN` but `dropped`, dotted, as `paper start` freezes them."""
+    return {f"risk.{k}": v for k, v in FROZEN.model_dump(mode="json").items() if k not in dropped}
+
+
+def test_frozen_risk_reads_a_window_frozen_before_max_skip_share_as_zero() -> None:
+    """Paper spec amendment 2026-10-18 item 3 (T202, #1808): the two open windows
+    froze today's keys and no `risk.max_skip_share`; `frozen_risk` reads it as 0,
+    so max(`max_skips_per_run`, 0) keeps their frozen absolute cap exactly, and
+    every other value is the frozen one."""
+    values = _todays_risk_keys_without("max_skip_share") | {
+        "risk.max_skips_per_run": 7,
+        "paper.tracking_k": 20,
+    }
+    frozen = frozen_risk(_window_with(json.dumps(values)))
+    assert frozen.max_skip_share == 0
+    assert frozen.max_skips_per_run == 7
+    assert frozen == FROZEN.model_copy(update={"max_skip_share": 0.0, "max_skips_per_run": 7})
+
+
+def test_frozen_risk_reads_a_frozen_max_skip_share_as_frozen() -> None:
+    """A window started after T202 froze the key: its value is read, never 0."""
+    values = _todays_risk_keys_without() | {"risk.max_skip_share": 0.2}
+    assert frozen_risk(_window_with(json.dumps(values))).max_skip_share == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize(
+    "missing", sorted(k for k in RiskConfig.model_fields if k != "max_skip_share")
+)
+def test_frozen_risk_still_refuses_a_window_lacking_any_other_risk_key(missing: str) -> None:
+    """The back-fill is for `risk.max_skip_share` alone: a `frozen_json` lacking
+    any other `RiskConfig` key still refuses, naming it."""
+    values = _todays_risk_keys_without(missing)
+    with pytest.raises(ValueError, match=f"window 7 frozen_json lacks risk keys.*{missing}"):
+        frozen_risk(_window_with(json.dumps(values)))
+
+
 def test_no_adapter_is_imported() -> None:
     module = Path(__file__).resolve().parents[2] / "src/tradepartner/execution/reconcile_run.py"
     source = module.read_text(encoding="utf-8")
