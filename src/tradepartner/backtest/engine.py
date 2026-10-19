@@ -45,6 +45,22 @@ that decided the exit: the value sold is the close already marked. It pays
 session on and the proceeds sit in cash.
 Exit notional and costs are added to the row's `turnover` and `cost_paid`.
 
+**Hold mode and the band** (backtest spec amendment #1731, T209b): under
+`strategy.weighting = "hold"` each cost level's book keeps the plan index at which every
+held name entered (`_Book.entries`) and `portfolio.hold_membership` decides, at each fill,
+who exits on session N (`hold_sessions` plans after entry) and who enters at
+`1 / hold_target_names` of equity; a live name is not traded and the rest is cash. The
+plan's `targets` are then the candidates (the top `hold_target_names` ranked names). Under
+either weighting `strategy.rebalance_band` leaves every name whose drift is inside the
+band alone (`portfolio.apply_rebalance_band`): such names are set aside, `apply_trades`
+trades only the rest (its targets rescaled to the whole equity), and a band of 0 with
+`equal` weighting takes no new path at all.
+
+**Cash accrual** (amendment #1731): under `backtest.cash_rate = "store"` the cash of each
+book grows by the session's `rf(s)` accrual (`riskfree`, over the frame read once at the
+data cutoff, before the first step) at every session after T_0: cash held to the fill
+accrues through F_i before the trade, exit proceeds from the session after theirs.
+
 **Read groups** (strategy-lab spec req 2, plan T105): `run_many` runs several
 variants that differ only in keys that change the computation, not the reads, in
 lockstep from one read set per step: each step's marking reads are made once for the
@@ -68,20 +84,33 @@ from __future__ import annotations
 import bisect
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Final, TypeVar, cast
 
 import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
-from tradepartner.backtest.fills import apply_trades
-from tradepartner.backtest.portfolio import target_weights
+from tradepartner.backtest.fills import FillResult, apply_trades
+from tradepartner.backtest.portfolio import (
+    _equal_weight,
+    _selected_count,
+    apply_rebalance_band,
+    drifted_weights,
+    hold_membership,
+    target_weights,
+)
 from tradepartner.backtest.provider import (
     TURNOVER_BAR_COLUMNS,
     DataProvider,
     GapReading,
     TurnoverInputs,
+)
+from tradepartner.backtest.riskfree import (
+    RiskFreeMissing,
+    published_by_session,
+    session_accruals,
+    to_yield,
 )
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.signals import anchor_sessions
@@ -97,6 +126,7 @@ from tradepartner.calendar import (
     last_completed_session,
     next_session,
     previous_session,
+    session_close,
 )
 from tradepartner.config import HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
@@ -197,6 +227,7 @@ class _Book:
     benchmarks: dict[str, _Holding] = field(default_factory=dict)
     held_on: dict[str, set[date]] = field(default_factory=dict)
     held_since: dict[str, date] = field(default_factory=dict)
+    entries: dict[str, int] = field(default_factory=dict)
     equity: list[EquityRow] = field(default_factory=list)
     rebalances: list[RebalanceRow] = field(default_factory=list)
     weights: list[WeightRow] = field(default_factory=list)
@@ -216,6 +247,50 @@ def _check_levels(cost_levels: Sequence[float]) -> list[float]:
 def _sessions(first: date, last: date) -> list[date]:
     sessions = all_sessions()
     return list(sessions[bisect.bisect_left(sessions, first) : bisect.bisect_right(sessions, last)])
+
+
+@dataclass(frozen=True)
+class _Construction:
+    """The portfolio-construction keys of the family's own section."""
+
+    weighting: str
+    top_fraction: float
+    band: float
+    hold_sessions: int
+    hold_target_names: int
+
+    def target_names(self, n_ranked: int) -> int:
+        """The names a hold-mode book aims to hold: `hold_target_names`, or the count
+        `top_fraction` selects when that is 0."""
+        return self.hold_target_names or _selected_count(n_ranked, self.top_fraction)
+
+
+def _construction(params: Settings, family: HypothesisFamily) -> _Construction:
+    section = getattr(params, signal_for(family).section)
+    return _Construction(
+        weighting=section.weighting,
+        top_fraction=section.top_fraction,
+        band=getattr(section, "rebalance_band", 0.0),
+        hold_sessions=getattr(section, "hold_sessions", 1),
+        hold_target_names=getattr(section, "hold_target_names", 0),
+    )
+
+
+def _ranked(scores: Mapping[str, float]) -> list[str]:
+    """Names by score descending, ties by `security_id` (as `target_weights` ranks)."""
+    return sorted(scores, key=lambda sid: (-scores[sid], sid))
+
+
+def _hold_candidates(scores: Mapping[str, float], construction: _Construction) -> dict[str, float]:
+    """A hold-mode plan's targets: the names it may enter, the top `target_names` ranked,
+    each at `1 / target_names`. Entries never go past that rank, because a live name
+    holds a slot and only the remaining slots fill from the best names not live."""
+    ranked = _ranked(scores)
+    count = construction.target_names(len(ranked))
+    if not ranked or count == 0:
+        return {}
+    weight = _equal_weight(count)
+    return {sid: weight for sid in sorted(ranked[:count])}
 
 
 def _plan(
@@ -240,10 +315,14 @@ def _plan(
     }
     no_history = exclusions.get("no_history", ())
     construction = getattr(params, strategy.section)
+    if construction.weighting == "hold":
+        targets = _hold_candidates(signal.scores, _construction(params, family))
+    else:
+        targets = target_weights(signal.scores, construction.top_fraction, construction.weighting)
     return Plan(
         session=session,
         fill_session=fill_session(session, cadence),
-        targets=target_weights(signal.scores, construction.top_fraction, construction.weighting),
+        targets=targets,
         n_universe=len(members),
         n_static_listings=provider.static_listing_count(t, members),
         n_excluded_no_history=len(no_history),
@@ -421,17 +500,125 @@ def _held_before(book: _Book, sid: str, ex_date: date) -> bool:
     return previous_session(ex_date) in book.held_on.get(sid, set())
 
 
+def _book_targets(
+    book: _Book,
+    plan: Plan,
+    index: int,
+    carried: Mapping[str, float],
+    cash: float,
+    construction: _Construction,
+) -> tuple[dict[str, float], set[str]]:
+    """The targets one book trades to at the plan's fill, and the names set aside.
+
+    Under `equal` weighting the targets are the plan's. Under `hold` the book's entry
+    sessions (`book.entries`, updated here) give the membership at plan `index`: an
+    entering name is targeted at `1 / target_names`, an exiting one is left out (sold
+    whole) and a live one is set aside at its current weight. With a band the targets
+    go through `apply_rebalance_band` against the drifted weights, and every name whose
+    effective weight is its current one is set aside too. A set-aside name is never
+    traded, which keeps an ulp-sized `target * equity - value` out of the orders."""
+    desired = dict(plan.targets)
+    aside: set[str] = set()
+    equity = math.fsum([cash, *carried.values()])
+    current = (
+        drifted_weights(carried, cash)
+        if equity > 0 and (construction.band > 0 or construction.weighting == "hold")
+        else {}
+    )
+    if construction.weighting == "hold":
+        ranked = _ranked(plan.scores)
+        membership = hold_membership(
+            ranked,
+            book.entries,
+            index,
+            construction.hold_sessions,
+            construction.hold_target_names,
+            construction.top_fraction,
+        )
+        book.entries = dict(membership.entries)
+        entering = set(membership.entering)
+        count = construction.target_names(len(ranked))
+        weight = _equal_weight(count) if count else 0.0
+        aside = {sid for sid in membership.held if sid not in entering and sid in current}
+        desired = {sid: weight for sid in membership.entering}
+        desired.update({sid: current[sid] for sid in aside})
+    if construction.band > 0 and current:
+        desired = apply_rebalance_band(desired, current, construction.band)
+        aside |= {sid for sid, weight in desired.items() if current.get(sid) == weight}
+    return desired, aside
+
+
+def _fill_to_targets(
+    carried: Mapping[str, float],
+    cash: float,
+    targets: Mapping[str, float],
+    aside: set[str],
+    frame: pl.DataFrame,
+    raw: pl.DataFrame,
+    plan: Plan,
+    book: _Book,
+    params: Settings,
+) -> FillResult:
+    """`apply_trades` towards `targets`, leaving the `aside` names untouched.
+
+    Without any, exactly the plain call. With some, only the other positions are traded
+    and their targets are rescaled from the whole equity to the part `apply_trades` sees
+    (`aside` excluded), so the orders are the same ones the whole book would place, the
+    turnover is over the whole equity, and the set-aside positions come back unchanged."""
+    fill_price = params.execution.fill_price
+    commissions = Commissions.from_config(params.costs)
+    if not aside:
+        return apply_trades(
+            carried,
+            cash,
+            targets,
+            frame,
+            raw,
+            plan.fill_session,
+            fill_price=fill_price,
+            per_side_bps=book.level,
+            commissions=commissions,
+        )
+    kept = {sid: value for sid, value in carried.items() if sid in aside}
+    traded = {sid: value for sid, value in carried.items() if sid not in aside}
+    part = math.fsum([cash, *traded.values()])
+    whole = math.fsum([cash, *carried.values()])
+    scale = whole / part if part > 0 else 1.0
+    fill = apply_trades(
+        traded,
+        cash,
+        {sid: weight * scale for sid, weight in targets.items() if sid not in aside},
+        frame,
+        raw,
+        plan.fill_session,
+        fill_price=fill_price,
+        per_side_bps=book.level,
+        commissions=commissions,
+    )
+    return replace(
+        fill,
+        positions={**fill.positions, **kept},
+        turnover=fill.turnover * part / whole if whole > 0 else 0.0,
+    )
+
+
 def _step(
     book: _Book,
     plan: Plan,
+    index: int,
     end: date,
     frame: pl.DataFrame,
     raw: pl.DataFrame,
     dividends: tuple[pl.DataFrame, pl.DataFrame],
     ended: dict[str, date | None],
     params: Settings,
+    construction: _Construction,
+    accruals: Mapping[date, float] | None,
 ) -> None:
-    """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}]."""
+    """Carry, fill, value and exit one cost level through the period (T_i, T_{i+1}].
+
+    `index` is the plan's place among the rebalance sessions (a hold-mode book's clock);
+    `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0."""
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -441,17 +628,12 @@ def _step(
         fill_price=fill_price,
         marked_at=book.marked_at,
     )
-    fill = apply_trades(
-        carried,
-        book.cash,
-        plan.targets,
-        frame,
-        raw,
-        plan.fill_session,
-        fill_price=fill_price,
-        per_side_bps=book.level,
-        commissions=Commissions.from_config(params.costs),
-    )
+    held_cash = book.cash
+    if accruals is not None:
+        for session in _sessions(plan.session, plan.fill_session)[1:]:
+            held_cash *= 1 + accruals[session]
+    targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
+    fill = _fill_to_targets(carried, held_cash, targets, aside, frame, raw, plan, book, params)
     values = value_positions(
         fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
     )
@@ -469,11 +651,13 @@ def _step(
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
     cash = fill.cash
     for session in _sessions(plan.fill_session, end):
+        if accruals is not None and session > plan.fill_session:
+            cash *= 1 + accruals[session]
         proceeds = [e.value - e.cost for e in exits if e.session == session]
         cash = math.fsum([cash, *proceeds])
         equity = math.fsum([cash, totals.get(session, 0.0)])
         book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, cash))
-    before = math.fsum([book.cash, *carried.values()])
+    before = math.fsum([held_cash, *carried.values()])
     exited = math.fsum(e.value for e in exits)
 
     dropped, late = dividends
@@ -503,10 +687,11 @@ def _step(
         for sid, marked in last.select("security_id", "marked_at").iter_rows()
         if sid in book.positions
     }
+    book.entries = {sid: entered for sid, entered in book.entries.items() if sid in book.positions}
     if book.keep_detail:
         book.values.append(values.select(list(_POSITION_SCHEMA)))
         fill_prices = {t.security_id: t.raw_fill_price for t in fill.trades}
-        for sid, weight in sorted(plan.targets.items()):
+        for sid, weight in sorted(targets.items()):
             raw_price = fill_prices.get(sid)
             if raw_price is None and sid not in fill.missing:
                 raw_price = _price_on(raw, sid, plan.fill_session, fill_price)
@@ -520,7 +705,7 @@ def _step(
             fill_session=plan.fill_session,
             n_universe=plan.n_universe,
             n_static_listings=plan.n_static_listings,
-            n_targets=len(plan.targets),
+            n_targets=len(targets),
             turnover=fill.turnover + (exited / (2 * before) if before > 0 else 0.0),
             cost_paid=math.fsum([fill.cost_paid, *(e.cost for e in exits)]),
             gap_count_share=plan.gap.count_share,
@@ -561,8 +746,9 @@ def run(
     `params` is the trial's frozen `Settings` (`hypothesis.load_frozen`, which reads the
     schedule keys through `frozen.frozen_values`). Raises `TypeError` without a
     `TrialHandle` (no id, no run; ADR 0005) and `ValueError` for fewer than two
-    rebalance sessions, a bad cost level or a non-zero `backtest.cash_rate` (interest on
-    cash is not implemented), all before any provider call.
+    rebalance sessions, a bad cost level, a numeric non-zero `backtest.cash_rate` or
+    `cash_rate = "store"` without `metrics.risk_free_source = "store"`
+    (`refused_cash_rate`), all before any provider call.
     """
     failure: Exception | None = None
     outcome = RunManyResults()
@@ -936,6 +1122,7 @@ class _Variant:
     last_stitched: dict[str, date] = field(default_factory=dict)
     targets: dict[date, Mapping[str, float]] = field(default_factory=dict)
     rates: pl.DataFrame | None = None
+    accruals: dict[date, float] | None = None
 
     @property
     def trial_id(self) -> int:
@@ -956,8 +1143,17 @@ def _check_variants(
     if len(set(ids)) != len(ids):
         raise ValueError(f"each variant needs its own trial, got trial ids {ids}")
     for params, _ in variants:
-        if params.backtest.cash_rate != 0:
-            raise ValueError("backtest.cash_rate other than 0 is not implemented")
+        cash_rate = params.backtest.cash_rate
+        if cash_rate == "store":
+            if params.metrics.risk_free_source != "store":
+                raise ValueError(
+                    "refused_cash_rate: backtest.cash_rate = 'store' needs "
+                    "metrics.risk_free_source = 'store' in the same file"
+                )
+        elif cash_rate != 0:
+            raise ValueError(
+                f"refused_cash_rate: backtest.cash_rate must be 0.0 or 'store', got {cash_rate}"
+            )
     cadences = {params.schedule.rebalance_cadence for params, _ in variants}
     if len(cadences) != 1:
         raise ValueError(f"a read group runs at one cadence, got {sorted(cadences)}")
@@ -1087,6 +1283,17 @@ def _run_group(
     """`run_many`'s loop over `group` (the module docstring's steps, in lockstep); a
     failed variant leaves `group` through `failed`."""
     cadence = group[0].settings.schedule.rebalance_cadence
+    # The one risk-free read, at the run's data cutoff and only under `store` (backtest
+    # spec, amendment 2026-10-11): `constant` never touches the provider's `rates`. A
+    # cash rate of `store` needs it before the first step, to accrue cash as it goes.
+    cutoff = read_time(sessions[-1], cadence)
+    read: dict[str, pl.DataFrame] = {}
+
+    def rates_for(series: str) -> pl.DataFrame:
+        if series not in read:
+            read[series] = view.rates(cutoff, series)
+        return read[series]
+
     plans = _plan_all(view, group, sessions[0], family, failed)
     if not group:
         return
@@ -1115,6 +1322,11 @@ def _run_group(
             )
             for name in benchmarks:
                 book.equity.append(EquityRow(name, book.level, sessions[0], capital, None))
+        if variant.settings.backtest.cash_rate == "store":
+            try:
+                variant.accruals = _cash_accruals(variant.settings, rates_for, sessions)
+            except RiskFreeMissing as exc:
+                failed(variant, exc)
 
     for index, step_end in enumerate(sessions[1:], start=1):
         if not group:
@@ -1139,23 +1351,39 @@ def _run_group(
         for variant in list(group):
             try:
                 _variant_step(
-                    view, variant, step_end, benchmarks, next_plans.get(variant.trial_id), family
+                    view,
+                    variant,
+                    index - 1,
+                    step_end,
+                    benchmarks,
+                    next_plans.get(variant.trial_id),
+                    family,
                 )
             except _ReadError:
                 raise
             except Exception as exc:
                 failed(variant, exc)
-    # The one risk-free read, at the run's data cutoff and only under `store` (backtest
-    # spec, amendment 2026-10-11): `constant` never touches the provider's `rates`.
-    cutoff = read_time(sessions[-1], cadence)
-    read: dict[str, pl.DataFrame] = {}
     for variant in group:
         metrics = variant.settings.metrics
         if metrics.risk_free_source == "store":
-            series = metrics.risk_free_series
-            if series not in read:
-                read[series] = view.rates(cutoff, series)
-            variant.rates = read[series]
+            variant.rates = rates_for(metrics.risk_free_series)
+
+
+def _cash_accruals(
+    params: Settings, rates_for: Callable[[str], pl.DataFrame], sessions: Sequence[date]
+) -> dict[date, float]:
+    """The accrual of each session after T_0 (`riskfree.session_accruals`) from the
+    frame read at the data cutoff, filtered to what was known at each session's close.
+    Raises `RiskFreeMissing` for the first session with no rate known at its close."""
+    metrics = params.metrics
+    series = metrics.risk_free_series
+    every = _sessions(sessions[0], sessions[-1])
+    rows = rates_for(series).filter(pl.col("series") == series)
+    published = published_by_session(
+        rows.select("known_at", "observation_date", "value").iter_rows(), every, session_close
+    )
+    yields = {s: to_yield(rate, metrics.risk_free_basis) for s, rate in published.items()}
+    return session_accruals(every, yields, series=series)
 
 
 def _marking_ids(
@@ -1208,13 +1436,15 @@ def _marking_bound(
 def _variant_step(
     view: _SharedReads,
     variant: _Variant,
+    index: int,
     step_end: date,
     benchmarks: Mapping[str, str],
     next_plan: Plan | None,
     family: HypothesisFamily,
 ) -> None:
     """One variant's step through `step_end` from the shared reads, restricted to its
-    own ids: carry, fill, value and exit every level, then take `next_plan`."""
+    own ids: carry, fill, value and exit every level, then take `next_plan`. `index` is
+    the current plan's place among the rebalance sessions."""
     plan = cast(Plan, variant.plan)
     params = variant.settings
     cadence = params.schedule.rebalance_cadence
@@ -1237,8 +1467,21 @@ def _variant_step(
     ):
         variant.last_stitched[sid] = session
     variant.targets[plan.fill_session] = dict(plan.targets)
+    construction = _construction(params, family)
     for book in variant.books:
-        _step(book, plan, step_end, frame, raw, (dropped, late), ended, params)
+        _step(
+            book,
+            plan,
+            index,
+            step_end,
+            frame,
+            raw,
+            (dropped, late),
+            ended,
+            params,
+            construction,
+            variant.accruals,
+        )
         _benchmark_step(book, plan, step_end, frame, raw, params)
     if next_plan is not None:
         variant.plan = next_plan

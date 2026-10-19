@@ -5,11 +5,6 @@ Locked tests (split trial, phase 1): written before the build, against the plan 
 Tests clause. The fixtures are `daily` with `close` fills, so the fill session F_i is
 T_{i+1} and a position's value at its fill session's close is its value after the trade;
 the hand values are at the 0 bp level unless a test says otherwise.
-
-`config.py` still refuses `strategy.weighting = "hold"` and a non-zero
-`strategy.rebalance_band` until T209b ("T209b removes this guard"), while T209b's Files
-do not list `config.py`; these tests therefore build their settings with `model_copy`,
-which skips that validator, so they exercise the engine alone.
 """
 
 from __future__ import annotations
@@ -88,10 +83,10 @@ def _settings(**sections: dict[str, Any]) -> Settings:
 
 
 def _with(settings: Settings, section: str, **updates: Any) -> Settings:
-    """`settings` with `section`'s fields replaced, skipping `config.py`'s validators
-    (the T209a guard on `hold` and the band; module docstring)."""
-    part = getattr(settings, section).model_copy(update=updates)
-    return settings.model_copy(update={section: part})
+    """`settings` with `section`'s fields replaced, validated as any construction is."""
+    values = settings.model_dump()
+    values[section] = {**values[section], **updates}
+    return Settings(_env_file=None, **values)
 
 
 def _run(

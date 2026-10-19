@@ -1235,8 +1235,7 @@ class StrategyConfig(BaseModel):
     amendment #1731). `hold_sessions`, `hold_target_names` and `rebalance_band` are
     post-registration own-section keys too, inert under the default `equal` weighting.
     `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
-    trades every non-zero drift, so every default reproduces today's behaviour. Until
-    T209b wires the engine, `hold` and a non-zero `rebalance_band` are refused.
+    trades every non-zero drift, so every default reproduces today's behaviour.
 
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
@@ -1265,23 +1264,6 @@ class StrategyConfig(BaseModel):
             raise ValueError(
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _refuse_hold_mode_until_wired(self) -> StrategyConfig:
-        """`hold` and a non-zero band load as keys but no build reads them yet, so until
-        T209b wires the engine a run would trade equal-weight targets while the row says
-        otherwise. T209b removes this guard."""
-        if self.weighting == "hold":
-            raise ValueError(
-                "strategy.weighting = 'hold' is not wired until T209b: the engine still "
-                "builds equal-weight targets and keeps no entry sessions"
-            )
-        if self.rebalance_band != 0:
-            raise ValueError(
-                f"strategy.rebalance_band = {self.rebalance_band} is not wired until "
-                "T209b: the engine still trades every drift to its exact target"
             )
         return self
 
