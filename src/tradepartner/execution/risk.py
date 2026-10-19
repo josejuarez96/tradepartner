@@ -59,8 +59,35 @@ orders left to submit). In order:
    - `refused_position_side`: an order of the phase, or a row of
      `rows_on_session` (the session's `decisions` and `orders` rows the
      wrapper read), whose `position_side` is not `schema.LONG`, one violation
-     per such order or row. Structural, like the two above: no short, ever,
-     until the shorting ADR (ADR 0015 seam 2, amending ADR 0010 point 1).
+     per such order or row. Structural, like the two above. It is lifted for
+     `short` only when `window_side == "long_short"` and `broker_paper is True`
+     (ADR 0010's amendment of 2026-10-19; paper spec amendment #1872 item 1):
+     any other pair, value or spelling refuses every short, so a live broker
+     inherits the refusal. Anything but `long` and `short` is always refused.
+   - the short side (T231; only reachable when lifted). An intent is
+     (`side`, `position_side`): `sell` + `short` opens a short, `buy` + `short`
+     covers one; a held short is a negative `Ledger.positions` quantity, and
+     equity is cash + long value - short value (computed here: `Ledger.equity`
+     refuses a negative position). A short open or cover by notional or by a
+     fractional quantity is a `ValueError`, a short open marked as an exit too;
+     a full cover (`full_exit`, a `forced_exit` too) is a buy that may be
+     marked as an exit, and is exempt from `max_order_notional_fraction`. The
+     rules: `cover_within_holding` (a cover at most the held short rounded down
+     to `quantity_decimals`: none of a name not held short), `one_side_per_name`
+     (no short open of a held long, no long buy of a held short, no name with
+     both a long and a short order, and none closed and opened in one phase),
+     `cover_sum_within_holding` (a name's covers plus its `open_covers` at most
+     the held short, rounded down, summed exactly in `Decimal`), `max_short_weight` (a short-opened
+     name's held short plus the open, after the phase, over equity),
+     `min_short_equity` (a phase with a short open halts when
+     `account.equity` is below it), and `net_exposure_band` (the signed net
+     after the batch over equity within `net_exposure_band` of `net_exposure`;
+     checked only in a `long_short` window and only when the caller passes
+     `net_exposure`, which it does for the phase that completes a batch holding
+     a rebalance's decisions). `max_gross_exposure` sums |value|, and
+     `buys_within_cash` deducts the held shorts' value at the reference prices
+     from `account.cash` (a same-phase open's proceeds are not yet in the cash
+     read; a cover's cost is not added).
    - `refused_order_shape`: an `orders` row of `rows_on_session` that
      `order_shape_violation` refuses, one violation per such row. Structural,
      like `refused_position_side` (ADR 0015 seam 3).
@@ -147,8 +174,13 @@ _SELL = "sell"
 _FORCED_EXIT = "forced_exit"
 _LIMIT_BREACH = "limit_breach"
 _SKIP_CAP = "skip_cap"
-#: The structural rule refusing any position side but long (ADR 0015 seam 2).
+#: The structural rule refusing any position side but long (ADR 0015 seam 2); lifted
+#: for `short` on a paper broker in a `long_short` window (T231).
 _REFUSED_POSITION_SIDE = "refused_position_side"
+#: The short position side (the `schema.LONG` counterpart).
+_SHORT = "short"
+#: The one window side that lifts the short refusal (`portfolio.side`).
+_LONG_SHORT = "long_short"
 #: The structural rule refusing any order but a market day order of one share
 #: class (ADR 0015 seam 3).
 _REFUSED_ORDER_SHAPE = "refused_order_shape"
@@ -520,6 +552,53 @@ def order_shape_violation(order_or_row: Order | OrderRow) -> Violation | None:
     )
 
 
+def _check_short_shape(order: PhaseOrder) -> None:
+    """A short open or cover goes by whole-share quantity (Alpaca refuses a
+    fractional short), and only a cover may be marked as an exit; else `ValueError`."""
+    what = f"short {'cover' if order.side == _BUY else 'open'} of decision {order.decision_id}"
+    if order.quantity is None:
+        raise ValueError(f"{what} is by notional, must be by whole-share quantity")
+    if order.quantity != math.floor(order.quantity):
+        raise ValueError(f"{what} is a fractional quantity {order.quantity}")
+    if order.side == _SELL and (order.full_exit or order.decision == _FORCED_EXIT):
+        raise ValueError(f"{what} marked as an exit")
+
+
+def _sides_violations(
+    left: Sequence[PhaseOrder], positions: Mapping[str, float]
+) -> list[tuple[str, str]]:
+    """`one_side_per_name` breaches as (name, detail): a short open of a held long,
+    a long buy of a held short, a name with both a long and a short order, and a
+    name both closed and opened in one phase when a short is in it (a long's trim
+    and top-up stay legal; a flip is a close in one phase, an open in the next)."""
+    found: list[tuple[str, str]] = []
+    closes: set[str] = set()
+    opens: set[str] = set()
+    shorts: set[str] = set()
+    longs: set[str] = set()
+    for order in left:
+        short = order.position_side == _SHORT
+        (shorts if short else longs).add(order.security_id)
+        held = positions.get(order.security_id, 0.0)
+        if order.side == _SELL and short:
+            opens.add(order.security_id)
+            if held > 0:
+                found.append((order.security_id, "short open of a held long"))
+        elif order.side == _BUY and not short:
+            opens.add(order.security_id)
+            if held < 0:
+                found.append((order.security_id, "long buy of a held short"))
+        else:
+            closes.add(order.security_id)
+    found.extend(
+        (name, "closed and opened in one phase") for name in sorted(closes & opens & shorts)
+    )
+    found.extend(
+        (name, "has a long and a short order in one phase") for name in sorted(longs & shorts)
+    )
+    return found
+
+
 def check_phase(
     orders: Sequence[PhaseOrder],
     ledger: Ledger,
@@ -535,6 +614,10 @@ def check_phase(
     prior_skips: int = 0,
     plan_decisions: int = 0,
     rows_on_session: Sequence[DecisionRow | OrderRow] = (),
+    open_covers: Sequence[OpenSell] = (),
+    window_side: str = "long_only",
+    broker_paper: bool = False,
+    net_exposure: float | None = None,
 ) -> Violations | Skips:
     """Check one phase's batch (module docstring). `assets` is keyed by
     `security_id`; `open_sells` are the non-terminal own sells from any session
@@ -543,7 +626,16 @@ def check_phase(
     cap max(`max_skips_per_run`, floor(`max_skip_share` x it)), 0 (the floor alone
     binds) when not given; `rows_on_session` are the session's `decisions` and
     `orders` rows, read only for `refused_position_side` and (its `orders`
-    rows) `refused_order_shape`."""
+    rows) `refused_order_shape`. `window_side` is the window's frozen
+    `portfolio.side`, `open_covers` the unfilled quantity of the non-terminal own
+    covers from any session (`cover_sum_within_holding`, as `open_sells` is for
+    sells), and `broker_paper` the broker's `paper`: only
+    `long_short` with `broker_paper is True` lifts the short refusal.
+    `net_exposure` is the window's frozen `portfolio.net_exposure`, passed for
+    the phase that completes a batch holding a rebalance's decisions and
+    `None` otherwise (which skips `net_exposure_band`)."""
+    lifted = window_side == _LONG_SHORT and broker_paper is True
+    allowed_sides = (schema.LONG, _SHORT) if lifted else (schema.LONG,)
     for order in orders:
         if order.side not in (_BUY, _SELL):
             raise ValueError(f"order of decision {order.decision_id} has side {order.side!r}")
@@ -551,6 +643,9 @@ def check_phase(
             raise ValueError(f"order of decision {order.decision_id} needs exactly one size")
         _finite(order.price, f"price of {order.security_id}", positive=True)
         _finite(order.value(), f"size of decision {order.decision_id}")
+        if lifted and order.position_side == _SHORT:
+            _check_short_shape(order)
+            continue
         if order.side == _BUY and (order.full_exit or order.decision == _FORCED_EXIT):
             raise ValueError(f"buy of decision {order.decision_id} marked as an exit")
         if order.side == _BUY and order.quantity is not None and not order.whole_share:
@@ -568,14 +663,14 @@ def check_phase(
         violations.append(Violation(kind, rule, detail))
 
     for order in orders:
-        if order.position_side != schema.LONG:
+        if order.position_side not in allowed_sides:
             breach(
                 _REFUSED_POSITION_SIDE,
                 f"order of decision {order.decision_id} for {order.security_id} "
                 f"has position_side {order.position_side!r}",
             )
     for row in rows_on_session:
-        if row.position_side != schema.LONG:
+        if row.position_side not in allowed_sides:
             what = (
                 f"order {row.client_order_id}"
                 if isinstance(row, OrderRow)
@@ -593,6 +688,8 @@ def check_phase(
     skips: list[Skip] = []
     left: list[PhaseOrder] = []
     for order in orders:
+        if order.position_side not in allowed_sides:
+            continue  # refused by name above; no other rule judges it
         if order.side == _SELL and order.quantity is None:
             breach("sell_by_quantity", f"{order.security_id} sell carries a notional")
             continue
@@ -601,9 +698,10 @@ def check_phase(
             continue
         asset = assets.get(order.security_id)
         if asset is None:
-            if order.side == _BUY:
+            if order.side == _BUY and order.position_side != _SHORT:
                 # A buy of a name the broker does not know is a per-name skip
-                # (spec amendment 2026-10-18 item 2); a held name's sell still fails closed.
+                # (spec amendment 2026-10-18 item 2); a held name's sell, and a cover of
+                # a held short, still fail closed.
                 skips.append(Skip(order.decision_id, order.security_id, "skip_asset_unknown"))
             else:
                 breach("asset_missing", f"no asset read for {order.security_id}")
@@ -631,7 +729,11 @@ def check_phase(
         )
 
     marks = {name: price_of(name) for name in ledger.positions}
-    equity = ledger.equity(marks)
+    if any(q < 0 for q in ledger.positions.values()):
+        # `Ledger.equity` refuses a short until T232: cash + long - short here.
+        equity = ledger.cash + sum(q * marks[name] for name, q in ledger.positions.items())
+    else:
+        equity = ledger.equity(marks)
     if not equity > 0:
         breach("max_order_notional_fraction", f"equity is {equity}, not positive")
         return Violations(tuple(violations))
@@ -654,14 +756,32 @@ def check_phase(
     bought: dict[str, tuple[float, float]] = {}
     over_weight: dict[str, str] = {}
     buy_cash = Decimal(0)
+    opened: dict[str, float] = {}
+    covered: dict[str, float] = defaultdict(float)
     for order in left:
+        is_short = order.position_side == _SHORT
         if not order.full_exit and order.value() > frozen.max_order_notional_fraction * equity:
             breach(
                 "max_order_notional_fraction",
                 f"{order.security_id} order of {order.value():.2f} over "
                 f"{frozen.max_order_notional_fraction} of equity {equity:.2f}",
             )
-        if order.side == _BUY:
+        if is_short and order.side == _BUY:
+            held_short = round_down(
+                max(-ledger.positions.get(order.security_id, 0.0), 0.0), quantity_decimals
+            )
+            if order.shares() > held_short:
+                breach(
+                    "cover_within_holding",
+                    f"{order.security_id} cover of {order.shares()} over the held short "
+                    f"{held_short}",
+                )
+            after[order.security_id] += order.shares()
+            covered[order.security_id] += order.shares()
+        elif is_short:
+            opened[order.security_id] = opened.get(order.security_id, 0.0) + order.shares()
+            after[order.security_id] -= order.shares()
+        elif order.side == _BUY:
             weight = order.target_weight
             if (
                 weight is None
@@ -702,6 +822,32 @@ def check_phase(
     for detail in over_weight.values():
         breach("max_position_weight", detail)
 
+    open_covered = open_sold(open_covers, quantity_decimals)
+    for name, total in covered.items():
+        held = round_down(max(-ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
+        total_exact = _dec(total) + open_covered.get(name, Decimal(0))
+        if total_exact > _dec(held):
+            breach(
+                "cover_sum_within_holding",
+                f"{name} covers and open covers of {total_exact} over the held short {held}",
+            )
+    for name, detail in _sides_violations(left, ledger.positions):
+        breach("one_side_per_name", f"{name} {detail}")
+    for name, shares in opened.items():
+        held_value = (max(-ledger.positions.get(name, 0.0), 0.0) + shares) * price_of(name)
+        if held_value > frozen.max_short_weight * equity:
+            breach(
+                "max_short_weight",
+                f"{name} held short {held_value:.2f} after the phase over "
+                f"{frozen.max_short_weight} of equity {equity:.2f}",
+            )
+    if opened and not account.equity >= frozen.min_short_equity:
+        breach(
+            "min_short_equity",
+            f"account equity {account.equity:.2f} under the short minimum "
+            f"{frozen.min_short_equity}",
+        )
+
     # Exact in `Decimal`, never `float`, with the open sells summed by the one
     # helper `phases.sell_orders` caps a trim with (`open_sold`), so a trim
     # capped there never breaches here on float drift alone (#605).
@@ -715,21 +861,39 @@ def check_phase(
                 f"{name} sells and open sells of {total_exact} over the holding {holding}",
             )
 
-    exposure = (
-        sum(
-            max(q, 0.0) * _finite(price_of(name), f"price of {name}", positive=True)
-            for name, q in after.items()
-        )
-        / equity
-    )
+    values = {
+        name: q * _finite(price_of(name), f"price of {name}", positive=True)
+        for name, q in after.items()
+    }
+    exposure = sum(abs(v) for v in values.values()) / equity
     if not math.isfinite(exposure) or exposure > frozen.max_gross_exposure:
         breach(
             "max_gross_exposure",
             f"gross exposure after the batch {exposure:.4f} over {frozen.max_gross_exposure}",
         )
 
-    if buy_cash > _dec(account.cash):
-        breach("buys_within_cash", f"buys need {buy_cash:.4f}, cash is {account.cash:.2f}")
+    if window_side == _LONG_SHORT and net_exposure is not None:
+        net = sum(values.values()) / equity
+        gap = abs(net - net_exposure)
+        if not math.isfinite(gap) or gap > frozen.net_exposure_band:
+            breach(
+                "net_exposure_band",
+                f"net exposure after the batch {net:.4f} is {gap:.4f} from the frozen "
+                f"{net_exposure} (band {frozen.net_exposure_band})",
+            )
+
+    # The held shorts are owed back: only the cash above their value is spendable.
+    held_shorts = sum(
+        (_dec(-q) * _dec(price_of(name)) for name, q in ledger.positions.items() if q < 0),
+        Decimal(0),
+    )
+    spendable = _dec(account.cash) - held_shorts
+    if buy_cash > spendable:
+        breach(
+            "buys_within_cash",
+            f"buys need {buy_cash:.4f}, cash is {account.cash:.2f} less held shorts "
+            f"{held_shorts:.2f}",
+        )
 
     if violations:
         return Violations(tuple(violations))
