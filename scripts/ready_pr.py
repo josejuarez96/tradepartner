@@ -488,7 +488,12 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         run
         for run, _base, cancelled in live
         if not (
-            cancelled and (run.name in finished or any(is_later_than(ok, run) for ok in succeeded))
+            cancelled
+            and (
+                run.name in finished
+                # never a cancelled `checks`: only a later `checks` excuses it (#1201)
+                or (run.name != "checks" and any(is_later_than(ok, run) for ok in succeeded))
+            )
         )
     ]
     if not any(r.name == "checks" for r in runs):

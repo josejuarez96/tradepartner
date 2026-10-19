@@ -416,6 +416,13 @@ def test_a_cancelled_check_with_no_later_success_still_fails() -> None:
         cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
     )
     assert ready_pr.checks_state(hc("abc", earlier_success_only), "abc") == "failure"
+    # #1201 with run ids: a cancelled full-run `checks` followed by a later draft run's
+    # successes stays `cancelled` (re-triggered), not `pending`.
+    full_cancelled_by_draft = (
+        cr("checks", "COMPLETED", "CANCELLED", 20, "2026-10-18T11:00:00Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 21, "2026-10-18T11:01:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", full_cancelled_by_draft), "abc") == "cancelled"
     unordered = (
         cr("odd-job", "COMPLETED", "CANCELLED"),
         cr("checks", "COMPLETED", "SUCCESS"),
