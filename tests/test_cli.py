@@ -883,6 +883,47 @@ def test_health_prints_the_report_and_check_passes_on_the_fixture_store(
     assert checked.exit_code == 0, checked.output
 
 
+def test_health_prints_the_figi_types_block_and_fails_only_with_the_threshold(
+    tmp_path: Path, fixture_store_path: Path
+) -> None:
+    """#1713, T189c: the block names a `common` class OpenFIGI calls a note;
+    unset `openfigi.max_disagreements` reports it and `--check` passes."""
+    settings = _settings(tmp_path, store=fixture_store_path)
+    with open_for_write(settings) as conn:
+        insert_row(
+            conn,
+            "openfigi_types",
+            {
+                "security_id": "SEC_FACTS_RESTATED",
+                "ticker": "FRST",
+                "figi": "BBG1",
+                "composite_figi": "BBG1",
+                "share_class_figi": "BBG2",
+                "security_type": "Medium Term Note",
+                "security_type2": "Note",
+                "market_sector": "Corp",
+                "name": "FRST",
+                "exch_code": "US",
+                "mapped": True,
+                "known_at": T_END - timedelta(days=1),
+                "ingested_at": T_END - timedelta(days=1),
+                "provenance": "openfigi",
+                "source": "openfigi",
+            },
+        )
+    plain = _invoke(settings, ["health"], clock=lambda: T_END)
+    assert plain.exit_code == 0, plain.output
+    out = plain.output.lower()
+    assert "figi types:" in out
+    assert "medium term note" in out
+    assert "figi_types_disagreements" in out
+    assert _invoke(settings, ["health", "--check"], clock=lambda: T_END).exit_code == 0
+    gated = _settings(tmp_path, store=fixture_store_path, openfigi={"max_disagreements": 0})
+    failed = _invoke(gated, ["health", "--check"], clock=lambda: T_END)
+    assert failed.exit_code == 1
+    assert "figi_types_disagreements" in failed.output
+
+
 def test_health_check_enforces_rate_stamp_and_passes_fixture(
     tmp_path: Path, fixture_store_path: Path
 ) -> None:

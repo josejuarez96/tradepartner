@@ -52,6 +52,7 @@ from tradepartner.store.master import (
     first_session,
     primary_security_id,
     securities_as_of,
+    security_cik,
     write_master,
 )
 
@@ -2078,3 +2079,127 @@ def test_write_master_stores_the_chain_row(tmp_path: Path) -> None:
         ]
     finally:
         conn.close()
+
+
+def _chain_only(master: MasterBuild) -> MasterBuild:
+    """`master` without its securities and listings, so a second write of the
+    same store does not duplicate them: the cases below exercise the chain path
+    alone."""
+    return replace(master, securities=(), listings=())
+
+
+def _hold_predecessor(conn: duckdb.DuckDBPyConnection, predecessor: str) -> None:
+    """One journal row of an open paper window naming `predecessor`."""
+    conn.execute(
+        "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+        "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+        "frozen_sha256, known_at, ingested_at) VALUES "
+        "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, 'v', "
+        "TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+        "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+    )
+    conn.execute(
+        "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+        "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+        "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, ?, 1.0, NULL, NULL, "
+        "TIMESTAMPTZ '2025-12-02 14:00:00+00', TIMESTAMPTZ '2025-12-02 14:00:00+00')",
+        [predecessor],
+    )
+
+
+def test_write_master_refuses_a_held_predecessor_until_the_window_closes() -> None:
+    """#1838: `write_master`'s chain path applies the held gate: an open paper
+    window holding the predecessor writes nothing, a closed stop releases it."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    _build, master = _chain_build(case)
+    build = _chain_only(master)
+    predecessor = case["predecessor"]["cik"]
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        _hold_predecessor(conn, predecessor)
+        assert write_master(conn, build, now=INGESTED_AT) == 0
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', 'closed', NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
+        )
+        assert write_master(conn, build, now=INGESTED_AT) == 1
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_write_master_refuses_an_unjudged_chain() -> None:
+    """#1838: a chain whose predecessor or successor CIK this run did not judge
+    writes nothing, so a transient fetch failure never moves it."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    _build, master = _chain_build(case)
+    build = _chain_only(master)
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        assert (
+            write_master(
+                conn,
+                build,
+                now=INGESTED_AT,
+                unjudged=frozenset({case["predecessor"]["cik"]}),
+            )
+            == 0
+        )
+        assert (
+            write_master(
+                conn,
+                build,
+                now=INGESTED_AT,
+                unjudged=frozenset({case["successor"]["cik"]}),
+            )
+            == 0
+        )
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_write_master_moves_a_live_chain_at_the_later_run_clock() -> None:
+    """#1838: a changed evidence stamp retracts the live row at the run's clock
+    and writes the new revision beside it, as ingestion's chain writer does."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    _build, master = _chain_build(case)
+    first = master.chains[0]
+    later = INGESTED_AT + timedelta(days=1)
+    moved = replace(first, known_at=first.known_at + timedelta(days=1), ingested_at=later)
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        assert write_master(conn, _chain_only(master), now=INGESTED_AT) == 1
+        assert write_master(conn, replace(_chain_only(master), chains=(moved,)), now=later) == 2
+        assert conn.execute(
+            "SELECT known_at FROM successor_chains c "
+            "WHERE successor_id = ? AND NOT retracted "
+            "AND NOT EXISTS (SELECT 1 FROM successor_chains n "
+            "WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at)",
+            [first.successor_id],
+        ).fetchall() == [(moved.known_at,)]
+        assert conn.execute(
+            "SELECT withdrawn_known_at FROM successor_chains WHERE retracted"
+        ).fetchall() == [(first.known_at,)]
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (3,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("security_id", "cik"),
+    [
+        ("0001000010", "0001000010"),
+        ("0001000010:class-a", "0001000010"),
+        ("0001000010@2020-02-07", "0001000010"),
+    ],
+)
+def test_security_cik_is_parsed_before_its_separator(security_id: str, cik: str) -> None:
+    """#1838: the CIK is the id before `:` or `@`, never the first ten
+    characters."""
+    assert security_cik(security_id) == cik

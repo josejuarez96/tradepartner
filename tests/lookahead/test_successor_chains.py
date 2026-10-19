@@ -20,6 +20,8 @@ import duckdb
 import pytest
 
 from lookahead.harness import PROBE_EPSILON, TruncatedStore
+from tradepartner.store import schema
+from tradepartner.store.master import Chain, MasterBuild, write_master
 
 #: The fixture's chainable pairs and their `successor_chains` rows, from
 #: `chain_cases.json` (the spin-off pair has none).
@@ -148,6 +150,42 @@ def test_a_moved_chain_is_absent_before_its_new_stamp_at_every_read(
         assert at(t) == [(accession, new)], t
     for t in (clock, clock.replace(month=5)):  # from the run on
         assert at(t) == [(accession, new)], t
+
+
+def test_write_master_stores_a_chain_no_earlier_than_its_evidence() -> None:
+    """#1838: `write_master`'s chain path stores the row at its evidence
+    `known_at`, never the run clock, so a read before that stamp sees no
+    chain and a read from it does."""
+    known_at = datetime.fromisoformat("2020-02-07T20:30:00+00:00")
+    clock = datetime.fromisoformat("2020-04-01T04:00:00+00:00")
+    accession = "0001000011-24-000001"
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        write_master(
+            conn,
+            MasterBuild(
+                (),
+                (),
+                (),
+                (),
+                chains=(Chain("0001000010", "0001000011", accession, "8-K12B", known_at, clock),),
+            ),
+            now=clock,
+        )
+        truncated = TruncatedStore(conn)
+        try:
+
+            def at(t: datetime) -> list[tuple[str, datetime]]:
+                return [tuple(row) for row in truncated.at(t).execute(_LIVE_AT_SQL, [t]).fetchall()]
+
+            assert at(known_at - PROBE_EPSILON) == []
+            assert at(known_at) == [(accession, known_at)]
+            assert at(clock) == [(accession, known_at)]
+        finally:
+            truncated.close()
+    finally:
+        conn.close()
 
 
 # --- the overlay stays out of the shared fixture (#821, PR #1836) -----------------------
