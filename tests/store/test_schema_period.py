@@ -150,7 +150,7 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 32
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -219,25 +219,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (2, None),
     ]
     assert v14.execute("SELECT version FROM schema_version ORDER BY 1").fetchall() == [
-        (14,),
-        (15,),
-        (16,),
-        (17,),
-        (18,),
-        (19,),
-        (20,),
-        (21,),
-        (22,),
-        (23,),
-        (24,),
-        (25,),
-        (26,),
-        (27,),
-        (28,),
-        (29,),
-        (30,),
-        (31,),
-        (32,),
+        (v,) for v in range(14, schema.CURRENT_SCHEMA_VERSION + 1)
     ]
 
 

@@ -110,6 +110,10 @@ def _shape(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[Any, ...]:
 #: Spec "Data / interfaces" > Tables, `order_events`: the version-28 set, then
 #: amendment item 2's three allowlist skip reasons (#1808, T202a, version 29).
 _SKIP_REASONS = ("skip_asset_unknown", "skip_not_fractionable", "skip_untradable")
+#: T228 (paper spec amendment 2026-10-19 item 12, #1872): the two short skips, the
+#: reason of a short open refused at the phase (not ETB and shortable, or under the
+#: short price floor), appended last in this order.
+_SHORT_SKIP_REASONS = ("skip_not_borrowable", "skip_short_price")
 
 
 def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
@@ -119,7 +123,13 @@ def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
     assert schema.HALT_REASON == "halt"
     assert schema.NOT_RECEIVED_REASON == "not_received"
     assert schema.OWNER_SETTLED_UNKNOWN_REASON == "owner_settled_unknown"
-    expected = ("halt", "not_received", "owner_settled_unknown", *_SKIP_REASONS)
+    expected = (
+        "halt",
+        "not_received",
+        "owner_settled_unknown",
+        *_SKIP_REASONS,
+        *_SHORT_SKIP_REASONS,
+    )
     assert expected == schema.ORDER_EVENT_REASONS
 
 
@@ -157,7 +167,7 @@ def test_every_listed_reason_and_null_is_accepted(
     assert journal.execute("SELECT reason FROM order_events").fetchall() == [(reason,)]
 
 
-@pytest.mark.parametrize("reason", _SKIP_REASONS)
+@pytest.mark.parametrize("reason", [*_SKIP_REASONS, *_SHORT_SKIP_REASONS])
 def test_each_allowlist_skip_reason_closes_a_rejected_event(
     journal: duckdb.DuckDBPyConnection, reason: str
 ) -> None:
@@ -188,6 +198,10 @@ def test_each_allowlist_skip_reason_closes_a_rejected_event(
         "skip-untradable",
         "untradable",
         "skip_below_one_share",
+        "skip_not_borowable",
+        "skip-short-price",
+        "Skip_Not_Borrowable",
+        "cover_not_borrowable",
     ],
 )
 def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason: str) -> None:
@@ -228,36 +242,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
             _event(conn, "halted")
     assert after == before
     assert len(after) == len(reasons)
-    assert versions == [
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-        22,
-        23,
-        24,
-        25,
-        26,
-        27,
-        28,
-        29,
-        30,
-        31,
-        32,
-    ]
+    assert versions == list(range(5, schema.CURRENT_SCHEMA_VERSION + 1))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
 
@@ -290,36 +275,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            28,
-            29,
-            30,
-            31,
-            32,
-        ]
+        assert _versions(conn) == list(range(5, schema.CURRENT_SCHEMA_VERSION + 1))
 
 
 def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothing(
@@ -454,33 +410,7 @@ def test_write_open_of_a_version_8_store_migrates_to_9_and_keeps_every_row(
     assert overrides_after == overrides_before
     assert [row[0] for row in overrides_after] == [3, 1, 2]
     assert order_ids == [(None,)] * 3
-    assert versions == [
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-        22,
-        23,
-        24,
-        25,
-        26,
-        27,
-        28,
-        29,
-        30,
-        31,
-        32,
-    ]
+    assert versions == list(range(8, schema.CURRENT_SCHEMA_VERSION + 1))
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
 
@@ -492,33 +422,7 @@ def test_a_version_8_store_reopens_at_current_without_another_version_row(tmp_pa
             schema.init_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
         schema.init_schema(conn)
-        assert _versions(conn) == [
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            28,
-            29,
-            30,
-            31,
-            32,
-        ]
+        assert _versions(conn) == list(range(8, schema.CURRENT_SCHEMA_VERSION + 1))
 
 
 def test_read_only_open_of_a_version_8_store_passes(tmp_path: Path) -> None:
