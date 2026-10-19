@@ -28,7 +28,7 @@ All commands run from the main checkout, as `uv run tradepartner <command>`. Two
 | **Kill ladder** | Five cheap-to-expensive tests an idea must survive, each with a kill rule written first ([ADR 0023](../decisions/0023-break-first-fast-books-paper-exam.md)): 1 cost break-even, 2 the published long leg, 3 capacity at $100, 4 a harsh backtest, 5 placebo. |
 | **Book** | One paper strategy with its own Alpaca paper account. Today: `main` (H1, monthly) and `daily` (a machine test). |
 | **Window** | One continuous run of a book, from `paper start` to stop. Its record is judged on its own. |
-| **Operations book vs exam** | An **operations book** tests the machine, never the strategy. An **exam** is a book whose family's holdout is unspent. It is the strategy's real test. Every `momentum` book is a tracking window, not an exam, because its holdout is spent. |
+| **Operations book vs exam** | An **operations book** tests the machine, never the strategy. An **exam** is a pre-registered book whose family's holdout is unspent and which reaches a minimum number of rebalances and fills ([ADR 0023](../decisions/0023-break-first-fast-books-paper-exam.md)). It is the strategy's real test. Every `momentum` book is a tracking window, not an exam, because its holdout is spent. |
 | **Kill switch** | A per-book stop. While engaged, the daily run still checks the broker but places no order. |
 | **Shakedown** | The machine-readiness gate before live money: `paper shakedown` must pass all seven lines ([ADR 0017](../decisions/0017-fast-paper-and-machine-readiness-gate.md) part E). |
 
@@ -87,19 +87,19 @@ Read it top to bottom. Data feeds ideas. An idea becomes a frozen file. Running 
 | 5a. Promote the winner | `sweep promote <slug> --file docs/hypotheses/<winner>.md --reason "<why>"` | Registers the winner's file with a promotion decision. Refused if the sweep met its own retire rule. |
 | 5b. Or retire it | `sweep retire <slug> --reason "<why>"` | The sweep promotes nothing afterwards. |
 | 6. Run one hypothesis | `backtest <slug>` (optional `--start`, `--end`, `--note`) | One in-sample trial of a standalone hypothesis. A sweep variant is refused here. |
-| 7. Spend the holdout | `backtest <slug> --spend-holdout --holdout-reason "<why>"` | Only for a promoted hypothesis, at most 3 times per family. **A decision, not a test.** `--holdout-repeat` spends it again. |
+| 7. Spend the holdout | `backtest <slug> --spend-holdout --holdout-reason "<why>"` | Only for a promoted (or pre-lab) hypothesis, at most 3 times per family. **A decision, not a test.** Never add `--holdout-repeat` without a written decision of yours: a second look at spent months is never an exam. |
 | 8. Stress the cost | `backtest <slug> --measured-cost-bps <x> --note "<book, window>"` | Adds one cost level measured from a paper book's fills. In-sample only. |
 
 Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap gate. Use it only with a written reason.
 
 ### Experiments (studies that are not backtests)
 1. `experiment register docs/experiments/<slug>.md`: freezes the design.
-2. `dataset register --name <n> --version <v> --path <file> --event-start <date> --event-end <date>` (plus `--split-json`, `--sealed`, `--seed` when the file asks): records the data it binds to.
+2. `dataset register --name <n> --version <v> --path <file> --event-start <date> --event-end <date>` (plus `--split-json` with `--event-column`, `--sealed`, `--seed` when the file asks): records the data it binds to.
 3. `experiment open <slug> --dataset <id> --split <name> --config <file.json>` (plus `--configurations <k>`): opens one run and prints its id. It counts in the family's N and is refused on a protected window without `--spend-holdout --holdout-reason`.
 4. **A script runs the analysis.** There is no `experiment run` command today. Claude writes the script.
 5. `experiments` (or `--registration <slug>`, `--family <f>`) lists the runs. `experiment abandon --run <id> --reason "<why>"` closes one that will not finish.
 
-**Worked example: T218, the long/short spike** ([long-short-spike.md](../experiments/long-short-spike.md)). It asked whether H1's ranking works as a 50/50 long/short book. Its kill rule was written before the run: kill if the net spread is below 0. It ran once on 10-19 (registration 1, run 1). The net spread was −6.82 points a year, with a 95% range of −24.9 to +11.3. The rule fired, so the long/short momentum idea on that ranking is killed. Note: the store holds the run, but its verdict shows `n/a` on the Research page. The verdict sits in a GitHub comment on #1876.
+**Worked example: T218, the long/short spike** ([long-short-spike.md](../experiments/long-short-spike.md)). It asked whether H1's ranking works as a 50/50 long/short book. Its kill rule was written before the run: kill if the net spread's estimate is below 0, **or** its one-sided 95% upper bound is below +2 points a year. It ran once on 10-19 (registration 1, run 1, per #1876). The net spread was −6.82 points a year, with bounds of −24.9 and +11.3. The first condition fired, so the long/short momentum idea on that ranking is killed. Note: the store holds the run, but its verdict shows `n/a` on the Research page. The verdict sits in a GitHub comment on #1876.
 
 ### Reading a result
 | Where | What to read |
@@ -112,7 +112,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 ### Rules that protect you
 - **Every run counts, forever.** A failed or refused trial still raises N, and so SR\*, for every later idea in the family. Run only what the file planned.
 - **Never re-run until it looks good.** A second look is a new file that discloses the first. Re-running a variant, a new grid or a tweaked window all count.
-- **Never touch the holdout without a decision.** It is spent once per hypothesis, by you, with `--spend-holdout --holdout-reason`, and at most 3 times per family. `momentum`'s is already spent.
+- **Never touch the holdout without a decision.** It is spent once per hypothesis, by you, with `--spend-holdout --holdout-reason`, and at most 3 times per family. `momentum`'s is already spent, so any further `momentum` spend is a repeat (`--holdout-repeat`). A repeat reads months already seen, so it is never an exam. Do it only after a written decision.
 - **Never edit a registered file.** Even a prose-only edit is refused. Corrections go in the PR or a decision note.
 - **Data repairs are releases.** Any repair that changes stored rows follows [data-releases](data-releases.md). It can stale trials, and each re-run counts in N.
 
@@ -124,19 +124,22 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | 2. Give it an ok in-sample trial | `backtest <slug>` | The gap sign-off must name an `ok`, in-sample trial. |
 | 3. Sign off the survivorship gap | `decision gap-signoff --trial <id> --reason "<why the gap is acceptable>"` | Read the gap on the Backtest page first. |
 | 4. Prepare the book's account | One new Alpaca paper account per book; its keys go in `.env` as `ALPACA_PAPER_BOOKS__<TOKEN>__API_KEY` and `..._API_SECRET` (book `main` uses `ALPACA_PAPER_API_KEY`/`_SECRET`) | The account must be flat: no positions and no open orders. |
-| 5. Start the window | `paper start --hypothesis <slug> --book <token>` | Refused without the gap sign-off, before the holdout's end (or, for a forward exam, its start), on an open window, on another book's account, on a non-flat account, or if live costs or fill price differ from the file. |
+| 5. Start the window | `paper start --hypothesis <slug> --book <token>` | Refused, among other reasons: for a sweep variant (promote it or use an operations file); for a family that cannot paper trade yet; without the gap sign-off; before the holdout's end (or, for a forward exam, its start); on an open window; on another book's account; on a non-flat account; on an account too small for the minimum order; or if live costs or fill price differ from the file. |
 | 6. The scheduler | `~/Library/LaunchAgents/com.tradepartner.paper.plist`, beside `com.tradepartner.ingest.plist` ([scheduling](scheduling.md)) | One job runs every open book, in token order. A new book needs no plist change. Keep the Mac on power and awake overnight. |
 
 **What runs, and when (times in ET; launchd uses the Mac's local clock).**
 - **18:30, ingest:** brings prices, filings and the T-bill rate up to that day.
 - **08:05, `paper run`:** for each open book it collects order results, reconciles the journal with Alpaca, and marks the account (the drawdown check). On a rebalance day it also plans, sells, waits, then buys. Orders go out only inside the submit window, 08:00 to 10:00 with the current defaults. While a book's kill switch is engaged, it places nothing.
-- **Never** start the paper job by hand (`launchctl kickstart`) inside the submit window to "test" it. It can place real paper orders.
+- **Never** run the paper job by hand inside the submit window to "test" it, neither `launchctl kickstart` nor a typed `paper run`. Either can place real paper orders. Use `paper status` instead.
 
 **What to check after a run:** `paper status --all` shows one line per book: window, positions, open orders, kill switch, last run, next rebalance. `launchctl print gui/$(id -u)/com.tradepartner.paper | grep "last exit code"` shows 0 for a routine run. Any other code is explained in [scheduling](scheduling.md), "What a `paper run` exit code means".
 
-**Ending a window.** `paper stop --reason` sells and closes. `paper kill` halts and keeps positions. `paper abandon --reason` ends the window without selling. After `abandon`, reset the Alpaca paper account until it is flat.
+**Ending a window.**
+- `paper stop --book <token> --reason "<why>"` is the normal way, in two steps. The first call only records the request. The next scheduled run inside the submit window sells. A second `paper stop` then closes the window. It is refused while the kill switch is engaged.
+- `paper kill` halts trading and keeps the positions. It does not end the window.
+- `paper abandon --book <token> --reason "<why stop could not finish>"` is the last resort, only when `stop` cannot complete. It ends the window without selling. Afterwards, reset that Alpaca paper account until it is strictly flat, and check whether the reset changed the account id or the keys in `.env` ([scheduling](scheduling.md), "`abandon`").
 
-**Toward live.** `decision shakedown-span --sessions <N> --order-sessions <M> --reason "<which strategy goes live first>"` opens the span. `decision shakedown-note --alert <id> --reason` explains each alert inside it. The kill-switch drill runs once. `paper shakedown` must then exit 0. As of 10-19 no span is open. Live trading (Phase 6) also needs its own ADR, the taxable cash account (#813) and a safety review. The live book is chosen from what survives, never by comparing paper books.
+**Toward live.** `decision shakedown-span --sessions 10 --order-sessions 5 --reason "<why the span opens now>"` opens the span (N = 10 and M = 5 are decided). The reason names no live strategy: the live book is chosen later, in T163. (The command's own help text still says to name one; it is out of date.) `decision shakedown-note --alert <id> --reason "<what happened>"` covers only a `stale_data` or `missed_run` alert inside the span. A note never excuses a mismatch or a halt; those restart the span. The kill-switch drill runs once. `paper shakedown` must then exit 0. As of 10-19 no span is open. Live trading (Phase 6) also needs its own ADR, the taxable cash account (#813) and a safety review. The live book is chosen from what survives, never by comparing paper books.
 
 ## 4. Daily and weekly operating card
 
@@ -151,11 +154,11 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `halted`, `run_failed` | The book stopped. Read the alert and `~/Library/Logs/tradepartner/paper.err.log`, then ask Claude to diagnose. Resume only once the cause is known. |
 | `reconciliation` | The journal and Alpaca disagree. Do not resume blind. Ask Claude. |
 | `rejection_cap`, `skip_cap` | Too many orders refused or names skipped. Find out why before resuming. |
-| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume, then decide whether to `paper stop`. |
-| `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. |
+| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to today's equity), then decide whether to `paper stop`. |
+| `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. Inside a shakedown span, add a `decision shakedown-note` for it. |
 | `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake (#1759). |
 | `kill_switch` | The switch changed state. `paper status` shows why. |
-| `kill_switch_write_failed` | The store may be damaged. Stop. Ask Claude before anything else. |
+| `kill_switch_write_failed` | The store may be damaged. This one arrives only as a macOS notification, never in the store. Stop. Ask Claude before anything else. |
 | `locked` | Two runs overlapped. Usually harmless. |
 | `no_window` | No open window. Normal before `paper start` or after a stop. |
 | `unspent_cash` | Informational. |
@@ -217,4 +220,4 @@ Alerts reach the store and a macOS notification only. Email is built but not con
 ## NOT VERIFIED
 - Alpaca's dashboard tab names (Orders, Activities). The repo does not describe Alpaca's web interface.
 - What to do for the alert kinds `lot_ledger`, `stale_mark`, `skipped` and `pending_unresolved`. The code sends them; the scheduling runbook's table does not cover them yet.
-- Store figures (trial 17's numbers, N, book windows, "no span open"). They come from the 10-19 reports, not from a read of the store for this page.
+- Store figures: trial 17's numbers, N, book windows, "no span open", T218's ids and result (registration 1, run 1, −6.82, −24.9 to +11.3), and the halt dates 10-12, 10-13 and 10-16. They come from the 10-19 reports and #1876, not from a read of the store for this page.
