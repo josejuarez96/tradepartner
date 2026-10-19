@@ -9,6 +9,8 @@ resolves the as-of rate of each session before it gets here.
   session as a bill does.
 - `period_risk_free` compounds the accruals over the sessions of each period
   `(T_i, T_{i+1}]`: `rf_i = prod(1 + accrual) - 1`.
+- `published_by_session` is the as-of read: each session's published rate, from the rows
+  known at its close (the engine's cash accrual; `results` applies the same rule).
 - `constant_period_returns` is the `constant` source: `(1 + r)^(1/ppy) - 1` for every
   period, exactly what the metrics computed before the series existed.
 
@@ -22,8 +24,8 @@ AST-literal test).
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
-from datetime import date
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import date, datetime
 from itertools import pairwise
 from typing import Final, Literal
 
@@ -36,6 +38,7 @@ __all__ = [
     "annualised",
     "constant_period_returns",
     "period_risk_free",
+    "published_by_session",
     "session_accruals",
     "to_yield",
 ]
@@ -145,3 +148,31 @@ def annualised(period_returns: Sequence[float], periods_per_year: int) -> float:
     if not period_returns:
         raise ValueError("need at least one period return")
     return math.prod(1 + r for r in period_returns) ** (periods_per_year / len(period_returns)) - 1
+
+
+def published_by_session(
+    rows: Iterable[tuple[datetime, date, float]],
+    sessions: Sequence[date],
+    close: Callable[[date], datetime],
+) -> dict[date, float]:
+    """`rf(s)` for every session after the first, as the published fraction.
+
+    `rows` are `(known_at, observation_date, value)` of one series, `value` a fraction.
+    A session takes the value of the latest observation (by `observation_date`) among
+    the rows with `known_at <= close(s)`, carried across the sessions with none newer;
+    a session with nothing known at its close is left out, which `session_accruals`
+    turns into `RiskFreeMissing`. Only rows known at a session's close are read for it."""
+    ordered = sorted(rows, key=lambda row: row[0])
+    out: dict[date, float] = {}
+    latest: tuple[date, float] | None = None
+    taken = 0
+    for session in sessions[1:]:
+        at = close(session)
+        while taken < len(ordered) and ordered[taken][0] <= at:
+            _, observed, value = ordered[taken]
+            if latest is None or observed >= latest[0]:
+                latest = (observed, value)
+            taken += 1
+        if latest is not None:
+            out[session] = latest[1]
+    return out

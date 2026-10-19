@@ -942,14 +942,11 @@ def test_strategy_weighting_literal_lists_hold() -> None:
     }
 
 
-def test_strategy_refuses_hold_and_band_until_they_are_wired() -> None:
-    """T209a adds the keys; the engine learns them in T209b. Until then a run would trade
-    equal-weight targets while the row says otherwise, so a config validator refuses,
-    naming T209b (reviewer on #1788)."""
-    with pytest.raises(ValidationError, match="T209b"):
-        StrategyConfig(weighting="hold")
-    with pytest.raises(ValidationError, match="T209b"):
-        StrategyConfig(rebalance_band=0.05)
+def test_strategy_loads_hold_and_a_non_zero_band() -> None:
+    """T209b wires the engine, so `hold` and a non-zero band load (T209a refused them
+    until then)."""
+    assert StrategyConfig(weighting="hold").weighting == "hold"
+    assert StrategyConfig(rebalance_band=0.05).rebalance_band == pytest.approx(0.05)
     assert StrategyConfig().weighting == "equal"
     assert StrategyConfig().rebalance_band == pytest.approx(0.0)
 
