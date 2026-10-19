@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,8 +28,19 @@ def parse_mapping(payload: list[Any]) -> list[FigiType | None]:
         data = job.get("data", []) if isinstance(job, dict) else []
         if not isinstance(data, list):
             raise ValueError("OpenFIGI mapping data is not a list")
-        us = next((x for x in data if isinstance(x, dict) and x.get("exchCode") == "US"), None)
-        chosen = us or next((x for x in data if isinstance(x, dict)), None)
+        us = [x for x in data if isinstance(x, dict) and x.get("exchCode") == "US"]
+        # Prefer the US composite, then a stable ordering of response fields.
+        chosen = (
+            min(
+                us,
+                key=lambda x: (
+                    not (x.get("figi") and x.get("figi") == x.get("compositeFIGI")),
+                    json.dumps(x, sort_keys=True, default=str),
+                ),
+            )
+            if us
+            else None
+        )
         if chosen is None:
             result.append(None)
             continue

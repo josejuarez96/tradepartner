@@ -150,7 +150,7 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 30
+    assert schema.CURRENT_SCHEMA_VERSION == 31
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -236,6 +236,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (28,),
         (29,),
         (30,),
+        (31,),
     ]
 
 

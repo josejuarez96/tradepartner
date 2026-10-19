@@ -288,7 +288,7 @@ def _snapshot(c: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 30
+    assert schema.CURRENT_SCHEMA_VERSION == 31
 
 
 def test_research_table_names_are_the_spec_five() -> None:
@@ -373,7 +373,7 @@ def test_a_fresh_store_has_every_research_table_at_version_17(
     conn: duckdb.DuckDBPyConnection,
 ) -> None:
     assert set(schema.RESEARCH_TABLE_NAMES) <= _tables(conn)
-    assert _versions(conn) == [30]
+    assert _versions(conn) == [31]
     assert _columns(conn, "trial_results")["n_research"] == ("INTEGER", False)
     schema.require_research(conn)
 
@@ -382,7 +382,7 @@ def test_init_schema_is_idempotent_on_version_17(conn: duckdb.DuckDBPyConnection
     before = _ddl(conn)
     schema.init_schema(conn)
     assert _ddl(conn) == before
-    assert _versions(conn) == [30]
+    assert _versions(conn) == [31]
 
 
 @pytest.mark.parametrize("table", schema.RESEARCH_TABLE_NAMES)
@@ -726,14 +726,16 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     assert all(c in ddl_after["trial_rebalances"] for c in schema.PROFITABILITY_REBALANCE_COLUMNS)
     # Version 21 (#1358) adds `filing_events`, version 23 (#1498) `rates`,
     # version 24 (#1506) `borrow_status`, version 28 (#1506, T172b)
-    # `symbol_changes` and version 29 (#821, T187) `successor_chains`, all
-    # empty; nothing else gains a table.
+    # `symbol_changes`, version 30 (#1713, T189c) `openfigi_types` and
+    # version 31 (#821, T187) `successor_chains`, all empty; nothing else
+    # gains a table.
     assert rows_after == {
         **rows_before,
         "filing_events": [],
         "rates": [],
         "borrow_status": [],
         "symbol_changes": [],
+        "openfigi_types": [],
         "successor_chains": [],
     }
     # And the migrated store is shaped exactly as a fresh one.

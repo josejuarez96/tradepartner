@@ -70,6 +70,8 @@ MAIN_REF = "origin/main"
 SHARED_FILES = ("docs/STATUS.md", "CHANGELOG.md")
 BULLET_RE = re.compile(r"^- \S")
 UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.*)$", re.MULTILINE)
+# The PR template's reviewer line, the only box ready_pr ticks itself (#1823).
+REVIEWER_BOX_PREFIX = "The reviewers `scripts/ready_pr.py` requires"
 CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
 BRANCH_ISSUE_RE = re.compile(r"^[a-z]+/(\d+)-")
 CONFLICT_RE = re.compile(
@@ -227,6 +229,8 @@ class CheckRun:
     name: str
     status: str  # COMPLETED | IN_PROGRESS | QUEUED | ...
     conclusion: str  # SUCCESS | FAILURE | ... | "" while running
+    run_id: int = 0  # workflow run id (from the details URL); 0 when unknown
+    started_at: str = ""  # ISO-8601 UTC start time; "" when unknown
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,7 @@ class Runner(Protocol):
     def read(self, path: str) -> str: ...
     def write(self, path: str, text: str) -> None: ...
     def pr(self, number: int) -> Pr: ...
+    def edit_body(self, number: int, body: str) -> None: ...
     def head_checks(self, number: int) -> HeadChecks: ...
     def mark_ready(self, number: int) -> None: ...
     def add_label(self, number: int, label: str) -> None: ...
@@ -351,6 +356,55 @@ def missing_reviews(required: set[str], comments: Sequence[str]) -> list[str]:
     return sorted(r for r in required if latest.get(r) != "pass")
 
 
+def tick_reviewer_boxes(
+    body: str, required: set[str], comments: Sequence[str]
+) -> tuple[str, list[str], list[str], list[str], dict[str, str]]:
+    """Return the edited body, other boxes, changed lines, missing SHAs, and review SHAs."""
+    reviewed_at: dict[str, str] = {}
+    for comment in comments:
+        verdict = VERDICT_RE.match(comment)
+        if verdict:
+            sha = re.match(r"[^\r\n]*\r?\nreviewed at ([0-9a-f]{8,40})(?:\r?\n|\Z)", comment)
+            agent = verdict.group("agent").lower()
+            if sha:
+                reviewed_at[agent] = sha.group(1)
+            else:
+                reviewed_at.pop(agent, None)
+    # Only boxes outside fenced code blocks count, and only the template's own reviewer
+    # line is ticked, and only when exactly one such line is unticked (#1823).
+    lines = body.splitlines(keepends=True)
+    boxes: dict[int, str] = {}
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
+            boxes[i] = m.group(1).strip()
+    review = [i for i, label in boxes.items() if label.startswith(REVIEWER_BOX_PREFIX)]
+    if len(review) != 1:
+        return body, list(boxes.values()), [], [], reviewed_at
+    other = [label for i, label in boxes.items() if i != review[0]]
+    missing_sha = sorted(required - reviewed_at.keys())
+    if missing_sha:
+        return body, other, [], missing_sha, reviewed_at
+    suffix = (
+        "; ".join(f"{agent}: PASS at {reviewed_at[agent][:8]}" for agent in sorted(required))
+        if required
+        else "n/a, none required"
+    )
+    original = lines[review[0]]
+    text = original.rstrip("\r\n")
+    ending = original[len(text) :]
+    lines[review[0]] = text.replace("- [ ]", "- [x]", 1) + "; " + suffix + ending
+    return "".join(lines), other, [lines[review[0]].rstrip("\r\n")], [], reviewed_at
+
+
+def _run_id(details_url: str) -> int:
+    """The workflow run id in a check's details URL (``.../actions/runs/<id>/job/...``)."""
+    m = re.search(r"/actions/runs/(\d+)", details_url)
+    return int(m.group(1)) if m else 0
+
+
 def matrix_base(name: str) -> str:
     """The bare name of a known matrix job's child: ``pytest-shard (3)`` -> ``pytest-shard``.
 
@@ -372,6 +426,16 @@ def is_cancelled(run: CheckRun) -> bool:
     return run.conclusion.upper() == "CANCELLED" and run.status.upper() == "COMPLETED"
 
 
+def is_later_than(run: CheckRun, other: CheckRun) -> bool:
+    """Whether ``run`` belongs to a later workflow run than ``other``: by run id when both
+    are known, else by start time. Unknown ordering is never "later"."""
+    if run.run_id and other.run_id:
+        return run.run_id > other.run_id
+    if run.started_at and other.started_at:
+        return run.started_at > other.started_at
+    return False
+
+
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
@@ -391,7 +455,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     head. A non-cancelled matrix child also excuses its cancelled bare parent -- the full
     run's ``pytest-shard (N)`` excuses a cancelled ``pytest-shard`` cancelled before it
     fanned out -- but never a cancelled sibling child: a cancelled ``pytest-shard (3)``
-    needs its own ``pytest-shard (3)`` success (#1254). A lone ``CANCELLED`` ``checks``
+    needs its own ``pytest-shard (3)`` success (#1254). A ``CANCELLED`` check is also
+    ignored when a later workflow run (by run id, else start time) on the head has a
+    ``SUCCESS`` check, whatever the names (#1844). A lone ``CANCELLED`` ``checks``
     with every run on the head completed is ``cancelled`` (#1201): the caller may
     re-trigger once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
@@ -408,7 +474,28 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         if not cancelled:
             finished.add(run.name)
             finished.add(base)
-    runs = [run for run, _base, cancelled in live if not (cancelled and run.name in finished)]
+    # A cancelled check is also excused by a SUCCESS in a later workflow run on this head,
+    # whatever the names (the draft run's cancelled `pytest-shard` vs the full run's
+    # `pytest-shard (N)`, #1844).
+    succeeded = [
+        run
+        for run, _base, cancelled in live
+        if not cancelled
+        and run.status.upper() == "COMPLETED"
+        and run.conclusion.upper() == "SUCCESS"
+    ]
+    runs = [
+        run
+        for run, _base, cancelled in live
+        if not (
+            cancelled
+            and (
+                run.name in finished
+                # never a cancelled `checks`: only a later `checks` excuses it (#1201)
+                or (run.name != "checks" and any(is_later_than(ok, run) for ok in succeeded))
+            )
+        )
+    ]
     if not any(r.name == "checks" for r in runs):
         return "pending"
     if any(r.status.upper() != "COMPLETED" for r in runs):
@@ -677,15 +764,18 @@ def ready(
             raise ReadyError(f"local check failed: {' '.join(cmd)}")
 
     # 5. template, linked issue, specialist reviews
-    boxes = unchecked_boxes(pr.body)
-    if boxes:
+    required = required_reviews(touched)
+    new_body, other_boxes, ticked, missing_sha, reviewed_at = tick_reviewer_boxes(
+        pr.body, required, pr.comments
+    )
+    if other_boxes:
         raise ReadyError(
-            "PR body still has unticked boxes (tick them or write n/a and why): " + "; ".join(boxes)
+            "PR body still has unticked boxes (tick them or write n/a and why): "
+            + "; ".join(other_boxes)
         )
     issue = issue_of_branch(pr.branch)
     if issue is not None and issue not in closed_issues(pr.body):
         raise ReadyError(f"PR body must say `Closes #{issue}` (the branch's issue)")
-    required = required_reviews(touched)
     missing = missing_reviews(required, pr.comments)
     if missing:
         raise ReadyError(
@@ -693,6 +783,35 @@ def ready(
             "verdict line is `<agent>: PASS` (PASS WITH FIXES needs a re-review) for each: "
             + ", ".join(missing)
         )
+    if missing_sha:
+        raise ReadyError(
+            "latest PASS review comment needs `reviewed at <sha>` before ticking the "
+            "reviewer box: " + ", ".join(missing_sha)
+        )
+    if ticked:
+        for agent in sorted(required):
+            sha = reviewed_at[agent]
+            if not r.git_ok(
+                "merge-base", "--is-ancestor", sha, "HEAD"
+            ) or agent in required_reviews(
+                [
+                    path
+                    for path in r.git(
+                        "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
+                    ).splitlines()
+                    if path in touched  # the PR's own changes; a main merge is not one
+                ]
+            ):
+                raise ReadyError(
+                    f"{agent} review no longer covers the current head; rerun it before "
+                    "ticking the reviewer box"
+                )
+    for line in ticked:
+        say(f"reviewer box: {line}")
+    if ticked and not dry_run:
+        if r.pr(number).body != pr.body:
+            raise ReadyError("PR body changed during checks; rerun to avoid overwriting that edit")
+        r.edit_body(number, new_body)
     say(f"reviews required: {sorted(required) or 'none'}; all recorded")
 
     if dry_run:
@@ -880,6 +999,9 @@ class ShellRunner:
             tuple(str(lb.get("name", "")) for lb in raw.get("labels") or []),
         )
 
+    def edit_body(self, number: int, body: str) -> None:
+        self._gh("pr", "edit", str(number), "--body", body)
+
     def head_checks(self, number: int) -> HeadChecks:
         raw = json.loads(
             self._gh("pr", "view", str(number), "--json", "headRefOid,statusCheckRollup")
@@ -889,6 +1011,8 @@ class ShellRunner:
                 str(c.get("name") or c.get("context") or "?"),
                 str(c.get("status") or ("COMPLETED" if c.get("conclusion") else "")),
                 str(c.get("conclusion") or c.get("state") or ""),
+                _run_id(str(c.get("detailsUrl") or "")),
+                str(c.get("startedAt") or ""),
             )
             for c in raw.get("statusCheckRollup") or []
         )

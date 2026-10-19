@@ -159,8 +159,8 @@ def test_the_three_name_tuples_are_pairwise_disjoint() -> None:
     assert registry_ & journal_ == set()
 
 
-def test_current_schema_version_is_29() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 30
+def test_current_schema_version_is_31() -> None:
+    assert schema.CURRENT_SCHEMA_VERSION == 31
     assert schema._PRE_FEE_ACTIVITIES_VERSION == 24
     assert schema._PRE_FILING_NAME_VERSION == 25
     assert schema._PRE_CASH_IN_LIEU_VERSION == 26
@@ -280,7 +280,7 @@ def test_migrating_a_version_24_store_books_the_fee_columns_once_and_keeps_rows(
         ).fetchone()[0]
         assert "'fee_cash'" in ddl
         assert "'cash_in_lieu'" in ddl  # the same init pass runs the version-27 widen
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 30
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 31
     finally:
         conn.close()
 
@@ -328,7 +328,7 @@ def test_migrating_a_version_26_store_widens_the_kind_check_once_and_keeps_rows(
         schema.init_schema(conn)
 
         assert conn.execute("SELECT * FROM adjustments ORDER BY rowid").fetchall() == before
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 30
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 31
         ddl = conn.execute(
             "SELECT sql FROM duckdb_tables() WHERE table_name = 'adjustments'"
         ).fetchone()[0]
@@ -1208,7 +1208,7 @@ def test_a_version_4_store_gets_alerts_book_id_directly(v4_path: Path) -> None:
     with duckdb.connect(str(v4_path)) as conn:
         schema.init_schema(conn)
         assert _columns(conn, "alerts")["book_id"] is False  # NOT NULL
-        assert _versions(conn)[-1] == 30
+        assert _versions(conn)[-1] == 31
 
 
 def test_default_book_id_is_a_nonempty_word() -> None:

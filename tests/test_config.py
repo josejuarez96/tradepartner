@@ -999,14 +999,11 @@ def test_strategy_weighting_literal_lists_hold() -> None:
     }
 
 
-def test_strategy_refuses_hold_and_band_until_they_are_wired() -> None:
-    """T209a adds the keys; the engine learns them in T209b. Until then a run would trade
-    equal-weight targets while the row says otherwise, so a config validator refuses,
-    naming T209b (reviewer on #1788)."""
-    with pytest.raises(ValidationError, match="T209b"):
-        StrategyConfig(weighting="hold")
-    with pytest.raises(ValidationError, match="T209b"):
-        StrategyConfig(rebalance_band=0.05)
+def test_strategy_loads_hold_and_a_non_zero_band() -> None:
+    """T209b wires the engine, so `hold` and a non-zero band load (T209a refused them
+    until then)."""
+    assert StrategyConfig(weighting="hold").weighting == "hold"
+    assert StrategyConfig(rebalance_band=0.05).rebalance_band == pytest.approx(0.05)
     assert StrategyConfig().weighting == "equal"
     assert StrategyConfig().rebalance_band == pytest.approx(0.0)
 
@@ -2705,6 +2702,40 @@ def test_the_free_disk_floor_is_a_run_time_key_that_cannot_be_negative() -> None
     with pytest.raises(ValidationError):
         Settings(_env_file=None, paper={"min_free_disk_gb": -1})
     assert "min_free_disk_gb" not in FROZEN_PAPER_KEYS
+
+
+# --- T210: the cost terms (backtest spec, amendment 2026-10-18 #1731, "Config keys") ---
+
+
+def test_t210_cost_term_defaults_are_the_identity() -> None:
+    """`costs.spread_bps=0.0`, `costs.impact_coeff=0.0`, `costs.adv_sessions=20`."""
+    c = _settings().costs
+    assert c.spread_bps == 0.0
+    assert c.impact_coeff == 0.0
+    assert c.adv_sessions == 20
+    assert isinstance(c.adv_sessions, int)
+
+
+def test_t210_cost_terms_accept_positive_values() -> None:
+    c = Settings(
+        _env_file=None, costs={"spread_bps": 2.5, "impact_coeff": 0.1, "adv_sessions": 60}
+    ).costs
+    assert (c.spread_bps, c.impact_coeff, c.adv_sessions) == (2.5, 0.1, 60)
+
+
+@pytest.mark.parametrize("field", ["spread_bps", "impact_coeff"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_t210_cost_terms_negative_or_non_finite_rejected(field: str, value: float) -> None:
+    """A negative cost would pay the strategy to trade (`CostsConfig`'s rule)."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={field: value})
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_t210_adv_window_must_hold_a_session(value: int) -> None:
+    """A median over no sessions is undefined."""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, costs={"adv_sessions": value})
 
 
 # --- risk.small_account (spec amendment 2026-10-18 item 8; ADR 0023 D6; T206) ---

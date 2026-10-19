@@ -724,6 +724,7 @@ def version_4_store(path: Path) -> Path:
             + schema._RATES_TABLE_DDL
             + schema._BORROW_STATUS_TABLE_DDL
             + schema._SYMBOL_CHANGES_TABLE_DDL
+            + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
         ):
             conn.execute(ddl)

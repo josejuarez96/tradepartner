@@ -156,6 +156,7 @@ from tradepartner.adapters.broker import (
     canonical_symbol,
     validate_positive_finite,
 )
+from tradepartner.adapters.broker_refusals import typed_refusal
 from tradepartner.errors import ClockError
 from tradepartner.timeutil import ensure_tz_aware_utc
 
@@ -504,13 +505,16 @@ class FakeBroker(Broker):
             # Open question: Alpaca's exact submit-time untradable body has
             # not been recorded. This follows its observed 403 refusal family;
             # T202 must classify the message, not this assumed code alone.
-            raise AlpacaTradingError(
-                403,
-                json.dumps(
-                    {"code": 40310000, "message": f'asset "{request.symbol}" is not tradable'},
-                    separators=(",", ":"),
+            raise _refused(
+                request,
+                AlpacaTradingError(
+                    403,
+                    json.dumps(
+                        {"code": 40310000, "message": f'asset "{request.symbol}" is not tradable'},
+                        separators=(",", ":"),
+                    ),
+                    retried=False,
                 ),
-                retried=False,
             )
         if request.side is Side.SELL:
             held = self._net_quantity.get(request.symbol, Decimal(0))
@@ -553,33 +557,42 @@ class FakeBroker(Broker):
             )
             available = max(Decimal(0), held - reserved)
             if requested > available:
-                raise AlpacaTradingError(
-                    403,
-                    json.dumps(
-                        {
-                            "available": str(available),
-                            "code": 40310000,
-                            "existing_qty": str(held),
-                            "held_for_orders": str(reserved),
-                            "message": "insufficient qty available for order "
-                            f"(requested: {requested}, available: {available})",
-                            "symbol": request.symbol,
-                        },
-                        separators=(",", ":"),
+                raise _refused(
+                    request,
+                    AlpacaTradingError(
+                        403,
+                        json.dumps(
+                            {
+                                "available": str(available),
+                                "code": 40310000,
+                                "existing_qty": str(held),
+                                "held_for_orders": str(reserved),
+                                "message": "insufficient qty available for order "
+                                f"(requested: {requested}, available: {available})",
+                                "symbol": request.symbol,
+                            },
+                            separators=(",", ":"),
+                        ),
+                        retried=False,
                     ),
-                    retried=False,
                 )
         if not asset.fractionable and (
             request.notional is not None
             or (request.quantity is not None and not float(request.quantity).is_integer())
         ):
-            raise AlpacaTradingError(
-                403,
-                json.dumps(
-                    {"code": 40310000, "message": f'asset "{request.symbol}" is not fractionable'},
-                    separators=(",", ":"),
+            raise _refused(
+                request,
+                AlpacaTradingError(
+                    403,
+                    json.dumps(
+                        {
+                            "code": 40310000,
+                            "message": f'asset "{request.symbol}" is not fractionable',
+                        },
+                        separators=(",", ":"),
+                    ),
+                    retried=False,
                 ),
-                retried=False,
             )
 
         script = self._scripted_by_id.get(cid) or (
@@ -871,6 +884,19 @@ class FakeBroker(Broker):
             raise OrderNotOpenError(
                 f"order {order.client_order_id!r} is {order.status.value}, cannot {action}"
             )
+
+
+def _refused(request: OrderRequest, error: AlpacaTradingError) -> Exception:
+    """What the real adapter raises for this refusal: the typed error its shared map
+    (`typed_refusal`) knows, else `error` itself. The typed error is also an
+    `AlpacaTradingError` (same status, body and `retried`), so a caller that reads
+    the Alpaca shape still can."""
+    typed = typed_refusal(error, request)
+    if typed is None:
+        return error
+    both = type(type(typed).__name__, (type(typed), AlpacaTradingError), {})
+    refusal: Exception = both(error.status_code, error.body, retried=error.retried)
+    return refusal
 
 
 def _transport_error(fault: TransportFault, message: str) -> Exception:

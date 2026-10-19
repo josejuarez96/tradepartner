@@ -209,7 +209,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -218,6 +218,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
+from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.alpaca_raw import ASSETS_ENDPOINT, ASSETS_REQUEST, AssetsFetch
 from tradepartner.adapters.borrow import (
@@ -239,6 +240,8 @@ from tradepartner.adapters.filings import (
     FilingSource,
     StatementFactRecord,
 )
+from tradepartner.adapters.openfigi import FigiType, parse_mapping
+from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
@@ -314,6 +317,129 @@ MODE = "session"
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
 PRICE_SOURCE = "alpaca"
 SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE, "fred")
+OPENFIGI_SOURCE = "openfigi"  # explicit only: never add to SOURCES / all
+
+
+def ingest_openfigi(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    mapping: Callable[..., list[tuple[list[Any], datetime, datetime]]] = map_tickers,
+) -> IngestResult:
+    """Map current live, recently traded listings; append only changed observations.
+
+    The set is every live listing on `universe.exchanges` with any bar in the last
+    `universe.min_history_months` calendar months: wider than the universe's
+    minimum-history rule (recent IPOs and thin names are in), which is fine for a
+    check-only table. A name that stops mapping (or never maps) gets a
+    `mapped = FALSE` row when that is a change; a per-job `error` writes nothing.
+    """
+    if not settings.openfigi.enabled:
+        raise ValueError("OpenFIGI ingest is disabled")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    session = last_completed_session(now)
+    first_bar = now.date() - relativedelta(months=settings.universe.min_history_months)
+    prepared: list[tuple[str, str, str]] = []
+    responses: list[tuple[list[Any], datetime, datetime]] = []
+    class_symbols = settings.alpaca.class_symbols
+
+    def prepare() -> None:
+        with open_read_only(settings) as conn:
+            bars = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT security_id FROM prices_daily "
+                    "WHERE session >= ? AND session <= ? AND known_at <= ?",
+                    [first_bar, session, now],
+                ).fetchall()
+            }
+            current: dict[str, dict[str, Any]] = {}
+            for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
+                sid = row["security_id"]
+                if row["valid_from"] > session:
+                    continue
+                old = current.get(sid)
+                if old is None or row["valid_from"] > old["valid_from"]:
+                    current[sid] = row
+            for sid, row in sorted(current.items()):
+                status, end = row["status"], row["end_session"]
+                live = status == LISTED or (
+                    status == TRANSFERRED and (end is None or end >= session)
+                )
+                if live and row["exchange"] in settings.universe.exchanges and sid in bars:
+                    ticker = row["ticker"]
+                    # OpenFIGI's `TICKER` id spells a US class share with a slash
+                    # (`BF/B`), the undotted form the spec names; `class_symbols`
+                    # gives the dotted Alpaca symbol for an undotted NYSE master
+                    # ticker (#1219), so a `BFB` or `BF.B` store ticker both land on
+                    # `BF/B`.
+                    undotted = class_symbols.get(ticker, ticker).replace(".", "/")
+                    prepared.append((sid, ticker, undotted))
+        responses.extend(mapping([job[2] for job in prepared], settings.openfigi, clock=clock))
+
+    def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        count = unmapped = errors = 0
+        offset = 0
+        for payload, sent, received in responses:
+            if (
+                sent.tzinfo is None
+                or received.tzinfo is None
+                or sent.utcoffset() != timedelta(0)
+                or received.utcoffset() != timedelta(0)
+                or received <= sent
+            ):
+                raise ValueError("OpenFIGI response timestamps must be ordered UTC-aware instants")
+            parsed = parse_mapping(payload)
+            for job, item in zip(payload, parsed, strict=True):
+                sid, ticker, _ = prepared[offset]
+                offset += 1
+                if isinstance(job, dict) and "error" in job:
+                    errors += 1
+                    continue
+                if item is None:
+                    unmapped += 1
+                    blank = {f.name: "" for f in fields(FigiType)}
+                    values = {"ticker": ticker, **blank, "mapped": False}
+                else:
+                    values = {"ticker": ticker, **asdict(item), "mapped": True}
+                prior = conn.execute(
+                    "SELECT ticker, figi, composite_figi, share_class_figi, security_type, "
+                    "security_type2, market_sector, name, exch_code, mapped, known_at "
+                    "FROM openfigi_types "
+                    "WHERE security_id = ? ORDER BY known_at DESC LIMIT 1",
+                    [sid],
+                ).fetchone()
+                if prior is not None and prior[:-1] == tuple(values.values()):
+                    continue
+                if prior is not None and received <= prior[-1]:
+                    raise ValueError("OpenFIGI revision must be newer than the last observation")
+                ingested = ensure_tz_aware_utc(clock(), field_name="clock()")
+                insert_row(
+                    conn,
+                    "openfigi_types",
+                    {
+                        "security_id": sid,
+                        **values,
+                        "known_at": received,
+                        "ingested_at": max(received, ingested),
+                        "provenance": "openfigi",
+                        "source": OPENFIGI_SOURCE,
+                    },
+                )
+                count += 1
+        if offset != len(prepared):
+            raise ValueError("OpenFIGI mapping response count does not match jobs")
+        return (
+            count,
+            f"mapped={len(prepared) - unmapped - errors}; unmapped={unmapped}; errors={errors}",
+        )
+
+    run = _run_source(
+        OPENFIGI_SOURCE, write, settings, now, clock, session.isoformat(), dry_run, prepare=prepare
+    )
+    return IngestResult((run,))
+
 
 #: XBRL concept requested from `FilingSource.facts` -> the store's `fact_name`.
 FACT_NAMES: dict[str, str] = {"EntityCommonStockSharesOutstanding": SHARES_FACT}

@@ -1327,8 +1327,7 @@ class StrategyConfig(BaseModel):
     amendment #1731). `hold_sessions`, `hold_target_names` and `rebalance_band` are
     post-registration own-section keys too, inert under the default `equal` weighting.
     `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
-    trades every non-zero drift, so every default reproduces today's behaviour. Until
-    T209b wires the engine, `hold` and a non-zero `rebalance_band` are refused.
+    trades every non-zero drift, so every default reproduces today's behaviour.
 
     `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
     delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
@@ -1357,23 +1356,6 @@ class StrategyConfig(BaseModel):
             raise ValueError(
                 f"formation_months ({self.formation_months}) must be greater than "
                 f"skip_months ({self.skip_months})"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _refuse_hold_mode_until_wired(self) -> StrategyConfig:
-        """`hold` and a non-zero band load as keys but no build reads them yet, so until
-        T209b wires the engine a run would trade equal-weight targets while the row says
-        otherwise. T209b removes this guard."""
-        if self.weighting == "hold":
-            raise ValueError(
-                "strategy.weighting = 'hold' is not wired until T209b: the engine still "
-                "builds equal-weight targets and keeps no entry sessions"
-            )
-        if self.rebalance_band != 0:
-            raise ValueError(
-                f"strategy.rebalance_band = {self.rebalance_band} is not wired until "
-                "T209b: the engine still trades every drift to its exact target"
             )
         return self
 
@@ -1612,13 +1594,21 @@ class CostsConfig(BaseModel):
     Velikov (2016) imply for 12-1 momentum, via G1. Commissions are zero at Alpaca; the
     keys exist for other brokers. Every value is non-negative: a negative cost would pay
     the strategy to trade.
+
+    Amendment 2026-10-18 (#1731) "Cost terms": `spread_bps` is a per-side level added to
+    `per_side_bps`, `impact_coeff` scales `sqrt(notional / ADV)` market impact, and
+    `adv_sessions` is the window (in XNYS sessions) over which ADV is measured. Both new
+    rate keys are `ge=0`; `adv_sessions` must hold at least one session.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     per_side_bps: float = Field(default=15.0, ge=0)
+    spread_bps: float = Field(default=0.0, ge=0)
+    impact_coeff: float = Field(default=0.0, ge=0)
     commission_per_share: float = Field(default=0.0, ge=0)
     commission_per_order: float = Field(default=0.0, ge=0)
+    adv_sessions: int = Field(default=20, ge=1)
     sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
     )
