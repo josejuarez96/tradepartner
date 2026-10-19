@@ -1430,18 +1430,18 @@ def _chain_same(stored: Mapping[str, Any], chain: Chain) -> bool:
     )
 
 
-#: The live rows for a successor: not retracted, and not a stamp a retraction
+#: The live rows for a successor: not retracted, and not a row a retraction
 #: names. A retraction is a `retracted` row at the run's clock whose
-#: `withdrawn_known_at` names the revision it withdraws, so a reader can tell
-#: which stamp moved (`schema.successor_chains`).
+#: `withdrawn_known_at` names the withdrawn row's own `known_at` (its revision
+#: identity), `schema.successor_chains`.
 _LIVE_CHAINS_SQL = """
     SELECT * FROM successor_chains
     WHERE successor_id = ? AND NOT retracted
-      AND evidence_known_at NOT IN (
+      AND known_at NOT IN (
           SELECT withdrawn_known_at FROM successor_chains
           WHERE successor_id = ? AND retracted
       )
-    ORDER BY known_at, evidence_known_at
+    ORDER BY known_at
 """
 
 
@@ -1460,15 +1460,16 @@ def _write_chains(
     (`unjudged`), or whose security it skipped as restamp-refused (`skipped`),
     is refused `unjudged` -- a transient fetch failure must not move a chain.
     Both write nothing. A successor with no live row gets one at its evidence
-    stamp. A successor whose live row's evidence moved to a *later* stamp gets
-    the new row at that stamp and the old live row retracted at `now` (the
-    run's clock, #859) with `withdrawn_known_at` naming it, counted under
-    `chains_moved`. When the evidence moves to an earlier or unchanged stamp,
-    the new row is stamped at `now` (a revision, as `_filed` does for the
-    master tables) with `evidence_known_at` carrying the evidence stamp, and
-    the superseded live row is retracted; `UNIQUE (successor_id, known_at)`
-    forbids a second row at a stamp already held, so no path can collide. An
-    unchanged re-run (same evidence, same evidence stamp) writes nothing."""
+    stamp. Otherwise the derived row is inserted at its evidence stamp and the
+    superseded live row retracted at `now` (the run's clock, #859) with
+    `withdrawn_known_at` naming it, counted under `chains_moved` -- but only
+    when its evidence stamp is newer than every row the successor holds and is
+    unoccupied (`UNIQUE (successor_id, known_at)`). When the evidence moves to
+    an earlier or unchanged stamp, the new row is stamped at `now` (a
+    revision, as `_filed` does for the master tables) with `evidence_known_at`
+    carrying the evidence stamp and no retraction (the newest revision wins),
+    so no path can collide. An unchanged re-run (same evidence, same evidence
+    stamp) writes nothing."""
     held = _held_ids(conn, [chain.predecessor_id for chain in master.chains])
     refusals: list[ChainRefusal] = list(master.chain_refusals)
     written = 0
@@ -1488,28 +1489,36 @@ def _write_chains(
         cursor = conn.execute(_LIVE_CHAINS_SQL, [chain.successor_id, chain.successor_id])
         names = [column[0] for column in cursor.description]
         stored = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
-        if stored and _chain_same(stored[-1], chain):
+        last = stored[-1] if stored else None
+        if last is not None and _chain_same(last, chain):
             continue
+        occupied = {
+            row[0]
+            for row in conn.execute(
+                "SELECT known_at FROM successor_chains WHERE successor_id = ?",
+                [chain.successor_id],
+            ).fetchall()
+        }
+        forced = last is not None and (
+            chain.known_at <= last["known_at"] or chain.known_at in occupied
+        )
         row = chain.row()
-        forced = bool(stored) and chain.known_at <= stored[-1]["evidence_known_at"]
         if forced:
-            # The evidence moved to an earlier or unchanged stamp: a revision at
-            # the run's clock, sharing it with no retraction (which would take
-            # the same `(successor_id, known_at)`), so the newest revision wins.
+            # An earlier or unchanged evidence stamp, or one already held: a
+            # revision at the run's clock, sharing it with no retraction.
             row["known_at"] = now
             row["ingested_at"] = now
-        else:
-            for previous in stored:
-                withdrawn = retraction(previous, now)
-                withdrawn["withdrawn_known_at"] = previous["evidence_known_at"]
-                insert_row(conn, "successor_chains", withdrawn)
-                inserted += 1
-        if stored:
+        elif last is not None:
+            withdrawn = retraction(last, now)
+            withdrawn["withdrawn_known_at"] = last["known_at"]
+            insert_row(conn, "successor_chains", withdrawn)
+            inserted += 1
+        insert_row(conn, "successor_chains", row)
+        inserted += 1
+        if last is not None:
             moved += 1
         else:
             written += 1
-        insert_row(conn, "successor_chains", row)
-        inserted += 1
     return _ChainTally(written, moved, inserted, tuple(refusals))
 
 

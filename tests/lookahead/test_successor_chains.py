@@ -87,16 +87,16 @@ def test_truncation_sees_exactly_the_rows_known_by_each_probe(
 
 
 #: The read rule `schema.successor_chains` documents: the live row with the
-#: greatest `evidence_known_at <= t` that no retraction *known at t* names.
+#: greatest `known_at <= t` that no retraction *known at t* names; its
+#: `evidence_known_at` is the chain's stamp.
 _LIVE_AT_SQL = """
     SELECT evidence_known_at FROM successor_chains
-    WHERE successor_id = '0001000011' AND NOT retracted
-      AND known_at <= ? AND evidence_known_at <= ?
-      AND evidence_known_at NOT IN (
+    WHERE successor_id = '0001000011' AND NOT retracted AND known_at <= ?
+      AND known_at NOT IN (
           SELECT withdrawn_known_at FROM successor_chains
           WHERE retracted AND known_at <= ?
       )
-    ORDER BY evidence_known_at DESC LIMIT 1
+    ORDER BY known_at DESC LIMIT 1
 """
 
 
@@ -114,7 +114,7 @@ def test_a_moved_chain_is_absent_from_the_old_stamp_once_the_run_is_known(
     clock = datetime.fromisoformat("2020-04-01T04:00:00+00:00")
 
     def at(t: datetime) -> list[datetime]:
-        return [row[0] for row in fixture_store.execute(_LIVE_AT_SQL, [t, t, t]).fetchall()]
+        return [row[0] for row in fixture_store.execute(_LIVE_AT_SQL, [t, t]).fetchall()]
 
     assert at(old) == [old]
     assert at(new) == [old]  # the fixture is unmoved: the old stamp, no new row yet

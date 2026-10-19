@@ -1214,17 +1214,19 @@ CREATE TABLE IF NOT EXISTS schema_version (
 # retraction flag. `evidence_known_at` is the latest of the four evidence
 # stamps (the 8-K12B's acceptance, the successor's `securities` row, its first
 # listing row under the predecessor's ticker and the predecessor's last
-# listing row). `known_at` is that stamp when the row is a first write or a
-# move to a later stamp; when the evidence moves to an earlier or unchanged
-# stamp, `known_at` is the run's clock (a revision, as `_filed` does for the
-# master tables), because `UNIQUE (successor_id, known_at)` forbids a second
-# row at a stamp already held. `retracted = FALSE` with `withdrawn_known_at
-# NULL` is a live row; a retraction is a row at the run's clock whose
-# `withdrawn_known_at` names the stamp it withdraws. A read at `t` takes the
-# live row with `evidence_known_at <= t` that no retraction with
-# `known_at <= t` names: so a moved chain is absent again once the retraction
-# is known and before the new stamp, never shown from a stamp its evidence no
-# longer carries. `evidence_form` is one of the four successor-issuer forms.
+# listing row) and is the row's identity. `known_at` is that stamp for a first
+# write or a move to a newer stamp; when the evidence moves to an earlier or
+# unchanged stamp (or one already held), `known_at` is the run's clock (a
+# revision, as `_filed` does for the master tables), because `UNIQUE
+# (successor_id, known_at)` forbids a second row at a stamp already held.
+# `retracted = FALSE` is a live row; a retraction is `retracted = TRUE` at the
+# run's clock whose `withdrawn_known_at` names the withdrawn row's own
+# `known_at`. A read at `t` takes the live row with the greatest `known_at <=
+# t` among rows no retraction known at `t` names, and reads its
+# `evidence_known_at`: so a chain moves to the new stamp and is absent from
+# the withdrawn one at every read once the retraction is known, never shown
+# from a stamp its evidence no longer carries. `evidence_form` is one of the
+# four successor-issuer forms.
 _CREATE_SUCCESSOR_CHAINS = f"""
 CREATE TABLE IF NOT EXISTS successor_chains (
     predecessor_id VARCHAR NOT NULL,
