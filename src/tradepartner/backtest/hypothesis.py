@@ -226,9 +226,9 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": 
 
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
 #: a value other than the table default, so no run or paper plan records results under a
-#: label its signal ignores. Empty since T165c (#1358): `strategies.py` applies
-#: `strategy.turnover_top_fraction`.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
+#: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
+#: `adjust.apply_spin_offs` (T211c, spec amendment #1894) enters until T211e applies it.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
 
 
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
@@ -405,7 +405,11 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     fixed = {
         key: defaults[key]
-        for key in sorted(frozen.POST_REGISTRATION_OWN_KEYS | frozen.POST_REGISTRATION_COST_KEYS)
+        for key in sorted(
+            frozen.POST_REGISTRATION_OWN_KEYS
+            | frozen.POST_REGISTRATION_COST_KEYS
+            | frozen.POST_REGISTRATION_ADJUST_KEYS
+        )
         if key not in parsed.file_params and key.partition(".")[0] not in inert
     }
     params = frozen_params_of(
@@ -795,7 +799,7 @@ def load_frozen(
     if pending:
         raise HypothesisFileError(
             f"{slug!r}: {', '.join(pending)} is registered off its default but no signal "
-            "applies it yet (backtest plan T165c); it cannot run"
+            "applies it yet; it cannot run"
         )
     live = settings if settings is not None else get_settings()
     return _overlay(live, values)

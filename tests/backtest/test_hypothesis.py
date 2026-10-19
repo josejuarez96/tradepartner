@@ -650,6 +650,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "master.chains_dismissed",
             "master.chain_window_sessions",
             "master.chain_max_price_ratio",
+            "adjust.apply_spin_offs",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1335,6 +1336,7 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "master.chains_dismissed",
         "master.chain_window_sessions",
         "master.chain_max_price_ratio",
+        "adjust.apply_spin_offs",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1364,10 +1366,10 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
 def test_a_screened_registration_runs_at_its_frozen_fraction(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
 ) -> None:
-    """T165c applies the key (#1358), so `NOT_YET_APPLIED_KEYS` is empty and a
-    registration at 0.20 loads at 0.20 (until T165c, quant-auditor on #1387 had it
-    refused)."""
-    assert frozenset() == hypothesis.NOT_YET_APPLIED_KEYS
+    """T165c applies the key (#1358), so nothing but T211c's opt-in spin-off key is in
+    `NOT_YET_APPLIED_KEYS` and a registration at 0.20 loads at 0.20 (until T165c,
+    quant-auditor on #1387 had it refused)."""
+    assert frozenset({"adjust.apply_spin_offs"}) == hypothesis.NOT_YET_APPLIED_KEYS
     _register(conn, _with_turnover(tmp_path, FIXTURE, SLUG, "0.20"), settings)
     loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
     assert loaded.strategy.turnover_top_fraction == 0.20
@@ -1697,7 +1699,11 @@ def test_h1s_unchanged_file_registered_before_the_terms_writes_nothing(
     returns that record (the three are a suffix of the table at their defaults; a
     registration from before them also predates T187's later chain keys)."""
     parsed = hypothesis.parse_file(H1_FILE)
-    later = {*COST_TERMS, *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain"))}
+    later = {
+        *COST_TERMS,
+        *(k for k in hypothesis.frozen_keys() if k.startswith("master.chain")),
+        "adjust.apply_spin_offs",
+    }
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     stored = registry.register_hypothesis(
         conn,
@@ -1856,3 +1862,69 @@ def test_a_standalone_placebo_file_registers(
     )
     record = _register(conn, path, settings)
     assert frozen.frozen_values(record)["strategy.placebo"] == "shuffle"
+
+
+# --- T211c: the opt-in `adjust.apply_spin_offs` key (#1917) ---------------------------
+
+SPIN_OFFS_KEY = "adjust.apply_spin_offs"
+
+
+def _spin_offs_file(tmp_path: Path, slug: str, value: str) -> Path:
+    """The momentum fixture with `adjust.apply_spin_offs = <value>` in its `[adjust]`."""
+    text = FIXTURE.read_text()
+    assert "\n[adjust]\n" not in text
+    path = tmp_path / "hypotheses" / f"{slug}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        text.replace("\n```\n", f"\n[adjust]\napply_spin_offs = {value}\n```\n", 1).replace(
+            f'slug = "{SLUG}"', f'slug = "{slug}"', 1
+        )
+    )
+    return path
+
+
+def test_apply_spin_offs_is_post_registration_and_not_yet_applied() -> None:
+    """The key is a post-registration member (spec amendment #1894, item 3): not
+    required of a file, and in `NOT_YET_APPLIED_KEYS` until T211e applies it."""
+    assert SPIN_OFFS_KEY in hypothesis.NOT_YET_APPLIED_KEYS
+    assert SPIN_OFFS_KEY in frozen.POST_REGISTRATION_ADJUST_KEYS
+    for family in sorted(config.FAMILIES):
+        required = hypothesis.required_keys(family)
+        assert SPIN_OFFS_KEY not in required
+        assert SPIN_OFFS_KEY in hypothesis.family_frozen_keys(family)  # frozen, not required
+
+
+def test_a_file_without_the_key_freezes_false_whatever_env_says(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A post-registration key never reaches a registration from `.env` (spec amendment
+    #1894, item 3): the live value moves, the stored one is the table default."""
+    monkeypatch.setenv("ADJUST__APPLY_SPIN_OFFS", "true")
+    monkeypatch.setenv("TRADEPARTNER_ENV_FILE", str(tmp_path / "no.env"))
+    live = Settings()
+    assert live.adjust.apply_spin_offs is True
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), live)
+    assert params[SPIN_OFFS_KEY] is False
+
+
+def test_a_file_naming_the_key_freezes_its_value(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    record = _register(conn, _spin_offs_file(tmp_path, SLUG, "true"), settings)
+    assert record.params[SPIN_OFFS_KEY] is True
+
+
+def test_load_frozen_refuses_true_until_t211e(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, _spin_offs_file(tmp_path, SLUG, "true"), settings)
+    with pytest.raises(HypothesisFileError, match=SPIN_OFFS_KEY):
+        hypothesis.load_frozen(conn, SLUG, settings=settings)
+
+
+def test_load_frozen_accepts_false(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    _register(conn, _spin_offs_file(tmp_path, SLUG, "false"), settings)
+    loaded = hypothesis.load_frozen(conn, SLUG, settings=settings)
+    assert loaded.adjust.apply_spin_offs is False

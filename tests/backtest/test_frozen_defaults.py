@@ -351,6 +351,7 @@ COMBINED_LATER_KEYS = (
     *COST_KEYS,
     *SHOCK_KEYS,
     *CHAIN_KEYS,
+    "adjust.apply_spin_offs",
 )
 
 
@@ -394,6 +395,7 @@ LATER_KEYS = (
     *COST_KEYS,
     *SHOCK_KEYS,
     *CHAIN_KEYS,
+    "adjust.apply_spin_offs",
 )
 
 
@@ -593,7 +595,16 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
     params = hypothesis.frozen_params(parsed, _defaults_settings())
     assert (
         registry.params_sha256(
-            _before(params, (*RISK_FREE_KEYS, "universe.rank_by", *COST_KEYS, *CHAIN_KEYS))
+            _before(
+                params,
+                (
+                    *RISK_FREE_KEYS,
+                    "universe.rank_by",
+                    *COST_KEYS,
+                    *CHAIN_KEYS,
+                    "adjust.apply_spin_offs",
+                ),
+            )
         )
         == params_sha256
     )
@@ -901,9 +912,10 @@ COST_ENTRIES = (
 def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     """Appended after `universe.rank_by` (the table is append-only and
     `frozen_hash_matches` drops only a suffix), at schema version 29: T202a
-    (#1818) takes 29 and lands first; T187's four chain entries follow them."""
+    (#1818) takes 29 and lands first; T187's four chain entries and T211c's
+    spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-4], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-5], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -1030,7 +1042,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-4:], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:-1], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1045,3 +1057,89 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         )
         chained = {**params, "master.chains": ["0001000010->0001000011@0001000011-24-000001"]}
         assert "master.chains" in frozen.canonical_frozen_set(chained, family)
+
+
+# --- the opt-in `adjust.apply_spin_offs` key (backtest spec amendment #1917, T211c) ----
+
+APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
+
+
+def test_apply_spin_offs_entry_is_last_and_pinned_by_value() -> None:
+    """Appended at version 31 at its default."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-1:], ((APPLY_SPIN_OFFS_KEY, False, 31),))
+
+
+def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:
+    """Append-only, disjoint from the other post-registration sets."""
+    assert frozenset({APPLY_SPIN_OFFS_KEY}) == frozen.POST_REGISTRATION_ADJUST_KEYS
+    table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key in frozen.POST_REGISTRATION_ADJUST_KEYS:
+        assert key in table
+        assert key.partition(".")[0] == "adjust"
+    assert not frozen.POST_REGISTRATION_ADJUST_KEYS & frozen.POST_REGISTRATION_OWN_KEYS
+    assert not frozen.POST_REGISTRATION_ADJUST_KEYS & frozen.POST_REGISTRATION_COST_KEYS
+    assert not frozen.POST_REGISTRATION_ADJUST_KEYS & frozen.LAB_BASELINE_FROZEN_KEYS
+
+
+def test_apply_spin_offs_is_a_fingerprint_key() -> None:
+    assert APPLY_SPIN_OFFS_KEY in frozen._FINGERPRINT_KEYS
+    assert "adjust" not in frozen._FINGERPRINT_SECTIONS
+
+
+def test_apply_spin_offs_at_its_defaults_moves_no_fingerprint_and_no_canonical_set(
+    settings: Settings,
+) -> None:
+    """H1's twin: the key is stored at its default and left out of the canonical
+    set (`adjust` is no family's own section), so a set stored with it reads as
+    one stored before it."""
+    params = _new_params(settings)
+    assert params[APPLY_SPIN_OFFS_KEY] is False
+    without = {k: v for k, v in params.items() if k != APPLY_SPIN_OFFS_KEY}
+    assert frozen.fingerprint("momentum", params, IN_SAMPLE_START) == frozen.fingerprint(
+        "momentum", without, IN_SAMPLE_START
+    )
+    canonical = frozen.canonical_frozen_set(params, "momentum")
+    assert canonical == frozen.canonical_frozen_set(without, "momentum")
+    assert APPLY_SPIN_OFFS_KEY not in canonical
+
+
+def _with_spin_offs(tmp_path: Path, source: Path, value: str) -> Path:
+    """`source` with `apply_spin_offs = <value>` added to its `[adjust]` table."""
+    text = source.read_text()
+    assert "\n[adjust]\n" not in text
+    text = text.replace("\n```\n", f"\n[adjust]\napply_spin_offs = {value}\n```\n", 1)
+    path = tmp_path / "hypotheses" / f"{source.stem}.md"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_a_file_naming_the_default_is_the_twin(tmp_path: Path, settings: Settings) -> None:
+    from tradepartner.store import registry
+
+    twin = _new_params(settings)
+    explicit = hypothesis.frozen_params(
+        hypothesis.parse_file(_with_spin_offs(tmp_path, FIXTURE, "false")),
+        settings,
+    )
+    assert explicit == twin
+    assert registry.params_sha256(explicit) == registry.params_sha256(twin)
+    assert frozen.fingerprint("momentum", explicit, IN_SAMPLE_START) == frozen.fingerprint(
+        "momentum", twin, IN_SAMPLE_START
+    )
+    assert frozen.canonical_frozen_set(explicit, "momentum") == frozen.canonical_frozen_set(
+        twin, "momentum"
+    )
+
+
+def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Settings) -> None:
+    twin_canonical = frozen.canonical_frozen_set(_new_params(settings), "momentum")
+    params = hypothesis.frozen_params(
+        hypothesis.parse_file(_with_spin_offs(tmp_path, FIXTURE, "true")), settings
+    )
+    assert params[APPLY_SPIN_OFFS_KEY] is True
+    assert frozen.fingerprint("momentum", params, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", _new_params(settings), IN_SAMPLE_START
+    )
+    canonical = frozen.canonical_frozen_set(params, "momentum")
+    assert canonical == {**twin_canonical, APPLY_SPIN_OFFS_KEY: True}
