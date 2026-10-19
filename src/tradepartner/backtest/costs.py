@@ -162,7 +162,7 @@ def buy_notional_after_costs(
         1 + (per_side_bps + spread_bps) / BPS_PER_UNIT + commissions.per_share / price
     )
     lo = 0.0
-    for _ in range(200):
+    for _ in range(10_000):
         mid = (lo + hi) / 2
         cost = trade_cost(
             mid,
