@@ -37,6 +37,9 @@ SCALE_SEED = 20_261_018
 SCALE_RUN_START = date(2014, 1, 2)
 SCALE_RUN_END = date(2023, 12, 29)
 SCALE_HISTORY_START = date(2012, 12, 3)
+REENTRY_NAME = "N0004"  # top-decile momentum at both sides of the fixture's gap
+REENTRY_GAP_START = date(2016, 1, 4)
+REENTRY_RETURN = date(2022, 1, 3)
 
 
 def scale_prices(
@@ -131,9 +134,16 @@ class _ScaleProvider(FakeProvider):
         return ()
 
 
-def _scale_provider(names: int, start: date, end: date, history_start: date) -> FakeProvider:
+def _scale_provider(
+    names: int, start: date, end: date, history_start: date, *, reentry: bool = False
+) -> FakeProvider:
     ids = [f"N{i:04d}" for i in range(names)]
-    members = {s: ids for s in rebalance_sessions(start, end, "daily")}
+    members = {
+        s: [sid for sid in ids if sid != REENTRY_NAME]
+        if reentry and REENTRY_GAP_START <= s < REENTRY_RETURN
+        else ids
+        for s in rebalance_sessions(start, end, "daily")
+    }
     prices = scale_prices(names, history_start, end)
     return _ScaleProvider(prices, members)
 
@@ -198,7 +208,9 @@ def test_a_small_daily_trial_runs_on_the_scale_fixture() -> None:
 )
 def test_a_ten_year_thousand_name_daily_trial_fits_the_budget() -> None:
     """The break: 1,000 names, 10 years, `daily`. Prints the wall clock either way."""
-    provider = _scale_provider(SCALE_NAMES, SCALE_RUN_START, SCALE_RUN_END, SCALE_HISTORY_START)
+    provider = _scale_provider(
+        SCALE_NAMES, SCALE_RUN_START, SCALE_RUN_END, SCALE_HISTORY_START, reentry=True
+    )
     started = time.perf_counter()
     result = run(
         _daily_params(),
@@ -214,5 +226,15 @@ def test_a_ten_year_thousand_name_daily_trial_fits_the_budget() -> None:
     print(
         f"\nscale trial: {SCALE_NAMES} names, {len(result.rebalances)} daily rebalances, "
         f"{elapsed:.1f} s wall clock (budget {BACKTEST_SCALE_BUDGET_SECONDS} s)"
+    )
+    assert any(
+        REENTRY_NAME in targets
+        for session, targets in result.targets.items()
+        if session < REENTRY_GAP_START
+    )
+    assert any(
+        REENTRY_NAME in targets
+        for session, targets in result.targets.items()
+        if session >= REENTRY_RETURN
     )
     assert elapsed <= BACKTEST_SCALE_BUDGET_SECONDS
