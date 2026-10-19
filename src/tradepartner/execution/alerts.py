@@ -30,6 +30,9 @@ Kinds (`ALERT_KINDS`, pinned to the spec's list) and who emits them:
 - `skipped`: the risk-gated wrapper's `execute` (T202), one per run naming each
   name skipped (an allowlisted per-name refusal or a phase-time skip) and its
   reason. Run-scoped.
+- `pending_unresolved`: the risk-gated wrapper's acknowledgement poll (T202b), when
+  the run's one order is still unacknowledged at `paper.accept_wait_max_seconds`;
+  the message names its `client_order_id`. Run-scoped.
 - `locked`, `no_window`: the run's entry (T63), before any run row exists.
   No run id; one alert per (book, kind, session), `session` being the calendar
   session containing the instant, or the next one on a non-session day (the
@@ -121,6 +124,7 @@ ALERT_KINDS: tuple[str, ...] = (
     "lot_ledger",
     "stale_mark",
     "skipped",
+    "pending_unresolved",
 )
 #: Kinds with no run, deduped on (kind, session).
 SESSION_SCOPED_KINDS: tuple[str, ...] = ("locked", "no_window")

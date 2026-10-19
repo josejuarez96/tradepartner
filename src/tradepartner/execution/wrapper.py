@@ -166,8 +166,17 @@ falling back to `settings.costs`. Each phase, in order:
    `pending` events, committed before the first submit;
 8. each submit, then `get_order` every `paper.poll_interval_seconds` until the
    broker knows the order (`UnknownOrderError` meanwhile is "not yet") or
-   `paper.accept_wait_seconds` passes (`AcknowledgementTimeoutError`, the
-   order left `pending`); the `accepted` event carries the broker's order id.
+   `paper.accept_wait_max_seconds` passes; the `accepted` event carries the
+   broker's order id. The first order of a run past that bound is journaled
+   `pending_unresolved` (T202b, paper spec amendment 2026-10-18 item 4, ADR
+   0023 D2) with one `pending_unresolved` alert, and the batch goes on: before
+   the next submit the clock pre-check and the submit-window test run again
+   (a closed window cancels the journaled-but-unsent orders `not_received`).
+   The unresolved order is left out of the sells' wait and of every
+   collection, its sell's proceeds are left out of the buys' cash, and the
+   next run's step 3 settles it by a read-back. A second order past the bound
+   in the same run (counted from the run's journaled `pending_unresolved`
+   events) raises `AcknowledgementTimeoutError`, its order left `pending`.
    A duplicate id goes through `replay`.
 
 Between the phases the sells are polled until all are terminal or
@@ -268,6 +277,7 @@ from tradepartner.store.asof import listings_as_of, live_actions_as_of
 from tradepartner.store.db import utc_now
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.journal import (
+    ACKNOWLEDGED_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
     DecisionEventRow,
     DecisionRow,
@@ -384,6 +394,8 @@ _CANCEL_REQUESTED = "cancel_requested"
 _CANCEL_NOOP = "cancel_noop"
 _CANCEL_FAILED = "cancel_failed"
 _REPLAY = "replay"
+_PENDING_UNRESOLVED = "pending_unresolved"
+_NOT_RECEIVED = "not_received"
 _READ_CLOCK_NOTE = "halt read stands on ClockError"
 #: The halt alert's kind for a fault type with a more specific mapping than
 #: `_HALTED` (owner decision 2026-10-03, #644, Option A), most specific first:
@@ -619,6 +631,9 @@ class RiskGatedBroker:
         self._alerter = alerter
         self._sleep = sleep
         self._last: datetime | None = None
+        #: The batch's orders `_collect` and `_await_sells` never poll: the
+        #: unresolved order and the orders never sent (reset by `_trade`).
+        self._set_aside: set[str] = set()
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -754,6 +769,7 @@ class RiskGatedBroker:
         if run.run_id is None or run.session is None:
             raise ValueError("execute needs a journaled run with its session")
         rows = [*decisions, *forced_exits]
+        self._set_aside = set()
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -826,6 +842,7 @@ class RiskGatedBroker:
                 gated.counted,
                 len(decisions),
                 frozenset(book.ledger.positions),
+                book.last_ok_ingest,
             )
             skips, counted = (*skips, *refused), counted + len(refused)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
@@ -912,7 +929,12 @@ class RiskGatedBroker:
             plan_decisions=plan_decisions,
         )
         submitted, refused = self._submit_all(
-            run, gated.to_submit, gated.counted, plan_decisions, frozenset(book.ledger.positions)
+            run,
+            gated.to_submit,
+            gated.counted,
+            plan_decisions,
+            frozenset(book.ledger.positions),
+            book.last_ok_ingest,
         )
         refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
@@ -963,7 +985,34 @@ class RiskGatedBroker:
             self._frozen,
             session=session,
         )
-        return float(max(Decimal(repr(float(account.cash))) - reserve, Decimal(0)))
+        proceeds = self._unresolved_proceeds(book)
+        return float(max(Decimal(repr(float(account.cash))) - reserve - proceeds, Decimal(0)))
+
+    def _unresolved_proceeds(self, book: _Book) -> Decimal:
+        """The most the own `pending_unresolved` sells may have credited: quantity
+        x reference price x (1 + `risk.whole_share_price_buffer`), or the
+        notional (`reconcile._pending_bounds`' bound). The broker's cash may
+        already hold them while the journal has no fill, so the buys never size
+        from them (T202b, item 4 (a))."""
+        statuses: dict[str, set[str]] = {}
+        for event in book.events:
+            statuses.setdefault(event.client_order_id, set()).add(event.status)
+        buffer = Decimal(repr(float(self._frozen.whole_share_price_buffer)))
+        total = Decimal(0)
+        for order in book.orders:
+            seen = statuses.get(order.client_order_id, set())
+            if (
+                order.side != _SELL
+                or _PENDING_UNRESOLVED not in seen
+                or seen & set(ACKNOWLEDGED_ORDER_STATUSES)
+            ):
+                continue
+            if order.quantity is not None:
+                price = Decimal(repr(float(book.price_of(order.security_id))))
+                total += Decimal(repr(float(order.quantity))) * price * (1 + buffer)
+            elif order.notional is not None:
+                total += Decimal(repr(float(order.notional)))
+        return total
 
     def _gate(
         self,
@@ -1363,6 +1412,7 @@ class RiskGatedBroker:
         counted: int,
         plan_decisions: int,
         held: Collection[str] = (),
+        last_ok_ingest: datetime | None = None,
     ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
@@ -1378,7 +1428,16 @@ class RiskGatedBroker:
         submitted and the refusals' skips."""
         submitted: list[str] = []
         refused: list[Skip] = []
-        for row, request in pairs:
+        unresolved = False
+        for index, (row, request) in enumerate(pairs):
+            if unresolved:
+                # After the longer poll: the clock pre-check and the submit
+                # window run again before the next submit (item 4 (a)).
+                assert run.session is not None
+                self.clock_precheck(run.session, last_ok_ingest)
+                if not self._in_submit_window(run.session):
+                    self._close_unsent(run, [r for r, _ in pairs[index:]])
+                    break
             try:
                 placed = self._broker.submit(request)
             except DuplicateClientOrderIdError as duplicate:
@@ -1399,10 +1458,46 @@ class RiskGatedBroker:
                     ) from None
                 continue
             else:
-                self._acknowledge(request.client_order_id)
+                if not self._acknowledge(run, request.client_order_id):
+                    unresolved = True
+                    self._set_aside.add(request.client_order_id)
+                    submitted.append(request.client_order_id)
+                    continue
                 _refuse_shape(placed, Broker.submit.__name__)
             submitted.append(request.client_order_id)
         return submitted, refused
+
+    def _in_submit_window(self, session: date) -> bool:
+        """Whether the clock reads inside [open(S) - `paper.submit_window_before_open_minutes`,
+        open(S) + `paper.submit_window_after_open_minutes`] (the interval of
+        `run.submit_window`)."""
+        paper = self._settings.paper
+        opening = self._calendar.session_open(session)
+        now = self.read_clock()
+        return (
+            opening - timedelta(minutes=paper.submit_window_before_open_minutes)
+            <= now
+            <= opening + timedelta(minutes=paper.submit_window_after_open_minutes)
+        )
+
+    def _close_unsent(self, run: PaperRunRow, rows: Sequence[OrderRow]) -> None:
+        """Close each journaled but never-sent order `cancelled`, reason
+        `not_received`, so none is left `pending`; the next in-window run
+        re-attempts its decision (item 4 (a), judgment call 1 of #1841)."""
+        stamp = self.read_clock()
+        with self._journal() as conn:
+            for row in rows:
+                append(
+                    conn,
+                    OrderEventRow(
+                        client_order_id=row.client_order_id,
+                        status="cancelled",
+                        reason=_NOT_RECEIVED,
+                        known_at=stamp,
+                        ingested_at=stamp,
+                    ),
+                )
+                self._set_aside.add(row.client_order_id)
 
     def _close_refused(self, run: PaperRunRow, row: OrderRow, refusal: Exception) -> Skip:
         """Journal an allowlisted refusal of a buy in one write chunk: the decision's
@@ -1435,21 +1530,23 @@ class RiskGatedBroker:
             )
         return Skip(row.decision_id, row.security_id, reason)
 
-    def _acknowledge(self, coid: str) -> None:
+    def _acknowledge(self, run: PaperRunRow, coid: str) -> bool:
         """Poll `get_order` until the broker knows the order, then journal its
-        `accepted` event and check its shape (module docstring);
-        `AcknowledgementTimeoutError` at the deadline."""
+        `accepted` event and check its shape (module docstring); True once
+        acknowledged. At `paper.accept_wait_max_seconds` the run's first
+        timeout journals one `pending_unresolved` event and one alert and
+        returns False; a second raises `AcknowledgementTimeoutError`, the
+        order left `pending`."""
         paper = self._settings.paper
-        deadline = self.read_clock() + timedelta(seconds=paper.accept_wait_seconds)
+        deadline = self.read_clock() + timedelta(seconds=paper.accept_wait_max_seconds)
         while True:
             try:
                 order = self._broker.get_order(coid)
             except UnknownOrderError:
                 now = self.read_clock()
                 if now >= deadline:
-                    raise AcknowledgementTimeoutError(
-                        f"order {coid} not acknowledged within {paper.accept_wait_seconds}s"
-                    ) from None
+                    self._leave_unresolved(run, coid)
+                    return False
                 self._sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
                 continue
             stamp = self.read_clock()
@@ -1467,7 +1564,44 @@ class RiskGatedBroker:
                     ),
                 )
             _refuse_shape(order, Broker.get_order.__name__)
-            return
+            return True
+
+    def _leave_unresolved(self, run: PaperRunRow, coid: str) -> None:
+        """Journal the run's one `pending_unresolved` event for `coid` and its
+        alert, or raise `AcknowledgementTimeoutError` when the run already has one."""
+        assert run.run_id is not None
+        wait = self._settings.paper.accept_wait_max_seconds
+        with self._journal() as conn:
+            ids = [
+                o.client_order_id
+                for o in orders_for(conn, window_id=run.window_id)
+                if o.run_id == run.run_id
+            ]
+            earlier = [
+                e
+                for e in order_events_for(conn, window_id=run.window_id, client_order_ids=ids)
+                if e.status == _PENDING_UNRESOLVED
+            ]
+        if earlier:
+            raise AcknowledgementTimeoutError(f"order {coid} not acknowledged within {wait}s")
+        stamp = self.read_clock()
+        with self._journal() as conn:
+            append(
+                conn,
+                OrderEventRow(
+                    client_order_id=coid,
+                    status=_PENDING_UNRESOLVED,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+        self._alerter.write(
+            _PENDING_UNRESOLVED,
+            run.run_id,
+            self._session(run, self.read_clock),
+            self._scrub(f"order {coid} not acknowledged within {wait}s: left pending_unresolved"),
+            book_id=self._run_book(run),
+        )
 
     def _await_sells(self, run: PaperRunRow, sells: Sequence[OrderRow]) -> None:
         """Poll this run's sells until each is terminal or
@@ -1477,7 +1611,9 @@ class RiskGatedBroker:
         deadline = self._calendar.session_open(run.session) + timedelta(
             seconds=paper.sell_wait_seconds
         )
-        waiting = [row.client_order_id for row in sells]
+        waiting = [
+            row.client_order_id for row in sells if row.client_order_id not in self._set_aside
+        ]
         while waiting:
             waiting = [
                 c for c in waiting if self._broker.get_order(c).status not in TERMINAL_STATUSES
@@ -1502,6 +1638,7 @@ class RiskGatedBroker:
         (spec "Two phases": a submitted buy that expires unfilled or is
         rejected is written off at collection, not at the phase's end); the
         decision ids written off that way are returned."""
+        orders = [o for o in orders if o.client_order_id not in self._set_aside]
         if not orders:
             return ()
         assert run.run_id is not None

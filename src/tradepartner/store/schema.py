@@ -474,7 +474,17 @@ registry; #83 took version 2 first, so the registry is version 3):
   outside the new set. The version-6 stray-value guard reads
   `ORDER_EVENT_REASONS`. A read-only connection accepts a version-28 store:
   every read works, and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 30**, with its own migration and a
+- **Version 30** (plan T202b; the spec's 2026-10-18 amendment items 4 and 11,
+  ADR 0023 D2): `order_events.status` gains `pending_unresolved`, appended last,
+  the non-terminal, unacknowledged status an acknowledgement timeout leaves on
+  the run's one unresolved order. The `CHECK` set only grows, so no stored row
+  falls outside it; DuckDB cannot change a `CHECK` in place, so the migration
+  from version 29 rebuilds `order_events` through a staging table
+  (`_migrate_pending_unresolved`), every row kept in insertion order (an older
+  store gets the widened set from the rebuilds of its own earlier steps). A
+  read-only connection accepts a version-29 store: no read depends on the
+  status `CHECK`, and the next writable `init_schema` call migrates it.
+- **A later DDL change goes to version 31**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -744,9 +754,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   and `skip_not_fractionable`, `order_events.reason` those two and
 #:   `skip_untradable`; both tables are rebuilt (`_migrate_skip_reasons`), every
 #:   row kept (module docstring, "Schema versions").
-#: - A later DDL change goes to version 30, with its own migration and a
+#: - 30 (plan T202b): `order_events.status` gains `pending_unresolved`;
+#:   `order_events` is rebuilt (`_migrate_pending_unresolved`), every row kept
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 31, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 29
+CURRENT_SCHEMA_VERSION = 30
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -878,6 +891,11 @@ _PRE_SYMBOL_CHANGES_VERSION = 27
 #: The last version without the skip reasons (#1813, T202a, version 29):
 #: read-only connections serve every read.
 _PRE_SKIP_REASONS_VERSION = 28
+
+#: The last version without the `pending_unresolved` order status (T202b,
+#: version 30): read-only connections serve every read, since no read depends
+#: on the status `CHECK` and no such event can exist there.
+_PRE_PENDING_UNRESOLVED_VERSION = 29
 
 
 class SchemaVersionError(RuntimeError):
@@ -1761,6 +1779,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "expired",
         "rejected",
         "cancelled",
+        "pending_unresolved",
     ),
     ("order_events", "reason"): ORDER_EVENT_REASONS,
     ("fills", "source"): ("broker_feed", "broker_status"),
@@ -2735,6 +2754,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
         _PRE_SKIP_REASONS_VERSION,
+        _PRE_PENDING_UNRESOLVED_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3514,9 +3534,28 @@ def _migrate_skip_reasons(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _migrate_pending_unresolved(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 30 (module docstring, "Schema versions"; T202b): rebuild
+    `order_events` with the status `CHECK` widened by `pending_unresolved`,
+    every row kept in insertion order (readers break `known_at` ties on rowid).
+    Runs only on a version-29 store; an older store's earlier rebuilds already
+    use the current DDL, and a fresh store is created with it. Inside
+    `init_schema`'s transaction, after every earlier step."""
+    staging = "order_events_v30"
+    conn.execute(
+        _CREATE_ORDER_EVENTS.replace(
+            "CREATE TABLE IF NOT EXISTS order_events (", f"CREATE TABLE {staging} (", 1
+        )
+    )
+    conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM order_events ORDER BY rowid")
+    conn.execute("DROP TABLE order_events")
+    conn.execute(f"ALTER TABLE {staging} RENAME TO order_events")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 28 store to version 29.
+    version-2 to 29 store to version 30.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3662,6 +3701,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
         _PRE_SKIP_REASONS_VERSION,
+        _PRE_PENDING_UNRESOLVED_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3733,6 +3773,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_cash_in_lieu_kind(conn)
         if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
             _migrate_skip_reasons(conn)
+        if max_version == _PRE_PENDING_UNRESOLVED_VERSION:
+            _migrate_pending_unresolved(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

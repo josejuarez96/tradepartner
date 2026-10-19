@@ -90,6 +90,11 @@ appends the `engaged` row (source `fault`, fault type
 `ReconciliationError`) before re-raising. It writes no alert: a
 `reconciliation` alert is run-scoped (`execution.alerts`) and this command
 has no run.
+
+`settle_pending_unresolved` is the read-back of a `pending_unresolved` order
+(T202b, paper spec amendment 2026-10-18 item 4 (c)): `reconcile_command` runs it
+before `reconcile_now`, as the run's step 3 and `paper resume` do before their
+collections.
 """
 
 from __future__ import annotations
@@ -98,7 +103,7 @@ import json
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -107,7 +112,7 @@ import duckdb
 import polars as pl
 from pydantic import ValidationError
 
-from tradepartner.adapters.broker import Account, Broker, Order, Position
+from tradepartner.adapters.broker import Account, Broker, Order, Position, UnknownOrderError
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
 from tradepartner.errors import ClockError, ReconciliationError
@@ -134,6 +139,7 @@ from tradepartner.store.dividend_reviews import (
 from tradepartner.store.journal import (
     AdjustmentRow,
     OrderedFill,
+    OrderEventRow,
     OrderRow,
     PaperWindowRow,
     ReconciliationRow,
@@ -142,6 +148,7 @@ from tradepartner.store.journal import (
     fills_for,
     non_terminal_orders,
     open_window,
+    order_events_for,
     orders_for,
     pending_orders,
     reconciliations_for,
@@ -806,6 +813,90 @@ def reconcile_now(
     return result
 
 
+#: The `Order` fields a read-back must match the journal row on (the replay's).
+_READ_BACK_FIELDS = ("symbol", "side", "notional", "quantity")
+
+
+def unresolved_orders(
+    connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]], window_id: int
+) -> list[OrderRow]:
+    """The window's orders left `pending_unresolved` and not yet settled (they
+    have no acknowledged event, so `pending_orders` lists them)."""
+    with connect() as conn:
+        unsettled = pending_orders(conn, window_id=window_id)
+        ids = [o.client_order_id for o in unsettled]
+        marked = {
+            e.client_order_id
+            for e in order_events_for(conn, window_id=window_id, client_order_ids=ids)
+            if e.status == "pending_unresolved"
+        }
+    return [o for o in unsettled if o.client_order_id in marked]
+
+
+def settle_pending_unresolved(
+    broker: Broker,
+    connect: Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]],
+    clock: Callable[[], datetime],
+    orders: Sequence[OrderRow],
+) -> tuple[str, ...]:
+    """Read back, by `client_order_id`, each of `orders` (`unresolved_orders`);
+    return the ids settled.
+
+    The broker knows it: an `accepted` event with the broker's order id (the
+    collection that follows journals its fills and terminal event). It does not
+    (`UnknownOrderError`): `cancelled` with reason `not_received`, so the
+    decision is open again. A read that fails otherwise, or a broker order whose
+    `symbol`, `side`, `notional` or `quantity` differ from the journal row, raises
+    `ReconciliationError` and writes nothing, leaving the order unsettled (a
+    `ClockError` keeps its type)."""
+    readings: dict[str, Order | None] = {}
+    for order in orders:
+        coid = order.client_order_id
+        try:
+            got = broker.get_order(coid)
+        except UnknownOrderError:
+            readings[coid] = None
+            continue
+        except ClockError:
+            raise
+        except Exception as exc:
+            raise ReconciliationError(
+                f"pending_unresolved order {coid} could not be read back ({type(exc).__name__})"
+            ) from exc
+        differing = [n for n in _READ_BACK_FIELDS if getattr(got, n) != getattr(order, n)]
+        if differing:
+            raise ReconciliationError(
+                f"pending_unresolved order {coid} differs from the broker's order in "
+                f"{', '.join(differing)}"
+            )
+        readings[coid] = got
+    if not readings:
+        return ()
+    stamp = _read_clock(clock)
+    with connect() as conn:
+        for coid, reading in readings.items():
+            if reading is None:
+                event = OrderEventRow(
+                    client_order_id=coid,
+                    status="cancelled",
+                    reason="not_received",
+                    known_at=stamp,
+                    ingested_at=stamp,
+                )
+            else:
+                event = OrderEventRow(
+                    client_order_id=coid,
+                    event_at=reading.submitted_at,
+                    status="accepted",
+                    broker_order_id=reading.broker_order_id,
+                    raw_json=json.dumps(asdict(reading), default=str, sort_keys=True),
+                    known_at=stamp,
+                    ingested_at=stamp,
+                )
+            append(conn, event)
+    return tuple(readings)
+
+
 def command_session(now: datetime) -> date:
     """The session `paper reconcile` states the ledger for: the clock's New
     York date when it is a session, else the latest session before it."""
@@ -836,9 +927,12 @@ def reconcile_command(
         if window is None:
             raise NoWindowError("no_window: no paper window is open")
         frozen = frozen_risk(window)
-        now = _read_clock(clock)
-        session = command_session(now)
         try:
+            settle_pending_unresolved(
+                broker, connect, clock, unresolved_orders(connect, _window_id(window))
+            )
+            now = _read_clock(clock)
+            session = command_session(now)
             return reconcile_now(
                 settings, connect, broker, window, session, clock, connect, frozen=frozen, as_of=now
             )
