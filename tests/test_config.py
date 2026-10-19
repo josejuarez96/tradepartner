@@ -117,6 +117,10 @@ def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.rates.max_stale_sessions == 3
     assert settings.rates.refetch_days == 10
     assert settings.rates.plausible_range_percent == [-1.0, 25.0]
+    assert settings.rates.fred_timeout_seconds == 60.0
+    assert settings.rates.fred_max_attempts == 4
+    assert settings.rates.fred_backoff_seconds == 2.0
+    assert settings.rates.fred_vintage_window_days == 365
     monkeypatch.setenv("FRED_API_KEY", "dummy-secret")
     monkeypatch.setenv("RATES__SERIES", '["DTB3", "DGS3MO"]')
     configured = _settings()
@@ -132,6 +136,11 @@ def test_fred_rate_defaults_and_environment(monkeypatch: pytest.MonkeyPatch) -> 
         {"series": ["DTB3", "DTB3"]},
         {"max_stale_sessions": -1},
         {"refetch_days": 0},
+        {"fred_timeout_seconds": 0},
+        {"fred_timeout_seconds": float("nan")},
+        {"fred_max_attempts": 0},
+        {"fred_backoff_seconds": -1},
+        {"fred_vintage_window_days": 0},
         {"plausible_range_percent": [25.0, -1.0]},
         {"plausible_range_percent": [float("nan"), 25.0]},
     ],
