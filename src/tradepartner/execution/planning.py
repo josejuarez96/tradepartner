@@ -94,6 +94,7 @@ from tradepartner.backtest.holdout import Flags, Frozen, Reasons, Window, decide
 from tradepartner.backtest.hypothesis import load_frozen
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.store_provider import StoreProvider
+from tradepartner.backtest.strategies import signal_for
 from tradepartner.calendar import all_sessions, is_session, previous_session, session_close
 from tradepartner.config import PAPER_FAMILIES, Cadence, HypothesisFamily, RiskConfig, Settings
 from tradepartner.errors import StaleDataError, SystemFaultError, UniverseCollapseError
@@ -584,6 +585,35 @@ class _Reads:
     held_symbols: dict[str, str | None]
 
 
+def _construction(params: Settings, family: HypothesisFamily) -> object:
+    """The family's own construction section of `params` (its first `FAMILIES`
+    section), the object `engine._plan` reads `top_fraction` and `weighting` from."""
+    return getattr(params, signal_for(family).section)
+
+
+def _frozen_band(params: Settings, family: HypothesisFamily) -> float:
+    """The window's frozen `strategy.rebalance_band`, read from the family's own
+    construction section: a section without the key (`profitability`, `combined`)
+    reads 0.0, never the live `strategy.rebalance_band` (backtest spec amendment
+    2026-10-18, T205)."""
+    return float(getattr(_construction(params, family), "rebalance_band", 0.0))
+
+
+def _refuse_hold(params: Settings, family: HypothesisFamily) -> None:
+    """Refuse a frozen `weighting = "hold"` window (#1832, T205).
+
+    Where a paper window's hold entry sessions come from is not decided yet, so
+    planning a hold window would trade equal-weight targets under a hold label:
+    refused, with a message naming `strategy.weighting`, before `engine.plan`.
+    """
+    if getattr(_construction(params, family), "weighting", "equal") == "hold":
+        raise ValueError(
+            "strategy.weighting = 'hold' is not wired until #1832 decides where a "
+            "window's hold entry sessions come from; the paper planner will not trade "
+            "an equal-weight plan under a hold label"
+        )
+
+
 def _frozen_params(
     conn: duckdb.DuckDBPyConnection, hypothesis_id: int, settings: Settings
 ) -> tuple[registry.HypothesisRecord, Settings]:
@@ -602,7 +632,9 @@ def _frozen_params(
             f"hypothesis {record.slug!r} was re-registered as {latest.hypothesis_id} after "
             f"the window froze registration {hypothesis_id}"
         )
-    return record, load_frozen(conn, record.slug, settings=settings)
+    params = load_frozen(conn, record.slug, settings=settings)
+    _refuse_hold(params, record.family)
+    return record, params
 
 
 def _read(
@@ -811,6 +843,7 @@ def plan_rebalance(
         prices = {**reads.prices, **reference_prices(conn, session, new, reads.actions)}
         listings_at = {**reads.ended, **_ended(conn, session, new, reads.params)}
         costs = reads.params.costs
+        band = _frozen_band(reads.params, cast(HypothesisFamily, reads.hypothesis.family))
         decided = decisions_from(
             plan,
             reads.ledger,
@@ -823,6 +856,8 @@ def plan_rebalance(
             price_of=prices.__getitem__,
             actions_as_of=reads.actions,
             costs=BuyCosts(costs.per_side_bps, Commissions.from_config(costs)),
+            band=band,
+            hold=None,
         )
         rows = _write(conn, journal, run.run_id, t_i, plan, decided, handle, now, window.book_id)
         _trial(lambda: _close_ok(conn, handle), "its result")
