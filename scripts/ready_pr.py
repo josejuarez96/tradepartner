@@ -374,13 +374,21 @@ def tick_reviewer_boxes(
     # line is ticked, and only when exactly one such line is unticked (#1823).
     lines = body.splitlines(keepends=True)
     boxes: dict[int, str] = {}
-    in_fence = False
+    fence: str | None = None
     for i, line in enumerate(lines):
-        if line.lstrip().startswith(("```", "~~~")):
-            in_fence = not in_fence
-        elif not in_fence and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
+        marker = re.match(r"(`{3,}|~{3,})", line.lstrip())
+        if marker and fence is None:
+            fence = marker.group(1)
+        elif (
+            marker
+            and fence
+            and marker.group(1)[0] == fence[0]
+            and len(marker.group(1)) >= len(fence)
+        ):
+            fence = None
+        elif fence is None and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
             boxes[i] = m.group(1).strip()
-    if in_fence:
+    if fence is not None:
         raise ReadyError("PR body has an unclosed code fence; close it before checking boxes")
     review = [i for i, label in boxes.items() if label.startswith(REVIEWER_BOX_PREFIX)]
     if len(review) != 1:

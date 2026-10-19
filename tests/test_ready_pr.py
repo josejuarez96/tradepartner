@@ -881,8 +881,9 @@ def test_template_line_quoted_in_a_code_fence_is_left_alone() -> None:
     ]
 
 
-def test_unclosed_fence_fails_closed_even_with_unticked_box() -> None:
-    body = BODY_OK + "```\n" + "- [ ] Complete the checklist\n"
+@pytest.mark.parametrize("tail", ["", "~~~\n"])
+def test_unclosed_fence_fails_closed_even_with_unticked_box(tail: str) -> None:
+    body = BODY_OK + "```\n" + "- [ ] Complete the checklist\n" + tail
     r = FakeRunner(body=body)
     with pytest.raises(ready_pr.ReadyError, match="unclosed code fence"):
         ready_pr.ready(r, 69, dry_run=True)
@@ -900,6 +901,7 @@ def test_real_git_non_ascii_path_makes_review_stale(tmp_path: Path) -> None:
     git("init", "-b", "main")
     git("config", "user.name", "Test")
     git("config", "user.email", "test@example.com")
+    git("config", "core.quotePath", "true")
     git("commit", "--allow-empty", "-m", "base")
     git("switch", "-c", "feature")
     path = "docs/runbooks/café.md"
