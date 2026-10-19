@@ -1,6 +1,6 @@
 # Research Report: A day in the life of the owner, as a user
 
-**Brief:** #1924 (the orchestrator's brief, 2026-10-19, from the owner's note on #1915)  ·  **Date:** 2026-10-19  ·  **Status:** COMPLETE  ·  **Agent/model:** team mvpreport, claude-opus-5-5  ·  **Repo at:** `888b04b0` (origin/main)
+**Brief:** #1924 (the orchestrator's brief, 2026-10-19, from the owner's note on #1915)  ·  **Date:** 2026-10-19  ·  **Status:** COMPLETE  ·  **Agent/model:** team mvpreport, claude-opus-5-5  ·  **Repo at:** `888b04b0` (origin/main, the code and docs cited); the outputs quoted were rendered from the owner's main checkout at `9d776b2d`
 
 **Question.** The owner wrote: "When I use this application what is needed to really run day to day. How as a user do I monitor what I'm doing, whether that's looking at portfolio performance. How do I actually develop new strategies, is that done externally working with Claude or something. How do we read backtest results or strategy testing results in a way that is legible for myself. How do I see what trades happened on which day. Maybe some of this stays in the Alpaca platform."
 
@@ -82,7 +82,7 @@ Each is walked in full, with what he sees today. Part B places them, and fifteen
 
 **What his design intends.** The **Books** screen shows each book against its own backtest: a tracking gap on a scale with a shaded tolerance zone, and the forward holdout as countable progress ("rebalance 3 of 12"). HANDOFF.md notes that the per-period values need `paper_report_periods`, which ADR 0018 lists and nobody has built.
 
-**Alpaca vs ours.** Each book is its own Alpaca paper account (`paper_windows.account_id` differs per book). So **Alpaca's portfolio chart is a correct per-book equity curve today**, with daily profit and loss. What Alpaca cannot show is the comparison with SPY, or with the backtest's expected path.
+**Alpaca vs ours.** Each book is its own Alpaca paper account (`paper_windows.account_id` differs per book). So **Alpaca's portfolio chart is a per-book equity curve today**, with daily profit and loss. Three limits: it is per **account**, not per paper window, so it spans every window the book has had (four restarts so far, on 10-13 and 10-18); `main`'s account had activity before its current window (it starts at 100,008.88, not 100,000); and a paper-account reset (the step after `paper abandon`) erases its history. It will not line up with the window that `paper check` and `paper report` judge. What Alpaca cannot show is the comparison with SPY, or with the backtest's expected path.
 
 **Severity: High** for "versus the backtest" (nothing works). **Low** for the plain equity curve (use Alpaca).
 
@@ -93,7 +93,7 @@ Each is walked in full, with what he sees today. Part B places them, and fifteen
 - **Operations page, Fills card:** `No fills yet in this window.` When it has rows, the columns are `security_id, symbol, side, quantity, price, broker_fill_id, known_at`. It covers the whole window, newest first, and is capped with `Showing the newest fills only`. It has no date picker, no slippage, and no reason column.
 - **Order chain card:** pick one order id from a dropdown to see its steps (`at, kind, detail`). This is good for chasing one stuck order. It is not a day's blotter.
 - **Signal ranking card:** the "why". Its tooltip carries `signal_reason`, `decision` and `decision_reason` for each name. It shows **the latest plan only**, so last Tuesday's reasons are not on screen.
-- **CLI:** no command lists orders or fills. The `paper` command list has `status`, `report`, `check` and `reconcile`, but nothing like `trades`. The slippage lines (each order's fill price against the session's opening price) appear only in `paper status` and `paper report`.
+- **CLI:** no command lists orders or fills. None of the 14 `paper` subcommands lists orders or fills. The slippage lines (each order's fill price against the session's opening price) appear only in `paper status` and `paper report`.
 
 **What is missing.** A blotter for one session: name, side, shares, fill price, slippage against the open, and the decision reason, with a date picker. Each order's result (`position_return`, `realised_pnl`) exists, but only as steps in the Order chain card, one order at a time. His prototype does not have one either; its Book screen focuses on tracking and the kill switch.
 
@@ -112,7 +112,7 @@ Each is walked in full, with what he sees today. Part B places them, and fifteen
 
   These are exception names and broker codes, not instructions.
 - **What he does:** read the Operations page's Alerts and Reconciliation cards, then the [scheduling runbook](../runbooks/scheduling.md)'s fault section. Its alert table lacks four of the alert kinds the code can send (#1915 found this). There is no entry for the 404 on a delisted name (#1480).
-- **How he resumes:** `uv run tradepartner paper resume --book <name> --reason "<why>"`, which settles, reconciles and releases the kill switch. That step is mechanical and he can do it alone. **Diagnosing why it halted has needed an agent every time** (four of four real faults).
+- **How he resumes:** `uv run tradepartner paper resume --book <name> --reason "<why>"`, which settles, reconciles and releases the kill switch. That step is mechanical and he can do it alone. **Diagnosing why it halted has needed an agent every time** (four of four real faults: the reconciliation halts of 10-12 and 10-13, the stale-data refusal and the broker 404 halt of 10-16 (#1480); the readiness report #1915 traced each to an agent PR).
 
 **What his design intends.** Today's not-healthy panel lists only the failed jobs and what they hold. The Book screen adds a **kill switch history** with reasons. Engaging the kill switch also works from the phone.
 
@@ -258,8 +258,10 @@ One line per routine. §n points to its section in Part A. **Sev** uses the scal
 10. **No research-pipeline or lifecycle screen: stages, what waits on whom, books side by side.** Medium (12, 13). → ADR 0018 Strategies screen: **no task yet**.
 11. **Low now, needed before live: a realised-P&L and tax-lot report, a key-rotation runbook, an agent-spend tally.** Low (18, 20, 22). → T163 family; **no task yet**.
 
+Filing: the orchestrator files the "no task yet" items it and the owner choose to pursue; until then this list is the record.
+
 ## (b) What to leave to Alpaca's dashboard for now
-- **Each book's equity curve and daily profit and loss.** One Alpaca paper account per book, so the chart is exact.
+- **Each book's equity curve and daily profit and loss.** One Alpaca paper account per book. Read it from the current window's start date: the curve spans earlier windows and resets with the account.
 - **The list of orders and fills by date,** with tickers and prices (Orders and Activities tabs).
 - **Account statements and the money history** for the weekly look.
 - **Cash, buying power and position values** (routine 8), and **dividends and corporate actions received** (routine 9, Activities tab).
@@ -267,6 +269,7 @@ One line per routine. §n points to its section in Part A. **Sev** uses the scal
 - **Not Alpaca:** "why this trade", "versus the backtest", "versus SPY", alerts, halts and anything about research. Only our system knows these.
 
 ## (c) Part 2 checklist: re-walk after the first real fills (Tue 10-20 onward)
+- [ ] Before reading Alpaca's chart, note each window's start (daily: window 5, opened 10-18; main: window 6, opened 10-18) and read from there.
 - [ ] Morning of 10-20: does `paper status --all` show the daily book's positions and `last run ok`? Is the `stale` badge on Operations gone or explained?
 - [ ] Does the Fills card list the 10-20 fills with symbols and prices? Do they match Alpaca's Activities tab line for line?
 - [ ] Does the Signal ranking card's `decision_reason` explain each name traded? Is it still readable after the 10-21 rebalance replaces it?
