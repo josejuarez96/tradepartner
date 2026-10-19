@@ -685,6 +685,7 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
             28,
             29,
             30,
+            31,
         ]
         assert set(schema.RESEARCH_TABLE_NAMES) <= set(ddl_after)
         n_research = c.execute("SELECT trial_id, n_research FROM trial_results ORDER BY 1")

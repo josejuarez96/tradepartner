@@ -787,9 +787,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -969,9 +969,9 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
         schema.init_schema(conn)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["rates"] == _shape(fresh)["rates"]
@@ -1149,9 +1149,9 @@ def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (0,)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30, 31]
         schema.init_schema(conn)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30, 31]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["borrow_status"] == _shape(fresh)["borrow_status"]
@@ -1297,9 +1297,9 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "classifications",
         }
         assert _all_rows(conn, tables_before) == rows_before
-        assert _versions(conn) == [25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [25, 26, 27, 28, 29, 30, 31]
         schema.init_schema(conn)
-        assert _versions(conn) == [25, 26, 27, 28, 29, 30]
+        assert _versions(conn) == [25, 26, 27, 28, 29, 30, 31]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         for table in ("listings", "classifications"):
@@ -1496,9 +1496,9 @@ def test_the_version_27_migration_adds_symbol_changes_and_successor_chains() -> 
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
         assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
-        assert _versions(conn) == [27, 28, 29, 30]
+        assert _versions(conn) == [27, 28, 29, 30, 31]
         schema.init_schema(conn)
-        assert _versions(conn) == [27, 28, 29, 30]
+        assert _versions(conn) == [27, 28, 29, 30, 31]
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["symbol_changes"] == _shape(fresh)["symbol_changes"]
@@ -1848,6 +1848,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
             28,
             29,
             30,
+            31,
         ]
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
