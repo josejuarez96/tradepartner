@@ -1111,6 +1111,7 @@ class AdjustConfig(_ClosedConfig):
 
     max_prior_close_gap_sessions: int = Field(default=5, gt=0)
     max_dividend_to_prior_close: float = Field(default=1.0, gt=0, le=1.0)
+    apply_spin_offs: bool = False
 
 
 class GapConfig(_ClosedConfig):

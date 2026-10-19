@@ -857,3 +857,36 @@ def test_a_cost_term_moves_the_fingerprint_but_not_the_promotion_identity(
     assert promotion.promotion_identity(
         "momentum", other, IN_SAMPLE_START
     ) != promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
+
+
+# --- the opt-in spin-off key is outside the promotion identity (#1917, T211c) --------
+
+
+def _spin_offs_text(slug: str, value: str) -> str:
+    """The momentum fixture at the module's window with `adjust.apply_spin_offs`
+    named in its `[adjust]` table."""
+    text = _text(slug, 0.10, 15.0)
+    assert "\n[adjust]\n" not in text
+    return text.replace("\n```\n", f"\n[adjust]\napply_spin_offs = {value}\n```\n", 1)
+
+
+def test_the_spin_offs_key_moves_the_fingerprint_but_not_the_promotion_identity(
+    tmp_path: Path,
+) -> None:
+    """`adjust.apply_spin_offs` is a fingerprint key outside the promotion identity, as
+    the cost terms are (spec amendment #1894, item 3): a survivor re-tested under
+    spin-offs is a new fingerprint and the same strategy, promoted at most once."""
+    settings = Settings(_env_file=None)
+    base_path = tmp_path / "twin.md"
+    base_path.write_text(_text("twin", 0.10, 15.0))
+    spin_path = tmp_path / "spin.md"
+    spin_path.write_text(_spin_offs_text("spin", "true"))
+    base = hypothesis.frozen_params(hypothesis.parse_file(base_path), settings)
+    spin = hypothesis.frozen_params(hypothesis.parse_file(spin_path), settings)
+    assert spin["adjust.apply_spin_offs"] is True
+    assert frozen.fingerprint("momentum", spin, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", base, IN_SAMPLE_START
+    )
+    assert promotion.promotion_identity(
+        "momentum", spin, IN_SAMPLE_START
+    ) == promotion.promotion_identity("momentum", base, IN_SAMPLE_START)
