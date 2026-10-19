@@ -164,7 +164,6 @@ def test_unknown_buy_asset_is_one_skip_and_other_names_trade(
     assert len(env.alerts("skipped")) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="#1828")
 def test_mid_run_fractionability_refusal_skips_only_the_buy(
     env: Env, window: PaperWindowRow
 ) -> None:
@@ -216,7 +215,7 @@ def test_skip_share_cap_halts_before_any_buy(env: Env, tmp_path: Path) -> None:
     assert journal(env) == ([], [], [])
 
 
-@pytest.mark.xfail(strict=True, reason="#1828")
+@pytest.mark.xfail(strict=True, reason="#1848")
 def test_sell_refused_after_position_changes_is_reconciliation_fault(
     env: Env, window: PaperWindowRow
 ) -> None:

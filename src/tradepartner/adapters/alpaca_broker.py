@@ -88,7 +88,6 @@ code and a response body, and this module's own messages name no setting value.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -121,13 +120,21 @@ from tradepartner.adapters.broker import (
     UnknownOrderError,
     canonical_symbol,
 )
+from tradepartner.adapters.broker_refusals import (
+    ASSET_NOT_FOUND_CODE as _ASSET_NOT_FOUND_CODE,
+)
+from tradepartner.adapters.broker_refusals import (
+    NOT_FOUND as _NOT_FOUND,
+)
+from tradepartner.adapters.broker_refusals import (
+    error_code as _error_code,
+)
+from tradepartner.adapters.broker_refusals import (
+    typed_refusal,
+)
 from tradepartner.config import Settings
 from tradepartner.errors import (
-    AssetNotFoundError,
-    AssetNotTradableError,
     ClockError,
-    NotFractionableError,
-    ReconciliationError,
     SystemFaultError,
 )
 from tradepartner.timeutil import ensure_tz_aware_utc
@@ -148,9 +155,6 @@ STATUS_TABLE: Mapping[str, OrderStatus] = {
 #: Alpaca's empty `order_class` on a simple order (#1298).
 _SIMPLE_ORDER_CLASS = "simple"
 #: HTTP status and Alpaca code of the broker's duplicate-id refusal (T48b).
-_NOT_FOUND = 404
-#: Alpaca's code on a `GET /v2/assets/{symbol}` 404 for a symbol it does not know (#1729).
-_ASSET_NOT_FOUND_CODE = 40410000
 _DUPLICATE_STATUS = 422
 _DUPLICATE_CODE = 40010001
 #: A cancel refused because the order is no longer cancelable, or gone.
@@ -325,61 +329,12 @@ def _mapped[A, T](what: str, build: Callable[[A], T], payload: A) -> T:
         raise SystemFaultError(f"malformed alpaca {what}: {type(exc).__name__}: {exc}") from exc
 
 
-def _error_code(error: AlpacaTradingError) -> object:
-    """Alpaca's `code` in a refusal's JSON body, or `None`."""
-    try:
-        body = json.loads(error.body)
-    except ValueError:
-        return None
-    return body.get("code") if isinstance(body, dict) else None
-
-
-#: HTTP status of the broker's per-order 403 refusals (code 40310000).
-_FORBIDDEN = 403
-
-
-def _error_message(error: AlpacaTradingError) -> str:
-    """The `message` in a refusal's JSON body, or an empty string."""
-    try:
-        body = json.loads(error.body)
-    except ValueError:
-        return ""
-    message = body.get("message") if isinstance(body, dict) else None
-    return message if isinstance(message, str) else ""
-
-
-#: Alpaca's code on the per-order 403 refusals.
-_FORBIDDEN_CODE = 40310000
-
-
 def _raise_typed_refusal(error: AlpacaTradingError, request: OrderRequest) -> None:
-    """Map the submit refusals the wrapper's allowlist knows to typed errors
-    (spec amendment 2026-10-18 item 2, T202); return for any other refusal, which
-    the caller raises as is. The map is exact: a 404 only with code 40410000, a 403
-    only with code 40310000 and `asset "<the order's symbol>" is not
-    tradable|fractionable`, and never for a retried submit (an earlier attempt may
-    have reached the broker, so the run halts and resume settles it). By refusal, not
-    by side: the wrapper decides what a sell's refusal means."""
-    if error.retried:
-        return
-    coid = request.client_order_id
-    code = _error_code(error)
-    if error.status_code == _NOT_FOUND and code == _ASSET_NOT_FOUND_CODE:
-        raise AssetNotFoundError(f"the broker does not know the asset of order {coid!r}") from None
-    if error.status_code != _FORBIDDEN or code != _FORBIDDEN_CODE:
-        return
-    message = _error_message(error)
-    if "insufficient qty available" in message:
-        raise ReconciliationError(f"the broker holds less than order {coid!r} sells") from None
-    symbol = re.escape(request.symbol)
-    if re.fullmatch(rf'asset "{symbol}" is not fractionable', message):
-        raise NotFractionableError(
-            f"the broker refused order {coid!r}: asset not fractionable"
-        ) from None
-    if re.fullmatch(rf'asset "{symbol}" is not tradable', message):
-        raise AssetNotTradableError(
-            f"the broker refused order {coid!r}: asset not tradable"
-        ) from None
+    """Raise the typed error `typed_refusal` maps `error` to; return for any other
+    refusal, which the caller raises as is."""
+    typed = typed_refusal(error, request)
+    if typed is not None:
+        raise typed from None
 
 
 def _decimals(value: float) -> int:

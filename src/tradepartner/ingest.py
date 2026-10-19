@@ -209,7 +209,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -218,6 +218,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
+from dateutil.relativedelta import relativedelta
 
 from tradepartner.adapters.alpaca_raw import ASSETS_ENDPOINT, ASSETS_REQUEST, AssetsFetch
 from tradepartner.adapters.borrow import (
@@ -239,6 +240,8 @@ from tradepartner.adapters.filings import (
     FilingSource,
     StatementFactRecord,
 )
+from tradepartner.adapters.openfigi import FigiType, parse_mapping
+from tradepartner.adapters.openfigi_raw import map_tickers
 from tradepartner.adapters.prices import (
     Bar,
     CorporateAction,
@@ -281,8 +284,14 @@ from tradepartner.store.delistings import (
     build_delistings,
     listing_ends_as_of,
 )
+from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.store.master import (
+    HELD_PREDECESSOR,
+    UNJUDGED,
+    Chain,
+    ChainRefusal,
     MasterBuild,
+    build_chains,
     build_master,
     primary_security_id,
     securities_as_of,
@@ -296,7 +305,7 @@ from tradepartner.store.restamp_precheck import (
     read_instants,
     window_first_session,
 )
-from tradepartner.store.retraction import record_underived, split_kept, stored_underived
+from tradepartner.store.retraction import record_underived, retraction, split_kept, stored_underived
 from tradepartner.store.schema import init_schema
 from tradepartner.timeutil import ensure_tz_aware_utc
 from tradepartner.universe import SHARES_FACT, member_links_title
@@ -308,6 +317,129 @@ MODE = "session"
 #: the paper run's fresh prices (staleness and the clock floor, #1440 Q3).
 PRICE_SOURCE = "alpaca"
 SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE, "fred")
+OPENFIGI_SOURCE = "openfigi"  # explicit only: never add to SOURCES / all
+
+
+def ingest_openfigi(
+    settings: Settings,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+    dry_run: bool = False,
+    mapping: Callable[..., list[tuple[list[Any], datetime, datetime]]] = map_tickers,
+) -> IngestResult:
+    """Map current live, recently traded listings; append only changed observations.
+
+    The set is every live listing on `universe.exchanges` with any bar in the last
+    `universe.min_history_months` calendar months: wider than the universe's
+    minimum-history rule (recent IPOs and thin names are in), which is fine for a
+    check-only table. A name that stops mapping (or never maps) gets a
+    `mapped = FALSE` row when that is a change; a per-job `error` writes nothing.
+    """
+    if not settings.openfigi.enabled:
+        raise ValueError("OpenFIGI ingest is disabled")
+    now = ensure_tz_aware_utc(clock(), field_name="clock()")
+    session = last_completed_session(now)
+    first_bar = now.date() - relativedelta(months=settings.universe.min_history_months)
+    prepared: list[tuple[str, str, str]] = []
+    responses: list[tuple[list[Any], datetime, datetime]] = []
+    class_symbols = settings.alpaca.class_symbols
+
+    def prepare() -> None:
+        with open_read_only(settings) as conn:
+            bars = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT security_id FROM prices_daily "
+                    "WHERE session >= ? AND session <= ? AND known_at <= ?",
+                    [first_bar, session, now],
+                ).fetchall()
+            }
+            current: dict[str, dict[str, Any]] = {}
+            for row in listing_ends_as_of(conn, now, settings).iter_rows(named=True):
+                sid = row["security_id"]
+                if row["valid_from"] > session:
+                    continue
+                old = current.get(sid)
+                if old is None or row["valid_from"] > old["valid_from"]:
+                    current[sid] = row
+            for sid, row in sorted(current.items()):
+                status, end = row["status"], row["end_session"]
+                live = status == LISTED or (
+                    status == TRANSFERRED and (end is None or end >= session)
+                )
+                if live and row["exchange"] in settings.universe.exchanges and sid in bars:
+                    ticker = row["ticker"]
+                    # OpenFIGI's `TICKER` id spells a US class share with a slash
+                    # (`BF/B`), the undotted form the spec names; `class_symbols`
+                    # gives the dotted Alpaca symbol for an undotted NYSE master
+                    # ticker (#1219), so a `BFB` or `BF.B` store ticker both land on
+                    # `BF/B`.
+                    undotted = class_symbols.get(ticker, ticker).replace(".", "/")
+                    prepared.append((sid, ticker, undotted))
+        responses.extend(mapping([job[2] for job in prepared], settings.openfigi, clock=clock))
+
+    def write(conn: duckdb.DuckDBPyConnection, _run_id: str) -> tuple[int, str]:
+        count = unmapped = errors = 0
+        offset = 0
+        for payload, sent, received in responses:
+            if (
+                sent.tzinfo is None
+                or received.tzinfo is None
+                or sent.utcoffset() != timedelta(0)
+                or received.utcoffset() != timedelta(0)
+                or received <= sent
+            ):
+                raise ValueError("OpenFIGI response timestamps must be ordered UTC-aware instants")
+            parsed = parse_mapping(payload)
+            for job, item in zip(payload, parsed, strict=True):
+                sid, ticker, _ = prepared[offset]
+                offset += 1
+                if isinstance(job, dict) and "error" in job:
+                    errors += 1
+                    continue
+                if item is None:
+                    unmapped += 1
+                    blank = {f.name: "" for f in fields(FigiType)}
+                    values = {"ticker": ticker, **blank, "mapped": False}
+                else:
+                    values = {"ticker": ticker, **asdict(item), "mapped": True}
+                prior = conn.execute(
+                    "SELECT ticker, figi, composite_figi, share_class_figi, security_type, "
+                    "security_type2, market_sector, name, exch_code, mapped, known_at "
+                    "FROM openfigi_types "
+                    "WHERE security_id = ? ORDER BY known_at DESC LIMIT 1",
+                    [sid],
+                ).fetchone()
+                if prior is not None and prior[:-1] == tuple(values.values()):
+                    continue
+                if prior is not None and received <= prior[-1]:
+                    raise ValueError("OpenFIGI revision must be newer than the last observation")
+                ingested = ensure_tz_aware_utc(clock(), field_name="clock()")
+                insert_row(
+                    conn,
+                    "openfigi_types",
+                    {
+                        "security_id": sid,
+                        **values,
+                        "known_at": received,
+                        "ingested_at": max(received, ingested),
+                        "provenance": "openfigi",
+                        "source": OPENFIGI_SOURCE,
+                    },
+                )
+                count += 1
+        if offset != len(prepared):
+            raise ValueError("OpenFIGI mapping response count does not match jobs")
+        return (
+            count,
+            f"mapped={len(prepared) - unmapped - errors}; unmapped={unmapped}; errors={errors}",
+        )
+
+    run = _run_source(
+        OPENFIGI_SOURCE, write, settings, now, clock, session.isoformat(), dry_run, prepare=prepare
+    )
+    return IngestResult((run,))
+
 
 #: XBRL concept requested from `FilingSource.facts` -> the store's `fact_name`.
 FACT_NAMES: dict[str, str] = {"EntityCommonStockSharesOutstanding": SHARES_FACT}
@@ -1227,8 +1359,9 @@ def _ingest_filings(
     else:
         skipped = frozenset()
     rebuilt = ""
+    unjudged_ciks = _unjudged_ciks(recorded).ciks
     if rebuild_classifications:
-        deleted = _delete_classifications(conn, master, skipped, _unjudged_ciks(recorded).ciks)
+        deleted = _delete_classifications(conn, master, skipped, unjudged_ciks)
         rebuilt = f"; classifications_deleted: {deleted}"
     added = 0
     for table, rows in (
@@ -1242,6 +1375,11 @@ def _ingest_filings(
         # rows at the new stamps beside them (#1382, an owner decision).
         kept = [row for row in rows if row["security_id"] not in skipped] if skipped else rows
         added += _add_rows(conn, table, kept, ingested_at=now, current=False)
+    chains = ""
+    if settings.master.chains:
+        chain_tally = _write_chains(conn, master, now, unjudged=unjudged_ciks, skipped=skipped)
+        added += chain_tally.inserted
+        chains = chain_tally.message()
     statements = ""
     if settings.edgar.statement_facts_enabled:
         tally = _write_statement_facts(
@@ -1274,7 +1412,7 @@ def _ingest_filings(
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
@@ -1335,6 +1473,165 @@ def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource
     for key in ("filename_index_fetches", "filename_document_fetches"):
         counts[key] = int(getattr(source, key, 0))
     return "".join(f"; {key}: {value}" for key, value in sorted(counts.items()))
+
+
+# --- the successor chains (#821, plan T187) --------------------------------
+
+#: The journal tables naming a security a window holds, each reaching its
+#: open window: `orders` and `positions_daily` by their `run_id`, `adjustments`
+#: by its `window_id`, and `lots` (which has none) by the books that have an
+#: open window. `?` is the ids list, then the closing stop states. This is
+#: `retract.py`'s `[traded]` test limited to open windows (the amendment's
+#: "A held position" paragraph): an order in flight counts as held.
+_HELD_SQL = """
+    SELECT security_id FROM orders
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM positions_daily
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM adjustments
+        WHERE list_contains(?, security_id) AND window_id IN (
+            SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+    UNION SELECT security_id FROM lots
+        WHERE list_contains(?, security_id) AND book_id IN (
+            SELECT book_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+"""
+
+
+def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
+    """The ids among `ids` an open paper window holds (#821): named by a
+    journal order, adjustment, daily position or lot of a window with no
+    `closed`/`abandoned` stop row. A store missing a journal table raises
+    (`duckdb.CatalogException`): the gate never fails open."""
+    wanted = sorted(set(ids))
+    if not wanted:
+        return frozenset()
+    states = list(CLOSING_STOP_STATES)
+    rows = conn.execute(
+        _HELD_SQL,
+        [wanted, states, wanted, states, wanted, states, wanted, states],
+    ).fetchall()
+    return frozenset(sid for (sid,) in rows if sid is not None)
+
+
+@dataclass(frozen=True)
+class _ChainTally:
+    """What `_write_chains` did: live rows written, live rows moved (retracted
+    and rewritten at a new stamp), rows inserted, and every refusal with its
+    reason."""
+
+    written: int
+    moved: int
+    inserted: int
+    refusals: tuple[ChainRefusal, ...]
+
+    def message(self) -> str:
+        """The run row's chain clause; the refusals name each successor and
+        its reason."""
+        refused = "; ".join(item.describe() for item in self.refusals) or "none"
+        return (
+            f"; chains_written: {self.written}; chains_refused: {refused}; "
+            f"chains_moved: {self.moved}"
+        )
+
+
+def _chain_same(stored: Mapping[str, Any], chain: Chain) -> bool:
+    """Whether `stored` is the row `chain` derives: same evidence, same
+    evidence stamp."""
+    return bool(
+        stored["predecessor_id"] == chain.predecessor_id
+        and stored["evidence_accession"] == chain.evidence_accession
+        and stored["evidence_form"] == chain.evidence_form
+        and stored["known_at"] == chain.known_at
+    )
+
+
+#: The live chain of a successor (`schema.successor_chains`): its unretracted
+#: row with the greatest `ingested_at`, unless a retraction was written after
+#: it. A run writes a retraction and its replacement at one clock, so the
+#: replacement is the latest row and the retraction supersedes every earlier
+#: revision.
+_LIVE_CHAIN_SQL = """
+    SELECT * FROM successor_chains c
+    WHERE successor_id = ? AND NOT retracted
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+      )
+"""
+
+
+def _write_chains(
+    conn: duckdb.DuckDBPyConnection,
+    master: MasterBuild,
+    now: datetime,
+    *,
+    unjudged: frozenset[str] = frozenset(),
+    skipped: frozenset[str] = frozenset(),
+) -> _ChainTally:
+    """Write the `successor_chains` rows `master` derives (#821).
+
+    An entry whose predecessor an open paper window holds is refused `held`,
+    and one whose predecessor or successor CIK this run did not judge
+    (`unjudged`), or whose security it skipped as restamp-refused (`skipped`),
+    is refused `unjudged` -- a transient fetch failure must not move a chain.
+    Both write nothing. A successor with no live chain gets the derived row
+    at its evidence stamp, counted under `chains_written`. A live chain the
+    entry derives unchanged (same predecessor, evidence and stamp) writes
+    nothing. Any other live chain -- a stamp earlier, later or the same, or
+    other evidence -- is retracted at `now` (the run's clock, #859;
+    `withdrawn_known_at` its stamp) and the derived row written beside it at
+    its evidence stamp, counted under `chains_moved`: the newer revision
+    supersedes every earlier one (`schema.successor_chains`)."""
+    held = _held_ids(conn, [chain.predecessor_id for chain in master.chains])
+    refusals: list[ChainRefusal] = list(master.chain_refusals)
+    written = 0
+    moved = 0
+    inserted = 0
+    for chain in master.chains:
+        if (
+            chain.predecessor_id in held
+            or chain.predecessor_id in skipped
+            or chain.successor_id in skipped
+            or chain.predecessor_id[:10] in unjudged
+            or chain.successor_id[:10] in unjudged
+        ):
+            reason = HELD_PREDECESSOR if chain.predecessor_id in held else UNJUDGED
+            refusals.append(ChainRefusal(chain.predecessor_id, chain.successor_id, reason))
+            continue
+        cursor = conn.execute(_LIVE_CHAIN_SQL, [chain.successor_id])
+        names = [column[0] for column in cursor.description]
+        stored = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
+        if len(stored) > 1:  # two unretracted rows at one clock: never written
+            raise RuntimeError(f"successor_chains holds {len(stored)} live rows for {chain}")
+        live = stored[0] if stored else None
+        if live is not None and _chain_same(live, chain):
+            continue
+        if live is not None and now <= live["ingested_at"]:
+            # The newest write is the live chain: an older clock would leave
+            # the superseded row live (`schema.successor_chains`).
+            raise ValueError(
+                f"chain run clock {now.isoformat()} is not after the live row's "
+                f"ingested_at {live['ingested_at'].isoformat()} for {chain.successor_id}"
+            )
+        if live is not None:
+            withdrawn = retraction(live, now)
+            withdrawn["withdrawn_known_at"] = live["known_at"]
+            insert_row(conn, "successor_chains", withdrawn)
+            inserted += 1
+            moved += 1
+        else:
+            written += 1
+        insert_row(conn, "successor_chains", chain.row() | {"ingested_at": now})
+        inserted += 1
+    return _ChainTally(written, moved, inserted, tuple(refusals))
 
 
 def _delete_classifications(
@@ -1437,6 +1734,10 @@ def _build_filings(
     master = build_master(filings, settings, ingested_at=ingested_at)
     delistings = build_delistings(filings.delistings(), master, ingested_at=ingested_at)
     classes = build_classifications(filings, master, settings, ingested_at=ingested_at)
+    if settings.master.chains:  # #821: the chained rows, on the classification
+        types = {row["security_id"]: row["security_type"] for row in classes.classifications}
+        chain_build = build_chains(filings, settings, master, types, ingested_at=ingested_at)
+        master = replace(master, chains=chain_build.chains, chain_refusals=chain_build.refusals)
     ciks = _issuer_ciks(master)
     records = [record for cik in ciks for record in filings.facts(cik, list(FACT_NAMES))]
     if fetch and settings.edgar.statement_facts_enabled:

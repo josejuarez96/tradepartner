@@ -229,6 +229,8 @@ class CheckRun:
     name: str
     status: str  # COMPLETED | IN_PROGRESS | QUEUED | ...
     conclusion: str  # SUCCESS | FAILURE | ... | "" while running
+    run_id: int = 0  # workflow run id (from the details URL); 0 when unknown
+    started_at: str = ""  # ISO-8601 UTC start time; "" when unknown
 
 
 @dataclass(frozen=True)
@@ -397,6 +399,12 @@ def tick_reviewer_boxes(
     return "".join(lines), other, [lines[review[0]].rstrip("\r\n")], [], reviewed_at
 
 
+def _run_id(details_url: str) -> int:
+    """The workflow run id in a check's details URL (``.../actions/runs/<id>/job/...``)."""
+    m = re.search(r"/actions/runs/(\d+)", details_url)
+    return int(m.group(1)) if m else 0
+
+
 def matrix_base(name: str) -> str:
     """The bare name of a known matrix job's child: ``pytest-shard (3)`` -> ``pytest-shard``.
 
@@ -418,6 +426,16 @@ def is_cancelled(run: CheckRun) -> bool:
     return run.conclusion.upper() == "CANCELLED" and run.status.upper() == "COMPLETED"
 
 
+def is_later_than(run: CheckRun, other: CheckRun) -> bool:
+    """Whether ``run`` belongs to a later workflow run than ``other``: by run id when both
+    are known, else by start time. Unknown ordering is never "later"."""
+    if run.run_id and other.run_id:
+        return run.run_id > other.run_id
+    if run.started_at and other.started_at:
+        return run.started_at > other.started_at
+    return False
+
+
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
@@ -437,7 +455,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     head. A non-cancelled matrix child also excuses its cancelled bare parent -- the full
     run's ``pytest-shard (N)`` excuses a cancelled ``pytest-shard`` cancelled before it
     fanned out -- but never a cancelled sibling child: a cancelled ``pytest-shard (3)``
-    needs its own ``pytest-shard (3)`` success (#1254). A lone ``CANCELLED`` ``checks``
+    needs its own ``pytest-shard (3)`` success (#1254). A ``CANCELLED`` check is also
+    ignored when a later workflow run (by run id, else start time) on the head has a
+    ``SUCCESS`` check, whatever the names (#1844). A lone ``CANCELLED`` ``checks``
     with every run on the head completed is ``cancelled`` (#1201): the caller may
     re-trigger once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
@@ -454,7 +474,28 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         if not cancelled:
             finished.add(run.name)
             finished.add(base)
-    runs = [run for run, _base, cancelled in live if not (cancelled and run.name in finished)]
+    # A cancelled check is also excused by a SUCCESS in a later workflow run on this head,
+    # whatever the names (the draft run's cancelled `pytest-shard` vs the full run's
+    # `pytest-shard (N)`, #1844).
+    succeeded = [
+        run
+        for run, _base, cancelled in live
+        if not cancelled
+        and run.status.upper() == "COMPLETED"
+        and run.conclusion.upper() == "SUCCESS"
+    ]
+    runs = [
+        run
+        for run, _base, cancelled in live
+        if not (
+            cancelled
+            and (
+                run.name in finished
+                # never a cancelled `checks`: only a later `checks` excuses it (#1201)
+                or (run.name != "checks" and any(is_later_than(ok, run) for ok in succeeded))
+            )
+        )
+    ]
     if not any(r.name == "checks" for r in runs):
         return "pending"
     if any(r.status.upper() != "COMPLETED" for r in runs):
@@ -750,16 +791,8 @@ def ready(
     if ticked:
         for agent in sorted(required):
             sha = reviewed_at[agent]
-            if not r.git_ok(
-                "merge-base", "--is-ancestor", sha, "HEAD"
-            ) or agent in required_reviews(
-                [
-                    path
-                    for path in r.git(
-                        "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
-                    ).splitlines()
-                    if path in touched  # the PR's own changes; a main merge is not one
-                ]
+            if not r.git_ok("merge-base", "--is-ancestor", sha, "HEAD") or agent in (
+                required_reviews(_own_changes_since(r, main_ref, sha, touched))
             ):
                 raise ReadyError(
                     f"{agent} review no longer covers the current head; rerun it before "
@@ -803,6 +836,40 @@ def ready(
     else:
         say(f"PR #{number} was already ready; CI green on {sha[:7]}")
     return 0
+
+
+HUNK_RE = re.compile(r"^@@ -\S+ \+\S+ @@")
+
+
+def _own_patch(r: Runner, main_ref: str, ref: str, path: str) -> list[str]:
+    """The PR's own change to ``path`` at ``ref``: the diff from the merge base with main,
+    with ``index`` lines dropped and hunk line numbers blanked (the function-name part of
+    a hunk header stays), so a main merge that only shifts line numbers compares equal
+    while a hunk moved to other context does not."""
+    out = r.git("diff", "--no-renames", f"{main_ref}...{ref}", "--", path)
+    return [HUNK_RE.sub("@@ @@", ln) for ln in out.splitlines() if not ln.startswith("index ")]
+
+
+def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str]) -> list[str]:
+    """PR-owned paths whose own change differs between the reviewed ``sha`` and ``HEAD``.
+
+    A path counts only if it changed in ``sha..HEAD`` and is in the PR's diff against
+    main; then equal blobs mean unchanged, a binary file that differs counts, and a text
+    file counts when its own patch against main differs at the two commits. So a main
+    merge, even one touching a file the PR also edits, does not stale a review (#1851).
+    Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
+    """
+    out: list[str] = []
+    for path in r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines():
+        if path not in touched:
+            continue
+        if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):
+            continue
+        if r.git("diff", "--numstat", sha, "HEAD", "--", path).startswith("-\t-"):
+            out.append(path)  # binary: no line patch to compare
+        elif _own_patch(r, main_ref, sha, path) != _own_patch(r, main_ref, "HEAD", path):
+            out.append(path)
+    return out
 
 
 def _merge_main(r: Runner, main_ref: str, say: Callable[[str], None]) -> None:
@@ -970,6 +1037,8 @@ class ShellRunner:
                 str(c.get("name") or c.get("context") or "?"),
                 str(c.get("status") or ("COMPLETED" if c.get("conclusion") else "")),
                 str(c.get("conclusion") or c.get("state") or ""),
+                _run_id(str(c.get("detailsUrl") or "")),
+                str(c.get("startedAt") or ""),
             )
             for c in raw.get("statusCheckRollup") or []
         )

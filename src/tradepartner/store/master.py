@@ -157,7 +157,7 @@ from tradepartner.adapters.filings import (
     FilingSource,
 )
 from tradepartner.calendar import is_session, next_session, previous_session
-from tradepartner.config import Settings
+from tradepartner.config import Settings, parse_chains
 from tradepartner.store.asof import _EXCHANGE_TZ, _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
 from tradepartner.store.filename_listings import (
@@ -205,6 +205,10 @@ class MasterBuild:
     filename_counts: Mapping[str, int] = field(default_factory=dict)
     filename_form25_accessions: tuple[str, ...] = ()
     filename_enabled: bool = False
+    #: `successor_chains` rows `build_chains` derives for `master.chains`
+    #: entries (#821), and the entries that derive none with their reason.
+    chains: tuple[Chain, ...] = ()
+    chain_refusals: tuple[ChainRefusal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -241,6 +245,69 @@ class Succession:
     predecessor_id: str
     security_id: str
     known_at: datetime
+
+
+#: The forms a successor issuer files for a 1:1 successor-CIK reorganisation
+#: (#821): an 8-K12B (Section 12(b)) or an 8-K12G3 (Section 12(g)), original
+#: or amendment.
+SUCCESSOR_EVIDENCE_FORMS: tuple[str, ...] = ("8-K12B", "8-K12B/A", "8-K12G3", "8-K12G3/A")
+
+#: Why a `master.chains` entry derives no `successor_chains` row (#821), named
+#: on the run row under `chains_refused`.
+NO_EVIDENCE = "no_evidence"
+NO_SECURITY = "no_security"
+NO_LISTING = "no_listing"
+SPAC_PREDECESSOR = "spac"
+HELD_PREDECESSOR = "held"
+UNJUDGED = "unjudged"
+
+
+@dataclass(frozen=True)
+class Chain:
+    """One derived `successor_chains` row (#821): `successor_id` continues
+    `predecessor_id`, known at `known_at` (the latest of the four evidence
+    stamps), on the strength of `evidence_accession` in `evidence_form`."""
+
+    predecessor_id: str
+    successor_id: str
+    evidence_accession: str
+    evidence_form: str
+    known_at: datetime
+    ingested_at: datetime
+
+    def row(self) -> Row:
+        """The stored `successor_chains` row, its `ingested_at` the run's
+        clock, its `source` `edgar` and its `provenance` `filing`."""
+        return {
+            "predecessor_id": self.predecessor_id,
+            "successor_id": self.successor_id,
+            "evidence_accession": self.evidence_accession,
+            "evidence_form": self.evidence_form,
+            "retracted": False,
+            "withdrawn_known_at": None,
+        } | _row(self.known_at, self.ingested_at, _EDGAR, "filing")
+
+
+@dataclass(frozen=True)
+class ChainRefusal:
+    """A `master.chains` entry that derives no row (#821): `reason` is one of
+    `NO_EVIDENCE`, `NO_SECURITY`, `NO_LISTING`, `SPAC_PREDECESSOR`,
+    `HELD_PREDECESSOR` or `UNJUDGED`, named with the ids on the run row."""
+
+    predecessor_id: str
+    successor_id: str
+    reason: str
+
+    def describe(self) -> str:
+        return f"{self.successor_id}={self.reason}"
+
+
+@dataclass(frozen=True)
+class ChainBuild:
+    """`Chain` rows and `ChainRefusal`s `build_chains` derives (#821)."""
+
+    chains: tuple[Chain, ...]
+    refusals: tuple[ChainRefusal, ...]
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1086,82 @@ def build_master(source: FilingSource, settings: Settings, *, ingested_at: datet
     )
 
 
+def build_chains(
+    source: FilingSource,
+    settings: Settings,
+    master: MasterBuild,
+    security_types: Mapping[str, str],
+    *,
+    ingested_at: datetime,
+) -> ChainBuild:
+    """`successor_chains` rows for the `master.chains` entries (#821).
+
+    Pure apart from calling `source`. For each `<predecessor>-><successor>@
+    <accession>` entry, a row is derived when three things are known at the
+    run: the accession is in the filing index under the successor's CIK with
+    form `8-K12B`, `8-K12B/A`, `8-K12G3` or `8-K12G3/A`; the successor has a
+    `securities` row; and the successor's earliest-known listing row names the
+    predecessor's last listing row's ticker and exchange (the earliest *known*
+    such row, not necessarily the successor's first listing row: the code
+    matches the earliest row carrying that ticker and exchange). `known_at` is
+    the latest of those four stamps, never the config's edit or the run's clock,
+    so a read before it sees two securities. An entry whose predecessor is
+    classified `spac` (`security_types`, the latest classification per id)
+    derives no row either, and each refusal is returned with its reason.
+    Raises `ValueError` if a derived `known_at` is later than `ingested_at`.
+    """
+    ingested_at = ensure_tz_aware_utc(ingested_at, field_name="ingested_at")
+    entries = parse_chains(settings.master.chains)
+    if not entries:
+        return ChainBuild((), ())
+    index = {(entry.cik, entry.accession): entry for entry in source.filing_index()}
+    securities = {row["security_id"]: row for row in master.securities}
+    listings: dict[str, list[Row]] = defaultdict(list)
+    for row in master.listings:
+        listings[row["security_id"]].append(row)
+    chains: list[Chain] = []
+    refusals: list[ChainRefusal] = []
+    for predecessor_id, successor_id, accession in entries:
+        evidence = index.get((successor_id[:10], accession))
+        if evidence is None or evidence.form not in SUCCESSOR_EVIDENCE_FORMS:
+            refusals.append(ChainRefusal(predecessor_id, successor_id, NO_EVIDENCE))
+            continue
+        security = securities.get(successor_id)
+        if security is None:
+            refusals.append(ChainRefusal(predecessor_id, successor_id, NO_SECURITY))
+            continue
+        predecessor_rows = listings.get(predecessor_id, [])
+        successor_rows = listings.get(successor_id, [])
+        if not predecessor_rows:
+            refusals.append(ChainRefusal(predecessor_id, successor_id, NO_LISTING))
+            continue
+        last = max(predecessor_rows, key=lambda r: (r["valid_from"], r["known_at"]))
+        matches = [
+            row
+            for row in successor_rows
+            if row["ticker"] == last["ticker"] and row["exchange"] == last["exchange"]
+        ]
+        if not matches:
+            refusals.append(ChainRefusal(predecessor_id, successor_id, NO_LISTING))
+            continue
+        if security_types.get(predecessor_id) == "spac":
+            refusals.append(ChainRefusal(predecessor_id, successor_id, SPAC_PREDECESSOR))
+            continue
+        earliest = min(matches, key=lambda r: (r["known_at"], r["valid_from"]))
+        known_at = max(
+            evidence.accepted_at, security["known_at"], last["known_at"], earliest["known_at"]
+        )
+        if known_at > ingested_at:
+            raise ValueError(
+                f"{successor_id}: chain known_at {known_at.isoformat()} is after "
+                f"ingested_at {ingested_at.isoformat()}"
+            )
+        chains.append(
+            Chain(predecessor_id, successor_id, accession, evidence.form, known_at, ingested_at)
+        )
+    return ChainBuild(tuple(chains), tuple(refusals))
+
+
 def _filename_rows(
     builder: _Builder,
     cik: str,
@@ -1177,7 +1320,9 @@ def write_master(conn: duckdb.DuckDBPyConnection, build: MasterBuild) -> int:
         insert_row(conn, "securities", row)
     for row in build.listings:
         insert_row(conn, "listings", row)
-    return len(build.securities) + len(build.listings)
+    for chain in build.chains:
+        insert_row(conn, "successor_chains", chain.row())
+    return len(build.securities) + len(build.listings) + len(build.chains)
 
 
 def securities_as_of(

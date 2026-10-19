@@ -17,6 +17,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -94,8 +95,127 @@ from tradepartner.store.asof import (
 )
 from tradepartner.store.classify import build_classifications, classifications_as_of
 from tradepartner.store.db import insert_row, open_for_write
-from tradepartner.store.master import build_master
+from tradepartner.store.master import Chain, MasterBuild, build_chains, build_master
 from tradepartner.store.schema import init_schema
+
+
+def test_openfigi_revisions_errors_and_unmapped(settings: Settings) -> None:
+    from tradepartner.store.registry import data_vintage
+
+    enabled = settings.model_copy(
+        update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+    )
+    t0 = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    with open_for_write(enabled) as conn:
+        init_schema(conn)
+        conn.execute(
+            "CREATE TEMP TABLE figi_jobs AS SELECT * FROM (VALUES "
+            "('S1', 'VZ'), ('S2', 'BF.B'), ('S3', 'CRH')) AS v(sid, ticker)"
+        )
+        conn.execute(
+            "INSERT INTO securities (security_id, cik, name, benchmark, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, sid, sid, FALSE, ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, ticker, 'NYSE', DATE '2025-01-01', ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) "
+            "SELECT sid, DATE '2026-10-15', 10, 11, 9, 10, 1000, ?, ?, "
+            "'test', 'bar' FROM figi_jobs",
+            [t0, t0],
+        )
+        before = data_vintage(conn, datetime(2026, 10, 16, 23, tzinfo=UTC))
+
+    calls = [0]
+    response_type = ["Common Stock"]
+    stamp_override: list[datetime | None] = [None]
+    s3_maps = [False]
+
+    def fake_mapping(
+        tickers: list[str], _config: object, **_kwargs: object
+    ) -> list[tuple[list[object], datetime, datetime]]:
+        assert tickers == ["VZ", "BF/B", "CRH"]
+        calls[0] += 1
+        stamp = stamp_override[0] or datetime(2026, 10, 16, 20, tzinfo=UTC) + timedelta(
+            minutes=calls[0]
+        )
+        item = {
+            "figi": "BBG1",
+            "compositeFIGI": "BBG1",
+            "exchCode": "US",
+            "securityType": response_type[0],
+        }
+        payload = [
+            {"data": [item]},
+            {"error": "per-job failure"},
+            {"data": [{**item, "figi": "BBG3", "securityType": "ADR"}]}
+            if s3_maps[0]
+            else {"warning": "No identifier found."},
+        ]
+        return [(payload, stamp, stamp + timedelta(seconds=1))]
+
+    now = datetime(2026, 10, 16, 21, tzinfo=UTC)
+    for expected in (2, 0, 1):
+        if calls[0] == 2:
+            response_type[0] = "Medium Term Note"
+        result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        assert len(result.runs) == 1
+        assert result.runs[0].rows_added == expected
+        assert "unmapped=1; errors=1" in result.runs[0].message
+    with open_for_write(enabled) as conn:
+        rows = conn.execute(
+            "SELECT security_type, known_at, ingested_at FROM openfigi_types "
+            "WHERE security_id = 'S1' ORDER BY known_at"
+        ).fetchall()
+        assert [row[0] for row in rows] == ["Common Stock", "Medium Term Note"]
+        assert all(row[1] <= row[2] for row in rows)
+        assert rows[0][1] > datetime(2026, 10, 16, 20, 1, tzinfo=UTC)
+        assert rows[1][1] > datetime(2026, 10, 16, 20, 3, tzinfo=UTC)
+        # S3 never mapped: one stored `mapped = FALSE` row; S2 (per-job error) none.
+        assert conn.execute(
+            "SELECT security_id, mapped, figi FROM openfigi_types WHERE security_id <> 'S1'"
+        ).fetchall() == [("S3", False, "")]
+        assert data_vintage(conn, datetime(2026, 10, 16, 23, tzinfo=UTC)) == before
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE source='openfigi'"
+        ).fetchone() == (3,)
+    stamp_override[0] = datetime(2026, 10, 16, 20, 2, tzinfo=UTC)
+    response_type[0] = "Preferred Stock"
+    failed = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert failed.runs[0].status == FAILED
+    with open_for_write(enabled) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM openfigi_types").fetchone() == (3,)
+    # S3 starts mapping (a row), then stops mapping again (another row): the
+    # latest state is stored, not a stale type.
+    stamp_override[0] = None
+    response_type[0] = "Medium Term Note"
+    s3_maps[0] = True
+    calls[0] = 10
+    assert (
+        ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        .runs[0]
+        .rows_added
+        == 1
+    )
+    s3_maps[0] = False
+    calls[0] = 20
+    assert (
+        ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        .runs[0]
+        .rows_added
+        == 1
+    )
+    with open_for_write(enabled) as conn:
+        assert conn.execute(
+            "SELECT mapped, figi FROM openfigi_types WHERE security_id = 'S3' ORDER BY known_at"
+        ).fetchall() == [(False, ""), (True, "BBG3"), (False, "")]
 
 
 def test_rates_backfill_is_point_in_time_and_idempotent(
@@ -5448,3 +5568,514 @@ def test_import_dry_run_keeps_the_counts_before_a_failing_file(
     assert [(run.status, run.rows_added) for run in dry.runs] == [(OK, 5), (FAILED, 0)]
     assert dry.runs[0].message.startswith("dry run: assets-c.json.gz")
     assert read("SELECT count(*) FROM ingestion_runs") == [(0,)]
+
+
+# --- successor chains (#821, plan T187) -------------------------------------
+
+_CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe" / "chains"
+_CHAIN_CASE = next(
+    case
+    for case in json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
+    if case["case"] == "chain_1to1"
+)
+
+
+def _chain_parse(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _chain_filings(
+    case: dict[str, Any],
+    *,
+    cover_shift: timedelta = timedelta(0),
+    successor_ticker: str | None = None,
+    accession: str | None = None,
+):
+    """`_filings()` plus the fixture's `chain_1to1` pair: each CIK's issuer
+    filings, its cover page listing the pair's ticker and exchange, and the
+    successor's 8-K12B. `cover_shift` moves the successor's listing row (to
+    drive `chains_moved`)."""
+    predecessor = case["predecessor"]
+    successor = case["successor"]
+    ticker = case["ticker"]
+    evidence = case["evidence"]
+    successor_cover = _chain_parse(successor["cover"]) + cover_shift
+    return _filings(
+        extra_index=[
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000001",
+                _chain_parse(predecessor["first_index"]),
+            ),
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                "10-K",
+                f"{successor['cik']}-20-000001",
+                _chain_parse(successor["first_index"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                evidence["form"],
+                accession or evidence["accession"],
+                _chain_parse(evidence["accepted_at"]),
+            ),
+        ],
+        extra_covers=[
+            CoverPage(
+                predecessor["cik"],
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+            CoverPage(
+                successor["cik"],
+                f"{successor['cik']}-20-000002",
+                successor_cover,
+                (CoverListing("Common Stock", successor_ticker or ticker, "NYSE"),),
+            ),
+        ],
+    )
+
+
+def _chained_settings(settings: Settings, case: dict[str, Any]) -> Settings:
+    entry = (
+        f"{case['predecessor']['cik']}->{case['successor']['cik']}@{case['evidence']['accession']}"
+    )
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"chains": [entry]})}
+    )
+
+
+def _chain_settings_for(settings: Settings, *, accession: str | None) -> Settings:
+    """`settings` with `master.chains` set to the fixture pair and `accession`."""
+    entry = (
+        f"{_CHAIN_CASE['predecessor']['cik']}->{_CHAIN_CASE['successor']['cik']}"
+        f"@{accession or _CHAIN_CASE['evidence']['accession']}"
+    )
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"chains": [entry]})}
+    )
+
+
+def _chain_now() -> datetime:
+    return datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
+
+
+def test_a_chain_entry_writes_a_row_and_the_run_row_counts_it(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: the run row counts `chains_written` and `chains_refused`, the row
+    is stored at the evidence's `known_at`, and a second run adds nothing."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    rows = read(
+        "SELECT predecessor_id, successor_id, evidence_form, known_at, ingested_at "
+        "FROM successor_chains"
+    )
+    assert rows == [
+        (
+            _CHAIN_CASE["predecessor"]["cik"],
+            _CHAIN_CASE["successor"]["cik"],
+            "8-K12B",
+            _chain_parse(_CHAIN_CASE["expected_known_at"]),
+            _chain_now(),
+        )
+    ]
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chains_written: 1" in message
+    assert "chains_refused: none" in message
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 1
+    second = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any("chains_written: 0" in m for m in second)
+
+
+#: The live chain `schema.successor_chains` documents: the successor's
+#: unretracted row with the greatest `ingested_at`, unless a retraction was
+#: written after it. A read at `t` shows it only when its `known_at <= t` (the
+#: corrected history the UPDATE-moved listing rows give, T166b).
+_CHAIN_LIVE_SQL = """
+    SELECT predecessor_id, evidence_accession, known_at FROM successor_chains c
+    WHERE successor_id = ? AND NOT retracted
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+      )
+"""
+
+
+def _chain_live(
+    read: Callable[[str], list[tuple[Any, ...]]], at: datetime | None = None
+) -> tuple[Any, ...] | None:
+    """The chain of the fixture's successor read at `at` (every revision
+    applied), or the live row with no `at`; None when there is none."""
+    successor = _CHAIN_CASE["successor"]["cik"]
+    rows = read(_CHAIN_LIVE_SQL.replace("?", f"'{successor}'"))
+    assert len(rows) <= 1, rows
+    if not rows or (at is not None and rows[0][2] > at):
+        return None
+    return rows[0]
+
+
+def _chain_unretracted(read: Callable[[str], list[tuple[Any, ...]]]) -> int:
+    """Unretracted rows no later write supersedes: one at most, always."""
+    successor = _CHAIN_CASE["successor"]["cik"]
+    return len(read(_CHAIN_LIVE_SQL.replace("?", f"'{successor}'")))
+
+
+_ACC2 = "0001000011-24-000009"
+
+#: The reviewer's sequences (quant-auditor pass 4 on #1836): each step is the
+#: successor listing row's shift from the fixture stamp (days) and the
+#: evidence accession (None: the fixture's).
+_CHAIN_SEQUENCES = {
+    "move later": [(0, None), (30, None)],
+    "move earlier then later": [(0, None), (-20, None), (30, None)],
+    "same-stamp correction then later": [(0, None), (0, _ACC2), (30, _ACC2)],
+    "later, earlier, later": [(0, None), (30, None), (10, None), (60, None)],
+    "A->B->A, B later": [(0, None), (30, None), (0, None)],
+    "A->B->A, B earlier": [(0, None), (-20, None), (0, None)],
+}
+
+
+@pytest.mark.parametrize("steps", _CHAIN_SEQUENCES.values(), ids=_CHAIN_SEQUENCES.keys())
+def test_every_revision_supersedes_every_earlier_one(
+    settings: Settings,
+    read: Callable[[str], list[tuple[Any, ...]]],
+    steps: list[tuple[int, str | None]],
+) -> None:
+    """#821: a write that differs from the live chain retracts it at the
+    run's clock and writes the derived row at its evidence stamp, so after
+    every run exactly one row is live and every earlier revision is gone. A
+    read at `t` gives the newest revision only from its own `known_at`:
+    absent at every earlier stamp the sequence used (the successor's listing
+    row, moved by UPDATE, reads absent there too), present from it, before the
+    last run's clock and after it. An unchanged last run writes nothing and
+    raises nothing."""
+    base = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    default = _CHAIN_CASE["evidence"]["accession"]
+    clocks = [_chain_now() + timedelta(days=60 * i) for i in range(len(steps) + 1)]
+    stamps = []
+    for (shift, accession), clock in zip(steps, clocks, strict=False):
+        _run(
+            _chain_settings_for(settings, accession=accession),
+            filings=_chain_filings(
+                _CHAIN_CASE, cover_shift=timedelta(days=shift), accession=accession
+            ),
+            now=clock,
+        )
+        stamp = base + timedelta(days=shift)
+        stamps.append(stamp)
+        assert _chain_unretracted(read) == 1
+        assert _chain_live(read) == (predecessor, accession or default, stamp)
+    changes = sum(1 for a, b in pairwise(steps) if a != b)
+    assert read("SELECT count(*) FROM successor_chains WHERE retracted") == [(changes,)]
+    final = (predecessor, steps[-1][1] or default, stamps[-1])
+    for stamp in stamps:
+        expected = final if stamp >= stamps[-1] else None
+        assert _chain_live(read, stamp) == expected, stamp
+        assert _chain_live(read, stamp - timedelta(microseconds=1)) == (
+            final if stamp - timedelta(microseconds=1) >= stamps[-1] else None
+        ), stamp
+    assert _chain_live(read, clocks[len(steps) - 1] - timedelta(seconds=1)) == final
+    assert _chain_live(read, clocks[len(steps) - 1] + timedelta(days=1)) == final
+    rows = read("SELECT count(*) FROM successor_chains")
+    shift, accession = steps[-1]
+    _run(
+        _chain_settings_for(settings, accession=accession),
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=shift), accession=accession),
+        now=clocks[-1],
+    )
+    assert read("SELECT count(*) FROM successor_chains") == rows
+    last = read("SELECT message FROM ingestion_runs WHERE source = 'edgar' ORDER BY started_at")
+    assert "chains_written: 0" in last[-1][0]
+    assert "chains_moved: 0" in last[-1][0]
+    assert _chain_live(read) == final
+
+
+def test_a_moved_chain_is_retracted_and_rewritten_in_one_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: a listing row restamped later moves the row's `known_at`; the run
+    retracts the live row at its clock (`withdrawn_known_at` names its stamp)
+    and writes the new one at the new stamp, counting `chains_moved`."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    old_known = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    moved_known = old_known + timedelta(days=30)
+    clock = _chain_now() + timedelta(days=60)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
+        now=clock,
+    )
+    assert read(
+        "SELECT known_at, ingested_at, withdrawn_known_at FROM successor_chains WHERE retracted"
+    ) == [(clock, clock, old_known)]
+    assert read(
+        "SELECT known_at, ingested_at FROM successor_chains WHERE NOT retracted ORDER BY 2"
+    ) == [(old_known, _chain_now()), (moved_known, clock)]
+    assert _chain_live(read) == (
+        _CHAIN_CASE["predecessor"]["cik"],
+        _CHAIN_CASE["evidence"]["accession"],
+        moved_known,
+    )
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any("chains_moved: 1" in m for m in messages)
+
+
+def test_a_chain_stamped_at_the_run_clock_does_not_collide(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821 (pass-4 nit): evidence whose stamp equals the run's clock is
+    written beside the retraction at that clock without a key collision."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    base = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=base + timedelta(days=1))
+    clock = base + timedelta(days=30)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)), now=clock)
+    assert _chain_live(read) == (
+        _CHAIN_CASE["predecessor"]["cik"],
+        _CHAIN_CASE["evidence"]["accession"],
+        clock,
+    )
+    assert read("SELECT count(*) FROM successor_chains WHERE retracted") == [(1,)]
+
+
+def test_a_held_predecessor_is_refused_then_written_after_the_window_closes(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: an open paper window holding the predecessor names `held` on the
+    run row and writes nothing; the first run after the window closes writes
+    the row."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    with duckdb.connect(chained.store.path) as conn:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, 'v', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, ?, 1.0, NULL, NULL, "
+            "TIMESTAMPTZ '2025-12-02 14:00:00+00', TIMESTAMPTZ '2025-12-02 14:00:00+00')",
+            [predecessor],
+        )
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 0
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any(f"{_CHAIN_CASE['successor']['cik']}=held" in m for m in messages)
+    with duckdb.connect(chained.store.path) as conn:
+        init_schema(conn)
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', 'closed', NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
+        )
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now() + timedelta(days=1))
+    assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
+
+
+def test_a_missing_listing_row_is_refused_and_written_on_the_next_run(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: an entry whose successor has no listing row under the
+    predecessor's ticker names `no_listing` on the run row and writes nothing;
+    the next run, with the row known, writes it."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, successor_ticker="CHNZ"),
+        now=_chain_now(),
+    )
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 0
+    messages = [m for (m,) in read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")]
+    assert any(f"{_CHAIN_CASE['successor']['cik']}=no_listing" in m for m in messages)
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now() + timedelta(days=1))
+    assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
+
+
+def test_a_chain_write_refuses_a_clock_before_the_live_row() -> None:
+    """#821: the live chain is the latest written row, so a run whose clock
+    is not after the live row's `ingested_at` would leave an earlier revision
+    live; the writer raises instead of writing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        stamp = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)
+        first = Chain("0001000010", "0001000011", "0001000011-24-000001", "8-K12B", stamp, stamp)
+        clock = datetime(2026, 1, 2, tzinfo=UTC)
+        master = MasterBuild((), (), (), (), chains=(first,))
+        ingest_module._write_chains(conn, master, clock)
+        moved = replace(first, known_at=stamp + timedelta(days=30))
+        with pytest.raises(ValueError, match="not after"):
+            ingest_module._write_chains(conn, replace(master, chains=(moved,)), clock)
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_held_ids_reads_open_windows_only() -> None:
+    """#821: `_held_ids` is `retract.py`'s `[traded]` test limited to open
+    windows: an adjustment of a window with no closing stop row holds its
+    security; a `closed` stop releases it."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, "
+            "'v', TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, 'HELD', 1.0, NULL, NULL, "
+            "TIMESTAMPTZ '2025-12-02 14:00:00+00', TIMESTAMPTZ '2025-12-02 14:00:00+00')"
+        )
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == frozenset({"HELD"})
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', 'closed', NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')"
+        )
+        assert ingest_module._held_ids(conn, ["HELD"]) == frozenset()
+    finally:
+        conn.close()
+
+
+_HELD_TS = "TIMESTAMPTZ '2025-12-02 14:00:00+00'"
+
+#: One journal row naming security `HELD` in window 1 (run 1), per source the
+#: held gate reads (`ingest._HELD_SQL`).
+_HELD_ROWS = {
+    "order": (
+        "INSERT INTO orders (client_order_id, decision_id, run_id, session, attempt, phase, "
+        "security_id, symbol, side, sells_in_flight_at_submit, known_at, ingested_at) VALUES "
+        f"('c1', 1, 1, DATE '2025-12-02', 1, 'buy', 'HELD', 'HLD', 'buy', FALSE, {_HELD_TS}, "
+        f"{_HELD_TS})"
+    ),
+    "daily position": (
+        "INSERT INTO positions_daily (run_id, session, security_id, quantity, known_at, "
+        f"ingested_at) VALUES (1, DATE '2025-12-02', 'HELD', 1.0, {_HELD_TS}, {_HELD_TS})"
+    ),
+    "lot": (
+        "INSERT INTO lots (lot_id, account_id, account_type, account_owner, security_id, symbol, "
+        "trade_at, trade_date_local, quantity, cost_basis, known_at, ingested_at) VALUES "
+        f"(1, 'acc', 'paper', 'owner', 'HELD', 'HLD', {_HELD_TS}, DATE '2025-12-02', 1.0, 1.0, "
+        f"{_HELD_TS}, {_HELD_TS})"
+    ),
+    "adjustment": (
+        "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+        "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+        "(1, 1, NULL, DATE '2025-12-02', 'spinoff_receipt', NULL, 'HELD', 1.0, NULL, NULL, "
+        f"{_HELD_TS}, {_HELD_TS})"
+    ),
+}
+
+
+@pytest.mark.parametrize("source", _HELD_ROWS)
+@pytest.mark.parametrize(
+    ("state", "held"), [("requested", True), ("closed", False), ("abandoned", False)]
+)
+def test_every_journal_source_holds_until_a_closing_stop(
+    source: str, state: str, held: bool
+) -> None:
+    """#821 (safety review): an order (in flight or not), a daily position, a
+    lot or an adjustment of an open window holds its security; a `requested`
+    stop keeps the window open, a `closed` or `abandoned` one releases it."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO paper_windows (window_id, hypothesis_id, first_rebalance_session, "
+            "account_id, starting_cash, starting_equity, code_version, started_at, frozen_json, "
+            "frozen_sha256, known_at, ingested_at) VALUES "
+            "(1, 1, DATE '2025-12-01', 'acc', 1.0, 1.0, 'v', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', '{}', 'sha', "
+            "TIMESTAMPTZ '2025-12-01 14:00:00+00', TIMESTAMPTZ '2025-12-01 14:00:00+00')"
+        )
+        conn.execute(
+            "INSERT INTO paper_runs (run_id, window_id, started_at, invoked_by, code_version, "
+            f"known_at, ingested_at) VALUES (1, 1, {_HELD_TS}, 'tty', 'v', {_HELD_TS}, {_HELD_TS})"
+        )
+        conn.execute(_HELD_ROWS[source])
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == frozenset({"HELD"})
+        conn.execute(
+            'INSERT INTO paper_window_stops (window_id, "at", state, reason, known_at, '
+            "ingested_at) VALUES (1, TIMESTAMPTZ '2025-12-03 14:00:00+00', ?, NULL, "
+            "TIMESTAMPTZ '2025-12-03 14:00:00+00', TIMESTAMPTZ '2025-12-03 14:00:00+00')",
+            [state],
+        )
+        expected = frozenset({"HELD"}) if held else frozenset()
+        assert ingest_module._held_ids(conn, ["HELD", "FREE"]) == expected
+    finally:
+        conn.close()
+
+
+def test_the_held_gate_fails_loud_without_the_journal() -> None:
+    """#821 (safety review): a store missing a journal table raises rather
+    than reading as holding nothing."""
+    conn = duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        conn.execute("DROP TABLE lots")
+        with pytest.raises(duckdb.CatalogException):
+            ingest_module._held_ids(conn, ["HELD"])
+    finally:
+        conn.close()
+
+
+def test_an_unjudged_entry_is_refused_and_writes_nothing() -> None:
+    """#821: an entry whose CIK this run did not judge is refused `unjudged`,
+    so a transient fetch failure never moves a chain."""
+    import duckdb as _duckdb
+
+    from tradepartner.config import Settings as _Settings
+
+    source = _chain_filings(_CHAIN_CASE)
+    predecessor = _CHAIN_CASE["predecessor"]["cik"]
+    settings = _Settings(
+        _env_file=None,
+        master={
+            "chains": [
+                f"{predecessor}->{_CHAIN_CASE['successor']['cik']}"
+                f"@{_CHAIN_CASE['evidence']['accession']}"
+            ]
+        },
+    )
+    built = build_master(source, settings, ingested_at=_chain_now())
+    chains = build_chains(source, settings, built, {}, ingested_at=_chain_now())
+    master = replace(built, chains=chains.chains, chain_refusals=chains.refusals)
+    conn = _duckdb.connect(":memory:")
+    try:
+        init_schema(conn)
+        tally = ingest_module._write_chains(
+            conn, master, _chain_now(), unjudged=frozenset({predecessor})
+        )
+        assert tally.written == 0
+        assert tally.refusals[-1].reason == "unjudged"
+        assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
+    finally:
+        conn.close()

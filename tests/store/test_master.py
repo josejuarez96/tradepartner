@@ -13,8 +13,11 @@ states exactly which filings exist.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import duckdb
 import polars as pl
@@ -44,6 +47,7 @@ from tradepartner.store.master import (
     ShownSpan,
     Succession,
     _refuse_separator,
+    build_chains,
     build_master,
     first_session,
     primary_security_id,
@@ -1902,3 +1906,175 @@ def test_registered_shares_class_is_the_primary_under_the_fallback() -> None:
         primary = primary_security_id(cik)
         first[on] = next(r["ticker"] for r in built.listings if r["security_id"] == primary)
     assert first == {True: "SWS", False: "SWP"}
+
+
+# --- successor chains (#821, plan T187) -------------------------------------
+
+_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+_CHAIN_CASES = json.loads((_FIXTURE_DIR / "chains" / "chain_cases.json").read_text())
+_CHAIN_BY_NAME = {case["case"]: case for case in _CHAIN_CASES}
+
+
+def _chain_source(
+    case: dict[str, object], *, evidence_form: str | None = None
+) -> FixtureFilingSource:
+    """The `FixtureFilingSource` the fixture case was built from: each CIK's
+    first issuer filing, its cover page (listing the pair's ticker and
+    exchange) and, for the successor, the 8-K12B evidence carried in
+    `chain_cases.json` (no fixture CSV holds the filing index)."""
+    predecessor = case["predecessor"]
+    successor = case["successor"]
+    ticker = case["ticker"]
+    evidence = case["evidence"]
+    index = [
+        _filing(
+            predecessor["cik"], predecessor["name"], "10-K", _parse(predecessor["first_index"])
+        ),
+        _filing(predecessor["cik"], predecessor["name"], "10-K", _parse(predecessor["cover"])),
+        _filing(successor["cik"], successor["name"], "10-K", _parse(successor["first_index"])),
+    ]
+    covers = [
+        _cover(predecessor["cik"], _parse(predecessor["cover"]), ("Common Stock", ticker, "NYSE")),
+        _cover(successor["cik"], _parse(successor["cover"]), ("Common Stock", ticker, "NYSE")),
+    ]
+    if evidence is not None:
+        accession = evidence["accession"]
+        index.append(
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                evidence_form or evidence["form"],
+                accession,
+                _parse(evidence["accepted_at"]),
+            )
+        )
+    return FixtureFilingSource(index=index, cover_pages=covers)
+
+
+def _parse(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _chain_entry(case: dict[str, object]) -> str:
+    evidence = case["evidence"]
+    accession = evidence["accession"] if evidence else f"{case['successor']['cik']}-24-999999"
+    return f"{case['predecessor']['cik']}->{case['successor']['cik']}@{accession}"
+
+
+def _chain_build(case: dict[str, object], *, evidence_form: str | None = None):
+    source = _chain_source(case, evidence_form=evidence_form)
+    settings = _settings(master={"chains": [_chain_entry(case)]})
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    build = build_chains(source, settings, master, {}, ingested_at=INGESTED_AT)
+    master = replace(master, chains=build.chains, chain_refusals=build.refusals)
+    return build, master
+
+
+@pytest.mark.parametrize(
+    "name", ["chain_1to1", "chain_evidence_latest", "chain_predecessor_latest"]
+)
+def test_a_live_entry_writes_the_row_known_at_the_latest_stamp(name: str) -> None:
+    """#821: the row's `known_at` is the latest of the four evidence stamps --
+    the successor's first listing row, the 8-K12B/A, or the predecessor's last
+    listing row -- and its `ingested_at` the run's clock."""
+    case = _CHAIN_BY_NAME[name]
+    build, master = _chain_build(case)
+    assert build.refusals == ()
+    (chain,) = build.chains
+    assert chain.known_at == _parse(case["expected_known_at"])
+    assert chain.ingested_at == INGESTED_AT
+    assert chain.predecessor_id == case["predecessor"]["cik"]
+    assert chain.successor_id == case["successor"]["cik"]
+    stored = chain.row()
+    assert stored["ingested_at"] == INGESTED_AT
+    assert stored["source"] == "edgar" and stored["provenance"] == "filing"
+    assert stored["retracted"] is False
+    assert master.chain_refusals == ()
+
+
+def test_the_spinoff_pair_writes_nothing_and_names_the_reason() -> None:
+    """#821: an entry whose evidence is not in the index derives no row and is
+    refused `no_evidence`."""
+    case = _CHAIN_BY_NAME["chain_spinoff"]
+    build, _ = _chain_build(case)
+    assert build.chains == ()
+    (refusal,) = build.refusals
+    assert refusal.reason == "no_evidence"
+    assert refusal.successor_id == case["successor"]["cik"]
+
+
+def test_a_plain_8k_evidence_form_is_refused() -> None:
+    """#821: the evidence must be one of the four successor forms; the same
+    accession as a plain 8-K writes nothing."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    build, _ = _chain_build(case, evidence_form="8-K")
+    assert build.chains == ()
+    assert build.refusals[0].reason == "no_evidence"
+
+
+def test_a_spac_predecessor_is_refused() -> None:
+    """#821: a de-SPAC predecessor (classified `spac`) derives no row."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    source = _chain_source(case)
+    settings = _settings(master={"chains": [_chain_entry(case)]})
+    master = build_master(source, settings, ingested_at=INGESTED_AT)
+    build = build_chains(
+        source, settings, master, {case["predecessor"]["cik"]: "spac"}, ingested_at=INGESTED_AT
+    )
+    assert build.chains == ()
+    assert build.refusals[0].reason == "spac"
+
+
+def test_a_missing_listing_row_is_refused_until_it_arrives() -> None:
+    """#821: the successor having no listing row under the predecessor's ticker
+    and exchange is `no_listing`, retried every run."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    source = _chain_source(case)
+    predecessor = case["predecessor"]
+    successor = case["successor"]
+    stripped = FixtureFilingSource(
+        index=list(source.filing_index()),
+        cover_pages=[
+            _cover(
+                predecessor["cik"],
+                _parse(predecessor["cover"]),
+                ("Common Stock", case["ticker"], "NYSE"),
+            ),
+            _cover(
+                successor["cik"],
+                _parse(successor["cover"]),
+                ("Common Stock", "CHNZ", "NYSE"),
+            ),
+        ],
+    )
+    settings = _settings(master={"chains": [_chain_entry(case)]})
+    master = build_master(stripped, settings, ingested_at=INGESTED_AT)
+    build = build_chains(stripped, settings, master, {}, ingested_at=INGESTED_AT)
+    assert build.chains == ()
+    assert build.refusals[0].reason == "no_listing"
+
+
+def test_write_master_stores_the_chain_row(tmp_path: Path) -> None:
+    """#821: `write_master` inserts the derived `successor_chains` row."""
+    case = _CHAIN_BY_NAME["chain_1to1"]
+    _build, master = _chain_build(case)
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        written = write_master(conn, master)
+        assert written >= len(master.securities) + len(master.chains)
+        rows = conn.execute(
+            "SELECT predecessor_id, successor_id, evidence_form, known_at, ingested_at "
+            "FROM successor_chains"
+        ).fetchall()
+        assert rows == [
+            (
+                case["predecessor"]["cik"],
+                case["successor"]["cik"],
+                "8-K12B",
+                _parse(case["expected_known_at"]),
+                INGESTED_AT,
+            )
+        ]
+    finally:
+        conn.close()
