@@ -1,5 +1,7 @@
 # 0021. The borrow-status record: a daily point-in-time snapshot of Alpaca's assets list, data only
 
+> **Superseded in part by [ADR 0024](0024-lift-long-only-and-top-1000.md) (2026-10-19), while this record is still Proposed:** "Shorting stays closed" no longer holds; shorts are allowed in research, backtests and paper, and live stays long-only.
+
 **Status:** Proposed  ·  **Date:** 2026-10-11  ·  **Issue:** #1506 (data-foundation plan tasks T171 to T171d)
 
 ## Context
