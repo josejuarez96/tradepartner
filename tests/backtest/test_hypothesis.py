@@ -642,6 +642,9 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "costs.spread_bps",
             "costs.impact_coeff",
             "costs.adv_sessions",
+            "strategy.signal_delay_sessions",
+            "strategy.placebo",
+            "strategy.placebo_seed",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1320,6 +1323,9 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "costs.spread_bps",
         "costs.impact_coeff",
         "costs.adv_sessions",
+        "strategy.signal_delay_sessions",
+        "strategy.placebo",
+        "strategy.placebo_seed",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(

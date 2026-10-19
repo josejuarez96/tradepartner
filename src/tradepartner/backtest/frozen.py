@@ -70,6 +70,12 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     # The universe's rule 8 ranking (ADR 0023 D4, T212): `cap` is today's rule, so no stored
     # fingerprint moves. A forward book registers `dollar_volume`.
     ("universe.rank_by", "cap", 28),
+    # T217: the kill ladder's rung-4 delay and rung-5 placebo (ADR 0023, backtest spec
+    # amendment #1820). Each default reproduces today's run; the config guard refuses a
+    # non-default value until T217c wires the engine.
+    ("strategy.signal_delay_sessions", 0, 29),
+    ("strategy.placebo", "none", 29),
+    ("strategy.placebo_seed", 0, 29),
     # T210: the pure cost terms (backtest spec amendment #1792). `spread_bps` and
     # `impact_coeff` are fingerprint keys that may rise above a family's rules; `adv_sessions`
     # must equal the rules' value. All three are post-registration cost keys: not required of
@@ -94,6 +100,9 @@ POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset(
         "strategy.hold_sessions",
         "strategy.hold_target_names",
         "strategy.rebalance_band",
+        "strategy.signal_delay_sessions",
+        "strategy.placebo",
+        "strategy.placebo_seed",
     }
 )
 

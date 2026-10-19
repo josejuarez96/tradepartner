@@ -138,6 +138,7 @@ __all__ = [
     "order_shape_violation",
     "round_down",
     "size_buys",
+    "skip_cap",
     "unfilled_sells",
 ]
 
@@ -157,6 +158,14 @@ _CENT = Decimal(1).scaleb(-2)
 _CAP_EXEMPT = frozenset({"dust", "untradable"})
 
 PriceOf = Callable[[str], float]
+
+
+def skip_cap(frozen: RiskConfig, plan_decisions: int = 0) -> int:
+    """The run's skip cap: max(`max_skips_per_run`, floor(`max_skip_share` x the
+    plan's decisions)) (paper spec amendment 2026-10-18 item 3). Exact in
+    `Decimal`: 0.57 x 100 is 56.99999999999999 as a float."""
+    share = math.floor(Decimal(str(frozen.max_skip_share)) * plan_decisions)
+    return max(frozen.max_skips_per_run, share)
 
 
 @dataclass(frozen=True)
@@ -524,12 +533,15 @@ def check_phase(
     open_sells: Sequence[OpenSell] = (),
     prior_orders: int = 0,
     prior_skips: int = 0,
+    plan_decisions: int = 0,
     rows_on_session: Sequence[DecisionRow | OrderRow] = (),
 ) -> Violations | Skips:
     """Check one phase's batch (module docstring). `assets` is keyed by
     `security_id`; `open_sells` are the non-terminal own sells from any session
     (`unfilled_sells`); `prior_orders` and `prior_skips` are this run's earlier
-    phases' counts; `rows_on_session` are the session's `decisions` and
+    phases' counts; `plan_decisions` is the plan's decision count, for the skip
+    cap max(`max_skips_per_run`, floor(`max_skip_share` x it)), 0 (the floor alone
+    binds) when not given; `rows_on_session` are the session's `decisions` and
     `orders` rows, read only for `refused_position_side` and (its `orders`
     rows) `refused_order_shape`."""
     for order in orders:
@@ -589,7 +601,12 @@ def check_phase(
             continue
         asset = assets.get(order.security_id)
         if asset is None:
-            breach("asset_missing", f"no asset read for {order.security_id}")
+            if order.side == _BUY:
+                # A buy of a name the broker does not know is a per-name skip
+                # (spec amendment 2026-10-18 item 2); a held name's sell still fails closed.
+                skips.append(Skip(order.decision_id, order.security_id, "skip_asset_unknown"))
+            else:
+                breach("asset_missing", f"no asset read for {order.security_id}")
             continue
         # A full exit keeps its decision's basis and sells the whole holding (#395).
         whole = order.whole_share or (not asset.fractionable and not order.full_exit)
@@ -605,10 +622,11 @@ def check_phase(
         left.append(order)
 
     counted = prior_skips + sum(s.counts_toward_cap for s in skips)
-    if counted > frozen.max_skips_per_run:
+    cap = skip_cap(frozen, plan_decisions)
+    if counted > cap:
         breach(
             "max_skips_per_run",
-            f"{counted} skips counted against the cap of {frozen.max_skips_per_run}",
+            f"{counted} skips counted against the cap of {cap}",
             _SKIP_CAP,
         )
 
@@ -741,6 +759,17 @@ def size_buys(
     }
     buffer = 1 + _dec(frozen.whole_share_price_buffer)
     cash_d = _dec(cash)
+    minimum = frozen.min_order_notional
+    # The small-account profile (T206): a notional buy under the minimum is ordered at
+    # exactly the minimum, never scaled or deferred; the limits then judge the rounded
+    # figure, and a cash shortfall is `check_phase`'s `buys_within_cash`, not a quiet skip.
+    rounded = {
+        id(b)
+        for b in decisions
+        if frozen.small_account.enabled
+        and not b.by_whole_shares
+        and 0 < b.remainder.notional <= minimum
+    }
 
     def whole_shares(buy: BuyToSize, scale: Decimal) -> float:
         buffered = _dec(prices[buy.decision.security_id]) * buffer
@@ -749,6 +778,8 @@ def size_buys(
         )
 
     def attempt(buy: BuyToSize, scale: Decimal) -> float:
+        if id(buy) in rounded:
+            return minimum
         return float((_dec(buy.remainder.notional) * scale).quantize(_CENT, rounding=ROUND_DOWN))
 
     def need(buy: BuyToSize, scale: Decimal) -> Decimal:
@@ -756,6 +787,16 @@ def size_buys(
         if buy.by_whole_shares:
             return _buy_cash(None, whole_shares(buy, scale), price, True, frozen, costs)
         return _buy_cash(attempt(buy, scale), None, price, False, frozen, costs)
+
+    fixed_need = sum(
+        (
+            _buy_cash(minimum, None, prices[b.decision.security_id], False, frozen, costs)
+            for b in decisions
+            if id(b) in rounded
+        ),
+        Decimal(0),
+    )
+    cash_rest = max(cash_d - fixed_need, Decimal(0))
 
     def scale_for(active: list[BuyToSize]) -> Decimal:
         total = sum((_dec(b.remainder.notional) for b in active), Decimal(0))
@@ -765,7 +806,7 @@ def size_buys(
         # the most shares (the worst case for a per-share one); Alpaca charges
         # neither.
         low_price = min(prices[b.decision.security_id] for b in active)
-        return min(Decimal(1), _spendable(cash_d, len(active), low_price, costs) / total)
+        return min(Decimal(1), _spendable(cash_rest, len(active), low_price, costs) / total)
 
     def below_minimum(buy: BuyToSize, scale: Decimal) -> bool:
         if not buy.by_whole_shares:
@@ -775,7 +816,7 @@ def size_buys(
         value = quantity * prices[buy.decision.security_id]
         return quantity < 1 or value < frozen.min_order_notional
 
-    active = [b for b in decisions if b.remainder.notional > 0]
+    active = [b for b in decisions if b.remainder.notional > 0 and id(b) not in rounded]
     deferred: set[int] = {id(b) for b in decisions if b.remainder.notional <= 0}
     never_fit = {id(b) for b in active if below_minimum(b, Decimal(1))}
     deferred.update(never_fit)
@@ -808,8 +849,12 @@ def size_buys(
     # overshoot (a dollar less needs at least a dollar less), so no loop; an
     # overshoot above a cent is not rounding, and raises.
     over = sum((notional_need(k) for k in notionals), Decimal(0)) - cash_d
-    if over > 0:
-        largest = max(notionals, key=lambda k: notionals[k])
+    # Rounded buys the cash cannot pay are left whole: `check_phase` refuses the batch.
+    if over > 0 and not (rounded and fixed_need > cash_d):
+        cuttable = [k for k in notionals if k not in rounded]
+        if not cuttable:
+            raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")
+        largest = max(cuttable, key=lambda k: notionals[k])
         cut = over.quantize(_CENT, rounding=ROUND_UP)
         if cut > _CENT or notionals[largest] - cut < _dec(frozen.min_order_notional):
             raise ValueError(f"buys of {cash} cash overshoot it by {over} and cannot be cut")

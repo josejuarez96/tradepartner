@@ -749,6 +749,9 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "costs.spread_bps",
                 "costs.impact_coeff",
                 "costs.adv_sessions",
+                "strategy.signal_delay_sessions",
+                "strategy.placebo",
+                "strategy.placebo_seed",
             )
         )
     }
@@ -855,6 +858,9 @@ def _register_more(
             "costs.spread_bps",
             "costs.impact_coeff",
             "costs.adv_sessions",
+            "strategy.signal_delay_sessions",
+            "strategy.placebo",
+            "strategy.placebo_seed",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:

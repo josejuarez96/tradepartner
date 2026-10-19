@@ -231,8 +231,11 @@ from tradepartner.config import (
 )
 from tradepartner.errors import (
     AcknowledgementTimeoutError,
+    AssetNotFoundError,
+    AssetNotTradableError,
     ClockError,
     LimitBreachError,
+    NotFractionableError,
     ReconciliationError,
     RejectionCapError,
     SkipCapError,
@@ -254,6 +257,7 @@ from tradepartner.execution.risk import (
     _buy_cash,
     check_phase,
     order_shape_violation,
+    skip_cap,
     unfilled_sells,
 )
 from tradepartner.execution.symbols import broker_symbol
@@ -315,7 +319,21 @@ __all__ = [
 
 #: The rejection allowlist, one frozen constant per `Broker` method (module
 #: docstring). Changing one is a safety-reviewed change (ADR 0007, ADR 0010).
-SUBMIT_ALLOWLIST: tuple[type[Exception], ...] = ()
+#: The three per-name refusals `submit` allows (paper spec amendment 2026-10-18
+#: item 2, ADR 0023 D2, T202): a skip on a buy, a `ReconciliationError` on a sell.
+SUBMIT_ALLOWLIST: tuple[type[Exception], ...] = (
+    AssetNotFoundError,
+    NotFractionableError,
+    AssetNotTradableError,
+)
+#: The skip reason each allowlisted refusal journals on a buy.
+_REFUSAL_REASONS: tuple[tuple[type[Exception], str], ...] = (
+    (AssetNotFoundError, "skip_asset_unknown"),
+    (NotFractionableError, "skip_not_fractionable"),
+    (AssetNotTradableError, "skip_untradable"),
+)
+#: The reasons the run's `skipped` alert names (the three per-name ones).
+_ALERTED_SKIPS = frozenset(reason for _, reason in _REFUSAL_REASONS)
 CANCEL_ALLOWLIST: tuple[type[Exception], ...] = (OrderNotOpenError,)
 GET_ORDER_ALLOWLIST: tuple[type[Exception], ...] = ()
 OPEN_ORDERS_ALLOWLIST: tuple[type[Exception], ...] = ()
@@ -700,7 +718,39 @@ class RiskGatedBroker:
         `decisions` are the pending rebalance's journaled decisions, both sides
         (empty for a forced-exits-only batch), `forced_exits` the journaled
         forced exits handed to this batch; each decision once. Every exception
-        is a fault for the caller's halt path."""
+        is a fault for the caller's halt path. A batch that skipped a name for one
+        of the three per-name reasons writes one `skipped` alert naming each name
+        and its reason (T202)."""
+        outcome = self._trade(run, decisions, forced_exits)
+        self._alert_skips(run, outcome.skips)
+        return outcome
+
+    def _alert_skips(self, run: PaperRunRow, skips: Sequence[Skip]) -> None:
+        """One `skipped` alert for the run naming every per-name skip (the three
+        allowlist reasons) by security id and reason. The alerter dedupes on
+        (kind, run), so a second call in one run is a no-op."""
+        named = [s for s in skips if s.reason in _ALERTED_SKIPS]
+        if not named or run.run_id is None:
+            return
+        message = self._scrub(
+            f"{len(named)} skipped: " + "; ".join(f"{s.security_id} {s.reason}" for s in named)
+        )
+        # No guard, as the run's other alerts (`run._alert`): an error takes the fault path.
+        self._alerter.write(
+            "skipped",
+            run.run_id,
+            self._session(run, self.read_clock),
+            message,
+            book_id=self._run_book(run),
+        )
+
+    def _trade(
+        self,
+        run: PaperRunRow,
+        decisions: Sequence[DecisionRow],
+        forced_exits: Sequence[DecisionRow],
+    ) -> BatchOutcome:
+        """`execute`'s two phases."""
         if run.run_id is None or run.session is None:
             raise ValueError("execute needs a journaled run with its session")
         rows = [*decisions, *forced_exits]
@@ -731,6 +781,7 @@ class RiskGatedBroker:
             if self._engaged(run, book.window):
                 return BatchOutcome(_SKIPPED_KILL_SWITCH)
             assets = self._phase_assets(run, book, rows, _SELL)
+            _refuse_unknown_held(assets, book)
             # Read once so the trim `sell_orders` caps and the `check_phase`
             # that verifies it see the same open sells (#605): both are the
             # same session's read of this same `book`.
@@ -763,17 +814,25 @@ class RiskGatedBroker:
                 0,
                 rows=rows,
                 open_sells=open_sells,
+                plan_decisions=len(decisions),
             )
             # The skips and the held sells ride along: `buy_orders` never buys
             # a name this phase skipped (#518 item 3) or held (#719 item 4).
             sold = phases.PhaseOrders(gated.left, gated.skips, session=run.session, held=sold.held)
             skips, counted = gated.skips, gated.counted
-            submitted = self._submit_all(gated.to_submit)
+            submitted, refused = self._submit_all(
+                run,
+                gated.to_submit,
+                gated.counted,
+                len(decisions),
+                frozenset(book.ledger.positions),
+            )
+            skips, counted = (*skips, *refused), counted + len(refused)
             if any(d.side == _BUY for d in decisions) and gated.to_submit:
                 self._await_sells(run, [row for row, _ in gated.to_submit])
         if not any(d.side == _BUY for d in decisions):
             return BatchOutcome(_OK, tuple(submitted), skips)
-        bought = self._buys(run, rows, rebalance, sold, len(submitted), counted)
+        bought = self._buys(run, rows, rebalance, sold, len(submitted), counted, len(decisions))
         return BatchOutcome(
             bought.status,
             (*submitted, *bought.submitted),
@@ -792,6 +851,7 @@ class RiskGatedBroker:
         sold: phases.PhaseOrders,
         prior_orders: int,
         prior_skips: int,
+        plan_decisions: int,
     ) -> BatchOutcome:
         """The buys phase, read after the sells' collection (module docstring)."""
         assert run.session is not None
@@ -818,6 +878,25 @@ class RiskGatedBroker:
             session=run.session,
             ended=book.ended,
         )
+        # A buy adding to a held name the broker lacks is a disagreement, not a skip.
+        _refuse_unknown_held(assets, book, buys=True)
+        # A name the broker does not know (the `assets` read's 404 answer) is
+        # `skip_asset_unknown`, not `skip_untradable` (spec amendment 2026-10-18 item 2).
+        unknown = {
+            sid
+            for sid, asset in assets.items()
+            if asset is UNRESOLVED_ASSET and sid not in book.unmappable
+        }
+        if unknown:
+            built = replace(
+                built,
+                skips=tuple(
+                    Skip(s.decision_id, s.security_id, "skip_asset_unknown")
+                    if s.security_id in unknown and s.reason == "skip_untradable"
+                    else s
+                    for s in built.skips
+                ),
+            )
         gated = self._gate(
             run,
             book,
@@ -830,11 +909,15 @@ class RiskGatedBroker:
             prior_skips,
             rows=rows,
             in_flight=not scope.last,
+            plan_decisions=plan_decisions,
         )
-        submitted = self._submit_all(gated.to_submit)
+        submitted, refused = self._submit_all(
+            run, gated.to_submit, gated.counted, plan_decisions, frozenset(book.ledger.positions)
+        )
+        refused_ids = {s.decision_id for s in refused}
         collected_written_off = self._collect(
             run,
-            [row for row, _ in gated.to_submit],
+            [row for row, _ in gated.to_submit if row.decision_id not in refused_ids],
             write_offs=WriteOffContext(
                 window_id=run.window_id,
                 actions_as_of=book.actions,
@@ -857,11 +940,14 @@ class RiskGatedBroker:
             (
                 _buy_cash(o.notional, o.quantity, o.price, o.whole_share, self._frozen, costs)
                 for o in gated.left
+                if o.decision_id not in refused_ids
             ),
             Decimal(0),
         )
         left = float(max(Decimal(repr(cash)) - spent, Decimal(0)))
-        return BatchOutcome(_OK, tuple(submitted), gated.skips, built.deferred, written, cash, left)
+        return BatchOutcome(
+            _OK, tuple(submitted), (*gated.skips, *refused), built.deferred, written, cash, left
+        )
 
     def _buys_cash(self, account: Account, book: _Book, session: date) -> float:
         """**The one cash read** spec req 2 may amend (the declared stub, module
@@ -894,6 +980,7 @@ class RiskGatedBroker:
         rows: Sequence[DecisionRow],
         in_flight: bool = True,
         open_sells: Sequence[OpenSell] | None = None,
+        plan_decisions: int = 0,
     ) -> _Gated:
         """Validate every request, check the batch and journal it (steps 5 to 7
         of the module docstring); raise the batch's violation after its
@@ -928,6 +1015,7 @@ class RiskGatedBroker:
             open_sells=open_sells,
             prior_orders=prior_orders,
             prior_skips=counted,
+            plan_decisions=plan_decisions,
             rows_on_session=[*rows, *(o for o in book.orders if o.session == session)],
         )
         if isinstance(verdict, Violations):
@@ -1268,21 +1356,84 @@ class RiskGatedBroker:
             session=session,
         )
 
-    def _submit_all(self, pairs: Sequence[tuple[OrderRow, OrderRequest]]) -> list[str]:
+    def _submit_all(
+        self,
+        run: PaperRunRow,
+        pairs: Sequence[tuple[OrderRow, OrderRequest]],
+        counted: int,
+        plan_decisions: int,
+        held: Collection[str] = (),
+    ) -> tuple[list[str], list[Skip]]:
         """Submit each journaled request in order and await its acknowledgement;
         `submit`'s `Order` passes the shape check after the acknowledgement's
-        `accepted` event is journaled (module docstring)."""
-        submitted = []
-        for _, request in pairs:
+        `accepted` event is journaled (module docstring).
+
+        An allowlisted per-name refusal (`SUBMIT_ALLOWLIST`) of a **buy** closes its
+        order `rejected` with the skip reason, with the decision's `skipped` row,
+        in one write chunk, and counts toward the skip cap (`counted` skips so
+        far, `plan_decisions` the plan's size); a count over the cap raises
+        `SkipCapError` before the next submit (after its `skipped` alert). On a sell,
+        or a buy of a `held` name, it is a `ReconciliationError`: a held name the
+        broker refuses means the ledger and the broker disagree. Returns the ids
+        submitted and the refusals' skips."""
+        submitted: list[str] = []
+        refused: list[Skip] = []
+        for row, request in pairs:
             try:
                 placed = self._broker.submit(request)
             except DuplicateClientOrderIdError as duplicate:
                 self.replay(request, duplicate)
+            except SUBMIT_ALLOWLIST as refusal:
+                if row.side != _BUY or row.security_id in held:
+                    raise ReconciliationError(
+                        f"the broker refused the {row.side} of held name {row.security_id}"
+                        f" ({type(refusal).__name__})"
+                    ) from refusal
+                skip = self._close_refused(run, row, refusal)
+                refused.append(skip)
+                if counted + len(refused) > skip_cap(self._frozen, plan_decisions):
+                    self._alert_skips(run, refused)
+                    raise SkipCapError(
+                        f"{counted + len(refused)} skips counted against the cap of "
+                        f"{skip_cap(self._frozen, plan_decisions)}"
+                    ) from None
+                continue
             else:
                 self._acknowledge(request.client_order_id)
                 _refuse_shape(placed, Broker.submit.__name__)
             submitted.append(request.client_order_id)
-        return submitted
+        return submitted, refused
+
+    def _close_refused(self, run: PaperRunRow, row: OrderRow, refusal: Exception) -> Skip:
+        """Journal an allowlisted refusal of a buy in one write chunk: the decision's
+        `skipped` row first, then the order's terminal `rejected` event, both with the
+        skip reason, so a fault between the two writes leaves neither."""
+        assert row.decision_id is not None
+        reason = next(r for cls, r in _REFUSAL_REASONS if isinstance(refusal, cls))
+        stamp = self.read_clock()
+        with self._journal() as conn:
+            append(
+                conn,
+                DecisionEventRow(
+                    decision_id=row.decision_id,
+                    run_id=row.run_id,
+                    status=_SKIPPED,
+                    reason=reason,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+            append(
+                conn,
+                OrderEventRow(
+                    client_order_id=row.client_order_id,
+                    status="rejected",
+                    reason=reason,
+                    known_at=stamp,
+                    ingested_at=stamp,
+                ),
+            )
+        return Skip(row.decision_id, row.security_id, reason)
 
     def _acknowledge(self, coid: str) -> None:
         """Poll `get_order` until the broker knows the order, then journal its
@@ -1594,6 +1745,23 @@ class RiskGatedBroker:
         for form in sorted(forms, key=len, reverse=True):
             text = re.sub(re.escape(form), _MASK, text, flags=re.IGNORECASE)
         return text
+
+
+def _refuse_unknown_held(assets: Mapping[str, Asset], book: _Book, *, buys: bool = False) -> None:
+    """A sells phase's name the broker's `assets` read does not know (its 404 answer,
+    `UNRESOLVED_ASSET`) is a held name the broker lacks: the ledger and the broker
+    disagree, so `ReconciliationError`, never a skip (spec amendment 2026-10-18
+    item 2; PR #1730's any-name untradable answer is narrowed to buys). A name with
+    no broker form (`book.unmappable`) keeps its untradable skip."""
+    unknown = sorted(
+        sid
+        for sid, asset in assets.items()
+        if asset is UNRESOLVED_ASSET
+        and sid not in book.unmappable
+        and (not buys or sid in book.ledger.positions)
+    )
+    if unknown:
+        raise ReconciliationError(f"the broker does not know held names {unknown}")
 
 
 def _refuse_shape(order: Order, method: str) -> None:

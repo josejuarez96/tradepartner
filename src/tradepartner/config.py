@@ -47,9 +47,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
+    SerializerFunctionWrapHandler,
+    StrictBool,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -1233,6 +1237,11 @@ class StrategyConfig(BaseModel):
     `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
     trades every non-zero drift, so every default reproduces today's behaviour. Until
     T209b wires the engine, `hold` and a non-zero `rebalance_band` are refused.
+
+    `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
+    delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
+    own-section keys, inert at their defaults, refused otherwise until T217c wires the
+    engine.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1246,6 +1255,9 @@ class StrategyConfig(BaseModel):
     hold_sessions: int = Field(default=1, gt=0)
     hold_target_names: int = Field(default=0, ge=0)
     rebalance_band: float = Field(default=0.0, ge=0, lt=1)
+    signal_delay_sessions: int = Field(default=0, ge=0)
+    placebo: Literal["none", "shuffle", "random_entry"] = "none"
+    placebo_seed: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1271,6 +1283,20 @@ class StrategyConfig(BaseModel):
                 f"strategy.rebalance_band = {self.rebalance_band} is not wired until "
                 "T209b: the engine still trades every drift to its exact target"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_shocks_until_wired(self) -> StrategyConfig:
+        """A delay or placebo loads as a key but no build reads it yet, so until T217c
+        wires the engine a run would trade the real signal while the row says otherwise.
+        T217c removes this guard."""
+        for name in ("signal_delay_sessions", "placebo", "placebo_seed"):
+            value = getattr(self, name)
+            if value != StrategyConfig.model_fields[name].default:
+                raise ValueError(
+                    f"strategy.{name} = {value!r} is not wired until T217c: the engine "
+                    "still reads the signal at the rebalance session, unshocked"
+                )
         return self
 
 
@@ -1868,6 +1894,29 @@ def paper_key_variable_names(book_id: str) -> tuple[str, str]:
     return f"{head}API_KEY", f"{head}API_SECRET"
 
 
+class SmallAccountConfig(BaseModel):
+    """`risk.small_account` (spec amendment 2026-10-18 item 8; ADR 0023 D6; plan T206).
+
+    `enabled` turns the small-account profile on: every buy is a fractional notional
+    order rounded up to `risk.min_order_notional`, and the limits judge the rounded
+    figure. ADR 0010's limits are unchanged. Off by default, so every window frozen
+    before the section existed is unchanged. Unknown keys and non-booleans are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, hide_input_in_errors=True)
+
+    enabled: StrictBool = False
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _bool_or_its_word(cls, value: object) -> object:
+        """A real bool, or the strings "true"/"false" in any case (the env-var form);
+        everything else ("yes", "1", "on", ints) is left for the strict check to refuse."""
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        return value
+
+
 class RiskConfig(BaseModel):
     """The Phase 4 risk rules, ADR 0010 point 1: every limit is a named key here, the
     whole section frozen into the paper window at `paper start` and read from the
@@ -1893,15 +1942,50 @@ class RiskConfig(BaseModel):
     The value is a fixed default, not derived at run time; a window keeps the value it
     froze at `paper start`. After the first `paper start` any change to a default is a
     new ADR (ADR 0010 point 5).
+
+    `small_account` (T206, `SmallAccountConfig`) is frozen with the section as the key
+    `risk.small_account`, but it is deliberately not a pydantic field: a window frozen
+    before T206 has no such key, and `reconcile_run.frozen_risk` refuses a `frozen_json`
+    that lacks any of `RiskConfig.model_fields`. It is read from the input by a wrap
+    validator, defaults to off when absent, and is written back by the serializer, so
+    `model_dump()` (what `paper start` freezes) carries it.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
+
+    _small_account: SmallAccountConfig = PrivateAttr(default_factory=SmallAccountConfig)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _read_small_account(cls, data: Any, handler: Any) -> Any:
+        """Split `small_account` off the input before the field validation sees it."""
+        if isinstance(data, dict) and "small_account" in data:
+            rest = {k: v for k, v in data.items() if k != "small_account"}
+            section = SmallAccountConfig.model_validate(data["small_account"])
+            built = handler(rest)
+            built._small_account = section
+            return built
+        return handler(data)
+
+    @model_serializer(mode="wrap")
+    def _write_small_account(self, handler: SerializerFunctionWrapHandler) -> Any:
+        """The dump carries `small_account`, so `paper start` freezes it."""
+        dumped = handler(self)
+        dumped["small_account"] = self._small_account.model_dump()
+        return dumped
+
+    @property
+    def small_account(self) -> SmallAccountConfig:
+        """The small-account profile (off unless the window froze it on)."""
+        return self._small_account
 
     max_position_weight: float = Field(default=0.05, ge=0, le=1)
     max_order_notional_fraction: float = Field(default=0.05, ge=0, le=1)
     max_gross_exposure: float = Field(default=1.0, ge=0, le=1)
     max_orders_per_run: int = Field(default=250, gt=0)
     max_skips_per_run: int = Field(default=10, ge=0)
+    # T202 (ADR 0023 D2): the skip cap is max(max_skips_per_run, floor(share x decisions)).
+    max_skip_share: float = Field(default=0.10, ge=0, le=0.25)
     max_rejections_per_run: int = Field(default=5, ge=0)
     max_drawdown: float = Field(default=0.30, ge=0, le=1)
     min_order_notional: float = Field(default=1.0, ge=0)

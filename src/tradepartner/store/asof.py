@@ -486,6 +486,53 @@ def prices_as_of(
     return _traded(frame) if traded_only else frame
 
 
+def marking_changed_ids_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    previous_t: datetime,
+    t: datetime,
+    security_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Names whose cached adjusted history may differ at `t`.
+
+    A newly known old bar can change a dividend's prior close even when the
+    bar is outside the marking window. A new action revision can cancel or
+    re-date an event. An already known action can become effective when its
+    ex-date arrives. The broad probe deliberately includes harmless changes.
+    """
+    previous_t, t = _validate_t(previous_t), _validate_t(t)
+    if not security_ids or t <= previous_t:
+        return ()
+    previous_session = previous_t.astimezone(_EXCHANGE_TZ).date()
+    current_session = t.astimezone(_EXCHANGE_TZ).date()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT security_id FROM (
+            SELECT security_id FROM prices_daily
+            WHERE known_at > ? AND known_at <= ? AND session <= ?
+            UNION ALL
+            SELECT security_id FROM corporate_actions
+            WHERE known_at > ? AND known_at <= ?
+            UNION ALL
+            SELECT security_id FROM corporate_actions
+            WHERE known_at <= ? AND ex_date > ? AND ex_date <= ?
+        ) WHERE security_id IN (SELECT unnest(?))
+        ORDER BY security_id
+        """,
+        [
+            previous_t,
+            t,
+            previous_session,
+            previous_t,
+            t,
+            t,
+            previous_session,
+            current_session,
+            list(security_ids),
+        ],
+    ).fetchall()
+    return tuple(row[0] for row in rows)
+
+
 def _traded(frame: pl.DataFrame) -> pl.DataFrame:
     """`frame` without its zero-volume bars (#787)."""
     return frame.filter(pl.col("volume") > 0)
@@ -1204,9 +1251,10 @@ def adjusted_prices_as_of(
     )
     with _sessions_registered(conn, include_dividends=include_dividends):
         _raise_on_invalid_factor(conn, common_ctes, params)
-        frame = conn.execute(_adjusted_select(common_ctes), params).pl()
-    if sessions_from is not None:
-        frame = frame.filter(pl.col("session") >= sessions_from)
+        frame = conn.execute(
+            _adjusted_select(common_ctes, bounded=sessions_from is not None),
+            [*params, sessions_from] if sessions_from is not None else params,
+        ).pl()
     return _traded(frame) if traded_only else frame
 
 
@@ -1237,8 +1285,9 @@ def _raise_on_invalid_factor(
         )
 
 
-def _adjusted_select(common_ctes: str) -> str:
+def _adjusted_select(common_ctes: str, *, bounded: bool = False) -> str:
     """`adjusted_prices_as_of`'s main query over `common_ctes`."""
+    session_filter = "WHERE b.session >= ?" if bounded else ""
     return f"""
         WITH {common_ctes},
         -- One factor per ex-date before the cumulative window: a split and
@@ -1275,6 +1324,7 @@ def _adjusted_select(common_ctes: str) -> str:
         FROM latest_bars b
         ASOF LEFT JOIN cum c
             ON b.security_id = c.security_id AND b.session < c.ex_date
+        {session_filter}
         ORDER BY b.security_id, b.session
     """
 

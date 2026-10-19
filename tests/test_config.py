@@ -970,6 +970,56 @@ def test_strategy_rejects_bad_hold_values(override: dict[str, object]) -> None:
         StrategyConfig(**override)  # type: ignore[arg-type]
 
 
+def test_strategy_shock_keys_load_at_their_defaults() -> None:
+    """T217 (backtest spec amendment #1820, items 1 and 2): rung 4's delay and rung 5's
+    placebo keys load at the values that reproduce today's run."""
+    for s in (_settings().strategy, StrategyConfig()):
+        assert s.signal_delay_sessions == 0
+        assert type(s.signal_delay_sessions) is int
+        assert s.placebo == "none"
+        assert s.placebo_seed == 0
+        assert type(s.placebo_seed) is int
+    assert set(get_args(StrategyConfig.model_fields["placebo"].annotation)) == {
+        "none",
+        "shuffle",
+        "random_entry",
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"signal_delay_sessions": 1},
+        {"signal_delay_sessions": 5},
+        {"placebo": "shuffle"},
+        {"placebo": "random_entry"},
+        {"placebo_seed": 7},
+        {"placebo": "shuffle", "placebo_seed": 7, "signal_delay_sessions": 1},
+    ],
+)
+def test_strategy_refuses_a_shock_until_t217c_wires_it(override: dict[str, object]) -> None:
+    """Until T217c wires the engine, a non-default delay, placebo or seed would label a
+    trial row with a shock the engine never ran, so `StrategyConfig` refuses each, naming
+    T217c, and so does `Settings.model_validate`, which registration goes through."""
+    with pytest.raises(ValidationError, match="T217c"):
+        StrategyConfig(**override)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="T217c"):
+        Settings.model_validate({"strategy": override})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"signal_delay_sessions": -1},
+        {"placebo_seed": -1},
+        {"placebo": "bogus"},
+    ],
+)
+def test_strategy_rejects_bad_shock_values(override: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        StrategyConfig(**override)  # type: ignore[arg-type]
+
+
 def test_costs_defaults() -> None:
     c = _settings().costs
     assert c.per_side_bps == pytest.approx(15.0)
@@ -1785,6 +1835,28 @@ def test_risk_defaults_match_adr_0010() -> None:
     # against (fractional remainder x the reference price); the ex-date valuation
     # sits below the pre-ex close, so ~10% passes and more halts.
     assert r.cash_in_lieu_tolerance == pytest.approx(0.10)
+
+
+def test_risk_max_skip_share_defaults_to_a_tenth() -> None:
+    """Paper spec amendment 2026-10-18 item 3 (T202, ADR 0010's amended table row):
+    the skip cap's share of the plan, default 0.10, beside the floor
+    `max_skips_per_run` = 10."""
+    r = _settings().risk
+    assert r.max_skip_share == pytest.approx(0.10)
+    assert "max_skip_share" in r.model_dump()
+
+
+@pytest.mark.parametrize("value", [0.0, 0.10, 0.25])
+def test_risk_max_skip_share_accepts_zero_to_a_quarter(value: float) -> None:
+    """Validated in [0, 0.25], both ends included: 0 is how a window frozen before
+    the key reads it (`frozen_risk`)."""
+    assert Settings(_env_file=None, risk={"max_skip_share": value}).risk.max_skip_share == value
+
+
+@pytest.mark.parametrize("value", [-0.01, 0.2501, 0.26, 1.0, float("nan"), float("inf")])
+def test_risk_max_skip_share_outside_zero_to_a_quarter_rejected(value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"max_skip_share": value})
 
 
 def test_alpaca_cash_in_lieu_max_lag_sessions_default() -> None:
@@ -2610,3 +2682,71 @@ def test_t210_adv_window_must_hold_a_session(value: int) -> None:
     """A median over no sessions is undefined."""
     with pytest.raises(ValidationError):
         Settings(_env_file=None, costs={"adv_sessions": value})
+
+
+# --- risk.small_account (spec amendment 2026-10-18 item 8; ADR 0023 D6; T206) ---
+
+
+def test_risk_small_account_is_off_by_default() -> None:
+    """The open windows are unchanged: the section defaults off."""
+    assert _settings().risk.small_account.enabled is False
+    assert RiskConfig().small_account.enabled is False
+
+
+def test_risk_small_account_turns_on_through_the_risk_section() -> None:
+    on = Settings(_env_file=None, risk={"small_account": {"enabled": True}}).risk
+    assert on.small_account.enabled is True
+    # ADR 0010's limits are unchanged by the section.
+    assert (on.max_position_weight, on.max_order_notional_fraction) == (0.05, 0.05)
+    assert on.min_order_notional == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"enabled": True, "min_names": 20},  # an unknown key in the section
+        {"enable": True},  # a typo of the one key
+        {"enabled": "sometimes"},  # not a boolean
+    ],
+)
+def test_risk_small_account_refuses_unknown_keys_and_non_booleans(
+    section: dict[str, object],
+) -> None:
+    """The section is frozen by name like the rest of `risk.*`: a typo or a
+    nonsense value fails at load, never falls back to off."""
+    assert Settings(_env_file=None, risk={"small_account": {"enabled": False}}).risk
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"small_account": section})
+
+
+# The env-var form (#1807 re-review): `RISK__SMALL_ACCOUNT__ENABLED` is how the
+# section is set beside the other `risk.*` keys. "true"/"false" load (any case); every
+# other spelling of a boolean, and an int, is refused at load, never read as on.
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [("true", True), ("false", False), ("TRUE", True), ("False", False)],
+)
+def test_risk_small_account_loads_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str, enabled: bool
+) -> None:
+    monkeypatch.setenv("RISK__SMALL_ACCOUNT__ENABLED", value)
+    assert Settings(_env_file=None).risk.small_account.enabled is enabled
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "on", "0"])
+def test_risk_small_account_refuses_other_boolean_spellings_in_the_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RISK__SMALL_ACCOUNT__ENABLED", value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", [1, 0, "yes", "1"])
+def test_risk_small_account_refuses_an_int_or_other_spelling_in_the_section(
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={"small_account": {"enabled": value}})

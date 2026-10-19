@@ -950,6 +950,9 @@ class TestRefusals:
                     "costs.spread_bps",
                     "costs.impact_coeff",
                     "costs.adv_sessions",
+                    "strategy.signal_delay_sessions",
+                    "strategy.placebo",
+                    "strategy.placebo_seed",
                 )
             )
         }
