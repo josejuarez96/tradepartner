@@ -494,7 +494,22 @@ registry; #83 took version 2 first, so the registry is version 3):
   store gets the widened set from the rebuilds of its own earlier steps). A
   read-only connection accepts a version-31 store: no read depends on the
   status `CHECK`, and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 33**, with its own migration and a
+- **Version 33** (plan T228; the spec's 2026-10-19 amendment items 5 and 12,
+  #1872, #1877): `decisions.reason` gains `skip_not_borrowable`,
+  `skip_short_price`, `cover_delisted`, `cover_drift` and `cover_not_borrowable`
+  (`DECISION_REASONS`); `decision_events.reason` and `order_events.reason` gain
+  `skip_not_borrowable` and `skip_short_price`; `decisions.decision` gains
+  `skip_not_borrowable` and `skip_short_price` as decision kinds, each value
+  last. The `CHECK` sets only grow, so no stored row falls outside them; DuckDB
+  cannot change a `CHECK` in place, so the migration from any earlier migratable
+  version rebuilds `decisions`, `decision_events` and `order_events` through
+  staging tables (`_migrate_short_reasons`), every row kept in insertion order.
+  It first refuses with `SchemaVersionError`, changing nothing, if a stored
+  reason or decision kind is outside the new set; that guard runs before
+  `_migrate_pending_unresolved` rebuilds `order_events`. A read-only connection
+  accepts a version-32 store: every read works, and the next writable
+  `init_schema` call migrates it.
+- **A later DDL change goes to version 34**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -776,7 +791,7 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   (module docstring, "Schema versions").
 #: - A later DDL change goes to version 33, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 32
+CURRENT_SCHEMA_VERSION = 33
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -922,6 +937,11 @@ _PRE_SUCCESSOR_CHAINS_VERSION = 30
 #: version 32): read-only connections serve every read, since no read depends
 #: on the status `CHECK` and no such event can exist there.
 _PRE_PENDING_UNRESOLVED_VERSION = 31
+
+#: The last version without the short reasons (T228, version 33): read-only
+#: connections serve every read, since no read depends on the reason or
+#: decision `CHECK`s and no such row can exist there.
+_PRE_SHORT_REASONS_VERSION = 32
 
 
 class SchemaVersionError(RuntimeError):
@@ -1766,6 +1786,8 @@ ORDER_EVENT_REASONS: tuple[str, ...] = (
     "skip_asset_unknown",
     "skip_not_fractionable",
     "skip_untradable",
+    "skip_not_borrowable",
+    "skip_short_price",
 )
 #: Every `decision_events.reason` the spec names (version 29, #1813): the two
 #: new skip reasons come last.
@@ -1779,6 +1801,8 @@ DECISION_EVENT_REASONS: tuple[str, ...] = (
     "unfunded",
     "skip_asset_unknown",
     "skip_not_fractionable",
+    "skip_not_borrowable",
+    "skip_short_price",
 )
 
 #: `decisions.reason` of a plan full exit: a held name that left the targets.
@@ -1812,6 +1836,11 @@ DECISION_REASONS: tuple[str, ...] = (
     DELISTED_REASON,
     UNTARGETED_RECEIPT_REASON,
     WINDOW_STOP_REASON,
+    "skip_not_borrowable",
+    "skip_short_price",
+    "cover_delisted",
+    "cover_drift",
+    "cover_not_borrowable",
 )
 
 #: Every journal column the spec enumerates as a closed set, with its allowed
@@ -1851,6 +1880,8 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
         "dust",
         "override",
         "forced_exit",
+        "skip_not_borrowable",
+        "skip_short_price",
     ),
     ("decisions", "reason"): DECISION_REASONS,
     ("decision_events", "status"): ("skipped", "written_off"),
@@ -2847,6 +2878,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPENFIGI_TYPES_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
         _PRE_PENDING_UNRESOLVED_VERSION,
+        _PRE_SHORT_REASONS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -3647,6 +3679,50 @@ def _migrate_pending_unresolved(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _refuse_stray_short_reasons(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 33 guard (T228): raise `SchemaVersionError`, changing nothing, if a
+    stored reason or decision kind is outside the widened sets. Runs before any
+    rebuild of the three tables (so before `_migrate_pending_unresolved`)."""
+    for table, column, allowed_values in (
+        ("decisions", "reason", DECISION_REASONS),
+        ("decisions", "decision", JOURNAL_ENUMS[("decisions", "decision")]),
+        ("decision_events", "reason", DECISION_EVENT_REASONS),
+        ("order_events", "reason", ORDER_EVENT_REASONS),
+    ):
+        marks = ", ".join("?" for _ in allowed_values)
+        stray = conn.execute(
+            f"SELECT DISTINCT {column} FROM {table} "
+            f"WHERE {column} IS NOT NULL AND {column} NOT IN ({marks}) ORDER BY {column}",
+            list(allowed_values),
+        ).fetchall()
+        if stray:
+            found = ", ".join(repr(value) for (value,) in stray)
+            raise SchemaVersionError(
+                f"{table}.{column} holds values outside {allowed_values}: {found}; the "
+                f"store stays at version {_PRE_SHORT_REASONS_VERSION} until they are resolved"
+            )
+
+
+def _migrate_short_reasons(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 33 (module docstring, "Schema versions"; T228): rebuild
+    `decisions`, `decision_events` and `order_events` with their widened `CHECK`s,
+    every row kept in insertion order (readers break `known_at` ties on rowid).
+    Runs after `_refuse_stray_short_reasons`, inside `init_schema`'s transaction."""
+    for table, create in (
+        ("decisions", _CREATE_DECISIONS),
+        ("decision_events", _CREATE_DECISION_EVENTS),
+        ("order_events", _CREATE_ORDER_EVENTS),
+    ):
+        staging = f"{table}_v33"
+        conn.execute(
+            create.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
     version-2 to 31 store to version 32.
@@ -3804,6 +3880,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPENFIGI_TYPES_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
         _PRE_PENDING_UNRESOLVED_VERSION,
+        _PRE_SHORT_REASONS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3875,12 +3952,16 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
             _migrate_cash_in_lieu_kind(conn)
+        if max_version is not None and max_version <= _PRE_SHORT_REASONS_VERSION:
+            _refuse_stray_short_reasons(conn)
         if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
             _migrate_skip_reasons(conn)
         if max_version is not None and _PRE_SKIP_REASONS_VERSION < max_version <= (
             _PRE_PENDING_UNRESOLVED_VERSION
         ):
             _migrate_pending_unresolved(conn)
+        if max_version is not None and max_version <= _PRE_SHORT_REASONS_VERSION:
+            _migrate_short_reasons(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()
