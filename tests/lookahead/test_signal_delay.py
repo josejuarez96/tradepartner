@@ -142,20 +142,28 @@ def _one_month() -> Settings:
     return test_engine_many._params("month_end", formation_months=1, skip_months=0)
 
 
-def _revised_prices(known_at: datetime) -> pl.DataFrame:
-    """B's bar on R_MONTH again, its close halved, known at `known_at`."""
+#: R_MONTH's own formation anchor under 1-0 momentum (the month-end before it).
+R_ANCHOR = date(2024, 2, 29)
+
+
+def _revised_prices(known_at: datetime, session: date = R_MONTH) -> pl.DataFrame:
+    """B's bar on `session` again, its close halved, known at `known_at` (after the
+    original bar, which is known at close(`session`))."""
     base = _prices(7)
-    row = base.filter((pl.col("security_id") == "B") & (pl.col("session") == R_MONTH))
+    row = base.filter((pl.col("security_id") == "B") & (pl.col("session") == session))
     revised = row.with_columns(
         pl.col("close") * 0.5, pl.lit(known_at).cast(base.schema["known_at"]).alias("known_at")
     )
     return pl.concat([base, revised])
 
 
-def _revision_provider(known_at: datetime) -> FakeProvider:
+def _revision_provider(known_at: datetime, session: date = R_MONTH) -> FakeProvider:
     members = {s: list(NAMES) for s in SESSIONS}
     return FakeProvider(
-        prices=_revised_prices(known_at), members=members, benchmarks=BENCHMARKS, gaps=GAPS
+        prices=_revised_prices(known_at, session),
+        members=members,
+        benchmarks=BENCHMARKS,
+        gaps=GAPS,
     )
 
 
@@ -175,13 +183,18 @@ def test_a_bar_revision_known_in_t_prime_t_enters_neither_members_nor_scores() -
 
 
 def test_the_same_revision_known_before_t_prime_does_reach_the_delayed_plan() -> None:
-    """Control: known an hour before close(R), the revision is the read session's own
-    fact, so the delayed plan carries it (the delay moves the read, it filters nothing)."""
+    """Control: a revision of B's bar on R's formation anchor (2024-02-29), known an hour
+    before close(R) and so after the original bar (known at close(02-29)), is the read
+    session's own fact, so the delayed plan carries it (the delay moves the read, it
+    filters nothing). The fake keeps the latest `known_at` per bar, so the revision must
+    be known after the original and at or before t'."""
     t_prime = read_time(R_MONTH, "month_end")
-    early = _revision_provider(t_prime - AFTER_READ)
+    known_at = t_prime - AFTER_READ
+    assert known_at > session_close(R_ANCHOR)
+    early = _revision_provider(known_at, R_ANCHOR)
     base = _one_month()
     got = plan(early, _delayed(base, 1), T_MONTH, "momentum")
-    want = plan(_revision_provider(t_prime - AFTER_READ), base, R_MONTH, "momentum")
+    want = plan(_revision_provider(known_at, R_ANCHOR), base, R_MONTH, "momentum")
     test_engine_delay._assert_redated(got, want, T_MONTH, "month_end")
     clean = plan(test_engine_many._provider(), base, R_MONTH, "momentum")
     assert got.scores != clean.scores

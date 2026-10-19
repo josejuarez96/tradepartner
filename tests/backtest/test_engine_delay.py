@@ -391,9 +391,17 @@ def test_monthly_screened_delay_run_trades_the_previous_month_ends_targets(
 # --- read groups: `run_many` at delay 1 equals separate runs -------------------------
 
 
-@pytest.mark.parametrize(
-    "window", list(test_engine_many.WINDOWS.values()), ids=list(test_engine_many.WINDOWS)
-)
+#: `test_engine_many.WINDOWS`, but `daily` over a window where the selection moves: at
+#: top_fraction 0.4 the fake's targets are B, E through 2024-03-28 and C, E from 04-01
+#: (a new month's anchors), so the delayed 04-01 plan (reading 03-28) differs. Its own
+#: May window holds C, E every session, where a delay cannot show.
+DELAY_WINDOWS: dict[str, tuple[Cadence, date, date]] = {
+    **test_engine_many.WINDOWS,
+    "daily": ("daily", date(2024, 3, 25), date(2024, 4, 12)),
+}
+
+
+@pytest.mark.parametrize("window", list(DELAY_WINDOWS.values()), ids=list(DELAY_WINDOWS))
 def test_run_many_at_delay_1_equals_separate_runs_and_reads_like_one(
     window: tuple[Cadence, date, date],
 ) -> None:
