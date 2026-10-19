@@ -282,6 +282,14 @@ class RatesConfig(_ClosedConfig):
     max_stale_sessions: int = Field(default=3, ge=0)
     refetch_days: int = Field(default=10, gt=0)
     plausible_range_percent: list[float] = Field(default_factory=lambda: [-1.0, 25.0])
+    # #1883: a full-vintage backfill is slow. Generous request timeout, bounded retry on
+    # timeouts and 5xx (never 4xx) with exponential backoff. FRED rejects a query spanning
+    # more than 2000 vintage dates (HTTP 400), so the real-time range is fetched in windows
+    # of this many days (~260 vintage dates a year).
+    fred_timeout_seconds: float = Field(default=60.0, gt=0.0, allow_inf_nan=False)
+    fred_max_attempts: int = Field(default=4, ge=1)
+    fred_backoff_seconds: float = Field(default=2.0, ge=0.0, allow_inf_nan=False)
+    fred_vintage_window_days: int = Field(default=365, ge=1, le=1000)
 
     @field_validator("series")
     @classmethod
