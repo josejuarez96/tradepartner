@@ -603,6 +603,7 @@ def decision_state(
     latest = mine[-1]
     if (
         decision.side == _BUY
+        and decision.position_side == LONG  # a cover is not a funding shortfall
         and not latest.sells_in_flight_at_submit
         and not _protected_from_write_off(events_by_order[latest.client_order_id])
     ):
