@@ -8,6 +8,8 @@ What TradePartner should test next, and why, in proposed order. An entry here is
 
 **Priority note 2026-10-18 ([ADR 0023](../decisions/0023-break-first-fast-books-paper-exam.md), #1731; the owner's direction: fast first, break first).** Short-horizon items go first and every item runs the ADR's **kill ladder** in cost order (1 cost break-even at the measured per-fill slippage, 2 the published long leg post-2010, 3 capacity at $100, 4 a harsh backtest on our store, 5 placebo), stopping at the first failed rung; rungs 1 to 3 are notes on the item's issue, 4 and 5 counted trials. The order is **B10 → B9 → IRRX** (**2026-10-18, later the same day: B10 first; IRRX parked behind T198 (rung 2 undecidable from open data, [retry](2026-10-18-irrx-rung2-retry.md), INSUFFICIENT); B9 killed at rungs 1-2; B3 retired. See the [desk note](2026-10-18-b9-kill-b3-retirement.md).**) (B10's rung 1 reads two weeks of the daily book's fills, kill above 12 bp per side; its rung 4 is the backtest plan's T165e; B9's rung 1 kills above 6 bp per side and gates T164e; IRRX needs a Chen–Zimmermann long leg ≥ 0.10 %/month, t ≥ 1.0, before anything is built), then any new idea through the same ladder. A survivor's paper book is a pre-registered forward exam with `paper.min_exam_fills` per cadence only if its family's holdout is unspent; a `momentum` book (B10's included) is a tracking window, since H1 spent that holdout. **B3's paper book is deferred** (D5; the slot goes to a fast survivor); B5 to B8 and the labeling track are paused. Only the owner reorders this file; this note records his priority, not a new ranking of the table.
 
+**Constraint note 2026-10-19:** the owner lifted the long-only constraint on 2026-10-19 (ADR 0024 in progress); long/short and short-leg candidates ([beyond long-only](2026-10-10-beyond-long-only.md), claims LS-1 to LS-20) re-enter the pool, still through the kill ladder and the ladder ledger below.
+
 ## Summary
 
 | # | Item | Claims it tests (grade) | Data | Engine | Cost | Status |
@@ -23,6 +25,7 @@ What TradePartner should test next, and why, in proposed order. An entry here is
 | B8 | Semantic labels (demand, inventory, liquidity): annotation pilot | TX-*, AP-*; ER-14 INSUFFICIENT | after B5's corpus | none (human labeling) | M + owner spend | parallel track, owner decisions pending |
 | B9 | Earnings-reaction (EAR) drift: top quintile by the [−1, +2] market-adjusted return around the 8-K Item 2.02 acceptance, 20-session hold, daily | SH-6 MIXED; SH-12 (a T1-source fact); against SH-5 NOT SUPPORTED, SH-2 | **8-K `items` field** (data-foundation plan T164 to T164e); bars, actions, SPY held | new root family `earnings_drift` (spec amendment, then the tasks listed in the file's "The family question") | M | **killed 2026-10-18** at kill-ladder rungs 1-2 (size-screened long leg +0.07 %/mo, t 0.94; break-even 1.75-3.5 bp per side; [note](2026-10-18-b9-kill-b3-retirement.md)); file left as filed, never registered |
 | B10 | Short-term momentum (STMOM): last month's winners in the top turnover quintile, monthly | SH-9 INSUFFICIENT; against SH-1 NOT SUPPORTED, SH-2 | have (volume, shares fact, actions) | `momentum` family amendment: one key `strategy.turnover_top_fraction` | S | file drafted (#1358); no exam of record (family holdout spent); paper book at the owner's word |
+| IRRX | Announcement-adjusted industry-relative one-month reversal, monthly | SH-4 MIXED; IL-1, IL-2 INSUFFICIENT; against SH-1 NOT SUPPORTED, SH-2 | 8-K `items` (T164 to T164e), bars; reaches back only to 2016 | new signal and event path | M | **parked 2026-10-18** behind T198: rung 2 undecidable from open data (no published long leg); not killed ([retry](2026-10-18-irrx-rung2-retry.md), [desk note](2026-10-18-b9-kill-b3-retirement.md) section 3) |
 
 Parked ideas are listed at the end with the reason.
 
@@ -125,6 +128,13 @@ Parked ideas are listed at the end with the reason.
 - **Information value:** moderate, at the lowest cost of any open item: no new data, one key, and the sign of the turnover-screened sort against its control regrades SH-9 and SH-1 with our data (`TP-` claims). As a paper book it is a monthly, 40-name, high-turnover test of the order path.
 - **Cost:** S (one spec amendment, one or two engine tasks, one paper task, one owner registration). Counted in `momentum`'s N.
 
+### IRRX. Industry-relative reversal, announcement-adjusted
+- **Status 2026-10-18: parked** behind T198 (owner). Rung 2 (ADR 0023: kill if the 2010-2024 long-only leg is under 0.10 %/month or t under 1.0) cannot be decided: Dai, Medhat, Novy-Marx and Rizova (FAJ 2024) report only the long-short spread (0.58 %/month, t 3.29, 2001-2021), and Chen-Zimmermann, JKP and Ken French carry no matching series. The plain-reversal proxy (-0.16 %/month, t -0.59) is not a valid stand-in. Neither killed nor passed.
+- **Tests:** SH-4 (MIXED: long-short gross after decimalization; best net version insignificant; long leg not reported) against SH-1 (NOT SUPPORTED) and SH-2 (costs). Rung 2 evidence: IL-1 (UNGRADED, no CZ series exists), IL-2 (INSUFFICIENT).
+- **Next step:** when T198 lands, build the long leg on our own store (rung 4; needs T164e's 8-K dates and reaches back only to 2016). Nothing is built before then. About 98 names fit $100 under D6's feasibility rule (rung 3 preview).
+- **Notes:** [#1734](2026-10-18-irrx-long-leg.md), [retry](2026-10-18-irrx-rung2-retry.md).
+- **Cost:** M.
+
 ## Parked (not recommended now)
 
 | Idea | Why parked | Claims |
@@ -142,9 +152,56 @@ Parked ideas are listed at the end with the reason.
 | Deep learning on prices, RL trading | No general evidence for standalone alpha | QI-22 INSUFFICIENT |
 | Diversified futures trend | SUPPORTED, but outside a long-only equity system's scope (charter) | QI-13 SUPPORTED |
 
+## Ladder ledger
+
+The record of looks before rung 4 (rules L1 to L5 of the [strategy-discovery report](2026-10-19-strategy-discovery.md#d3-the-smallest-rule-reuses-existing-records-no-code), #1862). Store trials and registered research runs are already counted in a family's N; this ledger covers what nothing else counts: rung 1-to-3 reads on open data, second series, mechanism checks and dropped ideas. It is not added to N mechanically (no agreed conversion exists in the literature); it is disclosed at rung 4 (L3).
+
+**L1. One row per idea.** An idea gets a row the first time **any** rung-1-to-3 number is computed for it, killed or not, **including rung 2-O mechanism checks** (a look at stored facts; it does not raise any family's N, but it is a look). The row is written with the declared read and the kill line **before** the read, then updated.
+
+| Field | Content |
+|---|---|
+| id | backlog id, or `L-<n>` for an idea that never became an item |
+| date | absolute |
+| origin | paper / extension / original; proposer: owner / agent / AI workflow (with its batch id) |
+| mechanism | one line |
+| declared read | the one open series (file, weighting, size screen, window) or stored-fact test, and the kill line, written before the read |
+| looks | series and constructions actually read (1 if the rule was kept) |
+| rungs | furthest rung passed; the verdict |
+| link | the issue note or desk note |
+
+**L2. Batches.** Any workflow (agent, AI, the owner's reading) that proposes ideas adds one batch row: date, proposer, number proposed, number admitted to rung 1, a link to the list. Ideas not admitted need no row each.
+
+**L3. Disclosure at rung 4.** A sweep or hypothesis file for an idea with ledger rows states, in its prior-evidence disclosure, the ledger's looks for that mechanism and its batch's denominator. Promotion still uses the DSR at the family's high-water mark, unchanged.
+
+**L4. Rung 2 window (adopted 2026-10-19).** A new item's rung-2 public read uses open data **ending 2019-12**, before every family's `in_sample_start` (2020-08-31), so rung 4 is a test on months the screen never saw. Cost: post-2020 decay is not seen until rung 4. B9 and IRRX read 2010-2024 and are not re-read.
+
+**L5. Close the loop.** A ladder verdict is recorded as a `TP-` claim (research-program section 6). Done 2026-10-19 for B3 (TP-5) and B9 (TP-6); IRRX's rung 2 is IL-2; the beyond-long-only claims are LS-1 to LS-20.
+
+**Upgrade path.** If more than one item a month reaches rung 1, or any batch exceeds 20 ideas, register the rung-2 read as a `return` experiment on an imported dataset version once the family exists; its configurations then count in N (research-registry req 9).
+
+**Items.**
+
+| id | date | origin | mechanism | declared read | looks | rungs | link |
+|---|---|---|---|---|---|---|---|
+| B9 | 2026-10-18 (backfill) | extension; owner/agent | market reaction at the 8-K 2.02 acceptance predicts a 20-session drift | CZ `AnnouncementReturn`, size-screened, 2010-2024; kill: long leg < 0.10 %/mo or t < 1.0, break-even <= 6 bp | 2 (size-screened, then the value-weighted file, reported and not used) | killed at rungs 1-2 | [note](2026-10-18-b9-kill-b3-retirement.md), TP-6 |
+| IRRX | 2026-10-18 (backfill) | paper; agent | announcement-adjusted industry-relative reversal | a CZ long leg; none exists | 2 (the FAJ spreads; the plain-reversal proxy) | rung 2 INSUFFICIENT; parked | [retry](2026-10-18-irrx-rung2-retry.md), IL-2 |
+| Q1 | 2026-10-19 | extension; agent | lowest net share issuance (largest net repurchasers) is underpriced | CZ `ShareIss1Y`, size-screened (ex NYSE p20), long leg, 2010-01..2019-12; kill: < 0.10 %/mo or t < 1.0 | 0 (declared, not read) | rung 1-2 pre-analysis written | [note](2026-10-19-q1-repurchasers-rung12.md) |
+
+Backfilled rows were not written before their read; their declared read is reconstructed from the notes.
+
+**Batches.**
+
+| date | proposer | proposed | admitted to rung 1 | list |
+|---|---|---|---|---|
+| 2026-10-09 | agent workflow | 10 short-horizon candidates (8 not recommended; count from the discovery report's D1, not re-counted) | 3 (B9, B10, IRRX) | [short-horizon](2026-10-09-short-horizon-candidates.md) |
+| 2026-10-10 | agent workflow (7 scouts, 3 skeptics each) | 7 long-short and hedged candidates | 0 (B11 is a decomposition of existing trials, not a candidate) | [beyond long-only](2026-10-10-beyond-long-only.md) |
+| 2026-10-19 | agent | 1 (Q1, chosen for kill-cost) | 1 | [discovery report](2026-10-19-strategy-discovery.md) |
+
 ## Changing this file
 
 - **Add an item:** cite its claim ids, prior, data, engine work, cost, kill criterion and information value. An idea with no graded claim behind it enters as "needs research" with a brief proposed.
 - **Reorder:** the owner only. An agent proposes the new order and its reason in a PR.
 - **Park an item:** the owner only, by a linked decision. The item keeps its section, marked parked with the reason first, and gains a row in the Parked table.
 - **Close an item:** link the `TP-` claim that records the result. Retired items stay in the file, struck through, with that link.
+- **Rung 2-O (an idea with no published long leg):** the mechanism must name a fundamental or behavioural consequence measurable without returns. Test it on stored facts as an `economic` research run with `touches_returns = false` ([research-registry](../specs/research-registry.md)), kill rule written in the experiment file first. Such a run does not raise any family's N, but it **does get a ledger row** (it is a look). Order: rung 1, then 2-O, then rung 3, then a new root family at rung 4. It cannot show the effect is priced, only that the stated mechanism is not false.
+- **Ladder ledger:** an idea's first rung-1-to-3 number adds its row (rules L1 to L5 above).
