@@ -1211,18 +1211,20 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 # T187 (#821): one live row per chained successor, the append-only master
 # shape (`known_at`, `ingested_at`, `source`, `provenance`) plus the #859
-# retraction flag. A live row is `retracted = FALSE` with `withdrawn_known_at
-# NULL`; a retraction is `retracted = TRUE` at the run's clock, naming in
-# `withdrawn_known_at` the stamp it withdraws, so a reader can tell which
-# revision was withdrawn when a stamp moves (`_write_chains` retracts the live
-# row at the run's clock and writes the newly derived row in the same run). A
-# read at `t` is the live row whose `known_at <= t` is not named by a
-# retraction whose `known_at <= t`; `known_at` is the latest of the four
-# evidence stamps (the 8-K12B's acceptance, the successor's `securities` row,
-# its first listing row under the predecessor's ticker and the predecessor's
-# last listing row), so a read before it sees two securities. `evidence_form`
-# is one of the four successor-issuer forms. UNIQUE (successor_id, known_at):
-# an id appears once per instant, so "the latest revision" is never a tie.
+# retraction flag. `evidence_known_at` is the latest of the four evidence
+# stamps (the 8-K12B's acceptance, the successor's `securities` row, its first
+# listing row under the predecessor's ticker and the predecessor's last
+# listing row). `known_at` is that stamp when the row is a first write or a
+# move to a later stamp; when the evidence moves to an earlier or unchanged
+# stamp, `known_at` is the run's clock (a revision, as `_filed` does for the
+# master tables), because `UNIQUE (successor_id, known_at)` forbids a second
+# row at a stamp already held. `retracted = FALSE` with `withdrawn_known_at
+# NULL` is a live row; a retraction is a row at the run's clock whose
+# `withdrawn_known_at` names the stamp it withdraws. A read at `t` takes the
+# live row with `evidence_known_at <= t` that no retraction with
+# `known_at <= t` names: so a moved chain is absent again once the retraction
+# is known and before the new stamp, never shown from a stamp its evidence no
+# longer carries. `evidence_form` is one of the four successor-issuer forms.
 _CREATE_SUCCESSOR_CHAINS = f"""
 CREATE TABLE IF NOT EXISTS successor_chains (
     predecessor_id VARCHAR NOT NULL,
@@ -1231,6 +1233,7 @@ CREATE TABLE IF NOT EXISTS successor_chains (
     evidence_form VARCHAR NOT NULL,
     retracted BOOLEAN NOT NULL DEFAULT FALSE,
     withdrawn_known_at TIMESTAMPTZ,
+    evidence_known_at TIMESTAMPTZ NOT NULL,
     {_common_fact_columns(TABLE_PROVENANCE_VALUES["successor_chains"])},
     UNIQUE (successor_id, known_at)
 )

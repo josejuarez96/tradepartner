@@ -5469,6 +5469,7 @@ def _chain_filings(
     *,
     cover_shift: timedelta = timedelta(0),
     successor_ticker: str | None = None,
+    accession: str | None = None,
 ):
     """`_filings()` plus the fixture's `chain_1to1` pair: each CIK's issuer
     filings, its cover page listing the pair's ticker and exchange, and the
@@ -5506,7 +5507,7 @@ def _chain_filings(
                 successor["cik"],
                 successor["name"],
                 evidence["form"],
-                evidence["accession"],
+                accession or evidence["accession"],
                 _chain_parse(evidence["accepted_at"]),
             ),
         ],
@@ -5530,6 +5531,17 @@ def _chain_filings(
 def _chained_settings(settings: Settings, case: dict[str, Any]) -> Settings:
     entry = (
         f"{case['predecessor']['cik']}->{case['successor']['cik']}@{case['evidence']['accession']}"
+    )
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"chains": [entry]})}
+    )
+
+
+def _chain_settings_for(settings: Settings, *, accession: str | None) -> Settings:
+    """`settings` with `master.chains` set to the fixture pair and `accession`."""
+    entry = (
+        f"{_CHAIN_CASE['predecessor']['cik']}->{_CHAIN_CASE['successor']['cik']}"
+        f"@{accession or _CHAIN_CASE['evidence']['accession']}"
     )
     return settings.model_copy(
         update={"master": settings.master.model_copy(update={"chains": [entry]})}
@@ -5700,6 +5712,56 @@ def test_a_missing_listing_row_is_refused_and_written_on_the_next_run(
     assert any(f"{_CHAIN_CASE['successor']['cik']}=no_listing" in m for m in messages)
     _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now() + timedelta(days=1))
     assert read("SELECT count(*) FROM successor_chains WHERE NOT retracted")[0][0] == 1
+
+
+def test_a_same_stamp_correction_does_not_collide(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: an evidence change at an unchanged stamp is a revision stamped at
+    the run's clock, not a second row at the same `known_at` (which `UNIQUE
+    (successor_id, known_at)` refuses)."""
+    base = _chain_settings_for(settings, accession=None)
+    other = "0001000011-24-000009"
+    _run(base, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    changed = _chain_settings_for(settings, accession=other)
+    _run(
+        changed,
+        filings=_chain_filings(_CHAIN_CASE, accession=other),
+        now=_chain_now() + timedelta(days=10),
+    )
+    latest = read(
+        "SELECT evidence_accession FROM successor_chains "
+        "ORDER BY known_at DESC, evidence_known_at DESC LIMIT 1"
+    )
+    assert latest == [(other,)]
+    assert read("SELECT count(*) FROM successor_chains WHERE retracted")[0][0] == 0
+
+
+def test_a_chain_that_moves_back_to_an_earlier_stamp(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821: A -> B -> A does not collide: the move back is a revision at the
+    run's clock, and B is retracted."""
+    chained = _chained_settings(settings, _CHAIN_CASE)
+    first = _chain_parse(_CHAIN_CASE["expected_known_at"])
+    _run(chained, filings=_chain_filings(_CHAIN_CASE), now=_chain_now())
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE, cover_shift=timedelta(days=30)),
+        now=_chain_now() + timedelta(days=60),
+    )
+    _run(
+        chained,
+        filings=_chain_filings(_CHAIN_CASE),
+        now=_chain_now() + timedelta(days=120),
+    )
+    assert read("SELECT withdrawn_known_at FROM successor_chains WHERE retracted ORDER BY 1") == [
+        (first,)
+    ]
+    assert read("SELECT count(*) FROM successor_chains")[0][0] == 4
+    assert read(
+        "SELECT evidence_known_at FROM successor_chains ORDER BY known_at DESC LIMIT 1"
+    ) == [(first,)]
 
 
 def test_held_ids_reads_open_windows_only() -> None:

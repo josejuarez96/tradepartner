@@ -1330,6 +1330,7 @@ def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
             "evidence_form": "8-K12B",
             "retracted": False,
             "withdrawn_known_at": None,
+            "evidence_known_at": _PIN_KNOWN,
             "known_at": _PIN_KNOWN,
             "ingested_at": _LATE_INGEST,
             "source": "edgar",
