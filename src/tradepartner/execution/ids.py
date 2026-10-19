@@ -3,9 +3,10 @@ superseded on the format by ADR 0015 seam 1, plan T133).
 
 Every order attempt's id is
 `f"{prefix}-{book}-{session:%Y%m%d}-{security_id}-{side}-{attempt}"`,
-where `prefix` is `paper.order_id_prefix`, `book` is the window's `book_id`,
+where `side` is the intent's token (`ID_TOKENS`: `buy`, `sell`, `short`, `cover`;
+T228), `prefix` is `paper.order_id_prefix`, `book` is the window's `book_id`,
 and `attempt` is 1 plus the count of `orders` rows already journaled on the
-session for that (security, side), across every decision, counting rows
+session for that (security, token), across every decision, counting rows
 written earlier in the same batch in write order. So two decisions on one
 name on one session never share an id, and a re-attempt never reuses a
 terminal order's id.
@@ -29,7 +30,7 @@ from collections.abc import Iterable
 from datetime import date, datetime
 
 from tradepartner.store.journal import OrderRow
-from tradepartner.store.schema import SIDES
+from tradepartner.store.schema import LONG
 
 #: The book token's grammar (ADR 0015 seam 1): alphanumerics only, so the
 #: prefix and the book parse from the left of the id and `security_id`'s `:`
@@ -37,9 +38,41 @@ from tradepartner.store.schema import SIDES
 _BOOK_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 
 
+#: The id's intent tokens (paper spec amendment 2026-10-19 item 5, T228): `buy`
+#: and `sell` for the long intents (so every long id is byte-identical to the
+#: pre-short format), `short` for a short open and `cover` for a short close.
+ID_TOKENS: tuple[str, ...] = ("buy", "sell", "short", "cover")
+
+#: Alpaca `position_intent` -> id token.
+_INTENT_TOKENS: dict[str, str] = {
+    "buy_to_open": "buy",
+    "sell_to_close": "sell",
+    "sell_to_open": "short",
+    "buy_to_close": "cover",
+}
+
+#: An `orders` row's (side, position_side) -> id token.
+_ROW_TOKENS: dict[tuple[str, str], str] = {
+    ("buy", LONG): "buy",
+    ("sell", LONG): "sell",
+    ("sell", "short"): "short",
+    ("buy", "short"): "cover",
+}
+
+
+def token_for(position_intent: str) -> str:
+    """The id token of an Alpaca `position_intent`; `ValueError` outside the four."""
+    try:
+        return _INTENT_TOKENS[position_intent]
+    except KeyError:
+        raise ValueError(
+            f"position_intent must be one of {tuple(_INTENT_TOKENS)}, got {position_intent!r}"
+        ) from None
+
+
 def _check_side(side: str) -> None:
-    if side not in SIDES:
-        raise ValueError(f"side must be one of {SIDES}, got {side!r}")
+    if side not in ID_TOKENS:
+        raise ValueError(f"token must be one of {ID_TOKENS}, got {side!r}")
 
 
 def _check_book(book: str) -> None:
@@ -90,7 +123,8 @@ def next_attempt(orders_on_session: Iterable[OrderRow], security_id: str, side: 
     attempts: list[int] = []
     for row in orders_on_session:
         sessions.add(row.session)
-        if row.security_id == security_id and row.side == side:
+        token = _ROW_TOKENS.get((row.side, row.position_side))
+        if row.security_id == security_id and token == side:
             attempts.append(row.attempt)
     if len(sessions) > 1:
         raise ValueError(f"orders_on_session spans sessions {sorted(sessions)}")

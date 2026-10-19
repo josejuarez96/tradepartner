@@ -787,9 +787,9 @@ def test_the_version_21_migration_adds_filing_events_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, sorted(set(shape_before) - {"schema_version"})) == rows_before
         assert conn.execute("SELECT count(*) FROM filing_events").fetchone() == (0,)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(20, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(20, schema.CURRENT_SCHEMA_VERSION + 1))
         # The migrated table is the fresh store's table.
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
@@ -969,9 +969,9 @@ def test_the_version_23_migration_adds_rates_and_keeps_every_row() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM rates").fetchone() == (0,)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(22, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(22, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["rates"] == _shape(fresh)["rates"]
@@ -1149,9 +1149,9 @@ def test_the_version_24_migration_adds_borrow_status_and_nothing_else() -> None:
         assert {t: shape_after[t] for t in shape_before} == shape_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM borrow_status").fetchone() == (0,)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(23, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(23, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["borrow_status"] == _shape(fresh)["borrow_status"]
@@ -1274,10 +1274,11 @@ def _version_25_store(conn: duckdb.DuckDBPyConnection) -> None:
 
 def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_row() -> None:
     """From 25: `listings` and `classifications` are rebuilt with the wider
-    provenance `CHECK` and no other table changes at all; every row is kept
-    byte-identical (the `CHECK` only widens, so nothing stored can be
-    refused), the versions go to [25, 26], a second open adds nothing, and
-    the two rebuilt tables are the fresh store's."""
+    provenance `CHECK` and (version 33, #1792, T210b) `trial_metrics` for
+    `cost_level_kind`; every row is kept byte-identical (the `CHECK` only
+    widens, so nothing stored can be refused), the versions go to [25, 26], a
+    second open adds nothing, and the two rebuilt tables are the fresh
+    store's."""
     conn = duckdb.connect(":memory:")
     try:
         _version_25_store(conn)
@@ -1295,11 +1296,12 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
             "classifications",
+            "trial_metrics",
         }
         assert _all_rows(conn, tables_before) == rows_before
-        assert _versions(conn) == [25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(25, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [25, 26, 27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(25, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         for table in ("listings", "classifications"):
@@ -1496,9 +1498,9 @@ def test_the_version_27_migration_adds_symbol_changes_and_successor_chains() -> 
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
         assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
-        assert _versions(conn) == [27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(27, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [27, 28, 29, 30, 31, 32]
+        assert _versions(conn) == list(range(27, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["symbol_changes"] == _shape(fresh)["symbol_changes"]
@@ -1529,9 +1531,9 @@ def test_the_version_31_migration_adds_successor_chains_and_nothing_else() -> No
         assert indexes_after == indexes_before
         assert _all_rows(conn, tables_before) == rows_before
         assert conn.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
-        assert _versions(conn) == [30, 31, 32]
+        assert _versions(conn) == list(range(30, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [30, 31, 32]
+        assert _versions(conn) == list(range(30, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         assert shape_after["successor_chains"] == _shape(fresh)["successor_chains"]
@@ -1559,9 +1561,9 @@ def test_a_version_29_store_migrates_to_31_with_both_new_tables() -> None:
         assert _all_rows(conn, tables_before) == rows_before
         for table in ("openfigi_types", "successor_chains"):
             assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
-        assert _versions(conn) == [29, 30, 31, 32]
+        assert _versions(conn) == list(range(29, schema.CURRENT_SCHEMA_VERSION + 1))
         schema.init_schema(conn)
-        assert _versions(conn) == [29, 30, 31, 32]
+        assert _versions(conn) == list(range(29, schema.CURRENT_SCHEMA_VERSION + 1))
         fresh = duckdb.connect(":memory:")
         schema.init_schema(fresh)
         for table in ("openfigi_types", "successor_chains"):
@@ -1580,11 +1582,15 @@ def test_version_30_adds_openfigi_types_without_touching_prior_rows() -> None:
         conn.execute("INSERT INTO schema_version VALUES (28, TIMESTAMPTZ '2026-10-15 00:00:00+00')")
         before = _all_rows(conn, sorted(set(_shape(conn)) - {"schema_version"}))
         schema.init_schema(conn)
-        assert _versions(conn)[-3:] == [30, 31, 32]
+        assert [v for v in _versions(conn) if v >= 30] == list(
+            range(30, schema.CURRENT_SCHEMA_VERSION + 1)
+        )
         assert conn.execute("SELECT COUNT(*) FROM openfigi_types").fetchone() == (0,)
         assert _all_rows(conn, sorted(before)) == before
         schema.init_schema(conn)
-        assert _versions(conn)[-3:] == [30, 31, 32]
+        assert [v for v in _versions(conn) if v >= 30] == list(
+            range(30, schema.CURRENT_SCHEMA_VERSION + 1)
+        )
     finally:
         conn.close()
 
@@ -1828,29 +1834,7 @@ def test_migrating_a_version_13_store_copies_the_counts_once_per_rebalance() -> 
         _version_13_store(conn)
         before = conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall()
         schema.init_schema(conn)
-        assert _versions(conn) == [
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            28,
-            29,
-            30,
-            31,
-            32,
-        ]
+        assert _versions(conn) == list(range(12, schema.CURRENT_SCHEMA_VERSION + 1))
         assert conn.execute("SELECT * FROM trial_rebalances ORDER BY ALL").fetchall() == before
         assert not _columns(conn, "trial_rebalances")["n_excluded_no_history"][1]
         rows = conn.execute(
@@ -2353,7 +2337,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == 32
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2474,3 +2458,114 @@ def test_symbol_changes_table_has_identity_and_action_provenance(
             "symbol_changes",
             {**base, "source_action_id": "another", "provenance": "snapshot"},
         )
+
+
+# --- version 33 (#1792, plan T210b): `trial_metrics.cost_level_kind` -----------
+
+_V33_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+
+
+def _version_32_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """A store as version 32 left it: `trial_metrics` in its version-4 shape (no
+    `cost_level_kind`), one hypothesis whose stored base cost is 15 bps, one
+    trial, and one `sharpe_period` value at each of the gross (0), base (15),
+    off-ladder (22) and ladder (30) levels."""
+    configure_connection(conn)
+    schema.init_schema(conn)
+    conn.execute("DROP TABLE trial_metrics")
+    conn.execute(schema._CREATE_TRIAL_METRICS)
+    conn.execute("DELETE FROM schema_version WHERE version = 33")
+    conn.execute(
+        "INSERT INTO hypotheses (hypothesis_id, slug, family, title, doc_path, doc_sha256, "
+        "params_json, params_sha256, in_sample_start, holdout_start, holdout_end, "
+        "registered_at, registered_by) VALUES (1, 'h1', 'momentum', 'H1', 'd', ?, ?, 'x', "
+        "DATE '2020-01-01', DATE '2030-01-01', DATE '2031-01-01', ?, 'owner')",
+        ["0" * 64, '{"costs.per_side_bps": 15.0, "strategy.top_fraction": 0.4}', _V33_AT],
+    )
+    conn.execute(
+        "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+        "end_session, code_version, synthetic, run_by) VALUES "
+        "(1, 1, 'in_sample', ?, '2020-01-31', '2020-12-31', 'abc', false, 'owner')",
+        [_V33_AT],
+    )
+    conn.execute(
+        "INSERT INTO trial_metrics (trial_id, series, cost_per_side_bps, metric, value) VALUES "
+        "(1, 'strategy', 0.0, 'sharpe_period', 0.20), "
+        "(1, 'strategy', 15.0, 'sharpe_period', 0.10), "
+        "(1, 'strategy', 22.0, 'sharpe_period', 0.08), "
+        "(1, 'strategy', 30.0, 'sharpe_period', 0.05)"
+    )
+
+
+def test_cost_level_kind_is_version_33_not_a_pinned_ddl_edit() -> None:
+    """`cost_level_kind` arrives by the `_migrate_cost_level_kind` rebuild
+    (spec amendment 2026-10-18, #1792, item 2), never by editing the pinned
+    `_REGISTRY_TABLE_DDL`/`_CREATE_TRIAL_METRICS` in place, so the version-4
+    hash stays put and a fresh store gets the column the same way."""
+    assert "cost_level_kind" not in schema._CREATE_TRIAL_METRICS
+    assert "cost_level_kind" in schema._COST_LEVEL_KIND_TABLE_DDL
+    assert schema.COST_LEVEL_KINDS == ("base", "ladder", "measured")
+
+
+def test_migrating_a_version_32_store_labels_base_and_ladder_and_keeps_values() -> None:
+    """A version-32 store migrates with `base` on exactly the base-level rows and
+    `ladder` elsewhere (the gross and off-ladder rows included), every value
+    unchanged, and one version-33 row."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _version_32_store(conn)
+        assert "cost_level_kind" not in _columns(conn, "trial_metrics")
+        before = conn.execute(
+            "SELECT trial_id, series, cost_per_side_bps, metric, value FROM trial_metrics "
+            "ORDER BY cost_per_side_bps"
+        ).fetchall()
+        schema.init_schema(conn)
+        dtype, notnull = _columns(conn, "trial_metrics")["cost_level_kind"]
+        assert (dtype, notnull) == ("VARCHAR", True)
+        assert conn.execute(
+            "SELECT trial_id, series, cost_per_side_bps, cost_level_kind, metric, value "
+            "FROM trial_metrics ORDER BY cost_per_side_bps"
+        ).fetchall() == [
+            (1, "strategy", 0.0, "ladder", "sharpe_period", 0.20),
+            (1, "strategy", 15.0, "base", "sharpe_period", 0.10),
+            (1, "strategy", 22.0, "ladder", "sharpe_period", 0.08),
+            (1, "strategy", 30.0, "ladder", "sharpe_period", 0.05),
+        ]
+        assert (
+            conn.execute(
+                "SELECT trial_id, series, cost_per_side_bps, metric, value FROM trial_metrics "
+                "ORDER BY cost_per_side_bps"
+            ).fetchall()
+            == before
+        )
+        assert _versions(conn)[-1] == schema.CURRENT_SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_a_fresh_store_has_the_cost_level_kind_column_and_its_check() -> None:
+    """`_migrate_cost_level_kind` runs unconditionally after the DDL pass, so a
+    fresh store's `trial_metrics` carries the NOT NULL column and its `CHECK`
+    too; a kind outside `COST_LEVEL_KINDS` is refused."""
+    conn = duckdb.connect(":memory:")
+    try:
+        schema.init_schema(conn)
+        assert _columns(conn, "trial_metrics")["cost_level_kind"] == ("VARCHAR", True)
+        conn.execute(
+            "INSERT INTO trials (trial_id, hypothesis_id, kind, started_at, start_session, "
+            "end_session, code_version, synthetic, run_by) VALUES "
+            "(1, 1, 'in_sample', ?, '2020-01-31', '2020-12-31', 'abc', false, 'owner')",
+            [_V33_AT],
+        )
+        conn.execute(
+            "INSERT INTO trial_metrics (trial_id, series, cost_per_side_bps, cost_level_kind, "
+            "metric, value) VALUES (1, 'strategy', 15.0, 'measured', 'sharpe_period', 0.1)"
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO trial_metrics (trial_id, series, cost_per_side_bps, "
+                "cost_level_kind, metric, value) VALUES "
+                "(2, 'strategy', 15.0, 'rung', 'sharpe_period', 0.1)"
+            )
+    finally:
+        conn.close()

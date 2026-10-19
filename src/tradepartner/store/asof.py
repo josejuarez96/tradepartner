@@ -146,6 +146,15 @@ combined rule: "Backfilled 2018 split in 2026:
 only `ingested_at` in a 2026 backfill run; `ingested_at` never gates this
 rule.
 
+**Spin-offs (`include_spin_offs`, #1894).** Opt-in and total-return only
+(it requires `include_dividends=True`). A `spinoff` row (child in
+`security_id`, ratio r in `ratio_or_amount`, parent in `source_action_id`)
+is selected by its parent and adjusts the parent as a dividend of D = r x
+the child's raw close on E, under the dividend's prior-close rules; it
+applies only once the row, the child's bar on E and the parent's prior bar
+are all known at `t`. `unvalued_spin_offs_as_of` lists the ones left out.
+At the default every reader is byte-identical with or without the rows.
+
 **Action identity, re-dates and cancellations (#108).** An action's
 identity is `(security_id, source_action_id)` when the source gave an id,
 else `(security_id, action_type, ex_date)` (`source_action_id = ''`). A
@@ -614,6 +623,31 @@ def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
     return LiveChains(dict(pairs), handovers)
 
 
+def _spin_off_actions_filter(
+    security_ids: Sequence[str] | None, params: list[Any], *, mapped: bool = False
+) -> str:
+    """`_security_filter` for `latest_actions` when it also reads `spinoff`
+    rows: a split or dividend is selected by its `security_id`, a spin-off
+    by its parent in `source_action_id` (its `security_id` is the child).
+    Same `None` / empty-sequence rules. With `mapped` (a live chain at `t`,
+    #821) both keys go through `_CHAINS_VIEW`, so a chained predecessor's
+    parent id matches its successor."""
+    if security_ids is None:
+        return ""
+    if not security_ids:
+        return "AND FALSE"
+    params.extend(security_ids)
+    placeholders = ", ".join("?" for _ in security_ids)
+
+    def key(column: str) -> str:
+        return f"COALESCE({_CHAINS_VIEW}.successor_id, {column})" if mapped else column
+
+    return (
+        f"AND (CASE WHEN action_type = 'spinoff' THEN {key('source_action_id')} "
+        f"ELSE {key('security_id')} END) IN ({placeholders})"
+    )
+
+
 def _latest_as_of(
     conn: duckdb.DuckDBPyConnection,
     table: str,
@@ -818,7 +852,9 @@ def marking_changed_ids_as_of(
     A newly known old bar can change a dividend's prior close even when the
     bar is outside the marking window. A new action revision can cancel or
     re-date an event. An already known action can become effective when its
-    ex-date arrives. The broad probe deliberately includes harmless changes.
+    ex-date arrives. A spin-off names its parent, not its child, when the row
+    or the child's bar on the ex-date becomes known or effective (#1894). The
+    broad probe deliberately includes harmless changes.
     """
     previous_t, t = _validate_t(previous_t), _validate_t(t)
     if not security_ids or t <= previous_t:
@@ -836,6 +872,20 @@ def marking_changed_ids_as_of(
             UNION ALL
             SELECT security_id FROM corporate_actions
             WHERE known_at <= ? AND ex_date > ? AND ex_date <= ?
+            UNION ALL
+            -- A spin-off adjusts its parent (`source_action_id`), not the child
+            -- in `security_id`, when the row, or the child's bar on E, becomes
+            -- known or effective (#1894). Broad whatever the opt-in key says.
+            SELECT source_action_id FROM corporate_actions
+            WHERE action_type = 'spinoff' AND source_action_id <> ''
+              AND ((known_at > ? AND known_at <= ?)
+                   OR (known_at <= ? AND ex_date > ? AND ex_date <= ?))
+            UNION ALL
+            SELECT ca.source_action_id FROM corporate_actions ca
+            JOIN prices_daily cb
+              ON cb.security_id = ca.security_id AND cb.session = ca.ex_date
+            WHERE ca.action_type = 'spinoff' AND ca.source_action_id <> ''
+              AND ca.known_at <= ? AND cb.known_at > ? AND cb.known_at <= ?
         ) WHERE security_id IN (SELECT unnest(?))
         ORDER BY security_id
         """,
@@ -848,6 +898,14 @@ def marking_changed_ids_as_of(
             t,
             previous_session,
             current_session,
+            previous_t,
+            t,
+            t,
+            previous_session,
+            current_session,
+            t,
+            previous_t,
+            t,
             list(security_ids),
         ],
     ).fetchall()
@@ -1409,20 +1467,78 @@ def _adjusted_ctes(
     *,
     chained: bool = False,
     hide: str = "",
+    spin_offs: bool = False,
 ) -> str:
     """The CTEs `adjusted_prices_as_of` shares between its validation query
     (checks `event_factor` before anything calls `LN()` on it) and its main
     query (adds the cumulative-factor window and the `ASOF JOIN` to bars).
 
-    `action_types` is `"'split'"` or `"'split', 'dividend'"` (always a
-    literal, never user input); `bars_filter`/`actions_filter` are each
-    `_security_filter`'s output for that CTE's own `?` placeholders. Build
-    all three, and the bind parameters in placeholder order, with
-    `_adjusted_params`; run the queries inside `_sessions_registered`,
-    which provides the `_SESSIONS_VIEW` the gap CTE reads. With `chained`
-    the bars and actions are re-keyed through `_CHAINS_VIEW` first (#821),
-    so a predecessor's splits and dividends adjust the successor's bars.
+    `action_types` is `"'split'"`, `"'split', 'dividend'"` or `"'split',
+    'dividend', 'spinoff'"` (always a literal, never user input);
+    `bars_filter`/`actions_filter` are each `_security_filter`'s output for
+    that CTE's own `?` placeholders. Build all three, and the bind
+    parameters in placeholder order, with `_adjusted_params`; run the
+    queries inside `_sessions_registered`, which provides the
+    `_SESSIONS_VIEW` the gap CTE reads.
+
+    With `chained` the bars and actions are re-keyed through `_CHAINS_VIEW`
+    first (#821), so a predecessor's splits and dividends adjust the
+    successor's bars; `hide` is the bar-hiding clause of a chained successor
+    whose chain is not known yet.
+
+    `spin_offs=True` (the opt-in read, #1894) adds two CTEs and one `?`
+    (`t`): `child_close`, the child's latest bar on E known at `t`, read
+    whether or not the child is in the read's ids, and `keyed_actions`,
+    which re-keys a `spinoff` row to its parent (`source_action_id`) and
+    turns its ratio into the distributed value D = r x C, so the rest of
+    the chain treats it as a parent dividend of amount D. A `spinoff` row
+    with no child close has `ratio_or_amount` NULL and `drop_reason`
+    `no_child_close`. `spin_ratio` and `child_close` carry r and C for
+    `_raise_on_invalid_factor`.
     """
+    if spin_offs:
+        spin_ctes = """
+        child_close AS (
+            SELECT security_id, session, close FROM (
+                SELECT security_id, session, close, ROW_NUMBER() OVER (
+                    PARTITION BY security_id, session ORDER BY known_at DESC
+                ) AS _rn
+                FROM prices_daily
+                WHERE known_at <= ?
+                  AND (security_id, session) IN (
+                      SELECT security_id, ex_date FROM latest_actions
+                      WHERE action_type = 'spinoff'
+                  )
+            )
+            WHERE _rn = 1
+        ),
+        -- A spin-off is keyed by its parent; D = r x C is its amount.
+        keyed_actions AS (
+            SELECT
+                CASE WHEN la.action_type = 'spinoff'
+                    THEN la.source_action_id ELSE la.security_id END AS security_id,
+                la.security_id AS child_id,
+                la.ex_date,
+                la.action_type,
+                CASE WHEN la.action_type = 'spinoff'
+                    THEN la.ratio_or_amount * cc.close
+                    ELSE la.ratio_or_amount END AS ratio_or_amount,
+                la.ratio_or_amount AS spin_ratio,
+                cc.close AS child_close
+            FROM latest_actions la
+            LEFT JOIN child_close cc
+                ON la.action_type = 'spinoff'
+                AND cc.security_id = la.security_id AND cc.session = la.ex_date
+        ),"""
+        action_source = "keyed_actions"
+        extra_cols = (
+            "\n                la.child_id,\n                la.spin_ratio,\n"
+            "                la.child_close,"
+        )
+        no_child = "WHEN action_type = 'spinoff' AND child_close IS NULL THEN 'no_child_close'"
+    else:
+        spin_ctes, action_source, extra_cols, no_child = "", "latest_actions", "", ""
+
     if chained:
         latest_bars = f"""
         latest_bars AS (
@@ -1491,7 +1607,7 @@ def _adjusted_ctes(
         -- cancelled filters apply to that latest revision, never before
         -- choosing it: a re-date into the future, or a cancel, must retire
         -- an older revision rather than leave it standing.
-        {latest_actions}
+        {latest_actions}{spin_ctes}
         -- `pb` (the ASOF-joined nearest bar with session < ex_date) is
         -- only read by the dividend branch; for a split row it is
         -- harmlessly present but unused. See this module's docstring on
@@ -1502,10 +1618,10 @@ def _adjusted_ctes(
                 la.security_id,
                 la.ex_date,
                 la.action_type,
-                la.ratio_or_amount,
+                la.ratio_or_amount,{extra_cols}
                 pb.session AS prior_session,
                 pb.close AS prior_close
-            FROM latest_actions la
+            FROM {action_source} la
             ASOF LEFT JOIN latest_bars pb
                 ON pb.security_id = la.security_id AND pb.session < la.ex_date
         ),
@@ -1523,7 +1639,7 @@ def _adjusted_ctes(
         event_gap AS (
             SELECT
                 ep.*,
-                CASE WHEN ep.action_type = 'dividend'
+                CASE WHEN ep.action_type IN ('dividend', 'spinoff')
                     AND ep.prior_session >= cb.first_session
                     AND ep.ex_date <= cb.last_session
                     THEN xe.idx - COALESCE(xp.idx, -1)
@@ -1539,8 +1655,9 @@ def _adjusted_ctes(
         event_drop AS (
             SELECT
                 *,
-                CASE WHEN action_type = 'dividend' THEN
+                CASE WHEN action_type IN ('dividend', 'spinoff') THEN
                     CASE
+                        {no_child}
                         WHEN prior_session IS NULL THEN 'no_prior_bar'
                         WHEN gap_sessions IS NULL THEN 'outside_calendar_range'
                         WHEN gap_sessions > ? THEN 'stale_prior_bar'
@@ -1577,13 +1694,16 @@ def _adjusted_params(
     settings: Settings | None,
     *,
     include_dividends: bool,
+    include_spin_offs: bool = False,
     chains: LiveChains | None = None,
 ) -> tuple[str, list[Any]]:
     """`_adjusted_ctes`' SQL and its bind parameters, in placeholder order:
     `t` and the bars filter (`latest_bars`), `t`, the actions filter and
-    `t_session` (`latest_actions`), then `max_prior_close_gap_sessions`
-    and `max_dividend_to_prior_close` (`event_drop`). `t` must already be
-    validated.
+    `t_session` (`latest_actions`), `t` again when `include_spin_offs`
+    (`child_close`), then `max_prior_close_gap_sessions` and
+    `max_dividend_to_prior_close` (`event_drop`). `t` must already be
+    validated. `include_spin_offs` requires `include_dividends` (the
+    caller checks); it selects `spinoff` rows by their parent.
 
     Both limits only matter for a dividend, so a splits-only query binds
     `0` and `1.0` and never loads settings (`get_settings()` rereads the
@@ -1593,6 +1713,8 @@ def _adjusted_params(
     """
     t_session = t.astimezone(_EXCHANGE_TZ).date()
     action_types = "'split', 'dividend'" if include_dividends else "'split'"
+    if include_spin_offs:
+        action_types += ", 'spinoff'"
     max_gap, max_share = 0, 1.0
     if include_dividends:
         adjust = (settings or get_settings()).adjust
@@ -1605,11 +1727,26 @@ def _adjusted_params(
     params: list[Any] = [t]
     bars_filter = _security_filter(security_ids, params, column=bar_column)
     params.append(t)
-    actions_filter = _security_filter(security_ids, params, column=action_column)
-    params += [t_session, max_gap, max_share]
-    return _adjusted_ctes(
-        action_types, bars_filter, actions_filter, chained=chained, hide=hide
-    ), params
+    actions_filter = (
+        _spin_off_actions_filter(security_ids, params, mapped=chained)
+        if include_spin_offs
+        else _security_filter(security_ids, params, column=action_column)
+    )
+    params.append(t_session)
+    if include_spin_offs:
+        params.append(t)
+    params += [max_gap, max_share]
+    return (
+        _adjusted_ctes(
+            action_types,
+            bars_filter,
+            actions_filter,
+            chained=chained,
+            hide=hide,
+            spin_offs=include_spin_offs,
+        ),
+        params,
+    )
 
 
 #: `(sessions, frame)` for the last `calendar.all_sessions()` tuple seen.
@@ -1659,6 +1796,7 @@ def adjusted_prices_as_of(
     security_ids: Sequence[str] | None = None,
     *,
     include_dividends: bool = False,
+    include_spin_offs: bool = False,
     settings: Settings | None = None,
     traded_only: bool = False,
     sessions_from: date | None = None,
@@ -1686,6 +1824,14 @@ def adjusted_prices_as_of(
     non-positive or non-finite (a split `ratio_or_amount` of `0`), or a
     dividend amount is negative.
 
+    `include_spin_offs=True` (spec amendment 2026-10-19, #1894; requires
+    `include_dividends=True`, else `ValueError`) also applies every
+    `spinoff` row of a parent in `security_ids` as a dividend in kind of
+    D = ratio x the child's raw close on the ex-date E, under the dividend's
+    prior-close rules, valued only from inputs known at `t`. A spin-off it
+    cannot value is left unapplied and listed by `unvalued_spin_offs_as_of`.
+    The default reads are byte-identical with or without `spinoff` rows.
+
     `traded_only=True` drops zero-volume bars after adjusting, as
     `prices_as_of(traded_only=True)` (#787); the factors themselves are
     computed over every stored bar, so a dividend's prior close is the one
@@ -1701,14 +1847,24 @@ def adjusted_prices_as_of(
     a session date, not a read time.
     """
     t = _validate_t(t)
+    if include_spin_offs and not include_dividends:
+        raise ValueError(
+            "include_spin_offs=True requires include_dividends=True: "
+            "a spin-off is a distribution, so it belongs in the total-return series only"
+        )
     if isinstance(sessions_from, datetime):
         raise TypeError(f"sessions_from must be a session date, not a datetime: {sessions_from!r}")
     with _chains_registered(conn, t) as chains:
         common_ctes, params = _adjusted_params(
-            t, security_ids, settings, include_dividends=include_dividends, chains=chains
+            t,
+            security_ids,
+            settings,
+            include_dividends=include_dividends,
+            include_spin_offs=include_spin_offs,
+            chains=chains,
         )
         with _sessions_registered(conn, include_dividends=include_dividends):
-            _raise_on_invalid_factor(conn, common_ctes, params)
+            _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=include_spin_offs)
             frame = conn.execute(
                 _adjusted_select(common_ctes, bounded=sessions_from is not None),
                 [*params, sessions_from] if sessions_from is not None else params,
@@ -1717,18 +1873,34 @@ def adjusted_prices_as_of(
 
 
 def _raise_on_invalid_factor(
-    conn: duckdb.DuckDBPyConnection, common_ctes: str, params: list[Any]
+    conn: duckdb.DuckDBPyConnection,
+    common_ctes: str,
+    params: list[Any],
+    *,
+    spin_offs: bool = False,
 ) -> None:
     """Raise `ValueError` naming the first event whose own factor is
     non-positive or non-finite, or the first negative dividend amount
-    (see this module's docstring), before anything calls `LN()`."""
+    (see this module's docstring), before anything calls `LN()`. With
+    `spin_offs`, also a `spinoff` whose ratio, or whose child close when
+    known, is non-positive or non-finite (corrupt data, as a split ratio
+    of `0` is), whatever drop reason the row would otherwise get."""
+    spin_check = (
+        """
+           OR (action_type = 'spinoff' AND (
+                NOT (spin_ratio > 0 AND isfinite(spin_ratio))
+                OR (child_close IS NOT NULL
+                    AND NOT (child_close > 0 AND isfinite(child_close)))))"""
+        if spin_offs
+        else ""
+    )
     bad_rows = conn.execute(
         f"""
         WITH {common_ctes}
         SELECT security_id, ex_date, ratio_or_amount, factor
         FROM event_factor
         WHERE (factor IS NOT NULL AND NOT (factor > 0 AND isfinite(factor)))
-           OR (action_type = 'dividend' AND ratio_or_amount < 0)
+           OR (action_type = 'dividend' AND ratio_or_amount < 0){spin_check}
         ORDER BY security_id, ex_date
         LIMIT 1
         """,
@@ -1837,3 +2009,42 @@ def dropped_dividends_as_of(
         with _sessions_registered(conn, include_dividends=True):
             _raise_on_invalid_factor(conn, common_ctes, params)
             return conn.execute(sql, params).pl()
+
+
+def unvalued_spin_offs_as_of(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    security_ids: Sequence[str] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Spin-offs of the parents in `security_ids` (`None`: all) known by `t`
+    with `ex_date <= t` that `adjusted_prices_as_of(..., include_dividends=
+    True, include_spin_offs=True)` leaves unapplied (spec amendment
+    2026-10-19, #1894, item 2): one row per `(parent, child, ex_date)`,
+    sorted by those, with `reason`, one of `"no_child_close"` (no bar of the
+    child on the ex-date is known at `t`) or the dividend's four, applied to
+    the parent's prior bar and to D = ratio x the child's close:
+    `"no_prior_bar"`, `"outside_calendar_range"`, `"stale_prior_bar"`,
+    `"implausible_amount"`. `settings` defaults to `get_settings()`.
+    Raises `ValueError` on the same corrupt data `adjusted_prices_as_of`
+    does (a non-positive or non-finite ratio or child close).
+    """
+    t = _validate_t(t)
+    common_ctes, params = _adjusted_params(
+        t, security_ids, settings, include_dividends=True, include_spin_offs=True
+    )
+    sql = f"""
+        WITH {common_ctes}
+        SELECT
+            security_id AS parent,
+            child_id AS child,
+            ex_date,
+            drop_reason AS reason
+        FROM event_factor
+        WHERE action_type = 'spinoff' AND drop_reason IS NOT NULL
+        ORDER BY parent, ex_date, child
+    """
+    with _sessions_registered(conn, include_dividends=True):
+        _raise_on_invalid_factor(conn, common_ctes, params, spin_offs=True)
+        return conn.execute(sql, params).pl()

@@ -210,6 +210,8 @@ def _by_id(orders: dict[str, Any]) -> Responder:
 
 
 def _request(**overrides: Any) -> OrderRequest:
+    """A request carrying its intent explicitly (T226): the long intent of its
+    side unless `position_intent` is overridden."""
     values: dict[str, Any] = {
         "client_order_id": "rec20261008151015-1",
         "symbol": "KO",
@@ -217,6 +219,9 @@ def _request(**overrides: Any) -> OrderRequest:
         "notional": 5.0,
     }
     values.update(overrides)
+    values.setdefault(
+        "position_intent", "buy_to_open" if values["side"] is Side.BUY else "sell_to_close"
+    )
     return OrderRequest(**values)
 
 
@@ -579,6 +584,9 @@ def test_submit_sends_a_market_day_order_and_maps_the_response() -> None:
         "time_in_force": "day",
         "client_order_id": "rec20261008151015-1",
         "notional": 5.0,
+        # T226 (paper spec amendment #1872 item 3): sent on every order, so the
+        # broker never infers a short from an oversell.
+        "position_intent": "buy_to_open",
     }
     assert order.status is OrderStatus.ACCEPTED and order.filled_quantity is None
     assert order.broker_order_id == "f1a08ee3-8b15-4d31-b04b-944f30a06604"
@@ -603,6 +611,8 @@ def test_a_quantity_sell_sends_its_quantity_at_nine_decimals() -> None:
 
     body = json.loads(http.calls("POST", "/v2/orders")[0].body or b"{}")
     assert body["qty"] == 0.557436865 and "notional" not in body
+    # T226: the long sell names its intent, the one the broker recorded.
+    assert body["position_intent"] == "sell_to_close" == sell["submit"]["position_intent"]
     assert order.quantity == 0.557436865 and order.side is Side.SELL
 
 
@@ -621,14 +631,35 @@ def test_a_duplicate_id_found_through_get_order_raises_before_any_submit() -> No
     assert http.calls("POST", "/v2/orders") == []
 
 
-def test_the_brokers_recorded_duplicate_refusal_raises_duplicate() -> None:
-    error = _load("duplicate_client_order_id")["error"]
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # Duplicate fixture plus three 2026-10-19 sandbox JSONL response bodies.
+        ("client_order_id must be unique", DuplicateClientOrderIdError),
+        ("invalid position_intent specified", AlpacaTradingError),
+        ("qty must be > 0", AlpacaTradingError),
+        (
+            "trailing stop orders cannot specify both trail_price and trail_percent",
+            AlpacaTradingError,
+        ),
+    ],
+)
+def test_40010001_refusals_are_classified_by_message(
+    message: str, expected: type[Exception]
+) -> None:
+    recorded = _load("duplicate_client_order_id")["error"]
+    body = json.loads(recorded["body"])
+    body["message"] = message
     broker, http = _broker()
     http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
-    http.route("POST", "/v2/orders", (error["status_code"], json.loads(error["body"])))
+    http.route("POST", "/v2/orders", (recorded["status_code"], body))
 
-    with pytest.raises(DuplicateClientOrderIdError):
+    with pytest.raises(expected) as err:
         broker.submit(_request())
+    assert type(err.value) is expected
+    if isinstance(err.value, AlpacaTradingError):
+        assert err.value.status_code == 422
+        assert json.loads(err.value.body) == body
 
 
 @pytest.mark.parametrize(
@@ -1387,3 +1418,138 @@ def test_an_asset_read_answering_fewer_symbols_raises_system_fault() -> None:
     raw.get_assets = lambda symbols: []  # type: ignore[method-assign]
     with pytest.raises(SystemFaultError, match="0 of 1"):
         AlpacaBroker(settings, lambda: NOW, client=raw, book_id="main").assets(["KO"])
+
+
+# --- T226: the four intents on the wire, and `paper` (paper spec amendment #1872) ------
+
+
+@pytest.mark.parametrize(
+    ("name", "size"),
+    [("buy_fractional", {"notional": 5.0}), ("buy_whole", {"quantity": 1.0})],
+)
+def test_a_recorded_long_buy_is_todays_body_plus_its_intent(
+    name: str, size: dict[str, float]
+) -> None:
+    """The recorded `buy_*.json` pins re-read with the one field: the body is
+    field for field today's (symbol, side, type, time in force, id, size) plus
+    `position_intent`, and the intent sent is the one the broker inferred when
+    T48b recorded it without one."""
+    recorded = _load(name)
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (200, recorded["submit"]))
+    coid = recorded["submit"]["client_order_id"]
+
+    broker.submit(_request(**{"client_order_id": coid, "notional": None, **size}))
+
+    body = json.loads(http.calls("POST", "/v2/orders")[0].body or b"{}")
+    wire = {"notional": size["notional"]} if "notional" in size else {"qty": size["quantity"]}
+    assert body == {
+        "symbol": "KO",
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": coid,
+        **wire,
+        "position_intent": "buy_to_open",
+    }
+    assert body["position_intent"] == recorded["submit"]["position_intent"]
+
+
+#: STUB (plan rule 4, T226): Alpaca's order payload for a 1-share `sell_to_open`
+#: of AAPL, as the paper sandbox answered `POST /v2/orders` on 2026-10-19
+#: (`intent.short_sell_to_open`, batch1). T227's `short_open.json` replaces it.
+SHORT_OPEN_STUB: dict[str, Any] = {
+    "id": "b9fdfcab-8c5f-403f-8cd6-d6864ba6a37f",
+    "client_order_id": "tp-short-1",
+    "created_at": "2026-10-19T17:27:29.19551305Z",
+    "updated_at": "2026-10-19T17:27:29.196355824Z",
+    "submitted_at": "2026-10-19T17:27:29.19551305Z",
+    "filled_at": None,
+    "expired_at": None,
+    "canceled_at": None,
+    "failed_at": None,
+    "replaced_at": None,
+    "replaced_by": None,
+    "replaces": None,
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "symbol": "AAPL",
+    "asset_class": "us_equity",
+    "notional": None,
+    "qty": "1",
+    "filled_qty": "0",
+    "filled_avg_price": None,
+    "order_class": "",
+    "order_type": "market",
+    "type": "market",
+    "side": "sell",
+    "position_intent": "sell_to_open",
+    "time_in_force": "day",
+    "limit_price": None,
+    "stop_price": None,
+    "status": "pending_new",
+    "extended_hours": False,
+    "legs": None,
+    "trail_percent": None,
+    "trail_price": None,
+    "hwm": None,
+    "subtag": None,
+    "source": None,
+    "expires_at": "2026-10-19T20:00:00Z",
+}
+#: STUB: the cover's payload, the same order with Alpaca's buy-side fields
+#: (sandbox `intent.cover_buy_no_intent`'s shape). T227's `short_cover.json`
+#: replaces it.
+SHORT_COVER_STUB: dict[str, Any] = dict(
+    SHORT_OPEN_STUB,
+    id="30b8fd01-3521-4553-a8c8-a3ba8ea0cccd",
+    client_order_id="tp-cover-1",
+    side="buy",
+    position_intent="buy_to_close",
+)
+
+
+@pytest.mark.parametrize(
+    ("stub", "side", "intent"),
+    [
+        (SHORT_OPEN_STUB, Side.SELL, "sell_to_open"),
+        (SHORT_COVER_STUB, Side.BUY, "buy_to_close"),
+    ],
+)
+def test_a_short_request_sends_its_intent_by_whole_share_quantity(
+    stub: dict[str, Any], side: Side, intent: str
+) -> None:
+    broker, http = _broker()
+    http.route("GET", "/v2/orders:by_client_order_id", _by_client_id({}))
+    http.route("POST", "/v2/orders", (200, stub))
+
+    order = broker.submit(
+        _request(
+            client_order_id=stub["client_order_id"],
+            symbol="AAPL",
+            side=side,
+            notional=None,
+            quantity=1.0,
+            position_intent=intent,
+        )
+    )
+
+    body = json.loads(http.calls("POST", "/v2/orders")[0].body or b"{}")
+    assert body == {
+        "symbol": "AAPL",
+        "side": side.value,
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": stub["client_order_id"],
+        "qty": 1.0,
+        "position_intent": intent,
+    }
+    assert order.side is side and order.quantity == 1.0
+    assert order.status is OrderStatus.ACCEPTED and order.broker_order_id == stub["id"]
+
+
+def test_the_alpaca_adapter_is_paper_with_its_literal() -> None:
+    """Spec amendment item 1: `paper` is `True` for the adapter, which refuses
+    to build unless `alpaca.paper` is the literal `True` (T48c)."""
+    broker, _ = _broker()
+    assert broker.paper is True

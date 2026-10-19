@@ -298,6 +298,17 @@ def _risk_free_returns(
     return period_risk_free(sessions, ends, published, basis=metrics.risk_free_basis, series=series)
 
 
+def _cost_level_kind(level: float, base: float, ladder: set[float]) -> str:
+    """The `trial_metrics.cost_level_kind` of `level` (spec amendment 2026-10-18,
+    #1792, item 2): `base` for the trial's `costs.per_side_bps`, `ladder` for one
+    of `costs.sensitivity_per_side_bps`, else `measured` — the one extra level
+    `--measured-cost-bps` adds, refused when it collides with either, so it is
+    the only level that reaches the last branch."""
+    if level == base:
+        return "base"
+    return "ladder" if level in ladder else "measured"
+
+
 def metric_rows(
     results: Mapping[float, BacktestResult],
     params: Settings,
@@ -305,16 +316,22 @@ def metric_rows(
     cadence: Cadence,
     family: str,
 ) -> list[MetricRow]:
-    """Every req 8 metric per series and level at `cadence`, as `trial_metrics` rows;
-    a `family` benchmark beyond SPY and MTUM adds a series and two keys per series."""
+    """Every req 8 metric per series and level at `cadence`, as `trial_metrics`
+    rows; a `family` benchmark beyond SPY and MTUM adds a series and two keys per
+    series. Each row carries its level's `cost_level_kind`: `base`, `ladder` or
+    `measured` (spec amendment 2026-10-18, #1792, item 2), so a measured column
+    is never read as a ladder rung."""
     _check(results, params, family)
     third = family_benchmark(family)
     all_series = family_series(family)
     gross = results[GROSS_LEVEL]
     ppy = periods_per_year(cadence)
+    base = params.costs.per_side_bps
+    ladder = set(params.costs.sensitivity_per_side_bps)
     rows: list[MetricRow] = []
     for level in sorted(results):
         result = results[level]
+        kind = _cost_level_kind(level, base, ladder)
         ends = _period_ends(result, cadence)
         returns = {s: _period_returns(_series_equity(result, s), ends) for s in all_series}
         risk_free = _risk_free_returns(result, params, ends, ppy, len(ends) - 1)
@@ -333,7 +350,7 @@ def metric_rows(
                 risk_free_period_returns=risk_free,
                 family_benchmark=None if third is None else (third, returns[third]),
             )
-            rows.extend(MetricRow(series, level, key, value) for key, value in values.items())
+            rows.extend(MetricRow(series, level, key, value, kind) for key, value in values.items())
     return rows
 
 
@@ -430,6 +447,11 @@ def write_results(
     `results` is the engine's output keyed by per-side bps; `params` is the trial's
     frozen `Settings`; `detail_level` is `full` for a standalone hypothesis (the
     default) and the sweep's level for a sweep variant (strategy-lab spec req 12).
+    A measured level (`--measured-cost-bps`) arrives as one more key of `results`
+    and is written as any other non-base level: its metrics labelled `measured`
+    by `metric_rows`, its equity and rebalance rows as a ladder level's. N, V,
+    DSR and the red flag stay the base level's (module docstring, step 4), so a
+    measured level is never in them.
     Raises `ValueError` before any write when `params` are not those frozen settings,
     a level or benchmark is missing or the detail level is unknown, and
     `ResearchNotInitialised` when the store has no research tables (module docstring,

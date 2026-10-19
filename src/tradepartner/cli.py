@@ -2481,6 +2481,14 @@ def make_app(
         ] = False,
         gap_reason: Annotated[str | None, typer.Option(help="why the gap is accepted")] = None,
         note: Annotated[str | None, typer.Option(help="a note stored with the trial")] = None,
+        measured_cost_bps: Annotated[
+            float | None,
+            typer.Option(
+                "--measured-cost-bps",
+                help="one more cost level (bps per side) from a paper book's measured "
+                "slippage, in-sample only; needs --note naming its source and window",
+            ),
+        ] = None,
     ) -> None:
         """Run a registered hypothesis as one trial on the store."""
         first, last = _parse_day("--start", start), _parse_day("--end", end)
@@ -2490,6 +2498,12 @@ def make_app(
             raise _fail("--holdout-reason goes with --spend-holdout", USAGE_ERROR)
         if gap_reason is not None and not override_gap:
             raise _fail("--gap-reason goes with --override-gap", USAGE_ERROR)
+        if measured_cost_bps is not None and _blank_text(note):
+            raise _fail(
+                "--measured-cost-bps needs --note naming the source book(s) and window "
+                "(the measured level is a pre-fixed input, not a fitted one)",
+                USAGE_ERROR,
+            )
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
@@ -2508,6 +2522,7 @@ def make_app(
                 ),
                 reasons=Reasons(holdout_reason=holdout_reason, gap_reason=gap_reason),
                 note=note,
+                measured_cost_bps=measured_cost_bps,
             )
         except StoreLockedError as exc:
             raise _fail(f"store busy: {exc}", 1) from None
