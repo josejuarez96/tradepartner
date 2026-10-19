@@ -250,6 +250,7 @@ def test_the_migration_keeps_every_master_row_live(tmp_path: Path) -> None:
             (27,),
             (28,),
             (29,),
+            (30,),
         ]
         assert c.execute("SELECT count(*) FROM master_underived").fetchone() == (0,)
         migrated = _ddl(c)

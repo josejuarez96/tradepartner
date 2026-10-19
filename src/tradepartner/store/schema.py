@@ -461,7 +461,6 @@ registry; #83 took version 2 first, so the registry is version 3):
   read-only connection accepts a version-27 store: every read works but a
   `symbol_changes` read, which fails on the missing table, and the next
   writable `init_schema` call migrates the store.
-
 - **Version 29** (#1813, plan T202a; the spec's 2026-10-18 amendment item 2):
   `decision_events.reason` gains `skip_asset_unknown` and `skip_not_fractionable`
   (`DECISION_EVENT_REASONS`), and `order_events.reason` gains those two and
@@ -474,7 +473,12 @@ registry; #83 took version 2 first, so the registry is version 3):
   outside the new set. The version-6 stray-value guard reads
   `ORDER_EVENT_REASONS`. A read-only connection accepts a version-28 store:
   every read works, and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 30**, with its own migration and a
+- **Version 30** (#1713, T189c): additive `openfigi_types` current observations,
+  one row per security per change, stamped after the mapping response. A
+  `mapped = FALSE` row (FIGI fields `''`) records that a name no longer (or
+  never) maps, so an absence is a stored fact, not a stale type. Trial
+  vintage excludes the table. A read-only version-29 store serves older reads.
+- **A later DDL change goes to version 31**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -561,6 +565,7 @@ PROVENANCE_VALUES: tuple[str, ...] = (
     "snapshot_static",
     "release",
     "filing_name",
+    "openfigi",
 )
 
 #: The provenance `CHECK` set of `_TABLE_DDL`'s three master tables at their
@@ -592,6 +597,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "rates": ("release",),
     "borrow_status": ("snapshot",),
     "symbol_changes": ("action",),
+    "openfigi_types": ("openfigi",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -744,9 +750,10 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   and `skip_not_fractionable`, `order_events.reason` those two and
 #:   `skip_untradable`; both tables are rebuilt (`_migrate_skip_reasons`), every
 #:   row kept (module docstring, "Schema versions").
-#: - A later DDL change goes to version 30, with its own migration and a
+#: - 30 (#1713, T189c): additive `openfigi_types` fact table.
+#: - A later DDL change goes to version 31, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 29
+CURRENT_SCHEMA_VERSION = 30
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -874,6 +881,10 @@ _PRE_CASH_IN_LIEU_VERSION = 26
 #: read-only connections serve every other read; a `symbol_changes` read
 #: there fails on the missing table, as a `borrow_status` read did at 23.
 _PRE_SYMBOL_CHANGES_VERSION = 27
+
+#: The last version without `openfigi_types` (#1713, T189c, version 30):
+#: read-only connections serve every other read.
+_PRE_OPENFIGI_TYPES_VERSION = 29
 
 #: The last version without the skip reasons (#1813, T202a, version 29):
 #: read-only connections serve every read.
@@ -1214,6 +1225,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS symbol_changes_identity ON symbol_changes (
 )
 """
 
+_CREATE_OPENFIGI_TYPES = f"""
+CREATE TABLE IF NOT EXISTS openfigi_types (
+    security_id VARCHAR NOT NULL,
+    ticker VARCHAR NOT NULL,
+    figi VARCHAR NOT NULL,
+    composite_figi VARCHAR NOT NULL,
+    share_class_figi VARCHAR NOT NULL,
+    security_type VARCHAR NOT NULL,
+    security_type2 VARCHAR NOT NULL,
+    market_sector VARCHAR NOT NULL,
+    name VARCHAR NOT NULL,
+    exch_code VARCHAR NOT NULL,
+    mapped BOOLEAN NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["openfigi_types"])},
+    UNIQUE (security_id, known_at)
+)
+"""
+
 _CREATE_SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL,
@@ -1237,6 +1266,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "rates",
     "borrow_status",
     "symbol_changes",
+    "openfigi_types",
     "ingestion_runs",
     "schema_version",
 )
@@ -1291,6 +1321,7 @@ _SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
     _CREATE_SYMBOL_CHANGES,
     _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
 )
+_OPENFIGI_TYPES_TABLE_DDL: tuple[str, ...] = (_CREATE_OPENFIGI_TYPES,)
 
 #: The master tables a retraction can withdraw a row from (#859): each gains
 #: `retracted` at version 11.
@@ -2735,6 +2766,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
         _PRE_SKIP_REASONS_VERSION,
+        _PRE_OPENFIGI_TYPES_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2764,7 +2796,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version-24 store lacks; version 25 every read (no `filing_name` row
         # can exist there, and no read depends on the provenance `CHECK`);
         # version 26 every read; version 27 every read but `symbol_changes`;
-        # version 28 every read.
+        # version 28 every read; version 29 every read but `openfigi_types`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3662,6 +3694,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
         _PRE_SKIP_REASONS_VERSION,
+        _PRE_OPENFIGI_TYPES_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3702,6 +3735,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _RATES_TABLE_DDL
             + _BORROW_STATUS_TABLE_DDL
             + _SYMBOL_CHANGES_TABLE_DDL
+            + _OPENFIGI_TYPES_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)

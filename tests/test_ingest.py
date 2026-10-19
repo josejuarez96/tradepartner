@@ -98,6 +98,125 @@ from tradepartner.store.master import build_master
 from tradepartner.store.schema import init_schema
 
 
+def test_openfigi_revisions_errors_and_unmapped(settings: Settings) -> None:
+    from tradepartner.store.registry import data_vintage
+
+    enabled = settings.model_copy(
+        update={"openfigi": settings.openfigi.model_copy(update={"enabled": True})}
+    )
+    t0 = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    with open_for_write(enabled) as conn:
+        init_schema(conn)
+        conn.execute(
+            "CREATE TEMP TABLE figi_jobs AS SELECT * FROM (VALUES "
+            "('S1', 'VZ'), ('S2', 'BF.B'), ('S3', 'CRH')) AS v(sid, ticker)"
+        )
+        conn.execute(
+            "INSERT INTO securities (security_id, cik, name, benchmark, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, sid, sid, FALSE, ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO listings (security_id, ticker, exchange, valid_from, known_at, "
+            "ingested_at, source, provenance) "
+            "SELECT sid, ticker, 'NYSE', DATE '2025-01-01', ?, ?, 'test', 'filing' FROM figi_jobs",
+            [t0, t0],
+        )
+        conn.execute(
+            "INSERT INTO prices_daily (security_id, session, open, high, low, close, "
+            "volume, known_at, ingested_at, source, provenance) "
+            "SELECT sid, DATE '2026-10-15', 10, 11, 9, 10, 1000, ?, ?, "
+            "'test', 'bar' FROM figi_jobs",
+            [t0, t0],
+        )
+        before = data_vintage(conn, datetime(2026, 10, 16, 23, tzinfo=UTC))
+
+    calls = [0]
+    response_type = ["Common Stock"]
+    stamp_override: list[datetime | None] = [None]
+    s3_maps = [False]
+
+    def fake_mapping(
+        tickers: list[str], _config: object, **_kwargs: object
+    ) -> list[tuple[list[object], datetime, datetime]]:
+        assert tickers == ["VZ", "BF/B", "CRH"]
+        calls[0] += 1
+        stamp = stamp_override[0] or datetime(2026, 10, 16, 20, tzinfo=UTC) + timedelta(
+            minutes=calls[0]
+        )
+        item = {
+            "figi": "BBG1",
+            "compositeFIGI": "BBG1",
+            "exchCode": "US",
+            "securityType": response_type[0],
+        }
+        payload = [
+            {"data": [item]},
+            {"error": "per-job failure"},
+            {"data": [{**item, "figi": "BBG3", "securityType": "ADR"}]}
+            if s3_maps[0]
+            else {"warning": "No identifier found."},
+        ]
+        return [(payload, stamp, stamp + timedelta(seconds=1))]
+
+    now = datetime(2026, 10, 16, 21, tzinfo=UTC)
+    for expected in (2, 0, 1):
+        if calls[0] == 2:
+            response_type[0] = "Medium Term Note"
+        result = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        assert len(result.runs) == 1
+        assert result.runs[0].rows_added == expected
+        assert "unmapped=1; errors=1" in result.runs[0].message
+    with open_for_write(enabled) as conn:
+        rows = conn.execute(
+            "SELECT security_type, known_at, ingested_at FROM openfigi_types "
+            "WHERE security_id = 'S1' ORDER BY known_at"
+        ).fetchall()
+        assert [row[0] for row in rows] == ["Common Stock", "Medium Term Note"]
+        assert all(row[1] <= row[2] for row in rows)
+        assert rows[0][1] > datetime(2026, 10, 16, 20, 1, tzinfo=UTC)
+        assert rows[1][1] > datetime(2026, 10, 16, 20, 3, tzinfo=UTC)
+        # S3 never mapped: one stored `mapped = FALSE` row; S2 (per-job error) none.
+        assert conn.execute(
+            "SELECT security_id, mapped, figi FROM openfigi_types WHERE security_id <> 'S1'"
+        ).fetchall() == [("S3", False, "")]
+        assert data_vintage(conn, datetime(2026, 10, 16, 23, tzinfo=UTC)) == before
+        assert conn.execute(
+            "SELECT count(*) FROM ingestion_runs WHERE source='openfigi'"
+        ).fetchone() == (3,)
+    stamp_override[0] = datetime(2026, 10, 16, 20, 2, tzinfo=UTC)
+    response_type[0] = "Preferred Stock"
+    failed = ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+    assert failed.runs[0].status == FAILED
+    with open_for_write(enabled) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM openfigi_types").fetchone() == (3,)
+    # S3 starts mapping (a row), then stops mapping again (another row): the
+    # latest state is stored, not a stale type.
+    stamp_override[0] = None
+    response_type[0] = "Medium Term Note"
+    s3_maps[0] = True
+    calls[0] = 10
+    assert (
+        ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        .runs[0]
+        .rows_added
+        == 1
+    )
+    s3_maps[0] = False
+    calls[0] = 20
+    assert (
+        ingest_module.ingest_openfigi(enabled, clock=lambda: now, mapping=fake_mapping)
+        .runs[0]
+        .rows_added
+        == 1
+    )
+    with open_for_write(enabled) as conn:
+        assert conn.execute(
+            "SELECT mapped, figi FROM openfigi_types WHERE security_id = 'S3' ORDER BY known_at"
+        ).fetchall() == [(False, ""), (True, "BBG3"), (False, "")]
+
+
 def test_rates_backfill_is_point_in_time_and_idempotent(
     settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
 ) -> None:
