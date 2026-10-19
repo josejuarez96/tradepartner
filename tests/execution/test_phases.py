@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -729,6 +730,27 @@ def test_a_whole_share_buy_that_does_not_fit_is_deferred_and_cash_left_is_not_ne
     result = _buys([THREE[2]], 40.0, costs=NO_COSTS)
     assert (result.orders, result.deferred, result.cash_left) == ((), (3,), 40.0)
     assert _buys(THREE, 0.0).cash_left == 0.0
+
+
+def test_small_account_skips_a_nonfractionable_buy_below_one_share_only_when_enabled() -> None:
+    buy = _d(3, "buy", target=20.0, whole_share=True)
+    assets = {"SEC_3": WHOLE}
+    on = RiskConfig.model_validate({"small_account": {"enabled": True}})
+    skipped = _buys([buy], 100.0, costs=NO_COSTS, assets=assets, frozen=on)
+    assert _reasons(skipped) == {"SEC_3": "skip_not_fractionable"}
+    assert skipped.orders == () and skipped.deferred == ()
+    assert skipped.skips[0].counts_toward_cap
+
+    off = _buys([buy], 100.0, costs=NO_COSTS, assets=assets)
+    assert off.skips == () and off.deferred == (3,)
+
+    short_buy = replace(buy, position_side="short")
+    short = _buys([short_buy], 100.0, costs=NO_COSTS, assets=assets, frozen=on)
+    assert short.skips == () and short.deferred == (3,)
+
+    funded_later = _d(3, "buy", target=300.0, whole_share=True)
+    cash_short = _buys([funded_later], 40.0, costs=NO_COSTS, assets=assets, frozen=on)
+    assert cash_short.skips == () and cash_short.deferred == (3,)
 
 
 def test_an_untradable_buy_skips_and_a_lost_fractionable_one_goes_by_whole_shares() -> None:

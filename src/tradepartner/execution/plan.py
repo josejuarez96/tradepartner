@@ -1106,7 +1106,8 @@ def decisions_from(
     - a full exit worth less than `risk.min_order_notional`, or a whole-share one
       below one share, is plan-time `dust` (never by the buffered-share minimum,
       ADR 0010 amendment 2026-09-30); a trade below the minimum is
-      `skip_below_minimum`, and exactly zero `skip_zero`.
+      `skip_below_minimum`, except a small-account whole-share buy stays open
+      for the buys phase's fractionability check; exactly zero is `skip_zero`.
 
     `band` (the frozen `strategy.rebalance_band`, default 0.0) suppresses a
     trade whose absolute drift from target is within the band: the planned
@@ -1311,7 +1312,8 @@ def decisions_from(
             # (shakedown E.3 measures fills against `planned_notional`).
             intents[sid] = replace(intent, notional=minimum)
             intent = intents[sid]
-        if intent.notional == 0 or intent.notional < minimum:
+        small_whole_buy = frozen.small_account.enabled and intent.side == _BUY and whole
+        if intent.notional == 0 or (intent.notional < minimum and not small_whole_buy):
             decided[sid] = Decision(
                 **base(sid),
                 decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
