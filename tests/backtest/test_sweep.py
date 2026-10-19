@@ -646,3 +646,30 @@ def test_a_combined_fixed_block_at_the_default_is_accepted(tmp_path: Path) -> No
         parsed = parse_sweep_file(path, _settings(strategy={"turnover_top_fraction": 0.5}))
         variants = expand_grid(parsed, _settings(strategy={"turnover_top_fraction": 0.5}))
         assert all(v.frozen_set[TURNOVER_KEY] == 1.0 for v in variants)
+
+
+# --- the cost terms: post-registration `costs.*` keys (#1792, T210) ------------------
+
+COST_TERMS = {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20}
+
+
+def test_a_fixed_block_without_the_terms_freezes_their_defaults_not_the_live_ones() -> None:
+    """`required_keys` lacks the three, so a registered sweep's fixed block still parses;
+    each variant freezes the table defaults, never a live `.env` value."""
+    live = _settings(costs={"spread_bps": 5.0, "impact_coeff": 0.1, "adv_sessions": 60})
+    parsed = parse_sweep_file(SWEEP, live)
+    assert not set(COST_TERMS) & set(parsed.fixed_params)
+    for variant in expand_grid(parsed, live):
+        assert {key: variant.frozen_set[key] for key in COST_TERMS} == COST_TERMS
+
+
+def test_a_fixed_block_naming_a_term_freezes_it_in_every_variant(tmp_path: Path) -> None:
+    settings = _settings()
+    path = _rewrite(
+        tmp_path, SWEEP, "per_side_bps = 15.0\n", "per_side_bps = 15.0\nimpact_coeff = 0.1\n"
+    )
+    variants = expand_grid(parse_sweep_file(path, settings), settings)
+    assert {v.frozen_set["costs.impact_coeff"] for v in variants} == {0.1}
+    assert {v.frozen_set["costs.spread_bps"] for v in variants} == {0.0}
+    base = expand_grid(parse_sweep_file(SWEEP, settings), settings)
+    assert {v.fingerprint for v in variants}.isdisjoint({v.fingerprint for v in base})

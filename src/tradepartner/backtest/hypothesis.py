@@ -207,12 +207,14 @@ def family_frozen_keys(family: str) -> tuple[str, ...]:
 def required_keys(family: str) -> frozenset[str]:
     """The config keys a `family` hypothesis file must name (besides `in_sample_start`):
     every key of its listed sections (`FAMILIES[family].sections`) not in
-    `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key. Raises `KeyError` for
-    an unlisted family (ADR 0014 point 2: the momentum fallback goes)."""
+    `frozen.POST_REGISTRATION_OWN_KEYS`, plus every `costs.*` key not in
+    `frozen.POST_REGISTRATION_COST_KEYS` (those are frozen at their table default when
+    absent, never required). Raises `KeyError` for an unlisted family (ADR 0014 point 2:
+    the momentum fallback goes)."""
     keys = set(REQUIRED_SINGLE_KEYS)
     for section in (*FAMILIES[family].sections, "costs"):  # type: ignore[index]
         keys.update(_section_keys(section))
-    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS)
+    return frozenset(keys - frozen.POST_REGISTRATION_OWN_KEYS - frozen.POST_REGISTRATION_COST_KEYS)
 
 
 #: Keys that are one family's rule although other families list their section
@@ -403,7 +405,7 @@ def frozen_params(parsed: HypothesisFile, settings: Settings) -> dict[str, Any]:
     defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     fixed = {
         key: defaults[key]
-        for key in sorted(frozen.POST_REGISTRATION_OWN_KEYS)
+        for key in sorted(frozen.POST_REGISTRATION_OWN_KEYS | frozen.POST_REGISTRATION_COST_KEYS)
         if key not in parsed.file_params and key.partition(".")[0] not in inert
     }
     params = frozen_params_of(
@@ -454,21 +456,29 @@ def _rule_differences(
         )
         if ours != theirs
     ]
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
-        if key == registry.BASE_COST_KEY:
+        if key in frozen.HIGHER_ALLOWED_COST_KEYS:
+            if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
+                continue
+            differences.append(f"{key} (lower than the family's {rule})")
+        elif key == "costs.adv_sessions":
+            if value is not None and frozen.is_default(value, rule):
+                continue
+            differences.append(key)
+        elif key == registry.BASE_COST_KEY:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
             differences.append(f"{key} (lower than the family's {rule})")
         elif key not in params or not frozen.is_default(value, rule):
             differences.append(key)
-    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     differences += sorted(
         f"{key} (not fixed by the family rules)"
         for key, value in params.items()
         if key.startswith(FORBIDDEN_AXIS_PREFIXES)
         and key not in rules.fixed_params
-        and not (key in defaults and frozen.is_default(value, defaults[key]))
+        and not (key in defaults and frozen._cost_key_allows(key, value, defaults[key]))
     )
     return differences
 

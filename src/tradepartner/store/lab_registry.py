@@ -46,6 +46,7 @@ from typing import Any, Final
 
 import duckdb
 
+import tradepartner.backtest.frozen as _frozen
 from tradepartner.backtest.frozen import FROZEN_KEY_DEFAULTS, frozen_values, is_default
 from tradepartner.backtest.holdout import Frozen, default_in_sample_window
 from tradepartner.backtest.metrics import expected_max_sharpe
@@ -702,21 +703,29 @@ def _rule_differences(record: HypothesisRecord, rules: FamilyRules) -> tuple[str
         if getattr(record, column) != getattr(rules, column)
     ]
     values = frozen_values(record)
+    defaults = {key: default for key, default, _version in FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = values.get(key)
-        if key == BASE_COST_KEY and isinstance(value, int | float) and value >= rule:
+        if key in _frozen.HIGHER_ALLOWED_COST_KEYS:
+            if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
+                continue
+            differences.append(key)
+        elif key == "costs.adv_sessions":
+            if value is not None and is_default(value, rule):
+                continue
+            differences.append(key)
+        elif key == BASE_COST_KEY and isinstance(value, int | float) and value >= rule:
             continue
-        if key not in values or not is_default(value, rule):
+        elif key not in values or not is_default(value, rule):
             differences.append(key)
     # Rules written before a table key landed lack it: they are read at its default too,
     # as `frozen_values` reads the registration (#1199's `gap.stale_listing_sessions`).
-    defaults = {key: default for key, default, _version in FROZEN_KEY_DEFAULTS}
     differences += sorted(
         key
         for key in values
         if key not in rules.fixed_params
         and key.startswith(FORBIDDEN_AXIS_PREFIXES)
-        and not (key in defaults and is_default(values[key], defaults[key]))
+        and not (key in defaults and _frozen._cost_key_allows(key, values[key], defaults[key]))
     )
     return tuple(differences)
 
