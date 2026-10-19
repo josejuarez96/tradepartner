@@ -334,12 +334,20 @@ RISK_FREE_KEYS = (
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
 #: T217's three post-registration own-section keys (backtest spec amendment #1820).
 SHOCK_KEYS = ("strategy.signal_delay_sessions", "strategy.placebo", "strategy.placebo_seed")
+#: T187's successor-chain keys (#821), table entries at version 30.
+CHAIN_KEYS = (
+    "master.chains",
+    "master.chains_dismissed",
+    "master.chain_window_sessions",
+    "master.chain_max_price_ratio",
+)
 COMBINED_LATER_KEYS = (
     "strategy.turnover_top_fraction",
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
     "universe.rank_by",
     *SHOCK_KEYS,
+    *CHAIN_KEYS,
 )
 
 
@@ -381,6 +389,7 @@ LATER_KEYS = (
     *HOLD_KEYS,
     "universe.rank_by",
     *SHOCK_KEYS,
+    *CHAIN_KEYS,
 )
 
 
@@ -579,7 +588,7 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
     parsed = hypothesis.parse_file(path)
     params = hypothesis.frozen_params(parsed, _defaults_settings())
     assert (
-        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by")))
+        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by", *CHAIN_KEYS)))
         == params_sha256
     )
     assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
@@ -779,9 +788,9 @@ SHOCK_ENTRIES = (
 
 
 def test_shock_entries_are_last_and_pinned_by_value() -> None:
-    """Appended in landing order (#1792) at their defaults, at schema version 29; the
-    last-entry pin is these three's until a later entry lands and re-pins it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:], SHOCK_ENTRIES)
+    """Appended in landing order (#1792) at their defaults, at schema version 29, just
+    before T187's four chain entries (which re-pin the last-entry slot)."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-7:-4], SHOCK_ENTRIES)
     keys = [key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS]
     assert keys.index(SHOCK_KEYS[0]) > keys.index(RANK_BY_KEY)
     assert set(SHOCK_KEYS) <= set(hypothesis.frozen_keys())
@@ -872,3 +881,39 @@ def test_a_non_default_shock_enters_the_canonical_set_and_the_fingerprint(
         )
     twin = {**_new_params(settings), key: value}
     assert frozen.fingerprint("momentum", twin, start) != TWIN_FINGERPRINT
+
+
+# --- the successor-chain keys (#821, T187) ----------------------------------------------
+
+CHAIN_ENTRIES = (
+    ("master.chains", [], 30),
+    ("master.chains_dismissed", [], 30),
+    ("master.chain_window_sessions", 65, 30),
+    ("master.chain_max_price_ratio", 1.15, 30),
+)
+
+
+def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
+    """The four keys enter the table at their config defaults (version 30), so a
+    registration stored without them reads the same canonical set and fingerprint;
+    a non-default chain list is a different frozen set."""
+    table = {key: (default, version) for key, default, version in frozen.FROZEN_KEY_DEFAULTS}
+    for key, default, version in CHAIN_ENTRIES:
+        assert table[key] == (default, version), key
+    settings = _defaults_settings()
+    keys = CHAIN_KEYS
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-4:], CHAIN_ENTRIES)
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        start = date(2017, 1, 31)
+        without = _before(params, keys)
+        assert frozen.fingerprint(family, params, start) == frozen.fingerprint(
+            family, without, start
+        )
+        assert frozen.canonical_frozen_set(params, family) == frozen.canonical_frozen_set(
+            without, family
+        )
+        chained = {**params, "master.chains": ["0001000010->0001000011@0001000011-24-000001"]}
+        assert "master.chains" in frozen.canonical_frozen_set(chained, family)

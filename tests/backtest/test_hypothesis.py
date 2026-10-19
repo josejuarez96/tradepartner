@@ -639,6 +639,10 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "strategy.signal_delay_sessions",
             "strategy.placebo",
             "strategy.placebo_seed",
+            "master.chains",
+            "master.chains_dismissed",
+            "master.chain_window_sessions",
+            "master.chain_max_price_ratio",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1317,6 +1321,10 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
+        "master.chains",
+        "master.chains_dismissed",
+        "master.chain_window_sessions",
+        "master.chain_max_price_ratio",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(

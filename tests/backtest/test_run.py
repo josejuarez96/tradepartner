@@ -749,6 +749,10 @@ def test_a_pre_lab_registration_loads_backtests_and_records(
                 "strategy.signal_delay_sessions",
                 "strategy.placebo",
                 "strategy.placebo_seed",
+                "master.chains",
+                "master.chains_dismissed",
+                "master.chain_window_sessions",
+                "master.chain_max_price_ratio",
             )
         )
     }
@@ -855,6 +859,10 @@ def _register_more(
             "strategy.signal_delay_sessions",
             "strategy.placebo",
             "strategy.placebo_seed",
+            "master.chains",
+            "master.chains_dismissed",
+            "master.chain_window_sessions",
+            "master.chain_max_price_ratio",
         )
         params = {k: v for k, v in params.items() if not k.startswith(later)}
     with open_for_write(_store(path)) as conn:
