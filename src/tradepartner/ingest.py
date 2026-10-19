@@ -285,9 +285,11 @@ from tradepartner.store.delistings import (
     listing_ends_as_of,
 )
 from tradepartner.store.master import (
+    ChainCandidate,
     MasterBuild,
     build_chains,
     build_master,
+    chain_candidates,
     primary_security_id,
     securities_as_of,
     security_cik,
@@ -1395,6 +1397,9 @@ def _ingest_filings(
         chain_tally = _write_chains(conn, master, now, unjudged=unjudged_ciks, skipped=skipped)
         added += chain_tally.inserted
         chains = chain_tally.message()
+    candidates = _chain_candidate_clause(
+        chain_candidates(_unwrap(filings), settings, master, delistings=delistings.delistings)
+    )
     statements = ""
     if settings.edgar.statement_facts_enabled:
         tally = _write_statement_facts(
@@ -1427,10 +1432,19 @@ def _ingest_filings(
         f"{len(master.securities)} securities; unmatched: {len(master.unmatched_snapshot)} "
         f"snapshot, {len(delistings.unmatched)} delistings, {len(unmatched)} facts"
         f"{statements}{events}{rebuilt}{restamped}{_source_counts(filings)}"
-        f"{_filename_counts(master, delistings, filings)}{chains}; "
+        f"{_filename_counts(master, delistings, filings)}{chains}{candidates}; "
         f"missing benchmarks: {', '.join(master.missing_benchmarks) or 'none'}"
     )
     return added, message
+
+
+def _chain_candidate_clause(candidates: Sequence[ChainCandidate]) -> str:
+    """The #821 chain-candidate clause of the EDGAR run row: the count and the
+    successor ids, or `none`. Health reads it beside `chain_price_break`."""
+    if not candidates:
+        return "; chain_candidates: none"
+    named = ", ".join(candidate.successor_id for candidate in candidates)
+    return f"; chain_candidates: {len(candidates)}: {named}"
 
 
 def _filename_counts(master: MasterBuild, delistings: Any, filings: FilingSource) -> str:

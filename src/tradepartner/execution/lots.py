@@ -12,9 +12,19 @@ journal. Nothing here reads a clock or the store.
 - **Disposals.** Each sale closes lots first in, first out by trade time, one
   disposal per lot touched, with proceeds, realised gain or loss before any
   wash-sale adjustment, and the tax year of the local trade date (R20). A sale
-  of more than the ledger holds raises `LotLedgerError`: the vehicle is long
-  only, and so does any order whose `position_side` is not long (ADR 0015
-  seam 2).
+  of more than the ledger holds raises `LotLedgerError`.
+- **Short lots (T232, paper spec amendment #1872 item 10).** An order's
+  `position_side` is `short` for a `sell_to_open` (a sell) and a `buy_to_close`
+  (a buy). A short sale opens a lot with `position_side == "short"`, an
+  unsigned quantity and `cost_basis` = -(the sale's value); a cover closes
+  short lots first in, first out, one disposal per lot, with `proceeds` =
+  -(the cover's cost). So `realised_pnl = proceeds - basis` holds for both
+  sides (owner decision 2026-10-19, #1903), the formula `lots_reconcile` reads.
+  A cover is at most the held short, and a name is never long and short at
+  once: a short sale of a name held long, a purchase of one held short, and a
+  cover with no short lot each raise `LotLedgerError`. Wash-sale scanning of
+  short disposals, and short lots as replacements, are deferred to Phase 6
+  (ADR 0015, ADR 0024 item 8): the scan reads long lots and disposals only.
 - **Merged orders.** An order with any `price_implied` fill (the synthetic
   residual of `paper resume`) becomes one acquisition or one sale: its fills'
   total quantity at the order's average price (their total value over their
@@ -55,6 +65,9 @@ from zoneinfo import ZoneInfo
 from tradepartner.adapters.broker import Asset
 from tradepartner.store.journal import OrderedFill, OrderRow
 from tradepartner.store.schema import LONG
+
+#: A short lot or disposal (T232); the other side is `schema.LONG`.
+SHORT = "short"
 
 #: IRC section 1091(a): the window runs from this many days before a loss sale
 #: to this many days after it (the "61-day period" of 26 CFR 1.1091-1(a)).
@@ -97,6 +110,7 @@ class Lot:
     fill_id: int | None
     client_order_id: str  # the acquiring order (not a `lots` column; T62 attributes by it)
     book_id: str  # the acquiring order's book (ADR 0015 seam 1, plan T133)
+    position_side: str = LONG  # `schema.LONG` or `SHORT` (T232)
 
 
 @dataclass(frozen=True)
@@ -116,6 +130,7 @@ class Disposal:
     fill_id: int | None
     client_order_id: str  # the selling order (not a `disposals` column; T62 attributes by it)
     book_id: str  # the selling order's book (ADR 0015 seam 1, plan T133)
+    position_side: str = LONG  # the closed lot's side (T232)
 
 
 @dataclass(frozen=True)
@@ -144,6 +159,7 @@ class _Trade:
     order_key: int  # the lowest fill_id, for a stable order within an instant
     client_order_id: str
     book_id: str  # the order's book (ADR 0015 seam 1, plan T133)
+    position_side: str = LONG  # the order's `position_side` (T232)
 
 
 @dataclass
@@ -166,26 +182,35 @@ def rebuild(
     A loss's flags depend on acquisitions after it, as the rule requires, so a
     caller reporting the ledger as of an instant t must pass only fills with
     `known_at <= t`; `fills_for` does not filter by `known_at`. Raises
-    `LotLedgerError` on a sale beyond the holding, which a split, a spin-off
-    receipt or a stock merger (none of them a fill) produces, and on a fill
-    with a non-finite quantity or price or a naive `filled_at`: a writer must
-    catch it and alert rather than fail its run. Also raises it on any order
-    whose `position_side` is not `schema.LONG`: closing short lots is the
-    shorting ADR's (ADR 0015 seam 2), so every `Lot` and `Disposal` is long
-    and `LotRow` and `DisposalRow` keep the DDL default."""
+    `LotLedgerError` on a sale or cover beyond the holding, which a split, a
+    spin-off receipt or a stock merger (none of them a fill) produces, and on a
+    fill with a non-finite quantity or price or a naive `filled_at`: a writer
+    must catch it and alert rather than fail its run. Also raises it on any
+    order whose `position_side` is neither `schema.LONG` nor `SHORT`, and on
+    a name that would be long and short at once (module docstring)."""
     for order in orders:
-        if order.position_side != LONG:
+        if order.position_side not in (LONG, SHORT):
             raise LotLedgerError(
                 f"order {order.client_order_id!r} has position_side "
-                f"{order.position_side!r}: the lot ledger is long only"
+                f"{order.position_side!r}: only 'long' and 'short' lots exist"
             )
     lot_list: list[Lot] = []
     disposals: list[Disposal] = []
     same_sale: dict[int, dict[int, Decimal]] = {}  # disposal id -> lot id -> quantity sold
-    open_lots: dict[str, list[_OpenLot]] = {}
+    open_lots: dict[str, list[_OpenLot]] = {}  # long lots per security
+    open_shorts: dict[str, list[_OpenLot]] = {}  # short lots per security
     for trade in _trades(fills, orders):
         local = trade.trade_at.astimezone(_EXCHANGE_TZ).date()
-        if trade.side == "buy":
+        short = trade.position_side == SHORT
+        opening = trade.side == ("sell" if short else "buy")
+        mine, other = (open_shorts, open_lots) if short else (open_lots, open_shorts)
+        if opening and other.get(trade.security_id):
+            raise LotLedgerError(
+                f"order {trade.client_order_id!r} has position_side {trade.position_side!r} "
+                f"on {trade.symbol}, held {'long' if short else 'short'}: a name is never "
+                f"long and short at once"
+            )
+        if opening:
             asset = assets.get(trade.symbol)
             lot = Lot(
                 lot_id=len(lot_list) + 1,
@@ -198,20 +223,22 @@ def rebuild(
                 trade_at=trade.trade_at,
                 trade_date_local=local,
                 quantity=float(trade.quantity),
-                cost_basis=float(trade.value),
+                cost_basis=float(-trade.value if short else trade.value),
                 fill_id=trade.fill_id,
                 client_order_id=trade.client_order_id,
                 book_id=trade.book_id,
+                position_side=trade.position_side,
             )
             lot_list.append(lot)
-            open_lots.setdefault(trade.security_id, []).append(
-                _OpenLot(lot, trade.quantity, trade.value)
+            mine.setdefault(trade.security_id, []).append(
+                _OpenLot(lot, trade.quantity, -trade.value if short else trade.value)
             )
             continue
-        closed = _close_fifo(open_lots.get(trade.security_id, []), trade)
+        closed = _close_fifo(mine.get(trade.security_id, []), trade)
+        sign = -1 if short else 1
         this_sale = {held.lot.lot_id: sold for held, sold, _ in closed}
         for held, sold, basis in closed:
-            proceeds = trade.value * sold / trade.quantity
+            proceeds = sign * trade.value * sold / trade.quantity
             disposal = Disposal(
                 disposal_id=len(disposals) + 1,
                 lot_id=held.lot.lot_id,
@@ -225,6 +252,7 @@ def rebuild(
                 fill_id=trade.fill_id,
                 client_order_id=trade.client_order_id,
                 book_id=trade.book_id,
+                position_side=trade.position_side,
             )
             disposals.append(disposal)
             same_sale[disposal.disposal_id] = this_sale
@@ -271,6 +299,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                     order_key=min(_fill_key(item) for item in group),
                     client_order_id=first.fill.client_order_id,
                     book_id=known[first.fill.client_order_id].book_id,
+                    position_side=known[first.fill.client_order_id].position_side,
                 )
             )
             continue
@@ -286,6 +315,7 @@ def _trades(fills: Sequence[OrderedFill], orders: Sequence[OrderRow]) -> list[_T
                 order_key=_fill_key(item),
                 client_order_id=item.fill.client_order_id,
                 book_id=known[item.fill.client_order_id].book_id,
+                position_side=known[item.fill.client_order_id].position_side,
             )
             for item, quantity, price in parts
         )
@@ -297,7 +327,8 @@ def _close_fifo(held: list[_OpenLot], sale: _Trade) -> list[tuple[_OpenLot, Deci
     per lot touched. Lots are appended in trade order, so the list is FIFO."""
     if sum((lot.quantity for lot in held), _ZERO) < sale.quantity:
         raise LotLedgerError(
-            f"sale of {sale.quantity} {sale.symbol} at {sale.trade_at.isoformat()} is more "
+            f"{sale.side} order {sale.client_order_id!r} (position_side {sale.position_side!r}) "
+            f"of {sale.quantity} {sale.symbol} at {sale.trade_at.isoformat()} is more "
             f"than the ledger holds"
         )
     closed: list[tuple[_OpenLot, Decimal, Decimal]] = []
@@ -322,12 +353,15 @@ def _wash_sale_flags(
 ) -> list[WashSaleFlag]:
     """Match each loss disposal, in disposal order, to replacement shares in
     acquisition order; each share absorbs one loss (module docstring)."""
-    by_acquisition = sorted(lot_list, key=lambda lot: (lot.trade_at, lot.lot_id))
+    by_acquisition = sorted(
+        (lot for lot in lot_list if lot.position_side == LONG),
+        key=lambda lot: (lot.trade_at, lot.lot_id),
+    )
     absorbed: dict[int, Decimal] = {}
     flags: list[WashSaleFlag] = []
     for disposal in disposals:
         loss = -_dec(disposal.realised_pnl)
-        if loss <= _ZERO:
+        if loss <= _ZERO or disposal.position_side != LONG:
             continue
         security = next(lot.security_id for lot in lot_list if lot.lot_id == disposal.lot_id)
         sold_here = same_sale[disposal.disposal_id]

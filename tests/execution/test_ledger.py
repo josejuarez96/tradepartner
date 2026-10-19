@@ -821,3 +821,121 @@ def test_a_split_holding_exits_fully(bought: float, ratio: float, after_split: f
 def test_a_tiny_split_ratio_is_not_rounded_to_zero() -> None:
     held = _ledger([_fill(BUY_A, 10**8, 50.0)], [BUY_A], actions=_splits((A, D8, 1e-7))).positions
     assert held == {A: pytest.approx(10.0)}
+
+
+# --- Short holdings, signed cash and equity (T232; paper spec amendment #1872,
+# item 10; ADR 0010 amendment 2026-10-19, the restated cash rule) -------------
+#
+# An order's intent is (`side`, `position_side`) (item 3). A `sell_to_open`
+# fill credits its proceeds and a `buy_to_close` fill debits its notional; the
+# short is held as an unsigned `short_holdings` entry, apart from `positions`,
+# so a long-side oversell stays the journal error `short_names` reports (the
+# test above). Equity at the mark is cash + long value - short value; the free
+# cash the buys use is cash less the short value at the same marks.
+
+SHORT = "short"
+
+
+def _short_order(security_id: str, side: str, session: date, attempt: int = 1) -> OrderRow:
+    """`sell` is `sell_to_open` (buy phase), `buy` is `buy_to_close` (sell phase)."""
+    order = _order(security_id, side, session, attempt)
+    return OrderRow(
+        **{
+            **order.__dict__,
+            "position_side": SHORT,
+            "phase": "buy" if side == "sell" else "sell",
+        }
+    )
+
+
+def test_a_short_open_partial_cover_and_full_cover() -> None:
+    """Hand values, starting cash 1000:
+
+    D1 sell_to_open A 10 @ 50.00  cash 1000 + 500 = 1500  short A 10
+    D5 buy_to_close A  4 @ 45.00  cash 1500 - 180 = 1320  short A  6
+    D8 buy_to_close A  6 @ 47.50  cash 1320 - 285 = 1035  short A  0
+    """
+    open_ = _short_order(A, "sell", D1)
+    partial = _short_order(A, "buy", D5)
+    full = _short_order(A, "buy", D8)
+    orders = [open_, partial, full]
+    fills = [
+        _fill(open_, 10, 50.0, fill_id=1),
+        _fill(partial, 4, 45.0, fill_id=2),
+        _fill(full, 6, 47.5, fill_id=3),
+    ]
+
+    opened = _ledger(fills, orders, through=D1)
+    assert opened.positions == {}
+    assert opened.short_holdings == {A: 10.0}
+    assert opened.short_names == ()
+    assert opened.cash == pytest.approx(1500.0)
+    # equity 1500 - 10 x 48 = 1020; free cash the same, with no long leg.
+    assert opened.equity({A: 48.0}) == pytest.approx(1020.0)
+    assert opened.free_cash({A: 48.0}) == pytest.approx(1020.0)
+
+    covered_in_part = _ledger(fills, orders, through=D5)
+    assert covered_in_part.positions == {}
+    assert covered_in_part.short_holdings == {A: 6.0}
+    assert covered_in_part.cash == pytest.approx(1320.0)
+    # equity 1320 - 6 x 45 = 1050.
+    assert covered_in_part.equity({A: 45.0}) == pytest.approx(1050.0)
+
+    covered = _ledger(fills, orders, through=D8)
+    assert covered.positions == {}
+    assert covered.short_holdings == {}
+    assert covered.cash == pytest.approx(1035.0)
+    # Nothing held: equity and free cash are the cash, 35 above the start
+    # (500 received - 465 paid).
+    assert covered.equity({}) == pytest.approx(1035.0)
+    assert covered.free_cash({}) == pytest.approx(1035.0)
+
+
+def test_a_short_and_a_long_of_different_names_in_one_ledger() -> None:
+    """Hand values, starting cash 1000:
+
+    D1 buy          B  8 @ 25.00  cash 1000 - 200 = 800
+    D1 sell_to_open A 10 @ 50.00  cash  800 + 500 = 1300   long B 8, short A 10
+    D5 buy_to_close A  4 @ 40.00  cash 1300 - 160 = 1140
+    D5 sell         B  3 @ 30.00  cash 1140 +  90 = 1230   long B 5, short A 6
+    """
+    buy_b = _order(B, "buy", D1)
+    short_a = _short_order(A, "sell", D1)
+    cover_a = _short_order(A, "buy", D5)
+    sell_b = _order(B, "sell", D5)
+    orders = [buy_b, short_a, cover_a, sell_b]
+    fills = [
+        _fill(buy_b, 8, 25.0, fill_id=1),
+        _fill(short_a, 10, 50.0, fill_id=2),
+        _fill(cover_a, 4, 40.0, fill_id=3),
+        _fill(sell_b, 3, 30.0, fill_id=4),
+    ]
+
+    day_one = _ledger(fills, orders, through=D1)
+    assert day_one.positions == {B: 8.0}
+    assert day_one.short_holdings == {A: 10.0}
+    assert day_one.short_names == ()
+    assert day_one.cash == pytest.approx(1300.0)
+    # At the fill prices: equity 1300 + 8 x 25 - 10 x 50 = 1000 (nothing made
+    # yet); free cash 1300 - 500 = 800, the long value never added.
+    assert day_one.equity({A: 50.0, B: 25.0}) == pytest.approx(1000.0)
+    assert day_one.free_cash({A: 50.0, B: 25.0}) == pytest.approx(800.0)
+    # At A 40, B 30: equity 1300 + 240 - 400 = 1140; free cash 1300 - 400 = 900.
+    assert day_one.equity({A: 40.0, B: 30.0}) == pytest.approx(1140.0)
+    assert day_one.free_cash({A: 40.0, B: 30.0}) == pytest.approx(900.0)
+
+    day_five = _ledger(fills, orders, through=D5)
+    assert day_five.positions == {B: 5.0}
+    assert day_five.short_holdings == {A: 6.0}
+    assert day_five.cash == pytest.approx(1230.0)
+    # Trading at the marks leaves equity where it was: 1230 + 5 x 30 - 6 x 40
+    # = 1140; free cash 1230 - 240 = 990.
+    assert day_five.equity({A: 40.0, B: 30.0}) == pytest.approx(1140.0)
+    assert day_five.free_cash({A: 40.0, B: 30.0}) == pytest.approx(990.0)
+
+
+def test_a_long_ledgers_free_cash_is_its_cash() -> None:
+    """With no short leg the restated cash rule is the old one: 1000 - 200."""
+    ledger = _ledger([_fill(BUY_A, 4, 50.0, fill_id=1)], [BUY_A], through=D1)
+    assert ledger.short_holdings == {}
+    assert ledger.free_cash({A: 55.0}) == pytest.approx(800.0)
