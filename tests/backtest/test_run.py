@@ -1363,6 +1363,84 @@ def test_a_measured_level_equal_to_the_base_or_a_ladder_level_is_refused(
     assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
 
 
+# --- T217b: the ladder's trial-row note tag and the placebo refusals -----------------
+
+
+def _register_shocked_on(
+    path: Path, slug: str, holdout_end: date = HOLDOUT[1], **strategy: Any
+) -> None:
+    frozen = Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5, **strategy},
+        holdout={"start": HOLDOUT[0], "end": holdout_end},
+        gap={"count_share_threshold": 0.05},
+    )
+    with open_for_write(_store(path)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title=slug,
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256="2" * 64,
+            params=frozen_params_of(frozen, family="momentum"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=holdout_end,
+            registered_by="test",
+            settings=frozen,
+        )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "note", "expected"),
+    [
+        ({"placebo": "shuffle", "placebo_seed": 7}, None, "placebo=shuffle seed=7"),
+        ({"signal_delay_sessions": 1}, None, "signal_delay=1"),
+        (
+            {"placebo": "shuffle", "placebo_seed": 7, "signal_delay_sessions": 1},
+            None,
+            "placebo=shuffle seed=7 signal_delay=1",
+        ),
+        ({"placebo": "shuffle", "placebo_seed": 7}, "x", "placebo=shuffle seed=7; x"),
+        ({"signal_delay_sessions": 1}, "x", "signal_delay=1; x"),
+        ({}, "x", "x"),
+        ({}, None, None),
+    ],
+)
+def test_the_trial_row_note_carries_the_shock_tag(
+    store: Path,
+    read: Read,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: dict[str, Any],
+    note: str | None,
+    expected: str | None,
+) -> None:
+    _spy(monkeypatch)
+    _register_shocked_on(store, "h-shock", **strategy)
+    outcome = run_hypothesis(
+        "h-shock", None, None, Flags(), synthetic=True, store_path=store, note=note
+    )
+
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["kind"], trial["note"]) == ("in_sample", expected)
+
+
+@pytest.mark.parametrize("mode", ["shuffle", "random_entry"])
+def test_a_holdout_run_of_a_placebo_file_is_refused_with_no_trial_row(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    calls = _spy(monkeypatch)
+    _register_shocked_on(store, "h-fake", placebo=mode, placebo_seed=7)
+
+    with pytest.raises(ValueError, match=r"h-fake: refused_placebo"):
+        run_hypothesis("h-fake", *HOLDOUT_WINDOW, SPEND, reasons=SPEND_REASON, store_path=store)
+
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
 @pytest.mark.parametrize("x", [-1.0, float("nan"), float("inf")], ids=["negative", "nan", "inf"])
 def test_a_non_finite_or_negative_measured_level_is_refused(
     store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, x: float
@@ -1374,3 +1452,44 @@ def test_a_non_finite_or_negative_measured_level_is_refused(
         )
     assert calls == []
     assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_tracking_run_of_a_placebo_file_is_refused_with_no_trial_row(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    _register_shocked_on(
+        store, "h-fake", holdout_end=date(2019, 8, 30), placebo="shuffle", placebo_seed=7
+    )
+
+    with pytest.raises(ValueError, match=r"h-fake: refused_placebo"):
+        run_hypothesis(
+            "h-fake",
+            date(2019, 8, 30),
+            date(2019, 9, 30),
+            Flags(),
+            store_path=store,
+            kind="tracking",
+        )
+
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_delayed_file_is_not_refused_a_holdout_or_tracking_run(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale-signal strategy is implementable: only the placebo is a fake signal."""
+    _spy(monkeypatch)
+    _register_shocked_on(store, "h-late", signal_delay_sessions=1)
+    outcome = run_hypothesis(
+        "h-late",
+        *HOLDOUT_WINDOW,
+        OVERRIDE,
+        reasons=OVERRIDE_REASONS,
+        synthetic=True,
+        store_path=store,
+    )
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["kind"], trial["note"]) == ("holdout", "signal_delay=1")
