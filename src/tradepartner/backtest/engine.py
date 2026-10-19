@@ -245,6 +245,7 @@ class _Book:
     weights: list[WeightRow] = field(default_factory=list)
     values: list[pl.DataFrame] = field(default_factory=list)
     keep_detail: bool = True
+    chained_positions: int = 0  # #821: positions renamed by a successor chain this step
 
 
 def _check_levels(cost_levels: Sequence[float]) -> list[float]:
@@ -787,9 +788,21 @@ def _step(
             n_stale_exits=sum(e.stale for e in exits),
             n_dropped_dividends=n_dropped,
             n_late_dividends=n_late,
-            counts=plan.counts,
+            counts=_rebalance_counts(plan, book),
         )
     )
+
+
+def _rebalance_counts(plan: Plan, book: _Book) -> Mapping[str, int]:
+    """The rebalance row's counts: the plan's, plus `n_chained_positions` (#821,
+    T187b) on the one step whose read saw the chain and renamed `book`'s
+    positions (0 in every other step, so no extra count row is written)."""
+    if not book.chained_positions:
+        return plan.counts
+    counts = dict(plan.counts)
+    counts["n_chained_positions"] = book.chained_positions
+    book.chained_positions = 0
+    return counts
 
 
 def _price_on(frame: pl.DataFrame, sid: str, session: date, fill_price: str) -> float | None:
@@ -1039,6 +1052,9 @@ class _SharedReads:
     def universe(self, t: datetime) -> Universe:
         return self._once(("universe", t), lambda: self._provider.universe(t))
 
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        return self._once(("chains", t), lambda: self._provider.chains(t))
+
     def adjusted_prices(
         self,
         t: datetime,
@@ -1126,6 +1142,11 @@ class _Requests:
 
     def universe(self, t: datetime) -> Universe:
         return self.view.universe(t)
+
+    def chains(self, t: datetime) -> tuple[tuple[str, str], ...]:
+        # Not a keyed read: the engine reads it once per step itself, never a
+        # signal reader (T187b).
+        return self.view.chains(t)
 
     def adjusted_prices(
         self,
@@ -1415,6 +1436,14 @@ def _run_group(
             return
         view.new_step()
         t = read_time(step_end, cadence)
+        # #821 (T187b): the live successor chains known at this step's read, applied
+        # to every variant's books and plans before the marking ids are built, so a
+        # held predecessor becomes its successor at one point (one share for one
+        # share) and the step's reads name the successor.
+        chains = view.chains(t)
+        if chains:
+            for variant in group:
+                _rename_chained(variant, chains)
         own = [_marking_ids(variant, benchmarks) for variant in group]
         t_prev = read_time(cast(Plan, group[0].plan).session, cadence)
         view.share(
@@ -1472,6 +1501,45 @@ def _cash_accruals(
     )
     yields = {s: to_yield(rate, metrics.risk_free_basis) for s, rate in published.items()}
     return session_accruals(every, yields, series=series)
+
+
+def _rename_chained(variant: _Variant, chains: Sequence[tuple[str, str]]) -> None:
+    """Rename a variant's books and plans through the live successor chains
+    (#821, T187b): each book's positions (one share for one share, summing a
+    collision), `held_on`, `held_since`, `entries` and `marked_at` keys, its
+    plan's targets, the targets it recorded per fill session, its last-stitched
+    sessions, and its benchmarks' holdings. `chained_positions` counts the
+    positions renamed for the book's next rebalance row; the map is idempotent,
+    so a later step re-reads no renamed name. The engine's `_marking_ids` and
+    reads then name the successor."""
+    mapping = dict(chains)
+    plan = variant.plan
+    if plan is not None:
+        targets = {mapping.get(sid, sid): weight for sid, weight in plan.targets.items()}
+        if targets != plan.targets:
+            variant.plan = replace(plan, targets=targets)
+    variant.last_stitched = {
+        mapping.get(sid, sid): session for sid, session in variant.last_stitched.items()
+    }
+    variant.targets = {
+        session: {mapping.get(sid, sid): weight for sid, weight in targets.items()}
+        for session, targets in variant.targets.items()
+    }
+    for book in variant.books:
+        positions: dict[str, float] = {}
+        renamed = 0
+        for sid, value in book.positions.items():
+            successor = mapping.get(sid, sid)
+            renamed += successor != sid
+            positions[successor] = positions.get(successor, 0.0) + value
+        book.positions = positions
+        book.chained_positions += renamed
+        book.marked_at = {mapping.get(sid, sid): day for sid, day in book.marked_at.items()}
+        book.held_since = {mapping.get(sid, sid): day for sid, day in book.held_since.items()}
+        book.entries = {mapping.get(sid, sid): count for sid, count in book.entries.items()}
+        book.held_on = {mapping.get(sid, sid): days for sid, days in book.held_on.items()}
+        for holding in book.benchmarks.values():
+            holding.security_id = mapping.get(holding.security_id, holding.security_id)
 
 
 def _marking_ids(

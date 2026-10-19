@@ -551,6 +551,7 @@ class ResolverReport:
     symbol_changes_followed: int = 0
     symbol_changes_unmatched: int = 0
     symbol_changes_refused: int = 0
+    chain_early_starts: int = 0
 
     def summary(self) -> str:
         """One line for an `ingestion_runs` message."""
@@ -578,7 +579,8 @@ class ResolverReport:
             f"{self.filename_disputes} sessions another security lost to a filing_name span; "
             f"{self.symbol_changes_followed} symbol changes followed, "
             f"{self.symbol_changes_refused} refused (the new ticker not theirs on the day), "
-            f"{self.symbol_changes_unmatched} matching no listing"
+            f"{self.symbol_changes_unmatched} matching no listing; "
+            f"{self.chain_early_starts} chained spans started early (rule 9)"
         )
 
 
@@ -796,6 +798,18 @@ class Handover:
     span: TickerSpan
 
 
+@dataclass(frozen=True)
+class ChainWindow:
+    """A rule-9 window (#821, T187b): a chained successor `security_id` traded
+    under `ticker` from `start` (its predecessor's span end) to `end` (its own
+    first listing row), where rule 9 starts its first span of the ticker."""
+
+    security_id: str
+    ticker: str
+    start: date
+    end: date
+
+
 #: `(security_id, start, before)` -> the session of the security's last
 #: traded Alpaca bar in `[start, before)` known at the run, or `None`
 #: (rule 8, #1314; `repair.store_resolver` reads it from `prices_daily`).
@@ -846,6 +860,7 @@ class ListingResolver:
         last_bar: LastBar | None = None,
         handover_sessions: int | None = None,
         symbol_changes: Iterable[Mapping[str, Any]] = (),
+        chains: Iterable[tuple[str, str]] = (),
     ) -> None:
         # `listings` is read twice more below (#1597: the `filing_name`
         # count's guard and the merge-base resolver), and the store passes a
@@ -853,6 +868,15 @@ class ListingResolver:
         # here rather than exhausted on the first pass. So are the changes,
         # read again by the merge base and by a rebuild after a refusal.
         listings = list(listings)
+        # Rule 9 (#821, T187b): the chained predecessors whose successors
+        # continue them. The pairs are read once; `accepted_relistings` names
+        # a predecessor re-keyed to its successor, so its stopped-line
+        # exemption follows the chain.
+        self._chains: tuple[tuple[str, str], ...] = tuple(
+            (str(predecessor), str(successor)) for predecessor, successor in chains
+        )
+        chain_map = {predecessor: successor for predecessor, successor in self._chains}
+        accepted_relistings = [chain_map.get(str(sid), str(sid)) for sid in accepted_relistings]
         changes = [
             (
                 str(change["security_id"]),
@@ -1054,6 +1078,12 @@ class ListingResolver:
             if handover_sessions is None:  # `master.transfer_window_sessions`, from config
                 raise ValueError("last_bar needs handover_sessions")
             self._hand_over(last_bar, handover_sessions, claims)
+        # Rule 9 (#821, T187b): a successor's first span under the
+        # predecessor's ticker starts on the predecessor's span end where that
+        # is earlier than the successor's first listing row, so the sessions
+        # between (today nobody's) are the successor's. Applied after rule 8,
+        # whose cut is the predecessor's end for a hand-over with no Form 25.
+        chain_early_starts = self._chain_spans()
         self._contested = frozenset(
             span
             for spans in self._by_ticker.values()
@@ -1140,6 +1170,7 @@ class ListingResolver:
                 if security_id not in by_security
                 for _, old, new in own
             ),
+            chain_early_starts=chain_early_starts,
             filename_disputes=(
                 self._filing_name_disputes(
                     listings,
@@ -1247,6 +1278,65 @@ class ListingResolver:
                 handover = Handover(span.security_id, ticker, handed, taken, cut)
                 self._handovers[ticker].append(handover)
                 self._handovers_of[span.security_id].append(handover)
+
+    def _chain_spans(self) -> int:
+        """Rule 9 (#821, T187b): for each chain known at the run, extend the
+        successor's first span under the predecessor's ticker back to the
+        predecessor's span end where that is earlier than the successor's
+        first listing row, and return how many spans moved. The predecessor's
+        end is its rule-8 cut where rule 8 cut it (a hand-over with no Form
+        25), else its own rule-7 end; a predecessor whose span runs to the
+        successor's row (`None` or not earlier) moves nothing. An id with no
+        assigned span, a successor with no span of the ticker, and a
+        predecessor whose span is not its last are passed over."""
+        assigned = {span for spans in self._by_ticker.values() for span in spans}
+        self._chain_windows: dict[str, list[ChainWindow]] = defaultdict(list)
+        moved = 0
+        for predecessor, successor in self._chains:
+            own = [span for span in self._by_security.get(predecessor, []) if span in assigned]
+            successor_spans = [
+                span for span in self._by_security.get(successor, []) if span in assigned
+            ]
+            if not own or not successor_spans:
+                continue
+            last = max(own, key=lambda span: span.start)
+            # Rule 7's end where the predecessor has one (a Form 25's effective day,
+            # or the day after its end_session); else rule 8's cut (a hand-over with
+            # no Form 25), the span's own end as the resolver left it.
+            end = self._end_before_handover.get(last) or last.end
+            first = next(
+                (
+                    span
+                    for span in sorted(successor_spans, key=lambda span: span.start)
+                    if span.ticker == last.ticker
+                ),
+                None,
+            )
+            if end is None or first is None or first.start <= end:
+                continue
+            self._replace_span(first, replace(first, start=end))
+            self._chain_windows[successor].append(
+                ChainWindow(successor, last.ticker, end, first.start)
+            )
+            moved += 1
+        return moved
+
+    def chain_windows(self, security_id: str) -> tuple[ChainWindow, ...]:
+        """The rule-9 windows (#821, T187b) `security_id` gained as a chained
+        successor: each `[start, end)` of a ticker, between its predecessor's
+        span end and its own first listing row, that now resolves to it."""
+        return tuple(self._chain_windows.get(security_id, ()))
+
+    def _replace_span(self, old: TickerSpan, new: TickerSpan) -> None:
+        """Replace `old` with `new` in the resolver's span indexes."""
+        for group in (
+            self._by_ticker.get(old.ticker, []),
+            self._by_security.get(old.security_id, []),
+            self._history.get(old.security_id, []),
+        ):
+            for index, span in enumerate(group):
+                if span is old:
+                    group[index] = new
 
     def handovers(self, security_id: str) -> tuple[Handover, ...]:
         """`security_id`'s rule-8 windows (#1314): each `[start, end)` of

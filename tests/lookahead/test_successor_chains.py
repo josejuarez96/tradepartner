@@ -225,3 +225,188 @@ def test_the_chain_overlay_regenerates_byte_identically(tmp_path: Path) -> None:
             tmp_path / "chains" / name
         ).read_bytes(), name
     assert not (tmp_path / "successor_chains.csv").exists()
+
+
+# --- the reads and the resolver (#821, plan T187b) ------------------------------------
+
+from datetime import date, timedelta  # noqa: E402
+
+import polars as pl  # noqa: E402
+
+from tradepartner.config import Settings, parse_accepted_jump  # noqa: E402
+from tradepartner.store.asof import (  # noqa: E402
+    LiveChains,
+    adjusted_prices_as_of,
+    facts_as_of,
+    live_actions_as_of,
+    live_chains,
+    price_jumps_as_of,
+    prices_as_of,
+)
+from tradepartner.store.db import insert_row  # noqa: E402
+from tradepartner.universe import universe_as_of  # noqa: E402
+
+#: The 1:1 pair this section reads: CHNA (predecessor) -> Chain One (successor),
+#: chained from 2020-02-07T20:30.
+_PREDECESSOR = "0001000010"
+_SUCCESSOR = "0001000011"
+_CHAIN_KNOWN_AT = datetime.fromisoformat("2020-02-07T20:30:00+00:00")
+#: A read just after it: the chain is live and the successor's bars through 2020-02-06
+#: (it lists 2020-02-04) are known.
+_AFTER = datetime.fromisoformat("2020-02-07T21:00:00+00:00")
+
+
+def _settings(**universe: object) -> Settings:
+    return Settings(_env_file=None, universe=universe)
+
+
+def test_before_the_known_at_the_pair_reads_under_its_own_ids(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    before = _CHAIN_KNOWN_AT - PROBE_EPSILON
+    assert live_chains(chain_fixture_store, before) == ()
+    predecessor = prices_as_of(chain_fixture_store, before, [_PREDECESSOR])
+    successor = prices_as_of(chain_fixture_store, before, [_SUCCESSOR])
+    assert predecessor.height == 250 and successor.height > 0
+    assert set(predecessor["security_id"].unique().to_list()) == {_PREDECESSOR}
+    assert set(successor["security_id"].unique().to_list()) == {_SUCCESSOR}
+    assert facts_as_of(chain_fixture_store, before, [_PREDECESSOR]).height == 1
+    assert facts_as_of(chain_fixture_store, before, [_SUCCESSOR]).is_empty()
+
+
+def test_from_the_known_at_the_successor_reads_both_histories(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """One read for the successor is the predecessor's rows re-keyed plus its
+    own, in session order; one for the predecessor is empty."""
+    assert live_chains(chain_fixture_store, _AFTER) == ((_PREDECESSOR, _SUCCESSOR),)
+    merged = prices_as_of(chain_fixture_store, _AFTER, [_SUCCESSOR])
+    assert set(merged["security_id"].unique().to_list()) == {_SUCCESSOR}
+    # The predecessor's first bar (2019-01-08) and the successor's own (2020-02-04)
+    # are both there, in session order, with no bar in the delisting hole.
+    sessions = merged["session"].to_list()
+    assert sessions == sorted(sessions)
+    assert sessions[0] == date(2019, 1, 8) and date(2020, 2, 4) in sessions
+    assert date(2020, 1, 10) not in sessions  # the predecessor's delisting tail
+    assert prices_as_of(chain_fixture_store, _AFTER, [_PREDECESSOR]).is_empty()
+    assert live_actions_as_of(chain_fixture_store, _AFTER, [_PREDECESSOR]).is_empty()
+    action = live_actions_as_of(chain_fixture_store, _AFTER, [_SUCCESSOR])
+    assert action.select("security_id", "action_type", "ex_date").rows() == [
+        (_SUCCESSOR, "dividend", date(2019, 12, 5))
+    ]
+
+
+def test_the_chained_dividend_adjusts_the_successors_early_bars(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    raw = prices_as_of(chain_fixture_store, _AFTER, [_SUCCESSOR])
+    adjusted = adjusted_prices_as_of(
+        chain_fixture_store, _AFTER, [_SUCCESSOR], include_dividends=True
+    )
+    session = date(2019, 12, 4)  # the prior close of the 2019-12-05 ex-date
+    close = float(raw.filter(pl.col("session") == session)["close"].item())
+    adj = float(adjusted.filter(pl.col("session") == session)["close"].item())
+    assert adj == pytest.approx(close - 0.25)  # factor 1 - amount / prior close
+
+
+def test_the_predecessors_facts_read_under_the_successor(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    later = datetime.fromisoformat("2020-03-01T21:00:00+00:00")
+    facts = facts_as_of(chain_fixture_store, later, [_SUCCESSOR])
+    assert set(facts["security_id"].unique().to_list()) == {_SUCCESSOR}
+    # The predecessor's two facts and the successor's own, all under the successor.
+    assert sorted(facts["as_of_date"].to_list()) == [
+        date(2019, 11, 20),
+        date(2020, 1, 13),
+        date(2020, 2, 4),
+    ]
+
+
+def test_an_accepted_price_jumps_entry_naming_the_predecessor_excuses_the_successor(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A revision of one predecessor bar makes a jump under the successor; a
+    `universe.accepted_price_jumps` entry naming the predecessor excuses it."""
+    session = date(2019, 12, 10)
+    before = _CHAIN_KNOWN_AT - PROBE_EPSILON
+    (bar,) = (
+        prices_as_of(chain_fixture_store, before, [_PREDECESSOR])
+        .filter(pl.col("session") == session)
+        .iter_rows(named=True)
+    )
+    original = float(bar["close"])
+    insert_row(
+        chain_fixture_store,
+        "prices_daily",
+        bar
+        | {
+            "close": original * 3,
+            "high": max(bar["high"], original * 3),
+            "known_at": _AFTER,
+            "ingested_at": _AFTER,
+        },
+    )
+    plain = price_jumps_as_of(chain_fixture_store, _AFTER, [_SUCCESSOR], settings=_settings())
+    jump = plain.filter(pl.col("session") == session)
+    assert jump.height == 1 and jump["security_id"].item() == _SUCCESSOR
+    assert jump["accepted"].item() is False
+    accepted = price_jumps_as_of(
+        chain_fixture_store,
+        _AFTER,
+        [_SUCCESSOR],
+        settings=_settings(accepted_price_jumps=[f"{_PREDECESSOR}@{session.isoformat()}"]),
+    ).filter(pl.col("session") == session)
+    assert accepted["accepted"].item() is True
+    # The helper maps the entry's id the same way it maps the rows.
+    chains = LiveChains(pairs={_PREDECESSOR: _SUCCESSOR})
+    assert chains.mapped_entry(f"{_PREDECESSOR}@{session.isoformat()}", parse_accepted_jump) == (
+        _SUCCESSOR,
+        session,
+    )
+
+
+def test_universe_admits_the_chained_history(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The predecessor's re-keyed bars are the successor's rule-6 history: by
+    2020-05-01 the successor is excluded for liquidity, not for missing bars,
+    while the same read without the chain still fails rule 6."""
+    late = datetime.fromisoformat("2020-05-01T20:30:00+00:00")
+    settings = Settings(_env_file=None)
+    with_chain = universe_as_of(chain_fixture_store, late, settings)
+    assert "0001000011" not in set(with_chain.members["security_id"].to_list())
+    reasons = {row[3] for row in with_chain.exclusions.rows() if row[0] == _SUCCESSOR}
+    assert reasons and "missing_bars" not in reasons  # rule 6 satisfied by the chain
+    truncated = TruncatedStore(chain_fixture_store)
+    try:
+        without = universe_as_of(truncated.at(_CHAIN_KNOWN_AT - PROBE_EPSILON), late, settings)
+    finally:
+        truncated.close()
+    # Without the chain the successor has only its own ~3 months of bars, so it is
+    # not a member and (its listing known at 20:30) is excluded for its history.
+    assert "0001000011" not in set(without.members["security_id"].to_list())
+
+
+def test_the_chain_reads_are_truncation_invariant_around_the_known_at(
+    chain_fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+) -> None:
+    """`f(T)` on the full store equals `f(T)` on the store truncated to
+    `known_at <= T`, around the chain's stamp (spec "Look-ahead")."""
+    reads = [
+        lambda c, t: prices_as_of(c, t, [_SUCCESSOR]),
+        lambda c, t: adjusted_prices_as_of(c, t, [_SUCCESSOR], include_dividends=True),
+        lambda c, t: live_actions_as_of(c, t, [_SUCCESSOR]),
+        lambda c, t: facts_as_of(c, t, [_SUCCESSOR]),
+    ]
+    for t in (
+        _CHAIN_KNOWN_AT - timedelta(days=1),
+        _CHAIN_KNOWN_AT - PROBE_EPSILON,
+        _CHAIN_KNOWN_AT,
+        _CHAIN_KNOWN_AT + PROBE_EPSILON,
+        _CHAIN_KNOWN_AT + timedelta(days=30),
+    ):
+        for read in reads:
+            full = read(chain_fixture_store, t)
+            seen = read(truncated.at(t), t)
+            assert full.equals(seen), (t, read)

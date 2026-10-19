@@ -1572,3 +1572,36 @@ def test_the_manifest_reads_both_tables_and_refuses_a_malformed_file(tmp_path: P
     bad.write_text("table,security_id\n")
     with pytest.raises(ValueError, match="the header must be"):
         repair.read_master_manifest(bad)
+
+
+# --- live successor chains (#821, plan T187b) ------------------------------------
+
+_UNIVERSE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
+
+
+def test_the_dry_run_lists_a_live_successor_chain(tmp_path: Path) -> None:
+    """A live chain's dry run lists the pair with its ratio and proposes no
+    deletion for it: with rule 9 the hole bars resolve to the successor."""
+    from conftest import load_chain_overlay, load_universe_fixtures
+
+    settings = Settings(_env_file=None, store={"path": str(tmp_path / "chains.duckdb")})
+    with open_for_write(settings) as conn:
+        init_schema(conn)
+        load_universe_fixtures(conn, _UNIVERSE_DIR)
+        load_chain_overlay(conn)
+    result = repair_resolution(settings, clock=lambda: RUN, dry_run=True)
+    assert [(chain.predecessor_id, chain.successor_id) for chain in result.chains] == [
+        ("0001000010", "0001000011"),
+        ("0001000012", "0001000013"),
+        ("0001000014", "0001000015"),
+    ]
+    assert all(chain.ratio is not None and chain.ratio > 0 for chain in result.chains)
+    assert any(line.startswith("  chain 0001000010->0001000011: ratio") for line in result.lines())
+    assert "0001000010" not in result.found.securities
+    assert "0001000011" not in result.found.securities
+
+
+def test_the_dry_run_lists_no_chain_without_the_overlay(store: Settings) -> None:
+    """The store fixture has no successor_chains rows: no chain line."""
+    result = repair_resolution(store, clock=lambda: RUN, dry_run=True)
+    assert result.chains == ()

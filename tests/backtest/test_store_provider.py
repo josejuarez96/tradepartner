@@ -19,7 +19,7 @@ from typing import Any
 import duckdb
 import polars as pl
 import pytest
-from conftest import load_universe_fixtures
+from conftest import load_chain_overlay, load_universe_fixtures
 
 from backtest.fake_provider import Call, FakeProvider
 from tradepartner import gap as gap_module
@@ -1053,3 +1053,65 @@ def test_rates_of_an_unknown_series_are_empty_and_t_is_checked(store: Store) -> 
             provider.rates(date(2019, 3, 21), "DTB3")  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="tz-aware"):
             provider.rates(datetime(2019, 3, 21, 20), "DTB3")  # noqa: DTZ001
+
+
+# --- the live successor chains (#821, plan T187b) --------------------------------
+
+_CHAIN_KNOWN_AT = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)
+
+
+def test_chains_reads_the_live_successor_chains(tmp_path: Path, store: Store) -> None:
+    """`StoreProvider.chains(t)` is `asof.live_chains(t)` over a store whose
+    chain overlay is loaded: empty before the row's stamp, the pair from it."""
+    from lookahead.harness import PROBE_EPSILON
+
+    path = tmp_path / "chains.duckdb"
+    settings = _settings(path)
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        load_universe_fixtures(conn, UNIVERSE_DIR)
+        load_chain_overlay(conn)
+    finally:
+        conn.close()
+    handle = _open_trial(settings, tmp_path)
+
+    @contextmanager
+    def connect() -> Iterator[duckdb.DuckDBPyConnection]:
+        with open_read_only(settings) as conn:
+            yield conn
+
+    with StoreProvider(connect, handle, settings) as provider:
+        assert provider.chains(_CHAIN_KNOWN_AT - PROBE_EPSILON) == ()
+        assert provider.chains(_CHAIN_KNOWN_AT) == (("0001000010", "0001000011"),)
+
+
+def _open_trial(settings: Settings, tmp_path: Path) -> registry.TrialHandle:
+    """A real `TrialHandle` recorded in `settings`'s store."""
+    with open_for_write(settings) as conn:
+        hypothesis = registry.register_hypothesis(
+            conn,
+            slug="h-chains",
+            family="momentum",
+            title="chains",
+            doc_path="docs/hypotheses/h-chains.md",
+            doc_sha256="0" * 64,
+            params={"costs.per_side_bps": 15.0},
+            in_sample_start=date(2017, 1, 31),
+            holdout_start=date(2023, 1, 1),
+            holdout_end=date(2025, 12, 31),
+            registered_by="owner",
+            settings=_settings(tmp_path / "real.duckdb"),
+        )
+        return registry.open_trial(
+            conn,
+            hypothesis_id=hypothesis.hypothesis_id,
+            kind="in_sample",
+            start_session=date(2019, 10, 31),
+            end_session=date(2020, 6, 30),
+            data_cutoff=datetime(2020, 6, 30, 20, tzinfo=UTC),
+            synthetic=True,
+            run_by="test",
+            settings=_settings(tmp_path / "real.duckdb"),
+        )
