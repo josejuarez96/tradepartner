@@ -40,6 +40,16 @@ revision instead.
   them as kept and never proposes them. Once the build derives the
   successor again, the keep no longer applies, so a stale listing of it is
   judged like any other (quant audit of #923).
+- **Chains (#821, T187c).** `underived_chains(live, derived_successors,
+  skip_ciks)` is the `successor_chains` counterpart of `underived`: each row
+  `live_chains_as_of` returns whose successor id no `master.chains` entry
+  derives, source `edgar` and provenance `filing`. `master-retract` proposes
+  and retracts them; the ingest's chain writer owns the moved-row case (an
+  entry whose evidence stamp changed), so only the entry-removed case is
+  judged here. Their keys are `successor_id`. They are never recorded in
+  `master_underived` (health's `underived_master_rows` is the `securities`
+  and `listings` rule), and a retraction keeps the withdrawn row's
+  `withdrawn_known_at` so `registry.data_vintage` counts it.
 - **Retraction.** `retraction(row, at)` is the stored row with `retracted
   = TRUE`, `known_at = ingested_at = at`: a revision of its key stamped at
   the correcting run, never back-dated (a row known after `at` raises).
@@ -89,6 +99,7 @@ CHECK_STATUSES: tuple[str, ...] = ("ok", RETRACTED)
 KEYS: dict[str, tuple[str, ...]] = {
     "securities": ("security_id",),
     "listings": ("security_id", "ticker", "exchange", "valid_from"),
+    "successor_chains": ("successor_id",),
 }
 
 Row = dict[str, Any]
@@ -197,6 +208,59 @@ def stored_underived(
     )
 
 
+#: The live chain of a successor at `at` (#821): its revision known by `at`,
+#: unretracted, that no later revision supersedes -- the same rule as
+#: `store.master._LIVE_CHAIN_SQL`, over stored rows.
+_LIVE_CHAIN_SQL = """
+    SELECT * FROM successor_chains c
+    WHERE known_at <= ? AND NOT c.retracted
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+      )
+"""
+
+
+def live_chains_as_of(
+    conn: duckdb.DuckDBPyConnection, at: datetime
+) -> tuple[Mapping[str, Any], ...]:
+    """The `successor_chains` rows live at `at` (module docstring): one per
+    successor, its latest revision known by `at`, never a retracted or
+    superseded one. Empty on a store without the table (a read-only
+    connection below version 31)."""
+    at = ensure_tz_aware_utc(at, field_name="at")
+    present = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'successor_chains'"
+    ).fetchone()
+    if present is None or not present[0]:
+        return ()
+    cursor = conn.execute(_LIVE_CHAIN_SQL, [at])
+    names = [column[0] for column in cursor.description]
+    return tuple(dict(zip(names, values, strict=True)) for values in cursor.fetchall())
+
+
+def underived_chains(
+    chains: Iterable[Mapping[str, Any]],
+    derived_successors: frozenset[str],
+    skip_ciks: frozenset[str] = frozenset(),
+) -> tuple[Underived, ...]:
+    """The live `successor_chains` rows no `master.chains` entry derives
+    (#821, T187c): source `edgar`, provenance `filing`, a successor id
+    `derived_successors` does not hold, and a successor CIK outside
+    `skip_ciks`. `master-retract` proposes and retracts them; the ingest's
+    chain writer owns the moved-row case (an entry whose evidence stamp
+    changed), so this is the entry-removed case alone. Pure."""
+    found = [
+        Underived("successor_chains", dict(row))
+        for row in chains
+        if row["source"] == EDGAR
+        and row["provenance"] == FILING
+        and cik_of(row["successor_id"]) not in skip_ciks
+        and row["successor_id"] not in derived_successors
+    ]
+    return tuple(sorted(found, key=lambda u: tuple(str(part) for part in u.key)))
+
+
 def retraction(row: Mapping[str, Any], at: datetime) -> Row:
     """The revision that withdraws `row`'s key from `at` on (module
     docstring). Raises `ValueError` if `row` is known after `at`."""
@@ -212,10 +276,15 @@ def retraction(row: Mapping[str, Any], at: datetime) -> Row:
 def write_retractions(
     conn: duckdb.DuckDBPyConnection, found: Iterable[Underived], at: datetime
 ) -> int:
-    """Insert a `retraction` of each row in `found`; return how many."""
+    """Insert a `retraction` of each row in `found`; return how many. A
+    `successor_chains` row also keeps its own `known_at` as `withdrawn_known_at`
+    (#821): the vintage counts a retraction from there."""
     written = 0
     for item in found:
-        insert_row(conn, item.table, retraction(item.row, at))
+        row = retraction(item.row, at)
+        if item.table == "successor_chains":
+            row["withdrawn_known_at"] = item.row["known_at"]
+        insert_row(conn, item.table, row)
         written += 1
     return written
 

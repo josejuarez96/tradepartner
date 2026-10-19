@@ -138,8 +138,9 @@ before it is always a CIK, never a type.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -156,7 +157,7 @@ from tradepartner.adapters.filings import (
     FilingIndexEntry,
     FilingSource,
 )
-from tradepartner.calendar import is_session, next_session, previous_session
+from tradepartner.calendar import all_sessions, is_session, next_session, previous_session
 from tradepartner.config import Settings, parse_chains
 from tradepartner.store.asof import _EXCHANGE_TZ, _latest_as_of, _validate_t
 from tradepartner.store.db import insert_row
@@ -1168,6 +1169,124 @@ def build_chains(
             Chain(predecessor_id, successor_id, accession, evidence.form, known_at, ingested_at)
         )
     return ChainBuild(tuple(chains), tuple(refusals))
+
+
+@dataclass(frozen=True)
+class ChainCandidate:
+    """A filer that looks like a 1:1 successor and is on no entry (#821):
+
+    `successor_id` filed an 8-K12B or 8-K12G3 and its first listing row names
+    a ticker and exchange another company's security last held `sessions`
+    sessions before it. Named on the EDGAR run row under `chain_candidates`,
+    so the owner sees the next reorganisation the day its listing row
+    arrives. `sessions` is the gap; never above `master.chain_window_sessions`."""
+
+    successor_id: str
+    predecessor_id: str
+    ticker: str
+    exchange: str
+    sessions: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.successor_id} <- {self.predecessor_id} "
+            f"({self.ticker} {self.exchange}, {self.sessions} sessions)"
+        )
+
+
+def _sessions_between(start: date, end: date) -> int:
+    """XNYS sessions strictly after `start` through `end` (0 when end <=
+    start), counted on the configured calendar, never weekdays."""
+    if end <= start:
+        return 0
+    days = all_sessions()
+    return bisect_right(days, end) - bisect_right(days, start)
+
+
+def _listing_ends(delistings: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], date]:
+    """The last day each `(security_id, exchange)` is known to be listed: the
+    greatest `effective_on` of any Form 25 that ended it (#821 candidates)."""
+    ends: dict[tuple[str, str], date] = {}
+    for row in delistings:
+        key = (row["security_id"], row["exchange"])
+        effective = row["effective_on"]
+        if effective is not None and effective > ends.get(key, date.min):
+            ends[key] = effective
+    return ends
+
+
+def chain_candidates(
+    source: FilingSource,
+    settings: Settings,
+    master: MasterBuild,
+    *,
+    delistings: Iterable[Mapping[str, Any]] = (),
+) -> tuple[ChainCandidate, ...]:
+    """The 1:1 successor-CIK candidates on no `master.chains` entry (#821).
+
+    Over the full-history index every EDGAR run scans (req 3), for each
+    8-K12B or 8-K12G3 filer in `source.filing_index()` whose security is on
+    no `master.chains` entry and not in `master.chains_dismissed`: its first
+    listing row (`master.listings` for the CIK's securities, the earliest
+    `valid_from`) names a ticker and exchange another company's security last
+    listed within `master.chain_window_sessions` sessions before it. The
+    other security's last listed day is the greatest of its own listing rows'
+    `valid_from` under that pair and any Form 25 `effective_on` of
+    `delistings` on that exchange; the nearest such other security is named.
+    Pure apart from reading `source`. The spin-off pair, with no successor
+    filing, is never a candidate."""
+    entries = parse_chains(settings.master.chains)
+    taken = {successor for _, successor, _ in entries}
+    dismissed = set(settings.master.chains_dismissed)
+    window = settings.master.chain_window_sessions
+    filers = {item.cik for item in source.filing_index() if item.form in SUCCESSOR_EVIDENCE_FORMS}
+    if not filers:
+        return ()
+    listings: dict[str, list[Row]] = defaultdict(list)
+    for row in master.listings:
+        listings[row["security_id"]].append(row)
+    ends = _listing_ends(delistings)
+    # Every security's latest `valid_from` per (ticker, exchange), so a
+    # candidate's pair is looked up, not the whole universe scanned.
+    by_pair: dict[tuple[str, str], list[tuple[str, date]]] = defaultdict(list)
+    for security_id, rows in listings.items():
+        latest: dict[tuple[str, str], date] = {}
+        for row in rows:
+            key = (row["ticker"], row["exchange"])
+            if row["valid_from"] > latest.get(key, date.min):
+                latest[key] = row["valid_from"]
+        for key, last in latest.items():
+            by_pair[key].append((security_id, last))
+    by_cik: dict[str, set[str]] = defaultdict(set)
+    for row in master.securities:
+        by_cik[row["cik"]].add(row["security_id"])
+    candidates: list[ChainCandidate] = []
+    for cik in sorted(filers):
+        if cik in dismissed:
+            continue
+        rows = [row for sid in by_cik.get(cik, ()) for row in listings.get(sid, [])]
+        if not rows:
+            continue
+        first = min(rows, key=lambda r: (r["valid_from"], r["known_at"]))
+        successor_id = first["security_id"]
+        if successor_id in taken or successor_id in dismissed:
+            continue
+        ticker, exchange = first["ticker"], first["exchange"]
+        best: ChainCandidate | None = None
+        for other_id, last in by_pair.get((ticker, exchange), ()):
+            if security_cik(other_id) == cik:
+                continue
+            end = max(last, ends.get((other_id, exchange), date.min))
+            if end > first["valid_from"]:
+                continue
+            gap = _sessions_between(end, first["valid_from"])
+            if gap > window:
+                continue
+            if best is None or gap < best.sessions:
+                best = ChainCandidate(successor_id, other_id, ticker, exchange, gap)
+        if best is not None:
+            candidates.append(best)
+    return tuple(sorted(candidates, key=lambda c: c.successor_id))
 
 
 def _filename_rows(

@@ -41,6 +41,12 @@ from tradepartner.gap import survivorship_gap
 from tradepartner.health import (
     BARS_ON_SESSIONS,
     BORROW_STATUS_UNIQUE,
+    CHAIN_IDS_DISTINCT_CIKS,
+    CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+    CHAIN_KNOWN_AT_LE_INGESTED_AT,
+    CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
+    CHAIN_PRICE_BREAK,
+    CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
     COVERAGE_REFERENCE_NAMES,
     DUPLICATE_DIVIDENDS,
     FIGI_TYPES_DISAGREEMENTS,
@@ -72,6 +78,7 @@ from tradepartner.health import (
     _bars_after_delisting,
     _overlapping_listings,
     bar_gaps,
+    chain_candidates_from_message,
     clock_suspect,
     coverage,
     coverage_reference,
@@ -3755,3 +3762,215 @@ def test_the_figi_block_reads_the_latest_observation_known_at_t(
     assert figi_types(fixture_store, T_END, settings).rows["figi_type"].to_list() == [
         "Medium Term Note"
     ]
+
+
+# --- successor chains (#821, plan T187c) ------------------------------------
+
+
+CHAIN_IDS = ("0001000010", "0001000011")
+
+
+def _live_chain(
+    predecessor: str,
+    successor: str,
+    *,
+    known_at: datetime = T_END,
+    ingested_at: datetime | None = None,
+) -> dict[str, Any]:
+    """A `successor_chains` row the way an ingest writes it: `edgar`/`filing`,
+    unretracted, known at `known_at` and ingested at `ingested_at` (default
+    `known_at`)."""
+    return {
+        "predecessor_id": predecessor,
+        "successor_id": successor,
+        "evidence_accession": f"{successor}-24-900001",
+        "evidence_form": "8-K12B",
+        "known_at": known_at,
+        "ingested_at": ingested_at if ingested_at is not None else known_at,
+        "source": "edgar",
+        "provenance": "filing",
+        "retracted": False,
+    }
+
+
+def _chain_rule(
+    conn: duckdb.DuckDBPyConnection, rule: str, t: datetime = T_END
+) -> list[dict[str, Any]]:
+    report = health_report(conn, t, _settings())
+    [check] = [c for c in report.integrity if c.rule == rule]
+    return check.violations.to_dicts()
+
+
+def test_the_fixture_chains_pass_the_five_rules(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the three fixture chains pass every chain rule, and a
+    price break is a warning, never a failure."""
+    report = health_report(chain_fixture_store, T_END, _settings())
+    failed = _failed(report.integrity)
+    for rule in (
+        CHAIN_IDS_DISTINCT_CIKS,
+        CHAIN_KNOWN_AT_LE_INGESTED_AT,
+        CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+        CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
+        CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
+    ):
+        assert rule not in failed
+    assert CHAIN_PRICE_BREAK not in failed
+
+
+def test_the_successor_chains_block_lists_each_chain_handover_and_ratio(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: each live chain carries its hand-over day (the successor's
+    first listing row's `valid_from`) and the close ratio across it from the
+    stored bars. Hand-computed from the fixture: 19.33/15.41 = 1.2544 for the
+    1:1 pair (the only break), 19.65/20.52 = 0.9576 and 19.27/19.87 = 0.9698
+    for the other two."""
+    block = health_report(chain_fixture_store, T_END, _settings()).successor_chains
+    rows = {r["successor_id"]: r for r in block.frame.iter_rows(named=True)}
+    assert block.count == 3
+    assert rows["0001000011"]["handover"] == date(2020, 2, 4)
+    assert rows["0001000011"]["ratio"] == pytest.approx(19.33 / 15.41)
+    assert rows["0001000013"]["ratio"] == pytest.approx(19.65 / 20.52)
+    assert rows["0001000015"]["ratio"] == pytest.approx(19.27 / 19.87)
+    assert block.breaks == ("0001000011",)
+
+
+def test_the_chain_price_break_ratio_follows_the_threshold(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the warning fires above `master.chain_max_price_ratio` or
+    below its inverse. At 1.20 the 1:1 pair's 1.2544 breaks; at 1.30 none
+    does; neither is ever a failure."""
+    tight = health_report(
+        chain_fixture_store, T_END, _settings(master={"chain_max_price_ratio": 1.20})
+    )
+    assert tight.successor_chains.breaks == ("0001000011",)
+    assert CHAIN_PRICE_BREAK not in _failed(tight.integrity)
+    loose = health_report(
+        chain_fixture_store, T_END, _settings(master={"chain_max_price_ratio": 1.30})
+    )
+    assert loose.successor_chains.breaks == ()
+
+
+def test_the_successor_chains_block_lists_predecessor_facts_after_the_handover(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the subsidiary case -- a predecessor share fact dated after
+    the successor's first listing row is listed under the chain."""
+    insert_row(
+        chain_fixture_store,
+        "facts",
+        {
+            "security_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+            "known_at": session_close(date(2020, 3, 2)),
+            "ingested_at": session_close(date(2020, 3, 2)),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    block = health_report(chain_fixture_store, T_END, _settings()).successor_chains
+    assert block.predecessor_facts.to_dicts() == [
+        {
+            "predecessor_id": "0001000010",
+            "fact_name": "shares_outstanding",
+            "as_of_date": date(2020, 3, 2),
+            "value": 4.2e8,
+        }
+    ]
+
+
+def test_chain_ids_distinct_ciks_fails_on_a_self_chain(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: the two ids naming one CIK fails the rule with both ids."""
+    insert_row(chain_fixture_store, "successor_chains", _live_chain("0001000099", "0001000099"))
+    violations = _chain_rule(chain_fixture_store, CHAIN_IDS_DISTINCT_CIKS)
+    assert [(v["predecessor_id"], v["successor_id"]) for v in violations] == [
+        ("0001000099", "0001000099")
+    ]
+
+
+def test_chain_known_at_le_ingested_at_fails_on_a_future_stamp(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: `known_at` after `ingested_at` fails the rule with the
+    ids. The schema's own CHECK blocks it, so inject into an unconstrained
+    copy (the shape a store built by other code could have)."""
+    loose = _unconstrained(chain_fixture_store)
+    try:
+        insert_row(
+            loose,
+            "successor_chains",
+            _live_chain(
+                "0001000098", "0001000097", known_at=T_END, ingested_at=T_END - timedelta(days=1)
+            ),
+        )
+        violations = _chain_rule(loose, CHAIN_KNOWN_AT_LE_INGESTED_AT)
+    finally:
+        loose.close()
+    assert [(v["predecessor_id"], v["successor_id"]) for v in violations] == [
+        ("0001000098", "0001000097")
+    ]
+
+
+def test_chain_known_at_ge_successor_rows_fails_on_a_lagging_stamp(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a chain stamp before the successor's `securities` row and
+    first listing row (both 2020-02-07) fails, naming the pair. The row is
+    ingested at `T_END`, so it supersedes the fixture's live row."""
+    insert_row(
+        chain_fixture_store,
+        "successor_chains",
+        _live_chain(
+            CHAIN_IDS[0],
+            CHAIN_IDS[1],
+            known_at=datetime(2020, 1, 1, 20, 30, tzinfo=UTC),
+            ingested_at=T_END,
+        ),
+    )
+    violations = _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+    assert {v["detail"] for v in violations} == {
+        "known_at 2020-01-01T20:30:00+00:00 < successor securities 2020-02-07T20:30:00+00:00",
+        "known_at 2020-01-01T20:30:00+00:00 < successor listing 2020-02-07T20:30:00+00:00",
+    }
+
+
+def test_chain_successor_listed_under_predecessor_ticker_fails(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a successor not listed under the predecessor's ticker and
+    exchange fails, naming the pair. 0001000013 is listed CHNE, not CHNA."""
+    insert_row(chain_fixture_store, "successor_chains", _live_chain(CHAIN_IDS[0], "0001000013"))
+    violations = _chain_rule(chain_fixture_store, CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {
+        (CHAIN_IDS[0], "0001000013")
+    }
+
+
+def test_chain_predecessor_no_bar_after_handover_fails_on_a_later_bar(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c: a predecessor bar on or after the successor's first bar
+    (2020-02-04) fails, naming the pair."""
+    insert_row(chain_fixture_store, "prices_daily", _bar("0001000010", date(2020, 2, 5)))
+    violations = _chain_rule(chain_fixture_store, CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}
+
+
+def test_chain_candidates_from_message_parses_the_run_row() -> None:
+    """#821, T187c: the run-row clause `none` or `N: id, id` parses to the
+    successor ids, and an absent clause parses to none."""
+    assert chain_candidates_from_message("chains_written: 0; chain_candidates: none") == ()
+    assert chain_candidates_from_message("x; chain_candidates: 2: 0001000011, 0001000013; y") == (
+        "0001000011",
+        "0001000013",
+    )
+    assert chain_candidates_from_message(None) == ()
+    assert chain_candidates_from_message("chains_written: 0") == ()

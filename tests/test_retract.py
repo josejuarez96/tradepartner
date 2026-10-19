@@ -161,7 +161,7 @@ def test_a_dry_run_lists_every_underived_row_and_changes_nothing(store: Settings
         ("listings", (FALSE_ID, "ACME", "NYSE", date(2019, 5, 1))),
     ]
     assert result.summary().startswith(
-        f"would retract 2 rows (1 securities, 1 listings), digest {result.digest}, at "
+        f"would retract 2 rows (1 securities, 1 listings, 0 chains), digest {result.digest}, at "
     )
     assert len(result.digest) == 12
     assert result.lines()[0] == f"securities: {FALSE_ID} (known {FALSE_KNOWN.isoformat()})"
@@ -477,7 +477,9 @@ def test_a_kept_successor_is_never_proposed_and_the_set_and_digest_change(two: S
 
 def test_the_dry_run_reports_a_kept_row_with_the_reason(two: Settings) -> None:
     result = master_retract(_keep(two, FALSE_ID), filings=_filings(), clock=lambda: CHECK)
-    assert result.summary().startswith("would retract 2 rows (1 securities, 1 listings), digest")
+    assert result.summary().startswith(
+        "would retract 2 rows (1 securities, 1 listings, 0 chains), digest"
+    )
     assert "; kept 2 rows on master.keep_successors (owner-accepted): " + FALSE_ID in (
         result.summary()
     )
@@ -578,3 +580,91 @@ def test_a_dry_run_works_on_a_version_11_store(store: Settings) -> None:
         conn.execute("DELETE FROM schema_version WHERE version > 11")
     result = master_retract(store, filings=_filings(), clock=lambda: CHECK)
     assert [u.table for u in result.found] == ["securities", "listings"]
+
+
+# --- #821: a chain row no `master.chains` entry names is underived ----------
+
+CHAIN_PRED = "0001000010"
+CHAIN_SUCC = "0001000011"
+CHAIN_KNOWN = _at(2019, 5, 1)
+CHAIN_EVIDENCE = f"{CHAIN_SUCC}-24-000001"
+
+
+def _chain_row() -> dict[str, Any]:
+    """A stored `successor_chains` row as an earlier ingest would have written
+    it: `edgar`/`filing`, unretracted, known at `CHAIN_KNOWN`."""
+    return {
+        "predecessor_id": CHAIN_PRED,
+        "successor_id": CHAIN_SUCC,
+        "evidence_accession": CHAIN_EVIDENCE,
+        "evidence_form": "8-K12B",
+        "known_at": CHAIN_KNOWN,
+        "ingested_at": CHAIN_KNOWN,
+        "source": "edgar",
+        "provenance": "filing",
+        "retracted": False,
+    }
+
+
+def _with_chain(store: Settings) -> Settings:
+    with open_for_write(store) as conn:
+        insert_row(conn, "successor_chains", _chain_row())
+    return store
+
+
+def _chained(settings: Settings, successor: str) -> Settings:
+    entry = f"{CHAIN_PRED}->{successor}@{CHAIN_EVIDENCE}"
+    return settings.model_copy(
+        update={"master": settings.master.model_copy(update={"chains": [entry]})}
+    )
+
+
+def test_a_chain_no_entry_names_is_proposed_and_retracted(store: Settings) -> None:
+    """#821, T187c: a live `successor_chains` row no entry derives is underived
+    -- proposed in the dry run, digested, retracted with `--apply` at the run's
+    clock, keeping its `known_at` as `withdrawn_known_at`, and gone after."""
+    _with_chain(store)
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    assert ("successor_chains", (CHAIN_SUCC,)) in {(u.table, u.key) for u in dry.found}
+    assert f"successor_chains: {CHAIN_SUCC} (known {CHAIN_KNOWN.isoformat()})" in dry.lines()
+    assert "(1 securities, 1 listings, 1 chains)" in dry.summary()
+    result = _apply(store, RETRACT_AT)
+    assert result.rows == 3
+    with _read(store) as conn:
+        rows = conn.execute(
+            "SELECT known_at, retracted, withdrawn_known_at FROM successor_chains "
+            "WHERE successor_id = ? ORDER BY known_at",
+            [CHAIN_SUCC],
+        ).fetchall()
+    assert rows == [(CHAIN_KNOWN, False, None), (RETRACT_AT, True, CHAIN_KNOWN)]
+    assert master_retract(store, filings=_filings(), clock=lambda: AFTER).found == ()
+
+
+def test_a_chain_on_an_entry_is_never_proposed(store: Settings) -> None:
+    """#821, T187c: while a `master.chains` entry names the successor the row
+    is derived, so `master-retract` leaves it alone (the ingest's chain
+    writer owns the moved-row case)."""
+    _with_chain(store)
+    result = master_retract(_chained(store, CHAIN_SUCC), filings=_filings(), clock=lambda: CHECK)
+    assert all(u.table != "successor_chains" for u in result.found)
+
+
+def test_a_chain_row_is_traded_when_the_journal_names_a_side(store: Settings) -> None:
+    """#821, T187c: the `[traded]` gate covers a chain row through its
+    predecessor and successor, so a window holding either refuses the apply."""
+    _with_chain(store)
+    with open_for_write(store) as conn:
+        conn.execute(
+            "INSERT INTO adjustments (adjustment_id, window_id, run_id, session, kind, origin, "
+            "security_id, quantity, cash, explanation_json, known_at, ingested_at) VALUES "
+            "(1, 1, NULL, DATE '2019-06-03', 'spinoff_receipt', NULL, ?, 10.0, NULL, NULL, ?, ?)",
+            [CHAIN_PRED, CHAIN_KNOWN, CHAIN_KNOWN],
+        )
+    dry = master_retract(store, filings=_filings(), clock=lambda: CHECK)
+    assert CHAIN_PRED in dry.traded
+    assert any(
+        line == f"successor_chains: {CHAIN_SUCC} (known {CHAIN_KNOWN.isoformat()}) [traded]"
+        for line in dry.lines()
+    )
+    with pytest.raises(RetractRefused, match="traded securities"):
+        _apply(store, RETRACT_AT)

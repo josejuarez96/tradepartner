@@ -311,6 +311,23 @@ derived at `t`, as the data is read.
   restates it for a store built by other code. The four common-column rules
   above also cover `borrow_status`, `provenance_allowed` holding it to
   `snapshot`.
+- The successor-chain rules (#821, T187c), over raw rows and never through
+  the chained reads, one per live `successor_chains` row at `t`
+  (`live_chains_as_of`): `chain_ids_distinct_ciks` (the two ids name
+  different CIKs), `chain_known_at_le_ingested_at`, and
+  `chain_known_at_ge_successor_rows` (the row's stamp is at or after the
+  successor's `securities` row's and its first listing row's, so a lagging
+  stamp is named until the next EDGAR run moves it). The row's
+  `chain_successor_listed_under_predecessor_ticker` and
+  `chain_predecessor_no_bar_after_handover` (no predecessor bar on or after
+  the successor's first bar) fail a row over the stored listings and bars.
+  A `chain_price_break` is a warning, never a failure: the close ratio
+  across the hand-over (the successor's first stored close over the
+  predecessor's last) is above `master.chain_max_price_ratio` or below its
+  inverse. The `successor_chains` block lists each live chain with its
+  hand-over day (the successor's first listing row's `valid_from`), the
+  ratio, the predecessor facts dated after the hand-over, and the latest
+  EDGAR run's `chain_candidates` beside them.
 
 **Borrow status** (`BorrowHealth`, #1506, T171e; ADR 0021): the table's row
 count and distinct assets known at `t`, the latest observation (the newest
@@ -353,7 +370,7 @@ import math
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from itertools import pairwise
@@ -392,6 +409,8 @@ from tradepartner.store.asof import (
     ASSETS_SOURCE,
     _validate_t,
     borrow_status_as_of,
+    facts_as_of,
+    listings_as_of,
     live_actions_as_of,
     price_jumps_as_of,
     prices_as_of,
@@ -419,8 +438,8 @@ from tradepartner.store.index_members import (
     normalize_ticker,
     resolve,
 )
-from tradepartner.store.master import first_session, securities_as_of, session_of
-from tradepartner.store.retraction import RETRACT, underived_as_of
+from tradepartner.store.master import first_session, securities_as_of, security_cik, session_of
+from tradepartner.store.retraction import EDGAR, RETRACT, live_chains_as_of, underived_as_of
 from tradepartner.store.schema import (
     STATEMENT_FACT_BASIS_VALUES,
     TABLE_PROVENANCE_VALUES,
@@ -487,6 +506,18 @@ BORROW_STATUS_UNIQUE = "borrow_status_unique"
 #: block, never from `INTEGRITY_RULES`, and only while
 #: `openfigi.max_disagreements` is set.
 FIGI_TYPES_DISAGREEMENTS = "figi_types_disagreements"
+#: The successor-chain rules (#821, T187c), over raw rows: distinct CIKs,
+#: the row's own stamp order, its stamp against its successor's rows, the
+#: successor listing under the predecessor's ticker, and no predecessor bar
+#: after the hand-over.
+CHAIN_IDS_DISTINCT_CIKS = "chain_ids_distinct_ciks"
+CHAIN_KNOWN_AT_LE_INGESTED_AT = "chain_known_at_le_ingested_at"
+CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS = "chain_known_at_ge_successor_rows"
+CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER = "chain_successor_listed_under_predecessor_ticker"
+CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER = "chain_predecessor_no_bar_after_handover"
+#: The successor-chain price-break warning (#821, T187c): a block warning,
+#: never a failure, so it is not in `INTEGRITY_RULES`.
+CHAIN_PRICE_BREAK = "chain_price_break"
 
 #: Every integrity rule, in the order `integrity_checks` reports them.
 INTEGRITY_RULES: tuple[str, ...] = (
@@ -515,6 +546,11 @@ INTEGRITY_RULES: tuple[str, ...] = (
     SYMBOL_CHANGE_KNOWN_AT,
     DUPLICATE_DIVIDENDS,
     BORROW_STATUS_UNIQUE,
+    CHAIN_IDS_DISTINCT_CIKS,
+    CHAIN_KNOWN_AT_LE_INGESTED_AT,
+    CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+    CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
+    CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
 )
 
 #: EDGAR's filing-date rule: a submission accepted on a business day after
@@ -1321,6 +1357,266 @@ def duplicate_dividends(
     return DuplicateDividends(tuple(g for g in groups if g.group_class != "repaired"))
 
 
+_SUCCESSOR_CHAIN_SCHEMA: dict[str, Any] = {
+    "predecessor_id": pl.Utf8,
+    "successor_id": pl.Utf8,
+    "evidence_accession": pl.Utf8,
+    "evidence_form": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "handover": pl.Date,
+    "ratio": pl.Float64,
+    "price_break": pl.Boolean,
+}
+
+#: One row per predecessor fact dated after the hand-over a read returns under
+#: the successor (#821; the subsidiary case).
+_PREDECESSOR_FACT_SCHEMA: dict[str, Any] = {
+    "predecessor_id": pl.Utf8,
+    "fact_name": pl.Utf8,
+    "as_of_date": pl.Date,
+    "value": pl.Float64,
+}
+
+#: A successor-chain rule's violations: the two ids, the row's stamp and a
+#: one-line detail (module docstring, `successor_chains`).
+_CHAIN_RULE_SCHEMA: dict[str, Any] = {
+    "predecessor_id": pl.Utf8,
+    "successor_id": pl.Utf8,
+    "known_at": pl.Datetime("us", "UTC"),
+    "detail": pl.Utf8,
+}
+
+#: `chain_candidates` on the run row: `none`, or `N: id, id`.
+_CHAIN_CANDIDATES = re.compile(r"\bchain_candidates: (none|\d+:(?: [^;]*)?)")
+
+
+@dataclass(frozen=True, eq=False)
+class SuccessorChains:
+    """The live `successor_chains` rows at `t` (#821, T187c), each with the
+    hand-over day and the close ratio across it from the stored bars, the
+    predecessor facts dated after the hand-over, and the latest EDGAR run's
+    candidates beside them. A price break is a warning, never a failure."""
+
+    frame: pl.DataFrame
+    predecessor_facts: pl.DataFrame
+    candidates: tuple[str, ...] = ()
+
+    @property
+    def count(self) -> int:
+        """How many live chains there are."""
+        return self.frame.height
+
+    @property
+    def breaks(self) -> tuple[str, ...]:
+        """The successors whose close ratio is out of bounds."""
+        return tuple(self.frame.filter(pl.col("price_break"))["successor_id"].to_list())
+
+
+def chain_candidates_from_message(message: str | None) -> tuple[str, ...]:
+    """The successor ids the latest EDGAR run named under `chain_candidates`
+    (ingest's clause), empty when it names none or the message is `None`."""
+    if not message:
+        return ()
+    match = _CHAIN_CANDIDATES.search(message)
+    if match is None or match.group(1) == "none":
+        return ()
+    _, _, ids = match.group(1).partition(":")
+    return tuple(part.strip() for part in ids.split(",") if part.strip())
+
+
+def _chain_amount(
+    settings: Settings, predecessor_last: float | None, successor_first: float | None
+) -> tuple[float | None, bool]:
+    """The close ratio across a hand-over and whether it breaks
+    `master.chain_max_price_ratio` (the ratio or its inverse)."""
+    if predecessor_last is None or successor_first is None or predecessor_last == 0:
+        return None, False
+    ratio = successor_first / predecessor_last
+    maximum = settings.master.chain_max_price_ratio
+    return ratio, ratio > maximum or ratio < 1 / maximum
+
+
+def _listing_rows(listings: pl.DataFrame, security_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """`listings`' rows whose `security_id` is in `security_ids` (an as-of
+    frame, one row per security and revision)."""
+    wanted = set(security_ids)
+    return [row for row in listings.iter_rows(named=True) if row["security_id"] in wanted]
+
+
+def successor_chains(
+    conn: duckdb.DuckDBPyConnection,
+    t: datetime,
+    settings: Settings,
+    candidates: Sequence[str] = (),
+) -> SuccessorChains:
+    """The `successor_chains` block at `t` (#821, T187c), store-only and over
+    raw rows (never through the chained reads): each live chain, its
+    hand-over day and close ratio, the predecessor facts after it, and the
+    latest EDGAR run's candidates. A bare date raises `TypeError`, a naive
+    datetime `ValueError`."""
+    t = _validate_t(t)
+    live = live_chains_as_of(conn, t)
+    if not live:
+        return SuccessorChains(
+            pl.DataFrame([], schema=_SUCCESSOR_CHAIN_SCHEMA),
+            pl.DataFrame([], schema=_PREDECESSOR_FACT_SCHEMA),
+            tuple(candidates),
+        )
+    listings = listings_as_of(conn, t)
+    facts = facts_as_of(conn, t)
+    ids = sorted({row["predecessor_id"] for row in live} | {row["successor_id"] for row in live})
+    bars = prices_as_of(conn, t, ids, traded_only=True)
+    first: dict[str, tuple[date, float]] = {}
+    last: dict[str, tuple[date, float]] = {}
+    for bar in bars.iter_rows(named=True):
+        sid = bar["security_id"]
+        if sid not in first or bar["session"] < first[sid][0]:
+            first[sid] = (bar["session"], bar["close"])
+        if sid not in last or bar["session"] > last[sid][0]:
+            last[sid] = (bar["session"], bar["close"])
+    rows: list[dict[str, Any]] = []
+    fact_rows: list[dict[str, Any]] = []
+    for chain in live:
+        predecessor, successor = chain["predecessor_id"], chain["successor_id"]
+        succ_listings = _listing_rows(listings, [successor])
+        succ_listings.sort(key=lambda r: (r["valid_from"], r["known_at"]))
+        handover = succ_listings[0]["valid_from"] if succ_listings else None
+        pred_close = last.get(predecessor, (None, None))[1]
+        succ_close = first.get(successor, (None, None))[1]
+        ratio, price_break = _chain_amount(settings, pred_close, succ_close)
+        rows.append(
+            {
+                "predecessor_id": predecessor,
+                "successor_id": successor,
+                "evidence_accession": chain["evidence_accession"],
+                "evidence_form": chain["evidence_form"],
+                "known_at": chain["known_at"],
+                "handover": handover,
+                "ratio": ratio,
+                "price_break": price_break,
+            }
+        )
+        if handover is not None:
+            for fact in facts.iter_rows(named=True):
+                if fact["security_id"] == predecessor and fact["as_of_date"] > handover:
+                    fact_rows.append(
+                        {
+                            "predecessor_id": predecessor,
+                            "fact_name": fact["fact_name"],
+                            "as_of_date": fact["as_of_date"],
+                            "value": fact["value"],
+                        }
+                    )
+    rows.sort(key=lambda r: r["successor_id"])
+    fact_rows.sort(key=lambda r: (r["predecessor_id"], r["as_of_date"], r["fact_name"]))
+    return SuccessorChains(
+        pl.DataFrame(rows, schema=_SUCCESSOR_CHAIN_SCHEMA),
+        pl.DataFrame(fact_rows, schema=_PREDECESSOR_FACT_SCHEMA),
+        tuple(candidates),
+    )
+
+
+def _chain_rule_rows(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, pl.DataFrame]:
+    """Every successor-chain rule's violations at `t` (#821, T187c), over raw
+    rows: live chain rows against the successor's `securities` and listing
+    rows, the predecessor's last listing row, and the stored bars."""
+    live = live_chains_as_of(conn, t)
+    empty = pl.DataFrame([], schema=_CHAIN_RULE_SCHEMA)
+    violations: dict[str, list[dict[str, Any]]] = {
+        CHAIN_IDS_DISTINCT_CIKS: [],
+        CHAIN_KNOWN_AT_LE_INGESTED_AT: [],
+        CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS: [],
+        CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER: [],
+        CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER: [],
+    }
+    if not live:
+        return {rule: empty for rule in violations}
+    listings = listings_as_of(conn, t)
+    securities = securities_as_of(conn, t)
+    security_known = {
+        row["security_id"]: row["known_at"] for row in securities.iter_rows(named=True)
+    }
+
+    def violation(rule: str, chain: Mapping[str, Any], detail: str) -> None:
+        violations[rule].append(
+            {
+                "predecessor_id": chain["predecessor_id"],
+                "successor_id": chain["successor_id"],
+                "known_at": chain["known_at"],
+                "detail": detail,
+            }
+        )
+
+    predecessor_bars: dict[str, list[date]] = defaultdict(list)
+    successor_first_bar: dict[str, date] = {}
+    wanted_bars = sorted(
+        {row["predecessor_id"] for row in live} | {row["successor_id"] for row in live}
+    )
+    for bar in (
+        prices_as_of(conn, t, wanted_bars, traded_only=True).iter_rows(named=True)
+        if wanted_bars
+        else ()
+    ):
+        sid = bar["security_id"]
+        predecessor_bars[sid].append(bar["session"])
+        if sid not in successor_first_bar or bar["session"] < successor_first_bar[sid]:
+            successor_first_bar[sid] = bar["session"]
+    for chain in live:
+        predecessor, successor = chain["predecessor_id"], chain["successor_id"]
+        if security_cik(predecessor) == security_cik(successor):
+            violation(CHAIN_IDS_DISTINCT_CIKS, chain, f"{predecessor} and {successor}")
+        if chain["known_at"] > chain["ingested_at"]:
+            violation(
+                CHAIN_KNOWN_AT_LE_INGESTED_AT,
+                chain,
+                f"known_at {chain['known_at'].isoformat()} > "
+                f"ingested_at {chain['ingested_at'].isoformat()}",
+            )
+        succ_rows = _listing_rows(listings, [successor])
+        succ_rows.sort(key=lambda r: (r["valid_from"], r["known_at"]))
+        succ_security = security_known.get(successor)
+        succ_first_listing = succ_rows[0] if succ_rows else None
+        for label, stamp in (
+            ("securities", succ_security),
+            ("listing", succ_first_listing["known_at"] if succ_first_listing else None),
+        ):
+            if stamp is not None and chain["known_at"] < stamp:
+                violation(
+                    CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS,
+                    chain,
+                    f"known_at {chain['known_at'].isoformat()} < successor {label} "
+                    f"{stamp.isoformat()}",
+                )
+        pred_rows = _listing_rows(listings, [predecessor])
+        pred_rows.sort(key=lambda r: (r["valid_from"], r["known_at"]))
+        if pred_rows:
+            last_pred = pred_rows[-1]
+            if not any(
+                row["ticker"] == last_pred["ticker"] and row["exchange"] == last_pred["exchange"]
+                for row in succ_rows
+            ):
+                violation(
+                    CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
+                    chain,
+                    f"{successor} is not listed {last_pred['ticker']}/{last_pred['exchange']}",
+                )
+        succ_bar = successor_first_bar.get(successor)
+        if succ_bar is not None:
+            after = [
+                session for session in predecessor_bars.get(predecessor, []) if session >= succ_bar
+            ]
+            if after:
+                violation(
+                    CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER,
+                    chain,
+                    f"{predecessor} has a bar on {min(after).isoformat()} "
+                    f"at/after {succ_bar.isoformat()}",
+                )
+    return {
+        rule: pl.DataFrame(rows, schema=_CHAIN_RULE_SCHEMA) for rule, rows in violations.items()
+    }
+
+
 @dataclass(frozen=True, eq=False)
 class HealthReport:
     """Everything the health command and page show (module docstring)."""
@@ -1346,6 +1642,7 @@ class HealthReport:
     figi_types: FigiTypes
     duplicate_dividends: DuplicateDividends
     filename_listings: FilenameListings
+    successor_chains: SuccessorChains
     integrity: tuple[IntegrityCheck, ...]
     #: `None` when the block was not computed ("not computed", never a pass).
     coverage_reference: CoverageReference | None = None
@@ -1407,6 +1704,14 @@ def health_report(
     overlaps, accepted_pairs = _overlapping_listings(listings, settings)
     ingests = last_ingests(conn, t)
     dividends = duplicate_dividends(conn, t, reviewed_groups() if reviewed is None else reviewed)
+    chain_candidates = next(
+        (
+            chain_candidates_from_message(status.latest_message)
+            for status in ingests
+            if status.source == EDGAR
+        ),
+        (),
+    )
     return HealthReport(
         t=t,
         session=session,
@@ -1432,6 +1737,7 @@ def health_report(
         figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         filename_listings=_filename_listings(conn, t, listings),
+        successor_chains=successor_chains(conn, t, settings, chain_candidates),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
         coverage_reference=(
             _coverage_reference(conn, t, settings, listings, index_key)
@@ -2514,6 +2820,7 @@ def _integrity_checks(
         **_new_action_stamp_rules(conn),
         DUPLICATE_DIVIDENDS: dividends.violations,
         BORROW_STATUS_UNIQUE: _borrow_duplicates(conn),
+        **_chain_rule_rows(conn, t),
     }
     return tuple(IntegrityCheck(rule=rule, violations=violations[rule]) for rule in INTEGRITY_RULES)
 

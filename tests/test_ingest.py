@@ -975,7 +975,10 @@ def test_edgar_run_message_carries_the_adapter_counts(
 
     Counted.skipped = skipped
     result = _run(settings, filings=_filings(cls=Counted), source="edgar")
-    counts = "; unstamped: 2 filings, 2 facts; skipped filers: 3; missing benchmarks:"
+    counts = (
+        "; unstamped: 2 filings, 2 facts; skipped filers: 3; chain_candidates: none; "
+        "missing benchmarks:"
+    )
     assert result.runs[0].status == OK
     assert counts in result.runs[0].message
     assert counts in read("SELECT message FROM ingestion_runs")[0][0]
@@ -987,7 +990,7 @@ def test_edgar_run_message_names_only_the_counts_the_source_exposes(settings: Se
 
     off = _switched(settings, False)  # the statement counts are their own tests' job
     message = _run(off, filings=_filings(cls=OnlyFacts), source="edgar").runs[0].message
-    assert " facts; unstamped: 1 facts; missing benchmarks:" in message
+    assert " facts; unstamped: 1 facts; chain_candidates: none; missing benchmarks:" in message
 
 
 def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
@@ -1006,7 +1009,8 @@ def test_edgar_run_message_carries_the_fsn_counts(settings: Settings) -> None:
     message = _run(settings, filings=_filings(cls=Fsn), source="edgar").runs[0].message
     counts = (
         "; FSN re-issued: 2; FSN duplicates: 1; FSN re-issues unchecked: 3; "
-        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; missing"
+        "FSN incomplete listings: 4; cover incomplete listings: 6; FSN missing: 5; "
+        "chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -1024,7 +1028,7 @@ def test_edgar_run_message_carries_the_exchange_axis_mismatch_counts(settings: S
     message = _run(settings, filings=_filings(cls=Mismatched), source="edgar").runs[0].message
     counts = (
         "; cover incomplete listings: 6; FSN exchange-axis mismatches: 7; "
-        "cover exchange-axis mismatches: 8; missing"
+        "cover exchange-axis mismatches: 8; chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -1037,7 +1041,10 @@ def test_edgar_run_message_carries_the_pre_xml_delistings_count(settings: Settin
         unstamped_delistings = 2
 
     message = _run(settings, filings=_filings(cls=Delistings), source="edgar").runs[0].message
-    assert "; pre-XML delistings: 7; unstamped delistings: 2; missing" in message
+    assert (
+        "; pre-XML delistings: 7; unstamped delistings: 2; chain_candidates: none; missing"
+        in message
+    )
 
 
 def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings) -> None:
@@ -1062,7 +1069,8 @@ def test_edgar_run_message_carries_the_failure_policy_counts(settings: Settings)
         "; failed filings: 2; quarantined: 1; facts missing: 4"
         "; empty bulk facts: 3; empty bulk submissions: 5"
         "; empty API facts: 6; empty API submissions: 7"
-        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; missing"
+        "; keyless bulk facts: 8; keyless API facts: 9; capped facts dropped: 1; "
+        "chain_candidates: none; missing"
     )
     assert counts in message
 
@@ -5640,11 +5648,8 @@ def test_import_dry_run_keeps_the_counts_before_a_failing_file(
 # --- successor chains (#821, plan T187) -------------------------------------
 
 _CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe" / "chains"
-_CHAIN_CASE = next(
-    case
-    for case in json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
-    if case["case"] == "chain_1to1"
-)
+_CHAIN_CASES = json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())
+_CHAIN_CASE = next(case for case in _CHAIN_CASES if case["case"] == "chain_1to1")
 
 
 def _chain_parse(value: str) -> datetime:
@@ -5737,6 +5742,109 @@ def _chain_settings_for(settings: Settings, *, accession: str | None) -> Setting
 
 def _chain_now() -> datetime:
     return datetime(2026, 1, 2, 3, 0, tzinfo=UTC)
+
+
+def _candidate_filings(*cases: dict[str, Any]) -> FixtureFilingSource:
+    """`_filings()` plus each case's pair, with the successor's 8-K12B only
+    where the case has evidence (#821 candidates)."""
+    index: list[FilingIndexEntry] = []
+    covers: list[CoverPage] = []
+    for case in cases:
+        predecessor = case["predecessor"]
+        successor = case["successor"]
+        ticker = case["ticker"]
+        index += [
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000001",
+                _chain_parse(predecessor["first_index"]),
+            ),
+            FilingIndexEntry(
+                predecessor["cik"],
+                predecessor["name"],
+                "10-K",
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+            ),
+            FilingIndexEntry(
+                successor["cik"],
+                successor["name"],
+                "10-K",
+                f"{successor['cik']}-20-000001",
+                _chain_parse(successor["first_index"]),
+            ),
+        ]
+        evidence = case["evidence"]
+        if evidence is not None:
+            index.append(
+                FilingIndexEntry(
+                    successor["cik"],
+                    successor["name"],
+                    evidence["form"],
+                    evidence["accession"],
+                    _chain_parse(evidence["accepted_at"]),
+                )
+            )
+        covers += [
+            CoverPage(
+                predecessor["cik"],
+                f"{predecessor['cik']}-20-000002",
+                _chain_parse(predecessor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+            CoverPage(
+                successor["cik"],
+                f"{successor['cik']}-20-000002",
+                _chain_parse(successor["cover"]),
+                (CoverListing("Common Stock", ticker, "NYSE"),),
+            ),
+        ]
+    return _filings(extra_index=index, extra_covers=covers)
+
+
+def test_the_edgar_run_row_names_chain_candidates(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: the run row counts and names `chain_candidates` -- the
+    8-K12B filer whose listing row takes the ticker, never the spin-off pair
+    with no successor filing. The gap is 63 sessions without a Form 25 in
+    the source, inside the default 65."""
+    spin_off = next(case for case in _CHAIN_CASES if case["case"] == "chain_spinoff")
+    _run(settings, filings=_candidate_filings(_CHAIN_CASE, spin_off), now=_chain_now())
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: 1: 0001000011" in message
+    assert "0001000017" not in message
+
+
+def test_a_chain_entry_removes_its_candidate(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: a successor on a `master.chains` entry is no candidate."""
+    _run(
+        _chained_settings(settings, _CHAIN_CASE),
+        filings=_candidate_filings(_CHAIN_CASE),
+        now=_chain_now(),
+    )
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: none" in message
+
+
+def test_a_dismissed_successor_is_no_candidate(
+    settings: Settings, read: Callable[[str], list[tuple[Any, ...]]]
+) -> None:
+    """#821, T187c: a successor in `master.chains_dismissed` is no candidate."""
+    dismissed = settings.model_copy(
+        update={
+            "master": settings.master.model_copy(
+                update={"chains_dismissed": [_CHAIN_CASE["successor"]["cik"]]}
+            )
+        }
+    )
+    _run(dismissed, filings=_candidate_filings(_CHAIN_CASE), now=_chain_now())
+    message = read("SELECT message FROM ingestion_runs WHERE source = 'edgar'")[0][0]
+    assert "chain_candidates: none" in message
 
 
 def test_a_chain_entry_writes_a_row_and_the_run_row_counts_it(

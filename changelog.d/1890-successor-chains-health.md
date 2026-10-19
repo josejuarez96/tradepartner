@@ -1,0 +1,5 @@
+- Successor chains: health's block, check rules and price-break warning, `master-retract`'s chain rows, and the EDGAR run row's candidates (#821, T187c).
+### Added
+- Added the `successor_chains` health block (each live chain's hand-over day, close ratio, predecessor facts after the hand-over, and the latest EDGAR run's `chain_candidates`) and the five `--check` rules `chain_ids_distinct_ciks`, `chain_known_at_le_ingested_at`, `chain_known_at_ge_successor_rows`, `chain_successor_listed_under_predecessor_ticker` and `chain_predecessor_no_bar_after_handover`, with the `chain_price_break` warning above `master.chain_max_price_ratio` or below its inverse (#821).
+- Added `chain_candidates` to the EDGAR run row: every 8-K12B or 8-K12G3 filer whose first listing row takes a ticker and exchange another company's security last listed within `master.chain_window_sessions` sessions before it, on no `master.chains` entry and not dismissed (#821).
+- `master-retract` now proposes and retracts a live `successor_chains` row no `master.chains` entry derives, `[traded]` through its predecessor and successor (#821).
