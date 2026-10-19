@@ -71,6 +71,10 @@ def _version_14_store(conn: duckdb.DuckDBPyConnection) -> None:
     for table, columns in (("trials", trials), ("trial_results", ("sharpe_unit",))):
         for column in columns:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    # `trial_metrics.cost_level_kind` is version 33's (#1792, T210b): a version-14
+    # store has no such column, so rebuild the table from its version-4 DDL.
+    conn.execute("DROP TABLE trial_metrics")
+    conn.execute(schema._CREATE_TRIAL_METRICS)
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version VALUES (14, ?)", [_AT])
     record = registry.register_hypothesis(
@@ -136,7 +140,13 @@ def _snapshot(conn: duckdb.DuckDBPyConnection, tables: list[str]) -> dict[str, A
 
 
 def _metric_rows(conn: duckdb.DuckDBPyConnection) -> set[tuple[Any, ...]]:
-    return set(conn.execute("SELECT * FROM trial_metrics").fetchall())
+    """The version-14 metric columns, so a before/after comparison is unmoved by
+    version 33's `cost_level_kind` (#1792, T210b)."""
+    return set(
+        conn.execute(
+            "SELECT trial_id, series, cost_per_side_bps, metric, value FROM trial_metrics"
+        ).fetchall()
+    )
 
 
 @pytest.fixture
@@ -150,7 +160,7 @@ def v14() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 32
+    assert schema.CURRENT_SCHEMA_VERSION == 33
 
 
 def test_the_rename_table_covers_every_phase3_period_key() -> None:
@@ -238,6 +248,7 @@ def test_the_migration_sets_detail_level_full_and_leaves_the_rest_null(
         (30,),
         (31,),
         (32,),
+        (33,),
     ]
 
 
@@ -274,7 +285,7 @@ def test_a_second_open_inserts_nothing_more(v14: duckdb.DuckDBPyConnection) -> N
     rows = _metric_rows(v14)
     schema.init_schema(v14)
     assert _metric_rows(v14) == rows
-    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (19,)
+    assert v14.execute("SELECT count(*) FROM schema_version").fetchone() == (20,)
 
 
 def test_new_trials_after_the_migration_carry_no_detail_default(

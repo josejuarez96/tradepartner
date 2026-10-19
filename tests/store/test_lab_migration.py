@@ -182,7 +182,7 @@ def _hypothesis_ids(conn: duckdb.DuckDBPyConnection) -> list[int]:
 
 
 def test_version_is_17_and_16_is_the_pre_expansion_seams_version() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == 32
+    assert schema.CURRENT_SCHEMA_VERSION == 33
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
     assert schema._PRE_LAB_VERSION == 15
 
@@ -241,6 +241,7 @@ def test_migration_identity(v15: tuple[duckdb.DuckDBPyConnection, dict[str, int]
         (30,),
         (31,),
         (32,),
+        (33,),
     ]
     assert _tables(conn) == before_tables | set(lab_schema.LAB_TABLE_NAMES)
     # Only the three populated lab tables have rows.
@@ -380,7 +381,7 @@ def test_a_fresh_store_stays_without_the_lab_tables() -> None:
     try:
         schema.init_schema(conn)
         assert not lab_schema.is_lab_initialised(conn)
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(32,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(33,)]
     finally:
         conn.close()
 
