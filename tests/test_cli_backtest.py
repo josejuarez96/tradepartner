@@ -560,3 +560,42 @@ def _unfinished_trial() -> int:
             synthetic=False,
             run_by="test",
         ).trial_id
+
+
+# --- the measured cost level (spec amendment 2026-10-18, #1792, item 2) ---------------
+
+
+def test_measured_cost_bps_needs_a_note(registered: Path, read: Any) -> None:
+    out = _cli("backtest", SLUG, "--measured-cost-bps", "22")
+    assert out.exit_code == 2, out.output
+    assert "--note" in out.output
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_measured_cost_bps_with_a_note_runs_and_labels_the_level(
+    registered: Path, read: Any
+) -> None:
+    out = _cli("backtest", SLUG, "--measured-cost-bps", "22", "--note", "book 1, 2026-01")
+    assert out.exit_code == 0, out.output
+    trial_id = _trial_id(out)
+    conn = read()
+    assert conn.execute(
+        "SELECT DISTINCT cost_level_kind FROM trial_metrics "
+        "WHERE trial_id = ? AND cost_per_side_bps = 22.0",
+        [trial_id],
+    ).fetchall() == [("measured",)]
+    levels = conn.execute(
+        "SELECT DISTINCT cost_per_side_bps FROM trial_metrics WHERE trial_id = ?",
+        [trial_id],
+    ).fetchall()
+    assert 22.0 in {level for (level,) in levels}
+    assert conn.execute("SELECT note FROM trials WHERE trial_id = ?", [trial_id]).fetchone() == (
+        "book 1, 2026-01",
+    )
+
+
+def test_measured_cost_bps_equal_to_a_ladder_level_exits_two(registered: Path, read: Any) -> None:
+    out = _cli("backtest", SLUG, "--measured-cost-bps", "30", "--note", "book 1")
+    assert out.exit_code == 2, out.output
+    assert "refused_measured_level" in out.output
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)

@@ -303,12 +303,18 @@ class ResultStatistics:
 
 @dataclass(frozen=True)
 class MetricRow:
-    """One `trial_metrics` row; `value` is None where a metric does not apply."""
+    """One `trial_metrics` row; `value` is None where a metric does not apply.
+
+    `cost_level_kind` is the version-33 label of the level (`base`, `ladder` or
+    `measured`; `schema.COST_LEVEL_KINDS`), the companion of `cost_per_side_bps`
+    the kill ladder's rung 1 reads. It defaults to `base` so a row built
+    without it (a rewrite of a base-level metric) reads as the base level."""
 
     series: str
     cost_per_side_bps: float
     metric: str
     value: float | None
+    cost_level_kind: str = "base"
 
 
 @dataclass(frozen=True)

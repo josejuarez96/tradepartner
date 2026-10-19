@@ -110,15 +110,21 @@ def _ok_trial(
     excess: float,
     *,
     details: bool = False,
+    measured: float | None = None,
     **kwargs: Any,
 ) -> registry.TrialHandle:
     handle = _open(conn, seed_settings, hypothesis_id, **kwargs)
     rows = [
-        registry.MetricRow(series, cost, key, value)
+        registry.MetricRow(series, cost, key, value, "base" if cost == BASE else "ladder")
         for series in ("strategy", "SPY", "MTUM")
         for cost in LADDER
         for key, value in _metrics(sharpe, excess).items()
     ]
+    if measured is not None:
+        rows.extend(
+            registry.MetricRow("strategy", measured, key, value, "measured")
+            for key, value in _metrics(sharpe, excess).items()
+        )
     registry.write_metrics(conn, handle, rows)
     if details:
         registry.write_equity(
@@ -426,7 +432,7 @@ def test_render_detailed_trial_shows_every_element(
     assert list(per_rebalance["n_universe"]) == [480, 481, 482]
 
     metrics = next(df.value for df in at.dataframe if "metric" in df.value.columns)
-    assert {"strategy @ 15.0 bps", "strategy @ 30.0 bps"} <= set(metrics.columns)
+    assert {"strategy @ 15.0 bps (base)", "strategy @ 30.0 bps (ladder)"} <= set(metrics.columns)
 
     assert "in_sample" in text
     spends = next(df.value for df in at.dataframe if "holdout_reason" in df.value.columns)
@@ -886,3 +892,22 @@ def test_holdout_spend_table_names_trial_and_research_sources(
     backtest_page._render_holdout_spends(view)
 
     assert frames[0]["source"].to_list() == ["trial", "research_run"]
+
+
+def test_a_measured_level_column_header_carries_its_kind(tmp_path: Path) -> None:
+    """A `measured` level is labelled in its column header, so it is never read
+    as a ladder rung (spec amendment 2026-10-18, #1792, item 2)."""
+    store_path = tmp_path / "measured.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.5)
+        handle = _ok_trial(conn, seed_settings, h1, 0.2, 0.05, measured=22.0)
+    with duckdb.connect(str(store_path), read_only=True) as conn:
+        view = backtest_page.load_trial_view(conn, handle.trial_id)
+
+    columns = set(backtest_page._metrics_table(view).columns)
+
+    assert "strategy @ 22.0 bps (measured)" in columns
+    assert "strategy @ 15.0 bps (base)" in columns
+    assert "strategy @ 30.0 bps (ladder)" in columns

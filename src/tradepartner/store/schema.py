@@ -494,7 +494,20 @@ registry; #83 took version 2 first, so the registry is version 3):
   store gets the widened set from the rebuilds of its own earlier steps). A
   read-only connection accepts a version-31 store: no read depends on the
   status `CHECK`, and the next writable `init_schema` call migrates it.
-- **A later DDL change goes to version 33**, with its own migration and a
+- **Version 33** (#1792, plan T210b; the spec's 2026-10-18 amendment item 2):
+  `trial_metrics` gains `cost_level_kind VARCHAR NOT NULL` with a `CHECK`
+  `IN ('base', 'ladder', 'measured')`, the companion of `cost_per_side_bps`
+  that labels the measured cost level the kill ladder's rung 1 reads. DuckDB
+  cannot add a NOT NULL column with a table `CHECK` in place, so the migration
+  `_migrate_cost_level_kind` rebuilds `trial_metrics` from its own DDL
+  (`_COST_LEVEL_KIND_TABLE_DDL`), every row kept in insertion order and
+  backfilled: `base` where the row's `cost_per_side_bps` equals its trial's
+  stored `costs.per_side_bps` (its hypothesis's `params_json`, a lab-baseline
+  key in every stored set) and `ladder` elsewhere, so no value moves. The
+  `UNIQUE (trial_id, series, cost_per_side_bps, metric)` is unchanged. A
+  read-only connection accepts a version-32 store: no read depends on the
+  column (the backtest page falls back to `base`/`ladder` by its level).
+- **A later DDL change goes to version 34**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -774,9 +787,13 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 32 (plan T202b): `order_events.status` gains `pending_unresolved`;
 #:   `order_events` is rebuilt (`_migrate_pending_unresolved`), every row kept
 #:   (module docstring, "Schema versions").
-#: - A later DDL change goes to version 33, with its own migration and a
+#: - 33 (#1792, plan T210b): `trial_metrics` gains the `cost_level_kind`
+#:   `CHECK` column; the table is rebuilt (`_migrate_cost_level_kind`), every
+#:   row kept and backfilled `base` or `ladder` (module docstring,
+#:   "Schema versions").
+#: - A later DDL change goes to version 34, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 32
+CURRENT_SCHEMA_VERSION = 33
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -922,6 +939,11 @@ _PRE_SUCCESSOR_CHAINS_VERSION = 30
 #: version 32): read-only connections serve every read, since no read depends
 #: on the status `CHECK` and no such event can exist there.
 _PRE_PENDING_UNRESOLVED_VERSION = 31
+
+#: The last version without `trial_metrics.cost_level_kind` (#1792, plan T210b,
+#: version 33): read-only connections serve every read, since no read depends
+#: on the column (the backtest page falls back to `base`/`ladder` by level).
+_PRE_COST_LEVEL_KIND_VERSION = 32
 
 
 class SchemaVersionError(RuntimeError):
@@ -1570,6 +1592,38 @@ CREATE TABLE IF NOT EXISTS trial_metrics (
     UNIQUE (trial_id, series, cost_per_side_bps, metric)
 )
 """
+
+#: `trial_metrics`'s `cost_level_kind` values (spec amendment 2026-10-18,
+#: #1792, item 2; version 33): `base` is the trial's `costs.per_side_bps`,
+#: `ladder` a sensitivity level the run also evaluated, and `measured` the one
+#: extra level `backtest --measured-cost-bps` adds (never in N, V or DSR).
+COST_LEVEL_KINDS: Final = ("base", "ladder", "measured")
+
+#: `trial_metrics` with the version-33 `cost_level_kind` column
+#: (`_migrate_cost_level_kind`); the pinned `_REGISTRY_TABLE_DDL` keeps its
+#: version-4 shape, so a fresh store is rebuilt empty here too. The `UNIQUE` is
+#: unchanged. `DEFAULT 'base'` matches `registry.MetricRow.cost_level_kind`'s
+#: default: every write names the kind, and a row built without it (a rewrite of
+#: a base-level metric, as the pre-#1792 test helpers insert) reads as the base
+#: level.
+_COST_LEVEL_KIND_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS trial_metrics (
+    trial_id BIGINT NOT NULL,
+    series VARCHAR NOT NULL,
+    cost_per_side_bps DOUBLE NOT NULL,
+    cost_level_kind VARCHAR NOT NULL DEFAULT 'base',
+    metric VARCHAR NOT NULL,
+    value DOUBLE,
+    CHECK (cost_level_kind IN ('base', 'ladder', 'measured')),
+    UNIQUE (trial_id, series, cost_per_side_bps, metric)
+)
+"""
+
+#: The JSON path to a stored hypothesis's base cost level inside its flat
+#: `params_json` (its key is the dotted `registry.BASE_COST_KEY`,
+#: `costs.per_side_bps`), used by `_migrate_cost_level_kind` to backfill
+#: `base` versus `ladder` without importing `store.registry`.
+_BASE_COST_JSON_PATH: Final = '$."costs.per_side_bps"'
 
 _CREATE_TRIAL_REBALANCES = """
 CREATE TABLE IF NOT EXISTS trial_rebalances (
@@ -2847,6 +2901,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPENFIGI_TYPES_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
         _PRE_PENDING_UNRESOLVED_VERSION,
+        _PRE_COST_LEVEL_KIND_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2877,7 +2932,10 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # can exist there, and no read depends on the provenance `CHECK`);
         # version 26 every read; version 27 every read but `symbol_changes`;
         # version 28 every read; version 29 every read but `openfigi_types` and
-        # `successor_chains`; version 30 every read but `successor_chains`.
+        # `successor_chains`; version 30 every read but `successor_chains`;
+        # version 31 every read (no `pending_unresolved` event can exist there);
+        # version 32 every read (no `cost_level_kind` column: the backtest page
+        # falls back to `base`/`ladder` by each level).
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3382,6 +3440,44 @@ def _migrate_period_metrics(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _migrate_cost_level_kind(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild `trial_metrics` with its version-33 DDL
+    (`_COST_LEVEL_KIND_TABLE_DDL`; module docstring, "Schema versions", #1792,
+    plan T210b): the pinned version-4 shape plus the NOT NULL
+    `cost_level_kind` column with its `CHECK`. DuckDB cannot add a NOT NULL
+    column with a table `CHECK` in place, so every row is copied into a staging
+    table in insertion order, backfilled `base` where the row's
+    `cost_per_side_bps` equals its trial's hypothesis's stored
+    `costs.per_side_bps` (its flat `params_json`) and `ladder` elsewhere, then
+    the tables are swapped. No value moves and the `UNIQUE` is unchanged. A
+    fresh store's table comes from `_REGISTRY_TABLE_DDL` (the version-4 shape)
+    and is rebuilt empty here. Idempotent: a table that has the column is left
+    alone. Runs inside `init_schema`'s transaction, after the DDL pass and
+    after `_migrate_period_metrics`, so its period rows are labelled too."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('trial_metrics')").fetchall()}
+    if "cost_level_kind" in columns:
+        return
+    staging = "trial_metrics_v33"
+    conn.execute(
+        _COST_LEVEL_KIND_TABLE_DDL.replace(
+            "CREATE TABLE IF NOT EXISTS trial_metrics (", f"CREATE TABLE {staging} (", 1
+        )
+    )
+    conn.execute(
+        "INSERT INTO trial_metrics_v33 BY NAME "
+        "SELECT m.trial_id, m.series, m.cost_per_side_bps, "
+        "CASE WHEN m.cost_per_side_bps = "
+        f"json_extract(h.params_json, '{_BASE_COST_JSON_PATH}')::DOUBLE "
+        "THEN 'base' ELSE 'ladder' END AS cost_level_kind, "
+        "m.metric, m.value "
+        "FROM trial_metrics m JOIN trials t ON t.trial_id = m.trial_id "
+        "LEFT JOIN hypotheses h ON h.hypothesis_id = t.hypothesis_id "
+        "ORDER BY m.rowid"
+    )
+    conn.execute("DROP TABLE trial_metrics")
+    conn.execute(f"ALTER TABLE {staging} RENAME TO trial_metrics")
+
+
 def _migrate_lab(conn: duckdb.DuckDBPyConnection) -> None:
     """The lab migration (module docstring, "Schema versions", version 16):
     `lab_schema.apply_lab_schema`, then, from the `hypotheses` rows that exist
@@ -3649,7 +3745,7 @@ def _migrate_pending_unresolved(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 31 store to version 32.
+    version-2 to 32 store to version 33.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3665,6 +3761,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     `openfigi_types` and `successor_chains` created where it lacks them (purely
     additive; a version-29 store gets version-30 and version-31 rows, a
     version-30 store a version-31 row; #1713, T189c; #821, T187); every store gets
+    `trial_metrics` rebuilt with its version-33 DDL (the `cost_level_kind`
+    `CHECK` column added, every row kept and backfilled `base` or `ladder` by
+    its trial's stored `costs.per_side_bps`; a version-2 to 32 store gets a
+    version-33 row; #1792, T210b); every store gets
     `adjustments` rebuilt with its version-27 DDL (the `kind` `CHECK` widened
     with `cash_in_lieu`, every row kept, byte-identical; a version-2 to 26 store
     gets a version-27 row; #1627); every store gets
@@ -3733,7 +3833,10 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-30 (every read but
+    On a read-only connection no DDL runs: a version-32 (every read; the
+    `cost_level_kind` column is missing and the backtest page falls back to
+    `base`/`ladder`), 31 (every read; no `pending_unresolved` event can exist
+    there), 30 (every read but
     `successor_chains`, missing there), 29 (every read but `openfigi_types`
     and `successor_chains`), 28, 27 (every read but
     `symbol_changes`, missing there), 26, 25 (every read; the
@@ -3804,6 +3907,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_OPENFIGI_TYPES_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
         _PRE_PENDING_UNRESOLVED_VERSION,
+        _PRE_COST_LEVEL_KIND_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -3858,6 +3962,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _migrate_period_columns(conn)
         if max_version is not None and max_version <= _PRE_PERIOD_KEYS_VERSION:
             _migrate_period_metrics(conn)
+        _migrate_cost_level_kind(conn)
         forget_column_types(conn)
         if max_version is not None and max_version <= _PRE_LAB_VERSION:
             _migrate_lab(conn)

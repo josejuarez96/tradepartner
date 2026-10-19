@@ -1581,3 +1581,70 @@ def test_a_fixture_backtest_under_store_stores_the_hand_product(
                 assert got == pytest.approx(want, rel=1e-12)
     finally:
         connection.close()
+
+
+# --- the measured cost level (spec amendment 2026-10-18, #1792, item 2) ----------------
+
+MEASURED = 22.0
+
+
+def _kinded_rows(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, level: float
+) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT series, metric, value, cost_level_kind FROM trial_metrics "
+        "WHERE trial_id = ? AND cost_per_side_bps = ? ORDER BY series, metric",
+        [trial_id, level],
+    ).fetchall()
+
+
+def _kinds(rows: list[Any]) -> dict[float, str]:
+    return {row.cost_per_side_bps: row.cost_level_kind for row in rows}
+
+
+def test_metric_rows_label_each_level_base_ladder_or_measured(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """`metric_rows` labels the base level `base`, a sensitivity level `ladder`
+    and the one extra level `measured`, and nothing outside `COST_LEVEL_KINDS`."""
+    settings = _settings(tmp_path)
+    _register(conn, settings)
+    handle = _open(conn, settings, tmp_path)
+    results = _run(settings, handle, levels=(0.0, 15.0, MEASURED, 30.0))
+
+    rows = metric_rows(results, settings, cadence="month_end", family="momentum")
+
+    assert _kinds(rows) == {0.0: "ladder", 15.0: "base", MEASURED: "measured", 30.0: "ladder"}
+    assert {row.cost_level_kind for row in rows} <= set(schema.COST_LEVEL_KINDS)
+
+
+def test_a_measured_level_writes_a_plain_rungs_values_under_a_measured_label(
+    conn: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """The 22 bp rows of a measured run equal a run where 22 is a plain ladder
+    rung, value for value; base and ladder rows are byte-identical with and
+    without the measured level, its label the only difference."""
+    measured_settings = _settings(tmp_path)
+    plain_settings = _settings(
+        tmp_path, costs={"per_side_bps": BASE, "sensitivity_per_side_bps": [0.0, MEASURED, 30.0]}
+    )
+    _register(conn, measured_settings, slug="h1")
+    _register(conn, plain_settings, slug="h2")
+    with_measured = _open(conn, measured_settings, tmp_path, slug="h1")
+    plain = _open(conn, plain_settings, tmp_path, slug="h2")
+    measured_results = _run(measured_settings, with_measured, levels=(0.0, BASE, MEASURED, 30.0))
+    plain_results = _run(plain_settings, plain, levels=(0.0, BASE, MEASURED, 30.0))
+    write_results(conn, with_measured, measured_results, measured_settings)
+    write_results(conn, plain, plain_results, plain_settings)
+
+    measured_22 = _kinded_rows(conn, with_measured.trial_id, MEASURED)
+    plain_22 = _kinded_rows(conn, plain.trial_id, MEASURED)
+    assert [(series, metric, value) for series, metric, value, _ in measured_22] == [
+        (series, metric, value) for series, metric, value, _ in plain_22
+    ]
+    assert {kind for *_, kind in measured_22} == {"measured"}
+    assert {kind for *_, kind in plain_22} == {"ladder"}
+    for level in (0.0, BASE, 30.0):
+        assert _kinded_rows(conn, with_measured.trial_id, level) == _kinded_rows(
+            conn, plain.trial_id, level
+        )
