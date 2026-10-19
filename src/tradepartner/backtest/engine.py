@@ -90,6 +90,7 @@ from typing import Final, TypeVar, cast
 
 import polars as pl
 
+from tradepartner.backtest import placebo
 from tradepartner.backtest.costs import (
     Commissions,
     adv_by_security,
@@ -118,7 +119,12 @@ from tradepartner.backtest.riskfree import (
     session_accruals,
     to_yield,
 )
-from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
+from tradepartner.backtest.schedule import (
+    _is_rebalance_session,
+    fill_session,
+    read_time,
+    rebalance_sessions,
+)
 from tradepartner.backtest.signals import anchor_sessions
 from tradepartner.backtest.strategies import signal_for
 from tradepartner.backtest.valuation import (
@@ -134,7 +140,7 @@ from tradepartner.calendar import (
     previous_session,
     session_close,
 )
-from tradepartner.config import HypothesisFamily, Settings
+from tradepartner.config import Cadence, HypothesisFamily, Settings
 from tradepartner.store.delistings import DELISTED
 from tradepartner.store.registry import EquityRow, RebalanceRow, TrialHandle, WeightRow
 from tradepartner.universe import Universe
@@ -299,6 +305,20 @@ def _hold_candidates(scores: Mapping[str, float], construction: _Construction) -
     return {sid: weight for sid in sorted(ranked[:count])}
 
 
+def _read_session(session: date, d: int, cadence: Cadence) -> date:
+    """The session a plan at rebalance session `session` reads at: `session` itself for
+    `d = 0`; otherwise step back `d` XNYS sessions, then back to the latest rebalance
+    session at `cadence` (the signal readers refuse any other). A delay (ADR 0023 rung 4)
+    moves only the read: the plan, its fill and the book it is built against stay
+    `session`'s."""
+    day = session
+    for _ in range(d):
+        day = previous_session(day)
+    while d > 0 and not _is_rebalance_session(day, cadence):
+        day = previous_session(day)
+    return day
+
+
 def _plan(
     provider: DataProvider,
     params: Settings,
@@ -307,11 +327,12 @@ def _plan(
 ) -> Plan:
     strategy = signal_for(family)
     cadence = params.schedule.rebalance_cadence
-    t = read_time(session, cadence)
+    read = _read_session(session, params.strategy.signal_delay_sessions, cadence)
+    t = read_time(read, cadence)
     universe = provider.universe(t)
     members = sorted(universe.members["security_id"].to_list())
     signal = strategy.signal(
-        strategy.reader(provider, params, session, t, members), params, session, t, members
+        strategy.reader(provider, params, read, t, members), params, read, t, members
     )
     undeclared = set(signal.exclusions) - set(strategy.exclusion_reasons)
     if undeclared:
@@ -320,11 +341,16 @@ def _plan(
         reason: tuple(signal.exclusions.get(reason, ())) for reason in strategy.exclusion_reasons
     }
     no_history = exclusions.get("no_history", ())
+    scores = signal.scores
+    mode = params.strategy.placebo
+    if mode != "none":
+        seed = f"{params.strategy.placebo_seed}:{session.toordinal()}"
+        scores = (placebo.shuffle if mode == "shuffle" else placebo.random_entry)(scores, seed)
     construction = getattr(params, strategy.section)
     if construction.weighting == "hold":
-        targets = _hold_candidates(signal.scores, _construction(params, family))
+        targets = _hold_candidates(scores, _construction(params, family))
     else:
-        targets = target_weights(signal.scores, construction.top_fraction, construction.weighting)
+        targets = target_weights(scores, construction.top_fraction, construction.weighting)
     return Plan(
         session=session,
         fill_session=fill_session(session, cadence),
@@ -334,7 +360,7 @@ def _plan(
         n_excluded_no_history=len(no_history),
         gap=provider.survivorship_gap(t),
         members=tuple(members),
-        scores=signal.scores,
+        scores=scores,
         excluded_no_history=no_history,
         counts=dict(signal.counts),
         exclusions=exclusions,
@@ -1224,12 +1250,16 @@ def _plan_all(
     each keyed read is made once for their union before any variant plans."""
     if len(group) > 1:
         strategy = signal_for(family)
-        t = read_time(session, group[0].settings.schedule.rebalance_cadence)
-        members = sorted(view.universe(t).members["security_id"].to_list())
+        cadence = group[0].settings.schedule.rebalance_cadence
         requests = _Requests(view)
+        universes: dict[date, list[str]] = {}
         for variant in list(group):
+            read = _read_session(session, variant.settings.strategy.signal_delay_sessions, cadence)
+            t = read_time(read, cadence)
+            if read not in universes:
+                universes[read] = sorted(view.universe(t).members["security_id"].to_list())
             try:
-                strategy.reader(requests, variant.settings, session, t, members)
+                strategy.reader(requests, variant.settings, read, t, universes[read])
             except _ReadError:
                 raise
             except Exception as exc:

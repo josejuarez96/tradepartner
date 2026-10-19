@@ -318,6 +318,14 @@ MODE = "session"
 PRICE_SOURCE = "alpaca"
 SOURCES: tuple[str, ...] = ("edgar", PRICE_SOURCE, "fred")
 OPENFIGI_SOURCE = "openfigi"  # explicit only: never add to SOURCES / all
+#: The `openfigi_types` columns compared against the previous observation, in
+#: `FigiType`'s own field order (`ticker` before it, `mapped` after), so the
+#: comparison by name cannot drift from the dataclass (#1713 review).
+_OPENFIGI_OBSERVATION_COLUMNS: tuple[str, ...] = (
+    "ticker",
+    *(f.name for f in fields(FigiType)),
+    "mapped",
+)
 
 
 def ingest_openfigi(
@@ -403,17 +411,22 @@ def ingest_openfigi(
                     values = {"ticker": ticker, **blank, "mapped": False}
                 else:
                     values = {"ticker": ticker, **asdict(item), "mapped": True}
-                prior = conn.execute(
-                    "SELECT ticker, figi, composite_figi, share_class_figi, security_type, "
-                    "security_type2, market_sector, name, exch_code, mapped, known_at "
-                    "FROM openfigi_types "
+                prior_row = conn.execute(
+                    "SELECT "
+                    + ", ".join((*_OPENFIGI_OBSERVATION_COLUMNS, "known_at"))
+                    + " FROM openfigi_types "
                     "WHERE security_id = ? ORDER BY known_at DESC LIMIT 1",
                     [sid],
                 ).fetchone()
-                if prior is not None and prior[:-1] == tuple(values.values()):
-                    continue
-                if prior is not None and received <= prior[-1]:
-                    raise ValueError("OpenFIGI revision must be newer than the last observation")
+                if prior_row is not None:
+                    # `prior_row` is the compared columns plus `known_at`.
+                    prior = dict(zip(_OPENFIGI_OBSERVATION_COLUMNS, prior_row[:-1], strict=True))
+                    if all(prior[name] == value for name, value in values.items()):
+                        continue
+                    if received <= prior_row[-1]:
+                        raise ValueError(
+                            "OpenFIGI revision must be newer than the last observation"
+                        )
                 ingested = ensure_tz_aware_utc(clock(), field_name="clock()")
                 insert_row(
                     conn,
