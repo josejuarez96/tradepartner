@@ -90,6 +90,10 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("master.chains_dismissed", [], 31),
     ("master.chain_window_sessions", 65, 31),
     ("master.chain_max_price_ratio", 1.15, 31),
+    # T211c: the opt-in `adjust.apply_spin_offs` (backtest spec amendment #1894).
+    # A post-registration key: frozen at `false` when absent, never from live
+    # Settings, and outside the promotion identity.
+    ("adjust.apply_spin_offs", False, 31),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -123,6 +127,10 @@ POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
         "costs.adv_sessions",
     }
 )
+
+#: T211c: the opt-in `adjust.apply_spin_offs` (backtest spec amendment #1894). A
+#: post-registration key like `POST_REGISTRATION_COST_KEYS`, not in its own section.
+POST_REGISTRATION_ADJUST_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
 
 #: `costs.*` keys a ruled family's file may set higher than its rules' value (a cost
 #: assumption may only get harsher), as `costs.per_side_bps` may; `adv_sessions` is not
@@ -205,6 +213,7 @@ _FINGERPRINT_KEYS: Final = (
     "costs.adv_sessions",
     "holdout.start",
     "holdout.end",
+    "adjust.apply_spin_offs",
 )
 _FINGERPRINT_SECTIONS: Final = ("schedule", "universe")
 
