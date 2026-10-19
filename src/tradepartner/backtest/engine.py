@@ -1535,9 +1535,20 @@ def _rename_chained(variant: _Variant, chains: Sequence[tuple[str, str]]) -> Non
         book.positions = positions
         book.chained_positions += renamed
         book.marked_at = {mapping.get(sid, sid): day for sid, day in book.marked_at.items()}
-        book.held_since = {mapping.get(sid, sid): day for sid, day in book.held_since.items()}
-        book.entries = {mapping.get(sid, sid): count for sid, count in book.entries.items()}
-        book.held_on = {mapping.get(sid, sid): days for sid, days in book.held_on.items()}
+        held_since: dict[str, date] = {}
+        for sid, day in book.held_since.items():
+            successor = mapping.get(sid, sid)
+            held_since[successor] = min(day, held_since.get(successor, day))
+        book.held_since = held_since
+        entries: dict[str, int] = {}
+        for sid, count in book.entries.items():
+            successor = mapping.get(sid, sid)
+            entries[successor] = count + entries.get(successor, 0)
+        book.entries = entries
+        held_on: dict[str, set[date]] = {}
+        for sid, days in book.held_on.items():
+            held_on.setdefault(mapping.get(sid, sid), set()).update(days)
+        book.held_on = held_on
         for holding in book.benchmarks.values():
             holding.security_id = mapping.get(holding.security_id, holding.security_id)
 

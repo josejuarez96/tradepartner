@@ -54,8 +54,14 @@ the predecessor returns nothing and one for the successor returns both
 histories; a key the two share is the successor's own row. The
 `security_ids` filter and the id-keyed `universe.accepted_price_jumps`
 entries are mapped the same way, so an entry naming a predecessor still
-excuses its re-keyed row under the successor. `listings_as_of`,
-`securities_as_of`, `statement_facts_as_of`, `filing_events_as_of` and the
+excuses its re-keyed row under the successor. A chained successor's **own**
+bar on a session before its first listing row's `valid_from` reads absent
+until a live chain naming that successor is known at `t`: the shares a fill
+writes into the rule-9 hole are its history only once the chain explains
+them, so a read before the chain's `known_at` must not serve them (the
+hiding needs no chain, only that the store names the id as a chained
+successor, so a store with no `successor_chains` rows is unaffected).
+`listings_as_of`, `securities_as_of`, `statement_facts_as_of`, `filing_events_as_of` and the
 delisting/classification reads are **unchanged**: the predecessor stays a
 security that rule 2 excludes as delisted. A predecessor fact dated after
 the hand-over (the successor's first listing row's `valid_from`) reads under
@@ -328,6 +334,11 @@ _SESSIONS_VIEW = "_asof_xnys_sessions"
 #: chains under, for the six chain-aware reads to LEFT JOIN (#821, T187b).
 _CHAINS_VIEW = "_asof_chains"
 
+#: Name of the temporary view `_chains_registered` exposes the chained
+#: successors whose own bars must stay hidden until their chain is known under
+#: (#821, T187b): their id and the first session their own later listings allow.
+_PRE_LISTING_VIEW = "_asof_pre_listing"
+
 #: The successor-chain master table (#821, T187). A store below schema 31 has
 #: no such table and no chain; `live_chains` returns nothing there.
 _CHAINS_TABLE = "successor_chains"
@@ -440,11 +451,17 @@ class LiveChains:
     the `valid_from` of its first listing row under the predecessor's ticker
     (the hand-over day a predecessor fact is judged against; a successor with
     no such row known at `t` is absent, so every predecessor fact is its
-    own). Empty (`bool(LiveChains())` false) when no chain is known at `t`,
-    in which case the reads build their pre-#821 SQL exactly."""
+    own). `pre_listing` maps a chained successor with **no** live chain at `t`
+    to the `valid_from` of its first own listing row known at `t`, so the
+    price reads hide its own bars before that session (the rule-9 hole bars a
+    fill wrote, which are its history only once its chain is known). Empty
+    (`bool(LiveChains())` false) when no chain is known at `t`, in which case
+    the reads build their pre-#821 SQL, except that `pre_listing` may still be
+    non-empty when the store has chain rows that are not live at `t`."""
 
     pairs: Mapping[str, str] = field(default_factory=dict)
     handovers: Mapping[str, date] = field(default_factory=dict)
+    pre_listing: Mapping[str, date] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return bool(self.pairs)
@@ -453,6 +470,20 @@ class LiveChains:
         """`security_id` as the chained read keys it: the successor's id when
         it is a chained predecessor, else itself."""
         return self.pairs.get(security_id, security_id)
+
+    def hide_sql(self, alias: str = "t") -> str:
+        """SQL `AND` clause dropping `alias`'s own bars on a session before the
+        successor's first own listing row (`pre_listing`); empty when nothing
+        is hidden. Applied to both the chained and the unchained SQL, since a
+        chained successor's hole bars must stay hidden until its chain is
+        known (#821)."""
+        if not self.pre_listing:
+            return ""
+        return (
+            f"AND NOT EXISTS (SELECT 1 FROM {_PRE_LISTING_VIEW} pl "
+            f"WHERE pl.successor_id = {alias}.security_id "
+            f"AND {alias}.session < pl.first_session)"
+        )
 
     def mapped_entry(self, entry: str, parse: Any) -> tuple[str, date]:
         """A `<security_id>@<date>` config entry (`universe.accepted_price_jumps`)
@@ -493,16 +524,20 @@ def _chain_mapped_key(key_columns: Sequence[str], alias: str = "t") -> str:
 @contextmanager
 def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator[LiveChains]:
     """Expose the live chains known at `t` to SQL as `_CHAINS_VIEW` (its
-    `predecessor_id`, `successor_id` and `handover`) for the block, then drop
-    the view. Yields the `LiveChains`; an empty one registers no view and the
-    reads skip the chain SQL. `live_chains` is read once here, and the
-    hand-over day is derived from the listings known at `t` (the successor's
-    first listing row under the predecessor's ticker and exchange)."""
+    `predecessor_id`, `successor_id` and `handover`) and the chained
+    successors whose own bars stay hidden *and* have no live chain at `t` as
+    `_PRE_LISTING_VIEW` (`successor_id`, `first_session`), for the block, then
+    drop both. Yields the `LiveChains`; when neither is needed nothing is
+    registered and the reads build their pre-#821 SQL. `live_chains` is read
+    once here, and the hand-over day is derived from the listings known at `t`
+    (the successor's first listing row under the predecessor's ticker and
+    exchange)."""
     chains = _live_chains_at(conn, t)
-    if not chains:
+    pre_listing = _pre_listing_at(conn, t, chains)
+    if not chains.pairs and not pre_listing:
         yield _NO_CHAINS
         return
-    frame = pl.DataFrame(
+    chains_frame = pl.DataFrame(
         {
             "predecessor_id": [pred for pred in chains.pairs],
             "successor_id": [chains.pairs[pred] for pred in chains.pairs],
@@ -514,11 +549,44 @@ def _chains_registered(conn: duckdb.DuckDBPyConnection, t: datetime) -> Iterator
             "handover": pl.Date,
         },
     )
-    conn.register(_CHAINS_VIEW, frame)
+    pre_frame = pl.DataFrame(
+        {
+            "successor_id": list(pre_listing),
+            "first_session": list(pre_listing.values()),
+        },
+        schema={"successor_id": pl.Utf8, "first_session": pl.Date},
+    )
+    conn.register(_CHAINS_VIEW, chains_frame)
+    conn.register(_PRE_LISTING_VIEW, pre_frame)
     try:
-        yield chains
+        yield LiveChains(chains.pairs, chains.handovers, pre_listing)
     finally:
         conn.unregister(_CHAINS_VIEW)
+        conn.unregister(_PRE_LISTING_VIEW)
+
+
+def _pre_listing_at(
+    conn: duckdb.DuckDBPyConnection, t: datetime, chains: LiveChains
+) -> dict[str, date]:
+    """The chained successors whose own bars a price read must hide at `t`:
+    every `successor_id` named by a `successor_chains` row (live or not, less
+    those with a live chain at `t`), mapped to the earliest `valid_from` its
+    `listings` rows give. Read without a `known_at` filter on purpose: the rule
+    only ever **hides** a bar, never shows one, so a listing row known after
+    `t` cannot leak a later bar into a read; it is what keeps a filled rule-9
+    hole bar hidden before its chain is known. See `LiveChains.pre_listing`."""
+    if not _has_table(conn, _CHAINS_TABLE) or not _has_table(conn, "listings"):
+        return {}
+    rows = conn.execute(f"SELECT DISTINCT successor_id FROM {_CHAINS_TABLE}").fetchall()
+    successors = sorted({str(successor) for (successor,) in rows} - set(chains.pairs.values()))
+    if not successors:
+        return {}
+    first = conn.execute(
+        "SELECT security_id, MIN(valid_from) FROM listings "
+        "WHERE security_id IN (SELECT unnest(?)) GROUP BY security_id",
+        [successors],
+    ).fetchall()
+    return {str(successor): valid_from for successor, valid_from in first}
 
 
 def _live_chains_at(conn: duckdb.DuckDBPyConnection, t: datetime) -> LiveChains:
@@ -600,6 +668,7 @@ def _latest_as_of(
     retractable = table in RETRACTABLE_TABLES and has_retracted(conn, table)
     excluded = "_rn, retracted" if retractable else "_rn"
     live = "AND NOT retracted" if retractable else ""
+    hide = chains.hide_sql("t") if chains is not None and "session" in key_columns else ""
     if chained:
         assert chains is not None  # bool(chains) is True
         # The join and the id filter live in the inner query (they read the
@@ -618,6 +687,7 @@ def _latest_as_of(
                     WHERE t.known_at <= ?
                     {security_filter}
                     {session_filter}
+                    {hide}
                 )
             )
             WHERE _rn = 1 {live}
@@ -629,10 +699,11 @@ def _latest_as_of(
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY {", ".join(key_columns)} ORDER BY known_at DESC
             ) AS _rn
-            FROM {table}
-            WHERE known_at <= ?
+            FROM {table} t
+            WHERE t.known_at <= ?
             {security_filter}
             {session_filter}
+            {hide}
         )
         WHERE _rn = 1 {live}
         ORDER BY {", ".join(key_columns)}
@@ -840,6 +911,7 @@ def price_jumps_as_of(
     cfg = settings.universe
     with _chains_registered(conn, t) as chains:
         params: list[Any] = [t]
+        hide = chains.hide_sql("b")
         if chains:
             security_filter = _security_filter(security_ids, params, column=_chain_id("b"))
             latest = f"""
@@ -851,6 +923,7 @@ def price_jumps_as_of(
                     FROM prices_daily b {_chain_join("b")}
                     WHERE b.known_at <= ?
                     {security_filter}
+                    {hide}
                 )
             """
         else:
@@ -859,9 +932,10 @@ def price_jumps_as_of(
                 SELECT security_id, session, close, volume, ROW_NUMBER() OVER (
                     PARTITION BY security_id, session ORDER BY known_at DESC
                 ) AS _rn
-                FROM prices_daily
-                WHERE known_at <= ?
+                FROM prices_daily b
+                WHERE b.known_at <= ?
                 {security_filter}
+                {hide}
             """
         params += [cfg.max_jump_ratio, cfg.min_jump_ratio]
         sql = f"""
@@ -1329,7 +1403,12 @@ def borrow_status_as_of(
 
 
 def _adjusted_ctes(
-    action_types: str, bars_filter: str, actions_filter: str, *, chained: bool = False
+    action_types: str,
+    bars_filter: str,
+    actions_filter: str,
+    *,
+    chained: bool = False,
+    hide: str = "",
 ) -> str:
     """The CTEs `adjusted_prices_as_of` shares between its validation query
     (checks `event_factor` before anything calls `LN()` on it) and its main
@@ -1356,6 +1435,7 @@ def _adjusted_ctes(
                     FROM prices_daily b {_chain_join("b")}
                     WHERE b.known_at <= ?
                     {bars_filter}
+                    {hide}
                 )
             )
             WHERE _rn = 1
@@ -1383,9 +1463,10 @@ def _adjusted_ctes(
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY security_id, session ORDER BY known_at DESC
                 ) AS _rn
-                FROM prices_daily
-                WHERE known_at <= ?
+                FROM prices_daily b
+                WHERE b.known_at <= ?
                 {bars_filter}
+                {hide}
             )
             WHERE _rn = 1
         ),"""
@@ -1518,6 +1599,7 @@ def _adjusted_params(
         max_gap, max_share = adjust.max_prior_close_gap_sessions, adjust.max_dividend_to_prior_close
 
     chained = bool(chains)
+    hide = chains.hide_sql("b") if chains is not None else ""
     bar_column = _chain_id("b") if chained else "security_id"
     action_column = _chain_id("a") if chained else "security_id"
     params: list[Any] = [t]
@@ -1525,7 +1607,9 @@ def _adjusted_params(
     params.append(t)
     actions_filter = _security_filter(security_ids, params, column=action_column)
     params += [t_session, max_gap, max_share]
-    return _adjusted_ctes(action_types, bars_filter, actions_filter, chained=chained), params
+    return _adjusted_ctes(
+        action_types, bars_filter, actions_filter, chained=chained, hide=hide
+    ), params
 
 
 #: `(sessions, frame)` for the last `calendar.all_sessions()` tuple seen.
