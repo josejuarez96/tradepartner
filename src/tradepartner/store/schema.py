@@ -461,7 +461,26 @@ registry; #83 took version 2 first, so the registry is version 3):
   read-only connection accepts a version-27 store: every read works but a
   `symbol_changes` read, which fails on the missing table, and the next
   writable `init_schema` call migrates the store.
-- **A later DDL change goes to version 29**, with its own migration and a
+
+- **Version 29** (#1813, plan T202a; the spec's 2026-10-18 amendment item 2):
+  `decision_events.reason` gains `skip_asset_unknown` and `skip_not_fractionable`
+  (`DECISION_EVENT_REASONS`), and `order_events.reason` gains those two and
+  `skip_untradable` (`ORDER_EVENT_REASONS`), each new value last. Both `CHECK`
+  sets only grow, so no stored row falls outside them; DuckDB cannot change a
+  `CHECK` in place, so the migration from any earlier migratable version
+  rebuilds `decision_events` and `order_events` through a staging table as
+  versions 6 and 7 rebuilt theirs, every row kept in insertion order, and
+  refuses first (`SchemaVersionError`, no change) if a stored reason is
+  outside the new set. The version-6 stray-value guard reads
+  `ORDER_EVENT_REASONS`. A read-only connection accepts a version-28 store:
+  every read works, and the next writable `init_schema` call migrates it.
+- **Version 30** (#821, data-foundation plan T187; the spec's 2026-10-12
+  amendment, "The row"): the `successor_chains` table, created by the DDL
+  pass (`_SUCCESSOR_CHAINS_TABLE_DDL`) and a version-30 row appended; no
+  existing table changes. A read-only connection accepts a version-29 store:
+  every read works but a `successor_chains` read, which fails on the missing
+  table, and the next writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 31**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -728,12 +747,16 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #: - 28 (#1506, data-foundation plan T172b): the `symbol_changes` table and
 #:   its identity index, created by the DDL pass (`_SYMBOL_CHANGES_TABLE_DDL`);
 #:   no existing table changes (module docstring, "Schema versions").
-#: - 29 (#821, data-foundation plan T187): the `successor_chains` table,
+#: - 29 (#1813, plan T202a): `decision_events.reason` gains `skip_asset_unknown`
+#:   and `skip_not_fractionable`, `order_events.reason` those two and
+#:   `skip_untradable`; both tables are rebuilt (`_migrate_skip_reasons`), every
+#:   row kept (module docstring, "Schema versions").
+#: - 30 (#821, data-foundation plan T187): the `successor_chains` table,
 #:   created by the DDL pass (`_SUCCESSOR_CHAINS_TABLE_DDL`); no existing
 #:   table changes (module docstring, "Schema versions").
-#: - A later DDL change goes to version 30, with its own migration and a
+#: - A later DDL change goes to version 31, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 29
+CURRENT_SCHEMA_VERSION = 30
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -862,10 +885,14 @@ _PRE_CASH_IN_LIEU_VERSION = 26
 #: there fails on the missing table, as a `borrow_status` read did at 23.
 _PRE_SYMBOL_CHANGES_VERSION = 27
 
-#: The last version without `successor_chains` (#821, T187, version 29):
+#: The last version without the skip reasons (#1813, T202a, version 29):
+#: read-only connections serve every read.
+_PRE_SKIP_REASONS_VERSION = 28
+
+#: The last version without `successor_chains` (#821, T187, version 30):
 #: read-only connections serve every other read; a `successor_chains` read
 #: there fails on the missing table, as a `symbol_changes` read did at 27.
-_PRE_SUCCESSOR_CHAINS_VERSION = 28
+_PRE_SUCCESSOR_CHAINS_VERSION = 29
 
 
 class SchemaVersionError(RuntimeError):
@@ -1313,7 +1340,7 @@ _SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
     _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
 )
 
-#: `successor_chains` (#821, T187), added at version 29: its own tuple, as
+#: `successor_chains` (#821, T187), added at version 30: its own tuple, as
 #: `_SYMBOL_CHANGES_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
 #: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
 #: schema version with its own migration.
@@ -1682,6 +1709,22 @@ ORDER_EVENT_REASONS: tuple[str, ...] = (
     HALT_REASON,
     NOT_RECEIVED_REASON,
     OWNER_SETTLED_UNKNOWN_REASON,
+    "skip_asset_unknown",
+    "skip_not_fractionable",
+    "skip_untradable",
+)
+#: Every `decision_events.reason` the spec names (version 29, #1813): the two
+#: new skip reasons come last.
+DECISION_EVENT_REASONS: tuple[str, ...] = (
+    "skip_below_one_share",
+    "skip_untradable",
+    "skip_below_minimum",
+    "skip_delisted",
+    "dust",
+    "untradable",
+    "unfunded",
+    "skip_asset_unknown",
+    "skip_not_fractionable",
 )
 
 #: `decisions.reason` of a plan full exit: a held name that left the targets.
@@ -1757,15 +1800,7 @@ JOURNAL_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("decisions", "reason"): DECISION_REASONS,
     ("decision_events", "status"): ("skipped", "written_off"),
-    ("decision_events", "reason"): (
-        "skip_below_one_share",
-        "skip_untradable",
-        "skip_below_minimum",
-        "skip_delisted",
-        "dust",
-        "untradable",
-        "unfunded",
-    ),
+    ("decision_events", "reason"): DECISION_EVENT_REASONS,
     ("orders", "phase"): ("sell", "buy", "exit"),
     ("orders", "side"): SIDES,
     ("orders", "position_side"): POSITION_SIDES,
@@ -2753,6 +2788,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FEE_ACTIVITIES_VERSION,
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
+        _PRE_SKIP_REASONS_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
@@ -2783,7 +2819,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # version-24 store lacks; version 25 every read (no `filing_name` row
         # can exist there, and no read depends on the provenance `CHECK`);
         # version 26 every read; version 27 every read but `symbol_changes`;
-        # version 28 every read but `successor_chains`.
+        # version 28 every read; version 29 every read but `successor_chains`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3495,9 +3531,47 @@ def _migrate_fee_activities(conn: duckdb.DuckDBPyConnection) -> None:
     forget_column_types(conn)
 
 
+def _migrate_skip_reasons(conn: duckdb.DuckDBPyConnection) -> None:
+    """Version 29 (module docstring, "Schema versions"; #1813, T202a): rebuild
+    `decision_events` and `order_events` with their widened reason `CHECK`s,
+    every row kept in insertion order (readers break `known_at` ties on rowid).
+    Raises `SchemaVersionError` before any change if a stored reason is outside
+    `DECISION_EVENT_REASONS` or `ORDER_EVENT_REASONS`. Idempotent in effect:
+    runs on a fresh or migrating writable store (never one already at 29),
+    inside `init_schema`'s transaction, after every earlier step."""
+    for table, reasons in (
+        ("decision_events", DECISION_EVENT_REASONS),
+        ("order_events", ORDER_EVENT_REASONS),
+    ):
+        allowed = ", ".join("?" for _ in reasons)
+        stray = conn.execute(
+            f"SELECT DISTINCT reason FROM {table} "
+            f"WHERE reason IS NOT NULL AND reason NOT IN ({allowed}) ORDER BY reason",
+            list(reasons),
+        ).fetchall()
+        if stray:
+            found = ", ".join(repr(reason) for (reason,) in stray)
+            raise SchemaVersionError(
+                f"{table} holds reasons outside {reasons}: {found}; the store stays at "
+                f"version {_PRE_SKIP_REASONS_VERSION} until they are resolved"
+            )
+    for table, create in (
+        ("decision_events", _CREATE_DECISION_EVENTS),
+        ("order_events", _CREATE_ORDER_EVENTS),
+    ):
+        staging = f"{table}_v29"
+        conn.execute(
+            create.replace(f"CREATE TABLE IF NOT EXISTS {table} (", f"CREATE TABLE {staging} (", 1)
+        )
+        conn.execute(f"INSERT INTO {staging} BY NAME SELECT * FROM {table} ORDER BY rowid")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+    forget_column_types(conn)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 28 store to version 29.
+    version-2 to 29 store to version 30.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3511,7 +3585,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     fresh store gets every table and one `schema_version` row for
     `CURRENT_SCHEMA_VERSION` and no lab table; every store gets
     `successor_chains` created where it lacks it (purely additive; a
-    version-28 store gets a version-29 row; #821, T187); every store gets
+    version-29 store gets a version-30 row; #821, T187); every store gets
     `adjustments` rebuilt with its version-27 DDL (the `kind` `CHECK` widened
     with `cash_in_lieu`, every row kept, byte-identical; a version-2 to 26 store
     gets a version-27 row; #1627); every store gets
@@ -3580,8 +3654,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     version-3 row. Nothing else changes (module docstring, "Schema
     versions").
 
-    On a read-only connection no DDL runs: a version-28, 27 (every read but
-    `successor_chains`, missing there), 26, 25 (every read; the
+    On a read-only connection no DDL runs: a version-29 (every read but
+    `successor_chains`, missing there), 28, 27 (every read but
+    `symbol_changes`, missing there), 26, 25 (every read; the
     provenance `CHECK` only widens), 24 (every read
     but the two version-25 columns `adjustments.broker_activity_id` and
     `paper_windows.activities_seen_json`), 23 (every read but
@@ -3645,6 +3720,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_FEE_ACTIVITIES_VERSION,
         _PRE_CASH_IN_LIEU_VERSION,
         _PRE_SYMBOL_CHANGES_VERSION,
+        _PRE_SKIP_REASONS_VERSION,
         _PRE_SUCCESSOR_CHAINS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
@@ -3716,6 +3792,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_fee_activities(conn)
         if max_version is None or max_version <= _PRE_CASH_IN_LIEU_VERSION:
             _migrate_cash_in_lieu_kind(conn)
+        if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
+            _migrate_skip_reasons(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1
             applied_at = utc_now()

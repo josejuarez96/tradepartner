@@ -13,10 +13,16 @@ Version 9 (#571, spec req 17) adds `owner_settled_unknown`, the reason of the
 `cancelled` event `paper settle` journals, and rebuilds `order_events` and
 `overrides` (the `settle_order` kind and its `client_order_id`) from version 8 with
 every row kept.
+
+Version 29 (#1808, T202a; spec amendment item 2) adds the allowlist's three skip
+reasons, the reason of the terminal `rejected` event a buy refused on `submit`
+gets; the version-6 guard reads the widened set too, so its refusal test uses a
+reason outside it.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +35,7 @@ from tradepartner.execution import plan
 from tradepartner.store import schema
 
 _NOW = datetime(2026, 10, 1, 21, 0, tzinfo=UTC)
+_SPEC = Path(__file__).resolve().parents[2] / "docs" / "specs" / "paper-trading.md"
 
 #: `order_events` as version 5 created it: the same DDL without the reason `CHECK`.
 _V5_ORDER_EVENTS_DDL = schema._CREATE_ORDER_EVENTS.replace(
@@ -100,16 +107,31 @@ def _shape(conn: duckdb.DuckDBPyConnection, table: str) -> tuple[Any, ...]:
 # --- the shared constants -----------------------------------------------------------
 
 
+#: Spec "Data / interfaces" > Tables, `order_events`: the version-28 set, then
+#: amendment item 2's three allowlist skip reasons (#1808, T202a, version 29).
+_SKIP_REASONS = ("skip_asset_unknown", "skip_not_fractionable", "skip_untradable")
+
+
 def test_the_reasons_are_spelt_as_the_spec_names_them() -> None:
-    """Spec "Data / interfaces" > Tables: `reason ∈ {null, not_received, halt}`."""
+    """Spec "Data / interfaces" > Tables: `reason ∈ {null, halt, not_received,
+    owner_settled_unknown, skip_asset_unknown, skip_not_fractionable,
+    skip_untradable}`."""
     assert schema.HALT_REASON == "halt"
     assert schema.NOT_RECEIVED_REASON == "not_received"
     assert schema.OWNER_SETTLED_UNKNOWN_REASON == "owner_settled_unknown"
-    assert schema.ORDER_EVENT_REASONS == (
-        schema.HALT_REASON,
-        schema.NOT_RECEIVED_REASON,
-        schema.OWNER_SETTLED_UNKNOWN_REASON,
-    )
+    expected = ("halt", "not_received", "owner_settled_unknown", *_SKIP_REASONS)
+    assert expected == schema.ORDER_EVENT_REASONS
+
+
+def test_the_spec_lists_exactly_the_checked_reasons() -> None:
+    """Spec "Data / interfaces" > Tables: the `order_events.reason` list is closed
+    and names the `CHECK`'s values and null."""
+    text = _SPEC.read_text(encoding="utf-8")
+    match = re.search(r"`order_events\(client_order_id[^`]*?reason ∈ \{([^}]*)\}", text)
+    assert match is not None
+    listed = [value.strip() for value in match.group(1).split(",")]
+    assert "…" not in listed
+    assert sorted(listed) == sorted(["null", *schema.ORDER_EVENT_REASONS])
 
 
 def test_the_check_is_built_from_the_shared_constants() -> None:
@@ -135,9 +157,38 @@ def test_every_listed_reason_and_null_is_accepted(
     assert journal.execute("SELECT reason FROM order_events").fetchall() == [(reason,)]
 
 
+@pytest.mark.parametrize("reason", _SKIP_REASONS)
+def test_each_allowlist_skip_reason_closes_a_rejected_event(
+    journal: duckdb.DuckDBPyConnection, reason: str
+) -> None:
+    """Spec amendment item 2 (#1808): a buy refused on `submit` for an allowlisted
+    reason gets one terminal `rejected` event with the skip reason."""
+    journal.execute(
+        "INSERT INTO order_events (client_order_id, status, reason, known_at, ingested_at) "
+        "VALUES ('tp-1', 'rejected', ?, ?, ?)",
+        [reason, _NOW, _NOW],
+    )
+    assert journal.execute("SELECT status, reason FROM order_events").fetchall() == [
+        ("rejected", reason)
+    ]
+
+
 @pytest.mark.parametrize(
     "reason",
-    ["halted", "Halt", "not received", "notreceived", "", "owner_settled", "settled_unknown"],
+    [
+        "halted",
+        "Halt",
+        "not received",
+        "notreceived",
+        "",
+        "owner_settled",
+        "settled_unknown",
+        "skip_asset_unkown",
+        "skip_not_fractional",
+        "skip-untradable",
+        "untradable",
+        "skip_below_one_share",
+    ],
 )
 def test_a_misspelt_reason_is_refused(journal: duckdb.DuckDBPyConnection, reason: str) -> None:
     with pytest.raises(duckdb.ConstraintException):
@@ -203,6 +254,7 @@ def test_write_open_of_a_version_5_store_adds_the_check_and_keeps_every_row(
         27,
         28,
         29,
+        30,
     ]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in _REBUILT} == others_before
@@ -262,6 +314,7 @@ def test_a_migrated_store_reopens_without_another_version_row(tmp_path: Path) ->
             27,
             28,
             29,
+            30,
         ]
 
 
@@ -278,6 +331,19 @@ def test_a_stored_reason_outside_the_set_refuses_the_migration_and_changes_nothi
             "halted",
         ]
         _event(conn, "still unchecked")  # the version-5 table is untouched
+
+
+def test_the_version_6_guard_reads_the_widened_set(tmp_path: Path) -> None:
+    """T202a: the version-6 stray-value guard reads `ORDER_EVENT_REASONS`, so a
+    version-29 skip reason passes it (and the refusal test above, on `halted`,
+    still names a reason outside the widened set)."""
+    assert "halted" not in schema.ORDER_EVENT_REASONS
+    path = _version_5_store(tmp_path / "v5.duckdb", (schema.HALT_REASON, *_SKIP_REASONS))
+    with duckdb.connect(str(path)) as conn:
+        schema.init_schema(conn)
+        assert _versions(conn)[-1] == schema.CURRENT_SCHEMA_VERSION
+        stored = conn.execute("SELECT reason FROM order_events ORDER BY rowid").fetchall()
+        assert [reason for (reason,) in stored] == [schema.HALT_REASON, *_SKIP_REASONS]
 
 
 def test_read_only_open_of_a_version_5_store_passes(tmp_path: Path) -> None:
@@ -407,6 +473,7 @@ def test_write_open_of_a_version_8_store_migrates_to_9_and_keeps_every_row(
         27,
         28,
         29,
+        30,
     ]
     assert shapes == {table: _shape(journal, table) for table in schema.JOURNAL_TABLE_NAMES}
     assert {t: s for t, s in shapes.items() if t not in rebuilt} == others_before
@@ -442,6 +509,7 @@ def test_a_version_8_store_reopens_at_current_without_another_version_row(tmp_pa
             27,
             28,
             29,
+            30,
         ]
 
 

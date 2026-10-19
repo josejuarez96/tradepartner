@@ -24,7 +24,7 @@ from tradepartner.backtest.fills import apply_trades
 from tradepartner.backtest.schedule import fill_session, read_time, rebalance_sessions
 from tradepartner.backtest.signals import momentum_12_1
 from tradepartner.backtest.store_provider import StoreProvider
-from tradepartner.calendar import all_sessions, session_close
+from tradepartner.calendar import all_sessions, last_completed_session, session_close
 from tradepartner.config import Cadence, Settings, SignalAnchor
 from tradepartner.store import registry
 
@@ -784,10 +784,49 @@ def _cadence_provider(
         .with_columns(pl.lit("E").alias("security_id"))
     )
     prices = pl.concat([_price_rows(), e_rows])
+    # The fake's adjusted rows encode late corrections to older bars, including
+    # the sort of restatement an action would cause in the store provider.
+    corrections = prices.filter(
+        ((pl.col("security_id") == "A") & (pl.col("session") == date(2024, 2, 1)))
+        | ((pl.col("security_id") == "B") & (pl.col("session") == date(2024, 2, 2)))
+    ).with_columns(
+        pl.col("close") * 0.98,
+        pl.col("open") * 0.98,
+        pl.when(pl.col("security_id") == "A")
+        .then(session_close(date(2024, 2, 6)))
+        .otherwise(session_close(date(2024, 2, 9)))
+        .alias("known_at"),
+    )
+    adjusted = pl.concat([prices, corrections])
     names = [*sorted(GROWTH), "E"]
     members = {session: names for session in rebalance_sessions(start, end, cadence)}
-    kind = _UnboundedProvider if unbounded else FakeProvider
-    return kind(prices=prices, members=members, benchmarks={})
+    kind = _UnboundedProvider if unbounded else _CachedProvider
+    return kind(prices=adjusted, members=members, benchmarks={})
+
+
+class _CachedProvider(FakeProvider):
+    """The fake's as-of revision rows provide a real marking change probe."""
+
+    change_checks = 0
+    changed_names: set[str]
+
+    def marking_changed_ids(
+        self, previous_t: datetime, t: datetime, ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        self.change_checks += 1
+        changed = (
+            self.prices.filter(
+                pl.col("security_id").is_in(ids)
+                & (pl.col("known_at") > previous_t)
+                & (pl.col("known_at") <= t)
+                & (pl.col("session") <= last_completed_session(previous_t))
+            )["security_id"]
+            .unique()
+            .sort()
+            .to_list()
+        )
+        self.changed_names = getattr(self, "changed_names", set()) | set(changed)
+        return tuple(changed)
 
 
 class _UnboundedProvider(FakeProvider):
@@ -818,7 +857,24 @@ def _assert_same_results(
         assert len(other.marking_frames) == len(result.marking_frames)
         for a, b in zip(other.marking_frames, result.marking_frames, strict=True):
             assert (a.start, a.end) == (b.start, b.end)
-            assert a.frame.equals(b.frame)
+            if a.frame.is_empty():
+                assert b.frame.is_empty()
+            else:
+                assert a.frame.equals(b.frame.filter(pl.col("session") >= a.frame["session"].min()))
+            # Stitching and valuation need each name's latest bar at or
+            # before this step's start, even if its first new bar is later.
+            anchors = (
+                b.frame.filter(pl.col("session") <= a.start)
+                .group_by("security_id")
+                .agg(pl.col("session").max())
+            )
+            for sid, anchor_session in anchors.iter_rows():
+                assert (
+                    a.frame.filter(
+                        (pl.col("security_id") == sid) & (pl.col("session") == anchor_session)
+                    ).height
+                    == 1
+                )
 
 
 class TestSignalFrameBound:
@@ -850,11 +906,14 @@ class TestSignalFrameBound:
             family="momentum",
         )
         _assert_same_results(got, want)
+        assert isinstance(bounded, _CachedProvider)
+        assert bounded.change_checks > 0
+        assert bounded.changed_names == {"A", "B"}
 
         signal_reads = [
             call
             for call in bounded.calls
-            if call.method == "adjusted_prices" and call.sessions_from is not None
+            if call.method == "adjusted_prices" and len(call.ids or ()) == len(GROWTH) + 1
         ]
         sessions = rebalance_sessions(start, end, cadence)
         assert len(signal_reads) == len(sessions) - 1  # one per plan, none at T_n
@@ -866,15 +925,101 @@ class TestSignalFrameBound:
             assert date(2023, 2, 5).weekday() == 6  # the weekend T - k
             assert any(call.sessions_from == date(2023, 2, 3) for call in signal_reads)
 
-    def test_the_marking_read_is_unbounded(self) -> None:
+    def test_the_marking_read_is_bounded(self) -> None:
         provider = _provider()
         _run(provider)
         marking = [
             call
             for call in provider.calls
-            if call.method == "adjusted_prices" and call.sessions_from is None
+            if call.method == "adjusted_prices" and len(call.ids or ()) < len(GROWTH)
         ]
         assert len(marking) == len(rebalance_sessions(T0, T3)) - 1
+        # T0's 12-month formation anchor is 2023-01-31; A remains held,
+        # so it is earlier than each step's five-session stale window.
+        assert [(call.t, call.sessions_from) for call in marking] == [
+            (read_time(T1), date(2023, 1, 31)),
+            (read_time(T2), date(2023, 1, 31)),
+            (read_time(T3), date(2023, 1, 31)),
+        ]
+
+    def test_stale_exit_window_sets_an_oracle_marking_bound(self) -> None:
+        start, end = date(2024, 1, 5), date(2024, 1, 19)
+        sessions = rebalance_sessions(start, end, "week_end")
+        provider = FakeProvider(
+            prices=_price_rows(),
+            members={session: ["A"] for session in sessions},
+            benchmarks={},
+        )
+        run(
+            _params(
+                strategy={"top_fraction": 1.0},
+                schedule={"rebalance_cadence": "week_end"},
+                backtest={"stale_exit_sessions": 10},
+            ),
+            provider,
+            start,
+            end,
+            _handle(),
+            (0.0,),
+            family="oracle",
+        )
+        marking = [
+            call
+            for call in provider.calls
+            if call.method == "adjusted_prices"
+            and call.include_dividends
+            and call.ids == ("A",)
+            and call.sessions_from is not None
+            and call.sessions_from >= date(2023, 12, 1)
+        ]
+        assert [(call.t, call.sessions_from) for call in marking] == [
+            (read_time(date(2024, 1, 12), "week_end"), date(2023, 12, 28)),
+            (read_time(date(2024, 1, 19), "week_end"), date(2024, 1, 4)),
+        ]
+
+    def test_reentry_keeps_the_last_stitched_session(self) -> None:
+        start, end = date(2024, 1, 5), date(2024, 3, 1)
+        sessions = rebalance_sessions(start, end, "week_end")
+        order = ["A", "C", "D", "B", "A"] + ["A"] * 10
+        members = {session: [order[i]] for i, session in enumerate(sessions)}
+        provider = FakeProvider(prices=_price_rows(), members=members, benchmarks={})
+        result = run(
+            _params(
+                strategy={"top_fraction": 1.0},
+                schedule={"rebalance_cadence": "week_end"},
+                costs={"per_side_bps": 0.0, "sensitivity_per_side_bps": []},
+            ),
+            provider,
+            start,
+            end,
+            _handle(),
+            (0.0,),
+            family="oracle",
+        )[0.0]
+        assert not result.stitched_returns().is_empty()
+        last_stitched: dict[str, date] = {}
+        saw_reentry = False
+        for step in result.marking_frames:
+            inside = (
+                step.frame.filter(
+                    (pl.col("session") > step.start) & (pl.col("session") <= step.end)
+                )
+                .group_by("security_id")
+                .agg(pl.col("session").max())
+            )
+            for sid, session in inside.iter_rows():
+                if sid in last_stitched:
+                    assert (
+                        step.frame.filter(
+                            (pl.col("security_id") == sid)
+                            & (pl.col("session") == last_stitched[sid])
+                        ).height
+                        == 1
+                    )
+                    if sid == "A" and step.end >= date(2024, 2, 9):
+                        saw_reentry = True
+                last_stitched[sid] = session
+        assert saw_reentry
 
 
 class TestCombinationsAndLag:
@@ -1126,7 +1271,7 @@ TWIN_CALL_METHODS = {
     "late_dividends",
 }
 TWIN_N_CALLS = 37
-TWIN_CALL_LOG_SHA256 = "a67e79433a68e158dacc4838930cc8dc787b6ca0db80d0938c0d8e135a49d341"
+TWIN_CALL_LOG_SHA256 = "0ddf16574afb66249b0115c32bdd659dddb9259ed87abf2bf2c2500d6d003665"
 #: Per cost level: a SHA-256 over the equity, rebalance (counts included), weight and
 #: target rows, floats rounded to nine places.
 TWIN_RUN_DIGESTS = {

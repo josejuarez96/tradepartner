@@ -682,7 +682,7 @@ def version_4_store(path: Path) -> Path:
     and `schema._migrate_filing_name` (version 26, #1597; the
     `filing_name` provenance `CHECK` the fixture listings and
     classifications rows may carry), and `schema._SUCCESSOR_CHAINS_TABLE_DDL`
-    (version 29, #821, plan T187; `successor_chains.csv`)."""
+    (version 30, #821, plan T187; `successor_chains.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
