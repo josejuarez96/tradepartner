@@ -74,8 +74,10 @@ orders left to submit). In order:
      marked as an exit, and is exempt from `max_order_notional_fraction`. The
      rules: `cover_within_holding` (a cover at most the held short rounded down
      to `quantity_decimals`: none of a name not held short), `one_side_per_name`
-     (no short open of a held long, no long buy of a held short, and no name
-     closed and opened in one phase), `max_short_weight` (a short-opened
+     (no short open of a held long, no long buy of a held short, no name with
+     both a long and a short order, and none closed and opened in one phase),
+     `cover_sum_within_holding` (a name's covers plus its `open_covers` at most
+     the held short, rounded down, summed exactly in `Decimal`), `max_short_weight` (a short-opened
      name's held short plus the open, after the phase, over equity),
      `min_short_equity` (a phase with a short open halts when
      `account.equity` is below it), and `net_exposure_band` (the signed net
@@ -566,17 +568,17 @@ def _sides_violations(
     left: Sequence[PhaseOrder], positions: Mapping[str, float]
 ) -> list[tuple[str, str]]:
     """`one_side_per_name` breaches as (name, detail): a short open of a held long,
-    a long buy of a held short, and a name both closed and opened in one phase
-    when a short is in it (a long's trim and top-up stay legal; a flip is a close
-    in one phase and an open in the next)."""
+    a long buy of a held short, a name with both a long and a short order, and a
+    name both closed and opened in one phase when a short is in it (a long's trim
+    and top-up stay legal; a flip is a close in one phase, an open in the next)."""
     found: list[tuple[str, str]] = []
     closes: set[str] = set()
     opens: set[str] = set()
     shorts: set[str] = set()
+    longs: set[str] = set()
     for order in left:
         short = order.position_side == _SHORT
-        if short:
-            shorts.add(order.security_id)
+        (shorts if short else longs).add(order.security_id)
         held = positions.get(order.security_id, 0.0)
         if order.side == _SELL and short:
             opens.add(order.security_id)
@@ -590,6 +592,9 @@ def _sides_violations(
             closes.add(order.security_id)
     found.extend(
         (name, "closed and opened in one phase") for name in sorted(closes & opens & shorts)
+    )
+    found.extend(
+        (name, "has a long and a short order in one phase") for name in sorted(longs & shorts)
     )
     return found
 
@@ -609,6 +614,7 @@ def check_phase(
     prior_skips: int = 0,
     plan_decisions: int = 0,
     rows_on_session: Sequence[DecisionRow | OrderRow] = (),
+    open_covers: Sequence[OpenSell] = (),
     window_side: str = "long_only",
     broker_paper: bool = False,
     net_exposure: float | None = None,
@@ -621,7 +627,9 @@ def check_phase(
     binds) when not given; `rows_on_session` are the session's `decisions` and
     `orders` rows, read only for `refused_position_side` and (its `orders`
     rows) `refused_order_shape`. `window_side` is the window's frozen
-    `portfolio.side` and `broker_paper` the broker's `paper`: only
+    `portfolio.side`, `open_covers` the unfilled quantity of the non-terminal own
+    covers from any session (`cover_sum_within_holding`, as `open_sells` is for
+    sells), and `broker_paper` the broker's `paper`: only
     `long_short` with `broker_paper is True` lifts the short refusal.
     `net_exposure` is the window's frozen `portfolio.net_exposure`, passed for
     the phase that completes a batch holding a rebalance's decisions and
@@ -690,9 +698,10 @@ def check_phase(
             continue
         asset = assets.get(order.security_id)
         if asset is None:
-            if order.side == _BUY:
+            if order.side == _BUY and order.position_side != _SHORT:
                 # A buy of a name the broker does not know is a per-name skip
-                # (spec amendment 2026-10-18 item 2); a held name's sell still fails closed.
+                # (spec amendment 2026-10-18 item 2); a held name's sell, and a cover of
+                # a held short, still fail closed.
                 skips.append(Skip(order.decision_id, order.security_id, "skip_asset_unknown"))
             else:
                 breach("asset_missing", f"no asset read for {order.security_id}")
@@ -748,6 +757,7 @@ def check_phase(
     over_weight: dict[str, str] = {}
     buy_cash = Decimal(0)
     opened: dict[str, float] = {}
+    covered: dict[str, float] = defaultdict(float)
     for order in left:
         is_short = order.position_side == _SHORT
         if not order.full_exit and order.value() > frozen.max_order_notional_fraction * equity:
@@ -767,6 +777,7 @@ def check_phase(
                     f"{held_short}",
                 )
             after[order.security_id] += order.shares()
+            covered[order.security_id] += order.shares()
         elif is_short:
             opened[order.security_id] = opened.get(order.security_id, 0.0) + order.shares()
             after[order.security_id] -= order.shares()
@@ -811,6 +822,15 @@ def check_phase(
     for detail in over_weight.values():
         breach("max_position_weight", detail)
 
+    open_covered = open_sold(open_covers, quantity_decimals)
+    for name, total in covered.items():
+        held = round_down(max(-ledger.positions.get(name, 0.0), 0.0), quantity_decimals)
+        total_exact = _dec(total) + open_covered.get(name, Decimal(0))
+        if total_exact > _dec(held):
+            breach(
+                "cover_sum_within_holding",
+                f"{name} covers and open covers of {total_exact} over the held short {held}",
+            )
     for name, detail in _sides_violations(left, ledger.positions):
         breach("one_side_per_name", f"{name} {detail}")
     for name, shares in opened.items():
