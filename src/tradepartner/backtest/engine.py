@@ -91,7 +91,12 @@ from typing import Final, TypeVar, cast
 import polars as pl
 
 from tradepartner.backtest import placebo
-from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
+from tradepartner.backtest.costs import (
+    Commissions,
+    adv_by_security,
+    buy_notional_after_costs,
+    trade_cost,
+)
 from tradepartner.backtest.fills import FillResult, apply_trades
 from tradepartner.backtest.metrics import PERCENT_POINTS_PER_UNIT
 from tradepartner.backtest.portfolio import (
@@ -426,6 +431,7 @@ def _exits(
     fill: date,
     end: date,
     params: Settings,
+    adv: Mapping[str, float],
 ) -> list[_Exit]:
     """The delisting and stale exits of `positions` at one cost level (module docstring)."""
     frame, raw, ended = reads
@@ -452,7 +458,15 @@ def _exits(
         raw_close = _last_close(raw, sid, session)
         if raw_close is None:
             raise ValueError(f"{sid} has no raw bar at or before {session.isoformat()} to exit at")
-        cost = trade_cost(value, value / raw_close, book.level, commissions)
+        cost = trade_cost(
+            value,
+            value / raw_close,
+            book.level,
+            commissions,
+            spread_bps=params.costs.spread_bps,
+            impact_coeff=params.costs.impact_coeff,
+            adv=adv.get(sid),
+        )
         exits.append(_Exit(sid, session, value, min(cost, value), stale))
     return exits
 
@@ -489,6 +503,11 @@ def _benchmark_step(
 ) -> None:
     """Buy (at F_0) or carry each benchmark, then value it through `end`."""
     fill_price = params.execution.fill_price
+    adv = (
+        adv_by_security(raw, plan.session, params.costs.adv_sessions)
+        if params.costs.impact_coeff != 0.0
+        else {}
+    )
     for name, holding in book.benchmarks.items():
         sid = holding.security_id
         if holding.marked_at is None:
@@ -499,9 +518,23 @@ def _benchmark_step(
                 )
             commissions = Commissions.from_config(params.costs)
             notional = buy_notional_after_costs(
-                holding.cash, book.level, commissions, price=raw_price
+                holding.cash,
+                book.level,
+                commissions,
+                price=raw_price,
+                spread_bps=params.costs.spread_bps,
+                impact_coeff=params.costs.impact_coeff,
+                adv=adv.get(sid),
             )
-            cost = trade_cost(notional, notional / raw_price, book.level, commissions)
+            cost = trade_cost(
+                notional,
+                notional / raw_price,
+                book.level,
+                commissions,
+                spread_bps=params.costs.spread_bps,
+                impact_coeff=params.costs.impact_coeff,
+                adv=adv.get(sid),
+            )
             holding.cash = holding.cash - notional - cost
             positions = {sid: notional}
         else:
@@ -585,6 +618,7 @@ def _fill_to_targets(
     plan: Plan,
     book: _Book,
     params: Settings,
+    adv: Mapping[str, float],
 ) -> FillResult:
     """`apply_trades` towards `targets`, leaving the `aside` names untouched.
 
@@ -605,6 +639,9 @@ def _fill_to_targets(
             fill_price=fill_price,
             per_side_bps=book.level,
             commissions=commissions,
+            spread_bps=params.costs.spread_bps,
+            impact_coeff=params.costs.impact_coeff,
+            adv=adv,
         )
     kept = {sid: value for sid, value in carried.items() if sid in aside}
     traded = {sid: value for sid, value in carried.items() if sid not in aside}
@@ -621,6 +658,9 @@ def _fill_to_targets(
         fill_price=fill_price,
         per_side_bps=book.level,
         commissions=commissions,
+        spread_bps=params.costs.spread_bps,
+        impact_coeff=params.costs.impact_coeff,
+        adv=adv,
     )
     return replace(
         fill,
@@ -660,7 +700,12 @@ def _step(
         for session in _sessions(plan.session, plan.fill_session)[1:]:
             held_cash *= 1 + accruals[session]
     targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
-    fill = _fill_to_targets(carried, held_cash, targets, aside, frame, raw, plan, book, params)
+    adv = (
+        adv_by_security(raw, plan.session, params.costs.adv_sessions)
+        if params.costs.impact_coeff != 0.0
+        else {}
+    )
+    fill = _fill_to_targets(carried, held_cash, targets, aside, frame, raw, plan, book, params, adv)
     values = value_positions(
         fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
     )
@@ -672,7 +717,7 @@ def _step(
             "long-only (ADR 0014, 0015), a negative value would be silently dropped"
         )
     exits = _exits(
-        book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params
+        book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params, adv
     )
     values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
