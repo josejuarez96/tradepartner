@@ -748,6 +748,10 @@ def test_small_account_skips_a_nonfractionable_buy_below_one_share_only_when_ena
     short = _buys([short_buy], 100.0, costs=NO_COSTS, assets=assets, frozen=on)
     assert short.skips == () and short.deferred == (3,)
 
+    funded_later = _d(3, "buy", target=300.0, whole_share=True)
+    cash_short = _buys([funded_later], 40.0, costs=NO_COSTS, assets=assets, frozen=on)
+    assert cash_short.skips == () and cash_short.deferred == (3,)
+
 
 def test_an_untradable_buy_skips_and_a_lost_fractionable_one_goes_by_whole_shares() -> None:
     assets = {"SEC_1": HALTED, "SEC_2": WHOLE, "SEC_3": TRADABLE}

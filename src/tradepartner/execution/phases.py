@@ -92,7 +92,9 @@ listing ended at close(S-1) (`ended`) is skipped as `skip_delisted` before
 sizing, so it takes no share of the other buys' scaling, instead of being
 sized in and only then dropped by `risk.check_phase` (#604). A buy whose
 attempt falls below the minimum is **deferred** (its id in `deferred`, no skip
-row, no cap count); a name not `tradable` is `skip_untradable`. A buy of a
+row, no cap count); with `risk.small_account` on, a long non-fractionable buy
+below one buffered share instead gets `skip_not_fractionable` before sizing and
+counts toward the skip cap. A name not `tradable` is `skip_untradable`. A buy of a
 name the sells phase ordered or skipped, or whose sell decision is in flight,
 raises `ValueError` (#518). The scale is
 capped at 1 against the buys' remainders, so cash beyond the targets (a forced
@@ -544,15 +546,7 @@ def buy_orders(
     for sizing in size_buys(to_size, cash, price_of, frozen, costs):
         decision = sizing_of[sizing.decision_id].decision
         if sizing.deferred:
-            asset = assets[decision.security_id]
-            if (
-                frozen.small_account.enabled
-                and decision.position_side == LONG
-                and not asset.fractionable
-            ):
-                skips.append(Skip(sizing.decision_id, decision.security_id, _SKIP_NOT_FRACTIONABLE))
-            else:
-                deferred.append(sizing.decision_id)
+            deferred.append(sizing.decision_id)
             continue
         price = _price(price_of, decision.security_id)
         whole = sizing.quantity is not None
