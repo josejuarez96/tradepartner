@@ -634,6 +634,7 @@ def test_a_duplicate_id_found_through_get_order_raises_before_any_submit() -> No
 @pytest.mark.parametrize(
     ("message", "expected"),
     [
+        # Duplicate fixture plus three 2026-10-19 sandbox JSONL response bodies.
         ("client_order_id must be unique", DuplicateClientOrderIdError),
         ("invalid position_intent specified", AlpacaTradingError),
         ("qty must be > 0", AlpacaTradingError),
@@ -643,7 +644,7 @@ def test_a_duplicate_id_found_through_get_order_raises_before_any_submit() -> No
         ),
     ],
 )
-def test_the_brokers_recorded_40010001_refusals_are_classified_by_message(
+def test_40010001_refusals_are_classified_by_message(
     message: str, expected: type[Exception]
 ) -> None:
     recorded = _load("duplicate_client_order_id")["error"]
