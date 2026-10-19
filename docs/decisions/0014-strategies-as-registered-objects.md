@@ -1,5 +1,7 @@
 # 0014. Strategies are registered objects: one dispatch seam, one family registry, generic exclusions
 
+> **Superseded in part by [ADR 0024](0024-lift-long-only-and-top-1000.md) (2026-10-19):** long/short is now allowed, so "no signed weights in the type until an ADR allows long/short" no longer holds; the signed type is build work for the shorting spec.
+
 **Status:** Accepted (owner decisions of 2026-10-06, in chat to the orchestrator, recorded under "Owner decisions" below; by merging PR #1077, a class-B merge by the owner; two open questions for him under "Open questions", neither of which this record pre-empts)  ·  **Date:** 2026-10-06  ·  **Issue:** #1074  ·  **Plan:** [strategy-interface](../plans/strategy-interface.md)  ·  **Related:** [backtest spec](../specs/backtest.md) (amendment #720, the `profitability` family; its Series and data-model lines carry this record's notes), [paper-trading spec](../specs/paper-trading.md) (the `signals` line), [backtest plan](../plans/backtest.md) (T85 to T85f), [strategy-lab spec](../specs/strategy-lab.md), [ADR 0005](0005-objective-benchmark-stop-criteria.md) (benchmarks, not amended), [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md) (cadence)
 
 ## Context

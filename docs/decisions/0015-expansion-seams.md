@@ -1,5 +1,7 @@
 # 0015. Expansion seams: what to open before Phase 4, what to defer
 
+> **Superseded in part by [ADR 0024](0024-lift-long-only-and-top-1000.md) (2026-10-19):** part A's sentence that the charter's Scope line changes only per capability at build time no longer holds for shorting or for time frame (intraday now comes through a spec and plan), nor does its statement that "no shorts, ever" holds. The seams and the rest of part A stand.
+
 **Status:** Accepted (2026-10-08, by the owner's merge of PR #1253; header set by #1258)  ·  **Date:** 2026-10-08  ·  **Issue:** #1252  ·  **Supersedes:** [ADR 0010](0010-phase-4-risk-rules.md) point 3, the id format only (the book token, seam 1)  ·  **Amends:** ADR 0010 point 1 with two structural refusals (`refused_position_side`, `refused_order_shape`; on breach the batch halts with `LimitBreachError`, as every structural rule there does), under its point 5  ·  **Related:** [charter](../charter.md) (Scope), [roadmap](../roadmap.md), [ADR 0003](0003-data-adapters-local-first.md) (adapters, point-in-time rules), [ADR 0005](0005-objective-benchmark-stop-criteria.md), [ADR 0006](0006-universe-and-cadence.md), [ADR 0009](0009-price-vendor.md), [ADR 0012](0012-cadence-as-a-hypothesis-parameter.md), [ADR 0014](0014-strategies-as-registered-objects.md) (the strategy seam), [paper-trading plan](../plans/paper-trading.md) (T48b, T48c, T71)
 
 ## Context
