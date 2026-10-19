@@ -229,6 +229,8 @@ class CheckRun:
     name: str
     status: str  # COMPLETED | IN_PROGRESS | QUEUED | ...
     conclusion: str  # SUCCESS | FAILURE | ... | "" while running
+    run_id: int = 0  # workflow run id (from the details URL); 0 when unknown
+    started_at: str = ""  # ISO-8601 UTC start time; "" when unknown
 
 
 @dataclass(frozen=True)
@@ -397,6 +399,12 @@ def tick_reviewer_boxes(
     return "".join(lines), other, [lines[review[0]].rstrip("\r\n")], [], reviewed_at
 
 
+def _run_id(details_url: str) -> int:
+    """The workflow run id in a check's details URL (``.../actions/runs/<id>/job/...``)."""
+    m = re.search(r"/actions/runs/(\d+)", details_url)
+    return int(m.group(1)) if m else 0
+
+
 def matrix_base(name: str) -> str:
     """The bare name of a known matrix job's child: ``pytest-shard (3)`` -> ``pytest-shard``.
 
@@ -418,6 +426,16 @@ def is_cancelled(run: CheckRun) -> bool:
     return run.conclusion.upper() == "CANCELLED" and run.status.upper() == "COMPLETED"
 
 
+def is_later_than(run: CheckRun, other: CheckRun) -> bool:
+    """Whether ``run`` belongs to a later workflow run than ``other``: by run id when both
+    are known, else by start time. Unknown ordering is never "later"."""
+    if run.run_id and other.run_id:
+        return run.run_id > other.run_id
+    if run.started_at and other.started_at:
+        return run.started_at > other.started_at
+    return False
+
+
 def checks_state(checks: HeadChecks, sha: str) -> str:
     """``pending`` | ``success`` | ``failure`` | ``cancelled`` for the CI on one commit.
 
@@ -437,7 +455,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     head. A non-cancelled matrix child also excuses its cancelled bare parent -- the full
     run's ``pytest-shard (N)`` excuses a cancelled ``pytest-shard`` cancelled before it
     fanned out -- but never a cancelled sibling child: a cancelled ``pytest-shard (3)``
-    needs its own ``pytest-shard (3)`` success (#1254). A lone ``CANCELLED`` ``checks``
+    needs its own ``pytest-shard (3)`` success (#1254). A ``CANCELLED`` check is also
+    ignored when a later workflow run (by run id, else start time) on the head has a
+    ``SUCCESS`` check, whatever the names (#1844). A lone ``CANCELLED`` ``checks``
     with every run on the head completed is ``cancelled`` (#1201): the caller may
     re-trigger once, and it is never green. Any other lone ``CANCELLED`` still fails.
     """
@@ -454,7 +474,23 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         if not cancelled:
             finished.add(run.name)
             finished.add(base)
-    runs = [run for run, _base, cancelled in live if not (cancelled and run.name in finished)]
+    # A cancelled check is also excused by a SUCCESS in a later workflow run on this head,
+    # whatever the names (the draft run's cancelled `pytest-shard` vs the full run's
+    # `pytest-shard (N)`, #1844).
+    succeeded = [
+        run
+        for run, _base, cancelled in live
+        if not cancelled
+        and run.status.upper() == "COMPLETED"
+        and run.conclusion.upper() == "SUCCESS"
+    ]
+    runs = [
+        run
+        for run, _base, cancelled in live
+        if not (
+            cancelled and (run.name in finished or any(is_later_than(ok, run) for ok in succeeded))
+        )
+    ]
     if not any(r.name == "checks" for r in runs):
         return "pending"
     if any(r.status.upper() != "COMPLETED" for r in runs):
@@ -970,6 +1006,8 @@ class ShellRunner:
                 str(c.get("name") or c.get("context") or "?"),
                 str(c.get("status") or ("COMPLETED" if c.get("conclusion") else "")),
                 str(c.get("conclusion") or c.get("state") or ""),
+                _run_id(str(c.get("detailsUrl") or "")),
+                str(c.get("startedAt") or ""),
             )
             for c in raw.get("statusCheckRollup") or []
         )

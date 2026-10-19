@@ -387,6 +387,42 @@ def test_a_cancelled_draft_shard_is_superseded_by_the_labelled_full_run() -> Non
     assert ready_pr.checks_state(hc("abc", (*cancelled_draft, *full_run)), "abc") == "success"
 
 
+def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_success() -> None:
+    """#1844: the draft run's cancelled `pytest-shard` and `claims-x` share no name with the
+    full run's checks; a later workflow run's SUCCESS (by run id, else start time) excuses them."""
+    hc = ready_pr.HeadChecks
+    cr = ready_pr.CheckRun
+    draft = (
+        cr("odd-job", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+        cr("pytest-shard", "COMPLETED", "CANCELLED", 10, "2026-10-18T10:00:00Z"),
+    )
+    full = (
+        cr("pytest-shard (0)", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", (*draft, *full)), "abc") == "success"
+    by_time = (
+        cr("odd-job", "COMPLETED", "CANCELLED", 0, "2026-10-18T10:00:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 0, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", by_time), "abc") == "success"
+
+
+def test_a_cancelled_check_with_no_later_success_still_fails() -> None:
+    hc = ready_pr.HeadChecks
+    cr = ready_pr.CheckRun
+    earlier_success_only = (
+        cr("odd-job", "COMPLETED", "CANCELLED", 12, "2026-10-18T10:10:00Z"),
+        cr("checks", "COMPLETED", "SUCCESS", 11, "2026-10-18T10:05:00Z"),
+    )
+    assert ready_pr.checks_state(hc("abc", earlier_success_only), "abc") == "failure"
+    unordered = (
+        cr("odd-job", "COMPLETED", "CANCELLED"),
+        cr("checks", "COMPLETED", "SUCCESS"),
+    )
+    assert ready_pr.checks_state(hc("abc", unordered), "abc") == "failure"
+
+
 # ── the flow, on a fake runner ──────────────────────────────────────────────────
 
 
