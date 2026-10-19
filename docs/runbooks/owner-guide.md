@@ -155,7 +155,7 @@ Rare flags: `--override-gap --gap-reason "<why>"` runs past the survivorship-gap
 | `halted`, `run_failed` | The book stopped. Read the alert and `~/Library/Logs/tradepartner/paper.err.log`, then ask Claude to diagnose. Resume only once the cause is known. |
 | `reconciliation` | The journal and Alpaca disagree. Do not resume blind. Ask Claude. |
 | `rejection_cap`, `skip_cap` | Too many orders refused or names skipped. Find out why before resuming. |
-| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to today's equity), then decide whether to `paper stop`. If you mean to stop, run `paper stop` straight after the resume: the next run in the submit window can trade again. |
+| `drawdown` | The book fell more than `risk.max_drawdown` (30%) from its peak. The switch engaged itself. Resume (this resets the peak to the equity at the last mark), then decide whether to `paper stop`. If you mean to stop, run `paper stop` straight after the resume: the next run in the submit window can trade again. |
 | `stale_data` | Ingest was late. No action. The next run proceeds once data catches up. Inside a shakedown span, add a `decision shakedown-note` for it. |
 | `missed_run`, `missed_rebalance` | The Mac was off or asleep, or a stop rule held the rebalance. Check the reason. Keep the Mac awake (#1759). |
 | `kill_switch` | The switch changed state. `paper status` shows why. |
