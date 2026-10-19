@@ -957,6 +957,7 @@ class TestRefusals:
                     "master.chains_dismissed",
                     "master.chain_window_sessions",
                     "master.chain_max_price_ratio",
+                    "adjust.apply_spin_offs",
                 )
             )
         }
