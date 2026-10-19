@@ -550,11 +550,32 @@ class FakeBroker(Broker):
                 if request.quantity is not None
                 else Decimal(repr(request.notional)) / price_now()
             )
-            if requested_cover > -held:
+            pending_cover = Decimal(0)
+            for open_order in self._orders.values():
+                if (
+                    open_order.symbol != request.symbol
+                    or open_order.side is not Side.BUY  # while short, a buy is a cover
+                    or open_order.status in TERMINAL_STATUSES
+                ):
+                    continue
+                filled_qty, filled_notional = self._filled.get(
+                    open_order.client_order_id, (Decimal(0), Decimal(0))
+                )
+                if open_order.quantity is not None:
+                    pending_cover += max(
+                        Decimal(0), Decimal(repr(open_order.quantity)) - filled_qty
+                    )
+                elif open_order.notional is not None:
+                    pending_cover += (
+                        max(Decimal(0), Decimal(repr(open_order.notional)) - filled_notional)
+                        / price_now()
+                    )
+            if requested_cover > -held - pending_cover:
                 raise _refused(
                     request,
                     _short_refusal(
-                        f"cannot cover {requested_cover} shares, short {-held}: "
+                        f"cannot cover {requested_cover} shares, short {-held} "
+                        f"with {pending_cover} already covered by open orders: "
                         "a cover cannot flip the position"
                     ),
                 )

@@ -1718,3 +1718,23 @@ def test_a_short_open_is_not_checked_against_a_held_quantity() -> None:
     broker.submit(short_open(quantity=2))
     broker.submit(short_open(client_order_id="co-2", quantity=3))
     assert broker.positions() == {"AAPL": Position(symbol="AAPL", quantity=-5)}
+
+
+def test_open_covers_count_against_the_short_so_two_cannot_flip_it_long() -> None:
+    """Quant-auditor re-pass: with fills held back, two open covers of 2 on a
+    short of 2 must not both be accepted (4 > 2 would flip it to +2)."""
+    broker = short_broker(auto_fill=False)
+    broker.submit(short_open(quantity=2, client_order_id="open"))
+    broker.simulate_fill("open")
+    first = broker.submit(cover(quantity=2, client_order_id="cover-1"))
+    assert first.status is OrderStatus.ACCEPTED
+
+    second = cover(quantity=2, client_order_id="cover-2")
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(second)
+    assert 400 <= (caught.value.status_code or 0) < 500
+    with pytest.raises(UnknownOrderError):
+        broker.get_order("cover-2")
+
+    broker.simulate_fill("cover-1")
+    assert broker.positions() == {}
