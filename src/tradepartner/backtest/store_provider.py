@@ -106,6 +106,7 @@ from tradepartner.store.asof import (
     adjusted_prices_as_of,
     dropped_dividends_as_of,
     listings_as_of,
+    marking_changed_ids_as_of,
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
@@ -232,6 +233,13 @@ class StoreProvider:
             traded_only=True,
             sessions_from=sessions_from,
         )
+
+    def marking_changed_ids(
+        self, previous_t: datetime, t: datetime, ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Invalidate incremental marks from the step's own as-of connection."""
+        previous_t, t = check_t(previous_t), check_t(t)
+        return marking_changed_ids_as_of(self._at(t), previous_t, t, _ids(ids))
 
     def raw_prices(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
         t, wanted = check_t(t), _ids(ids)

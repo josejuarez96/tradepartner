@@ -54,6 +54,7 @@ SPEC_KINDS = (
     "no_window",
     "lot_ledger",  # #366 Q5 (a), 2026-10-01
     "stale_mark",  # #1763, 2026-10-18
+    "skipped",  # T202, 2026-10-18 (paper spec amendment items 2 and 11, ADR 0023 D2)
 )
 
 

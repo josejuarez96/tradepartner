@@ -196,6 +196,10 @@ def frozen_risk(window: PaperWindowRow) -> RiskConfig:
     if not isinstance(parsed, dict):
         raise ValueError(f"window {window.window_id} frozen_json is not an object")
     risk = {k[len(_RISK_PREFIX) :]: v for k, v in parsed.items() if k.startswith(_RISK_PREFIX)}
+    # A window frozen before T202 has no `risk.max_skip_share`: read it as 0, so the
+    # skip cap stays max(max_skips_per_run, 0) (paper spec amendment 2026-10-18 item 3).
+    # The one key back-filled; every other missing key still refuses.
+    risk.setdefault("max_skip_share", 0.0)
     missing = sorted(set(RiskConfig.model_fields) - set(risk))
     if missing:
         raise ValueError(f"window {window.window_id} frozen_json lacks risk keys {missing}")

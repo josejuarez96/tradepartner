@@ -1237,6 +1237,11 @@ class StrategyConfig(BaseModel):
     `hold_target_names` 0 means the count `top_fraction` selects; `rebalance_band` 0.0
     trades every non-zero drift, so every default reproduces today's behaviour. Until
     T209b wires the engine, `hold` and a non-zero `rebalance_band` are refused.
+
+    `signal_delay_sessions`, `placebo` and `placebo_seed` are the kill ladder's rung-4
+    delay and rung-5 placebo (ADR 0023; backtest spec amendment #1820): post-registration
+    own-section keys, inert at their defaults, refused otherwise until T217c wires the
+    engine.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1250,6 +1255,9 @@ class StrategyConfig(BaseModel):
     hold_sessions: int = Field(default=1, gt=0)
     hold_target_names: int = Field(default=0, ge=0)
     rebalance_band: float = Field(default=0.0, ge=0, lt=1)
+    signal_delay_sessions: int = Field(default=0, ge=0)
+    placebo: Literal["none", "shuffle", "random_entry"] = "none"
+    placebo_seed: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _validate_formation_window(self) -> StrategyConfig:
@@ -1275,6 +1283,20 @@ class StrategyConfig(BaseModel):
                 f"strategy.rebalance_band = {self.rebalance_band} is not wired until "
                 "T209b: the engine still trades every drift to its exact target"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_shocks_until_wired(self) -> StrategyConfig:
+        """A delay or placebo loads as a key but no build reads it yet, so until T217c
+        wires the engine a run would trade the real signal while the row says otherwise.
+        T217c removes this guard."""
+        for name in ("signal_delay_sessions", "placebo", "placebo_seed"):
+            value = getattr(self, name)
+            if value != StrategyConfig.model_fields[name].default:
+                raise ValueError(
+                    f"strategy.{name} = {value!r} is not wired until T217c: the engine "
+                    "still reads the signal at the rebalance session, unshocked"
+                )
         return self
 
 
@@ -1954,6 +1976,8 @@ class RiskConfig(BaseModel):
     max_gross_exposure: float = Field(default=1.0, ge=0, le=1)
     max_orders_per_run: int = Field(default=250, gt=0)
     max_skips_per_run: int = Field(default=10, ge=0)
+    # T202 (ADR 0023 D2): the skip cap is max(max_skips_per_run, floor(share x decisions)).
+    max_skip_share: float = Field(default=0.10, ge=0, le=0.25)
     max_rejections_per_run: int = Field(default=5, ge=0)
     max_drawdown: float = Field(default=0.30, ge=0, le=1)
     min_order_notional: float = Field(default=1.0, ge=0)
