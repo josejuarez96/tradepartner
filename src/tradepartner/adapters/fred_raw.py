@@ -18,6 +18,12 @@ _ENDPOINT = "https://api.stlouisfed.org/fred/series/observations"
 _LIMIT = 100000
 _LOG_LOCK = RLock()
 _sleep = time.sleep
+
+
+def _today() -> date:
+    return datetime.now(UTC).date()
+
+
 _OPEN_END = date(9999, 12, 31)
 _MAX_ERROR_CHARS = 200
 
@@ -223,7 +229,7 @@ def observations(
         client = httpx.Client(timeout=cfg.fred_timeout_seconds)
     try:
         parts: list[tuple[date, date, list[Any]]] = []
-        today = datetime.now(UTC).date()
+        today = _today()
         for start, end in _vintage_windows(realtime_start, cfg.fred_vintage_window_days, today):
             window = params | {
                 "realtime_start": start.isoformat(),

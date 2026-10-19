@@ -19,13 +19,14 @@ from tradepartner.config import Settings
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     sleeps: list[float] = []
     monkeypatch.setattr(fred_raw, "_sleep", sleeps.append)
+    monkeypatch.setattr(fred_raw, "_today", lambda: date(2020, 1, 20))
     return sleeps
 
 
 def _settings(key: str = "dummy", **rates: object) -> Settings:
     """Settings whose default chunking is one window unless `rates` says otherwise."""
     return Settings(
-        _env_file=None, fred_api_key=key, rates={"fred_vintage_window_days": 36500, **rates}
+        _env_file=None, fred_api_key=key, rates={"fred_vintage_window_days": 1000, **rates}
     )
 
 
