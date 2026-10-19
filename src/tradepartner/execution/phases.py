@@ -144,6 +144,7 @@ _WHOLE_HOLDING_REASONS = frozenset({DELISTED_REASON, UNTARGETED_RECEIPT_REASON})
 _DUST = "dust"
 _UNTRADABLE = "untradable"
 _SKIP_UNTRADABLE = "skip_untradable"
+_SKIP_NOT_FRACTIONABLE = "skip_not_fractionable"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_DELISTED = "skip_delisted"
@@ -522,6 +523,17 @@ def buy_orders(
         if not asset.tradable:
             skips.append(Skip(_id(decision), sid, _SKIP_UNTRADABLE))
             continue
+        if (
+            frozen.small_account.enabled
+            and decision.position_side == LONG
+            and not asset.fractionable
+            and attempt.remainder.notional > 0
+            and Decimal(repr(attempt.remainder.notional))
+            < Decimal(repr(_price(price_of, sid)))
+            * (1 + Decimal(repr(frozen.whole_share_price_buffer)))
+        ):
+            skips.append(Skip(_id(decision), sid, _SKIP_NOT_FRACTIONABLE))
+            continue
         lost = True if not asset.fractionable else None
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
 
@@ -532,7 +544,15 @@ def buy_orders(
     for sizing in size_buys(to_size, cash, price_of, frozen, costs):
         decision = sizing_of[sizing.decision_id].decision
         if sizing.deferred:
-            deferred.append(sizing.decision_id)
+            asset = assets[decision.security_id]
+            if (
+                frozen.small_account.enabled
+                and decision.position_side == LONG
+                and not asset.fractionable
+            ):
+                skips.append(Skip(sizing.decision_id, decision.security_id, _SKIP_NOT_FRACTIONABLE))
+            else:
+                deferred.append(sizing.decision_id)
             continue
         price = _price(price_of, decision.security_id)
         whole = sizing.quantity is not None

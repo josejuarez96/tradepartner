@@ -1311,7 +1311,8 @@ def decisions_from(
             # (shakedown E.3 measures fills against `planned_notional`).
             intents[sid] = replace(intent, notional=minimum)
             intent = intents[sid]
-        if intent.notional == 0 or intent.notional < minimum:
+        small_whole_buy = frozen.small_account.enabled and intent.side == _BUY and whole
+        if intent.notional == 0 or (intent.notional < minimum and not small_whole_buy):
             decided[sid] = Decision(
                 **base(sid),
                 decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
