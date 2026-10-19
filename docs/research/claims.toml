@@ -2882,6 +2882,199 @@ source = "docs/research/2026-10-18-irrx-long-leg.md"
 section = "Answer"
 note = "Proxy figure from SH-1's 2026-10-09 CZ computation, not re-run. IRRX vs REV figures from Dai et al. (2023 WP) via SH-1/SH-4. Owner-side computation listed in the report."
 
+# ===== 2026-10-10-beyond-long-only.md =====
+# LS- entries: extracted 2026-10-19 (#1862) from the report's "Proposed claims" table (owed since #1452). Grades are the report's own; the report is a desk review, no TradePartner data was run.
+
+[[claim]]
+id = "LS-1"
+statement = "Classic factors (momentum, profitability, investment, value), long-short, earned positive premia that replicate"
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "gross, before borrow, mostly pre-2010, capped value weights (JKP 2023). The Hou-Xue-Zhang part was not re-verified"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-2"
+statement = "A momentum + profitability (+ investment or CF/P) long-short composite in the top ~1,000 US stocks nets a positive return after 15 bp per side and borrow, post-2010"
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "no direct test; own French-leg check +0.9%/yr gross, t 0.66 (UNVERIFIED, not in repo)"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: LS-2, MF-1."
+
+[[claim]]
+id = "LS-3"
+statement = "In large caps, single-stock shorts add net value over an index hedge of the long leg"
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "net of trading and borrow, post-2006 (Muravyev-Pearson-Pollet; Blitz-Baltussen-van Vliet). Conflicts gross with Israel-Moskowitz on momentum (short leg matters more in large firms). 1 of 3 skeptics graded MIXED"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-4"
+statement = "BAB/low-beta long-short earns a premium in value-weighted large caps"
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Novy-Marx-Velikov 2022"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-5"
+statement = "Value long-short in the largest stocks"
+kind = "empirical"
+grade = "MIXED"
+scope = "Israel-Moskowitz; the lost decade (T3, unverified). Not buildable faithfully: no book equity"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-6"
+statement = "Anomaly long-short returns come from the short leg, are about zero net of borrow fees, and are unprofitable even gross excluding high-fee stock-dates"
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "equal-weighted CRSP ex <$1/<$50M, 2006-2020, DGTW (JF 2025: 0.14 / −0.01; draft 0.15 / −0.02); concurs with Drechsler-Drechsler. Conflict: SH-6's CZ VW short leg"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-7"
+statement = "A short overlay of anomaly losers adds net return over SPY in liquid US large caps after 2005"
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "net of trading and borrow"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-8"
+statement = "Lifting the long-only constraint raises the IR of our signals (transfer coefficient)"
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "conditional on an IC we have not shown; the 40-50% figure comes from a practitioner page"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-9"
+statement = "Distance pairs earned large gross excess returns historically, declining steadily"
+kind = "empirical"
+grade = "SUPPORTED"
+scope = "gross, pre-2009 (GGR 2006; Do-Faff 2010, subperiod figures unverified)"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: SA-1, SA-2."
+
+[[claim]]
+id = "LS-10"
+statement = "Distance pairs net a positive return after 2002 in liquid US large caps at 15 bp per side"
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "Do-Faff 2012; Rad-Low-Faff 2016; the full-sample 24 bp large-cap alpha is pre-2002-dominated"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: SA-3, SA-6."
+
+[[claim]]
+id = "LS-11"
+statement = "Residual (PCA/ETF) stat arb survives costs in large caps"
+kind = "empirical"
+grade = "MIXED"
+scope = "only deep models at 5 bp to 2016; parametric OU gross Sharpe below 1"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: SA-4."
+
+[[claim]]
+id = "LS-12"
+statement = "EAR long-short with an ETB-only short leg is profitable net of trading and borrow, post-2006"
+kind = "empirical"
+grade = "NOT SUPPORTED"
+scope = "conflicts with SH-6 (CZ VW short leg ~0.49%/month gross 2010-2024)"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: EL-1."
+
+[[claim]]
+id = "LS-13"
+statement = "A beta-hedged long book trails SPY by about the equity premium unless its alpha exceeds it"
+kind = "fact"
+grade = "SUPPORTED"
+scope = "R_H ≈ α + (1−β)·rf with no rebate"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: HG-1."
+
+[[claim]]
+id = "LS-14"
+statement = "A long leg hedged with an index captures most of a factor premium (long-minus-market ≥ long-short)"
+kind = "empirical"
+grade = "MIXED"
+scope = "Blitz-Baltussen-van Vliet against Benaych-Georges-Bouchaud-Ciliberti; contaminated by an SMB artefact when the hedge is cap-weighted"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: HG-2."
+
+[[claim]]
+id = "LS-15"
+statement = "A beta-hedged B3 long book earns a positive net return over T-bills post-publication"
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "B3 has not run"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: HG-3."
+
+[[claim]]
+id = "LS-16"
+statement = "Alpaca terms: ETB $0 locate and borrow; $2,000 minimum for margin and shorts; maintenance max($5, 30%) at ≥$5 and max($2.50, 100%) below $5; margin interest 6.50% (5.00% elite); no fractional shorts; HTB fees in round lots"
+kind = "fact"
+grade = "SUPPORTED"
+scope = "Alpaca docs checked 2026-10-10; HTB *availability* conflicts across Alpaca pages"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-17"
+statement = "Retail short proceeds earn no rebate at Alpaca"
+kind = "fact"
+grade = "INSUFFICIENT"
+scope = "docs silent; confirm on paper; drives the T-bill drag in every market-neutral prior"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "Scout ids in the report: MF-2."
+
+[[claim]]
+id = "LS-18"
+statement = "Alpaca paper: margin account with shorting enabled; no dividend simulation; borrow fees \"Coming Soon\"; locate reportedly absent"
+kind = "fact"
+grade = "SUPPORTED"
+scope = "paper flatters shorts; the backtest and reconciliation must charge dividends and borrow"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+note = "locate: third-party only"
+
+[[claim]]
+id = "LS-19"
+statement = "FINRA free short-interest files cover exchange-listed stocks only from June 2021"
+kind = "fact"
+grade = "SUPPORTED"
+scope = "a point-in-time HTB proxy misses 2020-08 to 2021-05"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
+[[claim]]
+id = "LS-20"
+statement = "Composite equity issuance's short leg survives a low-fee screen"
+kind = "empirical"
+grade = "INSUFFICIENT"
+scope = "one appendix row (−0.25%/month low-fee, −0.17 net, 2006-2020); a lead for the issuance angle"
+source = "docs/research/2026-10-10-beyond-long-only.md"
+section = "Proposed claims for claims.toml"
+
 # ===== TradePartner's own results (TP-) =====
 
 [[claim]]
@@ -2927,3 +3120,25 @@ source = "docs/research/2026-10-11-h1-known-data-holes.md"
 section = "Bank-level registrants are absent"
 bears_on = ["hyp:h1-momentum-12-1", "spec:data-foundation"]
 note = "Recorded as a known hole in H1's write-up (#1541 item 5); no pipeline. The absence of the two failed names can only flatter a long-only book, by an unmeasured amount. Qualifies HO-17 from the other side: the free EDGAR route also misses a class of names, the bank-level registrants."
+
+[[claim]]
+id = "TP-5"
+statement = "B3 (gross profitability tilt) met its own retirement rule: its first audited in-sample trial (trial 3, 2020-08-31 to 2023-12-29, 40 monthly returns, N = 1, 15 bp per side, run 2026-10-07 at code bce1a28) has net excess CAGR over SPY of -3.28 pp/yr (CAGR 7.78% against SPY 11.06%) and a run-time dsr_excess of 0.3069, against the rule's lines of below -1 pp/yr and below 0.5; the owner retired B3 on 2026-10-18."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "One in-sample trial on the owner's store before the restamp-1382a/b repair releases; quant-auditor PASS on the trial (PR #1158); excess at 0 bp -2.93 pp/yr and at 30 bp -3.62; beta-adjusted (B11) alpha -3.2 pp/yr with beta 1.08 and R^2 0.84, so the trial is close to an index and its alpha is not significant either way; no holdout row"
+source = "docs/research/2026-10-18-b9-kill-b3-retirement.md"
+section = "2. B3 (gross profitability) is retired by its own retirement rule"
+bears_on = ["hyp:b3-gross-profitability", "backlog:B3", "backlog:B3b", "backlog:B4"]
+note = "Qualifies QI-6 (SUPPORTED, narrow) for our universe and window: the premium did not show up long-only in a 40-month window in which a mega-cap-led SPY beat the tilt. A re-run on the repaired store that moves excess above -1 pp/yr or dsr_excess to 0.5 or more is a data-vintage event for the owner, not an automatic un-retirement. B3b was retired with B3 unrun and B4 dropped. Power: 40 months can kill, not confirm."
+
+[[claim]]
+id = "TP-6"
+statement = "B9 (earnings-reaction drift) failed ADR 0023 kill-ladder rungs 1 and 2 on arithmetic and was killed by the owner on 2026-10-18: the size-screened Chen-Zimmermann AnnouncementReturn long leg, 2010-2024, is +0.07%/month (t 0.94) against the lines of >= 0.10%/month and t >= 1.0, and the break-even is 3.5 bp per side at 100% one-sided monthly turnover and 1.75 bp at 200%, against a 6 bp line."
+kind = "empirical"
+grade = "UNGRADED"
+scope = "Desk arithmetic on graded evidence (SH-6); no run, no store read; yardstick fixed before the numbers were read as the worse of two published files; the value-weighted file (+0.32%/month, t 1.88, which would pass and give 8-16 bp) was reported but not used, to avoid a forking path; 2019-2023 alone insignificant in both files; turnover from the hypothesis file's 100-200%/month"
+source = "docs/research/2026-10-18-b9-kill-b3-retirement.md"
+section = "1. B9 (earnings-reaction drift) is killed at rungs 1 and 2"
+bears_on = ["hyp:b9-earnings-reaction-drift", "backlog:B9", "adr:0023"]
+note = "Resolves SH-6 (MIXED) against B9 for the long-only, top-1,000 construction; SH-5 and SH-2 already pointed the same way. Conflicts with the value-weighted file only through the yardstick choice. The hypothesis file was never registered and is left as filed. IRRX's rung 2 stands separately as IL-2 (INSUFFICIENT; parked behind T198, not killed)."
