@@ -1,12 +1,4 @@
 security_id,sic,security_type,rule,known_at,ingested_at,source,provenance
-0001000010,7372,common,common_default,2019-11-06T20:30:00+00:00,2019-11-06T20:40:00+00:00,edgar,filing
-0001000011,7372,common,common_default,2020-02-07T20:30:00+00:00,2020-02-07T20:40:00+00:00,edgar,filing
-0001000012,7372,common,common_default,2019-12-19T20:30:00+00:00,2019-12-19T20:40:00+00:00,edgar,filing
-0001000013,7372,common,common_default,2020-03-23T20:30:00+00:00,2020-03-23T20:40:00+00:00,edgar,filing
-0001000014,7372,common,common_default,2020-05-11T20:30:00+00:00,2020-05-11T20:40:00+00:00,edgar,filing
-0001000015,7372,common,common_default,2020-05-05T20:30:00+00:00,2020-05-05T20:40:00+00:00,edgar,filing
-0001000016,7372,common,common_default,2020-03-18T20:30:00+00:00,2020-03-18T20:40:00+00:00,edgar,filing
-0001000017,7372,common,common_default,2020-06-17T20:30:00+00:00,2020-06-17T20:40:00+00:00,edgar,filing
 SEC_25NSE,7372,common,common_default,2018-03-02T20:30:00+00:00,2018-03-02T20:40:00+00:00,edgar,filing
 SEC_BOUNDARY_DELIST,7372,common,common_default,2018-04-03T20:30:00+00:00,2018-04-03T20:40:00+00:00,edgar,filing
 SEC_CLEAN_MERGER,7372,common,common_default,2018-01-31T20:30:00+00:00,2018-01-31T20:40:00+00:00,edgar,filing

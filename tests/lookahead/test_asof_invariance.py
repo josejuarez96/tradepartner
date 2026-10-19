@@ -126,8 +126,8 @@ def test_as_of_function_invariant_under_truncation(
 
 
 #: `probe_timestamps` on the fixture store, pinned (T216): the chunks walk exactly these.
-PROBE_COUNT = 2032
-PROBE_DIGEST = "6209c9f31bd336c2d5c977893f23fb63e8da111f961a98936b99af55318de8f7"
+PROBE_COUNT = 1942
+PROBE_DIGEST = "f8ccd42c8faaea4b04835e4161798c90701298e1a924f450b147b3058563ccef"
 
 
 def test_adjusted_prices_chunks_are_the_pinned_probe_set(

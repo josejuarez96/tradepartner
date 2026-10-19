@@ -5453,7 +5453,7 @@ def test_import_dry_run_keeps_the_counts_before_a_failing_file(
 
 # --- successor chains (#821, plan T187) -------------------------------------
 
-_CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe"
+_CHAIN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "universe" / "chains"
 _CHAIN_CASE = next(
     case
     for case in json.loads((_CHAIN_FIXTURE_DIR / "chain_cases.json").read_text())

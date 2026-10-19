@@ -10,8 +10,11 @@ absent strictly before its `known_at` and present from it.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -28,8 +31,8 @@ _CASES = {
 
 
 @pytest.fixture
-def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedStore]:
-    store = TruncatedStore(fixture_store)
+def truncated(chain_fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedStore]:
+    store = TruncatedStore(chain_fixture_store)
     try:
         yield store
     finally:
@@ -37,16 +40,16 @@ def truncated(fixture_store: duckdb.DuckDBPyConnection) -> Iterator[TruncatedSto
 
 
 def test_the_fixture_stores_a_chain_row_per_chainable_pair(
-    fixture_store: duckdb.DuckDBPyConnection,
+    chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
-    rows = fixture_store.execute(
+    rows = chain_fixture_store.execute(
         "SELECT successor_id, predecessor_id, known_at FROM successor_chains ORDER BY successor_id"
     ).fetchall()
     assert rows == [
         (successor, predecessor, known_at)
         for successor, (predecessor, known_at) in sorted(_CASES.items())
     ]
-    assert fixture_store.execute(
+    assert chain_fixture_store.execute(
         "SELECT count(*) FROM successor_chains WHERE successor_id = '0001000017'"
     ).fetchone() == (0,)
 
@@ -67,13 +70,13 @@ def test_the_row_is_absent_before_its_known_at_and_present_from_it(
 
 
 def test_truncation_sees_exactly_the_rows_known_by_each_probe(
-    fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
+    chain_fixture_store: duckdb.DuckDBPyConnection, truncated: TruncatedStore
 ) -> None:
     """Every probe sees the fixture rows with `known_at <= T` and no others."""
     probes = [known_at_ for _predecessor, known_at_ in _CASES.values()]
     for known_at in sorted(probes):
         for t in (known_at - PROBE_EPSILON, known_at, known_at + PROBE_EPSILON):
-            expected = fixture_store.execute(
+            expected = chain_fixture_store.execute(
                 "SELECT successor_id FROM successor_chains "
                 "WHERE known_at <= ? ORDER BY successor_id",
                 [t],
@@ -117,7 +120,7 @@ def _chain_row(known_at: datetime, ingested_at: datetime, **extra: object) -> di
 
 
 def test_a_moved_chain_is_absent_before_its_new_stamp_at_every_read(
-    fixture_store: duckdb.DuckDBPyConnection,
+    chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     """#821: after a move to a later stamp the chain reads absent at every
     `t` in [old, new), as the successor's listing row the move follows (moved
@@ -131,17 +134,56 @@ def test_a_moved_chain_is_absent_before_its_new_stamp_at_every_read(
     accession = "0001000011-24-000001"
 
     def at(t: datetime) -> list[tuple[str, datetime]]:
-        return [tuple(row) for row in fixture_store.execute(_LIVE_AT_SQL, [t]).fetchall()]
+        return [tuple(row) for row in chain_fixture_store.execute(_LIVE_AT_SQL, [t]).fetchall()]
 
     assert at(old - PROBE_EPSILON) == []
     assert at(old) == [(accession, old)]
     assert at(new) == [(accession, old)]  # unmoved: the old stamp, no new row yet
     withdrawn = _chain_row(clock, clock, retracted=True, withdrawn_known_at=old)
-    insert_row(fixture_store, "successor_chains", withdrawn)
-    insert_row(fixture_store, "successor_chains", _chain_row(new, clock))
+    insert_row(chain_fixture_store, "successor_chains", withdrawn)
+    insert_row(chain_fixture_store, "successor_chains", _chain_row(new, clock))
     for t in (old, old + PROBE_EPSILON, new - PROBE_EPSILON):  # [old, new)
         assert at(t) == [], t
     for t in (new, new + PROBE_EPSILON, clock - PROBE_EPSILON):  # [new, clock)
         assert at(t) == [(accession, new)], t
     for t in (clock, clock.replace(month=5)):  # from the run on
         assert at(t) == [(accession, new)], t
+
+
+# --- the overlay stays out of the shared fixture (#821, PR #1836) -----------------------
+
+_FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+_GENERATOR_PATH = Path(__file__).resolve().parents[2] / "scripts" / "make_fixture_universe.py"
+_CHAIN_IDS = tuple(f"00010000{n}" for n in range(10, 18))
+
+
+def test_the_shared_fixture_store_holds_no_chain_pair(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """The four pairs live only in the `chains/` overlay: the store every other test
+    reads (health, universe, the H1/TWIN/B3 pins) has none of their rows."""
+    for table in ("securities", "listings", "prices_daily", "facts", "classifications"):
+        count = fixture_store.execute(
+            f"SELECT count(*) FROM {table} WHERE security_id = ANY(?)",
+            [list(_CHAIN_IDS)],
+        ).fetchone()
+        assert count == (0,), table
+    assert fixture_store.execute("SELECT count(*) FROM successor_chains").fetchone() == (0,)
+
+
+def test_the_chain_overlay_regenerates_byte_identically(tmp_path: Path) -> None:
+    """`make_fixture_universe.py` writes the overlay beside the universe, byte for byte
+    what is committed under `tests/fixtures/universe/chains/`."""
+    spec = importlib.util.spec_from_file_location("_chain_overlay_gen", _GENERATOR_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.write_fixtures(tmp_path)
+    committed = sorted(p.name for p in (_FIXTURES_DIR / "chains").iterdir())
+    assert committed == sorted(p.name for p in (tmp_path / "chains").iterdir())
+    for name in committed:
+        assert (_FIXTURES_DIR / "chains" / name).read_bytes() == (
+            tmp_path / "chains" / name
+        ).read_bytes(), name
+    assert not (tmp_path / "successor_chains.csv").exists()

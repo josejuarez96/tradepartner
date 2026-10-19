@@ -1346,15 +1346,15 @@ def test_a_successor_chain_row_moves_the_trial_vintage_from_its_known_at(
 
 
 def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
-    fixture_store: duckdb.DuckDBPyConnection,
+    chain_fixture_store: duckdb.DuckDBPyConnection,
 ) -> None:
     """#821: a chain moved later reads absent at every `t` in [old, new) once
     moved (`schema.successor_chains`), so its retraction moves the vintage of
     every cutoff at or after the withdrawn stamp, not only from the new one;
     an earlier cutoff stays current."""
     old = datetime(2020, 2, 7, 20, 30, tzinfo=UTC)  # the fixture's chain_1to1 row
-    cutoffs = _fixture_cutoffs(fixture_store)
-    before = {cutoff: registry.data_vintage(fixture_store, cutoff) for cutoff in cutoffs}
+    cutoffs = _fixture_cutoffs(chain_fixture_store)
+    before = {cutoff: registry.data_vintage(chain_fixture_store, cutoff) for cutoff in cutoffs}
     row = {
         "predecessor_id": "0001000010",
         "successor_id": "0001000011",
@@ -1364,7 +1364,7 @@ def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
         "provenance": "filing",
     }
     insert_row(
-        fixture_store,
+        chain_fixture_store,
         "successor_chains",
         row
         | {
@@ -1375,7 +1375,7 @@ def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
         },
     )
     insert_row(
-        fixture_store,
+        chain_fixture_store,
         "successor_chains",
         row
         | {
@@ -1387,7 +1387,7 @@ def test_a_moved_chain_stales_every_cutoff_from_its_withdrawn_stamp(
     )
     assert any(old <= cutoff < _PIN_KNOWN for cutoff in cutoffs)
     for cutoff in cutoffs:
-        vintage = registry.data_vintage(fixture_store, cutoff)
+        vintage = registry.data_vintage(chain_fixture_store, cutoff)
         if cutoff < old:
             assert vintage == before[cutoff], cutoff
         else:

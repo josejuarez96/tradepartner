@@ -1911,7 +1911,7 @@ def test_registered_shares_class_is_the_primary_under_the_fallback() -> None:
 # --- successor chains (#821, plan T187) -------------------------------------
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
-_CHAIN_CASES = json.loads((_FIXTURE_DIR / "chain_cases.json").read_text())
+_CHAIN_CASES = json.loads((_FIXTURE_DIR / "chains" / "chain_cases.json").read_text())
 _CHAIN_BY_NAME = {case["case"]: case for case in _CHAIN_CASES}
 
 
