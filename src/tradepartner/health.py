@@ -1593,12 +1593,27 @@ def _chain_rule_rows(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, 
                 f"ingested_at {chain['ingested_at'].isoformat()}",
             )
         succ_rows = _listing_rows(listings, [successor])
-        succ_rows.sort(key=lambda r: (r["valid_from"], r["known_at"]))
-        succ_security = security_known.get(successor)
-        succ_first_listing = succ_rows[0] if succ_rows else None
+        pred_rows = _listing_rows(listings, [predecessor])
+        pred_rows.sort(key=lambda r: (r["valid_from"], r["known_at"]))
+        last_pred = pred_rows[-1] if pred_rows else None
+        matches = (
+            [
+                row
+                for row in succ_rows
+                if row["ticker"] == last_pred["ticker"] and row["exchange"] == last_pred["exchange"]
+            ]
+            if last_pred is not None
+            else []
+        )
+        # The row `build_chains` stamps the chain from: the successor's
+        # earliest-*known* listing row naming the predecessor's last ticker and
+        # exchange, never the earliest-`valid_from` row of any ticker (#821,
+        # quant audit of PR #1913), so a backdated row of another ticker that
+        # arrives later neither fails the rule forever nor hides a real lag.
+        derived = min(matches, key=lambda r: (r["known_at"], r["valid_from"])) if matches else None
         for label, stamp in (
-            ("securities", succ_security),
-            ("listing", succ_first_listing["known_at"] if succ_first_listing else None),
+            ("securities", security_known.get(successor)),
+            ("listing", derived["known_at"] if derived is not None else None),
         ):
             if stamp is not None and chain["known_at"] < stamp:
                 violation(
@@ -1607,19 +1622,12 @@ def _chain_rule_rows(conn: duckdb.DuckDBPyConnection, t: datetime) -> dict[str, 
                     f"known_at {chain['known_at'].isoformat()} < successor {label} "
                     f"{stamp.isoformat()}",
                 )
-        pred_rows = _listing_rows(listings, [predecessor])
-        pred_rows.sort(key=lambda r: (r["valid_from"], r["known_at"]))
-        if pred_rows:
-            last_pred = pred_rows[-1]
-            if not any(
-                row["ticker"] == last_pred["ticker"] and row["exchange"] == last_pred["exchange"]
-                for row in succ_rows
-            ):
-                violation(
-                    CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
-                    chain,
-                    f"{successor} is not listed {last_pred['ticker']}/{last_pred['exchange']}",
-                )
+        if last_pred is not None and not matches:
+            violation(
+                CHAIN_SUCCESSOR_LISTED_UNDER_PREDECESSOR_TICKER,
+                chain,
+                f"{successor} is not listed {last_pred['ticker']}/{last_pred['exchange']}",
+            )
         succ_bar = successor_first_bar.get(successor)
         if succ_bar is not None:
             after = [

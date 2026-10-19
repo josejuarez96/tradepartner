@@ -42,15 +42,18 @@ revision instead.
   judged like any other (quant audit of #923).
 - **Chains (#821, T187c).** `underived_chains(live, derived_successors,
   skip_ciks)` is the `successor_chains` counterpart of `underived`: each row
-  `live_chains_as_of` returns whose successor id is not in
+  `live_chains_as_of` returns whose   successor id is not in
   `derived_successors` (the successors `build_chains` honours at this run),
-  source `edgar` and provenance `filing`. `master-retract` runs the same
-  `build_chains`, so a refused entry (a `spac` predecessor, lost evidence, a
-  successor listing that no longer matches) leaves its row underived, as the
-  ingest's chain writer skips it. Their keys are `successor_id`. They are
-  never recorded in `master_underived` (health's `underived_master_rows` is
-  the `securities` and `listings` rule), and a retraction keeps the withdrawn
-  row's `withdrawn_known_at` so `registry.data_vintage` counts it.
+  source `edgar` and provenance `filing`, and neither side's CIK in
+  `skip_ciks` (an unjudged predecessor has no listings, so `build_chains`
+  would refuse `NO_LISTING` and propose a valid chain). `master-retract` runs
+  the same `build_chains`, so a refused entry (a `spac` predecessor, lost
+  evidence, a successor listing that no longer matches) leaves its row
+  underived, as the ingest's chain writer skips it. Their keys are
+  `successor_id`. They are never recorded in `master_underived` (health's
+  `underived_master_rows` is the `securities` and `listings` rule), and a
+  retraction keeps the withdrawn row's `withdrawn_known_at` so
+  `registry.data_vintage` counts it.
 - **Retraction.** `retraction(row, at)` is the stored row with `retracted
   = TRUE`, `known_at = ingested_at = at`: a revision of its key stamped at
   the correcting run, never back-dated (a row known after `at` raises).
@@ -247,17 +250,20 @@ def underived_chains(
 ) -> tuple[Underived, ...]:
     """The live `successor_chains` rows no entry derives at this run (#821,
     T187c): source `edgar`, provenance `filing`, a successor id not in
-    `derived_successors` (`build_chains`'s honoured successors), and a
-    successor CIK outside `skip_ciks`. `master-retract` proposes and retracts
-    them; a refused entry (a `spac` predecessor, lost evidence, a successor
-    listing that no longer matches) is therefore underived too, matching the
-    ingest's chain writer, which skips it. Pure."""
+    `derived_successors` (`build_chains`'s honoured successors), and neither
+    side's CIK in `skip_ciks` (an unjudged predecessor has no listings, so
+    `build_chains` would refuse `NO_LISTING` and propose a valid chain).
+    `master-retract` proposes and retracts them; a refused entry (a `spac`
+    predecessor, lost evidence, a successor listing that no longer matches) is
+    therefore underived too, matching the ingest's chain writer, which skips
+    it. Pure."""
     found = [
         Underived("successor_chains", dict(row))
         for row in chains
         if row["source"] == EDGAR
         and row["provenance"] == FILING
         and cik_of(row["successor_id"]) not in skip_ciks
+        and cik_of(row["predecessor_id"]) not in skip_ciks
         and row["successor_id"] not in derived_successors
     ]
     return tuple(sorted(found, key=lambda u: tuple(str(part) for part in u.key)))

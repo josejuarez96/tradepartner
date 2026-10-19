@@ -640,11 +640,36 @@ def test_a_chain_no_entry_names_is_proposed_and_retracted(store: Settings) -> No
     assert master_retract(store, filings=_filings(), clock=lambda: AFTER).found == ()
 
 
-def _chain_source(sic: int) -> FixtureFilingSource:
+def _chain_source(
+    sic: int,
+    cls: type[FixtureFilingSource] = FixtureFilingSource,
+    *,
+    predecessor_cover: bool = True,
+) -> FixtureFilingSource:
     """A predecessor and a successor that both list CHNA on NYSE, the
     successor with the 8-K12B evidence: a chain `build_chains` derives, unless
-    the predecessor's SIC 6770 (`sic`) makes it `spac` and refuses it."""
-    return FixtureFilingSource(
+    the predecessor's SIC 6770 (`sic`) makes it `spac` and refuses it. With
+    `predecessor_cover=False` the predecessor has an index entry but no cover
+    page, the shape a failed fetch leaves."""
+    covers = [
+        CoverPage(
+            CHAIN_SUCC,
+            f"{CHAIN_SUCC}-19-000002",
+            _at(2019, 5, 2),
+            (CoverListing("Common Stock", "CHNA", "NYSE"),),
+        )
+    ]
+    if predecessor_cover:
+        covers.insert(
+            0,
+            CoverPage(
+                CHAIN_PRED,
+                f"{CHAIN_PRED}-19-000001",
+                _at(2019, 1, 2),
+                (CoverListing("Common Stock", "CHNA", "NYSE"),),
+            ),
+        )
+    return cls(
         index=[
             FilingIndexEntry(
                 CHAIN_PRED, "Chain Pred", "10-K", f"{CHAIN_PRED}-19-000001", _at(2019, 1, 2)
@@ -654,20 +679,7 @@ def _chain_source(sic: int) -> FixtureFilingSource:
             ),
             FilingIndexEntry(CHAIN_SUCC, "Chain Succ", "8-K12B", CHAIN_EVIDENCE, _at(2019, 5, 2)),
         ],
-        cover_pages=[
-            CoverPage(
-                CHAIN_PRED,
-                f"{CHAIN_PRED}-19-000001",
-                _at(2019, 1, 2),
-                (CoverListing("Common Stock", "CHNA", "NYSE"),),
-            ),
-            CoverPage(
-                CHAIN_SUCC,
-                f"{CHAIN_SUCC}-19-000002",
-                _at(2019, 5, 2),
-                (CoverListing("Common Stock", "CHNA", "NYSE"),),
-            ),
-        ],
+        cover_pages=covers,
         headers=[
             FilingHeader(CHAIN_PRED, f"{CHAIN_PRED}-19-000001", "10-K", sic, _at(2019, 1, 2)),
             FilingHeader(CHAIN_SUCC, f"{CHAIN_SUCC}-19-000002", "10-K", 3571, _at(2019, 5, 1)),
@@ -705,6 +717,28 @@ def test_a_refused_spac_chain_is_proposed(settings: Settings) -> None:
         insert_row(conn, "successor_chains", _chain_row())
     result = master_retract(_chained(settings, CHAIN_SUCC), filings=source, clock=lambda: CHECK)
     assert [(u.table, u.key) for u in result.found] == [("successor_chains", (CHAIN_SUCC,))]
+
+
+def test_a_chain_whose_predecessor_is_unjudged_is_not_proposed(settings: Settings) -> None:
+    """#821, T187c, quant audit of PR #1913 (NIT): a predecessor whose fetch
+    failed has no listings, so `build_chains` refuses `NO_LISTING`; the dry run
+    must not propose the still-valid chain while that CIK is unjudged."""
+
+    class Failing(FixtureFilingSource):
+        _pending_failures: ClassVar[dict[str, tuple[str, str, str]]] = {
+            f"{CHAIN_PRED}-19-000001": ("ParseError", "10-K", "bad cover")
+        }
+
+    source = _chain_source(sic=3571)
+    _ingest_source(settings, source, INGEST)
+    with open_for_write(settings) as conn:
+        insert_row(conn, "successor_chains", _chain_row())
+    result = master_retract(
+        _chained(settings, CHAIN_SUCC),
+        filings=_chain_source(sic=3571, cls=Failing, predecessor_cover=False),
+        clock=lambda: CHECK,
+    )
+    assert all(u.table != "successor_chains" for u in result.found)
 
 
 def test_a_chain_row_is_traded_when_the_journal_names_a_side(store: Settings) -> None:

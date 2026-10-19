@@ -4012,3 +4012,54 @@ def test_the_chain_block_and_rules_read_raw_rows(
     rules = health._chain_rule_rows(chain_fixture_store, T_END)
     [violation] = rules[CHAIN_PREDECESSOR_NO_BAR_AFTER_HANDOVER].to_dicts()
     assert (violation["predecessor_id"], violation["successor_id"]) == ("0001000010", "0001000011")
+
+
+def test_chain_known_at_ge_successor_rows_uses_the_derived_listing_row(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c, quant audit of PR #1913: the rule compares the row
+    `build_chains` stamps from -- the successor's earliest-known listing row
+    naming the predecessor's ticker -- not the earliest-`valid_from` row of any
+    ticker. A CHNZ row dated earlier but known after the chain (2020-05-01)
+    must not fail the rule for the 1:1 pair."""
+    insert_row(
+        chain_fixture_store,
+        "listings",
+        {
+            "security_id": "0001000011",
+            "ticker": "CHNZ",
+            "exchange": "NYSE",
+            "class_title": None,
+            "valid_from": date(2020, 1, 2),
+            "known_at": datetime(2020, 5, 1, 20, 30, tzinfo=UTC),
+            "ingested_at": datetime(2020, 5, 1, 20, 30, tzinfo=UTC),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    assert _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS) == []
+
+
+def test_chain_known_at_ge_successor_rows_fails_when_the_derived_row_is_later(
+    chain_fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """#821, T187c, quant audit of PR #1913: a later revision of the matching
+    CHNA/NYSE row (known 2020-03-01, after the chain's 2020-02-07) fails the
+    rule, naming the pair."""
+    insert_row(
+        chain_fixture_store,
+        "listings",
+        {
+            "security_id": "0001000011",
+            "ticker": "CHNA",
+            "exchange": "NYSE",
+            "class_title": None,
+            "valid_from": date(2020, 2, 4),
+            "known_at": datetime(2020, 3, 1, 20, 30, tzinfo=UTC),
+            "ingested_at": datetime(2020, 3, 1, 20, 30, tzinfo=UTC),
+            "source": "edgar",
+            "provenance": "filing",
+        },
+    )
+    violations = _chain_rule(chain_fixture_store, CHAIN_KNOWN_AT_GE_SUCCESSOR_ROWS)
+    assert {(v["predecessor_id"], v["successor_id"]) for v in violations} == {CHAIN_IDS}

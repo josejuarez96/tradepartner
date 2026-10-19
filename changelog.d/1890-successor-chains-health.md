@@ -6,3 +6,5 @@
 ### Fixed
 - The `successor_chains` block and its rules read raw `prices_daily` and `facts` rows rather than `prices_as_of`/`facts_as_of`, which T187b re-keys by chain: otherwise a predecessor's last close and its post-hand-over facts vanish and `chain_price_break` and `chain_predecessor_no_bar_after_handover` go blind (#821).
 - `master-retract` treats a chain as derived only when `build_chains` honours its entry at the run, so a refused entry (a `spac` predecessor, lost evidence, a successor listing that no longer matches) leaves its live row underived and proposed (#821).
+- `chain_known_at_ge_successor_rows` compares the successor's earliest-*known* listing row naming the predecessor's ticker and exchange, the row `build_chains` stamps from, so a backdated row of another ticker neither fails the rule forever nor hides a real lag (#821).
+- `master-retract` does not propose a chain whose predecessor CIK is unjudged this run (its listings are missing and `build_chains` would refuse `NO_LISTING`) (#821).
