@@ -166,6 +166,7 @@ from tradepartner.store.filename_listings import (
     confirm_filename_listings,
     is_filename_listing_refused,
 )
+from tradepartner.store.journal import CLOSING_STOP_STATES
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 _EDGAR = "edgar"
@@ -405,6 +406,13 @@ def primary_security_id(cik: str) -> str:
     """
     _refuse_separator(cik, "cik")
     return cik
+
+
+def security_cik(security_id: str) -> str:
+    """The CIK a master `security_id` belongs to: the id before its `:`
+    class separator or its `@` successor separator, never its first ten
+    characters (#1838)."""
+    return re.split(r"[:@]", security_id, maxsplit=1)[0]
 
 
 def _numbered_id(base: str, taken: Collection[str]) -> str:
@@ -1122,7 +1130,7 @@ def build_chains(
     chains: list[Chain] = []
     refusals: list[ChainRefusal] = []
     for predecessor_id, successor_id, accession in entries:
-        evidence = index.get((successor_id[:10], accession))
+        evidence = index.get((security_cik(successor_id), accession))
         if evidence is None or evidence.form not in SUCCESSOR_EVIDENCE_FORMS:
             refusals.append(ChainRefusal(predecessor_id, successor_id, NO_EVIDENCE))
             continue
@@ -1201,7 +1209,7 @@ def _filename_rows(
         for row in builder.listings
         if first_page is not None
         and row["known_at"] == first_page.accepted_at
-        and row["security_id"][:10] == cik  # #1662: no other CIK's same-second row
+        and security_cik(row["security_id"]) == cik  # #1662: no other CIK's same-second row
     }
     cover_readings = (
         [
@@ -1310,9 +1318,179 @@ def _filename_rows(
         counts["filename_form25_rows"] += 1
 
 
-def write_master(conn: duckdb.DuckDBPyConnection, build: MasterBuild) -> int:
+#: The journal tables naming a security a window holds, each reaching its
+#: open window: `orders` and `positions_daily` by their `run_id`, `adjustments`
+#: by its `window_id`, and `lots` (which has none) by the books that have an
+#: open window. `?` is the ids list, then the closing stop states. This is
+#: `retract.py`'s `[traded]` test limited to open windows (the amendment's
+#: "A held position" paragraph): an order in flight counts as held.
+_HELD_SQL = """
+    SELECT security_id FROM orders
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM positions_daily
+        WHERE list_contains(?, security_id) AND run_id IN (
+            SELECT run_id FROM paper_runs WHERE window_id IN (
+                SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                    SELECT window_id FROM paper_window_stops WHERE list_contains(?, state))))
+    UNION SELECT security_id FROM adjustments
+        WHERE list_contains(?, security_id) AND window_id IN (
+            SELECT window_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+    UNION SELECT security_id FROM lots
+        WHERE list_contains(?, security_id) AND book_id IN (
+            SELECT book_id FROM paper_windows WHERE window_id NOT IN (
+                SELECT window_id FROM paper_window_stops WHERE list_contains(?, state)))
+"""
+
+
+def _held_ids(conn: duckdb.DuckDBPyConnection, ids: Sequence[str]) -> frozenset[str]:
+    """The ids among `ids` an open paper window holds (#821): named by a
+    journal order, adjustment, daily position or lot of a window with no
+    `closed`/`abandoned` stop row. A store missing a journal table raises
+    (`duckdb.CatalogException`): the gate never fails open."""
+    wanted = sorted(set(ids))
+    if not wanted:
+        return frozenset()
+    states = list(CLOSING_STOP_STATES)
+    rows = conn.execute(
+        _HELD_SQL,
+        [wanted, states, wanted, states, wanted, states, wanted, states],
+    ).fetchall()
+    return frozenset(sid for (sid,) in rows if sid is not None)
+
+
+@dataclass(frozen=True)
+class ChainTally:
+    """What `write_chains` did: live rows written, live rows moved (retracted
+    and rewritten at a new stamp), rows inserted, and every refusal with its
+    reason."""
+
+    written: int
+    moved: int
+    inserted: int
+    refusals: tuple[ChainRefusal, ...]
+
+    def message(self) -> str:
+        """The run row's chain clause; the refusals name each successor and
+        its reason."""
+        refused = "; ".join(item.describe() for item in self.refusals) or "none"
+        return (
+            f"; chains_written: {self.written}; chains_refused: {refused}; "
+            f"chains_moved: {self.moved}"
+        )
+
+
+def _chain_same(stored: Mapping[str, Any], chain: Chain) -> bool:
+    """Whether `stored` is the row `chain` derives: same evidence, same
+    evidence stamp."""
+    return bool(
+        stored["predecessor_id"] == chain.predecessor_id
+        and stored["evidence_accession"] == chain.evidence_accession
+        and stored["evidence_form"] == chain.evidence_form
+        and stored["known_at"] == chain.known_at
+    )
+
+
+#: The live chain of a successor (`schema.successor_chains`): its unretracted
+#: row with the greatest `ingested_at`, unless a retraction was written after
+#: it. A run writes a retraction and its replacement at one clock, so the
+#: replacement is the latest row and the retraction supersedes every earlier
+#: revision.
+_LIVE_CHAIN_SQL = """
+    SELECT * FROM successor_chains c
+    WHERE successor_id = ? AND NOT retracted
+      AND NOT EXISTS (
+          SELECT 1 FROM successor_chains n
+          WHERE n.successor_id = c.successor_id AND n.ingested_at > c.ingested_at
+      )
+"""
+
+
+def write_chains(
+    conn: duckdb.DuckDBPyConnection,
+    build: MasterBuild,
+    now: datetime,
+    *,
+    unjudged: Collection[str] = frozenset(),
+    skipped: Collection[str] = frozenset(),
+) -> ChainTally:
+    """Write the `successor_chains` rows `build` derives (#821).
+
+    An entry whose predecessor an open paper window holds is refused `held`,
+    and one whose predecessor or successor CIK this run did not judge
+    (`unjudged`), or whose security it skipped as restamp-refused (`skipped`),
+    is refused `unjudged` -- a transient fetch failure must not move a chain.
+    Both write nothing. A successor with no live chain gets the derived row
+    at its evidence stamp, counted under `chains_written`. A live chain the
+    entry derives unchanged (same predecessor, evidence and stamp) writes
+    nothing. Any other live chain -- a stamp earlier, later or the same, or
+    other evidence -- is retracted at `now` (the run's clock, #859;
+    `withdrawn_known_at` its stamp) and the derived row written beside it at
+    its evidence stamp, counted under `chains_moved`: the newer revision
+    supersedes every earlier one (`schema.successor_chains`)."""
+    from tradepartner.store.retraction import retraction  # cycle: it imports this module
+
+    held = _held_ids(conn, [chain.predecessor_id for chain in build.chains])
+    refusals: list[ChainRefusal] = list(build.chain_refusals)
+    written = 0
+    moved = 0
+    inserted = 0
+    for chain in build.chains:
+        if (
+            chain.predecessor_id in held
+            or chain.predecessor_id in skipped
+            or chain.successor_id in skipped
+            or security_cik(chain.predecessor_id) in unjudged
+            or security_cik(chain.successor_id) in unjudged
+        ):
+            reason = HELD_PREDECESSOR if chain.predecessor_id in held else UNJUDGED
+            refusals.append(ChainRefusal(chain.predecessor_id, chain.successor_id, reason))
+            continue
+        cursor = conn.execute(_LIVE_CHAIN_SQL, [chain.successor_id])
+        names = [column[0] for column in cursor.description]
+        stored = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
+        if len(stored) > 1:  # two unretracted rows at one clock: never written
+            raise RuntimeError(f"successor_chains holds {len(stored)} live rows for {chain}")
+        live = stored[0] if stored else None
+        if live is not None and _chain_same(live, chain):
+            continue
+        if live is not None and now <= live["ingested_at"]:
+            # The newest write is the live chain: an older clock would leave
+            # the superseded row live (`schema.successor_chains`).
+            raise ValueError(
+                f"chain run clock {now.isoformat()} is not after the live row's "
+                f"ingested_at {live['ingested_at'].isoformat()} for {chain.successor_id}"
+            )
+        if live is not None:
+            withdrawn = retraction(live, now)
+            withdrawn["withdrawn_known_at"] = live["known_at"]
+            insert_row(conn, "successor_chains", withdrawn)
+            inserted += 1
+            moved += 1
+        else:
+            written += 1
+        insert_row(conn, "successor_chains", chain.row() | {"ingested_at": now})
+        inserted += 1
+    return ChainTally(written, moved, inserted, tuple(refusals))
+
+
+def write_master(
+    conn: duckdb.DuckDBPyConnection,
+    build: MasterBuild,
+    *,
+    now: datetime | None = None,
+    unjudged: Collection[str] = frozenset(),
+    skipped: Collection[str] = frozenset(),
+) -> int:
     """Insert every row of `build`; return the number inserted.
 
+    `securities` and `listings` insert as derived. `chains` go through
+    `write_chains` with the run clock `now` (default: the derived rows'
+    `ingested_at`), so a held, unjudged or skipped entry writes nothing and a
+    moved chain is retracted at `now`, as ingestion's chain path does.
     Dedupe of an unchanged re-run belongs to ingest (T16); a duplicate row
     here trips the table's `UNIQUE` constraint.
     """
@@ -1320,9 +1498,11 @@ def write_master(conn: duckdb.DuckDBPyConnection, build: MasterBuild) -> int:
         insert_row(conn, "securities", row)
     for row in build.listings:
         insert_row(conn, "listings", row)
-    for chain in build.chains:
-        insert_row(conn, "successor_chains", chain.row())
-    return len(build.securities) + len(build.listings) + len(build.chains)
+    inserted = len(build.securities) + len(build.listings)
+    if build.chains:
+        clock = now if now is not None else max(chain.ingested_at for chain in build.chains)
+        inserted += write_chains(conn, build, clock, unjudged=unjudged, skipped=skipped).inserted
+    return inserted
 
 
 def securities_as_of(
