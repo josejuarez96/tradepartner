@@ -669,7 +669,8 @@ def parse_chains(entries: list[str]) -> list[tuple[str, str, str]]:
                     "'<cik>' or '<cik>:<class>' security id (never a "
                     "'<cik>@<date>' or a keep_successors id)"
                 )
-        if predecessor[:10] == successor[:10]:
+        # #1838: the parsed CIK, not the id's first ten characters.
+        if predecessor.partition(":")[0] == successor.partition(":")[0]:
             raise ValueError(
                 f"master.chains entry {entry!r}: predecessor and successor are "
                 "the same CIK, so there is nothing to chain"
