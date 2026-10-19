@@ -380,6 +380,8 @@ def tick_reviewer_boxes(
             in_fence = not in_fence
         elif not in_fence and (m := UNCHECKED_RE.match(line.rstrip("\r\n"))):
             boxes[i] = m.group(1).strip()
+    if in_fence:
+        raise ReadyError("PR body has an unclosed code fence; close it before checking boxes")
     review = [i for i, label in boxes.items() if label.startswith(REVIEWER_BOX_PREFIX)]
     if len(review) != 1:
         return body, list(boxes.values()), [], [], reviewed_at
@@ -459,7 +461,9 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
     ignored when a later workflow run (by run id, else start time) on the head has a
     ``SUCCESS`` check, whatever the names (#1844). A lone ``CANCELLED`` ``checks``
     with every run on the head completed is ``cancelled`` (#1201): the caller may
-    re-trigger once, and it is never green. Any other lone ``CANCELLED`` still fails.
+    re-trigger once, and it is never green. A failed ``checks`` aggregator whose own
+    ``checks-fast`` was cancelled is superseded by a newer run with ``checks-fast``
+    on the same head (#1856). Any other lone ``CANCELLED`` still fails.
     """
     if checks.sha != sha or not checks.runs:
         return "pending"
@@ -484,10 +488,30 @@ def checks_state(checks: HeadChecks, sha: str) -> str:
         and run.status.upper() == "COMPLETED"
         and run.conclusion.upper() == "SUCCESS"
     ]
+
+    def superseded_failed_aggregator(run: CheckRun) -> bool:
+        # A cancelled workflow may emit FAILURE for its `checks` aggregator rather than
+        # CANCELLED (#1856). Its cancelled checks-fast plus a newer run on the same head
+        # mean this failure is stale even before the newer `checks` job appears.
+        return (
+            run.name == "checks"
+            and run.conclusion.upper() == "FAILURE"
+            and run.run_id != 0
+            and any(
+                old.name == "checks-fast" and is_cancelled(old) and old.run_id == run.run_id
+                for old, _base, _cancelled in live
+            )
+            and any(
+                newer.name == "checks-fast" and is_later_than(newer, run)
+                for newer, _base, _cancelled in live
+            )
+        )
+
     runs = [
         run
         for run, _base, cancelled in live
-        if not (
+        if not superseded_failed_aggregator(run)
+        and not (
             cancelled
             and (
                 run.name in finished
@@ -860,7 +884,9 @@ def _own_changes_since(r: Runner, main_ref: str, sha: str, touched: Sequence[str
     Paths no reviewer gates (docs/plans, changelog.d) are dropped by ``required_reviews``.
     """
     out: list[str] = []
-    for path in r.git("diff", "--no-renames", "--name-only", f"{sha}..HEAD").splitlines():
+    for path in r.git(
+        "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", f"{sha}..HEAD"
+    ).splitlines():
         if path not in touched:
             continue
         if r.git("ls-tree", sha, "--", path) == r.git("ls-tree", "HEAD", "--", path):

@@ -1,11 +1,12 @@
 """Tests for scripts/ready_pr.py: conflict resolution, review routing, CI state and the flow.
 
-The flow runs against a fake ``Runner``; git and gh are never called.
+Most flow tests use a fake ``Runner``; one staleness test runs real git.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -408,6 +409,45 @@ def test_a_cancelled_check_with_a_different_name_is_superseded_by_a_later_succes
     assert ready_pr.checks_state(hc("abc", by_time), "abc") == "success"
 
 
+def test_failed_aggregator_from_cancelled_1856_run_waits_for_newer_full_run() -> None:
+    """#1856: attempt 1's `checks` was FAILURE even though checks-fast was CANCELLED.
+
+    Names, run ids, and start times are from runs 39272389919 and 39272458314
+    on 612089c5; attempt 1 was later rerun, replacing its check-run conclusions.
+    """
+    cr = ready_pr.CheckRun
+    old = (
+        cr("claims", "COMPLETED", "SUCCESS", 39272389919, "2026-10-19T14:49:17Z"),
+        cr("scope", "COMPLETED", "SUCCESS", 39272389919, "2026-10-19T14:49:17Z"),
+        cr("checks-fast", "COMPLETED", "CANCELLED", 39272389919, "2026-10-19T14:49:17Z"),
+        cr("pytest-shard", "COMPLETED", "SKIPPED", 39272389919, "2026-10-19T14:49:25Z"),
+        cr("checks", "COMPLETED", "FAILURE", 39272389919, "2026-10-19T14:50:00Z"),
+    )
+    newer = (
+        cr("scope", "COMPLETED", "SUCCESS", 39272458314, "2026-10-19T14:50:15Z"),
+        cr("claims", "COMPLETED", "SUCCESS", 39272458314, "2026-10-19T14:50:15Z"),
+        cr("checks-fast", "IN_PROGRESS", "", 39272458314, "2026-10-19T14:50:15Z"),
+        cr("pytest-shard", "COMPLETED", "SKIPPED", 39272458314, "2026-10-19T14:50:24Z"),
+    )
+    sha = "612089c5afa6f2793f2bf146b97ee01d624797d6"
+    hc = ready_pr.HeadChecks
+    assert ready_pr.checks_state(hc(sha, old), sha) == "failure"
+    assert ready_pr.checks_state(hc(sha, (*old, *newer)), sha) == "pending"
+    before_aggregator = (
+        *newer[:2],
+        cr("checks-fast", "COMPLETED", "SUCCESS", 39272458314, "2026-10-19T14:50:15Z"),
+        *newer[3:],
+    )
+    assert ready_pr.checks_state(hc(sha, (*old, *before_aggregator)), sha) == "pending"
+    green = (
+        *newer[:2],
+        cr("checks-fast", "COMPLETED", "SUCCESS", 39272458314, "2026-10-19T14:50:15Z"),
+        *newer[3:],
+        cr("checks", "COMPLETED", "SUCCESS", 39272458314, "2026-10-19T14:51:17Z"),
+    )
+    assert ready_pr.checks_state(hc(sha, (*old, *green)), sha) == "success"
+
+
 def test_a_cancelled_check_with_no_later_success_still_fails() -> None:
     hc = ready_pr.HeadChecks
     cr = ready_pr.CheckRun
@@ -504,7 +544,9 @@ class FakeRunner:
                 _,
             ):
                 return "\n".join(self.deleted)
-            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", _):
+            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", spec) if (
+                "..." in spec
+            ):
                 return "\n".join(self.touched)
             case ("show", spec):
                 return self.main_files[spec.split(":", 1)[1]]
@@ -518,7 +560,7 @@ class FakeRunner:
                 if spec.endswith("...HEAD"):
                     return self.own_patch_at_head
                 return self.own_patch_at_review
-            case ("diff", "--no-renames", "--name-only", _):
+            case ("-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", _):
                 return "\n".join(self.since_review_touched)
             case ("ls-files", "tests"):
                 return "\n".join([*self.test_sources, "tests/fixtures/a.json"])
@@ -837,6 +879,41 @@ def test_template_line_quoted_in_a_code_fence_is_left_alone() -> None:
             + "; quant-auditor: PASS at abc1234d\n",
         )
     ]
+
+
+def test_unclosed_fence_fails_closed_even_with_unticked_box() -> None:
+    body = BODY_OK + "```\n" + "- [ ] Complete the checklist\n"
+    r = FakeRunner(body=body)
+    with pytest.raises(ready_pr.ReadyError, match="unclosed code fence"):
+        ready_pr.ready(r, 69, dry_run=True)
+
+
+def test_real_git_non_ascii_path_makes_review_stale(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("commit", "--allow-empty", "-m", "base")
+    git("switch", "-c", "feature")
+    path = "docs/runbooks/café.md"
+    file = tmp_path / path
+    file.parent.mkdir(parents=True)
+    file.write_text("first\n")
+    git("add", path)
+    git("commit", "-m", "reviewed")
+    reviewed_sha = git("rev-parse", "HEAD")
+    file.write_text("second\n")
+    git("add", path)
+    git("commit", "-m", "changed")
+    runner = ready_pr.ShellRunner(tmp_path)
+    assert ready_pr._own_changes_since(runner, "main", reviewed_sha, [path]) == [path]
 
 
 def test_main_merged_after_review_does_not_make_the_review_stale() -> None:
