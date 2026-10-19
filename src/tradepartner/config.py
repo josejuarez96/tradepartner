@@ -1502,13 +1502,21 @@ class CostsConfig(BaseModel):
     Velikov (2016) imply for 12-1 momentum, via G1. Commissions are zero at Alpaca; the
     keys exist for other brokers. Every value is non-negative: a negative cost would pay
     the strategy to trade.
+
+    Amendment 2026-10-18 (#1731) "Cost terms": `spread_bps` is a per-side level added to
+    `per_side_bps`, `impact_coeff` scales `sqrt(notional / ADV)` market impact, and
+    `adv_sessions` is the window (in XNYS sessions) over which ADV is measured. Both new
+    rate keys are `ge=0`; `adv_sessions` must hold at least one session.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
 
     per_side_bps: float = Field(default=15.0, ge=0)
+    spread_bps: float = Field(default=0.0, ge=0)
+    impact_coeff: float = Field(default=0.0, ge=0)
     commission_per_share: float = Field(default=0.0, ge=0)
     commission_per_order: float = Field(default=0.0, ge=0)
+    adv_sessions: int = Field(default=20, ge=1)
     sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
     )

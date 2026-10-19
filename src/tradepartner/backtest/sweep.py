@@ -776,23 +776,30 @@ def _rule_differences(
     ]
     if file.parent_family is not None and file.parent_family != rules.parent_family:
         differences.append(f"parent_family (the family's is {rules.parent_family!r})")
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, rule in sorted(rules.fixed_params.items()):
         value = params.get(key)
-        if key == registry.BASE_COST_KEY:
+        if key in frozen.HIGHER_ALLOWED_COST_KEYS:
+            if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
+                continue
+            differences.append(f"{key} (lower than the family's {rule})")
+        elif key == "costs.adv_sessions":
+            if value is not None and frozen.is_default(value, rule):
+                continue
+            differences.append(key)
+        elif key == registry.BASE_COST_KEY:
             if isinstance(value, int | float) and not isinstance(value, bool) and value >= rule:
                 continue
             differences.append(f"{key} (lower than the family's {rule})")
         elif key not in params or not frozen.is_default(value, rule):
             differences.append(key)
-    table_defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
     for key, value in sorted(family_rule_params(params).items()):
         if key in rules.fixed_params:
             continue
         # A frozen key that landed after the rules were written, at its behaviour-
         # preserving default, is the rules' behaviour; any other value is not.
-        if key in table_defaults and frozen.is_default(value, table_defaults[key]):
-            continue
-        differences.append(f"{key} (not fixed by the family rules)")
+        if not (key in defaults and frozen._cost_key_allows(key, value, defaults[key])):
+            differences.append(f"{key} (not fixed by the family rules)")
     return differences
 
 

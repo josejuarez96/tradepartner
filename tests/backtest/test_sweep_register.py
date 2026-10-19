@@ -18,6 +18,7 @@ momentum's child with a test-only `monkeypatch` of the table.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -177,9 +178,12 @@ def _twin(
     run: bool = True,
     rules_settings: Settings | None = None,
     seed: float | None = None,
+    rules_without: tuple[str, ...] = (),
+    rules_with: dict[str, Any] | None = None,
 ) -> registry.HypothesisRecord:
     """H1's fixture twin registered, marked pre-lab, fingerprinted, its family rules
-    written as the lab migration would, and (with `run`) run once."""
+    written as the lab migration would (less `rules_without`, plus `rules_with`), and
+    (with `run`) run once."""
     record = _direct(conn, _copy(tmp_path, TWIN_SOURCE), settings)
     mark_pre_lab(conn, record.hypothesis_id)
     lab_registry.write_fingerprint(
@@ -195,7 +199,14 @@ def _twin(
         holdout_start=record.holdout_start,
         holdout_end=record.holdout_end,
         in_sample_start=record.in_sample_start,
-        fixed_params=sweep.family_rule_params(frozen.frozen_values(record)),
+        fixed_params={
+            **{
+                k: v
+                for k, v in sweep.family_rule_params(frozen.frozen_values(record)).items()
+                if k not in rules_without
+            },
+            **(rules_with or {}),
+        },
         sr_star_seed_annual=seed,
         settings=rules_settings or settings,
     )
@@ -1110,3 +1121,116 @@ def test_todays_registrations_and_files_are_unaffected_and_b4_is_refused_without
     assert (
         sweep.exam_overlap_refusal(lab_store, "combined", windows(b4, date(2023, 12, 29))) is None
     )
+
+
+# ── the cost terms under the family rules (#1792, T210) ─────────────────────────
+
+COST_TERMS = ("costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions")
+#: Rules a new family writes from its first registration: all three, at the defaults.
+NEW_RULES = {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20}
+
+
+def test_a_fixed_block_without_the_terms_registers_under_rules_stored_before_them(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    _twin(lab_store, settings, tmp_path, rules_without=COST_TERMS)
+    rules = lab_registry.family_rules(lab_store, "momentum")
+    assert rules is not None and not set(COST_TERMS) & set(rules.fixed_params)
+
+    result = register(lab_store, _copy(tmp_path, SWEEP_SOURCE), settings, registered_by="test")
+
+    assert isinstance(result, SweepRegistration) and result.created
+    for record in result.hypotheses:
+        assert {key: record.params[key] for key in COST_TERMS} == NEW_RULES
+
+
+@pytest.mark.parametrize(
+    ("rules_with", "line", "refusal"),
+    [
+        ({}, "spread_bps = 5.0", None),
+        ({}, "impact_coeff = 0.1", None),
+        ({}, "adv_sessions = 10", r"costs\.adv_sessions \(not fixed by the family rules\)"),
+        (
+            {"costs.spread_bps": 5.0},
+            "spread_bps = 2.0",
+            r"costs\.spread_bps \(lower than the family's 5\.0\)",
+        ),
+        ({"costs.spread_bps": 5.0}, "spread_bps = 8.0", None),
+    ],
+    ids=["spread-old-rules", "impact-old-rules", "adv-old-rules", "spread-lower", "spread-higher"],
+)
+def test_a_sweep_may_set_a_term_higher_than_the_family_rules(
+    lab_store: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    tmp_path: Path,
+    rules_with: dict[str, Any],
+    line: str,
+    refusal: str | None,
+) -> None:
+    """Refusal (a), which every re-test in a ruled family enters through: the rules'
+    value of a term they lack is its table default (rules stored before T210 read 0, 0
+    and 20); `spread_bps` and `impact_coeff` may be higher, `adv_sessions` may not
+    differ (spec amendment #1792, item 1)."""
+    _twin(lab_store, settings, tmp_path, rules_without=COST_TERMS, rules_with=rules_with)
+    path = _copy(
+        tmp_path, SWEEP_SOURCE, ("per_side_bps = 15.0\n", f"per_side_bps = 15.0\n{line}\n")
+    )
+    if refusal is not None:
+        _refused(lab_store, path, settings, FamilyRuleError, refusal)
+        return
+    result = register(lab_store, path, settings, registered_by="test")
+    assert result.created
+    key, _, value = line.partition(" = ")
+    assert {h.params[f"costs.{key}"] for h in result.hypotheses} == {float(value)}
+
+
+#: (rules over those stored before T210, the twin's set with these values, the keys
+#: refused): the one reading all three `_rule_differences` apply.
+_RULE_CASES = [
+    ({}, {}, set()),
+    ({}, {"costs.spread_bps": 5.0}, set()),
+    ({}, {"costs.impact_coeff": 0.1}, set()),
+    ({}, {"costs.spread_bps": 5.0, "costs.impact_coeff": 0.1}, set()),
+    ({}, {"costs.adv_sessions": 10}, {"costs.adv_sessions"}),
+    ({"costs.spread_bps": 5.0}, {"costs.spread_bps": 2.0}, {"costs.spread_bps"}),
+    ({"costs.spread_bps": 5.0}, {}, {"costs.spread_bps"}),
+    ({"costs.spread_bps": 5.0}, {"costs.spread_bps": 5.0}, set()),
+    ({"costs.spread_bps": 5.0}, {"costs.spread_bps": 8.0}, set()),
+    (NEW_RULES, {"costs.impact_coeff": 0.2}, set()),
+    (NEW_RULES, {"costs.adv_sessions": 30}, {"costs.adv_sessions"}),
+    ({}, {"costs.per_side_bps": 10.0}, {"costs.per_side_bps"}),
+    ({}, {"costs.per_side_bps": 20.0}, set()),
+]
+
+
+def test_the_three_rule_differences_agree_on_the_cost_terms(
+    lab_store: duckdb.DuckDBPyConnection, settings: Settings, tmp_path: Path
+) -> None:
+    """`hypothesis._rule_differences` (promoted and operations files),
+    `sweep._rule_differences` (refusal (a)) and `lab_registry._rule_differences` (the
+    grandfathered members) name the same keys on every case."""
+    twin = _twin(lab_store, settings, tmp_path, run=False, rules_without=COST_TERMS)
+    old_rules = lab_registry.family_rules(lab_store, "momentum")
+    assert old_rules is not None
+    parsed = hypothesis.parse_file(_copy(tmp_path, TWIN_SOURCE))
+    sweep_file = sweep.parse_sweep_file(_copy(tmp_path, SWEEP_SOURCE), settings)
+    base = frozen.frozen_values(twin)
+    for rules_with, values, refused in _RULE_CASES:
+        rules = dataclasses.replace(
+            old_rules, fixed_params={**old_rules.fixed_params, **rules_with}
+        )
+        params = {**base, **values}
+        record = dataclasses.replace(twin, params=params)
+        found = {
+            "hypothesis": hypothesis._rule_differences(parsed, params, rules),
+            "sweep": sweep._rule_differences(sweep_file, params, rules),
+            "lab_registry": list(lab_registry._rule_differences(record, rules)),
+        }
+        case = (rules_with, values)
+        for name, differences in found.items():
+            assert {d.split(" ")[0] for d in differences} == refused, (name, case)
+        for name in ("hypothesis", "sweep"):
+            if "costs.adv_sessions" in refused and "costs.adv_sessions" not in rules.fixed_params:
+                assert "costs.adv_sessions (not fixed by the family rules)" in found[name], case
+            if refused == {"costs.spread_bps"}:
+                assert "costs.spread_bps (lower than the family's 5.0)" in found[name], case

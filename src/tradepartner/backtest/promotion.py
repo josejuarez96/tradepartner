@@ -67,7 +67,7 @@ from tradepartner.backtest.sweep_report import SweepReport, VariantRow
 from tradepartner.config import Settings
 from tradepartner.store import lab_registry, registry
 from tradepartner.store.lab_schema import require_lab
-from tradepartner.store.registry import BASE_COST_KEY, HypothesisRecord
+from tradepartner.store.registry import HypothesisRecord
 
 __all__ = [
     "PROVENANCE_HEADING",
@@ -109,9 +109,15 @@ class PromotionOutcome:
 
 
 def promotion_identity(family: str, params: Mapping[str, Any], in_sample_start: date) -> str:
-    """The fingerprint computed without `costs.per_side_bps` (spec, Definitions,
-    Promotion): one identity for a strategy at every cost base."""
-    without_cost = {k: v for k, v in params.items() if k != BASE_COST_KEY}
+    """The fingerprint computed without the cost keys (spec, Definitions,
+    Promotion): one identity for a strategy at every cost base. `costs.per_side_bps`
+    and the T210 cost terms (`spread_bps`, `impact_coeff`, `adv_sessions`) are
+    fingerprint keys outside the promotion identity."""
+    without_cost = {
+        k: v
+        for k, v in params.items()
+        if k != registry.BASE_COST_KEY and k not in frozen.POST_REGISTRATION_COST_KEYS
+    }
     return frozen.fingerprint(family, without_cost, in_sample_start)
 
 
