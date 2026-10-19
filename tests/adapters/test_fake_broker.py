@@ -58,7 +58,7 @@ from tradepartner.adapters.fake_broker import (
     SetPosition,
     Vanish,
 )
-from tradepartner.errors import ClockError, SystemFaultError
+from tradepartner.errors import ClockError, ReconciliationError, SystemFaultError
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 PRICES = {"AAPL": 100.0, "MSFT": 200.0, "BRK.B": 400.0}
@@ -94,13 +94,19 @@ def make_request(
     side: Side = Side.BUY,
     quantity: float | None = 10,
     notional: float | None = None,
+    position_intent: str | None = None,
 ) -> OrderRequest:
+    """A request carrying its intent explicitly (T226): the long intent of its
+    side unless `position_intent` names another."""
+    if position_intent is None:
+        position_intent = "buy_to_open" if side is Side.BUY else "sell_to_close"
     return OrderRequest(
         client_order_id=client_order_id,
         symbol=symbol,
         side=side,
         notional=notional,
         quantity=None if notional is not None else quantity,
+        position_intent=position_intent,
     )
 
 
@@ -487,8 +493,11 @@ def test_position_netting_uses_exact_decimal_arithmetic() -> None:
 
 
 def test_sell_with_no_prior_long_is_refused() -> None:
+    """A `sell_to_close` with nothing held is Alpaca's intent mismatch (T226;
+    the 2026-10-19 sandbox), no longer "insufficient qty available": the
+    broker would infer a short open, and the explicit intent refuses it."""
     broker, _ = make_broker()
-    with pytest.raises(AlpacaTradingError, match="insufficient qty available"):
+    with pytest.raises(AlpacaTradingError, match="position intent mismatch"):
         broker.submit(
             make_request(client_order_id="co-1", symbol="AAPL", side=Side.SELL, quantity=5)
         )
@@ -961,6 +970,7 @@ def test_side_string_is_coerced_and_nets_correctly() -> None:
         symbol="AAPL",
         side="buy",  # type: ignore[arg-type]
         quantity=10,
+        position_intent="buy_to_open",
     )
     assert request.side is Side.BUY
 
@@ -975,6 +985,7 @@ def test_invalid_side_string_is_rejected() -> None:
             symbol="AAPL",
             side="hold",  # type: ignore[arg-type]
             quantity=10,
+            position_intent="buy_to_open",
         )
 
 
@@ -1396,3 +1407,314 @@ def test_apply_account_refuses_an_order_instruction() -> None:
 
     with pytest.raises(ValueError, match="account"):
         broker.apply_account(Vanish())  # type: ignore[arg-type]
+
+
+# --- T226: `paper` and the short rules (paper spec amendment #1872, items 1 to 3) -----
+#
+# Every refusal below is the body the Alpaca paper sandbox answered on 2026-10-19
+# (`~/tradepartner-probes/sandbox/results/batch1-*.jsonl`), parsed so key order is
+# not pinned, except where a test says the body is unrecorded: there only the
+# refusal itself is pinned until T227's recordings name its body.
+
+#: An easy-to-borrow, shortable name (AAPL's flags in the sandbox).
+ETB = Asset(True, True, "active", None, shortable=True, easy_to_borrow=True, marginable=True)
+#: Alpaca's per-order 422 code on every short refusal the sandbox saw.
+SHORT_REFUSAL_CODE = 42210000
+
+
+def short_broker(*, cash: float = 100_000.0, **kwargs: Any) -> FakeBroker:
+    """A paper fake whose every name is shortable and easy to borrow."""
+    kwargs.setdefault("assets", {symbol: ETB for symbol in PRICES})
+    broker, _ = make_broker(cash=cash, paper=True, **kwargs)
+    return broker
+
+
+def short_open(**overrides: Any) -> OrderRequest:
+    values: dict[str, Any] = {
+        "side": Side.SELL,
+        "quantity": 2,
+        "position_intent": "sell_to_open",
+    }
+    values.update(overrides)
+    return make_request(**values)
+
+
+def cover(**overrides: Any) -> OrderRequest:
+    values: dict[str, Any] = {
+        "client_order_id": "co-cover",
+        "side": Side.BUY,
+        "quantity": 2,
+        "position_intent": "buy_to_close",
+    }
+    values.update(overrides)
+    return make_request(**values)
+
+
+def assert_refused_with(
+    broker: FakeBroker, request: OrderRequest, status: int, body: dict[str, object]
+) -> AlpacaTradingError:
+    """`submit` raises Alpaca's refusal (`status`, `body`) and books nothing."""
+    positions, cash = broker.positions(), broker.account().cash
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(request)
+    assert caught.value.status_code == status
+    assert json.loads(caught.value.body) == body
+    assert_nothing_booked(broker, request, positions, cash)
+    return caught.value
+
+
+def assert_nothing_booked(
+    broker: FakeBroker, request: OrderRequest, positions: dict[str, Position], cash: float
+) -> None:
+    with pytest.raises(UnknownOrderError):
+        broker.get_order(request.client_order_id)
+    assert broker.positions() == positions
+    assert broker.account().cash == cash
+    assert [f for f in broker.fills() if f.client_order_id == request.client_order_id] == []
+
+
+def test_the_fake_is_not_paper_unless_built_paper() -> None:
+    """Spec item 1: `paper` is `True` only for `FakeBroker(paper=True)`."""
+    assert make_broker()[0].paper is False
+    assert make_broker(paper=True)[0].paper is True
+    assert make_broker(paper=False)[0].paper is False
+
+
+def test_a_whole_share_short_open_books_a_negative_position_and_credits_cash() -> None:
+    broker = short_broker(cash=10_000.0)
+
+    order = broker.submit(short_open(quantity=2))
+
+    assert order.status is OrderStatus.FILLED and order.side is Side.SELL
+    assert order.filled_quantity == 2 and order.filled_avg_price == 100.0
+    assert broker.positions() == {"AAPL": Position(symbol="AAPL", quantity=-2)}
+    account = broker.account()
+    assert account.cash == 10_200.0  # 10,000 + 2 x 100 of proceeds
+    assert account.equity == 10_000.0  # 10,200 cash - 2 x 100 short at the mark
+
+
+def test_a_cover_debits_cash_and_nets_the_short_to_nothing() -> None:
+    broker = short_broker(cash=10_000.0)
+    broker.submit(short_open(quantity=2))
+
+    broker.submit(cover(quantity=2))
+
+    assert broker.positions() == {}
+    assert broker.account().cash == 10_000.0
+
+
+def test_a_whole_share_short_is_covered_fractionally() -> None:
+    """Sandbox `short.fractional_partial_cover`: 0.5 of a 1-share short, accepted."""
+    broker = short_broker()
+    broker.submit(short_open(quantity=1))
+
+    order = broker.submit(cover(quantity=0.5))
+
+    assert order.status is OrderStatus.FILLED and order.filled_quantity == 0.5
+    assert broker.positions() == {"AAPL": Position(symbol="AAPL", quantity=-0.5)}
+
+
+def test_a_short_open_under_2000_equity_is_refused() -> None:
+    """Alpaca: "you must have $2,000 or more account equity" to sell short
+    (spec item 2). The body is unrecorded (T227), so only the refusal is
+    pinned: an Alpaca error, nothing booked; at exactly $2,000 it fills."""
+    broker = short_broker(cash=1_999.99)
+    request = short_open(quantity=1)
+    positions, cash = broker.positions(), broker.account().cash
+    with pytest.raises(AlpacaTradingError):
+        broker.submit(request)
+    assert_nothing_booked(broker, request, positions, cash)
+
+    at_the_line = short_broker(cash=2_000.0)
+    assert at_the_line.submit(short_open(quantity=1)).status is OrderStatus.FILLED
+
+
+def test_the_short_equity_line_reads_equity_not_cash() -> None:
+    """$1,000 cash plus a $1,000 long (5 MSFT at 200) is $2,000 of equity: a
+    short open of another name fills."""
+    broker = short_broker(cash=1_000.0)
+    broker.apply_account(SetPosition("MSFT", 5))
+    assert broker.account().equity == 2_000.0
+
+    assert broker.submit(short_open(quantity=1)).status is OrderStatus.FILLED
+
+
+def test_a_fractional_short_is_refused() -> None:
+    """Sandbox `fractional.short_from_flat`: 422 / 42210000."""
+    assert_refused_with(
+        short_broker(),
+        short_open(quantity=0.5),
+        422,
+        {"code": SHORT_REFUSAL_CODE, "message": "fractional orders cannot be sold short"},
+    )
+
+
+def test_a_fractional_add_to_a_short_is_refused() -> None:
+    """Sandbox `short.fractional_add_while_short`: the same 422 while short."""
+    broker = short_broker()
+    broker.submit(short_open(quantity=1))
+    assert_refused_with(
+        broker,
+        short_open(client_order_id="co-2", quantity=1.5),
+        422,
+        {"code": SHORT_REFUSAL_CODE, "message": "fractional orders cannot be sold short"},
+    )
+
+
+def test_a_notional_short_is_refused() -> None:
+    """A notional order is a fractional order at Alpaca ("All fractional sell
+    orders are marked long", spec item 2), so the fake answers the fractional
+    short's body; T227 records the real one."""
+    assert_refused_with(
+        short_broker(),
+        short_open(quantity=None, notional=200.0),
+        422,
+        {"code": SHORT_REFUSAL_CODE, "message": "fractional orders cannot be sold short"},
+    )
+
+
+def test_a_short_of_a_name_scripted_not_shortable_is_refused() -> None:
+    """Sandbox `htb.short_BYND` (`shortable` and `easy_to_borrow` both false)."""
+    broker = short_broker(
+        assets={"AAPL": replace(ETB, shortable=False, easy_to_borrow=False)},
+    )
+    assert_refused_with(
+        broker,
+        short_open(quantity=1),
+        422,
+        {"code": SHORT_REFUSAL_CODE, "message": 'asset "AAPL" cannot be sold short'},
+    )
+
+
+def test_a_short_of_a_shortable_name_that_is_not_etb_is_refused() -> None:
+    """Hard to borrow needs a locate (spec item 2; out of scope, item 13), so the
+    fake refuses it with the not-shortable body until T227 records paper's own."""
+    broker = short_broker(assets={"AAPL": replace(ETB, easy_to_borrow=False)})
+    assert_refused_with(
+        broker,
+        short_open(quantity=1),
+        422,
+        {"code": SHORT_REFUSAL_CODE, "message": 'asset "AAPL" cannot be sold short'},
+    )
+
+
+def test_a_name_turning_not_shortable_on_a_session_refuses_from_that_session() -> None:
+    """The dated asset schedule (`set_asset(from_session=)`) governs shorts too."""
+    broker = short_broker()
+    broker.set_asset("AAPL", replace(ETB, shortable=False), from_session=T0.date())
+    with pytest.raises(AlpacaTradingError, match="cannot be sold short"):
+        broker.submit(short_open(quantity=1))
+
+
+def test_a_sell_to_close_with_nothing_held_is_the_intent_mismatch() -> None:
+    """Sandbox `intent.sell_to_close_while_flat` (undocumented, sandbox only)."""
+    assert_refused_with(
+        short_broker(),
+        make_request(side=Side.SELL, quantity=1, position_intent="sell_to_close"),
+        422,
+        {
+            "code": SHORT_REFUSAL_CODE,
+            "message": "position intent mismatch, inferred: sell_to_open, specified: sell_to_close",
+        },
+    )
+
+
+def test_a_sell_to_close_above_the_long_is_the_recorded_insufficient_qty() -> None:
+    """A long is held: the recorded 403 (`sell_above_held.json`), as before T226."""
+    broker = short_broker(assets={"KO": ETB})
+    broker.apply_account(SetPosition("KO", 0.557436865))
+    request = make_request(
+        symbol="KO", side=Side.SELL, quantity=1.057436865, position_intent="sell_to_close"
+    )
+    recorded = _recorded_refusal("sell_above_held")
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(request)
+    assert (caught.value.status_code, caught.value.body) == (
+        recorded["status_code"],
+        recorded["body"],
+    )
+    assert isinstance(caught.value, ReconciliationError)
+    assert broker.positions() == {"KO": Position(symbol="KO", quantity=0.557436865)}
+
+
+def test_a_buy_to_close_with_nothing_short_is_the_intent_mismatch() -> None:
+    """Sandbox `intent.buy_to_close_while_flat` (undocumented, sandbox only)."""
+    assert_refused_with(
+        short_broker(),
+        cover(quantity=1),
+        422,
+        {
+            "code": SHORT_REFUSAL_CODE,
+            "message": "position intent mismatch, inferred: buy_to_open, specified: buy_to_close",
+        },
+    )
+
+
+def test_a_buy_to_close_above_the_short_is_refused() -> None:
+    """A cover larger than the short would flip it long in one order. The body
+    is unrecorded (T227), so the pin is the refusal with nothing booked."""
+    broker = short_broker()
+    broker.submit(short_open(quantity=2))
+    request = cover(quantity=3)
+    positions, cash = broker.positions(), broker.account().cash
+    with pytest.raises(AlpacaTradingError) as caught:
+        broker.submit(request)
+    assert 400 <= (caught.value.status_code or 0) < 500
+    assert_nothing_booked(broker, request, positions, cash)
+    assert broker.positions() == {"AAPL": Position(symbol="AAPL", quantity=-2)}
+
+
+def test_a_buy_to_close_while_long_is_the_intent_mismatch() -> None:
+    """One position per symbol: a long is closed by a sell, never by a cover."""
+    broker = short_broker()
+    broker.apply_account(SetPosition("AAPL", 5))
+    assert_refused_with(
+        broker,
+        cover(quantity=1),
+        422,
+        {
+            "code": SHORT_REFUSAL_CODE,
+            "message": "position intent mismatch, inferred: buy_to_open, specified: buy_to_close",
+        },
+    )
+
+
+def test_a_short_open_while_long_is_the_intent_mismatch() -> None:
+    """One position per symbol (spec item 4: a name is never long and short at
+    once): with a long held Alpaca infers `sell_to_close` for a sell, so a
+    `sell_to_open` is its mismatch, and the long is untouched."""
+    broker = short_broker()
+    broker.apply_account(SetPosition("AAPL", 5))
+    assert_refused_with(
+        broker,
+        short_open(quantity=1),
+        422,
+        {
+            "code": SHORT_REFUSAL_CODE,
+            "message": "position intent mismatch, inferred: sell_to_close, specified: sell_to_open",
+        },
+    )
+
+
+def test_a_buy_to_open_while_short_is_the_intent_mismatch() -> None:
+    """The mirror: with a short held Alpaca infers `buy_to_close` for a buy."""
+    broker = short_broker()
+    broker.submit(short_open(quantity=2))
+    assert_refused_with(
+        broker,
+        make_request(client_order_id="co-buy", side=Side.BUY, quantity=1),
+        422,
+        {
+            "code": SHORT_REFUSAL_CODE,
+            "message": "position intent mismatch, inferred: buy_to_close, specified: buy_to_open",
+        },
+    )
+
+
+def test_a_short_open_is_not_checked_against_a_held_quantity() -> None:
+    """The sell-side "insufficient qty" rule reads only `sell_to_close`: a short
+    open from flat, and a second one adding to the short, both fill."""
+    broker = short_broker()
+    broker.submit(short_open(quantity=2))
+    broker.submit(short_open(client_order_id="co-2", quantity=3))
+    assert broker.positions() == {"AAPL": Position(symbol="AAPL", quantity=-5)}
