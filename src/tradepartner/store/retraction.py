@@ -69,7 +69,7 @@ import polars as pl
 
 from tradepartner.store.asof import _validate_t, listings_as_of
 from tradepartner.store.db import insert_row
-from tradepartner.store.master import MasterBuild, securities_as_of
+from tradepartner.store.master import MasterBuild, securities_as_of, security_cik
 from tradepartner.timeutil import ensure_tz_aware_utc
 
 #: The source of every row the master builder derives.
@@ -124,9 +124,9 @@ class Underived:
 
 
 def cik_of(security_id: str) -> str:
-    """The CIK an EDGAR `security_id` belongs to: its first ten characters
-    (`<cik>`, `<cik>:<class>`, `<cik>@<valid_from>`)."""
-    return security_id[:10]
+    """The CIK an EDGAR `security_id` belongs to: the id before its `:`
+    class or `@` successor separator, not its first ten characters (#1838)."""
+    return security_cik(security_id)
 
 
 def underived(
