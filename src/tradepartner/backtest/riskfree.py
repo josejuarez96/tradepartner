@@ -52,10 +52,6 @@ BILL_TERM_DAYS: Final[int] = 91
 
 Basis = Literal["discount", "yield"]
 
-#: `rates.value` is the published quote in percent (`5.25` is 5.25%); the functions here
-#: take a fraction.
-_PERCENT: Final[float] = 100.0
-
 
 class RiskFreeMissing(ValueError):
     """A session has no risk-free rate known at its close (backtest spec, `risk_free_missing`).
@@ -161,7 +157,7 @@ def published_by_session(
 ) -> dict[date, float]:
     """`rf(s)` for every session after the first, as the published fraction.
 
-    `rows` are `(known_at, observation_date, value)` of one series, `value` in percent.
+    `rows` are `(known_at, observation_date, value)` of one series, `value` a fraction.
     A session takes the value of the latest observation (by `observation_date`) among
     the rows with `known_at <= close(s)`, carried across the sessions with none newer;
     a session with nothing known at its close is left out, which `session_accruals`
@@ -178,5 +174,5 @@ def published_by_session(
                 latest = (observed, value)
             taken += 1
         if latest is not None:
-            out[session] = latest[1] / _PERCENT
+            out[session] = latest[1]
     return out

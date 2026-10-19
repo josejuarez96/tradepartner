@@ -92,6 +92,7 @@ import polars as pl
 
 from tradepartner.backtest.costs import Commissions, buy_notional_after_costs, trade_cost
 from tradepartner.backtest.fills import FillResult, apply_trades
+from tradepartner.backtest.metrics import PERCENT_POINTS_PER_UNIT
 from tradepartner.backtest.portfolio import (
     _equal_weight,
     _selected_count,
@@ -1379,8 +1380,14 @@ def _cash_accruals(
     series = metrics.risk_free_series
     every = _sessions(sessions[0], sessions[-1])
     rows = rates_for(series).filter(pl.col("series") == series)
+    fractions = rows.select("known_at", "observation_date", "value").iter_rows()
     published = published_by_session(
-        rows.select("known_at", "observation_date", "value").iter_rows(), every, session_close
+        (
+            (known_at, observed, value / PERCENT_POINTS_PER_UNIT)
+            for known_at, observed, value in fractions
+        ),
+        every,
+        session_close,
     )
     yields = {s: to_yield(rate, metrics.risk_free_basis) for s, rate in published.items()}
     return session_accruals(every, yields, series=series)
