@@ -737,6 +737,22 @@ def test_migrating_the_previous_version_widens_the_status_check_once_and_keeps_r
         conn.close()
 
 
+def test_a_version_29_store_migrates_straight_to_head_with_the_widened_status_check() -> None:
+    """Review fix (#1843): the real store is at version 29, and other versions may
+    land between it and this one. A 29 store (the status `CHECK` of T202a) must get
+    the widened `CHECK` however many versions apart head is."""
+    conn = duckdb.connect(":memory:")
+    try:
+        _pre_pending_unresolved_store(conn)
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (29, ?)", [_NOW])
+        schema.init_schema(conn)
+        _insert_status(conn, "pending_unresolved")
+        assert _versions(conn) == list(range(29, schema.CURRENT_SCHEMA_VERSION + 1))
+    finally:
+        conn.close()
+
+
 def test_the_previous_version_migrates_once_and_reopens_without_another_version_row(
     tmp_path: Path,
 ) -> None:

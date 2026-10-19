@@ -3538,8 +3538,9 @@ def _migrate_pending_unresolved(conn: duckdb.DuckDBPyConnection) -> None:
     """Version 30 (module docstring, "Schema versions"; T202b): rebuild
     `order_events` with the status `CHECK` widened by `pending_unresolved`,
     every row kept in insertion order (readers break `known_at` ties on rowid).
-    Runs only on a version-29 store; an older store's earlier rebuilds already
-    use the current DDL, and a fresh store is created with it. Inside
+    Runs on a store above version 28 and below this one (a renumber may leave
+    more than one version between); a store at 28 or below is rebuilt by
+    `_migrate_skip_reasons` with the current DDL, and a fresh store is created with it. Inside
     `init_schema`'s transaction, after every earlier step."""
     staging = "order_events_v30"
     conn.execute(
@@ -3773,7 +3774,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _migrate_cash_in_lieu_kind(conn)
         if max_version is None or max_version <= _PRE_SKIP_REASONS_VERSION:
             _migrate_skip_reasons(conn)
-        if max_version == _PRE_PENDING_UNRESOLVED_VERSION:
+        if max_version is not None and _PRE_SKIP_REASONS_VERSION < max_version <= (
+            _PRE_PENDING_UNRESOLVED_VERSION
+        ):
             _migrate_pending_unresolved(conn)
         if max_version != CURRENT_SCHEMA_VERSION:
             first_new = CURRENT_SCHEMA_VERSION if max_version is None else max_version + 1

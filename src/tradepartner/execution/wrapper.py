@@ -634,6 +634,10 @@ class RiskGatedBroker:
         #: The batch's orders `_collect` and `_await_sells` never poll: the
         #: unresolved order and the orders never sent (reset by `_trade`).
         self._set_aside: set[str] = set()
+        #: Set once the batch has an unresolved order or has found the submit
+        #: window closed: every later submit, in either phase, re-runs the clock
+        #: pre-check and the window test first (reset by `_trade`).
+        self._recheck: bool = False
 
     def __repr__(self) -> str:
         return f"RiskGatedBroker(broker={type(self._broker).__name__})"
@@ -770,6 +774,7 @@ class RiskGatedBroker:
             raise ValueError("execute needs a journaled run with its session")
         rows = [*decisions, *forced_exits]
         self._set_aside = set()
+        self._recheck = False
         # The batch holds these rebalances: a halt in either phase marks them
         # `missed` (ADR 0010 point 2), whichever decisions that phase held.
         rebalance = sorted({d.rebalance_session for d in decisions if d.rebalance_session})
@@ -1428,9 +1433,8 @@ class RiskGatedBroker:
         submitted and the refusals' skips."""
         submitted: list[str] = []
         refused: list[Skip] = []
-        unresolved = False
         for index, (row, request) in enumerate(pairs):
-            if unresolved:
+            if self._recheck:
                 # After the longer poll: the clock pre-check and the submit
                 # window run again before the next submit (item 4 (a)).
                 assert run.session is not None
@@ -1459,7 +1463,7 @@ class RiskGatedBroker:
                 continue
             else:
                 if not self._acknowledge(run, request.client_order_id):
-                    unresolved = True
+                    self._recheck = True
                     self._set_aside.add(request.client_order_id)
                     submitted.append(request.client_order_id)
                     continue
@@ -1484,6 +1488,7 @@ class RiskGatedBroker:
         """Close each journaled but never-sent order `cancelled`, reason
         `not_received`, so none is left `pending`; the next in-window run
         re-attempts its decision (item 4 (a), judgment call 1 of #1841)."""
+        self._recheck = True
         stamp = self.read_clock()
         with self._journal() as conn:
             for row in rows:
