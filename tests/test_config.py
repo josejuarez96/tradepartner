@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import get_args
@@ -50,6 +50,8 @@ from tradepartner.config import (
     render_validation_errors,
     secret_values,
 )
+from tradepartner.execution.reconcile_run import frozen_risk
+from tradepartner.store.journal import PaperWindowRow
 from tradepartner.store.schema import DEFAULT_BOOK_ID
 
 
@@ -2838,3 +2840,118 @@ def test_risk_small_account_refuses_an_int_or_other_spelling_in_the_section(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, risk={"small_account": {"enabled": value}})
+
+
+# --- the short-side risk keys (ADR 0010 amendment 2026-10-19; paper spec #1872 items 7, 12;
+# T231) ---------------------------------------------------------------------------------------
+
+_SHORT_KEYS = {"max_short_weight": 0.05, "net_exposure_band": 0.10, "min_short_equity": 2000.0}
+
+
+def _short_values(risk: RiskConfig) -> dict[str, float]:
+    return {key: getattr(risk, key) for key in _SHORT_KEYS}
+
+
+def test_short_risk_keys_default_to_the_adrs_placeholders() -> None:
+    assert _short_values(RiskConfig()) == _SHORT_KEYS
+    assert _short_values(_settings().risk) == _SHORT_KEYS
+
+
+def test_short_risk_keys_are_set_through_the_risk_section() -> None:
+    values = {"max_short_weight": 0.03, "net_exposure_band": 0.2, "min_short_equity": 5000.0}
+    assert _short_values(Settings(_env_file=None, risk=values).risk) == values
+    assert _short_values(RiskConfig(**values)) == values
+
+
+def test_short_risk_keys_load_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RISK__MAX_SHORT_WEIGHT", "0.04")
+    monkeypatch.setenv("RISK__NET_EXPOSURE_BAND", "0.15")
+    monkeypatch.setenv("RISK__MIN_SHORT_EQUITY", "2500")
+    assert _short_values(Settings(_env_file=None).risk) == {
+        "max_short_weight": 0.04,
+        "net_exposure_band": 0.15,
+        "min_short_equity": 2500.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("max_short_weight", -0.01),
+        ("max_short_weight", 1.01),  # a fraction of equity, in [0, 1]
+        ("max_short_weight", float("nan")),
+        ("net_exposure_band", -0.01),
+        ("net_exposure_band", 1.01),
+        ("net_exposure_band", float("inf")),
+        ("min_short_equity", -1.0),
+        ("min_short_equity", float("nan")),
+        ("min_short_equity", float("inf")),
+    ],
+)
+def test_short_risk_keys_refuse_out_of_range_and_non_finite_values(key: str, value: float) -> None:
+    """The key loads in range (so the refusal is the bound, not an unknown key)."""
+    assert (
+        getattr(Settings(_env_file=None, risk={key: _SHORT_KEYS[key]}).risk, key)
+        == (_SHORT_KEYS[key])
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, risk={key: value})
+
+
+def test_the_dump_carries_the_short_keys_so_paper_start_freezes_them() -> None:
+    dumped = RiskConfig().model_dump()
+    assert {key: dumped[key] for key in _SHORT_KEYS} == _SHORT_KEYS
+    assert RiskConfig.model_validate(dumped) == RiskConfig()
+
+
+def _window(frozen: dict[str, object]) -> PaperWindowRow:
+    stamp = datetime(2026, 10, 19, 13, 0, tzinfo=UTC)
+    return PaperWindowRow(
+        window_id=1,
+        hypothesis_id=1,
+        first_rebalance_session=date(2026, 10, 20),
+        account_id="PA1",
+        starting_cash=10_000.0,
+        starting_equity=10_000.0,
+        code_version="test",
+        started_at=stamp,
+        frozen_json=json.dumps(frozen, sort_keys=True),
+        frozen_sha256="0" * 64,
+        known_at=stamp,
+        ingested_at=stamp,
+    )
+
+
+def _frozen_today(**overrides: object) -> dict[str, object]:
+    """Today's default `risk.*` section as `paper start` freezes it."""
+    frozen: dict[str, object] = {f"risk.{k}": v for k, v in RiskConfig().model_dump().items()}
+    frozen.update({f"risk.{k}": v for k, v in overrides.items()})
+    return frozen
+
+
+def test_a_window_frozen_before_t231_reads_the_short_keys_at_their_defaults() -> None:
+    """A `frozen_json` without the three keys (every window open today) is read,
+    never refused, and is the default section (spec item 12): the running
+    long-only books keep running."""
+    frozen = {k: v for k, v in _frozen_today().items() if k[len("risk.") :] not in _SHORT_KEYS}
+    read = frozen_risk(_window(frozen))
+    assert _short_values(read) == _SHORT_KEYS
+    assert read == RiskConfig()
+
+
+def test_a_window_frozen_with_short_keys_reads_them_back() -> None:
+    values = {"max_short_weight": 0.03, "net_exposure_band": 0.2, "min_short_equity": 5000.0}
+    read = frozen_risk(_window(_frozen_today(**values)))
+    assert _short_values(read) == values
+    assert read != RiskConfig()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("max_short_weight", 1.5), ("net_exposure_band", -0.1), ("min_short_equity", -1.0)],
+)
+def test_a_window_frozen_with_a_bad_short_key_is_refused(key: str, value: float) -> None:
+    """The same key in range reads back; out of range, `frozen_risk` refuses."""
+    assert getattr(frozen_risk(_window(_frozen_today())), key) == _SHORT_KEYS[key]
+    with pytest.raises(ValueError, match=key):
+        frozen_risk(_window(_frozen_today(**{key: value})))
