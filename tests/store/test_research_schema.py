@@ -695,12 +695,14 @@ def test_the_migration_from_version_11_is_additive(tmp_path: Path) -> None:
     # `trial_results` (their `CHECK` widened by the lab migration, version 16,
     # `tests/store/test_lab_migration.py`); no row of any table changed.
     # Version 25 (#1597, T184d) rebuilds `listings` and `classifications` for
-    # `filing_name` too, so they move with the same rows kept.
+    # `filing_name` too, and version 33 (#1792, T210b) rebuilds `trial_metrics`
+    # for `cost_level_kind`, so they move with the same rows kept.
     _moved = {
         "trial_results",
         "trial_rebalances",
         "trials",
         "owner_decisions",
+        "trial_metrics",
         "listings",
         "classifications",
     }

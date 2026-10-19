@@ -1226,12 +1226,21 @@ def test_write_open_of_a_version_4_store_adds_the_journal_and_nothing_else(
     # version 16 (#1195, T113) creates the lab tables and rebuilds
     # `owner_decisions` with every row kept (`tests/store/test_lab_migration.py`);
     # version 17 (#1258, T132) rebuilds the eight expanded journal tables with
-    # their new defaulted columns (every row kept, `_version_16_store` below).
+    # their new defaulted columns (every row kept, `_version_16_store` below);
+    # version 33 (#1792, T210b) rebuilds `trial_metrics` for `cost_level_kind`,
+    # every row kept.
     kept_without_versions = tuple(
         name
         for name in kept
         if name
-        not in ("schema_version", "trial_results", "trial_rebalances", "trials", "owner_decisions")
+        not in (
+            "schema_version",
+            "trial_results",
+            "trial_rebalances",
+            "trial_metrics",
+            "trials",
+            "owner_decisions",
+        )
         and name not in schema.RETRACTABLE_TABLES
         and name not in lab_schema.LAB_TABLE_NAMES
     )

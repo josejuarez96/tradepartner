@@ -352,6 +352,11 @@ def _ny_midnight(day: date) -> datetime:
 class AlpacaBroker(Broker):
     """`Broker` over Alpaca's paper trading API (module docstring)."""
 
+    @property
+    def paper(self) -> bool:
+        """`True`: the constructor refuses unless `alpaca.paper` is the literal `True`."""
+        return True
+
     def __init__(
         self,
         settings: Settings,
@@ -416,6 +421,7 @@ class AlpacaBroker(Broker):
             coid,
             notional=request.notional,
             qty=request.quantity,
+            position_intent=request.position_intent.value,
         )
         try:
             payload = self._raw.submit_order(order_data)

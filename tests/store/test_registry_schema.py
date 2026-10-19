@@ -302,8 +302,15 @@ def test_write_open_of_version_3_store_migrates_to_version_25(version_3_store: P
         # (`tests/store/test_research_schema.py`, `tests/store/test_schema.py`,
         # `tests/store/test_schema_period.py`); version 16 (#1195, T113) adds
         # the lab tables and rebuilds `owner_decisions`, every row kept
-        # (`tests/store/test_lab_migration.py`).
-        moved = ("trial_results", "trial_rebalances", "trials", "owner_decisions")
+        # (`tests/store/test_lab_migration.py`); version 33 (#1792, T210b)
+        # rebuilds `trial_metrics` for `cost_level_kind`, every row kept.
+        moved = (
+            "trial_results",
+            "trial_rebalances",
+            "trials",
+            "owner_decisions",
+            "trial_metrics",
+        )
         kept = tuple(t for t in _PHASE3_REGISTRY if t not in moved)
         before = _table_snapshot(conn, kept)
         assert before["hypotheses"][3], "the version-3 store should hold a registry row"

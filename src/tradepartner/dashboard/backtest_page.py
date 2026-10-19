@@ -15,7 +15,11 @@ needs no Streamlit. `render` draws that view.
 **Cost level.** Equity, drawdowns and per-rebalance rows are shown at the
 trial's base cost level (`costs.per_side_bps` of its hypothesis, read
 through `frozen_values`), the level N, V and DSR use (spec req 6). Metrics
-are shown at every stored level.
+are shown at every stored level, and each column's header carries the level's
+kind (`base`, `ladder` or `measured`; spec amendment 2026-10-18, item 2),
+so a `measured` column is never read as a ladder rung. On a store
+before schema version 33 (no `trial_metrics.cost_level_kind` column) the
+header falls back to `base`/`ladder` by the level.
 
 **Stored vs today's DSR** (spec req 8). The stored statistics used N and V
 at run time and go stale as the family grows; the page recomputes both
@@ -300,8 +304,7 @@ def load_trial_view(
     )
     metrics = _rows(
         conn,
-        "SELECT series, cost_per_side_bps, metric, value FROM trial_metrics "
-        "WHERE trial_id = ? ORDER BY series, cost_per_side_bps, metric",
+        "SELECT * FROM trial_metrics WHERE trial_id = ? ORDER BY series, cost_per_side_bps, metric",
         [trial_id],
     )
     base_metrics = {
@@ -388,13 +391,28 @@ def _bar_chart(rows: list[Row], y: str, title: str, palette: theme.Palette, fmt:
     st.altair_chart(theme.style(chart, palette), theme=None, width="stretch")
 
 
+def _level_kind(row: Row, base: float) -> str:
+    """The row's stored `cost_level_kind` (`base`, `ladder` or `measured`; spec
+    amendment 2026-10-18, item 2), or, on a store before schema version 33
+    (no such column), `base`/`ladder` by the level, so an old store's header
+    reads as it always did."""
+    kind = row.get("cost_level_kind")
+    if kind:
+        return str(kind)
+    return "base" if row["cost_per_side_bps"] == base else "ladder"
+
+
 def _metrics_table(view: TrialView) -> pl.DataFrame:
     columns = sorted({(r["series"], r["cost_per_side_bps"]) for r in view.metrics})
     values = {(r["series"], r["cost_per_side_bps"], r["metric"]): r["value"] for r in view.metrics}
+    kinds = {
+        (r["series"], r["cost_per_side_bps"]): _level_kind(r, view.base_cost) for r in view.metrics
+    }
     keys = [k for k in METRIC_KEYS if any(m == k for _, _, m in values)]
     return pl.DataFrame(
         [
-            {"metric": key} | {f"{s} @ {c} bps": values.get((s, c, key)) for s, c in columns}
+            {"metric": key}
+            | {f"{s} @ {c} bps ({kinds[(s, c)]})": values.get((s, c, key)) for s, c in columns}
             for key in keys
         ]
     )

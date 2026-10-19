@@ -33,6 +33,20 @@ row unless the process dies (then it lists as `unfinished`). An exception before
 the open (an unregistered slug, a synthetic trial on the real store) raises:
 there is no trial yet.
 
+**The measured cost level** (spec amendment 2026-10-18, #1792, item 2; ADR 0023
+kill-ladder rung 1). `measured_cost_bps`, when given, is appended to the run's
+cost `levels` for the one `engine.run`, so its metrics, equity and rebalance rows
+come from the same reads as every ladder level and are stored under that
+`cost_per_side_bps` (labelled `measured` by `results.metric_rows`; never in N, V,
+DSR or the red flag, which read the base level only). It is refused
+(`refused_measured_level`) after `holdout.decide` names the run's kind and before
+`registry.open_trial`, so a misused flag writes no `trials` row and spends no
+holdout: a tracking run and a holdout run refuse it (the flag is in-sample only),
+`x` equal to the base or a ladder level refuses it (that row already holds the
+number under the unchanged `trial_metrics` UNIQUE), and a level that is not
+finite and non-negative refuses it (the engine's own level rule, surfaced before
+the trial exists).
+
 Only `write_results` compares the data vintage at the cutoff with the one recorded
 at the open. A `refused_gap`, and the gap values stored with a `gap_override`, are
 not compared: an ingest after the open can at worst leave a refusal that newer
@@ -80,16 +94,18 @@ from __future__ import annotations
 
 import math
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import partial
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import duckdb
 
-from tradepartner.backtest import engine
+from tradepartner.backtest import engine, placebo
 from tradepartner.backtest.engine import BacktestResult
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.holdout import (
     Decision,
     Flags,
@@ -221,6 +237,49 @@ def _gap_values(decision: Decision, frozen: Frozen, series: dict[date, float]) -
     }
 
 
+def _refuse_measured_level(
+    slug: str,
+    measured_cost_bps: float,
+    params: Settings,
+    *,
+    tracking: bool,
+    decision: Decision,
+) -> None:
+    """Refuse `measured_cost_bps` for `slug` (`refused_measured_level`; module
+    docstring, "The measured cost level") where the run or the number cannot
+    take it: a tracking run, a run `holdout.decide` called a holdout (the flag is
+    in-sample only), `x` equal to the base or a `costs.sensitivity_per_side_bps`
+    level (that row already holds the number under the unchanged `trial_metrics`
+    UNIQUE), or a level that is not finite and non-negative (the rule
+    `engine._check_levels` would apply, surfaced before any trial exists). Runs
+    after `holdout.decide`, so a misused flag writes no `trials` row."""
+    if tracking or decision.kind == "holdout":
+        kind = "tracking" if tracking else "holdout"
+        raise ValueError(
+            f"{slug}: refused_measured_level: a {kind} run cannot take a measured cost "
+            "level; the flag is in-sample only"
+        )
+    if not math.isfinite(measured_cost_bps) or measured_cost_bps < 0:
+        raise ValueError(
+            f"{slug}: refused_measured_level: the measured cost must be finite and "
+            f"non-negative, got {measured_cost_bps}"
+        )
+    base = params.costs.per_side_bps
+    ladder = set(params.costs.sensitivity_per_side_bps)
+    if measured_cost_bps == base or measured_cost_bps in ladder:
+        raise ValueError(
+            f"{slug}: refused_measured_level: {measured_cost_bps} bp equals the base or a "
+            "ladder level, whose trial_metrics rows already hold that number"
+        )
+
+
+def _trial_note(frozen: Mapping[str, Any], note: str | None) -> str | None:
+    """The shock tag (`placebo.shock_note`), then `; ` and the given `note`; at the
+    defaults exactly the given `note`, so no stored row changes."""
+    tag = placebo.shock_note(frozen)
+    return "; ".join(part for part in (tag, note) if part) or None
+
+
 def run_hypothesis(
     slug: str,
     start: date | None,
@@ -234,6 +293,7 @@ def run_hypothesis(
     run_by: str = DEFAULT_RUN_BY,
     kind: Literal["tracking"] | None = None,
     keep_marking_frames: bool = False,
+    measured_cost_bps: float | None = None,
 ) -> RunOutcome:
     """Run `slug`'s latest registration over `[start, end]` as one trial and return
     its `RunOutcome` (module docstring).
@@ -245,6 +305,10 @@ def run_hypothesis(
     rules; `flags` and `reasons` are not read, and the trial is opened `kind=tracking`,
     so it is never counted in a family's `N`, `V` or holdout spends
     (`registry.family_sharpes` and `family_holdout_spends` both filter on `trials.kind`).
+    `measured_cost_bps`, when given, adds one more cost level to the same run and
+    trial (module docstring, "The measured cost level"); a tracking or holdout run
+    or an `x` equal to the base or a ladder level raises `ValueError` whose message
+    starts `refused_measured_level`, before any trial exists.
     The outcome carries the recorded status, the results written with an `ok` row
     and, on `failed`, the formatted traceback; the one-line message is in
     `trial_results`. Raises `registry.UnknownHypothesis` for an unregistered slug,
@@ -252,8 +316,12 @@ def run_hypothesis(
     `registry.UnmarkedStoreRefused` for a `store_path` that is neither
     `settings.store.path` nor a marked fixture store, `ValueError` for a family
     outside `config.ENGINE_FAMILIES` (#1053), and
-    `ValueError` for `kind="tracking"` with a missing `start` or `end`, all before
-    any trial exists.
+    `ValueError` for `kind="tracking"` with a missing `start` or `end`, and
+    `ValueError("<slug>: refused_placebo: ...")` for a holdout or tracking run of a file
+    whose frozen `strategy.placebo` is not `none` (a fake signal never spends a holdout;
+    ADR 0023), all before any trial exists. The trial's `note` is the shock tag
+    (`placebo.shock_note`: `placebo=<mode> seed=<n>`, `signal_delay=<d>`), then `; ` and
+    the `note` given; at the defaults exactly the `note` given.
 
     The results keep no step's marking frame unless `keep_marking_frames` (#1417:
     nothing written reads them, and over a long daily run they grow without bound);
@@ -299,6 +367,19 @@ def run_hypothesis(
             lab=lab,
             boundary=boundary,
         )
+        if measured_cost_bps is not None:
+            _refuse_measured_level(
+                slug, measured_cost_bps, params, tracking=tracking, decision=decision
+            )
+        shock = frozen_values(hypothesis)
+        if shock.get("strategy.placebo", "none") != "none" and (
+            tracking or decision.kind == "holdout"
+        ):
+            # A fake signal never spends a holdout or feeds a tracking book (ADR 0023).
+            raise ValueError(
+                f"{slug}: refused_placebo: strategy.placebo is {shock['strategy.placebo']!r}; "
+                "a placebo file runs in sample only, never on the holdout or as a tracking run"
+            )
         sessions = gap_sessions(window, cadence)
         refused = decision.outcome not in ("run", "needs_gap")
         holdout = decision.kind == "holdout" and not refused
@@ -319,7 +400,7 @@ def run_hypothesis(
             holdout_repeat=holdout and decision.holdout_repeat,
             holdout_reason=decision.holdout_reason if holdout else None,
             gap_override_reason=reasons.gap_reason if holdout and flags.override_gap else None,
-            note=note,
+            note=_trial_note(shock, note),
             settings=live,
         )
         if holdout and decision.holdout_reason is not None:
@@ -369,14 +450,16 @@ def run_hypothesis(
                             hypothesis_id=hypothesis.hypothesis_id,
                             trial_id=handle.trial_id,
                         )
-            levels = sorted({params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps})
+            levels = {params.costs.per_side_bps, *params.costs.sensitivity_per_side_bps}
+            if measured_cost_bps is not None:
+                levels.add(measured_cost_bps)
             results = engine.run(
                 params,
                 provider,
                 window.start,
                 window.end,
                 handle,
-                levels,
+                sorted(levels),
                 family=hypothesis.family,
                 keep_marking_frames=keep_marking_frames,
             )

@@ -71,6 +71,10 @@ def _version_14_store(conn: duckdb.DuckDBPyConnection) -> None:
     for table, columns in (("trials", trials), ("trial_results", ("sharpe_unit",))):
         for column in columns:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    # `trial_metrics.cost_level_kind` is version 33's (#1792, T210b): a version-14
+    # store has no such column, so rebuild the table from its version-4 DDL.
+    conn.execute("DROP TABLE trial_metrics")
+    conn.execute(schema._CREATE_TRIAL_METRICS)
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version VALUES (14, ?)", [_AT])
     record = registry.register_hypothesis(
@@ -136,7 +140,13 @@ def _snapshot(conn: duckdb.DuckDBPyConnection, tables: list[str]) -> dict[str, A
 
 
 def _metric_rows(conn: duckdb.DuckDBPyConnection) -> set[tuple[Any, ...]]:
-    return set(conn.execute("SELECT * FROM trial_metrics").fetchall())
+    """The version-14 metric columns, so a before/after comparison is unmoved by
+    version 33's `cost_level_kind` (#1792, T210b)."""
+    return set(
+        conn.execute(
+            "SELECT trial_id, series, cost_per_side_bps, metric, value FROM trial_metrics"
+        ).fetchall()
+    )
 
 
 @pytest.fixture

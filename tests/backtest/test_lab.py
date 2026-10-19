@@ -1134,3 +1134,42 @@ def test_no_lab_module_drops_deletes_truncates_or_vacuums(relative: str) -> None
         pytest.skip(f"{relative} is not built yet")
     found = _DESTRUCTIVE.findall(path.read_text())
     assert found == [], f"{relative} contains {found}"
+
+
+def test_a_sweep_whose_fixed_block_sets_a_delay_tags_every_variant_row(
+    store: Path, tmp_path: Path, clock: FakeClock
+) -> None:
+    """T217b: `strategy.signal_delay_sessions = 1` in the fixed block writes
+    `signal_delay=1` on every variant's `trials.note`; the plain sweep's rows keep a
+    NULL note."""
+    delayed = _copy_file(
+        tmp_path / "delayed",
+        SWEEP_SOURCE,
+        (
+            *EDITS_SMALL,
+            ('slug = "fixture-sweep"', 'slug = "fixture-sweep-delay"'),
+            ("signal_total_return = true", "signal_total_return = true\nsignal_delay_sessions = 1"),
+            ('"schedule.rebalance_cadence" = ["month_end", "week_end"]\n', ""),
+            (
+                'signal_anchor = "month_end"',
+                'signal_anchor = "month_end"\nrebalance_cadence = "month_end"',
+            ),
+        ),
+    )
+    delayed = delayed.rename(delayed.with_name("fixture-sweep-delay.md"))
+    with open_for_write(Settings()) as conn:
+        sweep.register(conn, delayed, Settings(_env_file=None), registered_by="test")
+    plain = lab.run_sweep(SLUG, clock=clock)
+    shocked = lab.run_sweep("fixture-sweep-delay", clock=clock)
+
+    assert shocked.n_ok == 2 and len(shocked.trials) == 2
+    with _read(store) as conn:
+
+        def notes(outcome: lab.SweepRunOutcome) -> list[tuple[Any]]:
+            return conn.execute(
+                "SELECT note FROM trials WHERE trial_id IN (SELECT UNNEST(?)) ORDER BY trial_id",
+                [[t.trial_id for t in outcome.trials]],
+            ).fetchall()
+
+        assert notes(shocked) == [("signal_delay=1",)] * 2
+        assert notes(plain) == [(None,)] * 4

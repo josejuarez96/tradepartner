@@ -14,6 +14,7 @@ used here, so the frozen threshold 0.05 refuses it.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -1235,3 +1236,260 @@ def test_a_single_run_keeps_no_marking_frames_and_writes_the_same_rows(
             for trial_id in (dropped.trial_id, kept.trial_id)
         ]
         assert rows[0] and rows[0] == rows[1]
+
+
+# --- the measured cost level (spec amendment 2026-10-18, #1792, item 2) ---------------
+
+MEASURED = 22.0
+
+
+def _metric_rows(conn: duckdb.DuckDBPyConnection, trial_id: int) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT series, cost_per_side_bps, cost_level_kind, metric, value FROM trial_metrics "
+        "WHERE trial_id = ? ORDER BY series, cost_per_side_bps, metric",
+        [trial_id],
+    ).fetchall()
+
+
+def test_a_measured_run_adds_one_measured_level_and_leaves_the_rest(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`measured_cost_bps=22` runs the one trial at one more level: the 22 bp rows
+    are labelled `measured`, every base and ladder row (metrics, equity, rebalance
+    and weight rows included) is byte-identical to a plain run's, the `trials`
+    count is the same, and N, V and DSR are the plain run's."""
+    _spy(monkeypatch)
+    plain_store = tmp_path / "plain.duckdb"
+    shutil.copyfile(store, plain_store)
+    plain = run_hypothesis(SLUG, None, None, Flags(), synthetic=True, store_path=plain_store)
+    measured = run_hypothesis(
+        SLUG, None, None, Flags(), synthetic=True, store_path=store, measured_cost_bps=MEASURED
+    )
+
+    assert (plain.status, measured.status) == ("ok", "ok")
+    assert plain.results is not None and measured.results is not None
+    assert set(plain.results) == LEVELS
+    assert set(measured.results) == LEVELS | {MEASURED}
+    with duckdb.connect(str(plain_store), read_only=True) as pconn:
+        conn = read()
+        assert pconn.execute("SELECT count(*) FROM trials").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM trials").fetchone() == (1,)
+        p_result = _row(pconn, "trial_results", plain.trial_id)
+        m_result = _row(conn, "trial_results", measured.trial_id)
+        for key in (
+            "status",
+            "n_trials",
+            "dsr_basis",
+            "sharpe_variance",
+            "sr_star",
+            "dsr",
+            "sharpe_variance_excess",
+            "sr_star_excess",
+            "dsr_excess",
+            "red_flag",
+            "gap_max_count_share",
+            "gap_max_size_share",
+        ):
+            assert m_result[key] == p_result[key], key
+        p_rows = _metric_rows(pconn, plain.trial_id)
+        m_rows = _metric_rows(conn, measured.trial_id)
+        assert [r for r in m_rows if r[1] != MEASURED] == p_rows
+        assert {r[1] for r in m_rows} == LEVELS | {MEASURED}
+        assert {r[2] for r in m_rows if r[1] == MEASURED} == {"measured"}
+        assert all(r[2] in schema.COST_LEVEL_KINDS for r in m_rows)
+        for table in ("trial_equity", "trial_rebalances", "trial_weights"):
+            filtered = table != "trial_weights"  # weights are base-only, no level column
+            p = pconn.execute(
+                f"SELECT * EXCLUDE (trial_id) FROM {table} WHERE trial_id = ? ORDER BY ALL",
+                [plain.trial_id],
+            ).fetchall()
+            where = " WHERE trial_id = ?" + (" AND cost_per_side_bps != ?" if filtered else "")
+            params: list[Any] = [measured.trial_id] + ([MEASURED] if filtered else [])
+            m = conn.execute(
+                f"SELECT * EXCLUDE (trial_id) FROM {table}{where} ORDER BY ALL", params
+            )
+            assert m.fetchall() == p, table
+
+
+def test_a_holdout_run_refuses_the_measured_level_before_any_row(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="refused_measured_level"):
+        run_hypothesis(
+            SLUG,
+            *HOLDOUT_WINDOW,
+            OVERRIDE,
+            reasons=OVERRIDE_REASONS,
+            synthetic=True,
+            store_path=store,
+            measured_cost_bps=MEASURED,
+        )
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_tracking_run_refuses_the_measured_level(
+    tracking_store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="refused_measured_level"):
+        run_hypothesis(
+            TRACKING_SLUG,
+            TRACKING_START,
+            TRACKING_END,
+            Flags(),
+            synthetic=True,
+            store_path=tracking_store,
+            kind="tracking",
+            measured_cost_bps=MEASURED,
+        )
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "x", [15.0, 0.0, 30.0, 100.0], ids=["base", "gross", "ladder", "ladder-top"]
+)
+def test_a_measured_level_equal_to_the_base_or_a_ladder_level_is_refused(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, x: float
+) -> None:
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="refused_measured_level"):
+        run_hypothesis(
+            SLUG, None, None, Flags(), synthetic=True, store_path=store, measured_cost_bps=x
+        )
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+# --- T217b: the ladder's trial-row note tag and the placebo refusals -----------------
+
+
+def _register_shocked_on(
+    path: Path, slug: str, holdout_end: date = HOLDOUT[1], **strategy: Any
+) -> None:
+    frozen = Settings(
+        _env_file=None,
+        strategy={"top_fraction": 0.5, **strategy},
+        holdout={"start": HOLDOUT[0], "end": holdout_end},
+        gap={"count_share_threshold": 0.05},
+    )
+    with open_for_write(_store(path)) as conn:
+        registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title=slug,
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256="2" * 64,
+            params=frozen_params_of(frozen, family="momentum"),
+            in_sample_start=IN_SAMPLE_START,
+            holdout_start=HOLDOUT[0],
+            holdout_end=holdout_end,
+            registered_by="test",
+            settings=frozen,
+        )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "note", "expected"),
+    [
+        ({"placebo": "shuffle", "placebo_seed": 7}, None, "placebo=shuffle seed=7"),
+        ({"signal_delay_sessions": 1}, None, "signal_delay=1"),
+        (
+            {"placebo": "shuffle", "placebo_seed": 7, "signal_delay_sessions": 1},
+            None,
+            "placebo=shuffle seed=7 signal_delay=1",
+        ),
+        ({"placebo": "shuffle", "placebo_seed": 7}, "x", "placebo=shuffle seed=7; x"),
+        ({"signal_delay_sessions": 1}, "x", "signal_delay=1; x"),
+        ({}, "x", "x"),
+        ({}, None, None),
+    ],
+)
+def test_the_trial_row_note_carries_the_shock_tag(
+    store: Path,
+    read: Read,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: dict[str, Any],
+    note: str | None,
+    expected: str | None,
+) -> None:
+    _spy(monkeypatch)
+    _register_shocked_on(store, "h-shock", **strategy)
+    outcome = run_hypothesis(
+        "h-shock", None, None, Flags(), synthetic=True, store_path=store, note=note
+    )
+
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["kind"], trial["note"]) == ("in_sample", expected)
+
+
+@pytest.mark.parametrize("mode", ["shuffle", "random_entry"])
+def test_a_holdout_run_of_a_placebo_file_is_refused_with_no_trial_row(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    calls = _spy(monkeypatch)
+    _register_shocked_on(store, "h-fake", placebo=mode, placebo_seed=7)
+
+    with pytest.raises(ValueError, match=r"h-fake: refused_placebo"):
+        run_hypothesis("h-fake", *HOLDOUT_WINDOW, SPEND, reasons=SPEND_REASON, store_path=store)
+
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("x", [-1.0, float("nan"), float("inf")], ids=["negative", "nan", "inf"])
+def test_a_non_finite_or_negative_measured_level_is_refused(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch, x: float
+) -> None:
+    calls = _spy(monkeypatch)
+    with pytest.raises(ValueError, match="refused_measured_level"):
+        run_hypothesis(
+            SLUG, None, None, Flags(), synthetic=True, store_path=store, measured_cost_bps=x
+        )
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_tracking_run_of_a_placebo_file_is_refused_with_no_trial_row(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy(monkeypatch)
+    _register_shocked_on(
+        store, "h-fake", holdout_end=date(2019, 8, 30), placebo="shuffle", placebo_seed=7
+    )
+
+    with pytest.raises(ValueError, match=r"h-fake: refused_placebo"):
+        run_hypothesis(
+            "h-fake",
+            date(2019, 8, 30),
+            date(2019, 9, 30),
+            Flags(),
+            store_path=store,
+            kind="tracking",
+        )
+
+    assert calls == []
+    assert read().execute("SELECT count(*) FROM trials").fetchone() == (0,)
+
+
+def test_a_delayed_file_is_not_refused_a_holdout_or_tracking_run(
+    store: Path, read: Read, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale-signal strategy is implementable: only the placebo is a fake signal."""
+    _spy(monkeypatch)
+    _register_shocked_on(store, "h-late", signal_delay_sessions=1)
+    outcome = run_hypothesis(
+        "h-late",
+        *HOLDOUT_WINDOW,
+        OVERRIDE,
+        reasons=OVERRIDE_REASONS,
+        synthetic=True,
+        store_path=store,
+    )
+    assert outcome.status == "ok"
+    trial = _row(read(), "trials", outcome.trial_id)
+    assert (trial["kind"], trial["note"]) == ("holdout", "signal_delay=1")

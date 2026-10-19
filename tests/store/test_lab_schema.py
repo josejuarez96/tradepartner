@@ -139,8 +139,9 @@ def _with_phase3_rows(conn: duckdb.DuckDBPyConnection) -> None:
             },
         )
     conn.execute(
-        "INSERT INTO trial_metrics VALUES (1, 'strategy', 15.0, 'sharpe', 0.42), "
-        "(1, 'spy', 15.0, 'sharpe', NULL)"
+        "INSERT INTO trial_metrics (trial_id, series, cost_per_side_bps, cost_level_kind, "
+        "metric, value) VALUES (1, 'strategy', 15.0, 'base', 'sharpe', 0.42), "
+        "(1, 'spy', 15.0, 'base', 'sharpe', NULL)"
     )
     conn.execute(
         "INSERT INTO trial_equity VALUES (1, 'strategy', 15.0, DATE '2020-09-30', 1.01, 0.0)"
