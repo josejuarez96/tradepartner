@@ -330,9 +330,12 @@ current listing's title at `t` (`listing_ends_as_of`): a security the store
 classifies `common` that OpenFIGI calls a note, bond, preferred, warrant,
 unit or depositary receipt, and the converse (ours `depositary`,
 `unclassifiable` or `debt` on a class OpenFIGI calls "Common Stock" or
-"REIT"), each named with both types in `rows`. A security whose latest
-observation is `mapped = FALSE` is not named, only counted in `unmapped`;
-a mapped row that agrees is not reported. The rule
+"REIT"), each named with both types in `rows`. Only a security whose
+current listing covers the session is counted, as the ingest maps live
+names alone: a delisted name's last observation does not weigh on the gate
+forever. A security whose latest observation is `mapped = FALSE` is not
+named, only counted in `unmapped`; a mapped row that agrees is not
+reported. The rule
 `figi_types_disagreements` joins `HealthReport.failures` only while
 `openfigi.max_disagreements` is set: the disagreements plus the unmapped
 count over it, or the table holding no observation at `t` (a gate never
@@ -998,15 +1001,16 @@ def _figi_word(text: str, words: tuple[str, ...]) -> bool:
 
 def _figi_is_common(security_type: str, security_type2: str) -> bool | None:
     """Whether an OpenFIGI type names a common equity (`Common Stock`,
-    `REIT`), False for the other instruments the spec names (a note, bond,
-    preferred, warrant, unit or depositary receipt), None when it names
-    neither (module docstring). `securityType2` is read beside
+    `REIT`); False for the other instruments the spec names (a note, bond,
+    preferred, warrant, unit or depositary receipt), even beside a common
+    word, since the instrument is the more specific reading; None when it
+    names neither (module docstring). `securityType2` is read beside
     `securityType`, since the response spells a short form there."""
     text = f"{security_type} {security_type2}".lower()
-    if _figi_word(text, _FIGI_COMMON_WORDS):
-        return True
     if _figi_word(text, _FIGI_OTHER_WORDS):
         return False
+    if _figi_word(text, _FIGI_COMMON_WORDS):
+        return True
     return None
 
 
@@ -1018,19 +1022,22 @@ def figi_types(
     settings = settings if settings is not None else get_settings()
     session = last_completed_session(t)
     current = _current_from(listing_ends_as_of(conn, t, settings), session)
-    return _figi_types_report(conn, t, settings, current, classifications_as_of(conn, t))
+    return _figi_types_report(conn, t, session, settings, current, classifications_as_of(conn, t))
 
 
 def _figi_types_report(
     conn: duckdb.DuckDBPyConnection,
     t: datetime,
+    session: date,
     settings: Settings,
     current: dict[str, dict[str, Any]],
     classes: pl.DataFrame,
 ) -> FigiTypes:
     """`health_report`'s own entry to the block: `current` is its current
     listing per security and `classes` its latest classification per
-    security, already read."""
+    security, already read. As the ingest maps live names alone, only a
+    security whose current listing covers `session` is counted (a delisted
+    name's last observation must not weigh on the gate forever)."""
     max_disagreements = settings.openfigi.max_disagreements
     if "openfigi_types" not in _present_tables(conn):
         return FigiTypes(
@@ -1045,8 +1052,13 @@ def _figi_types_report(
         latest[sid] = (ticker, stype, stype2, bool(mapped), known_at)
     ours_by_sid = {r["security_id"]: r["security_type"] for r in classes.iter_rows(named=True)}
     rows: list[dict[str, Any]] = []
+    observations = 0
     unmapped = 0
     for sid in sorted(latest):
+        listing = current.get(sid)
+        if listing is None or not _covers(listing, session):
+            continue
+        observations += 1
         ticker, figi_type, figi_type2, mapped, known_at = latest[sid]
         if not mapped:
             unmapped += 1
@@ -1058,12 +1070,11 @@ def _figi_types_report(
         )
         if not disagrees:
             continue
-        listing = current.get(sid)
         rows.append(
             {
                 "security_id": sid,
                 "ticker": ticker,
-                "class_title": None if listing is None else listing["class_title"],
+                "class_title": listing["class_title"],
                 "ours": ours,
                 "figi_type": figi_type,
                 "known_at": ensure_tz_aware_utc(known_at, field_name="known_at"),
@@ -1071,7 +1082,7 @@ def _figi_types_report(
         )
     return FigiTypes(
         max_disagreements,
-        len(latest),
+        observations,
         unmapped,
         pl.DataFrame(rows, schema=_FIGI_DISAGREEMENT_SCHEMA),
     )
@@ -1418,7 +1429,7 @@ def health_report(
         filing_events=_filing_events_report(conn, settings, ingests),
         rates=_rates_report(conn, t, settings),
         borrow=_borrow_report(conn, t, session, settings),
-        figi_types=_figi_types_report(conn, t, settings, current, classes),
+        figi_types=_figi_types_report(conn, t, session, settings, current, classes),
         duplicate_dividends=dividends,
         filename_listings=_filename_listings(conn, t, listings),
         integrity=_integrity_checks(conn, t, settings, listings, overlaps, dividends),
