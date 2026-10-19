@@ -491,7 +491,9 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 # they are excluded here rather than read and then filtered out:
 # `borrow_status` (T171, no consumer at all) and `symbol_changes` (T172b,
 # not a store table until that task lands) are written by ingests nothing a
-# registered trial reads. `tests/store/test_registry.py` pins that this list
+# registered trial reads. `openfigi_types` (#1713, T189c) joins them: a
+# check-only table whose one reader is the `health` types block.
+# `tests/store/test_registry.py` pins that this list
 # and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
     "securities",

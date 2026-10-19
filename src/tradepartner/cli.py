@@ -409,6 +409,7 @@ from tradepartner.execution.reconcile import OK as RECONCILE_OK
 from tradepartner.execution.wrapper import CRASH_EXIT_CODE, WRITE_FAILED_EXIT_CODE
 from tradepartner.health import (
     COVERAGE_REFERENCE_NAMES,
+    FIGI_TYPES_DISAGREEMENTS,
     INDEX_MEMBERS_MISSING,
     SESSION_HOLES,
     CoverageReference,
@@ -701,6 +702,19 @@ def _print_borrow(report: HealthReport) -> None:
         typer.echo(f"  warning: {warning}")
 
 
+def _print_figi_types(report: HealthReport) -> None:
+    """The `figi_types` block (#1713, T189c): the named type mismatches, both
+    ways with both types, then the verdict line (its unmapped count)."""
+    block = report.figi_types
+    typer.echo(f"figi types: {block.verdict}")
+    for row in block.rows.iter_rows(named=True):
+        title = "" if row["class_title"] is None else f" ({row['class_title']})"
+        typer.echo(
+            f"  {row['security_id']} {row['ticker']}{title}: "
+            f"ours {row['ours']}, OpenFIGI {row['figi_type']}"
+        )
+
+
 def _print_report(report: HealthReport) -> None:
     echo = typer.echo
     echo(f"health at {report.t.isoformat()} (session {report.session.isoformat()})")
@@ -776,6 +790,7 @@ def _print_report(report: HealthReport) -> None:
         echo(f"  {row['security_id']}@{row['valid_from']} {row['ticker']}/{row['next_ticker']}")
     _print_duplicate_dividends(report)
     _print_borrow(report)
+    _print_figi_types(report)
     echo(f"settings: {report.settings}")
     _print_coverage_reference(report.coverage_reference)
     echo("integrity:")
@@ -784,6 +799,7 @@ def _print_report(report: HealthReport) -> None:
         echo(f"  {check.rule}: {verdict}")
     echo(f"  {COVERAGE_REFERENCE_NAMES}: {_coverage_verdict(report.coverage_reference)}")
     echo(f"  {INDEX_MEMBERS_MISSING}: {_index_verdict(report.coverage_reference)}")
+    echo(f"  {FIGI_TYPES_DISAGREEMENTS}: {report.figi_types.verdict}")
 
 
 def _print_duplicate_dividends(report: HealthReport) -> None:
