@@ -1,0 +1,3 @@
+- The paper planner applies the window's frozen strategy.rebalance_band through the backtest's apply_rebalance_band; a hold window is refused before engine.plan (#1831).
+### Added
+- The paper planner's decisions_from takes band= (the frozen strategy.rebalance_band, applied through backtest.portfolio.apply_rebalance_band) and hold= (the HoldBook resolved through backtest.portfolio.hold_membership); a band of 0 and equal weighting are byte-identical to today's plan rows. planning.py reads the band from the family's own frozen construction section and refuses a weighting = hold window before engine.plan, with no row, until #1832 is decided (#1831).
