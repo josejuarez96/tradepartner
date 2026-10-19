@@ -72,6 +72,10 @@ Closes #69
 """
 
 
+TEMPLATE_BOX = "- [ ] The reviewers `scripts/ready_pr.py` requires ran"
+TICKED_BOX = TEMPLATE_BOX.replace("- [ ]", "- [x]")
+
+
 # ── pure logic ──────────────────────────────────────────────────────────────────
 
 
@@ -407,6 +411,8 @@ class FakeRunner:
         draft: bool = True,
         dirty: bool = False,
         test_sources: dict[str, str] | None = None,
+        review_sha_ancestor: bool = True,
+        since_review_touched: Sequence[str] = (),
     ) -> None:
         self.branch = branch
         self.contains_main = contains_main
@@ -419,6 +425,8 @@ class FakeRunner:
         self.checks_after = list(checks_after)
         self.dirty = dirty
         self.test_sources = dict(test_sources or {})
+        self.review_sha_ancestor = review_sha_ancestor
+        self.since_review_touched = list(since_review_touched)
         self.calls: list[tuple[str, ...]] = []
         self.checks_run: list[tuple[str, ...]] = []
         self.readied: list[int] = []
@@ -426,6 +434,7 @@ class FakeRunner:
         self.events: list[str] = []
         self.labelled: list[tuple[int, str]] = []
         self.unlabelled: list[tuple[int, str]] = []
+        self.edited_bodies: list[tuple[int, str]] = []
 
     def git(self, *args: str) -> str:
         self.calls.append(("git", *args))
@@ -450,6 +459,8 @@ class FakeRunner:
                 return self.main_files[spec.split(":", 1)[1]]
             case ("rev-parse", "HEAD"):
                 return "abc1234def"
+            case ("diff", "--no-renames", "--name-only", _):
+                return "\n".join(self.since_review_touched)
             case ("ls-files", "tests"):
                 return "\n".join([*self.test_sources, "tests/fixtures/a.json"])
             case ("push", *_):
@@ -460,6 +471,8 @@ class FakeRunner:
     def git_ok(self, *args: str) -> bool:
         self.calls.append(("git_ok", *args))
         if args[0] == "merge-base":
+            if args[2] != "origin/main":
+                return self.review_sha_ancestor
             return self.contains_main
         if "merge" in args:
             return self.merge_ok
@@ -483,6 +496,9 @@ class FakeRunner:
 
     def pr(self, number: int) -> ready_pr.Pr:
         return self._pr
+
+    def edit_body(self, number: int, body: str) -> None:
+        self.edited_bodies.append((number, body))
 
     def head_checks(self, number: int) -> ready_pr.HeadChecks:
         self.events.append("wait")
@@ -692,6 +708,199 @@ def test_template_issue_and_reviews_are_enforced() -> None:
         ready_pr.ready(FakeRunner(comments=()), 69, dry_run=True)
     with pytest.raises(ready_pr.ReadyError, match="quant-auditor"):
         ready_pr.ready(FakeRunner(comments=("quant-auditor ran, looks fine",)), 69, dry_run=True)
+
+
+def test_reviewer_box_is_ticked_from_latest_pass_comments_and_only_that_line_changes() -> None:
+    box = "- [ ] The reviewers `scripts/ready_pr.py` requires (`quant-auditor`) ran"
+    body = BODY_OK + box + "\nLeave this text untouched.\n"
+    r = FakeRunner(
+        body=body,
+        touched=["src/tradepartner/adapters/edgar.py", "changelog.d/69-x.md"],
+        comments=(
+            "quant-auditor: FAIL\nreviewed at 1111111111111111",
+            "quant-auditor: PASS\nreviewed at 123456789abcdef0",
+            "safety-reviewer: PASS\nreviewed at abcdef0123456789",
+        ),
+    )
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert r.edited_bodies == [
+        (
+            69,
+            body.replace(
+                box,
+                "- [x] The reviewers `scripts/ready_pr.py` requires (`quant-auditor`) ran; "
+                "quant-auditor: PASS at 12345678; safety-reviewer: PASS at abcdef01",
+            ),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "box",
+    [
+        "- [ ] safety-reviewer SHOULD FIX items fixed and re-run",
+        "- [ ] Owner reviewer sign-off required",
+        "- [ ] code-reviewer agreed",
+    ],
+)
+def test_author_added_reviewer_boxes_are_not_ticked(box: str) -> None:
+    r = FakeRunner(
+        body=BODY_OK + box + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+    )
+    with pytest.raises(ready_pr.ReadyError, match="PR body still has unticked boxes"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+def test_two_template_reviewer_lines_are_not_ticked() -> None:
+    r = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n" + TEMPLATE_BOX + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+    )
+    with pytest.raises(ready_pr.ReadyError, match="PR body still has unticked boxes"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+def test_template_line_quoted_in_a_code_fence_is_left_alone() -> None:
+    body = BODY_OK + "```\n" + TEMPLATE_BOX + "\n```\n" + TEMPLATE_BOX + "\n"
+    r = FakeRunner(body=body, comments=("quant-auditor: PASS\nreviewed at abc1234def",))
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert r.edited_bodies == [
+        (
+            69,
+            BODY_OK
+            + "```\n"
+            + TEMPLATE_BOX
+            + "\n```\n"
+            + TEMPLATE_BOX.replace("- [ ]", "- [x]")
+            + "; quant-auditor: PASS at abc1234d\n",
+        )
+    ]
+
+
+def test_main_merged_after_review_does_not_make_the_review_stale() -> None:
+    """Paths main brought in since the review are not the PR's own changes."""
+    r = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        touched=["src/tradepartner/store/asof.py", "changelog.d/69-x.md"],
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+        since_review_touched=["src/tradepartner/backtest/engine.py"],
+    )
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert len(r.edited_bodies) == 1
+
+
+def test_another_unticked_box_still_refuses_without_editing() -> None:
+    r = FakeRunner(body=BODY_OK + f"{TEMPLATE_BOX}\n- [ ] Update reviewer docs\n")
+    with pytest.raises(ready_pr.ReadyError, match="PR body still has unticked boxes"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+@pytest.mark.parametrize(
+    "comments", [(), ("quant-auditor: FAIL",), ("quant-auditor: PASS", "quant-auditor: FAIL")]
+)
+def test_reviewer_box_with_missing_or_failed_review_refuses_with_reviews_message(
+    comments: tuple[str, ...],
+) -> None:
+    r = FakeRunner(body=BODY_OK + TEMPLATE_BOX + "\n", comments=comments)
+    with pytest.raises(ready_pr.ReadyError, match="run these reviews"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+def test_reviewer_box_with_no_required_reviews_is_ticked_as_na() -> None:
+    body = BODY_OK + TEMPLATE_BOX + "\n"
+    r = FakeRunner(body=body, touched=["docs/x.md", "changelog.d/69-x.md"], comments=())
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert r.edited_bodies == [
+        (69, body.replace(TEMPLATE_BOX, TICKED_BOX + "; n/a, none required"))
+    ]
+
+
+def test_dry_run_prints_reviewer_box_change_without_writing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    r = FakeRunner(
+        body=BODY_OK + TEMPLATE_BOX + "\n",
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+    )
+    assert ready_pr.ready(r, 69, dry_run=True) == 0
+    assert TICKED_BOX + "; quant-auditor: PASS at abc1234d" in capsys.readouterr().out
+    assert r.edited_bodies == []
+
+
+def test_reviewer_box_needs_the_reviewed_sha_to_annotate_pass() -> None:
+    r = FakeRunner(body=BODY_OK + TEMPLATE_BOX + "\n")
+    with pytest.raises(ready_pr.ReadyError, match="reviewed at"):
+        ready_pr.ready(r, 69, dry_run=True)
+    assert r.edited_bodies == []
+
+
+def test_stale_or_foreign_review_sha_does_not_tick_the_box() -> None:
+    body = BODY_OK + TEMPLATE_BOX + "\n"
+    comment = ("quant-auditor: PASS\nreviewed at abc1234def",)
+    for r in (
+        FakeRunner(body=body, comments=comment, review_sha_ancestor=False),
+        FakeRunner(
+            body=body,
+            comments=comment,
+            since_review_touched=["src/tradepartner/store/asof.py"],
+        ),
+    ):
+        with pytest.raises(ready_pr.ReadyError, match="review no longer covers"):
+            ready_pr.ready(r, 69, dry_run=True)
+        assert r.edited_bodies == []
+
+
+def test_review_sha_ancestor_with_only_unrelated_changes_can_tick() -> None:
+    body = BODY_OK + TEMPLATE_BOX + "\n"
+    r = FakeRunner(
+        body=body,
+        comments=("quant-auditor: PASS\nreviewed at abc1234def",),
+        since_review_touched=["docs/x.md"],
+    )
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert r.edited_bodies == [
+        (
+            69,
+            body.replace(TEMPLATE_BOX, TICKED_BOX + "; quant-auditor: PASS at abc1234d"),
+        )
+    ]
+
+
+def test_reviewer_box_preserves_crlf_line_endings() -> None:
+    body = BODY_OK.replace("\n", "\r\n") + TEMPLATE_BOX + "\r\nNext line\r\n"
+    r = FakeRunner(body=body, comments=("quant-auditor: PASS\nreviewed at abc1234def",))
+    assert ready_pr.ready(r, 69, wait=False) == 0
+    assert r.edited_bodies == [
+        (
+            69,
+            body.replace(
+                TEMPLATE_BOX + "\r\n", TICKED_BOX + "; quant-auditor: PASS at abc1234d\r\n"
+            ),
+        )
+    ]
+
+
+def test_body_changed_during_checks_is_not_overwritten() -> None:
+    body = BODY_OK + TEMPLATE_BOX + "\n"
+    r = FakeRunner(body=body, comments=("quant-auditor: PASS\nreviewed at abc1234def",))
+    original_check = r.run_check
+
+    def check_and_edit(cmd: Sequence[str]) -> bool:
+        if r._pr.body == body:
+            r._pr = ready_pr.Pr(
+                69, "feat/69-x", "main", True, body + "external edit\n", r._pr.comments
+            )
+        return original_check(cmd)
+
+    r.run_check = check_and_edit
+    with pytest.raises(ready_pr.ReadyError, match="PR body changed during checks"):
+        ready_pr.ready(r, 69, wait=False)
+    assert r.edited_bodies == []
 
 
 def test_redact_strips_credentials_from_urls() -> None:

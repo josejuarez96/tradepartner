@@ -76,6 +76,9 @@ def apply_trades(
     fill_price: FillPrice,
     per_side_bps: float,
     commissions: Commissions,
+    spread_bps: float = 0.0,
+    impact_coeff: float = 0.0,
+    adv: Mapping[str, float] = {},
 ) -> FillResult:
     """Trade `positions` (dollar values at the fill price) and `cash` towards `targets`.
 
@@ -88,6 +91,10 @@ def apply_trades(
     cash is checked once all sells are done. Names whose trade is exactly zero are not
     orders. Raises `ValueError` for negative cash or positions, negative targets, or a
     traded name with a bar in the marking frame but none in `raw_frame`.
+
+    `spread_bps` and `impact_coeff` are threaded to every `trade_cost` /
+    `buy_notional_after_costs` call. A non-zero `impact_coeff` requires an ADV entry for
+    every traded name; a name without one raises `ValueError` naming it.
     """
     if not (math.isfinite(cash) and cash >= 0):
         raise ValueError(f"cash must be non-negative and finite, got {cash}")
@@ -108,8 +115,22 @@ def apply_trades(
             raise ValueError(f"{sid} has a bar on {fill_session.isoformat()} but no raw bar")
         return prices[sid], raw_prices[sid]
 
+    def _cost(sid: str, notional: float, price: tuple[float, float]) -> float:
+        sid_adv = adv.get(sid)
+        if impact_coeff != 0.0 and (sid_adv is None or sid_adv <= 0):
+            raise ValueError(f"{sid} has no ADV under a non-zero impact_coeff")
+        return trade_cost(
+            abs(notional),
+            abs(notional) / price[1],
+            per_side_bps,
+            commissions,
+            spread_bps=spread_bps,
+            impact_coeff=impact_coeff,
+            adv=sid_adv,
+        )
+
     def trade(sid: str, notional: float, price: tuple[float, float]) -> float:
-        cost = trade_cost(abs(notional), abs(notional) / price[1], per_side_bps, commissions)
+        cost = _cost(sid, notional, price)
         trades.append(Trade(sid, notional, cost, price[0], price[1]))
         return cost
 
@@ -129,7 +150,7 @@ def apply_trades(
             missing.append(sid)
             continue
         notional = min(-deltas[sid], held[sid])
-        cost = trade_cost(notional, notional / price[1], per_side_bps, commissions)
+        cost = _cost(sid, notional, price)
         if sid in targets and cost >= notional:
             continue  # a trim that costs at least what it raises is not an order
         trades.append(Trade(sid, -notional, cost, price[0], price[1]))
@@ -145,13 +166,19 @@ def apply_trades(
         if price is None:
             missing.append(sid)
             continue
+        sid_adv = adv.get(sid)
+        if impact_coeff != 0.0 and (sid_adv is None or sid_adv <= 0):
+            raise ValueError(f"{sid} has no ADV under a non-zero impact_coeff")
         notional = buy_notional_after_costs(
-            min(deltas[sid], cash), per_side_bps, commissions, price=price[1]
+            min(deltas[sid], cash),
+            per_side_bps,
+            commissions,
+            price=price[1],
+            spread_bps=spread_bps,
+            impact_coeff=impact_coeff,
+            adv=sid_adv,
         )
-        if (
-            notional <= 0
-            or trade_cost(notional, notional / price[1], per_side_bps, commissions) >= notional
-        ):
+        if notional <= 0 or _cost(sid, notional, price) >= notional:
             continue  # a buy that costs at least its notional is not an order
         cost = trade(sid, notional, price)
         cash = cash - notional - cost

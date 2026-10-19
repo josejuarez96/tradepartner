@@ -76,6 +76,14 @@ FROZEN_KEY_DEFAULTS: Final[tuple[tuple[str, Any, int], ...]] = (
     ("strategy.signal_delay_sessions", 0, 29),
     ("strategy.placebo", "none", 29),
     ("strategy.placebo_seed", 0, 29),
+    # T210: the pure cost terms (backtest spec amendment #1792). `spread_bps` and
+    # `impact_coeff` are fingerprint keys that may rise above a family's rules; `adv_sessions`
+    # must equal the rules' value. All three are post-registration cost keys: not required of
+    # a file or fixed block, frozen at their table default when absent, never from live
+    # Settings, and outside the promotion identity.
+    ("costs.spread_bps", 0.0, 29),
+    ("costs.impact_coeff", 0.0, 29),
+    ("costs.adv_sessions", 20, 29),
 )
 
 #: Keys added to a family's own listed section **after** that family's first
@@ -95,6 +103,29 @@ POST_REGISTRATION_OWN_KEYS: Final[frozenset[str]] = frozenset(
         "strategy.signal_delay_sessions",
         "strategy.placebo",
         "strategy.placebo_seed",
+    }
+)
+
+#: T210's three post-registration `costs.*` keys (backtest spec amendment #1792): not
+#: required of a file or a fixed block; frozen at their `FROZEN_KEY_DEFAULTS` default when
+#: absent; never from live `Settings`; outside the promotion identity. Disjoint from
+#: `POST_REGISTRATION_OWN_KEYS` and from `LAB_BASELINE_FROZEN_KEYS`.
+POST_REGISTRATION_COST_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "costs.spread_bps",
+        "costs.impact_coeff",
+        "costs.adv_sessions",
+    }
+)
+
+#: `costs.*` keys a ruled family's file may set higher than its rules' value (a cost
+#: assumption may only get harsher), as `costs.per_side_bps` may; `adv_sessions` is not
+#: one: it must equal the rules' value.
+HIGHER_ALLOWED_COST_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "costs.per_side_bps",
+        "costs.spread_bps",
+        "costs.impact_coeff",
     }
 )
 
@@ -163,6 +194,9 @@ FAMILY_SIGNAL_SECTIONS: Final[dict[HypothesisFamily, str]] = dict(_CONFIG_FAMILY
 _FINGERPRINT_KEYS: Final = (
     "execution.fill_price",
     "costs.per_side_bps",
+    "costs.spread_bps",
+    "costs.impact_coeff",
+    "costs.adv_sessions",
     "holdout.start",
     "holdout.end",
 )
@@ -247,6 +281,17 @@ def is_default(value: Any, default: Any) -> bool:
     Every comparison of a frozen value with its table default goes through this.
     Raises `ValueError` on a NaN or infinite value, as the fingerprint does."""
     return _canonical_json(value) == _canonical_json(default)
+
+
+def _cost_key_allows(key: str, value: Any, default: Any) -> bool:
+    """Whether a `costs.*` key at `value` is allowed when the family rules do not fix it:
+    `per_side_bps`, `spread_bps` and `impact_coeff` may rise above their table default
+    (a cost assumption may only get harsher); `adv_sessions` must equal its default."""
+    if key in HIGHER_ALLOWED_COST_KEYS:
+        return isinstance(value, int | float) and not isinstance(value, bool) and value >= default
+    if key == "costs.adv_sessions":
+        return is_default(value, default)
+    return is_default(value, default)
 
 
 def _canonical_json(value: Any) -> str:

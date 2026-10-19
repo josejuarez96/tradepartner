@@ -332,6 +332,8 @@ RISK_FREE_KEYS = (
 )
 #: T209a's three post-registration own-section keys (backtest spec amendment #1731).
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
+#: T210's three post-registration `costs.*` keys (backtest spec amendment #1792).
+COST_KEYS = ("costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions")
 #: T217's three post-registration own-section keys (backtest spec amendment #1820).
 SHOCK_KEYS = ("strategy.signal_delay_sessions", "strategy.placebo", "strategy.placebo_seed")
 COMBINED_LATER_KEYS = (
@@ -339,6 +341,7 @@ COMBINED_LATER_KEYS = (
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
     "universe.rank_by",
+    *COST_KEYS,
     *SHOCK_KEYS,
 )
 
@@ -380,6 +383,7 @@ LATER_KEYS = (
     *RISK_FREE_KEYS,
     *HOLD_KEYS,
     "universe.rank_by",
+    *COST_KEYS,
     *SHOCK_KEYS,
 )
 
@@ -579,7 +583,7 @@ def test_b3_fingerprint_canonical_set_and_hash_are_pinned(
     parsed = hypothesis.parse_file(path)
     params = hypothesis.frozen_params(parsed, _defaults_settings())
     assert (
-        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by")))
+        registry.params_sha256(_before(params, (*RISK_FREE_KEYS, "universe.rank_by", *COST_KEYS)))
         == params_sha256
     )
     assert frozen.fingerprint(parsed.family, params, parsed.in_sample_start) == fingerprint
@@ -781,7 +785,7 @@ SHOCK_ENTRIES = (
 def test_shock_entries_are_last_and_pinned_by_value() -> None:
     """Appended in landing order (#1792) at their defaults, at schema version 29; the
     last-entry pin is these three's until a later entry lands and re-pins it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-3:], SHOCK_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[20:23], SHOCK_ENTRIES)
     keys = [key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS]
     assert keys.index(SHOCK_KEYS[0]) > keys.index(RANK_BY_KEY)
     assert set(SHOCK_KEYS) <= set(hypothesis.frozen_keys())
@@ -872,3 +876,125 @@ def test_a_non_default_shock_enters_the_canonical_set_and_the_fingerprint(
         )
     twin = {**_new_params(settings), key: value}
     assert frozen.fingerprint("momentum", twin, start) != TWIN_FINGERPRINT
+
+
+# --- the cost terms (backtest spec amendment #1792, T210) ----------------------------
+
+COST_ENTRIES = (
+    ("costs.spread_bps", 0.0, 29),
+    ("costs.impact_coeff", 0.0, 29),
+    ("costs.adv_sessions", 20, 29),
+)
+
+
+def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
+    """Appended after `universe.rank_by` (the table is append-only and
+    `frozen_hash_matches` drops only a suffix), at schema version 29: T202a
+    (#1818) takes 29 and lands first."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:], COST_ENTRIES)
+
+
+def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
+    """Append-only, beside `POST_REGISTRATION_OWN_KEYS` and disjoint from it."""
+    assert frozenset(COST_KEYS) == frozen.POST_REGISTRATION_COST_KEYS
+    table = {key for key, _default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    for key in frozen.POST_REGISTRATION_COST_KEYS:
+        assert key in table
+        assert key.partition(".")[0] == "costs"
+    assert not frozen.POST_REGISTRATION_COST_KEYS & frozen.POST_REGISTRATION_OWN_KEYS
+    assert not frozen.POST_REGISTRATION_COST_KEYS & frozen.LAB_BASELINE_FROZEN_KEYS
+
+
+def test_higher_allowed_cost_keys_pinned() -> None:
+    """The keys a ruled family's file may set higher than its rules' (a cost assumption
+    may only get harsher); `adv_sessions` is not one."""
+    assert (
+        frozenset({"costs.per_side_bps", "costs.spread_bps", "costs.impact_coeff"})
+        == frozen.HIGHER_ALLOWED_COST_KEYS
+    )
+
+
+def test_cost_terms_are_fingerprint_keys_beside_the_base_cost() -> None:
+    assert {"costs.per_side_bps", *COST_KEYS} <= set(frozen._FINGERPRINT_KEYS)
+    assert "costs" not in frozen._FINGERPRINT_SECTIONS
+
+
+def test_cost_terms_at_their_defaults_move_no_fingerprint_and_no_canonical_set() -> None:
+    """H1's twin, the profitability and combined twins: the three keys are stored at
+    their defaults and left out of the canonical set (`costs` is no family's own
+    section), so a set stored with them reads as one stored before them."""
+    settings = _defaults_settings()
+    for family, params in (
+        ("momentum", _new_params(settings)),
+        ("oracle", _new_params(settings)),
+        ("profitability", _prof_params(settings)),
+        ("combined", _combined_params(settings)),
+    ):
+        start = date(2017, 1, 31)
+        assert (
+            params["costs.spread_bps"],
+            params["costs.impact_coeff"],
+            params["costs.adv_sessions"],
+        ) == (0.0, 0.0, 20), family
+        without = _before(params, COST_KEYS)
+        assert frozen.fingerprint(family, params, start) == frozen.fingerprint(
+            family, without, start
+        )
+        canonical = frozen.canonical_frozen_set(params, family)
+        assert canonical == frozen.canonical_frozen_set(without, family)
+        assert not set(COST_KEYS) & set(canonical)
+    assert frozen.fingerprint("momentum", _new_params(settings), date(2017, 1, 31)) == (
+        TWIN_FINGERPRINT
+    )
+
+
+def _twin_costs(tmp_path: Path, lines: str) -> Path:
+    """The momentum fixture with `lines` added to its `[costs]` table."""
+    text = FIXTURE.read_text()
+    old = "per_side_bps = 15.0\n"
+    assert old in text
+    path = tmp_path / FIXTURE.name
+    path.write_text(text.replace(old, f"{old}{lines}\n", 1))
+    return path
+
+
+def test_a_file_naming_the_three_defaults_is_the_twin(tmp_path: Path) -> None:
+    from tradepartner.store import registry
+
+    settings = _defaults_settings()
+    twin = _new_params(settings)
+    explicit = hypothesis.frozen_params(
+        hypothesis.parse_file(
+            _twin_costs(tmp_path, "spread_bps = 0.0\nimpact_coeff = 0.0\nadv_sessions = 20")
+        ),
+        settings,
+    )
+    assert explicit == twin
+    assert registry.params_sha256(explicit) == registry.params_sha256(twin)
+    assert frozen.fingerprint("momentum", explicit, date(2017, 1, 31)) == TWIN_FINGERPRINT
+    assert frozen.canonical_frozen_set(explicit, "momentum") == frozen.canonical_frozen_set(
+        twin, "momentum"
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "key", "value"),
+    [
+        ("spread_bps = 5.0", "costs.spread_bps", 5.0),
+        ("impact_coeff = 0.1", "costs.impact_coeff", 0.1),
+        ("adv_sessions = 10", "costs.adv_sessions", 10),
+    ],
+)
+def test_a_file_naming_a_term_is_a_new_fingerprint(
+    tmp_path: Path, line: str, key: str, value: float
+) -> None:
+    """A survivor re-tested under a term is a new fingerprint (the lab registers a
+    fingerprint at most once), its canonical set the twin's plus that one key."""
+    settings = _defaults_settings()
+    twin_canonical = frozen.canonical_frozen_set(_new_params(settings), "momentum")
+    params = hypothesis.frozen_params(hypothesis.parse_file(_twin_costs(tmp_path, line)), settings)
+    assert params[key] == value
+    assert frozen.fingerprint("momentum", params, date(2017, 1, 31)) != TWIN_FINGERPRINT
+    canonical = frozen.canonical_frozen_set(params, "momentum")
+    assert canonical == {**twin_canonical, key: value}
