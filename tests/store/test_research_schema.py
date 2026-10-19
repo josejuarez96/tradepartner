@@ -83,6 +83,21 @@ def _v11_journal_ddl() -> str:
         "CHECK (reason IS NULL OR reason IN ('halt', 'not_received', 'owner_settled_unknown'))",
         1,
     )
+    # T228 (#1879) appended the short kinds and reasons to `decisions`; restore the v11
+    # sets (the two event reason sets are restored above)
+    blob = blob.replace(
+        schema._check("decisions", "decision"),
+        "CHECK (decision IN ('trade', 'skip_below_minimum', 'skip_untradable', "
+        "'skip_below_one_share', 'skip_delisted', 'skip_zero', 'dust', 'override', "
+        "'forced_exit'))",
+        1,
+    )
+    blob = blob.replace(
+        schema._check("decisions", "reason"),
+        "CHECK (reason IS NULL OR reason IN ('left_targets', 'left_universe', "
+        "'exclude_name', 'keep_name', 'delisted', 'untargeted_receipt', 'window_stop'))",
+        1,
+    )
     # version 32 appended `pending_unresolved` to the order status set (T202b)
     old_statuses = ", ".join(f"'{s}'" for s in schema.JOURNAL_ENUMS["order_events", "status"][:-1])
     blob = blob.replace(
