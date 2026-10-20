@@ -25,8 +25,8 @@ def base_value(series: Series, base_session: date) -> float:
 
 
 def _check_base(base: float) -> None:
-    if base == 0:
-        raise ValueError("base value must be non-zero")
+    if not base > 0:  # also rejects NaN
+        raise ValueError("base value must be positive")
 
 
 def rebase(series: Series, base: float) -> Rows:
@@ -59,11 +59,13 @@ def excess_over_benchmark(
 ) -> Rows:
     """`100 * (P_t/P_B - S_t/S_B)` in percentage points at each paper session.
 
-    The base session B is the first paper session unless the bases are given.
+    The base is the first paper session unless both bases are given.
     The benchmark is read only at the paper series' sessions (extra benchmark
     sessions are ignored); a paper session with no benchmark value raises
     `ValueError` naming it.
     """
+    if (paper_base is None) != (benchmark_base is None):
+        raise ValueError("give both bases or neither: one explicit base skews the excess")
     if not paper:
         return []
     ordered = sorted(paper)

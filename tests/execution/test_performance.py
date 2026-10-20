@@ -39,7 +39,7 @@ def test_rebase_sorts_by_session() -> None:
 
 
 def test_rebase_zero_base_raises() -> None:
-    with pytest.raises(ValueError, match="base"):
+    with pytest.raises(ValueError, match="positive"):
         perf.rebase(PAPER, 0.0)
 
 
@@ -107,3 +107,16 @@ def test_empty_series_returns_empty_never_raises() -> None:
     assert perf.cumulative_return_pct({}) is None
     assert perf.excess_over_benchmark({}, SPY) == []
     assert perf.excess_over_benchmark({}, {}) == []
+
+
+def test_one_explicit_base_alone_raises() -> None:
+    with pytest.raises(ValueError, match="both bases"):
+        perf.excess_over_benchmark(PAPER, SPY, paper_base=99_000.0)
+    with pytest.raises(ValueError, match="both bases"):
+        perf.excess_over_benchmark(PAPER, SPY, benchmark_base=5_000.0)
+
+
+def test_nan_and_negative_base_raise() -> None:
+    for bad in (float("nan"), -1.0):
+        with pytest.raises(ValueError, match="positive"):
+            perf.rebase(PAPER, bad)
