@@ -334,6 +334,26 @@ def test_a_reverse_split_with_cash_in_lieu_disposes_of_the_fraction() -> None:
     assert flags == []
 
 
+def test_cash_in_lieu_leaves_whole_shares_so_nothing_is_stranded() -> None:
+    """The positions ledger's rule (#1627): cash in lieu rounds the name's exact
+    holding down to whole shares, never subtracting the float remainder (which
+    leaves a sub-ulp share). After the reverse split, the cash in lieu and the
+    2-share sale above, no long lot is open, so a short sale of SEC_X on 03-13
+    opens a short lot instead of raising "never long and short at once"."""
+    book = Book()
+    book.trade("buy", 7, 10.0, D0303)
+    book.adjust("cash_in_lieu", D0307, "SEC_X", quantity=-1 / 3, cash=10.5)
+    book.trade("sell", 2, 33.0, D0312)
+    book.trade("sell", 1, 30.0, D0313, position_side=SHORT)
+
+    lot_list, _, _ = book.run(D0313, _splits(("SEC_X", D0307, 1 / 3)))
+
+    assert [(lot.position_side, lot.quantity) for lot in lot_list] == [
+        (LONG, pytest.approx(7 / 3)),
+        (SHORT, 1.0),
+    ]
+
+
 def test_the_wash_sale_window_and_holding_dates_carry_across_a_split() -> None:
     """A loss after a 2:1 split is matched to a pre-split purchase in post-split
     shares. Hand values:
@@ -441,11 +461,32 @@ def test_a_spinoff_child_named_without_terms_is_a_zero_basis_lot() -> None:
     assert (child.symbol, child.quantity, child.cost_basis) == ("KID", 5.0, 0.0)
     assert (child.trade_date_local, child.fill_id, child.position_side) == (D0307, None, LONG)
     assert (child.account_id, child.book_id) == (ACCOUNT.account_id, "main")
+    assert child.client_order_id not in {order.client_order_id for order in book.orders}
     assert child.trade_at.tzinfo is not None
     assert [
         (d.lot_id, d.quantity, d.proceeds, d.realised_pnl, d.client_order_id) for d in disposals
     ] == [(child.lot_id, 5.0, 40.0, 40.0, sale)]
     assert flags == []
+
+
+def test_a_spinoff_receipt_with_no_explanation_is_a_zero_basis_lot() -> None:
+    """`paper start` journals a carried parent's spin-off with no
+    `explanation_json` at all (`window.py`): the child lot is zero-basis, as
+    with today's reconcile text, and nothing raises."""
+    book = Book()
+    book.trade("buy", 10, 100.0, D0303, security_id="SEC_P")
+    book.adjust("spinoff_receipt", D0307, "SEC_C", quantity=5.0)
+    book.trade("sell", 5, 8.0, D0312, security_id="SEC_C")
+
+    lot_list, disposals, _ = book.run(D0312)
+
+    [parent] = _of("SEC_P", lot_list)
+    [child] = _of("SEC_C", lot_list)
+    assert (parent.cost_basis, child.quantity, child.cost_basis) == (1000.0, 5.0, 0.0)
+    assert child.trade_date_local == D0307
+    assert [(d.lot_id, d.proceeds, d.realised_pnl) for d in disposals] == [
+        (child.lot_id, 40.0, 40.0)
+    ]
 
 
 def test_a_spinoff_receipt_after_through_opens_no_lot() -> None:
@@ -579,6 +620,27 @@ def test_a_carried_residue_is_a_zero_basis_lot_and_never_a_replacement() -> None
     assert flags == []
 
 
+def test_a_carried_residue_is_dated_on_its_session_and_split_adjusted_from_it() -> None:
+    """`paper start` journals a residue at the previous window's stop session
+    (`window.py`), not the new window's start, and the positions ledger
+    split-adjusts it from that session. Hand values:
+
+      03-03 carried_residue 3 (the previous stop session)   lot: 3 shares, basis 0
+      03-05 2:1 split                                        the lot is 6 shares
+      03-10 sell 6 @ 20                                      proceeds 120, pnl +120
+    """
+    book = Book()
+    book.adjust("carried_residue", D0303, "SEC_X", quantity=3.0)
+    book.trade("sell", 6, 20.0, D0310)
+
+    lot_list, disposals, _ = book.run(D0310, _splits(("SEC_X", D0305, 2.0)))
+
+    assert [(lot.quantity, lot.cost_basis, lot.trade_date_local) for lot in lot_list] == [
+        (6.0, 0.0, D0303)
+    ]
+    assert [(d.quantity, d.proceeds, d.realised_pnl) for d in disposals] == [(6.0, 120.0, 120.0)]
+
+
 def test_corporate_action_cash_closes_the_open_lots_fifo_at_the_journaled_cash() -> None:
     """An ended listing removes 10 shares for 420. Hand values:
 
@@ -604,6 +666,8 @@ def test_corporate_action_cash_closes_the_open_lots_fifo_at_the_journaled_cash()
     assert [d.proceeds for d in disposals] == pytest.approx([252.0, 168.0])
     assert [d.realised_pnl for d in disposals] == pytest.approx([-48.0, -52.0])
     assert all(d.fill_id is None for d in disposals)
+    orders = {order.client_order_id for order in book.orders}
+    assert all(d.client_order_id not in orders for d in disposals)
     assert flags == []
 
 
@@ -618,7 +682,7 @@ def test_a_split_on_an_open_short_lot_raises() -> None:
     book = Book()
     _short_open(book)
 
-    with pytest.raises(LotLedgerError, match="short"):
+    with pytest.raises(LotLedgerError, match="short lot"):
         book.run(D0310, _splits(("SEC_X", D0307, 2.0)))
 
 
@@ -628,14 +692,48 @@ def test_a_split_on_an_open_short_lot_raises() -> None:
     [
         ("corporate_action_cash", 10.0, -500.0),
         ("cash_in_lieu", 0.5, -25.0),
+        ("spinoff_receipt", -5.0, None),
+        ("carried_residue", -3.0, None),
     ],
 )
-def test_an_adjustment_on_an_open_short_lot_raises(kind: str, quantity: float, cash: float) -> None:
+def test_an_adjustment_on_an_open_short_lot_raises(
+    kind: str, quantity: float, cash: float | None
+) -> None:
     book = Book()
     _short_open(book)
     book.adjust(kind, D0307, "SEC_X", quantity=quantity, cash=cash)
 
-    with pytest.raises(LotLedgerError, match="short"):
+    with pytest.raises(LotLedgerError, match="short lot"):
+        book.run(D0310)
+
+
+@pytest.mark.parametrize("kind", ["spinoff_receipt", "carried_residue"])
+def test_a_negative_receipt_or_residue_raises_with_no_short_held(kind: str) -> None:
+    """A negative `spinoff_receipt` or `carried_residue` is a short's receipt
+    or a carried short: it raises even when no short lot is open yet."""
+    book = Book()
+    book.adjust(kind, D0307, "SEC_C", quantity=-5.0)
+
+    with pytest.raises(LotLedgerError, match="short lot"):
+        book.run(D0310)
+
+
+def test_a_spinoff_whose_named_parent_is_held_short_raises() -> None:
+    book = Book()
+    _short_open(book, "SEC_P")
+    book.adjust(
+        "spinoff_receipt",
+        D0307,
+        "SEC_C",
+        quantity=5.0,
+        explanation={
+            **_RECONCILE_EXPLANATION,
+            "parent_security_id": "SEC_P",
+            "basis_allocation": 0.2,
+        },
+    )
+
+    with pytest.raises(LotLedgerError, match="short lot"):
         book.run(D0310)
 
 
@@ -646,7 +744,7 @@ def test_a_stock_merger_of_an_open_short_lot_raises() -> None:
     # shares short in (-5).
     _merge(book, D0307, -10.0, -5.0)
 
-    with pytest.raises(LotLedgerError, match="short"):
+    with pytest.raises(LotLedgerError, match="short lot"):
         book.run(D0310)
 
 
