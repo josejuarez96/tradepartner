@@ -569,6 +569,15 @@ def test_a_short_to_long_flips_buy_waits_for_its_cover_to_fill() -> None:
         sells=sells,
     )
     assert (in_flight.orders, in_flight.skips, in_flight.deferred) == ((), (), ())
+    # The cover in flight from an earlier run: this run's sell phase had nothing
+    # to attempt, and the long buy still waits (no order, no skip, not deferred).
+    earlier = _buys(
+        [cover, buy],
+        10_000.0,
+        states={1: DecisionState(State.IN_FLIGHT), 2: buy_state},
+        sells=PhaseOrders((), ()),
+    )
+    assert (earlier.orders, earlier.skips, earlier.deferred) == ((), (), ())
     settled = DecisionState(State.SETTLED, remainder=Remainder(quantity=0.0, notional=0.0))
     filled = _buys([cover, buy], 10_000.0, states={1: settled, 2: buy_state}, sells=sells)
     assert _rows(filled) == [(2, "SEC_G", "buy", LONG, None, 500.0)]
