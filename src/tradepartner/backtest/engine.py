@@ -61,6 +61,22 @@ book grows by the session's `rf(s)` accrual (`riskfree`, over the frame read onc
 data cutoff, before the first step) at every session after T_0: cash held to the fill
 accrues through F_i before the trade, exit proceeds from the session after theirs.
 
+**The signed book** (spec amendment #1872, items 4 to 6; `portfolio.side = "long_short"`,
+plan T222): the same loop carries signed dollar values. Under `long_short` `_step` marks
+the positions with `value_positions(signed=True)`, trades with `apply_trades(signed=True)`
+(the long buys capped by free cash, cash minus the short magnitudes), and keeps a
+zero-excluded position set, so a short is a negative value; a short holding is recorded
+in `held_on` too, so the dividend counts see it. At every session after the plan's read the
+book pays the borrow fee (`costs.borrow_bps_per_year`, calendar days over a 360-day year,
+on the previous close's short values, the carry window from the plan to the fill
+included) and, under `cash_rate = "store"`, accrues `rf(s)` on free cash only (the short
+proceeds earn nothing). A session whose equity is not positive raises `ValueError` naming
+the session (a `failed` trial), never a silent ruin. `_exits`
+covers a delisted short at its last close and a stale one at its last bar's close like a
+long, and its cost is a magnitude, so the sign only decides which way cash moves. Under
+`long_only` (`side` at its default) no new branch is taken and every pinned run is
+byte-identical.
+
 **Read groups** (strategy-lab spec req 2, plan T105): `run_many` runs several
 variants that differ only in keys that change the computation, not the reads, in
 lockstep from one read set per step: each step's marking reads are made once for the
@@ -94,6 +110,7 @@ from tradepartner.backtest import placebo
 from tradepartner.backtest.costs import (
     Commissions,
     adv_by_security,
+    borrow_fee,
     buy_notional_after_costs,
     trade_cost,
 )
@@ -500,17 +517,44 @@ def _exits(
         raw_close = _last_close(raw, sid, session)
         if raw_close is None:
             raise ValueError(f"{sid} has no raw bar at or before {session.isoformat()} to exit at")
+        # A trade's cost is a magnitude: a short's value is negative, and its cover pays
+        # the same model as a long's sale (spec amendment #1872, item 7). `abs` is the
+        # identity on the positive value a `long_only` book carries.
+        notional = abs(value)
         cost = trade_cost(
-            value,
-            value / raw_close,
+            notional,
+            notional / raw_close,
             book.level,
             commissions,
             spread_bps=params.costs.spread_bps,
             impact_coeff=params.costs.impact_coeff,
             adv=adv.get(sid),
         )
-        exits.append(_Exit(sid, session, value, min(cost, value), stale))
+        exits.append(_Exit(sid, session, value, min(cost, notional), stale))
     return exits
+
+
+def _short_value(positions: Mapping[str, float]) -> float:
+    """The absolute dollar value of the short positions (Σ |v| over v < 0), 0 when none."""
+    return math.fsum(-value for value in positions.values() if value < 0)
+
+
+def _shorts(positions: Mapping[str, float]) -> dict[str, float]:
+    """The short positions (negative values) of a signed book, keyed by security."""
+    return {sid: value for sid, value in positions.items() if value < 0}
+
+
+def _shorts_by_session(values: pl.DataFrame) -> dict[date, dict[str, float]]:
+    """Each session's short positions (negative values), keyed by security.
+
+    A signed book's borrow fee and free-cash accrual read the short values at the
+    previous session's close (spec amendment #1872, item 6), so they are grouped once
+    over the step's post-exit marking frame."""
+    out: dict[date, dict[str, float]] = {}
+    for session, sid, value in values.select("session", "security_id", "value").iter_rows():
+        if value < 0:
+            out.setdefault(session, {})[sid] = value
+    return out
 
 
 def _last_close(raw: pl.DataFrame, sid: str, session: date) -> float | None:
@@ -661,13 +705,17 @@ def _fill_to_targets(
     book: _Book,
     params: Settings,
     adv: Mapping[str, float],
+    *,
+    signed: bool = False,
 ) -> FillResult:
     """`apply_trades` towards `targets`, leaving the `aside` names untouched.
 
     Without any, exactly the plain call. With some, only the other positions are traded
     and their targets are rescaled from the whole equity to the part `apply_trades` sees
     (`aside` excluded), so the orders are the same ones the whole book would place, the
-    turnover is over the whole equity, and the set-aside positions come back unchanged."""
+    turnover is over the whole equity, and the set-aside positions come back unchanged.
+    `signed` selects `apply_trades(signed=True)` for a `long_short` book (a signed book
+    is refused a band and `hold` weighting, so its `aside` is always empty)."""
     fill_price = params.execution.fill_price
     commissions = Commissions.from_config(params.costs)
     if not aside:
@@ -684,6 +732,7 @@ def _fill_to_targets(
             spread_bps=params.costs.spread_bps,
             impact_coeff=params.costs.impact_coeff,
             adv=adv,
+            signed=signed,
         )
     kept = {sid: value for sid, value in carried.items() if sid in aside}
     traded = {sid: value for sid, value in carried.items() if sid not in aside}
@@ -703,6 +752,7 @@ def _fill_to_targets(
         spread_bps=params.costs.spread_bps,
         impact_coeff=params.costs.impact_coeff,
         adv=adv,
+        signed=signed,
     )
     return replace(
         fill,
@@ -731,7 +781,15 @@ def _step(
     `accruals` is the cash accrual of each session after T_0, None for a cash rate of 0.
     `spin_offs` is the step's `(unvalued, late)` spin-off reads, present only under the
     trial's `adjust.apply_spin_offs` (spec amendment #1894, item 5), so a trial without
-    the key writes neither count and its rows are byte-identical."""
+    the key writes neither count and its rows are byte-identical.
+
+    Under `portfolio.side = "long_short"` the book is signed (spec amendment #1872, items
+    4 to 6): the same carries, fills and marks take `signed=True`, a short is a negative
+    value kept in the position set and in `held_on`, every session after the plan's read
+    pays the borrow fee (the carry window to the fill included) and accrues `rf(s)` on
+    free cash only, and an equity that is not positive ends the run with a `ValueError`
+    naming the session."""
+    signed = params.portfolio.side == "long_short"
     fill_price = params.execution.fill_price
     carried = carry_to_fill(
         book.positions,
@@ -740,50 +798,95 @@ def _step(
         plan.fill_session,
         fill_price=fill_price,
         marked_at=book.marked_at,
+        signed=signed,
     )
     held_cash = book.cash
     if accruals is not None:
+        if signed:
+            # Free cash is cash less the short proceeds, which earn nothing (item 6).
+            for session in _sessions(plan.session, plan.fill_session)[1:]:
+                held_cash += (held_cash - _short_value(book.positions)) * accruals[session]
+        else:
+            for session in _sessions(plan.session, plan.fill_session)[1:]:
+                held_cash *= 1 + accruals[session]
+    borrow_bps = params.costs.borrow_bps_per_year
+    if signed and borrow_bps > 0:
+        # The carry window (T_i, F_i] is charged too, on the positions held at
+        # close(T_i) (`book.positions`): the short pays for every session it is held, so
+        # a daily book (whose fill session is the step's end) is not charged nothing, and
+        # a monthly book is not charged from the fill only and missing one session each
+        # rebalance. The post-fill loop then charges from the fill on (item 6).
+        carried_shorts = _shorts(book.positions)
         for session in _sessions(plan.session, plan.fill_session)[1:]:
-            held_cash *= 1 + accruals[session]
+            held_cash -= borrow_fee(
+                carried_shorts, borrow_bps, (session - previous_session(session)).days
+            )
     targets, aside = _book_targets(book, plan, index, carried, held_cash, construction)
     adv = (
         adv_by_security(raw, plan.session, params.costs.adv_sessions)
         if params.costs.impact_coeff != 0.0
         else {}
     )
-    fill = _fill_to_targets(carried, held_cash, targets, aside, frame, raw, plan, book, params, adv)
-    values = value_positions(
-        fill.positions, frame, plan.fill_session, fill_price=fill_price, through=end
+    fill = _fill_to_targets(
+        carried, held_cash, targets, aside, frame, raw, plan, book, params, adv, signed=signed
     )
-    negative = values.filter(pl.col("value") < 0)
-    if negative.height:
-        sid, session, value = negative.select("security_id", "session", "value").row(0)
-        raise ValueError(
-            f"negative position value {value} for {sid} on {session}: the backtester is "
-            "long-only (ADR 0014, 0015), a negative value would be silently dropped"
-        )
+    values = value_positions(
+        fill.positions,
+        frame,
+        plan.fill_session,
+        fill_price=fill_price,
+        through=end,
+        signed=signed,
+    )
+    if not signed:
+        negative = values.filter(pl.col("value") < 0)
+        if negative.height:
+            sid, session, value = negative.select("security_id", "session", "value").row(0)
+            raise ValueError(
+                f"negative position value {value} for {sid} on {session}: the backtester is "
+                "long-only (ADR 0014, 0015), a negative value would be silently dropped"
+            )
     exits = _exits(
         book, fill.positions, values, (frame, raw, ended), plan.fill_session, end, params, adv
     )
     values = _book_exits(values, exits)
     totals = dict(values.group_by("session").agg(pl.col("value").sum()).iter_rows())
+    shorts = _shorts_by_session(values) if signed else {}
     cash = fill.cash
     for session in _sessions(plan.fill_session, end):
-        if accruals is not None and session > plan.fill_session:
-            cash *= 1 + accruals[session]
+        if session > plan.fill_session:
+            previous = previous_session(session)
+            held_shorts = shorts.get(previous, {})
+            if accruals is not None:
+                if signed:
+                    free = cash - _short_value(held_shorts)
+                    cash += free * accruals[session]
+                else:
+                    cash *= 1 + accruals[session]
+            if signed and borrow_bps > 0:
+                cash -= borrow_fee(held_shorts, borrow_bps, (session - previous).days)
         proceeds = [e.value - e.cost for e in exits if e.session == session]
         cash = math.fsum([cash, *proceeds])
         equity = math.fsum([cash, totals.get(session, 0.0)])
+        if signed and equity <= 0:
+            raise ValueError(
+                f"the book's equity is gone on {session.isoformat()}: equity {equity} is not "
+                "positive"
+            )
         book.equity.append(EquityRow(STRATEGY_SERIES, book.level, session, equity, cash))
     before = math.fsum([held_cash, *carried.values()])
-    exited = math.fsum(e.value for e in exits)
+    # A short's exit value is negative; its turnover contribution is the magnitude.
+    exited = math.fsum(abs(e.value) for e in exits)
 
     dropped, late = dividends
     n_late = sum(
         _held_before(book, sid, ex) for sid, ex in late.select("security_id", "ex_date").iter_rows()
     )
+    # `!= 0` keeps a short's negative value, so a short holding counts for a dividend
+    # (item 5); under `long_only` the negative-value guard above leaves only zero and
+    # positive values there, so it selects exactly what `> 0` did.
     for sid, session, value in values.select("security_id", "session", "value").iter_rows():
-        if value > 0:
+        if value != 0:
             book.held_on.setdefault(sid, set()).add(session)
     n_dropped = sum(
         plan.session < ex <= end and _held_before(book, sid, ex)
@@ -808,8 +911,10 @@ def _step(
     book.cash = cash
     previous_positions = set(book.positions)
     last = values.filter(pl.col("session") == end)
+    # `!= 0` keeps a short's negative value (item 4); under `long_only` the guard above
+    # already excluded negative values, so it selects exactly what `> 0` did.
     book.positions = {
-        sid: value for sid, value in last.select("security_id", "value").iter_rows() if value > 0
+        sid: value for sid, value in last.select("security_id", "value").iter_rows() if value != 0
     }
     book.held_since = {
         sid: book.held_since[sid] if sid in previous_positions else plan.session
