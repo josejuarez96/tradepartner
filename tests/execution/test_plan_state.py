@@ -11,6 +11,7 @@ import math
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -902,3 +903,57 @@ def test_a_partly_filled_short_cover_is_not_written_off_but_a_long_buy_is(
         assert state.written_off is written_off
         assert state.state is (State.CLOSED if written_off else State.OPEN)
         assert state.remainder == Remainder(quantity=2.0, notional=100.0)
+
+
+# A whole cover (#1961): `buy` + `short`, planned quantity, no target (item 14 (d)).
+
+
+def _whole_cover(**kw: Any) -> DecisionRow:
+    base: dict[str, Any] = {
+        "side": "buy",
+        "planned_quantity": 4.0,
+        "whole_share": True,
+        "reason": "left_targets",
+    }
+    return replace(_decision(**{**base, **kw}), position_side="short")
+
+
+@pytest.mark.parametrize(
+    "cover",
+    [
+        _whole_cover(),
+        _whole_cover(reason="left_universe"),
+        _whole_cover(decision="override", reason="exclude_name"),
+    ],
+    ids=["left_targets", "left_universe", "exclude_name"],
+)
+def test_a_whole_cover_remainder_follows_the_quantity_branch(cover: DecisionRow) -> None:
+    """Before any order: the planned 4 shares at 50 = 200. After an order of 4 with
+    1 filled: 3 shares = 150. A 2:1 split with ex-date in (S1, S2] doubles the
+    unfilled 3 to 6 (300); the planned 4 before any order stays split-free."""
+    assert _remainder(cover, [], []) == Remainder(quantity=4.0, notional=200.0)
+    o = _order(cover, S1, quantity=4.0)
+    assert _remainder(cover, [o], [_fill(o, 1, PRICE)]) == Remainder(quantity=3.0, notional=150.0)
+    split = _remainder(cover, [o], [_fill(o, 1, PRICE)], actions=_splits((A, S2, 2.0)))
+    assert split == Remainder(quantity=6.0, notional=300.0)
+
+
+def test_a_whole_cover_state_open_then_settled() -> None:
+    """The decision state no longer raises: no order is OPEN with the planned
+    quantity; the order of 4 with 4 filled settles; with 1 filled it stays OPEN
+    (a cover is not written off)."""
+    cover = _whole_cover()
+    open_state = _state(cover)
+    assert open_state.state == State.OPEN
+    assert open_state.remainder == Remainder(quantity=4.0, notional=200.0)
+    o = _order(cover, S1, quantity=4.0)
+    events = [_event(o, "accepted"), _event(o, "filled", minute=1)]
+    assert _state(cover, [o], events, [_fill(o, 4, PRICE)]).state == State.SETTLED
+    partly = _state(cover, [o], events, [_fill(o, 1, PRICE)])
+    assert partly.state == State.OPEN
+    assert partly.remainder == Remainder(quantity=3.0, notional=150.0)
+
+
+def test_a_long_buy_without_a_target_still_raises() -> None:
+    with pytest.raises(ValueError, match="no target_notional"):
+        _remainder(_decision(side="buy", planned_quantity=4.0), [], [])
