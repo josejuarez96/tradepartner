@@ -458,6 +458,8 @@ class _Unresolved:
     untradable."""
 
     fractionable: bool = False
+    shortable: bool = False
+    easy_to_borrow: bool = False
 
 
 _UNRESOLVED = _Unresolved()

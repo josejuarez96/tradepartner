@@ -84,7 +84,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -126,6 +126,7 @@ from tradepartner.store.schema import (
     KEEP_NAME_REASON,
     LEFT_TARGETS_REASON,
     LEFT_UNIVERSE_REASON,
+    LONG,
     NOT_RECEIVED_REASON,
     OWNER_SETTLED_UNKNOWN_REASON,
     UNTARGETED_RECEIPT_REASON,
@@ -176,6 +177,13 @@ _NAME_OVERRIDES = frozenset({_EXCLUDE_NAME, _KEEP_NAME})
 _SKIP_DELISTED = "skip_delisted"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_ZERO = "skip_zero"
+SHORT = "short"
+_SKIP_NOT_BORROWABLE = "skip_not_borrowable"
+_SKIP_SHORT_PRICE = "skip_short_price"
+_SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
+#: `decisions_from`'s `side` keyword (the window's frozen `portfolio.side`).
+_LONG_ONLY = "long_only"
+_LONG_SHORT = "long_short"
 #: `signals.reason` values.
 _SELECTED = "selected"
 _BELOW_CUT = "below_cut"
@@ -266,7 +274,14 @@ def is_full_exit(decision: DecisionRow) -> bool:
     Definitions > Full exit): a sell that is a `forced_exit` (any reason), an
     `override`, or a `trade` with reason `left_targets` or `left_universe`. A
     `trade` sell with no reason is a trim; any other sell raises `ValueError`.
+    A short book's whole cover is a full exit too (spec item 14 (d)): a `buy` +
+    `short` `trade` with reason `left_targets` or `left_universe`, or an
+    `override` (always `exclude_name`); a partial cover is a trim.
     """
+    if decision.side == _BUY and decision.position_side == SHORT:
+        if decision.decision == _OVERRIDE:
+            return True
+        return decision.decision == _TRADE and decision.reason in _FULL_EXIT_TRADE_REASONS
     if decision.side != _SELL:
         return False
     if decision.decision in (FORCED_EXIT, _OVERRIDE):
@@ -588,6 +603,7 @@ def decision_state(
     latest = mine[-1]
     if (
         decision.side == _BUY
+        and decision.position_side == LONG  # a cover is not a funding shortfall
         and not latest.sells_in_flight_at_submit
         and not _protected_from_write_off(events_by_order[latest.client_order_id])
     ):
@@ -831,6 +847,16 @@ class AssetFlags(Protocol):
         """Whether the broker trades the name in fractional shares."""
         ...
 
+    @property
+    def shortable(self) -> bool:
+        """Whether the broker lets the account sell the name short."""
+        ...
+
+    @property
+    def easy_to_borrow(self) -> bool:
+        """Whether the name is easy to borrow."""
+        ...
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -848,6 +874,8 @@ class Decision:
     target_notional: float | None = None
     reason: str | None = None
     override_id: int | None = None
+    #: Left out of the repr so a long book's digest (`test_plan_band`) stays today's.
+    position_side: str = field(default=LONG, repr=False)
 
     def row(
         self,
@@ -873,6 +901,7 @@ class Decision:
             decision=self.decision,
             reason=self.reason,
             override_id=self.override_id,
+            position_side=self.position_side,
             book_id=book_id,
             known_at=known_at,
             ingested_at=ingested_at,
@@ -922,6 +951,13 @@ class _Intent:
     notional: float
     full_exit_reason: str | None = None
     held: float = 0.0
+    position_side: str = LONG
+    drifted: float | None = None
+
+
+#: A decision's key while `decisions_from` builds them: (`security_id`, phase), phase
+#: 0 for the decision and a flip's close, 1 for a flip's open (the phase order).
+_Key = tuple[str, int]
 
 
 def _visible_splits(actions_as_of: pl.DataFrame, cutoff: datetime) -> pl.DataFrame:
@@ -1044,28 +1080,62 @@ def _signals(plan: Plan) -> tuple[Signal, ...]:
 
 
 def _buy_targets(
-    intents: Mapping[str, _Intent],
+    intents: Mapping[_Key, _Intent],
     cash_before: float,
     price_of: PriceOf,
     costs: BuyCosts,
-) -> dict[str, float]:
+) -> dict[_Key, float]:
     """Each buy's target (`target_notional`'s formula, spec Definitions): its
     notional x min(1, spendable / the buys' sum), spendable after costs on cash
     plus every plan sell's value at the reference price."""
-    proceeds = sum(i.notional for i in intents.values() if i.side == _SELL)
-    buys = {sid: i.notional for sid, i in intents.items() if i.side == _BUY}
+    proceeds = sum(
+        i.notional for i in intents.values() if i.side == _SELL and i.position_side == LONG
+    )
+    buys = {
+        sid: i.notional for sid, i in intents.items() if i.side == _BUY and i.position_side == LONG
+    }
     total = sum(buys.values())
     _finite(costs.per_side_bps, "costs.per_side_bps", non_negative=True)
-    targets: dict[str, float] = {}
+    targets: dict[_Key, float] = {}
     for sid, notional in buys.items():
         spendable = buy_notional_after_costs(
             cash_before + proceeds,
             costs.per_side_bps,
             costs.commissions,
-            price=_price(price_of, sid),
+            price=_price(price_of, sid[0]),
         )
         targets[sid] = notional * min(1.0, _finite(spendable, "spendable") / total)
     return targets
+
+
+def _short_skip(
+    intent: _Intent,
+    security_id: str,
+    assets: Mapping[str, AssetFlags],
+    price_of: PriceOf,
+    short_min_price: float | None,
+    minimum: float,
+) -> str | None:
+    """The skip kind of a short order (paper spec item 14 (e)), or None to trade.
+
+    A short open or add (`sell`) is checked for borrow, then the price floor;
+    then, for it and for a partial cover (`buy`), the minimum notional and one
+    whole share, all at the reference price.
+    """
+    price = _price(price_of, security_id)
+    if intent.side == _SELL:
+        if security_id not in assets:
+            raise ValueError(f"{security_id} is missing from the assets read")
+        flags = assets[security_id]
+        if not (flags.shortable and flags.easy_to_borrow):
+            return _SKIP_NOT_BORROWABLE
+        if short_min_price is not None and price < short_min_price:
+            return _SKIP_SHORT_PRICE
+    if intent.notional < minimum:
+        return _SKIP_BELOW_MINIMUM
+    if intent.notional / price < 1:
+        return _SKIP_BELOW_ONE_SHARE
+    return None
 
 
 def decisions_from(
@@ -1083,6 +1153,8 @@ def decisions_from(
     costs: BuyCosts,
     band: float = 0.0,
     hold: HoldBook | None = None,
+    side: str = _LONG_ONLY,
+    short_min_price: float | None = None,
 ) -> Decisions:
     """The decisions of rebalance T_i = `plan.session` on the run's session
     S = `ledger.through` (spec Definitions > Decision, reqs 7 step 6 and 9).
@@ -1146,6 +1218,26 @@ def decisions_from(
     `costs.buy_notional_after_costs` on `ledger.cash` plus every sell the plan
     made at the reference price (a forced exit's proceeds stay out).
 
+    `side` (the window's frozen `portfolio.side`, default `long_only`) and
+    `short_min_price` (the frozen `portfolio.short_min_price`, required under
+    `long_short`) make the book signed (paper spec item 14, plan T229). Under
+    `long_only` a negative target or a held short raises and every decision is
+    today's; under `long_short`, `hold`, a non-zero `band` or a missing
+    `short_min_price` raises. Each decision carries `position_side`; a short
+    decision, its skips included, is `short`, whole-share whatever `fractionable`
+    says, with signed `target_weight` and `drifted_weight`. A short open or add
+    is `sell` + `short` (`target_notional` minus its planned notional), a partial
+    cover `buy` + `short` (plus it); neither is scaled by cash. A held short
+    outside the targets is covered whole by quantity (`left_targets`, or
+    `left_universe`; an `exclude_name` covers it as an `override`). A name whose
+    held side and target side differ gets two decisions, the close then the open
+    sized from a zero holding. A short open or add is checked in this order:
+    `skip_not_borrowable` (the `assets` read not `shortable` and
+    `easy_to_borrow`), `skip_short_price` (reference price below
+    `short_min_price`), `skip_below_minimum`, `skip_below_one_share`; a partial
+    cover skips `skip_below_minimum` and `skip_below_one_share` only. The long
+    buys' spendable is `ledger.free_cash` plus the plan's long sells.
+
     `whole_share` is the name's `fractionable` flag negated, from `assets`
     (keyed by `security_id`; the caller maps symbols); a name that would trade
     and is missing from it raises. The plan side (targets, signals) reads only
@@ -1162,27 +1254,55 @@ def decisions_from(
         )
     if ledger.short_names:
         raise ValueError(f"the ledger is short {list(ledger.short_names)}")
+    if side not in (_LONG_ONLY, _LONG_SHORT):
+        raise ValueError(f"side {side!r} is neither {_LONG_ONLY!r} nor {_LONG_SHORT!r}")
+    signed = side == _LONG_SHORT
+    held_short = {sid for sid, quantity in ledger.short_holdings.items() if quantity > 0}
+    if signed:
+        if hold is not None:
+            raise ValueError("a long_short window cannot use the hold weighting")
+        if band != 0.0:
+            raise ValueError(f"a long_short window cannot use a rebalance band ({band})")
+        if short_min_price is None:
+            raise ValueError("a long_short window needs short_min_price")
+        _finite(short_min_price, "short_min_price", non_negative=True)
+    elif held_short:
+        raise ValueError(f"a long_only window holds short {sorted(held_short)}")
     previous = previous_session(session)
     splits = _visible_splits(actions_as_of, session_close(previous))
-    marks = {sid: _price(price_of, sid) for sid in ledger.positions}
+    marks = {sid: _price(price_of, sid) for sid in (*ledger.positions, *ledger.short_holdings)}
     equity = ledger.equity(marks)
     if not (math.isfinite(equity) and equity > 0):
         raise ValueError(f"equity is {equity}, the plan needs a positive equity")
-    drifted = ledger.weights(marks)
+    if held_short:
+        drifted = {
+            sid: (ledger.positions.get(sid, 0.0) * marks.get(sid, 0.0)) / equity
+            for sid in ledger.positions
+        }
+        for sid in held_short:
+            if ledger.positions.get(sid, 0.0) > 0:
+                raise ValueError(f"{sid} is held both long and short")
+            drifted[sid] = -ledger.short_holdings[sid] * marks[sid] / equity
+    else:
+        drifted = ledger.weights(marks)
     if hold is None:
         for sid, weight in plan.targets.items():
-            _finite(weight, f"target weight of {sid}", non_negative=True)
+            _finite(weight, f"target weight of {sid}", non_negative=not signed)
     signals = _signals(plan)
     named = _plan_overrides(overrides, plan.session)
     universe = set(plan.members)
     held = {sid for sid, quantity in ledger.positions.items() if quantity > 0}
-    targets = {sid for sid, weight in plan.targets.items() if weight > 0} if hold is None else set()
+    targets = (
+        {sid for sid, weight in plan.targets.items() if (weight != 0 if signed else weight > 0)}
+        if hold is None
+        else set()
+    )
     if hold is None:
         effective = apply_rebalance_band(plan.targets, drifted, band)
         entering: frozenset[str] = frozenset()
         exiting: frozenset[str] = frozenset()
         hold_weight = 0.0
-        names = held | targets
+        names = held | held_short | targets
     else:
         # The backtest's pure membership rule, never a copy (#1731, T209a).
         ranked = sorted(plan.scores, key=lambda sid: (-plan.scores[sid], sid))
@@ -1225,37 +1345,69 @@ def decisions_from(
             return plan.targets.get(sid, 0.0)
         return 0.0 if sid in exiting and sid not in entering else hold_weight
 
-    def base(sid: str) -> dict[str, Any]:
+    def base(sid: str, drift: float | None = None) -> dict[str, Any]:
         return {
             "security_id": sid,
             "rebalance_session": plan.session,
             "target_weight": base_weight(sid),
-            "drifted_weight": drifted.get(sid, 0.0),
+            "drifted_weight": drifted.get(sid, 0.0) if drift is None else drift,
         }
 
-    decided: dict[str, Decision] = {}
-    intents: dict[str, _Intent] = {}  # names with an order to place, before the minimum
+    def held_side(sid: str) -> str | None:
+        return LONG if sid in held else SHORT if sid in held_short else None
+
+    def target_side(sid: str) -> str | None:
+        weight = plan.targets.get(sid, 0.0) if hold is None else 0.0
+        return SHORT if weight < 0 else LONG if weight > 0 else None
+
+    def named_side(sid: str) -> str:
+        """The `position_side` of a name's skip or sideless override."""
+        return held_side(sid) or target_side(sid) or LONG
+
+    def close_of(sid: str, reason: str) -> _Intent:
+        """The whole-holding close of a held name: a long sells, a short covers."""
+        if sid in held_short:
+            held_qty = ledger.short_holdings[sid]
+            return _Intent(
+                _BUY, held_qty * marks[sid], reason, held_qty, SHORT, drifted.get(sid, 0.0)
+            )
+        held_qty = ledger.positions[sid]
+        return _Intent(
+            _SELL, held_qty * marks.get(sid, 0.0), reason, held_qty, LONG, drifted.get(sid, 0.0)
+        )
+
+    decided: dict[_Key, Decision] = {}
+    intents: dict[_Key, _Intent] = {}  # names with an order to place, before the minimum
     for sid in sorted(names):
         if sid in open_forced_exits:
             continue
+        key: _Key = (sid, 0)
         if ended(sid):
-            decided[sid] = Decision(
-                **base(sid), decision=_SKIP_DELISTED, whole_share=whole_share(sid, required=False)
+            position_side = named_side(sid)
+            decided[key] = Decision(
+                **base(sid),
+                decision=_SKIP_DELISTED,
+                whole_share=whole_share(sid, required=False) or position_side == SHORT,
+                position_side=position_side,
             )
             continue
         override = named.get(sid)
-        if override is not None and (override.kind == _KEEP_NAME or sid not in held):
-            decided[sid] = Decision(
+        if override is not None and (
+            override.kind == _KEEP_NAME or (sid not in held and sid not in held_short)
+        ):
+            position_side = named_side(sid)
+            decided[key] = Decision(
                 **base(sid),
                 decision=_OVERRIDE,
-                whole_share=whole_share(sid, required=False),
+                whole_share=whole_share(sid, required=False) or position_side == SHORT,
                 reason=override.kind,
                 override_id=override.override_id,
+                position_side=position_side,
             )
             continue
         value = ledger.positions.get(sid, 0.0) * marks.get(sid, 0.0)
         if override is not None:
-            intent = _Intent(_SELL, value, _EXCLUDE_NAME, ledger.positions[sid])
+            intent = close_of(sid, _EXCLUDE_NAME)
         elif hold is not None:
             if sid in exiting and sid not in entering:
                 intent = _Intent(_SELL, value, _LEFT_TARGETS, ledger.positions[sid])
@@ -1264,37 +1416,54 @@ def decisions_from(
                 intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
             else:
                 intent = _Intent(_BUY, 0.0)  # a live held name is never re-weighted
-        elif sid in held and sid not in universe:
-            intent = _Intent(_SELL, value, _LEFT_UNIVERSE, ledger.positions[sid])
-        elif sid in held and sid not in targets:
-            intent = _Intent(_SELL, value, _LEFT_TARGETS, ledger.positions[sid])
+        elif held_side(sid) is not None and sid not in universe:
+            intent = close_of(sid, _LEFT_UNIVERSE)
+        elif held_side(sid) is not None and sid not in targets:
+            intent = close_of(sid, _LEFT_TARGETS)
+        elif held_side(sid) is not None and held_side(sid) != target_side(sid):
+            # A flip: the close (phase 0), then the open sized from a zero holding.
+            intents[key] = close_of(sid, _LEFT_TARGETS)
+            key = (sid, 1)
+            opening = target_side(sid) or LONG
+            intent = _Intent(
+                _SELL if opening == SHORT else _BUY,
+                abs(plan.targets[sid]) * equity,
+                position_side=opening,
+                drifted=0.0,
+            )
         else:
             delta = (effective.get(sid, 0.0) - drifted.get(sid, 0.0)) * equity
-            intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta))
-        intents[sid] = intent
+            position_side = held_side(sid) or target_side(sid) or LONG
+            intent = _Intent(_BUY if delta > 0 else _SELL, abs(delta), position_side=position_side)
+        intents[key] = intent
 
     minimum = frozen.min_order_notional
-    original = {sid: i.notional for sid, i in intents.items()}
-    for sid, intent in list(intents.items()):
-        whole = whole_share(sid, required=True)
+    original = {key: i.notional for key, i in intents.items()}
+    for key, intent in list(intents.items()):
+        sid = key[0]
+        shorting = intent.position_side == SHORT
+        whole = whole_share(sid, required=True) or shorting
         kind = _OVERRIDE if intent.full_exit_reason == _EXCLUDE_NAME else _TRADE
         override_id = named[sid].override_id if sid in named else None
+        fields = {
+            **base(sid, intent.drifted),
+            "whole_share": whole,
+            "position_side": intent.position_side,
+        }
         if intent.full_exit_reason is not None:
             if intent.notional < minimum or (whole and intent.held < 1):
-                decided[sid] = Decision(
-                    **base(sid),
+                decided[key] = Decision(
+                    **fields,
                     decision=_DUST,
-                    whole_share=whole,
                     reason=intent.full_exit_reason,
                     override_id=override_id,
                 )
                 continue
             factor = _split_factor(splits, sid, plan.session, session)
-            decided[sid] = Decision(
-                **base(sid),
+            decided[key] = Decision(
+                **fields,
                 decision=kind,
-                whole_share=whole,
-                side=_SELL,
+                side=intent.side,
                 planned_quantity=intent.held / factor,
                 reason=intent.full_exit_reason,
                 override_id=override_id,
@@ -1309,33 +1478,44 @@ def decisions_from(
         if rounded_up:
             # The order goes out at the minimum, so the decision plans the minimum
             # (shakedown E.3 measures fills against `planned_notional`).
-            intents[sid] = replace(intent, notional=minimum)
-            intent = intents[sid]
-        if intent.notional == 0 or intent.notional < minimum:
-            decided[sid] = Decision(
-                **base(sid),
-                decision=_SKIP_ZERO if intent.notional == 0 else _SKIP_BELOW_MINIMUM,
-                whole_share=whole,
-            )
-            if intent.notional == 0:
-                del intents[sid]
+            intents[key] = replace(intent, notional=minimum)
+            intent = intents[key]
+        if intent.notional == 0:
+            decided[key] = Decision(**fields, decision=_SKIP_ZERO)
+            del intents[key]
             continue
-        decided[sid] = Decision(
-            **base(sid),
+        if shorting:
+            skip = _short_skip(intent, sid, assets, price_of, short_min_price, minimum)
+            if skip is not None:
+                decided[key] = Decision(**fields, decision=skip)
+                if skip in (_SKIP_NOT_BORROWABLE, _SKIP_SHORT_PRICE):
+                    del intents[key]  # no order was ever to be placed
+                continue
+        elif intent.notional < minimum:
+            decided[key] = Decision(**fields, decision=_SKIP_BELOW_MINIMUM)
+            continue
+        decided[key] = Decision(
+            **fields,
             decision=_TRADE,
-            whole_share=whole,
             side=intent.side,
             planned_notional=intent.notional,
+            target_notional=(
+                None
+                if not shorting
+                else intent.notional
+                if intent.side == _BUY
+                else -intent.notional
+            ),
         )
 
-    placed = {sid: i for sid, i in intents.items() if decided[sid].side is not None}
-    for sid, target in _buy_targets(placed, ledger.cash, price_of, costs).items():
-        decided[sid] = replace(decided[sid], target_notional=target)
+    placed = {key: i for key, i in intents.items() if decided[key].side is not None}
+    for key, target in _buy_targets(placed, ledger.free_cash(marks), price_of, costs).items():
+        decided[key] = replace(decided[key], target_notional=target)
 
     live_scale = settings.paper.live_capital_reference / equity
-    below = sum(1 for sid, _ in intents.items() if original[sid] * live_scale < minimum)
+    below = sum(1 for key in intents if original[key] * live_scale < minimum)
     return Decisions(
-        decisions=tuple(decided[sid] for sid in sorted(decided)),
+        decisions=tuple(decided[key] for key in sorted(decided)),
         signals=signals,
         n_orders_below_min_at_live_capital=below,
     )
