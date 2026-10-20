@@ -1,6 +1,6 @@
 # Long/short spike: H1's momentum ranking as a 50/50 book is killed (T218)
 
-**Date:** 2026-10-20  ·  **Issue:** #1876 (run result), #2013 (this report)  ·  **Status:** PARTIAL (the kill verdict and the recorded primary, leg and red-flag numbers are complete; the secondary values and three red flags are unread, see Open items)  ·  **Kind:** a registered exploratory `return` run, one run, two configurations  ·  **Experiment:** [long-short-spike](../experiments/long-short-spike.md) (backtest plan T218)
+**Date:** 2026-10-20  ·  **Issue:** #1876 (run result), #2013 (the report), #2018 (the secondary values and the three red flags)  ·  **Status:** complete (the kill verdict, the primary and leg figures, the artifact's secondary values and the three red flags are all recorded; the `n_delisted_short` listing ends sit outside the artifact and are not read here, see Open items)  ·  **Kind:** a registered exploratory `return` run, one run, two configurations  ·  **Experiment:** [long-short-spike](../experiments/long-short-spike.md) (backtest plan T218)
 
 ## Answer
 
@@ -35,10 +35,22 @@ Every number below is the recorded result (the orchestrator's comment on #1876, 
 | Short leg, gross CAGR (`short_leg_cagr_gross`) | +8.6% a year (the shorts beat the longs) |
 | Book CAGR at 30 bp borrow (`book_cagr_b30`) | -3.0% a year |
 | Book volatility at 30 bp (`book_vol_b30`) | 11.8% a year |
+| Book CAGR at 0 bp and 300 bp borrow (`book_cagr_b0`, `book_cagr_b300`) | -2.82% and -4.27% a year |
+| Book excess over T-bills, 0 / 30 / 300 bp (`book_excess_rf_b0`, `_b30`, `_b300`) | -4.35% / -4.50% / -5.86% a year |
+| SPY-hedged control CAGR, 0 / 30 / 300 bp (`hedged_cagr_b0`, `_b30`, `_b300`) | -1.24% / -1.39% / -2.71% a year |
+| SPY-hedged control excess over T-bills, 0 / 30 / 300 bp (`hedged_excess_rf_b0`, `_b30`, `_b300`) | -3.11% / -3.26% / -4.61% a year |
+| SPY-hedged control volatility at 30 bp (`hedged_vol_b30`) | 8.13% a year |
+| Book minus SPY-hedged control, 0 / 30 / 300 bp (`book_minus_hedged_cagr_b0`, `_b30`, `_b300`) | -1.58% / -1.58% / -1.56% a year |
+| Equal-weighted universe CAGR (`ew_universe_cagr`) | +10.35% a year |
+| Short leg minus equal-weighted universe (`short_minus_ew_universe_cagr`) | -1.75% a year |
+| Worst short month (`short_leg_worst_month`; the period rebalanced 2020-10-30, read 2020-12-01) | +26.2% |
+| `max_short_weight` (largest single short weight, 2023-01-03) | 1.12% |
+| `months_short_weight_above_cover` | 0 |
+| `n_delisted_short` | 11 |
 
-Reading it: on this window the bottom-decile short leg returned more (+8.6% a year gross) than the top-decile long leg (+6.8%), so the short half lost money and the gross spread (-4.02) is already negative before any cost. Trading and borrow take it to -6.82. The spread is the full long-minus-short figure (2 x (book - 0.5 x T-bill), before cash interest); the leg CAGRs are geometric and the book holds each leg at half of equity, so the leg figures do not subtract to the spread. No explanation of why the short leg rose is offered: the comparison with the equal-weighted universe was not recorded.
+Reading it: on this window the bottom-decile short leg returned more (+8.6% a year gross) than the top-decile long leg (+6.8%), so the short half lost money and the gross spread (-4.02) is already negative before any cost. Trading and borrow take it to -6.82. The spread is the full long-minus-short figure (2 x (book - 0.5 x T-bill), before cash interest); the leg CAGRs are geometric and the book holds each leg at half of equity, so the leg figures do not subtract to the spread. The short leg rose because the whole universe rose: the equal-weighted universe gained +10.35% a year and the bottom decile trailed it by 1.75 pp/yr, so the shorts did underperform the average name but every name rose and a short of any of them lost. The long leg (the top decile) rose less than the universe too.
 
-The secondary values are in the artifact and were not copied into this report: the b = 0 and b = 300 lines, the book's excess over T-bills, the SPY-hedged control and the book minus hedged control, the short leg against the equal-weighted universe, the worst short month, `max_short_weight` and the cover count, and `n_delisted_short`. The plan's report list asks for them, so this report is partial until they are posted from the artifact (Open items). The kill rule does not read them.
+The artifact's other secondary values are recorded in the table above. The b = 0, 30 and 300 lines run -2.82%, -2.97% and -4.27% a year, and the book sits 4.35, 4.50 and 5.86 pp/yr below T-bills. The SPY-hedged control (0.5 x the same long leg - 0.5 x SPY) lost 1.24%, 1.39% and 2.71% a year, better than the stock book at every borrow line, and sits 3.11, 3.26 and 4.61 pp/yr below T-bills. The book is 1.58, 1.58 and 1.56 pp/yr worse than the hedged control, so swapping the stock short leg for a 0.5 x SPY hedge would have added about 1.6 pp/yr. The kill rule reads none of these.
 
 ## Red flags (the experiment file's list)
 
@@ -50,8 +62,11 @@ The secondary values are in the artifact and were not copied into this report: t
 | `rf_cagr` | outside about 1.5% to 2.5% | 2.21% | yes |
 | `meta.rf_source` | must read `store` | `store` | yes |
 | `meta.max_read_t` | not after close(2023-12-29) | 2023-12-29 21:00 UTC | yes (see below) |
+| `max_short_weight` | above 0.10 in many months | 1.12% peak, 0 months above | yes |
+| `n_delisted_short` | above 10 | 11 | no (count above 10, no large gain — see below) |
+| Control vs B11's hedged line | a different sign of the excess over T-bills | below T-bills at every borrow line | yes (same sign — see below) |
 
-The experiment file and the owner sheet said "not after 20:00 UTC". 21:00 UTC is the 16:00 close on 2023-12-29, which is in EST (UTC-5); 20:00 UTC assumed EDT. The read is at the close, not after it. A `floor_replaced_share` of exactly 0.0 means the $5 floor replaced no name in any month, which fits a top-1,000 universe whose own rule already removes sub-$5 names (ADR 0006). Three flags are **not read**: `max_short_weight` (and the cover count), `n_delisted_short` (including a delisted short with a large gain at its last close) and the control against B11's hedged line. They exist to catch a broken run, and the primary is only as good as the run behind it, so the verdict stands on the recorded flags above and is open to these three.
+The experiment file and the owner sheet said "not after 20:00 UTC". 21:00 UTC is the 16:00 close on 2023-12-29, which is in EST (UTC-5); 20:00 UTC assumed EDT. The read is at the close, not after it. A `floor_replaced_share` of exactly 0.0 means the $5 floor replaced no name in any month, which fits a top-1,000 universe whose own rule already removes sub-$5 names (ADR 0006). The three flags the first report left unread are read here. `max_short_weight` peaks at 1.12% (2023-01-03), barely above the 1/101 equal weight, and `months_short_weight_above_cover` is 0, so no month came near the 0.10 drift-cover trigger in spec item 7 and no single name jumped by an implausible factor. `n_delisted_short` is 11, one above the experiment file's guide of 10, so the count flag is set; but the file's second condition — a delisted short with a large gain at its last close — does not fire: the largest last-close mark among the 11 is +19.6% (`0001594466`, the January 2021 period) and the rest run from -3.7% to +13.7%, so there is no missed-split jump, and 11 delistings among about 101 short names a month over 40 months is an ordinary rate. The control's excess over T-bills (-3.26 pp/yr at 30 bp; -3.11 and -4.61 at 0 and 300) has the same sign as B11's hedged line (8 to 17 pp/yr below T-bills, 8 to 13 with the beta capped at 1), so the flag — a different sign — does not fire; the gap to B11's range (5 to 14 pp/yr less below T-bills) is wider than the "few pp/yr" the experiment file expects, but the sign is the same, and B11 hedged by trailing beta over April 2021 to December 2023 while this run hedges at 0.5 x SPY over 2020-08-31 to 2023-12-29. The three flags exist to catch a broken run; none of them shows one, so the verdict stands.
 
 ## The engine check
 
@@ -68,11 +83,11 @@ I did not re-run the check for this report; the figures are the experiment file'
 
 - **Closed:** no long/short `momentum` hypothesis file is written on H1's ranking. The idea is retired under its registration; no variant runs under this slug. A later long/short `momentum` hypothesis discloses this run in its preamble (the experiment file's retirement condition). The run counts in `momentum`'s N (research-registry req 9).
 - **Not closed:** the signed-engine build (T219 to T224) and the paper plan's gated side are unaffected. Other long/short ideas (other rankings, composites with profitability, a different floor or fee) are not tested by this run and are not killed by it. B12 remains the full decomposition if it is run, and its park rule is not evaluated here.
-- **No comparison with the priors is made.** LS-3 (single-stock shorts versus an index hedge of the long leg) needs the control and the book minus hedged control, which were not recorded; and the beyond-long-only prior (about -2 pp/yr, range -7 to +3) is the book's excess over T-bills, whose counterpart (`book_excess_rf_b30`) was not recorded, not the net spread. The recorded `spy_cagr` (11.1%) is above the short leg's gross 8.6%, so the run says nothing in favour of LS-3 on this window until the control is read. The long leg had already been seen (H1's trials 1 and 2).
+- **The comparison with the priors is now made from the recorded values.** LS-3 (single-stock shorts versus an index hedge of the long leg) is not supported on this window: the book minus the SPY-hedged control (`book_minus_hedged_cagr_b30`) is -1.58 pp/yr, so the stock short leg subtracted from an index hedge. The beyond-long-only prior for a dollar-neutral momentum composite (about -2 pp/yr, range -7 to +3) is the book's excess over T-bills; the recorded `book_excess_rf_b30` is -4.50 pp/yr, below the prior's point estimate and inside its range. The recorded `spy_cagr` (11.1%) is above the short leg's gross 8.6%. The long leg had already been seen (H1's trials 1 and 2).
 
 ## Open items
 
-- Post the artifact's full summary on #1876 (the owner or the orchestrator; this report's author does not read the main checkout), then add the unread secondary values and the three unread red flags to this report in a follow-up. Any of them showing a broken run (a missed split in a short, a delisted short with a large gain) would reopen the verdict.
+- The artifact's secondary values and the three red flags are now recorded (this follow-up, #2018); none shows a broken run, so the verdict stands. One item is only partly retired: `n_delisted_short` is 11, above the experiment file's guide of 10, and clearing that count in full needs each delisted short's listing end in the store, which this report does not read; the artifact's last-close marks show no large short gain (largest +19.6%).
 
 ## Caveats
 
