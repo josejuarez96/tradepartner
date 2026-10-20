@@ -376,6 +376,30 @@ def test_a_non_positive_or_non_finite_close_is_never_a_mark(tmp_path, bad: float
     conn.close()
 
 
+def test_a_correction_known_after_the_session_does_not_clear_the_halt(tmp_path) -> None:
+    """As-of reads: a corrected bar stamped after close(S) is not visible to the
+    mark of S (no look-ahead), so the halt stands until the bad bar is repaired
+    in place; a correction known by close(S) is the bar the mark reads."""
+    d1 = date(2026, 10, 5)
+    late = session_close(d1) + timedelta(days=1)
+    conn = duckdb.connect(str(tmp_path / "store.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, d1, 0.0)
+    _bar(conn, A, d1, 10.0, known_at=late)
+    ledger = _ledger_for({d1: {A: 1.0}})
+    with pytest.raises(StaleDataError, match=A):
+        marks_for(conn, _window(), ledger, [d1], {}, actions=NO_ACTIONS)
+    conn.close()
+
+    conn = duckdb.connect(str(tmp_path / "ok.duckdb"))
+    schema.init_schema(conn)
+    _bar(conn, A, d1, 0.0, known_at=session_close(d1) - timedelta(hours=1))
+    _bar(conn, A, d1, 10.0, known_at=session_close(d1))
+    (mark,) = marks_for(conn, _window(), ledger, [d1], {}, actions=NO_ACTIONS)
+    assert mark.mark_price == 10.0
+    conn.close()
+
+
 def test_a_bad_close_in_the_carried_gap_is_never_a_mark(tmp_path) -> None:
     """The stale close a tradable name is carried at is checked too."""
     conn = duckdb.connect(str(tmp_path / "store.duckdb"))
