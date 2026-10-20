@@ -500,6 +500,130 @@ class TestDividends:
         assert [row.n_dropped_dividends for row in result.rebalances] == [1, 0, 0]
 
 
+class TestSpinOffs:
+    """`adjust.apply_spin_offs` (backtest spec amendment #1894, T211e): the engine reads
+    the two spin-off counts from the provider only under the opt-in key, and a valued
+    spin-off (a frame that carries the distribution, no unvalued or late row) moves no
+    equity: it is a dividend in kind (item 2).
+
+    The raw price drops by D = 10 on the ex-date, so the dividend-in-kind adjusted frame
+    is flat at P - D = 90; a held name earns no extra equity from the flag, exactly as
+    the dividend of amount D would (the dividend `TestDividends` puts in the frame)."""
+
+    EX = date(2024, 2, 15)
+    D, P = 10.0, 100.0
+
+    @staticmethod
+    def _params(*, on: bool) -> Settings:
+        return _params(
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            adjust={"apply_spin_offs": on},
+        )
+
+    def _frame(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        schema = {
+            "security_id": pl.Utf8,
+            "session": pl.Date,
+            "open": pl.Float64,
+            "close": pl.Float64,
+            "known_at": pl.Datetime("us", "UTC"),
+        }
+        raw, adjusted = [], []
+        for session in SESSIONS:
+            at = session_close(session)
+            close = self.P - self.D if session >= self.EX else self.P
+            raw.append(("A", session, close, close, at))
+            adjusted.append(("A", session, self.P - self.D, self.P - self.D, at))
+        return (
+            pl.DataFrame(raw, schema=schema, orient="row"),
+            pl.DataFrame(adjusted, schema=schema, orient="row"),
+        )
+
+    def _provider(self, *, unvalued: bool = False, late: bool = False) -> FakeProvider:
+        """One always-held name A over the flat dividend-in-kind frame; the spin-off rows
+        are declared as the test asks (a row `ex` 2024-02-15, in the T0 step's window)."""
+        raw, adjusted = self._frame()
+        members = {session: ["A"] for session in rebalance_sessions(T0, HISTORY_END)}
+        unvalued_rows = (
+            pl.DataFrame(
+                {
+                    "security_id": ["A"],
+                    "child": ["CHILD"],
+                    "ex_date": [self.EX],
+                    "reason": ["no_child_close"],
+                    "known_at": [session_close(date(2024, 2, 20))],
+                },
+                schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+            )
+            if unvalued
+            else pl.DataFrame(
+                schema={
+                    "security_id": pl.Utf8,
+                    "child": pl.Utf8,
+                    "ex_date": pl.Date,
+                    "reason": pl.Utf8,
+                    "known_at": pl.Datetime("us", "UTC"),
+                }
+            )
+        )
+        late_rows = (
+            pl.DataFrame(
+                {
+                    "security_id": ["A"],
+                    "ex_date": [self.EX],
+                    "ratio_or_amount": [0.5],
+                    "known_at": [session_close(date(2024, 3, 5))],
+                },
+                schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+            )
+            if late
+            else pl.DataFrame(
+                schema={
+                    "security_id": pl.Utf8,
+                    "ex_date": pl.Date,
+                    "ratio_or_amount": pl.Float64,
+                    "known_at": pl.Datetime("us", "UTC"),
+                }
+            )
+        )
+        return FakeProvider(
+            prices=raw,
+            dividend_prices=adjusted,
+            raw=raw,
+            members=members,
+            benchmarks={},
+            unvalued_spin_offs_rows=unvalued_rows,
+            late_spin_offs_rows=late_rows,
+        )
+
+    def test_the_two_counts_are_written_only_under_the_opt_in(self) -> None:
+        provider = self._provider(unvalued=True, late=True)
+        on = _run(provider, self._params(on=True), levels=[0.0])[0.0]
+        assert [row.counts.get("n_spin_offs_unvalued") for row in on.rebalances] == [1, 0, 0]
+        assert [row.counts.get("n_late_spin_offs") for row in on.rebalances] == [0, 1, 0]
+        assert {"unvalued_spin_offs", "late_spin_offs"} <= {call.method for call in provider.calls}
+        # The same rows at the default: no count name, no read, byte-identical.
+        off_provider = self._provider(unvalued=True, late=True)
+        off = _run(off_provider, self._params(on=False), levels=[0.0])[0.0]
+        plain = _run(self._provider(), self._params(on=False), levels=[0.0])[0.0]
+        assert _run_digest(off) == _run_digest(plain)
+        assert [row.counts for row in off.rebalances] == [row.counts for row in plain.rebalances]
+        assert not {"unvalued_spin_offs", "late_spin_offs"} & {
+            call.method for call in off_provider.calls
+        }
+
+    def test_a_valued_spin_off_changes_no_equity_and_adds_no_count(self) -> None:
+        on = _run(self._provider(), self._params(on=True), levels=[0.0])[0.0]
+        off = _run(self._provider(), self._params(on=False), levels=[0.0])[0.0]
+        assert _equity(on) == pytest.approx(_equity(off), rel=1e-12)
+        # Flat total return: the raw drop on the ex-date is the distribution, adjusted away.
+        assert _equity(on)[T1] == pytest.approx(_equity(on)[F0], rel=1e-12)
+        assert all(row.counts.get("n_spin_offs_unvalued") == 0 for row in on.rebalances)
+        assert all(row.counts.get("n_late_spin_offs") == 0 for row in on.rebalances)
+        assert all("n_spin_offs_unvalued" not in row.counts for row in off.rebalances)
+
+
 class TestInvariance:
     def test_a_shorter_run_is_a_prefix_of_a_longer_one(self) -> None:
         short = _run(_provider(), end=T2, levels=[0.0, 15.0])

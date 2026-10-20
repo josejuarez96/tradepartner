@@ -41,6 +41,19 @@ from tradepartner.universe import Universe
 #: family's numerator and denominator (`operating_cash_flow` joins with B3b).
 STATEMENT_FACT_NAMES: Final[tuple[str, ...]] = ("gross_profit", "total_assets")
 
+#: `DataProvider.unvalued_spin_offs`'s columns, in order: the parent, the distributed
+#: child, the ex-date and the store's drop reason (spec amendment #1894, item 2).
+UNVALUED_SPIN_OFF_COLUMNS: Final[tuple[str, ...]] = ("security_id", "child", "ex_date", "reason")
+
+#: `DataProvider.late_spin_offs`'s columns, in order: the parent, the ex-date, the ratio
+#: and the row's `known_at` (spec amendment #1894, item 4), as `late_dividends`'.
+LATE_SPIN_OFF_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id",
+    "ex_date",
+    "ratio_or_amount",
+    "known_at",
+)
+
 
 @dataclass(frozen=True)
 class TurnoverInputs:
@@ -148,6 +161,22 @@ class DataProvider(Protocol):
         `t_prev`'s session, however late (req 5): `security_id`, `ex_date`,
         `ratio_or_amount`, `known_at`. Whether the name was held on the ex-date is the
         engine's to decide; it passes the names it may have held."""
+        ...
+
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`unvalued_spin_offs_as_of(t, ids)`: the `spinoff` rows of the parents in `ids`
+        known at `t` with `ex_date <= t` that the dividend-including adjusted read leaves
+        unapplied (spec amendment #1894, item 2): one row per `(security_id, child,
+        ex_date)` with `reason`, the parent in `security_id`. Read only by a trial whose
+        frozen `adjust.apply_spin_offs` is true (T211e)."""
+        ...
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """Spin-offs of the parents in `ids` first known in `(t_prev, t]` whose ex-date is
+        at or before `t_prev`'s session, however late (spec amendment #1894, item 4):
+        `security_id` (the parent), `ex_date`, `ratio_or_amount`, `known_at`. Read only
+        under `adjust.apply_spin_offs` (T211e); whether the parent was held on the
+        ex-date is the engine's to decide, as `late_dividends` is."""
         ...
 
     def static_listing_count(self, t: datetime, ids: Sequence[str]) -> int:

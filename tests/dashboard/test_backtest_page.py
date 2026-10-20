@@ -111,6 +111,7 @@ def _ok_trial(
     *,
     details: bool = False,
     measured: float | None = None,
+    counts: dict[str, int] | None = None,
     **kwargs: Any,
 ) -> registry.TrialHandle:
     handle = _open(conn, seed_settings, hypothesis_id, **kwargs)
@@ -155,7 +156,7 @@ def _ok_trial(
                     n_missing_fill=0,
                     n_delisting_exits=1,
                     n_stale_exits=0,
-                    counts={"n_excluded_no_history": 3},
+                    counts=counts if counts is not None else {"n_excluded_no_history": 3},
                     n_dropped_dividends=2,
                     n_late_dividends=5 + i,
                 )
@@ -437,6 +438,25 @@ def test_render_detailed_trial_shows_every_element(
     assert "in_sample" in text
     spends = next(df.value for df in at.dataframe if "holdout_reason" in df.value.columns)
     assert set(spends["trial_id"]) == {seeded.refused, seeded.holdout}
+
+
+def test_the_page_shows_a_true_trials_spin_off_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two `adjust.apply_spin_offs` counts live in `trial_rebalance_counts` and reach
+    the per-rebalance table (spec amendment #1894, item 5; T211e)."""
+    store_path = tmp_path / "spins.duckdb"
+    seed_settings = Settings(_env_file=None, store={"path": str(tmp_path / "real.duckdb")})
+    counts = {"n_excluded_no_history": 0, "n_spin_offs_unvalued": 2, "n_late_spin_offs": 1}
+    with open_for_write(Settings(_env_file=None, store={"path": str(store_path)})) as conn:
+        schema.init_schema(conn)
+        h1 = _hypothesis(conn, seed_settings, "h1-momentum-12-1", 0.1)
+        _ok_trial(conn, seed_settings, h1, 0.2, 0.05, details=True, counts=counts)
+    at = _app(monkeypatch, store_path)
+    assert not at.exception
+    per_rebalance = next(df.value for df in at.dataframe if "n_universe" in df.value.columns)
+    assert list(per_rebalance["n_spin_offs_unvalued"]) == [2, 2, 2]
+    assert list(per_rebalance["n_late_spin_offs"]) == [1, 1, 1]
 
 
 def test_render_family_with_no_holdout_spend(

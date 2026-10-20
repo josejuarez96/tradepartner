@@ -41,6 +41,10 @@ single as-of function and are built from `store.asof` reads:
   `t_prev`, with an ex-date on or before `t_prev`'s session, at their latest
   revision as of `t` (`security_id`, `ex_date`, `ratio_or_amount`,
   `known_at`). A revision of a dividend already known at `t_prev` is not late.
+- `late_spin_offs(t_prev, t, ids)`: the same rule for `spinoff` rows, selected
+  and reported by their **parent** (`source_action_id`, #1894 item 2), so a
+  `spinoff` whose `known_at` lands after the rebalance that owned its ex-date
+  is counted late (T211e).
 - `static_listing_count(t, ids)`: ids whose current listing at `t`'s session
   (latest `valid_from` on or before it, among rows known at `t`) is a
   `snapshot_static` row.
@@ -110,6 +114,7 @@ from tradepartner.store.asof import (
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
+    unvalued_spin_offs_as_of,
 )
 from tradepartner.store.benchmarks import benchmark_security_ids
 from tradepartner.store.classify import classifications_as_of
@@ -121,7 +126,43 @@ Connect = Callable[[], AbstractContextManager[duckdb.DuckDBPyConnection]]
 
 _ACTION_KEY: Final = ("security_id", "action_type", "ex_date")
 _LATE_COLUMNS: Final = ("security_id", "ex_date", "ratio_or_amount", "known_at")
+#: `late_spin_offs`'s empty frame: the parent in `security_id`, the same four columns.
+_LATE_SPIN_OFF_SCHEMA: Final[dict[str, Any]] = {
+    "security_id": pl.Utf8,
+    "ex_date": pl.Date,
+    "ratio_or_amount": pl.Float64,
+    "known_at": pl.Datetime("us", "UTC"),
+}
 _RETRY_POLL_SECONDS: Final = 0.25
+
+
+def _latest_spin_offs(
+    conn: duckdb.DuckDBPyConnection, at: datetime, parents: Sequence[str]
+) -> pl.DataFrame:
+    """The latest-revision `spinoff` rows as of `at` whose **parent** is in `parents`, one
+    row per `(child, ex_date)`, the parent re-keyed into `security_id` (spec amendment
+    #1894, item 2: a `spinoff` row's `security_id` is the child, its parent is in
+    `source_action_id`). A later revision of a row wins, as `_latest_as_of` gives for
+    `late_dividends`; the two children of one parent on one ex-date are two rows.
+    `parents` empty selects nothing, as `_security_filter` gives."""
+    if not parents:
+        return pl.DataFrame(schema=_LATE_SPIN_OFF_SCHEMA)
+    return conn.execute(
+        """
+        SELECT source_action_id AS security_id, ex_date, ratio_or_amount, known_at
+        FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY security_id, action_type, ex_date ORDER BY known_at DESC
+            ) AS _rn
+            FROM corporate_actions
+            WHERE known_at <= ? AND action_type = 'spinoff'
+              AND source_action_id IN (SELECT unnest(?))
+        )
+        WHERE _rn = 1
+        ORDER BY security_id, ex_date
+        """,
+        [at, list(parents)],
+    ).pl()
 
 
 def _ids(ids: Sequence[str]) -> list[str]:
@@ -229,6 +270,10 @@ class StoreProvider:
             t,
             wanted,
             include_dividends=include_dividends,
+            # The frozen opt-in (spec amendment #1894, item 3): every dividend-including
+            # read the engine makes carries the trial's `adjust.apply_spin_offs`, the
+            # signal reads and the marking reads alike. A spin-off needs dividends.
+            include_spin_offs=include_dividends and self.settings.adjust.apply_spin_offs,
             settings=self.settings,
             traded_only=True,
             sessions_from=sessions_from,
@@ -280,6 +325,31 @@ class StoreProvider:
         known_before = dividends(t_prev).select("security_id", "ex_date")
         late = (
             dividends(t)
+            .join(known_before, on=["security_id", "ex_date"], how="anti")
+            .filter(pl.col("ex_date") <= prev_session)
+        )
+        return late.select(_LATE_COLUMNS).sort("security_id", "ex_date")
+
+    def unvalued_spin_offs(self, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`unvalued_spin_offs_as_of` with the parent in `security_id` (it returns
+        `parent`), read only under `adjust.apply_spin_offs` (spec amendment #1894,
+        item 2; T211e)."""
+        t, wanted = check_t(t), _ids(ids)
+        frame = unvalued_spin_offs_as_of(self._at(t), t, wanted, settings=self.settings)
+        return frame.rename({"parent": "security_id"})
+
+    def late_spin_offs(self, t_prev: datetime, t: datetime, ids: Sequence[str]) -> pl.DataFrame:
+        """`spinoff` rows of the parents in `ids` known at `t` but not at `t_prev`, with an
+        ex-date on or before `t_prev`'s session (spec amendment #1894, item 4), the same
+        rule `late_dividends` applies to dividends; the parent is in `security_id`."""
+        t, t_prev, wanted = check_t(t), check_t(t_prev, name="t_prev"), _ids(ids)
+        if t_prev >= t:
+            raise ValueError(f"t_prev {t_prev.isoformat()} is not before t {t.isoformat()}")
+        conn = self._at(t)
+        prev_session = last_completed_session(t_prev)
+        known_before = _latest_spin_offs(conn, t_prev, wanted).select("security_id", "ex_date")
+        late = (
+            _latest_spin_offs(conn, t, wanted)
             .join(known_before, on=["security_id", "ex_date"], how="anti")
             .filter(pl.col("ex_date") <= prev_session)
         )

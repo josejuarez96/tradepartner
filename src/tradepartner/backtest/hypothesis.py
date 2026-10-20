@@ -226,9 +226,9 @@ FAMILY_ONLY_KEYS: Final[Mapping[str, str]] = {"strategy.turnover_top_fraction": 
 
 #: Frozen keys a registration may store but no signal applies yet: `load_frozen` refuses
 #: a value other than the table default, so no run or paper plan records results under a
-#: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358);
-#: `adjust.apply_spin_offs` (T211c, spec amendment #1894) enters until T211e applies it.
-NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset({"adjust.apply_spin_offs"})
+#: label its signal ignores. `strategy.turnover_top_fraction` left it at T165c (#1358) and
+#: `adjust.apply_spin_offs` at T211e (#1894), so it is empty today.
+NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset()
 
 
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:

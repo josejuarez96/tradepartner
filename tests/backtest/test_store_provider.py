@@ -20,6 +20,7 @@ import duckdb
 import polars as pl
 import pytest
 from conftest import load_universe_fixtures
+from polars.testing import assert_frame_equal
 
 from backtest.fake_provider import Call, FakeProvider
 from tradepartner import gap as gap_module
@@ -36,6 +37,7 @@ from tradepartner.store.asof import (
     prices_as_of,
     rates_as_of,
     statement_facts_as_of,
+    unvalued_spin_offs_as_of,
 )
 from tradepartner.store.classify import classifications_as_of
 from tradepartner.store.db import (
@@ -469,6 +471,82 @@ def test_late_dividends(store: Store) -> None:
     ]
     assert late["known_at"].to_list() == [datetime(2019, 3, 5, 21, 0, tzinfo=UTC)]
     assert not_yet.is_empty() and other_ids.is_empty() and spinoff_window.is_empty()
+
+
+def test_adjusted_prices_pass_the_opt_in_from_the_frozen_settings(store: Store) -> None:
+    """A trial whose frozen `adjust.apply_spin_offs` is true reads the fixture's
+    `spinoff` row (`SEC_SPLIT_PLAIN`'s 2018-12-13 distribution to the parent
+    `SEC_TICKCHANGE`), exactly as `adjusted_prices_as_of(..., include_spin_offs=True)`,
+    which the store spec equates to a dividend of r x C (spec amendment #1894, item 3;
+    T211e). At the default false the read is the pinned one (item 3)."""
+    ids = ["SEC_TICKCHANGE"]
+    on = Settings(_env_file=None, store={"path": str(store.path)}, adjust={"apply_spin_offs": True})
+    with store.provider(on) as provider:
+        got_on = provider.adjusted_prices(T_MAR, ids, True)
+    with store.provider() as provider:
+        got_off = provider.adjusted_prices(T_MAR, ids, True)
+    with store.direct() as conn:
+        want_on = adjusted_prices_as_of(
+            conn,
+            T_MAR,
+            ids,
+            include_dividends=True,
+            include_spin_offs=True,
+            settings=store.settings,
+        )
+        want_off = adjusted_prices_as_of(
+            conn, T_MAR, ids, include_dividends=True, settings=store.settings
+        )
+    assert_frame_equal(got_on, want_on)
+    assert_frame_equal(got_off, want_off)
+    assert not got_on.equals(got_off)  # the fixture's row is valued and does move the frame
+
+
+def test_unvalued_spin_offs_select_by_the_parent(store: Store) -> None:
+    """The provider's read is the as-of read with `parent` renamed to `security_id`, and
+    a read for the child alone selects nothing: the row belongs to the parent
+    (spec amendment #1894, item 2)."""
+    with store.provider() as provider:
+        got = provider.unvalued_spin_offs(T_MAR, ["SEC_TICKCHANGE"])
+        child_alone = provider.unvalued_spin_offs(T_MAR, ["SEC_SPLIT_PLAIN"])
+    with store.direct() as conn:
+        want = unvalued_spin_offs_as_of(conn, T_MAR, ["SEC_TICKCHANGE"], settings=store.settings)
+    assert got.columns == ["security_id", "child", "ex_date", "reason"]
+    assert got.equals(want.rename({"parent": "security_id"}))
+    assert child_alone.is_empty()
+
+
+def test_late_spin_offs_are_keyed_by_parent_and_the_window(store: Store) -> None:
+    """The fixture's `spinoff` row (parent `SEC_TICKCHANGE`, ex 2018-12-13, first known
+    2018-12-14) is late for a window opening before that instant, like `late_dividends`
+    (spec amendment #1894, item 4)."""
+    opening = session_close(date(2018, 12, 13))
+    with store.provider() as provider:
+        late = provider.late_spin_offs(
+            opening, session_close(date(2018, 12, 17)), ["SEC_TICKCHANGE"]
+        )
+        child_alone = provider.late_spin_offs(
+            opening, session_close(date(2018, 12, 17)), ["SEC_SPLIT_PLAIN"]
+        )
+        # First known at the 2018-12-14 close: known at that window's `t_prev`, not late.
+        known = provider.late_spin_offs(
+            session_close(date(2018, 12, 14)), session_close(date(2018, 12, 17)), ["SEC_TICKCHANGE"]
+        )
+    assert late.columns == ["security_id", "ex_date", "ratio_or_amount", "known_at"]
+    assert late.select("security_id", "ex_date").rows() == [("SEC_TICKCHANGE", date(2018, 12, 13))]
+    assert child_alone.is_empty() and known.is_empty()
+
+
+def test_the_spin_off_reads_see_nothing_known_after_t(store: Store) -> None:
+    """The row is first known at the 2018-12-14 close; an instant before it, both new
+    reads see nothing (spec amendment #1894, item 4; no look-ahead)."""
+    before = session_close(date(2018, 12, 14)) - timedelta(seconds=1)
+    with store.provider() as provider:
+        unvalued = provider.unvalued_spin_offs(before, ["SEC_TICKCHANGE"])
+        late = provider.late_spin_offs(
+            session_close(date(2018, 12, 13)), before, ["SEC_TICKCHANGE"]
+        )
+    assert unvalued.is_empty() and late.is_empty()
 
 
 def test_static_listing_count(store: Store) -> None:
