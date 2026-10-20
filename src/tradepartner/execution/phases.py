@@ -118,17 +118,25 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_DOWN, Decimal
+from typing import Protocol
 
 import polars as pl
 
-from tradepartner.adapters.broker import OrderRequest, Side
+from tradepartner.adapters.broker import OrderRequest, PositionIntent, Side
 from tradepartner.calendar import previous_session, session_close
 from tradepartner.config import RiskConfig
 from tradepartner.execution import risk
 from tradepartner.execution.exits import ExitAsset
-from tradepartner.execution.ids import client_order_id, next_attempt
+from tradepartner.execution.ids import client_order_id, next_attempt, token_for
 from tradepartner.execution.ledger import Ledger
-from tradepartner.execution.plan import BuyCosts, DecisionState, PriceOf, is_full_exit
+from tradepartner.execution.plan import (
+    SHORT,
+    BuyCosts,
+    DecisionState,
+    PriceOf,
+    State,
+    is_full_exit,
+)
 from tradepartner.execution.reattempts import attempt_scope
 from tradepartner.execution.risk import BuyToSize, Skip, round_down, size_buys
 from tradepartner.store.journal import DecisionRow, OrderRow
@@ -147,6 +155,30 @@ _SKIP_UNTRADABLE = "skip_untradable"
 _SKIP_BELOW_ONE_SHARE = "skip_below_one_share"
 _SKIP_BELOW_MINIMUM = "skip_below_minimum"
 _SKIP_DELISTED = "skip_delisted"
+_SKIP_NOT_BORROWABLE = "skip_not_borrowable"
+#: An order's intent (`side`, `position_side`) -> Alpaca's `position_intent` (item 3).
+_INTENTS: dict[tuple[str, str], PositionIntent] = {
+    (_SELL, LONG): PositionIntent.SELL_TO_CLOSE,
+    (_BUY, SHORT): PositionIntent.BUY_TO_CLOSE,
+    (_SELL, SHORT): PositionIntent.SELL_TO_OPEN,
+    (_BUY, LONG): PositionIntent.BUY_TO_OPEN,
+}
+
+
+class BorrowAsset(ExitAsset, Protocol):
+    """What the buys phase reads from the broker's `assets` answer: the exits'
+    `tradable` and `fractionable`, plus the borrow flags a short open reads
+    (`adapters.broker.Asset` fits; this module imports no adapter's class)."""
+
+    @property
+    def shortable(self) -> bool:
+        """Whether the broker lets the name be sold short."""
+        ...
+
+    @property
+    def easy_to_borrow(self) -> bool:
+        """Whether the name is easy to borrow now."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -249,7 +281,7 @@ def _price(price_of: PriceOf, security_id: str) -> float:
     return price
 
 
-def _asset(security_id: str, assets: Mapping[str, ExitAsset]) -> ExitAsset:
+def _asset[A: ExitAsset](security_id: str, assets: Mapping[str, A]) -> A:
     if security_id not in assets:
         raise ValueError(f"{security_id} is missing from the assets read")
     return assets[security_id]
@@ -333,6 +365,7 @@ def sell_orders(
     session: date,
     quantity_decimals: int,
     open_sells: Sequence[risk.OpenSell] = (),
+    open_covers: Sequence[risk.OpenSell] = (),
 ) -> PhaseOrders:
     """The sells phase's orders and per-name skips on S = `session` (module
     docstring), in decision-id order.
@@ -368,6 +401,16 @@ def sell_orders(
     among `decisions`, a non-forced-exit or non-sell among `forced_exits`,
     two sells for one name, and every malformed input `attempt_scope`
     refuses.
+
+    The sells phase also orders the **covers** (`buy` + `short`, T230): the
+    `sell` + `long` orders first, then the covers, each in decision-id order.
+    A cover is by whole shares always, a whole cover (`is_full_exit`) buys the
+    ledger's `short_holdings` and a partial one its remainder, both capped at
+    the held short less the name's `open_covers` (the non-terminal own covers,
+    netted exactly as `open_sells` is from a long sell) and never reading the
+    borrow flags. A `sell` + `short` (a short open) is the buys phase's and is
+    neither an order, a skip, a hold nor in flight here, so a flip's close and
+    open are not "two sell decisions".
     """
     _check_session(session)
     if ledger.through != session:
@@ -382,23 +425,32 @@ def sell_orders(
     if any(d.decision != _FORCED_EXIT or d.side != _SELL for d in forced_exits):
         raise ValueError("forced_exits holds a decision that is not a forced-exit sell")
     rows = [*decisions, *forced_exits]
-    scope = attempt_scope(rows, states, phase=_SELL)
     by_id = {_id(d): d for d in rows}
-    names = Counter(
-        [a.decision.security_id for a in scope.attempts]
-        + [by_id[i].security_id for i in scope.in_flight]
-    )
-    twice = sorted(name for name, count in names.items() if count > 1)
-    if twice:
-        raise ValueError(f"two sell decisions for {twice} in one phase")
+    sell_scope = attempt_scope(rows, states, phase=_SELL)
+    cover_scope = attempt_scope(rows, states, phase=_BUY)
+    closes = [a for a in sell_scope.attempts if a.decision.position_side == LONG]
+    covers = [a for a in cover_scope.attempts if a.decision.position_side == SHORT]
+    for kind, position_side, attempts, in_flight in (
+        ("sell", LONG, closes, sell_scope.in_flight),
+        ("cover", SHORT, covers, cover_scope.in_flight),
+    ):
+        names = Counter(
+            [a.decision.security_id for a in attempts]
+            + [by_id[i].security_id for i in in_flight if by_id[i].position_side == position_side]
+        )
+        twice = sorted(name for name, count in names.items() if count > 1)
+        if twice:
+            raise ValueError(f"two {kind} decisions for {twice} in one phase")
 
     open_sold = risk.open_sold(open_sells, quantity_decimals)
+    covered = risk.open_sold(open_covers, quantity_decimals)
     orders: list[PhaseOrder] = []
     skips: list[Skip] = []
     held_sells: list[HeldSell] = []
-    for attempt in scope.attempts:
+    for attempt in [*closes, *covers]:
         decision = attempt.decision
         sid = decision.security_id
+        cover = decision.side == _BUY
         asset = _asset(sid, assets)
         if not asset.tradable:
             untradable = _UNTRADABLE if decision.decision == _FORCED_EXIT else _SKIP_UNTRADABLE
@@ -406,10 +458,17 @@ def sell_orders(
             continue
         price = _price(price_of, sid)
         full_exit = is_full_exit(decision)
-        held, residue = _held_and_residue(decision, ledger, residues)
-        sold = open_sold.get(sid, Decimal(0))
+        if cover:
+            # The held short is the ledger's unsigned `short_holdings`; a cover
+            # has no residue and nets its own open covers.
+            held = _finite(ledger.short_holdings.get(sid, 0.0), f"short holding of {sid}")
+            residue = 0.0
+            sold = covered.get(sid, Decimal(0))
+        else:
+            held, residue = _held_and_residue(decision, ledger, residues)
+            sold = open_sold.get(sid, Decimal(0))
         if full_exit:
-            whole = decision.whole_share
+            whole = decision.whole_share or cover
             # #647 item 5: the open-sells subtraction is netted out of the
             # full exit's quantity exactly like a trim's cap (`_trim_cap`);
             # "before" is the holding-and-residue cap alone, so a skip only
@@ -420,7 +479,7 @@ def sell_orders(
             quantity = _floor_if_whole(cap_after, whole)
         else:
             remainder_q = _finite(attempt.remainder.quantity, f"remainder of {sid}")
-            whole = decision.whole_share or not asset.fractionable
+            whole = decision.whole_share or not asset.fractionable or cover
             # #647 item 7: "before" is the trim's remainder with no cap at
             # all (not even the holding cap), so a skip the holding cap
             # and/or the open sells cause, that the uncapped remainder would
@@ -442,7 +501,7 @@ def sell_orders(
             PhaseOrder(
                 decision_id=_id(decision),
                 security_id=sid,
-                side=_SELL,
+                side=_BUY if cover else _SELL,
                 decision=decision.decision,
                 price=price,
                 quantity=quantity,
@@ -462,11 +521,12 @@ def buy_orders(
     planned_sells: PhaseOrders,
     price_of: PriceOf,
     costs: BuyCosts,
-    assets: Mapping[str, ExitAsset],
+    assets: Mapping[str, BorrowAsset],
     frozen: RiskConfig,
     *,
     session: date,
     ended: Collection[str] = (),
+    held_shorts: Mapping[str, float] = {},
 ) -> PhaseOrders:
     """The buys phase's orders, skips, deferred ids and cash left on S =
     `session` (module docstring).
@@ -485,6 +545,26 @@ def buy_orders(
     earlier. Orders are notional buys in decision-id order,
     then whole-share buys; a buy of a name no longer `fractionable` goes by
     whole shares.
+
+    The buys phase also orders the **short opens** (`sell` + `short`, T230),
+    first, in decision-id order, each by whole shares (the remainder floored;
+    never notional, never fractional): a short open takes no cash and is never
+    deferred. It reads the borrow flags of this phase's own `assets`: a name not
+    `shortable` or not `easy_to_borrow` is `skip_not_borrowable` (counted in
+    the cap); under one share, `skip_below_one_share`. `held_shorts` is the
+    held short shares per name (`Ledger.short_holdings`): they are valued at
+    `price_of` and deducted from `cash` before the long buys are sized, floored
+    at 0, so the long buys are sized within free cash (ADR 0010's restated cash
+    rule; `cash_left` is then of that free cash). A `buy` + `short` (a cover)
+    is the sells phase's and is no order here.
+
+    A **flip**'s second leg waits on its first: a short open of a name with a
+    long close among `decisions`, and a long buy of a name with a cover, is
+    ordered only once that close's (or cover's) state is `SETTLED`, so a name is
+    never long and short at once. Until then it is neither an order, a skip, a
+    hold nor deferred (so it stays open for the next run) and the "both sells
+    and buys" check does not apply to it. A close that ended in a skip is not
+    `SETTLED`, so its open waits (#1904).
     """
     _check_session(session)
     _finite(cash, "cash")
@@ -497,21 +577,77 @@ def buy_orders(
     scope = attempt_scope(decisions, states, phase=_BUY)
     selling = attempt_scope(decisions, states, phase=_SELL)
     by_id = {_id(d): d for d in decisions}
+    long_buys = [a for a in scope.attempts if a.decision.position_side == LONG]
+    short_opens = [a for a in selling.attempts if a.decision.position_side == SHORT]
+    # The first leg of a flip, by name: a cover (for a long buy) or a long close
+    # (for a short open), whatever its phase or state.
+    covers = {
+        _id(d): d.security_id for d in decisions if d.side == _BUY and d.position_side == SHORT
+    }
+    closes = {
+        _id(d): d.security_id for d in decisions if d.side == _SELL and d.position_side == LONG
+    }
     sold = (
         {order.security_id for order in planned_sells.orders}
         | {skip.security_id for skip in planned_sells.skips}
         | {held.security_id for held in planned_sells.held}
         | {by_id[i].security_id for i in selling.in_flight}
     )
-    both = sorted(sold & {a.decision.security_id for a in scope.attempts})
+    both = sorted((sold & {a.decision.security_id for a in long_buys}) - set(covers.values()))
     if both:
         raise ValueError(f"the phase both sells and buys {both}")
 
+    def first_leg_filled(first_legs: Mapping[int, str], sid: str) -> bool:
+        """True unless a first leg of `sid` is not `SETTLED` yet."""
+        return all(
+            states[i].state == State.SETTLED for i, name in first_legs.items() if name == sid
+        )
+
     skips: list[Skip] = []
-    to_size: list[BuyToSize] = []
-    for attempt in scope.attempts:
+    orders: list[PhaseOrder] = []
+    for attempt in short_opens:
         decision = attempt.decision
         sid = decision.security_id
+        if not first_leg_filled(closes, sid):
+            continue
+        if sid in ended:
+            skips.append(Skip(_id(decision), sid, _SKIP_DELISTED))
+            continue
+        asset = _asset(sid, assets)
+        if not asset.tradable:
+            skips.append(Skip(_id(decision), sid, _SKIP_UNTRADABLE))
+            continue
+        if not (asset.shortable and asset.easy_to_borrow):
+            skips.append(Skip(_id(decision), sid, _SKIP_NOT_BORROWABLE))
+            continue
+        price = _price(price_of, sid)
+        quantity = float(math.floor(_finite(attempt.remainder.quantity, f"remainder of {sid}")))
+        if quantity < 1:
+            skips.append(Skip(_id(decision), sid, _SKIP_BELOW_ONE_SHARE))
+            continue
+        if quantity * price < frozen.min_order_notional:
+            skips.append(Skip(_id(decision), sid, _SKIP_BELOW_MINIMUM))
+            continue
+        orders.append(
+            PhaseOrder(
+                decision_id=_id(decision),
+                security_id=sid,
+                side=_SELL,
+                decision=decision.decision,
+                price=price,
+                quantity=quantity,
+                whole_share=True,
+                target_weight=decision.target_weight,
+                position_side=SHORT,
+            )
+        )
+
+    to_size: list[BuyToSize] = []
+    for attempt in long_buys:
+        decision = attempt.decision
+        sid = decision.security_id
+        if not first_leg_filled(covers, sid):
+            continue
         if sid in ended:
             # Matches `risk.check_phase`'s precedence (listing-ended before
             # tradable): skipped before sizing, not after, so no other buy
@@ -526,9 +662,18 @@ def buy_orders(
         to_size.append(BuyToSize(decision, attempt.remainder, whole_share=lost))
 
     sizing_of = {_id(b.decision): b for b in to_size}
-    orders: list[PhaseOrder] = []
     deferred: list[int] = []
     spent = Decimal(0)
+    if held_shorts:
+        short_value = sum(
+            (
+                Decimal(repr(_finite(quantity, f"short holding of {sid}")))
+                * Decimal(repr(_price(price_of, sid)))
+                for sid, quantity in held_shorts.items()
+            ),
+            Decimal(0),
+        )
+        cash = float(max(Decimal(repr(float(cash))) - short_value, Decimal(0)))
     for sizing in size_buys(to_size, cash, price_of, frozen, costs):
         decision = sizing_of[sizing.decision_id].decision
         if sizing.deferred:
@@ -589,7 +734,11 @@ def requests_for(
     decision and phase (a row of another session raises); `max_length` is
     `alpaca.client_order_id_max_length` (`None` until T48b records it skips the
     check: T48c refuses to construct the real adapter while it is unset). A
-    sell carrying a notional raises.
+    sell carrying a notional raises, and so does a short order (`position_side`
+    short, open or cover) that is a notional or a fractional quantity. Each
+    request carries its `position_intent` from the order's intent (`side`,
+    `position_side`), and its id token (`ids.token_for`: `sell`, `buy`,
+    `short`, `cover`) counts the attempt per (`security_id`, token).
     """
     _check_session(session)
     if phase_orders.session != session:
@@ -608,14 +757,29 @@ def requests_for(
     for order in orders:
         if order.side == _SELL and order.notional is not None:
             raise ValueError(f"sell of decision {order.decision_id} carries a notional")
+        if (order.side, order.position_side) not in _INTENTS:
+            raise ValueError(
+                f"order of decision {order.decision_id} has side {order.side!r} and "
+                f"position side {order.position_side!r}"
+            )
+        if order.position_side == SHORT and (
+            order.notional is not None
+            or order.quantity is None
+            or not float(order.quantity).is_integer()
+        ):
+            raise ValueError(
+                f"short order of decision {order.decision_id} must be a whole-share quantity, "
+                f"got notional {order.notional} and quantity {order.quantity}"
+            )
 
     built: Counter[tuple[str, str]] = Counter()
     requests: list[OrderRequest] = []
     for order in orders:
-        key = (order.security_id, order.side)
+        intent = _INTENTS[(order.side, order.position_side)]
+        key = (order.security_id, token_for(intent.value))
         attempt = next_attempt(orders_on_session, *key) + built[key]
         built[key] += 1
-        coid = client_order_id(prefix, book, session, order.security_id, order.side, attempt)
+        coid = client_order_id(prefix, book, session, order.security_id, key[1], attempt)
         if max_length is not None and len(coid) > max_length:
             raise ValueError(f"client order id {coid!r} is longer than {max_length}")
         symbol = listings_at[order.security_id]
@@ -627,6 +791,7 @@ def requests_for(
                 side=Side(order.side),
                 notional=order.notional,
                 quantity=order.quantity,
+                position_intent=intent,
             )
         )
     return requests
