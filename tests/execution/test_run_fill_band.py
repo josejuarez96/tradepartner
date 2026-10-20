@@ -231,3 +231,11 @@ def test_a_late_fill_across_a_split_is_judged_against_its_orders_own_reference()
     before = date(2019, 4, 30)
     assert fill_band_violations([_ordered(100.0, order_session=before)], band) == ()
     assert len(fill_band_violations([_ordered(100.0, order_session=ex)], band)) == 1
+
+
+def test_a_fill_without_a_reference_is_reported_as_unjudged() -> None:
+    from tradepartner.execution.collect import _unpriced
+
+    band = _band({"SEC_A": 100.0})
+    assert not _unpriced(_ordered(100.0), band)
+    assert _unpriced(_ordered(100.0, "SEC_B"), band)

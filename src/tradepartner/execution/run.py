@@ -1689,6 +1689,7 @@ class _Run:
         )
         if collected.rejections:
             raise RejectionCapError("; ".join(b.message for b in collected.rejections))
+        self._note_unjudged(collected)
         self._lag_bound(collected)
         return collected
 
@@ -1830,6 +1831,7 @@ class _Run:
             if not orders:
                 return
             collected = self._halting(partial(self._collect_orders, orders))
+            self._note_unjudged(collected)
             if collected.rejections:
                 raise RejectionCapError("; ".join(b.message for b in collected.rejections))
             now = self.gate.read_clock()
@@ -1847,6 +1849,14 @@ class _Run:
                     )
                 return
             self.sleep(min(paper.poll_interval_seconds, (deadline - now).total_seconds()))
+
+    def _note_unjudged(self, collected: Collected) -> None:
+        """A note for the fills the price band had no reference price for (#1981)."""
+        if collected.unjudged:
+            self.notes.append(
+                "fill-price band: no reference price for "
+                + ", ".join(sorted(set(collected.unjudged)))
+            )
 
     def _collect_orders(self, orders: Sequence[OrderRow]) -> Collected:
         return collect(

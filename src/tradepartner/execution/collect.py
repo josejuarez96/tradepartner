@@ -252,6 +252,8 @@ class Collected:
     readings: tuple[OrderReading, ...]
     rejections: tuple[RejectionBreach, ...]
     written_off: tuple[int, ...]
+    #: `client_order_id`s of fills the price band could not judge (no reference price).
+    unjudged: tuple[str, ...] = ()
 
     @property
     def lagging(self) -> tuple[OrderReading, ...]:
@@ -365,8 +367,9 @@ def collect(
             # rejections again: the verdict leaves with the failure (#396).
             raise RejectionCapError("; ".join(b.message for b in rejections)) from exc
 
+    unjudged: tuple[str, ...] = ()
     if price_band is not None:
-        _judge_fill_band(connect, orders, journaled, price_band, rejections)
+        unjudged = _judge_fill_band(connect, orders, journaled, price_band, rejections)
 
     return Collected(
         since=since,
@@ -377,6 +380,7 @@ def collect(
         readings=tuple(collected),
         rejections=rejections,
         written_off=written_off,
+        unjudged=unjudged,
     )
 
 
@@ -386,13 +390,14 @@ def _judge_fill_band(
     journaled: Sequence[str],
     band: PriceBand,
     rejections: Sequence[RejectionBreach],
-) -> None:
-    """Raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
+) -> tuple[str, ...]:
+    """Return the ids of the fills the band could not price (a note for the caller);
+    raise `SystemFaultError` naming `fill_price_outside_band` for a fill this
     collection journaled outside the band (#1981). It runs after the collection has
     committed, so the fill is journaled as the broker holds it; a rejection verdict
     of the same collection is named in the message, never dropped."""
     if not journaled:
-        return
+        return ()
     new = set(journaled)
     with connect() as conn:
         fills = [
@@ -404,6 +409,7 @@ def _judge_fill_band(
     if found:
         verdicts = [b.message for b in rejections]
         raise SystemFaultError("; ".join([_FILL_BAND_FAULT + ": " + "; ".join(found), *verdicts]))
+    return tuple(f.fill.client_order_id for f in fills if _unpriced(f, band))
 
 
 def _refuse_shapes(readings: Iterable[Order]) -> None:
@@ -628,15 +634,10 @@ def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple
     for item in fills:
         fill = item.fill
         who = f"{fill.client_order_id} ({item.security_id})"
-        try:
-            ref = band.price_of(item.security_id) * _split_factor(
-                band.actions_as_of, item.security_id, item.order_session, band.session
-            )
-        except (KeyError, ValueError):
+        ref = _reference(item, band)
+        if ref is None:
             continue  # a name with no reference (an exit of an unpriced name) is not judged
         price = fill.price
-        if not (math.isfinite(ref) and ref > 0):
-            continue
         if not (
             math.isfinite(price)
             and ref * (1 - band.deviation) <= price <= ref * (1 + band.deviation)
@@ -646,6 +647,21 @@ def fill_band_violations(fills: Iterable[OrderedFill], band: PriceBand) -> tuple
                 f"reference price {ref}"
             )
     return tuple(out)
+
+
+def _reference(item: OrderedFill, band: PriceBand) -> float | None:
+    """The fill's reference price, or None when the band has none for its name."""
+    try:
+        ref = band.price_of(item.security_id) * _split_factor(
+            band.actions_as_of, item.security_id, item.order_session, band.session
+        )
+    except (KeyError, ValueError):
+        return None
+    return ref if math.isfinite(ref) and ref > 0 else None
+
+
+def _unpriced(item: OrderedFill, band: PriceBand) -> bool:
+    return _reference(item, band) is None
 
 
 def _split_factor(
