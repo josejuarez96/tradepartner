@@ -13,7 +13,7 @@ from alpaca.common.exceptions import APIError
 from tradepartner.adapters.broker import Asset, OrderRequest
 from tradepartner.adapters.fake_broker import PartialFill, Reject, SetPosition, Vanish
 from tradepartner.config import RiskConfig
-from tradepartner.errors import ReconciliationError
+from tradepartner.errors import AssetNotTradableError, ReconciliationError
 from tradepartner.store.journal import OverrideRow, PaperWindowRow
 
 from .test_run_stop import buy_id
@@ -216,7 +216,6 @@ def test_skip_share_cap_halts_before_any_buy(env: Env, tmp_path: Path) -> None:
     assert journal(env) == ([], [], [])
 
 
-@pytest.mark.xfail(strict=True, reason="#1848")
 def test_sell_refused_after_position_changes_is_reconciliation_fault(
     env: Env, window: PaperWindowRow
 ) -> None:
@@ -240,13 +239,20 @@ def test_sell_refused_after_position_changes_is_reconciliation_fault(
     def shrink_on_sell(request: OrderRequest) -> None:
         if request.side.value == "sell" and request.symbol == "TRNS":
             env.fake.apply_account(SetPosition("TRNS", 0))
+            # The broker then refuses the sell of a name it holds no more: a
+            # per-name refusal the submit allowlist knows, which on a sell is
+            # a ReconciliationError, never a skip (#1848, #1921).
+            raise AssetNotTradableError("TRNS: position gone at the broker")
 
     env.fake.on_submit = shrink_on_sell
     before = journal(env)
     with pytest.raises(ReconciliationError):
         env.run(at(date(2019, 6, 3)))
     assert env.result(env.latest_run())[:2] == ("halted", "ReconciliationError")
-    assert len(env.alerts("halted")) == 1
+    # One alert per halt (owner decision 2026-10-03, #644, Option A): the
+    # `reconciliation` alert, never a second `halted` one.
+    assert len(env.alerts("reconciliation")) == 1
+    assert env.alerts("halted") == []
     orders, events, fills = journal(env)
     assert len(orders) > len(before[0]) and len(fills) == len(before[2])
     assert any(status == "pending" for _, status in events)
