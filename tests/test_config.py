@@ -3156,3 +3156,29 @@ def test_portfolio_exposure_relation_is_pinned_for_t223() -> None:
     )
     with pytest.raises(ValueError, match="long_only"):
         PortfolioConfig._validate_exposures(long_only)
+
+
+# --- the borrow keys (T221; backtest spec amendment #1872, item 6) ----------------------
+
+
+def test_borrow_key_defaults() -> None:
+    """A long-only book pays no borrow and lists no sensitivity rate."""
+    for costs in (_settings().costs, CostsConfig()):
+        assert costs.borrow_bps_per_year == pytest.approx(0.0)
+        assert costs.borrow_sensitivity_bps == []
+
+
+def test_borrow_keys_accept_non_negative_rates() -> None:
+    costs = CostsConfig(borrow_bps_per_year=30.0, borrow_sensitivity_bps=[0.0, 30.0, 300.0])
+    assert costs.borrow_bps_per_year == pytest.approx(30.0)
+    assert costs.borrow_sensitivity_bps == [0.0, 30.0, 300.0]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"borrow_bps_per_year": -1.0}, {"borrow_sensitivity_bps": [30.0, -0.5]}],
+)
+def test_a_negative_borrow_rate_is_refused(override: dict[str, object]) -> None:
+    """A negative fee would pay the short book to hold its positions."""
+    with pytest.raises(ValueError, match="borrow"):
+        CostsConfig(**override)  # type: ignore[arg-type]
