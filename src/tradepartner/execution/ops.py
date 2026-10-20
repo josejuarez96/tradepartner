@@ -230,6 +230,7 @@ class OpsData:
     last_run_kind: str | None = None
     last_run_session: date | None = None
     targets_count: int = 0
+    plan_known_at: datetime | None = None
     switch_state: SwitchState | None = None
     ranking: tuple[RankedSignal, ...] = field(default_factory=tuple)
     fills: tuple[OrderedFill, ...] = field(default_factory=tuple)
@@ -259,6 +260,7 @@ class BookSummary:
     last_run_status: str | None
     last_run_kind: str | None
     last_run_session: date | None
+    last_run_has_orders: bool
     #: The first rebalance session at the window's cadence whose close is after
     #: now, never before the window's first rebalance; None for a window that is
     #: no longer open or whose cadence cannot be read.
@@ -266,7 +268,7 @@ class BookSummary:
 
 
 def rebalance_traded_today(row: BookSummary) -> date | None:
-    """The rebalance traded by today's completed fill-session run, if any."""
+    """The rebalance handled by today's completed fill-session run, if any."""
     if (
         row.last_run_kind != "rebalance"
         or row.last_run_status != "ok"
@@ -881,6 +883,7 @@ def page_data(
         last_run_kind=latest_run.kind if latest_run is not None else None,
         last_run_session=latest_run.session if latest_run is not None else None,
         targets_count=targets_count,
+        plan_known_at=plan.known_at if plan is not None else None,
         switch_state=switch_state,
         ranking=ranking,
         fills=fills,
@@ -948,6 +951,13 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
     )
     is_open = _is_open(conn, window_id)
     positions_count, _ = _positions(conn, window_id)
+    last_run_has_orders = False
+    if latest_run is not None:
+        order_exists = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE run_id = ?)",
+            [latest_run.run.run_id],
+        ).fetchone()
+        last_run_has_orders = bool(order_exists[0]) if order_exists else False
     return BookSummary(
         book_id=book,
         window=window,
@@ -958,6 +968,7 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
         last_run_status=last_run_status,
         last_run_kind=latest_run.run.kind if latest_run is not None else None,
         last_run_session=latest_run.run.session if latest_run is not None else None,
+        last_run_has_orders=last_run_has_orders,
         next_rebalance_session=(
             _next_rebalance_session(conn, window, utc_now()) if is_open else None
         ),
