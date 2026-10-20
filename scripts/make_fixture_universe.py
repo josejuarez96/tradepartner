@@ -5,8 +5,8 @@ override directory given as the first CLI argument, so tests can regenerate
 into a tmp dir): `securities.csv`, `listings.csv`, `classifications.csv`,
 `delistings.csv`, `prices_daily.csv`, `corporate_actions.csv`, `facts.csv`,
 `statement_facts.csv`, `filing_events.csv` (#1358), `rates.csv` (#1498),
-`borrow_status.csv` and `symbol_changes.csv` (#1506), plus `README.md` mapping
-every spec req 13 case, every statement-facts case (#660), every filing-events
+`borrow_status.csv` and `symbol_changes.csv` (#1506), `mergers.csv` (#1762), plus
+`README.md` mapping every spec req 13 case, every statement-facts case (#660), every filing-events
 case (#1358), every rates case (#1498) and every borrow-status case (#1506), to
 the rows that exercise it.
 
@@ -56,6 +56,7 @@ from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from tradepartner.adapters.prices import announcement_date_known_at
 from tradepartner.calendar import (
     is_half_day,
     is_session,
@@ -212,6 +213,25 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "old_cusip",
         "new_cusip",
         "process_date",
+        "source_action_id",
+        "known_at",
+        "ingested_at",
+        "source",
+        "provenance",
+    ),
+    "mergers": (
+        "security_id",
+        "kind",
+        "acquirer_security_id",
+        "acquiree_symbol",
+        "acquiree_cusip",
+        "acquirer_symbol",
+        "acquirer_cusip",
+        "share_ratio",
+        "cash_per_share",
+        "effective_date",
+        "process_date",
+        "payable_date",
         "source_action_id",
         "known_at",
         "ingested_at",
@@ -407,6 +427,7 @@ class Rows:
     prices_daily: list[dict[str, object]] = field(default_factory=list)
     corporate_actions: list[dict[str, object]] = field(default_factory=list)
     symbol_changes: list[dict[str, object]] = field(default_factory=list)
+    mergers: list[dict[str, object]] = field(default_factory=list)
     facts: list[dict[str, object]] = field(default_factory=list)
     statement_facts: list[dict[str, object]] = field(default_factory=list)
     filing_events: list[dict[str, object]] = field(default_factory=list)
@@ -1245,6 +1266,66 @@ def _spin_and_name_change(rows: Rows) -> None:
             "provenance": "action",
         }
     )
+
+
+def _mergers(rows: Rows) -> None:
+    """T248c (#1762): one cash merger and one stock merger, stamped as the table's rule
+    says (the close of the first session strictly after `process_date`). The cash merger's
+    acquiree is `SEC_CLEAN_MERGER`, effective the session of its Form 25 and bought by a
+    private buyer (no acquirer id). The stock merger's acquiree `SEC_DIV_CANCELLED` is
+    bought by `SEC_SPLIT_PLAIN` for 0.75 acquirer shares per share (acquirer rate 3,
+    acquiree rate 4) and keeps its bars after the effective date, as a wrong resolution
+    would (the health block's report-only list)."""
+    cash_effective = nth_session_after(
+        nth_session_after(_session_on_or_after(date(2018, 3, 1)), 100), 1
+    )
+    stock_effective = _session_on_or_after(date(2020, 2, 14))
+    for security_id, kind, acquirer_id, acquiree, acquirer, ratio, cash, effective, payable in (
+        (
+            "SEC_CLEAN_MERGER",
+            "cash",
+            None,
+            "CLNM",
+            "",
+            None,
+            62.5,
+            cash_effective,
+            next_session(cash_effective),
+        ),
+        (
+            "SEC_DIV_CANCELLED",
+            "stock",
+            "SEC_SPLIT_PLAIN",
+            "DCAN",
+            "SPLT",
+            0.75,
+            None,
+            stock_effective,
+            None,
+        ),
+    ):
+        stamp = announcement_date_known_at(effective)
+        rows.mergers.append(
+            {
+                "security_id": security_id,
+                "kind": kind,
+                "acquirer_security_id": acquirer_id,
+                "acquiree_symbol": acquiree,
+                "acquiree_cusip": f"SYNTH-{acquiree}",
+                "acquirer_symbol": acquirer,
+                "acquirer_cusip": f"SYNTH-{acquirer}" if acquirer else "",
+                "share_ratio": ratio,
+                "cash_per_share": cash,
+                "effective_date": effective,
+                "process_date": effective,
+                "payable_date": payable,
+                "source_action_id": f"fixture-merger-{kind}-1",
+                "known_at": stamp,
+                "ingested_at": stamp + timedelta(minutes=10),
+                "source": _SOURCE_ALPACA,
+                "provenance": "action",
+            }
+        )
 
 
 def _reused_ticker(rows: Rows) -> None:
@@ -3067,6 +3148,7 @@ def build_rows() -> Rows:
     _exchange_transfer(rows)
     _same_company_ticker_change(rows)
     _spin_and_name_change(rows)
+    _mergers(rows)
     _reused_ticker(rows)
     _plain_split(rows)
     _split_between_filing_and_t(rows)
@@ -3136,6 +3218,13 @@ def write_fixtures(output_dir: Path) -> None:
         "symbol_changes",
         rows.symbol_changes,
         ("security_id", "process_date", "old_symbol", "known_at"),
+        lineterminator="\n",
+    )
+    _write_csv(
+        output_dir / "mergers.csv",
+        "mergers",
+        rows.mergers,
+        ("security_id", "effective_date", "source_action_id", "known_at"),
         lineterminator="\n",
     )
     _write_csv(
@@ -3216,7 +3305,14 @@ def _write_chain_overlay(output_dir: Path) -> None:
         _write_csv(output_dir / f"{table}.csv", table, records, key, lineterminator=terminator)
     assert not any(
         getattr(rows, name)
-        for name in ("statement_facts", "filing_events", "rates", "borrow_status", "symbol_changes")
+        for name in (
+            "statement_facts",
+            "filing_events",
+            "rates",
+            "borrow_status",
+            "symbol_changes",
+            "mergers",
+        )
     )
     lines = [
         "# Successor-chain overlay (#821, T187)",

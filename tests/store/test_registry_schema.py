@@ -124,6 +124,7 @@ def _make_old_store(path: Path, version: int) -> None:
             + schema._SYMBOL_CHANGES_TABLE_DDL
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
+            + schema._MERGERS_TABLE_DDL
         ):
             conn.execute(ddl)
         if version >= 3:
@@ -236,7 +237,7 @@ def test_registry_table_names_disjoint_from_fact_table_names() -> None:
 
 
 def test_current_schema_version_is_26() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
 
 
 def test_fresh_init_creates_every_table_at_version_26() -> None:

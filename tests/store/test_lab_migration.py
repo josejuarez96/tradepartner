@@ -182,7 +182,7 @@ def _hypothesis_ids(conn: duckdb.DuckDBPyConnection) -> list[int]:
 
 
 def test_version_is_17_and_16_is_the_pre_expansion_seams_version() -> None:
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
     assert schema._PRE_EXPANSION_SEAMS_VERSION == 16
     assert schema._PRE_LAB_VERSION == 15
 
