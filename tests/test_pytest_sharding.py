@@ -1,22 +1,24 @@
 """Pure test-file bucketing used by CI's pytest shards (#1112).
 
 `shard_assignment` (tests/conftest.py) is what `pytest_collection_modifyitems`
-uses to keep only one shard's items per CI job. These tests exercise the
-pure function directly; the collection behavior is covered by CI itself
-running all N shards and the workflow comparing counts (see the PR body).
+uses to keep only one shard's items per CI job. These tests check the
+assignment against one real collection and cover the shard item order.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import (
     _DEFAULT_TEST_FILE_WEIGHT,
     _HEAVY_TEST_FILE_WEIGHTS,
     _SPLIT_BY_TEST,
+    _order_shard_items,
     _shard_unit,
+    pytest_collection_modifyitems,
     shard_assignment,
 )
 
@@ -129,43 +131,83 @@ def test_split_by_test_files_have_only_nodeid_keys_in_the_weight_table() -> None
         assert any(key.startswith(f"{split_file}::") for key in _HEAVY_TEST_FILE_WEIGHTS)
 
 
-def test_real_collection_shards_partition_the_full_suite() -> None:
-    """Collect the real suite once unsharded and once per shard (as CI does, #1749): every
-    nodeid lands in exactly one shard, so no test is lost or run twice."""
-    import os
-    import subprocess
-    import sys
-    from concurrent.futures import ThreadPoolExecutor
+def test_shard_order_is_heaviest_first_with_stable_unit_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weights 5/1/3 run in that order; equal weights sort by unit nodeid."""
+    for unit, weight in {"a": 5.0, "b": 1.0, "c": 3.0, "d": 3.0}.items():
+        monkeypatch.setitem(_HEAVY_TEST_FILE_WEIGHTS, f"tests/{unit}.py", weight)
+    items = [
+        _FakeItem(_ROOT_DIR / "tests/d.py", "tests/d.py::one"),
+        _FakeItem(_ROOT_DIR / "tests/a.py", "tests/a.py::second"),
+        _FakeItem(_ROOT_DIR / "tests/b.py", "tests/b.py::one"),
+        _FakeItem(_ROOT_DIR / "tests/a.py", "tests/a.py::first"),
+        _FakeItem(_ROOT_DIR / "tests/c.py", "tests/c.py::one"),
+    ]
+    _order_shard_items(items, _ROOT_DIR)
+    assert [item.nodeid for item in items] == [
+        "tests/a.py::second",
+        "tests/a.py::first",
+        "tests/c.py::one",
+        "tests/d.py::one",
+        "tests/b.py::one",
+    ]
 
+
+def test_local_collection_keeps_its_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTEST_SHARD_INDEX", raising=False)
+    monkeypatch.delenv("PYTEST_SHARD_COUNT", raising=False)
+    items = [
+        _FakeItem(_ROOT_DIR / "tests/b.py", "tests/b.py::one"),
+        _FakeItem(_ROOT_DIR / "tests/a.py", "tests/a.py::one"),
+    ]
+    pytest_collection_modifyitems(None, items)  # type: ignore[arg-type]
+    assert [item.nodeid for item in items] == ["tests/b.py::one", "tests/a.py::one"]
+
+
+def test_shard_collection_orders_kept_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYTEST_SHARD_INDEX", "0")
+    monkeypatch.setenv("PYTEST_SHARD_COUNT", "1")
+    monkeypatch.setitem(_HEAVY_TEST_FILE_WEIGHTS, "tests/a.py", 5.0)
+    monkeypatch.setitem(_HEAVY_TEST_FILE_WEIGHTS, "tests/b.py", 1.0)
+    items = [
+        _FakeItem(_ROOT_DIR / "tests/b.py", "tests/b.py::one"),
+        _FakeItem(_ROOT_DIR / "tests/a.py", "tests/a.py::one"),
+    ]
+    pytest_collection_modifyitems(SimpleNamespace(rootpath=_ROOT_DIR), items)  # type: ignore[arg-type]
+    assert [item.nodeid for item in items] == ["tests/a.py::one", "tests/b.py::one"]
+
+
+def test_real_collection_shards_partition_the_full_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One real collection, then the same assignment as each CI shard uses (#2056)."""
     count = 8
+    monkeypatch.delenv("PYTEST_SHARD_INDEX", raising=False)
+    monkeypatch.delenv("PYTEST_SHARD_COUNT", raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
 
-    def collect(index: int | None) -> list[str]:
-        skipped = ("PYTEST_SHARD", "PYTEST_XDIST", "PYTEST_CURRENT_TEST")
-        env = {k: v for k, v in os.environ.items() if not k.startswith(skipped)}
-        if index is not None:
-            env["PYTEST_SHARD_COUNT"] = str(count)
-            env["PYTEST_SHARD_INDEX"] = str(index)
-        done = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "--collect-only",
-                "-q",
-                "-p",
-                "no:cacheprovider",
-            ],
-            cwd=_ROOT_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
-        return [line for line in done.stdout.splitlines() if "::" in line]
+    class Collector:
+        def __init__(self) -> None:
+            self.nodeids: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=count + 1) as pool:
-        full, *shards = list(pool.map(collect, [None, *range(count)]))
+        def pytest_collection_finish(self, session: pytest.Session) -> None:
+            self.nodeids = [item.nodeid for item in session.items]
+
+    collector = Collector()
+    result = pytest.main(
+        ["--collect-only", "-q", "-p", "no:cacheprovider", "-o", "addopts=", "tests"],
+        plugins=[collector],
+    )
+    assert result == pytest.ExitCode.OK
+    full = collector.nodeids
+    unit_by_nodeid = {
+        nodeid: nodeid if nodeid.split("::")[0] in _SPLIT_BY_TEST else nodeid.split("::")[0]
+        for nodeid in full
+    }
+    units = set(unit_by_nodeid.values())
+    shards = []
+    for index in range(count):
+        assignment = shard_assignment(units, shard_count=count)
+        shards.append([nodeid for nodeid in full if assignment[unit_by_nodeid[nodeid]] == index])
     flat = [nodeid for shard in shards for nodeid in shard]
     assert len(flat) == len(set(flat)), "a test is collected by more than one shard"
     assert set(flat) == set(full)
@@ -173,9 +215,5 @@ def test_real_collection_shards_partition_the_full_suite() -> None:
     assert len(full) > 1000, "collection looks empty or truncated"
     # no stale weight keys: every listed unit is a real file or nodeid (a renamed test or
     # parameter would otherwise fall back to the default weight and unbalance a shard).
-    units = {
-        nodeid if nodeid.split("::")[0] in _SPLIT_BY_TEST else nodeid.split("::")[0]
-        for nodeid in full
-    }
     stale = sorted(set(_HEAVY_TEST_FILE_WEIGHTS) - units)
     assert not stale, f"weight table keys that match no collected unit: {stale}"
