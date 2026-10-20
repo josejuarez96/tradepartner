@@ -2238,6 +2238,9 @@ class ActionsParse:
     #: it was malformed and left out (`AlpacaPriceSource.corporate_actions`,
     #: `.symbol_changes`), so it never fails the day's other rows.
     malformed_categories: tuple[str, ...] = ()
+    #: #1676: a category whose request got no answer (a transport error); the
+    #: next daily run's window still covers its days, so it is asked again.
+    unanswered_categories: tuple[str, ...] = ()
     #: #1673: spin-off records returned as revisions of an earlier
     #: distribution of the same (child, parent) in the same payload (spec
     #: "Spin-offs"); identities left out because two differing rows share one
@@ -2657,6 +2660,15 @@ def _default_fetch_name_changes(
     return alpaca_raw._merge_batches(alpaca_raw._drop_actions_seen_in_earlier_batches(batches))
 
 
+def _transport_errors() -> tuple[type[BaseException], ...]:
+    """The errors a request to Alpaca raises on the wire (#1676): a network
+    failure (`requests.RequestException`, an `OSError`) or an API refusal."""
+    import requests
+    from alpaca.common.exceptions import APIError
+
+    return (requests.RequestException, APIError, OSError)
+
+
 class AlpacaPriceSource(PriceSource):
     """`PriceSource` over Alpaca: asks for every symbol the requested
     securities traded under in the range, parses, and keeps only the
@@ -2944,6 +2956,11 @@ class AlpacaPriceSource(PriceSource):
                 )
             if malformed := self.last_actions_report.malformed_categories:
                 line += f"; malformed {', '.join(malformed)} category skipped"
+            if unanswered := self.last_actions_report.unanswered_categories:
+                line += (
+                    f"; {', '.join(unanswered)} request unanswered (transport error), "
+                    "asked again next run"
+                )
             if self.last_actions_report.self_spinoff:
                 line += f"; {self.last_actions_report.self_spinoff} self spin-off(s)"
             if self.last_actions_report.spinoff_revisions:
@@ -3080,6 +3097,15 @@ class AlpacaPriceSource(PriceSource):
             # splits are already fetched); the actions backfill refuses it.
             self.last_actions_report = ActionsParse(
                 (), (), (), malformed_categories=("name_changes",)
+            )
+            return []
+        except _transport_errors():
+            # #1676: a network or API error on this request is tolerated the
+            # same way: the day's prices land, a warning is counted, and the
+            # window (`ingest._fetch_prices`: from one lag before the month)
+            # asks again next run, so no unanswered day is skipped.
+            self.last_actions_report = ActionsParse(
+                (), (), (), unanswered_categories=("name_changes",)
             )
             return []
         self.last_actions_report = parsed

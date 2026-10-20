@@ -942,7 +942,12 @@ def test_an_s_minus_1_row_crossing_close_s_minus_1_aborts_with_and_without_the_p
 ) -> None:
     stored = datetime(2019, 5, 1, 21, tzinfo=UTC)  # 17:00 New York: after the close
     store = _s1_store(settings, stored)
-    ok = _precheck(settings, tmp_path) if flag else None
+    if flag:
+        # #1524: the pre-check itself now fails on this pre-window row (21:00Z is
+        # within 5 h after close(S-1)); forced to pass, the exact check still aborts.
+        (tmp_path / "natural").mkdir()
+        assert not _precheck(settings, tmp_path / "natural").precheck.passed
+    ok = _precheck(settings, tmp_path, passed=True) if flag else None
     assert ok is None or (ok.precheck.passed and S1_CLOSE in ok.precheck.instants)
     before = _snapshot(store)
     status, message, results = _ingest(
