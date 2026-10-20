@@ -522,7 +522,27 @@ registry; #83 took version 2 first, so the registry is version 3):
   `_migrate_pending_unresolved` rebuilds `order_events`. A read-only connection
   accepts a version-33 store: every read works, and the next writable
   `init_schema` call migrates it.
-- **A later DDL change goes to version 35**, with its own migration and a
+- **Version 35** (#1762, data-foundation plan T248c; the spec's "Amendment
+  2026-10-19 (#1762, #1930)", mergers stored point-in-time): adds `mergers`
+  (one row per Alpaca cash, stock or stock-and-cash merger record: the
+  acquiree `security_id`, the acquirer when it is in the master, acquirer
+  shares per acquiree share, cash per acquiree share and three dates;
+  `known_at` = the close of the first session strictly after its
+  `process_date`). Purely additive, like versions 21, 23, 24 and 28: the
+  migration from any earlier migratable version just creates the table and
+  its identity index (`init_schema`'s DDL pass, `_MERGERS_TABLE_DDL`) and
+  appends a version-35 row; no existing table or row changes. Alpaca's id is
+  required (`source_action_id` is non-empty), so the identity is
+  `(security_id, source_action_id, known_at)`, enforced by the unique index
+  `mergers_identity`. A `CHECK` ties the rates to the kind (`cash` has
+  `cash_per_share` only, `stock` `share_ratio` only, `stock_and_cash` both,
+  each positive and finite) and the two stock kinds name their acquirer. The
+  table joins `TABLE_NAMES` and `TABLE_PROVENANCE_VALUES` (`action` only);
+  `registry.data_vintage` leaves it out (an explicit list), so a merger
+  backfill stales no trial. A read-only connection accepts a version-34 store:
+  every read works but a `mergers` read, which fails on the missing table, and
+  the next writable `init_schema` call migrates the store.
+- **A later DDL change goes to version 36**, with its own migration and a
   note here, never a silent edit of the DDL below.
 
 Registry tables are not fact tables: like `ingestion_runs` they carry no
@@ -643,6 +663,7 @@ TABLE_PROVENANCE_VALUES: dict[str, tuple[str, ...]] = {
     "symbol_changes": ("action",),
     "openfigi_types": ("openfigi",),
     "successor_chains": ("filing",),
+    "mergers": ("action",),
 }
 
 #: `statement_facts.basis` (#660): `reported` for an as-filed value,
@@ -810,9 +831,12 @@ STATEMENT_FACT_BASIS_VALUES: tuple[str, ...] = ("reported", "derived")
 #:   `decisions`, `decision_events` and `order_events`; the three tables are
 #:   rebuilt (`_migrate_short_reasons`), every row kept (module docstring,
 #:   "Schema versions").
-#: - A later DDL change goes to version 35, with its own migration and a
+#: - 35 (#1762, plan T248c): the `mergers` table and its identity index,
+#:   created by the DDL pass (`_MERGERS_TABLE_DDL`); no existing table changes
+#:   (module docstring, "Schema versions").
+#: - A later DDL change goes to version 36, with its own migration and a
 #:   note here, never a silent edit of the DDL below.
-CURRENT_SCHEMA_VERSION = 34
+CURRENT_SCHEMA_VERSION = 35
 
 #: The last version without the registry (fact tables as of #83).
 _PRE_REGISTRY_VERSION = 2
@@ -967,6 +991,11 @@ _PRE_COST_LEVEL_KIND_VERSION = 32
 #: connections serve every read, since no read depends on the reason or
 #: decision `CHECK`s and no such row can exist there.
 _PRE_SHORT_REASONS_VERSION = 33
+
+#: The last version without `mergers` (#1762, T248c, version 35): read-only
+#: connections serve every other read; a `mergers` read there fails on the
+#: missing table, as a `symbol_changes` read did at 27.
+_PRE_MERGERS_VERSION = 34
 
 
 class SchemaVersionError(RuntimeError):
@@ -1303,6 +1332,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS symbol_changes_identity ON symbol_changes (
 )
 """
 
+# T248c (#1762): merger facts. Alpaca's id is required, so the identity is the
+# acquiree, the id and the stamp; one `CHECK` ties the two rates to the kind.
+_CREATE_MERGERS = f"""
+CREATE TABLE IF NOT EXISTS mergers (
+    security_id VARCHAR NOT NULL,
+    kind VARCHAR NOT NULL,
+    acquirer_security_id VARCHAR,
+    acquiree_symbol VARCHAR NOT NULL,
+    acquiree_cusip VARCHAR NOT NULL,
+    acquirer_symbol VARCHAR NOT NULL,
+    acquirer_cusip VARCHAR NOT NULL,
+    share_ratio DOUBLE,
+    cash_per_share DOUBLE,
+    effective_date DATE NOT NULL,
+    process_date DATE NOT NULL,
+    payable_date DATE,
+    source_action_id VARCHAR NOT NULL,
+    {_common_fact_columns(TABLE_PROVENANCE_VALUES["mergers"])},
+    CHECK (source_action_id <> ''),
+    CHECK (kind IN ('cash', 'stock', 'stock_and_cash')),
+    CHECK (kind = 'cash' OR acquirer_security_id IS NOT NULL),
+    CHECK (
+        (share_ratio IS NOT NULL) = (kind IN ('stock', 'stock_and_cash'))
+        AND (cash_per_share IS NOT NULL) = (kind IN ('cash', 'stock_and_cash'))
+    ),
+    CHECK (share_ratio IS NULL OR (share_ratio > 0 AND isfinite(share_ratio))),
+    CHECK (cash_per_share IS NULL OR (cash_per_share > 0 AND isfinite(cash_per_share)))
+)
+"""
+
+_CREATE_MERGERS_IDENTITY_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS mergers_identity ON mergers (
+    security_id,
+    source_action_id,
+    known_at
+)
+"""
+
 _CREATE_OPENFIGI_TYPES = f"""
 CREATE TABLE IF NOT EXISTS openfigi_types (
     security_id VARCHAR NOT NULL,
@@ -1383,6 +1450,7 @@ TABLE_NAMES: tuple[str, ...] = (
     "symbol_changes",
     "openfigi_types",
     "successor_chains",
+    "mergers",
     "ingestion_runs",
     "schema_version",
 )
@@ -1438,6 +1506,12 @@ _SYMBOL_CHANGES_TABLE_DDL: tuple[str, ...] = (
     _CREATE_SYMBOL_CHANGES_IDENTITY_INDEX,
 )
 _OPENFIGI_TYPES_TABLE_DDL: tuple[str, ...] = (_CREATE_OPENFIGI_TYPES,)
+
+#: `mergers` (#1762, T248c), added at version 35: its own tuple, as
+#: `_SYMBOL_CHANGES_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
+#: `tests/store/test_schema.py`; a later edit of this DDL goes to the next
+#: schema version with its own migration.
+_MERGERS_TABLE_DDL: tuple[str, ...] = (_CREATE_MERGERS, _CREATE_MERGERS_IDENTITY_INDEX)
 
 #: `successor_chains` (#821, T187), added at version 31: its own tuple, as
 #: `_SYMBOL_CHANGES_TABLE_DDL` is, so no earlier pin moves. Pinned by hash in
@@ -2937,6 +3011,7 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PENDING_UNRESOLVED_VERSION,
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
+        _PRE_MERGERS_VERSION,
         CURRENT_SCHEMA_VERSION,
     ):
         # Version 4 serves fact and registry reads; versions 5 to 8 every journal
@@ -2970,7 +3045,9 @@ def _check_read_only(conn: duckdb.DuckDBPyConnection) -> None:
         # `successor_chains`; version 30 every read but `successor_chains`;
         # version 31 every read (no `pending_unresolved` event can exist there);
         # version 32 every read (no `cost_level_kind` column: the backtest page
-        # falls back to `base`/`ladder` by each level).
+        # falls back to `base`/`ladder` by each level);
+        # version 33 every read (no short reason can exist there); version 34
+        # every read but `mergers`.
 
         return
     if max_version == _PRE_ACTION_IDENTITY_VERSION:
@@ -3824,7 +3901,7 @@ def _migrate_short_reasons(conn: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every store table if it does not already exist, migrating a
-    version-2 to 33 store to version 34.
+    version-2 to 34 store to version 35.
 
     Idempotent: safe to call on every process start and every test. Also
     pins the connection's session timezone to UTC and disables extension
@@ -3988,6 +4065,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         _PRE_PENDING_UNRESOLVED_VERSION,
         _PRE_COST_LEVEL_KIND_VERSION,
         _PRE_SHORT_REASONS_VERSION,
+        _PRE_MERGERS_VERSION,
     )
     if max_version not in (None, *migratable, CURRENT_SCHEMA_VERSION):
         raise SchemaVersionError(
@@ -4030,6 +4108,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             + _SYMBOL_CHANGES_TABLE_DDL
             + _OPENFIGI_TYPES_TABLE_DDL
             + _SUCCESSOR_CHAINS_TABLE_DDL
+            + _MERGERS_TABLE_DDL
         ):
             conn.execute(ddl)
         _migrate_retracted(conn)
