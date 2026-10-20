@@ -24,6 +24,7 @@ term:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 
@@ -33,6 +34,23 @@ from tradepartner.calendar import all_sessions
 from tradepartner.config import CostsConfig, Settings
 
 BPS_PER_UNIT = 10_000
+
+
+def borrow_fee(short_values: Mapping[str, float], bps_per_year: float, calendar_days: int) -> float:
+    """Fee on short values over calendar days, using a 360-day year."""
+    if not math.isfinite(bps_per_year) or bps_per_year < 0:
+        raise ValueError("bps_per_year must be non-negative and finite")
+    if calendar_days < 0:
+        raise ValueError("calendar_days must be non-negative")
+    if any(not math.isfinite(value) for value in short_values.values()):
+        raise ValueError("short values must be finite")
+    return (
+        math.fsum(abs(value) for value in short_values.values())
+        * bps_per_year
+        / BPS_PER_UNIT
+        * calendar_days
+        / 360
+    )
 
 
 @dataclass(frozen=True)

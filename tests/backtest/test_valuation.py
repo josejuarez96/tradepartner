@@ -47,6 +47,31 @@ D2, D5, D6, D7, D8 = (date(2024, 2, d) for d in (2, 5, 6, 7, 8))
 T1 = date(2024, 2, 29)
 
 
+def test_signed_short_split_and_dividend_marks_to_hand_values() -> None:
+    split = _frame([("S", F0, 25.0, 25.0), ("S", D2, 25.0, 25.0)])
+    values = value_positions({"S": -50.0}, split, F0, fill_price="close", through=D2, signed=True)
+    assert _values(values, "S") == pytest.approx({F0: -50.0, D2: -50.0}, abs=1e-9)
+
+    # Raw prior close 100, D=2, factor=.98; adjusted prior=98, ex raw close=99.
+    dividend = _frame([("S", F0, 98.0, 98.0), ("S", D2, 99.0, 99.0)])
+    marked = value_positions(
+        {"S": -50.0}, dividend, F0, fill_price="close", through=D2, signed=True
+    )
+    marked_equity = 100.0 + _values(marked, "S")[D2]
+    cash_payment_equity = 100.0 - 50.0 * 99.0 / 100.0 - 0.5 * 2.0
+    assert marked_equity - cash_payment_equity == pytest.approx(
+        0.5 * 2.0 * (1.0 - 99.0 / (100.0 - 2.0)), abs=1e-9
+    )
+
+
+def test_signed_carry_to_fill_preserves_negative_value() -> None:
+    frame = _frame([("S", T0, 20.0, 20.0), ("S", F0, 22.0, 22.0)])
+    got = carry_to_fill(
+        {"S": -50.0}, frame, T0, F0, fill_price="close", marked_at={"S": T0}, signed=True
+    )
+    assert got == pytest.approx({"S": -55.0}, abs=1e-9)
+
+
 def _frame(rows: list[tuple[str, date, float, float]]) -> pl.DataFrame:
     """A marking frame from `(security_id, session, open, close)` rows."""
     return pl.DataFrame(

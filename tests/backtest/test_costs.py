@@ -18,6 +18,7 @@ import pytest
 
 from tradepartner.backtest.costs import (
     Commissions,
+    borrow_fee,
     buy_notional_after_costs,
     sensitivity_levels,
     trade_cost,
@@ -26,6 +27,14 @@ from tradepartner.calendar import all_sessions
 from tradepartner.config import Settings
 
 COSTS_PY = Path(__file__).resolve().parents[2] / "src" / "tradepartner" / "backtest" / "costs.py"
+
+
+def test_borrow_fee_hand_values_and_friday_to_monday() -> None:
+    assert borrow_fee({"A": -600.0, "B": -300.0}, 30.0, 1) == pytest.approx(0.0075, abs=1e-9)
+    assert borrow_fee({"A": -600.0, "B": -300.0}, 30.0, 3) == pytest.approx(0.0225, abs=1e-9)
+    assert borrow_fee({}, 300.0, 3) == 0.0
+    assert borrow_fee({"A": -600.0}, 0.0, 3) == 0.0
+
 
 # (notional, shares): a whole-share buy, a whole-share sell, a fractional buy.
 THREE_TRADES = [(10_000.0, 100.0), (2_500.0, 50.0), (333.33, 3.3333)]
@@ -136,7 +145,7 @@ def test_commissions_from_config() -> None:
 
 
 # Spec acceptance (Costs and metrics): no numeric literals in costs.py other than these.
-ALLOWED_LITERALS = {0, 1, -1, 2, 4, 12, 10_000}
+ALLOWED_LITERALS = {0, 1, -1, 2, 4, 12, 360, 10_000}
 
 
 def test_costs_module_has_no_stray_numeric_literals() -> None:

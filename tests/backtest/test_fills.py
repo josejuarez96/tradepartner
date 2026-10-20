@@ -60,6 +60,64 @@ def _fill(
     )
 
 
+def test_signed_short_open_rise_cover_and_flip_hand_ledger() -> None:
+    opened = _fill(
+        {}, 100.0, {"S": -0.5, "L": 0.5}, {"S": 10.0, "L": 10.0}, per_side_bps=0, signed=True
+    )
+    assert opened.positions == pytest.approx({"S": -50.0, "L": 50.0}, abs=1e-9)
+    assert opened.cash == pytest.approx(100.0, abs=1e-9)
+    assert [t.notional for t in opened.trades] == pytest.approx([-50.0, 50.0], abs=1e-9)
+    # S rises 10%: short value -55, cash 100, long value 50, equity 95.
+    covered = _fill(
+        {"S": -55.0, "L": 50.0},
+        100.0,
+        {"L": 1.0},
+        {"S": 11.0, "L": 10.0},
+        per_side_bps=0,
+        signed=True,
+    )
+    assert covered.positions == pytest.approx({"L": 95.0}, abs=1e-9)
+    assert covered.cash == pytest.approx(0.0, abs=1e-9)
+    assert [t.notional for t in covered.trades] == pytest.approx([55.0, 45.0], abs=1e-9)
+    flipped = _fill({"S": -55.0}, 150.0, {"S": 0.5}, {"S": 11.0}, per_side_bps=0, signed=True)
+    assert flipped.positions == pytest.approx({"S": 47.5}, abs=1e-9)
+    assert flipped.cash == pytest.approx(47.5, abs=1e-9)
+    assert [t.notional for t in flipped.trades] == pytest.approx([55.0, 47.5], abs=1e-9)
+
+
+def test_signed_long_buy_uses_only_free_cash_after_missed_sell() -> None:
+    result = _fill(
+        {"M": 90.0},
+        10.0,
+        {"S": -0.5, "L": 0.5},
+        {"S": 10.0, "L": 10.0},
+        per_side_bps=0,
+        signed=True,
+    )
+    assert result.missing == ("M",)
+    assert result.positions == pytest.approx({"M": 90.0, "S": -50.0, "L": 10.0}, abs=1e-9)
+    assert result.cash == pytest.approx(50.0, abs=1e-9)
+    assert result.cash - abs(result.positions["S"]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_signed_long_to_short_flip_has_two_trades() -> None:
+    result = _fill({"S": 50.0}, 50.0, {"S": -0.5}, {"S": 10.0}, per_side_bps=0, signed=True)
+    assert result.positions == pytest.approx({"S": -50.0}, abs=1e-9)
+    assert result.cash == pytest.approx(150.0, abs=1e-9)
+    assert [t.notional for t in result.trades] == pytest.approx([-50.0, -50.0], abs=1e-9)
+
+
+def test_signed_short_open_and_cover_each_pay_cost() -> None:
+    opened = _fill({}, 100.0, {"S": -0.5}, {"S": 10.0}, per_side_bps=100, signed=True)
+    assert opened.positions == pytest.approx({"S": -50.0}, abs=1e-9)
+    assert opened.cash == pytest.approx(149.5, abs=1e-9)
+    assert opened.cost_paid == pytest.approx(0.5, abs=1e-9)
+    covered = _fill(opened.positions, opened.cash, {}, {"S": 10.0}, per_side_bps=100, signed=True)
+    assert covered.positions == {}
+    assert covered.cash == pytest.approx(99.0, abs=1e-9)
+    assert covered.cost_paid == pytest.approx(0.5, abs=1e-9)
+
+
 # --- zero terms are today's fill to the last bit -----------------------------------
 
 #: A sell (A leaves the targets, sold whole), a trim (B from 40% to 30%), two buys (C, D)
