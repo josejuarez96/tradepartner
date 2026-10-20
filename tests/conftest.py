@@ -265,6 +265,16 @@ def _shard_unit(item: pytest.Item, rootdir: Path) -> str:
     return item.nodeid if rel in _SPLIT_BY_TEST else rel
 
 
+def _order_shard_items(items: list[pytest.Item], rootdir: Path) -> None:
+    """Run heavier shard units first, preserving collection order within each unit."""
+
+    def priority(item: pytest.Item) -> tuple[float, str]:
+        unit = _shard_unit(item, rootdir)
+        return (-_HEAVY_TEST_FILE_WEIGHTS.get(unit, _DEFAULT_TEST_FILE_WEIGHT), unit)
+
+    items.sort(key=priority)
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Keep only this shard's items, when CI sets `PYTEST_SHARD_INDEX`/`_COUNT` (#1112).
 
@@ -280,8 +290,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         return
     shard_count = int(count_raw)
     shard_index = int(index_raw)
-    if shard_count <= 1:
-        return
     if not 0 <= shard_index < shard_count:
         raise ValueError(
             f"{_SHARD_INDEX_ENV}={shard_index} out of range for {_SHARD_COUNT_ENV}={shard_count}"
@@ -294,6 +302,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         unit = _shard_unit(item, rootdir)
         (kept if assignment[unit] == shard_index else deselected).append(item)
+    _order_shard_items(kept, rootdir)
     items[:] = kept
     if deselected:
         config.hook.pytest_deselected(items=deselected)
@@ -665,7 +674,8 @@ def version_4_store(path: Path) -> Path:
     and `schema._migrate_filing_name` (version 26, #1597; the
     `filing_name` provenance `CHECK` the fixture listings and
     classifications rows may carry), and `schema._SUCCESSOR_CHAINS_TABLE_DDL`
-    (version 30, #821, plan T187; `successor_chains.csv`)."""
+    (version 30, #821, plan T187; `successor_chains.csv`) and `schema._MERGERS_TABLE_DDL`
+    (version 35, #1762, plan T248c; `mergers.csv`)."""
     conn = duckdb.connect(str(path))
     try:
         configure_connection(conn)
@@ -679,6 +689,7 @@ def version_4_store(path: Path) -> Path:
             + schema._SYMBOL_CHANGES_TABLE_DDL
             + schema._OPENFIGI_TYPES_TABLE_DDL
             + schema._SUCCESSOR_CHAINS_TABLE_DDL
+            + schema._MERGERS_TABLE_DDL
         ):
             conn.execute(ddl)
         schema._migrate_filing_name(conn)

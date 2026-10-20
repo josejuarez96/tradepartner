@@ -1601,11 +1601,12 @@ def test_status_all_prints_one_summary_line_per_book(
 
 @pytest.mark.usefixtures("started")
 @pytest.mark.parametrize(
-    ("cadence", "rebalance_day", "fill_day", "next_day"),
+    ("cadence", "rebalance_day", "fill_day", "next_day", "has_orders"),
     [
-        ("month_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 30)),
-        ("week_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 6)),
-        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30)),
+        ("month_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 30), True),
+        ("week_end", date(2026, 10, 30), date(2026, 11, 2), date(2026, 11, 6), True),
+        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30), True),
+        ("daily", date(2026, 10, 29), date(2026, 10, 30), date(2026, 10, 30), False),
     ],
 )
 def test_status_summary_labels_completed_rebalance_and_fill_lag(
@@ -1616,8 +1617,9 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
     rebalance_day: date,
     fill_day: date,
     next_day: date,
+    has_orders: bool,
 ) -> None:
-    """A run trades yesterday's rebalance on its fill session at every cadence."""
+    """A fill-session run names its own rebalance and whether it placed orders."""
     run_at = datetime.combine(fill_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=14)
     monkeypatch.setattr(ops, "utc_now", lambda: run_at)
     with open_for_write(_settings()) as conn:
@@ -1677,32 +1679,34 @@ def test_status_summary_labels_completed_rebalance_and_fill_lag(
             ),
         )
         assert decision_id is not None
-        journal.append(
-            conn,
-            OrderRow(
-                client_order_id="tp-main-20261030-0002023554-buy-1",
-                decision_id=decision_id,
-                run_id=run_id,
-                session=fill_day,
-                attempt=1,
-                phase="buy",
-                security_id="0002023554",
-                symbol="AAPL",
-                side="buy",
-                notional=494.0,
-                sells_in_flight_at_submit=False,
-                known_at=run_at,
-                ingested_at=run_at,
-            ),
-        )
+        if has_orders:
+            journal.append(
+                conn,
+                OrderRow(
+                    client_order_id="tp-main-20261030-0002023554-buy-1",
+                    decision_id=decision_id,
+                    run_id=run_id,
+                    session=fill_day,
+                    attempt=1,
+                    phase="buy",
+                    security_id="0002023554",
+                    symbol="AAPL",
+                    side="buy",
+                    notional=494.0,
+                    sells_in_flight_at_submit=False,
+                    known_at=run_at,
+                    ingested_at=run_at,
+                ),
+            )
     out = _paper(clock, factory, "status", "--all")
     assert f"next rebalance {next_day}" in out.output
-    assert f"rebalance {rebalance_day} traded today" in out.output
+    expected = "traded today" if has_orders else "ran today with no orders"
+    assert f"rebalance {rebalance_day} {expected}" in out.output
     assert f"next rebalance {next_day} (today (done))" not in out.output
-    assert "Fills are recorded at the next scheduled run" in out.output
+    assert ("Fills are recorded at the next scheduled run" in out.output) == has_orders
     assert "08:05 ET" not in out.output
     detail = _paper(clock, factory, "status")
-    assert "Fills are recorded at the next scheduled run" in detail.output
+    assert ("Fills are recorded at the next scheduled run" in detail.output) == has_orders
     assert "08:05 ET" not in detail.output
 
 

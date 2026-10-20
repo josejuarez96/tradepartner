@@ -24,6 +24,12 @@ only asks `execution.lock.is_held` (a non-blocking check) and
 `execution.switch.derive` (pure over rows already read), exactly as those
 modules document for readers that must never block a run.
 
+**Performance card** (plan T251, paper spec amendment 2026-10-20, #2006).
+`performance_data(conn, settings, book)` is the same read-only pattern for the per-book
+performance card: the window's equity from the base session B, SPY total return, `paper
+report`'s tracking count and the latest report row's trial line. It writes nothing and
+opens no trial; `None` for a book with no window.
+
 **Journal not initialised.** A version-4 store no write has migrated yet
 raises `store.journal.JournalNotInitialised` from the first read; this module
 catches it and returns an `OpsData` with `journal_not_initialised=True` and
@@ -102,17 +108,23 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import duckdb
 
+from tradepartner.backtest.frozen import frozen_values
 from tradepartner.backtest.schedule import rebalance_sessions
-from tradepartner.calendar import previous_session, session_close
-from tradepartner.config import Settings
-from tradepartner.execution import lock
+from tradepartner.calendar import is_session, previous_session, session_close
+from tradepartner.config import Cadence, Settings
+from tradepartner.execution import lock, performance
+from tradepartner.execution.marks import equity_at
+from tradepartner.execution.plan import stop_session as stop_session_of_request
 from tradepartner.execution.switch import FAULTED_RUN_STATUSES, SwitchState, derive
 from tradepartner.execution.window import window_cadence
 from tradepartner.store import journal, registry
+from tradepartner.store.asof import adjusted_prices_as_of
+from tradepartner.store.benchmarks import BenchmarkIdentityError, benchmark_security_ids
 from tradepartner.store.db import utc_now
 from tradepartner.store.journal import (
     CLOSING_STOP_STATES,
@@ -140,10 +152,12 @@ __all__ = [
     "ChainStep",
     "OpsData",
     "OrderChain",
+    "PerformanceData",
     "RankedSignal",
     "book_ids",
     "book_summaries",
     "page_data",
+    "performance_data",
 ]
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -230,6 +244,7 @@ class OpsData:
     last_run_kind: str | None = None
     last_run_session: date | None = None
     targets_count: int = 0
+    plan_known_at: datetime | None = None
     switch_state: SwitchState | None = None
     ranking: tuple[RankedSignal, ...] = field(default_factory=tuple)
     fills: tuple[OrderedFill, ...] = field(default_factory=tuple)
@@ -259,6 +274,7 @@ class BookSummary:
     last_run_status: str | None
     last_run_kind: str | None
     last_run_session: date | None
+    last_run_has_orders: bool
     #: The first rebalance session at the window's cadence whose close is after
     #: now, never before the window's first rebalance; None for a window that is
     #: no longer open or whose cadence cannot be read.
@@ -266,7 +282,7 @@ class BookSummary:
 
 
 def rebalance_traded_today(row: BookSummary) -> date | None:
-    """The rebalance traded by today's completed fill-session run, if any."""
+    """The rebalance handled by today's completed fill-session run, if any."""
     if (
         row.last_run_kind != "rebalance"
         or row.last_run_status != "ok"
@@ -881,6 +897,7 @@ def page_data(
         last_run_kind=latest_run.kind if latest_run is not None else None,
         last_run_session=latest_run.session if latest_run is not None else None,
         targets_count=targets_count,
+        plan_known_at=plan.known_at if plan is not None else None,
         switch_state=switch_state,
         ranking=ranking,
         fills=fills,
@@ -948,6 +965,13 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
     )
     is_open = _is_open(conn, window_id)
     positions_count, _ = _positions(conn, window_id)
+    last_run_has_orders = False
+    if latest_run is not None:
+        order_exists = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE run_id = ?)",
+            [latest_run.run.run_id],
+        ).fetchone()
+        last_run_has_orders = bool(order_exists[0]) if order_exists else False
     return BookSummary(
         book_id=book,
         window=window,
@@ -958,6 +982,7 @@ def _summary(conn: duckdb.DuckDBPyConnection, settings: Settings, book: str) -> 
         last_run_status=last_run_status,
         last_run_kind=latest_run.run.kind if latest_run is not None else None,
         last_run_session=latest_run.run.session if latest_run is not None else None,
+        last_run_has_orders=last_run_has_orders,
         next_rebalance_session=(
             _next_rebalance_session(conn, window, utc_now()) if is_open else None
         ),
@@ -983,3 +1008,277 @@ def _capped_fills(
     ordered = sorted(fills, key=lambda f: f.fill.fill_id or 0, reverse=True)
     capped = len(ordered) > limit
     return tuple(ordered[:limit]), capped
+
+
+# --- the performance read (plan T251, paper spec amendment 2026-10-20, #2006) ----
+
+_BENCHMARK_SYMBOL = "SPY"
+
+#: `paper report` needs two rebalance sessions to compare (`NothingToCompareYet`, #1923).
+_REPORT_MIN_REBALANCES = 2
+
+#: `paper report`'s own search bound for "last completed T" (`report._REBALANCE_SEARCH`).
+_REPORT_SEARCH = timedelta(days=62)
+
+TrackingState = Literal["drawn", "not_yet", "report_due", "unknown"]
+
+Rows = list[tuple[date, float]]
+
+
+@dataclass(frozen=True)
+class PerformanceData:
+    """Everything the performance card shows for one book (`performance_data`).
+
+    Dollar series are `(session, value)` rows ordered by session. `equity` is the
+    base point at B plus one point per marked session, empty until the window has
+    its first mark; `equity_index`, `benchmark_index` and `trial_index` are the
+    same series rebased to 100 at the base value (`execution.performance`).
+    `excess_pp` is `100 * (P_t/P_B - S_t/S_B)` at each equity session. The header
+    fields are `page_data`'s, so the card and the operations page agree."""
+
+    book_id: str
+    journal_not_initialised: bool = False
+    journal_outdated: str | None = None
+    window: PaperWindowRow | None = None
+    is_open: bool = False
+    as_of: datetime | None = None
+    last_updated: datetime | None = None
+    stale: bool = False
+    base_session: date | None = None
+    base_value: float | None = None
+    equity: tuple[tuple[date, float], ...] = ()
+    equity_index: tuple[tuple[date, float], ...] = ()
+    daily_pnl: tuple[tuple[date, float], ...] = ()
+    cumulative_return_pct: float | None = None
+    benchmark_index: tuple[tuple[date, float], ...] = ()
+    excess_pp: tuple[tuple[date, float], ...] = ()
+    #: Why the SPY line is missing (an unresolvable identity, a session with no
+    #: bar): the page's `benchmark unavailable` panel. The book's own series stand.
+    benchmark_error: str | None = None
+    tracking_state: TrackingState = "unknown"
+    #: `paper report`'s count of scheduled rebalances completed (None: cadence unreadable).
+    tracking_n: int | None = None
+    tracking_trial_id: int | None = None
+    #: The tracking trial's span and its strategy line, rebased to `equity_at(T_0)`
+    #: (dollars of the book's own curve), drawn only over the sessions it covers.
+    trial_span: tuple[date, date] | None = None
+    trial_line: tuple[tuple[date, float], ...] = ()
+    trial_index: tuple[tuple[date, float], ...] = ()
+    trial_error: str | None = None
+
+
+def _base_session(started_at: datetime) -> date:
+    """B: the latest session whose close is at or before `started_at`."""
+    day = started_at.astimezone(_NEW_YORK).date()
+    if is_session(day) and session_close(day) <= started_at:
+        return day
+    return previous_session(day)
+
+
+def _equity_by_session(conn: duckdb.DuckDBPyConnection, window_id: int) -> dict[date, float]:
+    """The window's ledger equity per marked session, one `marks.equity_at` per
+    session; `UnreadableMarkError` propagates (a check that cannot read does not pass)."""
+    marks = journal.positions_daily_for(conn, window_id)
+    sessions = sorted({m.session for m in marks})
+    return {s: equity_at(marks, s) for s in sessions}
+
+
+def _last_completed_rebalance_session(now: datetime, cadence: Cadence) -> date:
+    """`report._last_completed_rebalance_session`, copied locally (no task edits
+    `report.py`): the latest rebalance session at `cadence` whose close is at or
+    before `now`."""
+    today = now.astimezone(_NEW_YORK).date()
+    sessions = rebalance_sessions(today - _REPORT_SEARCH, today, cadence)
+    return next(t for t in reversed(sessions) if session_close(t) <= now)
+
+
+def _rebalance_session_before(session: date, cadence: Cadence) -> date:
+    """`report._before`: the last rebalance session strictly before `session`."""
+    last = session - timedelta(days=1)
+    return rebalance_sessions(last - _REPORT_SEARCH, last, cadence)[-1]
+
+
+def _tracking_count(
+    conn: duckdb.DuckDBPyConnection, window: PaperWindowRow, as_of: datetime
+) -> int | None:
+    """`paper report`'s count: scheduled rebalance sessions from the window's first
+    through the last completed one at `as_of`, capped strictly before the stop
+    session when the window has a `requested` stop. None when the cadence cannot
+    be read."""
+    assert window.window_id is not None
+    first = window.first_rebalance_session
+    try:
+        cadence = window_cadence(conn, window)
+        last_t = _last_completed_rebalance_session(as_of, cadence)
+        requested = [
+            s for s in journal.window_stops_for(conn, window.window_id) if s.state == "requested"
+        ]
+        stop = stop_session_of_request(min(s.at for s in requested)) if requested else None
+        while stop is not None and last_t >= stop and last_t >= first:
+            last_t = _rebalance_session_before(last_t, cadence)
+        if last_t < first:
+            return 0
+        return len(rebalance_sessions(first, last_t, cadence))
+    except (registry.UnknownHypothesis, ValueError, KeyError, TypeError, StopIteration, IndexError):
+        return None
+
+
+def _benchmark_series(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    *,
+    as_of: datetime,
+    base: date,
+    sessions: Sequence[date],
+) -> dict[date, float]:
+    """SPY's dividend- and split-adjusted close known at `as_of`, at `sessions`.
+    `BenchmarkIdentityError` for a missing or ambiguous identity; `ValueError`
+    naming the first session with no bar."""
+    ids = benchmark_security_ids(conn, [_BENCHMARK_SYMBOL], start=base, through=max(sessions))
+    frame = adjusted_prices_as_of(
+        conn,
+        as_of,
+        [ids[_BENCHMARK_SYMBOL]],
+        include_dividends=True,
+        settings=settings,
+        sessions_from=base,
+    )
+    closes = {s: float(c) for s, c in zip(frame["session"], frame["close"], strict=True)}
+    for s in sessions:
+        if s not in closes:
+            raise ValueError(f"benchmark unavailable for {s.isoformat()}")
+    return {s: closes[s] for s in sessions}
+
+
+def _latest_report(
+    conn: duckdb.DuckDBPyConnection, window_id: int
+) -> journal.PaperReportRow | None:
+    reports = journal.paper_reports_for(conn, window_id)
+    return max(reports, key=lambda r: (r.known_at, r.trial_id), default=None)
+
+
+def _trial_line(
+    conn: duckdb.DuckDBPyConnection, trial_id: int, equity: dict[date, float]
+) -> tuple[tuple[date, date], Rows]:
+    """The tracking trial's span and its `strategy` rows at the frozen base cost
+    level, scaled so its first session equals the book's equity there (`equity_at(T_0)`,
+    `paper report`'s own base, not `starting_equity`). `ValueError` when the trial
+    or the book's mark at T_0 is missing."""
+    found = conn.execute(
+        "SELECT hypothesis_id, start_session, end_session FROM trials WHERE trial_id = ?",
+        [trial_id],
+    ).fetchone()
+    if found is None:
+        raise ValueError(f"no trial {trial_id}")
+    hypothesis_id, start, end = found
+    hypothesis = registry.get_hypothesis_by_id(conn, hypothesis_id)
+    level = float(frozen_values(hypothesis)[registry.BASE_COST_KEY])
+    rows = conn.execute(
+        "SELECT session, equity FROM trial_equity "
+        "WHERE trial_id = ? AND series = 'strategy' AND cost_per_side_bps = ? ORDER BY session",
+        [trial_id, level],
+    ).fetchall()
+    trial = {s: float(v) for s, v in rows}
+    if start not in trial:
+        raise ValueError(f"trial {trial_id} has no equity at its first session {start.isoformat()}")
+    if start not in equity:
+        raise ValueError(f"the book has no mark at the trial's first session {start.isoformat()}")
+    scale = equity[start] / trial[start]
+    return (start, end), [(s, trial[s] * scale) for s in sorted(trial)]
+
+
+def performance_data(
+    conn: duckdb.DuckDBPyConnection, settings: Settings, book_id: str | None = None
+) -> PerformanceData | None:
+    """The per-book performance card's data (plan T251, paper spec amendment
+    2026-10-20): the window's equity from B, daily P&L, SPY total return at the
+    equity sessions, `paper report`'s tracking count and, once the window's latest
+    `paper_reports` row exists, that row's trial line. Reads only, through `conn`
+    (the shell's read-only connection): no write, no trial, no run lock, no broker.
+
+    None for a book with no window. A journal not initialised or outdated comes
+    back as flags on the result (as `page_data` does). A missing SPY identity or
+    bar is `benchmark_error`, not a raise; `UnreadableMarkError` from an unreadable
+    mark propagates, for the shell's unreadable panel."""
+    header = page_data(conn, settings, book_id)
+    if header.journal_not_initialised or header.journal_outdated is not None:
+        return PerformanceData(
+            book_id=header.book_id,
+            journal_not_initialised=header.journal_not_initialised,
+            journal_outdated=header.journal_outdated,
+        )
+    window = header.window
+    if window is None or window.window_id is None or header.as_of is None:
+        return None
+    window_id = window.window_id
+    report = _latest_report(conn, window_id)
+    #: The card's "as of" covers the report row it draws too, so the trial line is never
+    #: newer than the header, and SPY and the rebalance count are read at that same time.
+    as_of = header.as_of if report is None else max(header.as_of, report.known_at)
+
+    base_session = _base_session(window.started_at)
+    marks = _equity_by_session(conn, window_id)
+    base_value = (
+        marks[base_session] if marks and min(marks) == base_session else window.starting_equity
+    )
+    equity = {**marks, base_session: base_value} if marks else {}
+
+    tracking_n = _tracking_count(conn, window, as_of)
+    state: TrackingState
+    if report is not None:
+        state = "drawn"
+    elif tracking_n is None:
+        state = "unknown"
+    else:
+        state = "not_yet" if tracking_n < _REPORT_MIN_REBALANCES else "report_due"
+
+    benchmark: dict[date, float] = {}
+    benchmark_error: str | None = None
+    if equity:
+        try:
+            benchmark = _benchmark_series(
+                conn, settings, as_of=as_of, base=base_session, sessions=sorted(equity)
+            )
+        except (BenchmarkIdentityError, ValueError) as exc:
+            benchmark_error = str(exc)
+
+    trial_span: tuple[date, date] | None = None
+    trial_rows: Rows = []
+    trial_error: str | None = None
+    if report is not None:
+        try:
+            trial_span, trial_rows = _trial_line(conn, report.trial_id, equity)
+        except ValueError as exc:
+            trial_error = str(exc)
+
+    excess: Rows = []
+    benchmark_index: Rows = []
+    if benchmark:
+        benchmark_index = performance.rebase(benchmark, benchmark[base_session])
+        excess = performance.excess_over_benchmark(
+            equity, benchmark, equity[base_session], benchmark[base_session]
+        )
+    return PerformanceData(
+        book_id=header.book_id,
+        window=window,
+        is_open=_is_open(conn, window_id),
+        as_of=as_of,
+        last_updated=header.last_updated,
+        stale=header.stale,
+        base_session=base_session,
+        base_value=base_value,
+        equity=tuple(sorted(equity.items())),
+        equity_index=tuple(performance.rebase(equity, base_value)) if equity else (),
+        daily_pnl=tuple(performance.daily_pnl(equity)),
+        cumulative_return_pct=performance.cumulative_return_pct(equity, base_value),
+        benchmark_index=tuple(benchmark_index),
+        excess_pp=tuple(excess),
+        benchmark_error=benchmark_error,
+        tracking_state=state,
+        tracking_n=tracking_n,
+        tracking_trial_id=report.trial_id if report is not None else None,
+        trial_span=trial_span,
+        trial_line=tuple(trial_rows),
+        trial_index=tuple(performance.rebase(dict(trial_rows), base_value)) if trial_rows else (),
+        trial_error=trial_error,
+    )

@@ -126,6 +126,10 @@ def _switch_text(state: SwitchState) -> str:
     return "run in progress" if state.run_in_progress else "released"
 
 
+def _rebalance_result(row: ops.BookSummary) -> str:
+    return "traded today" if row.last_run_has_orders else "ran today with no orders"
+
+
 def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
     return pl.DataFrame(
         [
@@ -140,7 +144,7 @@ def _summary_table(summaries: tuple[ops.BookSummary, ...]) -> pl.DataFrame:
                 "next_rebalance": (
                     str(row.next_rebalance_session or "-")
                     + (
-                        f"; rebalance {traded} traded today"
+                        f"; rebalance {traded} {_rebalance_result(row)}"
                         if (traded := ops.rebalance_traded_today(row)) is not None
                         else ""
                     )
@@ -193,13 +197,13 @@ def _kpis(data: OpsData) -> None:
 
 
 def _symbols(conn: duckdb.DuckDBPyConnection, data: OpsData) -> dict[str, str]:
-    """Readable tickers known at the journal's stamp, with order symbols as fallback."""
-    ids = {r.security_id for r in data.ranking} | {f.security_id for f in data.fills}
+    """Ranking tickers known at the plan, with submitted order symbols as fallback."""
+    ids = {r.security_id for r in data.ranking}
     symbols: dict[str, str] = {}
-    if data.as_of is not None and ids:
-        listings = listings_as_of(conn, data.as_of, sorted(ids))
+    if data.plan_known_at is not None and ids:
+        listings = listings_as_of(conn, data.plan_known_at, sorted(ids))
         for row in (
-            listings.filter(pl.col("valid_from") <= data.as_of.date())
+            listings.filter(pl.col("valid_from") <= data.plan_known_at.date())
             .sort("valid_from")
             .iter_rows(named=True)
         ):
@@ -207,7 +211,8 @@ def _symbols(conn: duckdb.DuckDBPyConnection, data: OpsData) -> dict[str, str]:
     if data.window is not None and data.window.window_id is not None:
         limit = max(len(data.chains), len(data.ranking), len(data.fills), 1)
         for order in journal.orders_for(conn, window_id=data.window.window_id, limit=limit):
-            symbols.setdefault(order.security_id, order.symbol)
+            if data.plan_known_at is not None and order.known_at <= data.plan_known_at:
+                symbols.setdefault(order.security_id, order.symbol)
             symbols[order.client_order_id] = order.symbol
     return symbols
 
