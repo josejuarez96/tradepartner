@@ -223,7 +223,7 @@ class Env:
             code_version="test",
             started_at=started,
             frozen_json=frozen_json(frozen),
-            frozen_sha256="0" * 64,
+            frozen_sha256=registry.params_sha256(json.loads(frozen_json(frozen))),
             book_id=self.settings.paper.book_id,
             known_at=started,
             ingested_at=started,

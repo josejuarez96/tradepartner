@@ -115,7 +115,7 @@ from pydantic import ValidationError
 from tradepartner.adapters.broker import Account, Broker, Order, Position, UnknownOrderError
 from tradepartner.calendar import is_session, next_session, previous_session, session_close
 from tradepartner.config import RiskConfig, Settings, render_validation_errors
-from tradepartner.errors import ClockError, ReconciliationError
+from tradepartner.errors import ClockError, LimitBreachError, ReconciliationError
 from tradepartner.execution import switch
 from tradepartner.execution.ledger import Ledger, from_journal
 from tradepartner.execution.lock import resolve_book, run_lock
@@ -130,6 +130,7 @@ from tradepartner.execution.reconcile import (
 )
 from tradepartner.execution.risk import order_shape_violation
 from tradepartner.execution.symbols import broker_symbol
+from tradepartner.store import registry
 from tradepartner.store.asof import live_actions_as_of, prices_as_of, symbol_changes_as_of
 from tradepartner.store.delistings import DELISTED, listing_ends_as_of
 from tradepartner.store.dividend_reviews import (
@@ -186,6 +187,30 @@ class _JournalState:
         `paper reconcile` stated for Friday) cannot state `through`."""
         stated = [r for r in self.ok_rows if r.at.astimezone(_NEW_YORK).date() <= through]
         return stated[-1] if stated else None
+
+
+def verify_frozen_sha256(window: PaperWindowRow) -> None:
+    """Raise `LimitBreachError` unless `window.frozen_json` hashes to its
+    `frozen_sha256` (#1984). The hash is `registry.params_sha256` of the parsed
+    object, the canonical form `paper start` froze, so a whitespace-only change
+    passes and any changed value, added key or unparseable text does not. The
+    journal tables are append-only and nothing in `src` updates `paper_windows`:
+    a mismatch means the row was edited in place, so the limits it states are not
+    the ones the owner froze, and the run must not trade under them."""
+    try:
+        parsed = json.loads(window.frozen_json)
+        actual = registry.params_sha256(parsed)
+    except (ValueError, TypeError) as exc:
+        raise LimitBreachError(
+            f"window {window.window_id} frozen_json cannot be hashed ({type(exc).__name__}); "
+            "it does not match frozen_sha256"
+        ) from exc
+    if actual != window.frozen_sha256:
+        raise LimitBreachError(
+            f"window {window.window_id} frozen_json hashes to {actual}, not its "
+            f"frozen_sha256 {window.frozen_sha256}: the frozen limits were edited after "
+            "`paper start`"
+        )
 
 
 def frozen_risk(window: PaperWindowRow) -> RiskConfig:
