@@ -1738,6 +1738,14 @@ class CostsConfig(BaseModel):
     `per_side_bps`, `impact_coeff` scales `sqrt(notional / ADV)` market impact, and
     `adv_sessions` is the window (in XNYS sessions) over which ADV is measured. Both new
     rate keys are `ge=0`; `adv_sessions` must hold at least one session.
+
+    Amendment 2026-10-19 (#1872) item 6 (T221): `borrow_bps_per_year` is the declared
+    headline borrow fee on a short book's value, in basis points a year (default 0.0, so
+    a long-only book pays none), and `borrow_sensitivity_bps` lists further rates, each
+    run as one more reported-only book. Both are non-negative; a `long_short` file is
+    refused `refused_borrow_rate` at registration unless its headline is above 0 and
+    {0, 30, 300} is inside the headline and the sensitivities together. The engine reads
+    them at T222.
     """
 
     model_config = _PHASE3_MODEL_CONFIG
@@ -1751,6 +1759,8 @@ class CostsConfig(BaseModel):
     sensitivity_per_side_bps: list[Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: [0.0, 30.0, 60.0, 100.0]
     )
+    borrow_bps_per_year: float = Field(default=0.0, ge=0)
+    borrow_sensitivity_bps: list[Annotated[float, Field(ge=0)]] = Field(default_factory=list)
 
 
 class HoldoutConfig(BaseModel):

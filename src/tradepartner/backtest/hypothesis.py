@@ -246,6 +246,60 @@ NOT_YET_APPLIED_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 
+#: The borrow-rate grid a `long_short` file must cover (spec amendment #1872, item 6):
+#: the 0 bp reference, the 30 bp easy-to-borrow line and the 300 bp hard-to-borrow stress.
+BORROW_GRID_BPS: Final = (0.0, 30.0, 300.0)
+
+
+def long_short_refusal(params: Mapping[str, Any]) -> str | None:
+    """Why a `long_short` file's frozen values `params` may not be registered, or None
+    (backtest spec amendment #1872, items 1 and 6; T221). The message starts with the
+    refusal's name, `refused_portfolio` or `refused_borrow_rate`. A `long_only` set (the
+    default, or a key absent) takes no branch here.
+
+    `refused_portfolio`: the family's weighting is `hold`, `strategy.rebalance_band` is
+    non-zero, or `strategy.hold_top_fraction` is not its default (none is specified for
+    a signed book). `refused_borrow_rate`: the headline `costs.borrow_bps_per_year` is
+    not above 0, or {0, 30, 300} is not inside the headline and
+    `costs.borrow_sensitivity_bps` together."""
+    if params.get("portfolio.side", "long_only") != "long_short":
+        return None
+    defaults = {key: default for key, default, _version in frozen.FROZEN_KEY_DEFAULTS}
+    if params.get("strategy.weighting", "equal") == "hold":
+        return (
+            "refused_portfolio: portfolio.side is 'long_short' with strategy.weighting "
+            "'hold'; a hold book is not specified for a signed book"
+        )
+    band = params.get("strategy.rebalance_band", 0.0)
+    if not frozen.is_default(band, defaults["strategy.rebalance_band"]):
+        return (
+            f"refused_portfolio: portfolio.side is 'long_short' with strategy.rebalance_band "
+            f"{band!r}; a no-trade band is not specified for a signed book"
+        )
+    buffer = params.get("strategy.hold_top_fraction", 0.0)
+    if not frozen.is_default(buffer, defaults["strategy.hold_top_fraction"]):
+        return (
+            f"refused_portfolio: portfolio.side is 'long_short' with "
+            f"strategy.hold_top_fraction {buffer!r}; a buffered signed book is not specified"
+        )
+    headline = params.get("costs.borrow_bps_per_year", 0.0)
+    sensitivity = params.get("costs.borrow_sensitivity_bps", [])
+    if not (isinstance(headline, int | float) and not isinstance(headline, bool) and headline > 0):
+        return (
+            f"refused_borrow_rate: costs.borrow_bps_per_year is {headline!r}; a long_short "
+            "file declares a headline borrow fee above 0 bp (0 bp is a reference line only)"
+        )
+    covered = {float(headline), *(float(v) for v in sensitivity)}
+    missing = [bps for bps in BORROW_GRID_BPS if bps not in covered]
+    if missing:
+        return (
+            f"refused_borrow_rate: the headline {headline!r} and costs.borrow_sensitivity_bps "
+            f"{list(sensitivity)!r} do not cover {[int(b) for b in missing]} bp of the "
+            "0 / 30 / 300 bp grid"
+        )
+    return None
+
+
 def family_only_refusal(family: str, params: Mapping[str, Any]) -> str | None:
     """Why `params` (a `family` registration's frozen values, JSON form) may not be
     registered, or None: a `FAMILY_ONLY_KEYS` key of another family whose value is not
@@ -722,6 +776,9 @@ def register(
     settings = settings if settings is not None else get_settings()
     parsed = parse_file(path)
     params = frozen_params(parsed, settings)
+    refusal = long_short_refusal(params)
+    if refusal is not None:
+        raise HypothesisFileError(f"{path}: {refusal}")
     canonical = frozen.canonical_frozen_set(params, parsed.family)
     fingerprint = frozen.fingerprint(parsed.family, params, parsed.in_sample_start)
     if parsed.family not in settings.hypotheses.families:

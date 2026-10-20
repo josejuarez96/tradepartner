@@ -52,7 +52,15 @@ FROZEN_SECTIONS = (
 )
 FROZEN_SINGLE_KEYS = ("execution.fill_price", "benchmarks", "alpaca.historical_feed")
 #: T210's post-registration `costs.*` keys (#1792): frozen, never required of a file.
-LATE_COST_KEYS = frozenset({"costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions"})
+LATE_COST_KEYS = frozenset(
+    {
+        "costs.spread_bps",
+        "costs.impact_coeff",
+        "costs.adv_sessions",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
+    }
+)
 
 
 def _spec_frozen_keys() -> set[str]:
@@ -654,6 +662,7 @@ def test_combined_file_missing_a_strategy_key_is_refused_as_incomplete(tmp_path:
             "adjust.apply_spin_offs",
             "strategy.hold_top_fraction",
             "portfolio.",
+            "costs.borrow",
         ),
     ],
     ids=["today", "pre-lab"],
@@ -1346,6 +1355,8 @@ def test_a_registration_stored_before_the_entry_still_matches_and_is_returned(
         "portfolio.net_exposure",
         "portfolio.short_min_price",
         "portfolio.short_cover_weight",
+        "costs.borrow_bps_per_year",
+        "costs.borrow_sensitivity_bps",
     )
     params = {k: v for k, v in hypothesis.frozen_params(parsed, settings).items() if k not in later}
     record = registry.register_hypothesis(
@@ -1619,7 +1630,13 @@ def test_on_the_lab_the_h1_twins_unchanged_file_is_refused_under_the_new_default
 
 # --- the cost terms: the post-registration `costs.*` carve-out (#1792, T210) ---------
 
-COST_TERMS = {"costs.spread_bps": 0.0, "costs.impact_coeff": 0.0, "costs.adv_sessions": 20}
+COST_TERMS = {
+    "costs.spread_bps": 0.0,
+    "costs.impact_coeff": 0.0,
+    "costs.adv_sessions": 20,
+    "costs.borrow_bps_per_year": 0.0,
+    "costs.borrow_sensitivity_bps": [],
+}
 HYPOTHESES = H1_FILE.parent
 B9_FILE = HYPOTHESES / "b9-earnings-reaction-drift.md"
 #: The registered files whose family is wired on main, and the fixture twins. B9's
@@ -2054,3 +2071,167 @@ def test_a_non_default_portfolio_value_is_refused_until_t223(
     parsed = hypothesis.parse_file(_copy(tmp_path, text))
     with pytest.raises(HypothesisFileError, match="T223"):
         hypothesis.frozen_params(parsed, settings)
+
+
+# --- the long/short refusals (T221; backtest spec amendment #1872, items 1 and 6) -----
+
+#: A 50/50 book's frozen values on top of the fixture's: the headline 30 bp, the grid's
+#: other two lines in the sensitivity list.
+LONG_SHORT_5050: dict[str, Any] = {
+    "portfolio.side": "long_short",
+    "portfolio.net_exposure": 0.0,
+    "costs.borrow_bps_per_year": 30.0,
+    "costs.borrow_sensitivity_bps": [0.0, 300.0],
+}
+
+
+def _long_short(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
+    """`frozen_params` returns the fixture's values with a long/short book on top: the
+    #1788 guard (T223 removes it) refuses a `long_short` file before `register` could
+    see it, so the guard is stepped round, as T222's tests do with `PortfolioConfig`."""
+    real = hypothesis.frozen_params
+    changed = {**LONG_SHORT_5050, **{k.replace("__", "."): v for k, v in overrides.items()}}
+
+    def patched(parsed: hypothesis.HypothesisFile, settings: Settings) -> dict[str, Any]:
+        return {**real(parsed, settings), **changed}
+
+    monkeypatch.setattr(hypothesis, "frozen_params", patched)
+
+
+def _hypotheses(conn: duckdb.DuckDBPyConnection) -> int:
+    return int(conn.execute("SELECT count(*) FROM hypotheses").fetchone()[0])  # type: ignore[index]
+
+
+def test_a_valid_5050_file_registers(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _long_short(monkeypatch)
+    record = _register(conn, _copy(tmp_path), settings)
+    assert record.params["portfolio.side"] == "long_short"
+    assert record.params["costs.borrow_bps_per_year"] == 30.0
+    assert record.params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]
+    assert _hypotheses(conn) == 1
+
+
+@pytest.mark.parametrize(
+    ("headline", "sensitivity"),
+    [(30.0, [0.0, 300.0]), (300.0, [0.0, 30.0]), (100.0, [0.0, 30.0, 300.0]), (30.0, [300.0, 0])],
+)
+def test_every_headline_with_the_grid_covered_registers(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    headline: float,
+    sensitivity: list[float],
+) -> None:
+    _long_short(
+        monkeypatch,
+        costs__borrow_bps_per_year=headline,
+        costs__borrow_sensitivity_bps=sensitivity,
+    )
+    _register(conn, _copy(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+@pytest.mark.parametrize(
+    ("headline", "sensitivity"),
+    [
+        (0.0, [0.0, 30.0, 300.0]),  # a 0 bp headline is a reference line only
+        (30.0, [0.0]),  # 300 bp missing
+        (30.0, [300.0]),  # 0 bp missing
+        (300.0, [0.0]),  # 30 bp missing
+        (30.0, []),
+        (100.0, [0.0, 30.0]),
+    ],
+)
+def test_a_missing_borrow_line_is_refused_by_name_before_any_write(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    headline: float,
+    sensitivity: list[float],
+) -> None:
+    _long_short(
+        monkeypatch,
+        costs__borrow_bps_per_year=headline,
+        costs__borrow_sensitivity_bps=sensitivity,
+    )
+    path = _copy(tmp_path)
+    with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_borrow_rate"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"strategy__weighting": "hold"},
+        {"strategy__rebalance_band": 0.02},
+        {"strategy__hold_top_fraction": 0.2},
+    ],
+)
+def test_a_hold_a_band_or_a_buffer_on_a_signed_book_is_refused_by_name_before_any_write(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, Any],
+) -> None:
+    _long_short(monkeypatch, **override)
+    path = _copy(tmp_path)
+    with pytest.raises(HypothesisFileError, match=rf"^{re.escape(str(path))}: refused_portfolio"):
+        _register(conn, path, settings)
+    assert _hypotheses(conn) == 0
+
+
+def test_refused_portfolio_comes_before_refused_borrow_rate(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _long_short(monkeypatch, strategy__rebalance_band=0.02, costs__borrow_bps_per_year=0.0)
+    with pytest.raises(HypothesisFileError, match="refused_portfolio"):
+        _register(conn, _copy(tmp_path), settings)
+
+
+def test_a_long_only_file_takes_no_new_branch(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, settings: Settings
+) -> None:
+    """Hold, a band, a buffer and a 0 bp borrow headline are no concern of a long-only
+    book's registration (the refusals read `portfolio.side` first)."""
+    for params in (
+        {},
+        {"strategy.weighting": "hold", "strategy.rebalance_band": 0.02},
+        {"strategy.hold_top_fraction": 0.2, "costs.borrow_bps_per_year": 0.0},
+        {"portfolio.side": "long_only", "costs.borrow_sensitivity_bps": []},
+    ):
+        assert hypothesis.long_short_refusal(params) is None
+    _register(conn, _copy(tmp_path), settings)
+    assert _hypotheses(conn) == 1
+
+
+def test_borrow_keys_are_frozen_at_their_defaults_when_a_file_omits_them(
+    settings: Settings,
+) -> None:
+    params = hypothesis.frozen_params(hypothesis.parse_file(FIXTURE), settings)
+    assert params["costs.borrow_bps_per_year"] == 0.0
+    assert params["costs.borrow_sensitivity_bps"] == []
+    required = hypothesis.required_keys("momentum")
+    assert not {"costs.borrow_bps_per_year", "costs.borrow_sensitivity_bps"} & required
+
+
+def test_a_file_may_name_the_borrow_keys(tmp_path: Path, settings: Settings) -> None:
+    text = FIXTURE.read_text().replace(
+        "per_side_bps = 15.0",
+        "per_side_bps = 15.0\nborrow_bps_per_year = 30.0\nborrow_sensitivity_bps = [0.0, 300.0]",
+        1,
+    )
+    params = hypothesis.frozen_params(hypothesis.parse_file(_copy(tmp_path, text)), settings)
+    assert params["costs.borrow_bps_per_year"] == 30.0
+    assert params["costs.borrow_sensitivity_bps"] == [0.0, 300.0]

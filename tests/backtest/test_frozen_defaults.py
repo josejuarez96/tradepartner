@@ -333,7 +333,13 @@ RISK_FREE_KEYS = (
 #: T209a's three post-registration own-section keys (backtest spec amendment #1731).
 HOLD_KEYS = ("strategy.hold_sessions", "strategy.hold_target_names", "strategy.rebalance_band")
 #: T210's three post-registration `costs.*` keys (backtest spec amendment #1792).
-COST_KEYS = ("costs.spread_bps", "costs.impact_coeff", "costs.adv_sessions")
+COST_KEYS = (
+    "costs.spread_bps",
+    "costs.impact_coeff",
+    "costs.adv_sessions",
+    "costs.borrow_bps_per_year",
+    "costs.borrow_sensitivity_bps",
+)
 #: T217's three post-registration own-section keys (backtest spec amendment #1820).
 SHOCK_KEYS = ("strategy.signal_delay_sessions", "strategy.placebo", "strategy.placebo_seed")
 #: T219's five post-registration `portfolio.*` keys (backtest spec amendment #1872).
@@ -933,7 +939,7 @@ def test_cost_term_entries_are_last_and_pinned_by_value() -> None:
     (#1818) takes 29 and lands first; T187's four chain entries and T211c's
     spin-off key follow them."""
     assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:26], COST_ENTRIES)
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-11], COST_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[23:-13], COST_ENTRIES)
 
 
 def test_post_registration_cost_keys_pinned_and_each_a_costs_table_key() -> None:
@@ -951,7 +957,14 @@ def test_higher_allowed_cost_keys_pinned() -> None:
     """The keys a ruled family's file may set higher than its rules' (a cost assumption
     may only get harsher); `adv_sessions` is not one."""
     assert (
-        frozenset({"costs.per_side_bps", "costs.spread_bps", "costs.impact_coeff"})
+        frozenset(
+            {
+                "costs.per_side_bps",
+                "costs.spread_bps",
+                "costs.impact_coeff",
+                "costs.borrow_bps_per_year",
+            }
+        )
         == frozen.HIGHER_ALLOWED_COST_KEYS
     )
 
@@ -1060,7 +1073,7 @@ def test_the_chain_entries_are_pinned_and_move_no_fingerprint() -> None:
         assert table[key] == (default, version), key
     settings = _defaults_settings()
     keys = CHAIN_KEYS
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-11:-7], CHAIN_ENTRIES)
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-13:-9], CHAIN_ENTRIES)
     for family, params in (
         ("momentum", _new_params(settings)),
         ("combined", _combined_params(settings)),
@@ -1085,7 +1098,7 @@ APPLY_SPIN_OFFS_KEY = "adjust.apply_spin_offs"
 def test_apply_spin_offs_entry_is_pinned_by_value() -> None:
     """Appended at version 31 at its default; T238's buffer entry and T219's five
     `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-7:-6], ((APPLY_SPIN_OFFS_KEY, False, 31),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-9:-8], ((APPLY_SPIN_OFFS_KEY, False, 31),))
 
 
 def test_post_registration_adjust_keys_pinned_and_each_an_adjust_table_key() -> None:
@@ -1170,7 +1183,7 @@ def test_a_file_naming_true_is_a_new_fingerprint(tmp_path: Path, settings: Setti
 def test_buffer_entry_is_pinned_by_value() -> None:
     """Appended after the spin-off key, at the schema version current when it landed;
     T219's five `portfolio.*` entries follow it."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-6:-5], ((BUFFER_KEY, 0.0, 34),))
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-8:-7], ((BUFFER_KEY, 0.0, 34),))
     assert BUFFER_KEY in hypothesis.frozen_keys()
 
 
@@ -1231,10 +1244,10 @@ PORTFOLIO_ENTRIES = (
 )
 
 
-def test_portfolio_entries_are_last_and_pinned_by_value() -> None:
-    """Appended after T238's buffer entry, at the schema version current when they
-    landed, in the spec item 1 order."""
-    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-5:], PORTFOLIO_ENTRIES)
+def test_portfolio_entries_are_pinned_by_value() -> None:
+    """Appended after T238's buffer entry (T221's two borrow entries follow them), at the
+    schema version current when they landed, in the spec item 1 order."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-7:-2], PORTFOLIO_ENTRIES)
     for key, _default, _version in PORTFOLIO_ENTRIES:
         assert key in hypothesis.frozen_keys()
 
@@ -1301,3 +1314,58 @@ def test_a_non_default_portfolio_key_is_kept_and_moves_the_fingerprint(
     moved = {**params, key: value}
     assert frozen.canonical_frozen_set(moved, "momentum") == {**twin_canonical, key: value}
     assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != twin_fingerprint
+
+
+# --- the borrow keys (backtest spec amendment #1872, item 6; T221) ---------------------
+
+BORROW_ENTRIES = (
+    ("costs.borrow_bps_per_year", 0.0, 34),
+    ("costs.borrow_sensitivity_bps", [], 34),
+)
+
+
+def test_borrow_entries_are_last_and_pinned_by_value() -> None:
+    """Appended after T219's `portfolio.*` entries, at the current schema version; both
+    are post-registration cost keys, the headline alone may only rise."""
+    assert frozen.is_default(frozen.FROZEN_KEY_DEFAULTS[-2:], BORROW_ENTRIES)
+    for key, _default, _version in BORROW_ENTRIES:
+        assert key in hypothesis.frozen_keys()
+        assert key in frozen.POST_REGISTRATION_COST_KEYS
+        assert key in frozen._FINGERPRINT_KEYS
+    assert "costs.borrow_bps_per_year" in frozen.HIGHER_ALLOWED_COST_KEYS
+    assert "costs.borrow_sensitivity_bps" not in frozen.HIGHER_ALLOWED_COST_KEYS
+
+
+def test_borrow_keys_at_their_defaults_move_no_canonical_set_or_fingerprint(
+    settings: Settings,
+) -> None:
+    params = _new_params(settings)
+    for key, default, _version in BORROW_ENTRIES:
+        assert frozen.is_default(params[key], default), key
+    without = _before(params, tuple(k for k, _d, _v in BORROW_ENTRIES))
+    for family in ("momentum", "combined"):
+        assert frozen.fingerprint(family, params, IN_SAMPLE_START) == frozen.fingerprint(
+            family, without, IN_SAMPLE_START
+        )
+        assert frozen.canonical_frozen_set(params, family) == frozen.canonical_frozen_set(
+            without, family
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("costs.borrow_bps_per_year", 30.0), ("costs.borrow_sensitivity_bps", [0.0, 300.0])],
+)
+def test_a_non_default_borrow_key_moves_the_fingerprint_but_not_the_promotion_identity(
+    settings: Settings, key: str, value: object
+) -> None:
+    from tradepartner.backtest import promotion
+
+    params = _new_params(settings)
+    moved = {**params, key: value}
+    assert frozen.fingerprint("momentum", moved, IN_SAMPLE_START) != frozen.fingerprint(
+        "momentum", params, IN_SAMPLE_START
+    )
+    assert promotion.promotion_identity(
+        "momentum", moved, IN_SAMPLE_START
+    ) == promotion.promotion_identity("momentum", params, IN_SAMPLE_START)
