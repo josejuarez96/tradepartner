@@ -1256,7 +1256,7 @@ class _Variant:
 
 
 def _check_variants(
-    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float]
+    variants: Sequence[tuple[Settings, TrialHandle]], cost_levels: Sequence[float], provider: object
 ) -> list[float]:
     """Every refusal before any read; the checked cost levels."""
     if not variants:
@@ -1298,6 +1298,18 @@ def _check_variants(
             "a read group reads one provider: every variant needs the same "
             f"adjust.apply_spin_offs, got {sorted(spin_offs)}"
         )
+    # The provider's own frozen `Settings` decide its frames; a provider built from other
+    # settings would serve frames the variant's counts do not match (#1894, item 3). A
+    # provider with no `settings` (a fake) carries no flag to check.
+    provider_settings = getattr(provider, "settings", None)
+    if provider_settings is not None:
+        flag = variants[0][0].adjust.apply_spin_offs
+        if provider_settings.adjust.apply_spin_offs != flag:
+            raise ValueError(
+                "the provider's adjust.apply_spin_offs "
+                f"({provider_settings.adjust.apply_spin_offs}) differs from the variants' "
+                f"({flag}): its frames would not carry the spin-off factor the counts assume"
+            )
     return levels
 
 
@@ -1376,7 +1388,7 @@ def run_many(
     `()` (#1448: a summary-level sweep writes neither). Nothing else changes.
     """
     signal_for(family)
-    levels = _check_variants(variants, cost_levels)
+    levels = _check_variants(variants, cost_levels, provider)
     cadence = variants[0][0].schedule.rebalance_cadence
     sessions = rebalance_sessions(start, end, cadence)
     if len(sessions) < 2:

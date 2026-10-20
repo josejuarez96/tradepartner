@@ -15,6 +15,7 @@ from typing import Any, cast
 import duckdb
 import polars as pl
 import pytest
+from conftest import load_universe_fixtures
 from polars.testing import assert_frame_equal
 
 from backtest.fake_provider import FakeProvider
@@ -28,7 +29,7 @@ from tradepartner.backtest.store_provider import StoreProvider
 from tradepartner.calendar import all_sessions, last_completed_session, session_close
 from tradepartner.config import Cadence, HypothesisFamily, Settings, SignalAnchor
 from tradepartner.store import registry, schema
-from tradepartner.store.asof import adjusted_prices_as_of
+from tradepartner.store.asof import adjusted_prices_as_of, prices_as_of
 from tradepartner.store.db import configure_connection, insert_row
 
 SRC = Path(__file__).parents[2] / "src" / "tradepartner" / "backtest"
@@ -112,6 +113,12 @@ def _run(
 
 def _equity(result: BacktestResult) -> dict[date, float]:
     return {row.session: row.equity for row in result.equity}
+
+
+def _strategy_equity(result: BacktestResult) -> dict[date, float]:
+    """The strategy series' equity by session: a `StoreProvider` run also carries the store's
+    benchmark series, whose rows share every session and would overwrite it in `_equity`."""
+    return {row.session: row.equity for row in result.equity if row.series == STRATEGY_SERIES}
 
 
 def _rows(result: BacktestResult, session: date) -> Any:
@@ -636,8 +643,6 @@ class TestSpinOffs:
         late: bool = False,
         unadjusted: pl.DataFrame | None = None,
         adjusted: pl.DataFrame | None = None,
-        late_row: pl.DataFrame | None = None,
-        dividend_row: pl.DataFrame | None = None,
     ) -> FakeProvider:
         """One always-held name A; the frames default to the flat dividend-in-kind frame,
         the declared rows are the test's (a row `ex` 2024-02-15, in the T0 step's window)."""
@@ -699,9 +704,9 @@ class TestSpinOffs:
             raw=base,
             members=self._members(),
             benchmarks={},
-            dividends=dividend_row if dividend_row is not None else dividends,
+            dividends=dividends,
             unvalued_spin_offs_rows=unvalued_rows,
-            late_spin_offs_rows=late_row if late_row is not None else late_rows,
+            late_spin_offs_rows=late_rows,
         )
 
     def test_the_two_counts_are_written_only_under_the_opt_in(self) -> None:
@@ -733,6 +738,26 @@ class TestSpinOffs:
             engine.run_many(variants, provider, T0, T3, (0.0,), family="momentum")
         assert provider.calls == []
 
+    def test_a_provider_flag_that_differs_from_the_variants_is_refused(self) -> None:
+        """The provider's own frozen `Settings` decide its frames (#1894, item 3), so a
+        provider built from other settings would serve frames the variant's counts do not
+        match: `run_many` refuses it before any read, like a mixed-flag group."""
+        from tradepartner.backtest.provider import DataProvider
+
+        class _Provider:
+            settings = _params(adjust={"apply_spin_offs": False})
+
+        variants = [(_params(adjust={"apply_spin_offs": True}), _handle())]
+        with pytest.raises(ValueError, match=r"provider's adjust\.apply_spin_offs"):
+            engine.run_many(
+                variants,
+                cast(DataProvider, _Provider()),
+                T0,
+                T3,
+                (0.0,),
+                family="momentum",
+            )
+
     def test_a_valued_spin_off_equals_the_dividend_in_kind(self) -> None:
         """The store's `spinoff` frame equals its dividend of r x C to 1e-12, and the
         engine's equity over each is equal: a valued row (no unvalued or late listing)
@@ -757,43 +782,167 @@ class TestSpinOffs:
         assert all(row.counts.get("n_late_spin_offs") == 0 for row in on.rebalances)
         assert all("n_spin_offs_unvalued" not in row.counts for row in off.rebalances)
 
+    #: The fixture universe's spin-off material for the store-driven late case (T211e):
+    #: `SEC_SPLIT_FUTURE` is a member at every rebalance here and `SEC_SPLIT_PLAIN` has a
+    #: bar on every session, so the child's E close and the parent's prior close are real
+    #: stored bars, not a fake's frames.
+    LATE_PARENT, LATE_CHILD = "SEC_SPLIT_FUTURE", "SEC_SPLIT_PLAIN"
+    LATE_E = date(2018, 12, 13)
+    LATE_KNOWN = datetime(2018, 12, 14, 21, 0, tzinfo=UTC)
+    LATE_RATIO = 0.25
+    LATE_START, LATE_END = date(2018, 11, 30), date(2018, 12, 31)
+
+    @staticmethod
+    def _plant(
+        conn: duckdb.DuckDBPyConnection,
+        *,
+        security_id: str,
+        action_type: str,
+        amount: float,
+        source_action_id: str,
+        at: datetime,
+    ) -> None:
+        insert_row(
+            conn,
+            "corporate_actions",
+            {
+                "security_id": security_id,
+                "action_type": action_type,
+                "ex_date": TestSpinOffs.LATE_E,
+                "ratio_or_amount": amount,
+                "announced_at": None,
+                "source_action_id": source_action_id,
+                "cancelled": False,
+                "known_at": at,
+                "ingested_at": at,
+                "source": "alpaca",
+                "provenance": "action",
+            },
+        )
+
+    @staticmethod
+    def _late_trial(conn: duckdb.DuckDBPyConnection, settings: Settings, slug: str) -> Any:
+        hypothesis = registry.register_hypothesis(
+            conn,
+            slug=slug,
+            family="momentum",
+            title=slug,
+            doc_path=f"docs/hypotheses/{slug}.md",
+            doc_sha256="0" * 64,
+            params={"costs.per_side_bps": 0.0},
+            in_sample_start=TestSpinOffs.LATE_START,
+            holdout_start=date(2020, 1, 1),
+            holdout_end=date(2021, 12, 31),
+            registered_by="test",
+            settings=settings,
+        )
+        return registry.open_trial(
+            conn,
+            hypothesis_id=hypothesis.hypothesis_id,
+            kind="in_sample",
+            start_session=TestSpinOffs.LATE_START,
+            end_session=TestSpinOffs.LATE_END,
+            data_cutoff=session_close(TestSpinOffs.LATE_END),
+            synthetic=True,
+            run_by="test",
+            settings=settings,
+        )
+
+    def _late_run(self, conn: duckdb.DuckDBPyConnection, settings: Settings, slug: str) -> Any:
+        handle = self._late_trial(conn, settings, slug)
+        connect = _lend(conn)
+        with StoreProvider(connect, handle, settings, registry_connect=connect) as provider:
+            return run(
+                settings,
+                provider,
+                self.LATE_START,
+                self.LATE_END,
+                handle,
+                (0.0,),
+                family="momentum",
+            )[0.0]
+
+    @pytest.mark.usefixtures("_no_env_file")
     def test_a_late_spin_off_matches_a_late_dividend(self) -> None:
-        """A row first known after the step that owned its ex-date is counted late on a
-        held parent and never restates the earlier steps (item 4): its run is the late
-        dividend's, to 1e-12, and each row's count is one."""
-        late = session_close(date(2024, 3, 5))
-        spin_row = pl.DataFrame(
-            {
-                "security_id": ["A"],
-                "ex_date": [self.EX],
-                "ratio_or_amount": [self.RATIO],
-                "known_at": [late],
-            },
-            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        """A `spinoff` row first known after the step that owned its ex-date is counted late
+        on a held parent and never restates the earlier steps (item 4, T211e). Run on a real
+        store through `StoreProvider`: the same row known in time scales the parent's pre-E
+        marks and moves equity away from the row-free store (the adjustment is real, so the
+        equivalence has teeth), while the late row's `true` book equals a late parent
+        dividend of r x C, to 1e-12, and the row-free store at every session (no
+        restatement). The step that first knows the late row counts it once."""
+        base = Settings(
+            _env_file=None,
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            schedule={"rebalance_cadence": "daily"},
         )
-        dividend_row = pl.DataFrame(
-            {
-                "security_id": ["A"],
-                "ex_date": [self.EX],
-                "ratio_or_amount": [self.D],
-                "known_at": [late],
-            },
-            schema_overrides={"known_at": pl.Datetime("us", "UTC")},
+        on = Settings(
+            _env_file=None,
+            strategy={"top_fraction": 1.0},
+            costs={"per_side_bps": 0.0},
+            schedule={"rebalance_cadence": "daily"},
+            adjust={"apply_spin_offs": True},
         )
-        on = _run(self._provider(late_row=spin_row), self._params(on=True), end=T4, levels=[0.0])[
-            0.0
-        ]
-        off = _run(
-            self._provider(dividend_row=dividend_row), self._params(on=False), end=T4, levels=[0.0]
-        )[0.0]
-        assert _equity(on) == pytest.approx(_equity(off), rel=1e-12)
-        assert all(row.n_targets == 1 for row in on.rebalances)  # A is held, not cash
-        # The ex-date drop is never restated: the loss is permanent.
-        assert _equity(on)[T1] == pytest.approx(
-            _equity(on)[F0] * (self.P - self.D) / self.P, rel=1e-9
+        plain = _fixture_conn()
+        (child_close,) = (
+            prices_as_of(plain, session_close(self.LATE_E), [self.LATE_CHILD])
+            .filter(pl.col("session") == self.LATE_E)["close"]
+            .to_list()
         )
-        assert [row.counts.get("n_late_spin_offs") for row in on.rebalances] == [0, 1, 0, 0]
-        assert [row.n_late_dividends for row in off.rebalances] == [0, 1, 0, 0]
+        amount = self.LATE_RATIO * child_close
+        in_time = session_close(date(2018, 12, 12))  # the session before E, known by its step
+
+        def spin_row(at: datetime) -> duckdb.DuckDBPyConnection:
+            conn = _fixture_conn()
+            self._plant(
+                conn,
+                security_id=self.LATE_CHILD,
+                action_type="spinoff",
+                amount=self.LATE_RATIO,
+                source_action_id=self.LATE_PARENT,
+                at=at,
+            )
+            return conn
+
+        def div_row(at: datetime) -> duckdb.DuckDBPyConnection:
+            conn = _fixture_conn()
+            self._plant(
+                conn,
+                security_id=self.LATE_PARENT,
+                action_type="dividend",
+                amount=amount,
+                source_action_id="",
+                at=at,
+            )
+            return conn
+
+        none = self._late_run(plain, base, "h-spin-none")
+        spin = self._late_run(spin_row(self.LATE_KNOWN), on, "h-spin-late")
+        div = self._late_run(div_row(self.LATE_KNOWN), base, "h-div-late")
+        timed = self._late_run(spin_row(in_time), on, "h-spin-timed")
+        timed_div = self._late_run(div_row(in_time), base, "h-div-timed")
+        # The store seeds benchmarks (SPY, MTUM), whose equity rows share every session: keep
+        # the strategy series alone, as `_equity` would drop it for a benchmark's.
+        et, etd = _strategy_equity(timed), _strategy_equity(timed_div)
+        es, ed, en = _strategy_equity(spin), _strategy_equity(div), _strategy_equity(none)
+        assert all(row.n_targets > 0 for row in spin.rebalances)  # the parent is held, not cash
+        # In time, the factor is real: the spin-off's book equals the dividend's and moves away
+        # from the row-free store, so the late equality below is not a flat-cash tautology.
+        assert et == pytest.approx(etd, rel=1e-12)
+        assert et[self.LATE_E] != pytest.approx(en[self.LATE_E], rel=1e-9)
+        # Late: the `true` book equals the late dividend's and the row-free store everywhere
+        # (earlier steps' equity is never restated when the row arrives).
+        assert set(es) == set(ed) == set(en)
+        for session in es:
+            assert es[session] == pytest.approx(ed[session], rel=1e-12)
+            assert es[session] == pytest.approx(en[session], rel=1e-12)
+        late_spin = {row.session: row.counts.get("n_late_spin_offs") for row in spin.rebalances}
+        assert late_spin[self.LATE_E] == 1
+        assert sum(count or 0 for count in late_spin.values()) == 1
+        assert all(row.counts.get("n_spin_offs_unvalued") == 0 for row in spin.rebalances)
+        assert all(row.counts.get("n_late_spin_offs") == 0 for row in timed.rebalances)
+        assert [row.n_late_dividends for row in div.rebalances if row.session == self.LATE_E] == [1]
 
 
 class TestInvariance:
@@ -1390,6 +1539,19 @@ def _lend(conn: duckdb.DuckDBPyConnection) -> Callable[[], Any]:
         yield conn
 
     return _connect
+
+
+#: The fixture universe, for the store-driven spin-off test (T211e).
+FIXTURE_UNIVERSE = Path(__file__).resolve().parents[1] / "fixtures" / "universe"
+
+
+def _fixture_conn() -> duckdb.DuckDBPyConnection:
+    """A fresh in-memory store with the fixture universe loaded, as `fixture_store` builds."""
+    conn = duckdb.connect(":memory:")
+    configure_connection(conn)
+    schema.init_schema(conn)
+    load_universe_fixtures(conn, FIXTURE_UNIVERSE)
+    return conn
 
 
 @pytest.mark.usefixtures("_no_env_file")
