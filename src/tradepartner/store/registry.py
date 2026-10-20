@@ -504,6 +504,8 @@ def code_tree_sha256(repo_dir: Path | None = None) -> str | None:
 # not a store table until that task lands) are written by ingests nothing a
 # registered trial reads. `openfigi_types` (#1713, T189c) joins them: a
 # check-only table whose one reader is the `health` types block.
+# `mergers` (#1762, T248c) joins them: its one reader is the paper
+# reconciliation, so a merger backfill stales no trial.
 # `tests/store/test_registry.py` pins that this list
 # and the exclusions together cover every fact table.
 _TRIAL_FACT_TABLES: Final[tuple[str, ...]] = (
@@ -563,8 +565,8 @@ def data_vintage(
     store happens to have -- with a table absent from the store skipped, and
     with `corporate_actions` counted only for its `split` and `dividend` rows
     and a `successor_chains` retraction counted from its `withdrawn_known_at`
-    (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status` or `symbol_changes` row
-    therefore moves no trial's vintage, while `store_max_ingested_at` below
+    (`_TRIAL_TABLE_ROWS`; #821). Writing a `borrow_status`, `symbol_changes` or
+    `mergers` row therefore moves no trial's vintage, while `store_max_ingested_at` below
     stays whole over every fact table: it is the store's state, not a trial's.
 
     `spin_offs` (backtest spec amendment #1894, item 6; T211d) adds the

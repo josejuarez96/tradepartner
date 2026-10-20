@@ -1292,6 +1292,7 @@ def test_the_version_26_migration_widens_the_two_allowed_sets_and_keeps_every_ro
             "symbol_changes",
             "openfigi_types",
             "successor_chains",
+            "mergers",
         }
         assert {table for table in shape_before if shape_after[table] != shape_before[table]} == {
             "listings",
@@ -2337,7 +2338,7 @@ def test_schema_version_is_bumped_past_action_identity() -> None:
     26; #1627's `cash_in_lieu` kind is version 27; #1506's `symbol_changes`
     (T172b) is version 28; #1813's skip reasons (T202a) are version 29;
     #821's `successor_chains` (T187) is version 30."""
-    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_SHORT_REASONS_VERSION + 1
+    assert schema.CURRENT_SCHEMA_VERSION == schema._PRE_MERGERS_VERSION + 1
 
 
 # --- version 9 (#571, spec req 17): the `settle_order` override ----------------------
@@ -2569,3 +2570,199 @@ def test_a_fresh_store_has_the_cost_level_kind_column_and_its_check() -> None:
             )
     finally:
         conn.close()
+
+
+# --- version 35 (#1762, plan T248c): the `mergers` table ---------------------
+
+_V35_MERGERS_DDL_SHA256 = "acfaafaa6ee3fd3c14a675e0dadd022ebc41f87dec79099aef489740730e828f"
+_MERGER_STAMP = datetime(2020, 12, 2, 21, tzinfo=UTC)
+
+
+def _merger_row(**changes: object) -> dict[str, object]:
+    """A valid `stock_and_cash` merger row; `changes` override columns."""
+    row: dict[str, object] = {
+        "security_id": "S1",
+        "kind": "stock_and_cash",
+        "acquirer_security_id": "S2",
+        "acquiree_symbol": "TGT",
+        "acquiree_cusip": "TGT-CUSIP",
+        "acquirer_symbol": "ACQ",
+        "acquirer_cusip": "ACQ-CUSIP",
+        "share_ratio": 0.5,
+        "cash_per_share": 3.0,
+        "effective_date": date(2020, 12, 15),
+        "process_date": date(2020, 12, 1),
+        "payable_date": None,
+        "source_action_id": "merger-1",
+        "known_at": _MERGER_STAMP,
+        "ingested_at": _MERGER_STAMP,
+        "source": "alpaca",
+        "provenance": "action",
+    }
+    return row | changes
+
+
+def _as_version_34(conn: duckdb.DuckDBPyConnection) -> None:
+    """Leave `conn`'s schema_version as a version-34 store's: one row."""
+    conn.execute("DELETE FROM schema_version")
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at) VALUES (34, TIMESTAMPTZ "
+        "'2026-10-19 20:00:00+00')"
+    )
+
+
+def test_mergers_ddl_is_pinned_at_version_35() -> None:
+    digest = hashlib.sha256("".join(schema._MERGERS_TABLE_DDL).encode()).hexdigest()
+    assert digest == _V35_MERGERS_DDL_SHA256, (
+        "mergers DDL changed: bump the schema version and add a migration instead "
+        "of editing the table in place"
+    )
+
+
+def test_mergers_is_an_action_fact_table_with_nullable_rates_and_payable_date(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    assert "mergers" in schema.TABLE_NAMES
+    assert schema.TABLE_PROVENANCE_VALUES["mergers"] == ("action",)
+    nullable = {
+        name
+        for _, name, _, notnull, _, _ in fixture_store.execute(
+            "PRAGMA table_info('mergers')"
+        ).fetchall()
+        if not notnull
+    }
+    assert nullable == {"acquirer_security_id", "share_ratio", "cash_per_share", "payable_date"}
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _merger_row(kind="cash", share_ratio=None, acquirer_security_id=None, acquirer_symbol=""),
+        _merger_row(kind="cash", share_ratio=None),
+        _merger_row(kind="stock", cash_per_share=None),
+        _merger_row(),
+    ],
+)
+def test_mergers_accepts_each_kind_with_its_own_rates(
+    fixture_store: duckdb.DuckDBPyConnection, row: dict[str, object]
+) -> None:
+    insert_row(fixture_store, "mergers", row)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"kind": "spin"},
+        {"kind": "cash"},  # share_ratio set on a cash merger
+        {"kind": "cash", "share_ratio": None, "cash_per_share": None},
+        {"kind": "stock"},  # cash set on a stock merger
+        {"kind": "stock", "share_ratio": None, "cash_per_share": None},
+        {"kind": "stock", "cash_per_share": None, "acquirer_security_id": None},
+        {"kind": "stock_and_cash", "cash_per_share": None},
+        {"kind": "stock_and_cash", "share_ratio": None},
+        {"kind": "stock_and_cash", "acquirer_security_id": None},
+        {"share_ratio": 0.0},
+        {"share_ratio": -1.0},
+        {"share_ratio": float("nan")},
+        {"share_ratio": float("inf")},
+        {"cash_per_share": 0.0},
+        {"cash_per_share": -2.5},
+        {"cash_per_share": float("nan")},
+        {"cash_per_share": float("inf")},
+        {"source_action_id": ""},
+        {"provenance": "filing"},
+        {"known_at": _MERGER_STAMP + timedelta(seconds=1)},  # known_at after ingested_at
+    ],
+)
+def test_mergers_refuses_what_its_checks_name(
+    fixture_store: duckdb.DuckDBPyConnection, changes: dict[str, object]
+) -> None:
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(fixture_store, "mergers", _merger_row(**changes))
+
+
+def test_mergers_identity_is_the_acquiree_the_id_and_the_stamp(
+    fixture_store: duckdb.DuckDBPyConnection,
+) -> None:
+    """A second row for one `(security_id, source_action_id, known_at)` raises
+    even when its rates and dates differ (the unique index); a later stamp is a
+    revision and another id for the same acquiree is another deal."""
+    insert_row(fixture_store, "mergers", _merger_row())
+    with pytest.raises(duckdb.ConstraintException):
+        insert_row(
+            fixture_store,
+            "mergers",
+            _merger_row(cash_per_share=4.0, effective_date=date(2020, 12, 16)),
+        )
+    later = _MERGER_STAMP + timedelta(days=1)
+    insert_row(
+        fixture_store,
+        "mergers",
+        _merger_row(cash_per_share=4.0, known_at=later, ingested_at=later),
+    )
+    insert_row(fixture_store, "mergers", _merger_row(source_action_id="merger-2"))
+    assert fixture_store.execute(
+        "SELECT count(*) FROM mergers WHERE source_action_id LIKE 'merger-%'"
+    ).fetchone() == (3,)
+
+
+def test_the_version_35_migration_adds_mergers_and_nothing_else() -> None:
+    """From 34: `mergers` and its identity index, empty, and a version-35 row; no
+    other table, index or row changes; a second open adds nothing; the table is
+    the fresh store's."""
+    conn = duckdb.connect(":memory:")
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE mergers")
+        _as_version_34(conn)
+        conn.execute(
+            "INSERT INTO prices_daily VALUES ('S1', DATE '2020-01-02', 1, 1, 1, 1, 1, "
+            "TIMESTAMPTZ '2020-01-02 21:00:00+00', TIMESTAMPTZ '2020-01-02 21:10:00+00', "
+            "'test', 'bar')"
+        )
+        shape_before, indexes_before = _shape(conn), _indexes(conn)
+        tables_before = sorted(set(shape_before) - {"schema_version"})
+        rows_before = _all_rows(conn, tables_before)
+        assert "mergers" not in shape_before
+        assert "mergers_identity" not in indexes_before
+        assert max(_versions(conn)) == 34
+        schema.init_schema(conn)
+        shape_after, indexes_after = _shape(conn), _indexes(conn)
+        assert set(shape_after) - set(shape_before) == {"mergers"}
+        assert {t: shape_after[t] for t in shape_before} == shape_before
+        assert set(indexes_after) - set(indexes_before) == {"mergers_identity"}
+        assert {i: indexes_after[i] for i in indexes_before} == indexes_before
+        assert _all_rows(conn, tables_before) == rows_before
+        assert conn.execute("SELECT count(*) FROM mergers").fetchone() == (0,)
+        assert _versions(conn) == [34, 35] == [34, schema.CURRENT_SCHEMA_VERSION]
+        before_second = _versions(conn)
+        schema.init_schema(conn)
+        assert _versions(conn) == before_second
+        fresh = duckdb.connect(":memory:")
+        schema.init_schema(fresh)
+        assert shape_after["mergers"] == _shape(fresh)["mergers"]
+        assert indexes_after["mergers_identity"] == _indexes(fresh)["mergers_identity"]
+    finally:
+        conn.close()
+
+
+def test_read_only_open_of_a_version_34_store_passes(tmp_path: Path) -> None:
+    """A read-only connection never migrates: a version-34 store passes,
+    `schema_version` stays at 34, a `mergers` read fails on the missing table
+    and every other read works."""
+    path = tmp_path / "v34.duckdb"
+    conn = duckdb.connect(str(path))
+    try:
+        configure_connection(conn)
+        schema.init_schema(conn)
+        conn.execute("DROP TABLE mergers")
+        _as_version_34(conn)
+    finally:
+        conn.close()
+    with duckdb.connect(str(path), read_only=True) as ro:
+        schema.init_schema(ro)
+        assert max(_versions(ro)) == 34
+        assert ro.execute("SELECT count(*) FROM symbol_changes").fetchone() == (0,)
+        with pytest.raises(duckdb.CatalogException):
+            ro.execute("SELECT count(*) FROM mergers").fetchone()
