@@ -32,6 +32,7 @@ from tradepartner.execution.plan import (
     BuyCosts,
     Decision,
     Decisions,
+    HoldBook,
     Signal,
     decisions_from,
     is_full_exit,
@@ -759,3 +760,118 @@ def test_is_full_exit_reads_every_sell_decisions_from_writes() -> None:
     assert ("trade", "sell", "left_targets", True) in seen
     assert ("trade", "sell", "left_universe", True) in seen
     assert ("override", "sell", "exclude_name", True) in seen
+
+
+# --- a held name with no read-session bar is kept (spec amendment 2026-10-20, #2023; T253) ---
+
+
+def _kept_plan(no_bar: tuple[str, ...]) -> Plan:
+    return _plan(
+        {"B": 0.5, "D": 0.5},
+        {"B": 0.4, "D": 0.3},
+        members=("B", "D"),
+        excluded=(),
+        exclusions={"no_history": (), "no_t0_bar": no_bar},
+    )
+
+
+# A 10 x 50 = 500 and X 10 x 10 = 100 held; cash 1400: equity 2000.
+_KEPT_LEDGER = {"A": 10.0, "X": 10.0}
+
+
+def test_a_kept_name_is_skip_zero_with_the_engines_target_and_its_drifted_weight() -> None:
+    got = _by_name(_run(_kept_plan(("A",)), _ledger(_KEPT_LEDGER, cash=1400.0)))
+    a = got["A"]
+    assert (a.decision, a.side, a.reason, a.target_weight) == ("skip_zero", None, None, 0.0)
+    assert a.drifted_weight == pytest.approx(500.0 / 2000.0)
+    assert got["X"].reason == "left_universe"  # held, not a candidate: sold as today
+    assert "E" not in got  # an unheld candidate is not bought
+
+
+def test_an_unheld_no_bar_candidate_is_not_bought() -> None:
+    got = _by_name(_run(_kept_plan(("E",)), _ledger(_KEPT_LEDGER, cash=1400.0)))
+    assert "E" not in got and got["A"].reason == "left_universe"
+
+
+@pytest.mark.parametrize(
+    ("extra", "decision", "reason"),
+    [
+        ({"listings_at": {"A": T}}, "skip_delisted", None),
+        (
+            {"overrides": (_override("exclude_name", "A", override_id=7),)},
+            "override",
+            "exclude_name",
+        ),
+        ({"overrides": (_override("keep_name", "A", override_id=8),)}, "override", "keep_name"),
+    ],
+)
+def test_an_earlier_rule_claims_the_name_before_the_keep(
+    extra: dict[str, object], decision: str, reason: str | None
+) -> None:
+    got = _by_name(_run(_kept_plan(("A",)), _ledger(_KEPT_LEDGER, cash=1400.0), **extra))  # type: ignore[arg-type]
+    assert (got["A"].decision, got["A"].reason) == (decision, reason)
+    if reason == "exclude_name":
+        assert got["A"].side == "sell"
+
+
+def test_a_name_with_an_open_forced_exit_gets_no_decision() -> None:
+    got = _by_name(
+        _run(
+            _kept_plan(("A",)),
+            _ledger(_KEPT_LEDGER, cash=1400.0),
+            open_forced_exits=frozenset({"A"}),
+        )
+    )
+    assert "A" not in got
+
+
+def test_a_live_name_under_hold_weighting_is_skip_zero_as_today() -> None:
+    hold = HoldBook(
+        entries={"A": 1}, ordinal=2, hold_sessions=5, hold_target_names=2, top_fraction=0.5
+    )
+    plan = _kept_plan(("A",))
+    ledger = _ledger({"A": 10.0}, cash=1500.0)
+    got = decisions_from(
+        plan,
+        ledger,
+        (),
+        _assets(),
+        {},
+        frozenset(),
+        FROZEN,
+        SETTINGS,
+        price_of=price_of,
+        actions_as_of=_actions(),
+        costs=COSTS,
+        hold=hold,
+    )
+    assert _by_name(got)["A"].decision == "skip_zero"
+
+
+def test_a_kept_name_under_long_short_raises() -> None:
+    ledger = _ledger(_KEPT_LEDGER, cash=1400.0)
+    with pytest.raises(ValueError, match="long_only"):
+        decisions_from(
+            _kept_plan(("A",)),
+            ledger,
+            (),
+            _assets(),
+            {},
+            frozenset(),
+            FROZEN,
+            SETTINGS,
+            price_of=price_of,
+            actions_as_of=_actions(),
+            costs=COSTS,
+            side="long_short",
+            short_min_price=1.0,
+        )
+
+
+def test_an_empty_kept_set_is_todays_decisions() -> None:
+    ledger = _ledger(_KEPT_LEDGER, cash=1400.0)
+    with_key = _run(_kept_plan(()), ledger)
+    without = _run(
+        _plan({"B": 0.5, "D": 0.5}, {"B": 0.4, "D": 0.3}, members=("B", "D"), excluded=()), ledger
+    )
+    assert with_key == without
