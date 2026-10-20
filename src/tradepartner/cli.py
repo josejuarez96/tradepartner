@@ -3316,14 +3316,11 @@ def make_app(
         s = settings()
         if (missing := _store_missing(s)) is not None:
             raise missing
+        commit, dirty = registry.code_version()
         try:
-            commit = subprocess.run(
-                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-            ).stdout.strip()
-        except (OSError, subprocess.CalledProcessError):
-            commit = "unknown"
-        try:
-            result = store_backup_module.backup_store(s, now=clock(), git_commit=commit)
+            result = store_backup_module.backup_store(
+                s, now=clock(), git_commit=commit, code_dirty=dirty
+            )
         except store_backup_module.BackupError as exc:
             raise _fail(f"backup refused: {exc}", 1) from exc
         typer.echo(f"copy matches the store byte for byte: {result.copy_path}")

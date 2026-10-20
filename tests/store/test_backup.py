@@ -39,6 +39,7 @@ def test_copy_is_named_for_utc_minute_verified_and_manifested(store: Path) -> No
     manifest = json.loads(Path(f"{copy}.manifest.json").read_text())
     assert manifest["git_commit"] == "abc123"
     assert manifest["schema_version"] == 34
+    assert manifest["code_dirty"] is None
     assert manifest["store_bytes"] == store.stat().st_size
     assert manifest["wal_bytes"] is None
     assert not list(store.parent.glob("*.partial"))
@@ -127,3 +128,14 @@ def test_the_command_prints_the_copy_and_exits_zero(store: Path) -> None:
     again = CliRunner().invoke(app, ["store", "backup"])
     assert again.exit_code == 1
     assert "already exists" in again.output
+
+
+def test_the_command_records_this_checkouts_commit_and_dirty_flag(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.registry, "code_version", lambda: ("deadbeef", True))
+    out = CliRunner().invoke(cli.make_app(clock=lambda: NOW), ["store", "backup"])
+    assert out.exit_code == 0, out.output
+    manifest = json.loads(Path(f"{store}.bak-20261020-1405.manifest.json").read_text())
+    assert manifest["git_commit"] == "deadbeef"
+    assert manifest["code_dirty"] is True

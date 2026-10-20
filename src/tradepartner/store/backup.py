@@ -58,7 +58,9 @@ def _copy_checked(source: Path, temp: Path) -> None:
         raise BackupError(f"the copy of {source} does not match the original")
 
 
-def backup_store(settings: Settings, *, now: datetime, git_commit: str) -> BackupResult:
+def backup_store(
+    settings: Settings, *, now: datetime, git_commit: str, code_dirty: bool | None = None
+) -> BackupResult:
     """Copy the store (and its `.wal`) to `<store>.bak-<UTC stamp>` and verify it."""
     if now.tzinfo is None:
         raise ValueError("now must be tz-aware")
@@ -88,6 +90,7 @@ def backup_store(settings: Settings, *, now: datetime, git_commit: str) -> Backu
             record = {
                 "created_at_utc": now.astimezone(UTC).isoformat(),
                 "git_commit": git_commit,
+                "code_dirty": code_dirty,
                 "schema_version": schema_version,
                 "store_file": store.name,
                 "store_bytes": store.stat().st_size,
